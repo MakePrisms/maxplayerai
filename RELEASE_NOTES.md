@@ -1,3 +1,17 @@
+## v0.6.1-rc9
+
+Unreleased ninth release candidate for 0.6.1.
+
+### Changes since v0.6.1-rc8
+
+- Buyers can exclude one or more seller public identities with `[buyer] blocked_sellers`.
+  Automatic awards skip their claims while other eligible sellers remain selectable;
+  manual and lower-level new awards refuse blocked sellers. This includes the buyer's
+  own seller, public/private jobs, and paid/free jobs. Invalid entries fail startup.
+  Empty/omitted lists retain existing behavior. Restart the buyer daemon and MCP
+  server to load changes. Existing pinned awards and payment obligations are unaffected.
+  See [buyer configuration](docs/BUYER-QUICKSTART.md#block-sellers-from-new-work).
+
 ## v0.6.1-rc8
 
 Eighth release candidate for 0.6.1, including seller claim filtering (#1113),

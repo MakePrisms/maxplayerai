@@ -1,0 +1,30 @@
+[
+  {
+    "suite": "cli",
+    "exit": 0
+  },
+  {
+    "suite": "e2e",
+    "exit": 0
+  },
+  {
+    "suite": "maxplayer-trade",
+    "exit": 0
+  },
+  {
+    "suite": "maxplayer_trade",
+    "exit": 0
+  },
+  {
+    "suite": "money",
+    "exit": 0
+  },
+  {
+    "suite": "pinned_quote_recovery",
+    "exit": 0
+  },
+  {
+    "suite": "relays",
+    "exit": 0
+  }
+]

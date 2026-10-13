@@ -10,6 +10,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, MAXPLAYER_TAGGED_KINDS, OFFER, PROFILE, RECEIPT, RESULT,
+  TRADE_KINDS, TRADE_LOT, TRADE_STATUS,
 } from "../src/model/kinds.js";
 import { PROFILE_KIND, TAGGED_KINDS } from "../scripts/bake-snapshot.mjs";
 
@@ -32,7 +33,7 @@ function sourceFiles(dir: string): string[] {
 test("kind numbers appear in exactly one file", () => {
   // The distinctive ones only. PROFILE is 0, and scanning for a bare 0 would
   // match arithmetic everywhere — it gets the shape-based check below instead.
-  const distinctive = [OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT];
+  const distinctive = [OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT, TRADE_LOT, TRADE_STATUS, 23412];
   const pattern = new RegExp(`\\b(${distinctive.join("|")})\\b`);
 
   const offenders: string[] = [];
@@ -64,4 +65,11 @@ test("the baker's duplicated kind list cannot drift from the canonical one", () 
   // Allowed, therefore pinned.
   assert.deepEqual([...TAGGED_KINDS], [...MAXPLAYER_TAGGED_KINDS], "the baker's tagged kinds match kinds.ts");
   assert.equal(PROFILE_KIND, PROFILE, "and its profile kind does too");
+});
+
+test("trade kinds match the trade CLI and never include private negotiation", () => {
+  // crates/maxplayer-trade/src/lib.rs: LOT = 3410, STATUS = 3411, TRADE = 23412.
+  assert.deepEqual([TRADE_LOT, TRADE_STATUS], [3410, 3411]);
+  assert.deepEqual([...TRADE_KINDS], [TRADE_LOT, TRADE_STATUS]);
+  assert.ok(!MAXPLAYER_TAGGED_KINDS.includes(TRADE_LOT) && !MAXPLAYER_TAGGED_KINDS.includes(TRADE_STATUS), "the jobs board does not read trade kinds");
 });

@@ -1,7 +1,7 @@
 //! `maxplayer wallet` — flexible ecash wallet management (CLI).
 //!
-//! Never echoes the secret key. Token/bolt11 may appear on argv per subcommand
-//! surface but are not written to durable logs here.
+//! Never echoes the secret key. Bolt11 may appear on argv; `receive` takes its token from
+//! `--token-file` or stdin (argv still accepted for compatibility). Neither is written to logs here.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -62,7 +62,7 @@ fn wallet_usage(err: &mut dyn Write) {
          \x20 maxplayer wallet mint <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet send <amount> [--mint <url>] [--home <path>]\n\
-         \x20 maxplayer wallet receive <token> [--home <path>]\n\
+         \x20 maxplayer wallet receive (--token-file <path> | -) [--home <path>]   # `-` reads the token from stdin (paste, then Ctrl-D); a <token> argument still works but lands in shell history\n\
          \x20 maxplayer wallet melt <bolt11> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet invoice <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mints list [--home <path>]\n\
@@ -872,7 +872,222 @@ fn cmd_send(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
 #[cfg(feature = "wallet")]
 fn cmd_receive(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let (opts, positional) = match parse_common(args) {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    let stdin_is_tty = stdin.is_terminal();
+    cmd_receive_with_stdin(args, &mut stdin.lock(), stdin_is_tty, out, err)
+}
+
+#[cfg(feature = "wallet")]
+/// Where `wallet receive` reads its token from. The positional argv form stays for compatibility,
+/// but argv lands in shell history and the process list, so `--token-file` and stdin are preferred.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenSource {
+    Argv(String),
+    File(PathBuf),
+    Stdin,
+}
+
+#[cfg(feature = "wallet")]
+/// Split `--token-file <path>` out of the receive args (it is receive-only, so `parse_common` does
+/// not know it), then pick exactly one token source. Never echoes token material in an error.
+fn parse_receive_args(args: &[String]) -> Result<(CommonOpts, TokenSource), String> {
+    let mut token_file: Option<PathBuf> = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--token-file" {
+            index += 1;
+            let value = args
+                .get(index)
+                .ok_or_else(|| "--token-file requires a path".to_owned())?;
+            if token_file.replace(PathBuf::from(value)).is_some() {
+                return Err("--token-file given more than once".into());
+            }
+        } else {
+            rest.push(args[index].clone());
+        }
+        index += 1;
+    }
+    let (opts, positional) = parse_common(&rest)?;
+    let source = match (positional.as_slice(), token_file) {
+        ([], Some(path)) => TokenSource::File(path),
+        // Never read stdin implicitly: a caller that forgot the token while holding an open,
+        // never-closed stdin pipe would block forever. Stdin is read only for an explicit `-`.
+        ([], None) => {
+            return Err(
+                "no token given: pass --token-file <path>, or `-` to read the token from stdin"
+                    .into(),
+            );
+        }
+        ([dash], None) if dash == "-" => TokenSource::Stdin,
+        ([raw], None) => TokenSource::Argv(raw.clone()),
+        ([_], Some(_)) => {
+            return Err(
+                "give the token either as an argument or with --token-file, not both".into(),
+            );
+        }
+        (_, _) => return Err("receive takes at most one token".into()),
+    };
+    Ok((opts, source))
+}
+
+#[cfg(feature = "wallet")]
+/// Upper bound on a token read from `--token-file` or stdin. A cashuB token with hundreds of
+/// proofs is tens of KB; anything larger is not a token (a log file, `/dev/zero`).
+const MAX_TOKEN_BYTES: u64 = 1024 * 1024;
+
+#[cfg(feature = "wallet")]
+/// Read at most [`MAX_TOKEN_BYTES`] as UTF-8. Errors name `what` (path / stdin), never content.
+fn read_capped(reader: &mut dyn std::io::Read, what: &str) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_TOKEN_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {what}: {}", error.kind()))?;
+    if bytes.len() as u64 > MAX_TOKEN_BYTES {
+        return Err(format!(
+            "{what} is larger than {} bytes; that is not a cashu token",
+            MAX_TOKEN_BYTES
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("{what} is not UTF-8 text"))
+}
+
+#[cfg(feature = "wallet")]
+/// Resolve the token text and trim surrounding whitespace. Errors name the source (path / stdin),
+/// never the token. Stdin is read only for an explicit `-`; on a terminal a paste hint goes to
+/// `err` first.
+fn read_receive_token(
+    source: &TokenSource,
+    stdin: &mut dyn std::io::Read,
+    stdin_is_tty: bool,
+    err: &mut dyn Write,
+) -> Result<String, String> {
+    let raw = match source {
+        TokenSource::Argv(raw) => raw.clone(),
+        TokenSource::File(path) => {
+            let what = format!("--token-file {}", path.display());
+            // Refuse FIFOs, devices and directories before opening: a FIFO with no writer would
+            // block and `/dev/zero` never ends.
+            let metadata = std::fs::metadata(path)
+                .map_err(|error| format!("cannot read {what}: {}", error.kind()))?;
+            if !metadata.is_file() {
+                return Err(format!("{what} is not a regular file"));
+            }
+            let mut file = std::fs::File::open(path)
+                .map_err(|error| format!("cannot read {what}: {}", error.kind()))?;
+            read_capped(&mut file, &what)?
+        }
+        TokenSource::Stdin => {
+            if stdin_is_tty {
+                let _ = writeln!(err, "paste the token, then press Ctrl-D");
+            }
+            read_capped(stdin, "token on stdin")?
+        }
+    };
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(match source {
+            TokenSource::File(path) => format!("--token-file {} is empty", path.display()),
+            TokenSource::Stdin => "token on stdin is empty".into(),
+            TokenSource::Argv(_) => "token is empty".into(),
+        });
+    }
+    Ok(token.to_owned())
+}
+
+#[cfg(feature = "wallet")]
+/// Defence in depth: whatever the wallet layer reports, token material never reaches stderr. The
+/// exact token goes first, then [`redact_secret_runs`] catches prefixes and decoded parts.
+fn redact_token(message: &str, token: &str) -> String {
+    let message = if token.is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(token, "<redacted token>")
+    };
+    redact_secret_runs(&message)
+}
+
+#[cfg(feature = "wallet")]
+/// Does a `cashuA`/`cashuB` prefix (any case) start at byte `at`?
+fn token_prefix_at(bytes: &[u8], at: usize) -> bool {
+    bytes.len() - at >= 6
+        && (bytes[at..at + 6].eq_ignore_ascii_case(b"cashua")
+            || bytes[at..at + 6].eq_ignore_ascii_case(b"cashub"))
+}
+
+#[cfg(feature = "wallet")]
+/// Redact `cashuA`/`cashuB` runs (any case; base64, base64url and `%`-encoded bodies) and hex runs
+/// of 32+ characters (secrets, preimages, proof `C` points, signatures), mirroring
+/// `maxplayer_trade::redact_reason`. Short hex (keyset ids, codes), mint URLs and npubs stay
+/// readable.
+fn redact_secret_runs(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if token_prefix_at(bytes, i) {
+            let mut k = i + 6;
+            while k < bytes.len()
+                && (bytes[k].is_ascii_alphanumeric()
+                    || matches!(bytes[k], b'-' | b'_' | b'=' | b'+' | b'/' | b'%'))
+            {
+                k += 1;
+            }
+            out.push_str("<redacted token>");
+            i = k;
+            continue;
+        }
+        if bytes[i].is_ascii_hexdigit() {
+            let mut k = i;
+            while k < bytes.len() && bytes[k].is_ascii_hexdigit() && !token_prefix_at(bytes, k) {
+                k += 1;
+            }
+            if k - i >= 32 {
+                out.push_str("<redacted hex>");
+            } else {
+                out.push_str(&text[i..k]);
+            }
+            i = k;
+            continue;
+        }
+        // `i` is always on a char boundary: runs end on ASCII bytes.
+        let ch = text[i..].chars().next().expect("index within text");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+#[cfg(feature = "wallet")]
+/// The wallet call behind `receive`, injectable so tests can return a token-echoing error.
+type ReceiveFn<'a> = &'a dyn Fn(&MaxplayerHome, &str) -> Result<wallet_ops::ReceiveOutcome, String>;
+
+#[cfg(feature = "wallet")]
+fn cmd_receive_with_stdin(
+    args: &[String],
+    stdin: &mut dyn std::io::Read,
+    stdin_is_tty: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    cmd_receive_with(args, stdin, stdin_is_tty, out, err, &|home, token| {
+        wallet_ops::receive_blocking(home, token).map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(feature = "wallet")]
+fn cmd_receive_with(
+    args: &[String],
+    stdin: &mut dyn std::io::Read,
+    stdin_is_tty: bool,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    receive: ReceiveFn<'_>,
+) -> i32 {
+    let (opts, source) = match parse_receive_args(args) {
         Ok(value) => value,
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -880,10 +1095,10 @@ fn cmd_receive(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
             return USAGE_ERROR;
         }
     };
-    let token = match positional.as_slice() {
-        [raw] => raw.as_str(),
-        _ => {
-            wallet_usage(err);
+    let token = match read_receive_token(&source, stdin, stdin_is_tty, err) {
+        Ok(token) => token,
+        Err(message) => {
+            let _ = writeln!(err, "{message}");
             return USAGE_ERROR;
         }
     };
@@ -891,7 +1106,7 @@ fn cmd_receive(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
         Ok(home) => home,
         Err(code) => return code,
     };
-    match wallet_ops::receive_blocking(&home, token) {
+    match receive(&home, &token) {
         Ok(outcome) => {
             let _ = writeln!(
                 out,
@@ -901,7 +1116,7 @@ fn cmd_receive(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
             SUCCESS
         }
         Err(error) => {
-            let _ = writeln!(err, "{error}");
+            let _ = writeln!(err, "{}", redact_token(&error, &token));
             RUNTIME_ERROR
         }
     }
@@ -2001,5 +2216,400 @@ mod tests {
             "setup --mint must auto-add the mint:\n{out}"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ---- wallet receive: token off argv (--token-file / stdin) ----
+
+    #[cfg(feature = "wallet")]
+    const FAKE_TOKEN: &str = "cashuBnotARealTokenButSecretLookingXYZ123";
+
+    #[cfg(feature = "wallet")]
+    fn receive_tmp(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-receive-{label}-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir
+    }
+
+    #[cfg(feature = "wallet")]
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    /// A stdin that fails the test if anything reads it (proves stdin is left alone).
+    #[cfg(feature = "wallet")]
+    struct UntouchedStdin;
+
+    #[cfg(feature = "wallet")]
+    impl std::io::Read for UntouchedStdin {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("stdin must not be read without an explicit `-`");
+        }
+    }
+
+    #[cfg(feature = "wallet")]
+    fn read_token(
+        source: &TokenSource,
+        stdin: &mut dyn std::io::Read,
+        tty: bool,
+    ) -> Result<String, String> {
+        read_receive_token(source, stdin, tty, &mut Vec::new())
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_token_file_is_read_and_trimmed() {
+        let dir = receive_tmp("file");
+        let file = dir.join("t.token");
+        std::fs::write(&file, format!("  \n{FAKE_TOKEN}\r\n\t")).expect("write");
+        let (opts, source) = parse_receive_args(&strings(&[
+            "--token-file",
+            file.to_str().unwrap(),
+            "--home",
+            "/tmp/h",
+        ]))
+        .expect("parse");
+        assert_eq!(source, TokenSource::File(file.clone()));
+        assert_eq!(opts.home, Some(PathBuf::from("/tmp/h")));
+        let token = read_token(&source, &mut UntouchedStdin, true).expect("read");
+        assert_eq!(token, FAKE_TOKEN);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_reads_trimmed_token_from_stdin_only_with_explicit_dash() {
+        for args in [strings(&["-"]), strings(&["-", "--home", "/tmp/h"])] {
+            let (_, source) = parse_receive_args(&args).expect("parse");
+            assert_eq!(source, TokenSource::Stdin, "args {args:?}");
+            let mut stdin = std::io::Cursor::new(format!("{FAKE_TOKEN}\n"));
+            let token = read_token(&source, &mut stdin, false).expect("read");
+            assert_eq!(token, FAKE_TOKEN);
+        }
+    }
+
+    // M1: a caller that forgot the token while holding an open, never-closed stdin pipe must get
+    // the usage error back, not block forever reading stdin.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_without_a_token_is_a_usage_error_and_never_reads_stdin() {
+        let dir = receive_tmp("notoken");
+        let home = dir.join("home");
+        for tty in [false, true] {
+            for args in [strings(&[]), strings(&["--home", home.to_str().unwrap()])] {
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                let code = cmd_receive_with(
+                    &args,
+                    &mut UntouchedStdin,
+                    tty,
+                    &mut out,
+                    &mut err,
+                    &|_, _| panic!("no wallet call without a token"),
+                );
+                let err = String::from_utf8(err).expect("utf8");
+                assert_eq!(code, USAGE_ERROR, "{err}");
+                assert!(err.contains("no token given"), "{err}");
+                assert!(
+                    err.contains("--token-file <path>") && err.contains("`-`"),
+                    "{err}"
+                );
+                assert!(
+                    err.contains("maxplayer wallet receive (--token-file <path> | -)"),
+                    "usage line must show both sources:\n{err}"
+                );
+                assert!(out.is_empty());
+            }
+        }
+        assert!(
+            !home.exists(),
+            "refusal must happen before the home is bootstrapped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // N1: explicit `-` on a terminal is allowed (paste, then Ctrl-D) with a hint on stderr.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_dash_on_a_terminal_hints_then_reads_and_refuses_empty_input() {
+        let mut err = Vec::new();
+        let mut stdin = std::io::Cursor::new(format!("{FAKE_TOKEN}\n"));
+        let token =
+            read_receive_token(&TokenSource::Stdin, &mut stdin, true, &mut err).expect("tty paste");
+        assert_eq!(token, FAKE_TOKEN);
+        let err = String::from_utf8(err).expect("utf8");
+        assert!(err.contains("paste the token, then press Ctrl-D"), "{err}");
+        let mut quiet = Vec::new();
+        read_receive_token(
+            &TokenSource::Stdin,
+            &mut std::io::Cursor::new(FAKE_TOKEN),
+            false,
+            &mut quiet,
+        )
+        .expect("pipe");
+        assert!(quiet.is_empty(), "no hint when stdin is a pipe");
+        let err = read_token(&TokenSource::Stdin, &mut std::io::Cursor::new(" \n"), false)
+            .expect_err("blank stdin");
+        assert!(err.contains("empty"), "{err}");
+    }
+
+    // L1: token-file and stdin reads are capped; the refusal never quotes the content.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_token_reads_are_capped_at_one_mib_without_quoting_content() {
+        let max = MAX_TOKEN_BYTES as usize;
+        assert_eq!(max, 1024 * 1024);
+        let body = |len: usize| format!("cashuB{}", "Q".repeat(len - 6));
+        let dir = receive_tmp("cap");
+        let big = dir.join("big.token");
+        std::fs::write(&big, body(max + 1)).expect("write");
+        let err = read_token(&TokenSource::File(big.clone()), &mut UntouchedStdin, false)
+            .expect_err("over the cap");
+        assert!(
+            err.contains("larger than 1048576 bytes") && err.contains("big.token"),
+            "{err}"
+        );
+        assert!(!err.contains("QQQQ") && !err.contains("cashuB"), "{err}");
+        let err = read_token(
+            &TokenSource::Stdin,
+            &mut std::io::Cursor::new(body(max + 1)),
+            false,
+        )
+        .expect_err("stdin over the cap");
+        assert!(err.contains("token on stdin is larger than"), "{err}");
+        assert!(!err.contains("QQQQ"), "{err}");
+        // Exactly at the cap is still accepted.
+        let exact = dir.join("exact.token");
+        std::fs::write(&exact, body(max)).expect("write");
+        let token =
+            read_token(&TokenSource::File(exact), &mut UntouchedStdin, false).expect("at cap");
+        assert_eq!(token.len(), max);
+        // Non-UTF-8 is refused without echoing bytes.
+        let binary = dir.join("bin.token");
+        std::fs::write(&binary, [0xffu8, 0xfe, b'c']).expect("write");
+        let err =
+            read_token(&TokenSource::File(binary), &mut UntouchedStdin, false).expect_err("binary");
+        assert!(err.contains("is not UTF-8 text"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // L1: FIFOs, devices and directories are refused with a clear error before opening.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_token_file_must_be_a_regular_file() {
+        let dir = receive_tmp("notfile");
+        let mut paths = vec![dir.clone()];
+        let dev_null = PathBuf::from("/dev/null");
+        if dev_null.exists() {
+            paths.push(dev_null);
+        }
+        for path in paths {
+            let err = read_token(&TokenSource::File(path.clone()), &mut UntouchedStdin, false)
+                .expect_err("not a regular file");
+            assert!(
+                err.contains("is not a regular file"),
+                "{}: {err}",
+                path.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_positional_token_still_works() {
+        let (_, source) =
+            parse_receive_args(&strings(&[&format!(" {FAKE_TOKEN} ")])).expect("parse");
+        let token = read_token(&source, &mut UntouchedStdin, true).expect("read");
+        assert_eq!(token, FAKE_TOKEN);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_refuses_token_argument_and_token_file_together_without_echoing_token() {
+        let dir = receive_tmp("both");
+        let file = dir.join("t.token");
+        std::fs::write(&file, FAKE_TOKEN).expect("write");
+        let home = dir.join("home");
+        for args in [
+            strings(&[FAKE_TOKEN, "--token-file", file.to_str().unwrap()]),
+            strings(&["--token-file", file.to_str().unwrap(), FAKE_TOKEN]),
+            strings(&["--token-file", file.to_str().unwrap(), "-"]),
+        ] {
+            let mut full = args.clone();
+            full.extend(strings(&["--home", home.to_str().unwrap()]));
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_receive_with_stdin(&full, &mut UntouchedStdin, true, &mut out, &mut err);
+            let err = String::from_utf8(err).expect("utf8");
+            assert_eq!(code, USAGE_ERROR, "{err}");
+            assert!(err.contains("not both"), "{err}");
+            assert!(!err.contains(FAKE_TOKEN), "token leaked to stderr:\n{err}");
+            assert!(out.is_empty());
+        }
+        assert!(
+            !home.exists(),
+            "refusal must happen before the home is bootstrapped"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_missing_token_file_is_a_usage_error_naming_the_path() {
+        let dir = receive_tmp("missing");
+        let missing = dir.join("no-such.token");
+        let home = dir.join("home");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with_stdin(
+            &strings(&[
+                "--token-file",
+                missing.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+            ]),
+            &mut UntouchedStdin,
+            true,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, USAGE_ERROR, "{err}");
+        assert!(err.contains("cannot read --token-file"), "{err}");
+        assert!(err.contains("no-such.token"), "{err}");
+        assert!(
+            !home.exists(),
+            "a missing token file must not bootstrap the home"
+        );
+        let err2 = parse_receive_args(&strings(&["--token-file"])).expect_err("needs a path");
+        assert!(err2.contains("--token-file requires a path"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A malformed token from a file reaches the real wallet layer and fails there; stderr carries
+    // the wallet's message but not the token.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_real_wallet_error_for_a_malformed_token_omits_the_token() {
+        let dir = receive_tmp("realwallet");
+        let file = dir.join("t.token");
+        std::fs::write(&file, format!("{FAKE_TOKEN}\n")).expect("write");
+        let home = dir.join("home");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with_stdin(
+            &strings(&[
+                "--token-file",
+                file.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+            ]),
+            &mut UntouchedStdin,
+            true,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "{err}");
+        assert!(err.contains("invalid cashu token"), "{err}");
+        assert!(!err.contains(FAKE_TOKEN), "token leaked to stderr:\n{err}");
+        assert!(out.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The redaction wiring itself: a wallet error that echoes the whole token, a prefix of it, or
+    // a decoded secret must reach stderr redacted. Fails if `cmd_receive_with` prints the raw error.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_wallet_error_never_contains_the_token() {
+        let dir = receive_tmp("redact");
+        let home = dir.join("home");
+        let secret = "5f".repeat(32);
+        let echo = format!(
+            "wallet error: cannot redeem {FAKE_TOKEN}; unsupported token: {}…; proof secret {secret}",
+            &FAKE_TOKEN[..20]
+        );
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with(
+            &strings(&["-", "--home", home.to_str().unwrap()]),
+            &mut std::io::Cursor::new(format!("{FAKE_TOKEN}\n")),
+            false,
+            &mut out,
+            &mut err,
+            &|_, token| {
+                assert_eq!(token, FAKE_TOKEN, "the trimmed token reaches the wallet");
+                Err(echo.clone())
+            },
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "{err}");
+        assert!(
+            err.contains("wallet error: cannot redeem <redacted token>"),
+            "{err}"
+        );
+        assert!(
+            !err.contains(&FAKE_TOKEN[..12]),
+            "token prefix leaked:\n{err}"
+        );
+        assert!(
+            !err.contains(&secret) && err.contains("<redacted hex>"),
+            "{err}"
+        );
+        assert!(out.is_empty());
+
+        // Success prints the outcome, nothing on stderr.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with(
+            &strings(&["-", "--home", home.to_str().unwrap()]),
+            &mut std::io::Cursor::new(FAKE_TOKEN),
+            false,
+            &mut out,
+            &mut err,
+            &|_, _| {
+                Ok(wallet_ops::ReceiveOutcome {
+                    mint_url: "http://127.0.0.1:1".into(),
+                    received_sats: 8,
+                    balance_sats: 13,
+                })
+            },
+        );
+        assert_eq!(code, SUCCESS);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "received_sats=8 balance_sats=13 mint=http://127.0.0.1:1\n"
+        );
+        assert!(err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn redact_secret_runs_catches_token_and_secret_shapes_and_keeps_identifiers() {
+        let cases: &[(&str, &str)] = &[
+            ("bad cashuBo2F-_x+/= end", "bad <redacted token> end"),
+            ("bad cashuAeyJ0b2tlbiI6", "bad <redacted token>"),
+            ("QR CASHUBO2FTEBTODHRW here", "QR <redacted token> here"),
+            ("pct cashuB%2Fo2F%3Dxyz rest", "pct <redacted token> rest"),
+            ("glued deadcashuBo2F", "glued dead<redacted token>"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(redact_secret_runs(input), *want, "{input}");
+        }
+        let lower = "ab".repeat(32);
+        let upper = "AB".repeat(33);
+        let red = redact_secret_runs(&format!("C {upper} secret {lower}"));
+        assert_eq!(red, "C <redacted hex> secret <redacted hex>");
+        // Identifiers stay readable: keyset ids, short codes, mint URLs, npubs, non-ASCII text.
+        let keep = "keyset 009a1f293253e41e code 11001 mint https://mint.minibits.cash/Bitcoin \
+                    nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d — ok";
+        assert_eq!(redact_secret_runs(keep), keep);
+        // The exact-token pass runs first, then the shape pass.
+        assert_eq!(
+            redact_token(&format!("boom: {FAKE_TOKEN} failed"), FAKE_TOKEN),
+            "boom: <redacted token> failed"
+        );
+        assert_eq!(redact_token("plain", ""), "plain");
     }
 }

@@ -1,0 +1,163 @@
+[
+  {
+    "label": "fake-maker",
+    "swap": "95123d9c-1998-4dc2-9ec2-60db193a8013",
+    "mint": "https://testnut.cashudevkit.org",
+    "state": "refunded",
+    "witnesses": [
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      },
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      },
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      }
+    ],
+    "secret_material": "redacted",
+    "derivation": "all three pinned CDK hash_to_curve vectors passed"
+  },
+  {
+    "label": "fake-taker",
+    "swap": "95123d9c-1998-4dc2-9ec2-60db193a8013",
+    "mint": "https://testnut.cashu.space",
+    "state": "refunded",
+    "witnesses": [
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      },
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      },
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      }
+    ],
+    "secret_material": "redacted",
+    "derivation": "all three pinned CDK hash_to_curve vectors passed"
+  },
+  {
+    "label": "real-maker",
+    "swap": "e242bfeb-28ee-459e-b700-42624330114c",
+    "mint": "https://mint.macadamia.cash",
+    "state": "refunded",
+    "witnesses": [
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      },
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      },
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      }
+    ],
+    "secret_material": "redacted",
+    "derivation": "all three pinned CDK hash_to_curve vectors passed"
+  },
+  {
+    "label": "real-taker",
+    "swap": "e242bfeb-28ee-459e-b700-42624330114c",
+    "mint": "https://cashu.cz",
+    "state": "refunded",
+    "witnesses": [
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      },
+      {
+        "state": "SPENT",
+        "wire_carrier": "JSON string",
+        "keys": [
+          "preimage",
+          "signatures"
+        ],
+        "preimage": "empty (redacted)",
+        "signature_count": 1,
+        "signatures": "redacted"
+      }
+    ],
+    "secret_material": "redacted",
+    "derivation": "all three pinned CDK hash_to_curve vectors passed"
+  }
+]
