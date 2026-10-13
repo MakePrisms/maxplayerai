@@ -952,3 +952,35 @@ accounted-for change and SPENT inputs, not PAID alone; `unpaid_released` require
 absence/termination evidence. Ambiguous sends are not resubmitted. Preserve every funded
 home and exact authorization. Quarantined trade outputs never become withdrawal balance.
 The skill documents these states and the CLI help regression includes `withdraw --invoice`.
+
+### Mint diagnostics
+
+`maxplayer-trade doctor nostr://<npub> --mint-relay ws://127.0.0.1:<port> --json`
+uses an ephemeral key and exactly one logical **info** request to the explicit relay,
+re-sending the identical event every 5 s like trade admission does.
+It needs no `--home`, wallet, seed or journal. `--timeout-seconds` changes only this
+read-only probe's budget; silence within that budget does not prove the mint is offline.
+Doctor exits 0 for usable info (unknown compatibility warns), 1 for proven incompatibility,
+and 2 for an unsuccessful diagnostic. Existing monetary exit codes remain unchanged.
+
+New list/take admission and previews reuse existing info/keysets reads. A missing version
+or a capability schema this tool does not recognise (e.g. a newer one) prints **WARNING:
+compatibility unknown**; a recognised schema-1 block missing a required capability refuses
+new effects with **upgrade the mint sidecar and repeat preflight**. No historical minimum
+version is inferred. Existing-money recovery does not use this compatibility gate.
+A measured reply above 5 seconds warns, but does not refuse. An ACK is never a mint answer.
+
+Both mints must remain reachable through their mint relays while a trade runs. Preflight
+confirms only the shown operations at that time, not later claims/refunds. After submission,
+a timeout may still have moved funds: retain the existing operation and use status/recover,
+not a replacement spend. Accepted-but-unanswered, relay refusal, unknown acceptance and
+signed mint errors carry separate evidence; arbitrary server/relay text is not echoed.
+A signed reply that is malformed or uses another envelope version is recorded as evidence
+and ignored, as before: the request still waits for a usable answer and ends unanswered.
+
+A maker's initial request that fails only because a mint did not answer is not journaled
+as a rejection, so a later delivery of the same signed event (e.g. after a serve restart)
+is handled fresh. It is not queued: recovery never admits requests. Genuine refusals stay
+permanent, and the request id stays bound to its digest. A request whose `exp` is more than
+120 s (the 60 s quote window plus 60 s clock skew) past its creation time or this host's
+clock is refused.

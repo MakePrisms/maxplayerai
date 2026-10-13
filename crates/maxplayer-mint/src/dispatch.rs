@@ -33,7 +33,9 @@ async fn run(mint: &Mint, operation: &str, body: Value) -> Result<Value, ErrorBo
             info.nuts.nut04.disabled = true;
             info.nuts.nut05.methods.clear();
             info.nuts.nut05.disabled = true;
-            encode(&info)
+            let mut value = encode(&info)?;
+            overlay_implementation(&mut value);
+            Ok(value)
         }
         op::KEYS => encode(&mint.pubkeys()),
         op::KEYSET => {
@@ -92,4 +94,35 @@ fn decode<T: DeserializeOwned>(operation: &str, body: Value) -> Result<T, ErrorB
 
 fn encode<T: Serialize>(value: &T) -> Result<Value, ErrorBody> {
     serde_json::to_value(value).map_err(|error| named(code::INTERNAL, format!("encode: {error}")))
+}
+
+/// Owned live fields overlay stored metadata; operator fields remain untouched.
+pub fn overlay_implementation(info: &mut Value) {
+    info["version"] = format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION")).into();
+    info["maxplayer_mint"] = serde_json::json!({
+        "schema":1, "implementation":"maxplayer-mint", "version":env!("CARGO_PKG_VERSION"),
+        "build":env!("MINT_SIDECAR_BUILD"), "envelope_versions":[1],
+        "holder_ops":["info","keys","keyset","keysets","swap","checkstate","restore"],
+        "durable_replay":true, "expiry_rule":"now_gte_exp", "nut07_witnesses":"unverified"
+    });
+}
+
+#[cfg(test)]
+mod diagnostics_tests {
+    use super::*;
+    #[test]
+    fn live_overlay_preserves_operator_metadata_and_replaces_stale_version() {
+        for version in [Value::Null, Value::String("old/0.0.1".into())] {
+            let mut info = serde_json::json!({"name":"operator", "contact":[["email","operator@example.invalid"]],"version":version,"maxplayer_mint":{"build":"old"},"nuts":{}});
+            overlay_implementation(&mut info);
+            assert_eq!(info["name"], "operator");
+            assert_eq!(info["contact"][0][1], "operator@example.invalid");
+            assert_eq!(
+                info["version"],
+                format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION"))
+            );
+            assert_eq!(info["maxplayer_mint"]["build"], env!("MINT_SIDECAR_BUILD"));
+            let _: cdk::nuts::MintInfo = serde_json::from_value(info).unwrap();
+        }
+    }
 }

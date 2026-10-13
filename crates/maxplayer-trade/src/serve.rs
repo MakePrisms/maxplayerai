@@ -86,6 +86,7 @@ pub enum Reply {
 /// A request queued to serve's loop.
 pub struct Job {
     pub command: Command,
+    diagnostics: crate::diagnostics::Lines,
     reply: oneshot::Sender<std::result::Result<Outcome, Failure>>,
 }
 #[derive(Debug)]
@@ -275,7 +276,9 @@ async fn connection(
         bail!(error)
     }
     let (reply, rx) = oneshot::channel();
+    let diagnostics = crate::diagnostics::Lines::default();
     tx.send(Job {
+        diagnostics: diagnostics.clone(),
         command: request.command,
         reply,
     })
@@ -289,6 +292,13 @@ async fn connection(
             _ = tokio::time::sleep(KEEPALIVE) => write(&mut stream, &Reply::Keepalive).await?,
         }
     };
+    let lines = diagnostics
+        .lock()
+        .map(|lines| lines.clone())
+        .unwrap_or_default();
+    for line in lines {
+        write(&mut stream, &Reply::Stderr(line)).await?;
+    }
     let outcome = match outcome {
         Ok(o) => o,
         Err(f) => {
@@ -404,7 +414,7 @@ pub async fn execute(home: &Path, j: &Journal, m: &Market, job: Job) {
         "{}",
         serde_json::json!({"serve_request":name,"bounds":job.command})
     );
-    let result = run_command(home, j, m, &job.command)
+    let result = crate::diagnostics::scoped(job.diagnostics, run_command(home, j, m, &job.command))
         .await
         .map_err(|e| Failure {
             code: exit_code(&e),

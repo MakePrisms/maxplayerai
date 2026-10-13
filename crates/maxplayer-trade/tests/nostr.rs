@@ -29,7 +29,7 @@ use nostr_relay_builder::{
     builder::{PolicyResult, RateLimit, WritePolicy},
 };
 use nostr_sdk::nips::nip44;
-use nostr_sdk::prelude::{Client, Event, EventBuilder, EventId, Keys, Kind, Tag};
+use nostr_sdk::prelude::{Client, Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -89,6 +89,11 @@ struct Tap {
     /// live outages: no answer at all, relays up). Counted in `silenced`.
     silent: AtomicBool,
     silenced: AtomicU64,
+    info_mode: AtomicU64,
+    /// Lose the first reply to each info request (a lost first delivery); later ones pass.
+    drop_first_info: AtomicBool,
+    info_mint: Mutex<Option<nostr_sdk::prelude::PublicKey>>,
+    rewritten: Mutex<HashSet<EventId>>,
 }
 impl Tap {
     async fn admit(&self, event: &Event, mint_relay: bool) -> PolicyResult {
@@ -181,6 +186,78 @@ impl Tap {
                 .tags
                 .event_ids()
                 .find_map(|id| self.requests.lock().unwrap().get(id).map(|s| s.op.clone()));
+            if op.as_deref() == Some("info") && self.drop_first_info.load(SeqCst) {
+                if let Some(request) = event.tags.event_ids().next().copied() {
+                    if self.lost.lock().unwrap().insert(request) {
+                        return PolicyResult::Reject("tap: first info reply lost".into());
+                    }
+                }
+            }
+            let mode = self.info_mode.load(SeqCst);
+            if op.as_deref() == Some("info")
+                && self
+                    .info_mint
+                    .lock()
+                    .unwrap()
+                    .is_none_or(|key| key == event.pubkey)
+                && mode > 0
+                && !self.rewritten.lock().unwrap().remove(&event.id)
+            {
+                let mint = self
+                    .mints
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|k| k.public_key() == event.pubkey)
+                    .cloned()
+                    .unwrap();
+                let peer = event.tags.public_keys().next().unwrap();
+                let plain = nip44::decrypt(mint.secret_key(), peer, &event.content).unwrap();
+                let mut response: serde_json::Value = serde_json::from_str(&plain).unwrap();
+                match mode {
+                    1 => response["ok"]["maxplayer_mint"]["holder_ops"]
+                        .as_array_mut()
+                        .unwrap()
+                        .retain(|v| v != "restore"),
+                    2 => {
+                        response["ok"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("maxplayer_mint");
+                        response["ok"]["version"] = serde_json::Value::Null;
+                    }
+                    3 => response["v"] = 2.into(),
+                    // A newer schema whose shape this tool cannot judge: even a missing
+                    // holder op is not proof of incompatibility.
+                    5 => {
+                        response["ok"]["maxplayer_mint"]["schema"] = 2.into();
+                        response["ok"]["maxplayer_mint"]["holder_ops"]
+                            .as_array_mut()
+                            .unwrap()
+                            .retain(|v| v != "restore");
+                    }
+                    4 => {
+                        response.as_object_mut().unwrap().remove("ok");
+                        response["err"] = serde_json::json!({"code":"internal","detail":"private payload must not echo"});
+                    }
+                    _ => unreachable!(),
+                }
+                let content = nip44::encrypt(
+                    mint.secret_key(),
+                    peer,
+                    response.to_string(),
+                    nip44::Version::V2,
+                )
+                .unwrap();
+                let changed = EventBuilder::new(Kind::Custom(RESPONSE_KIND), content)
+                    .tags(event.tags.iter().cloned())
+                    .sign_with_keys(&mint)
+                    .unwrap();
+                self.rewritten.lock().unwrap().insert(changed.id);
+                let relay = self.relay.lock().unwrap().clone().unwrap();
+                tokio::spawn(republish(changed, relay, 0));
+                return PolicyResult::Reject("tap: replaced info fixture".into());
+            }
             let delay = {
                 let mut d = self.delay_op_reply.lock().unwrap();
                 match d.as_mut() {
@@ -1645,6 +1722,7 @@ async fn cli(e: &Env, home: &Path, args: &[&str]) -> (i32, String, String) {
         .arg(home)
         .args(["--mint-relay", &e.mint_relay_url])
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .unwrap();
@@ -1925,9 +2003,10 @@ async fn nostr_cli_dry_runs_and_discover_price_lots() {
     assert!(v["you_give"]["error"].is_null(), "{v}");
     assert_eq!(v["you_give"]["net"], 32);
     assert_eq!(v["you_receive"]["leg"]["net"], 24, "{v}");
-    assert!(
-        keysets_reads(&e.tap) >= 2,
-        "SAFETY: both legs' keysets read over the mint relay"
+    assert_eq!(
+        keysets_reads(&e.tap),
+        2,
+        "one preflight keysets read per mint; no preview duplicate"
     );
     assert!(!rows(&e.maker, &n1.url).await.1, "dry run reserves nothing");
 
@@ -1969,9 +2048,10 @@ async fn nostr_cli_dry_runs_and_discover_price_lots() {
     assert_eq!(v["you_give"]["mint"], n2.url.as_str());
     assert!(v["you_give"]["error"].is_null(), "{v}");
     assert_eq!(v["you_receive"]["leg"]["net"], 32, "{v}");
-    assert!(
-        keysets_reads(&e.tap) >= 2,
-        "SAFETY: keysets over the mint relay"
+    assert_eq!(
+        keysets_reads(&e.tap),
+        2,
+        "one preflight keysets read per mint; no preview duplicate"
     );
     assert!(
         e.jt.all::<Swap>("swap").await.unwrap().is_empty(),
@@ -2388,4 +2468,803 @@ async fn nostr_serve_completes_all_nostr_trade_on_slow_relay() {
         0,
         "SAFETY: no misrouted kinds"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_info_only_no_home_no_fallback_and_live_metadata() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    let mut stored = n.mint.mint_info().await.unwrap();
+    stored.name = Some("operator preserved".into());
+    stored.version = None;
+    n.mint.set_mint_info(stored).await.unwrap();
+    e.tap.reset();
+    let home = e.root.path().join("doctor-must-not-exist");
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "--home",
+            home.to_str().unwrap(),
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--json",
+            "--timeout-seconds",
+            "3",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["observation"]["outcome"], "ok");
+    assert_eq!(report["compatibility"]["status"], "supported_advertised");
+    assert_eq!(
+        report["observation"]["relays"].as_object().unwrap().len(),
+        1
+    );
+    assert!(!home.exists(), "doctor creates no home/seed/journal");
+    {
+        let requests = e.tap.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exactly one logical request, no extra probes"
+        );
+        assert!(requests.values().all(|r| r.op == "info" && r.count == 1));
+    }
+
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            "ws://127.0.0.1:1",
+            "--json",
+            "--timeout-seconds",
+            "1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["observation"]["reply_ms"], serde_json::Value::Null);
+    assert_eq!(
+        report["observation"]["relays"].as_object().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        e.tap.requests.lock().unwrap().len(),
+        1,
+        "no configured fallback contacted"
+    );
+    let info = wallet::preflight_admission(&n.url).await.unwrap();
+    assert!(info["keysets"].is_array());
+    assert_eq!(
+        n.mint.mint_info().await.unwrap().name.as_deref(),
+        Some("operator preserved")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_signed_error_incompatibility_unknown_and_slow_are_distinct() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    for (mode, exit, compatibility) in [
+        (1, 1, "incompatible"),
+        (2, 0, "unknown"),
+        (3, 1, ""),
+        (4, 2, ""),
+        (5, 0, "unknown"),
+    ] {
+        e.tap.info_mode.store(mode, SeqCst);
+        let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args([
+                "doctor",
+                &n.url,
+                "--mint-relay",
+                &e.mint_relay_url,
+                "--json",
+                "--timeout-seconds",
+                "3",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(exit),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        // A v2 reply is ignored, not an answer: the probe waits out its budget (M1).
+        assert_eq!(
+            report["observation"]["reachability"],
+            if mode == 3 {
+                "unusable_reply"
+            } else {
+                "answered"
+            },
+            "mode {mode}"
+        );
+        if mode == 3 {
+            assert_eq!(report["observation"]["outcome"], "unsupported_protocol");
+            assert!(report["observation"]["reply_ms"].is_null());
+        }
+        if !compatibility.is_empty() {
+            assert_eq!(report["compatibility"]["status"], compatibility);
+        }
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("private payload"));
+    }
+    e.tap.info_mode.store(0, SeqCst);
+    e.tap.delay_replies_ms.store(8000, SeqCst);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--json",
+            "--timeout-seconds",
+            "12",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["latency"], "slow");
+    assert!(report["observation"]["reply_ms"].as_u64().unwrap() >= 8000);
+    n.task.abort();
+    e.tap.delay_replies_ms.store(0, SeqCst);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--json",
+            "--timeout-seconds",
+            "1",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["observation"]["reachability"], "unanswered");
+    assert_eq!(
+        report["latency"], "unknown",
+        "ACK-only is never healthy/slow-but-answering"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let e = env().await;
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker, &n1, 128).await;
+    e.fund_nostr(&e.taker, &n2, 128).await;
+    let lot = e.list(&n1.url, 32, &n2.url, 24).await;
+    e.tap.info_mode.store(1, SeqCst);
+    *e.tap.info_mint.lock().unwrap() = Some(n1.keys.public_key());
+    e.tap.reset();
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    let error = coordinator::start_take(&e.taker, &e.jt, &e.mt, &lot, 40, 32, 16)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("upgrade the mint sidecar"));
+    assert!(
+        e.jt.all::<Swap>("swap").await.unwrap().is_empty(),
+        "counterparty gate precedes all new effects"
+    );
+    let (code, _, err) = cli(
+        &e,
+        &e.taker,
+        &[
+            "--relay",
+            &e._market_url,
+            "take",
+            &lot,
+            "--max-give",
+            "40",
+            "--min-receive",
+            "32",
+        ],
+    )
+    .await;
+    assert_eq!(code, 1);
+    assert!(err.contains("upgrade the mint sidecar"), "{err}");
+    assert!(e.jt.all::<Swap>("swap").await.unwrap().is_empty());
+    assert!(e.tap.swaps().is_empty());
+    assert!(!rows(&e.taker, &n2.url).await.1, "no reservation");
+
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(e.taker.join("owner.lock"))
+        .unwrap();
+    fs2::FileExt::try_lock_exclusive(&lock).unwrap();
+    let mut jobs = maxplayer_trade::serve::bind(&e.taker, vec![e._market_url.clone()]).unwrap();
+    let request = maxplayer_trade::serve::Request {
+        v: 1,
+        relays: vec![e._market_url.clone()],
+        command: maxplayer_trade::serve::Command::Take {
+            lot: lot.clone(),
+            max_give: 40,
+            min_receive: 32,
+            max_fees: 16,
+        },
+    };
+    let client = async {
+        let mut stream = tokio::net::UnixStream::connect(e.taker.join("serve.sock"))
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let mut lines = BufReader::new(stream).lines();
+        let mut diagnostics = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            match serde_json::from_str::<maxplayer_trade::serve::Reply>(&line).unwrap() {
+                maxplayer_trade::serve::Reply::Stderr(line) => diagnostics.push(line),
+                maxplayer_trade::serve::Reply::Exit { code, error } => {
+                    assert_eq!(code, 1);
+                    assert!(error.unwrap().contains("upgrade the mint sidecar"));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            diagnostics
+                .iter()
+                .any(|l| l.contains(&n1.url) && l.contains("incompatible"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|l| l.contains(&n2.url) && l.contains("supported_advertised")),
+            "both reports forwarded, even on refusal"
+        );
+    };
+    let server = async {
+        maxplayer_trade::serve::execute(&e.taker, &e.jt, &e.mt, jobs.recv().await.unwrap()).await;
+    };
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(client, server);
+    })
+    .await
+    .unwrap();
+    assert!(e.jt.all::<Swap>("swap").await.unwrap().is_empty());
+    assert!(e.tap.swaps().is_empty());
+    maxplayer_trade::backoff::set_wait_for_pacing(false);
+}
+
+#[cfg(feature = "lab")]
+fn sealed_trade(e: &Env, message: &maxplayer_trade::market::Envelope) -> Event {
+    let content = nip44::encrypt(
+        e.mt.keys.secret_key(),
+        &e.mm.keys.public_key(),
+        serde_json::to_string(message).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    EventBuilder::new(Kind::Custom(TRADE), content)
+        .tags([
+            Tag::public_key(e.mm.keys.public_key()),
+            Tag::hashtag("maxplayer"),
+            Tag::parse(["v", "1"]).unwrap(),
+        ])
+        .sign_with_keys(&e.mt.keys)
+        .unwrap()
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn compatibility_advertisement_never_strands_admitted_trade() {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let n1 = e.nostr_mint().await;
+    let n2 = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n1, 128).await;
+    e.fund_nostr(&e.taker.clone(), &n2, 128).await;
+    let lot = e.list(&n1.url, 32, &n2.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    e.step_until(true, &id, "quoted").await;
+    e.tap.info_mode.store(1, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    assert!(
+        wallet::preflight_admission(&n1.url).await.is_err(),
+        "new admission is blocked"
+    );
+    // This authorized swap already exists. Only its original protocol/timing checks apply.
+    e.step_until(false, &id, "first_locked").await;
+    e.step_until(true, &id, "second_locked").await;
+    let (maker, taker) = e.pump_terminal(&id).await;
+    assert_eq!(maker, "complete");
+    assert_eq!(taker, "complete");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn signed_trade_error_retains_evidence_without_reflecting_payload() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.tap.info_mode.store(4, SeqCst);
+    let error = maxplayer_trade::transport::get(&n.url, "info")
+        .await
+        .unwrap_err();
+    let observed = error
+        .downcast_ref::<maxplayer_trade::transport::ObservedMintError>()
+        .expect("trade error must retain typed request evidence");
+    assert_eq!(observed.0.outcome, "internal");
+    assert!(observed.0.reply_ms.is_some());
+    assert_eq!(
+        observed.0.mint_error.as_ref().unwrap().detail,
+        "private payload must not echo"
+    );
+    assert!(!format!("{error:#}").contains("private payload"));
+    assert!(!format!("{error:?}").contains("private payload"));
+    assert!(
+        !serde_json::to_string(&observed.0)
+            .unwrap()
+            .contains("private payload")
+    );
+    assert!(
+        !maxplayer_trade::backoff::unanswered(&error),
+        "signed internal error is an answer, not silence"
+    );
+    assert!(
+        error
+            .downcast_ref::<maxplayer_trade::mint::MintRefusal>()
+            .is_none(),
+        "internal remains financially ambiguous"
+    );
+}
+
+/// Doctor resends the identical info event on the production 5 s cadence: a lost first
+/// delivery does not make a healthy mint look unanswered (nemo M6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn doctor_resends_like_admission_after_a_lost_first_reply() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.tap.reset();
+    e.tap.drop_first_info.store(true, SeqCst);
+    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+        .args([
+            "doctor",
+            &n.url,
+            "--mint-relay",
+            &e.mint_relay_url,
+            "--json",
+            "--timeout-seconds",
+            "12",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["observation"]["outcome"], "ok");
+    let requests = e.tap.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "one logical request (one event id)");
+    assert!(requests.values().all(|r| r.op == "info" && r.count >= 2));
+}
+
+/// An unrecognised (newer) capability schema warns and proceeds; it never refuses (M3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_capability_schema_warns_and_admission_proceeds() {
+    let e = env().await;
+    let n = e.nostr_mint().await;
+    e.tap.info_mode.store(5, SeqCst);
+    let info = wallet::preflight_admission(&n.url)
+        .await
+        .expect("schema 2 is unknown, not incompatible");
+    assert!(info["keysets"].is_array());
+    e.tap.info_mode.store(1, SeqCst);
+    assert!(
+        wallet::preflight_admission(&n.url).await.is_err(),
+        "a recognised schema-1 block missing restore still refuses"
+    );
+    e.tap.info_mode.store(0, SeqCst);
+}
+
+/// A signed reply in another envelope version is ignored: the trade read ends unanswered
+/// (retained and retried like silence), never a plain error that drops the message (M1).
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unusable_signed_reply_stays_unanswered_for_trade_retry() {
+    let e = env().await;
+    let _lab = SilentLab::new();
+    let n = e.nostr_mint().await;
+    e.tap.info_mode.store(3, SeqCst);
+    let error = maxplayer_trade::transport::get(&n.url, "info")
+        .await
+        .unwrap_err();
+    assert!(
+        maxplayer_trade::backoff::unanswered(&error),
+        "unusable reply keeps the base unanswered classification: {error:#}"
+    );
+    assert!(
+        error
+            .downcast_ref::<maxplayer_trade::mint::MintRefusal>()
+            .is_none()
+    );
+    let observed = error
+        .downcast_ref::<maxplayer_trade::transport::ObservedMintError>()
+        .expect("evidence retained");
+    assert_eq!(observed.0.outcome, "unsupported_protocol");
+    assert!(observed.0.reply_ms.is_none());
+    assert!(observed.0.ignored_reply_ms.is_some());
+    e.tap.info_mode.store(0, SeqCst);
+}
+
+/// T1, minimal: an initial request the maker could not handle only because a mint did not
+/// answer is not journaled as rejected, so the SAME signed event is handled fresh when it is
+/// delivered again (e.g. serve restarts and re-reads the last hour). Nothing queues it: a
+/// recovery pass admits nothing. Genuine refusals and request-id digests stay as on main.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unanswered_initial_request_is_not_rejected_and_redelivery_is_handled_fresh() {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let a = MintFixture::start(0).await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n, 128).await;
+    support::fund(&e.taker, &a.url, 128).await;
+    let lot = e.list(&n.url, 32, &a.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    let event = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), e.mm.inbox.recv())
+            .await
+            .expect("taker request reaches the maker")
+            .unwrap();
+        if e.mm.decode(&ev).is_ok_and(|m| m.step == "request") {
+            break ev;
+        }
+    };
+    let msg = e.mm.decode(&event).unwrap();
+    let key = format!("{}_{}", event.pubkey, msg.request_id);
+    e.tap.silent.store(true, SeqCst);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap_err();
+    assert!(
+        maxplayer_trade::backoff::unanswered(&error),
+        "fixture: the maker's mint read went unanswered: {error:#}"
+    );
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &key)
+            .await
+            .unwrap()
+            .is_none(),
+        "an unanswered mint is not a permanent rejection"
+    );
+    assert_eq!(retained_rows(&e.jm).await, 0, "no initial-request queue");
+    assert!(e.jm.get::<Swap>("swap", &id).await.unwrap().is_none());
+    let digest = hex::encode(Sha256::digest(serde_json::to_vec(&msg).unwrap()));
+    assert_eq!(
+        e.jm.get::<String>("inbox", &key).await.unwrap(),
+        Some(digest),
+        "request id stays bound to its digest"
+    );
+    // A genuine refusal stays permanent, even during the outage.
+    let mut bad = msg.clone();
+    bad.request_id = uuid::Uuid::new_v4().to_string();
+    bad.swap_id = uuid::Uuid::new_v4().to_string();
+    bad.body["max_give"] = 0.into();
+    let bad_event = sealed_trade(&e, &bad);
+    let bad_key = format!("{}_{}", bad_event.pubkey, bad.request_id);
+    assert!(
+        coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
+            .await
+            .is_err()
+    );
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &bad_key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let again = coordinator::handle(&e.maker, &e.jm, &e.mm, &bad_event)
+        .await
+        .unwrap_err();
+    assert!(
+        again.to_string().contains("recorded rejection"),
+        "{again:#}"
+    );
+    // A request whose expiry exceeds the quote window is refused at decode (exp cap).
+    let mut stale = msg.clone();
+    stale.request_id = uuid::Uuid::new_v4().to_string();
+    stale.swap_id = uuid::Uuid::new_v4().to_string();
+    stale.exp = coordinator::now() + 600;
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &sealed_trade(&e, &stale))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("request expiry exceeds the quote window"),
+        "{error:#}"
+    );
+    // The mint answers again. A recovery pass (recover / the pass before list, cancel, take)
+    // admits nothing: no swap, no quote.
+    e.tap.silent.store(false, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    coordinator::recover(&e.maker, &e.jm, &e.mm).await.unwrap();
+    assert!(
+        e.jm.all::<Swap>("swap").await.unwrap().is_empty(),
+        "recovery never admits a request"
+    );
+    // Re-delivery of the identical signed event is handled fresh and quoted once.
+    coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap();
+    assert_eq!(e.state(true, &id).await.as_deref(), Some("quoted"));
+    coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap();
+    assert_eq!(
+        e.jm.all::<Swap>("swap").await.unwrap().len(),
+        1,
+        "a duplicate delivery re-sends the quote, never a second swap"
+    );
+    // Same request id, different body: refused by the digest binding.
+    let mut changed = msg.clone();
+    changed.body["max_fees"] = serde_json::json!(999);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &sealed_trade(&e, &changed))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("conflicting request-id reuse"),
+        "{error:#}"
+    );
+}
+
+/// N-T1 (re-review of #1133): a request left unrejected by an unanswered mint is refused on
+/// re-delivery once its lot is cancelled, and once it has expired; neither creates a swap. With
+/// `inbox` already bound, the request branch's `msg.exp > now()` is the only expiry guard.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redelivered_request_is_refused_after_cancel_or_expiry() {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let a = MintFixture::start(0).await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n, 128).await;
+    support::fund(&e.taker, &a.url, 128).await;
+    let lot = e.list(&n.url, 32, &a.url, 24).await;
+    let _id = e.take(&lot, 40, 32).await;
+    let event = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), e.mm.inbox.recv())
+            .await
+            .expect("taker request reaches the maker")
+            .unwrap();
+        if e.mm.decode(&ev).is_ok_and(|m| m.step == "request") {
+            break ev;
+        }
+    };
+    let msg = e.mm.decode(&event).unwrap();
+    let mut short = msg.clone();
+    short.request_id = uuid::Uuid::new_v4().to_string();
+    short.swap_id = uuid::Uuid::new_v4().to_string();
+    short.exp = coordinator::now() + 25;
+    let ev = sealed_trade(&e, &short);
+    let key = format!("{}_{}", ev.pubkey, short.request_id);
+    e.tap.silent.store(true, SeqCst);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &ev)
+        .await
+        .unwrap_err();
+    assert!(maxplayer_trade::backoff::unanswered(&error), "{error:#}");
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    e.tap.silent.store(false, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    // Cancelled lot: refused, no swap.
+    let mut listing =
+        e.jm.get::<coordinator::Listing>("listing", &lot)
+            .await
+            .unwrap()
+            .unwrap();
+    listing.cancelled = true;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &ev)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("lot busy or terminal"),
+        "{error:#}"
+    );
+    assert!(e.jm.all::<Swap>("swap").await.unwrap().is_empty());
+    listing.cancelled = false;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    // A second, fresh short request: unanswered, then re-delivered after its expiry.
+    let mut late = msg.clone();
+    late.request_id = uuid::Uuid::new_v4().to_string();
+    late.swap_id = uuid::Uuid::new_v4().to_string();
+    late.exp = coordinator::now() + 25;
+    let lev = sealed_trade(&e, &late);
+    e.tap.silent.store(true, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(false);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &lev)
+        .await
+        .unwrap_err();
+    assert!(maxplayer_trade::backoff::unanswered(&error), "{error:#}");
+    e.tap.silent.store(false, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    while coordinator::now() <= late.exp {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let result = coordinator::handle(&e.maker, &e.jm, &e.mm, &lev).await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("expired or pre-bound")),
+        "an expired re-delivery must be refused: {result:?}"
+    );
+    assert!(
+        e.jm.all::<Swap>("swap").await.unwrap().is_empty(),
+        "an expired re-delivery must not create a swap"
+    );
+}
+
+/// Seal `message` as a trade event from `from` to `to`, optionally with a chosen `created_at`.
+fn seal_trade_from(
+    from: &Keys,
+    to: &Keys,
+    message: &maxplayer_trade::market::Envelope,
+    created_at: Option<u64>,
+) -> Event {
+    let content = nip44::encrypt(
+        from.secret_key(),
+        &to.public_key(),
+        serde_json::to_string(message).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    let mut builder = EventBuilder::new(Kind::Custom(TRADE), content).tags([
+        Tag::public_key(to.public_key()),
+        Tag::hashtag("maxplayer"),
+        Tag::parse(["v", "1"]).unwrap(),
+    ]);
+    if let Some(t) = created_at {
+        builder = builder.custom_created_at(Timestamp::from(t));
+    }
+    builder.sign_with_keys(from).unwrap()
+}
+
+/// L-1 (re-review of #1133): a message timeout between `save(swap)` and the listing's `active`
+/// write leaves a quoted maker swap while `listing.active` is still `None` (until the next
+/// recovery tick). The swap row alone keeps the lot busy: another taker's request in that window
+/// is refused before any mint read and never gets a second quote for the same lot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quoted_swap_keeps_lot_busy_without_listing_active_index() {
+    let mut e = env().await;
+    let a = MintFixture::start(0).await;
+    let b = MintFixture::start(0).await;
+    support::fund(&e.maker, &a.url, 128).await;
+    support::fund(&e.taker, &b.url, 128).await;
+    let lot = e.list(&a.url, 32, &b.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    let event = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), e.mm.inbox.recv())
+            .await
+            .expect("taker request reaches the maker")
+            .unwrap();
+        if e.mm.decode(&ev).is_ok_and(|m| m.step == "request") {
+            break ev;
+        }
+    };
+    coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap();
+    assert_eq!(e.state(true, &id).await.as_deref(), Some("quoted"));
+    // Simulate the dropped future: the swap is saved, the listing update never ran.
+    let mut listing =
+        e.jm.get::<coordinator::Listing>("listing", &lot)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(listing.active.as_deref(), Some(id.as_str()));
+    listing.active = None;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    // A different taker (so the per-peer limit does not apply) asks for the same lot.
+    let other = Keys::generate();
+    let mut second = e.mm.decode(&event).unwrap();
+    second.request_id = uuid::Uuid::new_v4().to_string();
+    second.swap_id = uuid::Uuid::new_v4().to_string();
+    second.exp = coordinator::now() + 60;
+    let ev = seal_trade_from(&other, &e.mm.keys, &second, None);
+    let result = coordinator::handle(&e.maker, &e.jm, &e.mm, &ev).await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("lot busy or terminal")),
+        "a lot with a live quoted swap must not be quoted again: {result:?}"
+    );
+    assert_eq!(
+        e.jm.all::<Swap>("swap").await.unwrap().len(),
+        1,
+        "SAFETY: one quote per lot"
+    );
+}
+
+/// Nit-4 (re-review of #1133): the `request` exp cap is `exp <= created_at + 120` AND
+/// `exp <= now + 120`. Each clause is pinned by a case only it refuses (back-dated / post-dated
+/// `created_at`), and the exact boundary (+120 accepted, +121 refused) is pinned for both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_exp_cap_pins_both_clauses_at_the_exact_boundary() {
+    let e = env().await;
+    let bound = maxplayer_trade::QUOTE_SECONDS + maxplayer_trade::market::REQUEST_EXP_SKEW_SECONDS;
+    assert_eq!(bound, 120);
+    let template = maxplayer_trade::market::Envelope {
+        trade_v: 1,
+        request_id: String::new(),
+        swap_id: String::new(),
+        lot_id: EventId::all_zeros().to_hex(),
+        quote_hash: String::new(),
+        step: "request".into(),
+        body: serde_json::json!({}),
+        exp: 0,
+    };
+    // `(created_at, exp)` as offsets from the decoder's clock, read before signing; retried if
+    // the second ticks between signing and decoding, so the `now` clause boundary is exact.
+    let decode = |created: i64, exp: i64| loop {
+        let t = coordinator::now() as i64;
+        let mut m = template.clone();
+        m.request_id = uuid::Uuid::new_v4().to_string();
+        m.swap_id = uuid::Uuid::new_v4().to_string();
+        m.exp = (t + exp) as u64;
+        let ev = seal_trade_from(&e.mt.keys, &e.mm.keys, &m, Some((t + created) as u64));
+        let result = e.mm.decode(&ev);
+        if coordinator::now() as i64 == t {
+            break result.map(|_| ()).map_err(|e| e.to_string());
+        }
+    };
+    let refused = |r: Result<(), String>| {
+        r.is_err_and(|e| e.contains("request expiry exceeds the quote window"))
+    };
+    // Both clauses at once: created_at = now.
+    assert_eq!(decode(0, 120), Ok(()), "exp = created_at + 120 = now + 120");
+    assert!(refused(decode(0, 121)), "exp = created_at + 121");
+    // `created_at` clause alone (back-dated; the `now` clause passes).
+    assert_eq!(decode(-600, -480), Ok(()), "exp = created_at + 120");
+    assert!(
+        refused(decode(-600, -479)),
+        "created_at clause: exp = created_at + 121"
+    );
+    assert!(
+        refused(decode(-300, 30)),
+        "created_at clause: back-dated, exp within now + 120"
+    );
+    // `now` clause alone (post-dated; the `created_at` clause passes).
+    assert_eq!(decode(600, 120), Ok(()), "exp = now + 120");
+    assert!(refused(decode(600, 121)), "now clause: exp = now + 121");
 }
