@@ -355,6 +355,28 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     Ok(r)
 }
 
+/// The CLI result for a returned receive record (exit 0, 1, 3 or 4), shared by `receive` and a
+/// receive handed to `serve` so both report one outcome the same way.
+pub fn verdict(r: &Receipt) -> Result<()> {
+    use ReceiveState::*;
+    match r.state {
+        Done if r.settled() => Ok(()),
+        // Journaled done but the credited rows are not yet released: run recover.
+        Done => Err(crate::coordinator::RecoveryIncomplete.into()),
+        Quarantined => Err(crate::coordinator::ManualRecovery.into()),
+        Refused => anyhow::bail!(
+            "receive refused by the mint ({}); final: the token was NOT imported, nothing \
+             was credited or charged to the cap, and it can be redeemed elsewhere",
+            r.refusal_code
+                .map_or("NUT code not journaled".to_owned(), |c| format!(
+                    "NUT code {c}"
+                ))
+        ),
+        AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
+        Prepared | Submitted => Err(crate::coordinator::RecoveryIncomplete.into()),
+    }
+}
+
 /// The one receive swap body (DLEQ stripped by `SwapRequest::new`), for sizing and sending.
 fn swap_request(inputs: &Proofs, outputs: &[Output]) -> SwapRequest {
     SwapRequest::new(
