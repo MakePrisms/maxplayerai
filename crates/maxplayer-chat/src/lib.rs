@@ -11,8 +11,9 @@ use std::{
         unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
-    time::Duration,
 };
+mod network;
+pub use network::{SendOutcome, WatchOptions, WatchStatus, read_status, watch, watch_with_options};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 pub fn display_text(text: &str) -> String {
     text.chars()
@@ -30,7 +31,7 @@ fn visual_format(c: char) -> bool {
         | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{200b}' | '\u{200c}'
         | '\u{feff}' | '\u{2060}')
 }
-fn display_json(value: serde_json::Value) -> String {
+pub fn display_json(value: serde_json::Value) -> String {
     value
         .to_string()
         .chars()
@@ -258,7 +259,12 @@ impl Home {
             .map_err(|_| "watch is already running for this home".into())
     }
     pub fn watch_running(&self) -> bool {
-        self.watch_lock().is_err()
+        match Lock::acquire(&self.path("watch.lock"), true) {
+            Ok(_) => false,
+            Err(error) => error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.raw_os_error() == Some(libc::EWOULDBLOCK)),
+        }
     }
     fn read(&self, name: &str) -> Result<String> {
         match fs::read_to_string(self.path(name)) {
@@ -391,7 +397,13 @@ impl Home {
             return Ok(None);
         }
         let now = Timestamp::now().as_secs();
-        let cursor = self.cursor()?.max(event.created_at.as_secs().min(now));
+        let mut dropped: Vec<String> = match self.read("dropped.json")? {
+            s if s.is_empty() => vec![],
+            s => serde_json::from_str(&s)?,
+        };
+        if dropped.contains(&rumor_id) {
+            return Ok(None);
+        }
         if entries
             .iter()
             .filter(|e| {
@@ -402,8 +414,10 @@ impl Home {
             .count()
             >= INBOUND_DAILY_CAP
         {
-            // Quota drops are permanent: advance without storing or notifying.
-            self.write("cursor", &cursor.to_string())?;
+            // Remember intentional quota drops across overlap/restart/day rollover.
+            // Never advance a history checkpoint from a single (possibly newer) event.
+            dropped.push(rumor_id);
+            self.write("dropped.json", &serde_json::to_string(&dropped)?)?;
             return Ok(None);
         }
         self.append(&Entry {
@@ -414,11 +428,6 @@ impl Home {
             at: event.created_at.as_secs().min(Timestamp::now().as_secs()),
             text: env.text,
         })?;
-        // Outer time, never a peer-controlled future rumor timestamp. Only advance after durable append.
-        let cursor = self
-            .cursor()?
-            .max(event.created_at.as_secs().min(Timestamp::now().as_secs()));
-        self.write("cursor", &cursor.to_string())?;
         Ok(Some(peer.name))
     }
     pub fn print_inbox(&self, json: bool, mut out: impl Write) -> Result<()> {
@@ -512,41 +521,28 @@ impl Home {
         self.write("sent-today", &serde_json::to_string(&sent)?)
     }
     pub async fn send(&self, relay_url: &str, id: &str, text: &str) -> Result<String> {
-        let body = envelope(text)?;
-        let peer = self.peer(id)?;
-        let (event, rumor_id) =
-            wrap_for_send(&self.keys, PublicKey::parse(&peer.pubkey)?, body).await?;
-        let (client, relay, _notifications) = connect(&self.keys, relay_url).await?;
-        if let Err(error) = self.reserve_send(&peer.pubkey, Timestamp::now().as_secs()) {
-            client.shutdown().await;
-            return Err(error);
+        let outcome = self.send_outcome(relay_url, id, text).await?;
+        if outcome.status == "accepted" {
+            Ok(outcome.message())
+        } else {
+            Err(outcome.message().into())
         }
-        // SDK send_event retries auth-required rejections when auto-auth is enabled.
-        // The initial handshake is complete; this one-shot command must never replay.
-        client.automatic_authentication(false);
-        let result = relay.send_event(&event).await;
-        client.shutdown().await;
-        let id = result.map_err(|error| {
-            format!(
-                "relay did not accept message: {} (not retried)",
-                display_text(&error.to_string())
-            )
-        })?;
+    }
+    fn refund_send(&self, peer: &str, reserved_at: u64) -> Result<()> {
         let _lock = self.lock()?;
-        self.append(&Entry {
-            rumor_id,
-            peer: peer.pubkey,
-            dir: "out".into(),
-            received_at: None,
-            at: Timestamp::now().as_secs(),
-            text: text.into(),
-        })?;
-        Ok(format!("relay accepted {}", id.to_hex()))
+        let mut sent: Sent = serde_json::from_str(&self.read("sent-today")?)?;
+        if sent.day == reserved_at / 86400 {
+            if let Some(count) = sent.per_peer_counts.get_mut(peer) {
+                *count = count.saturating_sub(1);
+            }
+            self.write("sent-today", &serde_json::to_string(&sent)?)?;
+        }
+        Ok(())
     }
 }
 
 /// Same transport as core::wrap, retaining the rumor ID for the outbound transcript.
-/// SDK's gift_wrap randomizes by two days; the relay requires core's 180-second window.
+/// Use current UTC time so bounded retries retain the full 180-second admission window.
 pub async fn wrap_for_send(
     keys: &Keys,
     recipient: PublicKey,
@@ -573,44 +569,9 @@ pub async fn wrap_for_send(
     }
     let event = EventBuilder::new(Kind::GiftWrap, ciphertext)
         .tags([Tag::public_key(recipient)])
-        .custom_created_at(transport::fresh_created_at())
+        .custom_created_at(Timestamp::now())
         .sign_with_keys(&ephemeral)?;
     Ok((event, id))
-}
-
-async fn connect(
-    keys: &Keys,
-    url: &str,
-) -> Result<(
-    Client,
-    Relay,
-    tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
-)> {
-    let client = Client::builder()
-        .signer(keys.clone())
-        .opts(ClientOptions::new().automatic_authentication(true))
-        .build();
-    client
-        .pool()
-        .add_relay(url, RelayOptions::default().reconnect(false))
-        .await?;
-    let relay = client.relay(url).await?;
-    let mut notifications = relay.notifications();
-    relay.connect();
-    match maxplayer_core::relay_auth::wait_for_nip42_auth(
-        &mut notifications,
-        Duration::from_secs(10),
-    )
-    .await
-    {
-        Ok(maxplayer_core::relay_auth::AuthWait::Authenticated) => {
-            Ok((client, relay, notifications))
-        }
-        _ => {
-            client.shutdown().await;
-            Err("relay did not authenticate; no chat subscription sent".into())
-        }
-    }
 }
 
 /// One direct child at a time; a burst during a run becomes one pending wake-up.
@@ -668,68 +629,10 @@ impl Drop for Notifier {
         }
     }
 }
-pub async fn watch(home: &Home, url: &str, command: Vec<String>) -> Result<()> {
-    use nostr_sdk::pool::RelayNotification;
-    let _lock = home.watch_lock()?;
-    let mut notifier = Notifier::new(command);
-    loop {
-        let connected = connect(&home.keys, url).await;
-        if let Ok((client, relay, mut notifications)) = connected {
-            let cursor = match home.cursor() {
-                Ok(cursor) => cursor,
-                Err(_) => {
-                    eprintln!("chat cursor read failed; retrying");
-                    client.shutdown().await;
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
-            let filter = Filter::new()
-                .kind(Kind::GiftWrap)
-                .pubkey(home.keys.public_key())
-                .since(Timestamp::from(transport::receive_since(cursor)));
-            if relay
-                .subscribe(filter, SubscribeOptions::default())
-                .await
-                .is_ok()
-            {
-                loop {
-                    tokio::select! {
-                        notification=notifications.recv()=>match notification {
-                            Ok(RelayNotification::Event{event,..})=>match home.receive(&event).await {
-                                Ok(Some(peer))=>notifier.message(peer),
-                                Ok(None)=>{},
-                                Err(_)=>{eprintln!("chat receive failed; retrying");break;},
-                            },
-                            Ok(RelayNotification::RelayStatus{status}) if status!=RelayStatus::Connected=>break,
-                            Ok(RelayNotification::AuthenticationFailed | RelayNotification::Shutdown)=>break,
-                            Ok(RelayNotification::Message{message:RelayMessage::Closed{..}})=>break,
-                            Err(_)=>break,
-                            _=>{},
-                        },
-                        _=tokio::time::sleep(Duration::from_millis(50))=>{},
-                    }
-                    if notifier.tick().is_err() {
-                        eprintln!("notify failed; messages remain in inbox");
-                    }
-                }
-            }
-            // Discard the entire client's subscriptions before a fresh authenticated connection.
-            client.shutdown().await;
-        }
-        eprintln!("relay disconnected; retrying");
-        for _ in 0..20 {
-            if notifier.tick().is_err() {
-                eprintln!("notify failed; messages remain in inbox");
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn security_unapproved_skips_second_unwrap_and_lock() {

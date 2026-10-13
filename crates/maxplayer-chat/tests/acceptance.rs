@@ -16,7 +16,32 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 // A real nostr-relay-builder stores and streams events. This small front adds Buzz's
 // challenge-on-connect / restricted-before-auth rule (builder otherwise challenges lazily).
+#[derive(Default)]
+struct Faults {
+    refuse_auth: AtomicUsize,
+    omit_auth: AtomicBool,
+    omit_eose: AtomicBool,
+    wrong_eose: AtomicBool,
+    closed: AtomicBool,
+    drop_socket: AtomicBool,
+    reject_next: AtomicUsize,
+    refusal: Mutex<String>,
+    omit_ok: AtomicBool,
+    omit_next_ok: AtomicUsize,
+    ids: Mutex<Vec<String>>,
+}
+fn take_fault(value: &AtomicUsize) -> bool {
+    let mut n = value.load(Ordering::SeqCst);
+    while n > 0 {
+        match value.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(actual) => n = actual,
+        }
+    }
+    false
+}
 struct RelayFixture {
+    faults: Arc<Faults>,
     backend: LocalRelay,
     url: String,
     task: JoinHandle<()>,
@@ -30,7 +55,7 @@ impl RelayFixture {
         // The SDK probes a free port and then binds it separately. Retry only that
         // allocation race, with a fresh relay/address and a bounded attempt count.
         for attempt in 0..8 {
-            let backend = LocalRelay::new(RelayBuilder::default().auth_dm(false));
+            let backend = LocalRelay::new(RelayBuilder::default().auth_dm(false).max_filter_limit(1000).rate_limit(nostr_relay_builder::builder::RateLimit { max_reqs: 500, notes_per_minute: 10000 }));
             match backend.run().await {
                 Ok(()) => return Self::start(backend, 0, Arc::default()).await,
                 Err(nostr_relay_builder::Error::IO(e))
@@ -41,6 +66,8 @@ impl RelayFixture {
         unreachable!()
     }
     async fn start(backend: LocalRelay, port: u16, reqs: Arc<Mutex<Vec<bool>>>) -> Self {
+        let faults = Arc::new(Faults::default());
+        let injected_faults = faults.clone();
         let listener = TcpListener::bind(("127.0.0.1", port)).await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let backend_url = backend.url().await.to_string();
@@ -54,6 +81,8 @@ impl RelayFixture {
         let task = tokio::spawn(async move {
             loop {
                 let (socket, _) = listener.accept().await.unwrap();
+                let faults = injected_faults.clone();
+                let refuse_auth = take_fault(&faults.refuse_auth);
                 let backend_url = backend_url.clone();
                 let reqs = recorded.clone();
                 let reject_writes = rejects.clone();
@@ -75,13 +104,22 @@ impl RelayFixture {
                             _=rx.changed()=>break,
                             frame=front.next()=>{let Some(Ok(frame))=frame else{break};if !frame.is_text(){continue}let v:Value=serde_json::from_str(frame.to_text().unwrap()).unwrap();
                                 if v[0]=="AUTH" {let event:Event=serde_json::from_value(v[1].clone()).unwrap();
-                                    authenticated=event.verify().is_ok() && event.kind==Kind::Authentication && event.tags.iter().any(|t|t.as_slice()==["challenge",challenge]) && event.tags.iter().any(|t|t.as_slice()==["relay",url.as_str()]);
+                                    if faults.omit_auth.load(Ordering::SeqCst) { continue; }
+                                    authenticated=!refuse_auth && event.verify().is_ok() && event.kind==Kind::Authentication && event.tags.iter().any(|t|t.as_slice()==["challenge",challenge]) && event.tags.iter().any(|t|t.as_slice()==["relay",url.as_str()]);
                                     front.send(json!(["OK",event.id.to_hex(),authenticated,""]).to_string().into()).await.unwrap();
-                                }else{if v[0]=="REQ"{reqs.lock().unwrap().push(authenticated);if !authenticated{front.send(json!(["CLOSED",v[1],"restricted: auth first"]).to_string().into()).await.unwrap();continue;}}
+                                }else{if v[0]=="REQ"{
+                                    if faults.drop_socket.load(Ordering::SeqCst) { break; }
+                                    if faults.closed.load(Ordering::SeqCst) {
+                                        let _ = front.send(json!(["CLOSED",v[1],"blocked: fixture\n\u{202e}"]).to_string().into()).await;
+                                        continue;
+                                    }
+                                    reqs.lock().unwrap().push(authenticated);if !authenticated{front.send(json!(["CLOSED",v[1],"restricted: auth first"]).to_string().into()).await.unwrap();continue;}}
                                     if v[0]=="EVENT" {
                                         writes.fetch_add(1,Ordering::SeqCst);
-                                        if reject_writes.load(Ordering::SeqCst) {
-                                            front.send(json!(["OK",v[1]["id"],false,"auth-required: test refusal\u{202e}\u{200b}"]).to_string().into()).await.unwrap();
+                                        faults.ids.lock().unwrap().push(v[1]["id"].as_str().unwrap().into());
+                                        if reject_writes.load(Ordering::SeqCst) || take_fault(&faults.reject_next) {
+                                            let reason = { let configured = faults.refusal.lock().unwrap(); if configured.is_empty() { "auth-required: test refusal\u{202e}\u{200b}".to_string() } else { configured.clone() } };
+                                            front.send(json!(["OK",v[1]["id"],false,reason]).to_string().into()).await.unwrap();
                                             challenge="chat-fixture-rechallenge";
                                             let _=front.send(json!(["AUTH",challenge]).to_string().into()).await;
                                             continue;
@@ -90,13 +128,23 @@ impl RelayFixture {
                                     if back.send(frame).await.is_err(){break}
                                 }
                             },
-                            frame=back.next()=>{let Some(Ok(frame))=frame else{break};if front.send(frame).await.is_err(){break}},
+                            frame=back.next()=>{let Some(Ok(mut frame))=frame else{break};
+                                if frame.is_text() {
+                                    let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                                    if v[0]=="OK" && (faults.omit_ok.load(Ordering::SeqCst) || take_fault(&faults.omit_next_ok)) { continue; }
+                                    if v[0]=="EOSE" {
+                                        if faults.omit_eose.load(Ordering::SeqCst) { continue; }
+                                        if faults.wrong_eose.load(Ordering::SeqCst) { frame = json!(["EOSE", "wrong-subscription"]).to_string().into(); }
+                                    }
+                                }
+                                if front.send(frame).await.is_err(){break}},
                         }
                     }
                 });
             }
         });
         Self {
+            faults,
             backend,
             url,
             task,
@@ -375,15 +423,15 @@ async fn a5_cap() {
     assert!(failure.to_string().contains("auth-required: test refusal"));
     assert_eq!(
         relay.writes.load(Ordering::SeqCst),
-        before + 1,
-        "one EVENT, even on auth-required rejection"
+        before + 3,
+        "three same-event attempts on auth-required rejection"
     );
     assert_eq!(h.entries().unwrap().len(), 51);
     let sent: Value =
         serde_json::from_slice(&std::fs::read(h.root.join("chat/sent-today")).unwrap()).unwrap();
     assert_eq!(
-        sent["per_peer_counts"][&other], 2,
-        "rejected send consumes a slot"
+        sent["per_peer_counts"][&other], 1,
+        "definitely rejected command refunds its one reservation"
     );
     h.reserve_send(&p, Timestamp::now().as_secs() + 86400)
         .unwrap();
@@ -846,7 +894,7 @@ fn advisor_bad_argv_creates_no_home() {
 }
 
 #[tokio::test]
-async fn security_inbound_cap_is_per_peer_and_advances_cursor() {
+async fn security_inbound_cap_is_per_peer_without_advancing_checkpoint() {
     let (_d, h) = home();
     let sender = Keys::generate();
     let other = Keys::generate();
@@ -874,7 +922,8 @@ async fn security_inbound_cap_is_per_peer_and_advances_cursor() {
         h.receive(&event).await.unwrap().is_none(),
         "cap+1 must be dropped"
     );
-    assert_eq!(h.cursor().unwrap(), 1, "quota drop must advance cursor");
+    assert_eq!(h.cursor().unwrap(), 0, "quota drop must not advance checkpoint");
+    assert!(std::fs::read_to_string(h.root.join("chat/dropped.json")).unwrap().contains(&dropped_id));
     assert!(
         injected(&h, &other, envelope("other peer unaffected").unwrap())
             .await
@@ -1056,4 +1105,509 @@ async fn security_relay_rejection_is_display_safe() {
     assert_eq!(text.lines().count(), 1);
     assert!(!text.contains(['\u{202e}', '\u{200b}']));
     assert!(text.contains("\\u{202e}") && text.contains("\\u{200b}"));
+}
+
+fn fast_options() -> maxplayer_chat::WatchOptions {
+    maxplayer_chat::WatchOptions {
+        max_failures: 3,
+        cycle_timeout: Duration::from_millis(500),
+        liveness_interval: Duration::from_millis(200),
+        liveness_timeout: Duration::from_millis(150),
+        refresh_interval: Duration::from_millis(100),
+        backoff_unit: Duration::from_millis(30),
+    }
+}
+async fn wait_healthy(h: &Home) {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !h.status().is_ok_and(|s| s.state == "healthy") {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("EOSE-verified healthy status");
+}
+struct WatchProcess(std::process::Child);
+impl Drop for WatchProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+fn watch_process(h: &Home, url: &str, max: &str) -> WatchProcess {
+    let stderr = std::fs::File::create(h.root.join("chat/watch-test.log")).unwrap();
+    WatchProcess(
+        std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-chat"))
+            .args([
+                "--home",
+                h.root.to_str().unwrap(),
+                "--relay",
+                url,
+                "watch",
+                "--max-failures",
+                max,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .unwrap(),
+    )
+}
+#[tokio::test]
+async fn health_cli_ready_logs_status_and_process_restart_catchup() {
+    let relay = RelayFixture::new().await;
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    approve(&b, &a, "A");
+    let first = watch_process(&b, &relay.url, "10");
+    wait_healthy(&b).await;
+    let status = cli(&b.root, &["status", "--json"]);
+    assert!(status.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["state"],
+        "healthy"
+    );
+    let logs = std::fs::read_to_string(b.root.join("chat/watch-test.log")).unwrap();
+    assert!(
+        logs.contains("authenticated") && logs.contains("subscribed, caught up 0 messages since"),
+        "{logs}"
+    );
+    assert!(logs.contains(&relay.url) && logs.contains("attempt=1") && logs.contains("Z relay="));
+    drop(first); // Actual OS process gone, retaining the durable home and relay.
+    assert!(!cli(&b.root, &["status"]).status.success());
+    for i in 0..4 {
+        a.send(&relay.url, "B", &format!("offline-{i}"))
+            .await
+            .unwrap();
+    }
+    let second = watch_process(&b, &relay.url, "10");
+    wait_healthy(&b).await;
+    assert_eq!(b.entries().unwrap().len(), 4);
+    drop(second);
+    let third = watch_process(&b, &relay.url, "10");
+    wait_healthy(&b).await;
+    assert_eq!(
+        b.entries().unwrap().len(),
+        4,
+        "overlap must dedup across process restarts"
+    );
+    assert_eq!(inbox(&b, true).lines().count(), 4);
+    drop(third);
+}
+#[tokio::test]
+async fn health_auth_failures_grow_backoff_and_cli_exits() {
+    let relay = RelayFixture::new().await;
+    relay.faults.refuse_auth.store(10, Ordering::SeqCst);
+    let (_d, h) = home();
+    let mut process = watch_process(&h, &relay.url, "3");
+    let exit = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = process.0.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(exit.code(), Some(1));
+    let stored: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.root.join("chat/status.json")).unwrap())
+            .unwrap();
+    assert_eq!(stored["state"], "unhealthy");
+    assert_eq!(stored["consecutive_failures"], 3);
+    let logs = std::fs::read_to_string(h.root.join("chat/watch-test.log")).unwrap();
+    let delays: Vec<u64> = logs
+        .lines()
+        .filter_map(|l| l.split("next_delay_ms=").nth(1))
+        .map(|v| v.parse().unwrap())
+        .collect();
+    assert_eq!(delays.len(), 3, "{logs}");
+    assert!((1800..=2200).contains(&delays[0]), "{logs}");
+    assert!((3600..=4400).contains(&delays[1]), "{logs}");
+    assert!(logs.contains("auth: NIP-42 rejected") && logs.contains("attempt=3"));
+    assert!(!logs.contains("subscribed") && !logs.contains(" authenticated"));
+    assert!(relay.reqs.lock().unwrap().is_empty());
+}
+#[tokio::test]
+async fn health_withheld_or_wrong_eose_and_missing_auth_never_ready() {
+    for fault in ["omit", "wrong", "auth"] {
+        let relay = RelayFixture::new().await;
+        match fault {
+            "omit" => relay.faults.omit_eose.store(true, Ordering::SeqCst),
+            "wrong" => relay.faults.wrong_eose.store(true, Ordering::SeqCst),
+            _ => relay.faults.omit_auth.store(true, Ordering::SeqCst),
+        }
+        let (_d, h) = home();
+        let result = tokio::time::timeout(
+            Duration::from_secs(4),
+            maxplayer_chat::watch_with_options(&h, &relay.url, vec![], fast_options()),
+        )
+        .await
+        .expect("failed readiness must stop within the bounded cycles");
+        assert!(result.is_err());
+        let stored: Value = serde_json::from_str(
+            &std::fs::read_to_string(h.root.join("chat/status.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(stored["last_healthy_at"].is_null(), "{fault}: {stored}");
+        assert_eq!(stored["consecutive_failures"], 3);
+        assert_eq!(h.cursor().unwrap(), 0);
+        if fault == "auth" {
+            assert!(relay.reqs.lock().unwrap().is_empty());
+        }
+    }
+}
+#[tokio::test]
+async fn health_dead_open_socket_liveness_and_refresh() {
+    let relay = RelayFixture::new().await;
+    let (_d, h) = home();
+    let root = h.root.clone();
+    let url = relay.url.clone();
+    let task = tokio::spawn(async move {
+        maxplayer_chat::watch_with_options(&Home::open(root).unwrap(), &url, vec![], fast_options())
+            .await
+    });
+    wait_healthy(&h).await;
+    // Prove periodic refresh repairs an artificially old snapshot while the lock stays held.
+    let path = h.root.join("chat/status.json");
+    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    value["updated_at"] = json!(1);
+    std::fs::write(&path, value.to_string()).unwrap();
+    tokio::time::sleep(Duration::from_millis(130)).await;
+    assert!(h.status().unwrap().updated_at > 1);
+    relay.faults.omit_eose.store(true, Ordering::SeqCst); // TCP stays open and answers ping, but REQ is deaf.
+    tokio::time::timeout(Duration::from_secs(4), task)
+        .await
+        .expect("liveness must reconnect")
+        .unwrap()
+        .unwrap_err();
+    let logs = std::fs::read_to_string(&path).unwrap();
+    assert!(logs.contains("unhealthy"));
+    assert!(
+        relay.reqs.lock().unwrap().len() >= 4,
+        "probe plus reconnects"
+    );
+}
+#[test]
+fn health_status_stale_and_lock_only_are_not_healthy() {
+    let (_d, h) = home();
+    let guard = h.watch_lock().unwrap();
+    assert!(
+        !cli(&h.root, &["status", "--json"]).status.success(),
+        "lock alone is not readiness"
+    );
+    let path = h.root.join("chat/status.json");
+    let mut value = json!({"state":"healthy", "pid":std::process::id(), "relay":"ws://127.0.0.1:1", "last_healthy_at":1,
+        "consecutive_failures":0,"last_error":null,"updated_at":Timestamp::now().as_secs()-91});
+    std::fs::write(&path, value.to_string()).unwrap();
+    let status = cli(&h.root, &["status", "--json"]);
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("stale"));
+    value["updated_at"] = json!(Timestamp::now().as_secs());
+    std::fs::write(&path, value.to_string()).unwrap();
+    assert!(cli(&h.root, &["status"]).status.success());
+    drop(guard);
+    assert!(
+        !cli(&h.root, &["status"]).status.success(),
+        "fresh file without lock must fail"
+    );
+}
+#[tokio::test]
+async fn health_closed_and_socket_drop_reasons() {
+    for closed in [true, false] {
+        let relay = RelayFixture::new().await;
+        relay.faults.closed.store(closed, Ordering::SeqCst);
+        relay.faults.drop_socket.store(!closed, Ordering::SeqCst);
+        let (_d, h) = home();
+        maxplayer_chat::watch_with_options(&h, &relay.url, vec![], fast_options())
+            .await
+            .unwrap_err();
+        let value: Value = serde_json::from_str(
+            &std::fs::read_to_string(h.root.join("chat/status.json")).unwrap(),
+        )
+        .unwrap();
+        let error = value["last_error"].as_str().unwrap();
+        assert!(
+            error.contains(if closed {
+                "CLOSED: blocked: fixture"
+            } else {
+                "disconnected"
+            }),
+            "{error}"
+        );
+        assert!(!error.contains(['\n', '\u{202e}']));
+    }
+}
+#[tokio::test]
+async fn retry_auth_required_second_attempt_same_event_one_delivery() {
+    let relay = RelayFixture::new().await;
+    relay.faults.reject_next.store(1, Ordering::SeqCst);
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    approve(&b, &a, "A");
+    let watcher = watcher(&b, &relay.url, vec![]);
+    let result = async_cli(
+        &a.root,
+        &["--relay", &relay.url, "send", "B", "once", "--json"],
+    )
+    .await;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let outcome: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(outcome["status"], "accepted");
+    assert_eq!(outcome["attempts"], 2);
+    wait_entries(&b, 1).await;
+    assert_eq!(a.entries().unwrap().len(), 1);
+    assert_eq!(b.entries().unwrap().len(), 1);
+    assert_eq!(
+        a.entries().unwrap()[0].rumor_id,
+        b.entries().unwrap()[0].rumor_id
+    );
+    let ids = relay.faults.ids.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1]);
+    assert_eq!(outcome["event_id"], ids[0]);
+    watcher.abort();
+}
+#[tokio::test]
+async fn retry_definite_refusal_not_retried_cap_refunded() {
+    let relay = RelayFixture::new().await;
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    for reason in [
+        "blocked: policy",
+        "invalid: bad event",
+        "error: definite refusal",
+    ] {
+        *relay.faults.refusal.lock().unwrap() = reason.into();
+        relay.faults.reject_next.store(1, Ordering::SeqCst);
+        let outcome = a.send_outcome(&relay.url, "B", "refuse").await.unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.attempts, 1);
+        assert_eq!(outcome.exit_code(), 1);
+        let sent: Value =
+            serde_json::from_str(&std::fs::read_to_string(a.root.join("chat/sent-today")).unwrap())
+                .unwrap();
+        assert_eq!(sent["per_peer_counts"][b.keys.public_key().to_hex()], 0);
+    }
+    assert_eq!(relay.writes.load(Ordering::SeqCst), 3);
+    assert!(a.entries().unwrap().is_empty());
+}
+#[tokio::test]
+async fn retry_unconfirmed_exit_two_keeps_cap_no_out_entry() {
+    let relay = RelayFixture::new().await;
+    relay.faults.omit_ok.store(true, Ordering::SeqCst);
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    approve(&b, &a, "A");
+    let watcher = watcher(&b, &relay.url, vec![]);
+    let output = async_cli(
+        &a.root,
+        &["--relay", &relay.url, "send", "B", "maybe", "--json"],
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(2));
+    let outcome: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(outcome["status"], "unconfirmed");
+    assert_eq!(outcome["attempts"], 3);
+    assert!(a.entries().unwrap().is_empty());
+    assert_eq!(b.entries().unwrap().len(), 1);
+    let sent: Value =
+        serde_json::from_str(&std::fs::read_to_string(a.root.join("chat/sent-today")).unwrap())
+            .unwrap();
+    assert_eq!(sent["per_peer_counts"][b.keys.public_key().to_hex()], 1);
+    let ids = relay.faults.ids.lock().unwrap();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.iter().all(|id| id == &ids[0]));
+    watcher.abort();
+}
+#[tokio::test]
+async fn catchup_backlog_exceeds_builder_and_buzz_caps() {
+    let relay = RelayFixture::new().await;
+    let (_d, h) = home();
+    let publisher = Client::new(Keys::generate());
+    publisher
+        .add_relay(relay.backend.url().await)
+        .await
+        .unwrap();
+    publisher.connect().await;
+    // 1105 > builder's default 500 AND Buzz SQL's effective 1000. Spread over
+    // approved senders so the deliberate 100/day/peer quota does not mask paging.
+    let senders: Vec<_> = (0..12)
+        .map(|i| {
+            let keys = Keys::generate();
+            h.add_peer(&keys.public_key().to_hex(), &format!("peer-{i}"))
+                .unwrap();
+            keys
+        })
+        .collect();
+    let now = Timestamp::now().as_secs();
+    let publisher_relay = publisher.relay(relay.backend.url().await).await.unwrap();
+    for i in 0..1105 {
+        let event = manual_rumor(
+            &senders[i % 12],
+            h.keys.public_key(),
+            false,
+            i as u64 + 1,
+            now - 2200 + i as u64,
+        )
+        .await;
+        publisher_relay.send_event(&event).await.unwrap();
+    }
+    publisher.shutdown().await;
+    let process = watch_process(&h, &relay.url, "3");
+    wait_healthy(&h).await;
+    assert_eq!(
+        h.entries().unwrap().len(),
+        1105,
+        "all pages before checkpoint"
+    );
+    assert!(h.cursor().unwrap() >= now);
+    drop(process);
+    let process = watch_process(&h, &relay.url, "3");
+    wait_healthy(&h).await;
+    assert_eq!(h.entries().unwrap().len(), 1105);
+    drop(process);
+}
+#[tokio::test]
+async fn catchup_newer_event_does_not_skip_older_delayed_event() {
+    let relay = RelayFixture::new().await;
+    let (_d, h) = home();
+    let sender = Keys::generate();
+    h.add_peer(&sender.public_key().to_hex(), "friend").unwrap();
+    let now = Timestamp::now().as_secs();
+    std::fs::write(h.root.join("chat/checkpoint-version"), "2").unwrap();
+    std::fs::write(h.root.join("chat/cursor"), (now - 1000).to_string()).unwrap();
+    let newer = manual_rumor(&sender, h.keys.public_key(), false, 2, now).await;
+    h.receive(&newer).await.unwrap(); // Simulate process dying before history EOSE.
+    let older = manual_rumor(&sender, h.keys.public_key(), false, 1, now - 500).await;
+    let publisher = Client::new(Keys::generate());
+    publisher
+        .add_relay(relay.backend.url().await)
+        .await
+        .unwrap();
+    publisher.connect().await;
+    publisher.send_event(&older).await.unwrap();
+    publisher.shutdown().await;
+    let process = watch_process(&h, &relay.url, "3");
+    wait_healthy(&h).await;
+    assert_eq!(h.entries().unwrap().len(), 2);
+    drop(process);
+}
+
+#[tokio::test]
+async fn retry_connect_auth_and_rate_limit_are_retryable() {
+    for auth in [true, false] {
+        let relay = RelayFixture::new().await;
+        if auth {
+            relay.faults.refuse_auth.store(1, Ordering::SeqCst);
+        } else {
+            *relay.faults.refusal.lock().unwrap() = "rate-limited: try again".into();
+            relay.faults.reject_next.store(1, Ordering::SeqCst);
+        }
+        let (_a, a) = home();
+        let (_b, b) = home();
+        approve(&a, &b, "B");
+        let outcome = a.send_outcome(&relay.url, "B", "retry").await.unwrap();
+        assert_eq!(outcome.status, "accepted");
+        assert_eq!(outcome.attempts, 2);
+        assert_eq!(a.entries().unwrap().len(), 1);
+    }
+}
+#[tokio::test]
+async fn retry_lost_first_ok_duplicate_acceptance_resolves_ambiguity() {
+    let relay = RelayFixture::new().await;
+    relay.faults.omit_next_ok.store(1, Ordering::SeqCst);
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    let outcome = a
+        .send_outcome(&relay.url, "B", "duplicate accepted")
+        .await
+        .unwrap();
+    assert_eq!(outcome.status, "accepted");
+    assert_eq!(outcome.attempts, 2);
+    assert_eq!(a.entries().unwrap().len(), 1);
+    let ids = relay.faults.ids.lock().unwrap();
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1]);
+}
+#[tokio::test]
+async fn catchup_inclusive_boundary_second_is_not_skipped() {
+    let relay = RelayFixture::new().await;
+    let (_d, h) = home();
+    let a = Keys::generate();
+    let b = Keys::generate();
+    h.add_peer(&a.public_key().to_hex(), "a").unwrap();
+    h.add_peer(&b.public_key().to_hex(), "b").unwrap();
+    let publisher = Client::new(Keys::generate());
+    publisher
+        .add_relay(relay.backend.url().await)
+        .await
+        .unwrap();
+    publisher.connect().await;
+    let r = publisher.relay(relay.backend.url().await).await.unwrap();
+    let now = Timestamp::now().as_secs();
+    for i in 0..150 {
+        let sender = if i % 2 == 0 { &a } else { &b };
+        r.send_event(&manual_rumor(sender, h.keys.public_key(), false, i + 1, now - 500).await)
+            .await
+            .unwrap();
+    }
+    publisher.shutdown().await;
+    let process = watch_process(&h, &relay.url, "3");
+    wait_healthy(&h).await;
+    assert_eq!(h.entries().unwrap().len(), 150);
+    drop(process);
+}
+
+#[test]
+fn health_status_does_not_initialize_home_or_read_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("missing");
+    assert!(!cli(&missing, &["status", "--json"]).status.success());
+    assert!(!missing.exists());
+    let (_d, h) = home();
+    std::fs::remove_file(h.root.join("key")).unwrap();
+    assert!(!cli(&h.root, &["status", "--json"]).status.success());
+    assert!(
+        !h.root.join("key").exists(),
+        "status must not bootstrap a new identity"
+    );
+}
+
+#[tokio::test]
+async fn catchup_upgrade_rechecks_legacy_cursor_skipped_history() {
+    let relay = RelayFixture::new().await;
+    let (_d, h) = home();
+    let sender = Keys::generate();
+    h.add_peer(&sender.public_key().to_hex(), "friend").unwrap();
+    let now = Timestamp::now().as_secs();
+    std::fs::write(h.root.join("chat/cursor"), now.to_string()).unwrap();
+    let publisher = Client::new(Keys::generate());
+    publisher
+        .add_relay(relay.backend.url().await)
+        .await
+        .unwrap();
+    publisher.connect().await;
+    let r = publisher.relay(relay.backend.url().await).await.unwrap();
+    r.send_event(&manual_rumor(&sender, h.keys.public_key(), false, 1, now - 500).await)
+        .await
+        .unwrap();
+    publisher.shutdown().await;
+    let process = watch_process(&h, &relay.url, "3");
+    wait_healthy(&h).await;
+    assert_eq!(h.entries().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(h.root.join("chat/checkpoint-version")).unwrap(),
+        "2"
+    );
+    drop(process);
 }

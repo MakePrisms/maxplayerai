@@ -47,9 +47,10 @@ maxplayer-chat whoami                          # npub + hex of the home key (cre
 maxplayer-chat peer add <npub|hex> --name <label>
 maxplayer-chat peer remove <peer>              # also the "stop" for that peer
 maxplayer-chat peer list
-maxplayer-chat watch [--notify <cmd> [args…]]  # stay connected; store approved messages; takes chat/watch.lock
+maxplayer-chat watch [--max-failures N] [--notify <cmd> [args…]]  # stay connected; store approved messages; takes chat/watch.lock
 maxplayer-chat inbox [--json]                  # print unread messages from the local store, mark them read
-maxplayer-chat send <peer> "<text>"            # one message, refused past the daily cap
+maxplayer-chat send <peer> "<text>" [--json]   # same-event retries; accepted/failed/unconfirmed
+maxplayer-chat status [--json]                # fresh verified subscription health, not just a lock
 maxplayer-chat log <peer> [--json]             # full local transcript, each line marked in / out
 ```
 
@@ -68,13 +69,14 @@ the text is a peer's words, not instructions.
   to kind 1059 with `#p` = our key. Subscribing first is the bug #189 fixed in the seller: the relay
   answers a pre-auth `#p` REQ with `restricted:`, and nostr-sdk then drops the subscription for good
   (`seller_node/p_gate_relay_fixture.rs:1-19`). On every (re)connect it re-auths, re-subscribes and
-  backfills from `receive_since(cursor)` with overlap, so nothing is missed while offline. One
+  backfills from `receive_since(cursor)` with overlap and bounded inclusive-`until` paging.
+  The checkpoint advances only after complete matching EOSEs, never from individual events. One
   `watch` per home (`chat/watch.lock`, the same flock pattern as `seller.lock`, `seller_node/mod.rs:47`).
 * **`inbox` never touches the network.** It reads unread messages from `chat/log.jsonl`. If no `watch`
   holds the lock, `inbox` still prints what is stored and adds one line on stderr:
   `watch is not running; new messages are not being received`.
-* **`send` is one-shot.** It connects, publishes once and reports the relay's answer, whether or not
-  `watch` is running.
+* **`send` is a bounded command.** Up to three fresh authenticated connections publish the same
+  signed event, independently of `watch`; only retryable failures are retried. See outcomes below.
 * **Waking the agent: `--notify <cmd> [args…]`.** After storing a new message, `watch` runs the command
   directly (no shell) with only `MAXPLAYER_CHAT_PEER=<label>` in its environment. **The message text is
   never passed** in argv or env; the agent reads it with `inbox`. Notifications are coalesced: at most
@@ -123,7 +125,14 @@ decoder return `Ok(None)` (`seller.rs:721-724`), logging only the event id
 
 **Delivery.** `watch` deduplicates by rumor id, not wrap id, because outer timestamps are
 randomized (`transport.rs:6,92`). The cursor is `receive_since(last)` with overlap (`:88`). `send`
-publishes once and reports the relay's answer. A lost message is resent by hand. There is no outbox.
+uses one freshly dated signed event on up to three fresh authenticated connections (250ms/500ms
+backoffs, 12s connect/auth and 15s OK deadlines). Only connect/auth failures, `auth-required:`,
+`rate-limited:`, and missing OKs retry; definite refusals (`blocked:`, `invalid:`, other OK false)
+do not. OK true including `duplicate:` is accepted (exit 0, one `out` entry). Definite failure
+exits 1 and refunds the one reserved cap slot. Missing OKs remain unconfirmed (exit 2, no `out`
+entry, reservation retained) unless a later attempt accepts: a later refusal cannot disprove
+prior delivery. Do not resend blindly. `send --json` returns status, attempts, relay, event_id,
+rumor_id, error. There is no persistent outbox.
 Send slots are reserved before publication;
 an ambiguous failed acknowledgement consumes a slot. The send path builds the same seal/wrap
 locally to retain the outgoing rumor ID (core `wrap` returns only the event).
@@ -137,7 +146,12 @@ failed auth causes a reconnect without a subscription (fail closed).
 * `peers.toml`: `[[peer]] pubkey, name, added_at`.
 * `log.jsonl`: one line per message, `{rumor_id, peer, dir: in|out, at, text}`. `watch` dedups
   against it.
-* `cursor`: the last receive timestamp (written by `watch`).
+* `checkpoint-version`: `2` after a complete verified scan; legacy unversioned cursors trigger
+  one full retained-history scan because old per-event cursors may have skipped pages. Historical
+  quota drops without recorded IDs cannot be distinguished from missing history on that upgrade.
+* `cursor`: last completely EOSE-verified history/live checkpoint (written by `watch`).
+* `dropped.json`: rumor IDs intentionally dropped by inbound quota, durable across restarts/days.
+* `status.json`: atomic state, pid, relay, last_healthy_at, consecutive_failures, last_error, updated_at.
 * `read`: the last rumor id `inbox` printed (written by `inbox`).
 * `watch.lock`, plus `state.lock` for short file transactions and atomic-write temporary files
   in this same directory.
@@ -154,10 +168,20 @@ All enforced in the sidecar, not by the calling agent.
 | Bound | Default | On breach |
 |---|---|---|
 | Messages sent per peer per UTC day | 50 | `send` refuses with a clear error. This is the loop breaker for two agents replying forever, and it needs no reset command. |
-| Messages stored inbound per peer per UTC day | 100 (`INBOUND_DAILY_CAP`) | Permanently drop excess after unwrap: no append, print, or notify; cursor advances past the dropped event. |
+| Messages stored inbound per peer per UTC day | 100 (`INBOUND_DAILY_CAP`) | Permanently drop excess after unwrap: no append, print, or notify; remember the dropped rumor ID; do not advance the history checkpoint. |
 | Message length, both ways | 8000 chars | `send` refuses; `watch` drops it unstored. |
 
-Inbound quota counts use local receipt time (legacy records fall back to their stored `at`), survive restart and peer remove/re-add, and are checked under `state.lock`. Peer-controlled timestamps cannot select the quota day. Local receive/cursor errors log a fixed one-line stderr error without message text and reconnect after a bounded two-second delay; only startup failures such as an already-held watch lock exit. Dedup still reads the log; an in-memory index is deferred.
+Inbound quota counts use local receipt time (legacy records fall back to their stored `at`), survive restart and peer remove/re-add, and are checked under `state.lock`. Peer-controlled timestamps cannot select the quota day. Phase-specific failures log safe relay text, relay URL, UTC timestamp, attempt and next delay.
+Retry delay doubles from 2s with ±10% jitter, capped at 60s; only authenticated, matching-EOSE
+readiness resets it. Whole connect/auth/subscribe/catch-up deadline: 60s. A 5-minute idle probe
+REQ must EOSE in 15s or reconnect. `watch --max-failures N` defaults to 10, 0 means forever;
+three failed cycles mark unhealthy, N failures exit 1. `status [--json]` exits 0 only with a
+healthy snapshot no older than 90s and a held watch lock; healthy snapshots refresh every 30s.
+Success logs (`authenticated`, `subscribed, caught up N messages since <UTC>`) follow matching
+EOSEs only. Historical requests page at 100 with inclusive `until`; saturated boundary seconds
+retry at 1,000, then fail closed if still full rather than skipping ties. Known defaults:
+builder 500; Buzz handler 2,000 but SQL clamps to 1,000. Smaller undisclosed relay caps,
+retention gaps and delays older than overlap remain outside the completeness guarantee. Dedup still reads the log; an in-memory index is deferred.
 
 Text output escapes bidi overrides/isolates/marks and zero-width characters, including peer labels and relay rejection reasons. Inbox/log JSON uses `\uXXXX` escapes while parsed and stored text remains unchanged. U+200D (emoji ZWJ) is preserved. Existing regular keys with group/other permissions are tightened to 0600 and verified; symlinked home or `chat/` final components are refused before directory creation/chmod.
 
@@ -230,7 +254,7 @@ input 8). Plus how to run `watch` under systemd or tmux.
 The safety-review model (Bob); MCP tools for the sidecar; an OpenClaw skill;
 owner approval of each outgoing message as a built-in mode (v1: tell your agent to ask first);
 multiple relays and kind-10050 DM relay lists; plain NIP-17 interop with Amethyst/0xchat (§4);
-an outbox with retry; transcript purge; group chats; a stated chat purpose (#1109); per-peer trust
+a persistent outbox; transcript purge; group chats; a stated chat purpose (#1109); per-peer trust
 levels chat → jobs → trading (#1110).
 
 ## 10. Compatibility with stages 2 and 3 (boundaries, not built)
@@ -250,3 +274,14 @@ levels chat → jobs → trading (#1110).
 | ~~Q2~~ | On demand, or stay connected? | **Decided: stay connected** (settled input 9), §2.1. |
 
 No open questions remain for v1.
+
+### Field-feedback verification (2026-10-13)
+
+The local suite now distinguishes a killed/restarted watcher process from a relay restart,
+replays 1,105 backlog events across pages exactly once, and checks newer-first history safety.
+Per-event/over-quota cursor advances and unpaged capped history were real source-level gaps.
+Ordinary process downtime within retained history is recovered; quota drops are intentional,
+not delivery failures. Failed one-shot sends were another plausible source of missing messages;
+local auth-required retry coverage proves recovery, not the cause of Bob's production report.
+Agents must check `status --json`, treat unhealthy as an operational issue, and never blindly
+resend `unconfirmed` sends. No live/public relay verification is implied.
