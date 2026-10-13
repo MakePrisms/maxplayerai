@@ -346,23 +346,50 @@ pub(crate) enum Settled {
     Abandoned { after: Duration, redeeming: bool },
 }
 
-/// Let `work` finish within [`lane_settle_bound`]: the short grace, or the money bound while a
-/// payment redeem is in flight — including one that began during the grace.
+/// How often [`settle`] re-reads the redeem counter while a redeem is in flight, so the money bound
+/// ends as soon as the redeem does.
+const SETTLE_REDEEM_POLL: Duration = Duration::from_millis(250);
+
+/// Let `work` finish: the short grace for ordinary work, the money bound while a payment redeem is
+/// in flight — including one that began during the grace. The money bound lasts only as long as the
+/// redeem: once it finishes, whatever the lane is still doing gets one more grace from then (never
+/// past the money bound), not the rest of the 60 s. `redeeming` in the result is whether a redeem
+/// was still in flight when the work was abandoned.
 pub(crate) async fn settle<F: Future + Unpin>(work: &mut F, redeems_in_flight: &AtomicUsize) -> Settled {
     let started = Instant::now();
+    let money_deadline = started + LANE_SETTLE_MONEY_BOUND;
+    let mut deadline = started + LANE_SETTLE_GRACE;
     loop {
         let redeeming = redeems_in_flight.load(Ordering::SeqCst) > 0;
-        let deadline = started + lane_settle_bound(redeeming);
-        if tokio::time::timeout_at(deadline, &mut *work).await.is_ok() {
+        let wake = if redeeming {
+            (Instant::now() + SETTLE_REDEEM_POLL).min(money_deadline)
+        } else {
+            deadline
+        };
+        if tokio::time::timeout_at(wake, &mut *work).await.is_ok() {
             return Settled::Finished(started.elapsed());
         }
-        if !redeeming && redeems_in_flight.load(Ordering::SeqCst) > 0 {
+        let now = Instant::now();
+        if redeems_in_flight.load(Ordering::SeqCst) > 0 {
+            if now >= money_deadline {
+                return Settled::Abandoned {
+                    after: started.elapsed(),
+                    redeeming: true,
+                };
+            }
             continue;
         }
-        return Settled::Abandoned {
-            after: started.elapsed(),
-            redeeming,
-        };
+        if redeeming {
+            // The redeem just finished: the rest of the work gets one grace from now.
+            deadline = deadline.max(now + LANE_SETTLE_GRACE).min(money_deadline);
+            continue;
+        }
+        if now >= deadline {
+            return Settled::Abandoned {
+                after: started.elapsed(),
+                redeeming: false,
+            };
+        }
     }
 }
 
@@ -592,6 +619,26 @@ mod tests {
             Settled::Abandoned { after: LANE_SETTLE_MONEY_BOUND, redeeming: true }
         );
         starter.await.expect("starter task");
+
+        // A redeem that finishes at ~5 s: the money bound ends with it (detected within one poll),
+        // and the work still running gets one more grace — abandoned at ~8 s, not 60 s — reported
+        // as not redeeming.
+        let short = std::sync::Arc::new(AtomicUsize::new(1));
+        let flag = std::sync::Arc::clone(&short);
+        let finisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5_100)).await;
+            flag.fetch_sub(1, Ordering::SeqCst);
+        });
+        let Settled::Abandoned { after, redeeming } = settle(&mut Never, &short).await else {
+            panic!("work that never finishes is abandoned");
+        };
+        assert!(!redeeming, "the redeem had finished when the work was abandoned");
+        let earliest = Duration::from_millis(5_100) + LANE_SETTLE_GRACE;
+        assert!(
+            after >= earliest && after <= earliest + SETTLE_REDEEM_POLL,
+            "abandoned {after:?} after start; expected one grace after the redeem ended"
+        );
+        finisher.await.expect("finisher task");
 
         // Work that finishes is not abandoned.
         let mut quick = Box::pin(tokio::time::sleep(Duration::from_secs(1)));

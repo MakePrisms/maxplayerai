@@ -5696,7 +5696,12 @@ impl SellerNodeRunner {
                         last_backfill_at = now;
                     }
                     lane_busy.start(work.label(), now);
-                    lane = Some(Box::pin(Arc::clone(&self).lane_work(work, pacing.may_drain(now))));
+                    let drain = if pacing.may_drain(now) {
+                        DrainMode::Routine
+                    } else {
+                        DrainMode::FreshOnly
+                    };
+                    lane = Some(Box::pin(Arc::clone(&self).lane_work(work, drain)));
                 }
             }
             if queue.has_room() {
@@ -5889,6 +5894,9 @@ impl SellerNodeRunner {
                         Some(true) => {
                             stalled_since_recovery = true;
                             manual_recovery_succeeded = true;
+                            // A fresh authenticated socket: a pause earned against the dead one
+                            // must not hold the backlog back from the live one.
+                            pacing.reset();
                             // The full set was re-subscribed, so the open-pool half is back.
                             open_pool = None;
                         }
@@ -5904,7 +5912,15 @@ impl SellerNodeRunner {
                     if let Some((label, busy)) = lane_busy.finish(now) {
                         opline!("seller node WORK-LANE clear: {label} finished after {}s", busy.as_secs());
                     }
+                    // A fresh-only pass (routine drains paused) never extends the pause; one the relay
+                    // confirmed proves it is acknowledging again, so routine drains resume.
                     if let Some(counts) = done.drain
+                        && counts.fresh_only
+                    {
+                        if counts.confirmed > 0 {
+                            pacing.reset();
+                        }
+                    } else if let Some(counts) = done.drain
                         && let Some(pause) = pacing.record(counts.confirmed, counts.unconfirmed, now)
                     {
                         if pause == schedule::OUTBOX_BACKOFF_MIN {
@@ -5948,8 +5964,10 @@ impl SellerNodeRunner {
                     queue.request_backfill();
                     continue;
                 }
-                // Paused while the event queue is full: back-pressure on the relay stream, never a
-                // dropped event.
+                // Paused while the event queue is full. That is back-pressure on OUR reads only: the
+                // SDK's notification broadcast keeps filling meanwhile and can lag (dropping the
+                // oldest notifications, logged below). A dropped offer, award or wrap is recovered
+                // by the next stored-history backfill, which re-reads exactly those windows.
                 recv = notifications.recv(), if queue.has_room() => {
                     match recv {
                         Ok(RelayPoolNotification::Event { event, .. }) => {
@@ -8983,7 +9001,7 @@ impl SellerNodeRunner {
             }
         }
         self.publish_now(&format!("result:{job_id}")).await;
-        self.drain().await;
+        self.drain(DrainMode::Routine).await;
     }
 
     /// Task B2: deliver `job_id` through ONE sandbox container that runs the agent AND all git. The
@@ -9618,7 +9636,7 @@ impl SellerNodeRunner {
             }
         }
         self.publish_now(&format!("result:{job_id}")).await;
-        self.drain().await;
+        self.drain(DrainMode::Routine).await;
     }
 
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
@@ -9830,7 +9848,7 @@ impl SellerNodeRunner {
             }
         }
         self.publish_now(&format!("result:{job_id}")).await;
-        self.drain().await;
+        self.drain(DrainMode::Routine).await;
     }
 
     /// Settle one gift-wrapped payment: decode it (through the signer actor — the NIP-44 decrypt
@@ -10373,10 +10391,21 @@ impl SellerNodeRunner {
     /// client. Log-and-continue: an unconfirmed row stays pending (same signed event, same id) for
     /// the next pass. The returned counts drive the run loop's pacing; nothing here can hold the
     /// caller longer than [`OUTBOX_PASS_BUDGET`] + [`PRIVATE_FLUSH_BUDGET`] (plus one signer call).
-    async fn drain(&self) -> DrainCounts {
+    ///
+    /// [`DrainMode::FreshOnly`] (routine drains paused) tries only never-attempted rows and skips the
+    /// private-content flush: a fresh claim still gets its first attempt, the paced backlog waits.
+    async fn drain(&self, mode: DrainMode) -> DrainCounts {
         let now = now_unix();
-        let mut counts = DrainCounts::default();
-        let limits = DrainLimits::within(OUTBOX_PASS_BUDGET, OUTBOX_PASS_ROWS);
+        let fresh_only = mode == DrainMode::FreshOnly;
+        let mut counts = DrainCounts {
+            fresh_only,
+            ..DrainCounts::default()
+        };
+        let limits = if fresh_only {
+            DrainLimits::fresh_within(OUTBOX_PASS_BUDGET, OUTBOX_PASS_ROWS)
+        } else {
+            DrainLimits::within(OUTBOX_PASS_BUDGET, OUTBOX_PASS_ROWS)
+        };
         match drain_within(self.node.store(), &self.publisher, now, limits).await {
             Ok(report) => {
                 if report.confirmed > 0 || report.failed > 0 {
@@ -10389,6 +10418,9 @@ impl SellerNodeRunner {
                 counts.unconfirmed += report.failed + report.deferred;
             }
             Err(error) => opline!("seller node outbox drain error (continuing): {error}"),
+        }
+        if fresh_only {
+            return counts;
         }
         if let Some(flush) = self.flush_private_content().await {
             counts.confirmed += flush.accepted;
@@ -10414,12 +10446,12 @@ impl SellerNodeRunner {
 }
 
 impl SellerNodeRunner {
-    /// One unit of lane work. `drain_allowed` is the loop's pacing verdict for the routine drain
-    /// that follows it (claims an award reads and post-delivery results publish on their own).
+    /// One unit of lane work. `drain` is the loop's pacing verdict for the outbox drain that follows
+    /// it (claims an award reads and post-delivery results publish on their own).
     async fn lane_work(
         self: Arc<Self>,
         work: schedule::Work<Box<nostr_sdk::Event>>,
-        drain_allowed: bool,
+        drain: DrainMode,
     ) -> LaneDone {
         let mut done = LaneDone {
             backfill_complete: None,
@@ -10442,9 +10474,7 @@ impl SellerNodeRunner {
                 done.backfill_complete = Some(wraps && offers);
             }
         }
-        if drain_allowed {
-            done.drain = Some(self.drain().await);
-        }
+        done.drain = Some(self.drain(drain).await);
         done
     }
 
@@ -10609,9 +10639,20 @@ const BACKFILL_RETRY_MIN: Duration = Duration::from_secs(30);
 /// What one run-loop drain pass achieved — the input to [`schedule::OutboxPacing`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct DrainCounts {
+    /// The pass ran in [`DrainMode::FreshOnly`].
+    fresh_only: bool,
     confirmed: usize,
     /// Failed, cut short, or never reached: still pending.
     unconfirmed: usize,
+}
+
+/// Which outbox rows the drain after a unit of lane work may try.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainMode {
+    /// Every pending row (bounded): the relay is acknowledging, or the pause has run out.
+    Routine,
+    /// Routine drains are paused: only rows never attempted, so a fresh claim is not held back.
+    FreshOnly,
 }
 
 /// Whole-pass budget for one routine outbox drain: one SDK publish (10 s OK wait) plus an AUTH retry
@@ -14976,8 +15017,8 @@ mod tests {
                 assert_eq!(loser.slots.available(), 0, "the loser's single slot is reserved");
 
                 // Publish both claims so each has a real id on the wire; the award names the winner's.
-                winner.drain().await;
-                loser.drain().await;
+                winner.drain(DrainMode::Routine).await;
+                loser.drain(DrainMode::Routine).await;
                 let winner_claim_id = match winner.node.store().outbox_row(&format!("claim:{job_id}"))
                 {
                     Ok(Some((_, _, Some(published)))) => published,
@@ -15175,8 +15216,8 @@ mod tests {
                 // Publish both claims so each has a real id on the wire; the accept names the
                 // winner's. Without this the loser's own id is unreadable and it would refuse to
                 // bind for the WRONG reason (fail-closed), which would not test the identity match.
-                winner.drain().await;
-                loser.drain().await;
+                winner.drain(DrainMode::Routine).await;
+                loser.drain(DrainMode::Routine).await;
                 let published = |seat: &Arc<SellerNodeRunner>, label: &str| match seat
                     .node
                     .store()

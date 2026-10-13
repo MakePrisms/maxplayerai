@@ -2763,21 +2763,24 @@ impl SellerStore {
     /// front rows while a fresh claim — the row a buyer is waiting on — sat behind them. Every attempt
     /// stamps `updated_at_unix`, so failed rows rotate and a pass that runs out of time resumes with
     /// the rows the last one never reached.
+    ///
+    /// `fresh_only` restricts the batch to rows never attempted (`attempts = 0`).
     pub fn pending_outbox_batch(
         &self,
         now_unix: i64,
         limit: usize,
+        fresh_only: bool,
     ) -> Result<Vec<OutboxItem>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix
              FROM nostr_event_outbox
-             WHERE state = 'pending' AND expires_at_unix > ?1
+             WHERE state = 'pending' AND expires_at_unix > ?1 AND (?3 = 0 OR attempts = 0)
              ORDER BY attempts > 0, updated_at_unix, id
              LIMIT ?2",
         )?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        read_outbox_items(&mut stmt, params![now_unix, limit])
+        read_outbox_items(&mut stmt, params![now_unix, limit, fresh_only])
     }
 
     /// The still-pending, unexpired outbox row with `dedup_key`, if there is one.

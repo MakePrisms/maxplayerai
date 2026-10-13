@@ -55,6 +55,11 @@ pub struct DrainLimits {
     pub deadline: Option<tokio::time::Instant>,
     /// At most this many rows are tried in one pass.
     pub max_rows: usize,
+    /// Try only rows never attempted before. The run loop drains this way while routine drains are
+    /// paused behind an unresponsive relay: a fresh claim is the row a buyer is racing other sellers
+    /// for, so it gets its one attempt now rather than waiting out the pause behind rows the relay
+    /// already failed. Each row costs at most one such attempt; after it, the row is paced.
+    pub fresh_only: bool,
 }
 
 impl DrainLimits {
@@ -63,6 +68,15 @@ impl DrainLimits {
         Self {
             deadline: Some(tokio::time::Instant::now() + budget),
             max_rows,
+            fresh_only: false,
+        }
+    }
+
+    /// The same bound, restricted to rows never attempted before (see [`Self::fresh_only`]).
+    pub fn fresh_within(budget: Duration, max_rows: usize) -> Self {
+        Self {
+            fresh_only: true,
+            ..Self::within(budget, max_rows)
         }
     }
 
@@ -72,6 +86,7 @@ impl DrainLimits {
         Self {
             deadline: None,
             max_rows: usize::MAX,
+            fresh_only: false,
         }
     }
 }
@@ -107,7 +122,7 @@ pub async fn drain_within<P: EventPublisher>(
     let mut report = DrainReport::default();
     report.expired = store.expire_outbox(now_unix)?;
 
-    let batch = store.pending_outbox_batch(now_unix, limits.max_rows)?;
+    let batch = store.pending_outbox_batch(now_unix, limits.max_rows, limits.fresh_only)?;
     let total = batch.len();
     for (tried, item) in batch.into_iter().enumerate() {
         match publish_one(store, publisher, &item, now_unix, limits.deadline, &mut report).await? {
