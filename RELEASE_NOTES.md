@@ -1,3 +1,21 @@
+## Unreleased
+
+Changes on main since v0.6.1-rc9 (tagged 2026-10-10). Rename this heading to the next release
+when it is cut.
+
+- Seller daemon stays responsive when the relay stops acknowledging publications or stops
+  finishing history reads. Relay events, housekeeping, outbox publishing and backfills run on one
+  serialized work lane beside the loop, so heartbeats, the relay watchdog, the status line and
+  shutdown are never held behind them. Outbox passes are bounded (15 s / 256 rows) and fair: rows
+  never attempted go first, a row the relay hangs on rotates behind them, unacknowledged rows stay
+  pending and are retried with the same event id, and new claims still get their first attempt
+  while routine drains back off. A history read the relay never finishes is reported INCOMPLETE
+  and retried (30 s, doubling) instead of being treated as empty. The watchdog judges each tick
+  at its start and runs one probe/recovery at a time. Shutdown waits 3 s for in-flight work, or up
+  to 60 s while a payment redeem is running. The status line now ends with the relay and work-lane
+  state; see [Reading the log](docs/SELLER-QUICKSTART.md). Payment guards (pay-once, receipt
+  dedup, fail-closed redeem classification, the store-derived wrap cursor) are unchanged.
+
 ## v0.6.1-rc9
 
 Unreleased ninth release candidate for 0.6.1.
