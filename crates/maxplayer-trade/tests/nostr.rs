@@ -29,7 +29,7 @@ use nostr_relay_builder::{
     builder::{PolicyResult, RateLimit, WritePolicy},
 };
 use nostr_sdk::nips::nip44;
-use nostr_sdk::prelude::{Client, Event, EventBuilder, EventId, Keys, Kind, Tag};
+use nostr_sdk::prelude::{Client, Event, EventBuilder, EventId, Keys, Kind, Tag, Timestamp};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
@@ -3042,4 +3042,229 @@ async fn unanswered_initial_request_is_not_rejected_and_redelivery_is_handled_fr
         error.to_string().contains("conflicting request-id reuse"),
         "{error:#}"
     );
+}
+
+/// N-T1 (re-review of #1133): a request left unrejected by an unanswered mint is refused on
+/// re-delivery once its lot is cancelled, and once it has expired; neither creates a swap. With
+/// `inbox` already bound, the request branch's `msg.exp > now()` is the only expiry guard.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redelivered_request_is_refused_after_cancel_or_expiry() {
+    let mut e = env().await;
+    let _lab = SilentLab::new();
+    let a = MintFixture::start(0).await;
+    let n = e.nostr_mint().await;
+    e.fund_nostr(&e.maker.clone(), &n, 128).await;
+    support::fund(&e.taker, &a.url, 128).await;
+    let lot = e.list(&n.url, 32, &a.url, 24).await;
+    let _id = e.take(&lot, 40, 32).await;
+    let event = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), e.mm.inbox.recv())
+            .await
+            .expect("taker request reaches the maker")
+            .unwrap();
+        if e.mm.decode(&ev).is_ok_and(|m| m.step == "request") {
+            break ev;
+        }
+    };
+    let msg = e.mm.decode(&event).unwrap();
+    let mut short = msg.clone();
+    short.request_id = uuid::Uuid::new_v4().to_string();
+    short.swap_id = uuid::Uuid::new_v4().to_string();
+    short.exp = coordinator::now() + 25;
+    let ev = sealed_trade(&e, &short);
+    let key = format!("{}_{}", ev.pubkey, short.request_id);
+    e.tap.silent.store(true, SeqCst);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &ev)
+        .await
+        .unwrap_err();
+    assert!(maxplayer_trade::backoff::unanswered(&error), "{error:#}");
+    assert!(
+        e.jm.get::<(String, String)>("rejected", &key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    e.tap.silent.store(false, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    // Cancelled lot: refused, no swap.
+    let mut listing =
+        e.jm.get::<coordinator::Listing>("listing", &lot)
+            .await
+            .unwrap()
+            .unwrap();
+    listing.cancelled = true;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &ev)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("lot busy or terminal"),
+        "{error:#}"
+    );
+    assert!(e.jm.all::<Swap>("swap").await.unwrap().is_empty());
+    listing.cancelled = false;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    // A second, fresh short request: unanswered, then re-delivered after its expiry.
+    let mut late = msg.clone();
+    late.request_id = uuid::Uuid::new_v4().to_string();
+    late.swap_id = uuid::Uuid::new_v4().to_string();
+    late.exp = coordinator::now() + 25;
+    let lev = sealed_trade(&e, &late);
+    e.tap.silent.store(true, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(false);
+    let error = coordinator::handle(&e.maker, &e.jm, &e.mm, &lev)
+        .await
+        .unwrap_err();
+    assert!(maxplayer_trade::backoff::unanswered(&error), "{error:#}");
+    e.tap.silent.store(false, SeqCst);
+    maxplayer_trade::backoff::set_wait_for_pacing(true);
+    while coordinator::now() <= late.exp {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let result = coordinator::handle(&e.maker, &e.jm, &e.mm, &lev).await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("expired or pre-bound")),
+        "an expired re-delivery must be refused: {result:?}"
+    );
+    assert!(
+        e.jm.all::<Swap>("swap").await.unwrap().is_empty(),
+        "an expired re-delivery must not create a swap"
+    );
+}
+
+/// Seal `message` as a trade event from `from` to `to`, optionally with a chosen `created_at`.
+fn seal_trade_from(
+    from: &Keys,
+    to: &Keys,
+    message: &maxplayer_trade::market::Envelope,
+    created_at: Option<u64>,
+) -> Event {
+    let content = nip44::encrypt(
+        from.secret_key(),
+        &to.public_key(),
+        serde_json::to_string(message).unwrap(),
+        nip44::Version::V2,
+    )
+    .unwrap();
+    let mut builder = EventBuilder::new(Kind::Custom(TRADE), content).tags([
+        Tag::public_key(to.public_key()),
+        Tag::hashtag("maxplayer"),
+        Tag::parse(["v", "1"]).unwrap(),
+    ]);
+    if let Some(t) = created_at {
+        builder = builder.custom_created_at(Timestamp::from(t));
+    }
+    builder.sign_with_keys(from).unwrap()
+}
+
+/// L-1 (re-review of #1133): a message timeout between `save(swap)` and the listing's `active`
+/// write leaves a quoted maker swap while `listing.active` is still `None` (until the next
+/// recovery tick). The swap row alone keeps the lot busy: another taker's request in that window
+/// is refused before any mint read and never gets a second quote for the same lot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quoted_swap_keeps_lot_busy_without_listing_active_index() {
+    let mut e = env().await;
+    let a = MintFixture::start(0).await;
+    let b = MintFixture::start(0).await;
+    support::fund(&e.maker, &a.url, 128).await;
+    support::fund(&e.taker, &b.url, 128).await;
+    let lot = e.list(&a.url, 32, &b.url, 24).await;
+    let id = e.take(&lot, 40, 32).await;
+    let event = loop {
+        let ev = tokio::time::timeout(Duration::from_secs(10), e.mm.inbox.recv())
+            .await
+            .expect("taker request reaches the maker")
+            .unwrap();
+        if e.mm.decode(&ev).is_ok_and(|m| m.step == "request") {
+            break ev;
+        }
+    };
+    coordinator::handle(&e.maker, &e.jm, &e.mm, &event)
+        .await
+        .unwrap();
+    assert_eq!(e.state(true, &id).await.as_deref(), Some("quoted"));
+    // Simulate the dropped future: the swap is saved, the listing update never ran.
+    let mut listing =
+        e.jm.get::<coordinator::Listing>("listing", &lot)
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(listing.active.as_deref(), Some(id.as_str()));
+    listing.active = None;
+    e.jm.put("listing", &lot, &listing).await.unwrap();
+    // A different taker (so the per-peer limit does not apply) asks for the same lot.
+    let other = Keys::generate();
+    let mut second = e.mm.decode(&event).unwrap();
+    second.request_id = uuid::Uuid::new_v4().to_string();
+    second.swap_id = uuid::Uuid::new_v4().to_string();
+    second.exp = coordinator::now() + 60;
+    let ev = seal_trade_from(&other, &e.mm.keys, &second, None);
+    let result = coordinator::handle(&e.maker, &e.jm, &e.mm, &ev).await;
+    assert!(
+        result
+            .as_ref()
+            .is_err_and(|e| e.to_string().contains("lot busy or terminal")),
+        "a lot with a live quoted swap must not be quoted again: {result:?}"
+    );
+    assert_eq!(
+        e.jm.all::<Swap>("swap").await.unwrap().len(),
+        1,
+        "SAFETY: one quote per lot"
+    );
+}
+
+/// Nit-4 (re-review of #1133): the `request` exp cap is `exp <= created_at + 120` AND
+/// `exp <= now + 120`. Each clause is pinned by a case only it refuses (back-dated / post-dated
+/// `created_at`), and the exact boundary (+120 accepted, +121 refused) is pinned for both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_exp_cap_pins_both_clauses_at_the_exact_boundary() {
+    let e = env().await;
+    let bound = maxplayer_trade::QUOTE_SECONDS + maxplayer_trade::market::REQUEST_EXP_SKEW_SECONDS;
+    assert_eq!(bound, 120);
+    let template = maxplayer_trade::market::Envelope {
+        trade_v: 1,
+        request_id: String::new(),
+        swap_id: String::new(),
+        lot_id: EventId::all_zeros().to_hex(),
+        quote_hash: String::new(),
+        step: "request".into(),
+        body: serde_json::json!({}),
+        exp: 0,
+    };
+    // `(created_at, exp)` as offsets from the decoder's clock, read before signing; retried if
+    // the second ticks between signing and decoding, so the `now` clause boundary is exact.
+    let decode = |created: i64, exp: i64| loop {
+        let t = coordinator::now() as i64;
+        let mut m = template.clone();
+        m.request_id = uuid::Uuid::new_v4().to_string();
+        m.swap_id = uuid::Uuid::new_v4().to_string();
+        m.exp = (t + exp) as u64;
+        let ev = seal_trade_from(&e.mt.keys, &e.mm.keys, &m, Some((t + created) as u64));
+        let result = e.mm.decode(&ev);
+        if coordinator::now() as i64 == t {
+            break result.map(|_| ()).map_err(|e| e.to_string());
+        }
+    };
+    let refused = |r: Result<(), String>| {
+        r.is_err_and(|e| e.contains("request expiry exceeds the quote window"))
+    };
+    // Both clauses at once: created_at = now.
+    assert_eq!(decode(0, 120), Ok(()), "exp = created_at + 120 = now + 120");
+    assert!(refused(decode(0, 121)), "exp = created_at + 121");
+    // `created_at` clause alone (back-dated; the `now` clause passes).
+    assert_eq!(decode(-600, -480), Ok(()), "exp = created_at + 120");
+    assert!(
+        refused(decode(-600, -479)),
+        "created_at clause: exp = created_at + 121"
+    );
+    assert!(
+        refused(decode(-300, 30)),
+        "created_at clause: back-dated, exp within now + 120"
+    );
+    // `now` clause alone (post-dated; the `created_at` clause passes).
+    assert_eq!(decode(600, 120), Ok(()), "exp = now + 120");
+    assert!(refused(decode(600, 121)), "now clause: exp = now + 121");
 }

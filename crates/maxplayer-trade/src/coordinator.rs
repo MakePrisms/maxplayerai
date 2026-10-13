@@ -189,7 +189,7 @@ fn envelope(s: &Swap, step: &str, body: serde_json::Value) -> Result<Envelope> {
             .quote
             .as_ref()
             .map(|q| q.long + 86400)
-            .unwrap_or(s.created + 60),
+            .unwrap_or(s.created + QUOTE_SECONDS),
     })
 }
 async fn send(
@@ -574,6 +574,14 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
         );
         let lot = parse_lot(&l.event, now())?;
         let swaps = j.all::<Swap>("swap").await?;
+        // The swap row, not `listing.active`, decides busy-ness: a message timeout between
+        // `save(swap)` and the listing write below leaves `active` unset until the next tick.
+        ensure!(
+            !swaps
+                .iter()
+                .any(|s| s.role == "maker" && s.lot.id.to_hex() == msg.lot_id && !terminal(s)),
+            "lot busy or terminal"
+        );
         ensure!(
             swaps
                 .iter()
@@ -1164,7 +1172,7 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
         }
         let budget = item_budget(&s);
         let item = async {
-            if s.state == "requested" && now() > s.created + 60 {
+            if s.state == "requested" && now() > s.created + QUOTE_SECONDS {
                 mint::release(home, &s.plan, &s.id).await?;
                 s.state = "expired".into();
                 save(j, &s).await?;
