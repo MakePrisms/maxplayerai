@@ -194,6 +194,11 @@ test("all site pages share navigation and footer links, with a current page and 
   }
 });
 
+test("/chat carries the /tokens experimental notice under the nav", () => {
+  const chat = readFileSync(join(root, "dist", "chat.html"), "utf8");
+  assert.match(chat, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
+});
+
 test("/tokens ships its own read-only bundle and stays unlisted", () => {
   const tokens = readFileSync(join(root, "dist", "tokens.html"), "utf8");
   for (const id of ["tokens", "lots", "recent", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {

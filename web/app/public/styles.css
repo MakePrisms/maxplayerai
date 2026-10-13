@@ -1258,3 +1258,17 @@ button.chip { cursor: pointer; }
   color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
 }
 .foot-nav a:hover .lab-sup { border-color: var(--neon); }
+/* /chat carries the /tokens experimental notice strip (bob); same rules as
+   feat/trade-market-page, so a later merge keeps one copy. */
+.labs-strip {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0; min-height: 34px; padding: 8px 16px;
+  font-size: 11.5px; color: var(--ink-2);
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.labs-pill {
+  flex: none; display: inline-block;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  line-height: 1; padding: 3px 5px 2px;
+  color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
+}
