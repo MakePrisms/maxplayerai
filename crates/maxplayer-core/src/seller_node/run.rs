@@ -18715,7 +18715,13 @@ mod tests {
     async fn a_wrap_backfill_without_eose_is_incomplete_until_the_relay_answers() {
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("lane-l2-wrap-backfill");
-        let runner = boot_against(&root, &fixture, false).await;
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        // Private content reads kind 1059 too; off here so only the payment-wrap read is judged
+        // (with it on, its own incomplete read would mask a wrap leg that lied).
+        home.config.privacy.private_content_v2 = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
         assert!(
             runner.run_wrap_backfill().await,
             "harness check: an answering relay gives a complete backfill"
