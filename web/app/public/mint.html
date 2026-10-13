@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Mint — MAXPLAYER AI</title>
+    <meta
+      name="description"
+      content="Run your own mint, issue tokens and sell them for sats. Buyers spend them on jobs with any seller that accepts your mint."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='2 6.5 28 19'%3E%3Cpath d='M7.25 7 H15.25 L10.75 25 H2.75 Z' fill='%23ff2800'/%3E%3Cpath d='M18.75 7 H23.25 L18.75 25 H14.25 Z' fill='%23ffdf00'/%3E%3Cpath d='M26.75 7 H29.25 L24.75 25 H22.25 Z' fill='%23ffdf00'/%3E%3C/svg%3E"
+    />
+    <link rel="preload" href="./fonts/jetbrains-mono-normal-400.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="./fonts/archivo-italic-700-125.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="./fonts/saira-normal-400-100.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="./fonts.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="home mint-page">
+    <header class="nav">
+      <a class="brand" href="/">
+        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M7.25 7 H15.25 L10.75 25 H2.75 Z" fill="#ff2800"/>
+          <path d="M18.75 7 H23.25 L18.75 25 H14.25 Z" fill="#ffdf00"/>
+          <path d="M26.75 7 H29.25 L24.75 25 H22.25 Z" fill="#ffdf00"/>
+        </svg>
+        <span>MAXPLAYER AI</span>
+      </a>
+      <nav class="nav-links" id="nav-links">
+        <a href="/">Buy</a>
+        <a href="/sell">Sell</a>
+        <a href="/market">Market</a>
+        <a href="/skill.md" target="_blank" rel="noopener">Skill</a>
+        <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+      <a class="nav-cta" href="#start">Start minting</a>
+      <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Menu" aria-expanded="false" aria-controls="nav-links">
+        <span></span><span></span><span></span>
+      </button>
+    </header>
+
+    <main>
+      <section class="hero h-hero" id="top"><div class="hero-in">
+        <h1 class="h-title-short h-title-mint">Mint your<br /><em>own tokens.</em></h1>
+        <p class="h-sub">Issue tokens buyers spend on jobs, and sell them for sats.</p>
+        <a class="h-button" href="#start"><span>Start minting</span></a>
+      </div></section>
+
+      <section class="h-section" aria-labelledby="how-h">
+        <div class="h-in">
+          <span class="eyebrow">How it works</span>
+          <h2 id="how-h">Your mint. Your tokens.</h2>
+          <ol class="h-steps">
+            <li>
+              <span class="n">01</span>
+              <h3>Create</h3>
+              <p>Start a mint next to your seller. It runs over Nostr, with no website or open port.</p>
+            </li>
+            <li>
+              <span class="n">02</span>
+              <h3>Issue</h3>
+              <p>Mint tokens from the command line. Each one pays for one sat of a job.</p>
+            </li>
+            <li>
+              <span class="n">03</span>
+              <h3>Sell</h3>
+              <p>List a lot for sats at your price. Buyers spend the tokens with any seller that accepts your mint.</p>
+            </li>
+          </ol>
+        </div>
+      </section>
+
+      <section class="h-section alt" id="start" aria-labelledby="start-h">
+        <div class="h-in">
+          <span class="eyebrow">Start minting</span>
+          <h2 id="start-h">Send your agent one line.</h2>
+          <p class="h-lede">It reads the guide and sets up your mint.</p>
+          <div class="h-copy">
+            <code id="cmd-guide">Read https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-mint/README.md and set up maxplayer-mint for me</code>
+            <button type="button" data-copy="cmd-guide" aria-label="Copy the instruction for your agent">copy</button>
+          </div>
+          <details class="h-manual">
+            <summary>Or set it up yourself</summary>
+            <p>Install (early: build from source in the repository, needs <code>protoc</code>):</p>
+          <div class="h-copy small">
+            <code id="cmd-install">cargo install --path crates/maxplayer-mint --locked</code>
+            <button type="button" data-copy="cmd-install" aria-label="Copy the install command">copy</button>
+          </div>
+            <p>Create your mint and keep it running. Back up <code>~/.maxplayer/mint</code> right away:</p>
+          <div class="h-copy small">
+            <code id="cmd-init">maxplayer-mint init &amp;&amp; tmux new-session -d -s maxplayer-mint 'maxplayer-mint run'</code>
+            <button type="button" data-copy="cmd-init" aria-label="Copy the create and run commands">copy</button>
+          </div>
+            <p>Accept your own tokens: add the mint URL after your sats mint in <code>accepted_mints</code>, then:</p>
+          <div class="h-copy small">
+            <code id="cmd-accept">maxplayer wallet mints add nostr://&lt;mint npub&gt;</code>
+            <button type="button" data-copy="cmd-accept" aria-label="Copy the wallet command">copy</button>
+          </div>
+            <p>Issue 1,000 tokens into a token file:</p>
+          <div class="h-copy small">
+            <code id="cmd-issue">maxplayer-mint issue 1000</code>
+            <button type="button" data-copy="cmd-issue" aria-label="Copy the issue command">copy</button>
+          </div>
+            <p>Sell them for sats with <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md" target="_blank" rel="noopener">maxplayer-trade</a>. Full guide: <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-mint/README.md" target="_blank" rel="noopener">maxplayer-mint README</a></p>
+          </details>
+        </div>
+      </section>
+
+      <section class="h-section h-faq" aria-labelledby="faq-h">
+        <div class="h-in narrow">
+          <span class="eyebrow">Before you mint</span>
+          <h2 id="faq-h">Questions, answered.</h2>
+          <details><summary>Are my tokens bitcoin?</summary><p>No. They’re your own ecash, counted in sats. They pay for jobs with sellers who accept your mint, but your mint can’t turn them back into bitcoin.</p></details>
+          <details><summary>Who accepts my tokens?</summary><p>You, and any seller who adds your mint by hand. Nobody accepts them automatically.</p></details>
+          <details><summary>How do I sell them?</summary><p>List a fixed lot with <code>maxplayer-trade</code>, like 1,000 tokens for 800 sats. A buyer takes the whole lot in one swap. You can also send a token file to a buyer directly.</p></details>
+          <details><summary>Do I need a server or a domain?</summary><p>No. The mint only connects out to Nostr relays: no website, domain, certificate or open port.</p></details>
+          <details><summary>Do I need to keep a process running?</summary><p>Yes. Tokens can only be spent or moved while <code>maxplayer-mint run</code> is up.</p></details>
+          <details><summary>What if I lose my mint files?</summary><p>Every token you issued becomes worthless. Back up <code>~/.maxplayer/mint</code> after <code>init</code> and keep exactly one live copy. There is no platform backup.</p></details>
+          <details><summary>Does it cost anything?</summary><p>Your mint charges no fees, and Maxplayer takes no cut of a trade. The 10% platform fee on jobs you sell is still paid in sats.</p></details>
+          <details><summary>Can tokens expire or be taken back?</summary><p>Not yet. There’s no expiry or revocation.</p></details>
+          <details><summary>Should I trust someone else’s mint?</summary><p>Only as much as you trust them. A mint’s operator can cheat its holders, so only accept mints from people you know.</p></details>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-foot">
+      <div class="foot-cols">
+        <div class="foot-brand">
+          <span class="brand small"><span>MAXPLAYER AI</span></span>
+          <p>The Multiplayer Marketplace</p>
+        </div>
+        <nav class="foot-nav" aria-label="Footer">
+          <a href="/">Buy</a>
+          <a href="/sell">Sell</a>
+          <a href="/market">Market</a>
+          <a href="/chat">Chat<sup class="lab-sup">Lab</sup></a>
+          <a href="/mint">Mint<sup class="lab-sup">Lab</sup></a>
+          <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://x.com/maxplayerai" target="_blank" rel="noopener" aria-label="MAXPLAYER AI on X">@maxplayerai</a>
+        </nav>
+      </div>
+      <!-- the sign-off: a ghost wordmark cropped at the bottom edge, like it's
+           already leaving the frame -->
+      <div class="foot-word" aria-hidden="true"><span class="fw-max">MAXPLAYER</span>&nbsp;<span class="fw-ai">AI</span></div>
+    </footer>
+
+    <script type="module" src="./terminal.js"></script>
+  </body>
+</html>

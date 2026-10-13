@@ -91,7 +91,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "tokens.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
@@ -162,7 +162,7 @@ test("the live market ships at /market and the homepage links it", () => {
 });
 
 test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
-  const pages = ["index.html", "sell.html", "chat.html", "market.html", "tokens.html"];
+  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -179,8 +179,11 @@ test("all site pages share navigation and footer links, with a current page and 
     // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
     assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
     assert.match(footer, /href="\/market">Market<\/a>\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat is in the footer after Market, marked Lab`);
+    // Mint is a Lab page too: footer only, right after Chat.
+    assert.ok(!nav.includes('href="/mint"'), `${page}: /mint is not in the top nav`);
+    assert.match(footer, /<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /mint is in the footer after Chat, marked Lab`);
     const current = [...nav.matchAll(/aria-current="page"/g)].length;
-    if (page === "chat.html" || page === "tokens.html") {
+    if (page === "chat.html" || page === "mint.html" || page === "tokens.html") {
       assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
     } else {
       const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
@@ -222,7 +225,7 @@ test("/tokens ships its own read-only bundle and stays unlisted", () => {
   assert.ok(!tokens.includes('id="stats-note"') && !tokens.includes("Mints can fail"), "no footnotes (bob)");
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
   // Team link only (bob): nothing on the public site points at it.
-  for (const page of ["index.html", "market.html", "sell.html", "tokens.html", "llms.txt", "skill.md"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "llms.txt", "skill.md"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
     assert.ok(!/href="\/(tokens|trades)"|\]\(\/(tokens|trades)\)/.test(text), `${page} does not link the token page`);
   }
@@ -245,4 +248,18 @@ test("the /tokens CSP opens only the trade relays, only on /tokens, and is noind
   assert.match(t, /script-src 'self';/);
   const robots = matching("/tokens").flatMap((h) => h.headers.filter((x) => x.key === "X-Robots-Tag").map((x) => x.value));
   assert.deepEqual(robots, ["noindex, nofollow"]);
+});
+
+test("/mint explains the seller mint with the shared page layout", () => {
+  const mint = readFileSync(join(root, "dist", "mint.html"), "utf8");
+  assert.match(mint, /<body class="home mint-page">/);
+  assert.match(mint, /<h1 class="h-title-short h-title-mint">Mint your<br \/><em>own tokens\.<\/em><\/h1>/);
+  assert.equal([...mint.matchAll(/<ol class="h-steps">[\s\S]*?<\/ol>/g)].length, 1);
+  assert.equal([...mint.matchAll(/<li>\s*<span class="n">0\d<\/span>/g)].length, 3, "three steps, like Chat");
+  assert.ok(mint.includes('id="start"') && mint.includes('class="h-manual"') && mint.includes('class="h-section h-faq"'));
+  // Every command shown is a real one from the maxplayer-mint README / CLI usage.
+  for (const cmd of ["cargo install --path crates/maxplayer-mint --locked", "maxplayer-mint init", "maxplayer-mint run", "maxplayer-mint issue 1000", "maxplayer wallet mints add nostr://"]) {
+    assert.ok(mint.includes(cmd), `shows ${cmd}`);
+  }
+  assert.match(mint, /Are my tokens bitcoin\?<\/summary><p>No\./, "seller tokens are distinguished from bitcoin");
 });
