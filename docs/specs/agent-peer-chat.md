@@ -131,7 +131,7 @@ backoffs, 12s connect/auth and 15s OK deadlines). Only connect/auth failures, `a
 do not. OK true including `duplicate:` is accepted (exit 0, one `out` entry). Definite failure
 exits 1 and refunds the one reserved cap slot. Missing OKs remain unconfirmed (exit 2, no `out`
 entry, reservation retained) unless a later attempt accepts: a later refusal cannot disprove
-prior delivery. Do not resend blindly. `send --json` returns status, attempts, relay, event_id,
+prior delivery. Once a relay accepts, local transcript or refund errors only warn on stderr; the outcome stays accepted (exit 0) so a delivered message is never reported as failed. Do not resend blindly. `send --json` returns status, attempts, relay, event_id,
 rumor_id, error. There is no persistent outbox.
 Send slots are reserved before publication;
 an ambiguous failed acknowledgement consumes a slot. The send path builds the same seal/wrap
@@ -150,7 +150,7 @@ failed auth causes a reconnect without a subscription (fail closed).
   one full retained-history scan because old per-event cursors may have skipped pages. Historical
   quota drops without recorded IDs cannot be distinguished from missing history on that upgrade.
 * `cursor`: last completely EOSE-verified history/live checkpoint (written by `watch`).
-* `dropped.json`: rumor IDs intentionally dropped by inbound quota, durable across restarts/days.
+* `dropped.json`: rumor IDs intentionally dropped by inbound quota, each with its outer wrap timestamp, durable across restarts/days; entries older than the next history window are pruned at each checkpoint.
 * `status.json`: atomic state, pid, relay, last_healthy_at, consecutive_failures, last_error, updated_at.
 * `read`: the last rumor id `inbox` printed (written by `inbox`).
 * `watch.lock`, plus `state.lock` for short file transactions and atomic-write temporary files
@@ -174,7 +174,8 @@ All enforced in the sidecar, not by the calling agent.
 Inbound quota counts use local receipt time (legacy records fall back to their stored `at`), survive restart and peer remove/re-add, and are checked under `state.lock`. Peer-controlled timestamps cannot select the quota day. Phase-specific failures log safe relay text, relay URL, UTC timestamp, attempt and next delay.
 Retry delay doubles from 2s with ±10% jitter, capped at 60s; only authenticated, matching-EOSE
 readiness resets it. Whole connect/auth/subscribe/catch-up deadline: 60s. A 5-minute idle probe
-REQ must EOSE in 15s or reconnect. `watch --max-failures N` defaults to 10, 0 means forever;
+REQ must EOSE in 15s or reconnect; it then re-reads paged history since the last checkpoint
+and only that verified read advances the cursor (a responsive relay alone proves nothing). `watch --max-failures N` defaults to 10, 0 means forever;
 three failed cycles mark unhealthy, N failures exit 1. `status [--json]` exits 0 only with a
 healthy snapshot no older than 90s and a held watch lock; healthy snapshots refresh every 30s.
 Success logs (`authenticated`, `subscribed, caught up N messages since <UTC>`) follow matching

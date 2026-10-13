@@ -71,7 +71,7 @@ watcher exits 1. `chat/status.json` is atomically replaced, mode 0600, with stat
 last_healthy_at, consecutive_failures, last_error, updated_at (times are Unix UTC seconds).
 `inbox` works offline and warns when no watcher is running.
 
-Catch-up resumes from the last **completed history checkpoint**, with a 240-second overlap.
+Catch-up resumes from the last **completed history checkpoint**, with a 240-second overlap. The 5-minute liveness probe re-reads history since that checkpoint before advancing it.
 On upgrade, an unversioned legacy cursor is not trusted: the first connection re-scans retained
 history once, preserving transcript deduplication and current quotas. Old unrecorded quota drops
 cannot be distinguished from undelivered history. `checkpoint-version` is published only after

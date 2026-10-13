@@ -29,6 +29,8 @@ struct Faults {
     omit_ok: AtomicBool,
     omit_next_ok: AtomicUsize,
     ids: Mutex<Vec<String>>,
+    // Drop EVENT frames on each connection's first (live) subscription only; later REQs work.
+    drop_live_events: AtomicBool,
 }
 fn take_fault(value: &AtomicUsize) -> bool {
     let mut n = value.load(Ordering::SeqCst);
@@ -107,6 +109,7 @@ impl RelayFixture {
                         .await
                         .unwrap();
                     let mut authenticated = false;
+                    let mut live_sub: Option<Value> = None;
                     loop {
                         tokio::select! {
                             _=rx.changed()=>break,
@@ -122,6 +125,7 @@ impl RelayFixture {
                                         continue;
                                     }
                                     reqs.lock().unwrap().push(authenticated);if !authenticated{front.send(json!(["CLOSED",v[1],"restricted: auth first"]).to_string().into()).await.unwrap();continue;}}
+                                    if v[0]=="REQ" && live_sub.is_none() { live_sub = Some(v[1].clone()); }
                                     if v[0]=="EVENT" {
                                         writes.fetch_add(1,Ordering::SeqCst);
                                         faults.ids.lock().unwrap().push(v[1]["id"].as_str().unwrap().into());
@@ -139,6 +143,7 @@ impl RelayFixture {
                             frame=back.next()=>{let Some(Ok(mut frame))=frame else{break};
                                 if frame.is_text() {
                                     let v: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                                    if v[0]=="EVENT" && faults.drop_live_events.load(Ordering::SeqCst) && live_sub.as_ref() == Some(&v[1]) { continue; }
                                     if v[0]=="OK" && (faults.omit_ok.load(Ordering::SeqCst) || take_fault(&faults.omit_next_ok)) { continue; }
                                     if v[0]=="EOSE" {
                                         if faults.omit_eose.load(Ordering::SeqCst) { continue; }
@@ -277,12 +282,19 @@ async fn a2_approval() {
     assert!(h.entries().unwrap().is_empty());
     assert!(inbox(&h, true).is_empty());
     h.remove_peer("friend").unwrap();
-    // A label that looks like somebody else's key must never grant that key approval.
-    h.add_peer(
-        &Keys::generate().public_key().to_hex(),
-        &stranger.public_key().to_hex(),
-    )
-    .unwrap();
+    // A label that looks like somebody else's key must never grant that key approval,
+    // and is refused outright so `send <label>` cannot resolve to a different peer.
+    for label in [
+        stranger.public_key().to_hex(),
+        stranger.public_key().to_bech32().unwrap(),
+    ] {
+        assert!(
+            h.add_peer(&Keys::generate().public_key().to_hex(), &label)
+                .unwrap_err()
+                .to_string()
+                .contains("must not be a public key")
+        );
+    }
 
     assert!(
         injected(&h, &stranger, envelope("removed").unwrap())
@@ -1652,4 +1664,66 @@ async fn health_status_from_dead_previous_process_is_not_healthy() {
     );
     let out = cli(&h.root, &["status"]);
     assert!(!out.status.success());
+}
+
+#[tokio::test]
+async fn review_probe_recovers_event_the_live_subscription_missed() {
+    // The relay silently drops one event from the live feed but answers later REQs.
+    // The periodic probe must re-read history before advancing the checkpoint.
+    let relay = RelayFixture::new().await;
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    approve(&b, &a, "A");
+    let root = b.root.clone();
+    let url = relay.url.clone();
+    let task = tokio::spawn(async move {
+        maxplayer_chat::watch_with_options(&Home::open(root).unwrap(), &url, vec![], fast_options())
+            .await
+    });
+    wait_healthy(&b).await;
+    relay.faults.drop_live_events.store(true, Ordering::SeqCst);
+    let sent_at = Timestamp::now().as_secs();
+    a.send(&relay.url, "B", "missed live").await.unwrap();
+    wait_entries(&b, 1).await;
+    assert!(!task.is_finished(), "recovered without a reconnect");
+    assert_eq!(b.entries().unwrap()[0].text, "missed live");
+    // A later probe may advance the checkpoint past the event only once it is stored.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(b.cursor().unwrap() >= sent_at);
+    assert_eq!(b.entries().unwrap().len(), 1, "stored exactly once");
+    task.abort();
+}
+
+#[tokio::test]
+async fn review_accepted_send_survives_local_transcript_failure() {
+    use std::os::unix::fs::symlink;
+    let relay = RelayFixture::new().await;
+    let (_a, a) = home();
+    let (_b, b) = home();
+    approve(&a, &b, "B");
+    a.send(&relay.url, "B", "first").await.unwrap();
+    let log = a.root.join("chat/log.jsonl");
+    let saved = a.root.join("chat/saved-log");
+    std::fs::rename(&log, &saved).unwrap();
+    symlink(&saved, &log).unwrap(); // O_NOFOLLOW append fails after the relay accepts.
+    let before = relay.writes.load(Ordering::SeqCst);
+    let out = async_cli(
+        &a.root,
+        &["--relay", &relay.url, "send", "B", "delivered", "--json"],
+    )
+    .await;
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "delivered send must not exit as a failure"
+    );
+    let outcome: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(outcome["status"], "accepted");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("warning: delivered, but not recorded"));
+    assert_eq!(
+        relay.writes.load(Ordering::SeqCst),
+        before + 1,
+        "one publication"
+    );
 }

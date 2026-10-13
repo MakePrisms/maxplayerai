@@ -105,10 +105,12 @@ impl Home {
         }
         Ok(transport::receive_since(self.cursor()?))
     }
-    fn checkpoint(&self, at: u64) -> Result<()> {
+    pub(crate) fn checkpoint(&self, at: u64) -> Result<()> {
         let _lock = self.lock()?;
         self.write("cursor", &at.to_string())?;
-        self.write("checkpoint-version", "2")
+        self.write("checkpoint-version", "2")?;
+        // Wraps older than the next history window are never requested again.
+        self.prune_dropped(transport::receive_since(at))
     }
 }
 fn log(url: &str, attempt: u64, message: &str, delay: Duration) {
@@ -438,13 +440,30 @@ pub async fn watch_with_options(
                                 let id = relay.subscribe(filter(home, at).limit(0), SubscribeOptions::default()).await?;
                                 matching_eose(home, &mut notifications, &id, &live, &mut notifier).await?;
                                 relay.unsubscribe(&id).await?;
-                                home.checkpoint(at)?;
-                                status.last_healthy_at = Some(at);
-                                home.save_status(&mut status)
+                                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
                             };
-                            match tokio::time::timeout(options.liveness_timeout, check).await {
+                            let alive = match tokio::time::timeout(options.liveness_timeout, check).await {
                                 Ok(result) => result,
                                 Err(_) => Err("subscribe: liveness EOSE timeout".into()),
+                            };
+                            match alive {
+                                // The liveness EOSE proves the relay answers, not that the live
+                                // subscription delivered everything. Only a paged, EOSE-verified
+                                // re-read of history since the last checkpoint may advance it.
+                                Ok(()) => {
+                                    let verified = async {
+                                        let since = home.history_since()?;
+                                        catch_up(home, &relay, &mut notifications, &live, &mut notifier, since, at).await?;
+                                        home.checkpoint(at)?;
+                                        status.last_healthy_at = Some(at);
+                                        home.save_status(&mut status)
+                                    };
+                                    match tokio::time::timeout(options.cycle_timeout, verified).await {
+                                        Ok(result) => result,
+                                        Err(_) => Err("subscribe: history check deadline exceeded".into()),
+                                    }
+                                }
+                                Err(error) => Err(error),
                             }
                         },
                         _ = tokio::time::sleep(Duration::from_millis(50)) => Ok(()),
@@ -622,21 +641,33 @@ impl Home {
                 tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
             }
         }
+        // From here on the relay outcome is final: local bookkeeping failures only warn,
+        // so a delivered message never reads as "failed" and invites a duplicate resend.
         if outcome.status == "accepted" {
-            let _lock = self.lock()?;
-            self.append(&Entry {
-                rumor_id: outcome.rumor_id.clone(),
-                peer: peer.pubkey,
-                dir: "out".into(),
-                received_at: None,
-                at: Timestamp::now().as_secs(),
-                text: text.into(),
-            })?;
+            let recorded = self.lock().and_then(|_lock| {
+                self.append(&Entry {
+                    rumor_id: outcome.rumor_id.clone(),
+                    peer: peer.pubkey.clone(),
+                    dir: "out".into(),
+                    received_at: None,
+                    at: Timestamp::now().as_secs(),
+                    text: text.into(),
+                })
+            });
+            if let Err(error) = recorded {
+                eprintln!(
+                    "maxplayer-chat: warning: delivered, but not recorded in the local transcript: {}",
+                    display_text(&error.to_string())
+                );
+            }
         } else if ambiguous {
             // A later refusal cannot disprove delivery on an earlier ambiguous attempt.
             outcome.status = "unconfirmed".into();
-        } else {
-            self.refund_send(&peer.pubkey, reserved_at)?;
+        } else if let Err(error) = self.refund_send(&peer.pubkey, reserved_at) {
+            eprintln!(
+                "maxplayer-chat: warning: the daily send slot was not refunded: {}",
+                display_text(&error.to_string())
+            );
         }
         Ok(outcome)
     }

@@ -305,6 +305,10 @@ impl Home {
         if name.is_empty() || name.chars().any(char::is_control) || name.contains(['[', ']']) {
             return Err("invalid peer label".into());
         }
+        // `peer()` resolves keys before labels, so a key-shaped label would name someone else.
+        if PublicKey::parse(name).is_ok() {
+            return Err("peer label must not be a public key".into());
+        }
         let pubkey = PublicKey::parse(id)
             .map_err(|_| "invalid peer public key")?
             .to_hex();
@@ -361,6 +365,32 @@ impl Home {
         file.sync_all()?;
         Ok(())
     }
+    /// Quota-dropped rumor IDs with the outer wrap timestamp they arrived under.
+    /// Returns whether the file still uses the legacy timestamp-less list.
+    fn read_dropped(&self) -> Result<(BTreeMap<String, u64>, bool)> {
+        let s = self.read("dropped.json")?;
+        if s.trim().is_empty() {
+            return Ok((BTreeMap::new(), false));
+        }
+        if let Ok(map) = serde_json::from_str::<BTreeMap<String, u64>>(&s) {
+            return Ok((map, false));
+        }
+        // Legacy list: keep each ID for one more full history window from now.
+        let now = Timestamp::now().as_secs();
+        let ids: Vec<String> = serde_json::from_str(&s)?;
+        Ok((ids.into_iter().map(|id| (id, now)).collect(), true))
+    }
+    /// Forget drops whose wraps are older than `since`: history reads never request them
+    /// again, so the record would only grow. Callers hold state.lock.
+    pub(crate) fn prune_dropped(&self, since: u64) -> Result<()> {
+        let (mut dropped, legacy) = self.read_dropped()?;
+        let before = dropped.len();
+        dropped.retain(|_, at| *at >= since);
+        if legacy || dropped.len() != before {
+            self.write("dropped.json", &serde_json::to_string(&dropped)?)?;
+        }
+        Ok(())
+    }
     pub fn cursor(&self) -> Result<u64> {
         Ok(self.read("cursor")?.trim().parse().unwrap_or(0))
     }
@@ -387,6 +417,10 @@ impl Home {
         let Some(id) = gift.rumor.id else {
             return Ok(None);
         };
+        // Bind the dedup ID to the content we authorized: both unwraps must agree.
+        if gift.sender != sender || gift.rumor.content != body {
+            return Ok(None);
+        }
         let rumor_id = id.to_hex();
         let _lock = self.lock()?;
         let Ok(peer) = self.peer(&sender.to_hex()) else {
@@ -397,11 +431,8 @@ impl Home {
             return Ok(None);
         }
         let now = Timestamp::now().as_secs();
-        let mut dropped: Vec<String> = match self.read("dropped.json")? {
-            s if s.is_empty() => vec![],
-            s => serde_json::from_str(&s)?,
-        };
-        if dropped.contains(&rumor_id) {
+        let (mut dropped, _) = self.read_dropped()?;
+        if dropped.contains_key(&rumor_id) {
             return Ok(None);
         }
         if entries
@@ -416,7 +447,9 @@ impl Home {
         {
             // Remember intentional quota drops across overlap/restart/day rollover.
             // Never advance a history checkpoint from a single (possibly newer) event.
-            dropped.push(rumor_id);
+            // The raw outer timestamp, not a clamped one: history keeps requesting a wrap
+            // until the checkpoint window moves past it, so the record must last as long.
+            dropped.insert(rumor_id, event.created_at.as_secs());
             self.write("dropped.json", &serde_json::to_string(&dropped)?)?;
             return Ok(None);
         }
@@ -665,6 +698,31 @@ mod tests {
             result
                 .expect("unapproved receive took state.lock")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn review_dropped_ids_are_pruned_with_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = Home::open(dir.path()).unwrap();
+        // Legacy timestamp-less lists are kept (one more window) and converted.
+        h.write("dropped.json", r#"["legacy"]"#).unwrap();
+        h.prune_dropped(0).unwrap();
+        let (map, legacy) = h.read_dropped().unwrap();
+        assert!(!legacy && map.contains_key("legacy"));
+        let now = Timestamp::now().as_secs();
+        h.write(
+            "dropped.json",
+            &format!(r#"{{"old":1,"edge":{},"new":{now}}}"#, now - 240),
+        )
+        .unwrap();
+        h.checkpoint(now).unwrap();
+        let (map, _) = h.read_dropped().unwrap();
+        let kept: Vec<_> = map.keys().map(String::as_str).collect();
+        assert_eq!(
+            kept,
+            ["edge", "new"],
+            "only wraps a later history read can return are kept"
         );
     }
 
