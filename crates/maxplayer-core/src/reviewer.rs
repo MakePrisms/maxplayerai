@@ -645,9 +645,31 @@ struct Store {
     db: rusqlite::Connection,
     _lock: std::fs::File,
 }
+/// How long `Store::open` waits for a contended service lock before reporting another instance.
+/// A released flock can stay held briefly: a child forked by any thread of the previous owner
+/// shares the lock's open file description until its exec closes it (O_CLOEXEC only acts at
+/// exec). Without this grace a fast restart reads as `review_service_already_running`.
+const STORE_LOCK_GRACE: Duration = Duration::from_secs(1);
+const STORE_LOCK_RETRY: Duration = Duration::from_millis(10);
+
+fn lock_store(lock: &std::fs::File, grace: Duration) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        let contended = err.raw_os_error() == Some(libc::EWOULDBLOCK)
+            || err.kind() == std::io::ErrorKind::Interrupted;
+        if !contended || std::time::Instant::now() >= deadline {
+            return Err("review_service_already_running".into());
+        }
+        std::thread::sleep(STORE_LOCK_RETRY);
+    }
+}
 impl Store {
     fn open(path: &Path) -> Result<Self, String> {
-        use std::os::fd::AsRawFd;
         use std::os::unix::fs::OpenOptionsExt;
         let lock = std::fs::OpenOptions::new()
             .create(true)
@@ -658,9 +680,7 @@ impl Store {
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path.with_extension("lock"))
             .map_err(|_| "review_store")?;
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err("review_service_already_running".into());
-        }
+        lock_store(&lock, STORE_LOCK_GRACE)?;
         // Review digests/probabilities are private too; enforce permissions even
         // when reviewer serve is launched outside the systemd unit's umask.
         // Close before SQLite opens: closing any descriptor drops this process's POSIX locks on the file.
@@ -1494,6 +1514,50 @@ mod tests {
                 .unwrap_err(),
             "provider_outcome_unknown"
         );
+    }
+    fn hold_store_lock(path: &Path) -> std::fs::File {
+        use std::os::fd::AsRawFd;
+        // A separate open file description, as a forked child or another instance would hold.
+        let holder = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        holder
+    }
+    #[test]
+    fn reopen_waits_for_a_lock_that_is_being_released() {
+        let path = temp().join("cache.db");
+        let holder = hold_store_lock(&path);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+        // Fails with review_service_already_running without the grace period.
+        Store::open(&path).unwrap();
+        release.join().unwrap();
+    }
+    #[test]
+    fn a_lock_held_past_the_grace_still_reports_another_instance() {
+        let path = temp().join("cache.db");
+        let _holder = hold_store_lock(&path);
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            lock_store(&lock, Duration::from_millis(50)).unwrap_err(),
+            "review_service_already_running"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
     #[tokio::test]
     async fn persisted_error_only_retries_on_new_request() {
