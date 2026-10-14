@@ -126,6 +126,13 @@ fn outcome(stderr: &str) -> Option<String> {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find_map(|v| v["outcome"].as_str().map(str::to_owned))
 }
+/// The `note` serve reported for this request.
+fn note(stderr: &str) -> Option<String> {
+    stderr
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find_map(|v| v["note"].as_str().map(str::to_owned))
+}
 fn summary(stdout: &str) -> serde_json::Value {
     stdout
         .lines()
@@ -722,14 +729,27 @@ async fn token_text_never_in_serve_output_or_home_files() {
     let c = MintFixture::start(0).await;
     let (_s1, p1, t1) = issue(&c, 40).await;
     let (_s2, p2, t2) = issue(&c, 24).await;
+    let (_s3, p3, t3) = issue(&c, 8).await;
+    let (_s4, p4, t4) = issue(&c, 16).await;
     let mut serve = start_serve(&f.taker, &f.relay_url, f.root.path(), "serve").await;
     let ok = receive_cli(&f.taker, &f.relay_url, &c.url, Input::Stdin(&t1)).await;
     assert!(ok.status.success(), "{}", text(&ok).1);
     let dup = receive_cli(&f.taker, &f.relay_url, &c.url, Input::Stdin(&t1)).await;
     assert!(dup.status.success());
     let wrong = MintFixture::start(0).await;
-    let refused = receive_cli(&f.taker, &f.relay_url, &wrong.url, Input::Stdin(&t2)).await;
+    // A token of its own for the pre-journal refusal, so the home can be checked for its proofs.
+    let refused = receive_cli(&f.taker, &f.relay_url, &wrong.url, Input::Stdin(&t3)).await;
     assert_eq!(refused.status.code(), Some(1));
+    // Refused by the mint itself (journaled `refused`): the note names the state plainly.
+    c.faults.swap_nut_error.store(true, SeqCst);
+    let nut = receive_cli(&f.taker, &f.relay_url, &c.url, Input::Stdin(&t4)).await;
+    c.faults.swap_nut_error.store(false, SeqCst);
+    assert_eq!(nut.status.code(), Some(1), "{}", text(&nut).1);
+    assert_eq!(outcome(&text(&nut).1).as_deref(), Some("not_credited"));
+    assert_eq!(
+        note(&text(&nut).1).as_deref(),
+        Some("nothing was credited (state refused)")
+    );
     c.faults.lose_reply.store(true, SeqCst);
     let doubt = receive_cli(&f.taker, &f.relay_url, &c.url, Input::Stdin(&t2)).await;
     assert_eq!(doubt.status.code(), Some(3));
@@ -747,7 +767,9 @@ async fn token_text_never_in_serve_output_or_home_files() {
         "fixture: serve ran them"
     );
     let files = home_bytes(&f.taker);
-    for (token, proofs) in [(&t1, &p1), (&t2, &p2)] {
+    // Refused before any journal write: not even its proofs reach the home.
+    assert_secret_free("home files", &files, &t3, &p3);
+    for (token, proofs) in [(&t1, &p1), (&t2, &p2), (&t3, &p3), (&t4, &p4)] {
         assert_secret_free("serve stdout/stderr", &log, token, proofs);
         for t in [
             token.clone(),
@@ -755,7 +777,7 @@ async fn token_text_never_in_serve_output_or_home_files() {
         ] {
             assert!(!files.contains(&t), "SAFETY: token text stored in the home");
         }
-        for o in [&ok, &dup, &refused, &doubt] {
+        for o in [&ok, &dup, &refused, &nut, &doubt] {
             let (a, b) = text(o);
             assert_secret_free("client", &(a + &b), token, proofs);
         }

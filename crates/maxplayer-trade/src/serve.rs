@@ -686,7 +686,10 @@ async fn receive_command(home: &Path, j: &Journal, mint: &str, token: &str) -> R
         "in_doubt" => "not settled yet: the attempt is journaled and serve keeps recovering it. \
             Check `status`, or re-run this same receive: it resumes this attempt and never credits twice"
             .into(),
-        _ => format!("nothing was credited (state {})", serde_json::json!(r.state)),
+        _ => format!(
+            "nothing was credited (state {})",
+            serde_json::json!(r.state).as_str().unwrap_or("unknown")
+        ),
     };
     Ok(Outcome {
         stdout: vec![r.summary().to_string()],
