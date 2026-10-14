@@ -110,6 +110,8 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
     "/info",
     // NIP-05 — exact path
     "/.well-known/nostr.json",
+    // Public discovery + NIP-98-only registration, no membership prerequisite.
+    "/api/handles",
     // K8s / health probes (no auth) — exact paths
     "/health",
     "/_liveness",
@@ -318,6 +320,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/", get(nip11_or_ws_handler))
         .route("/info", get(relay_info_handler))
         .route("/.well-known/nostr.json", get(api::nip05::nostr_nip05))
+        // [FI-TRACE-AUTHORITY-EXEMPT] Public registry; mutations verify NIP-98.
+        .route("/api/handles", get(api::handles::batch))
+        .route("/api/handles/available", get(api::handles::available))
+        .route("/api/handles/claim", post(api::handles::claim))
+        .route("/api/handles/release", post(api::handles::release))
         // Health endpoints
         .route("/health", get(health_handler))
         .route("/_liveness", get(liveness_handler))
@@ -474,6 +481,29 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(middleware::from_fn(track_metrics))
         .layer(http_trace_layer())
         .layer(build_cors_layer(&state.config.cors_origins))
+        // Outer layer keeps discovery public even with a restrictive deployment CORS list.
+        .layer(middleware::from_fn(handle_discovery_headers))
+}
+
+async fn handle_discovery_headers(
+    request: Request<Body>,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let public = matches!(
+        request.uri().path(),
+        "/.well-known/nostr.json" | "/api/handles" | "/api/handles/available"
+    );
+    let mut response = next.run(request).await;
+    if public {
+        response.headers_mut().insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 fn http_trace_layer() -> TraceLayer<HttpMakeClassifier, fn(&Request<Body>) -> tracing::Span> {
