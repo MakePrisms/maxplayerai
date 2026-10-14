@@ -198,7 +198,9 @@ fn outputs(p: PreMintSecrets, send: bool) -> Vec<Output> {
 }
 
 /// Absolute target path: canonical existing parent + file name. Never created here.
-fn target(out: &Path) -> Result<PathBuf> {
+/// `out` as an absolute path (its directory canonicalized). A send handed to serve carries this
+/// form, so serve (another working directory) writes exactly the file the user named.
+pub fn target(out: &Path) -> Result<PathBuf> {
     let name = out.file_name().context("--out must name a file")?;
     let parent = out
         .parent()
@@ -1110,6 +1112,14 @@ async fn release_quietly(home: &Path, j: &Journal, r: &mut SendAttempt) {
 }
 
 /// One bounded pass over unfinished sends and reclaims. True when any remain unresolved.
+/// The journaled attempt that owns `out` (absolute), if any (latest non-refused first).
+pub async fn by_out(j: &Journal, out: &str) -> Result<Option<SendAttempt>> {
+    Ok(j.all::<SendAttempt>("send")
+        .await?
+        .into_iter()
+        .filter(|r| r.out == out)
+        .max_by_key(|r| r.state != SendState::Refused))
+}
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
     recover_for(home, j, None).await
 }
@@ -1220,6 +1230,11 @@ pub async fn command(
         }
     };
     println!("{}", r.summary());
+    verdict(&r, reclaiming)
+}
+/// The CLI result of a finished `send` (or `send --reclaim`) call: Ok, or the error that sets
+/// its exit code (3 unresolved, 4 manual recovery, 1 otherwise). Shared with serve.
+pub fn verdict(r: &SendAttempt, reclaiming: bool) -> Result<()> {
     use crate::coordinator::{ManualRecovery, RecoveryIncomplete};
     match r.state {
         SendState::Sent if !reclaiming => Ok(()),

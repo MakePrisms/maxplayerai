@@ -146,6 +146,29 @@ pub struct Funding {
     result: Option<Proofs>,
 }
 pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Funding> {
+    fund_with_id(home, j, url, amount, &uuid::Uuid::new_v4().to_string()).await
+}
+/// [`fund`] under an explicit operation id (a UUID the client chose and printed first). The same
+/// id again returns that journaled funding (same quote and invoice; nothing new is created or
+/// charged), so a retry after a lost reply never makes a second funding intent. The id must
+/// name the same mint and amount.
+pub async fn fund_with_id(
+    home: &Path,
+    j: &Journal,
+    url: &str,
+    amount: u64,
+    id: &str,
+) -> Result<Funding> {
+    let id = uuid::Uuid::parse_str(id)
+        .context("funding id must be a UUID")?
+        .to_string();
+    if let Some(f) = j.get::<Funding>("funding", &id).await? {
+        ensure!(
+            f.mint == url && f.amount == amount,
+            "funding id {id} belongs to another mint or amount"
+        );
+        return Ok(f);
+    }
     crate::Asset::new(url)?.fence()?;
     // Before ANY journal intent: a nostr:// credits mint has no NUT-04/NUT-20 to fund through.
     crate::transport::require_http(url, "fund")?;
@@ -167,7 +190,7 @@ pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Fu
     }
     crate::wallet::preflight_for(url, Some("fund")).await?;
     let mut f = Funding {
-        id: uuid::Uuid::new_v4().to_string(),
+        id,
         mint: url.into(),
         amount,
         quote: None,

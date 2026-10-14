@@ -304,7 +304,8 @@ async fn receive_via_serve_credits_once_and_serve_keeps_lock_listing_and_swap() 
         "SAFETY: serve's listing stays available"
     );
     // Writers that are not handed off are still refused while serve runs.
-    let fund = cmd(&f.taker, &f.relay_url, &["fund", &c.url, "--amount", "10"])
+    // (send and fund are handed off since T3b; recover still needs the home lock.)
+    let fund = cmd(&f.taker, &f.relay_url, &["recover"])
         .output()
         .await
         .unwrap();

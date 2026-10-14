@@ -45,7 +45,8 @@ pub const CLIENT_IDLE: Duration = Duration::from_secs(90);
 /// How long a client whose home is locked keeps looking for a serve socket (serve may be starting).
 pub const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// 2: requests carry the client's effective `nostr://` mint relays (`mint_relays`).
-pub const PROTOCOL_V: u8 = 2;
+/// 3: `send` and `fund` hand-offs (T3b).
+pub const PROTOCOL_V: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -71,6 +72,25 @@ pub enum Command {
         mint: String,
         token: TokenText,
     },
+    /// `send <mint> --amount N --out PATH [--max-fees F]`. `out` is absolute (the client resolved
+    /// it): serve, running as the same user, creates exactly that file. The send is keyed on it,
+    /// so the same request again resumes that attempt and never sends twice.
+    Send {
+        mint: String,
+        amount: u64,
+        out: String,
+        /// Exactly as given: `None` refuses a mint that charges input fees, as the CLI does.
+        max_fees: Option<u64>,
+    },
+    /// `fund <mint> --amount N` under the client's operation id (a UUID printed before the
+    /// hand-off). The same id again returns the same journaled quote and invoice. `quote`: resume
+    /// polling a journaled quote (`--quote`).
+    Fund {
+        mint: String,
+        amount: u64,
+        id: String,
+        quote: Option<String>,
+    },
 }
 impl Command {
     fn name(&self) -> &'static str {
@@ -79,6 +99,8 @@ impl Command {
             Command::Take { .. } => "take",
             Command::Cancel { .. } => "cancel",
             Command::Receive { .. } => "receive",
+            Command::Send { .. } => "send",
+            Command::Fund { .. } => "fund",
         }
     }
     /// The serve work keys this request may write (see `sched`): proof selection and new
@@ -89,12 +111,10 @@ impl Command {
             Command::List { .. } => vec!["admit".into()],
             Command::Take { .. } => vec!["admit".into(), "taker".into()],
             Command::Cancel { lot } => vec!["admit".into(), format!("lot:{lot}")],
-            Command::Receive { mint, .. } => vec![format!(
-                "wallet:{}",
-                Asset::from_cli(mint)
-                    .map(|a| a.mint_url)
-                    .unwrap_or_else(|_| mint.clone())
-            )],
+            Command::Receive { mint, .. } | Command::Fund { mint, .. } => vec![wallet_key(mint)],
+            // Selects proofs (`admit`: never alongside a list/take choosing inputs) and writes
+            // its mint's wallet journal.
+            Command::Send { mint, .. } => vec!["admit".into(), wallet_key(mint)],
         }
     }
     /// Which of the client's relay sets this command depends on, so serve can refuse a request
@@ -111,7 +131,9 @@ impl Command {
                 ..
             } => (true, nostr(give_mint) || nostr(want_mint)),
             Command::Take { .. } | Command::Cancel { .. } => (true, true),
-            Command::Receive { mint, .. } => (false, nostr(mint)),
+            Command::Receive { mint, .. } | Command::Send { mint, .. } => (false, nostr(mint)),
+            // fund refuses nostr:// mints before the hand-off.
+            Command::Fund { .. } => (false, false),
         }
     }
     /// What serve may log about a request: public bounds and ids only, never a payload. Each
@@ -138,6 +160,18 @@ impl Command {
             Command::Receive { mint, token } => {
                 serde_json::json!({"mint":mint,"receive":receive_id(mint, &token.0)})
             }
+            Command::Send {
+                mint,
+                amount,
+                out,
+                max_fees,
+            } => serde_json::json!({"mint":mint,"amount":amount,"out":out,"max_fees":max_fees}),
+            Command::Fund {
+                mint,
+                amount,
+                id,
+                quote,
+            } => serde_json::json!({"mint":mint,"amount":amount,"funding_id":id,"quote":quote}),
         };
         serde_json::json!({ self.name(): fields })
     }
@@ -151,6 +185,15 @@ impl std::fmt::Debug for TokenText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<token withheld>")
     }
+}
+/// The wallet work key of `mint` as the CLI names it (canonical form when it parses).
+fn wallet_key(mint: &str) -> String {
+    format!(
+        "wallet:{}",
+        Asset::from_cli(mint)
+            .map(|a| a.mint_url)
+            .unwrap_or_else(|_| mint.to_owned())
+    )
 }
 /// The public receive attempt id of `token` (static parse, no network), when it parses.
 pub fn receive_id(mint: &str, token: &str) -> Option<String> {
@@ -189,6 +232,8 @@ pub struct Job {
 pub struct Outcome {
     pub stdout: Vec<String>,
     pub swap: Option<String>,
+    /// A funding whose issuance serve's recovery keeps checking: streamed after `stdout`.
+    pub funding: Option<(String, String)>,
     /// Printed to the client's stderr after `stdout`.
     pub stderr: Vec<String>,
     /// Exit code and message after `stdout` was printed (the CLI's code for that result).
@@ -482,6 +527,9 @@ async fn connection(
         )
         .await;
     }
+    if let Some((id, mint)) = outcome.funding {
+        return stream_funding(&mut stream, home, &id, &mint).await;
+    }
     let Some(id) = outcome.swap else {
         return write(
             &mut stream,
@@ -500,6 +548,58 @@ async fn connection(
     )
     .await?;
     stream_take(&mut stream, home, &id).await
+}
+
+/// Follow one funding in the journal (read-only) while serve's recovery issues it: exit 0 once
+/// it is credited, 1 when the CLI's polling window passes first (the intent stays journaled and
+/// serve keeps checking it). Never waits inline in serve's loop.
+async fn stream_funding(stream: &mut UnixStream, home: &Path, id: &str, mint: &str) -> Result<()> {
+    let window = crate::money::fund_poll(mint) * crate::money::FUND_POLLS + Duration::from_secs(10);
+    let end = tokio::time::Instant::now() + window;
+    let mut quiet = tokio::time::Instant::now();
+    loop {
+        let row = observe::journal_rows(home, "funding")?
+            .into_iter()
+            .find(|(k, _, _)| k == id);
+        if let Some((_, v, _)) = row {
+            let f: crate::money::Funding = serde_json::from_slice(&v)?;
+            if f.done {
+                write(
+                    stream,
+                    &Reply::Stderr(
+                        serde_json::json!({"funding_id":id,"state":"issued"}).to_string(),
+                    ),
+                )
+                .await?;
+                return write(
+                    stream,
+                    &Reply::Exit {
+                        code: 0,
+                        error: None,
+                    },
+                )
+                .await;
+            }
+        }
+        if tokio::time::Instant::now() >= end {
+            return write(
+                stream,
+                &Reply::Exit {
+                    code: 1,
+                    error: Some(format!(
+                        "funding remains pending; invoice and intent retained; serve keeps checking \
+                         funding {id} (see `status`; re-run with --id {id} to follow it again)"
+                    )),
+                },
+            )
+            .await;
+        }
+        if quiet.elapsed() >= KEEPALIVE {
+            write(stream, &Reply::Keepalive).await?;
+            quiet = tokio::time::Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Stream one swap's state from the journal (read-only) until it is terminal.
@@ -659,6 +759,7 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"lot_id":id,"status_event_id":l.statuses[0].id,"status":"available","debit":l.plan.debit}).to_string()],
                 swap: None,
+                funding: None,
                 stderr: vec![],
                 failure: None,
             })
@@ -669,6 +770,7 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"lot_id":l.event.id,"status_event_ids":l.statuses.iter().map(|e|e.id.to_hex()).collect::<Vec<_>>(),"status":crate::lifecycle(&l.event,&l.statuses)?}).to_string()],
                 swap: None,
+                funding: None,
                 stderr: vec![],
                 failure: None,
             })
@@ -685,12 +787,122 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"swap_id":s.id,"state":s.state}).to_string()],
                 swap: Some(id),
+                funding: None,
                 stderr: vec![],
                 failure: None,
             })
         }
         Command::Receive { mint, token } => receive_command(home, j, mint, &token.0).await,
+        Command::Send {
+            mint,
+            amount,
+            out,
+            max_fees,
+        } => send_command(home, j, mint, *amount, out, *max_fees).await,
+        Command::Fund {
+            mint,
+            amount,
+            id,
+            quote,
+        } => fund_command(home, j, mint, *amount, id, quote.as_deref()).await,
     }
+}
+
+/// A handed-off `send`: the same `send::send` the CLI runs, bounded like one recovery item so a
+/// slow mint holds only this mint's wallet work. Dropping it is safe: the attempt is journaled
+/// before its reservation and swap, and recovery restores the same outputs. On expiry the
+/// journaled attempt (if any) is reported; serve's recovery finishes it and writes the file.
+async fn send_command(
+    home: &Path,
+    j: &Journal,
+    mint: &str,
+    amount: u64,
+    out: &str,
+    max_fees: Option<u64>,
+) -> Result<Outcome> {
+    let asset = Asset::from_cli(mint)?;
+    asset.fence()?;
+    let mint = asset.mint_url.as_str();
+    ensure!(
+        Path::new(out).is_absolute(),
+        "send --out must reach serve as an absolute path"
+    );
+    let budget = Duration::from_secs(crate::send::RECOVERY_ITEM_SECONDS);
+    let call = crate::send::send(home, j, mint, amount, Path::new(out), max_fees);
+    let r = match tokio::time::timeout(budget, call).await {
+        Ok(r) => r?,
+        Err(_) => {
+            crate::backoff::record(
+                mint,
+                crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
+            );
+            crate::send::by_out(j, out).await?.with_context(|| {
+                format!(
+                    "send did not finish within {}s and nothing was journaled: nothing was sent; re-run it",
+                    budget.as_secs()
+                )
+            })?
+        }
+    };
+    Ok(Outcome {
+        stdout: vec![r.summary().to_string()],
+        swap: None,
+        funding: None,
+        stderr: vec![],
+        failure: crate::send::verdict(&r, false).err().map(|e| Failure {
+            code: exit_code(&e),
+            message: e.to_string(),
+        }),
+    })
+}
+
+/// A handed-off `fund`: create (or, for the same id, look up) the journaled quote, try issuance
+/// once, and print the invoice. The client then follows the funding read-only while serve's
+/// recovery keeps checking it: no invoice wait runs inline in serve's loop.
+async fn fund_command(
+    home: &Path,
+    j: &Journal,
+    mint: &str,
+    amount: u64,
+    id: &str,
+    quote: Option<&str>,
+) -> Result<Outcome> {
+    let asset = Asset::from_cli(mint)?;
+    asset.fence()?;
+    let mint = asset.mint_url.as_str();
+    crate::transport::require_http(mint, "fund")?;
+    ensure!(
+        amount > 0 && amount <= crate::real_money::CAP,
+        "funding cap exceeds 100,000 sats"
+    );
+    let budget = Duration::from_secs(crate::send::RECOVERY_ITEM_SECONDS);
+    let mut f = match quote {
+        Some(q) => j
+            .all::<crate::money::Funding>("funding")
+            .await?
+            .into_iter()
+            .find(|f| f.quote.as_deref() == Some(q) && f.mint == mint && f.amount == amount)
+            .context("quote not journaled for this mint and amount")?,
+        None => tokio::time::timeout(
+            budget,
+            crate::money::fund_with_id(home, j, mint, amount, id),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("funding quote not answered in time; re-run with --id {id}")
+        })??,
+    };
+    // One issuance check now; later ones are recovery's (a lost answer only defers it).
+    let _ = tokio::time::timeout(budget, crate::money::resume_fund(home, j, &mut f)).await;
+    let line = serde_json::json!({"funding_id":f.id,"quote":f.quote,"invoice":f.invoice,
+        "amount":f.amount,"note":"pay externally; tool never auto-pays"});
+    Ok(Outcome {
+        stdout: vec![line.to_string()],
+        swap: None,
+        funding: (!f.done).then(|| (f.id.clone(), f.mint.clone())),
+        stderr: vec![],
+        failure: None,
+    })
 }
 
 /// How long one handed-off receive may hold serve's loop: one recovery item's budget. Lab
@@ -785,6 +997,7 @@ async fn receive_command(home: &Path, j: &Journal, mint: &str, token: &str) -> R
     Ok(Outcome {
         stdout: vec![r.summary().to_string()],
         swap: None,
+        funding: None,
         stderr: vec![serde_json::json!({"receive":r.id,"outcome":outcome,"note":note}).to_string()],
         failure: receive::verdict(&r).err().map(|e| Failure {
             code: exit_code(&e),
@@ -865,6 +1078,16 @@ pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
                          `status`, or re-run this same receive: it resumes that attempt and never \
                          credits twice",
                         receive_id(mint, &token.0).unwrap_or_else(|| "attempt".into())
+                    ),
+                    (None, Command::Send { out, .. }) => eprintln!(
+                        "{why} before reporting a result; the send to {out} may have been applied. \
+                         Re-run this same send (same --out): it resumes that attempt and never \
+                         sends twice; or check `status`"
+                    ),
+                    (None, Command::Fund { id, .. }) => eprintln!(
+                        "{why} before reporting a result; funding {id} may have been created. \
+                         Re-run with --id {id}: it returns that same invoice and never creates a \
+                         second one; or check `status`"
                     ),
                     (None, _) => eprintln!(
                         "{why} before reporting a result; the request may have been applied. Check status"
