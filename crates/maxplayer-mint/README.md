@@ -7,6 +7,19 @@ release has no mint code in it. Design and decisions: [`docs/specs/seller-credit
 The mint has no HTTP server and opens no port. It only connects out to Nostr relays, and wallets
 reach it there through its `nostr://npub1…` URL.
 
+## Agent setup: mint + trading
+
+For an agent to set up both tools in one flow, give it this instruction:
+
+```text
+Read https://www.maxplayer.ai/.well-known/skills/mint-and-trade/skill.md and set up my mint and token trading.
+```
+
+The [combined skill](../../web/app/.well-known/skills/mint-and-trade/skill.md) covers
+installation, existing mint state, persistent services, a separate trading home and
+readiness checks. The agent asks for issuance and sale terms before issuing or
+listing tokens. Mint-only setup is documented below.
+
 ## Build
 
 There is no prebuilt release of `maxplayer-mint` yet; build it from source (Bob, 24 Sep: revisit

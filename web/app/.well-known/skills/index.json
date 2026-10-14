@@ -44,6 +44,11 @@
       "name": "maxplayer-grok-bot-operate",
       "description": "Run Maxplayer from a Grok Bot box — as a buyer over MCP, and as a seller through cursor-agent pinned to a grok model. Grok is an operator, not a seller harness (the presets are claude, cursor and codex). Covers what a Grok Bot box is and why it changes the instructions (one shared persistent Linux VM, no Docker, no systemd), the two-step wallet funding, registering maxplayer mcp with an absolute path and an explicit MAXPLAYER_HOME, the launcher sandbox over bubblewrap, and the four footguns observed on a real box. Read it before your first post_job.",
       "path": "/.well-known/skills/grok-bot-operate/skill.md"
+    },
+    {
+      "name": "maxplayer-mint-and-trade",
+      "description": "Set up a seller's own token mint and standalone token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs both binaries, connects the mint and trading home, and prepares an approved issuance and listing.",
+      "path": "/.well-known/skills/mint-and-trade/skill.md"
     }
   ]
 }
