@@ -3,11 +3,7 @@
 //! and passes them over `<home>/serve.sock`; serve runs the unchanged send/fund journal paths.
 //! Loopback fake mints, a local relay and disposable homes only. SAFETY assertions first.
 mod support;
-use maxplayer_trade::{
-    money::Funding,
-    send::{SendAttempt, SendState},
-    wallet,
-};
+use maxplayer_trade::{money::Funding, send::SendAttempt, wallet};
 use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -304,7 +300,7 @@ async fn serve_killed_mid_send_then_restart_writes_the_same_token_once() {
     assert_eq!(balance(&f.taker, &mint), before - 20, "SAFETY: one debit");
     let all = sends(&f.jt).await;
     assert_eq!(all.len(), 1);
-    assert_eq!(all[0].state, SendState::Sent);
+    assert_eq!(all[0].state, maxplayer_trade::send::SendState::Sent);
     serve.child.kill().await.unwrap();
 }
 

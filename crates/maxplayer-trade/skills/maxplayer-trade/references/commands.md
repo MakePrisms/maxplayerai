@@ -25,7 +25,7 @@ doctor <mint> --mint-relay <url> [--json] [--timeout-seconds <seconds>]
 preflight <mint>
 balance <mint>
 status [--json] [--check-sends]
-fund <mint> --amount <sats> [--quote <quote-id>]
+fund <mint> --amount <sats> [--quote <quote-id>] [--id <funding-id>]
 receive <mint> [--token-file <path>]
 send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats> [--dry-run]
