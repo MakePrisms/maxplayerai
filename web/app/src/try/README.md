@@ -1,7 +1,7 @@
 # Try it — implementation and verification
 
 Implements stages 1–3 of `docs/specs/try-it.md`; stage 4 is deliberately not enabled.
-The production target is fixed to worker-nemo. Every browser reserves one signed job in
+The production target is fixed to worker-muse-wonder. Every browser reserves one signed job in
 IndexedDB before any write. No payment, wallet, house identity, analytics, third-party
 scripts, external quota store, or direct-to-relay browser publishing path is added.
 

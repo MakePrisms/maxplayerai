@@ -2,7 +2,7 @@
  * The board — buyers, activity, sellers, stats — rendered from a
  * MarketView through the keyed reconciler. All presentation; no derivation.
  */
-import { ago, esc, nf, now, shortHarness, short } from "./format.js";
+import { ago, esc, nf, now, short } from "./format.js";
 import { usd } from "./spot.js";
 import { posMark, statusDot } from "./indicators.js";
 import { reconcileList, type KeyedItem } from "./reconcile.js";
@@ -131,7 +131,6 @@ export function renderSellers(view: MarketView): void {
         ${posMark(view.sellerClimbs.get(r.pubkey), i + 1)}
         ${statusDot(r.online, view.activeBySeller.get(r.pubkey) || [])}
         <span class="nm">${label(view, r)}</span>
-        ${r.harness ? `<span class="harness" title="${esc(r.harness)}">${esc(shortHarness(r.harness))}</span>` : ""}
       </span>
       <span class="num">${nf.format(r.delivered)}</span>
       <span class="num ${r.askSats == null ? "dim" : ""}" title="Minimum price advertised by this seller">${r.askSats == null ? "—" : usd(r.askSats)}</span>

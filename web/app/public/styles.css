@@ -333,7 +333,6 @@ ol .row:hover .sats, ol .row:focus-visible .sats,
 ol .row:hover .when, ol .row:focus-visible .when,
 ol .row:hover code, ol .row:focus-visible code,
 ol .row:hover .dim, ol .row:focus-visible .dim,
-ol .row:hover .harness, ol .row:focus-visible .harness,
 ol .row:hover .person, ol .row:focus-visible .person { color: #0a0a0b; }
 ol .row:hover .tag, ol .row:focus-visible .tag { border-color: #0a0a0b; color: #0a0a0b; background: transparent; }
 
@@ -452,10 +451,6 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 @keyframes speed-flow-red {
   0% { background: var(--blue); }
   33.333%, 100% { background: #0a0a0b; }
-}
-.harness {
-  flex: none; font-size: 9px; letter-spacing: 0.08em; text-transform: uppercase;
-  color: var(--muted); border: 1px solid var(--line); border-radius: 2px; padding: 1px 4px;
 }
 
 /* feed rows */
@@ -1033,6 +1028,10 @@ button.chip { cursor: pointer; }
   min-height: calc(100svh - var(--nav-h));
 }
 .h-section { display: flex; flex-direction: column; justify-content: center; }
+/* FAQ: src/ui/faq.ts pins the closed, centred position so opening an answer
+   never moves the heading (bob); answers only grow the section downward. */
+.h-section.h-faq.faq-pinned { justify-content: flex-start; }
+.h-faq.faq-pinned > .h-in { margin-top: var(--faq-lift, 0px); }
 .h-section > .h-in { width: 100%; }
 /* "Just ask": one real job, start to finish. 16:9, or a 9:16 cut on portrait phones */
 .h-video { margin: 44px auto 0; max-width: 960px; }

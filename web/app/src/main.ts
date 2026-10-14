@@ -26,6 +26,7 @@ import { renderBuyers, renderFeed, renderSellers, renderStats } from "./ui/board
 import { refreshDocks, wireDocks, writeClipboard } from "./ui/docks.js";
 import { ago, now } from "./ui/format.js";
 import { refreshAges } from "./ui/reconcile.js";
+import { pinFaqs } from "./ui/faq.js";
 import { onSpotChange, startSpot } from "./ui/spot.js";
 
 const el = (id: string): HTMLElement => document.getElementById(id) as HTMLElement;
@@ -115,6 +116,7 @@ async function boot(): Promise<void> {
   wireVideo(video);
   wireNav();
   wirePicker();
+  pinFaqs();
   if (TRY_IT_ENABLED && document.getElementById("try")) void import("./try/ui.js").then(m => m.bootTry());
   // The homepage (/) is static copy: nav, role picker and copy buttons only.
   // The market terminal — relay, IndexedDB, spot quote — boots on /market,
