@@ -447,3 +447,73 @@ async fn progress_is_forwarded_to_the_following_take() {
     kill(&serve, "TERM");
     assert_eq!(exit_code(&mut serve, 60).await, Some(5));
 }
+
+/// Hold final stderr output under pipe backpressure so another owner can try to start at the
+/// exact shutdown boundary. Socket cleanup and the final snapshot must still own owner.lock.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn final_socket_cleanup_keeps_home_locked_until_exit() {
+    use fs2::FileExt;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let f = Fixture::new(0).await;
+    let home = f.root.path().join("shutdown-lock");
+    std::fs::create_dir_all(&home).unwrap();
+    {
+        let j = Journal::open(&home).await.unwrap();
+        // Recovery fails without a mint call. The final read-only snapshot reports each row,
+        // making its final line larger than a Linux pipe (which cannot grow automatically).
+        for i in 0..4096 {
+            j.put(
+                "swap",
+                &format!("broken-{i}"),
+                &serde_json::json!({"not":"a swap"}),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let mut c = cmd(&home, &f.relay_url, &["serve"]);
+    c.stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut serve = c.spawn().unwrap();
+    let mut stderr = BufReader::new(serve.stderr.take().unwrap());
+    let mut prefix = String::new();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let mut line = String::new();
+            assert_ne!(stderr.read_line(&mut line).await.unwrap(), 0);
+            let is_error = line.contains("missing field");
+            prefix.push_str(&line);
+            if is_error {
+                break;
+            }
+        }
+        while home.join("serve.sock").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("startup error and socket cleanup");
+    assert!(
+        serve.try_wait().unwrap().is_none(),
+        "final output must still be blocked"
+    );
+    let competing = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(home.join("owner.lock"))
+        .unwrap();
+    assert!(
+        competing.try_lock_exclusive().is_err(),
+        "SAFETY: shutdown must retain ownership through socket cleanup and final output"
+    );
+    let mut rest = String::new();
+    tokio::time::timeout(Duration::from_secs(30), stderr.read_to_string(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exit_code(&mut serve, 30).await, Some(1));
+    assert!(rest.contains("\"socket_removed\":true"), "{prefix}{rest}");
+    competing
+        .try_lock_exclusive()
+        .expect("ownership released only after finalization");
+}

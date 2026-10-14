@@ -136,7 +136,9 @@ use maxplayer_trade::{
 };
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    match execute().await {
+    // Keep ownership through the final snapshot and socket cleanup, not just execute().
+    let mut owner_lock = None;
+    match execute(&mut owner_lock).await {
         Ok(()) => {
             maxplayer_trade::shutdown::finished(0, None);
             std::process::ExitCode::SUCCESS
@@ -164,7 +166,7 @@ async fn main() -> std::process::ExitCode {
         }
     }
 }
-async fn execute() -> Result<()> {
+async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     let cli = Cli::parse();
     if let Command::Doctor {
         mint,
@@ -331,6 +333,8 @@ async fn execute() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
+    // main retains this file until shutdown::finished has removed our socket.
+    *owner_lock = Some(lock);
     #[cfg(feature = "lab")]
     let _trace = lab_trace::Writer::start();
     // Bind while holding owner.lock (an existing socket file is stale) and before the startup
