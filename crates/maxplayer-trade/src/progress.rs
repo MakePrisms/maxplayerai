@@ -181,11 +181,14 @@ pub async fn call<R>(
     f: impl std::future::Future<Output = R>,
     seen: impl FnOnce(&R) -> (Seen, Option<String>),
 ) -> R {
+    // Boxed on both paths: the wrapped mint futures are large and debug builds poll them on
+    // the test thread's stack (an inline await here overflowed `tests/e2e.rs`).
+    let f = Box::pin(f);
     let Ok(ctx) = CTX.try_with(Clone::clone) else {
         return f.await;
     };
     let started = Instant::now();
-    let r = OP.scope(op.to_owned(), Box::pin(f)).await;
+    let r = OP.scope(op.to_owned(), f).await;
     let (outcome, reason) = seen(&r);
     end(&ctx, mint, op, started.elapsed(), outcome, reason);
     r

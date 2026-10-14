@@ -98,6 +98,7 @@ async fn forced() -> Stopped {
 pub async fn bounded<T>(
     f: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
+    let f = Box::pin(f);
     tokio::select! {
         r = f => r,
         s = forced() => Err(s.into()),
