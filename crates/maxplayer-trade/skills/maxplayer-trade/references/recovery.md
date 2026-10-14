@@ -50,6 +50,9 @@ work is additional. A timeout does not undo a delivered RPC or release reservati
   A `mint <url> backing off` line means the request was not sent this pass (see
   [commands](commands.md#mint-backoff-and-pacing)); do not rerun `recover` in a loop.
 - **4:** terminal manual-recovery quarantine (unresolved work takes precedence as 3).
+- **5:** `serve` only: stopped by SIGTERM/SIGINT. The journal is kept; its final `exited`
+  line lists unfinished work. Restart serve while locks are live
+  ([lifecycle](commands.md#serve-lifecycle-stopping-and-progress-lines)).
 
 Exhausted/blocked relay publication is reported as `publication_abandoned`, not
 unresolved money work. Money records and signed receipts remain; the retry scan

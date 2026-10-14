@@ -31,7 +31,10 @@ Earlier dated verification sections are historical snapshots, not current covera
   both legs' fees, gross amounts and max total debit with zero side effects. A swap waiting
   >180 s on its counterparty shows `counterparty_unresponsive` (display only). Keep
   serve alive from second lock through settlement. Exits: 0 success, 1 command error,
-  pre-submission refusal, or definitive terminal `unpaid_released`, 2 usage, 3 unresolved work, 4 terminal manual recovery. Non-final
+  pre-submission refusal, or definitive terminal `unpaid_released`, 2 usage, 3 unresolved work, 4 terminal manual recovery,
+  5 serve stopped by SIGTERM/SIGINT (safe stop: nothing new admitted, the running step gets 30 s;
+  UTC `started`/`exited` lines with the reason and unfinished work; swap progress lines with
+  UTC claim/refund deadlines; see the skill's commands reference, "Serve lifecycle"). Non-final
   withdrawals never exit 0; a submitted (past `quote_created`) non-terminal withdrawal always
   exits 3, even when the mint fails after the POST. Exit 1 is never proof that a submitted
   withdrawal was refused: check `status` before paying the obligation another way.

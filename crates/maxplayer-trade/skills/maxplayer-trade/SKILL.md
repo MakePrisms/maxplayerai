@@ -19,7 +19,8 @@ journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; keep it afterward for recovery.
 Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,
 `list`/`take`/`cancel` hand off to it, exact bounds; `status`, `balance`,
-`discover` are lock-free. Don't stop serve to look.
+`discover` are lock-free. Don't stop serve to look. Stop it with SIGTERM (safe, exit 5;
+[lifecycle](references/commands.md#serve-lifecycle-stopping-and-progress-lines)).
 **Do not stop serve between `second_locked` and `settling`**; a maker can lose its
 claim window. Defer other writing commands until live obligations settle.
 Never copy its seed.
