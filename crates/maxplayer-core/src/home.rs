@@ -1764,6 +1764,9 @@ pub struct MaxplayerConfig {
     /// is disabled; no private request is silently published through the public lane.
     #[serde(default, skip_serializing_if = "PrivacyConfig::is_default")]
     pub privacy: PrivacyConfig,
+    /// NIP-05 registry domain, independent of the relay authority.
+    #[serde(default = "default_nip05_domain")]
+    pub nip05_domain: String,
     /// Open-market relay. Absent in the file ⇒ the built-in [`DEFAULT_RELAY_URL`].
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
@@ -1916,6 +1919,10 @@ fn default_accepted_mints() -> Vec<String> {
     vec![DEFAULT_MINIBITS_MINT_URL.to_owned()]
 }
 
+fn default_nip05_domain() -> String {
+    "maxplayer.ai".to_owned()
+}
+
 /// Serde default for [`MaxplayerConfig::relay_url`] — the built-in [`DEFAULT_RELAY_URL`].
 fn default_relay_url() -> String {
     DEFAULT_RELAY_URL.to_owned()
@@ -1974,6 +1981,7 @@ impl Default for MaxplayerConfig {
             review: crate::review::ReviewConfig::default(),
             privacy: PrivacyConfig::default(),
             relay_url: DEFAULT_RELAY_URL.to_owned(),
+            nip05_domain: default_nip05_domain(),
             accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             extra_mints: Vec::new(),

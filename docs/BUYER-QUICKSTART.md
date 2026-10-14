@@ -62,7 +62,10 @@ export MAXPLAYER_HOME="/absolute/path/to/a-buyer-home"
 
 The wallet and profile are managed through the CLI. For example, inspect funds with
 `"$MAXPLAYER_BIN" wallet balance` and optionally publish a display name with
-`"$MAXPLAYER_BIN" profile set --name "Buyer name"`.
+`"$MAXPLAYER_BIN" address claim buyer-name`.
+Use `address show` to inspect the claim and `address release` to release it.
+`profile set --name` remains available for self-declared kind-0 metadata, not displayed identity.
+See [NIP-05 handles](HANDLES.md) for configuration and recovery.
 
 **`wallet setup` does not leave you funded.** It prints a `quote_id` and a Lightning invoice, then
 waits for you to pay it out-of-band. Minting the ecash is a second command:

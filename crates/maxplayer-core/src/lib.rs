@@ -15,6 +15,8 @@ pub mod collect;
 pub mod job_lifecycle;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod profile;
+#[cfg(feature = "wallet")]
+pub mod address;
 pub mod contribution;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod crossmint;

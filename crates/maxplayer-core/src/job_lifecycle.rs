@@ -246,15 +246,15 @@ pub struct OfferView {
     pub event_id: String,
     pub created_at: u64,
     pub author_pubkey: String,
-    /// Cosmetic kind-0 `name` for `author_pubkey` (untrusted; never replaces hex).
-    pub author_display_name: Option<String>,
+    /// Registry identity (kind-0 fallback is explicitly untrusted) for `author_pubkey` (untrusted; never replaces hex).
+    pub author_display_name: Option<crate::address::DisplayName>,
     pub task: String,
     pub output: String,
     pub amount_sats: u64,
     pub deadline_unix: u64,
     pub seller_pubkey: Option<String>,
-    /// Cosmetic kind-0 `name` for targeted `seller_pubkey` (untrusted; never replaces hex).
-    pub seller_display_name: Option<String>,
+    /// Registry identity (kind-0 fallback is explicitly untrusted) for targeted `seller_pubkey` (untrusted; never replaces hex).
+    pub seller_display_name: Option<crate::address::DisplayName>,
     pub targeted: bool,
     /// Delivery modes THIS buyer declared it can read, off its own signed offer
     /// (`["param","accepts-delivery", …]`, §6.1). Empty ⇒ git only.
@@ -330,8 +330,8 @@ pub struct ClaimView {
     pub claim_id: String,
     pub created_at: u64,
     pub seller_pubkey: String,
-    /// Cosmetic kind-0 `name` for this claim's `seller_pubkey` (untrusted).
-    pub display_name: Option<String>,
+    /// Registry identity (kind-0 fallback is explicitly untrusted) for this claim's `seller_pubkey` (untrusted).
+    pub display_name: Option<crate::address::DisplayName>,
     pub status: String,
     /// This claim remains active independently of other sellers' claims.
     pub live: bool,
@@ -373,8 +373,8 @@ pub struct ResultView {
     pub result_id: String,
     pub created_at: u64,
     pub seller_pubkey: String,
-    /// Cosmetic kind-0 `name` for this result's `seller_pubkey` (untrusted).
-    pub display_name: Option<String>,
+    /// Registry identity (kind-0 fallback is explicitly untrusted) for this result's `seller_pubkey` (untrusted).
+    pub display_name: Option<crate::address::DisplayName>,
     pub job_hash: Option<String>,
     pub repo: Option<String>,
     pub branch: Option<String>,
@@ -4036,11 +4036,11 @@ fn display_name_pubkeys(view: &JobView) -> Vec<String> {
     pubkeys
 }
 
-fn apply_display_names(view: &mut JobView, names: &std::collections::HashMap<String, Option<String>>) {
-    let lookup = |hex: &str| -> Option<String> {
+fn apply_display_names(view: &mut JobView, names: &std::collections::HashMap<String, crate::address::DisplayName>) {
+    let lookup = |hex: &str| -> Option<crate::address::DisplayName> {
         names
             .get(&hex.to_ascii_lowercase())
-            .and_then(|value| value.clone())
+            .cloned()
     };
 
     if let Some(offer) = &mut view.offer {
@@ -4058,7 +4058,7 @@ fn apply_display_names(view: &mut JobView, names: &std::collections::HashMap<Str
     }
 }
 
-/// Cosmetic kind-0 enrichment only — never feeds accept-bind / targeting / pay.
+/// Registry identity enrichment only — never feeds accept-bind / targeting / pay.
 /// Async so `get_job`'s existing runtime does not nest `block_on` (panic).
 async fn maybe_attach_display_names_async(
     home: &MaxplayerHome,
@@ -4082,10 +4082,17 @@ async fn attach_display_names_async(home: &MaxplayerHome, view: &mut JobView) {
     if unique.is_empty() {
         return;
     }
-    let names = match crate::profile::fetch_names_async(home, &unique).await {
-        Ok(map) => map,
-        Err(_) => unique.into_iter().map(|k| (k, None)).collect(),
+    let unverified = crate::profile::fetch_names_async(home, &unique).await.unwrap_or_default();
+    let registry = crate::address::Registry::for_home(home);
+    let handles = match registry {
+        Ok(registry) => registry.lookup(&unique.iter().cloned().collect::<Vec<_>>()).await.unwrap_or_default(),
+        Err(_) => std::collections::HashMap::new(),
     };
+    let names = unique.into_iter().map(|key| {
+        let entry = crate::address::DisplayName::new(handles.get(&key).cloned(), &home.config.nip05_domain,
+            unverified.get(&key).cloned().flatten());
+        (key, entry)
+    }).collect();
     apply_display_names(view, &names);
 }
 
@@ -8376,7 +8383,7 @@ mod review_exposure_tests {
             result_id: "a".repeat(64),
             created_at: 1,
             seller_pubkey: "b".repeat(64),
-            display_name: Some("untrusted name".into()),
+            display_name: Some(crate::address::DisplayName::new(None, "maxplayer.ai", Some("untrusted name".into()))),
             job_hash: None,
             repo: Some("untrusted repo instructions".into()),
             branch: Some("untrusted branch".into()),

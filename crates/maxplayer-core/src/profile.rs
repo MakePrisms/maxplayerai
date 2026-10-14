@@ -239,7 +239,25 @@ async fn publish_metadata_merged_async(
     keys: &nostr_sdk::Keys,
     profile: &ProfileConfig,
 ) -> Result<String, ProfileError> {
-    use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind, Metadata};
+    publish_metadata_patch_async(home, keys, Some(profile), None).await
+}
+
+/// Advertise or clear a registry claim without replacing other kind-0 fields.
+pub async fn set_nip05_async(
+    home: &MaxplayerHome,
+    address: Option<&str>,
+) -> Result<String, ProfileError> {
+    let keys = buyer_keys(home)?;
+    publish_metadata_patch_async(home, &keys, None, Some(address)).await
+}
+
+async fn publish_metadata_patch_async(
+    home: &MaxplayerHome,
+    keys: &nostr_sdk::Keys,
+    profile: Option<&ProfileConfig>,
+    nip05: Option<Option<&str>>,
+) -> Result<String, ProfileError> {
+    use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind};
 
     let client = Client::new(keys.clone());
     client
@@ -264,44 +282,29 @@ async fn publish_metadata_merged_async(
         }
     };
 
-    use nostr_sdk::JsonUtil;
-    let mut metadata = Metadata::new();
-    // Preserve existing fields when present; local config wins for name/about.
-    if let Some(existing) = fetched.into_iter().next() {
-        if let Ok(parsed) = Metadata::from_json(&existing.content) {
-            metadata = parsed;
-        } else {
-            // Defensive fallback: at least keep name/about if content is partial JSON.
-            if let Some(name) = parse_kind0_name(&existing.content) {
-                metadata = metadata.name(name);
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing.content) {
-                if let Some(about) = value
-                    .get("about")
-                    .and_then(|v| v.as_str())
-                    .and_then(|a| clamp_field(a, PROFILE_ABOUT_MAX))
-                {
-                    metadata = metadata.about(about);
-                }
-            }
-        }
-    }
-    if let Some(name) = &profile.name {
-        metadata = metadata.name(name);
-    }
-    if let Some(about) = &profile.about {
-        metadata = metadata.about(about);
-    }
-
-    let event = EventBuilder::metadata(&metadata)
+    let existing = fetched.into_iter().next();
+    // NIP-01 breaks equal-timestamp ties by event id. Ensure an immediate claim/release
+    // replaces our previous advertisement instead of randomly leaving it visible.
+    let created_at = nostr_sdk::Timestamp::from(
+        existing
+            .as_ref()
+            .map(|e| e.created_at.as_secs().saturating_add(1))
+            .unwrap_or(0)
+            .max(nostr_sdk::Timestamp::now().as_secs()),
+    );
+    let content = merge_metadata(
+        existing.as_ref().map(|e| e.content.as_str()),
+        profile,
+        nip05,
+    )?;
+    let event = EventBuilder::new(Kind::Metadata, content)
+        .custom_created_at(created_at)
         .sign_with_keys(keys)
         .map_err(|error| {
             // disconnect best-effort before returning
             ProfileError::Relay(format!("sign kind-0: {error}"))
         })?;
-    let output = client
-        .send_event_to([&home.config.relay_url], &event)
-        .await;
+    let output = client.send_event_to([&home.config.relay_url], &event).await;
     client.disconnect().await;
     let output = output.map_err(|error| ProfileError::Relay(format!("send kind-0: {error}")))?;
     if output.success.is_empty() {
@@ -316,6 +319,43 @@ async fn publish_metadata_merged_async(
         )));
     }
     Ok(output.val.to_hex())
+}
+
+fn merge_metadata(
+    existing: Option<&str>,
+    profile: Option<&ProfileConfig>,
+    nip05: Option<Option<&str>>,
+) -> Result<String, ProfileError> {
+    let mut value = match existing {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw).map_err(|_| {
+            ProfileError::Input("invalid existing kind-0; refusing overwrite".into())
+        })?,
+        None => serde_json::json!({}),
+    };
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| ProfileError::Input("kind-0 must be an object".into()))?;
+    if let Some(profile) = profile {
+        if let Some(name) = &profile.name {
+            obj.insert("name".into(), name.clone().into());
+        }
+        if let Some(about) = &profile.about {
+            obj.insert("about".into(), about.clone().into());
+        }
+    }
+    if let Some(address) = nip05 {
+        match address {
+            Some(address) => {
+                obj.insert("nip05".into(), address.into());
+            }
+            None => {
+                obj.remove("nip05");
+            }
+        }
+        // Feature 1 never advertises a Lightning endpoint, including stale metadata.
+        obj.remove("lud16");
+    }
+    Ok(value.to_string())
 }
 
 fn apply_profile_updates(profile: &mut ProfileConfig, name: Option<String>, about: Option<String>) {
@@ -571,6 +611,84 @@ struct Kind0Content {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nip05_publish_path_preserves_fields_on_local_relay() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind, Timestamp};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let root = profile_test_root("nip05-local");
+        let mut home = home::bootstrap(&root).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        let keys = buyer_keys(&home).unwrap();
+        let client = Client::new(keys.clone());
+        client.add_relay(&home.config.relay_url).await.unwrap();
+        client.connect().await;
+        let original = serde_json::json!({"name":"self-declared","picture":"https://example.org/p.png","custom":{"nested":true}});
+        let event = EventBuilder::new(Kind::Metadata, original.to_string())
+            .custom_created_at(Timestamp::from(Timestamp::now().as_secs() - 10))
+            .sign_with_keys(&keys)
+            .unwrap();
+        client.send_event(&event).await.unwrap();
+        set_nip05_async(&home, Some("alice@maxplayer.ai"))
+            .await
+            .unwrap();
+        let filter = Filter::new()
+            .author(keys.public_key())
+            .kind(Kind::Metadata)
+            .limit(1);
+        let events = client
+            .fetch_events(filter.clone(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut expected = original.clone();
+        expected["nip05"] = "alice@maxplayer.ai".into();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events.into_iter().next().unwrap().content)
+                .unwrap(),
+            expected
+        );
+        // Immediate release must replace the claim, even within the same second.
+        set_nip05_async(&home, None).await.unwrap();
+        let events = client
+            .fetch_events(filter, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events.into_iter().next().unwrap().content)
+                .unwrap(),
+            original
+        );
+        client.disconnect().await;
+        relay.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn nip05_patch_preserves_unknown_profile_fields_and_clears() {
+        let original = serde_json::json!({"name":"self-declared", "about":"about", "picture":"https://example.org/p.png", "custom":{"x":1}, "lud16":"old@example.org"});
+        let set: serde_json::Value = serde_json::from_str(
+            &merge_metadata(
+                Some(&original.to_string()),
+                None,
+                Some(Some("alice@maxplayer.ai")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(set["nip05"], "alice@maxplayer.ai");
+        assert!(set.get("lud16").is_none());
+        let cleared: serde_json::Value = serde_json::from_str(
+            &merge_metadata(Some(&set.to_string()), None, Some(None)).unwrap(),
+        )
+        .unwrap();
+        let mut expected = original;
+        expected.as_object_mut().unwrap().remove("lud16");
+        assert_eq!(cleared, expected);
+        assert!(merge_metadata(Some("[]"), None, Some(None)).is_err());
+        assert!(merge_metadata(Some("broken"), None, Some(None)).is_err());
+    }
 
     #[test]
     fn parse_kind0_name_reads_name_field() {
