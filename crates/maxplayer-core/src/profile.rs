@@ -1,21 +1,18 @@
-//! Buyer kind-0 (NIP-01 metadata) publish + best-effort read.
+//! Buyer kind-0 (NIP-01 metadata) publish + clobber-safe metadata merge.
 //!
 //! **Composition rule:** kind-0 `name` is untrusted display metadata. It must never
 //! feed targeting, accept-bind, D2 tip-match, or budget decisions — those stay keyed
 //! on hex pubkey alone. This module is intentionally separate from
 //! `authorize_pay` / `budget` / `delivery` / `payment`.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::home::{self, HomeError, MaxplayerHome, ProfileConfig};
 
 const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 8;
-/// Cap hostile kind-0 payloads (same order as web network parser).
-const PROFILE_CONTENT_MAX: usize = 64 * 1024;
 const PROFILE_NAME_MAX: usize = 128;
 const PROFILE_ABOUT_MAX: usize = 512;
 
@@ -188,30 +185,6 @@ pub async fn publish_seller_discoverability_async(
         name: profile.name,
         relay_url: home.config.relay_url.clone(),
     })
-}
-
-/// Best-effort resolve of kind-0 `name` per pubkey. Missing/unparseable → `None`.
-///
-/// Returns a map keyed by lowercase hex pubkey. Never used for payment decisions.
-pub fn resolve_display_names(
-    home: &MaxplayerHome,
-    pubkeys: impl IntoIterator<Item = impl AsRef<str>>,
-) -> HashMap<String, Option<String>> {
-    let mut unique = HashSet::new();
-    for key in pubkeys {
-        let hex = key.as_ref().trim().to_ascii_lowercase();
-        if hex.len() == 64 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            unique.insert(hex);
-        }
-    }
-    if unique.is_empty() {
-        return HashMap::new();
-    }
-
-    match fetch_names(home, &unique) {
-        Ok(map) => map,
-        Err(_) => unique.into_iter().map(|k| (k, None)).collect(),
-    }
 }
 
 fn clamp_field(raw: &str, max: usize) -> Option<String> {
@@ -514,100 +487,6 @@ async fn send_signed_event(
     Ok(output.val.to_hex())
 }
 
-fn fetch_names(
-    home: &MaxplayerHome,
-    pubkeys: &HashSet<String>,
-) -> Result<HashMap<String, Option<String>>, ProfileError> {
-    // Sync entry only — must not be called from inside an existing Tokio runtime
-    // (nested block_on panics). Async callers use [`fetch_names_async`].
-    crate::runtime_guard::refuse_nested_block_on("fetch_names")
-        .map_err(ProfileError::Relay)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| ProfileError::Relay(error.to_string()))?;
-    runtime.block_on(fetch_names_async(home, pubkeys))
-}
-
-/// Async kind-0 name fetch for callers already on a Tokio runtime (e.g. `get_job`).
-pub async fn fetch_names_async(
-    home: &MaxplayerHome,
-    pubkeys: &HashSet<String>,
-) -> Result<HashMap<String, Option<String>>, ProfileError> {
-    use nostr_sdk::prelude::{Client, Filter, Kind, PublicKey};
-
-    let keys = buyer_keys(home)?;
-    let authors: Result<Vec<PublicKey>, ProfileError> = pubkeys
-        .iter()
-        .map(|hex| {
-            PublicKey::from_hex(hex)
-                .map_err(|error| ProfileError::Input(format!("pubkey {hex}: {error}")))
-        })
-        .collect();
-    let authors = authors?;
-
-    let client = Client::new(keys);
-    client
-        .add_relay(&home.config.relay_url)
-        .await
-        .map_err(|error| ProfileError::Relay(format!("add relay: {error}")))?;
-    client.connect().await;
-
-    let filter = Filter::new().authors(authors).kind(Kind::Metadata);
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
-    let events = client.fetch_events(filter, timeout).await;
-    client.disconnect().await;
-    let events =
-        events.map_err(|error| ProfileError::Relay(format!("fetch kind-0: {error}")))?;
-
-    // Newest replaceable kind-0 wins per author.
-    let mut newest: HashMap<String, (u64, String)> = HashMap::new();
-    for event in events {
-        let author = event.pubkey.to_hex().to_ascii_lowercase();
-        let created = event.created_at.as_secs();
-        if newest
-            .get(&author)
-            .map(|(prev, _)| created > *prev)
-            .unwrap_or(true)
-        {
-            newest.insert(author, (created, event.content.clone()));
-        }
-    }
-
-    let mut out = HashMap::new();
-    for hex in pubkeys {
-        let name = newest
-            .get(hex)
-            .and_then(|(_, content)| parse_kind0_name(content));
-        out.insert(hex.clone(), name);
-    }
-    Ok(out)
-}
-
-/// Defensive kind-0 content parse — `name` only (cosmetic).
-fn parse_kind0_name(content: &str) -> Option<String> {
-    let raw = if content.len() > PROFILE_CONTENT_MAX {
-        // Truncate on a char boundary — a plain `content[..PROFILE_CONTENT_MAX]` byte slice
-        // panics when a multibyte char straddles the cap. Walk down to the nearest boundary
-        // (a byte-cap over-fetch only feeds the JSON parser, which fails closed on garbage).
-        let mut end = PROFILE_CONTENT_MAX;
-        while end > 0 && !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        &content[..end]
-    } else {
-        content
-    };
-    let parsed: Kind0Content = serde_json::from_str(raw).ok()?;
-    clamp_field(parsed.name.as_deref()?, PROFILE_NAME_MAX)
-}
-
-#[derive(Debug, Deserialize)]
-struct Kind0Content {
-    #[serde(default)]
-    name: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,31 +569,6 @@ mod tests {
         assert!(merge_metadata(Some("broken"), None, Some(None)).is_err());
     }
 
-    #[test]
-    fn parse_kind0_name_reads_name_field() {
-        assert_eq!(
-            parse_kind0_name(r#"{"name":"seller-a","about":"x"}"#).as_deref(),
-            Some("seller-a")
-        );
-        assert_eq!(parse_kind0_name(r#"{"about":"only"}"#), None);
-        assert_eq!(parse_kind0_name("not-json"), None);
-        assert_eq!(parse_kind0_name(r#"{"name":"   "}"#), None);
-    }
-
-    // Finding D: parse_kind0_name must not panic when the PROFILE_CONTENT_MAX byte cap falls in
-    // the middle of a multibyte char. A plain `content[..MAX]` byte slice panics on that boundary.
-    #[test]
-    fn parse_kind0_name_survives_multibyte_char_on_byte_cap() {
-        // '😀' is 4 bytes; placing it so it starts at PROFILE_CONTENT_MAX-1 makes byte index
-        // PROFILE_CONTENT_MAX land INSIDE the char (not a char boundary).
-        let mut content = "a".repeat(PROFILE_CONTENT_MAX - 1);
-        content.push('😀');
-        content.push_str("bbbb");
-        assert!(!content.is_char_boundary(PROFILE_CONTENT_MAX));
-        // Must return without panicking (the over-cap content is not valid JSON → None).
-        assert_eq!(parse_kind0_name(&content), None);
-    }
-
     // Finding D: the delivery-repo announce runs the transport allowlist BEFORE any publish and
     // never leaks the raw locator (which could embed credentials) into error strings.
     #[test]
@@ -747,23 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_display_names_skips_invalid_hex_without_relay() {
-        let root = std::env::temp_dir().join(format!(
-            "maxplayer-profile-resolve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = home::bootstrap(&root).expect("home");
-        let map = resolve_display_names(&home, ["not-a-key", ""]);
-        assert!(map.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn set_profile_writes_config_without_inventing_on_bootstrap() {
         let root = std::env::temp_dir().join(format!(
             "maxplayer-profile-set-{}-{}",
@@ -790,33 +627,6 @@ mod tests {
         let profile = home.config.profile.expect("present");
         assert_eq!(profile.name.as_deref(), Some("buyer-x"));
         assert_eq!(profile.about.as_deref(), Some("about-x"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_names_sync_refuses_inside_runtime() {
-        let root = std::env::temp_dir().join(format!(
-            "maxplayer-fetch-names-nested-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = home::bootstrap(&root).expect("home");
-        let mut pubkeys = HashSet::new();
-        pubkeys.insert("aa".repeat(32));
-        let err = fetch_names(&home, &pubkeys).expect_err("must refuse nested block_on");
-        assert!(
-            err.to_string().contains("nested block_on refused"),
-            "unexpected: {err}"
-        );
-        assert!(
-            err.to_string().contains("fetch_names"),
-            "op name missing: {err}"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

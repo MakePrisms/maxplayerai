@@ -170,7 +170,7 @@ pub struct GetJobRequest {
     /// Optional long-poll: `claim` or `result`. Preference — not required for freeze.
     pub wait_for: Option<WaitFor>,
     pub timeout_secs: Option<u64>,
-    /// Opt in to cosmetic kind-0 display-name enrichment. Disabled by default at tool/RPC edges.
+    /// Opt in to registry-only display-name enrichment. Disabled by default at tool/RPC edges.
     pub include_display_names: bool,
 }
 
@@ -246,14 +246,14 @@ pub struct OfferView {
     pub event_id: String,
     pub created_at: u64,
     pub author_pubkey: String,
-    /// Registry identity (kind-0 fallback is explicitly untrusted) for `author_pubkey` (untrusted; never replaces hex).
+    /// Registry identity for `author_pubkey` (untrusted; never replaces hex).
     pub author_display_name: Option<crate::address::DisplayName>,
     pub task: String,
     pub output: String,
     pub amount_sats: u64,
     pub deadline_unix: u64,
     pub seller_pubkey: Option<String>,
-    /// Registry identity (kind-0 fallback is explicitly untrusted) for targeted `seller_pubkey` (untrusted; never replaces hex).
+    /// Registry identity for targeted `seller_pubkey` (untrusted; never replaces hex).
     pub seller_display_name: Option<crate::address::DisplayName>,
     pub targeted: bool,
     /// Delivery modes THIS buyer declared it can read, off its own signed offer
@@ -330,7 +330,7 @@ pub struct ClaimView {
     pub claim_id: String,
     pub created_at: u64,
     pub seller_pubkey: String,
-    /// Registry identity (kind-0 fallback is explicitly untrusted) for this claim's `seller_pubkey` (untrusted).
+    /// Registry identity for this claim's `seller_pubkey` (untrusted).
     pub display_name: Option<crate::address::DisplayName>,
     pub status: String,
     /// This claim remains active independently of other sellers' claims.
@@ -373,7 +373,7 @@ pub struct ResultView {
     pub result_id: String,
     pub created_at: u64,
     pub seller_pubkey: String,
-    /// Registry identity (kind-0 fallback is explicitly untrusted) for this result's `seller_pubkey` (untrusted).
+    /// Registry identity for this result's `seller_pubkey` (untrusted).
     pub display_name: Option<crate::address::DisplayName>,
     pub job_hash: Option<String>,
     pub repo: Option<String>,
@@ -4018,7 +4018,7 @@ fn private_view_from_events(
         publish_refused: None })
 }
 
-/// Collect hex pubkeys for cosmetic kind-0 enrichment (never for pay/targeting).
+/// Collect hex pubkeys for registry identity enrichment (never for pay/targeting).
 fn display_name_pubkeys(view: &JobView) -> Vec<String> {
     let mut pubkeys: Vec<String> = Vec::new();
     if let Some(offer) = &view.offer {
@@ -4082,17 +4082,21 @@ async fn attach_display_names_async(home: &MaxplayerHome, view: &mut JobView) {
     if unique.is_empty() {
         return;
     }
-    let unverified = crate::profile::fetch_names_async(home, &unique).await.unwrap_or_default();
     let registry = crate::address::Registry::for_home(home);
     let handles = match registry {
         Ok(registry) => registry.lookup(&unique.iter().cloned().collect::<Vec<_>>()).await.unwrap_or_default(),
         Err(_) => std::collections::HashMap::new(),
     };
-    let names = unique.into_iter().map(|key| {
-        let entry = crate::address::DisplayName::new(handles.get(&key).cloned(), &home.config.nip05_domain,
-            unverified.get(&key).cloned().flatten());
-        (key, entry)
-    }).collect();
+    let names = unique
+        .into_iter()
+        .map(|key| {
+            let entry = crate::address::DisplayName::new(
+                handles.get(&key).cloned(),
+                &home.config.nip05_domain,
+            );
+            (key, entry)
+        })
+        .collect();
     apply_display_names(view, &names);
 }
 
@@ -6413,13 +6417,9 @@ mod tests {
         (root, home)
     }
 
-    // Read by `get_job_default_skips_kind_zero_fetch` only, which is `live-mints`-gated below; the
-    // gate travels with its one caller so the offline build has no dead struct.
-    #[cfg(feature = "live-mints")]
     #[derive(Debug)]
     struct CountMetadataQueries(std::sync::Arc<std::sync::atomic::AtomicUsize>);
 
-    #[cfg(feature = "live-mints")]
     impl nostr_relay_builder::prelude::QueryPolicy for CountMetadataQueries {
         fn admit_query<'a>(
             &'a self,
@@ -6621,13 +6621,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    // NETWORK (#720): same shape as the wait test above — the relay is local, but the
-    // `post_job_async` fee floor reaches the home's shipped default mint before publishing, so this
-    // cannot run under `net: denied`. ON in the money-path CI job; see `live-mints` in Cargo.toml.
-    #[cfg(feature = "live-mints")]
+    // Offline regression: the seat publishes a name, but owns no registry handle.
+    // Exercise the same JobView serialization returned by MCP, with opt-in both off and on.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn get_job_default_skips_kind_zero_fetch() {
+    async fn get_job_registry_only_ignores_published_kind_zero_name() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::{Client, EventBuilder, Filter, Kind};
 
         let metadata_queries =
             std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6636,71 +6635,74 @@ mod tests {
                 .query_policy(CountMetadataQueries(std::sync::Arc::clone(&metadata_queries))),
         );
         relay.run().await.expect("relay run");
-
-        let (root, mut home) = temp_job_home("display-name-opt-in");
+        let (root, mut home) = temp_job_home("registry-only-display");
         home.config.relay_url = relay.url().await.to_string();
-        let posted = post_job_async(
-            &home,
-            PostJobRequest {
-                visibility: Some(crate::private_content::wire::Visibility::Public),
-                output_category: None,
-                #[cfg(feature = "wallet")]
-                inputs: vec![],
-                accepts_delivery: Vec::new(),
-                payment_mode: crate::gateway::PaymentMode::Sat,
-                task: "test display-name opt-in".into(),
-                output: "text/plain".into(),
-                amount_sats: 2,
-                seller_pubkey: Some(nostr_sdk::Keys::generate().public_key().to_hex()),
-                untargeted: false,
-                deadline_unix: Some(now_unix() + 3_600),
-                repo: None,
-                branch: None,
-                job: JobKind::FromScratch,
-                requested_agent: None,
-                requested_harness_family: None,
-                requested_model: None,
-                required_capabilities: Vec::new(),
-            },
-        )
-        .await
-        .expect("post job");
+        let (evidence, buyer) = crate::private_content::public_v2::tests::fixture(false, false);
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).expect("fixture buyer");
+        let seller = nostr_sdk::Keys::parse(&format!("{:064x}", 2)).unwrap();
+        for (signer, event) in [
+            (&buyer, &evidence.offer),
+            (&seller, &evidence.claim),
+            (&buyer, &evidence.award),
+            (&seller, &evidence.result),
+        ] {
+            publish_signed_event_async(&home, signer, event)
+                .await
+                .expect("publish fixture");
+        }
+        let client = Client::new(seller.clone());
+        client.add_relay(&home.config.relay_url).await.unwrap();
+        client.connect().await;
+        let metadata = EventBuilder::new(Kind::Metadata, r#"{"name":"unregistered-seat-name"}"#)
+            .sign_with_keys(&seller)
+            .unwrap();
+        client.send_event(&metadata).await.unwrap();
+        // Positive control: the name really is readable on this relay.
+        let profiles = client
+            .fetch_events(
+                Filter::new()
+                    .author(seller.public_key())
+                    .kind(Kind::Metadata),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        assert!(profiles.iter().any(|event| event.id == metadata.id));
+        client.disconnect().await;
+        metadata_queries.store(0, std::sync::atomic::Ordering::SeqCst);
 
-        let default_view = get_job_async(
-            &home,
-            GetJobRequest {
-                job_id: posted.job_id.clone(),
-                wait_for: None,
-                timeout_secs: None,
-                include_display_names: false,
-            },
-        )
-        .await
-        .expect("default get_job");
-        assert!(default_view.offer.is_some(), "fixture offer must be fetched");
-        assert_eq!(
-            metadata_queries.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "default get_job must not issue a kind-0 profile query"
-        );
-
-        get_job_async(
-            &home,
-            GetJobRequest {
-                job_id: posted.job_id,
-                wait_for: None,
-                timeout_secs: None,
-                include_display_names: true,
-            },
-        )
-        .await
-        .expect("opt-in get_job");
-        assert!(
-            metadata_queries.load(std::sync::atomic::Ordering::SeqCst) > 0,
-            "include_display_names=true must issue a kind-0 profile query"
-        );
-
-        let _ = std::fs::remove_dir_all(root);
+        for include_display_names in [false, true] {
+            let view = get_job_async(
+                &home,
+                GetJobRequest {
+                    job_id: evidence.offer.id.to_hex(),
+                    wait_for: None,
+                    timeout_secs: None,
+                    include_display_names,
+                },
+            )
+            .await
+            .expect("get_job");
+            assert!(view.offer.is_some());
+            assert_eq!(view.claims.len(), 1);
+            assert_eq!(view.results.len(), 1);
+            let output = serde_json::to_value(&view).unwrap();
+            let expected = if include_display_names {
+                serde_json::json!({"handle":null,"address":null})
+            } else {
+                serde_json::Value::Null
+            };
+            assert_eq!(output["offer"]["author_display_name"], expected);
+            assert_eq!(output["claims"][0]["display_name"], expected);
+            assert_eq!(output["results"][0]["display_name"], expected);
+            assert!(!output.to_string().contains("unregistered-seat-name"));
+            assert_eq!(
+                metadata_queries.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "get_job must never query kind-0, even with display names enabled"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
         relay.shutdown();
     }
 
@@ -8383,7 +8385,7 @@ mod review_exposure_tests {
             result_id: "a".repeat(64),
             created_at: 1,
             seller_pubkey: "b".repeat(64),
-            display_name: Some(crate::address::DisplayName::new(None, "maxplayer.ai", Some("untrusted name".into()))),
+            display_name: Some(crate::address::DisplayName::new(None, "maxplayer.ai")),
             job_hash: None,
             repo: Some("untrusted repo instructions".into()),
             branch: Some("untrusted branch".into()),

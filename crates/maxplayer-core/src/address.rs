@@ -23,19 +23,13 @@ pub fn normalize_name(raw: &str) -> Result<String, String> {
 pub struct DisplayName {
     pub handle: Option<String>,
     pub address: Option<String>,
-    /// Self-declared kind-0 metadata. Untrusted; never use as displayed identity or authority.
-    pub unverified_name: Option<String>,
 }
 impl DisplayName {
-    pub fn new(handle: Option<String>, domain: &str, unverified_name: Option<String>) -> Self {
+    pub fn new(handle: Option<String>, domain: &str) -> Self {
         let address = handle
             .as_ref()
             .map(|n| format!("{n}@{}", domain.to_ascii_lowercase()));
-        Self {
-            handle,
-            address,
-            unverified_name,
-        }
+        Self { handle, address }
     }
 }
 
@@ -430,19 +424,14 @@ mod tests {
         task.join().unwrap();
     }
     #[test]
-    fn mcp_display_name_shape_keeps_untrusted_fallback_separate() {
+    fn mcp_display_name_shape_is_registry_only() {
         assert_eq!(
-            serde_json::to_value(DisplayName::new(
-                Some("alice".into()),
-                "maxplayer.ai",
-                Some("imposter".into())
-            ))
-            .unwrap(),
-            serde_json::json!({"handle":"alice","address":"alice@maxplayer.ai","unverified_name":"imposter"})
+            serde_json::to_value(DisplayName::new(Some("alice".into()), "maxplayer.ai")).unwrap(),
+            serde_json::json!({"handle":"alice","address":"alice@maxplayer.ai"})
         );
         assert_eq!(
-            serde_json::to_value(DisplayName::new(None, "maxplayer.ai", None)).unwrap(),
-            serde_json::json!({"handle":null,"address":null,"unverified_name":null})
+            serde_json::to_value(DisplayName::new(None, "maxplayer.ai")).unwrap(),
+            serde_json::json!({"handle":null,"address":null})
         );
     }
 }

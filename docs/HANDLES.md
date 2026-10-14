@@ -32,10 +32,11 @@ MCP `get_job` with `include_display_names: true` enriches each existing
 `author_display_name`, `seller_display_name`, or `display_name` field with:
 
 ```json
-{"handle":"alice","address":"alice@maxplayer.ai","unverified_name":"Self-declared name"}
+{"handle":"alice","address":"alice@maxplayer.ai"}
 ```
 
 Unknown/unavailable registry entries have null `handle` and `address`.
-`unverified_name` is nullable, untrusted kind-0 fallback metadata, **never displayed
-identity or authorization**. Hex pubkeys and npubs remain authoritative. Without
+The registry is the only source of display names: kind-0 names are never fetched
+or returned, even when a seat has published one. Hex pubkeys and npubs remain
+authoritative. Without
 the opt-in, enrichment fields remain null and no identity lookup is made.
