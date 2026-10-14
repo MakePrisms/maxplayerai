@@ -1207,3 +1207,110 @@ async fn receive_and_serve_error_lines_redact_token_text() {
     assert_eq!(credited(&f.taker, &c.url), 64, "SAFETY: credited once");
     assert_eq!(c.faults.swaps.load(SeqCst), 2, "SAFETY: one swap per token");
 }
+
+/// T7: serve's work is keyed units, so a handed-off receive stuck on a stalled mint does not hold
+/// an unrelated swap's claim. The maker swap (claim possible, preimage known) appears in the
+/// journal only AFTER the receive is stuck at its mint; serve's next recovery tick claims it while
+/// that receive client is still waiting. Serially (before T7) the tick could not run until the
+/// receive returned. Then serve is SIGKILLed mid-receive and restarted: the retried receive
+/// credits exactly once, from one mint swap, and the claimed swap completes.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stuck_receive_does_not_hold_another_swaps_claim_and_restart_is_exact() {
+    let (f, id) = partial_claim_fixture().await;
+    let c = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&c, 40).await;
+    // Fixture only (serve not running yet): park the claimable swap row outside the journal.
+    let swap: Swap = f.jm.get("swap", &id).await.unwrap().unwrap();
+    assert_eq!(swap.state, "claiming", "fixture: claim possible");
+    let long = swap.quote.as_ref().unwrap().long;
+    f.jm.remove("swap", &id).await.unwrap();
+    let mut serve = start_serve(&f.maker, &f.relay_url, f.root.path(), "serve1").await;
+    // The receive mint stalls: every request sits past the 20 s HTTP RPC timeout.
+    c.faults.delay_ms.store(60_000, SeqCst);
+    let before = c.faults.requests.load(SeqCst);
+    let mut client = spawn_receive(&f.maker, &f.relay_url, &c.url, Input::Stdin(&token)).await;
+    let start = std::time::Instant::now();
+    while c.faults.requests.load(SeqCst) == before {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "receive never reached its mint"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The receive is now stuck at its mint inside serve. Make the swap visible (test-only write).
+    f.jm.put("swap", &id, &swap).await.unwrap();
+    let shown = std::time::Instant::now();
+    loop {
+        let state = f.state(true, &id).await;
+        if matches!(state.as_deref(), Some("settling" | "complete")) {
+            break;
+        }
+        assert!(
+            client.try_wait().unwrap().is_none(),
+            "SAFETY: the claim waited for the stuck receive (state {state:?}): {}",
+            serve.output()
+        );
+        assert!(
+            shown.elapsed() < Duration::from_secs(15),
+            "SAFETY: claim not landed within 15 s while a receive was stuck"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        coordinator::now() < long,
+        "SAFETY: claim landed before its deadline"
+    );
+    assert!(
+        client.try_wait().unwrap().is_none(),
+        "SAFETY: the receive was still stuck when the claim landed"
+    );
+    assert_eq!(credited(&f.maker, &c.url), 0, "nothing credited yet");
+    // Restart: kill serve mid-receive; the client loses its reply (exit 3), nothing is lost.
+    serve.child.kill().await.unwrap();
+    serve.child.wait().await.unwrap();
+    let out = tokio::time::timeout(Duration::from_secs(120), client.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let (stdout, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert_secret_free("client", &(stdout + &stderr), &token, &proofs);
+    c.faults.delay_ms.store(0, SeqCst);
+    let mut serve = start_serve(&f.maker, &f.relay_url, f.root.path(), "serve2").await;
+    let retry = receive_cli(&f.maker, &f.relay_url, &c.url, Input::Stdin(&token)).await;
+    let (stdout, stderr) = text(&retry);
+    assert!(retry.status.success(), "{stderr}");
+    assert!(
+        matches!(
+            outcome(&stderr).as_deref(),
+            Some("credited" | "already_received")
+        ),
+        "{stderr}"
+    );
+    assert_eq!(credited(&f.maker, &c.url), 40, "SAFETY: credited once");
+    assert!(
+        c.faults.swaps.load(SeqCst) <= 1,
+        "SAFETY: at most one mint swap"
+    );
+    // Same token again: nothing more.
+    let again = receive_cli(&f.maker, &f.relay_url, &c.url, Input::Stdin(&token)).await;
+    assert_eq!(
+        outcome(&text(&again).1).as_deref(),
+        Some("already_received")
+    );
+    assert_eq!(credited(&f.maker, &c.url), 40);
+    let start = std::time::Instant::now();
+    while f.state(true, &id).await.as_deref() != Some("complete") {
+        assert!(
+            start.elapsed() < Duration::from_secs(120),
+            "swap did not complete after restart: {:?}",
+            f.state(true, &id).await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let log = serve.output();
+    assert_secret_free("serve output", &log, &token, &proofs);
+    assert_secret_free("client", &(stdout + &stderr), &token, &proofs);
+    serve.child.kill().await.unwrap();
+}
