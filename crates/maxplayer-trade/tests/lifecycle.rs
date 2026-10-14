@@ -3,11 +3,12 @@
 //! and a closed market inbox reported instead of spun on. Fake mints, a loopback relay and
 //! disposable homes only. Every SAFETY assertion comes first in its test.
 mod support;
+#[cfg(not(feature = "lab"))]
+use maxplayer_trade::mint;
 use maxplayer_trade::{
     coordinator::{self, Swap},
     journal::Journal,
     market::Market,
-    mint,
 };
 use std::{path::Path, process::Stdio, sync::atomic::Ordering::SeqCst, time::Duration};
 use support::*;
@@ -144,6 +145,7 @@ async fn term_and_int_on_idle_serve_exit_5_with_one_final_line() {
     }
 }
 
+#[cfg(not(feature = "lab"))]
 /// Hand a take to serve and step the in-process maker until the taker's lock swap reaches mint
 /// b, where the fake mint holds it. Returns (serve, take client, swap id).
 async fn take_until_lock_held(f: &mut Fixture, log: &Path) -> (Child, Child, String) {
@@ -179,6 +181,7 @@ async fn take_until_lock_held(f: &mut Fixture, log: &Path) -> (Child, Child, Str
     let id = f.jt.all::<Swap>("swap").await.unwrap().pop().unwrap().id;
     (serve, client, id)
 }
+#[cfg(not(feature = "lab"))]
 /// Restart serve on the taker home and step the maker until the swap settles; then TERM it.
 async fn restart_and_settle(f: &mut Fixture, id: &str, log: &Path) {
     let mut serve = start_serve(&f.taker, &f.relay_url, log).await;
