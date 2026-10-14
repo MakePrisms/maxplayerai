@@ -91,7 +91,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "tokens.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "tokens.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
@@ -159,6 +159,44 @@ test("the live market ships at /market and the homepage links it", () => {
   // Old #market deep links (skill.md, llms.txt, shared URLs) still land on the board.
   assert.match(readFileSync(join(root, "src/main.ts"), "utf8"), /location\.hash === "#market".*location\.replace\("\/market"\)/);
   assert.ok(!home.includes("<script>"), "no inline scripts in the browser-key origin");
+});
+
+test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
+  const pages = ["index.html", "sell.html", "chat.html", "market.html", "tokens.html"];
+  let expectedNav;
+  let expectedFooter;
+  for (const page of pages) {
+    const html = readFileSync(join(root, "dist", page), "utf8");
+    const nav = html.match(/<nav class="nav-links"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
+    const footer = html.match(/<nav class="foot-nav"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
+    assert.ok(nav && footer, `${page} has shared chrome`);
+    const links = (markup) =>
+      [...markup.matchAll(/<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)].map((m) => [m[1], m[2].replace(/<[^>]+>/g, "")]);
+    expectedNav ??= links(nav);
+    expectedFooter ??= links(footer);
+    assert.deepEqual(links(nav), expectedNav, `${page} nav matches`);
+    assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
+    // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
+    assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
+    assert.match(footer, /href="\/market">Market<\/a>\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat is in the footer after Market, marked Lab`);
+    const current = [...nav.matchAll(/aria-current="page"/g)].length;
+    if (page === "chat.html" || page === "tokens.html") {
+      assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
+    } else {
+      const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
+      assert.ok(nav.includes(`href="${route}" aria-current="page"`), `${page} marks itself current`);
+      assert.equal(current, 1);
+    }
+    for (const script of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
+      assert.match(script[1], /\bsrc="/);
+      assert.equal(script[2].trim(), "", `${page} has no inline script`);
+    }
+  }
+});
+
+test("/chat carries the /tokens experimental notice under the nav", () => {
+  const chat = readFileSync(join(root, "dist", "chat.html"), "utf8");
+  assert.match(chat, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
 });
 
 test("/tokens ships its own read-only bundle and stays unlisted", () => {

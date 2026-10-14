@@ -1192,6 +1192,17 @@ button.chip { cursor: pointer; }
 @media (max-width: 760px) { .try-float { bottom: max(16px, env(safe-area-inset-bottom)); } }
 @media (prefers-reduced-motion: reduce) { .try-float, .try-float svg { transition: none; animation: none; } }
 
+/* Chat reuses Sell's section rhythm and chrome, with a title-specific width. */
+.h-hero h1.h-title-chat { line-height: 1.02; }
+.chat-page .h-copy code { white-space: normal; overflow-wrap: anywhere; word-break: normal; }
+@media (max-width: 760px) {
+  .h-hero h1.h-title-chat { font-size: min(calc((100vw - 60px) / 12.6), 84px); white-space: nowrap; }
+}
+/* Keep every shared mobile link/control at least one thumb target tall. */
+@media (max-width: 700px) {
+  .nav > .brand, .foot-nav a, .windows button { min-height: 44px; }
+  .h-manual a, .h-faq p a { display: inline-flex; align-items: center; min-height: 44px; }
+}
 /* ================= /tokens: the token-trade order book (unlisted) ===
    Same board chrome as /market; two columns (open lots, recent) instead of
    three. Everything is scoped to .trades-page so /market cannot change. */
@@ -1238,3 +1249,26 @@ button.chip { cursor: pointer; }
    fixed slot keeps the rest of the nav from sliding when it does. */
 @media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
 /* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
+/* Experimental pages (/chat, /tokens) get a small yellow boxed "Lab" superscript on
+   their footer link (bob); same rule as feat/trade-market-page. */
+.lab-sup {
+  display: inline-block; margin-left: 4px; vertical-align: super;
+  font-size: 0.62em; font-weight: 700; letter-spacing: 0.1em; line-height: 1;
+  padding: 2px 4px 1px;
+  color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
+}
+.foot-nav a:hover .lab-sup { border-color: var(--neon); }
+/* /chat carries the /tokens experimental notice strip (bob); same rules as
+   feat/trade-market-page, so a later merge keeps one copy. */
+.labs-strip {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0; min-height: 34px; padding: 8px 16px;
+  font-size: 11.5px; color: var(--ink-2);
+  background: var(--panel); border-bottom: 1px solid var(--line);
+}
+.labs-pill {
+  flex: none; display: inline-block;
+  font-size: 8.5px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase;
+  line-height: 1; padding: 3px 5px 2px;
+  color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
+}
