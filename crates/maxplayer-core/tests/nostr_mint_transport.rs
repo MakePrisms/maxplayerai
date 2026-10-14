@@ -3,6 +3,9 @@
 //! CDK mint over relays is exercised by the `maxplayer-mint` sidecar's tests (stage 2).
 #![cfg(all(unix, feature = "wallet"))]
 
+#[path = "support/auth_gated_relay.rs"]
+mod auth_gated_relay;
+
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,6 +86,11 @@ async fn start_mint(relay_url: &str, mode: Mode) -> Mint {
     let keys = Keys::generate();
     let client = Client::new(keys.clone());
     client.add_relay(relay_url).await.unwrap();
+    // On a sign-in-required relay the scripted mint, like the real one, re-sends its REQ after
+    // sign-in; on the plain local relay this never fires.
+    for relay in client.relays().await.into_values() {
+        maxplayer_core::relay_auth::resubscribe_on_auth(relay, "scripted-mint");
+    }
     client.connect().await;
     client.wait_for_connection(Duration::from_secs(5)).await;
     let mut notifications = client.notifications();
@@ -702,4 +710,88 @@ async fn diagnostics_reply_wins_while_another_relay_withholds_ack() {
     assert_eq!(obs.relays.len(), 2);
     assert!(obs.relays.values().any(|r| r.acceptance == "unknown"));
     task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_reply_arrives_on_a_sign_in_required_relay() {
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions, Counters};
+    let relay = AuthRelay::start(AuthRelayOptions::default()).await;
+    let mint = start_mint(&relay.url, Mode::Answer).await;
+    // The re-send interval is longer than the window: only a live reply can answer this call.
+    let (result, obs) = connector(&mint, &relay.url, 4000, 10_000)
+        .call_observed("info", Value::Null)
+        .await;
+    assert!(
+        result.is_ok(),
+        "{result:?}: the reply subscription went out before sign-in ({:?}, {obs:?})",
+        relay.counters
+    );
+    let r = obs.relays.values().next().unwrap();
+    assert!(r.challenged && r.auth == "authenticated", "{obs:?}");
+    assert_eq!(
+        Counters::get(&relay.counters.dropped_live),
+        0,
+        "{:?}",
+        relay.counters
+    );
+    assert!(obs.reply_ms.unwrap() < 2000, "{obs:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_refused_sign_in_is_an_auth_error_not_a_timeout() {
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
+    let relay = AuthRelay::start(AuthRelayOptions {
+        refuse_auth: true,
+        ..Default::default()
+    })
+    .await;
+    let npub = Keys::generate().public_key().to_bech32().unwrap();
+    let c = NostrMintConnector::new(
+        &MintUrl::from_str(&format!("nostr://{npub}")).unwrap(),
+        vec![relay.url.clone()],
+    )
+    .unwrap()
+    .with_timing(
+        Duration::from_secs(10),
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+    );
+    let started = std::time::Instant::now();
+    let (result, obs) = c.call_observed("info", Value::Null).await;
+    let error = result.expect_err("refused sign-in");
+    assert!(!matches!(error, Error::Timeout), "{error:?}");
+    assert!(error.to_string().contains("sign-in"), "{error}");
+    assert!(!error.is_definitive_failure(), "{error:?}");
+    assert_eq!(obs.reachability, "auth_failed", "{obs:?}");
+    assert!(
+        obs.request_event.is_some() && obs.attempts == 0,
+        "nothing published: {obs:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(3), "failed fast");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_open_relay_pays_only_the_short_grace() {
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
+    let relay = AuthRelay::start(AuthRelayOptions {
+        challenge: false,
+        ..Default::default()
+    })
+    .await;
+    let mint = start_mint(&relay.url, Mode::Answer).await;
+    let (result, obs) = connector(&mint, &relay.url, 4000, 10_000)
+        .call_observed("info", Value::Null)
+        .await;
+    assert!(result.is_ok(), "{result:?} {obs:?}");
+    let reply_ms = obs.reply_ms.unwrap();
+    assert!(
+        reply_ms < 1000,
+        "grace is {:?}: {obs:?}",
+        maxplayer_core::nostr_mint::DEFAULT_AUTH_GRACE
+    );
+    assert!(
+        obs.relays
+            .values()
+            .all(|r| !r.challenged && r.auth == "unknown")
+    );
 }

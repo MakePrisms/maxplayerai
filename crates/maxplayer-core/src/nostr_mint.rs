@@ -38,8 +38,8 @@ use cdk::{
 };
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::{
-    Client, Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey, RelayMessage,
-    RelayNotification, RelayPoolNotification, SubscriptionId, Tag, Timestamp,
+    Client, ClientMessage, Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey,
+    RelayMessage, RelayNotification, RelayPoolNotification, SubscriptionId, Tag, Timestamp,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -70,6 +70,13 @@ pub const OUTER_MARGIN: Duration = Duration::from_secs(10);
 pub const REQUEST_SETTLE: Duration = Duration::from_secs(300);
 /// Bound on the relay disconnect after a request, so it cannot stretch past [`OUTER_MARGIN`].
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a connected relay that has not sent a NIP-42 challenge is given to send one, when no
+/// relay has signed in yet. relay.maxplayer.ai challenges as soon as the socket opens, so with it
+/// in the list the wait ends at its sign-in and open relays add nothing.
+pub const DEFAULT_AUTH_GRACE: Duration = Duration::from_millis(300);
+/// Longest wait for a relay that sent a challenge to finish signing in before the request goes
+/// out; a relay still unsigned then is recorded as an auth timeout.
+const AUTH_WAIT: Duration = Duration::from_secs(3);
 
 /// The relays a wallet uses for a `nostr://` mint: the home's own `relay_url`, then
 /// [`FALLBACK_RELAYS`], without duplicates.
@@ -183,6 +190,9 @@ pub struct RelayEvidence {
     pub publish_failed: bool,
     pub acceptance: &'static str,
     pub refused: bool,
+    /// The relay sent a NIP-42 challenge on this request's connection.
+    pub challenged: bool,
+    /// `unknown`, `authenticated`, `failed`, or `timeout` (challenged, not signed in in time).
     pub auth: &'static str,
     pub connection_generation: u32,
     pub auth_generation: Option<u32>,
@@ -200,6 +210,7 @@ impl Default for RelayEvidence {
             publish_failed: false,
             acceptance: "unknown",
             refused: false,
+            challenged: false,
             auth: "unknown",
             connection_generation: 0,
             auth_generation: None,
@@ -250,8 +261,8 @@ impl RequestObservation {
             }
         } else if self.relays.values().any(accepted_open) {
             "Relay accepted the request, but mint did not answer. Offline, incompatible, unsubscribed mint or lost reply cannot be distinguished. Ask the operator to check the sidecar and selected relay; run doctor before a new take".into()
-        } else if self.relays.values().any(|r| r.auth == "failed") {
-            "Relay authentication failed. Check relay authorization; response visibility on this path is uncertain".into()
+        } else if self.relays.values().any(auth_failed) {
+            "Relay sign-in (NIP-42) failed or timed out. Check relay authorization; response visibility on this path is uncertain".into()
         } else if self.relays.values().any(|r| r.closed) {
             "Relay closed this mint-reply subscription. Check relay authorization and sidecar/client connection; cannot observe a response on this path".into()
         } else if self.relays.values().any(|r| r.refused) {
@@ -279,6 +290,11 @@ impl RequestObservation {
             self.elapsed_ms as f64 / 1000.0
         )
     }
+}
+
+/// A relay that challenged and then rejected or never completed NIP-42 sign-in.
+fn auth_failed(r: &RelayEvidence) -> bool {
+    r.auth == "failed" || r.auth == "timeout"
 }
 
 /// A relay that accepted the request and kept its reply subscription open: the path on which an
@@ -313,6 +329,9 @@ fn collect_lifecycle(
                     evidence.auth = "failed";
                     evidence.auth_generation = Some(evidence.connection_generation);
                 }
+                Ok(RelayNotification::Message {
+                    message: RelayMessage::Auth { .. },
+                }) => evidence.challenged = true,
                 Ok(RelayNotification::RelayStatus { status }) => {
                     let connected = status == nostr_sdk::prelude::RelayStatus::Connected;
                     if connected && !evidence.connected {
@@ -323,6 +342,7 @@ fn collect_lifecycle(
                     evidence.ever_connected |= connected;
                     if !connected {
                         evidence.auth_generation = None;
+                        evidence.challenged = false;
                         if evidence.auth == "authenticated" {
                             evidence.auth = "unknown";
                         }
@@ -347,6 +367,7 @@ pub struct NostrMintConnector {
     window: Duration,
     resend_every: Duration,
     connect_timeout: Duration,
+    auth_grace: Duration,
     last_observation: Arc<std::sync::Mutex<Option<RequestObservation>>>,
 }
 
@@ -370,6 +391,7 @@ impl NostrMintConnector {
             window: DEFAULT_WINDOW,
             resend_every: DEFAULT_RESEND_EVERY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            auth_grace: DEFAULT_AUTH_GRACE,
             last_observation: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -384,6 +406,12 @@ impl NostrMintConnector {
         self.window = window;
         self.resend_every = resend_every;
         self.connect_timeout = connect;
+        self
+    }
+
+    /// Override [`DEFAULT_AUTH_GRACE`] (tests).
+    pub fn with_auth_grace(mut self, grace: Duration) -> Self {
+        self.auth_grace = grace;
         self
     }
 
@@ -455,7 +483,7 @@ impl NostrMintConnector {
             // The best path decides: one relay that accepted with its reply subscription open
             // outranks auth failures, closed subscriptions or refusals on other relays.
             "unanswered"
-        } else if observation.relays.values().any(|r| r.auth == "failed") {
+        } else if observation.relays.values().any(auth_failed) {
             "auth_failed"
         } else if observation.relays.values().any(|r| r.closed) {
             "subscription_closed"
@@ -556,6 +584,53 @@ impl NostrMintConnector {
             ));
         }
 
+        // A relay that requires sign-in (relay.maxplayer.ai) never delivers live events to a
+        // REQ it saw before sign-in, and nostr-sdk does not re-send it afterwards: the reply would
+        // be lost while the subscription looks healthy. So subscribe only once every relay that
+        // challenged has signed in (or failed), giving silent relays a short grace to challenge.
+        let relays: Vec<(String, nostr_sdk::prelude::Relay)> = client
+            .relays()
+            .await
+            .into_iter()
+            .map(|(url, relay)| (url.to_string().trim_end_matches('/').to_owned(), relay))
+            .collect();
+        let auth_started = Instant::now();
+        let auth_deadline = deadline.min(auth_started + AUTH_WAIT);
+        loop {
+            collect_lifecycle(&mut lifecycle, observation);
+            let live = || observation.relays.values().filter(|r| r.connected);
+            let pending = live().any(|r| r.challenged && r.auth == "unknown");
+            let signed_in = live().any(|r| r.auth == "authenticated");
+            if !pending && (signed_in || auth_started.elapsed() >= self.auth_grace) {
+                break;
+            }
+            if Instant::now() >= auth_deadline {
+                for r in observation.relays.values_mut() {
+                    if r.connected && r.challenged && r.auth == "unknown" {
+                        r.auth = "timeout";
+                    }
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let reachable: Vec<&RelayEvidence> = observation
+            .relays
+            .values()
+            .filter(|r| r.connected)
+            .collect();
+        if !reachable.is_empty() && reachable.iter().all(|r| auth_failed(r)) {
+            disconnect(&client).await;
+            // Nothing was published. Ambiguous class, like an unreachable relay.
+            return Err(Error::HttpError(
+                None,
+                format!(
+                    "relay sign-in (NIP-42) failed or timed out on every reachable relay for mint {}",
+                    self.mint_url
+                ),
+            ));
+        }
+
         // Subscribe BEFORE publishing, so a fast reply isn't missed.
         let subscription = SubscriptionId::generate();
         let filter = Filter::new()
@@ -565,14 +640,35 @@ impl NostrMintConnector {
             .since(Timestamp::now() - Duration::from_secs(10));
         let _ = tokio::time::timeout(
             remaining(deadline),
-            client.subscribe_with_id(subscription.clone(), filter, None),
+            client.subscribe_with_id(subscription.clone(), filter.clone(), None),
         )
         .await;
+        // The sign-in each relay's REQ was sent under. A later sign-in (a relay that challenged
+        // late, or a reconnect within the window) re-sends the same REQ to that relay.
+        let mut subscribed_under: std::collections::HashMap<String, Option<u32>> = relays
+            .iter()
+            .map(|(url, _)| {
+                let r = observation.relays.get(url);
+                let authed = r.filter(|r| r.auth == "authenticated");
+                (url.clone(), authed.and_then(|r| r.auth_generation))
+            })
+            .collect();
 
         let mut next_send = Instant::now();
         let mut publish = None;
         let outcome = loop {
             collect_lifecycle(&mut lifecycle, observation);
+            for (url, relay) in &relays {
+                let Some(r) = observation.relays.get(url) else {
+                    continue;
+                };
+                let generation = r.auth_generation.filter(|_| r.auth == "authenticated");
+                if generation.is_some() && subscribed_under.get(url) != Some(&generation) {
+                    subscribed_under.insert(url.clone(), generation);
+                    let _ =
+                        relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
+                }
+            }
             if Instant::now() >= deadline {
                 break Err(Error::Timeout);
             }
