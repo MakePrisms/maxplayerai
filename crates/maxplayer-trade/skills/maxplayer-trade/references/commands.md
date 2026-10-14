@@ -147,8 +147,12 @@ can change in between; the real command enforces your bounds again.
 While `serve` owns the home, `list`, `take`, `cancel` and `receive` hand their request to it
 over `<home>/serve.sock` (mode 0600, same user only) and print serve's result with
 the usual output and exit codes. serve executes it with exactly the bounds given;
-it never fills in defaults. Use the same `--relay` set as serve or the request is
-refused. A handed-off `take` prints its swap id and that serve is watching it, then
+it never fills in defaults. serve refuses a request whose relays differ from its own
+where the command uses them: `list`, `take` and `cancel` need the same `--relay` set;
+`take`, `cancel`, and a `list` or `receive` with a `nostr://` mint need the same
+`--mint-relay` set (spelling and order do not matter). An HTTP `receive` never uses either,
+so any `--relay` works. serve is never asked to run a command on relays you did not give.
+The client sends only to a serve socket and peer owned by its own user. A handed-off `take` prints its swap id and that serve is watching it, then
 streams states until settlement; if the command is interrupted, serve keeps driving
 the swap (check `status`). Without a running serve these commands behave as before.
 A handed-off `receive` is described under [Receive](#receive-through-a-running-serve).
