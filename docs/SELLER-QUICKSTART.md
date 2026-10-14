@@ -1519,12 +1519,37 @@ can tell at a glance whether anything has happened since you last looked, and li
 against relay events. Every ~5 minutes the daemon states its own condition:
 
 ```text
-14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy
+14:32:07Z seller node status: ADVERTISING, ready for work · harness: claude · 0/1 job slot(s) busy · relay confirmed 41s ago · work idle
 ```
 
 That line is the answer to "is it working": it arriving means the loop is turning, and it says
 whether the seat is advertising and how much capacity is in use. `NOT serving — no live harness`
 means the process is up but every harness has faulted out, so it will take no work.
+
+The line is printed by the loop itself, not by the work it schedules, so it keeps its cadence even
+while that work is stuck on a slow relay. Its last two fields say how both halves are doing:
+
+- `relay confirmed Ns ago` — when the relay last both answered our read probe and acknowledged our
+  heartbeat. A number that keeps growing past a few heartbeat intervals means the relay has stopped
+  answering. `relay RECOVERING` means a reconnect is in progress; `relay watchdog off` means
+  heartbeats are disabled in config.
+- `work idle`, or `work BUSY Ns on <what>` — the one work lane that handles relay events (offers,
+  awards, payments), housekeeping, outbox publishing and history backfills, one at a time.
+  `(N event(s) queued)` follows when events are waiting behind it.
+
+Lines worth knowing when something is slow:
+
+| Line | Meaning |
+| --- | --- |
+| `WORK-LANE busy for 30s on <what> (…)` | One piece of work has held the lane that long. Repeats at 60s, 120s, … Heartbeats, the watchdog and shutdown are not affected. |
+| `WORK-LANE clear: <what> finished after Ns` | The long-running work ended. |
+| `WORK-LANE queue full (1024 events): relay reads pause until it drains` | Back-pressure. Anything dropped meanwhile is re-read by the next history backfill. |
+| `outbox: the relay confirmed none of N pending publication(s); routine drains pause 5s, backing off to 30s` | The relay is not acknowledging what we publish. The rows stay pending and are retried with the same event ids; new claims still get their first attempt during the pause. |
+| `outbox drain: confirmed=… failed=… expired=… deferred=…` | One bounded publishing pass. `deferred` rows were not reached before the pass's 15 s budget and go first next time. |
+| `backfill INCOMPLETE: retrying in Ns` (and `WARN: wrap backfill INCOMPLETE …`) | The relay did not finish answering a history read. It is retried soon (30 s, doubling) and is never treated as "nothing there". |
+| `RELAY-STALL detected: relay unconfirmed for Ns (threshold Ts; last confirmed ts=…; this tick probe=… heartbeat=…)` | The watchdog tripped; a reconnect and resubscribe follows. |
+| `RELAY-STALL recovery SUCCEEDED (attempts=…, recovery=Ns, outage=Ns since last confirmation)` | `recovery` is how long the reconnect took; `outage` is how long the relay had gone unconfirmed. |
+| `shutdown: abandoned in-flight work after Ns` | Stopping did not wait for slow relay work. Nothing is lost: pending publications are retried and jobs are resumed on the next start. An `INCIDENT` suffix means a payment redeem was still running after 60 s; the next start re-checks it. |
 
 Routine no-ops (a re-seen offer already claimed, a duplicate award) are hidden by default. Set
 `MAXPLAYER_VERBOSE=1` in the daemon's environment to see them. Nothing that reports a state change

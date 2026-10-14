@@ -2755,6 +2755,51 @@ impl SellerStore {
         Ok(items)
     }
 
+    /// At most `limit` still-pending, unexpired outbox rows, in the order ONE BOUNDED drain pass
+    /// tries them: rows never attempted first, then the least recently attempted.
+    ///
+    /// A pass has a deadline ([`super::outbox::DrainLimits`]), so this order decides what waits when
+    /// the relay is slow. Oldest-first let a backlog of failing rows spend every pass on the same
+    /// front rows while a fresh claim — the row a buyer is waiting on — sat behind them. Every attempt
+    /// stamps `updated_at_unix`, so failed rows rotate and a pass that runs out of time resumes with
+    /// the rows the last one never reached.
+    ///
+    /// `fresh_only` restricts the batch to rows never attempted (`attempts = 0`).
+    pub fn pending_outbox_batch(
+        &self,
+        now_unix: i64,
+        limit: usize,
+        fresh_only: bool,
+    ) -> Result<Vec<OutboxItem>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix
+             FROM nostr_event_outbox
+             WHERE state = 'pending' AND expires_at_unix > ?1 AND (?3 = 0 OR attempts = 0)
+             ORDER BY attempts > 0, updated_at_unix, id
+             LIMIT ?2",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        read_outbox_items(&mut stmt, params![now_unix, limit, fresh_only])
+    }
+
+    /// The still-pending, unexpired outbox row with `dedup_key`, if there is one.
+    pub fn pending_outbox_row(
+        &self,
+        dedup_key: &str,
+        now_unix: i64,
+    ) -> Result<Option<OutboxItem>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix
+             FROM nostr_event_outbox
+             WHERE dedup_key = ?1 AND state = 'pending' AND expires_at_unix > ?2",
+        )?;
+        Ok(read_outbox_items(&mut stmt, params![dedup_key, now_unix])?
+            .into_iter()
+            .next())
+    }
+
     /// Mark an outbox row confirmed by the relay, recording the published event id.
     pub fn mark_confirmed(
         &self,
@@ -2969,6 +3014,38 @@ impl SellerStore {
             pending_outbox,
         })
     }
+}
+
+/// Decode `(id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix)` outbox rows.
+fn read_outbox_items(
+    stmt: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> Result<Vec<OutboxItem>, StoreError> {
+    let rows = stmt.query_map(params, |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut items = Vec::new();
+    for row in rows {
+        let (id, dedup_key, draft_json, created_at_unix, attempts, expires_at_unix) = row?;
+        let draft: EventDraft = serde_json::from_str(&draft_json)
+            .map_err(|error| StoreError(format!("outbox draft decode: {error}")))?;
+        items.push(OutboxItem {
+            id,
+            dedup_key,
+            draft,
+            created_at_unix,
+            attempts,
+            expires_at_unix,
+        });
+    }
+    Ok(items)
 }
 
 /// Enqueue an event into the outbox within a live transaction. Idempotent on `dedup_key`: a second

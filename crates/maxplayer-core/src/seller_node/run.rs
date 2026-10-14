@@ -56,9 +56,11 @@ use crate::seller_exec::{
 use crate::seller_roster::{ExecutionFailure, Fault, LiveRoster, MissingCapability, Unavailable};
 use crate::seller_git::{self, DeliveryAgentIdentity};
 
-use super::outbox::drain_once;
+use super::outbox::{drain_key, drain_within, DrainLimits};
+use super::stored_read::{read_stored, StoredRead};
 use super::publisher::RelayPublisher;
 use super::shutdown;
+use super::schedule;
 use super::{now_unix, NodeError, SellerNode};
 
 /// How long (seconds) the outbox publisher keeps retrying a claim event before it expires. Matches
@@ -880,12 +882,6 @@ fn stall_threshold_secs(interval_secs: u64, missed_intervals: u32) -> u64 {
     interval_secs
         .max(1)
         .saturating_mul(u64::from(missed_intervals.max(1)))
-}
-
-/// Whether the live subscription is presumed dead: no own heartbeat has round-tripped for at least
-/// `threshold_secs`. Pure over an elapsed-seconds reading (fake-clock testable).
-fn subscription_stalled(elapsed_secs: u64, threshold_secs: u64) -> bool {
-    elapsed_secs >= threshold_secs
 }
 
 /// Whether a single-relay publish was CONFIRMED accepted by the relay it was sent to (#509).
@@ -4420,6 +4416,10 @@ pub struct SellerNodeRunner {
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
+    /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
+    /// shutdown waits (bounded, [`schedule::LANE_SETTLE_MONEY_BOUND`]) while this is non-zero
+    /// instead of cutting a swap off mid-flight.
+    redeems_in_flight: std::sync::atomic::AtomicUsize,
     /// Stage 2a, addendum 2 §3: single-flight for the platform-fee remittance. The collect path's
     /// thread and the loop's retry tick both reach the one remit entry point; whichever finds the
     /// slot taken skips. See [`crate::fee_remit::RemitFlight`].
@@ -4868,6 +4868,7 @@ impl SellerNodeRunner {
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
+            redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
             remit_pacing: Arc::new(Mutex::new(crate::fee_remit::RemitBackoff::new())),
             remit_pacing_changed: Arc::new(tokio::sync::Notify::new()),
@@ -5399,14 +5400,36 @@ impl SellerNodeRunner {
     /// `accepting=y` standing exactly as before. Consumer-side recency filtering stays the only
     /// cover for those. Belt AND braces, never a replacement.
     async fn run_loop(self: Arc<Self>) -> Result<(), NodeError> {
-        let served = Arc::clone(&self).serve().await;
+        let mut in_flight: Option<LaneFuture> = None;
+        let served = Arc::clone(&self).serve(&mut in_flight).await;
         // Addendum 3 RULING 2: serving has ended — no remittance attempt may start from here on
         // (the flag is checked by both node paths), the seat retracts, and then the attempt already
         // in flight (if any) is drained with a bounded wait. `run` returning means nothing of this
         // PR's is still running, or one INCIDENT line above said exactly what was abandoned.
         self.remit_closed
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        self.publish_retraction().await;
+        // The lane's in-flight work (if any) settles BESIDE the retraction, never ahead of it: a
+        // publish or read stuck on the relay must not delay the seat going quiet. Ordinary work gets
+        // a short grace; a mint redeem between breadcrumb and receipt gets the money bound. Nothing
+        // queued behind it runs — the relay re-delivers offers/awards/wraps on the next boot.
+        let settle_lane = async {
+            if let Some(mut work) = in_flight {
+                match schedule::settle(&mut work, &self.redeems_in_flight).await {
+                    schedule::Settled::Finished(took) => opline_verbose!(
+                        "seller node shutdown: in-flight work finished after {}ms",
+                        took.as_millis()
+                    ),
+                    schedule::Settled::Abandoned { after, redeeming } => opline!(
+                        "seller node shutdown: abandoned in-flight work after {}s{} (pending publications stay \
+                         queued and are retried with the same event ids; the boot resume path re-drives jobs)",
+                        after.as_secs(),
+                        if redeeming { " — INCIDENT: a mint redeem was still running; its breadcrumb is \
+                         re-checked by the wrap backfill on the next boot" } else { "" }
+                    ),
+                }
+            }
+        };
+        tokio::join!(self.publish_retraction(), settle_lane);
         self.drain_remit_in_flight().await;
         // The held tools follow the daemon: stopping the daemon is the one thing that takes them
         // away. Each login persists in its state volume for the next boot.
@@ -5451,7 +5474,12 @@ impl SellerNodeRunner {
         Ok(endpoints)
     }
 
-    async fn serve(self: Arc<Self>) -> Result<(), NodeError> {
+    /// The run loop proper. Event handlers, the drain tick's housekeeping and the periodic
+    /// backfills run on ONE serialized work lane that this loop polls beside the heartbeat
+    /// supervision, the shutdown request and the relay streams, so a relay that withholds OKs or
+    /// EOSEs delays that work and nothing else. On exit, the lane's in-flight work (if any) is
+    /// handed back through `in_flight` for [`Self::run_loop`] to settle beside the retraction.
+    async fn serve(self: Arc<Self>, in_flight: &mut Option<LaneFuture>) -> Result<(), NodeError> {
         // Heartbeat + relay-stall watchdog config. Disabled ⇒ no heartbeat publish and the watchdog
         // branch is inert (the loop only waits on the drain tick + relay stream).
         let hb = &self.node.home().config.seller_heartbeat;
@@ -5496,8 +5524,8 @@ impl SellerNodeRunner {
             resolve_wrap_backfill_interval_secs()
         );
 
-        // Drain anything reconcile left pending before the first tick.
-        self.drain().await;
+        // Whatever reconcile left pending drains on the lane's first tick (the drain interval fires
+        // immediately), not inline here: a dead relay must not hold boot either.
 
         // Resume execution for jobs a process restart left mid-flight (invariant 4, fallback form):
         // an `awarded`/`executing` job is re-driven through execute_job so a crash mid-job resumes
@@ -5564,8 +5592,10 @@ impl SellerNodeRunner {
         let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
-        let mut heartbeat_tick =
-            tokio::time::interval(Duration::from_secs(heartbeat_interval_secs.max(1)));
+        let heartbeat_interval = Duration::from_secs(heartbeat_interval_secs.max(1));
+        let mut heartbeat_tick = tokio::time::interval(heartbeat_interval);
+        // One supervision at a time: ticks that land while one runs are skipped, not queued.
+        heartbeat_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Stage 2a, addendum 2: the platform-fee remittance RETRY, on this loop's clock. The collect
         // path's attempt is the fast path (the fee normally leaves within a second of the sale); this
         // is the safety net behind it — a failed remittance retries with backoff for as long as the
@@ -5595,11 +5625,12 @@ impl SellerNodeRunner {
                 "seller node platform fee: automatic remittance is OFF ([platform_fee] auto_remit = false) — neither the collect path nor the retry tick will attempt it; the fee still accrues and is owed, and `maxplayer seller fees remit --confirm` pays it by hand"
             );
         }
-        // Watchdog liveness clocks: monotonic instant (staleness measure, robust to wall-clock jumps)
-        // + unix stamp (resubscribe `since` cursor). Refreshed whenever the relay answers our liveness
-        // probe. Seeded to "now" so a healthy node never trips before its first probe.
-        let mut last_liveness_seen = tokio::time::Instant::now();
-        let mut last_liveness_seen_unix = now_unix();
+        // Watchdog liveness clock: monotonic instant (staleness measure, robust to wall-clock jumps)
+        // + unix stamp (resubscribe `since` cursor). Moved only by a supervision tick whose read AND
+        // write legs both confirmed (#509), or by a successful recovery. Seeded to "now" so a healthy
+        // node never trips before its first probe.
+        let mut liveness = schedule::LivenessClock::new(tokio::time::Instant::now(), now_unix());
+        let stall_threshold_duration = Duration::from_secs(stall_threshold);
         // Set while the offer REQ is running in its degraded targeted-only shape after a relay
         // `CLOSED`. Carries its own re-arm schedule (#190) — see [`OpenPoolDegrade`].
         let mut open_pool: Option<OpenPoolDegrade> = None;
@@ -5635,7 +5666,47 @@ impl SellerNodeRunner {
         // [`shutdown::spawn_os_signal_listener`], or an embedder's handle). Taken once — a second
         // loop on the same node would get `None` and simply never see a request.
         let mut shutdown_rx = self.shutdown.take_receiver();
+        // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
+        // pause until it drains); ticks and backfills coalesce to one pending pass each and take
+        // turns with events.
+        let mut queue: schedule::WorkQueue<Box<nostr_sdk::Event>> =
+            schedule::WorkQueue::new(EVENT_QUEUE_CAP);
+        let mut lane: Option<LaneFuture> = None;
+        let mut lane_busy = schedule::LaneBusy::default();
+        let mut pacing = schedule::OutboxPacing::default();
+        let mut queue_full_logged = false;
+        // Heartbeat supervision (probe + publish + watchdog + recovery), single-flight.
+        let mut supervision: Option<SupervisionFuture> = None;
+        // Set while a recovery is reconnecting: nothing on the loop may issue a long-lived REQ then
+        // (it would go out pre-AUTH on the new socket and be refused, #189), and backfills wait.
+        let recovering = std::rc::Rc::new(std::cell::Cell::new(false));
+        // An incomplete backfill is retried sooner than the next periodic pass, backing off.
+        let backfill_retry = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(backfill_retry);
+        let mut backfill_retry_armed = false;
+        let mut backfill_backoff = schedule::RetryBackoff::new(
+            BACKFILL_RETRY_MIN,
+            Duration::from_secs(wrap_backfill_interval_secs),
+        );
         loop {
+            if lane.is_none() {
+                let now = tokio::time::Instant::now();
+                if let Some(work) = queue.next(!recovering.get()) {
+                    if matches!(work, schedule::Work::Backfill) {
+                        last_backfill_at = now;
+                    }
+                    lane_busy.start(work.label(), now);
+                    let drain = if pacing.may_drain(now) {
+                        DrainMode::Routine
+                    } else {
+                        DrainMode::FreshOnly
+                    };
+                    lane = Some(Box::pin(Arc::clone(&self).lane_work(work, drain)));
+                }
+            }
+            if queue.has_room() {
+                queue_full_logged = false;
+            }
             tokio::select! {
                 // #747: leave the selling role. Breaking here — rather than exiting the process
                 // where the signal arrived — is the whole point: the ONE exit path in
@@ -5660,14 +5731,20 @@ impl SellerNodeRunner {
                     Self::spawn_expiry_sweep(sweep_seat.clone(), &sweep_in_flight);
                     continue;
                 }
+                // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
+                // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
-                    for staged in self.private_preflight.take_redrive() {
-                        self.on_offer(&staged).await;
+                    queue.request_tick();
+                    if let Some((label, busy)) = lane_busy.due_warning(tokio::time::Instant::now()) {
+                        opline!(
+                            "seller node WORK-LANE busy for {}s on {label} ({} event(s) queued, {} \
+                             periodic pass(es) waiting); supervision, heartbeat and shutdown are \
+                             unaffected",
+                            busy.as_secs(),
+                            queue.queued_events(),
+                            queue.periodic_waiting()
+                        );
                     }
-                    self.sweep_lapsed_claims();
-                    self.reconsider_capacity_skips().await;
-                    self.start_due_harness_probes();
-                    self.drain().await;
                     continue;
                 }
                 // Stage 2a, addendum 2: the remittance retry tick. Disabled while an attempt is in
@@ -5720,22 +5797,39 @@ impl SellerNodeRunner {
                 // or offer subscription recovers without a restart (#560). Also the node's only
                 // periodic log lines, and therefore the positive signal external supervision watches.
                 _ = wrap_backfill_tick.tick() => {
-                    self.run_wrap_backfill().await;
-                    // #560: the offers analog, on the SAME owned cadence. It rides this tick (not the
-                    // heartbeat) for the same reason the wrap backfill does — a recovery leg must not
-                    // depend on a tick config can disable.
-                    self.run_offer_backfill().await;
-                    last_backfill_at = tokio::time::Instant::now();
+                    // The status line comes from the LOOP, so it keeps its cadence — and says so —
+                    // while the lane is stuck on a slow relay.
+                    let now = tokio::time::Instant::now();
+                    let relay_state = if !heartbeat_enabled {
+                        "relay watchdog off".to_owned()
+                    } else if recovering.get() {
+                        "relay RECOVERING".to_owned()
+                    } else {
+                        format!("relay confirmed {}s ago", liveness.unconfirmed_for(now).as_secs())
+                    };
+                    let work_state = match lane_busy.current(now) {
+                        None => "work idle".to_owned(),
+                        Some((label, busy)) => format!("work BUSY {}s on {label}", busy.as_secs()),
+                    };
+                    let queued = queue.queued_events();
+                    self.report_status(&format!(
+                        " · {relay_state} · {work_state}{}",
+                        if queued > 0 { format!(" ({queued} event(s) queued)") } else { String::new() }
+                    ));
+                    // Wraps then offers (#560), on the lane, on this owned cadence — a recovery leg
+                    // must not depend on a tick config can disable.
+                    queue.request_backfill();
                     // #190: the open-pool half is re-armed on THIS tick, which is owned and
                     // unconditional. It rides the backfill rather than the heartbeat because the
                     // heartbeat is disableable by config, and a repair must not depend on a tick that
                     // may never fire. Acceptance is the relay's EOSE below — a response the protocol
                     // owes us — never the fact that we managed to send the REQ.
-                    if let Some(state) = open_pool.as_mut()
+                    if !recovering.get()
+                        && let Some(state) = open_pool.as_mut()
                         && state.on_tick() == RearmStep::Attempt
                     {
                         let overlap = nostr_sdk::Timestamp::from(
-                            last_liveness_seen_unix
+                            liveness.confirmed_unix()
                                 .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
                                 .max(0) as u64,
                         );
@@ -5759,117 +5853,134 @@ impl SellerNodeRunner {
                     }
                     continue;
                 }
-                // The heartbeat tick rides the SAME loop (never a blocking side-thread). Probe the
-                // READ leg first, evaluate staleness, then publish the heartbeat (the WRITE leg) —
-                // both bounded so the tick cannot hang on a dead link. #509: relay-observed liveness
-                // needs BOTH legs, so the watchdog clock is refreshed only after the publish, and
-                // only when read AND publish both confirmed this tick (see below).
-                _ = heartbeat_tick.tick(), if heartbeat_enabled => {
-                    let probe_ok = probe_relay_serves_our_reqs(
-                        &self.client,
-                        self.seller_pubkey,
-                        LIVENESS_PROBE_TIMEOUT,
-                    )
-                    .await;
-                    if probe_ok {
-                        if stalled_since_recovery {
-                            if manual_recovery_succeeded {
-                                opline!(
-                                    "seller node subscription RESTORED via MANUAL recovery (relay \
-                                     is serving our REQs again)"
-                                );
-                            } else {
-                                opline!(
-                                    "seller node subscription RESTORED via SDK BACKGROUND reconnect \
-                                     — no manual recovery had succeeded (relay is serving our REQs \
-                                     again)"
-                                );
-                            }
-                            stalled_since_recovery = false;
-                            manual_recovery_succeeded = false;
-                        }
-                        // #509: the read leg passed, but the clock refresh is DEFERRED to after the
-                        // publish leg below. A seat whose reads answer while its heartbeat writes are
-                        // silently rejected is dark on the relay yet used to keep the clock fresh
-                        // here — the exact 2691s blind spot. The clock now moves only when both legs
-                        // confirm.
-                    }
-                    let stall_elapsed = last_liveness_seen.elapsed().as_secs();
-                    let stalled = subscription_stalled(stall_elapsed, stall_threshold);
-                    let forced = forced_recovery.take();
-                    if stalled || forced.is_some() {
-                        let overlap_since = nostr_sdk::Timestamp::from(
-                            last_liveness_seen_unix
-                                .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
-                                .max(0) as u64,
-                        );
-                        if stalled {
+                // Heartbeat supervision: read probe, heartbeat publish, watchdog and (if tripped)
+                // recovery, as ONE future beside the lane — never behind it. #509: the clock moves
+                // only when both legs confirmed.
+                _ = heartbeat_tick.tick(), if heartbeat_enabled && supervision.is_none() => {
+                    let input = SupervisionInput {
+                        clock: liveness,
+                        forced: forced_recovery.take(),
+                        threshold: stall_threshold_duration,
+                        interval: heartbeat_interval,
+                    };
+                    supervision = Some(Box::pin(Arc::clone(&self).supervise(
+                        relay.clone(),
+                        input,
+                        std::rc::Rc::clone(&recovering),
+                    )));
+                    continue;
+                }
+                report = async { supervision.as_mut().expect("polled only while armed").await },
+                    if supervision.is_some() => {
+                    supervision = None;
+                    if report.probe_ok && stalled_since_recovery {
+                        if manual_recovery_succeeded {
                             opline!(
-                                "seller node RELAY-STALL detected: relay has not served our REQs in \
-                                 {stall_elapsed}s (threshold {stall_threshold}s); reconnecting + \
-                                 resubscribing with since={} overlap",
-                                overlap_since.as_secs()
+                                "seller node subscription RESTORED via MANUAL recovery (relay \
+                                 is serving our REQs again)"
                             );
                         } else {
                             opline!(
-                                "seller node RELAY-RECOVERY triggered: {}; reconnecting + \
-                                 resubscribing with since={} overlap",
-                                forced.unwrap_or_default(),
-                                overlap_since.as_secs()
+                                "seller node subscription RESTORED via SDK BACKGROUND reconnect \
+                                 — no manual recovery had succeeded (relay is serving our REQs \
+                                 again)"
                             );
                         }
-                        stalled_since_recovery = true;
-                        match self.recover_stall(&relay, overlap_since).await {
-                            Ok(attempts) => {
-                                let outage = now_unix().saturating_sub(last_liveness_seen_unix);
-                                // Grace: reset the watchdog clock so it does not immediately re-fire
-                                // before the next tick's probe can answer.
-                                last_liveness_seen = tokio::time::Instant::now();
-                                last_liveness_seen_unix = now_unix();
-                                // The full set was re-subscribed, so the open-pool half is back.
-                                open_pool = None;
-                                manual_recovery_succeeded = true;
-                                opline!(
-                                    "seller node RELAY-STALL recovery SUCCEEDED (attempts={attempts}, \
-                                     outage={outage}s): reconnected + resubscribed \
-                                     (offers+awards+1059, since={} overlap)",
-                                    overlap_since.as_secs()
-                                );
-                            }
-                            Err(error) => {
-                                // Leave the clocks untouched so the next heartbeat tick retries.
-                                opline!(
-                                    "seller node RELAY-STALL recovery FAILED (will retry next heartbeat tick): {error}"
-                                );
-                            }
-                        }
+                        stalled_since_recovery = false;
+                        manual_recovery_succeeded = false;
                     }
-                    // The WRITE leg: publish the heartbeat and CONFIRM the relay accepted it (#509),
-                    // not merely that the SDK send returned `Ok`. Only a tick where the relay both
-                    // served our REQs (`probe_ok`) AND acknowledged our heartbeat (`publish_ok`)
-                    // refreshes the watchdog clock; a rejected/absent OK therefore leaves the clock
-                    // to age and drives the RELAY-STALL branch above on a later tick, exactly as a
-                    // failed read probe does.
-                    let publish_ok = self.publish_heartbeat().await;
-                    if relay_liveness_confirmed(probe_ok, publish_ok) {
-                        last_liveness_seen = tokio::time::Instant::now();
-                        last_liveness_seen_unix = now_unix();
+                    liveness = report.clock;
+                    match report.recovered {
+                        Some(true) => {
+                            stalled_since_recovery = true;
+                            manual_recovery_succeeded = true;
+                            // A fresh authenticated socket: a pause earned against the dead one
+                            // must not hold the backlog back from the live one.
+                            pacing.reset();
+                            // The full set was re-subscribed, so the open-pool half is back.
+                            open_pool = None;
+                        }
+                        Some(false) => stalled_since_recovery = true,
+                        None => {}
                     }
                     continue;
                 }
-                recv = notifications.recv() => {
+                done = async { lane.as_mut().expect("polled only while armed").await },
+                    if lane.is_some() => {
+                    lane = None;
+                    let now = tokio::time::Instant::now();
+                    if let Some((label, busy)) = lane_busy.finish(now) {
+                        opline!("seller node WORK-LANE clear: {label} finished after {}s", busy.as_secs());
+                    }
+                    // A fresh-only pass (routine drains paused) never extends the pause; one the relay
+                    // confirmed proves it is acknowledging again, so routine drains resume.
+                    if let Some(counts) = done.drain
+                        && counts.fresh_only
+                    {
+                        if counts.confirmed > 0 {
+                            pacing.reset();
+                        }
+                    } else if let Some(counts) = done.drain
+                        && let Some(pause) = pacing.record(counts.confirmed, counts.unconfirmed, now)
+                    {
+                        if pause == schedule::OUTBOX_BACKOFF_MIN {
+                            opline!(
+                                "seller node outbox: the relay confirmed none of {} pending \
+                                 publication(s); routine drains pause {}s, backing off to {}s (rows \
+                                 stay pending and are retried with the same event ids)",
+                                counts.unconfirmed,
+                                pause.as_secs(),
+                                schedule::OUTBOX_BACKOFF_MAX.as_secs()
+                            );
+                        } else {
+                            opline_verbose!(
+                                "seller node outbox: still unconfirmed ({}); routine drains pause {}s",
+                                counts.unconfirmed,
+                                pause.as_secs()
+                            );
+                        }
+                    }
+                    match done.backfill_complete {
+                        Some(true) => {
+                            backfill_backoff.reset();
+                            backfill_retry_armed = false;
+                        }
+                        Some(false) => {
+                            let delay = backfill_backoff.next_delay();
+                            backfill_retry.as_mut().reset(now + delay);
+                            backfill_retry_armed = true;
+                            opline!(
+                                "seller node backfill INCOMPLETE: retrying in {}s (incomplete \
+                                 history is never taken as empty)",
+                                delay.as_secs()
+                            );
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
+                () = &mut backfill_retry, if backfill_retry_armed => {
+                    backfill_retry_armed = false;
+                    queue.request_backfill();
+                    continue;
+                }
+                // Paused while the event queue is full. That is back-pressure on OUR reads only: the
+                // SDK's notification broadcast keeps filling meanwhile and can lag (dropping the
+                // oldest notifications, logged below). A dropped offer, award or wrap is recovered
+                // by the next stored-history backfill, which re-reads exactly those windows.
+                recv = notifications.recv(), if queue.has_room() => {
                     match recv {
                         Ok(RelayPoolNotification::Event { event, .. }) => {
-                            match event.kind {
-                                k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(&event).await,
-                                k if k.as_u16() == JOB_AWARD_KIND => self.on_award(&event).await,
-                                k if k.as_u16() == JOB_ACCEPT_KIND => self.on_accept(&event).await,
-                                k if k.as_u16() == JOB_REJECT_KIND => self.on_reject(&event).await,
-                                k if k.as_u16() == JOB_RECEIPT_KIND => self.on_receipt(&event).await,
-                                Kind::GiftWrap => self.on_gift_wrap(&event).await,
-                                _ => {}
+                            if handled_event_kind(event.kind) {
+                                queue.push_event(event);
+                                if !queue.has_room() && !queue_full_logged {
+                                    queue_full_logged = true;
+                                    opline!(
+                                        "seller node WORK-LANE queue full ({EVENT_QUEUE_CAP} events): \
+                                         relay reads pause until it drains"
+                                    );
+                                }
                             }
-                            self.drain().await;
                         }
                         Ok(RelayPoolNotification::Shutdown) => {
                             opline!("seller node: relay pool shutdown; loop ending");
@@ -5912,6 +6023,16 @@ impl SellerNodeRunner {
                                         last_authenticated_at.elapsed().as_secs(),
                                         nip42_authed,
                                     )
+                                );
+                                continue;
+                            }
+
+                            // While a recovery is reconnecting, its own resubscribe (after NIP-42)
+                            // re-issues every leg; a REQ from here would race it pre-AUTH (#189).
+                            if recovering.get() {
+                                opline!(
+                                    "seller node RELAY-CLOSED during recovery: the {label} \
+                                     subscription is re-issued by the recovery's resubscribe"
                                 );
                                 continue;
                             }
@@ -5983,7 +6104,7 @@ impl SellerNodeRunner {
                                 && restricted_retry_used.insert(id.clone())
                             {
                                 let overlap = nostr_sdk::Timestamp::from(
-                                    last_liveness_seen_unix
+                                    liveness.confirmed_unix()
                                         .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
                                         .max(0) as u64,
                                 );
@@ -6075,8 +6196,16 @@ impl SellerNodeRunner {
                             // auth (the notification stream is taken after `boot()` completes), and a
                             // duplicate REQ is answered the same as the first. The overlap cursor lets
                             // events published while a leg was deaf backfill on the re-send.
+                            // A recovery in flight resubscribes after its own auth; a second
+                            // subscribe_all from here would only duplicate it.
+                            if recovering.get() {
+                                opline_verbose!(
+                                    "seller node RELAY-AUTH during recovery: the recovery resubscribes"
+                                );
+                                continue;
+                            }
                             let overlap = nostr_sdk::Timestamp::from(
-                                last_liveness_seen_unix
+                                liveness.confirmed_unix()
                                     .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
                                     .max(0) as u64,
                             );
@@ -6112,6 +6241,7 @@ impl SellerNodeRunner {
                 }
             }
         }
+        *in_flight = lane.take();
         Ok(())
     }
 
@@ -6218,7 +6348,7 @@ impl SellerNodeRunner {
     /// `serving` is the authority on whether the seat can take work — NOT whether `names` is empty,
     /// which is also true for an unlabelled `--agent-argv` hatch that is serving perfectly well.
     /// Both come from ONE `advertisement()` snapshot, as that method requires.
-    fn report_status(&self) {
+    fn report_status(&self, loop_health: &str) {
         let roster = self.agents.advertisement();
         let busy = self.slots.capacity.saturating_sub(self.slots.available());
         let harnesses = if roster.names.is_empty() {
@@ -6227,7 +6357,7 @@ impl SellerNodeRunner {
             roster.names.join(", ")
         };
         opline!(
-            "seller node status: {} · harness: {harnesses} · {busy}/{} job slot(s) busy",
+            "seller node status: {} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
             if roster.serving {
                 "ADVERTISING, ready for work"
             } else {
@@ -6252,9 +6382,13 @@ impl SellerNodeRunner {
     /// only periodic line a healthy idle node produces, which makes it the positive liveness signal
     /// external supervision has — a parked process satisfies pid-presence, so absence of failures is
     /// not evidence of health. Do not make it conditional to reduce noise.
-    async fn run_wrap_backfill(&self) {
-        self.sync_private_content(true).await;
-        self.report_status();
+    ///
+    /// Returns whether the pass read COMPLETE history (relay EOSE for the wraps, and the private
+    /// content read when that is live). `false` is never "nothing there": the caller retries soon, the
+    /// private cursor keeps only the windows that completed, and the wrap cursor is store-derived
+    /// (receipts/deliveries), so an incomplete read cannot move it past an unread payment.
+    async fn run_wrap_backfill(&self) -> bool {
+        let private_complete = self.backfill_private_content().await;
         let since = match resolve_backfill_since(
             self.node.store().last_receipt_unix(),
             self.node.store().oldest_unsettled_delivery_unix(),
@@ -6265,7 +6399,7 @@ impl SellerNodeRunner {
                     "seller node wrap backfill: ABORT — cursor read failed (retrying next cycle, \
                      NOT defaulting to since=0): {error}"
                 );
-                return;
+                return false;
             }
         };
         opline!("seller node wrap backfill (periodic): fetching stored kind-1059(s) since ts={since}");
@@ -6273,33 +6407,38 @@ impl SellerNodeRunner {
             .kind(Kind::GiftWrap)
             .pubkey(self.seller_pubkey)
             .since(nostr_sdk::Timestamp::from(since));
-        match tokio::time::timeout(
-            WRAP_BACKFILL_FETCH_TIMEOUT,
-            self.client
-                .fetch_events(filter, WRAP_BACKFILL_FETCH_TIMEOUT / 2),
-        )
-        .await
-        {
-            Ok(Ok(events)) => {
+        let relay = match self.own_relay().await {
+            Ok(relay) => relay,
+            Err(error) => {
+                opline!("seller node WARN: wrap backfill INCOMPLETE (retry pending): {error}");
+                return false;
+            }
+        };
+        let read = read_stored(&relay, vec![filter], WRAP_BACKFILL_FETCH_TIMEOUT).await;
+        let complete = read.is_complete();
+        let events = match read {
+            StoredRead::Complete(events) => {
                 opline!(
                     "seller node wrap backfill (periodic): {} stored kind-1059(s) returned since ts={since}",
                     events.len()
                 );
-                for event in events {
-                    self.on_gift_wrap(&event).await;
-                }
-                self.drain().await;
+                events
             }
-            Ok(Err(error)) => opline!(
-                "seller node WARN: wrap backfill fetch failed (continuing; live 1059 subscription \
-                 active): {error}"
-            ),
-            Err(_) => opline!(
-                "seller node WARN: wrap backfill fetch timed out after {}s (continuing; live 1059 \
-                 subscription active)",
-                WRAP_BACKFILL_FETCH_TIMEOUT.as_secs()
-            ),
+            StoredRead::Incomplete { events, reason } => {
+                opline!(
+                    "seller node WARN: wrap backfill INCOMPLETE since ts={since}: {reason}; {} \
+                     kind-1059(s) arrived first (processed), more may exist — retry pending (live \
+                     1059 subscription active)",
+                    events.len()
+                );
+                events
+            }
+        };
+        // Every wrap goes through the normal pay-once guards; a partial read is safe to ingest.
+        for event in events {
+            self.on_gift_wrap(&event).await;
         }
+        complete && private_complete
     }
 
     /// Re-ask the relay for stored job OFFERS and ingest whatever comes back — the offers analog of
@@ -6323,7 +6462,7 @@ impl SellerNodeRunner {
     /// included — bounded to [`resolve_offer_backfill_since`]. `report_status` is left to the wrap
     /// backfill that precedes it on the shared tick, so the pair emits one status line, not two; the
     /// "fetching" line here is still emitted UNCONDITIONALLY, as the positive signal this leg ran.
-    async fn run_offer_backfill(&self) {
+    async fn run_offer_backfill(&self) -> bool {
         let open_pool = self.claim_open_pool();
         let now = now_unix().max(0) as u64;
         let offer_backfill_secs = self
@@ -6348,15 +6487,17 @@ impl SellerNodeRunner {
             since.as_secs(),
             filters.len()
         );
+        let relay = match self.own_relay().await {
+            Ok(relay) => relay,
+            Err(error) => {
+                opline!("seller node WARN: offer backfill INCOMPLETE (retry pending): {error}");
+                return false;
+            }
+        };
+        let mut complete = true;
         for filter in filters {
-            match tokio::time::timeout(
-                OFFER_BACKFILL_FETCH_TIMEOUT,
-                self.client
-                    .fetch_events(filter, OFFER_BACKFILL_FETCH_TIMEOUT / 2),
-            )
-            .await
-            {
-                Ok(Ok(events)) => {
+            match read_stored(&relay, vec![filter], OFFER_BACKFILL_FETCH_TIMEOUT).await {
+                StoredRead::Complete(events) => {
                     opline!(
                         "seller node offer backfill (periodic): {} stored kind-{}(s) returned",
                         events.len(),
@@ -6365,19 +6506,34 @@ impl SellerNodeRunner {
                     for event in events {
                         self.on_offer(&event).await;
                     }
-                    self.drain().await;
                 }
-                Ok(Err(error)) => opline!(
-                    "seller node WARN: offer backfill fetch failed (continuing; live offer \
-                     subscription active): {error}"
-                ),
-                Err(_) => opline!(
-                    "seller node WARN: offer backfill fetch timed out after {}s (continuing; live \
-                     offer subscription active)",
-                    OFFER_BACKFILL_FETCH_TIMEOUT.as_secs()
-                ),
+                StoredRead::Incomplete { events, reason } => {
+                    complete = false;
+                    opline!(
+                        "seller node WARN: offer backfill INCOMPLETE: {reason}; {} kind-{}(s) arrived \
+                         first (processed), more may exist — retry pending (live offer subscription \
+                         active)",
+                        events.len(),
+                        JOB_OFFER_KIND
+                    );
+                    for event in events {
+                        self.on_offer(&event).await;
+                    }
+                }
             }
         }
+        complete
+    }
+
+    /// The pool's handle for our one relay (the same `Relay` across reconnects).
+    async fn own_relay(&self) -> Result<nostr_sdk::Relay, String> {
+        let url = RelayUrl::parse(&self.relay_url).map_err(|error| format!("parse relay url: {error}"))?;
+        self.client
+            .relays()
+            .await
+            .get(&url)
+            .cloned()
+            .ok_or_else(|| "relay missing from the client pool".to_owned())
     }
 
     /// Publish one own-heartbeat (kind-30340) — best-effort liveness/discovery + the watchdog's
@@ -7303,8 +7459,9 @@ impl SellerNodeRunner {
             // accepted claim id arrives in the same event, so ask the identity question directly.
             Ok(None) => {
                 // Ensure our claim is on the wire, then read its published id for the win check —
-                // the same order `on_award` uses, for the same reason.
-                self.drain().await;
+                // the same order `on_award` uses, for the same reason. Only OUR claim's row: a
+                // backlog behind a slow relay must not stand between the award and the check.
+                self.publish_now(&format!("claim:{job_id}")).await;
                 let our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
                     Ok(Some((_, _, published))) => published,
                     _ => None,
@@ -7560,8 +7717,9 @@ impl SellerNodeRunner {
             }
         }
 
-        // Ensure our claim is on the wire, then read its published id for the win check.
-        self.drain().await;
+        // Ensure our claim is on the wire, then read its published id for the win check. Only OUR
+        // claim's row: a backlog behind a slow relay must not stand between the award and the check.
+        self.publish_now(&format!("claim:{job_id}")).await;
         let our_claim_id = match self.node.store().outbox_row(&format!("claim:{job_id}")) {
             Ok(Some((_, _, published))) => published,
             _ => None,
@@ -8842,7 +9000,8 @@ impl SellerNodeRunner {
                 return;
             }
         }
-        self.drain().await;
+        self.publish_now(&format!("result:{job_id}")).await;
+        self.drain(DrainMode::Routine).await;
     }
 
     /// Task B2: deliver `job_id` through ONE sandbox container that runs the agent AND all git. The
@@ -9476,7 +9635,8 @@ impl SellerNodeRunner {
                 return;
             }
         }
-        self.drain().await;
+        self.publish_now(&format!("result:{job_id}")).await;
+        self.drain(DrainMode::Routine).await;
     }
 
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
@@ -9687,7 +9847,8 @@ impl SellerNodeRunner {
                 return;
             }
         }
-        self.drain().await;
+        self.publish_now(&format!("result:{job_id}")).await;
+        self.drain(DrainMode::Routine).await;
     }
 
     /// Settle one gift-wrapped payment: decode it (through the signer actor — the NIP-44 decrypt
@@ -9888,6 +10049,9 @@ impl SellerNodeRunner {
             opline!("seller node wrap event={event_id}: breadcrumb write failed for job {job_id} ({error}) — refusing to receive");
             return;
         }
+        // From here to the receipt write the mint may move money: shutdown waits for this guard
+        // (bounded) rather than abandon the swap. Held to the end of this handler.
+        let _redeeming = schedule::InFlight::enter(&self.redeems_in_flight);
 
         // Swap at the mint, then classify FAIL-CLOSED (never infer prior collection from the
         // breadcrumb — the only proof is a COMPLETED receipt read fail-closed).
@@ -10179,34 +10343,329 @@ impl SellerNodeRunner {
             .await;
     }
 
-    async fn sync_private_content(&self, backfill: bool) {
+    /// One bounded pass over pending private-content copies (no history read). `None` when private
+    /// content is off or the socket is not authenticated yet — nothing was attempted.
+    async fn flush_private_content(&self) -> Option<crate::private_content::session::FlushReport> {
         if !self.node.home().config.privacy.private_content_v2
-            || !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return; }
+            || !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return None; }
+        let deadline = tokio::time::Instant::now() + PRIVATE_FLUSH_BUDGET;
         let result = async {
             let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
             let mut transport = crate::private_content::session::AuthenticatedContentRelay::shared(self.client.clone(), &self.relay_url, AuthWait::Authenticated).await?;
-            crate::private_content::session::flush_actor(&mut ctx.store, self.node.signer(), &mut transport, 64).await?;
-            if backfill { transport.backfill_actor(&mut ctx.store, self.node.signer(), now_unix().max(0) as u64).await?; }
-            Ok::<_, crate::private_content::Error>(())
+            crate::private_content::session::flush_actor_within(&mut ctx.store, self.node.signer(), &mut transport, 64, Some(deadline)).await
         }.await;
-        if let Err(e) = result { opline!("seller private content retry pending: {e}"); }
+        match result {
+            Ok(report) => Some(report),
+            Err(e) => {
+                opline!("seller private content retry pending: {e}");
+                Some(crate::private_content::session::FlushReport { pending: 1, ..Default::default() })
+            }
+        }
     }
 
-    /// One outbox drain pass over the shared authenticated client. Log-and-continue: a publish
-    /// failure leaves the row pending for the next tick (never wedges the loop).
-    async fn drain(&self) {
+    /// Flush, then read private-content history, bounded as a whole by [`PRIVATE_BACKFILL_BUDGET`].
+    /// `false` = the history read did not complete: the cursor kept only the windows that did, and
+    /// the caller retries. Off / not-yet-authenticated counts as complete (nothing to read yet; the
+    /// authenticated socket triggers the next pass).
+    async fn backfill_private_content(&self) -> bool {
+        if !self.node.home().config.privacy.private_content_v2
+            || !self.private_authenticated.load(std::sync::atomic::Ordering::Relaxed) { return true; }
+        let deadline = tokio::time::Instant::now() + PRIVATE_BACKFILL_BUDGET;
+        let result = async {
+            let mut ctx = crate::private_content::channel::ContentContext::open(self.node.home(), &self.seller_pubkey.to_hex())?;
+            let mut transport = crate::private_content::session::AuthenticatedContentRelay::shared(self.client.clone(), &self.relay_url, AuthWait::Authenticated).await?;
+            crate::private_content::session::flush_actor_within(&mut ctx.store, self.node.signer(), &mut transport, 64, Some(deadline)).await?;
+            transport.backfill_actor_within(&mut ctx.store, self.node.signer(), now_unix().max(0) as u64, Some(deadline)).await?;
+            Ok::<_, crate::private_content::Error>(())
+        }.await;
+        match result {
+            Ok(()) => true,
+            Err(e) => {
+                opline!("seller private content retry pending: {e}");
+                false
+            }
+        }
+    }
+
+    /// One BOUNDED outbox pass plus one bounded private-content flush, over the shared authenticated
+    /// client. Log-and-continue: an unconfirmed row stays pending (same signed event, same id) for
+    /// the next pass. The returned counts drive the run loop's pacing; nothing here can hold the
+    /// caller longer than [`OUTBOX_PASS_BUDGET`] + [`PRIVATE_FLUSH_BUDGET`] (plus one signer call).
+    ///
+    /// [`DrainMode::FreshOnly`] (routine drains paused) tries only never-attempted rows and skips the
+    /// private-content flush: a fresh claim still gets its first attempt, the paced backlog waits.
+    async fn drain(&self, mode: DrainMode) -> DrainCounts {
         let now = now_unix();
-        match drain_once(self.node.store(), &self.publisher, now).await {
-            Ok(report) if report.confirmed > 0 || report.failed > 0 => opline!(
-                "seller node outbox drain: confirmed={} failed={} expired={}",
-                report.confirmed, report.failed, report.expired
-            ),
-            Ok(_) => {}
+        let fresh_only = mode == DrainMode::FreshOnly;
+        let mut counts = DrainCounts {
+            fresh_only,
+            ..DrainCounts::default()
+        };
+        let limits = if fresh_only {
+            DrainLimits::fresh_within(OUTBOX_PASS_BUDGET, OUTBOX_PASS_ROWS)
+        } else {
+            DrainLimits::within(OUTBOX_PASS_BUDGET, OUTBOX_PASS_ROWS)
+        };
+        match drain_within(self.node.store(), &self.publisher, now, limits).await {
+            Ok(report) => {
+                if report.confirmed > 0 || report.failed > 0 {
+                    opline!(
+                        "seller node outbox drain: confirmed={} failed={} expired={} deferred={}",
+                        report.confirmed, report.failed, report.expired, report.deferred
+                    );
+                }
+                counts.confirmed += report.confirmed;
+                counts.unconfirmed += report.failed + report.deferred;
+            }
             Err(error) => opline!("seller node outbox drain error (continuing): {error}"),
         }
-        self.sync_private_content(false).await;
+        if fresh_only {
+            return counts;
+        }
+        if let Some(flush) = self.flush_private_content().await {
+            counts.confirmed += flush.accepted;
+            counts.unconfirmed += flush.pending;
+        }
+        counts
+    }
+
+    /// Publish the ONE pending outbox row `dedup_key` now (bounded by [`TARGETED_PUBLISH_BUDGET`]),
+    /// for a caller that must not wait behind — or be cut off by — the rest of the outbox: an award
+    /// must read OUR claim's published id, a delivery wants its result on the wire first. A row that
+    /// is absent or already confirmed is a no-op.
+    async fn publish_now(&self, dedup_key: &str) {
+        let limits = DrainLimits::within(TARGETED_PUBLISH_BUDGET, 1);
+        match drain_key(self.node.store(), &self.publisher, dedup_key, now_unix(), limits).await {
+            Ok(report) if report.failed > 0 || report.deferred > 0 => opline!(
+                "seller node publish {dedup_key}: not confirmed yet (stays pending, retried with the same event id)"
+            ),
+            Ok(_) => {}
+            Err(error) => opline!("seller node publish {dedup_key} error (continuing): {error}"),
+        }
     }
 }
+
+impl SellerNodeRunner {
+    /// One unit of lane work. `drain` is the loop's pacing verdict for the outbox drain that follows
+    /// it (claims an award reads and post-delivery results publish on their own).
+    async fn lane_work(
+        self: Arc<Self>,
+        work: schedule::Work<Box<nostr_sdk::Event>>,
+        drain: DrainMode,
+    ) -> LaneDone {
+        let mut done = LaneDone {
+            backfill_complete: None,
+            drain: None,
+        };
+        match work {
+            schedule::Work::Event(event) => self.dispatch_event(&event).await,
+            schedule::Work::Tick => {
+                for staged in self.private_preflight.take_redrive() {
+                    self.on_offer(&staged).await;
+                }
+                self.sweep_lapsed_claims();
+                self.reconsider_capacity_skips().await;
+                self.start_due_harness_probes();
+            }
+            schedule::Work::Backfill => {
+                let wraps = self.run_wrap_backfill().await;
+                // #560: the offers analog, on the same owned cadence.
+                let offers = self.run_offer_backfill().await;
+                done.backfill_complete = Some(wraps && offers);
+            }
+        }
+        done.drain = Some(self.drain(drain).await);
+        done
+    }
+
+    async fn dispatch_event(self: &Arc<Self>, event: &nostr_sdk::Event) {
+        match event.kind {
+            k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(event).await,
+            k if k.as_u16() == JOB_AWARD_KIND => self.on_award(event).await,
+            k if k.as_u16() == JOB_ACCEPT_KIND => self.on_accept(event).await,
+            k if k.as_u16() == JOB_REJECT_KIND => self.on_reject(event).await,
+            k if k.as_u16() == JOB_RECEIPT_KIND => self.on_receipt(event).await,
+            Kind::GiftWrap => self.on_gift_wrap(event).await,
+            _ => {}
+        }
+    }
+
+    /// One heartbeat supervision: probe the READ leg, publish the heartbeat (WRITE leg), judge the
+    /// watchdog on what THIS tick observed, and recover if it tripped (or a repair was forced).
+    /// Bounded throughout: probe [`LIVENESS_PROBE_TIMEOUT`], publish [`HEARTBEAT_PUBLISH_BUDGET`],
+    /// and `recover_stall`'s own paced attempts. Runs beside the work lane, so neither waits on the
+    /// other.
+    async fn supervise(
+        self: Arc<Self>,
+        relay: nostr_sdk::Relay,
+        input: SupervisionInput,
+        recovering: std::rc::Rc<std::cell::Cell<bool>>,
+    ) -> SupervisionDone {
+        let started = tokio::time::Instant::now();
+        let started_unix = now_unix();
+        let probe_ok =
+            probe_relay_serves_our_reqs(&self.client, self.seller_pubkey, LIVENESS_PROBE_TIMEOUT)
+                .await;
+        let publish_ok = self.publish_heartbeat_bounded().await;
+        let mut clock = input.clock;
+        let confirmed = relay_liveness_confirmed(probe_ok, publish_ok);
+        if confirmed {
+            clock.confirm(started, started_unix);
+        }
+        // Measured to this tick's START: the tick that completes N missed intervals trips, not
+        // the one after it.
+        let unconfirmed = clock.unconfirmed_for(started);
+        let stalled =
+            !confirmed && schedule::watchdog_tripped(unconfirmed, input.threshold, input.interval);
+        if !stalled && input.forced.is_none() {
+            return SupervisionDone { clock, probe_ok, recovered: None };
+        }
+        let overlap_since = nostr_sdk::Timestamp::from(
+            clock
+                .confirmed_unix()
+                .saturating_sub(STALL_OVERLAP_MARGIN_SECS as i64)
+                .max(0) as u64,
+        );
+        if stalled {
+            opline!(
+                "seller node RELAY-STALL detected: relay unconfirmed for {}s (threshold {}s; last \
+                 confirmed ts={}; this tick probe={} heartbeat={}); reconnecting + resubscribing \
+                 with since={} overlap",
+                unconfirmed.as_secs(),
+                input.threshold.as_secs(),
+                clock.confirmed_unix(),
+                if probe_ok { "ok" } else { "FAILED" },
+                if publish_ok { "ok" } else { "FAILED" },
+                overlap_since.as_secs()
+            );
+        } else {
+            opline!(
+                "seller node RELAY-RECOVERY triggered: {}; reconnecting + resubscribing with since={} \
+                 overlap",
+                input.forced.unwrap_or_default(),
+                overlap_since.as_secs()
+            );
+        }
+        struct Recovering(std::rc::Rc<std::cell::Cell<bool>>);
+        impl Drop for Recovering {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        recovering.set(true);
+        let guard = Recovering(recovering);
+        let recovery_started = tokio::time::Instant::now();
+        let result = self.recover_stall(&relay, overlap_since).await;
+        drop(guard);
+        let took = recovery_started.elapsed().as_secs();
+        let recovered = match result {
+            Ok(attempts) => {
+                let outage = now_unix().saturating_sub(clock.confirmed_unix());
+                // Grace: the watchdog does not re-fire before the next tick's probe can answer.
+                clock.confirm(tokio::time::Instant::now(), now_unix());
+                opline!(
+                    "seller node RELAY-STALL recovery SUCCEEDED (attempts={attempts}, recovery={took}s, \
+                     outage={outage}s since last confirmation): reconnected + resubscribed \
+                     (offers+awards+1059, since={} overlap)",
+                    overlap_since.as_secs()
+                );
+                // Announce the seat on the new socket now, not an interval later.
+                self.publish_heartbeat_bounded().await;
+                true
+            }
+            Err(error) => {
+                opline!(
+                    "seller node RELAY-STALL recovery FAILED after {took}s (will retry next heartbeat \
+                     tick): {error}"
+                );
+                false
+            }
+        };
+        SupervisionDone { clock, probe_ok, recovered: Some(recovered) }
+    }
+
+    async fn publish_heartbeat_bounded(&self) -> bool {
+        tokio::time::timeout(HEARTBEAT_PUBLISH_BUDGET, self.publish_heartbeat())
+            .await
+            .unwrap_or(false)
+    }
+}
+
+/// The relay event kinds the lane has a handler for; anything else is never queued.
+fn handled_event_kind(kind: Kind) -> bool {
+    let k = kind.as_u16();
+    k == JOB_OFFER_KIND
+        || k == JOB_AWARD_KIND
+        || k == JOB_ACCEPT_KIND
+        || k == JOB_REJECT_KIND
+        || k == JOB_RECEIPT_KIND
+        || kind == Kind::GiftWrap
+}
+
+type LaneFuture = std::pin::Pin<Box<dyn std::future::Future<Output = LaneDone>>>;
+type SupervisionFuture = std::pin::Pin<Box<dyn std::future::Future<Output = SupervisionDone>>>;
+
+/// What one unit of lane work reports back to the loop.
+struct LaneDone {
+    /// `Some` for a backfill pass: whether its history reads all completed.
+    backfill_complete: Option<bool>,
+    /// `Some` when the routine drain ran: what it achieved (feeds the pacing).
+    drain: Option<DrainCounts>,
+}
+
+/// The loop state one supervision tick starts from.
+struct SupervisionInput {
+    clock: schedule::LivenessClock,
+    forced: Option<String>,
+    threshold: Duration,
+    interval: Duration,
+}
+
+/// What one supervision tick established.
+struct SupervisionDone {
+    clock: schedule::LivenessClock,
+    probe_ok: bool,
+    /// `Some(ok)` when a recovery ran.
+    recovered: Option<bool>,
+}
+
+/// Events the lane may have queued before relay reads pause.
+const EVENT_QUEUE_CAP: usize = 1024;
+/// Bound on one heartbeat publish (signer + SDK OK wait + an AUTH retry).
+const HEARTBEAT_PUBLISH_BUDGET: Duration = Duration::from_secs(30);
+/// First retry delay after an incomplete backfill; doubles up to the backfill interval.
+const BACKFILL_RETRY_MIN: Duration = Duration::from_secs(30);
+
+/// What one run-loop drain pass achieved — the input to [`schedule::OutboxPacing`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DrainCounts {
+    /// The pass ran in [`DrainMode::FreshOnly`].
+    fresh_only: bool,
+    confirmed: usize,
+    /// Failed, cut short, or never reached: still pending.
+    unconfirmed: usize,
+}
+
+/// Which outbox rows the drain after a unit of lane work may try.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrainMode {
+    /// Every pending row (bounded): the relay is acknowledging, or the pause has run out.
+    Routine,
+    /// Routine drains are paused: only rows never attempted, so a fresh claim is not held back.
+    FreshOnly,
+}
+
+/// Whole-pass budget for one routine outbox drain: one SDK publish (10 s OK wait) plus an AUTH retry
+/// fits; a backlog behind a dead relay costs this, not rows × 10 s.
+const OUTBOX_PASS_BUDGET: Duration = Duration::from_secs(15);
+/// Rows one routine pass may try.
+const OUTBOX_PASS_ROWS: usize = 256;
+/// Budget for publishing one named row (claim before an award check, result after delivery).
+const TARGETED_PUBLISH_BUDGET: Duration = Duration::from_secs(30);
+/// Whole-pass budget for one private-content flush on the routine drain.
+const PRIVATE_FLUSH_BUDGET: Duration = Duration::from_secs(10);
+/// Whole-pass budget for flush + history read of private content on a backfill pass.
+const PRIVATE_BACKFILL_BUDGET: Duration = Duration::from_secs(45);
 
 #[cfg(test)]
 mod slot_gate_tests {
@@ -14558,8 +15017,8 @@ mod tests {
                 assert_eq!(loser.slots.available(), 0, "the loser's single slot is reserved");
 
                 // Publish both claims so each has a real id on the wire; the award names the winner's.
-                winner.drain().await;
-                loser.drain().await;
+                winner.drain(DrainMode::Routine).await;
+                loser.drain(DrainMode::Routine).await;
                 let winner_claim_id = match winner.node.store().outbox_row(&format!("claim:{job_id}"))
                 {
                     Ok(Some((_, _, Some(published)))) => published,
@@ -14757,8 +15216,8 @@ mod tests {
                 // Publish both claims so each has a real id on the wire; the accept names the
                 // winner's. Without this the loser's own id is unreadable and it would refuse to
                 // bind for the WRONG reason (fail-closed), which would not test the identity match.
-                winner.drain().await;
-                loser.drain().await;
+                winner.drain(DrainMode::Routine).await;
+                loser.drain(DrainMode::Routine).await;
                 let published = |seat: &Arc<SellerNodeRunner>, label: &str| match seat
                     .node
                     .store()
@@ -16451,9 +16910,15 @@ mod tests {
     fn watchdog_stall_math_clamps_and_trips_only_at_threshold() {
         assert_eq!(stall_threshold_secs(300, 3), 900);
         assert_eq!(stall_threshold_secs(0, 0), 1, "each factor clamped ≥1 so the product is never 0");
-        assert!(!subscription_stalled(899, 900), "below threshold ⇒ live");
-        assert!(subscription_stalled(900, 900), "at threshold ⇒ stalled");
-        assert!(subscription_stalled(901, 900));
+        // Judged at the START of the tick whose own legs failed: with a 300s interval and 3 missed
+        // intervals, the third missed tick (900s after the last confirmation) trips — not the
+        // fourth (1200s), which is what the old after-publish clock delivered (outage=1229s).
+        let (interval, threshold) = (Duration::from_secs(300), Duration::from_secs(900));
+        let trips = |secs| schedule::watchdog_tripped(Duration::from_secs(secs), threshold, interval);
+        assert!(!trips(600), "second missed tick ⇒ live");
+        assert!(trips(900), "third missed tick ⇒ stalled");
+        assert!(!trips(749), "tick jitter below half an interval cannot trip early");
+        assert!(trips(751), "nor delay a trip");
     }
 
     // #509 red-prove helper: build a `send_event_to`-shaped `Output` with the given per-relay verdict.
@@ -18061,6 +18526,286 @@ mod tests {
             "the terminal beat is an ordinary §4.2 announcement, not a special-cased event"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- Work lane / supervision loop teeth (seller-daemon resilience) -------------------------
+
+    /// A home for the loop teeth below: fixture relay, one-second heartbeats.
+    fn lane_home(root: &std::path::Path, fixture: &PGateRelay) -> crate::home::MaxplayerHome {
+        let mut home = crate::home::bootstrap(root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        home.config.seller_heartbeat.enabled = true;
+        home.config.seller_heartbeat.interval_secs = 1;
+        home
+    }
+
+    /// Journal one claim (and its outbox row) for `n` through a second connection to the node's
+    /// ledger; returns the outbox dedup key.
+    fn seed_claim(store: &crate::seller_node::store::SellerStore, n: u8) -> String {
+        let job = format!("{n:02x}").repeat(32);
+        let draft = claim_draft(
+            &job,
+            &"b".repeat(64),
+            &"c".repeat(64),
+            crate::gateway::ClaimPayment::Sat("creq-lane"),
+            &[],
+            &Default::default(),
+        );
+        let now = now_unix();
+        store
+            .claim_and_enqueue(&job, &job, Some("creq-lane"), &draft, now, now + 3_600, now)
+            .expect("seed claim");
+        format!("claim:{job}")
+    }
+
+    fn lane_store(root: &std::path::Path) -> crate::seller_node::store::SellerStore {
+        crate::seller_node::store::SellerStore::open(root.join(crate::seller_node::STATE_DB_FILE))
+            .expect("open store")
+    }
+
+    async fn wait_for_row_state(
+        store: &crate::seller_node::store::SellerStore,
+        key: &str,
+        state: &str,
+        timeout: Duration,
+    ) -> bool {
+        tokio::time::timeout(timeout, async {
+            loop {
+                if store
+                    .outbox_row(key)
+                    .expect("outbox row")
+                    .is_some_and(|row| row.0 == state)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// L1 — a relay that never acknowledges our claims holds neither the heartbeat nor a shutdown.
+    /// A backlog of claims is pending and the relay withholds every kind-3402 `OK`: heartbeats keep
+    /// reaching the relay, a requested shutdown returns within 10 s, and the rows stay `pending`.
+    /// Once the relay answers again (after a restart), every row is confirmed with the SAME event id
+    /// it carried while unacknowledged: three claims, three distinct ids on the wire, ever.
+    ///
+    /// RED ON REVERT: await the routine drain inline in the loop (or drop the settle bound in
+    /// `run_loop`) and the heartbeats stall behind the OK timeouts / the shutdown waits out the
+    /// whole pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn withheld_claim_oks_hold_neither_heartbeats_nor_shutdown_and_retries_reuse_the_event_id() {
+        use_fast_backfill_tick();
+        let claim_kind = u64::from(crate::kinds::JOB_CLAIM_KIND);
+        let beat_kind = u64::from(crate::heartbeat::SELLER_HEARTBEAT_KIND);
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("lane-l1-withheld-claim-oks");
+        let home = lane_home(&root, &fixture);
+        let keys: Vec<String> = {
+            let store = lane_store(&root);
+            (1..=3).map(|n| seed_claim(&store, n)).collect()
+        };
+        fixture.withhold_ok_for(&[claim_kind]);
+
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let (stop_took, joined) = local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| events
+                            .iter()
+                            .any(|event| event.kind == claim_kind))
+                        .await,
+                    "harness check: the backlog must reach the relay (unacknowledged)"
+                );
+                let beats = fixture.event_kind_count(beat_kind).await;
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| events
+                            .iter()
+                            .filter(|event| event.kind == beat_kind)
+                            .count()
+                            >= beats + 2)
+                        .await,
+                    "heartbeats must keep publishing while the relay withholds claim OKs"
+                );
+                let asked = tokio::time::Instant::now();
+                assert!(shutdown.request("L1 stop"), "the loop must accept a shutdown request");
+                let joined = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+                (asked.elapsed(), joined)
+            })
+            .await;
+        let outcome = joined
+            .expect("the run loop must RETURN on a shutdown request")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "a requested shutdown is a clean exit: {outcome:?}");
+        assert!(
+            stop_took < Duration::from_secs(10),
+            "shutdown took {stop_took:?} behind a relay that withholds OKs"
+        );
+        let store = lane_store(&root);
+        for key in &keys {
+            let row = store.outbox_row(key).expect("row").expect("row exists");
+            assert_eq!(row.0, "pending", "{key}: an unacknowledged claim stays pending");
+        }
+        // Claim key -> the event id the relay saw (unacknowledged) before the restart.
+        let unacknowledged: std::collections::HashMap<String, String> = fixture
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.kind == claim_kind)
+            .filter_map(|event| {
+                event.tag_value("e").map(|job| (format!("claim:{job}"), event.id.clone()))
+            })
+            .collect();
+        assert!(!unacknowledged.is_empty(), "harness check: a claim reached the wire unacknowledged");
+        drop(local);
+
+        // The relay answers again; a restarted node retries the backlog.
+        fixture.withhold_ok_for(&[]);
+        let runner = SellerNodeRunner::boot(lane_home(&root, &fixture))
+            .await
+            .expect("reboot runner");
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                for key in &keys {
+                    assert!(
+                        wait_for_row_state(&store, key, "confirmed", Duration::from_secs(30)).await,
+                        "{key}: the retry must be confirmed once the relay answers"
+                    );
+                }
+                assert!(shutdown.request("L1 stop 2"));
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        for key in &keys {
+            let row = store.outbox_row(key).expect("row").expect("row exists");
+            let id = row.2.expect("a confirmed row records its event id");
+            if let Some(seen) = unacknowledged.get(key) {
+                assert_eq!(&id, seen, "{key}: the retry must carry the event id the relay already saw");
+            }
+        }
+        let wire: std::collections::HashSet<String> = fixture
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.kind == claim_kind)
+            .map(|event| event.id.clone())
+            .collect();
+        assert_eq!(wire.len(), keys.len(), "one event id per claim across every retry: {wire:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L2 — a wrap backfill whose read never completes (no EOSE for kind 1059) reports INCOMPLETE
+    /// (`false`, so the loop schedules a retry) instead of "0 returned", and complete again once the
+    /// relay answers.
+    ///
+    /// RED ON REVERT: return `private_complete` alone (or read with the SDK's `fetch_events`) and the
+    /// silent relay reads as an empty, complete history.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_wrap_backfill_without_eose_is_incomplete_until_the_relay_answers() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("lane-l2-wrap-backfill");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.seller = Some(seller_cfg(1, false));
+        // Private content reads kind 1059 too; off here so only the payment-wrap read is judged
+        // (with it on, its own incomplete read would mask a wrap leg that lied).
+        home.config.privacy.private_content_v2 = false;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        assert!(
+            runner.run_wrap_backfill().await,
+            "harness check: an answering relay gives a complete backfill"
+        );
+        fixture.withhold_eose_for(&[1059]);
+        assert!(
+            !runner.run_wrap_backfill().await,
+            "a read the relay never finished must not count as a complete (empty) history"
+        );
+        fixture.withhold_eose_for(&[]);
+        assert!(runner.run_wrap_backfill().await, "complete again once the relay answers");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L3 — the relay serves heartbeats but never answers the liveness probe, so the watchdog trips
+    /// and recovers. Supervision is single-flight: a probe that waits out its timeout is never
+    /// stacked under more probes or recoveries (ticks are skipped while one is in flight), and the
+    /// work lane keeps publishing beside it.
+    ///
+    /// RED ON REVERT: drop `supervision.is_none()` from the heartbeat arm and a new probe starts every
+    /// tick (one per second here, against at most one per probe timeout).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hung_liveness_probe_recovers_one_at_a_time_while_the_lane_keeps_publishing() {
+        use_fast_backfill_tick();
+        let beat_kind = u64::from(crate::heartbeat::SELLER_HEARTBEAT_KIND);
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("lane-l3-hung-probe");
+        let runner = SellerNodeRunner::boot(lane_home(&root, &fixture))
+            .await
+            .expect("boot runner");
+        let shutdown = runner.shutdown_handle();
+        let store = lane_store(&root);
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until(FIXTURE_WAIT, |reqs| served_authed(reqs, LIVENESS_PROBE_SUB_ID) > 0)
+                        .await,
+                    "harness check: the probe is served before the outage"
+                );
+                fixture.withhold_eose_for(&[beat_kind]);
+                let started = tokio::time::Instant::now();
+                let connections = fixture.connections();
+                let probes = fixture.reqs_for(LIVENESS_PROBE_SUB_ID).await.len();
+
+                let recovered = tokio::time::timeout(Duration::from_secs(45), async {
+                    while fixture.connections() == connections {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .is_ok();
+                assert!(recovered, "the watchdog must trip and reconnect on an unanswered probe");
+
+                // The lane still serves while supervision is busy: a fresh claim is published.
+                let key = seed_claim(&store, 9);
+                assert!(
+                    wait_for_row_state(&store, &key, "confirmed", Duration::from_secs(30)).await,
+                    "the work lane must keep publishing during probe outages and recoveries"
+                );
+
+                let window = Duration::from_secs(40);
+                if let Some(rest) = window.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(rest).await;
+                }
+                let elapsed = started.elapsed();
+                let probes = fixture.reqs_for(LIVENESS_PROBE_SUB_ID).await.len() - probes;
+                let reconnects = fixture.connections() - connections;
+                let ceiling = (elapsed.as_secs() / LIVENESS_PROBE_TIMEOUT.as_secs()) as usize + 2;
+                assert!(
+                    probes <= ceiling,
+                    "{probes} probes in {elapsed:?}: supervision must be single-flight (at most \
+                     {ceiling})"
+                );
+                assert!(
+                    reconnects <= probes + 1,
+                    "{reconnects} reconnects for {probes} probes: recoveries must not stack"
+                );
+                assert!(shutdown.request("L3 stop"));
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
         let _ = std::fs::remove_dir_all(&root);
     }
 
