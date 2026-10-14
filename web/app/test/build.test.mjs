@@ -246,3 +246,16 @@ test("the /tokens CSP opens only the trade relays, only on /tokens, and is noind
   const robots = matching("/tokens").flatMap((h) => h.headers.filter((x) => x.key === "X-Robots-Tag").map((x) => x.value));
   assert.deepEqual(robots, ["noindex, nofollow"]);
 });
+
+test("FAQ sections pin their heading so opening an answer never moves it", () => {
+  const css = readFileSync(join(root, "dist", "styles.css"), "utf8");
+  assert.match(css, /\.h-section\.h-faq\.faq-pinned \{ justify-content: flex-start; \}/);
+  assert.match(css, /\.h-faq\.faq-pinned > \.h-in \{ margin-top: var\(--faq-lift, 0px\); \}/);
+  const js = readFileSync(join(root, "dist", "terminal.js"), "utf8");
+  assert.ok(js.includes("faq-pinned") && js.includes("--faq-lift"), "the shared bundle pins FAQs");
+  for (const page of ["index.html", "sell.html", "chat.html"]) {
+    const html = readFileSync(join(root, "dist", page), "utf8");
+    assert.match(html, /class="h-section h-faq[" ]/, `${page} has an FAQ`);
+    assert.match(html, /src="\.\/terminal\.js/, `${page} loads the bundle that pins it`);
+  }
+});

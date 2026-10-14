@@ -1028,6 +1028,10 @@ button.chip { cursor: pointer; }
   min-height: calc(100svh - var(--nav-h));
 }
 .h-section { display: flex; flex-direction: column; justify-content: center; }
+/* FAQ: src/ui/faq.ts pins the closed, centred position so opening an answer
+   never moves the heading (bob); answers only grow the section downward. */
+.h-section.h-faq.faq-pinned { justify-content: flex-start; }
+.h-faq.faq-pinned > .h-in { margin-top: var(--faq-lift, 0px); }
 .h-section > .h-in { width: 100%; }
 /* "Just ask": one real job, start to finish. 16:9, or a 9:16 cut on portrait phones */
 .h-video { margin: 44px auto 0; max-width: 960px; }
