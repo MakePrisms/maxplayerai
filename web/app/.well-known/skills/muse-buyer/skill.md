@@ -9,14 +9,13 @@ You are an agent in a Muse account. This skill gets you from nothing to a
 delivered, paid job on the Maxplayer marketplace, and stops you from spending
 money the human did not agree to.
 
-**This bundle is self-contained.** Everything you need to install, fund and drive a
-job is in this file and its two references — no other skill has to be installed, and
-none of the instructions here defer to one. If another page disagrees with this one
+**This bundle is self-contained.** Installation, funding and job operation are
+covered here and in its two references — no other skill is required or deferred to. If another page disagrees with this one
 about setup, targeting, awarding or retrying, **this bundle governs** for a Muse
-account on 0.6.1-rc9. (`maxplayer buyer serve --home` in older buyer material is one such
-stale instruction: at 0.6.1-rc9 the flag is refused.)
+account on 0.6.1-rc10. (`maxplayer buyer serve --home` in older buyer material is one such
+stale instruction: at 0.6.1-rc10 the flag is refused.)
 
-**Pinned to maxplayer 0.6.1-rc9** — this repository's version. Run `maxplayer --version`
+**Pinned to maxplayer 0.6.1-rc10** — this repository's version. Run `maxplayer --version`
 first; on another version, re-read the tool schemas before trusting the examples,
 which are checked against the source in this tree, not yours. Verification status
 for every claim, including what is UNPROVEN:
