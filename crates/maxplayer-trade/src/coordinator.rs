@@ -237,7 +237,9 @@ pub async fn list(
     let lot = parse_lot(&event, now())?;
     check_nostr_timing(&lot)?;
     preflight(&lot).await?;
-    let plan = mint::plan(home, &lot.give.asset.mint_url, lot.give.net, max_fees).await?;
+    let mint_url = &lot.give.asset.mint_url;
+    let exclude = crate::send::journaled_inputs(j, mint_url).await?;
+    let plan = mint::plan_excluding(home, mint_url, lot.give.net, max_fees, &exclude).await?;
     let initial = status_event(&m.keys, event.id, 1, event.id, Status::Available)?;
     let id = event.id.to_hex();
     let mut row = Listing {
@@ -324,7 +326,9 @@ pub async fn start_take(
     ensure!(l.give.net >= min_receive, "minimum receive cap");
     check_nostr_timing(&l)?;
     preflight(&l).await?;
-    let plan = mint::plan(home, &l.want.asset.mint_url, l.want.net, max_fees).await?;
+    let mint_url = &l.want.asset.mint_url;
+    let exclude = crate::send::journaled_inputs(j, mint_url).await?;
+    let plan = mint::plan_excluding(home, mint_url, l.want.net, max_fees, &exclude).await?;
     ensure!(plan.debit <= max_give, "maximum give cap");
     let key = secret();
     let pre = secret();
@@ -499,53 +503,60 @@ async fn replay_retained(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     let mut rows = j.all::<Retained>("inbox_retry").await?;
     rows.sort_by_key(|r| r.since);
     for r in rows {
-        let id = r.event.id.to_hex();
-        let s = j.get::<Swap>("swap", &r.swap_id).await?;
-        let live = s.as_ref().is_some_and(|s| {
-            !terminal(s)
-                && awaiting(&r.step, &s.role) == Some(s.state.as_str())
-                && now() < retry_until(s, &r.step)
-        });
-        if !live {
-            j.remove("inbox_retry", &id).await?;
-            continue;
-        }
-        let budget = s
-            .as_ref()
-            .map_or(std::time::Duration::from_secs(120), item_budget);
-        match tokio::time::timeout(budget, Box::pin(handle(home, j, m, &r.event))).await {
-            Ok(Ok(())) => {
-                j.remove("inbox_retry", &id).await?;
-                eprintln!("swap {}: retained {} message handled", r.swap_id, r.step);
-            }
-            Ok(Err(e))
-                if crate::backoff::unanswered(&e)
-                    && j.get::<Swap>("swap", &r.swap_id)
-                        .await?
-                        .is_some_and(|s| awaiting(&r.step, &s.role) == Some(s.state.as_str())) =>
-            {
-                pending = true;
-                eprintln!(
-                    "swap {}: retained {} message still waits for its mint: {e}",
-                    r.swap_id, r.step
-                );
-            }
-            Ok(Err(e)) => {
-                // A refusal, or the message was handled and a later step of the advance failed
-                // (that step is retried by the swap's own recovery).
-                j.remove("inbox_retry", &id).await?;
-                eprintln!("swap {}: retained {} message done: {e}", r.swap_id, r.step);
-            }
-            Err(_) => {
-                pending = true;
-                eprintln!(
-                    "swap {}: retained {} message timed out; kept",
-                    r.swap_id, r.step
-                );
-            }
-        }
+        pending |= replay_one(home, j, m, r).await?;
     }
     Ok(pending)
+}
+/// One retained message, one bounded attempt ([`replay_retained`]). Returns whether it is
+/// still retained. serve runs each as its own unit, keyed by its swap.
+async fn replay_one(home: &Path, j: &Journal, m: &Market, r: Retained) -> Result<bool> {
+    let mut return_pending = false;
+    let id = r.event.id.to_hex();
+    let s = j.get::<Swap>("swap", &r.swap_id).await?;
+    let live = s.as_ref().is_some_and(|s| {
+        !terminal(s)
+            && awaiting(&r.step, &s.role) == Some(s.state.as_str())
+            && now() < retry_until(s, &r.step)
+    });
+    if !live {
+        j.remove("inbox_retry", &id).await?;
+        return Ok(false);
+    }
+    let budget = s
+        .as_ref()
+        .map_or(std::time::Duration::from_secs(120), item_budget);
+    match tokio::time::timeout(budget, Box::pin(handle(home, j, m, &r.event))).await {
+        Ok(Ok(())) => {
+            j.remove("inbox_retry", &id).await?;
+            eprintln!("swap {}: retained {} message handled", r.swap_id, r.step);
+        }
+        Ok(Err(e))
+            if crate::backoff::unanswered(&e)
+                && j.get::<Swap>("swap", &r.swap_id)
+                    .await?
+                    .is_some_and(|s| awaiting(&r.step, &s.role) == Some(s.state.as_str())) =>
+        {
+            return_pending = true;
+            eprintln!(
+                "swap {}: retained {} message still waits for its mint: {e}",
+                r.swap_id, r.step
+            );
+        }
+        Ok(Err(e)) => {
+            // A refusal, or the message was handled and a later step of the advance failed
+            // (that step is retried by the swap's own recovery).
+            j.remove("inbox_retry", &id).await?;
+            eprintln!("swap {}: retained {} message done: {e}", r.swap_id, r.step);
+        }
+        Err(_) => {
+            return_pending = true;
+            eprintln!(
+                "swap {}: retained {} message timed out; kept",
+                r.swap_id, r.step
+            );
+        }
+    }
+    Ok(return_pending)
 }
 async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<()> {
     let msg = m.decode(e)?;
@@ -1161,6 +1172,7 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     // Swaps first: their claims and refunds have hard deadlines, while wallet money recovery
     // (funding, withdraw, receive, send) has none and can spend a whole item budget on one slow
     // mint. Each item is independent and journal-first, so this order only decides which waits.
+    // serve does not run this pass: it runs the same items as independent units (`sched`).
     match replay_retained(home, j, m).await {
         Ok(pending) => deferred |= pending,
         Err(error) => {
@@ -1170,216 +1182,453 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     }
     let mut swaps = j.all::<Swap>("swap").await?;
     crate::backoff::order(&mut swaps, |s| &s.id);
-    for mut s in swaps {
-        // Pacing: a live swap whose mints are at their request budget waits (recover) or is
-        // left for a later tick (serve). An item whose claim is possible is never paced.
-        if !terminal(&s)
-            && s.quote.is_some()
-            && !crate::backoff::ready(&s.id, &swap_mints(&s), claim_possible(&s)).await
-        {
-            deferred = true;
-            continue;
-        }
-        let budget = item_budget(&s);
-        let item = async {
-            if s.state == "requested" && now() > s.created + QUOTE_SECONDS {
-                mint::release(home, &s.plan, &s.id).await?;
-                s.state = "expired".into();
-                save(j, &s).await?;
-                return Ok::<(), anyhow::Error>(());
-            }
-
-            if terminal(&s) {
-                if s.role == "maker" && ["complete", "refunded"].contains(&s.state.as_str()) {
-                    let mut l: Listing = j
-                        .get("listing", &s.lot.id.to_hex())
-                        .await?
-                        .context("missing maker listing")?;
-                    let publication = finish_listing(
-                        j,
-                        m,
-                        &mut l,
-                        if s.state == "complete" {
-                            Status::Sold
-                        } else {
-                            Status::Cancelled
-                        },
-                    )
-                    .await;
-                    if let Err(error) = publication {
-                        deferred |= !error.is::<crate::market::PublicationAbandoned>();
-                        eprintln!("terminal listing publication: {error}");
-                    }
-                }
-                return Ok::<(), anyhow::Error>(());
-            }
-            if ["quoted", "accepted", "first_validated"].contains(&s.state.as_str())
-                && s.quote.as_ref().is_some_and(|q| now() >= q.exp)
-                && j.get::<mint::Attempt>("attempt", &format!("{}-lock", s.id))
-                    .await?
-                    .is_none()
-            {
-                if s.role == "taker" {
-                    mint::release(home, &s.plan, &s.id).await?;
-                }
-                s.state = "expired".into();
-                save(j, &s).await?;
-                if s.role == "maker" {
-                    let mut l: Listing = j
-                        .get("listing", &s.lot.id.to_hex())
-                        .await?
-                        .context("missing maker listing")?;
-                    l.active = None;
-                    if l.cancelled {
-                        mint::release(home, &l.plan, &l.reservation).await?;
-                    }
-                    j.put("listing", &s.lot.id.to_hex(), &l).await?;
-                }
-                return Ok::<(), anyhow::Error>(());
-            }
-            if s.role == "taker" && s.state == "requested" {
-                mint::reserve(home, &s.plan, &s.id).await?;
-                let _ = send(m, j, &s, "request", serde_json::to_value(&s.request)?).await;
-            }
-            if s.role == "maker" && s.state == "quoted" {
-                let _ = send(m, j, &s, "quote", serde_json::to_value(&s.quote)?).await;
-            }
-            advance(home, j, m, &mut s).await
-        };
-        let item = tokio::time::timeout(budget, item).await;
-        if !matches!(item, Ok(Ok(()))) {
-            deferred = true;
-            eprintln!(
-                "swap {}: recovery deferred ({}); journal retained",
-                s.id,
-                crate::deferral_reason(&item, budget.as_secs())
-            );
-        }
+    for s in swaps {
+        deferred |= recover_swap(home, j, m, s).await?;
     }
-    match crate::money::recover(home, j).await {
-        Ok(pending) => deferred |= pending,
-        Err(error) => {
-            deferred = true;
-            eprintln!(
-                "money recovery deferred; journal retained: {}",
-                crate::redact_reason(&format!("{error:#}"))
-            );
-        }
-    }
+    deferred |= recover_money(home, j, None).await;
     let swaps = j.all::<Swap>("swap").await?;
-    for mut l in j.all::<Listing>("listing").await? {
-        let publication: Result<()> = async {
-            if l.active
-                .as_ref()
-                .is_some_and(|id| swaps.iter().any(|s| &s.id == id && s.state == "expired"))
-            {
-                l.active = None;
-                if l.cancelled {
-                    mint::release(home, &l.plan, &l.reservation).await?;
-                }
-                j.put("listing", &l.event.id.to_hex(), &l).await?;
-            }
-            if l.cancelled && lifecycle(&l.event, &l.statuses)? == Status::Available {
-                if l.active.is_none() {
-                    mint::release(home, &l.plan, &l.reservation).await?;
-                }
-                finish_listing(j, m, &mut l, Status::Cancelled).await?;
-            }
-            if let Some(s) = swaps
-                .iter()
-                .find(|s| s.role == "maker" && s.lot.id == l.event.id && !terminal(s))
-            {
-                l.active = Some(s.id.clone());
-                j.put("listing", &l.event.id.to_hex(), &l).await?;
-            }
-            if l.active.is_none()
-                && !l.cancelled
-                && lifecycle(&l.event, &l.statuses)? == Status::Available
-            {
-                mint::reserve(home, &l.plan, &l.reservation).await?;
-                if l.published == 0 {
-                    m.publish_durable(j, &l.event).await?;
-                    m.publish_durable(j, &l.statuses[0]).await?;
-                    l.published = 1;
-                    j.put("listing", &l.event.id.to_hex(), &l).await?;
-                }
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(error) = publication {
-            deferred |= !error.is::<crate::market::PublicationAbandoned>();
-            eprintln!("listing recovery: {error}");
-        }
+    for l in j.all::<Listing>("listing").await? {
+        deferred |= recover_listing(home, j, m, l, &swaps).await;
     }
     if m.retry_publications(j).await.is_err() {
         deferred = true;
     }
     Ok(deferred)
 }
+/// Wallet recovery (funding, withdrawal, receive, send) for one mint, or every mint (`None`).
+/// Returns whether anything is deferred.
+async fn recover_money(home: &Path, j: &Journal, mint: Option<&str>) -> bool {
+    match crate::money::recover_for(home, j, mint).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            eprintln!(
+                "money recovery deferred; journal retained: {}",
+                crate::redact_reason(&format!("{error:#}"))
+            );
+            true
+        }
+    }
+}
+/// One swap's recovery item, bounded by its item budget. Returns whether it is deferred.
+async fn recover_swap(home: &Path, j: &Journal, m: &Market, mut s: Swap) -> Result<bool> {
+    let mut deferred = false;
+    // Pacing: a live swap whose mints are at their request budget waits (recover) or is
+    // left for a later tick (serve). An item whose claim is possible is never paced.
+    if !terminal(&s)
+        && s.quote.is_some()
+        && !crate::backoff::ready(&s.id, &swap_mints(&s), claim_possible(&s)).await
+    {
+        return Ok(true);
+    }
+    let budget = item_budget(&s);
+    let item = async {
+        if s.state == "requested" && now() > s.created + QUOTE_SECONDS {
+            mint::release(home, &s.plan, &s.id).await?;
+            s.state = "expired".into();
+            save(j, &s).await?;
+            return Ok::<(), anyhow::Error>(());
+        }
+
+        if terminal(&s) {
+            if s.role == "maker" && ["complete", "refunded"].contains(&s.state.as_str()) {
+                let mut l: Listing = j
+                    .get("listing", &s.lot.id.to_hex())
+                    .await?
+                    .context("missing maker listing")?;
+                let publication = finish_listing(
+                    j,
+                    m,
+                    &mut l,
+                    if s.state == "complete" {
+                        Status::Sold
+                    } else {
+                        Status::Cancelled
+                    },
+                )
+                .await;
+                if let Err(error) = publication {
+                    deferred |= !error.is::<crate::market::PublicationAbandoned>();
+                    eprintln!("terminal listing publication: {error}");
+                }
+            }
+            return Ok::<(), anyhow::Error>(());
+        }
+        if ["quoted", "accepted", "first_validated"].contains(&s.state.as_str())
+            && s.quote.as_ref().is_some_and(|q| now() >= q.exp)
+            && j.get::<mint::Attempt>("attempt", &format!("{}-lock", s.id))
+                .await?
+                .is_none()
+        {
+            if s.role == "taker" {
+                mint::release(home, &s.plan, &s.id).await?;
+            }
+            s.state = "expired".into();
+            save(j, &s).await?;
+            if s.role == "maker" {
+                let mut l: Listing = j
+                    .get("listing", &s.lot.id.to_hex())
+                    .await?
+                    .context("missing maker listing")?;
+                l.active = None;
+                if l.cancelled {
+                    mint::release(home, &l.plan, &l.reservation).await?;
+                }
+                j.put("listing", &s.lot.id.to_hex(), &l).await?;
+            }
+            return Ok::<(), anyhow::Error>(());
+        }
+        if s.role == "taker" && s.state == "requested" {
+            mint::reserve(home, &s.plan, &s.id).await?;
+            let _ = send(m, j, &s, "request", serde_json::to_value(&s.request)?).await;
+        }
+        if s.role == "maker" && s.state == "quoted" {
+            let _ = send(m, j, &s, "quote", serde_json::to_value(&s.quote)?).await;
+        }
+        advance(home, j, m, &mut s).await
+    };
+    let item = tokio::time::timeout(budget, item).await;
+    if !matches!(item, Ok(Ok(()))) {
+        deferred = true;
+        eprintln!(
+            "swap {}: recovery deferred ({}); journal retained",
+            s.id,
+            crate::deferral_reason(&item, budget.as_secs())
+        );
+    }
+    Ok(deferred)
+}
+/// One listing's recovery (active index, cancellation, reservation, publication). Returns
+/// whether it is deferred. `swaps`: the swap rows read before it.
+async fn recover_listing(
+    home: &Path,
+    j: &Journal,
+    m: &Market,
+    mut l: Listing,
+    swaps: &[Swap],
+) -> bool {
+    let mut deferred = false;
+    let publication: Result<()> = async {
+        if l.active
+            .as_ref()
+            .is_some_and(|id| swaps.iter().any(|s| &s.id == id && s.state == "expired"))
+        {
+            l.active = None;
+            if l.cancelled {
+                mint::release(home, &l.plan, &l.reservation).await?;
+            }
+            j.put("listing", &l.event.id.to_hex(), &l).await?;
+        }
+        if l.cancelled && lifecycle(&l.event, &l.statuses)? == Status::Available {
+            if l.active.is_none() {
+                mint::release(home, &l.plan, &l.reservation).await?;
+            }
+            finish_listing(j, m, &mut l, Status::Cancelled).await?;
+        }
+        if let Some(s) = swaps
+            .iter()
+            .find(|s| s.role == "maker" && s.lot.id == l.event.id && !terminal(s))
+        {
+            l.active = Some(s.id.clone());
+            j.put("listing", &l.event.id.to_hex(), &l).await?;
+        }
+        if l.active.is_none()
+            && !l.cancelled
+            && lifecycle(&l.event, &l.statuses)? == Status::Available
+        {
+            mint::reserve(home, &l.plan, &l.reservation).await?;
+            if l.published == 0 {
+                m.publish_durable(j, &l.event).await?;
+                m.publish_durable(j, &l.statuses[0]).await?;
+                l.published = 1;
+                j.put("listing", &l.event.id.to_hex(), &l).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = publication {
+        deferred |= !error.is::<crate::market::PublicationAbandoned>();
+        eprintln!("listing recovery: {error}");
+    }
+    deferred
+}
 pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) -> Result<()> {
     run_with(home, j, m, until, None).await
 }
-/// [`run`], also executing requests handed to `serve` over its local socket. Every request
-/// runs here, in this one loop, between inbox messages and recovery ticks: serve stays the
-/// single writer and each request keeps journal-before-effect ordering.
+/// [`run`], also executing requests handed to `serve` over its local socket.
+///
+/// Every message, request and recovery item is a unit of [`crate::sched`]: it names the journal
+/// rows it may write as keys, units sharing a key run one at a time in arrival order, and units
+/// on different keys are polled concurrently inside this one task. So serve stays the single
+/// writer of every row, each unit keeps its own journal-before-effect order, budget and deadline
+/// checks (it is the same code as before), and a slow mint only delays the units that use it:
+/// another swap's claim or refund never waits for a stuck receive, wallet item or other swap.
 pub async fn run_with(
     home: &Path,
     j: &Journal,
     m: &mut Market,
     until: Option<&str>,
+    jobs: Option<tokio::sync::mpsc::Receiver<crate::serve::Job>>,
+) -> Result<()> {
+    // Units borrow the market shared; only this loop reads its inbox.
+    let mut inbox = std::mem::replace(&mut m.inbox, tokio::sync::mpsc::unbounded_channel().1);
+    let result = run_units(home, j, m, &mut inbox, until, jobs).await;
+    m.inbox = inbox;
+    result
+}
+
+/// One scheduled unit of serve's work (see [`crate::sched`] for the keys).
+enum Unit {
+    Message(Box<Event>),
+    Job(crate::serve::Job),
+    Retained(Box<Retained>),
+    Swap(String),
+    Listing(String),
+    Money(String),
+    Publications,
+}
+/// The work key of a swap: its lot for a maker (the listing row and every maker swap on it), or
+/// the single `taker` key (a home has at most one open taker swap).
+fn swap_key(s: &Swap) -> String {
+    if s.role == "maker" {
+        format!("lot:{}", s.lot.id.to_hex())
+    } else {
+        "taker".into()
+    }
+}
+/// Keys of an inbound message: a quote request may create a maker swap and update its listing
+/// (`admit` + its lot); any other step writes only its swap. An undecodable message writes
+/// nothing (`handle` refuses it first).
+async fn message_keys(j: &Journal, m: &Market, e: &Event) -> Vec<String> {
+    let Ok(msg) = m.decode(e) else {
+        return vec![];
+    };
+    if msg.step == "request" {
+        return vec!["admit".into(), format!("lot:{}", msg.lot_id)];
+    }
+    match j.get::<Swap>("swap", &msg.swap_id).await {
+        Ok(Some(s)) => vec![swap_key(&s)],
+        _ => vec![format!("lot:{}", msg.lot_id)],
+    }
+}
+fn start_unit<'a>(
+    home: &'a Path,
+    j: &'a Journal,
+    m: &'a Market,
+    unit: Unit,
+) -> crate::sched::UnitFuture<'a> {
+    Box::pin(async move {
+        match unit {
+            Unit::Message(e) => {
+                let e = *e;
+                let budget = message_budget(j, m, &e).await;
+                match tokio::time::timeout(budget, Box::pin(handle(home, j, m, &e))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) if retained(j, &e).await => eprintln!(
+                        "trade message waits for its mint (no answer); retained, retried on the recovery tick: {err}"
+                    ),
+                    Ok(Err(err)) => eprintln!("trade message rejected: {err}"),
+                    Err(_) => match retain_timed_out(j, m, &e).await {
+                        Ok(true) => eprintln!(
+                            "trade message timed out; retained, retried on the recovery tick"
+                        ),
+                        _ => eprintln!("trade message timed out; dropped; journal retained"),
+                    },
+                }
+            }
+            Unit::Job(job) => crate::serve::execute(home, j, m, job).await,
+            Unit::Retained(r) => {
+                replay_one(home, j, m, *r).await?;
+            }
+            Unit::Swap(id) => {
+                // Read when the unit starts: an earlier unit on this key may have advanced it.
+                if let Some(s) = j.get::<Swap>("swap", &id).await? {
+                    recover_swap(home, j, m, s).await?;
+                }
+            }
+            Unit::Listing(id) => {
+                if let Some(l) = j.get::<Listing>("listing", &id).await? {
+                    let swaps = j.all::<Swap>("swap").await?;
+                    recover_listing(home, j, m, l, &swaps).await;
+                }
+            }
+            Unit::Money(mint) => {
+                recover_money(home, j, Some(&mint)).await;
+            }
+            Unit::Publications => {
+                let _ = m.retry_publications(j).await;
+            }
+        }
+        Ok(())
+    })
+}
+/// Queue the recovery pass as units: retained messages, live swaps (and terminal maker swaps
+/// whose listing may still need its final status), each mint's wallet work, listings and the
+/// publication retry. Already queued or running units are not doubled.
+async fn enqueue_recovery(
+    j: &Journal,
+    sched: &mut crate::sched::Scheduler<'_, Unit>,
+) -> Result<()> {
+    let mut rows = j.all::<Retained>("inbox_retry").await?;
+    rows.sort_by_key(|r| r.since);
+    for r in rows {
+        let keys = match j.get::<Swap>("swap", &r.swap_id).await? {
+            Some(s) => vec![swap_key(&s)],
+            None => vec![],
+        };
+        let _ = sched.push(
+            format!("retained:{}", r.event.id.to_hex()),
+            keys,
+            Unit::Retained(Box::new(r)),
+        );
+    }
+    let mut swaps = j.all::<Swap>("swap").await?;
+    crate::backoff::order(&mut swaps, |s| &s.id);
+    for s in swaps {
+        let listing_due = s.role == "maker" && ["complete", "refunded"].contains(&s.state.as_str());
+        if terminal(&s) && !listing_due {
+            continue;
+        }
+        let _ = sched.push(
+            format!("swap:{}", s.id),
+            vec![swap_key(&s)],
+            Unit::Swap(s.id),
+        );
+    }
+    for mint in crate::money::recovery_mints(j).await? {
+        let _ = sched.push(
+            format!("money:{mint}"),
+            vec![format!("wallet:{mint}")],
+            Unit::Money(mint),
+        );
+    }
+    for l in j.all::<Listing>("listing").await? {
+        let id = l.event.id.to_hex();
+        let keys = vec!["listings".to_string(), format!("lot:{id}")];
+        // Bookkeeping only: never queued behind (and so never ahead of) a busy lot or `list`.
+        if sched.free(&keys) {
+            let _ = sched.push(format!("listing:{id}"), keys, Unit::Listing(id));
+        }
+    }
+    let _ = sched.push(
+        "publications".into(),
+        vec!["publications".into()],
+        Unit::Publications,
+    );
+    Ok(())
+}
+fn report(id: &str, result: Result<()>) {
+    if let Err(error) = result {
+        eprintln!(
+            "{} {id}: deferred; journal retained: {}",
+            crate::clock::iso(crate::clock::now()),
+            crate::redact_reason(&format!("{error:#}"))
+        );
+    }
+}
+enum Next {
+    Stop,
+    Done(String, Result<()>),
+    Message(Option<Event>),
+    Job(crate::serve::Job),
+    Tick,
+}
+async fn run_units(
+    home: &Path,
+    j: &Journal,
+    m: &Market,
+    inbox: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    until: Option<&str>,
     mut jobs: Option<tokio::sync::mpsc::Receiver<crate::serve::Job>>,
 ) -> Result<()> {
+    let mut sched: crate::sched::Scheduler<'_, Unit> = crate::sched::Scheduler::default();
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut warned = crate::observe::Warned::default();
     let mut inbox_open = true;
+    let mut job_seq: u64 = 0;
+    // Startup recovery comes first in every key's line: before any message or request.
+    enqueue_recovery(j, &mut sched).await?;
     loop {
-        // A stop request (serve: SIGTERM/SIGINT) admits nothing new: checked before every
-        // select, and it wakes the wait below. A step already running finishes within the
-        // grace (`shutdown::bounded`). The order among messages, requests and ticks is unchanged.
+        // A stop request (serve: SIGTERM/SIGINT) admits nothing new: queued requests are refused
+        // as not started, queued units are dropped (nothing of theirs ran), and units already
+        // running finish within the grace (`shutdown::bounded`), or are dropped at their next
+        // wait when the stop is forced; every money step is journaled first, so that is safe.
         if let Some(stop) = crate::shutdown::stop() {
+            const WHY: &str = "serve is stopping; request not started, nothing was applied";
             if let Some(rx) = jobs.as_mut() {
                 rx.close();
                 while let Ok(job) = rx.try_recv() {
-                    crate::serve::refuse(
-                        job,
-                        "serve is stopping; request not started, nothing was applied",
-                    );
+                    crate::serve::refuse(job, WHY);
                 }
             }
+            for unit in sched.drain_queued() {
+                if let Unit::Job(job) = unit {
+                    crate::serve::refuse(job, WHY);
+                }
+            }
+            crate::shutdown::bounded(async {
+                while sched.running() > 0 {
+                    let (id, r) = sched.next().await;
+                    report(&id, r);
+                }
+                Ok(())
+            })
+            .await?;
             return Err(stop.into());
         }
-        tokio::select! {
-        _ = crate::shutdown::requested() => continue,
-        e = async { if inbox_open { m.inbox.recv().await } else { std::future::pending().await } } => {
-            let Some(e) = e else {
+        sched.start_ready(|unit| start_unit(home, j, m, unit));
+        let next = tokio::select! {
+            _ = crate::shutdown::requested() => Next::Stop,
+            (id, r) = sched.next() => Next::Done(id, r),
+            e = async { if inbox_open { inbox.recv().await } else { std::future::pending().await } } => Next::Message(e),
+            Some(job) = async { match jobs.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => Next::Job(job),
+            _ = tick.tick() => Next::Tick,
+        };
+        match next {
+            Next::Stop => continue,
+            Next::Done(id, r) => report(&id, r),
+            Next::Message(None) => {
                 // Every relay client stopped: no trade message can arrive. serve reports it and
                 // exits (journal retained); a take keeps recovering on its ticks.
                 if until.is_none() {
                     return Err(crate::shutdown::InboxClosed.into());
                 }
-                eprintln!("{} trade inbox closed; continuing with recovery ticks only", crate::clock::iso(crate::clock::now()));
+                eprintln!(
+                    "{} trade inbox closed; continuing with recovery ticks only",
+                    crate::clock::iso(crate::clock::now())
+                );
                 inbox_open = false;
-                continue;
-            };
-            match crate::shutdown::bounded(async { Ok(tokio::time::timeout(message_budget(j,m,&e).await, handle(home,j,m,&e)).await) }).await? {
-            Ok(Ok(())) => {},
-            Ok(Err(err)) if retained(j, &e).await => eprintln!("trade message waits for its mint (no answer); retained, retried on the recovery tick: {err}"),
-            Ok(Err(err)) => eprintln!("trade message rejected: {err}"),
-            Err(_) => match retain_timed_out(j, m, &e).await {
-                Ok(true) => eprintln!("trade message timed out; retained, retried on the recovery tick"),
-                _ => eprintln!("trade message timed out; dropped; journal retained"),
             }
-        }},
-        Some(job) = async { match jobs.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => crate::shutdown::bounded(async { crate::serve::execute(home, j, m, job).await; Ok(()) }).await?,
-        _=tick.tick()=>{
-            crate::shutdown::bounded(recover(home,j,m)).await?;
-            // Display only: derived from the journal, never fed back into the state machine.
-            let now = now();
-            for u in warned.due(&crate::observe::unresponsive(home, now).unwrap_or_default()) {
-                eprintln!("{}", u.json(now));
+            Next::Message(Some(e)) => {
+                let keys = message_keys(j, m, &e).await;
+                // A relay duplicate of a message already queued or running is not doubled.
+                let _ = sched.push(
+                    format!("message:{}", e.id.to_hex()),
+                    keys,
+                    Unit::Message(Box::new(e)),
+                );
             }
-        }}
+            Next::Job(job) => {
+                job_seq += 1;
+                let keys = job.command.keys();
+                if let Err(Unit::Job(job)) =
+                    sched.push(format!("request:{job_seq}"), keys, Unit::Job(job))
+                {
+                    crate::serve::refuse(job, "serve request id collision; nothing was applied");
+                }
+            }
+            Next::Tick => {
+                if let Err(error) = enqueue_recovery(j, &mut sched).await {
+                    eprintln!("recovery scan deferred: {error}");
+                }
+                // Display only: derived from the journal, never fed back into the state machine.
+                let now = now();
+                for u in warned.due(&crate::observe::unresponsive(home, now).unwrap_or_default()) {
+                    eprintln!("{}", u.json(now));
+                }
+            }
+        }
         if let Some(id) = until {
             if let Some(s) = j.get::<Swap>("swap", id).await? {
                 if terminal(&s) {
@@ -1533,9 +1782,10 @@ fn canonical_key(key: &str) -> Result<()> {
 /// `short - cutoff`; the maker claims until `long`. [`nostr_timing_fits`] checks at list/take that
 /// both claim chains fit their windows with every call at its bound.
 ///
-/// Serve runs messages and recovery items one at a time, so on a slow relay one swap can hold
-/// the loop for up to 1040 s. That delays other swaps (liveness); their deadlines stay
-/// mint-enforced, so a late claim is never sent, and the trade refunds.
+/// serve runs messages and recovery items as keyed units ([`crate::sched`]): a slow swap holds only
+/// its own lot (or the taker key) for up to 1040 s, never another swap's claim or refund. A one-shot
+/// `recover` pass still visits items one at a time. Deadlines stay mint-enforced either way, so a
+/// late claim is never sent, and the trade refunds.
 const ADVANCE_BUDGET_SECONDS: u64 = 100;
 /// HTTP cap on own-mint refund work inside that deadline; the claim gets the remainder.
 const REFUND_BUDGET_SECONDS: u64 = 50;

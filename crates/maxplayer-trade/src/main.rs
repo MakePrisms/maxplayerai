@@ -394,8 +394,9 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         let keys = maxplayer_trade::wallet::identity(home)?;
         let j = Journal::open(home).await?;
         let mut m = Market::connect(keys, &relays).await?;
-        if !matches!(cli.command, Command::Recover) {
-            // serve: a stop signal lets this pass finish within the grace (shutdown module).
+        // serve starts the same recovery as its first scheduled units (`sched`), before any
+        // message or request it admits, so one slow mint never holds the start either.
+        if !matches!(cli.command, Command::Recover | Command::Serve) {
             maxplayer_trade::shutdown::bounded(coordinator::recover(home, &j, &m)).await?;
         }
         return match cli.command {

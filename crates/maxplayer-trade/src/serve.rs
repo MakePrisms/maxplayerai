@@ -81,6 +81,22 @@ impl Command {
             Command::Receive { .. } => "receive",
         }
     }
+    /// The serve work keys this request may write (see `sched`): proof selection and new
+    /// swaps/listings take `admit`; a take also every taker swap; a cancel its lot; a receive
+    /// only its mint's wallet journal.
+    pub fn keys(&self) -> Vec<String> {
+        match self {
+            Command::List { .. } => vec!["admit".into()],
+            Command::Take { .. } => vec!["admit".into(), "taker".into()],
+            Command::Cancel { lot } => vec!["admit".into(), format!("lot:{lot}")],
+            Command::Receive { mint, .. } => vec![format!(
+                "wallet:{}",
+                Asset::from_cli(mint)
+                    .map(|a| a.mint_url)
+                    .unwrap_or_else(|_| mint.clone())
+            )],
+        }
+    }
     /// Which of the client's relay sets this command depends on, so serve can refuse a request
     /// it would otherwise run on different relays: `(market, mint)`. Market relays: list, take
     /// and cancel publish or read lots; a receive never touches the market. Mint relays: any

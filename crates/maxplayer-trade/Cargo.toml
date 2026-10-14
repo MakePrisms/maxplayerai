@@ -31,6 +31,8 @@ rusqlite = "=0.31.0"
 url = "2"
 # Retry-After as an HTTP-date (already in the lock through hyper/reqwest).
 httpdate = "1"
+# serve's keyed work units (`sched`): already in the lock through reqwest/hyper.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 uuid = { version = "1", features = ["v4", "serde"] }
 bitcoin = "0.32"

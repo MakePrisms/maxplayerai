@@ -519,7 +519,7 @@ pub async fn send(
 
 /// Ys named by unfinished journaled intents on `mint`: sends, withdrawals, listings
 /// (not cancelled) and coordinator swaps. Coin selection never takes them.
-async fn journaled_inputs(j: &Journal, mint: &str) -> Result<HashSet<PublicKey>> {
+pub(crate) async fn journaled_inputs(j: &Journal, mint: &str) -> Result<HashSet<PublicKey>> {
     let mut ys = HashSet::new();
     for r in j.all::<SendAttempt>("send").await? {
         if r.mint == mint && !r.terminal() {
@@ -1111,8 +1111,15 @@ async fn release_quietly(home: &Path, j: &Journal, r: &mut SendAttempt) {
 
 /// One bounded pass over unfinished sends and reclaims. True when any remain unresolved.
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
+    recover_for(home, j, None).await
+}
+/// [`recover`] limited to one mint's attempts (`None`: all).
+pub async fn recover_for(home: &Path, j: &Journal, mint: Option<&str>) -> Result<bool> {
     let mut failed = false;
     for mut r in j.all::<SendAttempt>("send").await? {
+        if mint.is_some_and(|m| m != r.mint) {
+            continue;
+        }
         if r.terminal() {
             // Idempotent: a crash between journaling the state and the release.
             if let Err(error) = release(home, j, &mut r).await {
