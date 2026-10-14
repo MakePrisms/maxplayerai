@@ -1141,16 +1141,10 @@ pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
     recover_pass(home, j, m).await.map(|_| ())
 }
 async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
-    let mut deferred = match crate::money::recover(home, j).await {
-        Ok(pending) => pending,
-        Err(error) => {
-            eprintln!(
-                "money recovery deferred; journal retained: {}",
-                crate::redact_reason(&format!("{error:#}"))
-            );
-            true
-        }
-    };
+    let mut deferred = false;
+    // Swaps first: their claims and refunds have hard deadlines, while wallet money recovery
+    // (funding, withdraw, receive, send) has none and can spend a whole item budget on one slow
+    // mint. Each item is independent and journal-first, so this order only decides which waits.
     match replay_retained(home, j, m).await {
         Ok(pending) => deferred |= pending,
         Err(error) => {
@@ -1243,6 +1237,16 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
                 "swap {}: recovery deferred ({}); journal retained",
                 s.id,
                 crate::deferral_reason(&item, budget.as_secs())
+            );
+        }
+    }
+    match crate::money::recover(home, j).await {
+        Ok(pending) => deferred |= pending,
+        Err(error) => {
+            deferred = true;
+            eprintln!(
+                "money recovery deferred; journal retained: {}",
+                crate::redact_reason(&format!("{error:#}"))
             );
         }
     }

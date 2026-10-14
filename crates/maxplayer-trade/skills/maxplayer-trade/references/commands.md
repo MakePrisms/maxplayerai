@@ -144,14 +144,16 @@ can change in between; the real command enforces your bounds again.
 
 ## Hand-off to a running serve
 
-While `serve` owns the home, `list`, `take` and `cancel` hand their request to it
+While `serve` owns the home, `list`, `take`, `cancel` and `receive` hand their request to it
 over `<home>/serve.sock` (mode 0600, same user only) and print serve's result with
 the usual output and exit codes. serve executes it with exactly the bounds given;
 it never fills in defaults. Use the same `--relay` set as serve or the request is
 refused. A handed-off `take` prints its swap id and that serve is watching it, then
 streams states until settlement; if the command is interrupted, serve keeps driving
 the swap (check `status`). Without a running serve these commands behave as before.
-`recover` and the money commands still need the home lock; stop serve first.
+A handed-off `receive` is described under [Receive](#receive-through-a-running-serve).
+`recover`, `fund`, `withdraw` and `send` still need the home lock (`home is already in
+use` while serve runs); stop serve first.
 `cancel` first recovers existing authorizations when it runs without serve.
 `serve` continuously accepts trades and recovers obligations; keep it running while
 locks are live. `recover` is a bounded single pass, not a replacement watcher;
@@ -215,6 +217,25 @@ fees charged by another wallet. Never assume a real invoice is auto-paid because
 a test mint behaved that way. Reuse the retained quote for the same mint/amount.
 
 ## Receive
+
+### Receive through a running serve
+
+While `serve` runs, `receive <mint> --token-file <path>` (or stdin) reads the token
+(at most 1 MiB; larger input is refused with `token missing or oversized` before serve is
+contacted) and passes it to serve over `<home>/serve.sock` only. serve runs the same
+receive below, as the only writer, between trade messages; listings and swaps keep
+running. serve's log names the request kind, mint and public attempt id, never the token;
+refusals are redacted. Output is the same JSON summary and exit code as a local receive,
+plus one stderr line `{"receive":<id>,"outcome":...}`: `credited` (this request credited
+it), `already_received` (an earlier request did; nothing new), `in_doubt` (exit 3: journaled,
+not settled yet; serve keeps recovering it) or `not_credited`. If the reply is lost
+(client killed, serve stopped), the client exits 3 naming the attempt id. Re-run the
+**same** receive or check `status`: the same token always resumes the same attempt and
+never credits twice, also after a serve restart. One receive holds serve's loop at most
+120 s; an unfinished, journaled attempt is then reported `in_doubt` and finished by
+serve's recovery.
+
+### Receive without serve
 
 `receive <mint> --token-file <path>` (or the token on stdin; never argv) imports one
 Cashu token. Refused **before anything is journaled**: a token whose mint is not

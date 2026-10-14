@@ -249,7 +249,11 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     if let Some(mut r) = existing {
         // `refused` is terminal, so `resume` below only no-ops: a refusal is final.
         if let Err(error) = resume(home, j, &mut r).await {
-            eprintln!("receive {}: {error:#}; attempt retained", r.id);
+            eprintln!(
+                "receive {}: {}; attempt retained",
+                r.id,
+                crate::redact_reason(&format!("{error:#}"))
+            );
         }
         return Ok(r);
     }
@@ -350,9 +354,35 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     };
     j.put("receive", &r.id, &r).await?;
     if let Err(error) = resume(home, j, &mut r).await {
-        eprintln!("receive {}: {error:#}; attempt retained", r.id);
+        eprintln!(
+            "receive {}: {}; attempt retained",
+            r.id,
+            crate::redact_reason(&format!("{error:#}"))
+        );
     }
     Ok(r)
+}
+
+/// The CLI result for a returned receive record (exit 0, 1, 3 or 4), shared by `receive` and a
+/// receive handed to `serve` so both report one outcome the same way.
+pub fn verdict(r: &Receipt) -> Result<()> {
+    use ReceiveState::*;
+    match r.state {
+        Done if r.settled() => Ok(()),
+        // Journaled done but the credited rows are not yet released: run recover.
+        Done => Err(crate::coordinator::RecoveryIncomplete.into()),
+        Quarantined => Err(crate::coordinator::ManualRecovery.into()),
+        Refused => anyhow::bail!(
+            "receive refused by the mint ({}); final: the token was NOT imported, nothing \
+             was credited or charged to the cap, and it can be redeemed elsewhere",
+            r.refusal_code
+                .map_or("NUT code not journaled".to_owned(), |c| format!(
+                    "NUT code {c}"
+                ))
+        ),
+        AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
+        Prepared | Submitted => Err(crate::coordinator::RecoveryIncomplete.into()),
+    }
 }
 
 /// The one receive swap body (DLEQ stripped by `SwapRequest::new`), for sizing and sending.
@@ -449,6 +479,11 @@ fn operation(r: &Receipt) -> Result<uuid::Uuid> {
 async fn release(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
     if r.state != ReceiveState::Done || r.released {
         return Ok(());
+    }
+    // Lab fault: the release fails with this text (redaction tests put token text in it).
+    #[cfg(feature = "lab")]
+    if let Ok(text) = std::env::var("TRADE_LAB_RECEIVE_RELEASE_ERROR") {
+        anyhow::bail!("lab fault: release failed: {text}");
     }
     database(home, &r.mint)
         .await?
@@ -667,7 +702,11 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         if r.terminal() {
             if let Err(error) = release(home, j, &mut r).await {
                 failed = true;
-                eprintln!("receive {}: release deferred: {error:#}", r.id);
+                eprintln!(
+                    "receive {}: release deferred: {}",
+                    r.id,
+                    crate::redact_reason(&format!("{error:#}"))
+                );
             }
             continue;
         }
