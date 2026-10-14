@@ -166,6 +166,41 @@ processes multiply the load a rate-limited or blocking mint sees (a live run kep
 a TCP block alive for 9+ hours this way). If a mint is backing off, wait for serve; rerun
 `recover` at most every few minutes, not in a tight loop.
 
+## Serve lifecycle, stopping and progress lines
+
+serve writes one JSON object per line to stderr; times are UTC (`2026-10-12T20:39:58Z`).
+
+- **Start:** `{"serve":"started","at":…,"version":…,"commit":<sha or unknown>,"pid":…,"home":…,"relays":[…],"mint_relays":[…]}`.
+- **Stop:** the first SIGTERM or SIGINT prints `"serve":"stopping"`. serve then admits nothing
+  new (no inbox message, hand-off request or recovery tick is started; a queued hand-off is
+  answered `serve is stopping; request not started`, exit 1). The step already running may
+  finish for up to 30 s. A second signal, or the end of the grace, cancels that step at its
+  next wait (`"serve":"stop_forced"`). Every money step is journaled before it takes effect,
+  so a cancelled step stays ambiguous in the journal and is replayed on the next start;
+  nothing is released or marked refused.
+- **End:** exactly one `{"serve":"exited","reason":"signal"|"error"|"inbox_closed","exit":N,"unfinished":{…}}`
+  where catchable. `unfinished` lists non-terminal swaps (id, role, state, earliest refund as
+  UTC plus time remaining), unserved lots and open funding/withdrawal/receive/send ids. Exit
+  codes: **5** stopped by a signal (graceful or forced); 1 error or closed market inbox (every
+  relay client stopped; restart serve); 3 and 4 unchanged. The socket file is removed, which
+  says nothing about settlement: read `unfinished`.
+- **Not catchable:** SIGKILL, OOM kills and power loss leave no final line; the next start then
+  logs `"serve_socket":"stale_removed"`. Run serve under a supervisor (systemd, a shell loop)
+  that records exit status and signal and restarts it while locks are live, e.g. systemd
+  `Restart=on-failure`, `KillSignal=SIGTERM`, `TimeoutStopSec=45` (above the 30 s grace).
+  Exit 5 after an intended stop is not a failure.
+- **Swap progress** (display only, never fed back into any decision):
+  `{"progress":"swap_state",…}` after each journaled state change, and
+  `{"progress":"mint_attempt","at":…,"swap_id":…,"mint":…,"op":…,"attempt":N,"outcome":"timeout|no_answer|backing_off|refused|error|answered|started","elapsed":…,"next_retry":…,"claim_deadline":…,"claim_deadline_in":…,"refund_earliest":…,"refund_earliest_in":…}`
+  once a swap's mint stops answering (or answers slower than 5 s). `attempt` counts requests
+  since that mint last answered. The claim deadline is judged on the mint clock
+  (`claim_deadline_clock` says which skew was used); `refund_earliest` is eligibility on this
+  host's clock, not a guaranteed refund. Rate-limited: an outcome change prints at once, a
+  repeat at most once per 60 s per swap and mint (`suppressed` counts what was held back).
+  Lines carry outcome classes, NUT codes and redacted outer messages, never tokens, proofs or
+  mint bodies. A `take` handed to serve receives its own swap's lines on stderr; stdout is
+  unchanged. Backoff lines (below) are prefixed with the UTC time and show deadlines as UTC.
+
 ## Mint backoff and pacing
 
 Every request to a mint (HTTP or `nostr://`) passes a per-mint gate shared by all items

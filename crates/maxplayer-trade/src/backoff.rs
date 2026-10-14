@@ -265,16 +265,18 @@ impl Book {
                             m.warned = Some((u.deadline, stage));
                             log.push(if stage == 1 {
                                 format!(
-                                    "mint {mint} backing off ({}, {}s left) but a claim to it is possible: retrying it every {}s until its deadline (unix {}, mint clock)",
+                                    "mint {mint} backing off ({}, {}s left) but a claim to it is possible: retrying it every {}s until its deadline {} (mint clock, unix {})",
                                     reason.label(),
                                     remaining.as_secs(),
                                     every.as_secs_f64(),
+                                    crate::clock::iso(u.deadline),
                                     u.deadline
                                 )
                             } else {
                                 format!(
-                                    "mint {mint} backing off ({}) and a claim to it is due before unix {} (mint clock): final stretch, retrying it every {}s",
+                                    "mint {mint} backing off ({}) and a claim to it is due before {} (mint clock, unix {}): final stretch, retrying it every {}s",
                                     reason.label(),
+                                    crate::clock::iso(u.deadline),
                                     u.deadline,
                                     every.as_secs_f64()
                                 )
@@ -398,7 +400,7 @@ fn timing() -> Timing {
 }
 fn emit(lines: Vec<String>) {
     for line in lines {
-        eprintln!("{line}");
+        eprintln!("{} {line}", crate::clock::iso(crate::clock::now()));
         #[cfg(feature = "lab")]
         LOG.lock().unwrap_or_else(|e| e.into_inner()).push(line);
     }
@@ -471,6 +473,7 @@ pub fn set_wait_for_pacing(wait: bool) {
 /// calls, often served from cache, do not).
 pub fn admit(mint: &str, charge: bool) -> Result<(), Deferred> {
     if exempt(mint) {
+        crate::progress::sending(mint, charge);
         return Ok(());
     }
     let mut log = vec![];
@@ -478,7 +481,48 @@ pub fn admit(mint: &str, charge: bool) -> Result<(), Deferred> {
     let urgent = urgency(mint);
     let result = book().admit(&timing(), mint, Instant::now(), charge, urgent, &mut log);
     emit(log);
+    if result.is_ok() {
+        // Display only, after the decision: the request goes out now.
+        crate::progress::sending(mint, charge);
+    }
     result
+}
+
+/// Display only (progress lines): how long until `mint` may be tried again, as [`admit`] would
+/// decide it now: the backoff, or the next claim round when the current task's claim scope covers
+/// `mint`. `None`: no backoff (the next attempt waits only for its item's turn). Reads, never
+/// changes, the book.
+pub fn next_retry(mint: &str) -> Option<Duration> {
+    if exempt(mint) {
+        return None;
+    }
+    let urgent = urgency(mint);
+    let t = timing();
+    let now = Instant::now();
+    let b = book();
+    let m = b.mints.get(&key(mint))?;
+    let remaining = m.until.filter(|u| *u > now)? - now;
+    let Some(u) = urgent.filter(|u| !u.over()) else {
+        return Some(remaining);
+    };
+    let every = if u.final_stretch() {
+        t.final_retry
+    } else {
+        t.claim_retry
+    };
+    Some(m.round.map_or(Duration::ZERO, |r| {
+        (r.start + every)
+            .saturating_duration_since(now)
+            .min(remaining)
+    }))
+}
+
+/// Display only: (seconds `mint`'s clock is taken to lead this host's for claim deadlines, the
+/// observed skew if `info.time` was seen). Same rule as [`mint_now`].
+pub fn clock_lead(mint: &str) -> (u64, Option<i64>) {
+    let b = book();
+    let skew = b.mints.get(&key(mint)).and_then(|m| m.skew);
+    (b.mint_now(&timing(), mint, 0), skew)
 }
 
 /// Report one request's outcome.

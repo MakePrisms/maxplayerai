@@ -375,6 +375,21 @@ pub async fn post<T: DeserializeOwned>(
     body: &impl Serialize,
     not_after: Option<u64>,
 ) -> Result<T> {
+    // Display only: progress lines for a swap's mint calls (nothing is decided there).
+    crate::progress::call(
+        mint,
+        path,
+        post_inner(mint, path, body, not_after),
+        crate::progress::of_result,
+    )
+    .await
+}
+async fn post_inner<T: DeserializeOwned>(
+    mint: &str,
+    path: &str,
+    body: &impl Serialize,
+    not_after: Option<u64>,
+) -> Result<T> {
     if is_nostr(mint) {
         let value = nostr_call(mint, path, serde_json::to_value(body)?, not_after).await?;
         return serde_json::from_value(value)
@@ -411,6 +426,15 @@ pub async fn post<T: DeserializeOwned>(
 
 /// GET-equivalent read (`info`, `keysets`).
 pub async fn get(mint: &str, path: &str) -> Result<serde_json::Value> {
+    crate::progress::call(
+        mint,
+        path,
+        get_inner(mint, path),
+        crate::progress::of_result,
+    )
+    .await
+}
+async fn get_inner(mint: &str, path: &str) -> Result<serde_json::Value> {
     if is_nostr(mint) {
         return nostr_call(mint, path, serde_json::Value::Null, None).await;
     }
@@ -433,7 +457,13 @@ pub async fn get_observed(
     observation: &mut Option<maxplayer_core::nostr_mint::RequestObservation>,
 ) -> Result<serde_json::Value> {
     if is_nostr(mint) {
-        nostr_call_observed(mint, path, serde_json::Value::Null, None, Some(observation)).await
+        crate::progress::call(
+            mint,
+            path,
+            nostr_call_observed(mint, path, serde_json::Value::Null, None, Some(observation)),
+            crate::progress::of_result,
+        )
+        .await
     } else {
         get(mint, path).await
     }

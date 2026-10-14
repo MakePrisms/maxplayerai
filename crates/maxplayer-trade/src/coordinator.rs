@@ -174,7 +174,10 @@ async fn recovery_preflight(l: &Lot) -> Result<()> {
     Ok(())
 }
 async fn save(j: &Journal, s: &Swap) -> Result<()> {
-    j.put("swap", &s.id, s).await
+    j.put("swap", &s.id, s).await?;
+    // Display only, after the journal write: a state is never shown before it is durable.
+    crate::progress::state(s);
+    Ok(())
 }
 fn envelope(s: &Swap, step: &str, body: serde_json::Value) -> Result<Envelope> {
     Ok(Envelope {
@@ -366,7 +369,14 @@ pub async fn handle(home: &Path, j: &Journal, m: &Market, e: &Event) -> Result<(
         );
         anyhow::bail!("recorded rejection: {reason}");
     }
-    let result = handle_message(home, j, m, e).await;
+    // Display only: progress lines for this message's mint calls (fresh requests have no swap).
+    let progress = j
+        .get::<Swap>("swap", &message.swap_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|s| crate::progress::Ctx::of(&s));
+    let result = crate::progress::scoped(progress, handle_message(home, j, m, e)).await;
     if let Err(ref error) = result {
         if message.step == "request" && j.get::<Swap>("swap", &message.swap_id).await?.is_none() {
             // A refusal is permanent. A mint that did not answer is not a refusal: record
@@ -795,11 +805,17 @@ pub async fn advance(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Resu
     }
     // While a claim may have to land, its requests to the claim mint (only that mint) are
     // retried on a short cadence however long that mint's backoff (see `backoff`).
+    let progress = Some(crate::progress::Ctx::of(s));
     let result = match claim_deadline(s).map(|(deadline, mint)| (deadline, mint.to_owned())) {
         Some((deadline, mint)) => {
-            crate::backoff::with_claim(deadline, &mint, advance_inner(home, j, m, s)).await
+            crate::backoff::with_claim(
+                deadline,
+                &mint,
+                crate::progress::scoped(progress, advance_inner(home, j, m, s)),
+            )
+            .await
         }
-        None => advance_inner(home, j, m, s).await,
+        None => crate::progress::scoped(progress, advance_inner(home, j, m, s)).await,
     };
     // Run even when redemption returned an error. Persist terminal manual-recovery
     // status before the next tick; never turn a quarantined claim into refund authority.
@@ -1316,8 +1332,37 @@ pub async fn run_with(
 ) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
     let mut warned = crate::observe::Warned::default();
+    let mut inbox_open = true;
     loop {
-        tokio::select! {e=m.inbox.recv()=>{if let Some(e)=e{match tokio::time::timeout(message_budget(j,m,&e).await, handle(home,j,m,&e)).await {
+        // A stop request (serve: SIGTERM/SIGINT) admits nothing new: checked before every
+        // select, and it wakes the wait below. A step already running finishes within the
+        // grace (`shutdown::bounded`). The order among messages, requests and ticks is unchanged.
+        if let Some(stop) = crate::shutdown::stop() {
+            if let Some(rx) = jobs.as_mut() {
+                rx.close();
+                while let Ok(job) = rx.try_recv() {
+                    crate::serve::refuse(
+                        job,
+                        "serve is stopping; request not started, nothing was applied",
+                    );
+                }
+            }
+            return Err(stop.into());
+        }
+        tokio::select! {
+        _ = crate::shutdown::requested() => continue,
+        e = async { if inbox_open { m.inbox.recv().await } else { std::future::pending().await } } => {
+            let Some(e) = e else {
+                // Every relay client stopped: no trade message can arrive. serve reports it and
+                // exits (journal retained); a take keeps recovering on its ticks.
+                if until.is_none() {
+                    return Err(crate::shutdown::InboxClosed.into());
+                }
+                eprintln!("{} trade inbox closed; continuing with recovery ticks only", crate::clock::iso(crate::clock::now()));
+                inbox_open = false;
+                continue;
+            };
+            match crate::shutdown::bounded(async { Ok(tokio::time::timeout(message_budget(j,m,&e).await, handle(home,j,m,&e)).await) }).await? {
             Ok(Ok(())) => {},
             Ok(Err(err)) if retained(j, &e).await => eprintln!("trade message waits for its mint (no answer); retained, retried on the recovery tick: {err}"),
             Ok(Err(err)) => eprintln!("trade message rejected: {err}"),
@@ -1325,10 +1370,10 @@ pub async fn run_with(
                 Ok(true) => eprintln!("trade message timed out; retained, retried on the recovery tick"),
                 _ => eprintln!("trade message timed out; dropped; journal retained"),
             }
-        }}},
-        Some(job) = async { match jobs.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => crate::serve::execute(home, j, m, job).await,
+        }},
+        Some(job) = async { match jobs.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => crate::shutdown::bounded(async { crate::serve::execute(home, j, m, job).await; Ok(()) }).await?,
         _=tick.tick()=>{
-            recover(home,j,m).await?;
+            crate::shutdown::bounded(recover(home,j,m)).await?;
             // Display only: derived from the journal, never fed back into the state machine.
             let now = now();
             for u in warned.due(&crate::observe::unresponsive(home, now).unwrap_or_default()) {
