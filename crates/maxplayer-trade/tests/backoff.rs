@@ -460,3 +460,69 @@ async fn swap_only_rate_limit_keeps_claim_rounds() {
     assert!(coordinator::now() < long, "claimed before long");
     assert_eq!(balance(&f.maker, &f.b.url).await, 24);
 }
+
+/// #1140 review F1: a handed-off receive cut off by its budget because the mint never answered
+/// its swap records that mint's backoff, exactly as any other unanswered mint call does, so the
+/// recovery tick that follows does not go straight back to the same silent mint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receive_budget_timeout_records_mint_backoff() {
+    use cashu::nuts::{CurrencyUnit, Token};
+    use maxplayer_trade::{journal::Journal, receive::ReceiveState, serve, wallet};
+    use std::str::FromStr;
+    let _lab = Lab::new(1);
+    // A long base delay, so the backoff cannot lapse before it is observed below.
+    backoff::lab_configure(Some(Timing {
+        base: Duration::from_secs(30),
+        cap: Duration::from_secs(60),
+        retry_after_cap: Duration::from_secs(900),
+        interval: Duration::from_millis(100),
+        burst: Duration::from_millis(500),
+        urgent_margin: Some(Duration::from_secs(1)),
+        claim_retry: Duration::from_secs(2),
+        final_retry: Duration::from_secs(1),
+        unknown_skew: Duration::ZERO,
+        loopback: true,
+    }));
+    let m = MintFixture::start(0).await;
+    let sender = tempfile::tempdir().unwrap();
+    fund(sender.path(), &m.url, 32).await;
+    let proofs = wallet::wallet(sender.path(), &m.url)
+        .await
+        .unwrap()
+        .get_unspent_proofs()
+        .await
+        .unwrap();
+    let token = Token::new(
+        cdk::mint_url::MintUrl::from_str(&m.url).unwrap(),
+        proofs,
+        None,
+        CurrencyUnit::Sat,
+    )
+    .to_string();
+    let home = tempfile::tempdir().unwrap();
+    let j = Journal::open(home.path()).await.unwrap();
+    // The swap POST reaches the mint and is never answered within the budget (well under the
+    // 20 s HTTP RPC timeout, so only the budget can end it).
+    m.faults.hold_swap.store(true, SeqCst);
+    let r = serve::receive_within(home.path(), &j, &m.url, &token, Duration::from_secs(8))
+        .await
+        .unwrap();
+    assert_eq!(r.state, ReceiveState::Submitted, "fixture: swap was sent");
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "fixture: swap was sent");
+    assert!(
+        backoff::remaining(&m.url).is_some(),
+        "SAFETY: a receive budget timeout must back the silent mint off"
+    );
+    let before = m.faults.requests.load(SeqCst);
+    let e = transport::get(&m.url, "info").await.unwrap_err();
+    assert!(backoff::deferred(&e), "{e:#}");
+    assert_eq!(m.faults.requests.load(SeqCst), before, "nothing sent");
+    assert!(
+        backoff::lab_log()
+            .iter()
+            .any(|l| l.contains(&format!("mint {} backing off", m.url)) && l.contains("timeout")),
+        "{:?}",
+        backoff::lab_log()
+    );
+    m.faults.swap_release.notify_one();
+}

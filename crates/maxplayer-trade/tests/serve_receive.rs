@@ -848,3 +848,87 @@ async fn slow_mint_receive_releases_serve_loop_and_is_recovered() {
     assert_secret_free("serve output", &log, &quick, &p2);
     serve.child.kill().await.unwrap();
 }
+
+/// #1140 review F1: a recovery pass runs active swaps' claims and refunds before wallet money
+/// recovery. With a journaled receive whose mint has stalled and a maker swap whose claim is
+/// possible, the claim lands first and well inside its deadline; the receive is retried in the
+/// same pass afterwards, stays retained, and later credits exactly once.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_claims_active_swap_before_stalled_receive_mint() {
+    let (f, id) = partial_claim_fixture().await;
+    let c = MintFixture::start(0).await;
+    let (_s, _p, token) = issue(&c, 40).await;
+    // A receive in the same home whose swap reply was lost: journaled, owed recovery.
+    c.faults.lose_reply.store(true, SeqCst);
+    let r = receive::receive(&f.maker, &f.jm, &c.url, &token)
+        .await
+        .unwrap();
+    c.faults.lose_reply.store(false, SeqCst);
+    assert_eq!(
+        r.state,
+        ReceiveState::Submitted,
+        "fixture: receive in doubt"
+    );
+    assert_eq!(f.state(true, &id).await.as_deref(), Some("claiming"));
+    let long =
+        f.jm.get::<Swap>("swap", &id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quote
+            .unwrap()
+            .long;
+    // The receive mint now stalls: every request sits past the 20 s HTTP RPC timeout.
+    c.faults.delay_ms.store(60_000, SeqCst);
+    let before = c.faults.requests.load(SeqCst);
+    let started = std::time::Instant::now();
+    let watch = async {
+        loop {
+            let state = f.state(true, &id).await;
+            if matches!(state.as_deref(), Some("settling" | "complete")) {
+                return (
+                    c.faults.requests.load(SeqCst),
+                    started.elapsed(),
+                    coordinator::now(),
+                );
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "claim never landed"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    let (pass, (at_claim, claim_elapsed, claim_now)) =
+        tokio::join!(coordinator::recover(&f.maker, &f.jm, &f.mm), watch);
+    pass.unwrap();
+    assert_eq!(
+        at_claim, before,
+        "SAFETY: the stalled receive mint was contacted before the swap's claim"
+    );
+    assert!(
+        claim_elapsed < Duration::from_secs(15),
+        "SAFETY: claim waited on the stalled receive mint ({claim_elapsed:?})"
+    );
+    assert!(claim_now < long, "SAFETY: claim landed before its deadline");
+    assert!(
+        c.faults.requests.load(SeqCst) > before,
+        "the same pass still retried the receive after the swaps"
+    );
+    let r = f.jm.all::<Receipt>("receive").await.unwrap().pop().unwrap();
+    assert_eq!(r.state, ReceiveState::Submitted, "SAFETY: receive retained");
+    // The mint answers again: the retained receive credits exactly once, with no second swap.
+    c.faults.delay_ms.store(0, SeqCst);
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    assert!(
+        f.jm.all::<Receipt>("receive")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .settled()
+    );
+    assert_eq!(credited(&f.maker, &c.url), 40, "SAFETY: credited once");
+    assert_eq!(c.faults.swaps.load(SeqCst), 1, "SAFETY: one swap");
+}

@@ -622,6 +622,37 @@ async fn journaled(j: &Journal, mint: &str, token: &str) -> Result<Option<receiv
         None => Ok(None),
     }
 }
+/// [`receive::receive`] bounded by `budget` (`mint` canonical). Dropping the call is safe: the
+/// attempt is journaled before its POST and later passes only restore and replay that identical
+/// swap. On expiry the mint did not answer in time: that is recorded as a timeout for `mint`,
+/// exactly like any other unanswered mint call ([`crate::backoff`]), so the recovery tick that
+/// follows does not re-enter the same mint at once. The journaled attempt is returned.
+pub async fn receive_within(
+    home: &Path,
+    j: &Journal,
+    mint: &str,
+    token: &str,
+    budget: Duration,
+) -> Result<receive::Receipt> {
+    match tokio::time::timeout(budget, receive::receive(home, j, mint, token)).await {
+        Ok(r) => r,
+        Err(_) => {
+            crate::backoff::record(
+                mint,
+                crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
+            );
+            // Journaled: report its state; serve's recovery ticks finish it.
+            match journaled(j, mint, token).await? {
+                Some(r) => Ok(r),
+                None => bail!(
+                    "receive did not finish within {}s and nothing was journaled: nothing was \
+                     sent to the mint for this token; re-run it",
+                    budget.as_secs()
+                ),
+            }
+        }
+    }
+}
 /// A handed-off `receive`: the CLI's own path (same canonicalization, fence, journal and
 /// replay protection), plus one stderr line saying what THIS request did for the home.
 async fn receive_command(home: &Path, j: &Journal, mint: &str, token: &str) -> Result<Outcome> {
@@ -630,21 +661,8 @@ async fn receive_command(home: &Path, j: &Journal, mint: &str, token: &str) -> R
     let mint = asset.mint_url.as_str();
     let prior = journaled(j, mint, token).await?;
     // Bounded like one recovery item, so a slow mint cannot hold serve's loop (and its claims and
-    // refunds) for long. Dropping the call is safe: the attempt is journaled before its POST and
-    // later passes only restore and replay that identical swap.
-    let budget = receive_budget(mint);
-    let r = match tokio::time::timeout(budget, receive::receive(home, j, mint, token)).await {
-        Ok(r) => r?,
-        // Journaled: report its state; serve's recovery ticks finish it.
-        Err(_) => match journaled(j, mint, token).await? {
-            Some(r) => r,
-            None => bail!(
-                "receive did not finish within {}s and nothing was journaled: nothing was sent \
-                 to the mint for this token; re-run it",
-                budget.as_secs()
-            ),
-        },
-    };
+    // refunds) for long.
+    let r = receive_within(home, j, mint, token, receive_budget(mint)).await?;
     let outcome = if r.settled() {
         if prior.as_ref().is_some_and(receive::Receipt::settled) {
             "already_received"
