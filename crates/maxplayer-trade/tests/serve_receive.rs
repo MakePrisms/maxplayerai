@@ -822,9 +822,10 @@ async fn receive_with_home_locked_and_no_serve_is_refused() {
     assert_eq!(credited(&f.taker, &c.url), 16);
 }
 
-/// A receive whose mint swap hangs holds serve's loop only for its budget (lab: 3 s on loopback):
+/// A receive whose mint swap hangs holds serve's loop only for its budget (lab: 6 s on loopback):
 /// the client is told `in_doubt` (exit 3), serve then serves another receive while that swap is
-/// still stuck at the mint, and recovery later credits the stuck one exactly once.
+/// still stuck at the mint (uncredited, and every retry answered 429), and recovery later credits
+/// the stuck one exactly once, from that one swap.
 #[cfg(feature = "lab")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_mint_receive_releases_serve_loop_and_is_recovered() {
@@ -833,11 +834,20 @@ async fn slow_mint_receive_releases_serve_loop_and_is_recovered() {
     let d = MintFixture::start(0).await;
     let (_s1, p1, slow) = issue(&c, 40).await;
     let (_s2, p2, quick) = issue(&d, 24).await;
-    let env = [("TRADE_LAB_SERVE_RECEIVE_SECONDS", "3")];
+    // 6 s: room for a cold-wallet receive in a debug build, far below the 20 s HTTP RPC timeout.
+    let env = [("TRADE_LAB_SERVE_RECEIVE_SECONDS", "6")];
     let mut serve = start_serve_env(&f.taker, &f.relay_url, f.root.path(), "serve", &env).await;
     c.faults.hold_swap.store(true, SeqCst);
     let started = std::time::Instant::now();
-    let first = receive_cli(&f.taker, &f.relay_url, &c.url, Input::Stdin(&slow)).await;
+    // Once the first swap POST is held at the mint, every later swap POST (serve's recovery
+    // retries) is answered 429 unprocessed, so the held swap stays the only one in flight.
+    let (first, ()) = tokio::join!(
+        receive_cli(&f.taker, &f.relay_url, &c.url, Input::Stdin(&slow)),
+        async {
+            c.faults.swap_entered.notified().await;
+            c.faults.rate_limit_swap.store(true, SeqCst);
+        }
+    );
     let (stdout, stderr) = text(&first);
     assert_eq!(
         first.status.code(),
@@ -845,7 +855,7 @@ async fn slow_mint_receive_releases_serve_loop_and_is_recovered() {
         "SAFETY: in doubt, not failed: {stderr}"
     );
     assert!(
-        // Under the 20 s HTTP RPC timeout: serve's own budget (3 s here) released the loop.
+        // Under the 20 s HTTP RPC timeout: serve's own budget (6 s here) released the loop.
         started.elapsed() < Duration::from_secs(15),
         "SAFETY: a stuck mint held serve's loop"
     );
@@ -855,7 +865,19 @@ async fn slow_mint_receive_releases_serve_loop_and_is_recovered() {
     let second = receive_cli(&f.taker, &f.relay_url, &d.url, Input::Stdin(&quick)).await;
     assert!(second.status.success(), "{}", text(&second).1);
     assert_eq!(credited(&f.taker, &d.url), 24);
+    // ...and it was served while the first was still stuck, not after it settled.
+    assert_eq!(credited(&f.taker, &c.url), 0, "first still uncredited");
+    let stuck = receipts(&f)
+        .await
+        .into_iter()
+        .find(|r| r.mint == c.url)
+        .unwrap();
+    assert_eq!(stuck.state, ReceiveState::Submitted, "first still in doubt");
+    assert_eq!(c.faults.swaps.load(SeqCst), 1, "only the held swap ran");
+    // The mint finishes the held swap; recovery credits it from that swap (restore), once.
     c.faults.swap_release.notify_one();
+    c.faults.swap_finished.notified().await;
+    c.faults.rate_limit_swap.store(false, SeqCst);
     let start = std::time::Instant::now();
     while credited(&f.taker, &c.url) == 0 {
         assert!(start.elapsed() < Duration::from_secs(90), "serve recovery");
@@ -863,6 +885,7 @@ async fn slow_mint_receive_releases_serve_loop_and_is_recovered() {
     }
     tokio::time::sleep(Duration::from_secs(4)).await;
     assert_eq!(credited(&f.taker, &c.url), 40, "SAFETY: credited once");
+    assert_eq!(c.faults.swaps.load(SeqCst), 1, "SAFETY: no second swap");
     assert_eq!(receipts(&f).await.len(), 2);
     let log = serve.output();
     assert_secret_free("client", &(stdout + &stderr), &slow, &p1);
