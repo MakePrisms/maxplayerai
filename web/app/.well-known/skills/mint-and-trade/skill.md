@@ -35,16 +35,23 @@ restarts; do not move an existing funded home without a recovery plan.
 
 From one checkout of the chosen revision, install missing binaries using the mint
 README and [trading build instructions](https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md).
-Both are separate Cargo workspaces; check Rust and
-`protoc` prerequisites. From the repository root, the source installs are:
+Both are separate Cargo workspaces; check Rust prerequisites. The mint build also
+needs `protoc`; the production trading build does not. From the repository root:
 
 ```sh
-cargo install --locked --path crates/maxplayer-mint
-cargo install --locked --path crates/maxplayer-trade
+cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"
+cargo install --locked --path crates/maxplayer-trade --root "$HOME/.local"
 ```
 
-Check the installed commands' `--help`; do not guess flags or overwrite a running
-installation without checking its current version and obligations.
+This explicitly installs both binaries in `~/.local/bin`, matching the mint
+README's `ExecStart=%h/.local/bin/maxplayer-mint run`. Use those absolute executable
+paths for services and checks; add `~/.local/bin` to the interactive PATH if needed.
+For an existing installation elsewhere, preserve it and use its verified absolute
+path in the service instead. Verify the service's executable exists and is the
+chosen build before starting it; do not rely on the service inheriting shell PATH.
+Check the installed commands' usage; do not guess flags or overwrite a running
+installation without checking its current version and obligations. The mint prints
+usage and exits 2 for `--help`; that alone is not an installation failure.
 
 - Initialize a mint **only if none exists**. Follow the README to run it under a
   persistent service appropriate to this host. Inspect and preserve existing
@@ -74,11 +81,35 @@ will survive logout or reboot.
 
 ## 3. Prepare the first issuance and sale
 
+**Check capacity before issuing.** `maxplayer-mint issue` does not enforce the
+trading limits. Explain these limits before asking for the amount, then validate
+the proposed terms against the chosen mint and existing trading home:
+
+- A token received must be at most **100,000 sats gross**. All funding intents
+  plus charged receives share a **100,000-sat cumulative cap per mint per home**.
+  Inspect `status` and the recorded history, not just the current balance. Count
+  `prepared`, `submitted`, `done` and `quarantined` receives; exclude `refused` and
+  `already_spent`. Remaining capacity is `100,000 - funding intents - charged
+  receives`. Spending or sending tokens out does not reset this lifetime cap.
+- Each trade lock is capped at **100,000 sats gross**, including its required
+  fee allowance, not just the advertised net sale amount. Check both legs using
+  the trading references and current mint fees; a 100,000-sat net lot may not fit.
+- A receive permits at most **128 input proofs** (and at most 128 fresh output
+  proofs). For `nostr://`, its swap must also fit one **NIP-44 request**. Check the
+  chosen revision's issuance split and receive sizing rules before issuing;
+  a face amount under the cap alone is not proof that an arbitrary token fits.
+
+If remaining capacity, fee-inclusive locks or proof/payload fit cannot be
+established, stop before issuance and report the uncertainty. Do not test capacity
+by issuing spendable tokens, silently lower amounts, split batches to evade the
+cumulative cap, or create a new home to bypass it. Propose supported terms for
+fresh approval. Recheck capacity immediately before issuance if the home changed.
+
 Ask only for missing terms: how many tokens to issue and import, how many to sell,
 which exact mint's tokens to receive, the net price, and the maximum fees/debit.
 Do not invent a price or assume that “set up” authorizes issuance or trading.
 
-1. Obtain approval for the exact issuance and import amount. Issue using the mint
+1. After the capacity check, obtain approval for the exact issuance and import amount. Issue using the mint
    README. Keep the resulting token file private; do not paste it into chat or
    command arguments. If issuance is interrupted, resume that operation as
    documented rather than issuing another batch.

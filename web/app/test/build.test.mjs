@@ -271,8 +271,8 @@ test("/mint explains the seller mint with the shared page layout", () => {
   assert.equal([...mint.matchAll(/<ol class="h-steps">[\s\S]*?<\/ol>/g)].length, 1);
   assert.equal([...mint.matchAll(/<li>\s*<span class="n">0\d<\/span>/g)].length, 3, "three steps, like Chat");
   assert.ok(mint.includes('id="start"') && mint.includes('class="h-manual"') && mint.includes('class="h-section h-faq"'));
-  // Every command shown is a real one from the maxplayer-mint README / CLI usage.
-  for (const cmd of ["cargo install --path crates/maxplayer-mint --locked", "maxplayer-mint init", "maxplayer-mint run", "maxplayer-mint issue 1000", "maxplayer wallet mints add nostr://"]) {
+  // Operational commands match the mint README / CLI usage; install paths are checked below.
+  for (const cmd of ["maxplayer-mint init", "maxplayer-mint run", "maxplayer-mint issue 1000", "maxplayer wallet mints add nostr://"]) {
     assert.ok(mint.includes(cmd), `shows ${cmd}`);
   }
   assert.match(mint, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
@@ -297,6 +297,20 @@ test("Mint's one-line instruction resolves to a shipped, discoverable combined s
   }
   const mintReadme = readFileSync(join(root, "../../crates/maxplayer-mint/README.md"), "utf8");
   assert.ok(mintReadme.includes(instruction), "README and website give the same entry instruction");
+  // Both entry points must install the executable where the linked service starts it.
+  const servicePath = /ExecStart=%h\/(\S+) run/.exec(mintReadme)?.[1];
+  assert.ok(servicePath, "mint README declares an absolute user-service executable");
+  const install = /<code id="cmd-install">([^<]+)<\/code>/.exec(mint)?.[1]?.replaceAll("&amp;", "&");
+  assert.ok(install, "manual copy button has an install command");
+  for (const command of install.split(" && ")) {
+    assert.ok(skill.includes(command), "manual and agent install commands agree");
+    const crate = /--path crates\/(maxplayer-(?:mint|trade))\b/.exec(command)?.[1];
+    const prefix = /--root "\$HOME\/([^"]+)"/.exec(command)?.[1];
+    assert.ok(crate && prefix, "install explicitly selects the crate and destination");
+    if (crate === "maxplayer-mint") {
+      assert.equal(`${prefix}/bin/${crate}`, servicePath, "mint install and service paths agree");
+    }
+  }
 });
 
 test("FAQ sections pin their heading so opening an answer never moves it", () => {

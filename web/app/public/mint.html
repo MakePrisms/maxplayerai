@@ -84,9 +84,9 @@
           </div>
           <details class="h-manual">
             <summary>Or set it up yourself</summary>
-            <p>Install both tools (early: build from source in the repository, needs <code>protoc</code>):</p>
+            <p>Install both tools into <code>~/.local/bin</code>, matching the mint service (early: build from source in the repository; the mint needs <code>protoc</code>). Add that directory to your PATH:</p>
           <div class="h-copy small">
-            <code id="cmd-install">cargo install --path crates/maxplayer-mint --locked &amp;&amp; cargo install --path crates/maxplayer-trade --locked</code>
+            <code id="cmd-install">cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local" &amp;&amp; cargo install --locked --path crates/maxplayer-trade --root "$HOME/.local"</code>
             <button type="button" data-copy="cmd-install" aria-label="Copy the install command">copy</button>
           </div>
             <p>For a new mint, initialize and run it below. Reuse an existing mint instead. Follow the <a href="/.well-known/skills/mint-and-trade/skill.md">combined setup guide</a> for persistent services, stopped backups and a separate trading home:</p>
