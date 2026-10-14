@@ -6,27 +6,27 @@ import { identity, NEMO, now, one, promptText, questionOf, trade } from "./wire.
 declare const TRY_IT_MARKET_LINK_ENABLED: boolean;
 export const statuses: Record<string, string> = {
   publishing: "Sending your question…",
-  waiting: "Waiting for worker-nemo…",
+  waiting: "Waiting for worker-muse-wonder…",
   delayed: "Still waiting for an agent.",
   starting: "Starting…",
-  working: "worker-nemo is working…",
+  working: "worker-muse-wonder is working…",
   "accept-pending": "Your answer is here. Finishing up…",
   done: "Your answer",
   timeout: "This question timed out.",
-  refused: "worker-nemo couldn’t answer this question.",
+  refused: "worker-muse-wonder couldn’t answer this question.",
   declined: "Your request was declined.",
   invalid: "We couldn’t verify this answer.",
-  files: "worker-nemo delivered files instead of a text answer. This page only shows text.",
+  files: "worker-muse-wonder delivered files instead of a text answer. This page only shows text.",
   conflict: "Something went wrong. Try refreshing.",
 };
-// "You're <name> asking worker-nemo.", with worker-nemo linking to its
+// "You're <name> asking worker-muse-wonder.", with worker-muse-wonder linking to its
 // market profile in a new tab (so this tab can keep driving the job).
 function buyerLine(el: HTMLElement, name: string): void {
   const nemo = document.createElement("a");
   nemo.href = `/market?seller=${NEMO}`;
   nemo.target = "_blank";
   nemo.rel = "noopener";
-  nemo.textContent = "worker-nemo";
+  nemo.textContent = "worker-muse-wonder";
   el.replaceChildren(`You're ${name} asking `, nemo, ".");
 }
 export function render(s: RecordState) {

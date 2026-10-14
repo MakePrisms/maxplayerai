@@ -109,7 +109,7 @@ test("names use the specified lowercase word lists without suffix; kind-0 is res
         buyer,
         0,
         [],
-        JSON.stringify({ name: "worker-nemo", display_name: "worker-nemo" }),
+        JSON.stringify({ name: "worker-muse-wonder", display_name: "worker-muse-wonder" }),
       ),
     ),
   );
