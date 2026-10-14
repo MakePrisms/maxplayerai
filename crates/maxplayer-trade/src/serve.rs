@@ -1,16 +1,22 @@
 //! Local hand-off from a CLI invocation to a running `serve` over `<home>/serve.sock`.
 //!
-//! `serve` holds `owner.lock` and stays the only writer: a handed-off `list`, `take` or `cancel`
-//! is queued to serve's own loop and executed there, between inbox messages and recovery ticks,
+//! `serve` holds `owner.lock` and stays the only writer: a handed-off `list`, `take`, `cancel`
+//! or `receive` is queued to serve's own loop and executed there, between inbox messages and recovery ticks,
 //! by the same coordinator functions (journal before effect) the CLI would have called, with
 //! exactly the bounds the client sent. The client only relays output. A client that disconnects
 //! never cancels a queued or running request; a take keeps being driven by serve.
+//!
+//! A `receive` carries the token text over the socket only. serve logs [`Command::public`]
+//! (kind, mint and the token's public receive id), never the request; [`TokenText`] never prints
+//! through `Debug`; refusals sent back are redacted. Idempotency is the receive journal's: the
+//! same token always maps to the same attempt id, so a retry after a lost reply or a restart
+//! resumes that attempt and never credits twice.
 //!
 //! The socket is mode 0600 inside the 0700 home, and every peer must have the uid that owns the
 //! socket (SO_PEERCRED). One request per connection; the request is at most
 //! [`MAX_REQUEST_BYTES`]; reads and writes are bounded by [`IO_TIMEOUT`]; at most
 //! [`MAX_CONNECTIONS`] connections are served at once.
-use crate::{Asset, Leg, coordinator, journal::Journal, market::Market, observe};
+use crate::{Asset, Leg, coordinator, journal::Journal, market::Market, observe, receive};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -25,7 +31,8 @@ use tokio::{
 };
 
 pub const SOCKET: &str = "serve.sock";
-pub const MAX_REQUEST_BYTES: usize = 16 * 1024;
+/// Room for the largest token `receive` accepts plus the request envelope (mint, relays).
+pub const MAX_REQUEST_BYTES: usize = receive::MAX_TOKEN_BYTES + 16 * 1024;
 pub const MAX_REPLY_LINE_BYTES: usize = 64 * 1024;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_CONNECTIONS: usize = 8;
@@ -56,6 +63,11 @@ pub enum Command {
     Cancel {
         lot: String,
     },
+    Receive {
+        /// The mint exactly as given on the command line; serve canonicalizes it as the CLI does.
+        mint: String,
+        token: TokenText,
+    },
 }
 impl Command {
     fn name(&self) -> &'static str {
@@ -63,8 +75,51 @@ impl Command {
             Command::List { .. } => "list",
             Command::Take { .. } => "take",
             Command::Cancel { .. } => "cancel",
+            Command::Receive { .. } => "receive",
         }
     }
+    /// What serve may log about a request: public bounds and ids only, never a payload. Each
+    /// variant names its fields explicitly so a new secret-bearing field is not logged by default.
+    /// Same `{"<kind>":{..}}` shape the log always had for list/take/cancel.
+    pub fn public(&self) -> serde_json::Value {
+        let fields = match self {
+            Command::List {
+                give_mint,
+                give,
+                want_mint,
+                want,
+                max_fees,
+            } => serde_json::json!({"give_mint":give_mint,"give":give,"want_mint":want_mint,
+                "want":want,"max_fees":max_fees}),
+            Command::Take {
+                lot,
+                max_give,
+                min_receive,
+                max_fees,
+            } => serde_json::json!({"lot":lot,"max_give":max_give,"min_receive":min_receive,
+                "max_fees":max_fees}),
+            Command::Cancel { lot } => serde_json::json!({"lot":lot}),
+            Command::Receive { mint, token } => {
+                serde_json::json!({"mint":mint,"receive":receive_id(mint, &token.0)})
+            }
+        };
+        serde_json::json!({ self.name(): fields })
+    }
+}
+/// The token text of a handed-off `receive`. It crosses only the 0600 same-uid socket; `Debug`
+/// withholds it, so no `{:?}` of a request, job or panic payload can print it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TokenText(pub String);
+impl std::fmt::Debug for TokenText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<token withheld>")
+    }
+}
+/// The public receive attempt id of `token` (static parse, no network), when it parses.
+pub fn receive_id(mint: &str, token: &str) -> Option<String> {
+    let asset = Asset::from_cli(mint).ok()?;
+    receive::inspect(&asset.mint_url, token).ok().map(|p| p.id)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,11 +148,20 @@ pub struct Job {
 pub struct Outcome {
     pub stdout: Vec<String>,
     pub swap: Option<String>,
+    /// Printed to the client's stderr after `stdout`.
+    pub stderr: Vec<String>,
+    /// Exit code and message after `stdout` was printed (the CLI's code for that result).
+    pub failure: Option<Failure>,
 }
 #[derive(Debug)]
 pub struct Failure {
     pub code: u8,
     pub message: String,
+}
+/// Only a peer with the socket owner's uid may talk to serve (both directions).
+fn peer_allowed(peer: u32, owner: u32) -> Result<()> {
+    ensure!(peer == owner, "peer uid {peer} refused");
+    Ok(())
 }
 /// Same exit-code mapping as the CLI.
 pub fn exit_code(error: &anyhow::Error) -> u8 {
@@ -174,7 +238,7 @@ pub fn bind(home: &Path, relays: Vec<String>) -> Result<mpsc::Receiver<Job>> {
                 if let Err(e) = connection(stream, owner, &home, &relays, tx).await {
                     eprintln!(
                         "{}",
-                        serde_json::json!({"serve_client":"closed","reason":e.to_string()})
+                        serde_json::json!({"serve_client":"closed","reason":crate::redact_reason(&e.to_string())})
                     );
                 }
             });
@@ -231,20 +295,38 @@ async fn connection(
     relays: &[String],
     tx: mpsc::Sender<Job>,
 ) -> Result<()> {
-    let peer = stream.peer_cred()?;
-    ensure!(peer.uid() == owner, "peer uid {} refused", peer.uid());
+    peer_allowed(stream.peer_cred()?.uid(), owner)?;
     // One request per connection: nothing after its line is read.
-    let line = tokio::time::timeout(
+    let read = tokio::time::timeout(
         IO_TIMEOUT,
         read_line_bounded(&mut BufReader::new(&mut stream), MAX_REQUEST_BYTES),
     )
     .await
-    .context("request read timed out")??
-    .context("empty request")?;
+    .context("request read timed out")?;
+    let line = match read {
+        Ok(line) => line.context("empty request")?,
+        Err(e) => {
+            // Never echoes request bytes: the bound and decode errors carry no content.
+            let error = format!("serve request refused, nothing executed: {e}");
+            let _ = write(
+                &mut stream,
+                &Reply::Exit {
+                    code: 1,
+                    error: Some(error.clone()),
+                },
+            )
+            .await;
+            bail!(error)
+        }
+    };
     let request: Request = match serde_json::from_str(&line) {
         Ok(r) => r,
         Err(e) => {
-            let error = format!("invalid serve request: {e}");
+            // serde can quote a mistyped value, which may be token text: redact it.
+            let error = format!(
+                "invalid serve request: {}",
+                crate::redact_reason(&e.to_string())
+            );
             write(
                 &mut stream,
                 &Reply::Exit {
@@ -260,10 +342,11 @@ async fn connection(
         let error = if request.v != PROTOCOL_V {
             "serve protocol version mismatch".to_string()
         } else {
-            format!(
+            // The requested relays are caller text (a mistyped flag may hold a token): redacted.
+            crate::redact_reason(&format!(
                 "serve uses relays {relays:?}; this command asked for {:?}. Use the same --relay set as serve",
                 request.relays
-            )
+            ))
         };
         write(
             &mut stream,
@@ -314,6 +397,19 @@ async fn connection(
     };
     for line in outcome.stdout {
         write(&mut stream, &Reply::Stdout(line)).await?;
+    }
+    for line in outcome.stderr {
+        write(&mut stream, &Reply::Stderr(line)).await?;
+    }
+    if let Some(f) = outcome.failure {
+        return write(
+            &mut stream,
+            &Reply::Exit {
+                code: f.code,
+                error: Some(f.message),
+            },
+        )
+        .await;
     }
     let Some(id) = outcome.swap else {
         return write(
@@ -430,17 +526,29 @@ pub fn refuse(job: Job, why: &str) {
 /// Execute one queued request inside serve's loop. Never panics the loop.
 pub async fn execute(home: &Path, j: &Journal, m: &Market, job: Job) {
     let name = job.command.name();
+    // Public view only: a request (a receive's token) is never serialized into the log.
     eprintln!(
         "{}",
-        serde_json::json!({"serve_request":name,"bounds":job.command})
+        serde_json::json!({"serve_request":name,"bounds":job.command.public()})
     );
+    let secret = matches!(job.command, Command::Receive { .. });
     let result = crate::diagnostics::scoped(job.diagnostics, run_command(home, j, m, &job.command))
         .await
         .map_err(|e| Failure {
             code: exit_code(&e),
-            message: e.to_string(),
+            message: if secret {
+                crate::redact_reason(&e.to_string())
+            } else {
+                e.to_string()
+            },
         });
     match &result {
+        Ok(Outcome {
+            failure: Some(f), ..
+        }) => eprintln!(
+            "{}",
+            serde_json::json!({"serve_request":name,"result":"exit","exit":f.code,"error":f.message})
+        ),
         Ok(o) => eprintln!(
             "{}",
             serde_json::json!({"serve_request":name,"result":"ok","swap_id":o.swap})
@@ -480,6 +588,8 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"lot_id":id,"status_event_id":l.statuses[0].id,"status":"available","debit":l.plan.debit}).to_string()],
                 swap: None,
+                stderr: vec![],
+                failure: None,
             })
         }
         Command::Cancel { lot } => {
@@ -488,6 +598,8 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"lot_id":l.event.id,"status_event_ids":l.statuses.iter().map(|e|e.id.to_hex()).collect::<Vec<_>>(),"status":crate::lifecycle(&l.event,&l.statuses)?}).to_string()],
                 swap: None,
+                stderr: vec![],
+                failure: None,
             })
         }
         Command::Take {
@@ -502,9 +614,112 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"swap_id":s.id,"state":s.state}).to_string()],
                 swap: Some(id),
+                stderr: vec![],
+                failure: None,
             })
         }
+        Command::Receive { mint, token } => receive_command(home, j, mint, &token.0).await,
     }
+}
+
+/// How long one handed-off receive may hold serve's loop: one recovery item's budget. Lab
+/// builds may shorten it for loopback mints only (`TRADE_LAB_SERVE_RECEIVE_SECONDS`).
+fn receive_budget(mint: &str) -> Duration {
+    #[cfg(feature = "lab")]
+    if let Some(s) = std::env::var("TRADE_LAB_SERVE_RECEIVE_SECONDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        if crate::transport::loopback_only(mint) {
+            return Duration::from_secs(s);
+        }
+    }
+    let _ = mint;
+    Duration::from_secs(receive::RECOVERY_ITEM_SECONDS)
+}
+async fn journaled(j: &Journal, mint: &str, token: &str) -> Result<Option<receive::Receipt>> {
+    match receive_id(mint, token) {
+        Some(id) => j.get("receive", &id).await,
+        None => Ok(None),
+    }
+}
+/// [`receive::receive`] bounded by `budget` (`mint` canonical). Dropping the call is safe: the
+/// attempt is journaled before its POST and later passes only restore and replay that identical
+/// swap. On expiry the mint did not answer in time: that is recorded as a timeout for `mint`,
+/// exactly like any other unanswered mint call ([`crate::backoff`]), so the recovery tick that
+/// follows does not re-enter the same mint at once. The journaled attempt is returned.
+pub async fn receive_within(
+    home: &Path,
+    j: &Journal,
+    mint: &str,
+    token: &str,
+    budget: Duration,
+) -> Result<receive::Receipt> {
+    match tokio::time::timeout(budget, receive::receive(home, j, mint, token)).await {
+        Ok(r) => r,
+        Err(_) => {
+            crate::backoff::record(
+                mint,
+                crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
+            );
+            // Journaled: report its state; serve's recovery ticks finish it.
+            match journaled(j, mint, token).await? {
+                Some(r) => Ok(r),
+                None => bail!(
+                    "receive did not finish within {}s and nothing was journaled: nothing was \
+                     sent to the mint for this token; re-run it",
+                    budget.as_secs()
+                ),
+            }
+        }
+    }
+}
+/// A handed-off `receive`: the CLI's own path (same canonicalization, fence, journal and
+/// replay protection), plus one stderr line saying what THIS request did for the home.
+async fn receive_command(home: &Path, j: &Journal, mint: &str, token: &str) -> Result<Outcome> {
+    let asset = Asset::from_cli(mint)?;
+    asset.fence()?;
+    let mint = asset.mint_url.as_str();
+    let prior = journaled(j, mint, token).await?;
+    // Bounded like one recovery item, so a slow mint cannot hold serve's loop (and its claims and
+    // refunds) for long.
+    let r = receive_within(home, j, mint, token, receive_budget(mint)).await?;
+    let outcome = if r.settled() {
+        if prior.as_ref().is_some_and(receive::Receipt::settled) {
+            "already_received"
+        } else {
+            "credited"
+        }
+    } else if r.unresolved() {
+        "in_doubt"
+    } else {
+        "not_credited"
+    };
+    let note = match outcome {
+        "credited" => format!(
+            "credited {} sats; repeating this token resumes this attempt and credits nothing more",
+            r.net
+        ),
+        "already_received" => {
+            "this token was already received into this home; nothing new was credited".into()
+        }
+        "in_doubt" => "not settled yet: the attempt is journaled and serve keeps recovering it. \
+            Check `status`, or re-run this same receive: it resumes this attempt and never credits twice"
+            .into(),
+        _ => format!(
+            "nothing was credited (state {})",
+            serde_json::json!(r.state).as_str().unwrap_or("unknown")
+        ),
+    };
+    Ok(Outcome {
+        stdout: vec![r.summary().to_string()],
+        swap: None,
+        stderr: vec![serde_json::json!({"receive":r.id,"outcome":outcome,"note":note}).to_string()],
+        failure: receive::verdict(&r).err().map(|e| Failure {
+            code: exit_code(&e),
+            message: e.to_string(),
+        }),
+    })
 }
 
 /// Exit code relayed from serve. The message was already printed.
@@ -533,14 +748,14 @@ pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
         Err(e) => return Err(e).context("connect to serve socket"),
     };
     let owner = std::fs::symlink_metadata(home.join(SOCKET))?.uid();
-    let peer = stream.peer_cred()?;
-    ensure!(
-        peer.uid() == owner,
-        "serve socket peer uid {} does not own the socket; refusing",
-        peer.uid()
-    );
+    peer_allowed(stream.peer_cred()?.uid(), owner)
+        .context("serve socket peer does not own the socket; refusing")?;
+    // Sized before anything is written: an over-limit request never reaches serve.
     let mut line = serde_json::to_string(request)?;
-    ensure!(line.len() <= MAX_REQUEST_BYTES, "request too large");
+    ensure!(
+        line.len() <= MAX_REQUEST_BYTES,
+        "request exceeds serve's {MAX_REQUEST_BYTES}-byte limit; nothing was sent to serve"
+    );
     line.push('\n');
     tokio::time::timeout(IO_TIMEOUT, stream.write_all(line.as_bytes()))
         .await
@@ -565,11 +780,17 @@ pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
                     Ok(Err(e)) => e.to_string(),
                     _ => "serve closed the connection".to_string(),
                 };
-                match &swap {
-                    Some(id) => eprintln!(
+                match (&swap, &request.command) {
+                    (Some(id), _) => eprintln!(
                         "{why}; swap {id} is journaled and stays with the home: keep serve running or run recover"
                     ),
-                    None => eprintln!(
+                    (None, Command::Receive { mint, token }) => eprintln!(
+                        "{why} before reporting a result; receive {} may have been applied. Check \
+                         `status`, or re-run this same receive: it resumes that attempt and never \
+                         credits twice",
+                        receive_id(mint, &token.0).unwrap_or_else(|| "attempt".into())
+                    ),
+                    (None, _) => eprintln!(
                         "{why} before reporting a result; the request may have been applied. Check status"
                     ),
                 }
@@ -620,6 +841,47 @@ mod tests {
         assert!(
             serde_json::from_str::<Request>(&missing).is_err(),
             "SAFETY: no serve-side default may fill a missing bound"
+        );
+    }
+    #[test]
+    fn receive_request_round_trips_and_never_prints_its_token() {
+        let token = format!("cashuB{}", "Zm9v".repeat(64));
+        let r = Request {
+            v: 1,
+            relays: vec!["ws://127.0.0.1:1".into()],
+            command: Command::Receive {
+                mint: "http://127.0.0.1:1".into(),
+                token: TokenText(token.clone()),
+            },
+        };
+        let text = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), r);
+        assert!(
+            !format!("{r:?}").contains(&token),
+            "SAFETY: Debug prints the token"
+        );
+        let public = r.command.public().to_string();
+        assert!(
+            !public.contains(&token),
+            "SAFETY: logged view has the token"
+        );
+        assert_eq!(
+            public,
+            r#"{"receive":{"mint":"http://127.0.0.1:1","receive":null}}"#
+        );
+        let loose = text.replace("\"token\":", "\"memo\":\"x\",\"token\":");
+        assert!(serde_json::from_str::<Request>(&loose).is_err());
+    }
+    #[test]
+    fn only_the_socket_owner_uid_is_allowed() {
+        assert!(peer_allowed(1001, 1001).is_ok());
+        assert!(
+            peer_allowed(1002, 1001).is_err(),
+            "SAFETY: another uid must be refused"
+        );
+        assert!(
+            peer_allowed(0, 1001).is_err(),
+            "SAFETY: root is not the owner"
         );
     }
     #[tokio::test]

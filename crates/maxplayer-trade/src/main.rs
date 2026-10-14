@@ -259,7 +259,13 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         }
         _ => {}
     }
-    // A running serve owns the home: hand list/take/cancel to it, with these exact bounds.
+    // The token is read once, bounded, before any hand-off: a running serve receives it over its
+    // socket; otherwise the local path below uses this same text.
+    let mut token = match &cli.command {
+        Command::Receive { token_file, .. } => Some(read_token(token_file.as_deref())?),
+        _ => None,
+    };
+    // A running serve owns the home: hand list/take/cancel/receive to it, with these exact bounds.
     let handoff = match &cli.command {
         Command::List {
             give_mint,
@@ -289,6 +295,18 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         }),
         Command::Cancel { lot } => {
             Some(maxplayer_trade::serve::Command::Cancel { lot: lot.clone() })
+        }
+        Command::Receive { mint, .. } => {
+            let raw = token.as_deref().unwrap_or_default().trim();
+            // Refused before connecting, exactly as the local path refuses it.
+            ensure!(
+                raw.len() <= maxplayer_trade::receive::MAX_TOKEN_BYTES,
+                "token missing or oversized"
+            );
+            Some(maxplayer_trade::serve::Command::Receive {
+                mint: mint.clone(),
+                token: maxplayer_trade::serve::TokenText(raw.to_owned()),
+            })
         }
         _ => None,
     }
@@ -497,42 +515,14 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         );
         return Ok(());
     }
-    if let Command::Receive { ref token_file, .. } = cli.command {
-        use std::io::Read;
-        let limit = maxplayer_trade::receive::MAX_TOKEN_BYTES as u64 + 1;
-        let mut raw = String::new();
-        match token_file {
-            Some(path) => fs::File::open(path)
-                .context("cannot open token file")?
-                .take(limit)
-                .read_to_string(&mut raw)
-                .context("token file is not readable UTF-8")?,
-            None => std::io::stdin()
-                .take(limit)
-                .read_to_string(&mut raw)
-                .context("stdin token is not readable UTF-8")?,
-        };
+    if matches!(cli.command, Command::Receive { .. }) {
+        let raw = token.take().unwrap_or_default();
+        drop(handoff);
         let r = maxplayer_trade::receive::receive(home, &money_journal, mint, &raw).await;
         drop(raw);
         let r = r?;
         println!("{}", r.summary());
-        use maxplayer_trade::receive::ReceiveState::*;
-        return match r.state {
-            Done if r.settled() => Ok(()),
-            // Journaled done but the credited rows are not yet released: run recover.
-            Done => Err(coordinator::RecoveryIncomplete.into()),
-            Quarantined => Err(coordinator::ManualRecovery.into()),
-            Refused => anyhow::bail!(
-                "receive refused by the mint ({}); final: the token was NOT imported, nothing \
-                 was credited or charged to the cap, and it can be redeemed elsewhere",
-                r.refusal_code
-                    .map_or("NUT code not journaled".to_owned(), |c| format!(
-                        "NUT code {c}"
-                    ))
-            ),
-            AlreadySpent => anyhow::bail!("token already spent; nothing credited"),
-            Prepared | Submitted => Err(coordinator::RecoveryIncomplete.into()),
-        };
+        return maxplayer_trade::receive::verdict(&r);
     }
     if let Command::Fund {
         amount, ref quote, ..
@@ -568,6 +558,26 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     }
 
     unreachable!()
+}
+
+/// Read one token from `--token-file` or stdin, at most `MAX_TOKEN_BYTES` + 1 bytes (the
+/// excess byte lets `receive::inspect` refuse an oversized token instead of truncating it).
+fn read_token(token_file: Option<&std::path::Path>) -> Result<String> {
+    use std::io::Read;
+    let limit = maxplayer_trade::receive::MAX_TOKEN_BYTES as u64 + 1;
+    let mut raw = String::new();
+    match token_file {
+        Some(path) => fs::File::open(path)
+            .context("cannot open token file")?
+            .take(limit)
+            .read_to_string(&mut raw)
+            .context("token file is not readable UTF-8")?,
+        None => std::io::stdin()
+            .take(limit)
+            .read_to_string(&mut raw)
+            .context("stdin token is not readable UTF-8")?,
+    };
+    Ok(raw)
 }
 
 fn forwarded(code: u8) -> Result<()> {

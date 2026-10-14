@@ -18,8 +18,8 @@ Choose **one private, persistent absolute home** for this human. Put
 journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; keep it afterward for recovery.
 Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,
-`list`/`take`/`cancel` hand off to it, exact bounds; `status`, `balance`,
-`discover` are lock-free. Don't stop serve to look. Stop it with SIGTERM (safe, exit 5;
+`list`/`take`/`cancel`/`receive` hand off to it, exact bounds; `status`, `balance`,
+`discover` are lock-free. Don't stop serve to look. Stop it with SIGTERM (exit 5;
 [lifecycle](references/commands.md#serve-lifecycle-stopping-and-progress-lines)).
 **Do not stop serve between `second_locked` and `settling`**; a maker can lose its
 claim window. Defer other writing commands until live obligations settle.
@@ -81,7 +81,7 @@ quote is reported unresolved without another payment.
 Needs the human's yes (mint, amount); charges the shared cap (§2).
 Save it to a private file; run `receive <mint> --token-file <file>` (or
 stdin). Never put tokens in argv/chat/logs. Only plain sat proofs of that
-mint; fee deducted. Exit 3: `recover`, never re-import; 4 `quarantined`: escalate; other exits:
+mint; fee deducted. Works while serve runs (handed off). Exit 3: `recover` (serve running: it recovers; check `status`), never re-import; 4 `quarantined`: escalate; other exits:
 [commands](references/commands.md#receive). **Done:** `done` + `balance <mint>`.
 
 ### Send a token / move funds to another wallet
