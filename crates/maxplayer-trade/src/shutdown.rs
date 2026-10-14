@@ -116,7 +116,12 @@ pub fn signal(name: &'static str) {
             2
         }
     };
-    PHASE.send_replace(phase.max(*PHASE.borrow()));
+    // Never hold a `borrow()` guard across `send_*`: the watch lock would deadlock.
+    PHASE.send_if_modified(|p| {
+        let changed = phase > *p;
+        *p = (*p).max(phase);
+        changed
+    });
     let now = crate::clock::now();
     let line = if phase == 1 {
         serde_json::json!({"at":crate::clock::iso(now),"serve":"stopping","signal":name,
@@ -144,19 +149,6 @@ pub fn start(home: &Path, relays: &[String]) -> anyhow::Result<()> {
             "home":home,"relays":relays,"mint_relays":crate::transport::mint_relays(),
             "stop":format!("SIGTERM/SIGINT: safe stop within {}s, exit {EXIT_STOPPED}", GRACE.as_secs())})
     );
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // Location only: a panic message may quote data.
-        let at = crate::clock::iso(crate::clock::now());
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}", l.file(), l.line()));
-        eprintln!(
-            "{}",
-            serde_json::json!({"at":at,"serve":"panic","location":location,"journal":"retained"})
-        );
-        previous(info);
-    }));
     tokio::spawn(async move {
         let first = tokio::select! {
             _ = term.recv() => "SIGTERM",
