@@ -44,6 +44,19 @@ pub async fn bounded_for<T>(
     mint: &str,
     f: impl std::future::Future<Output = Result<T, cdk::Error>>,
 ) -> Result<Result<T, cdk::Error>, Bound> {
+    // Display only: a timed-out or unanswered wallet call shows in the swap's progress lines.
+    crate::progress::call(
+        mint,
+        "wallet",
+        bounded_inner(mint, f),
+        crate::progress::of_wallet,
+    )
+    .await
+}
+async fn bounded_inner<T>(
+    mint: &str,
+    f: impl std::future::Future<Output = Result<T, cdk::Error>>,
+) -> Result<Result<T, cdk::Error>, Bound> {
     crate::backoff::admit(mint, false).map_err(Bound::Deferred)?;
     match tokio::time::timeout(crate::transport::wallet_bound(mint), f).await {
         Err(_) => {

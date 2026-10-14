@@ -1191,11 +1191,13 @@ button.chip { cursor: pointer; }
 @media (max-width: 760px) { .try-float { bottom: max(16px, env(safe-area-inset-bottom)); } }
 @media (prefers-reduced-motion: reduce) { .try-float, .try-float svg { transition: none; animation: none; } }
 
-/* Chat reuses Sell's section rhythm and chrome, with a title-specific width. */
+/* Chat and Mint reuse Sell's section rhythm and chrome, each with a title-specific phone width
+   so its longest line matches Buy's ("own tokens." is wider than "Hire Expert" at /9). */
 .h-hero h1.h-title-chat { line-height: 1.02; }
-.chat-page .h-copy code { white-space: normal; overflow-wrap: anywhere; word-break: normal; }
+.chat-page .h-copy code, .mint-page .h-copy code { white-space: normal; overflow-wrap: anywhere; word-break: normal; }
 @media (max-width: 760px) {
   .h-hero h1.h-title-chat { font-size: min(calc((100vw - 60px) / 12.6), 84px); white-space: nowrap; }
+  .h-hero h1.h-title-mint { font-size: min(calc((100vw - 60px) / 9.7), 84px); }
 }
 /* Keep every shared mobile link/control at least one thumb target tall. */
 @media (max-width: 700px) {
@@ -1248,7 +1250,7 @@ button.chip { cursor: pointer; }
    fixed slot keeps the rest of the nav from sliding when it does. */
 @media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
 /* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
-/* Experimental pages (/chat, /tokens) get a small yellow boxed "Lab" superscript on
+/* Experimental pages (/chat, /mint, /tokens) get a small yellow boxed "Lab" superscript on
    their footer link (bob); same rule as feat/trade-market-page. */
 .lab-sup {
   display: inline-block; margin-left: 4px; vertical-align: super;
@@ -1257,7 +1259,7 @@ button.chip { cursor: pointer; }
   color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
 }
 .foot-nav a:hover .lab-sup { border-color: var(--neon); }
-/* /chat carries the /tokens experimental notice strip (bob); same rules as
+/* /chat and /mint carry the /tokens experimental notice strip (bob); same rules as
    feat/trade-market-page, so a later merge keeps one copy. */
 .labs-strip {
   display: flex; align-items: center; gap: 10px;

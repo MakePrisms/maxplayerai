@@ -436,7 +436,15 @@ async fn stream_take(stream: &mut UnixStream, home: &Path, id: &str) -> Result<(
     let mut last = String::new();
     let mut warned = observe::Warned::default();
     let mut quiet = tokio::time::Instant::now();
+    // This swap's progress lines (display only, already redacted), as serve prints them.
+    let mut progress = crate::progress::subscribe();
     loop {
+        while let Ok((swap, line)) = progress.try_recv() {
+            if swap == id {
+                write(stream, &Reply::Stderr(line)).await?;
+                quiet = tokio::time::Instant::now();
+            }
+        }
         let row = observe::journal_rows(home, "swap")?
             .into_iter()
             .find(|(k, _, _)| k == id);
@@ -501,6 +509,18 @@ pub fn terminal_lines(s: &coordinator::Swap) -> Vec<String> {
     }
     out.push(serde_json::json!({"swap_id":s.id,"state":s.state}).to_string());
     out
+}
+
+/// Answer a queued request that serve will not start (it is stopping): exit 1, nothing applied.
+pub fn refuse(job: Job, why: &str) {
+    eprintln!(
+        "{}",
+        serde_json::json!({"serve_request":job.command.name(),"result":"not_started","reason":why})
+    );
+    let _ = job.reply.send(Err(Failure {
+        code: 1,
+        message: why.to_owned(),
+    }));
 }
 
 /// Execute one queued request inside serve's loop. Never panics the loop.
