@@ -6335,12 +6335,27 @@ impl SellerNodeRunner {
                         )
                         .await
                         {
-                        Ok(Ok(_)) => {
+                        // #509: `Ok(Output)` is not an acknowledgement; a rejected or unanswered
+                        // publish lands in `output.failed`. Report success only when confirmed, so a
+                        // deduping caller lets the next re-ingest surface it again.
+                        Ok(Ok(output)) if publish_confirmed(&output) => {
                             opline!(
                                 "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
                                 reason_code.as_str()
                             );
                             true
+                        }
+                        Ok(Ok(output)) => {
+                            let reasons: Vec<String> = output
+                                .failed
+                                .iter()
+                                .map(|(url, reason)| format!("{url}: {reason}"))
+                                .collect();
+                            opline!(
+                                "seller node WARN: buyer feedback not confirmed offer={offer_id} ({})",
+                                if reasons.is_empty() { "no acknowledgement".to_owned() } else { reasons.join("; ") }
+                            );
+                            false
                         }
                         Ok(Err(error)) => {
                             opline!(
@@ -18684,6 +18699,8 @@ mod tests {
     ///
     /// RED ON REVERT: drop the `tokio::time::timeout(FEEDBACK_PUBLISH_BUDGET, ..)` around
     /// `send_event_to` in `publish_buyer_feedback`; the call then waits out the SDK's 10s OK timeout.
+    /// Or restore `Ok(_) => true`: the SDK reports the unanswered publish as `Ok(Output)` with the
+    /// relay in `failed`, which the old arm counted as surfaced.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_withheld_feedback_ok_holds_the_lane_no_longer_than_the_feedback_budget() {
         let feedback_kind = u64::from(crate::kinds::JOB_FEEDBACK_KIND);
