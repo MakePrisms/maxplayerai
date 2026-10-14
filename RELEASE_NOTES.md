@@ -1,7 +1,20 @@
-## Unreleased
+## v0.6.1-rc10
 
-Changes on main since v0.6.1-rc9 (tagged 2026-10-10). Rename this heading to the next release
-when it is cut.
+Tenth release candidate for 0.6.1, prepared for testing before a stable release.
+After publication, install with `npm install -g maxplayer@0.6.1-rc10`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.6.1-rc9
+
+- Private delivery review no longer duplicates the offer and task evidence (#1147,
+  fixes #1104). The reviewer accepts old and new request formats; clients use actual
+  encrypted-message size checks, and open-pool task encoding avoids repeated JSON
+  escaping. Size refusals name the measured size and limit, and deterministic review
+  failures no longer misleadingly promise recovery by retrying unchanged input.
+- Sellers budget private delivery review before agent execution, conservatively
+  selecting Git when an inline answer would not fit. New answer text is capped at
+  4 KiB; existing answer envelopes retain their decode compatibility. The task-body
+  limit stays 16 KiB, including metadata; oversize posting errors point to input files.
 
 - Seller daemon stays responsive when the relay stops acknowledging publications or stops
   finishing history reads. Relay events, housekeeping, outbox publishing and backfills run on one
@@ -19,6 +32,48 @@ when it is cut.
   relay confirming outbox rows no longer keeps failing private copies retried every tick (and
   vice versa); a buyer-feedback publish holds the work lane at most 5 s; a backfill cut short by a
   relay recovery re-runs once the relay is back instead of being reported as a failed read.
+
+- Reviewer startup waits briefly for its single-instance store lock during process
+  replacement, while retaining exclusive ownership and refusing sustained contention
+  (#1138).
+- Vendored Buzz relay updated to upstream `30873ba46`, retaining Maxplayer private-job
+  ACLs and open-history behavior, with improved refusal, authentication and bounded
+  history handling (#1134). Relay deployment is separate from client publication.
+- Source-only Cashu trading sidecar: fixed-lot credit trading, receive/send workflows,
+  Nostr-mint keyset handling, operator UX and build guidance (#1107, #1119, #1121,
+  #1123, #1125, #1127, #1129). Follow-ups add mint backoff, bounded Nostr operations,
+  unanswered-message retries, clearer errors and diagnostics, serve-driven receive,
+  and lifecycle progress (#1128, #1130–#1133, #1140, #1141).
+- Source-only approved-peer chat sidecar gains health reporting, catch-up pagination,
+  signed-send retry and receive/storage hardening (#1136).
+- Website: credit-trading market, Chat lab page and Mint product page; market cards
+  stop showing the harness badge (#1118, #1120, #1135, #1137); the Tokens page is
+  marked Lab in the footer (#1148). Website deployment is separate from npm client
+  publication.
+
+### Rollout and RC verification
+
+- **Deploy the updated reviewer before updated clients.** Old reviewers cannot read
+  the new request format. The updated reviewer still accepts older clients.
+- Restart buyer daemons, MCP servers and sellers after upgrading, preserving their
+  existing homes, keys, wallets and state. Match Docker sandbox image overrides to
+  the upgraded seller version.
+- Retry collection of the existing stuck private job with review enabled; do not
+  repost it or bypass review. Its real-world recovery remains unverified until that
+  rollout and collection succeed. Passing regression tests is not production proof.
+- This RC does not add support for reviewing changed binaries/symlinks/submodules,
+  screen seller input files at offer time, or increase task limits (#1144–#1146).
+  Muse's non-blocking follow-ups remain separate: inline-check errors can reject
+  before Git fallback, and control-character-heavy answers can exceed the serialized
+  body limit despite fitting the raw-text cap. Smaller retry/classifier findings
+  are also deferred; this RC does not claim to resolve them.
+- The bundled relay update has a **one-way database migration**. For a separate
+  relay deployment, back up and follow `crates/buzz/README.md` ("Upgrading a deployed
+  relay"); rollback requires restoring the database backup. Publishing the client
+  does not deploy the relay or reviewer.
+- The release workflow packages the `maxplayer` client and sandbox image. Mint,
+  trade and chat sidecars remain separately source-built; website deployment is
+  separate. Stable publication is deferred until RC testing is accepted.
 
 ## v0.6.1-rc9
 
