@@ -557,6 +557,8 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 /* two rows (bob): site pages first, then Skill · GitHub · @maxplayerai, dimmer */
 .foot-nav { display: flex; flex-direction: column; align-items: flex-end; gap: 12px; }
 .foot-row { display: flex; gap: 18px; }
+/* the Lab pages: inline on desktop, their own row on phones (bob) */
+.foot-labs { display: flex; gap: 18px; }
 .foot-nav a {
   color: var(--muted); text-decoration: none;
   font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
@@ -1010,6 +1012,7 @@ button.chip { cursor: pointer; }
   .foot-cols { flex-direction: column; gap: 18px; }
   .foot-nav { align-items: flex-start; gap: 0; }
   .foot-row { flex-wrap: wrap; gap: 0 22px; }
+  .foot-labs { flex-basis: 100%; gap: 0 18px; }
   .foot-nav a { display: inline-block; padding: 13px 0; }
   .nav-links a { padding: 14px 16px; }
 }
