@@ -462,9 +462,60 @@ wrappers; old wrapper IDs are not required. Public requests referencing private 
 produce no public error response. Other gift-wrap domains and public results cannot
 satisfy private reviews.
 
-Serialized private request bundles are limited to 30 KiB and inner transport messages
-to 60 KiB, with the shared ciphertext limit also enforced. Oversized inputs and
-saturated recent-response windows fail closed, without truncation or public fallback.
+Private review messages send the signed offer and task envelope **once**, including
+for delivery reviews. The reviewer reconstructs the unchanged payment-evidence shape
+and checks all signatures, commitments, participants and commit bindings. Open-pool
+task JSON is carried as base64 alongside an empty `i`-tag placeholder in the wire
+offer; the reviewer restores the exact signed bytes and verifies the offer before use.
+This prevents JSON-escape amplification, without changing the public offer itself.
+It also accepts the old duplicated request shape, but rejects inconsistent duplicates.
+
+The old guessed 30 KiB request cap is removed. The transport checks actual serialized
+rumor and encrypted-seal sizes against the locked NIP-44 implementation's 65,408-byte
+plaintext limit at each layer, plus the existing 60 KiB message and 128 KiB ciphertext
+bounds. Size errors identify the layer, actual bytes and allowed bytes without printing
+private content. JSON escaping, base64 and encryption padding count; there is no single
+character-count equivalent. Oversize and saturated response windows fail closed, with
+no truncation or public fallback.
+
+Task admission still limits the **serialized content body including metadata** (or
+open-pool serialized task) to 16,384 bytes; it is not a promise of 16,384 task characters.
+Posting errors name that limit. New private inline answer text is limited to 4,096
+UTF-8 bytes; larger output belongs in Git. Existing immutable answer envelopes remain
+decodable so this change does not invalidate previously delivered work.
+
+Deterministic input failures (`input_too_large`, `unsupported_input`, `input_integrity`,
+invalid subject/input/request and unauthorized request) are recorded as `input_refused`.
+The buyer watcher and repeated `get_job` reads hold instead of retrying them. Correct
+input or update the reviewer before an **explicit** collect/accept or seller retry;
+explicit retries can recover after software changes and still require a signed review.
+Availability errors retain normal explicit retry guidance. No payment gate is bypassed.
+
+Before a seller runs an agent, it checks a conservative delivery-review budget using
+that job's actual offer, task, claim (including mint invoice), and award. It reserves
+all projected result fields and the full allowed answer-envelope size, including
+JSON escaping. If inline cannot fit, the agent receives file-delivery instructions
+and both host/container paths disable inline for that run. Git is always supported
+by the buyer protocol. If even the Git review cannot fit, execution is refused before
+agent work starts; the seller reports the failure. This gate also runs when the
+seller skips its own safety review, since the buyer may still require one.
+
+The reservation is deliberately conservative: some short actual answers would fit
+where the largest permitted answer would not, so those jobs use Git. The task cap is
+unchanged. This protects new execution; it cannot retroactively change an old,
+already-published oversized inline delivery. The original reported Git job still
+uses rebuilt review requests at collection time.
+
+**Rollout order:** deploy the updated reviewer first (it accepts both wire shapes),
+then update buyer/seller clients. Old reviewers cannot read compact delivery requests.
+This fix does not require a relay message-limit change. Do not roll the reviewer back
+while compact-writing clients remain active. After rollout, retry the existing stuck
+job, without reposting or disabling review. The reported user's job cannot be proven
+recovered by local fixtures: live collection remains an operator verification step.
+
+Follow-ups: [binary changes](https://github.com/MakePrisms/maxplayerai/issues/1144),
+[input-file screening](https://github.com/MakePrisms/maxplayerai/issues/1145), and
+[tasks beyond 16 KiB](https://github.com/MakePrisms/maxplayerai/issues/1146).
 This does not promise flood resistance or review of arbitrarily large repositories.
 
 Before production rollout:

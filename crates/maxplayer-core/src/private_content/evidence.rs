@@ -274,6 +274,50 @@ pub(crate) fn inline_fixture_with_mints(
     nostr_sdk::Keys,
     Policy,
 ) {
+    inline_fixture_with_text(
+        targeted,
+        paid,
+        deadline,
+        mints,
+        if targeted {
+            "private task"
+        } else {
+            "deliberately public discovery"
+        },
+        "exact private answer",
+    )
+}
+#[cfg(all(test, feature = "wallet"))]
+pub(crate) fn inline_fixture_with_text(
+    targeted: bool,
+    paid: bool,
+    deadline: u64,
+    mints: Vec<String>,
+    task: &str,
+    answer: &str,
+) -> (
+    PrivateEvidence,
+    crate::authorize_pay::AuthorizePayRequest,
+    nostr_sdk::Keys,
+    Policy,
+) {
+    inline_fixture_with_metadata(targeted, paid, deadline, mints, task, answer, false)
+}
+#[cfg(all(test, feature = "wallet"))]
+pub(crate) fn inline_fixture_with_metadata(
+    targeted: bool,
+    paid: bool,
+    deadline: u64,
+    mints: Vec<String>,
+    task: &str,
+    answer: &str,
+    maximal_metadata: bool,
+) -> (
+    PrivateEvidence,
+    crate::authorize_pay::AuthorizePayRequest,
+    nostr_sdk::Keys,
+    Policy,
+) {
     let amount = if paid { 10 } else { 0 };
     let payment_mode = if paid {
         crate::gateway::PaymentMode::Sat
@@ -301,21 +345,23 @@ pub(crate) fn inline_fixture_with_mints(
         &buyer,
         &(if targeted {
             gateway::OfferDraft::new(
-                "private task",
+                task,
                 "text/markdown",
                 amount,
                 deadline,
                 seller.public_key().to_hex(),
             )
         } else {
-            gateway::OfferDraft::untargeted(
-                "deliberately public discovery",
-                "text/markdown",
-                amount,
-                deadline,
-            )
+            gateway::OfferDraft::untargeted(task, "text/markdown", amount, deadline)
         })
         .with_payment_mode(payment_mode)
+        .requesting_agent(maximal_metadata.then_some("codex"))
+        .requiring_capability(
+            maximal_metadata.then_some("codex"), None,
+            &if maximal_metadata {
+                vec!["node".into(), "python".into(), "rust".into()]
+            } else { vec![] },
+        )
         .accepting_delivery(["inline"]),
         builders::OfferOptions {
             visibility: wire::Visibility::Private,
@@ -350,8 +396,16 @@ pub(crate) fn inline_fixture_with_mints(
                 creq.as_deref()
                     .map(gateway::ClaimPayment::Sat)
                     .unwrap_or(gateway::ClaimPayment::None),
-                &["codex".into()],
-                &crate::heartbeat::SeatCapability::default(),
+                &if maximal_metadata {
+                    vec!["claude".into(), "codex".into(), "cursor".into()]
+                } else { vec!["codex".into()] },
+                &if maximal_metadata {
+                    crate::heartbeat::SeatCapability {
+                        harness_families: vec!["claude-code".into(), "codex".into(), "cursor".into(), "goose".into()],
+                        capabilities: vec!["node".into(), "python".into(), "rust".into()],
+                        ..Default::default()
+                    }
+                } else { Default::default() },
             ),
             None,
             None,
@@ -384,7 +438,7 @@ pub(crate) fn inline_fixture_with_mints(
         &seller.public_key().to_hex(),
         &service,
         ContentType::Answer,
-        "exact private answer".into(),
+        answer.into(),
         None,
         &policy.host,
     )

@@ -6,16 +6,68 @@ use nostr_sdk::{nostr::nips::nip44, prelude::*};
 pub const TIMESTAMP_TWEAK_SECS: u64 = 180;
 pub const MAX_WRAPPER_CONTENT: usize = 128 * 1024;
 
+// Pinned to nostr 0.44's NIP-44 implementation; the boundary test deliberately
+// fails on a library upgrade so its transport/peer compatibility is reconsidered.
+pub(crate) const NIP44_MAX: usize = 65_408;
+
+#[derive(Debug)]
+pub(crate) enum WrapError {
+    Size {
+        layer: &'static str,
+        actual: usize,
+        allowed: usize,
+    },
+    Other(&'static str),
+}
+fn check_size(
+    layer: &'static str,
+    actual: usize,
+    allowed: usize,
+) -> std::result::Result<(), WrapError> {
+    if actual > allowed {
+        return Err(WrapError::Size {
+            layer,
+            actual,
+            allowed,
+        });
+    }
+    Ok(())
+}
+
 pub async fn wrap(keys: &Keys, recipient: PublicKey, message: String) -> Result<Event> {
-    let rumor = EventBuilder::private_msg_rumor(recipient, message)
+    wrap_checked(keys, recipient, message)
+        .await
+        .map_err(|error| match error {
+            WrapError::Other(message) => Error(message),
+            WrapError::Size { layer: "rumor", .. } => {
+                Error("private rumor exceeds NIP-44 size limit")
+            }
+            WrapError::Size { layer: "seal", .. } => {
+                Error("private seal exceeds NIP-44 size limit")
+            }
+            WrapError::Size { .. } => Error("encrypted wrapper too large"),
+        })
+}
+
+/// One builder for content and review messages. Measure the actual plaintext at
+/// each encryption layer, including padding, base64 and JSON escape expansion.
+pub(crate) async fn wrap_checked(
+    keys: &Keys,
+    recipient: PublicKey,
+    message: String,
+) -> std::result::Result<Event, WrapError> {
+    let mut rumor = EventBuilder::private_msg_rumor(recipient, message)
         .allow_self_tagging()
         .build(keys.public_key());
+    rumor.ensure_id();
+    check_size("rumor", rumor.as_json().len(), NIP44_MAX)?;
     let seal = EventBuilder::seal(keys, &recipient, rumor)
         .await
-        .map_err(|_| Error("could not construct private seal"))?
+        .map_err(|_| WrapError::Other("could not construct private seal"))?
         .sign(keys)
         .await
-        .map_err(|_| Error("could not sign private seal"))?;
+        .map_err(|_| WrapError::Other("could not sign private seal"))?;
+    check_size("seal", seal.as_json().len(), NIP44_MAX)?;
     let ephemeral = Keys::generate();
     let ciphertext = nip44::encrypt(
         ephemeral.secret_key(),
@@ -23,15 +75,40 @@ pub async fn wrap(keys: &Keys, recipient: PublicKey, message: String) -> Result<
         seal.as_json(),
         nip44::Version::default(),
     )
-    .map_err(|_| Error("could not encrypt private wrapper"))?;
-    if ciphertext.len() > MAX_WRAPPER_CONTENT {
-        return Err(Error("encrypted wrapper too large"));
-    }
+    .map_err(|_| WrapError::Other("could not encrypt private wrapper"))?;
+    check_size("wrapper", ciphertext.len(), MAX_WRAPPER_CONTENT)?;
     EventBuilder::new(Kind::GiftWrap, ciphertext)
         .tags([Tag::public_key(recipient)])
         .custom_created_at(fresh_created_at())
         .sign_with_keys(&ephemeral)
-        .map_err(|_| Error("could not sign private wrapper"))
+        .map_err(|_| WrapError::Other("could not sign private wrapper"))
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+    #[test]
+    fn nip44_library_plaintext_limit_is_pinned() {
+        let keys = Keys::generate();
+        assert!(
+            nip44::encrypt(
+                keys.secret_key(),
+                &keys.public_key(),
+                "x".repeat(NIP44_MAX),
+                nip44::Version::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            nip44::encrypt(
+                keys.secret_key(),
+                &keys.public_key(),
+                "x".repeat(NIP44_MAX + 1),
+                nip44::Version::default()
+            )
+            .is_err()
+        );
+    }
 }
 
 /// Authenticate the transport envelope before domain-specific decoding. Callers must

@@ -4,10 +4,16 @@ use super::*;
 use crate::{home::MaxplayerHome, private_content as pc};
 use nostr_sdk::prelude::*;
 
+#[path = "delivery_budget.rs"]
+mod delivery_budget;
+#[path = "request_wire.rs"]
+mod request_wire;
+pub(crate) use delivery_budget::seller_delivery_budget;
+
 const DOMAIN: &str = "maxplayer-private-review-v1";
 const MAX_MESSAGE: usize = 60 * 1024;
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Deserialize)]
+#[serde(try_from = "request_wire::RequestWire")]
 pub struct Request {
     pub subject: Subject,
     pub offer: Event,
@@ -52,13 +58,24 @@ pub async fn wrap(keys: &Keys, recipient: PublicKey, event: &Event) -> Result<Ev
         event: event.clone(),
     })
     .map_err(|_| "review: encoding failed")?;
-    if body.len() > MAX_MESSAGE {
-        return Err("review: encrypted message too large".into());
-    }
-    pc::transport::wrap(keys, recipient, body)
+    check_size("message", body.len(), MAX_MESSAGE)?;
+    pc::transport::wrap_checked(keys, recipient, body)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|error| match error {
+            pc::transport::WrapError::Size { layer, actual, allowed } =>
+                format!("review: permanent input error: private {layer} is {actual} bytes; limit {allowed} bytes; retrying unchanged input cannot help"),
+            pc::transport::WrapError::Other(message) => format!("review: {message}"),
+        })
 }
+fn check_size(layer: &str, actual: usize, allowed: usize) -> Result<(), String> {
+    if actual > allowed {
+        return Err(format!(
+            "review: permanent input error: private {layer} is {actual} bytes; limit {allowed} bytes; retrying unchanged input cannot help"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn unwrap(keys: &Keys, outer: &Event) -> Result<Event, String> {
     let (author, plaintext) = pc::transport::unwrap_message(keys, outer)
         .await
@@ -91,7 +108,7 @@ impl Request {
         requester: &PublicKey,
         policy: &pc::runtime::Policy,
     ) -> Result<Vec<String>, String> {
-        self.subject.validate()?;
+        self.subject.validate().map_err(|_| "invalid_subject")?;
         if self.subject.offer != self.offer.id.to_hex() || !is_private(&self.offer) {
             return Err("invalid_subject".into());
         }
@@ -153,9 +170,7 @@ impl Request {
         let mut draft = request_draft(&self.subject, reviewer)?;
         draft.tags.push(TagSpec::new(["visibility", "private"]));
         draft.content = serde_json::to_string(self).map_err(|_| "review: request encoding")?;
-        if draft.content.len() > MAX_MESSAGE / 2 {
-            return Err("review: private input too large".into());
-        }
+        check_size("request", draft.content.len(), MAX_MESSAGE)?;
         Ok(draft)
     }
 }
@@ -257,9 +272,9 @@ impl wire::Transport for Transport<'_> {
                         // lifetime generously, or a later attempt reads a published
                         // reply as "no response" (#1115). A reply older than this is
                         // still collected by any retry within 30 minutes of it.
-                        Timestamp::now().as_secs().saturating_sub(
-                            pc::transport::TIMESTAMP_TWEAK_SECS + 1800,
-                        ),
+                        Timestamp::now()
+                            .as_secs()
+                            .saturating_sub(pc::transport::TIMESTAMP_TWEAK_SECS + 1800),
                     ))
                     .limit(128),
                 std::time::Duration::from_secs(2),
@@ -322,7 +337,9 @@ pub async fn check(
             "review: private reviewer must be the configured content-service identity".into(),
         );
     }
-    request.validate(&identity.public_key()?, &policy)?;
+    request
+        .validate(&identity.public_key()?, &policy)
+        .map_err(|code| reviewer_error(&code))?;
     let transport = Transport {
         client,
         relay: &home.config.relay_url,
@@ -378,7 +395,7 @@ pub async fn seller_offer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn key(n: u8) -> Keys {
+    pub(super) fn key(n: u8) -> Keys {
         Keys::parse(&format!("{n:064x}")).unwrap()
     }
     pub(crate) fn fixture(targeted: bool, delivery: bool) -> (Request, pc::runtime::Policy) {
@@ -573,5 +590,49 @@ mod tests {
             .unwrap_err()
             .contains("content-service")
         );
+    }
+}
+
+#[cfg(test)]
+mod local_error_tests {
+    use super::*;
+    #[tokio::test]
+    async fn private_local_validation_failures_are_permanent_in_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut home = crate::home::bootstrap(dir.path()).unwrap();
+        let (mut request, policy) = super::tests::fixture(true, true);
+        home.config.privacy.service_pubkey = Some(policy.service.clone());
+        home.config.privacy.git_base = Some(policy.host.git_prefix);
+        home.config
+            .review
+            .reviewers
+            .insert(home.config.relay_url.clone(), policy.service);
+        let buyer = super::tests::key(1);
+        let client = Client::new(buyer.clone());
+        for unauthorized in [false, true] {
+            let identity = if unauthorized {
+                super::tests::key(4)
+            } else {
+                buyer.clone()
+            };
+            if !unauthorized {
+                request.subject.event = "ab".repeat(32);
+            } else {
+                request.subject.event = request.delivery.as_ref().unwrap().result.id.to_hex();
+            }
+            let result = check(
+                &home,
+                &client,
+                Identity::Buyer(&identity),
+                &request,
+                &super::tests::key(2).public_key().to_hex(),
+            )
+            .await;
+            assert!(permanent_error(result.as_ref().unwrap_err()));
+            state::completed(&home.root, &request.subject, &result).unwrap();
+            let status = state::read(&home.root, &request.subject.event).unwrap();
+            assert_eq!(status.state, "input_refused");
+            assert!(!status.retry.contains("Retry the same"));
+        }
     }
 }

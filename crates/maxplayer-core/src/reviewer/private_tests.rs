@@ -45,6 +45,9 @@ async fn scenario(targeted: bool, delivery: bool, provider_failure: bool) {
                         let body: Value =
                             serde_json::from_slice(&bytes[at + 4..at + 4 + len]).unwrap();
                         let state = body["state"].as_str().unwrap();
+                        for encoded in ["public_task_b64", "task_envelope", "answer_envelope", "body_b64"] {
+                            assert!(!state.contains(encoded), "classifier must receive readable content, not wire encodings");
+                        }
                         assert!(state.contains(if targeted {
                             "private task"
                         } else {
@@ -495,7 +498,14 @@ async fn stale_public_request_gets_a_signed_stale_request_error() {
 #[tokio::test]
 async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
     use crate::private_content as pc;
-    let (mut evidence, _, _, policy) = pc::evidence::inline_fixture();
+    let (mut evidence, _, _, policy) = pc::evidence::inline_fixture_with_text(
+        true,
+        false,
+        2_000_000_000,
+        vec!["https://testnut.cashu.space".into()],
+        &"x".repeat(12_018),
+        "exact private answer",
+    );
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
     let path = root.join("bare");
@@ -563,6 +573,17 @@ async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
         task_envelope: evidence.task_envelope.clone(),
         delivery: Some(evidence),
     };
+    let inner = crate::gateway::nostr::event_builder(
+        &request.draft(&key(3).public_key().to_hex()).unwrap(),
+    )
+    .unwrap()
+    .sign_with_keys(&key(1))
+    .unwrap();
+    let outer = private::wrap(&key(1), key(3).public_key(), &inner)
+        .await
+        .unwrap();
+    let decoded = private::unwrap(&key(3), &outer).await.unwrap();
+    let request: Request = serde_json::from_str(&decoded.content).unwrap();
     request.validate(&key(1).public_key(), &policy).unwrap();
     let config = ServiceConfig {
         relay: "wss://git.example".into(),
