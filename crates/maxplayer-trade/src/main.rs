@@ -313,6 +313,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     .map(|command| maxplayer_trade::serve::Request {
         v: maxplayer_trade::serve::PROTOCOL_V,
         relays: relays.clone(),
+        mint_relays: maxplayer_trade::transport::mint_relays(),
         command,
     });
     if let Some(request) = &handoff {

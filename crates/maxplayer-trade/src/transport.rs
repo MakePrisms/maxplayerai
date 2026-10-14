@@ -104,6 +104,18 @@ fn relay_key(relay: &str) -> String {
         .unwrap_or_else(|| relay.to_owned())
 }
 
+/// Whether two mint relay lists name the same relays: compared as sets of [`relay_key`], so
+/// spelling (host case, trailing slash or dot) and order do not matter. A `serve` hand-off
+/// refuses a different set rather than silently using serve's own.
+pub fn same_mint_relays(a: &[String], b: &[String]) -> bool {
+    let set = |l: &[String]| {
+        l.iter()
+            .map(|r| relay_key(r))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    set(a) == set(b)
+}
+
 /// One mint relay: `wss://`, or `ws://` on loopback (tests), no credentials/query/fragment.
 pub fn check_mint_relay(relay: &str) -> Result<()> {
     let u = url::Url::parse(relay).with_context(|| format!("invalid mint relay {relay}"))?;

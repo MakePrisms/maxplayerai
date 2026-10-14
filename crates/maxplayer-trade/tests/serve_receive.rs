@@ -822,6 +822,117 @@ async fn receive_with_home_locked_and_no_serve_is_refused() {
     assert_eq!(credited(&f.taker, &c.url), 16);
 }
 
+/// #1140 F4: a handed-off receive is checked against the relays it actually uses. An HTTP
+/// receive never touches the market, so a client with a different (or default) `--relay` set is
+/// served instead of refused. A `nostr://` receive uses mint relays: a client whose
+/// `--mint-relay` set differs from serve's is refused before anything is queued, journaled or
+/// sent (it is never silently run on serve's own mint relays), and the same set is accepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn handed_off_receive_checks_only_the_relays_it_uses() {
+    let f = Fixture::new(0).await;
+    let c = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&c, 16).await;
+    let serve_mint_relay = "ws://127.0.0.1:9";
+    let mut sc = Command::new(BIN);
+    let log = f.root.path().join("serve.stderr");
+    sc.arg("--home")
+        .arg(&f.taker)
+        .args([
+            "--relay",
+            &f.relay_url,
+            "--mint-relay",
+            serve_mint_relay,
+            "serve",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .kill_on_drop(true);
+    let mut serve = sc.spawn().unwrap();
+    let start = std::time::Instant::now();
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("{\"serve_socket\":\"")
+    {
+        assert!(start.elapsed() < Duration::from_secs(30), "serve socket");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let run = |relay: Option<String>, mint_relay: Option<String>, mint: String, input: String| {
+        let home = f.taker.clone();
+        async move {
+            let mut c = Command::new(BIN);
+            c.arg("--home").arg(&home);
+            if let Some(r) = relay {
+                c.args(["--relay", &r]);
+            }
+            if let Some(r) = mint_relay {
+                c.args(["--mint-relay", &r]);
+            }
+            c.args(["receive", &mint])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            let mut child = c.spawn().unwrap();
+            let mut i = child.stdin.take().unwrap();
+            i.write_all(input.as_bytes()).await.unwrap();
+            drop(i);
+            tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+                .await
+                .expect("receive timed out")
+                .unwrap()
+        }
+    };
+    // nostr:// receive with a different mint relay set: refused before queueing.
+    let npub = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+    let other = run(
+        Some(f.relay_url.clone()),
+        Some("ws://127.0.0.1:10".into()),
+        npub.into(),
+        token.clone(),
+    )
+    .await;
+    let (stdout, stderr) = text(&other);
+    assert_eq!(other.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("handed_to_serve"), "{stderr}");
+    assert!(
+        stderr.contains("Use the same --mint-relay set as serve"),
+        "SAFETY: a nostr:// receive must not run on serve's mint relays: {stderr}"
+    );
+    assert!(receipts(&f).await.is_empty(), "SAFETY: nothing journaled");
+    assert_secret_free("client", &(stdout + &stderr), &token, &proofs);
+    // The default mint relays differ from serve's too: refused the same way.
+    let default = run(Some(f.relay_url.clone()), None, npub.into(), token.clone()).await;
+    assert_eq!(default.status.code(), Some(1));
+    assert!(text(&default).1.contains("--mint-relay set"));
+    assert!(receipts(&f).await.is_empty());
+    // HTTP receive with the default market relays (not serve's): accepted and credited.
+    let ok = run(None, None, c.url.clone(), token.clone()).await;
+    let (stdout, stderr) = text(&ok);
+    assert!(ok.status.success(), "{stderr}");
+    assert!(stderr.contains("handed_to_serve"), "{stderr}");
+    assert_eq!(outcome(&stderr).as_deref(), Some("credited"), "{stderr}");
+    assert_eq!(credited(&f.taker, &c.url), 16);
+    assert_eq!(c.faults.swaps.load(SeqCst), 1);
+    assert_secret_free("client", &(stdout + &stderr), &token, &proofs);
+    // The same mint relay set (another spelling) passes the relay check and reaches the
+    // receive itself, which refuses the token for that mint (it was issued by `c`).
+    let same = run(
+        Some("wss://unused.example".into()),
+        Some("ws://127.0.0.1:9/".into()),
+        npub.into(),
+        token.clone(),
+    )
+    .await;
+    let stderr = text(&same).1;
+    assert!(!stderr.contains("--mint-relay set"), "{stderr}");
+    assert!(!stderr.contains("--relay set"), "{stderr}");
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert_secret_free("serve log", &log, &token, &proofs);
+    assert!(serve.try_wait().unwrap().is_none());
+    serve.kill().await.unwrap();
+}
+
 /// A receive whose mint swap hangs holds serve's loop only for its budget (lab: 6 s on loopback):
 /// the client is told `in_doubt` (exit 3), serve then serves another receive while that swap is
 /// still stuck at the mint (uncredited, and every retry answered 429), and recovery later credits
@@ -1060,7 +1171,7 @@ async fn receive_and_serve_error_lines_redact_token_text() {
     let mut s = tokio::net::UnixStream::connect(f.taker.join("serve.sock"))
         .await
         .unwrap();
-    let line = serde_json::json!({"v":1,"relays":[leak],"command":{"cancel":{"lot":"x"}}});
+    let line = serde_json::json!({"v":maxplayer_trade::serve::PROTOCOL_V,"relays":[leak],"mint_relays":[],"command":{"cancel":{"lot":"x"}}});
     s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
     let mut reply = String::new();
     tokio::time::timeout(Duration::from_secs(15), s.read_to_string(&mut reply))
