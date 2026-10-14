@@ -1556,25 +1556,30 @@ async fn run_units(
         // wait when the stop is forced; every money step is journaled first, so that is safe.
         if let Some(stop) = crate::shutdown::stop() {
             const WHY: &str = "serve is stopping; request not started, nothing was applied";
+            for unit in sched.drain_queued() {
+                if let Unit::Job(job) = unit {
+                    crate::serve::refuse(job, WHY);
+                }
+            }
+            // While running units finish, a request that still arrives is answered "not
+            // started" (as when serve was one step at a time); the channel closes after them.
+            let drained = crate::shutdown::bounded(async {
+                while sched.running() > 0 {
+                    tokio::select! {
+                        (id, r) = sched.next() => report(&id, r),
+                        Some(job) = async { match jobs.as_mut() { Some(rx) => rx.recv().await, None => std::future::pending().await } } => crate::serve::refuse(job, WHY),
+                    }
+                }
+                Ok(())
+            })
+            .await;
             if let Some(rx) = jobs.as_mut() {
                 rx.close();
                 while let Ok(job) = rx.try_recv() {
                     crate::serve::refuse(job, WHY);
                 }
             }
-            for unit in sched.drain_queued() {
-                if let Unit::Job(job) = unit {
-                    crate::serve::refuse(job, WHY);
-                }
-            }
-            crate::shutdown::bounded(async {
-                while sched.running() > 0 {
-                    let (id, r) = sched.next().await;
-                    report(&id, r);
-                }
-                Ok(())
-            })
-            .await?;
+            drained?;
             return Err(stop.into());
         }
         sched.start_ready(|unit| start_unit(home, j, m, unit));
