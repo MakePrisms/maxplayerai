@@ -932,3 +932,122 @@ async fn recovery_claims_active_swap_before_stalled_receive_mint() {
     assert_eq!(credited(&f.maker, &c.url), 40, "SAFETY: credited once");
     assert_eq!(c.faults.swaps.load(SeqCst), 1, "SAFETY: one swap");
 }
+
+/// #1140 review F3: every error line on the receive and serve paths goes through
+/// `redact_reason`. A lab fault makes the credit release fail with token- and secret-shaped text;
+/// each line that prints it must show only the redaction markers: a new attempt
+/// (`receive::receive`), a repeated attempt, `receive::recover` (CLI `recover` and serve's ticks),
+/// a receive handed to serve, and serve's relay-mismatch reply and its connection log.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn receive_and_serve_error_lines_redact_token_text() {
+    const FAULT: &str = "TRADE_LAB_RECEIVE_RELEASE_ERROR";
+    let token_like = format!("cashuB{}", "o2FteBtodHRwOi8v".repeat(4));
+    let hex = "ab".repeat(32);
+    let leak = format!("{token_like} {hex}");
+    let leaked = |what: &str, text: &str| {
+        assert!(
+            !text.contains(&token_like),
+            "SAFETY: token text in {what}: {text}"
+        );
+        assert!(!text.contains(&hex), "SAFETY: secret hex in {what}: {text}");
+    };
+    let redacted = "lab fault: release failed: <redacted token> <redacted hex>";
+    async fn run(
+        home: &Path,
+        relay: &str,
+        args: &[&str],
+        stdin: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> (String, String) {
+        let mut c = cmd(home, relay, args);
+        c.envs(env.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if stdin.is_some() {
+            c.stdin(Stdio::piped());
+        }
+        let mut child = c.spawn().unwrap();
+        if let Some(s) = stdin {
+            let mut i = child.stdin.take().unwrap();
+            i.write_all(s.as_bytes()).await.unwrap();
+            drop(i);
+        }
+        let out = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        text(&out)
+    }
+    let f = Fixture::new(0).await;
+    let c = MintFixture::start(0).await;
+    let (_s1, p1, t1) = issue(&c, 40).await;
+    let (_s2, p2, t2) = issue(&c, 24).await;
+    let fault = [(FAULT, leak.as_str())];
+    let receive = ["receive", c.url.as_str()];
+    // receive::receive, new attempt.
+    let (out, err) = run(&f.taker, &f.relay_url, &receive, Some(&t1), &fault).await;
+    leaked("new attempt", &(out.clone() + &err));
+    assert!(
+        err.contains(&format!("{redacted}; attempt retained")),
+        "{err}"
+    );
+    // receive::receive, the same attempt again.
+    let (out, err) = run(&f.taker, &f.relay_url, &receive, Some(&t1), &fault).await;
+    leaked("repeated attempt", &(out.clone() + &err));
+    assert!(
+        err.contains(&format!("{redacted}; attempt retained")),
+        "{err}"
+    );
+    // receive::recover.
+    let (out, err) = run(&f.taker, &f.relay_url, &["recover"], None, &fault).await;
+    leaked("recover", &(out.clone() + &err));
+    assert!(
+        err.contains(&format!("release deferred: {redacted}")),
+        "{err}"
+    );
+    // Through serve: its recovery ticks and a handed-off receive.
+    let mut serve = start_serve_env(&f.taker, &f.relay_url, f.root.path(), "serve", &fault).await;
+    let (out, err) = run(&f.taker, &f.relay_url, &receive, Some(&t2), &[]).await;
+    assert!(err.contains("handed_to_serve"), "{err}");
+    leaked("handed-off client", &(out + &err));
+    // serve's relay-mismatch reply quotes the requested relays: a mistyped one may be a token.
+    let mut s = tokio::net::UnixStream::connect(f.taker.join("serve.sock"))
+        .await
+        .unwrap();
+    let line = serde_json::json!({"v":1,"relays":[leak],"command":{"cancel":{"lot":"x"}}});
+    s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+    let mut reply = String::new();
+    tokio::time::timeout(Duration::from_secs(15), s.read_to_string(&mut reply))
+        .await
+        .unwrap()
+        .unwrap();
+    leaked("serve reply", &reply);
+    assert!(reply.contains("this command asked for"), "{reply}");
+    assert!(reply.contains("<redacted token>"), "{reply}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let log = serve.output();
+    leaked("serve output", &log);
+    assert!(
+        log.contains(&format!("{redacted}; attempt retained")),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("release deferred: {redacted}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("\"serve_client\":\"closed\"") && log.contains("this command asked for"),
+        "{log}"
+    );
+    serve.child.kill().await.unwrap();
+    serve.child.wait().await.unwrap();
+    for (t, p) in [(&t1, &p1), (&t2, &p2)] {
+        assert_secret_free("serve output", &log, t, p);
+    }
+    // Without the fault the retained attempts settle, each credited once.
+    let (_, err) = run(&f.taker, &f.relay_url, &["recover"], None, &[]).await;
+    assert!(receipts(&f).await.iter().all(Receipt::settled), "{err}");
+    assert_eq!(credited(&f.taker, &c.url), 64, "SAFETY: credited once");
+    assert_eq!(c.faults.swaps.load(SeqCst), 2, "SAFETY: one swap per token");
+}

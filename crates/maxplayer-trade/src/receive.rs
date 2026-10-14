@@ -249,7 +249,11 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     if let Some(mut r) = existing {
         // `refused` is terminal, so `resume` below only no-ops: a refusal is final.
         if let Err(error) = resume(home, j, &mut r).await {
-            eprintln!("receive {}: {error:#}; attempt retained", r.id);
+            eprintln!(
+                "receive {}: {}; attempt retained",
+                r.id,
+                crate::redact_reason(&format!("{error:#}"))
+            );
         }
         return Ok(r);
     }
@@ -350,7 +354,11 @@ pub async fn receive(home: &Path, j: &Journal, mint: &str, raw: &str) -> Result<
     };
     j.put("receive", &r.id, &r).await?;
     if let Err(error) = resume(home, j, &mut r).await {
-        eprintln!("receive {}: {error:#}; attempt retained", r.id);
+        eprintln!(
+            "receive {}: {}; attempt retained",
+            r.id,
+            crate::redact_reason(&format!("{error:#}"))
+        );
     }
     Ok(r)
 }
@@ -471,6 +479,11 @@ fn operation(r: &Receipt) -> Result<uuid::Uuid> {
 async fn release(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
     if r.state != ReceiveState::Done || r.released {
         return Ok(());
+    }
+    // Lab fault: the release fails with this text (redaction tests put token text in it).
+    #[cfg(feature = "lab")]
+    if let Ok(text) = std::env::var("TRADE_LAB_RECEIVE_RELEASE_ERROR") {
+        anyhow::bail!("lab fault: release failed: {text}");
     }
     database(home, &r.mint)
         .await?
@@ -689,7 +702,11 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         if r.terminal() {
             if let Err(error) = release(home, j, &mut r).await {
                 failed = true;
-                eprintln!("receive {}: release deferred: {error:#}", r.id);
+                eprintln!(
+                    "receive {}: release deferred: {}",
+                    r.id,
+                    crate::redact_reason(&format!("{error:#}"))
+                );
             }
             continue;
         }

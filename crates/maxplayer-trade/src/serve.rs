@@ -238,7 +238,7 @@ pub fn bind(home: &Path, relays: Vec<String>) -> Result<mpsc::Receiver<Job>> {
                 if let Err(e) = connection(stream, owner, &home, &relays, tx).await {
                     eprintln!(
                         "{}",
-                        serde_json::json!({"serve_client":"closed","reason":e.to_string()})
+                        serde_json::json!({"serve_client":"closed","reason":crate::redact_reason(&e.to_string())})
                     );
                 }
             });
@@ -342,10 +342,11 @@ async fn connection(
         let error = if request.v != PROTOCOL_V {
             "serve protocol version mismatch".to_string()
         } else {
-            format!(
+            // The requested relays are caller text (a mistyped flag may hold a token): redacted.
+            crate::redact_reason(&format!(
                 "serve uses relays {relays:?}; this command asked for {:?}. Use the same --relay set as serve",
                 request.relays
-            )
+            ))
         };
         write(
             &mut stream,
