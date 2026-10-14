@@ -554,12 +554,15 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 }
 .brand.small span { font-size: 12px; letter-spacing: 0.04em; }
 .foot-brand p { margin: 6px 0 0; font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.1em; }
-.foot-nav { display: flex; gap: 18px; }
+/* two rows (bob): site pages first, then Skill · GitHub · @maxplayerai, dimmer */
+.foot-nav { display: flex; flex-direction: column; align-items: flex-end; gap: 12px; }
+.foot-row { display: flex; gap: 18px; }
 .foot-nav a {
   color: var(--muted); text-decoration: none;
   font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
 }
 .foot-nav a:hover { color: var(--neon); }
+.foot-sub a { color: var(--faint); }
 .foot-word {
   margin: 34px 0 max(0.16em, 18px);
   font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
@@ -1005,7 +1008,8 @@ button.chip { cursor: pointer; }
   .h-sub br { display: none; }
   .windows button { padding: 11px 14px; font-size: 11px; }
   .foot-cols { flex-direction: column; gap: 18px; }
-  .foot-nav { flex-wrap: wrap; gap: 0 22px; }
+  .foot-nav { align-items: flex-start; gap: 0; }
+  .foot-row { flex-wrap: wrap; gap: 0 22px; }
   .foot-nav a { display: inline-block; padding: 13px 0; }
   .nav-links a { padding: 14px 16px; }
 }
