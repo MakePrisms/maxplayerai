@@ -1963,10 +1963,23 @@ async fn private_snapshot(
         }
     }
     let files = file_manifest(files)?;
-    let metadata = json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,"answer":answer,"evidence":bundle});
+    let metadata = json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,
+        "requested_output":resolved.offer.output,"requested_agent":resolved.offer.requested_agent,
+        "requested_harness_family":resolved.offer.requested_harness_family,
+        "requested_model":resolved.offer.requested_model,"required_capabilities":resolved.offer.required_capabilities,
+        "answer":answer,"evidence":private_classifier_evidence(bundle)});
     let model = config.model.clone();
     tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &files, &model, deadline))
         .await.map_err(|_| "input_unavailable")?
+}
+
+// Only readable, nonduplicated context goes to the classifier. The signed
+// lifecycle and commitments have already been validated; wire encodings are not
+// additional task content and must not be mistaken for hidden instructions.
+fn private_classifier_evidence(bundle: &crate::review::private::Request) -> Value {
+    json!({"offer":bundle.offer.id, "claim":bundle.delivery.as_ref().map(|e| e.claim.id),
+        "award":bundle.delivery.as_ref().map(|e| e.award.id),
+        "result":bundle.delivery.as_ref().map(|e| e.result.id)})
 }
 
 async fn publish_review(client: &Client, relay: &str, keys: &Keys, event: &Event, recipients: Option<&[String]>) -> Result<(), String> {

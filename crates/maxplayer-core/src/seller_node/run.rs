@@ -3554,6 +3554,7 @@ pub const INLINE_ANSWER_MAX_BYTES: usize = crate::delivery_orchestrator::OUTCOME
     // so an answer sized to the raw cap makes the message exceed it and be cut. The limit stated
     // to the agent, and enforced here, is the cap MINUS the line it was told to add.
     - (crate::engine::INLINE_ANSWER_MARKER.len() + 1);
+const _: () = assert!(INLINE_ANSWER_MAX_BYTES <= crate::private_content::MAX_INLINE_ANSWER_BYTES);
 
 /// The refusal reason for the UNRUNNABLE launcher/exec shape.
 ///
@@ -8335,11 +8336,34 @@ impl SellerNodeRunner {
         };
         if let Some(private) = &private_execution { seller.git_remote = private.remote.clone(); }
         // `offer` was read tolerantly above (for the deadline); its true absence fails the job here.
-        let Some(offer) = offer else {
+        let Some(mut offer) = offer else {
             opline!("seller node execute fail job_id={job_id}: offer facts missing");
             self.fail_job(job_id).await;
             return;
         };
+        // Independent of the seller's own review skip: the buyer may require review.
+        // Decide the transport before either host/container agent performs any work.
+        let inline_requested = offer
+            .accepts_delivery
+            .iter()
+            .any(|m| m == gateway::DELIVERY_MODE_INLINE);
+        match crate::review::private::seller_delivery_budget(
+            self.node.home(), self.node.signer(), job_id, inline_requested,
+        ).await {
+            Ok(false) if inline_requested => {
+                offer.accepts_delivery.retain(|m| m != gateway::DELIVERY_MODE_INLINE);
+                opline!("seller job_id={job_id}: reserving delivery review space; agent must deliver files through Git");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                opline!("seller job_id={job_id}: delivery review preflight refused before agent execution: {error}");
+                self.fail_job_with_feedback(
+                    job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed,
+                    DELIVERY_FAILURE_FEEDBACK, None,
+                ).await;
+                return;
+            }
+        }
         // The claim-time creq is the single source of truth for the payment terms (audit N-4): the
         // delivery cosignature signs ITS hash, never a rebuild from live config.
         let stored_creq = match self.node.store().job_creq(job_id) {

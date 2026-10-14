@@ -491,6 +491,21 @@ input or update the reviewer before an **explicit** collect/accept or seller ret
 explicit retries can recover after software changes and still require a signed review.
 Availability errors retain normal explicit retry guidance. No payment gate is bypassed.
 
+Before a seller runs an agent, it checks a conservative delivery-review budget using
+that job's actual offer, task, claim (including mint invoice), and award. It reserves
+all projected result fields and the full allowed answer-envelope size, including
+JSON escaping. If inline cannot fit, the agent receives file-delivery instructions
+and both host/container paths disable inline for that run. Git is always supported
+by the buyer protocol. If even the Git review cannot fit, execution is refused before
+agent work starts; the seller reports the failure. This gate also runs when the
+seller skips its own safety review, since the buyer may still require one.
+
+The reservation is deliberately conservative: some short actual answers would fit
+where the largest permitted answer would not, so those jobs use Git. The task cap is
+unchanged. This protects new execution; it cannot retroactively change an old,
+already-published oversized inline delivery. The original reported Git job still
+uses rebuilt review requests at collection time.
+
 **Rollout order:** deploy the updated reviewer first (it accepts both wire shapes),
 then update buyer/seller clients. Old reviewers cannot read compact delivery requests.
 This fix does not require a relay message-limit change. Do not roll the reviewer back

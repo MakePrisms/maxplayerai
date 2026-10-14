@@ -205,45 +205,51 @@ mod tests {
             for unit in ["x", "\"", "é"] {
                 let cost = serde_json::to_string(unit).unwrap().len() - 2;
                 let task = unit.repeat((pc::MAX_BODY_BYTES - overhead) / cost);
-                let (evidence, _, buyer, policy) = pc::evidence::inline_fixture_with_text(
-                    targeted,
-                    false,
-                    2_000_000_000,
-                    vec!["https://testnut.cashu.space".into()],
-                    &task,
-                    &"a".repeat(pc::MAX_INLINE_ANSWER_BYTES),
-                );
-                for delivery in [false, true] {
-                    let request = Request {
-                        subject: Subject {
-                            offer: evidence.offer.id.to_hex(),
-                            event: if delivery {
-                                evidence.result.id.to_hex()
-                            } else {
-                                evidence.offer.id.to_hex()
+                for answer_unit in ["a", "\"", "\n", "é"] {
+                    let (evidence, _, buyer, policy) = pc::evidence::inline_fixture_with_text(
+                        targeted,
+                        false,
+                        2_000_000_000,
+                        vec!["https://testnut.cashu.space".into()],
+                        &task,
+                        &format!(
+                            "x{}",
+                            answer_unit
+                                .repeat((pc::MAX_INLINE_ANSWER_BYTES - 1) / answer_unit.len())
+                        ),
+                    );
+                    for delivery in [false, true] {
+                        let request = Request {
+                            subject: Subject {
+                                offer: evidence.offer.id.to_hex(),
+                                event: if delivery {
+                                    evidence.result.id.to_hex()
+                                } else {
+                                    evidence.offer.id.to_hex()
+                                },
+                                kind: if delivery {
+                                    JOB_RESULT_KIND
+                                } else {
+                                    JOB_OFFER_KIND
+                                },
+                                commit: None,
                             },
-                            kind: if delivery {
-                                JOB_RESULT_KIND
-                            } else {
-                                JOB_OFFER_KIND
-                            },
-                            commit: None,
-                        },
-                        offer: evidence.offer.clone(),
-                        task_envelope: evidence.task_envelope.clone(),
-                        delivery: delivery.then_some(evidence.clone()),
-                    };
-                    let service = super::super::tests::key(3);
-                    let draft = request.draft(&service.public_key().to_hex()).unwrap();
-                    let inner = crate::gateway::nostr::event_builder(&draft)
-                        .unwrap()
-                        .sign_with_keys(&buyer)
-                        .unwrap();
-                    let outer = wrap(&buyer, service.public_key(), &inner).await.unwrap();
-                    let decoded = unwrap(&service, &outer).await.unwrap();
-                    let restored: Request = serde_json::from_str(&decoded.content).unwrap();
-                    restored.validate(&buyer.public_key(), &policy).unwrap();
-                    assert!(restored.delivery == request.delivery);
+                            offer: evidence.offer.clone(),
+                            task_envelope: evidence.task_envelope.clone(),
+                            delivery: delivery.then_some(evidence.clone()),
+                        };
+                        let service = super::super::tests::key(3);
+                        let draft = request.draft(&service.public_key().to_hex()).unwrap();
+                        let inner = crate::gateway::nostr::event_builder(&draft)
+                            .unwrap()
+                            .sign_with_keys(&buyer)
+                            .unwrap();
+                        let outer = wrap(&buyer, service.public_key(), &inner).await.unwrap();
+                        let decoded = unwrap(&service, &outer).await.unwrap();
+                        let restored: Request = serde_json::from_str(&decoded.content).unwrap();
+                        restored.validate(&buyer.public_key(), &policy).unwrap();
+                        assert!(restored.delivery == request.delivery);
+                    }
                 }
             }
         }

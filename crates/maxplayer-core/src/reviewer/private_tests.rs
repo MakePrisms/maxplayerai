@@ -45,6 +45,9 @@ async fn scenario(targeted: bool, delivery: bool, provider_failure: bool) {
                         let body: Value =
                             serde_json::from_slice(&bytes[at + 4..at + 4 + len]).unwrap();
                         let state = body["state"].as_str().unwrap();
+                        for encoded in ["public_task_b64", "task_envelope", "answer_envelope", "body_b64"] {
+                            assert!(!state.contains(encoded), "classifier must receive readable content, not wire encodings");
+                        }
                         assert!(state.contains(if targeted {
                             "private task"
                         } else {
