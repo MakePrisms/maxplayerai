@@ -95,13 +95,16 @@ async fn forced() -> Stopped {
 }
 /// Run `f` unless the stop is forced first: then `f` is dropped at its current wait (see the
 /// module docs for why that keeps the journal intact) and [`Stopped`] is returned.
-pub async fn bounded<T>(
+/// Not an `async fn`: `f` is boxed before the returned future exists (see `progress::scoped`).
+pub fn bounded<T>(
     f: impl std::future::Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
+) -> impl std::future::Future<Output = anyhow::Result<T>> {
     let f = Box::pin(f);
-    tokio::select! {
-        r = f => r,
-        s = forced() => Err(s.into()),
+    async move {
+        tokio::select! {
+            r = f => r,
+            s = forced() => Err(s.into()),
+        }
     }
 }
 

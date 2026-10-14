@@ -164,34 +164,44 @@ tokio::task_local! {
 }
 
 /// Run `f` with progress for this swap (`None`: plainly). Task-local like `backoff::with_claim`:
-/// it does not cross `tokio::spawn`. Boxed: the wrapped coordinator futures are large.
-pub async fn scoped<F: std::future::Future>(ctx: Option<Ctx>, f: F) -> F::Output {
+/// it does not cross `tokio::spawn`.
+///
+/// Not an `async fn`: `f` is boxed BEFORE the returned future exists, so that future holds only
+/// the box. An `async fn` taking `f` by value embeds all of `f` in its own state, and these
+/// wrappers then nest coordinator and mint futures deep enough to overflow a debug-build stack.
+pub fn scoped<F: std::future::Future>(
+    ctx: Option<Ctx>,
+    f: F,
+) -> impl std::future::Future<Output = F::Output> {
     let f = Box::pin(f);
-    match ctx {
-        Some(ctx) => CTX.scope(ctx, f).await,
-        None => f.await,
+    async move {
+        match ctx {
+            Some(ctx) => CTX.scope(ctx, f).await,
+            None => f.await,
+        }
     }
 }
 
 /// Report one mint call `op` to `mint`: [`sending`] (from `backoff::admit`) when a request
 /// actually goes out, the outcome when it returns. Outside a swap scope it only runs `f`.
-pub async fn call<R>(
+/// Boxes `f` up front like [`scoped`].
+pub fn call<R>(
     mint: &str,
     op: &str,
     f: impl std::future::Future<Output = R>,
     seen: impl FnOnce(&R) -> (Seen, Option<String>),
-) -> R {
-    // Boxed on both paths: the wrapped mint futures are large and debug builds poll them on
-    // the test thread's stack (an inline await here overflowed `tests/e2e.rs`).
+) -> impl std::future::Future<Output = R> {
     let f = Box::pin(f);
-    let Ok(ctx) = CTX.try_with(Clone::clone) else {
-        return f.await;
-    };
-    let started = Instant::now();
-    let r = OP.scope(op.to_owned(), f).await;
-    let (outcome, reason) = seen(&r);
-    end(&ctx, mint, op, started.elapsed(), outcome, reason);
-    r
+    async move {
+        let Ok(ctx) = CTX.try_with(Clone::clone) else {
+            return f.await;
+        };
+        let started = Instant::now();
+        let r = OP.scope(op.to_owned(), f).await;
+        let (outcome, reason) = seen(&r);
+        end(&ctx, mint, op, started.elapsed(), outcome, reason);
+        r
+    }
 }
 
 #[derive(Default)]
