@@ -4416,6 +4416,8 @@ pub struct SellerNodeRunner {
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
+    /// Backfill cadence, resolved once at boot (tests shorten it per runner, never via the env).
+    wrap_backfill_interval_secs: u64,
     /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
     /// shutdown waits (bounded, [`schedule::LANE_SETTLE_MONEY_BOUND`]) while this is non-zero
     /// instead of cutting a swap off mid-flight.
@@ -4868,6 +4870,7 @@ impl SellerNodeRunner {
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
+            wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
             redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
             remit_pacing: Arc::new(Mutex::new(crate::fee_remit::RemitBackoff::new())),
@@ -5521,7 +5524,7 @@ impl SellerNodeRunner {
             "seller node wrap backfill enabled: re-fetching stored kind-1059(s) every {}s (recovers a \
              silently-deaf payment subscription without a restart; its log line is the periodic \
              liveness signal)",
-            resolve_wrap_backfill_interval_secs()
+            self.wrap_backfill_interval_secs
         );
 
         // Whatever reconcile left pending drains on the lane's first tick (the drain interval fires
@@ -5589,7 +5592,7 @@ impl SellerNodeRunner {
         let sweep_enabled = SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref())
             .map(|sandbox| sandbox.sandbox_network().is_some())
             .unwrap_or(false);
-        let wrap_backfill_interval_secs = resolve_wrap_backfill_interval_secs();
+        let wrap_backfill_interval_secs = self.wrap_backfill_interval_secs;
         let mut wrap_backfill_tick =
             tokio::time::interval(Duration::from_secs(wrap_backfill_interval_secs));
         let heartbeat_interval = Duration::from_secs(heartbeat_interval_secs.max(1));
@@ -5674,6 +5677,12 @@ impl SellerNodeRunner {
         let mut lane: Option<LaneFuture> = None;
         let mut lane_busy = schedule::LaneBusy::default();
         let mut pacing = schedule::OutboxPacing::default();
+        // The private-content flush's own pacing (independent of the outbox's).
+        let mut private_pacing = schedule::OutboxPacing::default();
+        // When the current lane work started, and when the last recovery ended: a backfill whose
+        // reads a recovery cut off is re-run, not reported as a failed read (finding 1).
+        let mut lane_started_at = tokio::time::Instant::now();
+        let mut last_recovery_end: Option<tokio::time::Instant> = None;
         let mut queue_full_logged = false;
         // Heartbeat supervision (probe + publish + watchdog + recovery), single-flight.
         let mut supervision: Option<SupervisionFuture> = None;
@@ -5696,12 +5705,14 @@ impl SellerNodeRunner {
                         last_backfill_at = now;
                     }
                     lane_busy.start(work.label(), now);
+                    lane_started_at = now;
                     let drain = if pacing.may_drain(now) {
                         DrainMode::Routine
                     } else {
                         DrainMode::FreshOnly
                     };
-                    lane = Some(Box::pin(Arc::clone(&self).lane_work(work, drain)));
+                    let flush_private = private_pacing.may_drain(now);
+                    lane = Some(Box::pin(Arc::clone(&self).lane_work(work, drain, flush_private)));
                 }
             }
             if queue.has_room() {
@@ -5890,6 +5901,9 @@ impl SellerNodeRunner {
                         manual_recovery_succeeded = false;
                     }
                     liveness = report.clock;
+                    if report.recovered.is_some() {
+                        last_recovery_end = Some(tokio::time::Instant::now());
+                    }
                     match report.recovered {
                         Some(true) => {
                             stalled_since_recovery = true;
@@ -5897,6 +5911,7 @@ impl SellerNodeRunner {
                             // A fresh authenticated socket: a pause earned against the dead one
                             // must not hold the backlog back from the live one.
                             pacing.reset();
+                            private_pacing.reset();
                             // The full set was re-subscribed, so the open-pool half is back.
                             open_pool = None;
                         }
@@ -5912,50 +5927,71 @@ impl SellerNodeRunner {
                     if let Some((label, busy)) = lane_busy.finish(now) {
                         opline!("seller node WORK-LANE clear: {label} finished after {}s", busy.as_secs());
                     }
-                    // A fresh-only pass (routine drains paused) never extends the pause; one the relay
-                    // confirmed proves it is acknowledging again, so routine drains resume.
-                    if let Some(counts) = done.drain
-                        && counts.fresh_only
-                    {
-                        if counts.confirmed > 0 {
-                            pacing.reset();
+                    if let Some(counts) = done.drain {
+                        let pauses = fold_drain(counts, &mut pacing, &mut private_pacing, now);
+                        if let Some(pause) = pauses.outbox {
+                            if pause == schedule::OUTBOX_BACKOFF_MIN {
+                                opline!(
+                                    "seller node outbox: the relay confirmed none of {} pending \
+                                     publication(s); routine drains pause {}s, backing off to {}s \
+                                     (rows stay pending and are retried with the same event ids)",
+                                    counts.unconfirmed,
+                                    pause.as_secs(),
+                                    schedule::OUTBOX_BACKOFF_MAX.as_secs()
+                                );
+                            } else {
+                                opline_verbose!(
+                                    "seller node outbox: still unconfirmed ({}); routine drains pause {}s",
+                                    counts.unconfirmed,
+                                    pause.as_secs()
+                                );
+                            }
                         }
-                    } else if let Some(counts) = done.drain
-                        && let Some(pause) = pacing.record(counts.confirmed, counts.unconfirmed, now)
-                    {
-                        if pause == schedule::OUTBOX_BACKOFF_MIN {
-                            opline!(
-                                "seller node outbox: the relay confirmed none of {} pending \
-                                 publication(s); routine drains pause {}s, backing off to {}s (rows \
-                                 stay pending and are retried with the same event ids)",
-                                counts.unconfirmed,
-                                pause.as_secs(),
-                                schedule::OUTBOX_BACKOFF_MAX.as_secs()
-                            );
-                        } else {
-                            opline_verbose!(
-                                "seller node outbox: still unconfirmed ({}); routine drains pause {}s",
-                                counts.unconfirmed,
-                                pause.as_secs()
-                            );
+                        if let (Some(pause), Some(flush)) = (pauses.private, counts.private) {
+                            if pause == schedule::OUTBOX_BACKOFF_MIN {
+                                opline!(
+                                    "seller node private content: the relay confirmed none of {} \
+                                     pending copies; the flush pauses {}s, backing off to {}s \
+                                     (copies stay pending)",
+                                    flush.unconfirmed,
+                                    pause.as_secs(),
+                                    schedule::OUTBOX_BACKOFF_MAX.as_secs()
+                                );
+                            } else {
+                                opline_verbose!(
+                                    "seller node private content: still unconfirmed ({}); the flush pauses {}s",
+                                    flush.unconfirmed,
+                                    pause.as_secs()
+                                );
+                            }
                         }
                     }
-                    match done.backfill_complete {
-                        Some(true) => {
-                            backfill_backoff.reset();
-                            backfill_retry_armed = false;
+                    if let Some(complete) = done.backfill_complete {
+                        let overlapped = schedule::overlapped_recovery(
+                            lane_started_at,
+                            recovering.get(),
+                            last_recovery_end,
+                        );
+                        match schedule::after_backfill(complete, overlapped, &mut backfill_backoff) {
+                            schedule::BackfillNext::Done => backfill_retry_armed = false,
+                            schedule::BackfillNext::RerunAfterRecovery => {
+                                // Waits in the queue while the recovery is still reconnecting.
+                                queue.request_backfill();
+                                opline_verbose!(
+                                    "seller node backfill cut short by a relay recovery: re-running \
+                                     once the relay is back"
+                                );
+                            }
+                            schedule::BackfillNext::RetryAfter(delay) => {
+                                backfill_retry.as_mut().reset(now + delay);
+                                backfill_retry_armed = true;
+                                opline!(
+                                    "seller node backfill INCOMPLETE: retrying in {}s (incomplete \
+                                     history is never taken as empty)",
+                                    delay.as_secs()
+                                );
+                            }
                         }
-                        Some(false) => {
-                            let delay = backfill_backoff.next_delay();
-                            backfill_retry.as_mut().reset(now + delay);
-                            backfill_retry_armed = true;
-                            opline!(
-                                "seller node backfill INCOMPLETE: retrying in {}s (incomplete \
-                                 history is never taken as empty)",
-                                delay.as_secs()
-                            );
-                        }
-                        None => {}
                     }
                     continue;
                 }
@@ -6290,17 +6326,48 @@ impl SellerNodeRunner {
                                 opline!("seller private feedback not persisted: {e}"); return false;
                             }
                         }
-                        match self.client.send_event_to([&self.relay_url], &feedback).await {
-                        Ok(_) => {
+                        // Bounded on its own: this runs on the work lane, and the SDK's OK wait (plus an
+                        // AUTH retry) is longer than advisory feedback is worth. A private copy is
+                        // already persisted above and goes out again with the private flush.
+                        match tokio::time::timeout(
+                            FEEDBACK_PUBLISH_BUDGET,
+                            self.client.send_event_to([&self.relay_url], &feedback),
+                        )
+                        .await
+                        {
+                        // #509: `Ok(Output)` is not an acknowledgement; a rejected or unanswered
+                        // publish lands in `output.failed`. Report success only when confirmed, so a
+                        // deduping caller lets the next re-ingest surface it again.
+                        Ok(Ok(output)) if publish_confirmed(&output) => {
                             opline!(
                                 "seller node buyer feedback surfaced: offer={offer_id} reason_code={} reason={reason}",
                                 reason_code.as_str()
                             );
                             true
                         }
-                        Err(error) => {
+                        Ok(Ok(output)) => {
+                            let reasons: Vec<String> = output
+                                .failed
+                                .iter()
+                                .map(|(url, reason)| format!("{url}: {reason}"))
+                                .collect();
+                            opline!(
+                                "seller node WARN: buyer feedback not confirmed offer={offer_id} ({})",
+                                if reasons.is_empty() { "no acknowledgement".to_owned() } else { reasons.join("; ") }
+                            );
+                            false
+                        }
+                        Ok(Err(error)) => {
                             opline!(
                                 "seller node WARN: buyer feedback publish failed offer={offer_id} ({error})"
+                            );
+                            false
+                        }
+                        Err(_) => {
+                            opline!(
+                                "seller node WARN: buyer feedback publish not acknowledged within {}s \
+                                 offer={offer_id} (continuing)",
+                                FEEDBACK_PUBLISH_BUDGET.as_secs()
                             );
                             false
                         }
@@ -9001,7 +9068,7 @@ impl SellerNodeRunner {
             }
         }
         self.publish_now(&format!("result:{job_id}")).await;
-        self.drain(DrainMode::Routine).await;
+        self.drain(DrainMode::Routine, true).await;
     }
 
     /// Task B2: deliver `job_id` through ONE sandbox container that runs the agent AND all git. The
@@ -9636,7 +9703,7 @@ impl SellerNodeRunner {
             }
         }
         self.publish_now(&format!("result:{job_id}")).await;
-        self.drain(DrainMode::Routine).await;
+        self.drain(DrainMode::Routine, true).await;
     }
 
     /// Fail a container-delivered job with the SAME feedback reason codes and harness attribution the
@@ -9848,7 +9915,7 @@ impl SellerNodeRunner {
             }
         }
         self.publish_now(&format!("result:{job_id}")).await;
-        self.drain(DrainMode::Routine).await;
+        self.drain(DrainMode::Routine, true).await;
     }
 
     /// Settle one gift-wrapped payment: decode it (through the signer actor — the NIP-44 decrypt
@@ -10392,9 +10459,11 @@ impl SellerNodeRunner {
     /// the next pass. The returned counts drive the run loop's pacing; nothing here can hold the
     /// caller longer than [`OUTBOX_PASS_BUDGET`] + [`PRIVATE_FLUSH_BUDGET`] (plus one signer call).
     ///
-    /// [`DrainMode::FreshOnly`] (routine drains paused) tries only never-attempted rows and skips the
-    /// private-content flush: a fresh claim still gets its first attempt, the paced backlog waits.
-    async fn drain(&self, mode: DrainMode) -> DrainCounts {
+    /// [`DrainMode::FreshOnly`] (routine drains paused) tries only never-attempted rows: a fresh claim
+    /// still gets its first attempt, the paced backlog waits. `flush_private` is the private-content
+    /// flush's OWN pacing verdict: its copies are acknowledged (or not) independently of the outbox,
+    /// so neither can mask the other's failures (aragon review of #1139, finding 4).
+    async fn drain(&self, mode: DrainMode, flush_private: bool) -> DrainCounts {
         let now = now_unix();
         let fresh_only = mode == DrainMode::FreshOnly;
         let mut counts = DrainCounts {
@@ -10419,12 +10488,11 @@ impl SellerNodeRunner {
             }
             Err(error) => opline!("seller node outbox drain error (continuing): {error}"),
         }
-        if fresh_only {
-            return counts;
-        }
-        if let Some(flush) = self.flush_private_content().await {
-            counts.confirmed += flush.accepted;
-            counts.unconfirmed += flush.pending;
+        if flush_private && let Some(flush) = self.flush_private_content().await {
+            counts.private = Some(PassCounts {
+                confirmed: flush.accepted,
+                unconfirmed: flush.pending,
+            });
         }
         counts
     }
@@ -10446,12 +10514,14 @@ impl SellerNodeRunner {
 }
 
 impl SellerNodeRunner {
-    /// One unit of lane work. `drain` is the loop's pacing verdict for the outbox drain that follows
-    /// it (claims an award reads and post-delivery results publish on their own).
+    /// One unit of lane work. `drain` and `flush_private` are the loop's pacing verdicts for the
+    /// outbox drain and private-content flush that follow it (claims an award reads and
+    /// post-delivery results publish on their own).
     async fn lane_work(
         self: Arc<Self>,
         work: schedule::Work<Box<nostr_sdk::Event>>,
         drain: DrainMode,
+        flush_private: bool,
     ) -> LaneDone {
         let mut done = LaneDone {
             backfill_complete: None,
@@ -10474,7 +10544,7 @@ impl SellerNodeRunner {
                 done.backfill_complete = Some(wraps && offers);
             }
         }
-        done.drain = Some(self.drain(drain).await);
+        done.drain = Some(self.drain(drain, flush_private).await);
         done
     }
 
@@ -10633,6 +10703,9 @@ struct SupervisionDone {
 const EVENT_QUEUE_CAP: usize = 1024;
 /// Bound on one heartbeat publish (signer + SDK OK wait + an AUTH retry).
 const HEARTBEAT_PUBLISH_BUDGET: Duration = Duration::from_secs(30);
+/// Bound on one buyer-feedback publish. Feedback is advisory and runs on the work lane, so it gets
+/// less than the SDK's own OK wait; a private copy is retried by the private-content flush.
+const FEEDBACK_PUBLISH_BUDGET: Duration = Duration::from_secs(5);
 /// First retry delay after an incomplete backfill; doubles up to the backfill interval.
 const BACKFILL_RETRY_MIN: Duration = Duration::from_secs(30);
 
@@ -10641,9 +10714,51 @@ const BACKFILL_RETRY_MIN: Duration = Duration::from_secs(30);
 struct DrainCounts {
     /// The pass ran in [`DrainMode::FreshOnly`].
     fresh_only: bool,
+    /// Outbox rows confirmed by the relay.
     confirmed: usize,
-    /// Failed, cut short, or never reached: still pending.
+    /// Outbox rows failed, cut short, or never reached: still pending.
     unconfirmed: usize,
+    /// `Some` when the private-content flush ran: its own counts, for its own pacing.
+    private: Option<PassCounts>,
+}
+
+/// Confirmed vs still-pending publications in one pass.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PassCounts {
+    confirmed: usize,
+    unconfirmed: usize,
+}
+
+/// The pauses one finished drain pass put in force.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct DrainPauses {
+    /// Routine outbox drains are now paused for this long.
+    outbox: Option<Duration>,
+    /// The private-content flush is now paused for this long.
+    private: Option<Duration>,
+}
+
+/// Fold one finished drain pass into the two independent pacings. A fresh-only pass never extends
+/// the outbox pause; one the relay confirmed proves it is acknowledging again, so routine drains
+/// resume. Private-content copies are paced only by their own outcome.
+fn fold_drain(
+    counts: DrainCounts,
+    outbox: &mut schedule::OutboxPacing,
+    private: &mut schedule::OutboxPacing,
+    now: tokio::time::Instant,
+) -> DrainPauses {
+    let mut pauses = DrainPauses::default();
+    if counts.fresh_only {
+        if counts.confirmed > 0 {
+            outbox.reset();
+        }
+    } else {
+        pauses.outbox = outbox.record(counts.confirmed, counts.unconfirmed, now);
+    }
+    if let Some(flush) = counts.private {
+        pauses.private = private.record(flush.confirmed, flush.unconfirmed, now);
+    }
+    pauses
 }
 
 /// Which outbox rows the drain after a unit of lane work may try.
@@ -15017,8 +15132,8 @@ mod tests {
                 assert_eq!(loser.slots.available(), 0, "the loser's single slot is reserved");
 
                 // Publish both claims so each has a real id on the wire; the award names the winner's.
-                winner.drain(DrainMode::Routine).await;
-                loser.drain(DrainMode::Routine).await;
+                winner.drain(DrainMode::Routine, true).await;
+                loser.drain(DrainMode::Routine, true).await;
                 let winner_claim_id = match winner.node.store().outbox_row(&format!("claim:{job_id}"))
                 {
                     Ok(Some((_, _, Some(published)))) => published,
@@ -15216,8 +15331,8 @@ mod tests {
                 // Publish both claims so each has a real id on the wire; the accept names the
                 // winner's. Without this the loser's own id is unreadable and it would refuse to
                 // bind for the WRONG reason (fail-closed), which would not test the identity match.
-                winner.drain(DrainMode::Routine).await;
-                loser.drain(DrainMode::Routine).await;
+                winner.drain(DrainMode::Routine, true).await;
+                loser.drain(DrainMode::Routine, true).await;
                 let published = |seat: &Arc<SellerNodeRunner>, label: &str| match seat
                     .node
                     .store()
@@ -16906,6 +17021,44 @@ mod tests {
     // TOOTH (#150 relay-stall watchdog) — the stall threshold is interval*missed with each factor
     // clamped ≥1 (never 0, so the watchdog can never trip on the first tick), and staleness trips
     // only AT/after the threshold.
+    /// The outbox and the private-content flush pace independently (aragon review of #1139,
+    /// finding 4): confirmations on one must not keep the other's failures retried every tick.
+    ///
+    /// RED ON REVERT: fold the private counts into the outbox's (`counts.confirmed +=
+    /// flush.accepted`) and pace both with one `OutboxPacing`; the first block goes red.
+    #[test]
+    fn private_copies_are_paced_by_their_own_outcome_not_the_outbox() {
+        let now = tokio::time::Instant::now();
+        let min = schedule::OUTBOX_BACKOFF_MIN;
+        let pass = |fresh_only, confirmed, unconfirmed, private: Option<(usize, usize)>| DrainCounts {
+            fresh_only,
+            confirmed,
+            unconfirmed,
+            private: private.map(|(confirmed, unconfirmed)| PassCounts { confirmed, unconfirmed }),
+        };
+
+        // Outbox confirming, private copies all failing: the flush pauses, the outbox does not.
+        let (mut outbox, mut private) = (schedule::OutboxPacing::default(), schedule::OutboxPacing::default());
+        let pauses = fold_drain(pass(false, 2, 0, Some((0, 3))), &mut outbox, &mut private, now);
+        assert_eq!(pauses, DrainPauses { outbox: None, private: Some(min) });
+        assert!(outbox.may_drain(now) && !private.may_drain(now));
+        // A pass that skipped the flush (paused) leaves its pacing alone.
+        fold_drain(pass(false, 1, 0, None), &mut outbox, &mut private, now);
+        assert!(!private.may_drain(now), "an outbox confirmation must not lift the flush pause");
+
+        // The reverse: confirmed private copies do not lift an outbox pause.
+        let (mut outbox, mut private) = (schedule::OutboxPacing::default(), schedule::OutboxPacing::default());
+        let pauses = fold_drain(pass(false, 0, 4, Some((1, 0))), &mut outbox, &mut private, now);
+        assert_eq!(pauses, DrainPauses { outbox: Some(min), private: None });
+        assert!(!outbox.may_drain(now) && private.may_drain(now));
+
+        // A fresh-only pass never extends the outbox pause; one the relay confirmed lifts it.
+        assert_eq!(fold_drain(pass(true, 0, 5, None), &mut outbox, &mut private, now).outbox, None);
+        assert!(!outbox.may_drain(now));
+        fold_drain(pass(true, 1, 0, None), &mut outbox, &mut private, now);
+        assert!(outbox.may_drain(now));
+    }
+
     #[test]
     fn watchdog_stall_math_clamps_and_trips_only_at_threshold() {
         assert_eq!(stall_threshold_secs(300, 3), 900);
@@ -17833,7 +17986,6 @@ mod tests {
     /// to `forced_recovery`, and the socket-count assertion fires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_unknown_id_closed_costs_no_reconnect_and_no_resubscribe() {
-        use_fast_backfill_tick();
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("unknownid");
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
@@ -17841,7 +17993,8 @@ mod tests {
         home.config.seller = Some(seller_cfg(1, false));
         home.config.seller_heartbeat.enabled = true;
         home.config.seller_heartbeat.interval_secs = 1;
-        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner")
+            .with_fast_backfill_tick();
         // `run()` is NOT `Send` under the `acp` feature — the runner holds an `AcpDriver`
         // whose std mpsc `Receiver` is `!Sync` — so `tokio::spawn` fails to COMPILE on the
         // seller's real feature combo (`acp` + `wallet`), while compiling fine on the
@@ -17962,7 +18115,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_requested_shutdown_ends_the_platform_fee_retries() {
         use std::sync::atomic::Ordering;
-        use_fast_backfill_tick();
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("remit-retry-stops-with-loop");
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
@@ -17972,7 +18124,8 @@ mod tests {
             home.config.platform_fee.auto_remit,
             "harness check: the switch is ON by default, so the tick is live"
         );
-        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner")
+            .with_fast_backfill_tick();
         let base = Duration::from_millis(25);
         let started = runner.remit_retry_bounds_for_test(base, Duration::from_millis(100));
         assert_eq!(started.load(Ordering::SeqCst), 0, "nothing runs at startup");
@@ -18039,7 +18192,6 @@ mod tests {
     ) {
         use crate::fee_remit::test_support::{Fake, Gate};
         use crate::seller_node::store::{ReceiptFees, SellerStore};
-        use_fast_backfill_tick();
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root(label);
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
@@ -18062,7 +18214,8 @@ mod tests {
                 1,
             )
             .expect("collect");
-        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner")
+            .with_fast_backfill_tick();
         let started = runner
             .remit_retry_bounds_for_test(Duration::from_millis(25), Duration::from_millis(100));
         let gate = Gate::new();
@@ -18459,7 +18612,6 @@ mod tests {
     /// and this goes red.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_seat_leaving_the_selling_role_retracts_its_announcement() {
-        use_fast_backfill_tick();
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("retract-on-leave");
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
@@ -18467,7 +18619,8 @@ mod tests {
         home.config.seller = Some(seller_cfg(1, false));
         home.config.seller_heartbeat.enabled = true;
         home.config.seller_heartbeat.interval_secs = 1;
-        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner")
+            .with_fast_backfill_tick();
         // Taken BEFORE `run`, which consumes the runner — the same order `sell.rs` uses.
         let shutdown = runner.shutdown_handle();
 
@@ -18541,6 +18694,47 @@ mod tests {
         home
     }
 
+    /// Buyer feedback runs on the work lane, so its publish is bounded on its own (aragon review of
+    /// #1139, finding 3), well inside the SDK's OK wait.
+    ///
+    /// RED ON REVERT: drop the `tokio::time::timeout(FEEDBACK_PUBLISH_BUDGET, ..)` around
+    /// `send_event_to` in `publish_buyer_feedback`; the call then waits out the SDK's 10s OK timeout.
+    /// Or restore `Ok(_) => true`: the SDK reports the unanswered publish as `Ok(Output)` with the
+    /// relay in `failed`, which the old arm counted as surfaced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_withheld_feedback_ok_holds_the_lane_no_longer_than_the_feedback_budget() {
+        let feedback_kind = u64::from(crate::kinds::JOB_FEEDBACK_KIND);
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("feedback-budget");
+        let runner = SellerNodeRunner::boot(lane_home(&root, &fixture))
+            .await
+            .expect("boot runner");
+        fixture.withhold_ok_for(&[feedback_kind]);
+
+        let started = std::time::Instant::now();
+        let published = runner
+            .publish_buyer_feedback(
+                &"f".repeat(64),
+                &"b".repeat(64),
+                ReasonCode::BelowRate,
+                "below the seller's rate",
+                None,
+            )
+            .await;
+        let took = started.elapsed();
+
+        assert!(!published, "an unacknowledged feedback publish must not report success");
+        assert!(
+            took < FEEDBACK_PUBLISH_BUDGET + Duration::from_secs(2),
+            "the feedback publish held the lane for {took:?} (budget {FEEDBACK_PUBLISH_BUDGET:?})"
+        );
+        assert!(
+            fixture.events().await.iter().any(|event| event.kind == feedback_kind),
+            "the feedback must have reached the relay (the bound cut the OK wait, not the send)"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Journal one claim (and its outbox row) for `n` through a second connection to the node's
     /// ledger; returns the outbox dedup key.
     fn seed_claim(store: &crate::seller_node::store::SellerStore, n: u8) -> String {
@@ -18598,7 +18792,6 @@ mod tests {
     /// whole pass.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn withheld_claim_oks_hold_neither_heartbeats_nor_shutdown_and_retries_reuse_the_event_id() {
-        use_fast_backfill_tick();
         let claim_kind = u64::from(crate::kinds::JOB_CLAIM_KIND);
         let beat_kind = u64::from(crate::heartbeat::SELLER_HEARTBEAT_KIND);
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
@@ -18610,7 +18803,8 @@ mod tests {
         };
         fixture.withhold_ok_for(&[claim_kind]);
 
-        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner")
+            .with_fast_backfill_tick();
         let shutdown = runner.shutdown_handle();
         let local = tokio::task::LocalSet::new();
         let loop_handle = local.spawn_local(async move { runner.run().await });
@@ -18745,13 +18939,13 @@ mod tests {
     /// tick (one per second here, against at most one per probe timeout).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hung_liveness_probe_recovers_one_at_a_time_while_the_lane_keeps_publishing() {
-        use_fast_backfill_tick();
         let beat_kind = u64::from(crate::heartbeat::SELLER_HEARTBEAT_KIND);
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("lane-l3-hung-probe");
         let runner = SellerNodeRunner::boot(lane_home(&root, &fixture))
             .await
-            .expect("boot runner");
+            .expect("boot runner")
+            .with_fast_backfill_tick();
         let shutdown = runner.shutdown_handle();
         let store = lane_store(&root);
         let local = tokio::task::LocalSet::new();
@@ -19005,14 +19199,16 @@ mod tests {
         }
     }
 
-    /// One owned tick, for the loop teeth below. Both #190 loop teeth set the SAME value, so running
-    /// them in parallel cannot make them disagree.
-    const TEST_BACKFILL_SECS: &str = "1";
+    /// One owned tick, for the loop teeth below.
+    const TEST_BACKFILL_SECS: u64 = 1;
 
-    /// Drive the backfill tick fast enough to observe. This is the documented test-only seam; no
-    /// production path sets it.
-    fn use_fast_backfill_tick() {
-        unsafe { std::env::set_var(WRAP_BACKFILL_INTERVAL_ENV, TEST_BACKFILL_SECS) };
+    impl SellerNodeRunner {
+        /// Drive THIS runner's backfill tick fast enough to observe. Per runner, not via the
+        /// process env, so parallel tests cannot see each other's cadence.
+        fn with_fast_backfill_tick(mut self) -> Self {
+            self.wrap_backfill_interval_secs = TEST_BACKFILL_SECS;
+            self
+        }
     }
 
     /// Offer REQs that carried the un-pinned open-pool filter — i.e. the grouped shape, armed.
@@ -19036,7 +19232,6 @@ mod tests {
     /// real loop.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn open_pool_rearms_on_an_owned_tick_without_any_reconnect() {
-        use_fast_backfill_tick();
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("rearm");
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
@@ -19045,7 +19240,8 @@ mod tests {
         // The watchdog is off so nothing but the CLOSED under test can move the node. A recovery
         // would re-arm the open-pool half for the wrong reason and the tooth would prove nothing.
         home.config.seller_heartbeat.enabled = false;
-        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner")
+            .with_fast_backfill_tick();
         // `run()` is NOT `Send` under the `acp` feature — the runner holds an `AcpDriver`
         // whose std mpsc `Receiver` is `!Sync` — so `tokio::spawn` fails to COMPILE on the
         // seller's real feature combo (`acp` + `wallet`), while compiling fine on the
@@ -19129,14 +19325,14 @@ mod tests {
     /// skip 1, skip 2, skip 4, …) has to hold the attempt count far below the tick count.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn repeated_open_pool_rejection_backs_off_and_never_hot_loops() {
-        use_fast_backfill_tick();
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let root = throwaway_root("backoff");
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         home.config.relay_url = fixture.url();
         home.config.seller = Some(seller_cfg(1, true));
         home.config.seller_heartbeat.enabled = false;
-        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner")
+            .with_fast_backfill_tick();
         // `run()` is NOT `Send` under the `acp` feature — the runner holds an `AcpDriver`
         // whose std mpsc `Receiver` is `!Sync` — so `tokio::spawn` fails to COMPILE on the
         // seller's real feature combo (`acp` + `wallet`), while compiling fine on the

@@ -15,6 +15,10 @@ when it is cut.
   to 60 s while a payment redeem is running. The status line now ends with the relay and work-lane
   state; see [Reading the log](docs/SELLER-QUICKSTART.md). Payment guards (pay-once, receipt
   dedup, fail-closed redeem classification, the store-derived wrap cursor) are unchanged.
+- Seller follow-ups to the above: private-content copies are paced on their own outcome, so the
+  relay confirming outbox rows no longer keeps failing private copies retried every tick (and
+  vice versa); a buyer-feedback publish holds the work lane at most 5 s; a backfill cut short by a
+  relay recovery re-runs once the relay is back instead of being reported as a failed read.
 
 ## v0.6.1-rc9
 

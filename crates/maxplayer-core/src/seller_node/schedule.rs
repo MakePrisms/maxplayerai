@@ -241,6 +241,45 @@ impl OutboxPacing {
     }
 }
 
+/// What the loop does after a backfill pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackfillNext {
+    /// Every read completed: the retry backoff resets.
+    Done,
+    /// A relay recovery overlapped the pass and cut its reads off (it drops every subscription).
+    /// That is not evidence the relay withholds history: re-run once the relay is back, without
+    /// growing the backoff.
+    RerunAfterRecovery,
+    /// The relay did not complete the reads on its own: retry after this delay (backing off).
+    RetryAfter(Duration),
+}
+
+/// Whether a recovery overlapped lane work that started at `lane_started`: one is reconnecting
+/// right now, or the last one ended after the work began.
+pub(crate) fn overlapped_recovery(
+    lane_started: Instant,
+    recovering_now: bool,
+    last_recovery_end: Option<Instant>,
+) -> bool {
+    recovering_now || last_recovery_end.is_some_and(|ended| ended >= lane_started)
+}
+
+/// Decide what follows a backfill pass. Incomplete history is never taken as empty either way.
+pub(crate) fn after_backfill(
+    complete: bool,
+    overlapped_recovery: bool,
+    backoff: &mut RetryBackoff,
+) -> BackfillNext {
+    if complete {
+        backoff.reset();
+        BackfillNext::Done
+    } else if overlapped_recovery {
+        BackfillNext::RerunAfterRecovery
+    } else {
+        BackfillNext::RetryAfter(backoff.next_delay())
+    }
+}
+
 /// A doubling retry delay between `min` and `max`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetryBackoff {
@@ -652,4 +691,32 @@ mod tests {
         assert_eq!(lane_settle_bound(true), LANE_SETTLE_MONEY_BOUND);
         assert!(LANE_SETTLE_GRACE < LANE_SETTLE_MONEY_BOUND);
     }
+
+    #[test]
+    fn a_backfill_cut_off_by_a_recovery_reruns_without_growing_the_backoff() {
+        let min = Duration::from_secs(30);
+        let mut backoff = RetryBackoff::new(min, Duration::from_secs(300));
+        let started = Instant::now();
+        let ended_after = started + Duration::from_secs(2);
+
+        // A recovery reconnecting now, or one that ended after the pass began: re-run.
+        assert!(overlapped_recovery(started, true, None));
+        assert!(overlapped_recovery(started, false, Some(ended_after)));
+        assert!(overlapped_recovery(started, false, Some(started)));
+        // One that ended before the pass began is unrelated.
+        assert!(!overlapped_recovery(ended_after, false, Some(started)));
+        assert!(!overlapped_recovery(started, false, None));
+
+        assert_eq!(after_backfill(false, true, &mut backoff), BackfillNext::RerunAfterRecovery);
+        assert_eq!(after_backfill(false, true, &mut backoff), BackfillNext::RerunAfterRecovery);
+        // The re-runs did not consume backoff steps: a genuine failure still starts at the minimum.
+        assert_eq!(after_backfill(false, false, &mut backoff), BackfillNext::RetryAfter(min));
+        assert_eq!(after_backfill(false, false, &mut backoff), BackfillNext::RetryAfter(min * 2));
+        // A complete pass resets it.
+        assert_eq!(after_backfill(true, false, &mut backoff), BackfillNext::Done);
+        assert_eq!(after_backfill(false, false, &mut backoff), BackfillNext::RetryAfter(min));
+        // Complete wins even when a recovery overlapped.
+        assert_eq!(after_backfill(true, true, &mut backoff), BackfillNext::Done);
+    }
+
 }
