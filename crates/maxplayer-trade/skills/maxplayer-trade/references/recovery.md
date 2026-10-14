@@ -40,6 +40,16 @@ withdrawal, receive, send, and swap attempt has a **120-second** budget (a swap 
 this is not a whole-command deadline. Items are handled sequentially and relay/setup/publication
 work is additional. A timeout does not undo a delivered RPC or release reservations.
 
+### Serve scheduling
+
+`serve` runs the same items, plus inbound trade messages and handed-off requests, as
+independent units. Each unit writes only its own records: one lot (a listing and its maker
+swaps), the taker swap, one mint's wallet work (funding, withdrawal, receive, send), or new
+listings/takes. Units sharing records run one at a time in arrival order; others run side by
+side. A slow or silent mint therefore delays only the units that use it: another swap's claim
+or refund is never queued behind it. Budgets, deadlines and journal-first ordering per item are
+unchanged, and serve remains the only writer of the home.
+
 - **0:** successful command; recovery has all items terminal, no deferred work or quarantine.
 - **1:** command error, or a withdrawal refused/unpaid with no unresolved submission;
   inspect the state. Exit 1 is never proof that a submitted withdrawal was refused.

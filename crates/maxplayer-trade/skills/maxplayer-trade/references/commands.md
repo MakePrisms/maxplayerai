@@ -262,17 +262,17 @@ a test mint behaved that way. Reuse the retained quote for the same mint/amount.
 While `serve` runs, `receive <mint> --token-file <path>` (or stdin) reads the token
 (at most 1 MiB; larger input is refused with `token missing or oversized` before serve is
 contacted) and passes it to serve over `<home>/serve.sock` only. serve runs the same
-receive below, as the only writer, between trade messages; listings and swaps keep
-running. serve's log names the request kind, mint and public attempt id, never the token;
+receive below, as the only writer; listings and swaps keep running alongside it. serve's log names the request kind, mint and public attempt id, never the token;
 refusals are redacted. Output is the same JSON summary and exit code as a local receive,
 plus one stderr line `{"receive":<id>,"outcome":...}`: `credited` (this request credited
 it), `already_received` (an earlier request did; nothing new), `in_doubt` (exit 3: journaled,
 not settled yet; serve keeps recovering it) or `not_credited`. If the reply is lost
 (client killed, serve stopped), the client exits 3 naming the attempt id. Re-run the
 **same** receive or check `status`: the same token always resumes the same attempt and
-never credits twice, also after a serve restart. One receive holds serve's loop at most
-120 s; an unfinished, journaled attempt is then reported `in_doubt` and finished by
-serve's recovery.
+never credits twice, also after a serve restart. A receive waits at most 120 s for its
+mint; an unfinished, journaled attempt is then reported `in_doubt` and finished by
+serve's recovery. A slow receive mint delays only that mint's wallet work, never another
+swap's claim or refund (see [serve scheduling](recovery.md#serve-scheduling)).
 
 ### Receive without serve
 
