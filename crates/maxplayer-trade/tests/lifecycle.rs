@@ -367,3 +367,80 @@ async fn closed_inbox_ends_serve_loop() {
     let e = r.unwrap_err();
     assert!(e.is::<maxplayer_trade::shutdown::InboxClosed>(), "{e:#}");
 }
+
+/// T2 through serve: while mint b answers the taker's lock swap with 503, serve prints a
+/// timestamped `mint_attempt` line for that swap and forwards it to the `take` client that
+/// handed the swap off (stderr only; stdout keeps its machine-readable state lines). No token
+/// or proof text reaches either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn progress_is_forwarded_to_the_following_take() {
+    let mut f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let log = f.root.path().join("serve.log");
+    let mut serve = start_serve(&f.taker, &f.relay_url, &log).await;
+    f.b.faults.reject_swap.store(true, SeqCst);
+    let mut client = cmd(
+        &f.taker,
+        &f.relay_url,
+        &["take", &lot, "--max-give", "40", "--min-receive", "32"],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    let stderr = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    {
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(client.stderr.take().unwrap()).lines();
+        let sink = stderr.clone();
+        tokio::spawn(async move {
+            while let Ok(Some(l)) = lines.next_line().await {
+                let mut s = sink.lock().unwrap();
+                s.push_str(&l);
+                s.push('\n');
+            }
+        });
+    }
+    let forwarded = |id: &str| {
+        stderr
+            .lock()
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["progress"] == "mint_attempt" && v["swap_id"] == id)
+    };
+    let start = std::time::Instant::now();
+    let line = loop {
+        f.step(true).await;
+        if let Some(s) = f.jt.all::<Swap>("swap").await.unwrap().pop() {
+            if let Some(line) = forwarded(&s.id) {
+                break line;
+            }
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(90),
+            "no forwarded progress\nclient:\n{}\nserve:\n{}",
+            stderr.lock().unwrap(),
+            std::fs::read_to_string(&log).unwrap()
+        );
+    };
+    assert_eq!(line["mint"], f.b.url.as_str(), "{line}");
+    assert_eq!(line["op"], "swap", "{line}");
+    assert_eq!(line["outcome"], "no_answer", "{line}");
+    assert_eq!(line["attempt"], 1, "{line}");
+    assert!(utc(&line["at"]), "{line}");
+    let served = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        served.contains("\"progress\":\"mint_attempt\""),
+        "serve prints it too"
+    );
+    for text in [served.as_str(), stderr.lock().unwrap().as_str()] {
+        assert!(
+            !text.contains("cashuA") && !text.contains("cashuB"),
+            "SAFETY: token text: {text}"
+        );
+    }
+    let _ = client.kill().await;
+    kill(&serve, "TERM");
+    assert_eq!(exit_code(&mut serve, 60).await, Some(5));
+}
