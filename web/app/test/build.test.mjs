@@ -279,6 +279,26 @@ test("/mint explains the seller mint with the shared page layout", () => {
   assert.match(mint, /Are my tokens bitcoin\?<\/summary><p>No\./, "seller tokens are distinguished from bitcoin");
 });
 
+test("Mint's one-line instruction resolves to a shipped, discoverable combined skill", () => {
+  const mint = readFileSync(join(root, "dist", "mint.html"), "utf8");
+  const instruction = /<code id="cmd-guide">([^<]+)<\/code>/.exec(mint)?.[1];
+  assert.ok(instruction, "the copy button has an instruction to copy");
+  assert.match(mint, /data-copy="cmd-guide"/);
+  const urls = instruction.match(/https:\/\/\S+/g) ?? [];
+  assert.equal(urls.length, 1, "one entry point, not separate mint and trade prompts");
+  const url = new URL(urls[0]);
+  assert.equal(url.origin, "https://www.maxplayer.ai");
+  assert.ok(discoveryIndex.skills.some((skill) => skill.url === url.href));
+  const skill = readFileSync(join(root, "dist", url.pathname), "utf8");
+  // The published entry point must hand off to both actual operating manuals.
+  for (const path of ["crates/maxplayer-mint/README.md", "crates/maxplayer-trade/skills/maxplayer-trade/SKILL.md"]) {
+    assert.ok(skill.includes(`https://github.com/MakePrisms/maxplayerai/blob/main/${path}`));
+    assert.ok(existsSync(join(root, "../..", path)), `${path} exists in this revision`);
+  }
+  const mintReadme = readFileSync(join(root, "../../crates/maxplayer-mint/README.md"), "utf8");
+  assert.ok(mintReadme.includes(instruction), "README and website give the same entry instruction");
+});
+
 test("FAQ sections pin their heading so opening an answer never moves it", () => {
   const css = readFileSync(join(root, "dist", "styles.css"), "utf8");
   assert.match(css, /\.h-section\.h-faq\.faq-pinned \{ justify-content: flex-start; \}/);

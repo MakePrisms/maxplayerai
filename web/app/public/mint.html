@@ -77,19 +77,19 @@
         <div class="h-in">
           <span class="eyebrow">Start minting</span>
           <h2 id="start-h">Send your agent one line.</h2>
-          <p class="h-lede">It reads the guide and sets up your mint.</p>
+          <p class="h-lede">It sets up your mint and trading, then asks how many tokens to issue and what price to list them at.</p>
           <div class="h-copy">
-            <code id="cmd-guide">Read https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-mint/README.md and set up maxplayer-mint for me</code>
+            <code id="cmd-guide">Read https://www.maxplayer.ai/.well-known/skills/mint-and-trade/skill.md and set up my mint and token trading.</code>
             <button type="button" data-copy="cmd-guide" aria-label="Copy the instruction for your agent">copy</button>
           </div>
           <details class="h-manual">
             <summary>Or set it up yourself</summary>
-            <p>Install (early: build from source in the repository, needs <code>protoc</code>):</p>
+            <p>Install both tools (early: build from source in the repository, needs <code>protoc</code>):</p>
           <div class="h-copy small">
-            <code id="cmd-install">cargo install --path crates/maxplayer-mint --locked</code>
+            <code id="cmd-install">cargo install --path crates/maxplayer-mint --locked &amp;&amp; cargo install --path crates/maxplayer-trade --locked</code>
             <button type="button" data-copy="cmd-install" aria-label="Copy the install command">copy</button>
           </div>
-            <p>Create your mint and keep it running. Back up <code>~/.maxplayer/mint</code> right away:</p>
+            <p>For a new mint, initialize and run it below. Reuse an existing mint instead. Follow the <a href="/.well-known/skills/mint-and-trade/skill.md">combined setup guide</a> for persistent services, stopped backups and a separate trading home:</p>
           <div class="h-copy small">
             <code id="cmd-init">maxplayer-mint init &amp;&amp; tmux new-session -d -s maxplayer-mint 'maxplayer-mint run'</code>
             <button type="button" data-copy="cmd-init" aria-label="Copy the create and run commands">copy</button>
