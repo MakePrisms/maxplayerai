@@ -25,7 +25,7 @@ const dist = join(root, "dist");
 const SITE_ORIGIN = "https://www.maxplayer.ai";
 
 const watch = process.argv.includes("--watch");
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "tokens.html"];
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
@@ -80,7 +80,7 @@ if (watch) {
       .replace(/url\((['"])(\.\/fonts\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
   );
   // Every page: the buyer homepage (/), the seller page (/sell), the live
-  // market (/market), the chat page (/chat) and the token-trade page (/tokens) — cleanUrls serves them.
+  // market (/market), the chat page (/chat), the mint page (/mint) and the token-trade page (/tokens) — cleanUrls serves them.
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
