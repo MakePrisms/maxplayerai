@@ -220,7 +220,7 @@ async fn restart_and_settle(f: &mut Fixture, id: &str, log: &Path) {
 async fn term_during_a_swap_step_lets_it_finish_and_restart_settles() {
     let mut f = Fixture::new(0).await;
     let log = f.root.path().join("serve.log");
-    let (mut serve, mut client, id) = take_until_lock_held(&mut f, &log).await;
+    let (mut serve, mut client, id) = Box::pin(take_until_lock_held(&mut f, &log)).await;
     kill(&serve, "TERM");
     wait_log(&log, "\"serve\":\"stopping\"", 10).await;
     // Admits nothing new: a hand-off now is answered "not started" once the step ends.
@@ -255,7 +255,7 @@ async fn term_during_a_swap_step_lets_it_finish_and_restart_settles() {
     assert!(utc(&swaps[0]["refund_earliest"]), "{end}");
     let _ = client.kill().await;
     let log2 = f.root.path().join("serve2.log");
-    restart_and_settle(&mut f, &id, &log2).await;
+    Box::pin(restart_and_settle(&mut f, &id, &log2)).await;
 }
 
 /// SAFETY: a second signal while the lock swap is still at the mint cancels the step at its
@@ -267,7 +267,7 @@ async fn term_during_a_swap_step_lets_it_finish_and_restart_settles() {
 async fn second_signal_cancels_the_step_with_the_journal_intact() {
     let mut f = Fixture::new(0).await;
     let log = f.root.path().join("serve.log");
-    let (mut serve, mut client, id) = take_until_lock_held(&mut f, &log).await;
+    let (mut serve, mut client, id) = Box::pin(take_until_lock_held(&mut f, &log)).await;
     kill(&serve, "TERM");
     wait_log(&log, "\"serve\":\"stopping\"", 10).await;
     kill(&serve, "INT");
@@ -303,7 +303,7 @@ async fn second_signal_cancels_the_step_with_the_journal_intact() {
     f.b.faults.swap_release.notify_one();
     f.b.faults.swap_finished.notified().await;
     let log2 = f.root.path().join("serve2.log");
-    restart_and_settle(&mut f, &id, &log2).await;
+    Box::pin(restart_and_settle(&mut f, &id, &log2)).await;
 }
 
 /// An error in serve's startup recovery keeps exit 1 (codes 1/3/4 unchanged) and its final line
