@@ -299,6 +299,37 @@ pub fn input_digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+/// These errors require changed input or an operator/software fix, not automatic retries.
+fn permanent_code(code: &str) -> bool {
+    matches!(
+        code,
+        "input_too_large"
+            | "unsupported_input"
+            | "input_integrity"
+            | "invalid_subject"
+            | "invalid_input"
+            | "invalid_request"
+            | "unauthorized_request"
+    )
+}
+fn reviewer_error(code: &str) -> String {
+    if permanent_code(code) {
+        let hint = if code == "unsupported_input" {
+            "; changed binary/non-UTF-8 files, symlinks and submodules are not supported"
+        } else {
+            ""
+        };
+        format!(
+            "review: permanent input error ({code}){hint}; retrying unchanged input cannot help; correct the input or update the reviewer before explicitly retrying"
+        )
+    } else {
+        format!("review: reviewer error ({code}); next step blocked; explicit retry available")
+    }
+}
+pub(crate) fn permanent_error(error: &str) -> bool {
+    error.starts_with("review: permanent input error")
+}
+
 #[cfg(feature = "gateway")]
 pub mod wire {
     use super::*;
@@ -464,17 +495,13 @@ pub mod wire {
                         Decision::Refused => Err(
                             "review: execution-safety probability exceeds local threshold".into(),
                         ),
-                        Decision::Error(code) => {
-                            Err(format!("review: reviewer error ({code}); retry available"))
-                        }
+                        Decision::Error(code) => Err(reviewer_error(&code)),
                     };
                 }
                 if let Some(code) = provider_error {
                     // A deliberate new check requests recovery; never invent a safe result.
                     if *requested {
-                        return Err(format!(
-                            "review: reviewer error ({code}); next step blocked; explicit retry available"
-                        ));
+                        return Err(reviewer_error(&code));
                     }
                     // An old error is not a response to this new attempt. Request once below
                     // and wait for a new signed result instead of returning the stale error.
@@ -583,8 +610,13 @@ pub async fn check_buyer(
     }.await;
     client.disconnect().await;
     state::completed(&home.root, subject, &result)?;
-    result
-        .map_err(|e| format!("{e}; retry the same collect or accept operation (no new job needed)"))
+    result.map_err(|e| {
+        if permanent_error(&e) {
+            e
+        } else {
+            format!("{e}; retry the same collect or accept operation (no new job needed)")
+        }
+    })
 }
 
 #[cfg(all(test, feature = "gateway"))]
@@ -689,6 +721,33 @@ mod tests {
         );
         assert_eq!(m.requests.load(Ordering::SeqCst), 1);
     }
+    #[tokio::test(start_paused = true)]
+    async fn permanent_review_errors_are_actionable_and_explicit_retry_can_recover() {
+        let keys = Keys::generate();
+        for code in [
+            "input_too_large",
+            "unsupported_input",
+            "input_integrity",
+            "invalid_subject",
+        ] {
+            let mut error = answer(0.1);
+            error.status = "error".into();
+            error.results.clear();
+            error.error_code = Some(code.into());
+            let m = mock(vec![], vec![signed(&error, &keys)]);
+            let result = check(&m, &config(&keys)).await.unwrap_err();
+            assert!(permanent_error(&result), "{result}");
+            assert!(result.contains("retrying unchanged input cannot help"));
+            assert!(!result.contains("retry available"));
+            let passed = signed(&answer(0.1), &keys);
+            let m = mock(vec![signed(&error, &keys)], vec![passed.clone()]);
+            assert_eq!(
+                check(&m, &config(&keys)).await.unwrap(),
+                Some(passed.id.to_hex())
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn timeout_blocks_and_an_explicit_retry_can_recover() {
         let keys = Keys::generate();
@@ -1054,13 +1113,14 @@ pub async fn protect_job_view(
             // re-verifies the signed review (collect and accept are unthrottled).
             let recent_failure = state::read(&home.root, &subject.event).ok().filter(|s| {
                 s.subject == subject
-                    && matches!(s.state.as_str(), "pending" | "error" | "policy_refused")
-                    && std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                        .saturating_sub(s.updated_unix)
-                        < VIEW_REVIEW_THROTTLE_SECS
+                    && (s.state == "input_refused"
+                        || (matches!(s.state.as_str(), "pending" | "error" | "policy_refused")
+                            && std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0)
+                                .saturating_sub(s.updated_unix)
+                                < VIEW_REVIEW_THROTTLE_SECS))
             });
             if let Some(status) = recent_failure {
                 Err(if status.state == "pending" {

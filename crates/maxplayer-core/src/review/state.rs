@@ -20,7 +20,9 @@ pub fn write(root: &Path, subject: &Subject, state: &str, detail: &str) -> Resul
         subject: subject.clone(),
         state: state.into(),
         detail: detail.into(),
-        retry: if subject.kind == JOB_OFFER_KIND {
+        retry: if state == "input_refused" {
+            "Retrying unchanged input cannot help. Correct the input or update the reviewer, then explicitly retry.".into()
+        } else if subject.kind == JOB_OFFER_KIND {
             format!("maxplayer review retry {}", subject.event)
         } else {
             "Retry the same collect or accept operation; no new job or delivery is needed.".into()
@@ -75,7 +77,7 @@ pub fn blocked_job(root: &Path, job_id: &str) -> Result<Option<Status>, String> 
     }
     Ok(matches!(
         status.state.as_str(),
-        "pending" | "error" | "policy_refused"
+        "pending" | "error" | "policy_refused" | "input_refused"
     )
     .then_some(status))
 }
@@ -92,7 +94,7 @@ pub fn retry(root: &Path, id: &str) -> Result<(), String> {
     if status.subject.kind != JOB_OFFER_KIND {
         return Err(status.retry);
     }
-    if status.state != "error" {
+    if !matches!(status.state.as_str(), "error" | "input_refused") {
         return Err("review: only availability errors can be retried; pending work is already running and policy refusals require a policy decision".into());
     }
     let dir = root.join("review-retry");
@@ -118,7 +120,9 @@ pub fn completed(
         Err(e) => write(
             root,
             subject,
-            if e.contains("threshold") || e.contains("conflicting") {
+            if permanent_error(e) {
+                "input_refused"
+            } else if e.contains("threshold") || e.contains("conflicting") {
                 "policy_refused"
             } else {
                 "error"
@@ -154,6 +158,29 @@ mod tests {
 #[cfg(test)]
 mod buyer_hold_tests {
     use super::*;
+    #[test]
+    fn permanent_input_refusal_holds_watcher_and_has_no_blind_retry_advice() {
+        let root = tempfile::tempdir().unwrap();
+        let subject = Subject {
+            offer: "a".repeat(64),
+            event: "b".repeat(64),
+            kind: JOB_RESULT_KIND,
+            commit: None,
+        };
+        completed(
+            root.path(),
+            &subject,
+            &Err(reviewer_error("unsupported_input")),
+        )
+        .unwrap();
+        let status = blocked_job(root.path(), &subject.offer).unwrap().unwrap();
+        assert_eq!(status.state, "input_refused");
+        assert!(status.retry.contains("unchanged input cannot help"));
+        assert!(!status.retry.contains("no new job"));
+        completed(root.path(), &subject, &Ok(Some("c".repeat(64)))).unwrap();
+        assert!(blocked_job(root.path(), &subject.offer).unwrap().is_none());
+    }
+
     #[test]
     fn review_failure_holds_automatic_settlement_until_explicit_recovery() {
         let root = std::env::temp_dir().join(format!("review-hold-{}", uuid::Uuid::new_v4()));

@@ -274,6 +274,33 @@ pub(crate) fn inline_fixture_with_mints(
     nostr_sdk::Keys,
     Policy,
 ) {
+    inline_fixture_with_text(
+        targeted,
+        paid,
+        deadline,
+        mints,
+        if targeted {
+            "private task"
+        } else {
+            "deliberately public discovery"
+        },
+        "exact private answer",
+    )
+}
+#[cfg(all(test, feature = "wallet"))]
+pub(crate) fn inline_fixture_with_text(
+    targeted: bool,
+    paid: bool,
+    deadline: u64,
+    mints: Vec<String>,
+    task: &str,
+    answer: &str,
+) -> (
+    PrivateEvidence,
+    crate::authorize_pay::AuthorizePayRequest,
+    nostr_sdk::Keys,
+    Policy,
+) {
     let amount = if paid { 10 } else { 0 };
     let payment_mode = if paid {
         crate::gateway::PaymentMode::Sat
@@ -301,19 +328,14 @@ pub(crate) fn inline_fixture_with_mints(
         &buyer,
         &(if targeted {
             gateway::OfferDraft::new(
-                "private task",
+                task,
                 "text/markdown",
                 amount,
                 deadline,
                 seller.public_key().to_hex(),
             )
         } else {
-            gateway::OfferDraft::untargeted(
-                "deliberately public discovery",
-                "text/markdown",
-                amount,
-                deadline,
-            )
+            gateway::OfferDraft::untargeted(task, "text/markdown", amount, deadline)
         })
         .with_payment_mode(payment_mode)
         .accepting_delivery(["inline"]),
@@ -384,7 +406,7 @@ pub(crate) fn inline_fixture_with_mints(
         &seller.public_key().to_hex(),
         &service,
         ContentType::Answer,
-        "exact private answer".into(),
+        answer.into(),
         None,
         &policy.host,
     )

@@ -4,10 +4,13 @@ use super::*;
 use crate::{home::MaxplayerHome, private_content as pc};
 use nostr_sdk::prelude::*;
 
+#[path = "request_wire.rs"]
+mod request_wire;
+
 const DOMAIN: &str = "maxplayer-private-review-v1";
 const MAX_MESSAGE: usize = 60 * 1024;
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Deserialize)]
+#[serde(try_from = "request_wire::RequestWire")]
 pub struct Request {
     pub subject: Subject,
     pub offer: Event,
@@ -52,13 +55,50 @@ pub async fn wrap(keys: &Keys, recipient: PublicKey, event: &Event) -> Result<Ev
         event: event.clone(),
     })
     .map_err(|_| "review: encoding failed")?;
-    if body.len() > MAX_MESSAGE {
-        return Err("review: encrypted message too large".into());
-    }
-    pc::transport::wrap(keys, recipient, body)
+    check_size("message", body.len(), MAX_MESSAGE)?;
+    // Measure both actual serialized encryption inputs, including JSON escaping,
+    // NIP-44 padding and base64. The old request.len()/2 guess missed these layers.
+    // nostr 0.44.4's NIP-44 implementation accepts at most 65,408 plaintext bytes.
+    const NIP44_MAX: usize = 65_408;
+    let rumor = EventBuilder::private_msg_rumor(recipient, body)
+        .allow_self_tagging()
+        .build(keys.public_key());
+    check_size("rumor", rumor.as_json().len(), NIP44_MAX)?;
+    let seal = EventBuilder::seal(keys, &recipient, rumor)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|_| "review: could not construct private seal")?
+        .sign(keys)
+        .await
+        .map_err(|_| "review: could not sign private seal")?;
+    check_size("seal", seal.as_json().len(), NIP44_MAX)?;
+    let ephemeral = Keys::generate();
+    let ciphertext = nostr_sdk::nostr::nips::nip44::encrypt(
+        ephemeral.secret_key(),
+        &recipient,
+        seal.as_json(),
+        nostr_sdk::nostr::nips::nip44::Version::default(),
+    )
+    .map_err(|_| "review: could not encrypt private wrapper")?;
+    check_size(
+        "wrapper",
+        ciphertext.len(),
+        pc::transport::MAX_WRAPPER_CONTENT,
+    )?;
+    EventBuilder::new(Kind::GiftWrap, ciphertext)
+        .tags([Tag::public_key(recipient)])
+        .custom_created_at(pc::transport::fresh_created_at())
+        .sign_with_keys(&ephemeral)
+        .map_err(|_| "review: could not sign private wrapper".into())
 }
+fn check_size(layer: &str, actual: usize, allowed: usize) -> Result<(), String> {
+    if actual > allowed {
+        return Err(format!(
+            "review: permanent input error: private {layer} is {actual} bytes; limit {allowed} bytes; retrying unchanged input cannot help"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn unwrap(keys: &Keys, outer: &Event) -> Result<Event, String> {
     let (author, plaintext) = pc::transport::unwrap_message(keys, outer)
         .await
@@ -153,9 +193,7 @@ impl Request {
         let mut draft = request_draft(&self.subject, reviewer)?;
         draft.tags.push(TagSpec::new(["visibility", "private"]));
         draft.content = serde_json::to_string(self).map_err(|_| "review: request encoding")?;
-        if draft.content.len() > MAX_MESSAGE / 2 {
-            return Err("review: private input too large".into());
-        }
+        check_size("request", draft.content.len(), MAX_MESSAGE)?;
         Ok(draft)
     }
 }
@@ -378,7 +416,7 @@ pub async fn seller_offer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn key(n: u8) -> Keys {
+    pub(super) fn key(n: u8) -> Keys {
         Keys::parse(&format!("{n:064x}")).unwrap()
     }
     pub(crate) fn fixture(targeted: bool, delivery: bool) -> (Request, pc::runtime::Policy) {

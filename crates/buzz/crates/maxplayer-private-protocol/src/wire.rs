@@ -52,7 +52,9 @@ pub struct PublicTask {
 impl PublicTask {
     pub fn parse(json: &str, job: &str) -> Result<Self> {
         if json.len() > super::MAX_BODY_BYTES {
-            return Err(Error("public task too large"));
+            return Err(Error(
+                "public task exceeds 16384-byte (16 KiB) serialized limit, including metadata; shorten the task",
+            ));
         }
         super::strict_json::validate(json.as_bytes())?;
         let task: Self = serde_json::from_str(json).map_err(|_| Error("invalid public task"))?;

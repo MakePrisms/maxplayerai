@@ -15,6 +15,8 @@ pub const DEFAULT_SERVICE_PUBKEY: &str =
 pub const BODY_SCHEMA: &str = "maxplayer.content.v2";
 pub const ENVELOPE_SCHEMA: &str = "maxplayer.content-envelope.v2";
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
+/// New inline answers; old immutable envelopes remain decodable for recovery.
+pub const MAX_INLINE_ANSWER_BYTES: usize = 4 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 23 * 1024;
 /// Shared admission policy for public/private Git repositories and review fetches.
 pub const MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
@@ -343,6 +345,11 @@ impl PreparedContent {
     }
     fn with_nonce(body: ContentBody, nonce: &str) -> Result<Self> {
         body.validate()?;
+        if body.kind == ContentType::Answer && body.text.len() > MAX_INLINE_ANSWER_BYTES {
+            return Err(Error(
+                "inline answer exceeds 4096-byte limit; deliver larger output through Git",
+            ));
+        }
         let bytes = serde_json::to_vec(&body).map_err(|_| Error("content serialization failed"))?;
         let commitment = commit(nonce, &bytes)?;
         let envelope = serde_json::to_string(&Envelope {
@@ -476,7 +483,9 @@ pub struct Binding<'a> {
 fn commit(nonce: &str, body: &[u8]) -> Result<String> {
     require_hex(nonce, 32)?;
     if body.len() > MAX_BODY_BYTES {
-        return Err(Error("body too large"));
+        return Err(Error(
+            "content body exceeds 16384-byte (16 KiB) serialized limit, including metadata; shorten the task or move supporting material to input files",
+        ));
     }
     let mut h = Sha256::new();
     h.update(b"maxplayer/content/v2\0");
