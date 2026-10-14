@@ -60,9 +60,10 @@ pub async fn wrap(keys: &Keys, recipient: PublicKey, event: &Event) -> Result<Ev
     // NIP-44 padding and base64. The old request.len()/2 guess missed these layers.
     // nostr 0.44.4's NIP-44 implementation accepts at most 65,408 plaintext bytes.
     const NIP44_MAX: usize = 65_408;
-    let rumor = EventBuilder::private_msg_rumor(recipient, body)
+    let mut rumor = EventBuilder::private_msg_rumor(recipient, body)
         .allow_self_tagging()
         .build(keys.public_key());
+    rumor.ensure_id(); // seal() includes this ID in its encryption input.
     check_size("rumor", rumor.as_json().len(), NIP44_MAX)?;
     let seal = EventBuilder::seal(keys, &recipient, rumor)
         .await
