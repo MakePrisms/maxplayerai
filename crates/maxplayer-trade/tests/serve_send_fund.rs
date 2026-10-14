@@ -388,15 +388,23 @@ async fn fund_via_serve_is_idempotent_by_operation_id() {
 async fn pending_fund_does_not_hold_serve() {
     let f = Fixture::new(0).await;
     let c = MintFixture::start(0).await;
-    c.faults.near_expiry.store(false, SeqCst);
     let mint = f.b.url.clone();
     let mut serve = start_serve(&f.taker, &f.relay_url, f.root.path(), "serve", &[]).await;
-    // Funding on another mint whose issuance is answered slowly.
-    c.faults.delay_ms.store(3_000, SeqCst);
+    // Funding on another mint that answers every request after 10 s (still inside the 20 s
+    // RPC timeout): its quote creation alone holds that mint's unit for tens of seconds.
+    c.faults.delay_ms.store(10_000, SeqCst);
     let fund = cmd(&f.taker, &f.relay_url, &["fund", &c.url, "--amount", "10"])
         .spawn()
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait until serve is inside the fund unit (its first request reached the slow mint).
+    let start = std::time::Instant::now();
+    while c.faults.requests.load(SeqCst) == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "fund never reached its mint"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let dir = tempfile::tempdir().unwrap();
     let out = dir.path().join("t.token");
     let started = std::time::Instant::now();
