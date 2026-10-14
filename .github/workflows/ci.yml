@@ -9,6 +9,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  maxplayer-chat:
+    name: maxplayer-chat sidecar
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test maxplayer-chat (in-process relay only)
+        run: cargo test -p maxplayer-chat --locked
+
   # Default-feature builds + the canonical core test suite (AGENTS.md "Build & test").
   build-default:
     name: Build & test (default features)
