@@ -15,6 +15,7 @@ import { dockSide, mintLabel, rate, seller, timeLeft } from "./trade/format.js";
 import { DEFAULT_TRADE_RELAYS, createTradeReader, type RelayState } from "./trade/relays.js";
 import { ago, duration, esc, nf, now, stamp } from "./ui/format.js";
 import { reconcileList, type KeyedItem } from "./ui/reconcile.js";
+import { writeClipboard } from "./ui/clipboard.js";
 
 const el = (id: string): HTMLElement => document.getElementById(id) as HTMLElement;
 
@@ -119,7 +120,7 @@ function renderDetail(): void {
     kv("Seller", `<code>${esc(s.npub)}</code>`) +
     kv("Listed", esc(stamp(r.lot.created_at))) +
     kv("Expires", esc(stamp(r.lot.expires_at))) +
-    kv("Listing id", `<code>${esc(r.id)}</code>`) +
+    kv("Listing id", `<button type="button" class="pk-copy" data-copy-text="${esc(r.id)}" title="Click to copy the listing id" aria-label="Copy listing id"><code>${esc(r.id)}</code></button>`) +
     (r.chain.length ? kv("Status chain", r.chain.map((id) => `<code>${esc(id.slice(0, 12))}</code>`).join(" → ")) : "") +
     `</dl>`;
 }
@@ -215,6 +216,19 @@ function boot(): void {
     renderDetail();
   };
   el("trade-detail-close").addEventListener("click", closeDetail);
+  // bob: click the listing id to copy it. The body repaints on new data,
+  // which may end the "copied" flash early, never the copy itself.
+  el("trade-detail-body").addEventListener("click", async (ev) => {
+    const btn = (ev.target as HTMLElement).closest<HTMLElement>("[data-copy-text]");
+    if (!btn) return;
+    const ok = await writeClipboard(btn.dataset.copyText ?? "");
+    const code = btn.querySelector("code");
+    if (!code) return;
+    const prev = code.textContent;
+    btn.classList.toggle("ok", ok);
+    code.textContent = ok ? "copied ✓" : "copy failed — select it";
+    setTimeout(() => { code.textContent = prev; btn.classList.remove("ok"); }, 1200);
+  });
   document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeDetail(); });
 
   // Time left and ages tick in place; a full re-derive each minute moves

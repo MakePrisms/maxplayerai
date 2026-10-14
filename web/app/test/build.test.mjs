@@ -178,10 +178,21 @@ test("all site pages share navigation and footer links, with a current page and 
     assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
     // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
     assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
-    assert.match(footer, /href="\/market">Market<\/a>\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat is in the footer after Market, marked Lab`);
+    assert.match(footer, /href="\/market">Market<\/a>\s*<div class="foot-labs">\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat is in the footer after Market, marked Lab`);
     // Mint is a Lab page too: footer only, right after Chat.
     assert.ok(!nav.includes('href="/mint"'), `${page}: /mint is not in the top nav`);
     assert.match(footer, /<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /mint is in the footer after Chat, marked Lab`);
+    // Tokens is a Lab page too: footer only, right after Mint.
+    assert.ok(!nav.includes('href="/tokens"'), `${page}: /tokens is not in the top nav`);
+    assert.match(footer, /<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /tokens is in the footer after Mint, marked Lab`);
+    // bob: Skill and GitHub leave the top bar; they sit with @maxplayerai on the
+    // footer's second, dimmer row.
+    assert.deepEqual(links(nav).map(([href]) => href), ["/", "/sell", "/market"], `${page}: top nav is Buy, Sell, Market`);
+    // bob: the Lab pages are grouped, so phones can put them on their own row.
+    const labs = footer.match(/<div class="foot-labs">([\s\S]*?)<\/div>/)?.[1] ?? "";
+    assert.deepEqual(links(labs).map(([href]) => href), ["/chat", "/mint", "/tokens"], `${page}: Lab links grouped`);
+    const sub = footer.match(/<div class="foot-row foot-sub">([\s\S]*?)<\/div>/)?.[1] ?? "";
+    assert.deepEqual(links(sub).map(([, text]) => text), ["Skill", "GitHub", "@maxplayerai"], `${page}: footer second row`);
     const current = [...nav.matchAll(/aria-current="page"/g)].length;
     if (page === "chat.html" || page === "mint.html" || page === "tokens.html") {
       assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
@@ -202,7 +213,7 @@ test("/chat carries the /tokens experimental notice under the nav", () => {
   assert.match(chat, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
 });
 
-test("/tokens ships its own read-only bundle and stays unlisted", () => {
+test("/tokens ships its own read-only bundle and is linked from the footer", () => {
   const tokens = readFileSync(join(root, "dist", "tokens.html"), "utf8");
   for (const id of ["tokens", "lots", "recent", "windows", "statgrid", "conn", "utc-clock", "trade-detail"]) {
     assert.ok(tokens.includes(`id="${id}"`), `tokens.html carries #${id}`);
@@ -224,10 +235,13 @@ test("/tokens ships its own read-only bundle and stays unlisted", () => {
   assert.ok(!tokens.includes('id="done"'), "no completed-trades table under the board (bob)");
   assert.ok(!tokens.includes('id="stats-note"') && !tokens.includes("Mints can fail"), "no footnotes (bob)");
   assert.ok(tokens.indexOf('id="trade-detail"') > tokens.indexOf("</footer>"), "the popup lives outside the page flow");
-  // Team link only (bob): nothing on the public site points at it.
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "llms.txt", "skill.md"]) {
+  // bob: linked from the footer (asserted with the shared chrome); the page
+  // carries the experimental notice right under the nav, like /chat and /mint.
+  assert.match(tokens, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/);
+  // Agent-facing docs stay about the jobs market.
+  for (const page of ["llms.txt", "skill.md"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
-    assert.ok(!/href="\/(tokens|trades)"|\]\(\/(tokens|trades)\)/.test(text), `${page} does not link the token page`);
+    assert.ok(!/\]\(\/(tokens|trades)\)|maxplayer\.ai\/tokens/.test(text), `${page} does not link the token page`);
   }
 });
 
