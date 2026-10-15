@@ -51,7 +51,6 @@ function render(s: Snapshot): void {
   const c = s.challenge;
   if (!c) return;
   renderJob(document, c.goal);
-  text("join-open", when(c.joinOpens));
   text("challenge-start", when(c.starts));
   text("challenge-budget", usd(s.budget!.totalSats));
   text("buyer-npub", c.buyerNpub);
