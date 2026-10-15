@@ -168,6 +168,13 @@ async fn r5_consumed_token_file_is_not_reported_as_another_filesystem_view() {
             .starts_with("cashu")
     );
     let (_, stderr) = text(&o);
+    // serve identifies the file as created, so the client can say it was moved or consumed
+    // (not "did not say which file"), unless it was still in place when the client looked.
+    assert!(
+        o.status.success() || stderr.contains("no longer there"),
+        "exit {:?}:\n{stderr}",
+        o.status.code()
+    );
     assert!(
         !stderr.contains("--reclaim"),
         "a delivered token must not be sent to --reclaim (exit {:?}):\n{stderr}",
