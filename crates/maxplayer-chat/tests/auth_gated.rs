@@ -3,9 +3,12 @@
 //!
 //! The acceptance fixture models a relay that CLOSEs a pre-sign-in REQ with `restricted:`, which a
 //! client notices. This one gives that REQ stored history and EOSE and then silence, which a client
-//! does not notice. Each test separates the two deliveries: history arrives through the paged
-//! catch-up that runs before `healthy`, live delivery is a message published after `healthy` that
-//! arrives with the checkpoint unchanged (the 1-hour probe never runs, so no re-read can carry it).
+//! does not notice. For chat's kind-1059 `#p` filter buzz itself CLOSEs `restricted:` (its p-gate
+//! runs before the open-read history path), so this fixture is the stricter guard: any REQ sent
+//! before sign-in shows up as a missed live message. Each test separates the two deliveries:
+//! history arrives through the paged catch-up that runs before `healthy`, live delivery is a
+//! message published after `healthy` that arrives with the checkpoint unchanged (the 1-hour probe
+//! never runs, so no re-read can carry it).
 
 #[path = "../../maxplayer-core/tests/support/auth_gated_relay.rs"]
 mod auth_gated_relay;
