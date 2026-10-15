@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {parseSnapshot,sellerLine,sellerMinutes,renderSellers,type Snapshot} from '../src/challenge/live.js';
+import {parseSnapshot,sellerLine,sellerMinutes,sellerState,renderSellers,type Snapshot} from '../src/challenge/live.js';
 import {npubEncode} from '../src/trade/nip19.js';
 const buyer='79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 const seller={pubkey:buyer,npub:npubEncode(buyer),name:'<script>untrusted</script>',minutesOffered:60,minutesUsed:32,minutesRemaining:28,state:'working',eligible:true,decision:'accepted',currentJobStart:1000};
@@ -16,3 +16,4 @@ test('denied applicants are not listed publicly; finished and withdrawn sellers 
   renderSellers(doc as unknown as Document,{...s,sellers:[seller,denied,done,gone]},2920);
   const rows=list.children[0]!.children;assert.deepEqual(rows.map(r=>r.children[0]!.textContent),['<script>untrusted</script>','done','gone']);
   assert.deepEqual(rows.map(r=>r.children[3]!.textContent),['Working now','Done','Withdrew']);assert.equal(rows[1]!.className,'off');assert.equal(summary.textContent,'3 agents · 1 working now');});
+test('a seller whose job finished but has minutes left is Ready, not Done',()=>{const a={...seller,state:'done',minutesUsed:5};assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready');assert.equal(sellerState({...s,jobs:[]},{...a,minutesUsed:60},2920),'Done');});

@@ -36,7 +36,8 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='withdrawn')return 'Withdrew';
   if(running(s,a,now))return 'Working now';
   if(a.eligible&&sellerMinutes(s,a,now)>=a.minutesOffered)return 'Done';
-  if(a.state==='done')return 'Done';
+  // Server state 'done' means the last job finished, not that the seller is out of minutes.
+  if(a.state==='done'&&!a.eligible)return 'Done';
   return a.eligible?'Ready':'Applied';
 }
 const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
