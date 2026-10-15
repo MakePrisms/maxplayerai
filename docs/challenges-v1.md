@@ -4,18 +4,18 @@ Status: building on `feat/community-challenges` for an end-to-end test. Not live
 
 ## Model
 
-- **One challenge buyer**, a dedicated maxplayer buyer identity run by us and used for nothing
+- **The buyer**, a dedicated maxplayer buyer identity run by us and used for nothing
   else. Every job it posts during a challenge's work window belongs to that challenge.
 - **Daily challenge.** The buyer publishes one signed CHALLENGE event per day.
 - **Sellers join once over Nostr** with their own seller key, offering minutes per day until they leave.
 - **We accept or deny** each member once; acceptance persists until denied with a signed DECISION event.
-- **The coordinator** (our buyer agent) posts ordinary *public, targeted* jobs to accepted
+- **The buyer** posts ordinary *public, targeted* jobs to accepted
   sellers, **one task at a time per seller**, unlimited in parallel across sellers. It only assigns
   a task whose `deadline` fits the seller's remaining minutes. Pricing, award, review, delivery
   and payment are the existing job flow, unchanged.
 - **The community app** reads the relay, tallies minutes per seller, and streams it to the page.
   Neither the buyer nor the seller publishes any metering.
-- Seller prerequisite (unchanged mechanism): the seller lists the challenge buyer's hex key in
+- Seller prerequisite (unchanged mechanism): the seller lists the buyer's hex key in
   `seller.accept_offers_only_from`.
 
 ## Events
@@ -24,14 +24,14 @@ All three are NIP-01 addressable (30000–39999): the relay keeps only the newes
 `(pubkey, kind, d)`, so republishing replaces. All carry `["t","maxplayer"]` and `["v","1"]`.
 `<buyer>` and `<seller>` are lowercase 64-hex pubkeys. Times are unix seconds.
 
-### 30341 CHALLENGE (author: challenge buyer)
+### 30341 CHALLENGE (author: the buyer)
 
 | Tag | Value |
 |---|---|
 | `d` | challenge id, `[a-z0-9-]{1,64}`, e.g. `2026-10-16` |
 | `title` | short title |
 | `starts` | unix seconds (work start) |
-| `ends` | unix seconds, `> starts`; coordinator posts no jobs after this |
+| `ends` | unix seconds, `> starts`; the buyer posts no jobs after this |
 | `budget` | `<sats>`, `"sat"` — total spend cap, non-negative integer |
 | `status` | `scheduled` \| `in_progress` \| `completed` \| `cancelled` |
 
@@ -55,7 +55,7 @@ Republish `joined` to change minutes, preserving `since`. Joining after `left` s
 new membership period with a fresh `since`. Leave at any time by republishing `left`:
 no new assignments, but already-awarded jobs finish, deliver and settle normally.
 
-### 30343 DECISION (author: challenge buyer)
+### 30343 DECISION (author: the buyer)
 
 | Tag | Value |
 |---|---|
@@ -83,7 +83,7 @@ Acceptance persists across challenges until the buyer republishes `denied`.
    The ±900-second drift tolerance applies only to event `created_at` validation,
    never to membership eligibility.
 
-## Minute tally (community app and coordinator must implement the same algorithm)
+## Minute tally (community app and the buyer must implement the same algorithm)
 
 For a challenge `C` with buyer `B`, seller `S`:
 
@@ -99,7 +99,7 @@ For a challenge `C` with buyer `B`, seller `S`:
 Known limit: `created_at` is signer-chosen (relay drift ±900 s); a seller can shift its RESULT
 time. Acceptable for "about an hour"; the deadline cap bounds it.
 
-## Coordinator rules
+## Buyer rules
 
 - Post only while `now ∈ [C.starts, C.ends]` and `C.status = in_progress`.
 - Target only eligible sellers with no running job, and only a task with
@@ -108,7 +108,7 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
   would exceed it.
 - Public jobs, `seller_pubkey` targeted, existing review/collect/pay.
 
-The executable coordinator is `node scripts/challenges/swarm.mjs`; `coordinator.mjs`
+The buyer's swarm runner is `node scripts/challenges/swarm.mjs`; `coordinator.mjs`
 remains its pure admission decision function. Sellers are manually accepted once, then the
 runner automatically assigns successive tasks until solved or exhausted. Deadlines must fit
 both the remaining donated minutes and the remaining work window. There is at most one
@@ -181,5 +181,5 @@ key; none prints a secret.
 - Current means the newest non-cancelled challenge (newest cancelled if none); ties use lowest
   event id. Duplicate awards for an offer select the earliest valid award, then lowest id.
 - Review past jobs include completed jobs across known challenges, deduplicated by offer id. Heartbeat capabilities are
-  advertised, not independently verified. The reader is a projection, not a coordinator;
-  Rust coordinator parity must be checked with the same event fixtures by its implementation.
+  advertised, not independently verified. The reader is a projection, not the buyer;
+  Rust buyer parity must be checked with the same event fixtures by its implementation.

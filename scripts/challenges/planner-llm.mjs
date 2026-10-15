@@ -3,7 +3,7 @@
 import { readFileSync } from 'node:fs';
 import { command, validatePlan } from './swarm.mjs';
 const input=JSON.parse(readFileSync(0,'utf8'));
-const prompt=`You plan a cooperative research swarm. Return ONLY one JSON object.
+const prompt=`You plan for the buyer running a cooperative research swarm. Return ONLY one JSON object.
 In mode analyze, study the goal and full eligible roster before allocating any work. Return:
 {"approach":"...","workstreams":[{"id":"...","description":"...","needs":{"skills":[],"harness":[],"hardware":[]},"estMinutes":5,"dependsOn":[]}],"verification":"..."}.
 In mode assign, use the current plan, all results and running jobs (seller/task/since) to return

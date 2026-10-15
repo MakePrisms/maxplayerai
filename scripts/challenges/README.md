@@ -1,4 +1,4 @@
-# Community challenges v1 coordinator + local E2E
+# Community challenges v1 buyer tools + local E2E
 
 Run from the repository root (Node **24+**, Python 3, Cargo toolchain used by this checkout,
 PostgreSQL 17 and Redis installed):
@@ -42,14 +42,14 @@ proves the trade integrity/collect path, not a deployed reviewer service. It hol
 running HTTP/SSE state, then waits two seconds to make positive minute usage observable. No new money path is introduced.
 
 Assertions: publish → 60/30-minute memberships → accept/deny → authenticated HTTP tally →
-coordinator selects only accepted seller → real MCP post → seller claim / buyer award (auto or existing manual override) →
+the buyer selects only accepted seller → real MCP post → seller claim / buyer award (auto or existing manual override) →
 running tally and no concurrent assignment → delivered result / free collect → exact minute
 tally and done → denied seller idle → leave blocks new assignment while preserving work.
 `--baseline` tests only the existing free-job trade loop and must not be cited as full challenge
 coverage. Failed assertions exit nonzero and print the private artifact location. Successful
 runs end in `PASS ALL community challenge E2E`.
 
-The standalone pure coordinator prints JSON and does not post; the automatic runner below consumes it. Standalone [buyer runbook](../../docs/challenge-coordinate.md).
+The standalone admission tool (`coordinator.mjs`) prints JSON and does not post; the buyer's swarm runner below consumes it. Standalone [buyer runbook](../../docs/challenge-coordinate.md).
 It shares the app tally by consuming the snapshot, not by copying its event projection.
 Paid assignment requires an explicit reconciled buyer budget input because the public app
 cannot prove settlement. Serialise assignment and track pending offers as the runbook describes.

@@ -23,7 +23,7 @@
 
 /// Daily community challenge.
 pub const CHALLENGE_KIND: u16 = 30341;
-/// Persistent seller membership with a challenge buyer.
+/// Persistent seller membership with the buyer.
 pub const CHALLENGE_MEMBERSHIP_KIND: u16 = 30342;
 /// Persistent buyer decision on a seller membership.
 pub const CHALLENGE_DECISION_KIND: u16 = 30343;

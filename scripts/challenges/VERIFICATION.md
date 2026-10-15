@@ -9,14 +9,14 @@ bash scripts/challenges/run-e2e.sh
 Integrated core `ceb29d537420e0a4da567ccd514904d9c187ca43` and app
 `1e0cf89aae11be1092323dafbcfc5c16ba14e2e6`. Full real-Buzz E2E passed on implementation
 `15b6736f`; the subsequent app merge `50ca3321` adds only the frontend demo module, page
-wiring and its test. Frontend tests/build were rerun after that merge; coordinator,
+wiring and its test. Frontend tests/build were rerun after that merge; buyer tools,
 community service, harness, CLI and relay runtime sources were unchanged.
 
 ## Final gates
 
 | Gate | Result |
 | --- | --- |
-| Coordinator policy | 4 passed, 0 failed |
+| Buyer policy | 4 passed, 0 failed |
 | Community service + public-v2 regression | 26 passed, 0 failed |
 | Frontend (including typecheck) | 331 passed, 0 failed |
 | Frontend build | PASS |
@@ -34,6 +34,8 @@ cargo test --locked -p maxplayer --no-default-features --features wallet,acp cha
 
 ## Full final E2E output summary
 
+Assertion labels below are normalized to the current buyer terminology; historical results are unchanged.
+
 ```text
 PASS integration binaries exist
 PASS Postgres ready
@@ -45,10 +47,10 @@ PASS both applications visible (60 and 30 minutes)
 PASS both initially applied
 PASS accepted/denied tally and authenticated history
 PASS Rust CLI and app agree on eligibility
-PASS coordinator blocks before work window
+PASS buyer blocks before work window
 PASS challenge work window open
-PASS coordinator permits only accepted idle seller
-PASS coordinator task posted through existing buyer MCP
+PASS buyer permits only accepted idle seller
+PASS buyer task posted through existing buyer MCP
 PASS accepted seller live claim observed
 PASS existing manual award override committed
 PASS claim and award yield running tally
@@ -103,6 +105,6 @@ Exact events, logs, causes and the list of small cross-agent fixes: [INTEGRATION
 
 The buyer/relay incomplete-history and stalled auto-award behavior remains an implementation
 follow-up, not fixed here; the harness uses the existing idempotent award override and bounded
-history retries. No required coordinator/E2E work remains. Paid/mint, external reviewer and
-Git/S3 delivery paths were deliberately not exercised. The coordinator runbook requires a
+history retries. No required buyer-tool/E2E work remains. Paid/mint, external reviewer and
+Git/S3 delivery paths were deliberately not exercised. The buyer runbook requires a
 reconciled existing buyer budget for paid assignments; public app totals are estimates.

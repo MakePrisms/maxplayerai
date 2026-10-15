@@ -195,17 +195,17 @@ try:
         rows = json.loads(cli(buyer_env, 'members', '--challenge', 'local-e2e', '--json'))['members']
         check('Rust CLI and app agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
-            check('coordinator blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
+            check('buyer blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
         wait('challenge work window open', lambda: int(time.time()) >= starts)
         s = snapshot()
         p = plan(s)
-        check('coordinator permits only accepted idle seller', p['postingAllowed'] and [x['seller_pubkey'] for x in p['sellers']] == [SELLER] and p['budgetHeadroomSats'] == 0)
+        check('buyer permits only accepted idle seller', p['postingAllowed'] and [x['seller_pubkey'] for x in p['sellers']] == [SELLER] and p['budgetHeadroomSats'] == 0)
         deadline = p['sellers'][0]['deadlineUnix']
     else:
         deadline = int(time.time()) + 120
     posted = mcp(buyer_env, 'post_job', {'task':'Return exactly the fixture answer 42.', 'output':'text/plain', 'payment':'none', 'amount_sats':0, 'max_sats':0, 'visibility':'public', 'seller_pubkey':SELLER, 'deadline_unix':deadline, 'request_id':'challenge-e2e-free'})
     job = posted['job_id']
-    check('coordinator task posted through existing buyer MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
+    check('buyer task posted through existing buyer MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
     def claimed():
         state = mcp(buyer_env, 'get_job', {'job_id': job})
         return state if any(c['seller_pubkey'] == SELLER and c['live'] for c in state['claims']) else None

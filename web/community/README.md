@@ -3,7 +3,7 @@
 Node 24 ESM, one direct dependency (`@noble/curves`, matching web/app). Uses Node's
 WebSocket, HTTP, crypto and test runner; reuses the app's pure NIP-19 codec through
 Node 24 type stripping. Run from this repository (not a standalone copied folder).
-No buyer wallet, coordinator, payment execution, or event-publishing API.
+No buyer wallet, swarm runner, payment execution, or event-publishing API.
 
 ```sh
 npm ci --prefix web/community
@@ -64,7 +64,7 @@ It checks rendered data, not just a static shell. Build with the default same-or
 
 Every ingested event's canonical NIP-01 id and Schnorr signature is verified locally.
 Addressable replacements use timestamp then lowest id. Validation and tally are in
-`src/events.mjs` / `src/model.mjs`; the Rust coordinator is developed separately and must
+`src/events.mjs` / `src/model.mjs`; the Rust buyer implementation is developed separately and must
 run parity fixtures (it cannot literally import this JavaScript module).
 
 History uses per-kind 500-event pages, overlapping the boundary second; live subscription
