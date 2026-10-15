@@ -26,7 +26,8 @@ Earlier dated verification sections are historical snapshots, not current covera
   `balance` use SQLite snapshots without the writer lock; `discover` reads only relays and
   mint keysets (per-lot `expected_fees`, `unknown` if a mint is slow) with no lock, home or
   journal access. While `serve` runs, `list`/`take`/`cancel`/`receive` hand off to it over
-  `<home>/serve.sock` (0600, same uid, token size + 16 KiB, one request per connection) and serve
+  `<home>/serve.sock` (0600, both ends check the other is their own euid, token size + 16 KiB, one request
+  per connection; refused if the `--relay` list (exact, in order) or `--mint-relay` set (any order) the command uses differs) and serve
   executes them with the client's exact bounds as the single writer. A handed-off `receive`
   sends the token only over that socket; serve logs its public attempt id, never the token. `list`/`take --dry-run` preview
   both legs' fees, gross amounts and max total debit with zero side effects. A swap waiting

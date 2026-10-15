@@ -25,6 +25,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 sha2 = "0.10"
 hex = "0.4"
 fs2 = "0.4"
+# Effective uid for the serve socket owner checks (already in the lock through tempfile/tokio).
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
 rusqlite = "=0.31.0"
 url = "2"
 # Retry-After as an HTTP-date (already in the lock through hyper/reqwest).

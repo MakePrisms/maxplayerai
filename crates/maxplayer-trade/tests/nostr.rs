@@ -2705,8 +2705,10 @@ async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
     fs2::FileExt::try_lock_exclusive(&lock).unwrap();
     let mut jobs = maxplayer_trade::serve::bind(&e.taker, vec![e._market_url.clone()]).unwrap();
     let request = maxplayer_trade::serve::Request {
-        v: 1,
+        v: maxplayer_trade::serve::PROTOCOL_V,
         relays: vec![e._market_url.clone()],
+        // serve compares a take's mint relays with its own (this process's configured list).
+        mint_relays: transport::mint_relays(),
         command: maxplayer_trade::serve::Command::Take {
             lot: lot.clone(),
             max_give: 40,

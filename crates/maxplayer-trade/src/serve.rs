@@ -12,8 +12,10 @@
 //! same token always maps to the same attempt id, so a retry after a lost reply or a restart
 //! resumes that attempt and never credits twice.
 //!
-//! The socket is mode 0600 inside the 0700 home, and every peer must have the uid that owns the
-//! socket (SO_PEERCRED). One request per connection; the request is at most
+//! The socket is mode 0600 inside the 0700 home. Both ends check the other with SO_PEERCRED
+//! against their own effective uid; the client also requires the socket file to be its own.
+//! serve refuses a request whose market or mint relay set differs from its own wherever the
+//! command depends on it ([`Command::relay_needs`]). One request per connection; the request is at most
 //! [`MAX_REQUEST_BYTES`]; reads and writes are bounded by [`IO_TIMEOUT`]; at most
 //! [`MAX_CONNECTIONS`] connections are served at once.
 use crate::{Asset, Leg, coordinator, journal::Journal, market::Market, observe, receive};
@@ -42,7 +44,8 @@ pub const KEEPALIVE: Duration = Duration::from_secs(15);
 pub const CLIENT_IDLE: Duration = Duration::from_secs(90);
 /// How long a client whose home is locked keeps looking for a serve socket (serve may be starting).
 pub const CONNECT_WAIT: Duration = Duration::from_secs(5);
-pub const PROTOCOL_V: u8 = 1;
+/// 2: requests carry the client's effective `nostr://` mint relays (`mint_relays`).
+pub const PROTOCOL_V: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -76,6 +79,23 @@ impl Command {
             Command::Take { .. } => "take",
             Command::Cancel { .. } => "cancel",
             Command::Receive { .. } => "receive",
+        }
+    }
+    /// Which of the client's relay sets this command depends on, so serve can refuse a request
+    /// it would otherwise run on different relays: `(market, mint)`. Market relays: list, take
+    /// and cancel publish or read lots; a receive never touches the market. Mint relays: any
+    /// command that may reach a `nostr://` mint. take and cancel act on a lot whose mints the
+    /// client does not know, so they always compare them.
+    pub fn relay_needs(&self) -> (bool, bool) {
+        let nostr = crate::transport::is_nostr;
+        match self {
+            Command::List {
+                give_mint,
+                want_mint,
+                ..
+            } => (true, nostr(give_mint) || nostr(want_mint)),
+            Command::Take { .. } | Command::Cancel { .. } => (true, true),
+            Command::Receive { mint, .. } => (false, nostr(mint)),
         }
     }
     /// What serve may log about a request: public bounds and ids only, never a payload. Each
@@ -125,8 +145,15 @@ pub fn receive_id(mint: &str, token: &str) -> Option<String> {
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub v: u8,
-    /// The client's resolved relay set; serve refuses a request for a different set.
+    /// The client's resolved market relay set; serve refuses a request for a different set when
+    /// the command uses the market ([`Command::relay_needs`]).
     pub relays: Vec<String>,
+    /// The client's effective `nostr://` mint relays (`--mint-relay`, or the defaults). serve
+    /// refuses a different set when the command may reach a `nostr://` mint, instead of silently
+    /// running it on serve's own mint relays. Defaulted so a protocol-1 client (which never
+    /// sends it) gets the version message; an empty set never equals serve's (never empty).
+    #[serde(default)]
+    pub mint_relays: Vec<String>,
     pub command: Command,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +189,12 @@ pub struct Failure {
 fn peer_allowed(peer: u32, owner: u32) -> Result<()> {
     ensure!(peer == owner, "peer uid {peer} refused");
     Ok(())
+}
+/// Client side: hand a request (possibly a token) only to a serve whose socket peer and socket
+/// file are both owned by the client's effective uid.
+fn trusted_serve(peer: u32, socket_owner: u32, me: u32) -> Result<()> {
+    peer_allowed(socket_owner, me).context("serve socket is owned by another user; refusing")?;
+    peer_allowed(peer, me).context("serve socket peer runs as another user; refusing")
 }
 /// Same exit-code mapping as the CLI.
 pub fn exit_code(error: &anyhow::Error) -> u8 {
@@ -199,6 +232,12 @@ fn socket_path(home: &Path) -> Result<SocketPath> {
 /// Bind the socket. Call only while holding `owner.lock`: any existing socket file is then
 /// stale (its serve no longer holds the lock) and is replaced.
 pub fn bind(home: &Path, relays: Vec<String>) -> Result<mpsc::Receiver<Job>> {
+    bind_expecting(home, relays, rustix::process::geteuid().as_raw())
+}
+/// [`bind`] admitting only peers of uid `owner` (serve's own euid in production). Tests pass
+/// another uid to prove the real socket drops a foreign peer before reading anything.
+#[doc(hidden)]
+pub fn bind_expecting(home: &Path, relays: Vec<String>, owner: u32) -> Result<mpsc::Receiver<Job>> {
     let file = home.join(SOCKET);
     match std::fs::symlink_metadata(&file) {
         Ok(meta) => {
@@ -215,8 +254,12 @@ pub fn bind(home: &Path, relays: Vec<String>) -> Result<mpsc::Receiver<Job>> {
     }
     let sp = socket_path(home)?;
     let listener = UnixListener::bind(&sp.path).context("bind serve socket")?;
+    let me = rustix::process::geteuid().as_raw();
+    if std::fs::symlink_metadata(&file)?.uid() != me {
+        let _ = std::fs::remove_file(&file);
+        bail!("serve socket is not owned by serve's user; refusing");
+    }
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))?;
-    let owner = std::fs::symlink_metadata(&file)?.uid();
     let (tx, rx) = mpsc::channel(MAX_CONNECTIONS);
     let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     let home = home.to_path_buf();
@@ -288,6 +331,35 @@ async fn write(stream: &mut UnixStream, reply: &Reply) -> Result<()> {
     Ok(())
 }
 
+/// Why serve refuses `request` before queueing it, if it does: a protocol mismatch, or a relay
+/// set the command depends on ([`Command::relay_needs`]) that differs from serve's own. Serve
+/// never runs a request on relays other than the ones the client resolved. The requested relays
+/// are caller text (a mistyped flag may hold a token), so the message is redacted.
+fn refusal(request: &Request, relays: &[String], mint_relays: &[String]) -> Option<String> {
+    if request.v != PROTOCOL_V {
+        return Some(format!(
+            "serve protocol version mismatch (serve {PROTOCOL_V}, client {}); run the same \
+             maxplayer-trade version as serve",
+            request.v
+        ));
+    }
+    let (market, mint) = request.command.relay_needs();
+    if market && request.relays != relays {
+        return Some(crate::redact_reason(&format!(
+            "serve uses relays {relays:?}; this command asked for {:?}. Use exactly serve's --relay list (same values, same order); nothing was queued or executed",
+            request.relays
+        )));
+    }
+    if mint && !crate::transport::same_mint_relays(&request.mint_relays, mint_relays) {
+        return Some(crate::redact_reason(&format!(
+            "serve uses mint relays {mint_relays:?}; this command asked for {:?}. Use the same \
+             --mint-relay set as serve; nothing was queued or executed",
+            request.mint_relays
+        )));
+    }
+    None
+}
+
 async fn connection(
     mut stream: UnixStream,
     owner: u32,
@@ -338,16 +410,7 @@ async fn connection(
             bail!(error)
         }
     };
-    if request.v != PROTOCOL_V || request.relays != relays {
-        let error = if request.v != PROTOCOL_V {
-            "serve protocol version mismatch".to_string()
-        } else {
-            // The requested relays are caller text (a mistyped flag may hold a token): redacted.
-            crate::redact_reason(&format!(
-                "serve uses relays {relays:?}; this command asked for {:?}. Use the same --relay set as serve",
-                request.relays
-            ))
-        };
+    if let Some(error) = refusal(&request, relays, &crate::transport::mint_relays()) {
         write(
             &mut stream,
             &Reply::Exit {
@@ -734,6 +797,12 @@ impl std::error::Error for Forwarded {}
 
 /// Hand `request` to a running serve. `Ok(None)`: nothing is listening (no serve).
 pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
+    forward_expecting(home, request, rustix::process::geteuid().as_raw()).await
+}
+/// [`forward`] trusting only a serve of uid `me` (the client's own euid in production). Tests
+/// pass another uid to prove nothing (no token) is written to a foreign serve.
+#[doc(hidden)]
+pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Result<Option<u8>> {
     let sp = socket_path(home)?;
     let mut stream = match UnixStream::connect(&sp.path).await {
         Ok(s) => s,
@@ -747,9 +816,16 @@ pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
         }
         Err(e) => return Err(e).context("connect to serve socket"),
     };
-    let owner = std::fs::symlink_metadata(home.join(SOCKET))?.uid();
-    peer_allowed(stream.peer_cred()?.uid(), owner)
-        .context("serve socket peer does not own the socket; refusing")?;
+    // The token goes only to a serve running as this user: the listening peer AND the socket
+    // file must both be ours. Comparing the peer with the socket's owner alone would trust a
+    // socket another uid planted in the home.
+    trusted_serve(
+        stream.peer_cred()?.uid(),
+        std::fs::symlink_metadata(home.join(SOCKET))
+            .context("serve socket vanished during hand-off; nothing was sent")?
+            .uid(),
+        me,
+    )?;
     // Sized before anything is written: an over-limit request never reaches serve.
     let mut line = serde_json::to_string(request)?;
     ensure!(
@@ -824,8 +900,9 @@ mod tests {
     #[test]
     fn request_rejects_unknown_fields_and_keeps_bounds() {
         let r = Request {
-            v: 1,
+            v: PROTOCOL_V,
             relays: vec!["ws://127.0.0.1:1".into()],
+            mint_relays: vec![],
             command: Command::Take {
                 lot: "x".into(),
                 max_give: 27,
@@ -847,8 +924,9 @@ mod tests {
     fn receive_request_round_trips_and_never_prints_its_token() {
         let token = format!("cashuB{}", "Zm9v".repeat(64));
         let r = Request {
-            v: 1,
+            v: PROTOCOL_V,
             relays: vec!["ws://127.0.0.1:1".into()],
+            mint_relays: vec![],
             command: Command::Receive {
                 mint: "http://127.0.0.1:1".into(),
                 token: TokenText(token.clone()),
@@ -882,6 +960,201 @@ mod tests {
         assert!(
             peer_allowed(0, 1001).is_err(),
             "SAFETY: root is not the owner"
+        );
+    }
+    #[test]
+    fn client_trusts_only_a_serve_of_its_own_uid() {
+        assert!(trusted_serve(1001, 1001, 1001).is_ok());
+        assert!(
+            trusted_serve(1001, 1002, 1001).is_err(),
+            "SAFETY: a socket file planted by another uid is refused even if its peer is ours"
+        );
+        assert!(
+            trusted_serve(1002, 1002, 1001).is_err(),
+            "SAFETY: another uid's serve (owning its own socket) is refused (#1140 F5)"
+        );
+        assert!(trusted_serve(0, 0, 1001).is_err(), "SAFETY: root's serve");
+        assert!(trusted_serve(1002, 1001, 1001).is_err());
+    }
+    #[test]
+    fn relay_refusals_follow_what_the_command_uses() {
+        let market = vec!["ws://127.0.0.1:1".to_string()];
+        let mint_relays = vec!["wss://m.example".to_string()];
+        let npub = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+        let req = |relays: &[&str], mints: &[&str], command: Command| Request {
+            v: PROTOCOL_V,
+            relays: relays.iter().map(|s| s.to_string()).collect(),
+            mint_relays: mints.iter().map(|s| s.to_string()).collect(),
+            command,
+        };
+        let receive = |mint: &str| Command::Receive {
+            mint: mint.into(),
+            token: TokenText("cashuBx".into()),
+        };
+        let take = || Command::Take {
+            lot: "x".into(),
+            max_give: 1,
+            min_receive: 1,
+            max_fees: 1,
+        };
+        let list = |give: &str| Command::List {
+            give_mint: give.into(),
+            give: 1,
+            want_mint: "http://127.0.0.1:2".into(),
+            want: 1,
+            max_fees: 1,
+        };
+        let refused = |r: &Request| refusal(r, &market, &mint_relays);
+        // A receive never uses the market: other (or default) --relay values are accepted.
+        let r = req(
+            &["wss://other.example"],
+            &["wss://m.example"],
+            receive("http://127.0.0.1:2"),
+        );
+        assert_eq!(refused(&r), None);
+        // An HTTP receive does not use mint relays either.
+        let r = req(
+            &["wss://other.example"],
+            &["wss://x.example"],
+            receive("http://127.0.0.1:2"),
+        );
+        assert_eq!(refused(&r), None);
+        // A nostr:// receive does: a different --mint-relay set is refused, never silently
+        // replaced by serve's own (#1140 F4).
+        let r = req(
+            &["wss://other.example"],
+            &["wss://x.example"],
+            receive(npub),
+        );
+        assert!(refused(&r).unwrap().contains("--mint-relay"), "{r:?}");
+        let r = req(&[], &["wss://M.EXAMPLE/"], receive(npub));
+        assert_eq!(refused(&r), None, "spelling of the same relay set");
+        // Market commands still compare --relay exactly.
+        let r = req(&["wss://other.example"], &["wss://m.example"], take());
+        assert!(refused(&r).unwrap().contains("--relay list"));
+        let r = req(
+            &["ws://127.0.0.1:1"],
+            &["wss://m.example"],
+            list("http://127.0.0.1:3"),
+        );
+        assert_eq!(refused(&r), None);
+        // take/cancel may reach a lot's nostr:// mint: mint relays are compared.
+        let r = req(&["ws://127.0.0.1:1"], &["wss://x.example"], take());
+        assert!(refused(&r).unwrap().contains("--mint-relay"));
+        let r = req(
+            &["ws://127.0.0.1:1"],
+            &["wss://x.example"],
+            Command::Cancel { lot: "x".into() },
+        );
+        assert!(refused(&r).is_some());
+        // list: only when one of its mints is nostr://.
+        let r = req(
+            &["ws://127.0.0.1:1"],
+            &["wss://x.example"],
+            list("http://127.0.0.1:3"),
+        );
+        assert_eq!(refused(&r), None);
+        let r = req(&["ws://127.0.0.1:1"], &["wss://x.example"], list(npub));
+        assert!(refused(&r).is_some());
+        // Version mismatch names both versions.
+        // What a protocol-1 binary actually sends (no mint_relays field) reaches the version check.
+        let v1 = r#"{"v":1,"relays":["ws://127.0.0.1:1"],"command":{"cancel":{"lot":"x"}}}"#;
+        let r = serde_json::from_str::<Request>(v1).unwrap();
+        assert!(refused(&r).unwrap().contains("client 1"));
+        // Redacted: a mistyped mint relay holding token text is not echoed.
+        let leak = format!("cashuB{}", "o2FteBtodHRwOi8v".repeat(4));
+        let r = req(&[], &[&leak], receive(npub));
+        let e = refused(&r).unwrap();
+        assert!(!e.contains(&leak) && e.contains("<redacted token>"), "{e}");
+    }
+    fn rv_req(relays: &[&str], mints: &[&str], command: Command) -> Request {
+        Request {
+            v: PROTOCOL_V,
+            relays: relays.iter().map(|s| s.to_string()).collect(),
+            mint_relays: mints.iter().map(|s| s.to_string()).collect(),
+            command,
+        }
+    }
+    fn rv_take() -> Command {
+        Command::Take {
+            lot: "x".into(),
+            max_give: 1,
+            min_receive: 1,
+            max_fees: 1,
+        }
+    }
+    /// Review of #1153, L4: subsets, supersets and the empty set are refused; order, spelling,
+    /// default port and duplicates of the SAME mint relays are accepted; a path counts.
+    #[test]
+    fn mint_relay_subsets_supersets_and_order() {
+        let market = vec!["ws://127.0.0.1:1".to_string()];
+        let serve_mint = vec!["wss://a.example".to_string(), "wss://b.example".to_string()];
+        let r = |m: &[&str]| {
+            refusal(
+                &rv_req(&["ws://127.0.0.1:1"], m, rv_take()),
+                &market,
+                &serve_mint,
+            )
+        };
+        assert!(r(&["wss://a.example"]).is_some(), "SAFETY: subset refused");
+        assert!(
+            r(&["wss://a.example", "wss://b.example", "wss://c.example"]).is_some(),
+            "SAFETY: superset refused"
+        );
+        assert!(r(&[]).is_some(), "SAFETY: empty set refused");
+        assert_eq!(r(&["wss://b.example", "wss://a.example"]), None, "order");
+        assert_eq!(
+            r(&[
+                "wss://B.example.:443/",
+                "wss://a.example",
+                "wss://a.example/"
+            ]),
+            None,
+            "spelling, default port, duplicates"
+        );
+        assert!(r(&["ws://127.0.0.1:443", "wss://b.example"]).is_some());
+        assert!(
+            r(&["wss://a.example/x", "wss://b.example"]).is_some(),
+            "path counts"
+        );
+        let recv = Command::Receive {
+            mint: "NOSTR://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d".into(),
+            token: TokenText("cashuBx".into()),
+        };
+        assert!(
+            refusal(
+                &rv_req(&[], &["wss://a.example"], recv),
+                &market,
+                &serve_mint
+            )
+            .is_some(),
+            "SAFETY: an upper-case nostr scheme is still checked"
+        );
+    }
+    /// Review of #1153, L2: `--relay` is compared exactly (documented): reordering, subsets and
+    /// respelling are refused. Fail-closed.
+    #[test]
+    fn market_relays_are_compared_exactly() {
+        let market = vec![
+            "ws://127.0.0.1:1".to_string(),
+            "ws://127.0.0.1:2".to_string(),
+        ];
+        let mints = vec!["wss://a.example".to_string()];
+        let r = |relays: &[&str]| {
+            refusal(
+                &rv_req(relays, &["wss://a.example"], rv_take()),
+                &market,
+                &mints,
+            )
+        };
+        assert!(r(&["ws://127.0.0.1:2", "ws://127.0.0.1:1"]).is_some());
+        assert!(r(&["ws://127.0.0.1:1"]).is_some(), "SAFETY: subset refused");
+        assert!(r(&["ws://127.0.0.1:1/", "ws://127.0.0.1:2"]).is_some());
+        assert_eq!(r(&["ws://127.0.0.1:1", "ws://127.0.0.1:2"]), None);
+        assert!(
+            r(&["ws://127.0.0.1:2"])
+                .unwrap()
+                .contains("nothing was queued or executed")
         );
     }
     #[tokio::test]
