@@ -124,10 +124,7 @@ fn parse_challenge_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Ch
     require(valid_id(id), "bad challenge d")?;
     let starts = number(value(d, "starts")?)?;
     let ends = number(value(d, "ends")?)?;
-    require(
-        ends > starts,
-        "invalid challenge times",
-    )?;
+    require(ends > starts, "invalid challenge times")?;
     let b = tag(d, "budget")?;
     require(b.len() == 3 && b[2] == "sat", "invalid budget unit")?;
     let budget_sats = number(&b[1])?;
@@ -309,11 +306,7 @@ mod signed {
         latest
             .iter()
             .filter_map(|e| parse_membership(e, &c.buyer).ok())
-            .filter(|a| {
-                a.status == "joined"
-                    && a.since <= c.starts
-                    && accepted.contains(&a.seller)
-            })
+            .filter(|a| a.status == "joined" && a.since <= c.starts && accepted.contains(&a.seller))
             .collect()
     }
 }
@@ -422,14 +415,12 @@ mod tests {
         let c = challenge();
         let a = membership();
         assert!(parse_challenge_draft(&c.to_event_draft().unwrap(), &a.seller, &c.buyer).is_err());
-        assert!(
-            parse_decision_draft(
-                &decision().to_event_draft(&c.buyer).unwrap(),
-                &a.seller,
-                &c.buyer
-            )
-            .is_err()
-        );
+        assert!(parse_decision_draft(
+            &decision().to_event_draft(&c.buyer).unwrap(),
+            &a.seller,
+            &c.buyer
+        )
+        .is_err());
         for (k, v) in [
             ("d", "30341:unknown:today"),
             ("p", &a.seller),

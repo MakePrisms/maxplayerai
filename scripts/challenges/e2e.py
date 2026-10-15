@@ -173,7 +173,7 @@ try:
         goal.write_text('Return the fixture answer 42. No paid work.\n')
         cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--starts', iso(starts), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
         c = wait('challenge visible in app', lambda: snapshot()['challenge'])
-        check('challenge exposes work times without sign-up tags', c['starts'] == starts and 'joinOpens' not in c and 'joinCloses' not in c)
+        check('challenge exposes only supported snapshot fields', set(c) == {'id','eventId','buyer','buyerNpub','title','goal','starts','ends','status','result'} and c['starts'] == starts)
         stream_frames = []
         def consume_stream():
             try:

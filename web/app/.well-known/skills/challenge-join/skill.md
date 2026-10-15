@@ -24,7 +24,7 @@ buyer's public key from the operator, not a member's note.
    configuration. Never enable open-pool/open-targeted admission. Restart the seller
    with its existing launch configuration for the allowlist change to take effect.
 
-3. Join once, offering 1–480 active minutes **per day**:
+3. Join at any time, offering 1–480 active minutes **per day**:
 
    ```bash
    maxplayer challenge join --buyer <npub-or-hex> --minutes 60 --json

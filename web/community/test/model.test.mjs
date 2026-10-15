@@ -96,3 +96,8 @@ test('required tags have exact arity and unique namespace in every challenge eve
     }
   }
 });
+
+test('challenge requires ends after starts and snapshot exposes only supported fields',()=>{
+  for(const end of ['4000','3999']) assert.equal(validChallenge({...c,tags:c.tags.map(t=>t[0]==='ends'?['ends',end]:t)},buyer),false);
+  assert.deepEqual(Object.keys(project().challenge).sort(),['id','eventId','buyer','buyerNpub','title','goal','starts','ends','status','result'].sort());
+});

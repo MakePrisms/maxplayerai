@@ -9,7 +9,8 @@ const HELP: &str = "Usage: maxplayer challenge <command> [--home <path>] [--json
   publish --id <d> --title <text> --goal-file <path> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>]
   members [--challenge <d>]
   decide --seller <npub|hex> --accept|--deny
-Membership and acceptance persist across days. Leave at any time. Minutes are offered per day.
+Join or leave at any time. Joining after work starts means eligibility from the next day.
+Membership and acceptance persist across days. Minutes are offered per day.
 Status/members default to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
 ";
 #[derive(Debug)]
@@ -154,7 +155,17 @@ fn human(body: &serde_json::Value) -> String {
     }
     let mut lines = Vec::new();
     if let Some(c) = body.get("challenge").filter(|c| !c.is_null()) {
-        lines.push(format!("Challenge {}: {} ({})\nBuyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",c["id"].as_str().unwrap_or(""),c["title"].as_str().unwrap_or(""),c["status"].as_str().unwrap_or(""),c["buyer"].as_str().unwrap_or(""),c["goal"].as_str().unwrap_or(""),c["starts"],c["ends"],c["budget_sats"]));
+        lines.push(format!(
+            "Challenge {}: {} ({})\nBuyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",
+            c["id"].as_str().unwrap_or(""),
+            c["title"].as_str().unwrap_or(""),
+            c["status"].as_str().unwrap_or(""),
+            c["buyer"].as_str().unwrap_or(""),
+            c["goal"].as_str().unwrap_or(""),
+            c["starts"],
+            c["ends"],
+            c["budget_sats"]
+        ));
     }
     if let Some(rows) = body.get("members").and_then(|v| v.as_array()) {
         for row in rows {
@@ -428,11 +439,6 @@ mod tests {
         s.split_whitespace().map(str::to_owned).collect()
     }
     #[test]
-    fn publish_rejects_removed_join_opens_option() {
-        assert!(parse(&args("publish --join-opens 2026-10-15T00:00:00Z")).is_err());
-        assert!(!HELP.contains("--join-opens"));
-    }
-    #[test]
     fn challenge_options_are_strict() {
         for s in [
             "join --buyer abc --minutes 1",
@@ -478,11 +484,9 @@ mod tests {
                 0
             );
             assert!(err.is_empty());
-            assert!(
-                String::from_utf8(out)
-                    .unwrap()
-                    .contains("maxplayer challenge")
-            );
+            assert!(String::from_utf8(out)
+                .unwrap()
+                .contains("maxplayer challenge"));
         }
     }
     #[test]
@@ -502,13 +506,11 @@ mod tests {
             "../../../web/app/.well-known/skills/index.json"
         ))
         .unwrap();
-        assert!(
-            index["skills"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|row| row["path"] == "/.well-known/skills/challenge-join/skill.md")
-        );
+        assert!(index["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == "/.well-known/skills/challenge-join/skill.md"));
     }
     #[cfg(feature = "wallet")]
     mod wallet {
@@ -661,8 +663,6 @@ mod tests {
             let since = body["members"][0]["membership"]["since"].clone();
             let publish=parse(&args(&format!("publish --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now+3590),iso(now+7200)))).unwrap();
             let (published, _) = execute_async(&publish, &buyer).await.unwrap();
-            assert!(published["challenge"].get("join_opens").is_none());
-            assert!(published["challenge"].get("join_closes").is_none());
             assert_eq!(published["challenge"]["starts"], now + 3590);
             let join = parse(&args(&format!("join --buyer {buyer_key} --minutes 60"))).unwrap();
             let (_, warning) = execute_async(&join, &seller).await.unwrap();
