@@ -31,12 +31,32 @@ async fn delivered(from: &Market, to: &mut Market, text: &str) -> bool {
     .is_ok()
 }
 
+/// Wait until at least `connections` sockets have opened, every one of them has signed in, and no
+/// subscription is still deaf (sent before sign-in, not re-sent): the barrier the fixed sleeps
+/// stood in for (#1156 review M4). A client sends its REQ on connect and its AUTH only after the
+/// challenge, so a socket's pre-sign-in REQ is always counted before its sign-in is.
+async fn all_hear(relay: &AuthRelay, connections: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let c = &relay.counters;
+        let open = Counters::get(&c.connections);
+        if open >= connections && Counters::get(&c.auths) >= open && Counters::get(&c.deaf) == 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscriptions never re-sent after sign-in: {c:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn markets(relay: &AuthRelay) -> (Market, Market) {
     let urls = [relay.url.clone()];
     let a = Market::connect(Keys::generate(), &urls).await.unwrap();
     let b = Market::connect(Keys::generate(), &urls).await.unwrap();
-    // Both signed in (the publishing side's EVENT is refused until then, then re-sent by the SDK).
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Both inboxes re-subscribed after sign-in.
+    all_hear(relay, 2).await;
     (a, b)
 }
 
@@ -76,7 +96,7 @@ async fn trade_inbox_receives_again_after_a_reconnect() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    all_hear(&relay, connections + 2).await;
     assert!(delivered(&a, &mut b, "after").await, "{:?}", relay.counters);
 }
 

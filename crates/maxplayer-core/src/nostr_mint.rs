@@ -158,7 +158,8 @@ pub struct RequestObservation {
     pub elapsed_ms: u64,
     pub budget_ms: u64,
     pub attempts: u32,
-    /// SDK authentication retransmissions are not counted as wire sends.
+    /// Request frames queued to relays: scheduled sends plus the re-send after each sign-in.
+    /// Queued is not delivered: a reconnecting relay flushes its queue on the next socket.
     pub wire_sends: Option<u32>,
     pub request_event: Option<String>,
     pub reply_ms: Option<u64>,
@@ -189,6 +190,9 @@ pub struct RelayEvidence {
     pub auth: &'static str,
     pub connection_generation: u32,
     pub auth_generation: Option<u32>,
+    /// Connection generation on which the relay refused this request or closed its reply
+    /// subscription with an `auth-required:`/`restricted:` reason.
+    pub auth_refused_generation: Option<u32>,
     pub refusal_category: Option<&'static str>,
     pub closed_category: Option<&'static str>,
     pub eose: bool,
@@ -207,6 +211,7 @@ impl Default for RelayEvidence {
             auth: "unknown",
             connection_generation: 0,
             auth_generation: None,
+            auth_refused_generation: None,
             refusal_category: None,
             closed_category: None,
             eose: false,
@@ -290,6 +295,19 @@ fn auth_failed(r: &RelayEvidence) -> bool {
     r.auth == "failed" || r.auth == "timeout"
 }
 
+/// On its current socket the relay rejected sign-in AND refused this request (or closed its reply
+/// subscription) for lack of it, and never accepted the request: positive evidence that this path
+/// cannot carry a reply. A stale failure from an earlier socket, a dropped socket, or a relay
+/// that challenges without requiring sign-in does not qualify.
+fn refused_for_sign_in(r: &RelayEvidence) -> bool {
+    let current = Some(r.connection_generation);
+    r.connected
+        && r.auth == "failed"
+        && r.auth_generation == current
+        && r.auth_refused_generation == current
+        && r.acceptance != "accepted"
+}
+
 /// A relay that accepted the request and kept its reply subscription open: the path on which an
 /// answer could have been observed.
 fn accepted_open(r: &RelayEvidence) -> bool {
@@ -336,7 +354,8 @@ fn collect_lifecycle(
                     if !connected {
                         evidence.auth_generation = None;
                         evidence.challenged = false;
-                        if evidence.auth == "authenticated" {
+                        // Sign-in state, success or failure, belongs to the socket that ended.
+                        if evidence.auth == "authenticated" || evidence.auth == "failed" {
                             evidence.auth = "unknown";
                         }
                     }
@@ -414,10 +433,13 @@ impl NostrMintConnector {
     ///
     /// The whole call, relay connect included, ends at `deadline = start + window`. The request's
     /// `exp` is [`request_exp`] of the same start: the mint refuses from that second on, which is
-    /// never later than the deadline, so once the connector stops waiting a compliant mint with a
-    /// synchronized clock can no longer execute it (spec §3.1). A mint clock behind by up to
-    /// `MAX_CLOCK_SKEW_SECS` can still execute it until then; recovery's `REQUEST_SETTLE` hold is
-    /// what covers that. Nothing past the deadline is awaited except a bounded disconnect.
+    /// never later than the deadline, so once the window has passed a compliant mint with a
+    /// synchronized clock can no longer execute it (spec §3.1). The call can return BEFORE the
+    /// deadline with an ambiguous error (every reachable relay refused sign-in, or the relay pool
+    /// closed) while a queued or relayed copy of the request is still executable until `exp`; a
+    /// mint clock behind by up to `MAX_CLOCK_SKEW_SECS` extends that. Recovery's
+    /// `REQUEST_SETTLE` hold, measured from the saga's last update rather than from this return,
+    /// is what covers both. Nothing past the deadline is awaited except a bounded disconnect.
     pub async fn call_raw(&self, operation: &str, body: Value) -> Result<Value, Error> {
         self.call_observed(operation, body).await.0
     }
@@ -599,10 +621,115 @@ impl NostrMintConnector {
         let send_event = |relay: &nostr_sdk::prelude::Relay| {
             relay.send_msg(ClientMessage::event(event.clone())).is_ok()
         };
+        let count_send = |observation: &mut RequestObservation, url: &str, queued: bool| {
+            if queued {
+                observation.wire_sends = Some(observation.wire_sends.unwrap_or(0) + 1);
+            } else {
+                observation
+                    .relays
+                    .entry(url.to_owned())
+                    .or_default()
+                    .publish_failed = true;
+            }
+        };
+        // One pool notification: a usable reply ends the call; relay messages are evidence.
+        let handle = |notification: RelayPoolNotification,
+                      observation: &mut RequestObservation|
+         -> Option<Result<Value, Error>> {
+            match notification {
+                RelayPoolNotification::Event {
+                    event: reply,
+                    relay_url,
+                    ..
+                } => {
+                    let elapsed_ms = start.elapsed().as_millis() as u64;
+                    let result = self.accept(
+                        &reply,
+                        &event.id,
+                        &keys,
+                        &request.id,
+                        observation,
+                        elapsed_ms,
+                    )?;
+                    observation.reply_ms = Some(start.elapsed().as_millis() as u64);
+                    observation.reply_relay = Some(relay_url.to_string());
+                    Some(result)
+                }
+                RelayPoolNotification::Message { relay_url, message } => {
+                    let r = observation
+                        .relays
+                        .entry(relay_url.to_string().trim_end_matches('/').to_owned())
+                        .or_default();
+                    match message {
+                        // Refusal text is untrusted and never reflected, only its prefix.
+                        RelayMessage::Ok {
+                            event_id,
+                            status,
+                            message,
+                        } if event_id == event.id => {
+                            if status {
+                                // A later acceptance supersedes the pre-sign-in refusal.
+                                r.acceptance = "accepted";
+                                r.refused = false;
+                                r.publish_failed = false;
+                            } else {
+                                let category = reason_category(&message);
+                                r.refused = true;
+                                r.publish_failed = true;
+                                r.refusal_category = Some(category);
+                                if category == "auth" {
+                                    r.auth_refused_generation = Some(r.connection_generation);
+                                }
+                                if r.acceptance != "accepted" {
+                                    r.acceptance = "refused";
+                                }
+                            }
+                        }
+                        RelayMessage::Closed {
+                            subscription_id,
+                            message,
+                        } if subscription_id.as_ref() == &subscription => {
+                            let category = reason_category(&message);
+                            r.closed = true;
+                            r.closed_category = Some(category);
+                            if category == "auth" {
+                                r.auth_refused_generation = Some(r.connection_generation);
+                            }
+                        }
+                        RelayMessage::EndOfStoredEvents(id) if id.as_ref() == &subscription => {
+                            r.eose = true
+                        }
+                        RelayMessage::Notice(_) => r.notice = true,
+                        _ => {}
+                    }
+                    None
+                }
+                _ => None,
+            }
+        };
 
         let mut next_send = Instant::now();
-        let outcome = loop {
+        let outcome = 'call: loop {
             collect_lifecycle(&mut lifecycle, observation);
+            // Bring relay-message evidence (OK, CLOSED) up to date with the lifecycle evidence
+            // just drained, so the checks below never see a sign-in failure without the
+            // acceptance that arrived alongside it.
+            loop {
+                match notifications.try_recv() {
+                    Ok(notification) => {
+                        if let Some(result) = handle(notification, observation) {
+                            break 'call result;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                        observation.evidence_lost = true
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        break 'call Err(Error::HttpError(None, "relay pool closed".into()));
+                    }
+                }
+            }
             for (url, relay) in &relays {
                 let Some(r) = observation.relays.get(url) else {
                     continue;
@@ -612,27 +739,22 @@ impl NostrMintConnector {
                     signed_in_under.insert(url.clone(), generation);
                     let _ =
                         relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
-                    if observation.attempts > 0 && !send_event(relay) {
-                        observation
-                            .relays
-                            .entry(url.clone())
-                            .or_default()
-                            .publish_failed = true;
+                    if observation.attempts > 0 {
+                        let queued = send_event(relay);
+                        count_send(observation, url, queued);
                     }
                 }
             }
-            // Every relay we reached rejected sign-in and none accepted the request: no path can
-            // carry a reply, so say so now instead of waiting out the window.
+            // Every relay we reached refused this request for lack of sign-in AND rejected
+            // sign-in, both on its current socket: no path can carry a reply, so say so now
+            // instead of waiting out the window. A failed sign-in alone proves nothing (many
+            // relays challenge without requiring it), so it never triggers this.
             let reachable: Vec<&RelayEvidence> = observation
                 .relays
                 .values()
                 .filter(|r| r.ever_connected)
                 .collect();
-            if !reachable.is_empty()
-                && reachable
-                    .iter()
-                    .all(|r| r.auth == "failed" && r.acceptance != "accepted")
-            {
+            if !reachable.is_empty() && reachable.iter().all(|r| refused_for_sign_in(r)) {
                 break Err(Error::HttpError(
                     None,
                     format!(
@@ -647,13 +769,8 @@ impl NostrMintConnector {
             if Instant::now() >= next_send {
                 observation.attempts += 1;
                 for (url, relay) in &relays {
-                    if !send_event(relay) {
-                        observation
-                            .relays
-                            .entry(url.clone())
-                            .or_default()
-                            .publish_failed = true;
-                    }
+                    let queued = send_event(relay);
+                    count_send(observation, url, queued);
                 }
                 next_send = Instant::now() + self.resend_every;
             }
@@ -662,40 +779,22 @@ impl NostrMintConnector {
                 notification = notifications.recv() => match notification {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => observation.evidence_lost = true,
                     Err(_) => break Err(Error::HttpError(None, "relay pool closed".into())),
-                    Ok(RelayPoolNotification::Event { event: reply, relay_url, .. }) => {
-                        let elapsed_ms = start.elapsed().as_millis() as u64;
-                        if let Some(result) = self.accept(&reply, &event.id, &keys, &request.id, observation, elapsed_ms) {
-                            observation.reply_ms = Some(start.elapsed().as_millis() as u64);
-                            observation.reply_relay = Some(relay_url.to_string());
-                            break result;
-                        }
-                    }
-                    Ok(RelayPoolNotification::Message { relay_url, message }) => {
-                        let r = observation.relays.entry(relay_url.to_string().trim_end_matches('/').to_owned()).or_default();
-                        match message {
-                            // Refusal text is untrusted and never reflected, only its prefix.
-                            RelayMessage::Ok { event_id, status, message } if event_id == event.id => {
-                                if status { r.acceptance = "accepted"; }
-                                else { r.refused = true; r.publish_failed = true; r.refusal_category = Some(reason_category(&message)); if r.acceptance != "accepted" { r.acceptance = "refused"; } }
-                            }
-                            RelayMessage::Closed { subscription_id, message } if subscription_id.as_ref() == &subscription => { r.closed = true; r.closed_category = Some(reason_category(&message)); },
-                            RelayMessage::EndOfStoredEvents(id) if id.as_ref() == &subscription => r.eose = true,
-                            RelayMessage::Notice(_) => r.notice = true,
-                            _ => {}
-                        }
-                    }
-                    _ => {}
+                    Ok(notification) => if let Some(result) = handle(notification, observation) {
+                        break result;
+                    },
                 }
             }
         };
-        // Challenged but never signed in within the window: an auth timeout, not mint silence.
         collect_lifecycle(&mut lifecycle, observation);
-        for r in observation.relays.values_mut() {
-            if r.challenged && r.auth == "unknown" && r.acceptance != "accepted" {
-                r.auth = "timeout";
+        // The call ran out its window on a relay that challenged but never signed in: an auth
+        // timeout, not mint silence. Not applied when another path answered or failed first.
+        if matches!(outcome, Err(Error::Timeout)) {
+            for r in observation.relays.values_mut() {
+                if r.challenged && r.auth == "unknown" && r.acceptance != "accepted" {
+                    r.auth = "timeout";
+                }
             }
         }
-        collect_lifecycle(&mut lifecycle, observation);
         disconnect(&client).await;
         outcome
     }
@@ -797,8 +896,12 @@ pub fn map_error(error: ErrorBody) -> Error {
                 Some(404),
                 "mint answered unsupported; upgrade the mint sidecar".into(),
             ),
+            // Ambiguous, not 429: the mint's limiter refuses BEFORE it records the request, so
+            // another copy of the same signed event (another relay, a scheduled re-send, the
+            // re-send after NIP-42 sign-in) can still execute it until `exp`. A definitive 429
+            // would let cdk compensate inputs the mint may yet spend (PR #1156 review H1).
             code::RATE_LIMITED => Error::HttpError(
-                Some(429),
+                Some(503),
                 "mint answered rate_limited; respect retry backoff".into(),
             ),
             code::BAD_REQUEST | code::EXPIRED => Error::HttpError(
@@ -1134,7 +1237,6 @@ mod tests {
             (code::BAD_REQUEST, 400),
             (code::EXPIRED, 400),
             (code::UNSUPPORTED, 404),
-            (code::RATE_LIMITED, 429),
         ] {
             let error = named(name);
             assert!(
@@ -1143,6 +1245,17 @@ mod tests {
             );
             assert!(error.is_definitive_failure(), "{name} must be definitive");
         }
+        // A rate-limited copy leaves no replay record, so a later copy of the same request may
+        // still execute: never definitive (PR #1156 review H1).
+        let limited = named(code::RATE_LIMITED);
+        assert!(
+            matches!(limited, Error::HttpError(Some(503), _)),
+            "{limited:?}"
+        );
+        assert!(
+            !limited.is_definitive_failure(),
+            "rate_limited must be ambiguous"
+        );
         let internal = named(code::INTERNAL);
         assert!(
             matches!(internal, Error::HttpError(Some(500), _)),

@@ -6,8 +6,10 @@
 //! - A REQ sent before sign-in gets stored history and EOSE, then NO live events, ever, even after
 //!   sign-in succeeds, unless the client sends that REQ again. This is the silent failure: the
 //!   client sees a healthy EOSE and then nothing.
-//! - An EVENT sent before sign-in is refused with `auth-required:` (nostr-sdk then waits for
-//!   sign-in and re-sends it).
+//! - An EVENT sent before sign-in is refused with `auth-required:`.
+//! - `gate: false` models a relay that challenges but does not require sign-in.
+//! - `events_while_deaf` counts EVENTs a client published while its own connection still had a
+//!   pre-sign-in subscription, i.e. before re-sending its REQ (the order the connector relies on).
 //!
 //! Events are stored and fanned out by a real `nostr-relay-builder` relay behind this front.
 //! Shared by path from the maxplayer-core, maxplayer-mint and maxplayer-trade tests.
@@ -34,6 +36,9 @@ pub struct AuthRelayOptions {
     pub refuse_auth: bool,
     /// Delay between the socket opening and the AUTH challenge.
     pub challenge_delay: Duration,
+    /// Require sign-in: refuse EVENT and withhold live events from pre-sign-in REQs. `false` is a
+    /// relay that challenges but serves everyone anyway (sign-in is optional there).
+    pub gate: bool,
 }
 
 impl Default for AuthRelayOptions {
@@ -42,6 +47,7 @@ impl Default for AuthRelayOptions {
             challenge: true,
             refuse_auth: false,
             challenge_delay: Duration::from_millis(150),
+            gate: true,
         }
     }
 }
@@ -54,6 +60,40 @@ pub struct Counters {
     pub post_auth_reqs: AtomicUsize,
     /// Live events withheld from a subscription that was opened before sign-in.
     pub dropped_live: AtomicUsize,
+    /// EVENTs forwarded from a client while that same connection still had a pre-sign-in
+    /// (deaf) subscription: a publish that went out before its reply subscription was re-sent.
+    pub events_while_deaf: AtomicUsize,
+    /// Subscriptions open right now that were sent before sign-in and not re-sent since: they
+    /// get no live events. A test barrier ("everyone can hear") is `deaf == 0` after sign-in.
+    pub deaf: AtomicUsize,
+}
+
+/// Per-connection pre-sign-in subscriptions (id -> EOSE passed), mirrored into `Counters::deaf`
+/// and released when the connection ends.
+struct PreAuth {
+    subs: HashMap<String, bool>,
+    counters: Arc<Counters>,
+}
+
+impl PreAuth {
+    fn insert(&mut self, id: String) {
+        if self.subs.insert(id, false).is_none() {
+            self.counters.deaf.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn remove(&mut self, id: &str) {
+        if self.subs.remove(id).is_some() {
+            self.counters.deaf.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for PreAuth {
+    fn drop(&mut self) {
+        self.counters
+            .deaf
+            .fetch_sub(self.subs.len(), Ordering::SeqCst);
+    }
 }
 
 impl Counters {
@@ -134,7 +174,10 @@ async fn connection(
     tokio::pin!(challenge_at);
     let mut challenged = !options.challenge;
     // Subscriptions opened before sign-in -> whether their EOSE has passed.
-    let mut pre_auth: HashMap<String, bool> = HashMap::new();
+    let mut pre_auth = PreAuth {
+        subs: HashMap::new(),
+        counters: counters.clone(),
+    };
     loop {
         tokio::select! {
             _ = kill.changed() => return,
@@ -174,13 +217,18 @@ async fn connection(
                             pre_auth.remove(&id);
                         } else {
                             counters.pre_auth_reqs.fetch_add(1, Ordering::SeqCst);
-                            pre_auth.insert(id, false);
+                            if options.gate {
+                                pre_auth.insert(id);
+                            }
                         }
                     }
                     Some("CLOSE") => {
                         pre_auth.remove(v[1].as_str().unwrap_or_default());
                     }
-                    Some("EVENT") if !authenticated => {
+                    Some("EVENT") if authenticated && !pre_auth.subs.is_empty() => {
+                        counters.events_while_deaf.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Some("EVENT") if !authenticated && options.gate => {
                         let refusal = json!(["OK", v[1]["id"], false, "auth-required: not authenticated"]);
                         if front.send(text(refusal)).await.is_err() {
                             return;
@@ -196,7 +244,7 @@ async fn connection(
             frame = back.next() => {
                 let Some(Ok(frame)) = frame else { return };
                 if let Some(v) = parse(&frame) {
-                    match (v[0].as_str(), pre_auth.get_mut(v[1].as_str().unwrap_or_default())) {
+                    match (v[0].as_str(), pre_auth.subs.get_mut(v[1].as_str().unwrap_or_default())) {
                         (Some("EOSE"), Some(eose)) => *eose = true,
                         (Some("EVENT"), Some(true)) => {
                             counters.dropped_live.fetch_add(1, Ordering::SeqCst);

@@ -19,6 +19,26 @@ use nostr_sdk::prelude::{
 };
 use serde_json::Value;
 
+/// Wait until at least `connections` sockets have opened, every one of them has signed in, and no
+/// subscription is still deaf (sent before sign-in, not re-sent): the barrier the fixed sleeps
+/// stood in for (#1156 review M4). A client sends its REQ on connect and its AUTH only after the
+/// challenge, so a socket's pre-sign-in REQ is always counted before its sign-in is.
+async fn all_hear(relay: &AuthRelay, connections: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let c = &relay.counters;
+        let open = Counters::get(&c.connections);
+        if open >= connections && Counters::get(&c.auths) >= open && Counters::get(&c.deaf) == 0 {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "subscriptions never re-sent after sign-in: {c:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn start_mint(relay: &str) -> (Keys, tokio::task::JoinHandle<()>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let keys = Keys::generate();
@@ -158,7 +178,8 @@ async fn mint_answers_again_after_the_relay_drops_its_connection() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // The sidecar is the only client until the next info call.
+    all_hear(&relay, connections + 1).await;
     assert!(
         info_after_sign_in(&relay.url, &mint, Duration::from_secs(5))
             .await

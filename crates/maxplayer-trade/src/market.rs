@@ -334,7 +334,16 @@ impl Market {
             tasks.spawn(async move {
                 let id = SubscriptionId::generate();
                 let mut rx = c.notifications();
-                c.subscribe_with_id(id.clone(), f, None).await?;
+                // Auto-closing: it ends at EOSE and is never re-sent after a sign-in, so an
+                // unsubscribe can't race a re-send and leave an orphan on the relay (#1156 L2).
+                c.subscribe_with_id(
+                    id.clone(),
+                    f,
+                    Some(
+                        SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::ExitOnEOSE),
+                    ),
+                )
+                .await?;
                 let result = tokio::time::timeout(Duration::from_secs(10), async {
                     let mut events = vec![];
                     loop {

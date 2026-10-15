@@ -371,8 +371,9 @@ async fn nostr_mint_transport_errors_map_to_their_cdk_class() {
         .post_swap(SwapRequest::new(vec![], vec![]))
         .await
         .expect_err("rate limited");
-    assert!(matches!(error, Error::HttpError(Some(429), _)), "{error:?}");
-    assert!(error.is_definitive_failure(), "the mint did not run it");
+    assert!(matches!(error, Error::HttpError(Some(503), _)), "{error:?}");
+    // This copy did not run, but another copy of the same request still could.
+    assert!(!error.is_definitive_failure(), "rate_limited is ambiguous");
 
     let unsupported = start_mint(&relay_url, Mode::Err(mint_wire::code::UNSUPPORTED)).await;
     let error = connector(&unsupported, &relay_url, 5_000, 1_000)
@@ -734,7 +735,78 @@ async fn nostr_mint_reply_arrives_on_a_sign_in_required_relay() {
         "{:?}",
         relay.counters
     );
+    // The scenario really happened: the scripted mint's AND the connector's REQ went out before
+    // sign-in (review M2). Without this the test would pass on a slow box with or without the fix.
+    assert!(
+        Counters::get(&relay.counters.pre_auth_reqs) >= 2,
+        "{:?}",
+        relay.counters
+    );
+    // After sign-in the REQ went out before the EVENT on the connector's socket (review M3).
+    assert_eq!(
+        Counters::get(&relay.counters.events_while_deaf),
+        0,
+        "request published before its reply subscription was re-sent: {:?}",
+        relay.counters
+    );
     assert!(obs.reply_ms.unwrap() < 2000, "{obs:?}");
+}
+
+/// A relay that challenges, rejects the throwaway key's sign-in, but does not REQUIRE sign-in
+/// still carries the request and the reply: a failed sign-in alone must never end the call
+/// (review M1; the challenge on the first round trip is the realistic case).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_optional_sign_in_rejected_still_answers() {
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
+    for delay_ms in [0, 1, 5] {
+        let relay = AuthRelay::start(AuthRelayOptions {
+            refuse_auth: true,
+            gate: false,
+            challenge_delay: Duration::from_millis(delay_ms),
+            ..Default::default()
+        })
+        .await;
+        let mint = start_mint(&relay.url, Mode::Answer).await;
+        for _ in 0..5 {
+            let (result, obs) = connector(&mint, &relay.url, 4000, 10_000)
+                .call_observed("info", Value::Null)
+                .await;
+            assert!(result.is_ok(), "delay {delay_ms} ms: {result:?} {obs:?}");
+        }
+    }
+}
+
+/// One relay requires sign-in and refuses it; another is open and carries the mint. The call
+/// must succeed over the open relay (review M1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_refusing_relay_beside_an_open_one_still_answers() {
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
+    let refusing = AuthRelay::start(AuthRelayOptions {
+        refuse_auth: true,
+        challenge_delay: Duration::ZERO,
+        ..Default::default()
+    })
+    .await;
+    let open = AuthRelay::start(AuthRelayOptions {
+        challenge: false,
+        ..Default::default()
+    })
+    .await;
+    let mint = start_mint(&open.url, Mode::Answer).await;
+    for _ in 0..5 {
+        let c = NostrMintConnector::new(
+            &MintUrl::from_str(&mint.url).unwrap(),
+            vec![refusing.url.clone(), open.url.clone()],
+        )
+        .unwrap()
+        .with_timing(
+            Duration::from_secs(4),
+            Duration::from_secs(10),
+            Duration::from_secs(3),
+        );
+        let (result, obs) = c.call_observed("info", Value::Null).await;
+        assert!(result.is_ok(), "{result:?} {obs:?}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -772,7 +844,7 @@ async fn nostr_mint_refused_sign_in_is_an_auth_error_not_a_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nostr_mint_open_relay_adds_no_wait() {
-    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions, Counters};
     let relay = AuthRelay::start(AuthRelayOptions {
         challenge: false,
         ..Default::default()
@@ -783,8 +855,23 @@ async fn nostr_mint_open_relay_adds_no_wait() {
         .call_observed("info", Value::Null)
         .await;
     assert!(result.is_ok(), "{result:?} {obs:?}");
-    let reply_ms = obs.reply_ms.unwrap();
-    assert!(reply_ms < 250, "no sign-in wait on an open relay: {obs:?}");
+    // Frames, not wall time (review M4): no sign-in, no REQ before sign-in, one scheduled send.
+    assert_eq!(
+        Counters::get(&relay.counters.auths),
+        0,
+        "{:?}",
+        relay.counters
+    );
+    assert_eq!(
+        Counters::get(&relay.counters.pre_auth_reqs),
+        0,
+        "{:?}",
+        relay.counters
+    );
+    assert_eq!(obs.attempts, 1, "{obs:?}");
+    assert_eq!(obs.wire_sends, Some(1), "{obs:?}");
+    // Backstop only.
+    assert!(obs.reply_ms.unwrap() < 1000, "{obs:?}");
     assert!(
         obs.relays
             .values()

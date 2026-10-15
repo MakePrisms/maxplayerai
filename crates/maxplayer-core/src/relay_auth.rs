@@ -96,8 +96,14 @@ pub async fn wait_for_nip42_auth(
 /// Subscribing right away and re-sending the same REQ (same id, which replaces it on the relay)
 /// once signed in keeps relays that never ask for sign-in exactly as fast as before, and covers
 /// every reconnect: the relay challenges again on each new socket. Call this BEFORE
-/// `Client::connect` so the first `Authenticated` is not missed. The task ends when the relay is
-/// shut down. A failed sign-in is logged as an auth error under `label`.
+/// `Client::connect` so the first `Authenticated` is not missed. A failed sign-in is logged as an
+/// auth error under `label`.
+///
+/// The task ends on `Relay::disconnect()`/`Client::disconnect()` as well as on shutdown (both
+/// send `Shutdown`): call it again after reconnecting a disconnected client, and for every relay
+/// added later. Subscriptions are re-sent with their original filters (including `since`), so it
+/// is meant for ephemeral or low-volume filters. Use auto-closing subscriptions for one-shot
+/// queries: they are not re-sent.
 pub fn resubscribe_on_auth(
     relay: nostr_sdk::prelude::Relay,
     label: &'static str,
@@ -113,6 +119,11 @@ pub fn resubscribe_on_auth(
                 // A lagged receiver may have missed an `Authenticated`: re-sending is harmless.
                 Ok(RelayNotification::Authenticated) | Err(RecvError::Lagged(_)) => {
                     for (id, filters) in relay.subscriptions().await {
+                        // Skip one that was closed since the snapshot: re-sending it would
+                        // leave a subscription on the relay that the client no longer tracks.
+                        if filters.is_empty() || relay.subscription(&id).await.is_none() {
+                            continue;
+                        }
                         let _ = relay.send_msg(ClientMessage::req(id, filters));
                     }
                 }
