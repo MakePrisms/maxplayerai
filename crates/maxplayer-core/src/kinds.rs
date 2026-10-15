@@ -17,6 +17,17 @@
 //! | `3407` | REJECT (verified delivery refusal) | buyer |
 //! | `30340` | SELLER HEARTBEAT (addressable, `d="maxplayer-seller"`) | seller |
 
+//! | `30341` | CHALLENGE | buyer |
+//! | `30342` | CHALLENGE APPLICATION | seller |
+//! | `30343` | CHALLENGE DECISION | buyer |
+
+/// Daily community challenge.
+pub const CHALLENGE_KIND: u16 = 30341;
+/// Seller application to a challenge.
+pub const CHALLENGE_APPLICATION_KIND: u16 = 30342;
+/// Buyer decision on a seller application.
+pub const CHALLENGE_DECISION_KIND: u16 = 30343;
+
 /// Co-signed settlement receipt (buyer + seller).
 pub const JOB_RECEIPT_KIND: u16 = 3400;
 /// Buyer-authored work offer.
@@ -83,6 +94,26 @@ mod tests {
                 .contains(&kind),
                 "generic DVM kind {kind} must not appear in the maxplayer block"
             );
+        }
+    }
+
+    #[test]
+    fn challenge_kinds_are_distinct_and_addressable() {
+        assert_eq!(
+            [
+                CHALLENGE_KIND,
+                CHALLENGE_APPLICATION_KIND,
+                CHALLENGE_DECISION_KIND
+            ],
+            [30341, 30342, 30343]
+        );
+        for kind in [
+            CHALLENGE_KIND,
+            CHALLENGE_APPLICATION_KIND,
+            CHALLENGE_DECISION_KIND,
+        ] {
+            assert!((30000..=39999).contains(&kind));
+            assert_ne!(kind, SELLER_HEARTBEAT_KIND);
         }
     }
 

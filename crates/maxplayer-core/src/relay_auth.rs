@@ -139,3 +139,30 @@ pub fn resubscribe_on_auth(
         }
     })
 }
+
+/// Short-lived signed reads/writes: register notifications before connecting, authenticate
+/// when challenged, and leave lazy-auth relays to the SDK's auth-required retry path.
+pub async fn connect_authenticated(
+    keys: &nostr_sdk::Keys,
+    url: &str,
+) -> Result<nostr_sdk::Client, RelayAuthError> {
+    let client = nostr_sdk::Client::new(keys.clone());
+    client.automatic_authentication(true);
+    client
+        .add_relay(url)
+        .await
+        .map_err(|_| RelayAuthError("could not add relay".into()))?;
+    let relay = client
+        .relays()
+        .await
+        .into_values()
+        .next()
+        .ok_or_else(|| RelayAuthError("relay missing after add".into()))?;
+    let mut notifications = relay.notifications();
+    client.connect().await;
+    if let Err(error) = wait_for_nip42_auth(&mut notifications, Duration::from_secs(3)).await {
+        client.disconnect().await;
+        return Err(error);
+    }
+    Ok(client)
+}
