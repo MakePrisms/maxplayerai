@@ -6,7 +6,7 @@ const HELP: &str = "Usage: maxplayer challenge <command> [--home <path>] [--json
   join --buyer <npub|hex> --minutes <1..480> [--note <text>]
   status --buyer <npub|hex> [--challenge <d>]
   leave --buyer <npub|hex>
-  publish --id <d> --title <text> --goal-file <path> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>]
+  publish --id <d> --title <text> --goal-file <path> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>] [--result <text>]
   members [--challenge <d>]
   decide --seller <npub|hex> --accept|--deny
 Join or leave at any time. Joining after work starts means eligibility from the next day.
@@ -42,6 +42,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--budget-sats",
             "--status",
             "--update",
+            "--result",
         ],
         "members" => &["--challenge"],
         "decide" => &["--seller", "--accept", "--deny"],
@@ -278,7 +279,7 @@ async fn execute_async(
                 .map_err(|_| "invalid budget")?,
             status: o.get("--status").unwrap_or("scheduled").into(),
             update: o.get("--update").map(str::to_owned),
-            result: None,
+            result: o.get("--result").map(str::to_owned),
         };
         let draft = c.to_event_draft().map_err(|e| e.to_string())?;
         let previous = relay::fetch(

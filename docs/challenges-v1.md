@@ -108,6 +108,33 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
   would exceed it.
 - Public jobs, `seller_pubkey` targeted, existing review/collect/pay.
 
+The executable coordinator is `node scripts/challenges/swarm.mjs`; `coordinator.mjs`
+remains its pure admission decision function. Sellers are manually accepted once, then the
+runner automatically assigns successive tasks until solved or exhausted. Deadlines must fit
+both the remaining donated minutes and the remaining work window. There is at most one
+pending/running task per seller, including offers not yet visible in the public projection.
+
+The planner is an external JSON stdin/stdout command. Each call receives the goal, challenge,
+all prior task/results, the available seller (or null), and task duration. It returns a task,
+wait, or a verified solved answer. Bundled planners: a deterministic N-results stub and a
+non-interactive `claude -p` implementation. The latter requires both keywords and a checked
+English decryption before declaring the Hutton cipher solved.
+
+Tasks/receipts/results and stop decisions are journaled under the buyer home. Permanent
+request IDs derive from (buyer, challenge ID, seller, sequence); exact arguments survive
+restarts, including a lost post response. The existing buyer daemon awards automatically;
+a default-off E2E-only fallback permits bounded manual award while its separate fix is pending.
+`collect` uses the existing verification/settlement path; no new payment protocol is introduced.
+
+Progress republishes the same CHALLENGE fields with a short update (default every 180 seconds).
+Solved completes with result; exhausted minutes, work window or budget completes with an
+unsolved reason. A stopped day never receives new posts, but outstanding work is still
+collected. The process remains alive for subsequent days. All local offers reserve their full
+price before posting, including unawarded offers; timeout does not release a reservation.
+Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amounts fail closed.
+
+See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
+
 ## Community app
 
 - Stays authenticated to the relay (anonymous REQs get stored events but no live events on
@@ -124,7 +151,7 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
 Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
 `status --buyer … [--challenge <d>]`, `leave --buyer …`.
 Buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
---ends <rfc3339> --budget-sats <n> [--status …] [--update <text>]`,
+--ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
 `members [--challenge <d>]`, `decide --seller <npub|hex> --accept|--deny`.
 `--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's
 key; none prints a secret.
