@@ -36,6 +36,31 @@ and pinned-award path. An unavailable local cache is retried without inventing a
 re-read on every failure. Unknown history never releases reservations or falsely
 marks an offer absent.
 
+## Final auto-award verification
+
+Production/test implementation: `33034fa6`. All commands used `--locked`,
+`CARGO_BUILD_JOBS=4`, `CARGO_PROFILE_DEV_DEBUG=0` and the authorized warm target.
+
+| Gate | Passed | Ignored | Failed |
+| --- | ---: | ---: | ---: |
+| `cargo test -p maxplayer-core --locked` | 558 | 0 | 0 |
+| `cargo test -p maxplayer-core --features wallet --locked` | 2144 | 8 | 0 |
+| `cargo test -p maxplayer --no-default-features --features wallet,acp --locked` | 268 | 1 | 0 |
+| Focused wire/history regressions (`--features wallet --lib private_content::history`) | 12 | 0 | 0 |
+| Focused retry/deadline regressions (`--features wallet --lib auto_award_retr`) | 6 | 0 | 0 |
+
+Full local Buzz/community E2E passed **twice normally**, then **once with
+`--duplicate-history`**, on the final implementation. Each run emitted 49 PASS
+lines, authenticated with NIP-42, and needed zero read retries. The fault run
+replayed **18 historical claim frames**. All three required automatic awards;
+there is no `award_claim` call in the harness. Free collection completed with zero
+sats and no payment attempt.
+
+The copied Buzz binary's source tree matched this branch's bundled Buzz tree.
+E2Es used a private copy of the rebuilt buyer binary, isolated ports, disposable
+homes/Postgres/Redis, and the stub ACP agent. No real relay writes, money,
+deployments, shared test environment or `ct-*` units were involved.
+
 ---
 
 # Local integration evidence
