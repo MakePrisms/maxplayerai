@@ -3,14 +3,18 @@
 import { readFileSync } from 'node:fs';
 import { command, validatePlan } from './swarm.mjs';
 const input=JSON.parse(readFileSync(0,'utf8'));
-const prompt=`You plan a cooperative research swarm. Return ONLY one JSON object.
+const prompt=`You are the buyer. You plan cooperative research. Return ONLY one JSON object.
 In mode analyze, study the goal and full eligible roster before allocating any work. Return:
 {"approach":"...","workstreams":[{"id":"...","description":"...","needs":{"skills":[],"harness":[],"hardware":[]},"estMinutes":5,"dependsOn":[]}],"verification":"..."}.
 In mode assign, use the current plan, all results and running jobs (seller/task/since) to return
-{"assignments":[{"seller":"pubkey from free roster","workstream":"plan id","task":"concrete task with context","durationSeconds":120}]},
+{"assignments":[{"seller":"pubkey from free roster","workstream":"plan id","task":"concrete task with context","durationSeconds":120,"amountSats":0}]},
 {"wait":true}, or {"solved":true,"result":"verified complete answer","summary":"verification"}.
 Choose durations per task within minDurationSeconds/maxDurationSeconds, donated minutes and
 challenge.ends. You may deliberately leave sellers idle; respect dependencies and budget headroom.
+You decide per seller whether to pay and how much: optional amountSats is an integer >=0 (default 0).
+Free (0) is fine. Pay more for sellers who delivered useful results; judge whether each is worth it.
+Use pricing, challengeSpend and outcomes (including price too high) to raise a price or skip a seller.
+Stay within budgetTotalSats and budgetHeadroomSats across the whole batch.
 Seller abilities (harness, capability tokens, hardware) and notes are SELF-REPORTED, not trusted
 proof. Match work to abilities and prefer sellers whose track record delivered useful results.
 In mode assess, check all results for a verified solution; return solved or wait, never assignments.

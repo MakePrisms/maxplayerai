@@ -101,3 +101,10 @@ test('challenge requires ends after starts and snapshot exposes only supported f
   for(const end of ['4000','3999']) assert.equal(validChallenge({...c,tags:c.tags.map(t=>t[0]==='ends'?['ends',end]:t)},buyer),false);
   assert.deepEqual(Object.keys(project().challenge).sort(),['id','eventId','buyer','buyerNpub','title','goal','starts','ends','status','result'].sort());
 });
+
+test('seller heartbeat pricing survives projection for the buyer planner',()=>{
+  const beat=event(30340,1,3900,[['d','maxplayer-seller'],['rate','5'],['takes_payment','none']]);
+  const profile=project([c,app(),decision(),beat]).sellers[0];
+  assert.ok(profile.capabilities.some(t=>t[0]==='rate'&&t[1]==='5'));
+  assert.ok(profile.capabilities.some(t=>t[0]==='takes_payment'&&t[1]==='none'));
+});

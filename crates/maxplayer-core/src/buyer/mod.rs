@@ -773,9 +773,11 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             // `context.store` is in scope. A store read error must NOT sink the whole response —
             // the relay view is still useful — so it degrades to `None` and is logged, never
             // surfaced as a false "no award".
+            let mut award_read_confirmed = true;
             let awarded = match context.store.award_record(&view.job_id) {
                 Ok(record) => record.map(AwardedView::from),
                 Err(error) => {
+                    award_read_confirmed = false;
                     crate::opline!("get_job: could not read {}'s award row: {error}", view.job_id);
                     None
                 }
@@ -784,7 +786,23 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
                 job_lifecycle::awarded_delivery_pending(&view, &a.claim_id, &a.seller_pubkey)
             });
             let review_status = crate::review::protect_job_view(&context.home, &mut view, awarded.as_ref().map(|a| a.seller_pubkey.as_str())).await;
-            Response::ok(id, json!(GetJobResponse { view, awarded, awarded_delivery_pending, review_status }))
+            // Read-only planner hints. Parsing stays with the existing Cashu parser;
+            // these self-reported prices never authorize an award or payment.
+            let claim_prices: Vec<_> = view.claims.iter().map(|claim| {
+                let amount = claim.creq.as_deref()
+                    .and_then(|creq| crate::gateway::creq::parse_creq(creq).ok())
+                    .filter(|request| request.unit.as_ref() == Some(&cashu::CurrencyUnit::Sat))
+                    .and_then(|request| request.amount).map(u64::from);
+                json!({"claim_id": claim.claim_id, "seller_pubkey": claim.seller_pubkey, "amount_sats": amount})
+            }).collect();
+            let mut response = json!(GetJobResponse { view, awarded, awarded_delivery_pending, review_status });
+            response["award_read_confirmed"] = json!(award_read_confirmed);
+            // Only the existing buyer reconciliation decides that held funds are released.
+            // An unreadable ledger is unknown, never an empty reservation.
+            response["reservation_state"] = json!(context.store.reservation(&response["job_id"].as_str().unwrap_or_default())
+                .ok().map(|row| row.map(|(state, _)| state.as_str()).unwrap_or("none")));
+            response["claim_prices"] = json!(claim_prices);
+            Response::ok(id, response)
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }

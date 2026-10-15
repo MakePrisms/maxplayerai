@@ -45,7 +45,7 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     const profile=latest(events.filter(e=>e.kind===0&&e.pubkey===app.pubkey),e=>e.pubkey)[0];
     let name=''; try { const p=JSON.parse(profile?.content??'{}'); name=typeof p.display_name==='string'?p.display_name:typeof p.name==='string'?p.name:''; } catch {}
     const beat=latest(trade.filter(e=>e.kind===30340&&e.pubkey===app.pubkey&&tag(e,'d')==='maxplayer-seller'),e=>e.pubkey)[0];
-    const capabilities=beat?.tags.filter(t=>['agents','harness_family','harness_model','capabilities','harness_variant','hardware'].includes(t[0]))??[];
+    const capabilities=beat?.tags.filter(t=>['agents','harness_family','harness_model','capabilities','harness_variant','hardware','rate','takes_payment'].includes(t[0]))??[];
     const state=tag(app,'status')==='left'?'left':decisionState==='denied'?'denied':running.length?'working':eligible&&own.length?'done':decisionState;
     return {since:+tag(app,'since'),membershipStatus:tag(app,'status'),pubkey:app.pubkey,npub:npubEncode(app.pubkey),name,minutesOffered:offered,minutesUsed:used,minutesRemaining:offered-used,state,eligible,decision:decisionState,currentJobStart:running.length?Math.min(...running.map(j=>j.start)):null,capabilities,heartbeatAt:beat?.created_at??null,note:app.content,pastJobs:[...new Map([...priorJobs.filter(j=>j.seller===app.pubkey),...own.map(j=>({...j,challengeId:tag(c,'d')}))].filter(j=>!j.running).map(j=>[j.id,j])).values()]};
   }).sort((a,b)=>a.npub.localeCompare(b.npub));

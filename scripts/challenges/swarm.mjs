@@ -56,13 +56,25 @@ export function validatePlan(p, mode='assign') {
   if(p.plan)validateAnalysis(p.plan);
   return p;
 }
+// Old journals without a release/receipt stay fully reserved (fail closed).
+export function jobBudget(j) {
+  if(j.released) return {reservedSats:0,paidSats:0};
+  const pay=j.pay;
+  if(j.done && pay?.state==='none' && pay.amount_sats===0) return {reservedSats:0,paidSats:0};
+  if(j.done && typeof pay?.state==='string' && /^Closed \{/.test(pay.state) && Number.isSafeInteger(pay.amount_sats) && pay.amount_sats>=0)
+    return {reservedSats:0,paidSats:pay.amount_sats};
+  return {reservedSats:j.args.max_sats,paidSats:0};
+}
 export function sellerProfile(s,jobs) {
   const tags=s.capabilities??[], values=name=>tags.filter(t=>t[0]===name).flatMap(t=>t.slice(1));
-  const tasks=jobs.filter(j=>j.seller===s.pubkey&&j.done).map(j=>({task:j.args.task,workstream:j.workstream??null,
+  const own=jobs.filter(j=>j.seller===s.pubkey);
+  const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:j.args.task,workstream:j.workstream??null,
     outcome:j.outcome,delivered:j.outcome==='collected',turnaroundSeconds:(j.ts??j.created)-j.created}));
   return {pubkey:s.pubkey,npub:s.npub??'',name:s.name??'',agents:values('agents'),
     harness:{family:values('harness_family'),model:values('harness_model'),variant:values('harness_variant')},
     capabilities:values('capabilities'),hardware:values('hardware'),minutesRemaining:s.minutesRemaining,note:s.note??'',
+    pricing:{rateSats:values('rate'),takesPayment:values('takes_payment')},
+    challengeSpend:{paidSats:own.reduce((n,j)=>n+jobBudget(j).paidSats,0),reservedSats:own.reduce((n,j)=>n+jobBudget(j).reservedSats,0)},
     trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
 }
 export function requestId(c,s,n) {return 'swarm-'+createHash('sha256').update(JSON.stringify([c.buyer,c.id,s,n])).digest('hex');}
@@ -72,7 +84,7 @@ export function preparationId(request) {return 'preparation:'+createHash('sha256
 export function reservedBudget(snapshot,jobs,now) {
   const known=new Set(jobs.map(j=>j.id));
   return {challengeId:snapshot.challenge.id,asOf:now,totalSats:snapshot.budget.totalSats,
-    committedSats:jobs.reduce((n,j)=>n+j.args.max_sats,0)+(snapshot.jobs??[]).filter(j=>!known.has(j.id)).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:0};
+    committedSats:jobs.reduce((n,j)=>n+jobBudget(j).reservedSats,0)+(snapshot.jobs??[]).filter(j=>!known.has(j.id)).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.reduce((n,j)=>n+jobBudget(j).paidSats,0)};
 }
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
@@ -102,7 +114,7 @@ export class Swarm {
           if(this.state.days[j.key]?.stop || fresh.challenge?.id!==j.challenge.id || fresh.challenge?.buyer!==j.challenge.buyer || at>=j.args.deadline_unix || j.args.deadline_unix>fresh.challenge.ends || !valid.sellers.some(s=>s.seller_pubkey===j.seller&&s.postingAllowed)) {
             // Unready history is transient, not proof that an intent should be discarded.
             if(valid.reasons.some(r=>['stale_snapshot','relay_not_ready','unknown_budget'].includes(r)))continue;
-            j.done=true;j.outcome='abandoned intent';j.ts=at;this.save();continue;
+            j.released=true;j.done=true;j.outcome='abandoned intent';j.ts=at;this.save();continue;
           }
           const posted=await this.io.mcp('post_job',j.args);j.id=posted.job_id??posted.preparation_id;this.save();
         }
@@ -111,11 +123,28 @@ export class Swarm {
       now=this.io.now();
       if(state.status==='preparing')continue;
       if(state.status==='posted' && state.job_id && state.job_id!==j.id){j.id=state.job_id;this.save();continue;}
+      const expensive=(state.claim_prices??[]).find(p=>p.seller_pubkey===j.seller&&Number.isSafeInteger(p.amount_sats)&&p.amount_sats>j.args.max_sats);
+      if(expensive && j.priceAsked!==expensive.amount_sats) {
+        j.priceAsked=expensive.amount_sats;j.outcome=`price too high: asked ${expensive.amount_sats}`;j.ts=now;this.save();
+        this.io.report?.(`Job ${j.id}: ${j.outcome}`);
+      }
       if(state.results?.length) {
         const collected=await this.io.mcp('collect',{job_id:j.id});
         j.answer=await this.io.answer(collected);j.ts=now;j.done=true;j.outcome='collected';j.pay=collected.pay;this.save();
-      } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
-      else if(now>=j.args.deadline_unix) {j.done=true;j.outcome='expired/undelivered';j.ts=now;this.save();}
+      } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.released=true;j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
+      else if(now>j.args.deadline_unix) {
+        // Deadline alone is not proof of nonpayment. A confirmed empty/expired claim history,
+        // matching expired offer and successful local award lookup prove never awarded.
+        // Unresolved claims/awards/accepts or incomplete reads stay reserved and are polled again.
+        const neverAwarded=state.read_confirmed===true && state.award_read_confirmed===true && state.reservation_state==='none' &&
+          state.offer?.deadline_unix===j.args.deadline_unix && Array.isArray(state.claims) && state.claims.every(c=>c.live===false&&c.status==='expired') &&
+          Array.isArray(state.results) && !state.results.length && state.accepted===null && !state.awarded && !state.awarded_delivery_pending;
+        const reconciled=state.reservation_state==='released' && state.read_confirmed===true &&
+          state.offer?.deadline_unix===j.args.deadline_unix && Array.isArray(state.results) &&
+          !state.results.length && state.accepted===null && !state.awarded_delivery_pending;
+        j.done=j.args.payment==='none'||neverAwarded||reconciled;
+        j.released=j.done;j.outcome=j.priceAsked?`price too high: asked ${j.priceAsked}`:'expired/undelivered';j.ts=now;this.save();
+      }
       else if(this.c.awardFallback && now-j.created>=this.c.awardAfter && !state.awarded) {
         const claim=state.claims?.find(c=>c.live&&c.seller_pubkey===j.seller);
         if(claim)await this.io.mcp('award_claim',{job_id:j.id,claim_id:claim.claim_id,max_sats:j.args.max_sats});
@@ -127,7 +156,7 @@ export class Swarm {
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
-    const results=jobs.filter(j=>j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:j.args.task,answer:j.answer??`[${j.outcome}]`,ts:j.ts??now}));
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:j.args.task,amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,ts:j.ts??now}));
     const ready=snap.relay?.connected&&snap.relay?.authenticated&&snap.relay?.historyComplete&&!snap.relay?.error && now-snap.asOf<=5 && now>=snap.asOf;
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
@@ -136,10 +165,10 @@ export class Swarm {
     const running=()=>[
       ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:j.args.task,since:j.created,deadline:j.args.deadline_unix})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
-    const ask=async(mode,sellers=[])=>{
+    const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
       const p=validatePlan(await this.io.plan({mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
-        running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,amountSats:this.c.amount,
-        budgetHeadroomSats:snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats,now:this.io.now()}),mode);
+        running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
+        budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now()}),mode);
       if(mode==='analyze'){day.plan=p;this.save();}
       else if(p.plan){day.plan=p.plan;this.save();}
       return p;
@@ -147,40 +176,43 @@ export class Swarm {
     if(!day.plan&&!day.stop&&ready&&c.status==='in_progress'&&now>=c.starts&&now<c.ends)
       await ask('analyze',snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)));
     // Final results can solve even after posting has stopped.
-    if(results.length && day.assessed!==results.length && !day.stop?.external) {
+    const resultVersion=createHash('sha256').update(JSON.stringify(results.map(r=>[r.seller,r.task,r.outcome,r.answer]))).digest('hex');
+    if(results.length && day.assessed!==resultVersion && !day.stop?.external) {
       const verdict=await ask('assess');
       if(verdict.solved && !day.stop?.result) {stop(verdict.summary??'Solved',verdict.result);day.published=false;}
-      day.assessed=results.length;this.save();
+      day.assessed=resultVersion;this.save();
     }
     if(!day.stop && ready && c.status==='in_progress' && now>=c.starts) {
       const awaitingProjection=jobs.filter(j=>j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&p.result));
       const pending=()=>[...this.state.jobs.filter(j=>!j.done),...awaitingProjection].map(j=>j.seller);
-      const decision=coordinate(snap,{now,durationSeconds:min,amountSats:this.c.amount,budgetState:reservedBudget(snap,jobs,now),pendingSellers:pending()});
+      const decision=coordinate(snap,{now,durationSeconds:min,amountSats:0,budgetState:reservedBudget(snap,jobs,now),pendingSellers:pending()});
       if(now>=c.ends)stop('Unsolved: work window ended');
-      else if(decision.reasons.includes('budget_exceeded'))stop('Unsolved: budget exhausted');
       else if(!decision.reasons.length) {
         const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends);
         const p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)));
         if(p.solved)stop(p.summary??'Solved',p.result);
+        let budgetRejected=0;
         for(const assignment of p.assignments??[]) {
-          const {seller,workstream,task,durationSeconds}=assignment??{};
+          const {seller,workstream,task,durationSeconds,amountSats=0}=assignment??{};
           const reject=reason=>this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
+          if(!Number.isSafeInteger(amountSats)||amountSats<0){reject('amountSats must be a nonnegative safe integer');continue;}
           if(!candidates.some(s=>s.seller_pubkey===seller)){reject('seller busy or ineligible (not in free roster)');continue;}
           if(typeof task!=='string'||!task.trim()||!day.plan.workstreams.some(w=>w.id===workstream)){reject('invalid task or workstream');continue;}
           if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject('duration outside configured bounds');continue;}
           // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
           const fresh=await this.io.snapshot(),at=this.io.now();
-          const check=coordinate(fresh,{now:at,durationSeconds,amountSats:this.c.amount,budgetState:fresh.challenge?reservedBudget(fresh,jobs,at):null,pendingSellers:pending()});
+          const check=coordinate(fresh,{now:at,durationSeconds,amountSats,budgetState:fresh.challenge?reservedBudget(fresh,jobs,at):null,pendingSellers:pending()});
           if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+durationSeconds>fresh.challenge.ends){reject('challenge changed or work window exceeded');continue;}
           const candidate=check.sellers.find(x=>x.seller_pubkey===seller);
-          if(!candidate?.postingAllowed){reject([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])].join(', '));continue;}
+          if(!candidate?.postingAllowed){if(check.reasons.includes('budget_exceeded'))budgetRejected++;reject([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])].join(', '));continue;}
           const sequence=jobs.filter(j=>j.seller===seller).length+1;
-          const args={task,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:this.c.amount?'sat':'none',amount_sats:this.c.amount,max_sats:this.c.amount,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
+          const args={task,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
           const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args};
           this.state.jobs.push(j);jobs.push(j);this.save();
           const posted=await this.io.mcp('post_job',args);j.id=posted.job_id??posted.preparation_id;
           if(!j.id)throw Error('Post returned no job or preparation id');this.save();
         }
+        if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         if(!day.stop&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
       }
     }
@@ -197,10 +229,11 @@ export function childEnv(env,home) {
   return {...out,MAXPLAYER_HOME:home};
 }
 export function config(argv,env=process.env) {
-  const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--app-url','--planner','--duration-seconds','--amount-sats','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--app-url']??env.COMMUNITY_APP_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),amount:+(values['--amount-sats']??env.SWARM_AMOUNT_SATS??0),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),awardFallback:values['--award-fallback']===true};
+  if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
+  const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--app-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
+  const c={home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--app-url']??env.COMMUNITY_APP_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),awardFallback:values['--award-fallback']===true};
   if(!c.home||!c.url)throw Error('Explicit buyer home and community app URL required');
-  for(const k of ['duration','minDuration','maxDuration','amount','poll','updateEvery','awardAfter'])if(!Number.isSafeInteger(c[k])||c[k]<(k==='amount'?0:1))throw Error(`Invalid ${k}`);
+  for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
   c.home=resolve(c.home);return c;
 }

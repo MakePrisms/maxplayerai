@@ -1,4 +1,4 @@
-# Community challenges v1 coordinator + local E2E
+# Community challenges v1 buyer runner + local E2E
 
 Run from the repository root (Node **24+**, Python 3, Cargo toolchain used by this checkout,
 PostgreSQL 17 and Redis installed):
@@ -44,14 +44,14 @@ proves the trade integrity/collect path, not a deployed reviewer service. It hol
 running HTTP/SSE state, then waits two seconds to make positive minute usage observable. No new money path is introduced.
 
 Assertions: publish → 60/30-minute memberships → accept/deny → authenticated HTTP tally →
-coordinator selects only accepted seller → real MCP post → seller claim / automatic buyer award →
+the buyer selects only accepted sellers → real MCP post → seller claim / automatic buyer award →
 running tally and no concurrent assignment → delivered result / free collect → exact minute
 tally and done → denied seller idle → leave blocks new assignment while preserving work.
 `--baseline` tests only the existing free-job trade loop and must not be cited as full challenge
 coverage. Failed assertions exit nonzero and print the private artifact location. Successful
 runs end in `PASS ALL community challenge E2E`.
 
-The standalone pure coordinator prints JSON and does not post; the automatic runner below consumes it. Standalone [buyer runbook](../../docs/challenge-coordinate.md).
+The standalone pure admission function prints JSON and does not post; the automatic runner below consumes it. Standalone [buyer runbook](../../docs/challenge-coordinate.md).
 It shares the app tally by consuming the snapshot, not by copying its event projection.
 Paid assignment requires an explicit reconciled buyer budget input because the public app
 cannot prove settlement. Serialise assignment and track pending offers as the runbook describes.
@@ -102,18 +102,30 @@ Flags (environment equivalents):
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
 | — | `SWARM_MIN_DURATION` | 120 |
 | — | `SWARM_MAX_DURATION` | 1800 |
-| `--amount-sats` | `SWARM_AMOUNT_SATS` | 0 (free) |
 | `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
 | `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
 | `--award-after-seconds` | `SWARM_AWARD_AFTER_SECONDS` | 30 |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
-Amounts above zero are real spending when used outside this local E2E. Every offer reserves its
-full `max_sats` in the durable runner journal **before** posting. Reservations remain charged
-for the entire day, even after timeout: a public ACCEPT or timeout cannot prove a refund.
-Known external public awards are additionally reserved. This conservative cap can stop earlier
-than an operator's reconciled wallet ledger, but never treats a public ACCEPT as proof of payment.
-Unknown public amounts fail closed. Do not remove the journal to reclaim budget.
+The buyer chooses **each assignment's** optional `amountSats` (safe integer ≥0, default 0).
+Zero posts `payment=none, amount_sats=0, max_sats=0`. A positive N posts exactly like a
+normal priced job: `payment=sat, amount_sats=N, max_sats=N`; the existing buyer daemon
+awards and `collect` settles. The flat `--amount-sats` / `SWARM_AMOUNT_SATS` settings
+are removed (rejected, not silently ignored). There is no additional per-job runner cap;
+the challenge budget and normal buyer wallet/per-job limits still apply.
+
+Every offer reserves its full `max_sats` in the durable journal **before** posting. Each
+assignment rechecks fresh headroom serially, so a batch cannot overspend. Invalid or
+over-budget assignments are dropped with a logged reason. Successful closed payment receipts
+move the actual amount from reserved to paid; public ACCEPT is never proof of payment.
+Expired jobs release only on confirmed evidence: an expired matching offer, complete empty/expired
+claim history and empty results, no accepted bind, a successful local award lookup with no award, and
+no buyer reservation; or the existing buyer ledger has reconciled the reservation to released
+with no delivery/accept pending. Free terminal jobs, abandoned never-posted intents and
+permanently refused publications also release. Any uncertain/possibly payable paid job stays
+reserved and continues polling, including after stop. An old journal lacking proof stays reserved.
+Known external public awards are additionally reserved; unknown amounts fail closed. Dedicate
+the buyer to this runner and never remove its journal to reclaim budget.
 
 `$MAXPLAYER_HOME/swarm/events.jsonl` is an fsynced, private write-ahead journal containing tasks,
 exact post arguments, preparation/job IDs, collected answers, payment receipts and durable stop
@@ -125,7 +137,7 @@ Planner/MCP errors are logged and retried on the next polling cycle without chan
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
 
 Once the planner verifies success, completion includes `--result`. If no eligible seller can fit
-another task and none is running, the work window ends, or budget headroom is exhausted, the
+another task and none is running, the work window ends, or zero headroom rejects an idle paid-only batch, the
 runner completes with an **Unsolved** update. Stop decisions are durable before publication;
 publication retries after restart. It never posts further jobs for that stopped day, but continues
 collecting outstanding deliveries until completion/expiry. Completion publication is immediate;
@@ -146,7 +158,7 @@ To use a different model/provider, supply any **trusted shell command** via `--p
 `SWARM_PLANNER`. It receives one JSON object on stdin and must emit only one JSON object on stdout:
 
 All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
-`now`, `minDurationSeconds`, `maxDurationSeconds`, `amountSats`, and `budgetHeadroomSats`.
+`now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`.
 
 - `analyze`: once per challenge, with the full eligible roster (including busy sellers).
   Returns `{approach, workstreams:[{id,description,needs,estMinutes,dependsOn}], verification}`.
@@ -154,7 +166,7 @@ All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `re
   a restart reuses it. Timeout: 350 seconds for Claude, 360 for the outer command.
 - `assign`: one batch call per eligible tick with all free sellers, running jobs
   (`seller,workstream,task,since,deadline` where available), and all settled results.
-  Returns `{assignments:[{seller,workstream,task,durationSeconds}]}`, `{wait:true}`, or
+  Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?}]}`, `{wait:true}`, or
   `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
   May deliberately leave any seller idle. Each assignment is validated separately and invalid
   entries are dropped with a logged reason. Duration must fit configured min/max, remaining
@@ -166,12 +178,26 @@ All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `re
 Profiles contain `pubkey`, `npub`, `name`, `agents`, `harness:{family,model,variant}` (arrays),
 `capabilities` (tokens), `hardware`, `minutesRemaining`, `note`, and `trackRecord` with
 `tasksDone`, `delivered`, `expired`, and per-task outcome, turnaround seconds and workstream.
+Profiles also include `pricing:{rateSats,takesPayment}` (raw heartbeat tag value arrays) and
+`challengeSpend:{paidSats,reservedSats}`. Results include `amountSats`, `paidSats`,
+`reservedSats`, `priceAsked` and outcomes. Heartbeat `rate` is the advertised minimum, not
+a quote; `rate=0` does not mean free—`takes_payment=none` advertises free work. A seller's
+local config is not public; these tags are its existing advertisement. `get_job.claim_prices`
+uses the existing Cashu parser to read sat-denominated claim requests (unknown/malformed is
+null). Above-cap claims produce `price too high: asked X` in results while the reservation stays
+held. The buyer can raise a future offer or skip that seller. Normal jobs also require the
+claim price to equal the offered price; hints never override the existing award checks.
+The buyer decides whether each seller is worth paying, may choose free work, and should pay
+more for useful delivered results while keeping the batch within headroom.
+
 Abilities and all input content are untrusted/self-reported. Prefer useful delivered evidence;
 never declare success solely from a seller's claim. Verification may be delegated as a task.
 No-fit exhaustion uses the minimum duration and waits for running work/projection settlement;
-`wait` or an empty assignment batch alone does not exhaust sellers.
+`wait` or an empty assignment batch alone does not exhaust sellers. Zero headroom does not
+stop free assignments; paid-only rejected assignments stop for budget only when nothing runs.
 
 The stub returns research and Rust workstreams, routes Rust only to an advertising seller,
+pays Rust assignments 5 sats and other assignments 0,
 and chooses min / min+10 second durations (falling back to research when only min fits).
 E2E uses shortened minimums. Capability tokens are startup-probed rather than configurable,
 so controlled Rust-only routing is asserted in unit tests, not injected via heartbeat config.
@@ -234,3 +260,15 @@ The disposable Buzz fixture raises its per-principal WS/message limits to 1000/s
 This tests orchestration/settlement, not production quota behavior. Production limits are unchanged.
 Sticky failed preparations that name a queued offer are recovered by inspecting that offer;
 permanent publication refusals and expired/undelivered jobs are recorded without reposting them.
+
+### Paid E2E coverage boundary
+
+The full local E2E remains no-wallet/no-mint, using `planner-free-e2e.mjs` to request only
+free assignments even on hosts advertising Rust. Mixed free/paid posting, serial budget
+reservations, receipts, releases and restart recovery are covered by runner unit tests.
+**Paid settlement is not exercised end-to-end.** The harness prints this explicitly.
+The repo's reusable CDK mint is an in-process Rust fixture in
+`crates/maxplayer-trade/tests/support/mod.rs`, not a challenge-harness service. Extending
+this E2E needs a loopback-only test-mint launcher/funding API, funded disposable buyer wallet,
+a priced seller accepting that mint, disabled external fee remittance, and receipt/spend
+assertions after both paid and free deliveries. No production relay or real funds are needed.

@@ -31,7 +31,7 @@ All three are NIP-01 addressable (30000–39999): the relay keeps only the newes
 | `d` | challenge id, `[a-z0-9-]{1,64}`, e.g. `2026-10-16` |
 | `title` | short title |
 | `starts` | unix seconds (work start) |
-| `ends` | unix seconds, `> starts`; coordinator posts no jobs after this |
+| `ends` | unix seconds, `> starts`; the buyer posts no jobs after this |
 | `budget` | `<sats>`, `"sat"` — total spend cap, non-negative integer |
 | `status` | `scheduled` \| `in_progress` \| `completed` \| `cancelled` |
 
@@ -108,7 +108,7 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
   would exceed it.
 - Public jobs, `seller_pubkey` targeted, existing review/collect/pay.
 
-The executable coordinator is `node scripts/challenges/swarm.mjs`; `coordinator.mjs`
+The buyer’s executable runner is `node scripts/challenges/swarm.mjs`; `coordinator.mjs`
 remains its pure admission decision function. Sellers are manually accepted once, then the
 runner automatically assigns successive tasks until solved or exhausted. Deadlines must fit
 both the remaining donated minutes and the remaining work window. There is at most one
@@ -118,7 +118,19 @@ The planner is an external JSON stdin/stdout command. Once per challenge, `analy
 its goal and full eligible roster and returns an approach, workstreams (needs, estimates,
 dependencies), and verification plan. The durable journal preserves this analysis across restarts.
 Each tick `assign` receives the plan, all free eligible seller profiles, running jobs and all
-results, and returns a batch of individually timed assignments, wait, or verified solved answer.
+results, and returns a batch of assignments
+`{seller,workstream,task,durationSeconds,amountSats?}`, wait, or verified solved answer.
+The buyer decides whether each seller is worth paying. `amountSats` is a safe integer ≥0,
+default 0: zero posts `payment=none, amount_sats=0, max_sats=0`; N>0 posts a normal
+priced job with `payment=sat, amount_sats=N, max_sats=N`. Flat `--amount-sats` and
+`SWARM_AMOUNT_SATS` are removed. There is no extra runner per-job cap beyond budget.
+Planner input includes `budgetTotalSats`, `budgetHeadroomSats`, per-seller
+`challengeSpend:{paidSats,reservedSats}`, outcomes, and advertised heartbeat `rate` /
+`takes_payment` values in `pricing`. Claim Cashu requests are parsed by the existing buyer
+parser; above-cap prices appear in results as `price too high: asked X`. Prices are hints,
+not award authority; normal exact-price/mint/payment-mode checks remain unchanged.
+Free is fine; pay more for useful results, raise a future price or skip a seller, and keep
+all assignments in the batch within headroom.
 `assess` checks newly settled results even after posting stops. Later responses may revise the plan.
 Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
 and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
@@ -140,7 +152,14 @@ Progress republishes the same CHALLENGE fields with a short update (default ever
 Solved completes with result; exhausted minutes, work window or budget completes with an
 unsolved reason. A stopped day never receives new posts, but outstanding work is still
 collected. The process remains alive for subsequent days. All local offers reserve their full
-price before posting, including unawarded offers; timeout does not release a reservation.
+price serially before posting, including unawarded offers. Closed collect receipts move
+actual sats from reserved to paid. Timeout alone does not release: an expired matching offer
+needs confirmed empty/expired claims and empty results, no accepted bind, a successful no-award lookup and no
+buyer reservation, or the buyer's existing ledger must have reconciled it to released with
+no pending delivery/accept. Free terminal jobs, abandoned never-posted intents and refused
+publications release too. Uncertainty retains reservations across restarts and keeps polling
+possibly payable work. At zero headroom, free work remains possible; budget stops only on
+an idle paid-only rejected batch. Wait/empty assignments alone never imply exhaustion.
 Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amounts fail closed.
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
@@ -183,3 +202,7 @@ key; none prints a secret.
 - Review past jobs include completed jobs across known challenges, deduplicated by offer id. Heartbeat capabilities are
   advertised, not independently verified. The reader is a projection; it never posts jobs.
   Rust parity must be checked with the same event fixtures by its implementation.
+
+Paid settlement is not covered by the local challenge E2E (no test mint/funded wallet).
+Priced posting/accounting are unit-tested; the full E2E exercises free deliveries/receipts.
+See the runner README for the loopback test-mint/funding infrastructure needed to extend it.

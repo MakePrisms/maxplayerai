@@ -203,17 +203,17 @@ try:
         rows = json.loads(cli(buyer_env, 'members', '--challenge', 'local-e2e', '--json'))['members']
         check('Rust CLI and app agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
-            check('coordinator blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
+            check('the buyer blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
         wait('challenge work window open', lambda: int(time.time()) >= starts)
         s = snapshot()
         p = plan(s)
-        check('coordinator permits only accepted idle seller', p['postingAllowed'] and [x['seller_pubkey'] for x in p['sellers']] == [SELLER] and p['budgetHeadroomSats'] == 0)
+        check('the buyer permits only accepted idle seller', p['postingAllowed'] and [x['seller_pubkey'] for x in p['sellers']] == [SELLER] and p['budgetHeadroomSats'] == 0)
         deadline = p['sellers'][0]['deadlineUnix']
     else:
         deadline = int(time.time()) + 120
     posted = mcp(buyer_env, 'post_job', {'task':'Return exactly the fixture answer 42.', 'output':'text/plain', 'payment':'none', 'amount_sats':0, 'max_sats':0, 'visibility':'public', 'seller_pubkey':SELLER, 'deadline_unix':deadline, 'request_id':'challenge-e2e-free'})
     job = posted['job_id']
-    check('coordinator task posted through existing buyer MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
+    check('the buyer posts through existing MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
     def claimed():
         state = mcp(buyer_env, 'get_job', {'job_id': job})
         return state if any(c['seller_pubkey'] == SELLER and c['live'] for c in state['claims']) else None
@@ -222,6 +222,7 @@ try:
         state = mcp(buyer_env, 'get_job', {'job_id': job})
         return state if state.get('awarded') else None
     state = wait('buyer auto-award committed without manual override', awarded, seconds=60)
+    check('buyer exposes confirmed award read and reservation/claim price hints', state.get('award_read_confirmed') is True and state.get('reservation_state') in ['none', 'reserved', 'spent', 'released'] and all(p['amount_sats'] is None for p in state['claim_prices']))
     check('auto-award selected accepted seller', state['awarded']['seller_pubkey'] == SELLER)
     if not ARGS.baseline:
         s = wait('claim and award yield running tally', lambda: (s if any(j['id'] == job and j['running'] and j['claim'] and j['award'] for j in s['jobs']) else None) if (s := snapshot()) else None)
@@ -296,7 +297,7 @@ try:
             publish_day(day, begin, begin + 600)
             runner = start(day + '-runner', ['node', ROOT / 'scripts/challenges/swarm.mjs',
                 '--binary', BIN, '--app-url', f'http://127.0.0.1:{appport}',
-                '--planner', 'node scripts/challenges/planner-stub.mjs',
+                '--planner', 'node scripts/challenges/planner-free-e2e.mjs',
                 '--duration-seconds', str(duration), '--poll-seconds', '1'],
                 {**buyer_env, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration)})
             final = wait(day + ' status completed', lambda: (s if s['challenge']['id'] == day and s['challenge']['status'] == 'completed' else None) if (s := snapshot()) else None, seconds=240)
@@ -321,6 +322,7 @@ try:
         exhausted = swarm_day('swarm-exhausted', 100000, 40)
         check('swarm exhausted: completed + unsolved update visible', not exhausted['challenge']['result'] and any('Unsolved: all eligible sellers exhausted' in u for u in exhausted['updates']))
         (RUN / 'final-snapshot.json').write_text(json.dumps(s, indent=2))
+    print('NOT EXERCISED paid settlement: this harness has no test mint/funded wallet; priced posting is unit-tested', flush=True)
     print('PASS ALL ' + ('baseline free-job flow' if ARGS.baseline else 'community challenge E2E'), flush=True)
 except Exception as e:
     print(f'FAIL {e}', flush=True)

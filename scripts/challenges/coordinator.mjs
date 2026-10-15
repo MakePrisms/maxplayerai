@@ -15,7 +15,7 @@ export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 30
   const validBudget = b && [b.totalSats,b.committedSats,b.paidSats].every(n => Number.isSafeInteger(n) && nonnegative(n)) && !snapshot.budget?.unknownAmounts;
   const headroom = validBudget ? b.totalSats - b.committedSats - b.paidSats : null;
   if (!validBudget) reasons.push('unknown_budget');
-  if (headroom !== null && amountSats > headroom) reasons.push('budget_exceeded');
+  if (headroom !== null && amountSats > 0 && amountSats > headroom) reasons.push('budget_exceeded');
   // Public ACCEPT is not settlement. Paid assignment requires a reconciled buyer ledger.
   if (amountSats > 0 && (!budgetState || budgetState.challengeId !== c?.id || budgetState.asOf !== now || budgetState.totalSats !== snapshot.budget?.totalSats)) reasons.push('buyer_budget_required');
   const pending = new Set(pendingSellers);

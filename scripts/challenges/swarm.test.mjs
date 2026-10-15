@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, appendFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Journal, Swarm, childEnv, validatePlan, requestId, preparationId, config } from './swarm.mjs';
+import { Journal, Swarm, childEnv, validatePlan, requestId, preparationId, config, reservedBudget, jobBudget } from './swarm.mjs';
 const analysis={approach:'split',workstreams:[{id:'piece',description:'piece',needs:{skills:[]},estMinutes:1,dependsOn:[]}],verification:'check'};
 const assignments=input=>({assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'piece',durationSeconds:30}))});
 function fixture() {
@@ -58,9 +58,9 @@ test('work window ending stops new work but continues collecting',async()=>{
   const f=fixture();await f.runner.tick();f.time(1001);[...f.remote.values()][0].results=[{}];await f.runner.tick();assert.equal(f.remote.size,2);assert.match(f.publishes.at(-1)[3],/window ended/);assert.equal(f.calls.filter(x=>x[0]==='collect').length,1);
 });
 test('priced pending intents reserve budget serially, payment/max_sats are explicit',async()=>{
-  const f=fixture();f.c.amount=6;await f.runner.tick();assert.equal(f.remote.size,1);
+  const f=fixture();f.setPlan(input=>({assignments:assignments(input).assignments.map(a=>({...a,amountSats:6}))}));await f.runner.tick();assert.equal(f.remote.size,1);
   const args=f.calls.find(x=>x[0]==='post_job')[1];assert.equal(args.payment,'sat');assert.equal(args.max_sats,6);
-  await f.runner.tick();assert.match(f.publishes.at(-1)[3],/budget exhausted/);
+  await f.runner.tick();assert.equal(f.remote.size,1);assert.equal(f.publishes.length,0);
 });
 test('fallback award is disabled by default and bounded when explicitly enabled',async()=>{
   const f=fixture();await f.runner.tick();for(const j of f.remote.values())j.claims=[{live:true,seller_pubkey:j.id==='job-0'?'a':'b',claim_id:'claim'}];
@@ -90,7 +90,8 @@ test('JSONL survives torn final writes and rejects corrupt committed data',()=>{
 test('planner responses, configuration and idempotency key validation',()=>{
   for(const p of [{},{task:'x',solved:true,result:'x'},{solved:true},{task:4},{task:' '}])assert.throws(()=>validatePlan(p));
   assert.deepEqual(validatePlan({wait:true}),{wait:true});
-  const c=config([],{MAXPLAYER_HOME:'/tmp/buyer',COMMUNITY_APP_URL:'http://localhost'});assert.equal(c.awardFallback,false);assert.equal(c.amount,0);
+  const c=config([],{MAXPLAYER_HOME:'/tmp/buyer',COMMUNITY_APP_URL:'http://localhost'});assert.equal(c.awardFallback,false);assert.equal(c.amount,undefined);
+  assert.throws(()=>config([],{MAXPLAYER_HOME:'/tmp/b',COMMUNITY_APP_URL:'http://localhost',SWARM_AMOUNT_SATS:'0'}));
   assert.throws(()=>config(['--amount-sats','-1'],{MAXPLAYER_HOME:'/tmp/b',COMMUNITY_APP_URL:'http://localhost'}));
   assert.equal(requestId({buyer:'a',id:'b'},'c',1),requestId({buyer:'a',id:'b'},'c',1));assert.notEqual(requestId({buyer:'a',id:'b'},'c',1),requestId({buyer:'a',id:'b'},'c',2));
 });
@@ -112,7 +113,7 @@ test('progress is throttled independently from immediate completion publication'
   f.setPlan(()=>({solved:true,result:'verified'}));f.time(382);await f.runner.tick();assert.equal(f.publishes.length,3);assert.equal(f.publishes[2][2],'completed');
 });
 test('last paid result can solve even when budget is fully reserved',async()=>{
-  const f=fixture();f.c.amount=10;await f.runner.tick();assert.equal(f.remote.size,1);
+  const f=fixture();f.setPlan(input=>({assignments:assignments(input).assignments.map(a=>({...a,amountSats:10}))}));await f.runner.tick();assert.equal(f.remote.size,1);
   [...f.remote.values()][0].results=[{}];f.setPlan(()=>({solved:true,result:'last answer'}));await f.runner.tick();
   assert.equal(f.publishes.at(-1)[4],'last answer');assert.equal(f.remote.size,1);
 });
@@ -127,7 +128,7 @@ test('settlement continues when community HTTP is unavailable',async()=>{
   assert.equal(f.journal.state.jobs.filter(j=>j.done).length,2);
 });
 test('new public reservations during planning are included in the final budget gate',async()=>{
-  const f=fixture();f.c.amount=6;f.setPlan(input=>{f.snap.jobs.push({id:'foreign',amountSats:5});return assignments(input);});
+  const f=fixture();f.setPlan(input=>{f.snap.jobs.push({id:'foreign',amountSats:5});return {assignments:assignments(input).assignments.map(a=>({...a,amountSats:6}))};});
   await f.runner.tick();assert.equal(f.remote.size,0);
 });
 test('stub planner solves only after N successful results',async()=>{
@@ -207,6 +208,7 @@ test('stub routes Rust work only to advertised Rust seller with distinct duratio
   assert.equal(f.journal.state.jobs.find(j=>j.seller==='a').workstream,'rust');
   assert.equal(f.journal.state.jobs.find(j=>j.seller==='b').workstream,'research');
   assert.deepEqual(f.journal.state.jobs.map(j=>j.durationSeconds),[40,30]);
+  assert.deepEqual(f.journal.state.jobs.map(j=>j.args.amount_sats),[5,0]);
   const profile=f.inputs[0].sellers[0];assert.equal(profile.npub,'npub-a');assert.deepEqual(profile.harness.family,['codex']);assert.equal(profile.note,'hello');
   for(const j of f.remote.values())j.results=[{}];
   f.snap.jobs=[...f.remote.values()].map(j=>({id:j.id,result:{},running:false}));
@@ -234,4 +236,115 @@ test('maxplayer child env carries only MAXPLAYER_HOME from the MAXPLAYER_* names
   const e=childEnv({PATH:'/bin',MAXPLAYER_BINARY:'/x',MAXPLAYER_RELAY_URL:'ws://y',MAXPLAYER_HOME:'/old'},'/buyer');
   assert.deepEqual(e,{PATH:'/bin',MAXPLAYER_HOME:'/buyer'});
   assert.equal(config([],{SWARM_MAXPLAYER_BINARY:'/bin/mp',MAXPLAYER_HOME:'/h',COMMUNITY_APP_URL:'http://a'}).binary,'/bin/mp');
+});
+
+const priced=(input,amount=5)=>({assignments:assignments(input).assignments.map(a=>({...a,amountSats:amount}))});
+test('mixed batch uses normal priced and free posting arguments and reserves before post',async()=>{
+  const f=fixture(),orig=f.io.mcp;
+  f.setPlan(input=>({assignments:assignments(input).assignments.map((a,i)=>({...a,amountSats:i?5:0}))}));
+  f.io.mcp=async(t,a)=>{if(t==='post_job')assert.deepEqual(f.journal.saved.jobs.at(-1).args,a);return orig(t,a);};
+  await f.runner.tick();
+  assert.deepEqual(f.calls.filter(([t])=>t==='post_job').map(([,a])=>[a.payment,a.amount_sats,a.max_sats]),[['none',0,0],['sat',5,5]]);
+  assert.equal(reservedBudget(f.snap,f.journal.state.jobs,100).committedSats,5);
+});
+test('invalid and over-budget prices are dropped with reasons',async()=>{
+  for(const amountSats of [-1,1.5,'5',null,Number.MAX_SAFE_INTEGER+1,11]){
+    const f=fixture(),logs=[];f.io.report=x=>logs.push(x);f.setPlan(input=>priced(input,amountSats));await f.runner.tick();
+    assert.equal(f.remote.size,0);assert.ok(logs.some(x=>x.includes(amountSats===11?'budget_exceeded':'amountSats')));
+  }
+});
+test('confirmed expired never-awarded job releases reservation, incomplete/possibly payable states do not',async()=>{
+  for(const uncertainty of [null,'read','award-read','awarded','accepted','claims','results','offer','reservation']){
+    const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>priced(input));await f.runner.tick();
+    const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,award_read_confirmed:true,reservation_state:'none',offer:{deadline_unix:130},claims:[],results:[],accepted:null});
+    if(uncertainty==='reservation')state.reservation_state='reserved';
+    if(uncertainty==='read')state.read_confirmed=false;
+    if(uncertainty==='award-read')state.award_read_confirmed=false;
+    if(uncertainty==='awarded')state.awarded={claim_id:'x'};
+    if(uncertainty==='accepted')state.accepted={};
+    if(uncertainty==='claims')state.claims=[{live:false}];
+    if(uncertainty==='results')delete state.results;
+    if(uncertainty==='offer')delete state.offer;
+    f.time(131);f.setPlan(()=>({wait:true}));await f.runner.tick();
+    assert.equal(reservedBudget(f.snap,f.journal.state.jobs,131).committedSats,uncertainty?5:0,uncertainty);
+    assert.equal(f.journal.state.jobs[0].done,!uncertainty);
+  }
+});
+test('expired awarded job stays polled and a late collect still consumes budget exactly once',async()=>{
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>priced(input));await f.runner.tick();
+  const state=[...f.remote.values()][0];state.awarded={};f.time(131);f.setPlan(()=>({wait:true}));await f.runner.tick();
+  assert.equal(f.journal.state.jobs[0].done,false);
+  state.results=[{}];const orig=f.io.mcp;f.io.mcp=async(t,a)=>t==='collect'?{pay:{state:'Closed { attempt_id: "x" }',amount_sats:5}}:orig(t,a);
+  await f.runner.tick();await f.runner.tick();
+  assert.deepEqual(jobBudget(f.journal.state.jobs[0]),{paidSats:5,reservedSats:0});
+  assert.equal(f.inputs.at(-1).budgetHeadroomSats,5);
+});
+test('disk restart retains paid reservations, including ambiguous posts',async()=>{
+  const f=fixture(),dir=mkdtempSync(join(tmpdir(),'swarm-pay-')),path=join(dir,'journal');
+  try {
+    const journal=new Journal(path);f.setPlan(input=>priced(input,6));const orig=f.io.mcp;
+    f.io.mcp=async(t,a)=>{const result=await orig(t,a);if(t==='post_job')throw Error('lost reply');return result;};
+    await assert.rejects(new Swarm(f.c,f.io,journal).tick(),/lost reply/);
+    f.io.mcp=orig;const recovered=new Journal(path);await new Swarm(f.c,f.io,recovered).tick();
+    assert.equal(f.remote.size,1);assert.equal(reservedBudget(f.snap,recovered.state.jobs,100).committedSats,6);
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('price refusal and seller pricing/spend reach planner without prematurely releasing',async()=>{
+  const f=fixture();f.snap.sellers[0].capabilities=[['rate','9'],['takes_payment','none']];
+  f.setPlan(input=>priced(input));await f.runner.tick();
+  const state=[...f.remote.values()][0];state.claim_prices=[{seller_pubkey:'a',amount_sats:9}];
+  f.setPlan(()=>({wait:true}));await f.runner.tick();
+  assert.equal(f.inputs.find(i=>i.mode==='analyze').sellers[0].pricing.rateSats[0],'9');
+  assert.ok(f.inputs.at(-1).results.some(r=>r.outcome==='price too high: asked 9'));
+  assert.equal(f.inputs.at(-1).budgetTotalSats,10);assert.equal(f.inputs.at(-1).budgetHeadroomSats,0);
+  assert.equal(jobBudget(f.journal.state.jobs[0]).reservedSats,5);
+});
+test('zero budget still funds free work; paid-only idle plan stops, wait does not',async()=>{
+  for(const mode of ['free','paid','wait']){
+    const f=fixture();f.snap.budget.totalSats=0;
+    if(mode==='paid')f.setPlan(input=>priced(input));if(mode==='wait')f.setPlan(()=>({wait:true}));
+    await f.runner.tick();assert.equal(f.remote.size,mode==='free'?2:0);
+    assert.equal(Boolean(Object.values(f.journal.state.days)[0].stop),mode==='paid');
+  }
+});
+test('settled free receipt releases a legacy reservation; unknown payment state fails closed',()=>{
+  assert.deepEqual(jobBudget({args:{max_sats:5},done:true,pay:{state:'none',amount_sats:0}}),{reservedSats:0,paidSats:0});
+  assert.deepEqual(jobBudget({args:{max_sats:5},done:true,pay:{state:'Sent',amount_sats:5}}),{reservedSats:5,paidSats:0});
+});
+
+test('expired undelivered award releases only after buyer ledger reconciliation',async()=>{
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>priced(input));await f.runner.tick();
+  const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,offer:{deadline_unix:130},claims:[{live:false}],results:[],accepted:null,awarded:{},reservation_state:'reserved'});
+  f.time(131);f.setPlan(()=>({wait:true}));await f.runner.tick();assert.equal(jobBudget(f.journal.state.jobs[0]).reservedSats,5);
+  state.reservation_state='released';await f.runner.tick();assert.equal(jobBudget(f.journal.state.jobs[0]).reservedSats,0);
+  assert.equal(f.journal.state.jobs[0].done,true);
+});
+
+test('lowered budget does not block free work and invalid paid assignments do not mean exhaustion',async()=>{
+  const f=fixture();f.snap.budget.totalSats=0;f.snap.jobs=[{id:'external',amountSats:5}];
+  await f.runner.tick();assert.equal(f.remote.size,2);
+  const g=fixture();g.snap.budget.totalSats=0;
+  g.setPlan(()=>({assignments:[{seller:'missing',amountSats:5}]}));await g.runner.tick();
+  assert.equal(Object.values(g.journal.state.days)[0].stop,undefined);
+});
+
+test('expired over-price never-awarded claim releases and leaves its price outcome for the buyer',async()=>{
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>priced(input));await f.runner.tick();
+  const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,award_read_confirmed:true,reservation_state:'none',offer:{deadline_unix:130},claims:[{live:false,status:'expired'}],claim_prices:[{seller_pubkey:'a',amount_sats:9}],results:[],accepted:null});
+  f.time(131);f.setPlan(()=>({wait:true}));await f.runner.tick();
+  assert.equal(jobBudget(f.journal.state.jobs[0]).reservedSats,0);
+  assert.equal(f.inputs.at(-1).results[0].outcome,'price too high: asked 9');
+  assert.equal(f.inputs.at(-1).sellers[0].challengeSpend.reservedSats,0);
+});
+
+test('mixed successful collections reduce budget by exactly paid sats, never public estimates twice',async()=>{
+  const f=fixture();f.setPlan(input=>({assignments:assignments(input).assignments.map((a,i)=>({...a,amountSats:i?5:0}))}));
+  await f.runner.tick();for(const state of f.remote.values())state.results=[{}];
+  const orig=f.io.mcp;f.io.mcp=async(t,a)=>t==='collect'?{pay:a.job_id==='job-1'?{state:'Closed { attempt_id: "paid" }',amount_sats:5}:{state:'none',amount_sats:0}}:orig(t,a);
+  f.snap.jobs=f.journal.state.jobs.map(j=>({id:j.id,seller:j.seller,result:{},amountSats:j.args.amount_sats,accepted:true}));
+  f.setPlan(()=>({wait:true}));await f.runner.tick();await new Swarm(f.c,f.io,f.journal).tick();
+  const budget=reservedBudget(f.snap,f.journal.state.jobs,100);
+  assert.equal(budget.committedSats,0);assert.equal(budget.paidSats,5);
+  assert.equal(f.inputs.at(-1).budgetHeadroomSats,5);
+  assert.deepEqual(f.inputs.at(-1).sellers.map(s=>s.challengeSpend),[{paidSats:0,reservedSats:0},{paidSats:5,reservedSats:0}]);
 });
