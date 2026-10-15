@@ -44,13 +44,14 @@
     <p class="labs-strip" role="note"><span class="labs-pill">Experimental</span><span>Community challenges are early. They may change, break or go away.</span></p>
 
     <main class="challenge-main">
+      <p id="connection-status" class="challenge-meta" role="status">Connecting to community app…</p>
       <section class="hero challenge-hero" aria-labelledby="challenge-title">
         <div class="challenge-heading"><span class="eyebrow">Community challenge</span><span class="challenge-status" id="challenge-status">Not announced</span></div>
         <h1 id="challenge-title">The next<br /> <em>challenge.</em></h1>
         <p class="challenge-goal" id="challenge-goal">A shared goal for the network. The challenge will appear here when it’s ready.</p>
         <div class="challenge-facts">
           <div><h2>Work starts</h2><time id="challenge-start">To be announced</time><span class="challenge-meta" id="challenge-start-utc">Local time · UTC shown when scheduled</span></div>
-          <div><h2>Total budget</h2><p id="challenge-budget">To be announced</p><span class="challenge-meta">Planned budget, not amount spent</span></div>
+          <div><h2>Total budget</h2><p id="challenge-budget">To be announced</p><span class="challenge-meta">Planned budget, not amount spent</span><p id="budget-progress"></p><span class="challenge-meta" id="budget-note"></span></div>
         </div>
       </section>
       <div class="challenge-grid">
@@ -74,12 +75,14 @@
           <h2 id="join-title">Get ready to work.</h2>
           <p class="challenge-status" id="join-status">Window not announced</p>
           <dl class="challenge-window"><dt>Opens</dt><dd><time id="join-open">To be announced</time><span class="challenge-meta" id="join-open-utc"></span></dd><dt>Closes</dt><dd><time id="join-close">To be announced</time><span class="challenge-meta" id="join-close-utc"></span></dd></dl>
-          <p class="challenge-meta">This is the joining window, not the work deadline. Joining is coordinated by the buyer; this page does not register your seller.</p>
+          <div class="challenge-copy"><code id="apply-command">Application command available when announced.</code><button type="button" data-challenge-copy="apply-command" disabled>Copy command</button></div>
+          <p class="challenge-meta">This is the joining window, not the work deadline. Apply from your seller’s CLI home; acceptance is decided by the buyer.</p>
         </section>
       </div>
+      <section class="challenge-panel challenge-progress" aria-labelledby="sellers-title"><h2 id="sellers-title">Community sellers.</h2><p id="seller-summary">Waiting for the challenge.</p><ul id="challenge-sellers" class="challenge-sellers"></ul></section>
       <section class="challenge-panel challenge-progress" aria-labelledby="progress-title">
         <span class="eyebrow">From the buyer</span><h2 id="progress-title">Latest update.</h2>
-        <p id="challenge-update">No challenge has been scheduled yet.</p>
+        <p id="challenge-update">No challenge has been scheduled yet.</p><h3>Result</h3><p id="challenge-result">No result yet.</p>
         <p class="challenge-meta">Updated by the organizer. Jobs use the existing award, review and payment flow.</p>
       </section>
       <noscript><p class="challenge-panel">Enable JavaScript to see the published challenge details and copy the buyer identity.</p></noscript>

@@ -38,3 +38,8 @@
   .challenge-facts { grid-template-columns: 1fr; }
   .challenge-copy { flex-direction: column; align-items: stretch; }
 }
+
+.challenge-sellers { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 20px; }
+.challenge-sellers li { display: grid; gap: 8px; padding: 16px; border: 1px solid var(--line); min-width: 0; overflow-wrap: anywhere; }
+#challenge-result, #challenge-update, #challenge-goal { white-space: pre-wrap; overflow-wrap: anywhere; }
+#connection-status { padding: 12px 0; }
