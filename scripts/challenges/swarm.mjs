@@ -41,11 +41,29 @@ export class Journal {
     finally {if(fd!==undefined)closeSync(fd);}
   }
 }
-export function validatePlan(p) {
-  if(!p||typeof p!=='object'||[!!p.task,p.solved===true,p.wait===true].filter(Boolean).length!==1)throw Error('Invalid planner response');
-  if(p.task && (typeof p.task!=='string'||!p.task.trim()))throw Error('Empty task');
-  if(p.solved && (typeof p.result!=='string'||!p.result.trim()))throw Error('Solved requires result');
+export function validateAnalysis(p) {
+  if(!p || typeof p.approach!=='string' || !p.approach.trim() || !Array.isArray(p.workstreams) ||
+    !p.workstreams.length || !p.verification || new Set(p.workstreams.map(w=>w?.id)).size!==p.workstreams.length ||
+    p.workstreams.some(w=>!w || typeof w.id!=='string' || !w.id || typeof w.description!=='string' || !w.needs ||
+      !Number.isFinite(w.estMinutes) || w.estMinutes<=0 || !Array.isArray(w.dependsOn) || w.dependsOn.some(id=>!p.workstreams.some(x=>x.id===id))))throw Error('Invalid analysis plan');
   return p;
+}
+export function validatePlan(p, mode='assign') {
+  if(mode==='analyze')return validateAnalysis(p);
+  if(!p||typeof p!=='object'||'task' in p||[Array.isArray(p.assignments),p.solved===true,p.wait===true].filter(Boolean).length!==1 ||
+    (mode==='assess' && p.assignments))throw Error('Invalid planner response');
+  if(p.solved && (typeof p.result!=='string'||!p.result.trim()))throw Error('Solved requires result');
+  if(p.plan)validateAnalysis(p.plan);
+  return p;
+}
+export function sellerProfile(s,jobs) {
+  const tags=s.capabilities??[], values=name=>tags.filter(t=>t[0]===name).flatMap(t=>t.slice(1));
+  const tasks=jobs.filter(j=>j.seller===s.pubkey&&j.done).map(j=>({task:j.args.task,workstream:j.workstream??null,
+    outcome:j.outcome,delivered:j.outcome==='collected',turnaroundSeconds:(j.ts??j.created)-j.created}));
+  return {pubkey:s.pubkey,npub:s.npub??'',name:s.name??'',agents:values('agents'),
+    harness:{family:values('harness_family'),model:values('harness_model'),variant:values('harness_variant')},
+    capabilities:values('capabilities'),hardware:values('hardware'),minutesRemaining:s.minutesRemaining,note:s.note??'',
+    trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
 }
 export function requestId(c,s,n) {return 'swarm-'+createHash('sha256').update(JSON.stringify([c.buyer,c.id,s,n])).digest('hex');}
 // This is the buyer's explicit-request preparation identity (buyer/preparations.rs).
@@ -80,7 +98,7 @@ export class Swarm {
           // No preparation exists: a post would be NEW work. Recheck admission before retrying.
           const fresh=await this.io.snapshot(),at=this.io.now();
           const reservation=fresh.challenge?reservedBudget(fresh,this.state.jobs.filter(x=>x.key===j.key),at):null;
-          const valid=coordinate(fresh,{now:at,durationSeconds:this.c.duration,amountSats:0,budgetState:reservation});
+          const valid=coordinate(fresh,{now:at,durationSeconds:j.durationSeconds??(j.args.deadline_unix-j.created),amountSats:0,budgetState:reservation});
           if(this.state.days[j.key]?.stop || fresh.challenge?.id!==j.challenge.id || fresh.challenge?.buyer!==j.challenge.buyer || at>=j.args.deadline_unix || j.args.deadline_unix>fresh.challenge.ends || !valid.sellers.some(s=>s.seller_pubkey===j.seller&&s.postingAllowed)) {
             // Unready history is transient, not proof that an intent should be discarded.
             if(valid.reasons.some(r=>['stale_snapshot','relay_not_ready','unknown_budget'].includes(r)))continue;
@@ -108,49 +126,62 @@ export class Swarm {
     const key=JSON.stringify([c.buyer,c.id]);
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
-    const jobs=this.state.jobs.filter(j=>j.key===key), active=jobs.filter(j=>!j.done);
-    const results=jobs.filter(j=>j.done).map(j=>({seller:j.seller,task:j.args.task,answer:j.answer??`[${j.outcome}]`,ts:j.ts??now}));
+    const jobs=this.state.jobs.filter(j=>j.key===key);
+    const results=jobs.filter(j=>j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:j.args.task,answer:j.answer??`[${j.outcome}]`,ts:j.ts??now}));
     const ready=snap.relay?.connected&&snap.relay?.authenticated&&snap.relay?.historyComplete&&!snap.relay?.error && now-snap.asOf<=5 && now>=snap.asOf;
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
-    // Assess every newly collected/expired result even when no further task fits, or when
-    // posting already stopped but outstanding work has just settled.
+    const min=this.c.minDuration??120, max=this.c.maxDuration??1800;
+    const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
+    const running=()=>[
+      ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:j.args.task,since:j.created,deadline:j.args.deadline_unix})),
+      ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
+    const ask=async(mode,sellers=[])=>{
+      const p=validatePlan(await this.io.plan({mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
+        running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,amountSats:this.c.amount,
+        budgetHeadroomSats:snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats,now:this.io.now()}),mode);
+      if(mode==='analyze'){day.plan=p;this.save();}
+      else if(p.plan){day.plan=p.plan;this.save();}
+      return p;
+    };
+    if(!day.plan&&!day.stop&&ready&&c.status==='in_progress'&&now>=c.starts&&now<c.ends)
+      await ask('analyze',snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)));
+    // Final results can solve even after posting has stopped.
     if(results.length && day.assessed!==results.length && !day.stop?.external) {
-      const verdict=validatePlan(await this.io.plan({goal:c.goal,challenge:c,results,seller:null,durationSeconds:this.c.duration}));
+      const verdict=await ask('assess');
       if(verdict.solved && !day.stop?.result) {stop(verdict.summary??'Solved',verdict.result);day.published=false;}
       day.assessed=results.length;this.save();
     }
     if(!day.stop && ready && c.status==='in_progress' && now>=c.starts) {
-      // Reserve every local intent, including unawarded offers and expired work. Never free a
-      // priced reservation based on a public ACCEPT or timeout. This is conservative, not a refund ledger.
-      const budgetState=reservedBudget(snap,jobs,now);
       const awaitingProjection=jobs.filter(j=>j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&p.result));
-      const pendingSellers=[...active,...awaitingProjection].map(j=>j.seller);
-      const decision=coordinate(snap,{now,durationSeconds:this.c.duration,amountSats:this.c.amount,budgetState,pendingSellers});
+      const pending=()=>[...this.state.jobs.filter(j=>!j.done),...awaitingProjection].map(j=>j.seller);
+      const decision=coordinate(snap,{now,durationSeconds:min,amountSats:this.c.amount,budgetState:reservedBudget(snap,jobs,now),pendingSellers:pending()});
       if(now>=c.ends)stop('Unsolved: work window ended');
       else if(decision.reasons.includes('budget_exceeded'))stop('Unsolved: budget exhausted');
       else if(!decision.reasons.length) {
-        // Ask even without an available seller: the final delivery may solve the problem.
         const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends);
-        const choices=candidates.length?candidates:[null];
-        for(const s of choices) {
-          const seller=s?{pubkey:s.seller_pubkey,name:snap.sellers.find(x=>x.pubkey===s.seller_pubkey)?.name??'',remainingMinutes:s.remainingMinutes}:null;
-          const p=validatePlan(await this.io.plan({goal:c.goal,challenge:c,results,seller,durationSeconds:this.c.duration}));
-          if(p.solved){stop(p.summary??'Solved',p.result);break;}
-          if(!s || p.wait)continue;
-          // Planning can be slow. Re-read and recheck all admission gates immediately before posting.
-          const fresh=await this.io.snapshot(), at=this.io.now();
-          const check=coordinate(fresh,{now:at,durationSeconds:this.c.duration,amountSats:this.c.amount,budgetState:fresh.challenge?reservedBudget(fresh,jobs,at):null,pendingSellers:this.state.jobs.filter(j=>!j.done).map(j=>j.seller)});
-          if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+this.c.duration>fresh.challenge.ends||!check.sellers.some(x=>x.seller_pubkey===s.seller_pubkey&&x.postingAllowed))break;
-          const sequence=jobs.filter(j=>j.seller===s.seller_pubkey).length+1;
-          const args={task:p.task,output:'text/plain',visibility:'public',seller_pubkey:s.seller_pubkey,payment:this.c.amount?'sat':'none',amount_sats:this.c.amount,max_sats:this.c.amount,deadline_unix:at+this.c.duration,request_id:requestId(c,s.seller_pubkey,sequence)};
-          const j={key,challenge:c,seller:s.seller_pubkey,created:at,args};
-          this.state.jobs.push(j);jobs.push(j);this.save(); // write-ahead: retries MUST reuse args
+        const p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)));
+        if(p.solved)stop(p.summary??'Solved',p.result);
+        for(const assignment of p.assignments??[]) {
+          const {seller,workstream,task,durationSeconds}=assignment??{};
+          const reject=reason=>this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
+          if(!candidates.some(s=>s.seller_pubkey===seller)){reject('seller busy or ineligible (not in free roster)');continue;}
+          if(typeof task!=='string'||!task.trim()||!day.plan.workstreams.some(w=>w.id===workstream)){reject('invalid task or workstream');continue;}
+          if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject('duration outside configured bounds');continue;}
+          // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
+          const fresh=await this.io.snapshot(),at=this.io.now();
+          const check=coordinate(fresh,{now:at,durationSeconds,amountSats:this.c.amount,budgetState:fresh.challenge?reservedBudget(fresh,jobs,at):null,pendingSellers:pending()});
+          if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+durationSeconds>fresh.challenge.ends){reject('challenge changed or work window exceeded');continue;}
+          const candidate=check.sellers.find(x=>x.seller_pubkey===seller);
+          if(!candidate?.postingAllowed){reject([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])].join(', '));continue;}
+          const sequence=jobs.filter(j=>j.seller===seller).length+1;
+          const args={task,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:this.c.amount?'sat':'none',amount_sats:this.c.amount,max_sats:this.c.amount,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
+          const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args};
+          this.state.jobs.push(j);jobs.push(j);this.save();
           const posted=await this.io.mcp('post_job',args);j.id=posted.job_id??posted.preparation_id;
           if(!j.id)throw Error('Post returned no job or preparation id');this.save();
-          budgetState.committedSats+=this.c.amount;
         }
-        if(!day.stop&&!candidates.length&&!active.length&&!awaitingProjection.length&&!(snap.jobs??[]).some(j=>j.running))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
+        if(!day.stop&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
@@ -162,9 +193,10 @@ export class Swarm {
 }
 export function config(argv,env=process.env) {
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--app-url','--planner','--duration-seconds','--amount-sats','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.MAXPLAYER_BINARY??'maxplayer',url:values['--app-url']??env.COMMUNITY_APP_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),amount:+(values['--amount-sats']??env.SWARM_AMOUNT_SATS??0),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),awardFallback:values['--award-fallback']===true};
+  const c={home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.MAXPLAYER_BINARY??'maxplayer',url:values['--app-url']??env.COMMUNITY_APP_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),amount:+(values['--amount-sats']??env.SWARM_AMOUNT_SATS??0),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),awardFallback:values['--award-fallback']===true};
   if(!c.home||!c.url)throw Error('Explicit buyer home and community app URL required');
-  for(const k of ['duration','amount','poll','updateEvery','awardAfter'])if(!Number.isSafeInteger(c[k])||c[k]<(k==='amount'?0:1))throw Error(`Invalid ${k}`);
+  for(const k of ['duration','minDuration','maxDuration','amount','poll','updateEvery','awardAfter'])if(!Number.isSafeInteger(c[k])||c[k]<(k==='amount'?0:1))throw Error(`Invalid ${k}`);
+  if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
   c.home=resolve(c.home);return c;
 }
 async function main() {
@@ -181,7 +213,7 @@ async function main() {
   if(!buyer)throw Error('Cannot identify configured buyer');
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>{const r=await fetch(new URL('/api/challenges/current',c.url),{signal:AbortSignal.timeout(10000)});if(!r.ok)throw Error(`Snapshot HTTP ${r.status}`);const snapshot=await r.json();if(snapshot.challenge&&snapshot.challenge.buyer!==buyer)throw Error('Community snapshot belongs to a different buyer');return snapshot;},
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
-    plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:180000})),
+    plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:input.mode==='analyze'?360000:180000})),
     answer:async collected=>readFileSync(join(collected.path,'answer.txt'),'utf8'),
     publish:async(challenge,budget,status,update,result)=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});

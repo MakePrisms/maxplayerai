@@ -282,6 +282,8 @@ try:
         cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '1')
         cli(buyer_env, 'decide', '--seller', SELLER, '--accept')
         cli(buyer_env, 'decide', '--seller', DENIED, '--accept')
+        # Capability tokens are startup-probed, not configurable. Deterministic Rust-only
+        # routing and unequal durations are asserted in swarm.test.mjs.
         def swarm_day(day, solve_after, duration):
             begin = int(time.time()) + 3
             publish_day(day, begin, begin + 600)
@@ -290,7 +292,7 @@ try:
                 '--planner', 'node scripts/challenges/planner-stub.mjs',
                 '--duration-seconds', str(duration), '--poll-seconds', '1',
                 '--award-fallback', '--award-after-seconds', '2'],
-                {**buyer_env, 'SWARM_STUB_SOLVE_AFTER': str(solve_after)})
+                {**buyer_env, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration)})
             final = wait(day + ' status completed', lambda: (s if s['challenge']['id'] == day and s['challenge']['status'] == 'completed' else None) if (s := snapshot()) else None, seconds=240)
             def settled():
                 log = Path(buyer_env['MAXPLAYER_HOME']) / 'swarm/events.jsonl'

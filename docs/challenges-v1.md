@@ -114,11 +114,21 @@ runner automatically assigns successive tasks until solved or exhausted. Deadlin
 both the remaining donated minutes and the remaining work window. There is at most one
 pending/running task per seller, including offers not yet visible in the public projection.
 
-The planner is an external JSON stdin/stdout command. Each call receives the goal, challenge,
-all prior task/results, the available seller (or null), and task duration. It returns a task,
-wait, or a verified solved answer. Bundled planners: a deterministic N-results stub and a
-non-interactive `claude -p` implementation. The latter requires both keywords and a checked
-English decryption before declaring the Hutton cipher solved.
+The planner is an external JSON stdin/stdout command. Once per challenge, `analyze` receives
+its goal and full eligible roster and returns an approach, workstreams (needs, estimates,
+dependencies), and verification plan. The durable journal preserves this analysis across restarts.
+Each tick `assign` receives the plan, all free eligible seller profiles, running jobs and all
+results, and returns a batch of individually timed assignments, wait, or verified solved answer.
+`assess` checks newly settled results even after posting stops. Later responses may revise the plan.
+Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
+and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
+and prefer useful past deliveries. Every assignment is revalidated against fresh eligibility,
+availability, budget, donated minutes and work-window limits. Durations must fall within
+`SWARM_MIN_DURATION` (120 seconds) and `SWARM_MAX_DURATION` (1800 seconds).
+Exhaustion means no free seller can fit the minimum duration and no work is running; choosing
+wait alone never exhausts a challenge. Bundled planners are a deterministic capability-routing
+stub and non-interactive Claude; verified-solution rules remain, including both Hutton keywords
+and checked English decryption. Verification can itself be a delegated task.
 
 Tasks/receipts/results and stop decisions are journaled under the buyer home. Permanent
 request IDs derive from (buyer, challenge ID, seller, sequence); exact arguments survive

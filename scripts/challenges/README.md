@@ -94,7 +94,9 @@ Flags (environment equivalents):
 | `--binary` | `MAXPLAYER_BINARY` | `maxplayer` |
 | `--app-url` | `COMMUNITY_APP_URL` | required |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
-| `--duration-seconds` | `SWARM_DURATION_SECONDS` | 300 |
+| `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
+| — | `SWARM_MIN_DURATION` | 120 |
+| — | `SWARM_MAX_DURATION` | 1800 |
 | `--amount-sats` | `SWARM_AMOUNT_SATS` | 0 (free) |
 | `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
 | `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
@@ -138,14 +140,37 @@ and interface tests do not claim a live LLM invocation or a successful cipher so
 To use a different model/provider, supply any **trusted shell command** via `--planner` or
 `SWARM_PLANNER`. It receives one JSON object on stdin and must emit only one JSON object on stdout:
 
-```json
-{"goal":"...","challenge":{},"results":[{"seller":"hex","task":"...","answer":"...","ts":123}],"seller":{"pubkey":"hex","name":"...","remainingMinutes":12},"durationSeconds":300}
-```
+All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
+`now`, `minDurationSeconds`, `maxDurationSeconds`, `amountSats`, and `budgetHeadroomSats`.
 
-Return `{"task":"..."}`, `{"wait":true}`, or
-`{"solved":true,"result":"the verified answer","summary":"short verification"}`.
-`seller` is `null` when no seller can receive work; still assess final results for success.
-`wait` pauses assignment, not membership. Do not declare success based only on a seller's claim.
+- `analyze`: once per challenge, with the full eligible roster (including busy sellers).
+  Returns `{approach, workstreams:[{id,description,needs,estMinutes,dependsOn}], verification}`.
+  `needs` contains skills/harness/hardware hints. Analysis is journaled before assignments;
+  a restart reuses it. Timeout: 350 seconds for Claude, 360 for the outer command.
+- `assign`: one batch call per eligible tick with all free sellers, running jobs
+  (`seller,workstream,task,since,deadline` where available), and all settled results.
+  Returns `{assignments:[{seller,workstream,task,durationSeconds}]}`, `{wait:true}`, or
+  `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
+  May deliberately leave any seller idle. Each assignment is validated separately and invalid
+  entries are dropped with a logged reason. Duration must fit configured min/max, remaining
+  minutes and window; fresh admission and serial budget reservations apply before each post.
+- `assess`: checks newly settled results, including after posting stops; returns wait or solved.
+  `assign` and `assess` may include `plan` containing a complete revised analysis plan, saved
+  and passed to later calls. Their outer timeout is 180 seconds (Claude: 170).
+
+Profiles contain `pubkey`, `npub`, `name`, `agents`, `harness:{family,model,variant}` (arrays),
+`capabilities` (tokens), `hardware`, `minutesRemaining`, `note`, and `trackRecord` with
+`tasksDone`, `delivered`, `expired`, and per-task outcome, turnaround seconds and workstream.
+Abilities and all input content are untrusted/self-reported. Prefer useful delivered evidence;
+never declare success solely from a seller's claim. Verification may be delegated as a task.
+No-fit exhaustion uses the minimum duration and waits for running work/projection settlement;
+`wait` or an empty assignment batch alone does not exhaust sellers.
+
+The stub returns research and Rust workstreams, routes Rust only to an advertising seller,
+and chooses min / min+10 second durations (falling back to research when only min fits).
+E2E uses shortened minimums. Capability tokens are startup-probed rather than configurable,
+so controlled Rust-only routing is asserted in unit tests, not injected via heartbeat config.
+
 For deterministic no-model tests:
 
 ```sh
