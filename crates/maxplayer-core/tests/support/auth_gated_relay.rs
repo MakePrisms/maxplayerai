@@ -66,6 +66,9 @@ pub struct Counters {
     /// Subscriptions open right now that were sent before sign-in and not re-sent since: they
     /// get no live events. A test barrier ("everyone can hear") is `deaf == 0` after sign-in.
     pub deaf: AtomicUsize,
+    /// Per connection: the kind of its first EVENT and the time since its first REQ on the same
+    /// socket. Relative and intra-socket, so connect and mint latency don't enter it (#1156 N2).
+    pub req_to_first_event: std::sync::Mutex<Vec<(u64, Duration)>>,
 }
 
 /// Per-connection pre-sign-in subscriptions (id -> EOSE passed), mirrored into `Counters::deaf`
@@ -174,6 +177,8 @@ async fn connection(
     tokio::pin!(challenge_at);
     let mut challenged = !options.challenge;
     // Subscriptions opened before sign-in -> whether their EOSE has passed.
+    let mut first_req: Option<std::time::Instant> = None;
+    let mut first_event_seen = false;
     let mut pre_auth = PreAuth {
         subs: HashMap::new(),
         counters: counters.clone(),
@@ -190,6 +195,23 @@ async fn connection(
             frame = front.next() => {
                 let Some(Ok(frame)) = frame else { return };
                 let Some(v) = parse(&frame) else { continue };
+                match v[0].as_str() {
+                    Some("REQ") => {
+                        first_req.get_or_insert_with(std::time::Instant::now);
+                    }
+                    Some("EVENT") if !first_event_seen => {
+                        first_event_seen = true;
+                        if let Some(at) = first_req {
+                            let kind = v[1]["kind"].as_u64().unwrap_or_default();
+                            counters
+                                .req_to_first_event
+                                .lock()
+                                .unwrap()
+                                .push((kind, at.elapsed()));
+                        }
+                    }
+                    _ => {}
+                }
                 match v[0].as_str() {
                     Some("AUTH") => {
                         let ok = !options.refuse_auth

@@ -103,9 +103,15 @@ relay.maxplayer.ai already passes them (tested, §6). No collision with `kinds.r
   up to 1 s longer, which is safe). Wallet and mint clocks must agree within **60 s**
   (`MAX_CLOCK_SKEW_SECS`); a mint clock behind the wallet's lets a request run after the wallet
   gave up, and the wallet's 300 s recovery hold is sized to cover that bound.
-- **Definitive errors** (`unsupported`, `rate_limited`, `bad_request`, `expired`) promise the
-  request was not executed. The mint sends them only before the op reaches anything that can
-  commit it; after that it answers `internal` or the original reply.
+- **Definitive errors** (`unsupported`, `bad_request`, `expired`) promise the request was not
+  executed: every byte-identical copy gets the same answer (`expired`: every later copy). The mint
+  sends them only before the op reaches anything that can commit it; after that it answers
+  `internal` or the original reply.
+- **`rate_limited` is ambiguous.** It promises only that *this copy* was not executed: the limiter
+  runs before the replay record is written, so another copy of the same signed event (another
+  relay, a scheduled re-send, the re-send after NIP-42 sign-in) may still execute until `exp`.
+  Clients MUST NOT treat it as definitive (no input compensation); the reference connector maps it
+  to HTTP 503.
 - **Response:** kind `23411`, `["p", <client key>]`, `["e", <request id>]`, NIP-44 to the client,
   signed by the mint key. The connector drops anything not signed by the npub in the URL. Plaintext
   `{"v":1,"id":…,"ok":<NUT JSON>}` or `{"v":1,"id":…,"err":{"code":…,"detail":…}}`.

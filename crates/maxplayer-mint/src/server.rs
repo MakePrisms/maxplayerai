@@ -2,6 +2,8 @@
 //!
 //! Every check that can refuse a request runs BEFORE the mint is called, so the named refusals
 //! (`bad_request`, `expired`, `rate_limited`, `unsupported`) keep their promise that nothing ran.
+//! For `rate_limited` that promise is per copy only: it is refused before the replay record, so
+//! another copy of the same event may still run until `exp`, and clients treat it as ambiguous.
 //! Events that can't be answered safely (forged, not for us, undecryptable, no request id) are
 //! dropped without a reply.
 

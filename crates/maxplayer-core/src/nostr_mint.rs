@@ -435,8 +435,8 @@ impl NostrMintConnector {
     /// `exp` is [`request_exp`] of the same start: the mint refuses from that second on, which is
     /// never later than the deadline, so once the window has passed a compliant mint with a
     /// synchronized clock can no longer execute it (spec §3.1). The call can return BEFORE the
-    /// deadline with an ambiguous error (every reachable relay refused sign-in, or the relay pool
-    /// closed) while a queued or relayed copy of the request is still executable until `exp`; a
+    /// deadline with an ambiguous error (every reachable relay refused sign-in, the relay pool
+    /// closed, or the mint answered `rate_limited` to one copy) while a queued or relayed copy of the request is still executable until `exp`; a
     /// mint clock behind by up to `MAX_CLOCK_SKEW_SECS` extends that. Recovery's
     /// `REQUEST_SETTLE` hold, measured from the saga's last update rather than from this return,
     /// is what covers both. Nothing past the deadline is awaited except a bounded disconnect.
@@ -672,6 +672,7 @@ impl NostrMintConnector {
                                 r.acceptance = "accepted";
                                 r.refused = false;
                                 r.publish_failed = false;
+                                r.refusal_category = None;
                             } else {
                                 let category = reason_category(&message);
                                 r.refused = true;
@@ -714,7 +715,8 @@ impl NostrMintConnector {
             // Bring relay-message evidence (OK, CLOSED) up to date with the lifecycle evidence
             // just drained, so the checks below never see a sign-in failure without the
             // acceptance that arrived alongside it.
-            loop {
+            // Bounded like `collect_lifecycle`, so a flooding relay can't starve the deadline check.
+            for _ in 0..1024 {
                 match notifications.try_recv() {
                     Ok(notification) => {
                         if let Some(result) = handle(notification, observation) {
@@ -739,6 +741,12 @@ impl NostrMintConnector {
                     signed_in_under.insert(url.clone(), generation);
                     let _ =
                         relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
+                    // The re-sent REQ reopens a subscription the relay CLOSEd before sign-in.
+                    if let Some(r) = observation.relays.get_mut(url) {
+                        r.closed = false;
+                        r.closed_category = None;
+                        r.eose = false;
+                    }
                     if observation.attempts > 0 {
                         let queued = send_event(relay);
                         count_send(observation, url, queued);
@@ -754,7 +762,11 @@ impl NostrMintConnector {
                 .values()
                 .filter(|r| r.ever_connected)
                 .collect();
-            if !reachable.is_empty() && reachable.iter().all(|r| refused_for_sign_in(r)) {
+            // Lost relay messages (a lagged receiver) may have held the acceptance: no fast-fail.
+            if !observation.evidence_lost
+                && !reachable.is_empty()
+                && reachable.iter().all(|r| refused_for_sign_in(r))
+            {
                 break Err(Error::HttpError(
                     None,
                     format!(

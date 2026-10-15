@@ -844,7 +844,7 @@ async fn nostr_mint_refused_sign_in_is_an_auth_error_not_a_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nostr_mint_open_relay_adds_no_wait() {
-    use auth_gated_relay::{AuthRelay, AuthRelayOptions, Counters};
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
     let relay = AuthRelay::start(AuthRelayOptions {
         challenge: false,
         ..Default::default()
@@ -855,19 +855,20 @@ async fn nostr_mint_open_relay_adds_no_wait() {
         .call_observed("info", Value::Null)
         .await;
     assert!(result.is_ok(), "{result:?} {obs:?}");
-    // Frames, not wall time (review M4): no sign-in, no REQ before sign-in, one scheduled send.
-    assert_eq!(
-        Counters::get(&relay.counters.auths),
-        0,
-        "{:?}",
-        relay.counters
+    // No sign-in grace: on the connector's own socket the request goes out right after its
+    // reply subscription (#1156 review N2; a 300 ms wait broke 5 trade tests in round 1).
+    let gaps = relay.counters.req_to_first_event.lock().unwrap().clone();
+    let request_gaps: Vec<_> = gaps
+        .iter()
+        .filter(|(kind, _)| *kind == u64::from(maxplayer_core::mint_wire::REQUEST_KIND))
+        .collect();
+    assert_eq!(request_gaps.len(), 1, "{gaps:?}");
+    assert!(
+        request_gaps[0].1 < Duration::from_millis(150),
+        "request published {:?} after its REQ: a wait crept in",
+        request_gaps[0].1
     );
-    assert_eq!(
-        Counters::get(&relay.counters.pre_auth_reqs),
-        0,
-        "{:?}",
-        relay.counters
-    );
+    // One scheduled send.
     assert_eq!(obs.attempts, 1, "{obs:?}");
     assert_eq!(obs.wire_sends, Some(1), "{obs:?}");
     // Backstop only.

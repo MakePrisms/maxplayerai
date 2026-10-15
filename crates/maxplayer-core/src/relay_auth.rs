@@ -103,7 +103,8 @@ pub async fn wait_for_nip42_auth(
 /// send `Shutdown`): call it again after reconnecting a disconnected client, and for every relay
 /// added later. Subscriptions are re-sent with their original filters (including `since`), so it
 /// is meant for ephemeral or low-volume filters. Use auto-closing subscriptions for one-shot
-/// queries: they are not re-sent.
+/// queries: they are not re-sent. Not safe against a concurrent `unsubscribe` of a long-lived
+/// subscription: its CLOSE can go out before the re-sent REQ and leave an orphan on the relay.
 pub fn resubscribe_on_auth(
     relay: nostr_sdk::prelude::Relay,
     label: &'static str,
