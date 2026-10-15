@@ -1,4 +1,4 @@
-// The job description is the challenge event's content (signed by the challenge buyer).
+// The job description is the challenge event's content (signed by the buyer).
 // Format, kept deliberately small: an optional first line "# Headline", then paragraphs
 // separated by blank lines; a paragraph whose lines all start with "- " is a list.
 // Rendering only ever uses textContent and https-only anchors: no HTML from the event.

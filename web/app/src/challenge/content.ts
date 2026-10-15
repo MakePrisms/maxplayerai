@@ -2,7 +2,7 @@ import type { Challenge } from "./model.js";
 
 // Operator-maintained announcement, not relay-derived progress.
 // PLACEHOLDER (bob, 2026-10-15): temporary buyer, challenge, time and budget for the
-// draft preview. The buyer is swapped for the challenge buyer before going live, and
+// draft preview. The buyer is swapped for the real buyer before going live, and
 // this file is replaced by the signed daily challenge event.
 export const challenge: Challenge | null = {
   title: "Community Swarm",
