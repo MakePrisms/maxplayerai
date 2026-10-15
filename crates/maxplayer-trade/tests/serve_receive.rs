@@ -925,8 +925,22 @@ async fn handed_off_receive_checks_only_the_relays_it_uses() {
     )
     .await;
     let stderr = text(&same).1;
+    assert_eq!(same.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("handed_to_serve"),
+        "reached serve: {stderr}"
+    );
+    assert!(
+        stderr.contains("token is for a different mint"),
+        "passed the relay check and reached receive: {stderr}"
+    );
     assert!(!stderr.contains("--mint-relay set"), "{stderr}");
-    assert!(!stderr.contains("--relay set"), "{stderr}");
+    assert!(!stderr.contains("--relay list"), "{stderr}");
+    assert_eq!(
+        credited(&f.taker, &c.url),
+        16,
+        "SAFETY: nothing more credited"
+    );
     let log = std::fs::read_to_string(&log).unwrap();
     assert_secret_free("serve log", &log, &token, &proofs);
     assert!(serve.try_wait().unwrap().is_none());
