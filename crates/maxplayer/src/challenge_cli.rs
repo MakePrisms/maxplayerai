@@ -3,14 +3,14 @@ use std::collections::BTreeMap;
 use std::io::Write;
 
 const HELP: &str = "Usage: maxplayer challenge <command> [--home <path>] [--json]
-  apply --buyer <npub|hex> [--challenge <d>] --minutes <1..480> [--note <text>]
+  join --buyer <npub|hex> --minutes <1..480> [--note <text>]
   status --buyer <npub|hex> [--challenge <d>]
-  withdraw --buyer <npub|hex> [--challenge <d>]
-  publish --id <d> --title <text> --goal-file <path> --join-opens <rfc3339> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>]
-  applicants [--challenge <d>]
-  decide --seller <npub|hex> --accept|--deny [--challenge <d>]
-Defaults to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
-Withdrawals after join_closes + 900 seconds are refused by the v1 reader contract.
+  leave --buyer <npub|hex>
+  publish --id <d> --title <text> --goal-file <path> [--join-opens <rfc3339>] --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>]
+  members [--challenge <d>]
+  decide --seller <npub|hex> --accept|--deny
+Membership and acceptance persist across days. Leave at any time. Minutes are offered per day.
+Status/members default to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
 ";
 #[derive(Debug)]
 struct Opts {
@@ -29,8 +29,9 @@ impl Opts {
 fn parse(args: &[String]) -> Result<Opts, String> {
     let command = args.first().ok_or("missing command")?.as_str();
     let allowed: &[&str] = match command {
-        "apply" => &["--buyer", "--challenge", "--minutes", "--note"],
-        "status" | "withdraw" => &["--buyer", "--challenge"],
+        "join" => &["--buyer", "--minutes", "--note"],
+        "status" => &["--buyer", "--challenge"],
+        "leave" => &["--buyer"],
         "publish" => &[
             "--id",
             "--title",
@@ -42,8 +43,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--status",
             "--update",
         ],
-        "applicants" => &["--challenge"],
-        "decide" => &["--seller", "--accept", "--deny", "--challenge"],
+        "members" => &["--challenge"],
+        "decide" => &["--seller", "--accept", "--deny"],
         _ => return Err("unknown challenge command".into()),
     };
     let mut o = Opts {
@@ -73,7 +74,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     }
     o.json = o.get("--json").is_some();
     match command {
-        "apply" => {
+        "join" => {
             o.required("--buyer")?;
             let n = o
                 .required("--minutes")?
@@ -83,7 +84,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 return Err("minutes must be 1..=480".into());
             }
         }
-        "status" | "withdraw" => {
+        "status" | "leave" => {
             o.required("--buyer")?;
         }
         "decide" => {
@@ -97,7 +98,6 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 "--id",
                 "--title",
                 "--goal-file",
-                "--join-opens",
                 "--starts",
                 "--ends",
                 "--budget-sats",
@@ -154,12 +154,12 @@ fn human(body: &serde_json::Value) -> String {
         return format!("Published challenge event {id}");
     }
     let mut lines = Vec::new();
-    if let Some(c) = body.get("challenge") {
+    if let Some(c) = body.get("challenge").filter(|c| !c.is_null()) {
         lines.push(format!("Challenge {}: {} ({})\nBuyer: {}\nGoal: {}\nJoin: {} – {}\nWork: {} – {}\nBudget: {} sat",c["id"].as_str().unwrap_or(""),c["title"].as_str().unwrap_or(""),c["status"].as_str().unwrap_or(""),c["buyer"].as_str().unwrap_or(""),c["goal"].as_str().unwrap_or(""),c["join_opens"],c["join_closes"],c["starts"],c["ends"],c["budget_sats"]));
     }
-    if let Some(rows) = body.get("applicants").and_then(|v| v.as_array()) {
+    if let Some(rows) = body.get("members").and_then(|v| v.as_array()) {
         for row in rows {
-            let a = &row["application"];
+            let a = &row["membership"];
             lines.push(format!(
                 "{}: {} minutes, {}, decision {}, eligible {}",
                 a["seller"].as_str().unwrap_or(""),
@@ -170,7 +170,7 @@ fn human(body: &serde_json::Value) -> String {
             ));
         }
         if rows.is_empty() {
-            lines.push("No application found.".into());
+            lines.push("No membership found.".into());
         }
     }
     lines.join("\n")
@@ -253,7 +253,13 @@ async fn execute_async(
         .to_hex();
     let now = Timestamp::now().as_secs();
     if o.command == "publish" {
-        let join_opens = timestamp(o.required("--join-opens")?)?;
+        let starts = timestamp(o.required("--starts")?)?;
+        let join_opens = match o.get("--join-opens") {
+            Some(t) => timestamp(t)?,
+            None => starts
+                .checked_sub(8 * 3600)
+                .ok_or("start is before the eight-hour join window")?,
+        };
         let c = Challenge {
             buyer,
             id: o.required("--id")?.into(),
@@ -261,8 +267,8 @@ async fn execute_async(
             goal: std::fs::read_to_string(o.required("--goal-file")?)
                 .map_err(|_| "could not read goal file")?,
             join_opens,
-            join_closes: join_opens.checked_add(3600).ok_or("join time overflow")?,
-            starts: timestamp(o.required("--starts")?)?,
+            join_closes: starts,
+            starts,
             ends: timestamp(o.required("--ends")?)?,
             budget_sats: o
                 .required("--budget-sats")?
@@ -288,92 +294,109 @@ async fn execute_async(
             .map_err(|e| e.to_string())?;
         return Ok((json!({"ok":true,"event_id":id,"challenge":c}), None));
     }
-    let events = relay::fetch(
+    // Membership operations do not depend on any daily challenge existing.
+    let c = if matches!(o.command.as_str(), "status" | "members") {
+        let challenges = relay::fetch(
+            home,
+            Filter::new()
+                .author(public_key(&buyer)?)
+                .kind(Kind::from(CHALLENGE_KIND)),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if challenges.is_empty() && o.get("--challenge").is_none() {
+            None
+        } else {
+            Some(select_challenge(&challenges, &buyer, o.get("--challenge"))?)
+        }
+    } else {
+        None
+    };
+    let mut events = relay::fetch(
         home,
         Filter::new()
-            .author(public_key(&buyer)?)
-            .kind(Kind::from(CHALLENGE_KIND)),
+            .kind(Kind::from(CHALLENGE_MEMBERSHIP_KIND))
+            .pubkey(public_key(&buyer)?),
     )
     .await
     .map_err(|e| e.to_string())?;
-    let c = select_challenge(&events, &buyer, o.get("--challenge"))?;
-    let events = relay::fetch(
-        home,
-        Filter::new()
-            .kinds([
-                Kind::from(CHALLENGE_APPLICATION_KIND),
-                Kind::from(CHALLENGE_DECISION_KIND),
-            ])
-            .custom_tag(SingleLetterTag::lowercase(Alphabet::A), c.coordinate()),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
+    events.extend(
+        relay::fetch(
+            home,
+            Filter::new()
+                .kind(Kind::from(CHALLENGE_DECISION_KIND))
+                .author(public_key(&buyer)?),
+        )
+        .await
+        .map_err(|e| e.to_string())?,
+    );
     let latest = latest_per_coordinate(
         events
             .iter()
-            .filter(|e| parse_application(e, &c).is_ok() || parse_decision(e, &c).is_ok()),
+            .filter(|e| parse_membership(e, &buyer).is_ok() || parse_decision(e, &buyer).is_ok()),
     );
-    let applications: Vec<_> = latest
+    let memberships: Vec<_> = latest
         .iter()
-        .filter_map(|e| parse_application(e, &c).ok().map(|a| (*e, a)))
+        .filter_map(|e| parse_membership(e, &buyer).ok().map(|a| (*e, a)))
         .collect();
     let decisions: Vec<_> = latest
         .iter()
-        .filter_map(|e| parse_decision(e, &c).ok())
+        .filter_map(|e| parse_decision(e, &buyer).ok())
         .collect();
     let now = Timestamp::now().as_secs();
     let (kind, coordinate_d) = match o.command.as_str() {
         "decide" => (
             CHALLENGE_DECISION_KIND,
-            format!("{}:{}", c.id, public_key(o.required("--seller")?)?.to_hex()),
+            public_key(o.required("--seller")?)?.to_hex(),
         ),
-        _ => (CHALLENGE_APPLICATION_KIND, format!("{}:{}", c.buyer, c.id)),
+        _ => (CHALLENGE_MEMBERSHIP_KIND, buyer.clone()),
     };
-    let created = if matches!(o.command.as_str(), "status" | "applicants") {
+    let created = if matches!(o.command.as_str(), "status" | "members") {
         now
     } else {
         replacement_timestamp(now, &events, &own, kind, &coordinate_d)?
     };
     let mut warning = None;
     let draft = match o.command.as_str() {
-        "apply" => {
-            c.check_join(now).map_err(|e| e.to_string())?;
+        "join" => {
             if !home.config.seller.as_ref().is_some_and(|s| s.accept_offers_only_from.contains(&buyer)) {
                 warning = Some(format!("buyer {buyer} is not in seller.accept_offers_only_from; append it without removing existing entries and restart the seller."));
             }
-            Application {
+            Membership {
+                since: memberships.iter().find(|(_, a)| a.seller == own && a.status == "joined")
+                    .map(|(_, a)| a.since).unwrap_or(created),
                 seller: own.clone(),
                 minutes: o.required("--minutes")?.parse().map_err(|_| "invalid minutes")?,
-                status: "applied".into(),
+                status: "joined".into(),
                 note: o.get("--note").unwrap_or("").into(),
-            }.to_event_draft(&c, created)
+            }.to_event_draft(&buyer)
         }
-        "withdraw" => {
-            let mut a = applications.iter().find(|(_, a)| a.seller == own)
-                .map(|(_, a)| a.clone()).ok_or("no verified application to withdraw")?;
-            a.status = "withdrawn".into();
-            a.to_event_draft(&c, created)
+        "leave" => {
+            let mut a = memberships.iter().find(|(_, a)| a.seller == own)
+                .map(|(_, a)| a.clone()).ok_or("no verified membership to leave")?;
+            a.status = "left".into();
+            a.to_event_draft(&buyer)
         }
         "decide" => {
             let seller = public_key(o.required("--seller")?)?.to_hex();
             Decision {
-                application_event_id: applications.iter().find(|(_, a)| a.seller == seller)
+                membership_event_id: memberships.iter().find(|(_, a)| a.seller == seller)
                     .map(|(e, _)| e.id.to_hex()),
                 seller,
                 decision: if o.get("--accept").is_some() { "accepted" } else { "denied" }.into(),
                 reason: String::new(),
-            }.to_event_draft(&c)
+            }.to_event_draft(&buyer)
         }
         _ => {
-            let eligible = eligible_sellers(&c, &events);
-            let rows: Vec<_> = applications.iter()
-                .filter(|(_, a)| o.command == "applicants" || a.seller == own)
+            let eligible = c.as_ref().map(|c| eligible_sellers(c, &events)).unwrap_or_default();
+            let rows: Vec<_> = memberships.iter()
+                .filter(|(_, a)| o.command == "members" || a.seller == own)
                 .map(|(e, a)| {
                     let decision = decisions.iter().find(|d| d.seller == a.seller).map(|d| d.decision.as_str());
-                    json!({"event_id": e.id.to_hex(), "application": a, "decision": decision,
+                    json!({"event_id": e.id.to_hex(), "membership": a, "decision": decision,
                         "eligible": eligible.iter().any(|s| s.seller == a.seller)})
                 }).collect();
-            return Ok((json!({"challenge": c, "applicants": rows}), None));
+            return Ok((json!({"challenge": c, "members": rows}), None));
         }
     }.map_err(|e| e.to_string())?;
     let id = relay::publish(home, draft, created)
@@ -416,27 +439,33 @@ mod tests {
     #[test]
     fn challenge_options_are_strict() {
         for s in [
-            "apply --buyer abc --minutes 1",
-            "apply --buyer abc --minutes 480 --json",
+            "join --buyer abc --minutes 1",
+            "join --buyer abc --minutes 480 --json",
             "status --buyer abc",
-            "withdraw --buyer abc",
-            "applicants",
+            "leave --buyer abc",
+            "members",
             "decide --seller abc --accept",
             "decide --seller abc --deny",
         ] {
             assert!(parse(&args(s)).is_ok(), "{s}");
         }
         for s in [
-            "apply --buyer abc --minutes 0",
-            "apply --buyer abc --minutes 481",
-            "apply --minutes 5",
+            "join --buyer abc --minutes 0",
+            "join --buyer abc --minutes 481",
+            "join --minutes 5",
             "status",
             "decide --seller abc",
             "decide --seller abc --accept --deny",
             "status --buyer abc --minutes 5",
             "status --buyer abc --buyer abc",
-            "apply --buyer abc --minutes",
+            "join --buyer abc --minutes",
             "publish --id today",
+            "apply --buyer abc --minutes 60",
+            "withdraw --buyer abc",
+            "applicants",
+            "join --buyer abc --minutes 60 --challenge today",
+            "leave --buyer abc --challenge today",
+            "decide --seller abc --accept --challenge today",
         ] {
             assert!(parse(&args(s)).is_err(), "{s}");
         }
@@ -444,13 +473,7 @@ mod tests {
     #[test]
     fn challenge_help_is_side_effect_free() {
         for command in [
-            "",
-            "apply",
-            "status",
-            "withdraw",
-            "publish",
-            "applicants",
-            "decide",
+            "", "join", "status", "leave", "publish", "members", "decide",
         ] {
             let mut out = Vec::new();
             let mut err = Vec::new();
@@ -474,7 +497,7 @@ mod tests {
             .filter(|line| line.trim().starts_with("maxplayer challenge "))
         {
             let tokens: Vec<_> = line.split_whitespace().collect();
-            assert!(["status", "apply", "withdraw"].contains(&tokens[2]));
+            assert!(["status", "join", "leave"].contains(&tokens[2]));
             for flag in tokens.iter().filter(|word| word.starts_with("--")) {
                 assert!(HELP.contains(*flag), "undocumented skill flag {flag}");
             }
@@ -609,12 +632,12 @@ mod tests {
             assert!(
                 select_challenge(&[e, cancelled], &c.buyer, Some("today"))
                     .unwrap()
-                    .check_join(now)
-                    .is_err()
+                    .status
+                    == "cancelled"
             );
         }
         #[tokio::test]
-        async fn challenge_cli_local_relay_publish_apply_decide_status_withdraw() {
+        async fn challenge_cli_local_relay_publish_join_decide_status_leave() {
             use nostr_relay_builder::prelude::*;
             let relay =
                 LocalRelay::new(RelayBuilder::default().nip42(RelayBuilderNip42::default()));
@@ -635,24 +658,55 @@ mod tests {
             let goal = root.join("goal.md");
             std::fs::write(&goal, "Build a thing").unwrap();
             let iso = |t| Timestamp::from(t).to_human_datetime();
-            let publish=parse(&args(&format!("publish --id today --title Build --goal-file {} --join-opens {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now-10),iso(now+3590),iso(now+7200)))).unwrap();
-            execute_async(&publish, &buyer).await.unwrap();
-            let apply = parse(&args(&format!("apply --buyer {buyer_key} --minutes 60"))).unwrap();
-            let (_, warning) = execute_async(&apply, &seller).await.unwrap();
+            // Membership exists before any challenge; decisions are equally persistent.
+            let before = parse(&args(&format!("join --buyer {buyer_key} --minutes 60"))).unwrap();
+            execute_async(&before, &seller).await.unwrap();
+            let status = parse(&args(&format!("status --buyer {buyer_key} --json"))).unwrap();
+            let (body, _) = execute_async(&status, &seller).await.unwrap();
+            assert!(body["challenge"].is_null());
+            let since = body["members"][0]["membership"]["since"].clone();
+            let publish=parse(&args(&format!("publish --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now+3590),iso(now+7200)))).unwrap();
+            let (published, _) = execute_async(&publish, &buyer).await.unwrap();
+            assert_eq!(published["challenge"]["join_opens"], now + 3590 - 28800);
+            assert_eq!(published["challenge"]["join_closes"], now + 3590);
+            let join = parse(&args(&format!("join --buyer {buyer_key} --minutes 60"))).unwrap();
+            let (_, warning) = execute_async(&join, &seller).await.unwrap();
             assert!(warning.is_some());
             let decide = parse(&args(&format!("decide --seller {seller_key} --accept"))).unwrap();
             execute_async(&decide, &buyer).await.unwrap();
             let status = parse(&args(&format!("status --buyer {buyer_key} --json"))).unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
-            assert_eq!(body["applicants"][0]["eligible"], true);
-            let list = parse(&args("applicants --json")).unwrap();
-            let (body, _) = execute_async(&list, &buyer).await.unwrap();
-            assert_eq!(body["applicants"].as_array().unwrap().len(), 1);
-            let withdraw = parse(&args(&format!("withdraw --buyer {buyer_key}"))).unwrap();
-            execute_async(&withdraw, &seller).await.unwrap();
+            assert_eq!(body["members"][0]["eligible"], true);
+            assert_eq!(body["members"][0]["membership"]["since"], since);
+            let change = parse(&args(&format!("join --buyer {buyer_key} --minutes 120"))).unwrap();
+            execute_async(&change, &seller).await.unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
-            assert_eq!(body["applicants"][0]["application"]["status"], "withdrawn");
-            assert_eq!(body["applicants"][0]["eligible"], false);
+            assert_eq!(body["members"][0]["membership"]["since"], since);
+            assert_eq!(body["members"][0]["membership"]["minutes"], 120);
+            let tomorrow=parse(&args(&format!("publish --id tomorrow --title Build --goal-file {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now+86400),iso(now+90000)))).unwrap();
+            execute_async(&tomorrow, &buyer).await.unwrap();
+            let status = parse(&args(&format!(
+                "status --buyer {buyer_key} --challenge tomorrow --json"
+            )))
+            .unwrap();
+            let (body, _) = execute_async(&status, &seller).await.unwrap();
+            assert_eq!(body["challenge"]["id"], "tomorrow");
+            assert_eq!(body["members"][0]["eligible"], true);
+            let list = parse(&args("members --json")).unwrap();
+            let (body, _) = execute_async(&list, &buyer).await.unwrap();
+            assert_eq!(body["members"].as_array().unwrap().len(), 1);
+            let leave = parse(&args(&format!("leave --buyer {buyer_key}"))).unwrap();
+            execute_async(&leave, &seller).await.unwrap();
+            let (body, _) = execute_async(&status, &seller).await.unwrap();
+            assert_eq!(body["members"][0]["membership"]["status"], "left");
+            assert_eq!(body["members"][0]["eligible"], false);
+            execute_async(&join, &seller).await.unwrap();
+            let (body, _) = execute_async(&status, &seller).await.unwrap();
+            assert!(
+                body["members"][0]["membership"]["since"].as_u64().unwrap()
+                    > since.as_u64().unwrap()
+            );
+            assert_eq!(body["members"][0]["eligible"], true);
             let secret = home::read_secret_key_hex(&seller).unwrap();
             assert!(!body.to_string().contains(&secret));
             std::fs::remove_dir_all(root).unwrap();

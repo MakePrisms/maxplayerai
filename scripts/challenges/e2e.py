@@ -171,8 +171,9 @@ try:
         starts = now + 45
         goal = RUN / 'goal.md'
         goal.write_text('Return the fixture answer 42. No paid work.\n')
-        cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--join-opens', iso(starts - 3600), '--starts', iso(starts), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
-        wait('challenge visible in app', lambda: snapshot()['challenge'])
+        cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--starts', iso(starts), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
+        c = wait('challenge visible in app', lambda: snapshot()['challenge'])
+        check('default sign-ups open eight hours before work and close at start', c['joinOpens'] == starts - 28800 and c['joinCloses'] == starts)
         stream_frames = []
         def consume_stream():
             try:
@@ -184,15 +185,15 @@ try:
                 pass  # Missing lifecycle frames fail the assertions below.
         threading.Thread(target=consume_stream, daemon=True).start()
         wait('SSE initial snapshot received', lambda: stream_frames and stream_frames[0]['challenge']['id'] == 'local-e2e')
-        cli(seller_env, 'apply', '--buyer', BUYER, '--challenge', 'local-e2e', '--minutes', '60')
-        cli(denied_env, 'apply', '--buyer', BUYER, '--challenge', 'local-e2e', '--minutes', '30')
-        s = wait('both applications visible (60 and 30 minutes)', lambda: (s if sorted(x['minutesOffered'] for x in s['sellers']) == [30, 60] else None) if (s := snapshot()) else None)
-        check('both initially applied', all(x['state'] == 'applied' for x in s['sellers']))
-        cli(buyer_env, 'decide', '--challenge', 'local-e2e', '--seller', SELLER, '--accept')
-        cli(buyer_env, 'decide', '--challenge', 'local-e2e', '--seller', DENIED, '--deny')
+        cli(seller_env, 'join', '--buyer', BUYER, '--minutes', '60')
+        cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '30')
+        s = wait('both memberships visible (60 and 30 minutes)', lambda: (s if sorted(x['minutesOffered'] for x in s['sellers']) == [30, 60] else None) if (s := snapshot()) else None)
+        check('both initially joined', all(x['state'] == 'joined' for x in s['sellers']))
+        cli(buyer_env, 'decide', '--seller', SELLER, '--accept')
+        cli(buyer_env, 'decide', '--seller', DENIED, '--deny')
         s = wait('accepted/denied tally and authenticated history', lambda: (s if {x['state'] for x in s['sellers']} == {'accepted','denied'} and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
-        rows = json.loads(cli(buyer_env, 'applicants', '--challenge', 'local-e2e', '--json'))['applicants']
-        check('Rust CLI and app agree on eligibility', len(rows) == 2 and [r['application']['seller'] for r in rows if r['eligible']] == [SELLER])
+        rows = json.loads(cli(buyer_env, 'members', '--challenge', 'local-e2e', '--json'))['members']
+        check('Rust CLI and app agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
             check('coordinator blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
         wait('challenge work window open', lambda: int(time.time()) >= starts)
@@ -236,14 +237,46 @@ try:
         check('minutes exactly match award/result timestamps', abs(own['minutesUsed'] - max(0,min(j['end']-j['start'],j['deadline']-j['start']))/60) < 1e-9 and abs(own['minutesRemaining'] + own['minutesUsed'] - 60) < 1e-9)
         check('denied seller got no job/minutes', not any(j['seller'] == DENIED for j in s['jobs']) and next(x for x in s['sellers'] if x['pubkey'] == DENIED)['minutesUsed'] == 0)
         check('completed seller can receive next task', plan(s)['postingAllowed'])
-        cli(seller_env, 'withdraw', '--buyer', BUYER, '--challenge', 'local-e2e')
-        s = wait('withdraw visible', lambda: (s if any(x['pubkey'] == SELLER and x['state'] == 'withdrawn' for x in s['sellers']) else None) if (s := snapshot()) else None)
+        # A separately published second day reuses the very same membership and decision.
+        def publish_day(day, begin, end):
+            time.sleep(1.1)  # Distinct coordinates select current by publication timestamp.
+            cli(buyer_env, 'publish', '--id', day, '--title', day, '--goal-file', str(goal),
+                '--starts', iso(begin), '--ends', iso(end), '--budget-sats', '0', '--status', 'in_progress')
+            return wait(day + ' visible', lambda: (s if s['challenge']['id'] == day else None) if (s := snapshot()) else None)
+        day2 = publish_day('day-2', starts + 86400, starts + 90000)
+        day2own = next(x for x in day2['sellers'] if x['pubkey'] == SELLER)
+        check('join once eligible on day 1 and day 2 without rejoining or reaccepting', own['eligible'] and day2own['eligible'] and day2own['since'] == own['since'])
+        check('minutes reset per day while prior jobs remain in history', day2own['minutesUsed'] == 0 and day2own['minutesRemaining'] == 60 and any(j['id'] == job for j in day2own['pastJobs']))
+        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'day-2', '--json'))['members']
+        check('Rust confirms persistent day 2 eligibility', rows[0]['eligible'])
+        publish_day('local-e2e', starts, now + 900)
+        cli(seller_env, 'leave', '--buyer', BUYER)
+        s = wait('leave visible', lambda: (s if any(x['pubkey'] == SELLER and x['state'] == 'left' for x in s['sellers']) else None) if (s := snapshot()) else None)
         p = plan(s)
-        check('withdraw stops further assignment', not p['postingAllowed'] and p['sellers'] == [])
-        wait('SSE withdrawal received', lambda: any(any(x['pubkey'] == SELLER and x['state'] == 'withdrawn' for x in f['sellers']) for f in stream_frames))
-        check('withdraw preserves settled job/minutes', len(s['jobs']) == 1 and next(x for x in s['sellers'] if x['pubkey'] == SELLER)['minutesUsed'] == own['minutesUsed'])
-        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'local-e2e', '--json'))['applicants']
-        check('Rust CLI confirms withdrawn ineligible seller', len(rows) == 1 and not rows[0]['eligible'] and rows[0]['application']['status'] == 'withdrawn')
+        check('leave stops further assignment', not p['postingAllowed'] and p['sellers'] == [])
+        wait('SSE leave received', lambda: any(any(x['pubkey'] == SELLER and x['state'] == 'left' for x in f['sellers']) for f in stream_frames))
+        check('leave preserves settled job/minutes', len(s['jobs']) == 1 and next(x for x in s['sellers'] if x['pubkey'] == SELLER)['minutesUsed'] == own['minutesUsed'])
+        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'local-e2e', '--json'))['members']
+        check('Rust CLI confirms left ineligible seller', len(rows) == 1 and not rows[0]['eligible'] and rows[0]['membership']['status'] == 'left')
+        # Publish a past day so a real-time join is beyond the 900-second tolerance.
+        late_start = int(time.time()) - 1800
+        publish_day('late-day', late_start, late_start + 3600)
+        cli(denied_env, 'leave', '--buyer', BUYER)
+        cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '30')
+        cli(buyer_env, 'decide', '--seller', DENIED, '--accept')
+        late = wait('late join visible and accepted', lambda: (s if any(x['pubkey'] == DENIED and x['membershipStatus'] == 'joined' and x['decision'] == 'accepted' and x['since'] > late_start + 900 for x in s['sellers']) else None) if (s := snapshot()) else None)
+        lateown = next(x for x in late['sellers'] if x['pubkey'] == DENIED)
+        check('join after close plus tolerance cannot receive same-day assignments', not lateown['eligible'] and not plan(late)['postingAllowed'])
+        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-day', '--json'))['members']
+        check('Rust confirms late join ineligible that day', not rows[0]['eligible'])
+        nextday = publish_day('late-next-day', late_start + 86400, late_start + 90000)
+        nextown = next(x for x in nextday['sellers'] if x['pubkey'] == DENIED)
+        check('late join eligible next day without rejoining', nextown['eligible'] and nextown['since'] == lateown['since'])
+        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-next-day', '--json'))['members']
+        check('Rust confirms late join eligible next day', rows[0]['eligible'])
+        cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '45')
+        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-next-day', '--json'))['members']
+        check('changing daily minutes preserves membership since', rows[0]['membership']['since'] == lateown['since'] and rows[0]['membership']['minutes'] == 45)
         (RUN / 'final-snapshot.json').write_text(json.dumps(s, indent=2))
     print('PASS ALL ' + ('baseline free-job flow' if ARGS.baseline else 'community challenge E2E'), flush=True)
 except Exception as e:

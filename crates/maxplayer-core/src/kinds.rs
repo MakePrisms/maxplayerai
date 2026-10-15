@@ -18,14 +18,14 @@
 //! | `30340` | SELLER HEARTBEAT (addressable, `d="maxplayer-seller"`) | seller |
 
 //! | `30341` | CHALLENGE | buyer |
-//! | `30342` | CHALLENGE APPLICATION | seller |
+//! | `30342` | CHALLENGE MEMBERSHIP | seller |
 //! | `30343` | CHALLENGE DECISION | buyer |
 
 /// Daily community challenge.
 pub const CHALLENGE_KIND: u16 = 30341;
-/// Seller application to a challenge.
-pub const CHALLENGE_APPLICATION_KIND: u16 = 30342;
-/// Buyer decision on a seller application.
+/// Persistent seller membership with a challenge buyer.
+pub const CHALLENGE_MEMBERSHIP_KIND: u16 = 30342;
+/// Persistent buyer decision on a seller membership.
 pub const CHALLENGE_DECISION_KIND: u16 = 30343;
 
 /// Co-signed settlement receipt (buyer + seller).
@@ -102,14 +102,14 @@ mod tests {
         assert_eq!(
             [
                 CHALLENGE_KIND,
-                CHALLENGE_APPLICATION_KIND,
+                CHALLENGE_MEMBERSHIP_KIND,
                 CHALLENGE_DECISION_KIND
             ],
             [30341, 30342, 30343]
         );
         for kind in [
             CHALLENGE_KIND,
-            CHALLENGE_APPLICATION_KIND,
+            CHALLENGE_MEMBERSHIP_KIND,
             CHALLENGE_DECISION_KIND,
         ] {
             assert!((30000..=39999).contains(&kind));

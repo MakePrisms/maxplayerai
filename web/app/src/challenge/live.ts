@@ -33,21 +33,21 @@ export function sellerLine(s: Snapshot,a: Seller,now: number): string {
 }
 const running=(s: Snapshot,a: Seller,now: number)=>s.jobs.some(j=>j.seller===a.pubkey&&j.running&&now<j.deadline);
 export function sellerState(s: Snapshot,a: Seller,now: number): string {
-  if(a.state==='withdrawn')return 'Withdrew';
+  if(a.state==='left')return 'Left';
   if(running(s,a,now))return 'Working now';
   if(a.eligible&&sellerMinutes(s,a,now)>=a.minutesOffered)return 'Done';
   // Server state 'done' means the last job finished, not that the seller is out of minutes.
   if(a.state==='done'&&!a.eligible)return 'Done';
-  return a.eligible?'Ready':'Applied';
+  return a.eligible?'Ready':'Joined';
 }
 const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
-// Public page: denied applicants are not listed. Remote text only ever reaches textContent.
+// Public page: denied members are not listed. Remote text only ever reaches textContent.
 export function renderSellers(doc: Document,s: Snapshot,now: number): void {
   const list=doc.getElementById('challenge-sellers')!;const fragment=doc.createDocumentFragment();
   const shown=s.sellers.filter(a=>a.decision!=='denied');
   for(const a of shown) {
     const row=doc.createElement('li');const state=sellerState(s,a,now);
-    if(state==='Done'||state==='Withdrew')row.className='off';
+    if(state==='Done'||state==='Left')row.className='off';
     const name=doc.createElement('strong');name.textContent=a.name||shortNpub(a.npub);
     const mins=doc.createElement('span');mins.className='c-mins';mins.textContent=sellerLine(s,a,now);
     const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
@@ -56,5 +56,5 @@ export function renderSellers(doc: Document,s: Snapshot,now: number): void {
   }
   list.replaceChildren(fragment);
   const working=shown.filter(a=>running(s,a,now)).length;
-  doc.getElementById('seller-summary')!.textContent=shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No applicants yet.';
+  doc.getElementById('seller-summary')!.textContent=shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.';
 }

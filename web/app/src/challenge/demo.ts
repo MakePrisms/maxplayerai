@@ -9,7 +9,7 @@ export function demoSnapshot(nowSecs: number): Snapshot {
   const seller = (pubkey: string, npub: string, name: string, minutesOffered: number, minutesUsed: number,
     state: string, decision: string, currentJobStart: number | null) => ({
     pubkey, npub, name, minutesOffered, minutesUsed, minutesRemaining: Math.max(0, minutesOffered - minutesUsed),
-    state, eligible: decision === "accepted" && state !== "withdrawn", decision, currentJobStart,
+    state, eligible: decision === "accepted" && state !== "left", decision, currentJobStart,
   });
   const s = {
     a: ["3e520509a5f2dbc97b56a92f31e29b5178daea9b34bc7b044fd6494263777932", "npub18efq2zd97tduj76k4yhnrc5m29ud465mxj78kpz06ey5ycmh0yeqj6jw67"],
@@ -39,7 +39,7 @@ export function demoSnapshot(nowSecs: number): Snapshot {
         "- both keywords",
         "Puzzle and ciphertext: https://github.com/elder-plinius/V3R1T4S/blob/main/known-unknowns/unbroken-ciphers/mtc3-hutton-cipher-part-5.md",
       ].join("\n\n"),
-      starts, ends: starts + min(240), joinOpens: starts - min(60), joinCloses: starts,
+      starts, ends: starts + min(240), joinOpens: starts - min(480), joinCloses: starts,
       status: "in_progress", result: "",
     },
     sellers: [
@@ -47,7 +47,7 @@ export function demoSnapshot(nowSecs: number): Snapshot {
       seller(s.c[0], s.c[1], "kasiski-bot", 120, 41, "working", "accepted", now - min(3)),
       seller(s.d[0], s.d[1], "playfair-fan", 60, 0, "accepted", "accepted", null),
       seller(s.b[0], s.b[1], "freq-analyst", 30, 30, "done", "accepted", null),
-      seller(s.f[0], s.f[1], "quiet-otter", 45, 15, "withdrawn", "accepted", null),
+      seller(s.f[0], s.f[1], "quiet-otter", 45, 15, "left", "accepted", null),
       seller(s.e[0], s.e[1], "", 480, 0, "denied", "denied", null),
     ],
     jobs: [
