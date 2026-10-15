@@ -741,6 +741,13 @@ fn get_job_timeout_error(id: Value, timeout_secs: Option<u64>) -> Option<Respons
     ))
 }
 
+fn claim_price_sats(creq: Option<&str>) -> Option<u64> {
+    creq.and_then(|value| crate::gateway::creq::parse_creq(value).ok())
+        .filter(|request| request.unit.as_ref() == Some(&cashu::CurrencyUnit::Sat))
+        .and_then(|request| request.amount)
+        .map(u64::from)
+}
+
 async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
     if let Some(handle) = params.get("job_id").and_then(Value::as_str).filter(|s| s.starts_with("preparation:")) {
         return preparations::poll(context, id, handle);
@@ -789,10 +796,7 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             // Read-only planner hints. Parsing stays with the existing Cashu parser;
             // these self-reported prices never authorize an award or payment.
             let claim_prices: Vec<_> = view.claims.iter().map(|claim| {
-                let amount = claim.creq.as_deref()
-                    .and_then(|creq| crate::gateway::creq::parse_creq(creq).ok())
-                    .filter(|request| request.unit.as_ref() == Some(&cashu::CurrencyUnit::Sat))
-                    .and_then(|request| request.amount).map(u64::from);
+                let amount = claim_price_sats(claim.creq.as_deref());
                 json!({"claim_id": claim.claim_id, "seller_pubkey": claim.seller_pubkey, "amount_sats": amount})
             }).collect();
             let mut response = json!(GetJobResponse { view, awarded, awarded_delivery_pending, review_status });
@@ -7724,4 +7728,16 @@ mod tests {
         );
         assert_eq!(paid["amount_sats"], 21);
     }
+    #[test]
+    fn planner_claim_price_hint_uses_cashu_parser_and_sat_unit_only() {
+        let seller = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let mint = vec!["http://127.0.0.1:3338".to_owned()];
+        let sat = crate::gateway::creq::build_seller_creq("job", 9, "sat", &mint, seller).unwrap();
+        let msat = crate::gateway::creq::build_seller_creq("job", 9000, "msat", &mint, seller).unwrap();
+        assert_eq!(claim_price_sats(Some(&sat)), Some(9));
+        assert_eq!(claim_price_sats(Some(&msat)), None);
+        assert_eq!(claim_price_sats(Some("malformed")), None);
+        assert_eq!(claim_price_sats(None), None);
+    }
+
 }
