@@ -29,7 +29,12 @@ export class Journal {
     if(end<text.length)truncateSync(path,Buffer.byteLength(text.slice(0,end)));
     for(const line of text.slice(0,end).split('\n').filter(Boolean))this.state=JSON.parse(line);
   }
-  save() {const fd=openSync(this.path,'a',0o600);try{writeSync(fd,JSON.stringify(this.state)+'\n');fsyncSync(fd);}finally{closeSync(fd);}}
+  save() {
+    let fd;
+    try {fd=openSync(this.path,'a',0o600);writeSync(fd,JSON.stringify(this.state)+'\n');fsyncSync(fd);}
+    catch(e) {e.journalFailure=true;throw e;}
+    finally {if(fd!==undefined)closeSync(fd);}
+  }
 }
 export function validatePlan(p) {
   if(!p||typeof p!=='object'||[!!p.task,p.solved===true,p.wait===true].filter(Boolean).length!==1)throw Error('Invalid planner response');
@@ -85,7 +90,7 @@ export class Swarm {
         const claim=state.claims?.find(c=>c.live&&c.seller_pubkey===j.seller);
         if(claim)await this.io.mcp('award_claim',{job_id:j.id,claim_id:claim.claim_id,max_sats:j.args.max_sats});
       }
-      } catch(e) { this.io.report?.(`Job ${j.id??j.args.request_id}: ${e.message}`); }
+      } catch(e) { if(e.journalFailure)throw e;this.io.report?.(`Job ${j.id??j.args.request_id}: ${e.message}`); }
     }
     snap=await this.io.snapshot(); now=this.io.now(); const c=snap.challenge;if(!c)return;
     const key=JSON.stringify([c.buyer,c.id]);
@@ -173,6 +178,6 @@ async function main() {
     }};
   const runner=new Swarm(c,io,new Journal(join(c.home,'swarm/events.jsonl')));
   let quitting=false;for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{quitting=true;});
-  while(!quitting){try{await runner.tick();}catch(e){console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}
+  while(!quitting){try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{console.error(e.message);process.exitCode=1;});

@@ -143,3 +143,7 @@ test('real planner adapter passes noninteractive/tool-free arguments and verific
     assert.deepEqual(JSON.parse(output),{wait:true});
   } finally {rmSync(dir,{recursive:true});}
 });
+test('journal I/O failure is fatal, never retried from unpersisted in-memory intent',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-'));
+  try{const j=new Journal(join(dir,'missing','events.jsonl'));assert.throws(()=>j.save(),e=>e.journalFailure===true);}finally{rmSync(dir,{recursive:true});}
+});
