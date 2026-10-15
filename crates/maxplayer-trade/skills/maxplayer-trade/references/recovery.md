@@ -49,7 +49,8 @@ listings/takes. Units sharing records run one at a time in arrival order; others
 side. A live swap's recovery and its claim/refund steps may go ahead of quote requests and
 handed-off `list`/`take`/`cancel` that are still waiting (those re-check the journal when they
 start). A slow or silent mint therefore delays another swap's claim or refund only while a unit
-of that same lot is actually running, never through a queue of waiting requests. Two swaps on
+of that same lot is actually running, never through a queue of waiting requests. All units
+share serve's run slots (32 at a time), so a full slot table can also delay it. Two swaps on
 the same mint still share that mint's capacity. Budgets, deadlines and journal-first ordering per item are
 unchanged, and serve remains the only writer of the home.
 

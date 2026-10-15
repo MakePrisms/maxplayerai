@@ -1370,8 +1370,10 @@ pub async fn run(home: &Path, j: &Journal, m: &mut Market, until: Option<&str>) 
 /// rows it may write as keys, units sharing a key run one at a time in arrival order, and units
 /// on different keys are polled concurrently inside this one task. So serve stays the single
 /// writer of every row, each unit keeps its own journal-before-effect order, budget and deadline
-/// checks (it is the same code as before), and a slow mint only delays the units that use it:
-/// another swap's claim or refund never waits for a stuck receive, wallet item or other swap.
+/// checks (it is the same code as before), and a slow mint only delays the units that use it.
+/// A live swap's claim/refund units may overtake waiting requests; they still wait for a
+/// running unit of their own lot or swap, and for a free slot (`sched::MAX_RUNNING`). See
+/// `recovery.md#serve-scheduling` for the exact guarantee.
 pub async fn run_with(
     home: &Path,
     j: &Journal,
@@ -1482,11 +1484,16 @@ async fn enqueue_recovery(
     // queued below, which would leave `lot:<id>` never free and `listing.active` never restored.
     // Queued ahead, a listing unit only rewrites `active` (it publishes nothing for a lot that is
     // published and not cancelled), and the lot's urgent swap unit may still overtake it.
-    for l in j.all::<Listing>("listing").await? {
-        let id = l.event.id.to_hex();
-        let keys = vec!["listings".to_string(), format!("lot:{id}")];
-        if sched.free(&keys) {
-            let _ = sched.push(format!("listing:{id}"), keys, Unit::Listing(id));
+    // One check for `list` (it holds `listings` while its new row is not yet reserved and
+    // published); each listing unit then keys only its own lot, so every listing gets a unit
+    // (review of #1155, R2-1: a shared `listings` key let only one listing in per tick, ever).
+    if sched.free(&["listings".to_string()]) {
+        for l in j.all::<Listing>("listing").await? {
+            let id = l.event.id.to_hex();
+            let keys = vec![format!("lot:{id}")];
+            if sched.free(&keys) {
+                let _ = sched.push(format!("listing:{id}"), keys, Unit::Listing(id));
+            }
         }
     }
     let mut rows = j.all::<Retained>("inbox_retry").await?;
@@ -2218,6 +2225,148 @@ mod t7_review_regressions {
         assert!(
             live_maker_swap(&j, &lot_id).await.unwrap(),
             "SAFETY: cancel must refuse a lot with a live maker swap"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_r2 {
+    use super::*;
+    fn plan(n: u64) -> Plan {
+        Plan {
+            mint: "http://127.0.0.1:1".into(),
+            inputs: vec![],
+            keyset: "009a1f293253e41e".parse().unwrap(),
+            ppk: 0,
+            net: n,
+            gross: n,
+            lock_fee: 0,
+            claim_fee: 0,
+            debit: n,
+        }
+    }
+    fn listing(keys: &Keys, n: u64, cancelled: bool) -> (String, Listing) {
+        let leg = |mint: &str| Leg {
+            asset: Asset::new(mint).unwrap(),
+            net: n,
+        };
+        let event = lot_event(keys, leg("http://127.0.0.1:1"), leg("http://127.0.0.1:2")).unwrap();
+        let initial = status_event(keys, event.id, 1, event.id, Status::Available).unwrap();
+        (
+            event.id.to_hex(),
+            Listing {
+                published: 1,
+                max_fees: 0,
+                event,
+                statuses: vec![initial],
+                plan: plan(n),
+                reservation: uuid::Uuid::new_v4().to_string(),
+                active: None,
+                cancelled,
+            },
+        )
+    }
+    /// Review of #1155, R2-1 (cashu-rust-dev's repro): every listing gets its recovery unit, not
+    /// only the first one in journal order.
+    #[tokio::test]
+    async fn every_listing_gets_its_recovery_unit_within_a_few_ticks() {
+        let home = tempfile::tempdir().unwrap();
+        let j = Journal::open(home.path()).await.unwrap();
+        let keys = Keys::generate();
+        let mut ids = vec![];
+        for n in 1..=3u64 {
+            // n == 3: e.g. a cancel whose release found the mint unreachable.
+            let (id, l) = listing(&keys, n, n == 3);
+            j.put("listing", &id, &l).await.unwrap();
+            ids.push(id);
+        }
+        let mut sched: crate::sched::Scheduler<'_, Unit> = crate::sched::Scheduler::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _tick in 0..6 {
+            enqueue_recovery(&j, &mut sched).await.unwrap();
+            for id in &ids {
+                if sched.contains(&format!("listing:{id}")) {
+                    seen.insert(id.clone());
+                }
+            }
+            sched.drain_queued();
+        }
+        assert_eq!(
+            seen.len(),
+            ids.len(),
+            "listing units queued: {seen:?} of {ids:?}"
+        );
+    }
+    /// R2-1 keeps F3: while a `list` (key `listings`) is queued, no listing unit is pushed.
+    #[tokio::test]
+    async fn no_listing_unit_while_a_list_is_queued() {
+        let home = tempfile::tempdir().unwrap();
+        let j = Journal::open(home.path()).await.unwrap();
+        let (id, l) = listing(&Keys::generate(), 1, false);
+        j.put("listing", &id, &l).await.unwrap();
+        let mut sched: crate::sched::Scheduler<'_, Unit> = crate::sched::Scheduler::default();
+        sched
+            .push(
+                "job:list".into(),
+                vec!["admit".into(), "listings".into()],
+                Unit::Publications,
+            )
+            .unwrap_or_else(|_| panic!("dup"));
+        enqueue_recovery(&j, &mut sched).await.unwrap();
+        assert!(
+            !sched.contains(&format!("listing:{id}")),
+            "SAFETY: listing unit beside a queued list"
+        );
+    }
+    /// Review of #1155, R2-2 (cashu-rust-dev): drive `cancel` itself in the window where the swap
+    /// row is saved but `listing.active` is not. It must refuse before journaling `cancelled`.
+    #[tokio::test]
+    async fn cancel_itself_refuses_a_lot_whose_live_swap_is_not_in_listing_active() {
+        let home = tempfile::tempdir().unwrap();
+        let j = Journal::open(home.path()).await.unwrap();
+        let keys = Keys::generate();
+        let (lot_id, l) = listing(&keys, 10, false);
+        let event = l.event.clone();
+        j.put("listing", &lot_id, &l).await.unwrap();
+        let p = plan(10);
+        let swap = Swap {
+            created: now(),
+            id: uuid::Uuid::new_v4().to_string(),
+            lot: event,
+            role: "maker".into(),
+            peer: Keys::generate().public_key().to_hex(),
+            key: secret(),
+            preimage: None,
+            request: Request {
+                hash: "00".repeat(32),
+                taker_key: pubkey(&secret()).unwrap(),
+                funding: Terms::from(&p),
+                max_give: 10,
+                min_receive: 10,
+                max_fees: 0,
+            },
+            quote: None,
+            plan: p,
+            state: "second_locked".into(),
+            outgoing: vec![],
+            incoming: vec![],
+            max_fees: 0,
+            refund_generation: 0,
+        };
+        j.put("swap", &swap.id, &swap).await.unwrap();
+        // A dead loopback relay: cancel must refuse before it touches the market.
+        let m = Market::connect(keys, &["ws://127.0.0.1:9".into()])
+            .await
+            .unwrap();
+        let err = cancel(home.path(), &j, &m, &lot_id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("cannot cancel active swap"),
+            "{err}"
+        );
+        let l: Listing = j.get("listing", &lot_id).await.unwrap().unwrap();
+        assert!(
+            !l.cancelled,
+            "SAFETY: cancelled journaled for a lot with a live maker swap"
         );
     }
 }

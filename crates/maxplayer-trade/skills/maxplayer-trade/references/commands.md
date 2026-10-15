@@ -289,8 +289,9 @@ not settled yet; serve keeps recovering it) or `not_credited`. If the reply is l
 **same** receive or check `status`: the same token always resumes the same attempt and
 never credits twice, also after a serve restart. A receive waits at most 120 s for its
 mint; an unfinished, journaled attempt is then reported `in_doubt` and finished by
-serve's recovery. A slow receive mint delays only that mint's wallet work, never another
-swap's claim or refund (see [serve scheduling](recovery.md#serve-scheduling)).
+serve's recovery. A slow receive mint delays that mint's wallet work; another swap's claim
+or refund waits for it only through a shared run slot (see
+[serve scheduling](recovery.md#serve-scheduling)).
 
 ### Receive without serve
 
