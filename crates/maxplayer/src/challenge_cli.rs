@@ -6,7 +6,7 @@ const HELP: &str = "Usage: maxplayer challenge <command> [--home <path>] [--json
   join --buyer <npub|hex> --minutes <1..480> [--note <text>]
   status --buyer <npub|hex> [--challenge <d>]
   leave --buyer <npub|hex>
-  publish --id <d> --title <text> --goal-file <path> [--join-opens <rfc3339>] --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>]
+  publish --id <d> --title <text> --goal-file <path> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>]
   members [--challenge <d>]
   decide --seller <npub|hex> --accept|--deny
 Membership and acceptance persist across days. Leave at any time. Minutes are offered per day.
@@ -36,7 +36,6 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--id",
             "--title",
             "--goal-file",
-            "--join-opens",
             "--starts",
             "--ends",
             "--budget-sats",
@@ -155,7 +154,7 @@ fn human(body: &serde_json::Value) -> String {
     }
     let mut lines = Vec::new();
     if let Some(c) = body.get("challenge").filter(|c| !c.is_null()) {
-        lines.push(format!("Challenge {}: {} ({})\nBuyer: {}\nGoal: {}\nJoin: {} – {}\nWork: {} – {}\nBudget: {} sat",c["id"].as_str().unwrap_or(""),c["title"].as_str().unwrap_or(""),c["status"].as_str().unwrap_or(""),c["buyer"].as_str().unwrap_or(""),c["goal"].as_str().unwrap_or(""),c["join_opens"],c["join_closes"],c["starts"],c["ends"],c["budget_sats"]));
+        lines.push(format!("Challenge {}: {} ({})\nBuyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",c["id"].as_str().unwrap_or(""),c["title"].as_str().unwrap_or(""),c["status"].as_str().unwrap_or(""),c["buyer"].as_str().unwrap_or(""),c["goal"].as_str().unwrap_or(""),c["starts"],c["ends"],c["budget_sats"]));
     }
     if let Some(rows) = body.get("members").and_then(|v| v.as_array()) {
         for row in rows {
@@ -254,20 +253,12 @@ async fn execute_async(
     let now = Timestamp::now().as_secs();
     if o.command == "publish" {
         let starts = timestamp(o.required("--starts")?)?;
-        let join_opens = match o.get("--join-opens") {
-            Some(t) => timestamp(t)?,
-            None => starts
-                .checked_sub(8 * 3600)
-                .ok_or("start is before the eight-hour join window")?,
-        };
         let c = Challenge {
             buyer,
             id: o.required("--id")?.into(),
             title: o.required("--title")?.into(),
             goal: std::fs::read_to_string(o.required("--goal-file")?)
                 .map_err(|_| "could not read goal file")?,
-            join_opens,
-            join_closes: starts,
             starts,
             ends: timestamp(o.required("--ends")?)?,
             budget_sats: o
@@ -437,6 +428,11 @@ mod tests {
         s.split_whitespace().map(str::to_owned).collect()
     }
     #[test]
+    fn publish_rejects_removed_join_opens_option() {
+        assert!(parse(&args("publish --join-opens 2026-10-15T00:00:00Z")).is_err());
+        assert!(!HELP.contains("--join-opens"));
+    }
+    #[test]
     fn challenge_options_are_strict() {
         for s in [
             "join --buyer abc --minutes 1",
@@ -602,8 +598,6 @@ mod tests {
                 id: "today".into(),
                 title: "Build".into(),
                 goal: String::new(),
-                join_opens: now,
-                join_closes: now + 3600,
                 starts: now + 3600,
                 ends: now + 7200,
                 budget_sats: 0,
@@ -667,8 +661,9 @@ mod tests {
             let since = body["members"][0]["membership"]["since"].clone();
             let publish=parse(&args(&format!("publish --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now+3590),iso(now+7200)))).unwrap();
             let (published, _) = execute_async(&publish, &buyer).await.unwrap();
-            assert_eq!(published["challenge"]["join_opens"], now + 3590 - 28800);
-            assert_eq!(published["challenge"]["join_closes"], now + 3590);
+            assert!(published["challenge"].get("join_opens").is_none());
+            assert!(published["challenge"].get("join_closes").is_none());
+            assert_eq!(published["challenge"]["starts"], now + 3590);
             let join = parse(&args(&format!("join --buyer {buyer_key} --minutes 60"))).unwrap();
             let (_, warning) = execute_async(&join, &seller).await.unwrap();
             assert!(warning.is_some());

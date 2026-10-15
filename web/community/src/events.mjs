@@ -20,9 +20,9 @@ export function signAuth(key, relay, challenge, now = Math.floor(Date.now()/1000
 const scalar = (e,k) => one(e,k) && e.tags.find(t=>t[0]===k).length===2;
 export function validChallenge(e,buyer) {
   if (e.kind !== 30341 || e.pubkey !== buyer || !namespace(e)) return false;
-  if (!['d','title','join_opens','join_closes','starts','ends','status'].every(k=>scalar(e,k)) || !one(e,'budget') || e.tags.find(t=>t[0]==='budget').length!==3 || ['update','result'].some(k=>e.tags.some(t=>t[0]===k)&&!scalar(e,k))) return false;
-  const [opens,closes,starts,ends,budget] = ['join_opens','join_closes','starts','ends','budget'].map(k=>number(tag(e,k)));
-  return /^[a-z0-9-]{1,64}$/.test(tag(e,'d')) && !!tag(e,'title')?.trim() && [opens,closes,starts,ends,budget].every(n=>n!==null) && opens<closes && starts===closes && ends>starts && e.tags.find(t=>t[0]==='budget')[2]==='sat' && ['scheduled','in_progress','completed','cancelled'].includes(tag(e,'status'));
+  if (!['d','title','starts','ends','status'].every(k=>scalar(e,k)) || !one(e,'budget') || e.tags.find(t=>t[0]==='budget').length!==3 || ['update','result'].some(k=>e.tags.some(t=>t[0]===k)&&!scalar(e,k))) return false;
+  const [starts,ends,budget] = ['starts','ends','budget'].map(k=>number(tag(e,k)));
+  return /^[a-z0-9-]{1,64}$/.test(tag(e,'d')) && !!tag(e,'title')?.trim() && [starts,ends,budget].every(n=>n!==null) && ends>starts && e.tags.find(t=>t[0]==='budget')[2]==='sat' && ['scheduled','in_progress','completed','cancelled'].includes(tag(e,'status'));
 }
 // Challenge events remain v1; existing buyer public jobs use the public-v2 envelope.
 export const tradeNamespace = e => namespace(e) || ([3401,3402,3403,3405,3406].includes(e.kind) && e.tags.some(t=>t[0]==='t'&&t[1]==='maxplayer') && one(e,'v') && tag(e,'v')==='2' && one(e,'visibility') && tag(e,'visibility')==='public' && one(e,'job') && hex(tag(e,'job')));

@@ -39,8 +39,7 @@ export function demoSnapshot(nowSecs: number): Snapshot {
         "- both keywords",
         "Puzzle and ciphertext: https://github.com/elder-plinius/V3R1T4S/blob/main/known-unknowns/unbroken-ciphers/mtc3-hutton-cipher-part-5.md",
       ].join("\n\n"),
-      starts, ends: starts + min(240), joinOpens: starts - min(480), joinCloses: starts,
-      status: "in_progress", result: "",
+      starts, ends: starts + min(240), status: "in_progress", result: "",
     },
     sellers: [
       seller(s.a[0], s.a[1], "cipher-crunch", 60, 32, "working", "accepted", now - min(12)),

@@ -77,8 +77,6 @@ pub struct Challenge {
     pub id: String,
     pub title: String,
     pub goal: String,
-    pub join_opens: u64,
-    pub join_closes: u64,
     pub starts: u64,
     pub ends: u64,
     pub budget_sats: u64,
@@ -94,8 +92,6 @@ impl Challenge {
         let mut t = tags(&self.id);
         for (k, v) in [
             ("title", self.title.clone()),
-            ("join_opens", self.join_opens.to_string()),
-            ("join_closes", self.join_closes.to_string()),
             ("starts", self.starts.to_string()),
             ("ends", self.ends.to_string()),
             ("status", self.status.clone()),
@@ -126,12 +122,10 @@ fn parse_challenge_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Ch
     )?;
     let id = value(d, "d")?;
     require(valid_id(id), "bad challenge d")?;
-    let join_opens = number(value(d, "join_opens")?)?;
-    let join_closes = number(value(d, "join_closes")?)?;
     let starts = number(value(d, "starts")?)?;
     let ends = number(value(d, "ends")?)?;
     require(
-        join_opens < join_closes && starts == join_closes && ends > starts,
+        ends > starts,
         "invalid challenge times",
     )?;
     let b = tag(d, "budget")?;
@@ -152,8 +146,6 @@ fn parse_challenge_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Ch
         id: id.into(),
         title: title.into(),
         goal: d.content.clone(),
-        join_opens,
-        join_closes,
         starts,
         ends,
         budget_sats,
@@ -319,7 +311,7 @@ mod signed {
             .filter_map(|e| parse_membership(e, &c.buyer).ok())
             .filter(|a| {
                 a.status == "joined"
-                    && a.since <= c.join_closes.saturating_add(900)
+                    && a.since <= c.starts
                     && accepted.contains(&a.seller)
             })
             .collect()
@@ -337,8 +329,6 @@ mod tests {
             id: "today".into(),
             title: "Build".into(),
             goal: "Goal".into(),
-            join_opens: 100,
-            join_closes: 3700,
             starts: 3700,
             ends: 7300,
             budget_sats: 100,
@@ -477,10 +467,7 @@ mod tests {
             assert!(a.to_event_draft(&c.buyer).is_ok());
         }
         for (k, v) in [
-            ("join_opens", "-1"),
-            ("join_closes", "100"),
-            ("join_closes", "3701"),
-            ("starts", "3699"),
+            ("starts", "-1"),
             ("ends", "3700"),
             ("budget", "-1"),
             ("status", "unknown"),
@@ -559,8 +546,6 @@ mod tests {
             let mut day2 = c.clone();
             day2.id = "tomorrow".into();
             day2.starts += 86400;
-            day2.join_closes += 86400;
-            day2.join_opens += 86400;
             day2.ends += 86400;
             for day in [&c, &day2] {
                 assert_eq!(eligible_sellers(day, [&joined, &accepted]), vec![a.clone()]);
@@ -572,7 +557,7 @@ mod tests {
                 eligible_sellers(&c, [&joined, &changed, &accepted]),
                 vec![a.clone()]
             );
-            a.since = c.join_closes + 900;
+            a.since = c.starts;
             let boundary = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 10000);
             assert_eq!(eligible_sellers(&c, [&boundary, &accepted]).len(), 1);
             a.since += 1;

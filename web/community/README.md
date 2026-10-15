@@ -92,11 +92,11 @@ refunds and private money state cannot be inferred. Missing amounts are counted 
 30342 is one membership per seller/buyer (`d=p=buyer`, no `a`), with daily minutes,
 `joined|left`, and `since`. 30343 is one persistent decision per buyer/seller
 (`d=p=seller`, no `a`). Accepted membership carries into every daily challenge without
-rejoining. Eligibility requires joined + accepted + `since <= join_closes + 900`.
+rejoining. Eligibility requires joined + accepted + `since <= starts`.
 Leaving immediately blocks new assignments but preserves awarded work and settlement.
 Minutes used include only jobs in the selected day's work window, so allowances reset
 daily. The API includes `membershipStatus` and `since`; states include joined, accepted,
 working, done, left and denied. Review commands are per seller, not per challenge.
 
-Publish defaults to an eight-hour sign-up window ending at `starts`. Use
+Sellers can join at any time. Joining after work starts takes effect the next day. Use
 `maxplayer challenge members [--challenge <d>]` to compare CLI eligibility with the reader.

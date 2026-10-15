@@ -173,7 +173,7 @@ try:
         goal.write_text('Return the fixture answer 42. No paid work.\n')
         cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--starts', iso(starts), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
         c = wait('challenge visible in app', lambda: snapshot()['challenge'])
-        check('default sign-ups open eight hours before work and close at start', c['joinOpens'] == starts - 28800 and c['joinCloses'] == starts)
+        check('challenge exposes work times without sign-up tags', c['starts'] == starts and 'joinOpens' not in c and 'joinCloses' not in c)
         stream_frames = []
         def consume_stream():
             try:
@@ -258,15 +258,15 @@ try:
         check('leave preserves settled job/minutes', len(s['jobs']) == 1 and next(x for x in s['sellers'] if x['pubkey'] == SELLER)['minutesUsed'] == own['minutesUsed'])
         rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'local-e2e', '--json'))['members']
         check('Rust CLI confirms left ineligible seller', len(rows) == 1 and not rows[0]['eligible'] and rows[0]['membership']['status'] == 'left')
-        # Publish a past day so a real-time join is beyond the 900-second tolerance.
-        late_start = int(time.time()) - 1800
+        # Join just after work starts: even within 900 seconds there is no grace period.
+        late_start = int(time.time()) - 1
         publish_day('late-day', late_start, late_start + 3600)
         cli(denied_env, 'leave', '--buyer', BUYER)
         cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '30')
         cli(buyer_env, 'decide', '--seller', DENIED, '--accept')
-        late = wait('late join visible and accepted', lambda: (s if any(x['pubkey'] == DENIED and x['membershipStatus'] == 'joined' and x['decision'] == 'accepted' and x['since'] > late_start + 900 for x in s['sellers']) else None) if (s := snapshot()) else None)
+        late = wait('late join visible and accepted', lambda: (s if any(x['pubkey'] == DENIED and x['membershipStatus'] == 'joined' and x['decision'] == 'accepted' and x['since'] > late_start for x in s['sellers']) else None) if (s := snapshot()) else None)
         lateown = next(x for x in late['sellers'] if x['pubkey'] == DENIED)
-        check('join after close plus tolerance cannot receive same-day assignments', not lateown['eligible'] and not plan(late)['postingAllowed'])
+        check('join after starts cannot receive same-day assignments', not lateown['eligible'] and not plan(late)['postingAllowed'])
         rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-day', '--json'))['members']
         check('Rust confirms late join ineligible that day', not rows[0]['eligible'])
         nextday = publish_day('late-next-day', late_start + 86400, late_start + 90000)

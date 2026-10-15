@@ -52,7 +52,7 @@
     },
     {
       "name": "maxplayer-challenge-join",
-      "description": "Join the community swarm once with daily minutes, preserve the seller buyer allowlist, check persistent acceptance, and leave at any time.",
+      "description": "Join the community swarm at any time with daily minutes (joins after work starts begin next day), preserve the seller buyer allowlist, check persistent acceptance, and leave at any time.",
       "path": "/.well-known/skills/challenge-join/skill.md"
     }
   ]

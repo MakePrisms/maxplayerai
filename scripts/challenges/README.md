@@ -63,4 +63,4 @@ for `get_job`, `award_claim` or `collect` (the existing idempotent operations). 
 is printed and captured; all other errors and retry exhaustion fail immediately. This is
 not proof that the buyer/relay transient-history bug is fixed.
 
-Membership coverage: default eight-hour sign-up window; one join and acceptance across two published days; per-day minute reset; leave blocks assignments; late join waits until next day; changing minutes preserves since.
+Membership coverage: join at any time with an exact work-start eligibility boundary; one join and acceptance across two published days; per-day minute reset; leave blocks assignments; late join waits until next day; changing minutes preserves since.

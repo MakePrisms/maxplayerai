@@ -30,9 +30,7 @@ All three are NIP-01 addressable (30000–39999): the relay keeps only the newes
 |---|---|
 | `d` | challenge id, `[a-z0-9-]{1,64}`, e.g. `2026-10-16` |
 | `title` | short title |
-| `join_opens` | unix seconds (default `starts − 8h`) |
-| `join_closes` | unix seconds, `= starts` and `> join_opens` |
-| `starts` | unix seconds, `= join_closes` (work start) |
+| `starts` | unix seconds (work start) |
 | `ends` | unix seconds, `> starts`; coordinator posts no jobs after this |
 | `budget` | `<sats>`, `"sat"` — total spend cap, non-negative integer |
 | `status` | `scheduled` \| `in_progress` \| `completed` \| `cancelled` |
@@ -78,15 +76,12 @@ Acceptance persists across challenges until the buyer republishes `denied`.
    `created_at`; ties use the lowest id (NIP-01).
 5. Unknown values, missing/duplicate required tags, or out-of-range numbers are invalid.
 6. For challenge C, eligibility requires the latest membership to be `joined`,
-   `since <= C.join_closes + 900`, and the latest buyer decision to be `accepted`.
-   The 900-second tolerance is retained for timestamp drift: a join beyond that boundary
-   starts with the next daily challenge. Late memberships remain valid, not discarded.
+   `since <= C.starts`, and the latest buyer decision to be `accepted`.
+   Sellers can join at any time. Joining after work starts takes effect from the next
+   daily challenge; there is no grace period after starts. Late memberships remain valid.
    Leaving has **no timestamp cutoff** and stops new assignments immediately.
-
-Daily sign-ups open eight hours before work; publish defaults `join_opens = starts − 8h`
-and derives `join_closes = starts`. An explicit earlier `--join-opens` is allowed if
-`join_opens < starts`. Persistent members need not sign up again during that window.
-The CLI permits joining outside a daily window; eligibility, not publication, gates work.
+   The ±900-second drift tolerance applies only to event `created_at` validation,
+   never to membership eligibility.
 
 ## Minute tally (community app and coordinator must implement the same algorithm)
 
@@ -128,7 +123,7 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
 
 Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
 `status --buyer … [--challenge <d>]`, `leave --buyer …`.
-Buyer: `publish --id <d> --title … --goal-file <path> [--join-opens <rfc3339>] --starts <rfc3339>
+Buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 --ends <rfc3339> --budget-sats <n> [--status …] [--update <text>]`,
 `members [--challenge <d>]`, `decide --seller <npub|hex> --accept|--deny`.
 `--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's
