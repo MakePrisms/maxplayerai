@@ -3,6 +3,7 @@ import { demoSnapshot } from "./challenge/demo.js";
 import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
 import { writeClipboard } from "./ui/clipboard.js";
+import { usd, onSpotChange, startSpot } from "./ui/spot.js";
 declare const COMMUNITY_APP_URL: string;
 
 const el = (id: string) => document.getElementById(id)!;
@@ -52,10 +53,10 @@ function render(s: Snapshot): void {
   renderJob(document, c.goal);
   text("join-open", when(c.joinOpens));
   text("challenge-start", when(c.starts));
-  text("challenge-budget", `${s.budget!.totalSats.toLocaleString()} sats`);
+  text("challenge-budget", usd(s.budget!.totalSats));
   text("buyer-npub", c.buyerNpub);
   text("buyer-hex", buyerHex(c.buyerNpub));
-  text("apply-command", `maxplayer challenge apply --buyer ${c.buyerNpub} --challenge ${c.id} --minutes 60`);
+  text("apply-command", `maxplayer challenge join --buyer ${c.buyerNpub} --minutes 60`);
   tick();
 }
 function tick(): void {
@@ -88,3 +89,6 @@ async function connect(): Promise<void> {
 if (new URLSearchParams(location.search).has("demo")) receive(demoSnapshot(Date.now() / 1000), "Demo data · not a real challenge");
 else void connect();
 setInterval(tick, 1000);
+// Budget shows in dollars at the live BTC-USD rate, like the rest of the site.
+onSpotChange(() => { if (snapshot) render(snapshot); });
+startSpot();

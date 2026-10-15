@@ -344,6 +344,6 @@ test('community connection is isolated to the unlisted challenge route', () => {
   const {headers}=JSON.parse(readFileSync(join(root,'vercel.json'),'utf8'));
   const csp=path=>headers.filter(h=>new RegExp(`^${h.source}$`).test(path)).flatMap(h=>h.headers.filter(x=>x.key==='Content-Security-Policy').map(x=>x.value));
   assert.equal(csp('/challenges').length,1);
-  assert.match(csp('/challenges')[0],/connect-src 'self' https:\/\/community\.maxplayer\.ai;/);
+  assert.match(csp('/challenges')[0],/connect-src 'self' https:\/\/community\.maxplayer\.ai https:\/\/api\.coinbase\.com;/);
   for(const path of ['/','/market','/challenges.js'])assert.ok(!csp(path)[0].includes('community.maxplayer.ai'));
 });
