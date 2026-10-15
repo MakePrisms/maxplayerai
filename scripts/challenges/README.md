@@ -199,3 +199,8 @@ runner launch per day assigns successive jobs to **both** accepted sellers, coll
 and publishes either solved + result or unsolved minute exhaustion. The harness makes no manual
 post/award/collect calls in these scenarios. Both assert zero payment and no post after stop.
 The run script honors an explicitly supplied `CARGO_TARGET_DIR`; Buzz retains its separate target.
+The disposable Buzz fixture raises its per-principal WS/message limits to 1000/sec and
+10000/min respectively because one-second polling opens many MCP lifecycle subscriptions.
+This tests orchestration/settlement, not production quota behavior. Production limits are unchanged.
+Sticky failed preparations that name a queued offer are recovered by inspecting that offer;
+permanent publication refusals and expired/undelivered jobs are recorded without reposting them.

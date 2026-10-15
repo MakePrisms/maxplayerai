@@ -67,7 +67,13 @@ export class Swarm {
       if(!j.id) {
         let recovered;
         try { recovered=await this.io.mcp('get_job',{job_id:preparationId(j.args.request_id)}); }
-        catch(e) { if(!e.message.includes('unknown preparation handle'))throw e; }
+        catch(e) {
+          // Failed preparations are sticky once an offer was queued. The buyer explicitly
+          // supplies its ID: inspect that offer, never retry the failed preparation forever.
+          const offer=e.message.match(/Offer ([0-9a-f]{64}) was queued for publication/);
+          if(offer)recovered={job_id:offer[1]};
+          else if(!e.message.includes('unknown preparation handle'))throw e;
+        }
         if(recovered) {
           j.id=recovered.job_id??recovered.preparation_id??preparationId(j.args.request_id);this.save();
         } else {
@@ -90,7 +96,8 @@ export class Swarm {
       if(state.results?.length) {
         const collected=await this.io.mcp('collect',{job_id:j.id});
         j.answer=await this.io.answer(collected);j.ts=now;j.done=true;j.outcome='collected';j.pay=collected.pay;this.save();
-      } else if(now>=j.args.deadline_unix) {j.done=true;j.outcome='expired/undelivered';j.ts=now;this.save();}
+      } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
+      else if(now>=j.args.deadline_unix) {j.done=true;j.outcome='expired/undelivered';j.ts=now;this.save();}
       else if(this.c.awardFallback && now-j.created>=this.c.awardAfter && !state.awarded) {
         const claim=state.claims?.find(c=>c.live&&c.seller_pubkey===j.seller);
         if(claim)await this.io.mcp('award_claim',{job_id:j.id,claim_id:claim.claim_id,max_sats:j.args.max_sats});

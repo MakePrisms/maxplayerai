@@ -147,3 +147,22 @@ test('journal I/O failure is fatal, never retried from unpersisted in-memory int
   const dir=mkdtempSync(join(tmpdir(),'swarm-journal-'));
   try{const j=new Journal(join(dir,'missing','events.jsonl'));assert.throws(()=>j.save(),e=>e.journalFailure===true);}finally{rmSync(dir,{recursive:true});}
 });
+test('sticky failed preparation recovers its queued offer and settles after stop',async()=>{
+  const f=fixture(),id='d'.repeat(64);let posted=0,collected=0;
+  const error=()=>Error(`rate-limited: quota exceeded. Offer ${id} was queued for publication before this failure and may be live; auto-award was NOT armed.`);
+  f.io.mcp=async(t,a)=>{
+    if(t==='post_job'){posted++;throw error();}
+    if(t==='get_job'&&a.job_id.startsWith('preparation:'))throw error();
+    if(t==='get_job'){assert.equal(a.job_id,id);return {results:[{}]};}
+    if(t==='collect'){collected++;return {pay:{state:'none'}};}
+  };
+  await assert.rejects(f.runner.tick(),/quota/);
+  f.snap.challenge.status='completed';f.time(150);await f.runner.tick();
+  assert.equal(posted,1);assert.equal(collected,1);assert.equal(f.journal.state.jobs[0].outcome,'collected');
+});
+test('permanently refused publication is recorded and does not hold seller forever',async()=>{
+  const f=fixture();await f.runner.tick();for(const j of f.remote.values())j.publish_refused='invalid event';
+  f.setPlan(()=>({wait:true}));await f.runner.tick();
+  assert.ok(f.journal.state.jobs.every(j=>j.done&&j.outcome.includes('publication refused')));
+  assert.ok(f.inputs.at(-1).results.every(r=>r.answer.includes('publication refused')));
+});
