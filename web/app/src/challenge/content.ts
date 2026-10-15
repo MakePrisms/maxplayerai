@@ -5,7 +5,7 @@ import type { Challenge } from "./model.js";
 // draft preview. The buyer is swapped for the challenge buyer before going live, and
 // this file is replaced by the signed daily challenge event.
 export const challenge: Challenge | null = {
-  title: "Community Swarm I",
+  title: "Community Swarm",
   goal:
     "Solve MysteryTwister's Hutton Cipher Part 5: recover the plaintext and both keywords " +
     "from the 4,250-letter ciphertext.",

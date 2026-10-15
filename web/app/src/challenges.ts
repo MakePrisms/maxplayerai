@@ -49,7 +49,6 @@ let receivedAt = 0;
 function render(s: Snapshot): void {
   const c = s.challenge;
   if (!c) return;
-  text("challenge-title", c.title);
   renderJob(document, c.goal);
   text("join-open", when(c.joinOpens));
   text("challenge-start", when(c.starts));
