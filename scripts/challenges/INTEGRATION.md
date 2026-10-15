@@ -1,3 +1,42 @@
+# Auto-award regression follow-up — 2026-10-15
+
+The harness now **never calls `award_claim`**: it requires the buyer daemon's
+award within 60 seconds after observing the claim. Historical evidence below
+predates this change.
+
+A full unmodified-transport run and five repeated baseline runs passed, confirming
+that ordinary scheduling does not reproduce the original failure consistently.
+The loopback-only `--duplicate-history` fixture deterministically models Buzz's
+live/history overlap: `req.rs` registers live fan-out before querying historical
+rows, allowing the same signed claim to arrive twice before EOSE.
+
+Reproduce with the base buyer (2b434ad6 plus count-only diagnostics):
+
+```sh
+bash scripts/challenges/run-e2e.sh --skip-build --baseline --duplicate-history
+```
+
+Captured on the base buyer, without a manual award:
+
+```text
+lifecycle wire history incomplete: rows=2 accepted=1 ended=true failed=false
+22:12:47Z buyer: auto-award for 7ec203017a136da343e5fe9f80a420023674625caaf76e93df87e8b69496127f did not complete (job lifecycle relay: lifecycle wire history incomplete); left pending for re-arm
+```
+
+The wire guard counts frames; `history::collect` formerly deduplicated IDs before
+that comparison. It now retains validated frames until completeness/saturation
+checks, and `paginate` deduplicates the final history. Invalid events, missing
+EOSE, notification loss, partial auth restarts and saturated pages still fail
+closed. Original deployment frames were not retained, so this proves a matching
+failure mechanism, not that every historical incident had the same cause.
+
+Transient driver errors now retry after 1/2/4/8/16/30 seconds (30-second cap), bounded
+by the locally retained signed offer deadline. Retries use the same reserve-first
+and pinned-award path. Missing legacy cache gets a bounded 5-minute recovery window;
+unknown history never releases reservations or falsely marks an offer absent.
+
+---
+
 # Local integration evidence
 
 ## Existing buyer auto-award: intermittent incomplete history

@@ -29,6 +29,7 @@ pub mod reservations;
 pub mod signer;
 pub mod store;
 mod preparations;
+mod auto_award_retry;
 
 /// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
 #[cfg(test)]
@@ -1583,13 +1584,51 @@ fn buyer_keys(home: &MaxplayerHome) -> Result<nostr_sdk::Keys, String> {
     nostr_sdk::Keys::parse(&secret).map_err(|error| format!("buyer key parse: {error}"))
 }
 
-/// Spawn the background auto-award task for a posted job — the daemon-drives-the-award half of the
-/// 2-call trade loop. A task failure never affects the daemon; the intent stays `pending` and is
-/// re-armed on the next start.
+/// Read the locally signed offer, so a relay outage cannot hide the retry deadline.
+/// Both public and private post paths persist it before publication.
+fn auto_award_deadline(context: &BuyerContext, job_id: &str) -> Option<u64> {
+    for name in ["public-v2.sqlite", "private-content.sqlite"] {
+        let path = context.home.root.join(name);
+        if !path.exists() { continue; }
+        let offer = crate::private_content::store::ContentStore::open(&path)
+            .and_then(|store| store.event(job_id));
+        if let Ok(Some(offer)) = offer {
+            if offer.id.to_hex() == job_id && offer.verify().is_ok() {
+                if let Ok(parsed) = crate::gateway::parse_offer(&job_lifecycle::event_to_draft(&offer)) {
+                    return Some(parsed.deadline_unix);
+                }
+            }
+        }
+    }
+    context.store.award_attempt(job_id).ok().flatten()
+        .and_then(|attempt| u64::try_from(attempt.offer_deadline_unix).ok())
+}
+
+/// Spawn one retrying driver per posted/re-armed intent. Every retry re-enters the
+/// existing idempotency and reserve-then-award checks, including pinned bytes.
 fn spawn_auto_award(context: Arc<BuyerContext>, job_id: String, max_sats: u64) {
     tokio::spawn(async move {
-        if let Err(error) = drive_auto_award(&context, &job_id, max_sats).await {
-            crate::opline!("buyer: auto-award for {job_id} did not complete ({error}); left pending for re-arm");
+        // Legacy intents without cached offers get a bounded recovery window;
+        // their driver still checks the actual offer deadline before awarding.
+        let remaining = auto_award_deadline(&context, &job_id)
+            .map(|deadline| deadline.saturating_sub(now_unix() as u64))
+            .unwrap_or(300);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(remaining);
+        let result = auto_award_retry::run(deadline, || async {
+            if context.store.pending_award_state(&job_id).ok().flatten()
+                .is_some_and(|(state, _)| state != "pending") {
+                return Ok(());
+            }
+            let result = drive_auto_award(&context, &job_id, max_sats).await;
+            if let Err(error) = &result {
+                crate::opline!("buyer: auto-award for {job_id} did not complete ({error}); retrying with bounded backoff until offer deadline");
+            }
+            result
+        }).await;
+        if let Err(error) = result {
+            // Unknown history is never proof of absence. Preserve pending state
+            // and reservations; the attempt resolver can still probe an ambiguous send.
+            crate::opline!("buyer: auto-award retry window ended for {job_id} ({error}); left pending for reconciliation");
         }
     });
 }
@@ -1605,7 +1644,7 @@ fn spawn_auto_award(context: Arc<BuyerContext>, job_id: String, max_sats: u64) {
 ///   (e.g. funds shrank) PARKS the intent with a surfaced reason — never a silent drop.
 ///
 /// Returns `Err` only on a transient relay/wallet failure; the intent then stays `pending` and is
-/// re-armed on the next start.
+/// retried in-process until the offer deadline (and re-armed after a crash).
 async fn drive_auto_award(
     context: &Arc<BuyerContext>,
     job_id: &str,
@@ -1900,7 +1939,7 @@ async fn finalize_auto_award(
         }
         // Presence could not be verified, local state could not be read, or the send got no
         // verdict: UNKNOWN, and possibly a transient relay/DB blip. Return Err so the intent stays
-        // `pending` and re-arms on the next start (this function's contract) instead of demanding
+        // `pending` and retries in-process (this function's contract) instead of demanding
         // an operator for a 10-second hiccup. Re-arming is safe by construction: the chokepoint
         // refuses again on every unverified pass, and an UNRESOLVED attempt re-sends its own
         // pinned bytes — so retrying can never publish a duplicate; it can only converge.
@@ -4650,6 +4689,65 @@ mod tests {
                 } else { nostr_relay_builder::prelude::PolicyResult::Accept }
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct RefuseFirstClaimRead(Arc<std::sync::atomic::AtomicUsize>);
+    impl nostr_relay_builder::prelude::QueryPolicy for RefuseFirstClaimRead {
+        fn admit_query<'a>(&'a self, query: &'a nostr_sdk::Filter, _: &'a std::net::SocketAddr)
+            -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult> {
+            Box::pin(async move {
+                if query.kinds.as_ref().is_some_and(|k|
+                    k.contains(&nostr_sdk::Kind::Custom(crate::kinds::JOB_CLAIM_KIND)))
+                    && self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    nostr_relay_builder::prelude::PolicyResult::Reject("temporary history failure".into())
+                } else { nostr_relay_builder::prelude::PolicyResult::Accept }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_award_retries_in_process_and_rearm_keeps_one_reserved_award() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::*;
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let relay = LocalRelay::new(RelayBuilder::default().query_policy(RefuseFirstClaimRead(reads.clone())));
+        relay.run().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut home = bootstrap_home(root.path()).unwrap();
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        let deadline = now_unix() as u64 + 120;
+        let (e, keys) = crate::private_content::public_v2::tests::fixture_deadline(false, false, deadline);
+        crate::private_content::public_v2::Context::open(&home).unwrap().remember(&e.offer, &e.offer).unwrap();
+        let publisher = Client::new(keys);
+        publisher.add_relay(&home.config.relay_url).await.unwrap();
+        publisher.connect().await;
+        for event in [&e.offer, &e.claim] {
+            assert!(!publisher.send_event(event).await.unwrap().success.is_empty());
+        }
+        let job = e.offer.id.to_hex();
+        let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        assert_eq!(auto_award_deadline(&context, &job), Some(deadline));
+        context.store.put_pending_award(&job, 0, None, None, now_unix()).unwrap();
+        spawn_auto_award(context.clone(), job.clone(), 0);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if context.store.pending_award_state(&job).unwrap().is_some_and(|(state, _)| state == "awarded") { break; }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.expect("one failed read must recover without restarting or manual award");
+        assert!(reads.load(Ordering::SeqCst) >= 2);
+        let before = context.store.award_attempt(&job).unwrap().unwrap();
+        assert_eq!(before.state, store::AttemptState::Confirmed);
+        assert!(context.store.reservation(&job).unwrap().is_some());
+        drive_auto_award(&context, &job, 0).await.unwrap();
+        let after = context.store.award_attempt(&job).unwrap().unwrap();
+        assert_eq!(after.event_json, before.event_json);
+        assert_eq!(after.send_count, before.send_count);
+        let awards = publisher.fetch_events(Filter::new().kind(Kind::Custom(crate::kinds::JOB_AWARD_KIND)).event(e.offer.id), Duration::from_secs(2)).await.unwrap();
+        assert_eq!(awards.len(), 1);
+        publisher.disconnect().await;
     }
 
     #[tokio::test]
