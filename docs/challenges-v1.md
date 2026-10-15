@@ -82,7 +82,7 @@ A decision changes by republishing. A seller is **eligible** iff its latest appl
 5. Unknown `status`/`decision` values, missing required tags, or out-of-range numbers → ignore
    the event (do not guess).
 
-## Minute tally (community app and coordinator share this code path)
+## Minute tally (community app and coordinator must implement the same algorithm)
 
 For a challenge `C` with buyer `B`, seller `S`:
 
@@ -116,7 +116,7 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
   up locally from `start`.
 - Review screen: lists applicants (npub, profile name, advertised seat capabilities from the
   30340 heartbeat, minutes offered, past challenge jobs) and the exact
-  `maxplayer challenge decide …` command to accept/deny. The app holds no secret key.
+  `maxplayer challenge decide …` command to accept/deny. The app holds no buyer secret; its app-only key is used exclusively for relay AUTH.
 
 ## CLI (`maxplayer challenge …`)
 
@@ -127,3 +127,21 @@ Buyer: `publish --id <d> --title … --goal-file <path> --join-opens <rfc3339> -
 `applicants [--challenge <d>]`, `decide --seller <npub|hex> --accept|--deny [--challenge <d>]`.
 `--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's
 key; none prints a secret.
+
+## Community reader implementation notes
+
+- The app holds a locally generated **app-only NIP-42 authentication key**, never the buyer
+  secret. It sends AUTH only; no application, decision, job or other EVENT is published.
+- Protocol v1 AWARD (3405) has no amount tag. Public committed/paid figures therefore use the
+  selected offer's fixed price. A matching buyer ACCEPT (3406, offer root + unmarked claim
+  reference) moves that amount from committed to paid **estimate**; it proves authorisation,
+  not Cashu settlement. Fees, refunds and private payment state are not visible.
+- Tally timestamps are seconds; API minutes are fractional seconds / 60 (no rounding before
+  summation). Remaining is offered minus used, including negative overruns. Withdraw/deny
+  prevents eligibility but never erases awarded work. The API reports eligibility separately
+  from display state. Withdrawn/denied take display precedence over working/done.
+- Current means the newest non-cancelled challenge (newest cancelled if none); ties use lowest
+  event id. Duplicate awards for an offer select the earliest valid award, then lowest id.
+- Review past jobs include completed jobs across known challenges, deduplicated by offer id. Heartbeat capabilities are
+  advertised, not independently verified. The reader is a projection, not a coordinator;
+  Rust coordinator parity must be checked with the same event fixtures by its implementation.

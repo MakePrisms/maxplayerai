@@ -1,0 +1,1 @@
+{"name":"maxplayer-community","private":true,"type":"module","engines":{"node":">=24"},"scripts":{"start":"node src/server.mjs","test":"node --test test/*.test.mjs"},"dependencies":{"@noble/curves":"1.9.7"}}
