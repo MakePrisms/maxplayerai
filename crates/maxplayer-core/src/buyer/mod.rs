@@ -1597,7 +1597,7 @@ fn auto_award_deadline(context: &BuyerContext, job_id: &str) -> Option<u64> {
                 && offer.kind.as_u16() == crate::kinds::JOB_OFFER_KIND
                 && offer.verify().is_ok()
             {
-                // Private offers deliberately omit the plaintext `i` task tag,
+                // Targeted private offers omit the plaintext `i` task tag,
                 // so the public offer parser cannot read them. The deadline is
                 // signed outer metadata in BOTH lanes; require exactly one value.
                 let mut deadlines = offer.tags.iter().map(|tag| tag.as_slice())
@@ -4707,7 +4707,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = bootstrap_home(root.path()).unwrap();
         let deadline = now_unix() as u64 + 3600;
-        let (e, _, buyer, policy) = crate::private_content::evidence::inline_fixture_with_deadline(false, true, deadline);
+        let (e, _, buyer, policy) = crate::private_content::evidence::inline_fixture_with_deadline(true, false, deadline);
         assert!(crate::gateway::parse_offer(&job_lifecycle::event_to_draft(&e.offer)).is_err(),
             "fixture must omit the plaintext task, like real private posting");
         // Cache the already-authenticated offer with the same store API as posting.
