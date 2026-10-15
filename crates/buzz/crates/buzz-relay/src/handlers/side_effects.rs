@@ -1361,16 +1361,7 @@ async fn handle_kind0_profile(
 
     let about = content.get("about").and_then(|v| v.as_str()).unwrap_or("");
 
-    // Validate NIP-05 handle: must be user@domain where domain matches the
-    // bound tenant host. Invalid or off-domain handles are silently cleared
-    // (treated as absent) rather than stored, since the event is already
-    // persisted and can't be rejected.
-    let nip05_owned = content
-        .get("nip05")
-        .and_then(|v| v.as_str())
-        .and_then(|raw| crate::api::nip05::canonicalize_nip05(raw, tenant.host()).ok());
-    let nip05_handle = nip05_owned.as_deref().unwrap_or("");
-
+    // NIP-05 advertisement is not ownership. Only the explicit registry writes handles.
     let pubkey_bytes = event.pubkey.to_bytes().to_vec();
 
     if state
@@ -1385,11 +1376,7 @@ async fn handle_kind0_profile(
         .increment(1);
     }
 
-    // Pass all fields as Some — empty string clears the field in the DB.
-    // This ensures kind:0 is treated as absolute state, not a partial update.
-    // If the NIP-05 handle collides with another user's UNIQUE constraint, retry
-    // without it so display_name/about/avatar_url are still written.
-    let result = state
+    state
         .db
         .update_user_profile(
             tenant.community(),
@@ -1397,30 +1384,9 @@ async fn handle_kind0_profile(
             Some(display_name),
             Some(avatar_url),
             Some(about),
-            Some(nip05_handle),
+            None,
         )
-        .await;
-
-    if let Err(ref e) = result {
-        let msg = format!("{e}");
-        if msg.contains("duplicate key value") || msg.contains("23505") {
-            warn!(pubkey = %hex::encode(&pubkey_bytes),
-                "kind:0 NIP-05 handle contested, syncing profile without it");
-            state
-                .db
-                .update_user_profile(
-                    tenant.community(),
-                    &pubkey_bytes,
-                    Some(display_name),
-                    Some(avatar_url),
-                    Some(about),
-                    None, // skip contested NIP-05
-                )
-                .await?;
-        } else {
-            result?;
-        }
-    }
+        .await?;
 
     info!(pubkey = %hex::encode(&pubkey_bytes), "kind:0 profile synced to users table");
     Ok(())

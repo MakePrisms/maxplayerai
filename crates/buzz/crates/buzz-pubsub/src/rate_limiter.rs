@@ -90,6 +90,34 @@ pub struct RedisRateLimiter {
 }
 
 impl RedisRateLimiter {
+    /// Handle mutations: shared per-IP limit, including unauthenticated attempts.
+    pub async fn check_handle_ip(&self, ip: &IpAddr) -> Result<RateLimitResult, AuthError> {
+        run_rate_limit(
+            &self.pool,
+            &format!("buzz:ratelimit:ip:{ip}:handles"),
+            60,
+            60,
+        )
+        .await
+    }
+    /// Handle mutations: separate community/pubkey budget from other API calls.
+    pub async fn check_handle_pubkey(
+        &self,
+        ctx: &TenantContext,
+        pubkey: &PublicKey,
+    ) -> Result<RateLimitResult, AuthError> {
+        run_rate_limit(
+            &self.pool,
+            &format!(
+                "buzz:{}:ratelimit:{}:handles",
+                ctx.community(),
+                pubkey.to_hex()
+            ),
+            60,
+            10,
+        )
+        .await
+    }
     /// Create a new `RedisRateLimiter` backed by the given connection pool.
     pub fn new(pool: deadpool_redis::Pool) -> Self {
         Self { pool }

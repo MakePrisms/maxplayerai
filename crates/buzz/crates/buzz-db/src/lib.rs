@@ -28,6 +28,8 @@ mod store;
 pub mod error;
 /// Maxplayer: job-scoped private Git repository authorization (see NOTICE).
 pub mod private_jobs;
+/// Explicit NIP-05 handle registry.
+pub mod handles;
 
 #[cfg(test)]
 mod test_support;
