@@ -799,8 +799,10 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             response["award_read_confirmed"] = json!(award_read_confirmed);
             // Only the existing buyer reconciliation decides that held funds are released.
             // An unreadable ledger is unknown, never an empty reservation.
-            response["reservation_state"] = json!(context.store.reservation(&response["job_id"].as_str().unwrap_or_default())
+            response["reservation_state"] = json!(context.store.reservation(response["job_id"].as_str().unwrap_or_default())
                 .ok().map(|row| row.map(|(state, _)| state.as_str()).unwrap_or("none")));
+            response["auto_award_state"] = json!(context.store.pending_award_state(response["job_id"].as_str().unwrap_or_default())
+                .ok().flatten().map(|(state, _)| state));
             response["claim_prices"] = json!(claim_prices);
             Response::ok(id, response)
         }

@@ -155,7 +155,7 @@ collected. The process remains alive for subsequent days. All local offers reser
 price serially before posting, including unawarded offers. Closed collect receipts move
 actual sats from reserved to paid. Timeout alone does not release: an expired matching offer
 needs confirmed empty/expired claims and empty results, no accepted bind, a successful no-award lookup and no
-buyer reservation, or the buyer's existing ledger must have reconciled it to released with
+buyer reservation and parked auto-award intent, or the buyer's existing ledger must have reconciled it to released with
 no pending delivery/accept. Free terminal jobs, abandoned never-posted intents and refused
 publications release too. Uncertainty retains reservations across restarts and keeps polling
 possibly payable work. At zero headroom, free work remains possible; budget stops only on

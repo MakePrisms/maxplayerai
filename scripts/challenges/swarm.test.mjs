@@ -254,9 +254,10 @@ test('invalid and over-budget prices are dropped with reasons',async()=>{
   }
 });
 test('confirmed expired never-awarded job releases reservation, incomplete/possibly payable states do not',async()=>{
-  for(const uncertainty of [null,'read','award-read','awarded','accepted','claims','results','offer','reservation']){
+  for(const uncertainty of [null,'read','award-read','awarded','accepted','claims','results','offer','reservation','auto-award']){
     const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>priced(input));await f.runner.tick();
-    const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,award_read_confirmed:true,reservation_state:'none',offer:{deadline_unix:130},claims:[],results:[],accepted:null});
+    const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,award_read_confirmed:true,reservation_state:'none',auto_award_state:'parked',offer:{deadline_unix:130},claims:[],results:[],accepted:null});
+    if(uncertainty==='auto-award')state.auto_award_state='pending';
     if(uncertainty==='reservation')state.reservation_state='reserved';
     if(uncertainty==='read')state.read_confirmed=false;
     if(uncertainty==='award-read')state.award_read_confirmed=false;
@@ -330,7 +331,7 @@ test('lowered budget does not block free work and invalid paid assignments do no
 
 test('expired over-price never-awarded claim releases and leaves its price outcome for the buyer',async()=>{
   const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>priced(input));await f.runner.tick();
-  const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,award_read_confirmed:true,reservation_state:'none',offer:{deadline_unix:130},claims:[{live:false,status:'expired'}],claim_prices:[{seller_pubkey:'a',amount_sats:9}],results:[],accepted:null});
+  const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,award_read_confirmed:true,reservation_state:'none',auto_award_state:'parked',offer:{deadline_unix:130},claims:[{live:false,status:'expired'}],claim_prices:[{seller_pubkey:'a',amount_sats:9}],results:[],accepted:null});
   f.time(131);f.setPlan(()=>({wait:true}));await f.runner.tick();
   assert.equal(jobBudget(f.journal.state.jobs[0]).reservedSats,0);
   assert.equal(f.inputs.at(-1).results[0].outcome,'price too high: asked 9');

@@ -120,7 +120,7 @@ over-budget assignments are dropped with a logged reason. Successful closed paym
 move the actual amount from reserved to paid; public ACCEPT is never proof of payment.
 Expired jobs release only on confirmed evidence: an expired matching offer, complete empty/expired
 claim history and empty results, no accepted bind, a successful local award lookup with no award, and
-no buyer reservation; or the existing buyer ledger has reconciled the reservation to released
+no buyer reservation and parked auto-award intent; or the existing buyer ledger has reconciled the reservation to released
 with no delivery/accept pending. Free terminal jobs, abandoned never-posted intents and
 permanently refused publications also release. Any uncertain/possibly payable paid job stays
 reserved and continues polling, including after stop. An old journal lacking proof stays reserved.
