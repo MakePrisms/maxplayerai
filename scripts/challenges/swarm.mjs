@@ -191,9 +191,14 @@ export class Swarm {
     }
   }
 }
+// maxplayer rejects unknown MAXPLAYER_* variables, so only MAXPLAYER_HOME reaches it from here.
+export function childEnv(env,home) {
+  const out={};for(const [k,v] of Object.entries(env)) if(!k.startsWith('MAXPLAYER_')) out[k]=v;
+  return {...out,MAXPLAYER_HOME:home};
+}
 export function config(argv,env=process.env) {
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--app-url','--planner','--duration-seconds','--amount-sats','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.MAXPLAYER_BINARY??'maxplayer',url:values['--app-url']??env.COMMUNITY_APP_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),amount:+(values['--amount-sats']??env.SWARM_AMOUNT_SATS??0),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),awardFallback:values['--award-fallback']===true};
+  const c={home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--app-url']??env.COMMUNITY_APP_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),amount:+(values['--amount-sats']??env.SWARM_AMOUNT_SATS??0),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),awardFallback:values['--award-fallback']===true};
   if(!c.home||!c.url)throw Error('Explicit buyer home and community app URL required');
   for(const k of ['duration','minDuration','maxDuration','amount','poll','updateEvery','awardAfter'])if(!Number.isSafeInteger(c[k])||c[k]<(k==='amount'?0:1))throw Error(`Invalid ${k}`);
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
@@ -207,7 +212,7 @@ async function main() {
     for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.kill(sig));
     child.on('error',e=>{console.error(e.message);process.exitCode=1;});child.on('exit',code=>{process.exitCode=code??1;});return;
   }
-  const env={...process.env,MAXPLAYER_HOME:c.home};
+  const env=childEnv(process.env,c.home);
   const identity=await command(c.binary,['whoami'],{env});
   const buyer=identity.match(/pubkey: ([0-9a-f]{64})/)?.[1];
   if(!buyer)throw Error('Cannot identify configured buyer');

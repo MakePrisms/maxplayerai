@@ -78,7 +78,7 @@ the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer 
 
 ```sh
 MAXPLAYER_HOME=/absolute/buyer-home \
-MAXPLAYER_BINARY=/absolute/bin/maxplayer \
+SWARM_MAXPLAYER_BINARY=/absolute/bin/maxplayer \
 COMMUNITY_APP_URL=http://127.0.0.1:8787 \
 node scripts/challenges/swarm.mjs
 ```
@@ -96,7 +96,7 @@ Flags (environment equivalents):
 | Flag | Environment | Default |
 | --- | --- | --- |
 | `--home` | `MAXPLAYER_HOME` | required, explicit |
-| `--binary` | `MAXPLAYER_BINARY` | `maxplayer` |
+| `--binary` | `SWARM_MAXPLAYER_BINARY` | `maxplayer` |
 | `--app-url` | `COMMUNITY_APP_URL` | required |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
@@ -203,7 +203,7 @@ After=network-online.target
 Type=simple
 WorkingDirectory=/absolute/maxplayerai
 Environment=MAXPLAYER_HOME=/absolute/buyer-home
-Environment=MAXPLAYER_BINARY=/absolute/bin/maxplayer
+Environment=SWARM_MAXPLAYER_BINARY=/absolute/bin/maxplayer
 Environment=COMMUNITY_APP_URL=http://127.0.0.1:8787
 Environment=SWARM_LLM_BINARY=/absolute/bin/claude
 ExecStart=/absolute/bin/node /absolute/maxplayerai/scripts/challenges/swarm.mjs

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, appendFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Journal, Swarm, validatePlan, requestId, preparationId, config } from './swarm.mjs';
+import { Journal, Swarm, childEnv, validatePlan, requestId, preparationId, config } from './swarm.mjs';
 const analysis={approach:'split',workstreams:[{id:'piece',description:'piece',needs:{skills:[]},estMinutes:1,dependsOn:[]}],verification:'check'};
 const assignments=input=>({assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'piece',durationSeconds:30}))});
 function fixture() {
@@ -228,4 +228,10 @@ test('a current-job marker prevents exhaustion even before the job is projected'
 test('pending work from a previous challenge still blocks a seller',async()=>{
   const f=fixture();await f.runner.tick();f.snap.challenge.id='next';await f.runner.tick();
   assert.equal(f.remote.size,2);assert.equal(f.journal.state.days[JSON.stringify(['b','next'])].stop,undefined);
+});
+
+test('maxplayer child env carries only MAXPLAYER_HOME from the MAXPLAYER_* namespace',()=>{
+  const e=childEnv({PATH:'/bin',MAXPLAYER_BINARY:'/x',MAXPLAYER_RELAY_URL:'ws://y',MAXPLAYER_HOME:'/old'},'/buyer');
+  assert.deepEqual(e,{PATH:'/bin',MAXPLAYER_HOME:'/buyer'});
+  assert.equal(config([],{SWARM_MAXPLAYER_BINARY:'/bin/mp',MAXPLAYER_HOME:'/h',COMMUNITY_APP_URL:'http://a'}).binary,'/bin/mp');
 });
