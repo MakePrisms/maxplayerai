@@ -219,7 +219,16 @@ pub enum Reply {
     Stdout(String),
     Stderr(String),
     Keepalive,
-    Exit { code: u8, error: Option<String> },
+    /// A handed-off send's token file as serve created it: (`st_dev`, `st_ino`). The client
+    /// checks that its own `--out` is that same file before reporting success.
+    Written {
+        dev: u64,
+        ino: u64,
+    },
+    Exit {
+        code: u8,
+        error: Option<String>,
+    },
 }
 
 /// A request queued to serve's loop.
@@ -236,6 +245,8 @@ pub struct Outcome {
     pub funding: Option<(String, String)>,
     /// Printed to the client's stderr after `stdout`.
     pub stderr: Vec<String>,
+    /// A send's written token file (`st_dev`, `st_ino`) in serve's filesystem view.
+    pub written: Option<(u64, u64)>,
     /// Exit code and message after `stdout` was printed (the CLI's code for that result).
     pub failure: Option<Failure>,
 }
@@ -517,6 +528,9 @@ async fn connection(
     for line in outcome.stderr {
         write(&mut stream, &Reply::Stderr(line)).await?;
     }
+    if let Some((dev, ino)) = outcome.written {
+        write(&mut stream, &Reply::Written { dev, ino }).await?;
+    }
     if let Some(f) = outcome.failure {
         return write(
             &mut stream,
@@ -558,11 +572,30 @@ async fn stream_funding(stream: &mut UnixStream, home: &Path, id: &str, mint: &s
     let end = tokio::time::Instant::now() + window;
     let mut quiet = tokio::time::Instant::now();
     loop {
-        let row = observe::journal_rows(home, "funding")?
-            .into_iter()
-            .find(|(k, _, _)| k == id);
+        let rows = match observe::journal_rows(home, "funding") {
+            Ok(rows) => rows,
+            // A busy journal: one retry on the next tick, then report it.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                observe::journal_rows(home, "funding")?
+            }
+        };
+        let row = rows.into_iter().find(|(k, _, _)| k == id);
         if let Some((_, v, _)) = row {
             let f: crate::money::Funding = serde_json::from_slice(&v)?;
+            if f.expired_unpaid {
+                return write(
+                    stream,
+                    &Reply::Exit {
+                        code: 1,
+                        error: Some(format!(
+                            "funding {id}: quote expired unpaid; nothing to pay and nothing is \
+                             checked further; start a new funding"
+                        )),
+                    },
+                )
+                .await;
+            }
             if f.done {
                 write(
                     stream,
@@ -761,6 +794,7 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
                 swap: None,
                 funding: None,
                 stderr: vec![],
+                written: None,
                 failure: None,
             })
         }
@@ -772,6 +806,7 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
                 swap: None,
                 funding: None,
                 stderr: vec![],
+                written: None,
                 failure: None,
             })
         }
@@ -789,6 +824,7 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
                 swap: Some(id),
                 funding: None,
                 stderr: vec![],
+                written: None,
                 failure: None,
             })
         }
@@ -836,19 +872,28 @@ async fn send_command(
                 mint,
                 crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
             );
-            crate::send::by_out(j, out).await?.with_context(|| {
+            let target = crate::send::target(Path::new(out))?;
+            let target = target.to_str().context("--out path must be UTF-8")?;
+            crate::send::by_out(j, target).await?.with_context(|| {
                 format!(
-                    "send did not finish within {}s and nothing was journaled: nothing was sent; re-run it",
+                    "send did not finish within {}s and no attempt for --out {out} was found yet; \
+                     re-run the same command (same --out): it resumes any attempt and never sends twice",
                     budget.as_secs()
                 )
             })?
         }
     };
+    // The file as serve sees it: the client checks its own --out is this same file.
+    let written = (r.state == crate::send::SendState::Sent)
+        .then(|| std::fs::symlink_metadata(crate::send::target(Path::new(out)).ok()?).ok())
+        .flatten()
+        .map(|m| (m.dev(), m.ino()));
     Ok(Outcome {
         stdout: vec![r.summary().to_string()],
         swap: None,
         funding: None,
         stderr: vec![],
+        written,
         failure: crate::send::verdict(&r, false).err().map(|e| Failure {
             code: exit_code(&e),
             message: e.to_string(),
@@ -858,7 +903,9 @@ async fn send_command(
 
 /// A handed-off `fund`: create (or, for the same id, look up) the journaled quote, try issuance
 /// once, and print the invoice. The client then follows the funding read-only while serve's
-/// recovery keeps checking it: no invoice wait runs inline in serve's loop.
+/// recovery keeps checking it: no invoice wait runs inline in serve's loop. Quote creation and
+/// the one issuance check hold this mint's wallet unit (at most one item budget each); other
+/// mints' work never waits on them.
 async fn fund_command(
     home: &Path,
     j: &Journal,
@@ -901,6 +948,7 @@ async fn fund_command(
         swap: None,
         funding: (!f.done).then(|| (f.id.clone(), f.mint.clone())),
         stderr: vec![],
+        written: None,
         failure: None,
     })
 }
@@ -999,6 +1047,7 @@ async fn receive_command(home: &Path, j: &Journal, mint: &str, token: &str) -> R
         swap: None,
         funding: None,
         stderr: vec![serde_json::json!({"receive":r.id,"outcome":outcome,"note":note}).to_string()],
+        written: None,
         failure: receive::verdict(&r).err().map(|e| Failure {
             code: exit_code(&e),
             message: e.to_string(),
@@ -1054,6 +1103,8 @@ pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
         serde_json::json!({"handed_to_serve":request.command.name()})
     );
     let mut swap: Option<String> = None;
+    // A handed-off send succeeds only when serve's file is the client's own --out.
+    let mut written_ok = false;
     let mut stream = BufReader::new(stream);
     loop {
         let next = tokio::time::timeout(
@@ -1107,9 +1158,25 @@ pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
             }
             Reply::Stderr(s) => eprintln!("{s}"),
             Reply::Keepalive => {}
+            Reply::Written { dev, ino } => {
+                if let Command::Send { out, .. } = &request.command {
+                    written_ok = same_file(Path::new(out), dev, ino);
+                }
+            }
             Reply::Exit { code, error } => {
                 if let Some(e) = error {
                     eprintln!("{e}");
+                }
+                if code == 0 && !written_ok {
+                    if let Command::Send { out, .. } = &request.command {
+                        eprintln!(
+                            "serve reports the send complete but {out} is not the file serve wrote: \
+                             serve and this client do not share a filesystem view (private /tmp, \
+                             container or chroot). The token is journaled, not lost; run send from \
+                             serve's view or stop serve and use send --reclaim"
+                        );
+                        return Ok(Some(3));
+                    }
                 }
                 return Ok(Some(code));
             }
@@ -1117,9 +1184,33 @@ pub async fn forward(home: &Path, request: &Request) -> Result<Option<u8>> {
     }
 }
 
+/// `path` (not followed) is the file with this (`st_dev`, `st_ino`).
+fn same_file(path: &Path, dev: u64, ino: u64) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.dev() == dev && m.ino() == ino)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn written_file_must_be_the_clients_own_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "x").unwrap();
+        let m = std::fs::metadata(&a).unwrap();
+        assert!(same_file(&a, m.dev(), m.ino()));
+        // Same content elsewhere (serve's private /tmp) is not the same file.
+        assert!(!same_file(&b, m.dev(), m.ino()));
+        assert!(!same_file(&dir.path().join("missing"), m.dev(), m.ino()));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        assert!(
+            !same_file(&link, m.dev(), m.ino()),
+            "a symlink is not the file"
+        );
+    }
     #[test]
     fn request_rejects_unknown_fields_and_keeps_bounds() {
         let r = Request {

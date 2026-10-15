@@ -165,8 +165,16 @@ again resumes that attempt and never sends twice; other terms for that `--out` a
 If the reply is lost (exit 3), re-run the same send. A handed-off `fund` first prints
 `{"funding_id":...}` on stderr, then the invoice line. Re-running `fund <mint> --amount N
 --id <funding_id>` returns that same quote and invoice and never creates a second one (a
-different mint or amount for that id is refused). serve's recovery checks issuance; the
-client only follows it, so an unpaid invoice never holds serve's other work.
+different mint or amount for that id is refused). The fund id is only a lookup key; the
+wallet uses its own operation id for the funding. If the quote reply was lost, the same `--id`
+creates the quote under that same funding (no second charge against the cap). serve's
+recovery checks issuance; the client only follows it, so an unpaid invoice never holds other
+mints' work (quote creation and one issuance check hold this mint's wallet work for at most
+one item budget each). An expired unpaid quote ends the follow with "nothing to pay".
+serve writes the send's `--out` file in its own filesystem view; the client then checks it
+is the same file and exits 3 if not (serve and its clients must share a filesystem view: no
+private `/tmp`, container or chroot between them). Protocol version 3: older clients' handed-off
+`list`/`take`/`cancel`/`receive` are refused with a version mismatch.
 `cancel` first recovers existing authorizations when it runs without serve.
 `serve` continuously accepts trades and recovers obligations; keep it running while
 locks are live. `recover` is a bounded single pass, not a replacement watcher;

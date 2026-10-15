@@ -12,7 +12,10 @@ use std::{
     time::Duration,
 };
 use support::*;
-use tokio::process::{Child, Command};
+use tokio::{
+    io::AsyncBufReadExt,
+    process::{Child, Command},
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_maxplayer-trade");
 
@@ -301,6 +304,17 @@ async fn serve_killed_mid_send_then_restart_writes_the_same_token_once() {
     let all = sends(&f.jt).await;
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].state, maxplayer_trade::send::SendState::Sent);
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().permissions().mode() & 0o777,
+        0o600,
+        "SAFETY: recovery writes the token 0600"
+    );
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+        .collect();
+    assert!(leftovers.is_empty(), "no partial token file left behind");
     serve.child.kill().await.unwrap();
 }
 
@@ -374,14 +388,28 @@ async fn fund_via_serve_is_idempotent_by_operation_id() {
         text(&wrong).1
     );
     assert_eq!(f.jt.all::<Funding>("funding").await.unwrap().len(), 1);
+    let other_mint = run(
+        &f.taker,
+        &f.relay_url,
+        &["fund", &f.a.url, "--amount", "30", "--id", &id],
+    )
+    .await;
+    assert_eq!(other_mint.status.code(), Some(1));
+    assert!(
+        text(&other_mint).1.contains("another mint or amount"),
+        "{}",
+        text(&other_mint).1
+    );
+    assert_eq!(f.jt.all::<Funding>("funding").await.unwrap().len(), 1);
     assert!(serve.child.try_wait().unwrap().is_none());
     serve.child.kill().await.unwrap();
 }
 
-/// A funding whose quote stays unpaid does not wait inline in serve's loop: a send to the same
-/// home, handed to serve while that fund's client is still following, completes first.
+/// A slow funding mint holds only its own wallet unit: a send on ANOTHER mint, handed to serve
+/// while that fund's quote creation is still waiting on its mint, completes first. (The same-mint
+/// property is `unpaid_fund_does_not_hold_a_send_on_the_same_mint`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pending_fund_does_not_hold_serve() {
+async fn slow_fund_mint_does_not_hold_a_send_on_another_mint() {
     let f = Fixture::new(0).await;
     let c = MintFixture::start(0).await;
     let mint = f.b.url.clone();
@@ -429,5 +457,187 @@ async fn pending_fund_does_not_hold_serve() {
         .unwrap()
         .unwrap();
     assert!(fo.status.success(), "{}", text(&fo).1);
+    serve.child.kill().await.unwrap();
+}
+
+/// Review of #1157, M3: an unpaid invoice on the SAME mint never holds serve. The fund client
+/// gets its invoice line within about one poll interval, and a send to that same mint, started
+/// while the client is still following the unpaid funding, finishes promptly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpaid_fund_does_not_hold_a_send_on_the_same_mint() {
+    let f = Fixture::new(0).await;
+    let mint = f.b.url.clone();
+    let mut serve = start_serve(&f.taker, &f.relay_url, f.root.path(), "serve", &[]).await;
+    f.b.faults.unpaid_funding.store(true, SeqCst);
+    let started = std::time::Instant::now();
+    let mut fund = cmd(&f.taker, &f.relay_url, &["fund", &mint, "--amount", "10"])
+        .spawn()
+        .unwrap();
+    let mut lines = tokio::io::BufReader::new(fund.stdout.take().unwrap()).lines();
+    let invoice = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(l) = lines.next_line().await.unwrap() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&l) {
+                if v["invoice"].is_string() {
+                    return v;
+                }
+            }
+        }
+        panic!("fund stdout closed without an invoice")
+    })
+    .await
+    .expect("SAFETY: invoice line not printed promptly");
+    assert!(invoice["funding_id"].is_string());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "invoice took {:?}",
+        started.elapsed()
+    );
+    assert!(fund.try_wait().unwrap().is_none(), "client still follows");
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t.token");
+    let sent = std::time::Instant::now();
+    let send = run(
+        &f.taker,
+        &f.relay_url,
+        &[
+            "send",
+            &mint,
+            "--amount",
+            "5",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    )
+    .await;
+    assert!(send.status.success(), "{}", text(&send).1);
+    assert!(
+        sent.elapsed() < Duration::from_secs(5),
+        "SAFETY: send waited on the unpaid funding ({:?})",
+        sent.elapsed()
+    );
+    assert!(std::fs::read_to_string(&out).unwrap().starts_with("cashu"));
+    let fo = tokio::time::timeout(Duration::from_secs(60), fund.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fo.code(), Some(1), "unpaid funding ends pending");
+    serve.child.kill().await.unwrap();
+}
+
+/// Review of #1157, R1 (adopted): the swap reaches the mint but its reply is lost while serve
+/// runs the send. The client gets exit 3; the same send again resolves by restore, never a
+/// second swap POST; exactly one token file, one debit, one attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_swap_reply_via_serve_resolves_by_restore_once() {
+    let f = Fixture::new(0).await;
+    let mint = f.b.url.clone();
+    let mut serve = start_serve(&f.taker, &f.relay_url, f.root.path(), "serve", &[]).await;
+    let before = balance(&f.taker, &mint);
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t.token");
+    let args = [
+        "send",
+        &mint,
+        "--amount",
+        "20",
+        "--out",
+        out.to_str().unwrap(),
+    ];
+    f.b.faults.lose_reply.store(true, SeqCst);
+    let lost = run(&f.taker, &f.relay_url, &args).await;
+    assert_eq!(lost.status.code(), Some(3), "{}", text(&lost).1);
+    assert_eq!(f.b.faults.swaps.load(SeqCst), 1);
+    assert!(!out.exists());
+    f.b.faults.lose_reply.store(false, SeqCst);
+    let again = run(&f.taker, &f.relay_url, &args).await;
+    assert!(again.status.success(), "{}", text(&again).1);
+    assert!(std::fs::read_to_string(&out).unwrap().starts_with("cashu"));
+    assert_eq!(f.b.faults.swaps.load(SeqCst), 1, "SAFETY: one swap POST");
+    assert_eq!(balance(&f.taker, &mint), before - 20, "SAFETY: one debit");
+    assert_eq!(sends(&f.jt).await.len(), 1);
+    serve.child.kill().await.unwrap();
+}
+
+/// Review of #1157, H1 (R2): a funding id that names an in-flight send's id never releases that
+/// send's reserved inputs. The client id is only the funding's lookup key; the wallet operation
+/// id is the funding's own.
+#[cfg(feature = "lab")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fund_id_colliding_with_a_send_keeps_its_reservation() {
+    let f = Fixture::new(0).await;
+    let mint = f.b.url.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t.token");
+    let mut c = cmd(
+        &f.taker,
+        &f.relay_url,
+        &[
+            "send",
+            &mint,
+            "--amount",
+            "20",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    c.env("TRADE_CRASH_BEFORE_SEND_SWAP", "1");
+    let crashed = c.output().await.unwrap();
+    assert_eq!(crashed.status.code(), Some(87), "{}", text(&crashed).1);
+    let held = balance(&f.taker, &mint);
+    let send_id = sends(&f.jt).await[0].id.clone();
+    let o = run(
+        &f.taker,
+        &f.relay_url,
+        &["fund", &mint, "--amount", "10", "--id", &send_id],
+    )
+    .await;
+    assert!(o.status.success(), "{}", text(&o).1);
+    assert_eq!(
+        balance(&f.taker, &mint),
+        held + 10,
+        "SAFETY: the in-flight send's reserved inputs stay reserved"
+    );
+    // A later recovery pass (which re-releases done fundings) still leaves them reserved.
+    let r = run(&f.taker, &f.relay_url, &["recover"]).await;
+    let _ = r;
+    let after = balance(&f.taker, &mint);
+    assert!(after <= held + 10, "SAFETY: no phantom balance ({after})");
+}
+
+/// Review of #1157, M1 (R3): a funding whose quote reply was lost (`quote: None`, cap already
+/// charged, no invoice ever shown) gets its quote under the same row when the same `--id` is
+/// re-run: an invoice comes back, it issues, and no second funding intent is charged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fund_id_after_lost_quote_reply_resumes_under_the_same_row() {
+    let f = Fixture::new(0).await;
+    let mint = f.b.url.clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    // Exactly the row fund_with_id writes before its quote POST (a pre-`op` row shape).
+    let row = serde_json::json!({"id":id,"mint":mint,"amount":10,"quote":null,"invoice":null,
+        "done":false,"expired_unpaid":false,"quote_key":"11".repeat(32),"outputs":[],"result":null});
+    f.jt.put("funding", &id, &row).await.unwrap();
+    let before = balance(&f.taker, &mint);
+    let mut serve = start_serve(&f.taker, &f.relay_url, f.root.path(), "serve", &[]).await;
+    let o = run(
+        &f.taker,
+        &f.relay_url,
+        &["fund", &mint, "--amount", "10", "--id", &id],
+    )
+    .await;
+    let (stdout, stderr) = text(&o);
+    let invoice = json_lines(&stdout)
+        .into_iter()
+        .find_map(|v| v.get("invoice").cloned());
+    assert!(
+        o.status.success() && invoice.as_ref().is_some_and(|v| v.is_string()),
+        "re-run with --id did not resume: exit {:?}, invoice {invoice:?}\n{stderr}",
+        o.status.code()
+    );
+    assert_eq!(balance(&f.taker, &mint), before + 10, "issued once");
+    assert_eq!(
+        f.jt.all::<Funding>("funding").await.unwrap().len(),
+        1,
+        "SAFETY: no second funding intent"
+    );
     serve.child.kill().await.unwrap();
 }

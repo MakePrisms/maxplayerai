@@ -144,14 +144,27 @@ pub struct Funding {
     quote_key: String,
     outputs: Vec<Output>,
     result: Option<Proofs>,
+    /// The wallet operation id the issued proofs are credited and released under. Never the
+    /// client-chosen `id` (a lookup key only): a pasted send/withdrawal/swap id must not name
+    /// another operation's reservation. `None` only on rows from before it existed, which used
+    /// `id` (always a fresh v4 then).
+    #[serde(default)]
+    op: Option<String>,
+}
+impl Funding {
+    fn op(&self) -> &str {
+        self.op.as_deref().unwrap_or(&self.id)
+    }
 }
 pub async fn fund(home: &Path, j: &Journal, url: &str, amount: u64) -> Result<Funding> {
     fund_with_id(home, j, url, amount, &uuid::Uuid::new_v4().to_string()).await
 }
-/// [`fund`] under an explicit operation id (a UUID the client chose and printed first). The same
-/// id again returns that journaled funding (same quote and invoice; nothing new is created or
-/// charged), so a retry after a lost reply never makes a second funding intent. The id must
-/// name the same mint and amount.
+/// [`fund`] under an explicit funding id (a UUID the client chose and printed first). The same
+/// id again returns that journaled funding (same quote and invoice; nothing new is charged), so a
+/// retry after a lost reply never makes a second funding intent. The id must name the same mint
+/// and amount. It is only the lookup key: the wallet operation id is a fresh UUID of its own.
+/// A row whose quote reply was lost (`quote: None`: no invoice was ever shown, the cap is
+/// already charged) gets its quote now, under that same row and NUT-20 key.
 pub async fn fund_with_id(
     home: &Path,
     j: &Journal,
@@ -162,11 +175,21 @@ pub async fn fund_with_id(
     let id = uuid::Uuid::parse_str(id)
         .context("funding id must be a UUID")?
         .to_string();
-    if let Some(f) = j.get::<Funding>("funding", &id).await? {
+    if let Some(mut f) = j.get::<Funding>("funding", &id).await? {
         ensure!(
             f.mint == url && f.amount == amount,
             "funding id {id} belongs to another mint or amount"
         );
+        if f.quote.is_none() {
+            // Nothing was credited under this row yet: a row from before `op` existed gets its own.
+            if f.op.is_none() && f.result.is_none() {
+                f.op = Some(uuid::Uuid::new_v4().to_string());
+            }
+            crate::Asset::new(url)?.fence()?;
+            crate::transport::require_http(url, "fund")?;
+            crate::wallet::preflight_for(url, Some("fund")).await?;
+            quote(j, &mut f).await?;
+        }
         return Ok(f);
     }
     crate::Asset::new(url)?.fence()?;
@@ -200,9 +223,19 @@ pub async fn fund_with_id(
         quote_key: hex::encode(SecretKey::generate().to_secret_bytes()),
         outputs: vec![],
         result: None,
+        op: Some(uuid::Uuid::new_v4().to_string()),
     };
-    // Charge the cap BEFORE creating a quote. A lost quote reply remains charged.
+    // Charge the cap BEFORE creating a quote. A lost quote reply remains charged; the same id
+    // again creates the quote under this row.
     j.put("funding", &f.id, &f).await?;
+    quote(j, &mut f).await?;
+    let _ = home;
+    Ok(f)
+}
+/// Create the NUT-20-bound quote for a journaled funding intent, journal it, then check it.
+async fn quote(j: &Journal, f: &mut Funding) -> Result<()> {
+    let (url, amount) = (f.mint.clone(), f.amount);
+    let url = url.as_str();
     let q: serde_json::Value = mint::rpc(
         url,
         "mint/quote/bolt11",
@@ -211,7 +244,7 @@ pub async fn fund_with_id(
     .await?;
     f.quote = Some(q["quote"].as_str().context("missing quote")?.into());
     f.invoice = Some(q["request"].as_str().context("missing invoice")?.into());
-    j.put("funding", &f.id, &f).await?;
+    j.put("funding", &f.id, &*f).await?;
     ensure!(
         q["pubkey"].as_str() == Some(&f.quote_key.parse::<SecretKey>()?.public_key().to_string()),
         "mint did not bind funding quote to NUT-20 key"
@@ -229,9 +262,8 @@ pub async fn fund_with_id(
         invoice_check.request.amount_milli_satoshis() == amount.checked_mul(1000),
         "funding invoice amount mismatch"
     );
-    j.put("funding", &f.id, &f).await?;
-    let _ = home;
-    Ok(f)
+    j.put("funding", &f.id, &*f).await?;
+    Ok(())
 }
 async fn get<T: serde::de::DeserializeOwned>(url: &str, path: &str, id: &str) -> Result<T> {
     crate::Asset::new(url)?.fence()?;
@@ -267,7 +299,7 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
     if f.done {
         database(home, &f.mint)
             .await?
-            .release_proofs(&f.id.parse()?)
+            .release_proofs(&f.op().parse()?)
             .await?;
         return Ok(());
     }
@@ -350,14 +382,14 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
         &f.mint,
         f.result.as_ref().context("missing funding result")?,
         &vec![],
-        &f.id,
+        f.op(),
     )
     .await?;
     f.done = true;
     j.put("funding", &f.id, f).await?;
     database(home, &f.mint)
         .await?
-        .release_proofs(&f.id.parse()?)
+        .release_proofs(&f.op().parse()?)
         .await?;
     Ok(())
 }

@@ -362,9 +362,16 @@ pub async fn send(
             r.id,
             r.id
         );
+        if max_fees.unwrap_or(0) < r.fee {
+            crate::diagnostics::emit(format!(
+                "send {}: resuming at its journaled fee {} sat; the new --max-fees does not \
+                 lower an already-authorized attempt",
+                r.id, r.fee
+            ));
+        }
         if !r.terminal() {
             if let Err(error) = resume(home, j, &mut r).await {
-                eprintln!("send {}: {error:#}; attempt retained", r.id);
+                crate::diagnostics::emit(format!("send {}: {error:#}; attempt retained", r.id));
             }
             return Ok(r);
         }
@@ -390,10 +397,10 @@ pub async fn send(
             r.id
         );
         write_token(&out, &r.id, &token)?;
-        eprintln!(
+        crate::diagnostics::emit(format!(
             "send {}: --out already belongs to this send; rewrote the same token; no new value was sent",
             r.id
-        );
+        ));
         r.rewritten = true;
         return Ok(r);
     }
@@ -514,7 +521,7 @@ pub async fn send(
         return Err(error.context("send inputs could not be reserved; refused"));
     }
     if let Err(error) = resume(home, j, &mut r).await {
-        eprintln!("send {}: {error:#}; attempt retained", r.id);
+        crate::diagnostics::emit(format!("send {}: {error:#}; attempt retained", r.id));
     }
     Ok(r)
 }
@@ -1111,8 +1118,8 @@ async fn release_quietly(home: &Path, j: &Journal, r: &mut SendAttempt) {
     }
 }
 
-/// One bounded pass over unfinished sends and reclaims. True when any remain unresolved.
-/// The journaled attempt that owns `out` (absolute), if any (latest non-refused first).
+/// The journaled attempt that owns `out` (absolute, as [`target`] gives it), if any (latest
+/// non-refused first).
 pub async fn by_out(j: &Journal, out: &str) -> Result<Option<SendAttempt>> {
     Ok(j.all::<SendAttempt>("send")
         .await?
@@ -1120,6 +1127,7 @@ pub async fn by_out(j: &Journal, out: &str) -> Result<Option<SendAttempt>> {
         .filter(|r| r.out == out)
         .max_by_key(|r| r.state != SendState::Refused))
 }
+/// One bounded pass over unfinished sends and reclaims. True when any remain unresolved.
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
     recover_for(home, j, None).await
 }

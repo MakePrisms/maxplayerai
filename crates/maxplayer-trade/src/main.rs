@@ -269,6 +269,19 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         Command::Receive { token_file, .. } => Some(read_token(token_file.as_deref())?),
         _ => None,
     };
+    // A partial send (no --reclaim) can never run: say what is missing before any hand-off or lock.
+    if let Command::Send {
+        mint,
+        amount,
+        out,
+        reclaim: None,
+        ..
+    } = &cli.command
+    {
+        mint.as_ref().context("mint required")?;
+        amount.as_ref().context("--amount required")?;
+        out.as_ref().context("--out required")?;
+    }
     // A running serve owns the home: hand list/take/cancel/receive to it, with these exact bounds.
     let handoff = match &cli.command {
         Command::List {
