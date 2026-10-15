@@ -31,4 +31,4 @@
 .c-job-body ul { margin: 0 0 20px; padding-left: 22px; }
 .c-job-body li { margin: 4px 0; }
 .c-job-body li::marker { color: var(--neon); }
-.c-job-body a, .h-hero .h-sub a { color: var(--neon); overflow-wrap: anywhere; }
+.c-job-body a { color: var(--neon); overflow-wrap: anywhere; }
