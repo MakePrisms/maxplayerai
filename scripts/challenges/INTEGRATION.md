@@ -77,3 +77,12 @@ Small fix: a separate trade predicate admits existing public-v2 envelopes (known
 kinds, one version/public-visibility/hex job tag); challenge validation stays strictly v1.
 Two signed-event regression tests cover v2 running/result/accept tally and reject private,
 malformed, unknown-version envelopes and v2 challenges. No app tally algorithm was rewritten.
+
+### Incomplete history also reproduced after core integration
+
+The next full run at `570e254b` (`.scratch/ce-v4jz09it`) reached the public post, then
+`get_job` returned MCP `isError:true`, text `job lifecycle relay: lifecycle wire history incomplete`.
+Offer: `c0cc0965a1996e0132f1c776e87466ada6d8253dcdc0c249f29698fbc7bb69fa`.
+The harness now allows at most three identical attempts of the existing idempotent
+get/award/collect operations for **only** that exact failure, logging each retry. Other
+errors and exhaustion still fail. The underlying client/relay behavior remains unfixed.

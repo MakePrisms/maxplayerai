@@ -111,7 +111,19 @@ def mcp(env, tool, args):
     if tool == 'post_job':
         assert args['payment'] == 'none' and args['amount_sats'] == args['max_sats'] == 0
         assert args['visibility'] == 'public' and args['seller_pubkey'] == SELLER
-    out = command(['node', ROOT / 'scripts/challenges/mcp-call.mjs', BIN, tool, json.dumps(args)], env)
+    for attempt in range(3):
+        try:
+            out = command(['node', ROOT / 'scripts/challenges/mcp-call.mjs', BIN, tool, json.dumps(args)], env)
+            break
+        except RuntimeError as error:
+            # These existing operations are idempotent. Never retry arbitrary errors or
+            # change a claim/request in response to a transient incomplete read.
+            if tool not in ('get_job', 'award_claim', 'collect') or 'lifecycle wire history incomplete' not in str(error) or attempt == 2:
+                raise
+            print(f'RETRY {tool}: incomplete relay history ({attempt + 1}/3)', flush=True)
+            with open(RUN / (tool + '-retries.log'), 'a') as log:
+                log.write(str(error) + '\n')
+            time.sleep(1)
     result = json.loads(out)
     (RUN / f'{tool}-latest.json').write_text(json.dumps(result, indent=2))
     return result

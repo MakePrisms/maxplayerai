@@ -57,3 +57,8 @@ cannot prove settlement. Serialise assignment and track pending offers as the ru
 The runner uses `award_claim` with max_sats=0 if `get_job` sees a live claim but no
 committed award. The selected claim is identical on retries; this is the existing manual
 override, not a new award path. See [INTEGRATION.md](INTEGRATION.md) for observed failures.
+
+Known `lifecycle wire history incomplete` failures get at most three identical attempts
+for `get_job`, `award_claim` or `collect` (the existing idempotent operations). Each retry
+is printed and captured; all other errors and retry exhaustion fail immediately. This is
+not proof that the buyer/relay transient-history bug is fixed.
