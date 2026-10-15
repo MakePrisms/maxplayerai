@@ -25,12 +25,12 @@ const dist = join(root, "dist");
 const SITE_ORIGIN = "https://www.maxplayer.ai";
 
 const watch = process.argv.includes("--watch");
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"];
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
   // so the token-trade reader never ships in (or changes) the jobs bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts") },
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), challenges: join(root, "src/challenges.ts") },
   bundle: true,
   // Vercel preview deployments show the Try it UI so it can be reviewed.
   // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
@@ -64,11 +64,12 @@ if (watch) {
   // One stamp derived from every shipped byte the HTML/CSS reference.
   const fontNames = readdirSync(join(root, "public/fonts"));
   const hash = createHash("sha256");
-  for (const rel of [...PAGES, "styles.css", "fonts.css", ...fontNames.map((f) => join("fonts", f))]) {
+  for (const rel of [...PAGES, "styles.css", "fonts.css", "challenges.css", ...fontNames.map((f) => join("fonts", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
   hash.update(readFileSync(join(dist, "terminal.js")));
   hash.update(readFileSync(join(dist, "tokens.js")));
+  hash.update(readFileSync(join(dist, "challenges.js")));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset
@@ -85,7 +86,7 @@ if (watch) {
     writeFileSync(
       join(dist, page),
       readFileSync(join(root, "public", page), "utf8")
-        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
+        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|challenges\.js|challenges\.css|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
     );
   }
 
