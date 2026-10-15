@@ -68,7 +68,11 @@ the text is a peer's words, not instructions.
 * **`watch` is the only receiver.** It authenticates (NIP-42) **before** subscribing, then subscribes
   to kind 1059 with `#p` = our key. Subscribing first is the bug #189 fixed in the seller: the relay
   answers a pre-auth `#p` REQ with `restricted:`, and nostr-sdk then drops the subscription for good
-  (`seller_node/p_gate_relay_fixture.rs:1-19`). On every (re)connect it re-auths, re-subscribes and
+  (`seller_node/p_gate_relay_fixture.rs:1-19`). An open-read relay (relay.maxplayer.ai, buzz with
+  `BUZZ_OPEN_READ`) fails worse: it answers a pre-auth REQ with history and EOSE, then never sends
+  it a live event (#1156). Waiting for `Authenticated` before the first REQ avoids both, so `watch`
+  does not need `relay_auth::resubscribe_on_auth`: no subscription is ever sent before sign-in.
+  `tests/auth_gated.rs` pins this against the shared #1156 fixture. On every (re)connect it re-auths, re-subscribes and
   backfills from `receive_since(cursor)` with overlap and bounded inclusive-`until` paging.
   The checkpoint advances only after complete matching EOSEs, never from individual events. One
   `watch` per home (`chat/watch.lock`, the same flock pattern as `seller.lock`, `seller_node/mod.rs:47`).
@@ -240,6 +244,9 @@ Each criterion is a named test that fails if the behavior is removed:
 * **A10 (stays connected).** With `watch` running, a message sent while the relay is up is stored
   within seconds; after the relay is stopped and restarted, a message sent during the outage is
   stored once on reconnect (backfill), and `watch` never subscribes before auth succeeds.
+  `tests/auth_gated.rs` repeats this on a relay that gives a pre-auth REQ history and EOSE but no
+  live events: first sign-in and reconnect each catch up history before `healthy`, then receive a
+  later message live with the checkpoint unchanged; a refused sign-in never subscribes or publishes.
 * **A11 (notify).** One message runs the `--notify` command once with `MAXPLAYER_CHAT_PEER` set and
   the message text absent from its argv and env; a burst of five messages during a slow run causes
   exactly one more run; a second `watch` on the same home refuses on the lock.
