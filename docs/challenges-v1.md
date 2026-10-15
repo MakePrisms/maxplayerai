@@ -4,18 +4,18 @@ Status: building on `feat/community-challenges` for an end-to-end test. Not live
 
 ## Model
 
-- **One challenge buyer**, a dedicated maxplayer buyer identity run by us and used for nothing
+- **One buyer**, a dedicated maxplayer buyer identity run by us and used for nothing
   else. Every job it posts during a challenge's work window belongs to that challenge.
 - **Daily challenge.** The buyer publishes one signed CHALLENGE event per day.
 - **Sellers join once over Nostr** with their own seller key, offering minutes per day until they leave.
 - **We accept or deny** each member once; acceptance persists until denied with a signed DECISION event.
-- **The coordinator** (our buyer agent) posts ordinary *public, targeted* jobs to accepted
+- **The buyer** (through its swarm runner) posts ordinary *public, targeted* jobs to accepted
   sellers, **one task at a time per seller**, unlimited in parallel across sellers. It only assigns
   a task whose `deadline` fits the seller's remaining minutes. Pricing, award, review, delivery
   and payment are the existing job flow, unchanged.
 - **The community app** reads the relay, tallies minutes per seller, and streams it to the page.
   Neither the buyer nor the seller publishes any metering.
-- Seller prerequisite (unchanged mechanism): the seller lists the challenge buyer's hex key in
+- Seller prerequisite (unchanged mechanism): the seller lists the buyer's hex key in
   `seller.accept_offers_only_from`.
 
 ## Events
@@ -24,7 +24,7 @@ All three are NIP-01 addressable (30000–39999): the relay keeps only the newes
 `(pubkey, kind, d)`, so republishing replaces. All carry `["t","maxplayer"]` and `["v","1"]`.
 `<buyer>` and `<seller>` are lowercase 64-hex pubkeys. Times are unix seconds.
 
-### 30341 CHALLENGE (author: challenge buyer)
+### 30341 CHALLENGE (author: the buyer)
 
 | Tag | Value |
 |---|---|
@@ -55,7 +55,7 @@ Republish `joined` to change minutes, preserving `since`. Joining after `left` s
 new membership period with a fresh `since`. Leave at any time by republishing `left`:
 no new assignments, but already-awarded jobs finish, deliver and settle normally.
 
-### 30343 DECISION (author: challenge buyer)
+### 30343 DECISION (author: the buyer)
 
 | Tag | Value |
 |---|---|
@@ -83,7 +83,7 @@ Acceptance persists across challenges until the buyer republishes `denied`.
    The ±900-second drift tolerance applies only to event `created_at` validation,
    never to membership eligibility.
 
-## Minute tally (community app and coordinator must implement the same algorithm)
+## Minute tally (community app and the buyer must implement the same algorithm)
 
 For a challenge `C` with buyer `B`, seller `S`:
 
@@ -108,6 +108,43 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
   would exceed it.
 - Public jobs, `seller_pubkey` targeted, existing review/collect/pay.
 
+The executable coordinator is `node scripts/challenges/swarm.mjs`; `coordinator.mjs`
+remains its pure admission decision function. Sellers are manually accepted once, then the
+runner automatically assigns successive tasks until solved or exhausted. Deadlines must fit
+both the remaining donated minutes and the remaining work window. There is at most one
+pending/running task per seller, including offers not yet visible in the public projection.
+
+The planner is an external JSON stdin/stdout command. Once per challenge, `analyze` receives
+its goal and full eligible roster and returns an approach, workstreams (needs, estimates,
+dependencies), and verification plan. The durable journal preserves this analysis across restarts.
+Each tick `assign` receives the plan, all free eligible seller profiles, running jobs and all
+results, and returns a batch of individually timed assignments, wait, or verified solved answer.
+`assess` checks newly settled results even after posting stops. Later responses may revise the plan.
+Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
+and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
+and prefer useful past deliveries. Every assignment is revalidated against fresh eligibility,
+availability, budget, donated minutes and work-window limits. Durations must fall within
+`SWARM_MIN_DURATION` (120 seconds) and `SWARM_MAX_DURATION` (1800 seconds).
+Exhaustion means no free seller can fit the minimum duration and no work is running; choosing
+wait alone never exhausts a challenge. Bundled planners are a deterministic capability-routing
+stub and non-interactive Claude; verified-solution rules remain, including both Hutton keywords
+and checked English decryption. Verification can itself be a delegated task.
+
+Tasks/receipts/results and stop decisions are journaled under the buyer home. Permanent
+request IDs derive from (buyer, challenge ID, seller, sequence); exact arguments survive
+restarts, including a lost post response. The existing buyer daemon awards automatically;
+a default-off E2E-only fallback permits bounded manual award while its separate fix is pending.
+`collect` uses the existing verification/settlement path; no new payment protocol is introduced.
+
+Progress republishes the same CHALLENGE fields with a short update (default every 180 seconds).
+Solved completes with result; exhausted minutes, work window or budget completes with an
+unsolved reason. A stopped day never receives new posts, but outstanding work is still
+collected. The process remains alive for subsequent days. All local offers reserve their full
+price before posting, including unawarded offers; timeout does not release a reservation.
+Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amounts fail closed.
+
+See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
+
 ## Community app
 
 - Stays authenticated to the relay (anonymous REQs get stored events but no live events on
@@ -124,7 +161,7 @@ time. Acceptable for "about an hour"; the deadline cap bounds it.
 Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
 `status --buyer … [--challenge <d>]`, `leave --buyer …`.
 Buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
---ends <rfc3339> --budget-sats <n> [--status …] [--update <text>]`,
+--ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
 `members [--challenge <d>]`, `decide --seller <npub|hex> --accept|--deny`.
 `--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's
 key; none prints a secret.
@@ -144,5 +181,5 @@ key; none prints a secret.
 - Current means the newest non-cancelled challenge (newest cancelled if none); ties use lowest
   event id. Duplicate awards for an offer select the earliest valid award, then lowest id.
 - Review past jobs include completed jobs across known challenges, deduplicated by offer id. Heartbeat capabilities are
-  advertised, not independently verified. The reader is a projection, not a coordinator;
-  Rust coordinator parity must be checked with the same event fixtures by its implementation.
+  advertised, not independently verified. The reader is a projection; it never posts jobs.
+  Rust parity must be checked with the same event fixtures by its implementation.

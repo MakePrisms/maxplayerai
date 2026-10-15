@@ -42,7 +42,10 @@ rl.on("line", async (line) => {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
         // Ensure a positive metered duration even on a fast machine.
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        const delayFile = process.env.E2E_STUB_DELAY_FILE;
+        const delay = delayFile && fs.existsSync(delayFile) ? Number(fs.readFileSync(delayFile, 'utf8')) : 2000;
+        if (!Number.isFinite(delay) || delay < 0 || delay > 60000) throw Error('Invalid fixture delay');
+        await new Promise(resolve => setTimeout(resolve, delay));
         send({
           method: "session/update",
           params: {

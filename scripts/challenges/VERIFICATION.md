@@ -107,5 +107,5 @@ Exact events, logs, causes and the list of small cross-agent fixes: [INTEGRATION
 The buyer/relay incomplete-history and stalled auto-award behavior remains an implementation
 follow-up, not fixed here; the harness uses the existing idempotent award override and bounded
 history retries. No required coordinator/E2E work remains. Paid/mint, external reviewer and
-Git/S3 delivery paths were deliberately not exercised. The coordinator runbook requires a
+Git/S3 delivery paths were deliberately not exercised. The buyer runbook requires a
 reconciled existing buyer budget for paid assignments; public app totals are estimates.

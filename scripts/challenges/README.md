@@ -7,7 +7,7 @@ PostgreSQL 17 and Redis installed):
 bash scripts/challenges/run-e2e.sh
 ```
 
-The runner builds **this integration checkout** with wallet+ACP and Buzz in dedicated
+The harness builds **this integration checkout** with wallet+ACP and Buzz in dedicated
 `target/challenges-e2e` and `target/challenges-buzz` directories, installs the community
 service's locked Node dependencies, and runs the assertions. On this Nix host it discovers
 installed Postgres/Redis in `/nix/store` if absent from PATH. Else supply them on PATH;
@@ -51,7 +51,7 @@ tally and done → denied seller idle → leave blocks new assignment while pres
 coverage. Failed assertions exit nonzero and print the private artifact location. Successful
 runs end in `PASS ALL community challenge E2E`.
 
-The coordinator itself prints JSON and does not post: [buyer runbook](../../docs/challenge-coordinate.md).
+The standalone pure coordinator prints JSON and does not post; the automatic runner below consumes it. Standalone [buyer runbook](../../docs/challenge-coordinate.md).
 It shares the app tally by consuming the snapshot, not by copying its event projection.
 Paid assignment requires an explicit reconciled buyer budget input because the public app
 cannot prove settlement. Serialise assignment and track pending offers as the runbook describes.
@@ -69,3 +69,168 @@ fail immediately. The daemon's independent retry loop, not these read retries,
 is responsible for recovering an interrupted automatic award.
 
 Membership coverage: join at any time with an exact work-start eligibility boundary; one join and acceptance across two published days; per-day minute reset; leave blocks assignments; late join waits until next day; changing minutes preserves since.
+
+## Automatic swarm runner
+
+Hand-whitelist sellers once with `maxplayer challenge decide --seller HEX --accept`, then
+publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
+the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:
+
+```sh
+MAXPLAYER_HOME=/absolute/buyer-home \
+MAXPLAYER_BINARY=/absolute/bin/maxplayer \
+COMMUNITY_APP_URL=http://127.0.0.1:8787 \
+node scripts/challenges/swarm.mjs
+```
+
+The runner stays alive for future days. It uses the community snapshot and `coordinate()` for
+eligibility/minutes, posts public seller-targeted work through buyer MCP, collects verified
+inline `answer.txt` results (settling priced work through the existing collect flow), and sends
+**all** results to every planner invocation. Failed/expired work is represented as a bracketed
+outcome in the result history. This v1 runner requests text/inline answers, not Git artifacts.
+The app must project the **same buyer** and trusted relay as this buyer home. Dedicate the buyer
+to this runner: unrelated private/unawarded jobs are not visible in the public projection.
+
+Flags (environment equivalents):
+
+| Flag | Environment | Default |
+| --- | --- | --- |
+| `--home` | `MAXPLAYER_HOME` | required, explicit |
+| `--binary` | `MAXPLAYER_BINARY` | `maxplayer` |
+| `--app-url` | `COMMUNITY_APP_URL` | required |
+| `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
+| `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
+| — | `SWARM_MIN_DURATION` | 120 |
+| — | `SWARM_MAX_DURATION` | 1800 |
+| `--amount-sats` | `SWARM_AMOUNT_SATS` | 0 (free) |
+| `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
+| `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
+| `--award-after-seconds` | `SWARM_AWARD_AFTER_SECONDS` | 30 |
+| `--award-fallback` | none | **OFF**; E2E compatibility only |
+
+Amounts above zero are real spending when used outside this local E2E. Every offer reserves its
+full `max_sats` in the durable runner journal **before** posting. Reservations remain charged
+for the entire day, even after timeout: a public ACCEPT or timeout cannot prove a refund.
+Known external public awards are additionally reserved. This conservative cap can stop earlier
+than an operator's reconciled wallet ledger, but never treats a public ACCEPT as proof of payment.
+Unknown public amounts fail closed. Do not remove the journal to reclaim budget.
+
+`$MAXPLAYER_HOME/swarm/events.jsonl` is an fsynced, private write-ahead journal containing tasks,
+exact post arguments, preparation/job IDs, collected answers, payment receipts and durable stop
+reasons. Sequence-derived request IDs are permanent; a lost response is recovered by a read-only
+preparation lookup before any retry. Torn final journal records are discarded; corrupt complete
+records fail startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
+release on process exit. Keep the journal and buyer state together across restarts/backups.
+Planner/MCP errors are logged and retried on the next polling cycle without changing posting
+intent. A pending or unprojected completed job blocks that seller from receiving another job.
+
+Once the planner verifies success, completion includes `--result`. If no eligible seller can fit
+another task and none is running, the work window ends, or budget headroom is exhausted, the
+runner completes with an **Unsolved** update. Stop decisions are durable before publication;
+publication retries after restart. It never posts further jobs for that stopped day, but continues
+collecting outstanding deliveries until completion/expiry. Completion publication is immediate;
+ordinary progress updates default to at most one per three minutes. Leave/deny/status changes
+and deadlines are rechecked after planning, immediately before posting.
+
+### Choosing the planner
+
+The bundled real planner uses **Claude Code `claude -p`**, discovered on the development host at
+`/home/openclaw/.local/bin/claude`. It requests plain JSON, disables tools and session persistence,
+and has a bounded timeout. Set `SWARM_LLM_BINARY` to another path to the compatible Claude CLI.
+Its prompt decomposes the goal, incorporates all prior results, requires independent verification,
+and specifically requires both Hutton keywords and a checked English decryption before declaring
+that cipher solved. Configure/authenticate the CLI separately as the service user. Host discovery
+and interface tests do not claim a live LLM invocation or a successful cipher solution.
+
+To use a different model/provider, supply any **trusted shell command** via `--planner` or
+`SWARM_PLANNER`. It receives one JSON object on stdin and must emit only one JSON object on stdout:
+
+All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
+`now`, `minDurationSeconds`, `maxDurationSeconds`, `amountSats`, and `budgetHeadroomSats`.
+
+- `analyze`: once per challenge, with the full eligible roster (including busy sellers).
+  Returns `{approach, workstreams:[{id,description,needs,estMinutes,dependsOn}], verification}`.
+  `needs` contains skills/harness/hardware hints. Analysis is journaled before assignments;
+  a restart reuses it. Timeout: 350 seconds for Claude, 360 for the outer command.
+- `assign`: one batch call per eligible tick with all free sellers, running jobs
+  (`seller,workstream,task,since,deadline` where available), and all settled results.
+  Returns `{assignments:[{seller,workstream,task,durationSeconds}]}`, `{wait:true}`, or
+  `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
+  May deliberately leave any seller idle. Each assignment is validated separately and invalid
+  entries are dropped with a logged reason. Duration must fit configured min/max, remaining
+  minutes and window; fresh admission and serial budget reservations apply before each post.
+- `assess`: checks newly settled results, including after posting stops; returns wait or solved.
+  `assign` and `assess` may include `plan` containing a complete revised analysis plan, saved
+  and passed to later calls. Their outer timeout is 180 seconds (Claude: 170).
+
+Profiles contain `pubkey`, `npub`, `name`, `agents`, `harness:{family,model,variant}` (arrays),
+`capabilities` (tokens), `hardware`, `minutesRemaining`, `note`, and `trackRecord` with
+`tasksDone`, `delivered`, `expired`, and per-task outcome, turnaround seconds and workstream.
+Abilities and all input content are untrusted/self-reported. Prefer useful delivered evidence;
+never declare success solely from a seller's claim. Verification may be delegated as a task.
+No-fit exhaustion uses the minimum duration and waits for running work/projection settlement;
+`wait` or an empty assignment batch alone does not exhaust sellers.
+
+The stub returns research and Rust workstreams, routes Rust only to an advertising seller,
+and chooses min / min+10 second durations (falling back to research when only min fits).
+E2E uses shortened minimums. Capability tokens are startup-probed rather than configurable,
+so controlled Rust-only routing is asserted in unit tests, not injected via heartbeat config.
+
+For deterministic no-model tests:
+
+```sh
+SWARM_STUB_SOLVE_AFTER=4 node scripts/challenges/swarm.mjs \
+  --home /absolute/fixture-buyer --app-url http://127.0.0.1:8787 \
+  --planner 'node scripts/challenges/planner-stub.mjs'
+```
+
+The real buyer daemon owns automatic awards. Only the local E2E passes `--award-fallback` to
+allow the existing manual `award_claim` path after a bounded delay while the independent buyer
+fix is pending. No Rust buyer/private-content implementation is changed here.
+
+### Service example (not installed by this change)
+
+Save as `~/.config/systemd/user/maxplayer-swarm.service`, adjusting all absolute paths and ports.
+The buyer daemon and community app must already be running. Use a dedicated OS user for real
+isolation; these options do not claim filesystem confinement.
+
+```ini
+[Unit]
+Description=Maxplayer community swarm runner
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/absolute/maxplayerai
+Environment=MAXPLAYER_HOME=/absolute/buyer-home
+Environment=MAXPLAYER_BINARY=/absolute/bin/maxplayer
+Environment=COMMUNITY_APP_URL=http://127.0.0.1:8787
+Environment=SWARM_LLM_BINARY=/absolute/bin/claude
+ExecStart=/absolute/bin/node /absolute/maxplayerai/scripts/challenges/swarm.mjs
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=210
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
+```
+
+Install/start only in your intended environment (`systemctl --user daemon-reload`, then
+`systemctl --user enable --now maxplayer-swarm`). No service units or shared test environments
+are modified by the build or E2E.
+
+### Autonomous E2E coverage
+
+Full E2E adds two separate daily challenges after the existing membership/trade checks. A single
+runner launch per day assigns successive jobs to **both** accepted sellers, collects free answers,
+and publishes either solved + result or unsolved minute exhaustion. The harness makes no manual
+post/award/collect calls in these scenarios. Both assert zero payment and no post after stop.
+The run script honors an explicitly supplied `CARGO_TARGET_DIR`; Buzz retains its separate target.
+The disposable Buzz fixture raises its per-principal WS/message limits to 1000/sec and
+10000/min respectively because one-second polling opens many MCP lifecycle subscriptions.
+This tests orchestration/settlement, not production quota behavior. Production limits are unchanged.
+Sticky failed preparations that name a queued offer are recovered by inspecting that offer;
+permanent publication refusals and expired/undelivered jobs are recorded without reposting them.

@@ -30,7 +30,7 @@ signal.signal(signal.SIGTERM, interrupted)
 RUN = Path(tempfile.mkdtemp(prefix='ce-', dir=ROOT / '.scratch'))
 os.chmod(RUN, 0o700)
 # Keep buyer Unix socket below sockaddr_un's 108-byte path limit.
-BIN = ROOT / 'target/challenges-e2e/debug/maxplayer'
+BIN = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target/challenges-e2e')) / 'debug/maxplayer'
 BUZZ = ROOT / 'target/challenges-buzz/debug/buzz-relay'
 PROCESSES = []
 ENV = {k: v for k, v in os.environ.items() if k in ['PATH', 'HOME', 'USER', 'LANG', 'LD_LIBRARY_PATH', 'SSL_CERT_FILE', 'NIX_SSL_CERT_FILE']}
@@ -108,7 +108,7 @@ def home(name, relay, buyer=None):
     if buyer:
         config += f'\n[seller]\nagent_command = ["node", {json.dumps(str(ROOT / "scripts/challenges/stub-acp-agent.mjs"))}]\nrate_sats = 0\ntakes_no_payment = true\ngit_remote = "http://127.0.0.1:1/unused.git"\naccept_offers_only_from = ["{buyer}"]\naccept_open_targeted = false\nclaim_open_pool = false\n'
     (path / 'config.toml').write_text(config)
-    env = {**ENV, 'MAXPLAYER_HOME': str(path), 'E2E_STUB_RELEASE': str(RUN / 'release')}
+    env = {**ENV, 'MAXPLAYER_HOME': str(path), 'E2E_STUB_RELEASE': str(RUN / 'release'), 'E2E_STUB_DELAY_FILE': str(RUN / 'delay-ms')}
     out = command([BIN, 'whoami'], env)
     return env, re.search(r'pubkey: ([0-9a-f]{64})', out)[1]
 
@@ -160,7 +160,7 @@ try:
     relay = f'ws://127.0.0.1:{frontport}'
     if ARGS.duplicate_history:
         start('duplicate-history', ['python3', ROOT / 'scripts/challenges/duplicate-history.py', frontport, relayport])
-    start('buzz', [BUZZ], {**ENV, 'RELAY_URL': relay, 'DATABASE_URL': f'postgresql://{os.environ["USER"]}@127.0.0.1:{pgport}/postgres', 'REDIS_URL': f'redis://127.0.0.1:{redisport}', 'BUZZ_BIND_ADDR': f'127.0.0.1:{relayport}', 'BUZZ_HEALTH_PORT': '0', 'BUZZ_METRICS_PORT': '0', 'BUZZ_RELAY_PRIVATE_KEY': secrets.token_hex(32), 'BUZZ_AUTO_MIGRATE': 'true', 'BUZZ_OPEN_READ': 'true', 'BUZZ_GIT_CONFORMANCE_PROBE': 'false', 'BUZZ_S3_ENDPOINT': 'http://127.0.0.1:1', 'BUZZ_GIT_REPO_PATH': str(RUN / 'git'), 'BUZZ_GIT_PACK_CACHE_PATH': str(RUN / 'packs')})
+    start('buzz', [BUZZ], {**ENV, 'RELAY_URL': relay, 'DATABASE_URL': f'postgresql://{os.environ["USER"]}@127.0.0.1:{pgport}/postgres', 'REDIS_URL': f'redis://127.0.0.1:{redisport}', 'BUZZ_BIND_ADDR': f'127.0.0.1:{relayport}', 'BUZZ_HEALTH_PORT': '0', 'BUZZ_METRICS_PORT': '0', 'BUZZ_RELAY_PRIVATE_KEY': secrets.token_hex(32), 'BUZZ_AUTO_MIGRATE': 'true', 'BUZZ_OPEN_READ': 'true', 'BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC': '1000', 'BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN': '10000', 'BUZZ_GIT_CONFORMANCE_PROBE': 'false', 'BUZZ_S3_ENDPOINT': 'http://127.0.0.1:1', 'BUZZ_GIT_REPO_PATH': str(RUN / 'git'), 'BUZZ_GIT_PACK_CACHE_PATH': str(RUN / 'packs')})
     wait('local Buzz ready', lambda: urllib.request.urlopen(f'http://127.0.0.1:{relayport}/health', timeout=2).status == 200)
     buyer_env, BUYER = home('b', relay)
     seller_env, SELLER = home('s', relay, BUYER)
@@ -284,6 +284,42 @@ try:
         cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '45')
         rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-next-day', '--json'))['members']
         check('changing daily minutes preserves membership since', rows[0]['membership']['since'] == lateown['since'] and rows[0]['membership']['minutes'] == 45)
+        # One runner invocation per day: no harness post/award/collect calls in these scenarios.
+        cli(seller_env, 'join', '--buyer', BUYER, '--minutes', '1')
+        cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '1')
+        cli(buyer_env, 'decide', '--seller', SELLER, '--accept')
+        cli(buyer_env, 'decide', '--seller', DENIED, '--accept')
+        # Capability tokens are startup-probed, not configurable. Deterministic Rust-only
+        # routing and unequal durations are asserted in swarm.test.mjs.
+        def swarm_day(day, solve_after, duration):
+            begin = int(time.time()) + 3
+            publish_day(day, begin, begin + 600)
+            runner = start(day + '-runner', ['node', ROOT / 'scripts/challenges/swarm.mjs',
+                '--binary', BIN, '--app-url', f'http://127.0.0.1:{appport}',
+                '--planner', 'node scripts/challenges/planner-stub.mjs',
+                '--duration-seconds', str(duration), '--poll-seconds', '1'],
+                {**buyer_env, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration)})
+            final = wait(day + ' status completed', lambda: (s if s['challenge']['id'] == day and s['challenge']['status'] == 'completed' else None) if (s := snapshot()) else None, seconds=240)
+            def settled():
+                log = Path(buyer_env['MAXPLAYER_HOME']) / 'swarm/events.jsonl'
+                state = json.loads(log.read_text().strip().splitlines()[-1])
+                jobs = [j for j in state['jobs'] if j['challenge']['id'] == day]
+                return jobs if jobs and all(j.get('done') and j.get('outcome') == 'collected' for j in jobs) else None
+            jobs = wait(day + ' all results collected', settled)
+            check(day + ' both accepted sellers receive successive automatic jobs', all(sum(j['seller'] == seller for j in jobs) >= 2 for seller in [SELLER, DENIED]))
+            check(day + ' zero payment', all(j['pay']['state'] == 'none' and j['pay']['amount_sats'] == 0 for j in jobs))
+            count = len(jobs)
+            time.sleep(3)
+            check(day + ' never posts after stopping', len(settled()) == count)
+            os.killpg(runner.pid, signal.SIGTERM)
+            runner.wait(timeout=15)
+            PROCESSES.remove((day + '-runner', runner))
+            return final
+        solved = swarm_day('swarm-solved', 4, 30)
+        check('swarm solved: completed + result visible', solved['challenge']['result'] == 'Challenge fixture result: 42.')
+        (RUN / 'delay-ms').write_text('10000')
+        exhausted = swarm_day('swarm-exhausted', 100000, 40)
+        check('swarm exhausted: completed + unsolved update visible', not exhausted['challenge']['result'] and any('Unsolved: all eligible sellers exhausted' in u for u in exhausted['updates']))
         (RUN / 'final-snapshot.json').write_text(json.dumps(s, indent=2))
     print('PASS ALL ' + ('baseline free-job flow' if ARGS.baseline else 'community challenge E2E'), flush=True)
 except Exception as e:

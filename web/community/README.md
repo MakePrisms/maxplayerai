@@ -64,7 +64,7 @@ It checks rendered data, not just a static shell. Build with the default same-or
 
 Every ingested event's canonical NIP-01 id and Schnorr signature is verified locally.
 Addressable replacements use timestamp then lowest id. Validation and tally are in
-`src/events.mjs` / `src/model.mjs`; the Rust coordinator is developed separately and must
+`src/events.mjs` / `src/model.mjs`; the buyer side is implemented separately and must
 run parity fixtures (it cannot literally import this JavaScript module).
 
 History uses per-kind 500-event pages, overlapping the boundary second; live subscription
