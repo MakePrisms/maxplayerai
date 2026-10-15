@@ -23,6 +23,8 @@ loopback port 1. This harness does not verify Git/S3 delivery or its conformance
 bash scripts/challenges/run-e2e.sh --skip-build
 # Existing kinds only; useful before challenge-core is integrated:
 bash scripts/challenges/run-e2e.sh --skip-build --baseline
+# Deterministically exercise valid duplicate claims before EOSE:
+bash scripts/challenges/run-e2e.sh --skip-build --duplicate-history
 node --test scripts/challenges/coordinator.test.mjs
 ```
 
@@ -42,7 +44,7 @@ proves the trade integrity/collect path, not a deployed reviewer service. It hol
 running HTTP/SSE state, then waits two seconds to make positive minute usage observable. No new money path is introduced.
 
 Assertions: publish → 60/30-minute memberships → accept/deny → authenticated HTTP tally →
-coordinator selects only accepted seller → real MCP post → seller claim / buyer award (auto or existing manual override) →
+coordinator selects only accepted seller → real MCP post → seller claim / automatic buyer award →
 running tally and no concurrent assignment → delivered result / free collect → exact minute
 tally and done → denied seller idle → leave blocks new assignment while preserving work.
 `--baseline` tests only the existing free-job trade loop and must not be cited as full challenge
@@ -54,13 +56,16 @@ It shares the app tally by consuming the snapshot, not by copying its event proj
 Paid assignment requires an explicit reconciled buyer budget input because the public app
 cannot prove settlement. Serialise assignment and track pending offers as the runbook describes.
 
-The runner uses `award_claim` with max_sats=0 if `get_job` sees a live claim but no
-committed award. The selected claim is identical on retries; this is the existing manual
-override, not a new award path. See [INTEGRATION.md](INTEGRATION.md) for observed failures.
+The runner never calls `award_claim`. Once a live claim is observed, the daemon must
+commit its own award within a bounded 60-second polling window. The optional
+`--duplicate-history` loopback proxy replays signed claim frames before EOSE to
+exercise live/history overlap without relying on scheduler timing. See
+[INTEGRATION.md](INTEGRATION.md) for the failing base log and root cause.
 
 Known `lifecycle wire history incomplete` failures get at most three identical attempts
-for `get_job`, `award_claim` or `collect` (the existing idempotent operations). Each retry
-is printed and captured; all other errors and retry exhaustion fail immediately. This is
-not proof that the buyer/relay transient-history bug is fixed.
+per `get_job` or `collect` invocation. Each retry is printed and captured. Polling
+continues through this error only within the enclosing bounded wait; other errors
+fail immediately. The daemon's independent retry loop, not these read retries,
+is responsible for recovering an interrupted automatic award.
 
 Membership coverage: join at any time with an exact work-start eligibility boundary; one join and acceptance across two published days; per-day minute reset; leave blocks assignments; late join waits until next day; changing minutes preserves since.

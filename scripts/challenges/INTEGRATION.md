@@ -32,8 +32,9 @@ failure mechanism, not that every historical incident had the same cause.
 
 Transient driver errors now retry after 1/2/4/8/16/30 seconds (30-second cap), bounded
 by the locally retained signed offer deadline. Retries use the same reserve-first
-and pinned-award path. Missing legacy cache gets a bounded 5-minute recovery window;
-unknown history never releases reservations or falsely marks an offer absent.
+and pinned-award path. An unavailable local cache is retried without inventing an expiry; the deadline is
+re-read on every failure. Unknown history never releases reservations or falsely
+marks an offer absent.
 
 ---
 

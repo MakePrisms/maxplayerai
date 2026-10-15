@@ -1619,12 +1619,11 @@ fn auto_award_deadline(context: &BuyerContext, job_id: &str) -> Option<u64> {
 /// existing idempotency and reserve-then-award checks, including pinned bytes.
 fn spawn_auto_award(context: Arc<BuyerContext>, job_id: String, max_sats: u64) {
     tokio::spawn(async move {
-        // Legacy intents without cached offers get a bounded recovery window;
-        // their driver still checks the actual offer deadline before awarding.
-        let remaining = auto_award_deadline(&context, &job_id)
-            .map(|deadline| deadline.saturating_sub(now_unix() as u64))
-            .unwrap_or(300);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(remaining);
+        let deadline = || auto_award_deadline(&context, &job_id).and_then(|deadline| {
+            tokio::time::Instant::now().checked_add(Duration::from_secs(
+                deadline.saturating_sub(now_unix() as u64),
+            ))
+        });
         let result = auto_award_retry::run(deadline, || async {
             if context.store.pending_award_state(&job_id).ok().flatten()
                 .is_some_and(|(state, _)| state != "pending") {
