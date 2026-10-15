@@ -25,6 +25,24 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
   });
 }
 
+// Floating "See the job" pill, same as Buy's "Try it first": gone once the job section reaches it.
+const jobSection = el("job");
+const jobFloat = el("job-float");
+let floatQueued = false;
+const placeFloat = () => {
+  floatQueued = false;
+  jobFloat.classList.toggle("is-gone", jobSection.getBoundingClientRect().top <= jobFloat.getBoundingClientRect().bottom);
+};
+const scheduleFloat = () => { if (!floatQueued) { floatQueued = true; requestAnimationFrame(placeFloat); } };
+addEventListener("scroll", scheduleFloat, { passive: true });
+addEventListener("resize", scheduleFloat);
+placeFloat();
+jobFloat.addEventListener("click", (e) => {
+  e.preventDefault();
+  history.pushState(null, "", "#job");
+  jobSection.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+});
+
 let snapshot: Snapshot | null = null;
 let receivedAt = 0;
 
