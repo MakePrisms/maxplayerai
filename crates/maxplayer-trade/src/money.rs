@@ -200,11 +200,11 @@ pub async fn fund_with_id(
                      (nothing beyond the cap reservation was charged)"
                 ))
             };
-            invoice_matches(&f).map_err(&refused)?;
+            invoice_matches(&f).map_err(refused)?;
             let quote = f.quote.clone().unwrap_or_default();
             let q: serde_json::Value = get(url, "mint/quote/bolt11", &quote).await?;
             ensure!(q["quote"].as_str() == Some(&quote), "fund quote mismatch");
-            key_matches(&f, q["pubkey"].as_str()).map_err(&refused)?;
+            key_matches(&f, q["pubkey"].as_str()).map_err(refused)?;
         }
         return Ok(f);
     }
