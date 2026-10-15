@@ -1,45 +1,24 @@
-.challenge-main { max-width: 1200px; margin: 0 auto; padding: 40px 30px 72px; font-family: var(--sans); }
-.challenge-hero { padding: 36px 0 42px; min-height: 0; display: block; text-align: left; }
-.challenge-hero > * { position: relative; z-index: 1; }
-.challenge-hero::before, .challenge-hero::after { opacity: .2; }
-.challenge-heading { display: flex; align-items: center; gap: 20px; flex-wrap: wrap; margin-bottom: 24px; }
-.challenge-status { font: 12px var(--mono); color: var(--neon); text-transform: uppercase; letter-spacing: .06em; }
-.challenge-hero h1 { font: italic 800 clamp(36px, 5vw, 72px)/1.05 var(--display); letter-spacing: -.04em; max-width: 1000px; margin: 0; overflow-wrap: anywhere; white-space: normal; }
-.challenge-hero h1 em { color: var(--neon); }
-.challenge-goal { font-size: clamp(18px, 2vw, 24px); color: var(--ink-2); max-width: 760px; margin: 24px 0 36px; }
-.challenge-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; border-top: 1px solid var(--line); padding-top: 24px; }
-.challenge-facts h2 { font: 12px var(--mono); text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 12px; }
-.challenge-facts time, .challenge-facts p { display: block; font-size: clamp(24px, 3vw, 36px); line-height: 1.2; margin: 0 0 8px; font-weight: 600; overflow-wrap: anywhere; }
-#challenge-budget { color: var(--neon); }
-.challenge-meta { display: block; font-size: 14px; line-height: 1.6; color: var(--muted); }
-.challenge-grid { display: grid; grid-template-columns: 1.3fr 1fr; gap: 20px; align-items: start; }
-.challenge-panel { padding: 28px; border: 1px solid var(--line); background: var(--panel); min-width: 0; }
-.challenge-panel h2 { font: italic 700 clamp(24px, 3vw, 34px)/1.15 var(--display); margin: 12px 0 18px; }
-.challenge-panel p { line-height: 1.6; }
-.challenge-label { display: block; font: 11px var(--mono); color: var(--muted); text-transform: uppercase; margin: 24px 0 10px; }
-.challenge-copy { display: flex; align-items: center; gap: 14px; padding: 14px; border: 1px solid var(--line); background: var(--bg); }
-.challenge-copy code { flex: 1; min-width: 0; font: 12px/1.7 var(--mono); overflow-wrap: anywhere; white-space: pre-wrap; user-select: all; }
-.challenge-copy button { flex: 0 0 auto; min-height: 44px; padding: 10px 14px; border: 1px solid var(--neon); background: var(--neon); color: var(--bg); cursor: pointer; font: 12px var(--mono); }
-.challenge-copy button:disabled { border-color: var(--line); color: var(--muted); background: var(--raise); cursor: default; }
-.challenge-page :focus-visible { outline: 2px solid var(--neon); outline-offset: 4px; }
-.challenge-setup { border-top: 1px solid var(--line); margin-top: 24px; }
-.challenge-setup summary { min-height: 48px; padding: 14px 0; cursor: pointer; }
-.challenge-setup .challenge-copy { flex-direction: column; align-items: stretch; }
-.challenge-window { margin: 24px 0; }
-.challenge-window dt { color: var(--muted); font: 12px var(--mono); text-transform: uppercase; margin-top: 20px; }
-.challenge-window dd { margin: 8px 0; font-size: 20px; }
-.challenge-progress { margin-top: 20px; }
-#copy-feedback { min-height: 22px; margin-bottom: 0; }
-@media (max-width: 760px) {
-  .challenge-main { padding: 20px 20px 40px; }
-  .challenge-hero { padding: 20px 0 28px; }
-  .challenge-grid { grid-template-columns: 1fr; }
-  .challenge-panel { padding: 20px; }
-  .challenge-facts { grid-template-columns: 1fr; }
-  .challenge-copy { flex-direction: column; align-items: stretch; }
+/* /challenges reuses the /sell layout (styles.css h-*). Only the bits /sell doesn't have live here. */
+.c-facts { display: flex; justify-content: center; flex-wrap: wrap; gap: 14px 44px; margin: 34px 0 0; }
+.c-facts dt { font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.c-facts dd { margin: 6px 0 0; font-family: var(--sans); font-size: 16px; color: var(--ink); }
+.c-sellers { list-style: none; margin: 36px 0 0; padding: 0; text-align: left; }
+.c-sellers li {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 18px; align-items: baseline;
+  padding: 16px 2px; border-bottom: 1px solid var(--line); font-family: var(--sans);
 }
-
-.challenge-sellers { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr)); gap: 20px; }
-.challenge-sellers li { display: grid; gap: 8px; padding: 16px; border: 1px solid var(--line); min-width: 0; overflow-wrap: anywhere; }
-#challenge-result, #challenge-update, #challenge-goal { white-space: pre-wrap; overflow-wrap: anywhere; }
-#connection-status { padding: 12px 0; }
+.c-sellers li:first-child { border-top: 1px solid var(--line); }
+.c-sellers strong { font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.c-sellers .c-mins { font-family: var(--mono); font-size: 13px; color: var(--neon); white-space: nowrap; }
+.c-sellers .c-id, .c-sellers .c-state { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.c-sellers .c-state { text-align: right; }
+.c-sellers li.off .c-mins { color: var(--muted); }
+.c-note { margin: 22px 0 0; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+.h-faq details p code { font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .c-facts { gap: 14px 28px; }
+  .c-sellers li { grid-template-columns: 1fr; }
+  .c-sellers .c-state { text-align: left; }
+}
+/* challenge titles are dynamic: let them wrap instead of the wordmark's single line */
+.h-hero h1#challenge-title { white-space: normal; text-wrap: balance; max-width: 980px; margin: 18px auto 0; font-size: clamp(32px, 6vw, 80px); overflow-wrap: anywhere; }
