@@ -764,14 +764,14 @@ async fn nostr_mint_refused_sign_in_is_an_auth_error_not_a_timeout() {
     assert!(!error.is_definitive_failure(), "{error:?}");
     assert_eq!(obs.reachability, "auth_failed", "{obs:?}");
     assert!(
-        obs.request_event.is_some() && obs.attempts == 0,
-        "nothing published: {obs:?}"
+        obs.relays.values().all(|r| r.acceptance != "accepted"),
+        "the relay accepted nothing: {obs:?}"
     );
     assert!(started.elapsed() < Duration::from_secs(3), "failed fast");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nostr_mint_open_relay_pays_only_the_short_grace() {
+async fn nostr_mint_open_relay_adds_no_wait() {
     use auth_gated_relay::{AuthRelay, AuthRelayOptions};
     let relay = AuthRelay::start(AuthRelayOptions {
         challenge: false,
@@ -784,11 +784,7 @@ async fn nostr_mint_open_relay_pays_only_the_short_grace() {
         .await;
     assert!(result.is_ok(), "{result:?} {obs:?}");
     let reply_ms = obs.reply_ms.unwrap();
-    assert!(
-        reply_ms < 1000,
-        "grace is {:?}: {obs:?}",
-        maxplayer_core::nostr_mint::DEFAULT_AUTH_GRACE
-    );
+    assert!(reply_ms < 250, "no sign-in wait on an open relay: {obs:?}");
     assert!(
         obs.relays
             .values()

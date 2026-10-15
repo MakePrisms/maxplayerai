@@ -70,13 +70,6 @@ pub const OUTER_MARGIN: Duration = Duration::from_secs(10);
 pub const REQUEST_SETTLE: Duration = Duration::from_secs(300);
 /// Bound on the relay disconnect after a request, so it cannot stretch past [`OUTER_MARGIN`].
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a connected relay that has not sent a NIP-42 challenge is given to send one, when no
-/// relay has signed in yet. relay.maxplayer.ai challenges as soon as the socket opens, so with it
-/// in the list the wait ends at its sign-in and open relays add nothing.
-pub const DEFAULT_AUTH_GRACE: Duration = Duration::from_millis(300);
-/// Longest wait for a relay that sent a challenge to finish signing in before the request goes
-/// out; a relay still unsigned then is recorded as an auth timeout.
-const AUTH_WAIT: Duration = Duration::from_secs(3);
 
 /// The relays a wallet uses for a `nostr://` mint: the home's own `relay_url`, then
 /// [`FALLBACK_RELAYS`], without duplicates.
@@ -367,7 +360,6 @@ pub struct NostrMintConnector {
     window: Duration,
     resend_every: Duration,
     connect_timeout: Duration,
-    auth_grace: Duration,
     last_observation: Arc<std::sync::Mutex<Option<RequestObservation>>>,
 }
 
@@ -391,7 +383,6 @@ impl NostrMintConnector {
             window: DEFAULT_WINDOW,
             resend_every: DEFAULT_RESEND_EVERY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            auth_grace: DEFAULT_AUTH_GRACE,
             last_observation: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -406,12 +397,6 @@ impl NostrMintConnector {
         self.window = window;
         self.resend_every = resend_every;
         self.connect_timeout = connect;
-        self
-    }
-
-    /// Override [`DEFAULT_AUTH_GRACE`] (tests).
-    pub fn with_auth_grace(mut self, grace: Duration) -> Self {
-        self.auth_grace = grace;
         self
     }
 
@@ -584,52 +569,12 @@ impl NostrMintConnector {
             ));
         }
 
-        // A relay that requires sign-in (relay.maxplayer.ai) never delivers live events to a
-        // REQ it saw before sign-in, and nostr-sdk does not re-send it afterwards: the reply would
-        // be lost while the subscription looks healthy. So subscribe only once every relay that
-        // challenged has signed in (or failed), giving silent relays a short grace to challenge.
         let relays: Vec<(String, nostr_sdk::prelude::Relay)> = client
             .relays()
             .await
             .into_iter()
             .map(|(url, relay)| (url.to_string().trim_end_matches('/').to_owned(), relay))
             .collect();
-        let auth_started = Instant::now();
-        let auth_deadline = deadline.min(auth_started + AUTH_WAIT);
-        loop {
-            collect_lifecycle(&mut lifecycle, observation);
-            let live = || observation.relays.values().filter(|r| r.connected);
-            let pending = live().any(|r| r.challenged && r.auth == "unknown");
-            let signed_in = live().any(|r| r.auth == "authenticated");
-            if !pending && (signed_in || auth_started.elapsed() >= self.auth_grace) {
-                break;
-            }
-            if Instant::now() >= auth_deadline {
-                for r in observation.relays.values_mut() {
-                    if r.connected && r.challenged && r.auth == "unknown" {
-                        r.auth = "timeout";
-                    }
-                }
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let reachable: Vec<&RelayEvidence> = observation
-            .relays
-            .values()
-            .filter(|r| r.connected)
-            .collect();
-        if !reachable.is_empty() && reachable.iter().all(|r| auth_failed(r)) {
-            disconnect(&client).await;
-            // Nothing was published. Ambiguous class, like an unreachable relay.
-            return Err(Error::HttpError(
-                None,
-                format!(
-                    "relay sign-in (NIP-42) failed or timed out on every reachable relay for mint {}",
-                    self.mint_url
-                ),
-            ));
-        }
 
         // Subscribe BEFORE publishing, so a fast reply isn't missed.
         let subscription = SubscriptionId::generate();
@@ -643,19 +588,19 @@ impl NostrMintConnector {
             client.subscribe_with_id(subscription.clone(), filter.clone(), None),
         )
         .await;
-        // The sign-in each relay's REQ was sent under. A later sign-in (a relay that challenged
-        // late, or a reconnect within the window) re-sends the same REQ to that relay.
-        let mut subscribed_under: std::collections::HashMap<String, Option<u32>> = relays
-            .iter()
-            .map(|(url, _)| {
-                let r = observation.relays.get(url);
-                let authed = r.filter(|r| r.auth == "authenticated");
-                (url.clone(), authed.and_then(|r| r.auth_generation))
-            })
-            .collect();
+        // A relay that requires sign-in (relay.maxplayer.ai) refuses an EVENT sent before sign-in
+        // (`auth-required:`) and never delivers live events to a REQ it saw before sign-in;
+        // nostr-sdk does not re-send that REQ. So after each sign-in on a relay this call re-sends
+        // its REQ and THEN its EVENT to that relay, in that order on the one socket, so the reply
+        // cannot beat the subscription. The EVENT goes out raw (no SDK auth retry that could race
+        // the REQ). Relays that never ask for sign-in see exactly the old REQ-then-EVENT, no wait.
+        let mut signed_in_under: std::collections::HashMap<String, Option<u32>> =
+            relays.iter().map(|(url, _)| (url.clone(), None)).collect();
+        let send_event = |relay: &nostr_sdk::prelude::Relay| {
+            relay.send_msg(ClientMessage::event(event.clone())).is_ok()
+        };
 
         let mut next_send = Instant::now();
-        let mut publish = None;
         let outcome = loop {
             collect_lifecycle(&mut lifecycle, observation);
             for (url, relay) in &relays {
@@ -663,34 +608,56 @@ impl NostrMintConnector {
                     continue;
                 };
                 let generation = r.auth_generation.filter(|_| r.auth == "authenticated");
-                if generation.is_some() && subscribed_under.get(url) != Some(&generation) {
-                    subscribed_under.insert(url.clone(), generation);
+                if generation.is_some() && signed_in_under.get(url) != Some(&generation) {
+                    signed_in_under.insert(url.clone(), generation);
                     let _ =
                         relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
+                    if observation.attempts > 0 && !send_event(relay) {
+                        observation
+                            .relays
+                            .entry(url.clone())
+                            .or_default()
+                            .publish_failed = true;
+                    }
                 }
+            }
+            // Every relay we reached rejected sign-in and none accepted the request: no path can
+            // carry a reply, so say so now instead of waiting out the window.
+            let reachable: Vec<&RelayEvidence> = observation
+                .relays
+                .values()
+                .filter(|r| r.ever_connected)
+                .collect();
+            if !reachable.is_empty()
+                && reachable
+                    .iter()
+                    .all(|r| r.auth == "failed" && r.acceptance != "accepted")
+            {
+                break Err(Error::HttpError(
+                    None,
+                    format!(
+                        "relay sign-in (NIP-42) failed on every reachable relay for mint {}",
+                        self.mint_url
+                    ),
+                ));
             }
             if Instant::now() >= deadline {
                 break Err(Error::Timeout);
             }
-            if publish.is_none() && Instant::now() >= next_send {
+            if Instant::now() >= next_send {
                 observation.attempts += 1;
-                publish = Some(Box::pin(client.send_event(&event)));
+                for (url, relay) in &relays {
+                    if !send_event(relay) {
+                        observation
+                            .relays
+                            .entry(url.clone())
+                            .or_default()
+                            .publish_failed = true;
+                    }
+                }
+                next_send = Instant::now() + self.resend_every;
             }
             tokio::select! {
-                result = async { publish.as_mut().unwrap().await }, if publish.is_some() => {
-                    if let Ok(output) = result {
-                        for url in output.success {
-                            observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default().acceptance = "accepted";
-                        }
-                        for url in output.failed.keys() {
-                            observation.relays.entry(url.to_string().trim_end_matches('/').to_owned()).or_default().publish_failed = true;
-                        }
-                        // Failure text is untrusted and is never reflected. Raw matching OK=false
-                        // below proves refusal; an SDK failure alone does not.
-                    }
-                    publish = None;
-                    next_send = Instant::now() + self.resend_every;
-                }
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {},
                 notification = notifications.recv() => match notification {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => observation.evidence_lost = true,
@@ -706,9 +673,10 @@ impl NostrMintConnector {
                     Ok(RelayPoolNotification::Message { relay_url, message }) => {
                         let r = observation.relays.entry(relay_url.to_string().trim_end_matches('/').to_owned()).or_default();
                         match message {
+                            // Refusal text is untrusted and never reflected, only its prefix.
                             RelayMessage::Ok { event_id, status, message } if event_id == event.id => {
                                 if status { r.acceptance = "accepted"; }
-                                else { r.refused = true; r.refusal_category = Some(reason_category(&message)); if r.acceptance != "accepted" { r.acceptance = "refused"; } }
+                                else { r.refused = true; r.publish_failed = true; r.refusal_category = Some(reason_category(&message)); if r.acceptance != "accepted" { r.acceptance = "refused"; } }
                             }
                             RelayMessage::Closed { subscription_id, message } if subscription_id.as_ref() == &subscription => { r.closed = true; r.closed_category = Some(reason_category(&message)); },
                             RelayMessage::EndOfStoredEvents(id) if id.as_ref() == &subscription => r.eose = true,
@@ -720,7 +688,13 @@ impl NostrMintConnector {
                 }
             }
         };
-        drop(publish);
+        // Challenged but never signed in within the window: an auth timeout, not mint silence.
+        collect_lifecycle(&mut lifecycle, observation);
+        for r in observation.relays.values_mut() {
+            if r.challenged && r.auth == "unknown" && r.acceptance != "accepted" {
+                r.auth = "timeout";
+            }
+        }
         collect_lifecycle(&mut lifecycle, observation);
         disconnect(&client).await;
         outcome
