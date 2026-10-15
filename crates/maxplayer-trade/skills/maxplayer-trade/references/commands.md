@@ -168,13 +168,18 @@ If the reply is lost (exit 3), re-run the same send. A handed-off `fund` first p
 --id <funding_id>` returns that same quote and invoice and never creates a second one (a
 different mint or amount for that id is refused). The fund id is only a lookup key; the
 wallet uses its own operation id for the funding. If the quote reply was lost, the same `--id`
-creates the quote under that same funding (no second charge against the cap). serve's
+creates the quote under that same funding (no second charge against the cap). A re-run with `--id` re-checks a journaled quote (NUT-20
+binding, invoice amount) and refuses one that failed: never pay that invoice. serve's
 recovery checks issuance; the client only follows it, so an unpaid invoice never holds other
 mints' work (quote creation and one issuance check hold this mint's wallet work for at most
 one item budget each). An expired unpaid quote ends the follow with "nothing to pay".
-serve writes the send's `--out` file in its own filesystem view; the client then checks it
-is the same file and exits 3 if not (serve and its clients must share a filesystem view: no
-private `/tmp`, container or chroot between them). Protocol version 3: older clients' handed-off
+serve writes the send's `--out` file in its own filesystem view and reports that file's
+identity as created; the client checks its own `--out` is that file and exits 3 if not. A
+file already gone (moved or consumed by another program at once) is reported as such: the
+send is complete, so check where the token went before any `--reclaim`, which cancels a
+payment the recipient may already hold. serve and its clients must share a filesystem view:
+bind mounts of the same filesystem are fine; a private `/tmp`, container, chroot, an
+overlay's upperdir or a second NFS mount between them is not. Protocol version 3: older clients' handed-off
 `list`/`take`/`cancel`/`receive` are refused with a version mismatch.
 `cancel` first recovers existing authorizations when it runs without serve.
 `serve` continuously accepts trades and recovers obligations; keep it running while

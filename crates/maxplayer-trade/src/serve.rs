@@ -893,11 +893,11 @@ async fn send_command(
             })?
         }
     };
-    // The file as serve sees it: the client checks its own --out is this same file.
+    // The file serve created (or found in place), identified when it was written, not by a
+    // later path lookup: a consumer may move it at once (review of #1157 round 2, M-B).
     let written = (r.state == crate::send::SendState::Sent)
-        .then(|| std::fs::symlink_metadata(crate::send::target(Path::new(out)).ok()?).ok())
-        .flatten()
-        .map(|m| (m.dev(), m.ino()));
+        .then_some(r.written)
+        .flatten();
     Ok(Outcome {
         stdout: vec![r.summary().to_string()],
         swap: None,
@@ -1122,7 +1122,7 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
     );
     let mut swap: Option<String> = None;
     // A handed-off send succeeds only when serve's file is the client's own --out.
-    let mut written_ok = false;
+    let mut written: Option<(u64, u64)> = None;
     let mut stream = BufReader::new(stream);
     loop {
         let next = tokio::time::timeout(
@@ -1130,14 +1130,18 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
             read_line_bounded(&mut stream, MAX_REPLY_LINE_BYTES),
         )
         .await;
-        let line = match next {
-            Ok(Ok(Some(line))) => line,
-            other => {
-                let why = match other {
-                    Err(_) => "serve went silent".to_string(),
-                    Ok(Err(e)) => e.to_string(),
-                    _ => "serve closed the connection".to_string(),
-                };
+        // An unreadable line (e.g. a reply this client does not know) is handled like a lost
+        // reply: the request was delivered and may have been applied.
+        let parsed = match next {
+            Ok(Ok(Some(line))) => serde_json::from_str::<Reply>(&line)
+                .map_err(|e| format!("unreadable serve reply ({e})")),
+            Err(_) => Err("serve went silent".to_string()),
+            Ok(Err(e)) => Err(e.to_string()),
+            _ => Err("serve closed the connection".to_string()),
+        };
+        let reply = match parsed {
+            Ok(reply) => reply,
+            Err(why) => {
                 match (&swap, &request.command) {
                     (Some(id), _) => eprintln!(
                         "{why}; swap {id} is journaled and stays with the home: keep serve running or run recover"
@@ -1165,7 +1169,7 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
                 return Ok(Some(3));
             }
         };
-        match serde_json::from_str::<Reply>(&line).context("invalid serve reply")? {
+        match reply {
             Reply::Stdout(s) => {
                 if swap.is_none() && matches!(request.command, Command::Take { .. }) {
                     swap = serde_json::from_str::<serde_json::Value>(&s)
@@ -1176,24 +1180,17 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
             }
             Reply::Stderr(s) => eprintln!("{s}"),
             Reply::Keepalive => {}
-            Reply::Written { dev, ino } => {
-                if let Command::Send { out, .. } = &request.command {
-                    written_ok = same_file(Path::new(out), dev, ino);
-                }
-            }
+            Reply::Written { dev, ino } => written = Some((dev, ino)),
             Reply::Exit { code, error } => {
                 if let Some(e) = error {
                     eprintln!("{e}");
                 }
-                if code == 0 && !written_ok {
+                if code == 0 {
                     if let Command::Send { out, .. } = &request.command {
-                        eprintln!(
-                            "serve reports the send complete but {out} is not the file serve wrote: \
-                             serve and this client do not share a filesystem view (private /tmp, \
-                             container or chroot). The token is journaled, not lost; run send from \
-                             serve's view or stop serve and use send --reclaim"
-                        );
-                        return Ok(Some(3));
+                        if let Some(why) = file_mismatch(Path::new(out), written) {
+                            eprintln!("{why}");
+                            return Ok(Some(3));
+                        }
                     }
                 }
                 return Ok(Some(code));
@@ -1202,9 +1199,31 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
     }
 }
 
-/// `path` (not followed) is the file with this (`st_dev`, `st_ino`).
-fn same_file(path: &Path, dev: u64, ino: u64) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.dev() == dev && m.ino() == ino)
+/// Why the client's `--out` is not confirmed as the file serve wrote (`written`), if it is not.
+/// Never advises `--reclaim` unconditionally: reclaiming can cancel a delivered payment.
+fn file_mismatch(out: &Path, written: Option<(u64, u64)>) -> Option<String> {
+    const CHECK: &str = "The send is complete and its token is journaled. Check where the token \
+                         went before acting: reclaiming cancels a payment the recipient may \
+                         already hold";
+    let shown = out.display();
+    let Some((dev, ino)) = written else {
+        return Some(format!(
+            "serve reports the send complete but did not say which file it wrote; check {shown}. \
+             {CHECK}"
+        ));
+    };
+    match std::fs::symlink_metadata(out) {
+        Ok(m) if m.is_file() && m.dev() == dev && m.ino() == ino => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
+            "serve wrote the token to {shown}, but it is no longer there in your view: moved or \
+             consumed by another program, or serve runs in a different filesystem view. {CHECK}"
+        )),
+        _ => Some(format!(
+            "{shown} in your view is not the file serve wrote: serve and this client do not share \
+             a filesystem view (private /tmp, container or chroot), or the file was replaced. \
+             {CHECK}. Only once you know it was not delivered: stop serve and use send --reclaim"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1218,16 +1237,27 @@ mod tests {
         std::fs::write(&a, "x").unwrap();
         std::fs::write(&b, "x").unwrap();
         let m = std::fs::metadata(&a).unwrap();
-        assert!(same_file(&a, m.dev(), m.ino()));
+        let w = Some((m.dev(), m.ino()));
+        assert_eq!(file_mismatch(&a, w), None);
         // Same content elsewhere (serve's private /tmp) is not the same file.
-        assert!(!same_file(&b, m.dev(), m.ino()));
-        assert!(!same_file(&dir.path().join("missing"), m.dev(), m.ino()));
+        assert!(
+            file_mismatch(&b, w)
+                .unwrap()
+                .contains("not the file serve wrote")
+        );
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&a, &link).unwrap();
         assert!(
-            !same_file(&link, m.dev(), m.ino()),
+            file_mismatch(&link, w).is_some(),
             "a symlink is not the file"
         );
+        // Moved or consumed at once: never sent to --reclaim (review of #1157 round 2, M-B).
+        let gone = file_mismatch(&dir.path().join("missing"), w).unwrap();
+        assert!(
+            gone.contains("no longer there") && !gone.contains("--reclaim"),
+            "{gone}"
+        );
+        assert!(!file_mismatch(&a, None).unwrap().contains("--reclaim"));
     }
     /// Review of #1155, F3: `list` writes a new listing row before it is reserved and published,
     /// so it takes `listings` and no listing recovery unit runs on that row meanwhile.

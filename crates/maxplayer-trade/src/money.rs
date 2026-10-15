@@ -181,14 +181,30 @@ pub async fn fund_with_id(
             "funding id {id} belongs to another mint or amount"
         );
         if f.quote.is_none() {
-            // Nothing was credited under this row yet: a row from before `op` existed gets its own.
-            if f.op.is_none() && f.result.is_none() {
+            // No quote yet, so nothing was credited: a row from before `op` existed gets its own.
+            if f.op.is_none() {
                 f.op = Some(uuid::Uuid::new_v4().to_string());
             }
             crate::Asset::new(url)?.fence()?;
             crate::transport::require_http(url, "fund")?;
             crate::wallet::preflight_for(url, Some("fund")).await?;
             quote(j, &mut f).await?;
+        } else if !f.done && !f.expired_unpaid {
+            // The first run journals the quote BEFORE checking it, so a re-run checks it again:
+            // an invoice that failed the checks is never shown (review of #1157 round 2, M-A).
+            crate::Asset::new(url)?.fence()?;
+            crate::transport::require_http(url, "fund")?;
+            let refused = |e: anyhow::Error| {
+                e.context(format!(
+                    "funding {id}: the mint's quote failed its checks; do not pay its invoice \
+                     (nothing beyond the cap reservation was charged)"
+                ))
+            };
+            invoice_matches(&f).map_err(&refused)?;
+            let quote = f.quote.clone().unwrap_or_default();
+            let q: serde_json::Value = get(url, "mint/quote/bolt11", &quote).await?;
+            ensure!(q["quote"].as_str() == Some(&quote), "fund quote mismatch");
+            key_matches(&f, q["pubkey"].as_str()).map_err(&refused)?;
         }
         return Ok(f);
     }
@@ -245,10 +261,28 @@ async fn quote(j: &Journal, f: &mut Funding) -> Result<()> {
     f.quote = Some(q["quote"].as_str().context("missing quote")?.into());
     f.invoice = Some(q["request"].as_str().context("missing invoice")?.into());
     j.put("funding", &f.id, &*f).await?;
+    key_matches(f, q["pubkey"].as_str())?;
+    invoice_matches(f)?;
+    j.put("funding", &f.id, &*f).await?;
+    Ok(())
+}
+/// The mint bound the quote to this funding's NUT-20 key.
+fn key_matches(f: &Funding, pubkey: Option<&str>) -> Result<()> {
     ensure!(
-        q["pubkey"].as_str() == Some(&f.quote_key.parse::<SecretKey>()?.public_key().to_string()),
+        pubkey
+            == Some(
+                f.quote_key
+                    .parse::<SecretKey>()?
+                    .public_key()
+                    .to_string()
+                    .as_str()
+            ),
         "mint did not bind funding quote to NUT-20 key"
     );
+    Ok(())
+}
+/// The journaled invoice is for exactly this funding's amount.
+fn invoice_matches(f: &Funding) -> Result<()> {
     let invoice_check = MeltQuoteBolt11Request {
         request: f
             .invoice
@@ -259,10 +293,9 @@ async fn quote(j: &Journal, f: &mut Funding) -> Result<()> {
         options: None,
     };
     ensure!(
-        invoice_check.request.amount_milli_satoshis() == amount.checked_mul(1000),
+        invoice_check.request.amount_milli_satoshis() == f.amount.checked_mul(1000),
         "funding invoice amount mismatch"
     );
-    j.put("funding", &f.id, &*f).await?;
     Ok(())
 }
 async fn get<T: serde::de::DeserializeOwned>(url: &str, path: &str, id: &str) -> Result<T> {
