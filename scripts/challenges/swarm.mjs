@@ -31,7 +31,12 @@ export class Journal {
   }
   save() {
     let fd;
-    try {fd=openSync(this.path,'a',0o600);writeSync(fd,JSON.stringify(this.state)+'\n');fsyncSync(fd);}
+    try {
+      fd=openSync(this.path,'a',0o600);
+      const record=Buffer.from(JSON.stringify(this.state)+'\n');
+      for(let offset=0;offset<record.length;){const n=writeSync(fd,record,offset,record.length-offset);if(!n)throw Error('Short journal write');offset+=n;}
+      fsyncSync(fd);
+    }
     catch(e) {e.journalFailure=true;throw e;}
     finally {if(fd!==undefined)closeSync(fd);}
   }
@@ -129,7 +134,7 @@ export class Swarm {
           // Planning can be slow. Re-read and recheck all admission gates immediately before posting.
           const fresh=await this.io.snapshot(), at=this.io.now();
           const check=coordinate(fresh,{now:at,durationSeconds:this.c.duration,amountSats:this.c.amount,budgetState:fresh.challenge?reservedBudget(fresh,jobs,at):null,pendingSellers:this.state.jobs.filter(j=>!j.done).map(j=>j.seller)});
-          if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+this.c.duration>c.ends||!check.sellers.some(x=>x.seller_pubkey===s.seller_pubkey&&x.postingAllowed))break;
+          if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+this.c.duration>fresh.challenge.ends||!check.sellers.some(x=>x.seller_pubkey===s.seller_pubkey&&x.postingAllowed))break;
           const sequence=jobs.filter(j=>j.seller===s.seller_pubkey).length+1;
           const args={task:p.task,output:'text/plain',visibility:'public',seller_pubkey:s.seller_pubkey,payment:this.c.amount?'sat':'none',amount_sats:this.c.amount,max_sats:this.c.amount,deadline_unix:at+this.c.duration,request_id:requestId(c,s.seller_pubkey,sequence)};
           const j={key,challenge:c,seller:s.seller_pubkey,created:at,args};

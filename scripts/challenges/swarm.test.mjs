@@ -66,7 +66,7 @@ test('fallback award is disabled by default and bounded when explicitly enabled'
   f.c.awardFallback=true;await f.runner.tick();assert.equal(f.calls.filter(x=>x[0]==='award_claim').length,2);
 });
 test('planner latency rechecks deadline and changed acceptance immediately before post',async()=>{
-  for(const change of [f=>f.time(999),f=>f.snap.sellers.forEach(s=>s.decision='denied'),f=>f.snap.challenge.status='completed']){
+  for(const change of [f=>f.time(999),f=>{f.snap.challenge.ends=110;},f=>f.snap.sellers.forEach(s=>s.decision='denied'),f=>f.snap.challenge.status='completed']){
     const f=fixture();f.setPlan(()=>{change(f);return {task:'too late'};});await f.runner.tick();assert.equal(f.remote.size,0);
   }
 });
