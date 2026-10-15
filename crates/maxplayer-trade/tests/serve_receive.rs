@@ -304,15 +304,16 @@ async fn receive_via_serve_credits_once_and_serve_keeps_lock_listing_and_swap() 
         "SAFETY: serve's listing stays available"
     );
     // Writers that are not handed off are still refused while serve runs.
-    let fund = cmd(&f.taker, &f.relay_url, &["fund", &c.url, "--amount", "10"])
+    // (send and fund are handed off since T3b; recover still needs the home lock.)
+    let recover = cmd(&f.taker, &f.relay_url, &["recover"])
         .output()
         .await
         .unwrap();
-    assert_eq!(fund.status.code(), Some(1));
+    assert_eq!(recover.status.code(), Some(1));
     assert!(
-        text(&fund).1.contains("home is already in use"),
+        text(&recover).1.contains("home is already in use"),
         "{}",
-        text(&fund).1
+        text(&recover).1
     );
     // The swap that was active during the receive settles.
     let begin = std::time::Instant::now();

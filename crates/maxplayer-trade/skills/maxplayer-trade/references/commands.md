@@ -25,7 +25,7 @@ doctor <mint> --mint-relay <url> [--json] [--timeout-seconds <seconds>]
 preflight <mint>
 balance <mint>
 status [--json] [--check-sends]
-fund <mint> --amount <sats> [--quote <quote-id>]
+fund <mint> --amount <sats> [--quote <quote-id>] [--id <funding-id>]
 receive <mint> [--token-file <path>]
 send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats> [--dry-run]
@@ -144,7 +144,7 @@ can change in between; the real command enforces your bounds again.
 
 ## Hand-off to a running serve
 
-While `serve` owns the home, `list`, `take`, `cancel` and `receive` hand their request to it
+While `serve` owns the home, `list`, `take`, `cancel`, `receive`, `send` and `fund` hand their request to it
 over `<home>/serve.sock` (mode 0600, same user only) and print serve's result with
 the usual output and exit codes. serve executes it with exactly the bounds given;
 it never fills in defaults. serve refuses a request whose relays differ from its own
@@ -157,8 +157,30 @@ The client sends only to a serve socket and peer owned by its own user. A handed
 streams states until settlement; if the command is interrupted, serve keeps driving
 the swap (check `status`). Without a running serve these commands behave as before.
 A handed-off `receive` is described under [Receive](#receive-through-a-running-serve).
-`recover`, `fund`, `withdraw` and `send` still need the home lock (`home is already in
+`recover`, `withdraw` and `send --reclaim` still need the home lock (`home is already in
 use` while serve runs); stop serve first.
+
+A handed-off `send` passes `--out` as an absolute path (resolved in your directory) and
+`--max-fees` exactly as given; serve creates that 0600 file. The same send (same `--out`)
+again resumes that attempt and never sends twice; other terms for that `--out` are refused.
+If the reply is lost (exit 3), re-run the same send. A handed-off `fund` first prints
+`{"funding_id":...}` on stderr, then the invoice line. Re-running `fund <mint> --amount N
+--id <funding_id>` returns that same quote and invoice and never creates a second one (a
+different mint or amount for that id is refused). The fund id is only a lookup key; the
+wallet uses its own operation id for the funding. If the quote reply was lost, the same `--id`
+creates the quote under that same funding (no second charge against the cap). A re-run with `--id` re-checks a journaled quote (NUT-20
+binding, invoice amount) and refuses one that failed: never pay that invoice. serve's
+recovery checks issuance; the client only follows it, so an unpaid invoice never holds other
+mints' work (quote creation and one issuance check hold this mint's wallet work for at most
+one item budget each). An expired unpaid quote ends the follow with "nothing to pay".
+serve writes the send's `--out` file in its own filesystem view and reports that file's
+identity as created; the client checks its own `--out` is that file and exits 3 if not. A
+file already gone (moved or consumed by another program at once) is reported as such: the
+send is complete, so check where the token went before any `--reclaim`, which cancels a
+payment the recipient may already hold. serve and its clients must share a filesystem view:
+bind mounts of the same filesystem are fine; a private `/tmp`, container, chroot, an
+overlay's upperdir or a second NFS mount between them is not. Protocol version 3: older clients' handed-off
+`list`/`take`/`cancel`/`receive` are refused with a version mismatch.
 `cancel` first recovers existing authorizations when it runs without serve.
 `serve` continuously accepts trades and recovers obligations; keep it running while
 locks are live. `recover` is a bounded single pass, not a replacement watcher;

@@ -45,7 +45,8 @@ pub const CLIENT_IDLE: Duration = Duration::from_secs(90);
 /// How long a client whose home is locked keeps looking for a serve socket (serve may be starting).
 pub const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// 2: requests carry the client's effective `nostr://` mint relays (`mint_relays`).
-pub const PROTOCOL_V: u8 = 2;
+/// 3: `send` and `fund` hand-offs (T3b).
+pub const PROTOCOL_V: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -71,6 +72,25 @@ pub enum Command {
         mint: String,
         token: TokenText,
     },
+    /// `send <mint> --amount N --out PATH [--max-fees F]`. `out` is absolute (the client resolved
+    /// it): serve, running as the same user, creates exactly that file. The send is keyed on it,
+    /// so the same request again resumes that attempt and never sends twice.
+    Send {
+        mint: String,
+        amount: u64,
+        out: String,
+        /// Exactly as given: `None` refuses a mint that charges input fees, as the CLI does.
+        max_fees: Option<u64>,
+    },
+    /// `fund <mint> --amount N` under the client's operation id (a UUID printed before the
+    /// hand-off). The same id again returns the same journaled quote and invoice. `quote`: resume
+    /// polling a journaled quote (`--quote`).
+    Fund {
+        mint: String,
+        amount: u64,
+        id: String,
+        quote: Option<String>,
+    },
 }
 impl Command {
     fn name(&self) -> &'static str {
@@ -79,6 +99,8 @@ impl Command {
             Command::Take { .. } => "take",
             Command::Cancel { .. } => "cancel",
             Command::Receive { .. } => "receive",
+            Command::Send { .. } => "send",
+            Command::Fund { .. } => "fund",
         }
     }
     /// The serve work keys this request may write (see `sched`): proof selection and new
@@ -91,12 +113,10 @@ impl Command {
             Command::List { .. } => vec!["admit".into(), "listings".into()],
             Command::Take { .. } => vec!["admit".into(), "taker".into()],
             Command::Cancel { lot } => vec!["admit".into(), format!("lot:{lot}")],
-            Command::Receive { mint, .. } => vec![format!(
-                "wallet:{}",
-                Asset::from_cli(mint)
-                    .map(|a| a.mint_url)
-                    .unwrap_or_else(|_| mint.clone())
-            )],
+            Command::Receive { mint, .. } | Command::Fund { mint, .. } => vec![wallet_key(mint)],
+            // Selects proofs (`admit`: never alongside a list/take choosing inputs) and writes
+            // its mint's wallet journal.
+            Command::Send { mint, .. } => vec!["admit".into(), wallet_key(mint)],
         }
     }
     /// Which of the client's relay sets this command depends on, so serve can refuse a request
@@ -113,7 +133,9 @@ impl Command {
                 ..
             } => (true, nostr(give_mint) || nostr(want_mint)),
             Command::Take { .. } | Command::Cancel { .. } => (true, true),
-            Command::Receive { mint, .. } => (false, nostr(mint)),
+            Command::Receive { mint, .. } | Command::Send { mint, .. } => (false, nostr(mint)),
+            // fund refuses nostr:// mints before the hand-off.
+            Command::Fund { .. } => (false, false),
         }
     }
     /// What serve may log about a request: public bounds and ids only, never a payload. Each
@@ -140,6 +162,18 @@ impl Command {
             Command::Receive { mint, token } => {
                 serde_json::json!({"mint":mint,"receive":receive_id(mint, &token.0)})
             }
+            Command::Send {
+                mint,
+                amount,
+                out,
+                max_fees,
+            } => serde_json::json!({"mint":mint,"amount":amount,"out":out,"max_fees":max_fees}),
+            Command::Fund {
+                mint,
+                amount,
+                id,
+                quote,
+            } => serde_json::json!({"mint":mint,"amount":amount,"funding_id":id,"quote":quote}),
         };
         serde_json::json!({ self.name(): fields })
     }
@@ -153,6 +187,15 @@ impl std::fmt::Debug for TokenText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("<token withheld>")
     }
+}
+/// The wallet work key of `mint` as the CLI names it (canonical form when it parses).
+fn wallet_key(mint: &str) -> String {
+    format!(
+        "wallet:{}",
+        Asset::from_cli(mint)
+            .map(|a| a.mint_url)
+            .unwrap_or_else(|_| mint.to_owned())
+    )
 }
 /// The public receive attempt id of `token` (static parse, no network), when it parses.
 pub fn receive_id(mint: &str, token: &str) -> Option<String> {
@@ -180,7 +223,16 @@ pub enum Reply {
     Stdout(String),
     Stderr(String),
     Keepalive,
-    Exit { code: u8, error: Option<String> },
+    /// A handed-off send's token file as serve created it: (`st_dev`, `st_ino`). The client
+    /// checks that its own `--out` is that same file before reporting success.
+    Written {
+        dev: u64,
+        ino: u64,
+    },
+    Exit {
+        code: u8,
+        error: Option<String>,
+    },
 }
 
 /// A request queued to serve's loop.
@@ -193,8 +245,12 @@ pub struct Job {
 pub struct Outcome {
     pub stdout: Vec<String>,
     pub swap: Option<String>,
+    /// A funding whose issuance serve's recovery keeps checking: streamed after `stdout`.
+    pub funding: Option<(String, String)>,
     /// Printed to the client's stderr after `stdout`.
     pub stderr: Vec<String>,
+    /// A send's written token file (`st_dev`, `st_ino`) in serve's filesystem view.
+    pub written: Option<(u64, u64)>,
     /// Exit code and message after `stdout` was printed (the CLI's code for that result).
     pub failure: Option<Failure>,
 }
@@ -482,6 +538,9 @@ async fn connection(
     for line in outcome.stderr {
         write(&mut stream, &Reply::Stderr(line)).await?;
     }
+    if let Some((dev, ino)) = outcome.written {
+        write(&mut stream, &Reply::Written { dev, ino }).await?;
+    }
     if let Some(f) = outcome.failure {
         return write(
             &mut stream,
@@ -491,6 +550,9 @@ async fn connection(
             },
         )
         .await;
+    }
+    if let Some((id, mint)) = outcome.funding {
+        return stream_funding(&mut stream, home, &id, &mint).await;
     }
     let Some(id) = outcome.swap else {
         return write(
@@ -510,6 +572,77 @@ async fn connection(
     )
     .await?;
     stream_take(&mut stream, home, &id).await
+}
+
+/// Follow one funding in the journal (read-only) while serve's recovery issues it: exit 0 once
+/// it is credited, 1 when the CLI's polling window passes first (the intent stays journaled and
+/// serve keeps checking it). Never waits inline in serve's loop.
+async fn stream_funding(stream: &mut UnixStream, home: &Path, id: &str, mint: &str) -> Result<()> {
+    let window = crate::money::fund_poll(mint) * crate::money::FUND_POLLS + Duration::from_secs(10);
+    let end = tokio::time::Instant::now() + window;
+    let mut quiet = tokio::time::Instant::now();
+    loop {
+        let rows = match observe::journal_rows(home, "funding") {
+            Ok(rows) => rows,
+            // A busy journal: one retry on the next tick, then report it.
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                observe::journal_rows(home, "funding")?
+            }
+        };
+        let row = rows.into_iter().find(|(k, _, _)| k == id);
+        if let Some((_, v, _)) = row {
+            let f: crate::money::Funding = serde_json::from_slice(&v)?;
+            if f.expired_unpaid {
+                return write(
+                    stream,
+                    &Reply::Exit {
+                        code: 1,
+                        error: Some(format!(
+                            "funding {id}: quote expired unpaid; nothing to pay and nothing is \
+                             checked further; start a new funding"
+                        )),
+                    },
+                )
+                .await;
+            }
+            if f.done {
+                write(
+                    stream,
+                    &Reply::Stderr(
+                        serde_json::json!({"funding_id":id,"state":"issued"}).to_string(),
+                    ),
+                )
+                .await?;
+                return write(
+                    stream,
+                    &Reply::Exit {
+                        code: 0,
+                        error: None,
+                    },
+                )
+                .await;
+            }
+        }
+        if tokio::time::Instant::now() >= end {
+            return write(
+                stream,
+                &Reply::Exit {
+                    code: 1,
+                    error: Some(format!(
+                        "funding remains pending; invoice and intent retained; serve keeps checking \
+                         funding {id} (see `status`; re-run with --id {id} to follow it again)"
+                    )),
+                },
+            )
+            .await;
+        }
+        if quiet.elapsed() >= KEEPALIVE {
+            write(stream, &Reply::Keepalive).await?;
+            quiet = tokio::time::Instant::now();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Stream one swap's state from the journal (read-only) until it is terminal.
@@ -669,7 +802,9 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"lot_id":id,"status_event_id":l.statuses[0].id,"status":"available","debit":l.plan.debit}).to_string()],
                 swap: None,
+                funding: None,
                 stderr: vec![],
+                written: None,
                 failure: None,
             })
         }
@@ -679,7 +814,9 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"lot_id":l.event.id,"status_event_ids":l.statuses.iter().map(|e|e.id.to_hex()).collect::<Vec<_>>(),"status":crate::lifecycle(&l.event,&l.statuses)?}).to_string()],
                 swap: None,
+                funding: None,
                 stderr: vec![],
+                written: None,
                 failure: None,
             })
         }
@@ -695,12 +832,135 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
             Ok(Outcome {
                 stdout: vec![serde_json::json!({"swap_id":s.id,"state":s.state}).to_string()],
                 swap: Some(id),
+                funding: None,
                 stderr: vec![],
+                written: None,
                 failure: None,
             })
         }
         Command::Receive { mint, token } => receive_command(home, j, mint, &token.0).await,
+        Command::Send {
+            mint,
+            amount,
+            out,
+            max_fees,
+        } => send_command(home, j, mint, *amount, out, *max_fees).await,
+        Command::Fund {
+            mint,
+            amount,
+            id,
+            quote,
+        } => fund_command(home, j, mint, *amount, id, quote.as_deref()).await,
     }
+}
+
+/// A handed-off `send`: the same `send::send` the CLI runs, bounded like one recovery item so a
+/// slow mint holds only this mint's wallet work. Dropping it is safe: the attempt is journaled
+/// before its reservation and swap, and recovery restores the same outputs. On expiry the
+/// journaled attempt (if any) is reported; serve's recovery finishes it and writes the file.
+async fn send_command(
+    home: &Path,
+    j: &Journal,
+    mint: &str,
+    amount: u64,
+    out: &str,
+    max_fees: Option<u64>,
+) -> Result<Outcome> {
+    let asset = Asset::from_cli(mint)?;
+    asset.fence()?;
+    let mint = asset.mint_url.as_str();
+    ensure!(
+        Path::new(out).is_absolute(),
+        "send --out must reach serve as an absolute path"
+    );
+    let budget = Duration::from_secs(crate::send::RECOVERY_ITEM_SECONDS);
+    let call = crate::send::send(home, j, mint, amount, Path::new(out), max_fees);
+    let r = match tokio::time::timeout(budget, call).await {
+        Ok(r) => r?,
+        Err(_) => {
+            crate::backoff::record(
+                mint,
+                crate::backoff::Outcome::Failed(crate::backoff::Reason::Timeout, None),
+            );
+            let target = crate::send::target(Path::new(out))?;
+            let target = target.to_str().context("--out path must be UTF-8")?;
+            crate::send::by_out(j, target).await?.with_context(|| {
+                format!(
+                    "send did not finish within {}s and no attempt for --out {out} was found yet; \
+                     re-run the same command (same --out): it resumes any attempt and never sends twice",
+                    budget.as_secs()
+                )
+            })?
+        }
+    };
+    // The file serve created (or found in place), identified when it was written, not by a
+    // later path lookup: a consumer may move it at once (review of #1157 round 2, M-B).
+    let written = (r.state == crate::send::SendState::Sent)
+        .then_some(r.written)
+        .flatten();
+    Ok(Outcome {
+        stdout: vec![r.summary().to_string()],
+        swap: None,
+        funding: None,
+        stderr: vec![],
+        written,
+        failure: crate::send::verdict(&r, false).err().map(|e| Failure {
+            code: exit_code(&e),
+            message: e.to_string(),
+        }),
+    })
+}
+
+/// A handed-off `fund`: create (or, for the same id, look up) the journaled quote, try issuance
+/// once, and print the invoice. The client then follows the funding read-only while serve's
+/// recovery keeps checking it: no invoice wait runs inline in serve's loop. Quote creation and
+/// the one issuance check hold this mint's wallet unit (at most one item budget each); other
+/// mints' work never waits on them.
+async fn fund_command(
+    home: &Path,
+    j: &Journal,
+    mint: &str,
+    amount: u64,
+    id: &str,
+    quote: Option<&str>,
+) -> Result<Outcome> {
+    let asset = Asset::from_cli(mint)?;
+    asset.fence()?;
+    let mint = asset.mint_url.as_str();
+    crate::transport::require_http(mint, "fund")?;
+    ensure!(
+        amount > 0 && amount <= crate::real_money::CAP,
+        "funding cap exceeds 100,000 sats"
+    );
+    let budget = Duration::from_secs(crate::send::RECOVERY_ITEM_SECONDS);
+    let mut f = match quote {
+        Some(q) => j
+            .all::<crate::money::Funding>("funding")
+            .await?
+            .into_iter()
+            .find(|f| f.quote.as_deref() == Some(q) && f.mint == mint && f.amount == amount)
+            .context("quote not journaled for this mint and amount")?,
+        None => tokio::time::timeout(
+            budget,
+            crate::money::fund_with_id(home, j, mint, amount, id),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("funding quote not answered in time; re-run with --id {id}")
+        })??,
+    };
+    // One issuance check now; later ones are recovery's (a lost answer only defers it).
+    let _ = tokio::time::timeout(budget, crate::money::resume_fund(home, j, &mut f)).await;
+    let line = serde_json::json!({"funding_id":f.id,"quote":f.quote,"invoice":f.invoice,
+        "amount":f.amount,"note":"pay externally; tool never auto-pays"});
+    Ok(Outcome {
+        stdout: vec![line.to_string()],
+        swap: None,
+        funding: (!f.done).then(|| (f.id.clone(), f.mint.clone())),
+        stderr: vec![],
+        written: None,
+        failure: None,
+    })
 }
 
 /// How long one handed-off receive may hold serve's loop: one recovery item's budget. Lab
@@ -795,7 +1055,9 @@ async fn receive_command(home: &Path, j: &Journal, mint: &str, token: &str) -> R
     Ok(Outcome {
         stdout: vec![r.summary().to_string()],
         swap: None,
+        funding: None,
         stderr: vec![serde_json::json!({"receive":r.id,"outcome":outcome,"note":note}).to_string()],
+        written: None,
         failure: receive::verdict(&r).err().map(|e| Failure {
             code: exit_code(&e),
             message: e.to_string(),
@@ -859,6 +1121,8 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
         serde_json::json!({"handed_to_serve":request.command.name()})
     );
     let mut swap: Option<String> = None;
+    // A handed-off send succeeds only when serve's file is the client's own --out.
+    let mut written: Option<(u64, u64)> = None;
     let mut stream = BufReader::new(stream);
     loop {
         let next = tokio::time::timeout(
@@ -866,14 +1130,18 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
             read_line_bounded(&mut stream, MAX_REPLY_LINE_BYTES),
         )
         .await;
-        let line = match next {
-            Ok(Ok(Some(line))) => line,
-            other => {
-                let why = match other {
-                    Err(_) => "serve went silent".to_string(),
-                    Ok(Err(e)) => e.to_string(),
-                    _ => "serve closed the connection".to_string(),
-                };
+        // An unreadable line (e.g. a reply this client does not know) is handled like a lost
+        // reply: the request was delivered and may have been applied.
+        let parsed = match next {
+            Ok(Ok(Some(line))) => serde_json::from_str::<Reply>(&line)
+                .map_err(|e| format!("unreadable serve reply ({e})")),
+            Err(_) => Err("serve went silent".to_string()),
+            Ok(Err(e)) => Err(e.to_string()),
+            _ => Err("serve closed the connection".to_string()),
+        };
+        let reply = match parsed {
+            Ok(reply) => reply,
+            Err(why) => {
                 match (&swap, &request.command) {
                     (Some(id), _) => eprintln!(
                         "{why}; swap {id} is journaled and stays with the home: keep serve running or run recover"
@@ -884,6 +1152,16 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
                          credits twice",
                         receive_id(mint, &token.0).unwrap_or_else(|| "attempt".into())
                     ),
+                    (None, Command::Send { out, .. }) => eprintln!(
+                        "{why} before reporting a result; the send to {out} may have been applied. \
+                         Re-run this same send (same --out): it resumes that attempt and never \
+                         sends twice; or check `status`"
+                    ),
+                    (None, Command::Fund { id, .. }) => eprintln!(
+                        "{why} before reporting a result; funding {id} may have been created. \
+                         Re-run with --id {id}: it returns that same invoice and never creates a \
+                         second one; or check `status`"
+                    ),
                     (None, _) => eprintln!(
                         "{why} before reporting a result; the request may have been applied. Check status"
                     ),
@@ -891,7 +1169,7 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
                 return Ok(Some(3));
             }
         };
-        match serde_json::from_str::<Reply>(&line).context("invalid serve reply")? {
+        match reply {
             Reply::Stdout(s) => {
                 if swap.is_none() && matches!(request.command, Command::Take { .. }) {
                     swap = serde_json::from_str::<serde_json::Value>(&s)
@@ -902,9 +1180,18 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
             }
             Reply::Stderr(s) => eprintln!("{s}"),
             Reply::Keepalive => {}
+            Reply::Written { dev, ino } => written = Some((dev, ino)),
             Reply::Exit { code, error } => {
                 if let Some(e) = error {
                     eprintln!("{e}");
+                }
+                if code == 0 {
+                    if let Command::Send { out, .. } = &request.command {
+                        if let Some(why) = file_mismatch(Path::new(out), written) {
+                            eprintln!("{why}");
+                            return Ok(Some(3));
+                        }
+                    }
                 }
                 return Ok(Some(code));
             }
@@ -912,9 +1199,66 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
     }
 }
 
+/// Why the client's `--out` is not confirmed as the file serve wrote (`written`), if it is not.
+/// Never advises `--reclaim` unconditionally: reclaiming can cancel a delivered payment.
+fn file_mismatch(out: &Path, written: Option<(u64, u64)>) -> Option<String> {
+    const CHECK: &str = "The send is complete and its token is journaled. Check where the token \
+                         went before acting: reclaiming cancels a payment the recipient may \
+                         already hold";
+    let shown = out.display();
+    let Some((dev, ino)) = written else {
+        return Some(format!(
+            "serve reports the send complete but did not say which file it wrote; check {shown}. \
+             {CHECK}"
+        ));
+    };
+    match std::fs::symlink_metadata(out) {
+        Ok(m) if m.is_file() && m.dev() == dev && m.ino() == ino => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
+            "serve wrote the token to {shown}, but it is no longer there in your view: moved or \
+             consumed by another program, or serve runs in a different filesystem view. {CHECK}"
+        )),
+        _ => Some(format!(
+            "{shown} in your view is not the file serve wrote: serve and this client do not share \
+             a filesystem view (private /tmp, container or chroot), or the file was replaced. \
+             {CHECK}. Only once you know it was not delivered: stop serve and use send --reclaim"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn written_file_must_be_the_clients_own_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, "x").unwrap();
+        std::fs::write(&b, "x").unwrap();
+        let m = std::fs::metadata(&a).unwrap();
+        let w = Some((m.dev(), m.ino()));
+        assert_eq!(file_mismatch(&a, w), None);
+        // Same content elsewhere (serve's private /tmp) is not the same file.
+        assert!(
+            file_mismatch(&b, w)
+                .unwrap()
+                .contains("not the file serve wrote")
+        );
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        assert!(
+            file_mismatch(&link, w).is_some(),
+            "a symlink is not the file"
+        );
+        // Moved or consumed at once: never sent to --reclaim (review of #1157 round 2, M-B).
+        let gone = file_mismatch(&dir.path().join("missing"), w).unwrap();
+        assert!(
+            gone.contains("no longer there") && !gone.contains("--reclaim"),
+            "{gone}"
+        );
+        assert!(!file_mismatch(&a, None).unwrap().contains("--reclaim"));
+    }
     /// Review of #1155, F3: `list` writes a new listing row before it is reserved and published,
     /// so it takes `listings` and no listing recovery unit runs on that row meanwhile.
     #[test]

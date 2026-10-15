@@ -22,7 +22,7 @@ use std::{
     collections::HashSet,
     fs::{self, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -92,6 +92,10 @@ pub struct SendAttempt {
     pub amount: u64,
     /// Sender-paid mint input fee of the send swap.
     pub fee: u64,
+    /// The token file this run created or found in place (`st_dev`, `st_ino`), taken from the
+    /// file itself when it was written, never re-read later by path. Not journaled.
+    #[serde(skip)]
+    pub written: Option<(u64, u64)>,
     out: String,
     swap: Leg,
     token: Option<String>,
@@ -198,7 +202,9 @@ fn outputs(p: PreMintSecrets, send: bool) -> Vec<Output> {
 }
 
 /// Absolute target path: canonical existing parent + file name. Never created here.
-fn target(out: &Path) -> Result<PathBuf> {
+/// `out` as an absolute path (its directory canonicalized). A send handed to serve carries this
+/// form, so serve (another working directory) writes exactly the file the user named.
+pub fn target(out: &Path) -> Result<PathBuf> {
     let name = out.file_name().context("--out must name a file")?;
     let parent = out
         .parent()
@@ -229,8 +235,10 @@ fn holds(path: &Path, token: &str) -> Result<Option<bool>> {
 
 /// Exclusive 0600 creation: a private O_EXCL temporary, fsynced, then hard-linked to
 /// `out` (link fails if `out` exists, so nothing is ever overwritten and a crash never
-/// leaves a partial token at `out`).
-fn write_token(out: &Path, id: &str, token: &str) -> Result<()> {
+/// leaves a partial token at `out`). Returns the identity of the file as created (or as found
+/// already in place), for serve's client to check its own `--out` against.
+fn write_token(out: &Path, id: &str, token: &str) -> Result<Option<(u64, u64)>> {
+    let here = |p: &Path| fs::symlink_metadata(p).ok().map(|m| (m.dev(), m.ino()));
     let name = out.file_name().context("--out must name a file")?;
     let tmp = out.with_file_name(format!(
         ".{}.{id}.partial",
@@ -240,7 +248,7 @@ fn write_token(out: &Path, id: &str, token: &str) -> Result<()> {
         Some(true) => {
             // A crash after the link may have left the private temporary copy.
             let _ = fs::remove_file(&tmp);
-            return Ok(());
+            return Ok(here(out));
         }
         Some(false) => bail!("--out path exists with other content; token retained in journal"),
         None => {}
@@ -256,6 +264,8 @@ fn write_token(out: &Path, id: &str, token: &str) -> Result<()> {
         .write_all(token.as_bytes())
         .and_then(|()| f.write_all(b"\n"))
         .and_then(|()| f.sync_all());
+    // The link below keeps this inode: this is the identity of the file placed at `out`.
+    let created = f.metadata().ok().map(|m| (m.dev(), m.ino()));
     drop(f);
     if let Err(e) = written {
         // Never leave a full bearer-token copy behind (e.g. disk full).
@@ -266,14 +276,14 @@ fn write_token(out: &Path, id: &str, token: &str) -> Result<()> {
     let _ = fs::remove_file(&tmp);
     if let Err(e) = linked {
         if holds(out, token)? == Some(true) {
-            return Ok(());
+            return Ok(here(out));
         }
         return Err(anyhow!(e).context("cannot place token file; token retained in journal"));
     }
     if let Some(dir) = out.parent() {
         fs::File::open(dir)?.sync_all()?;
     }
-    Ok(())
+    Ok(created)
 }
 
 /// Persist `state` FIRST; only then let the caller-visible record change. A failed
@@ -360,9 +370,16 @@ pub async fn send(
             r.id,
             r.id
         );
+        if max_fees.unwrap_or(0) < r.fee {
+            crate::diagnostics::emit(format!(
+                "send {}: resuming at its journaled fee {} sat; the new --max-fees does not \
+                 lower an already-authorized attempt",
+                r.id, r.fee
+            ));
+        }
         if !r.terminal() {
             if let Err(error) = resume(home, j, &mut r).await {
-                eprintln!("send {}: {error:#}; attempt retained", r.id);
+                crate::diagnostics::emit(format!("send {}: {error:#}; attempt retained", r.id));
             }
             return Ok(r);
         }
@@ -378,7 +395,7 @@ pub async fn send(
         let token = r.token.clone().context("missing journaled token")?;
         if holds(&out, &token)? == Some(true) {
             // Already in place: an idempotent no-op, nothing is (re)emitted.
-            write_token(&out, &r.id, &token)?;
+            r.written = write_token(&out, &r.id, &token)?;
             return Ok(r);
         }
         let states = mint::states(&r.mint, &r.sent_proofs()?).await?;
@@ -387,11 +404,11 @@ pub async fn send(
             "--out belongs to send {} whose token is already (partially) redeemed or pending; choose another --out",
             r.id
         );
-        write_token(&out, &r.id, &token)?;
-        eprintln!(
+        r.written = write_token(&out, &r.id, &token)?;
+        crate::diagnostics::emit(format!(
             "send {}: --out already belongs to this send; rewrote the same token; no new value was sent",
             r.id
-        );
+        ));
         r.rewritten = true;
         return Ok(r);
     }
@@ -485,6 +502,7 @@ pub async fn send(
         anyhow!("send refused: {e:#}; nothing journaled, reserved or sent; send a smaller amount")
     })?;
     let mut r = SendAttempt {
+        written: None,
         id: uuid::Uuid::new_v4().to_string(),
         mint: mint.into(),
         state: SendState::Prepared,
@@ -512,7 +530,7 @@ pub async fn send(
         return Err(error.context("send inputs could not be reserved; refused"));
     }
     if let Err(error) = resume(home, j, &mut r).await {
-        eprintln!("send {}: {error:#}; attempt retained", r.id);
+        crate::diagnostics::emit(format!("send {}: {error:#}; attempt retained", r.id));
     }
     Ok(r)
 }
@@ -875,7 +893,7 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result<()>
     }
     lab_crash("TRADE_CRASH_BEFORE_SEND_FILE", 85);
     let token = r.token.clone().context("missing journaled token")?;
-    write_token(Path::new(&r.out), &r.id, &token)?;
+    r.written = write_token(Path::new(&r.out), &r.id, &token)?;
     finish(j, r, SendState::Sent).await?;
     release(home, j, r).await
 }
@@ -1109,6 +1127,15 @@ async fn release_quietly(home: &Path, j: &Journal, r: &mut SendAttempt) {
     }
 }
 
+/// The journaled attempt that owns `out` (absolute, as [`target`] gives it), if any (latest
+/// non-refused first).
+pub async fn by_out(j: &Journal, out: &str) -> Result<Option<SendAttempt>> {
+    Ok(j.all::<SendAttempt>("send")
+        .await?
+        .into_iter()
+        .filter(|r| r.out == out)
+        .max_by_key(|r| r.state != SendState::Refused))
+}
 /// One bounded pass over unfinished sends and reclaims. True when any remain unresolved.
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
     recover_for(home, j, None).await
@@ -1220,6 +1247,11 @@ pub async fn command(
         }
     };
     println!("{}", r.summary());
+    verdict(&r, reclaiming)
+}
+/// The CLI result of a finished `send` (or `send --reclaim`) call: Ok, or the error that sets
+/// its exit code (3 unresolved, 4 manual recovery, 1 otherwise). Shared with serve.
+pub fn verdict(r: &SendAttempt, reclaiming: bool) -> Result<()> {
     use crate::coordinator::{ManualRecovery, RecoveryIncomplete};
     match r.state {
         SendState::Sent if !reclaiming => Ok(()),

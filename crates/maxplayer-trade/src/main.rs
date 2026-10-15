@@ -86,6 +86,10 @@ enum Command {
         amount: u64,
         #[arg(long)]
         quote: Option<String>,
+        /// Operation id (UUID) of this funding. Re-running with the same id returns the same
+        /// journaled quote and invoice instead of creating another. Printed before the request.
+        #[arg(long, conflicts_with = "quote")]
+        id: Option<String>,
     },
     /// Pay one exact BOLT11 invoice (max 100,000 sats), journaling inputs and change.
     Withdraw {
@@ -265,6 +269,19 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         Command::Receive { token_file, .. } => Some(read_token(token_file.as_deref())?),
         _ => None,
     };
+    // A partial send (no --reclaim) can never run: say what is missing before any hand-off or lock.
+    if let Command::Send {
+        mint,
+        amount,
+        out,
+        reclaim: None,
+        ..
+    } = &cli.command
+    {
+        mint.as_ref().context("mint required")?;
+        amount.as_ref().context("--amount required")?;
+        out.as_ref().context("--out required")?;
+    }
     // A running serve owns the home: hand list/take/cancel/receive to it, with these exact bounds.
     let handoff = match &cli.command {
         Command::List {
@@ -296,6 +313,44 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         Command::Cancel { lot } => {
             Some(maxplayer_trade::serve::Command::Cancel { lot: lot.clone() })
         }
+        Command::Send {
+            mint: Some(mint),
+            amount: Some(amount),
+            out: Some(out),
+            max_fees,
+            reclaim: None,
+        } => Some(maxplayer_trade::serve::Command::Send {
+            mint: mint.clone(),
+            amount: *amount,
+            // serve runs in another directory: hand over the absolute path the user meant.
+            out: maxplayer_trade::send::target(out)?
+                .to_str()
+                .context("--out path must be UTF-8")?
+                .to_owned(),
+            max_fees: *max_fees,
+        }),
+        Command::Fund {
+            mint,
+            amount,
+            quote,
+            id,
+        } => {
+            ensure!(
+                *amount <= maxplayer_trade::real_money::CAP,
+                "funding cap exceeds 100,000 sats"
+            );
+            Some(maxplayer_trade::serve::Command::Fund {
+                mint: mint.clone(),
+                amount: *amount,
+                id: match id {
+                    Some(id) => uuid::Uuid::parse_str(id)
+                        .context("--id must be a UUID")?
+                        .to_string(),
+                    None => uuid::Uuid::new_v4().to_string(),
+                },
+                quote: quote.clone(),
+            })
+        }
         Command::Receive { mint, .. } => {
             let raw = token.as_deref().unwrap_or_default().trim();
             // Refused before connecting, exactly as the local path refuses it.
@@ -316,6 +371,19 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         mint_relays: maxplayer_trade::transport::mint_relays(),
         command,
     });
+    if let Some(maxplayer_trade::serve::Request {
+        command: maxplayer_trade::serve::Command::Fund {
+            id, quote: None, ..
+        },
+        ..
+    }) = &handoff
+    {
+        // Before anything can be created: the id that retrieves this same funding later.
+        eprintln!(
+            "{}",
+            serde_json::json!({"funding_id":id,"note":"re-run with --id to resume this funding"})
+        );
+    }
     if let Some(request) = &handoff {
         if home.is_dir() {
             if let Some(code) = maxplayer_trade::serve::forward(home, request).await? {
@@ -530,6 +598,13 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         amount, ref quote, ..
     } = cli.command
     {
+        let id = match &handoff {
+            Some(maxplayer_trade::serve::Request {
+                command: maxplayer_trade::serve::Command::Fund { id, .. },
+                ..
+            }) => id.clone(),
+            _ => uuid::Uuid::new_v4().to_string(),
+        };
         ensure!(
             amount > 0 && amount <= maxplayer_trade::real_money::CAP,
             "funding cap exceeds 100,000 sats"
@@ -542,11 +617,11 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
                 .find(|f| f.quote.as_ref() == Some(id) && f.mint == *mint && f.amount == amount)
                 .context("quote not journaled for this mint and amount")?
         } else {
-            maxplayer_trade::money::fund(home, &money_journal, mint, amount).await?
+            maxplayer_trade::money::fund_with_id(home, &money_journal, mint, amount, &id).await?
         };
         println!(
             "{}",
-            serde_json::json!({"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
+            serde_json::json!({"funding_id":f.id,"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
         );
         // Quote polling: one status GET per FUND_POLL (about 30 s in total).
         for _ in 0..maxplayer_trade::money::FUND_POLLS {

@@ -25,6 +25,8 @@ pub struct Faults {
     pub quote_error: std::sync::atomic::AtomicBool,
     pub near_expiry: std::sync::atomic::AtomicBool,
     pub expired_funding: std::sync::atomic::AtomicBool,
+    /// Every funding quote reads UNPAID (no expiry change): an invoice nobody pays.
+    pub unpaid_funding: std::sync::atomic::AtomicBool,
     pub no_time: std::sync::atomic::AtomicBool,
     pub melt_requests: std::sync::Mutex<Vec<Vec<u8>>>,
     pub prefer_async_melt: std::sync::atomic::AtomicBool,
@@ -357,6 +359,11 @@ impl MintFixture {
                         {
                             v["state"] = "UNPAID".into();
                             v["expiry"] = 1.into();
+                        }
+                        if path.contains("/mint/quote/bolt11")
+                            && control.unpaid_funding.load(SeqCst)
+                        {
+                            v["state"] = "UNPAID".into();
                         }
                         if path.ends_with("/melt/quote/bolt11") && control.near_expiry.load(SeqCst)
                         {
