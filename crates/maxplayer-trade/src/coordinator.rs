@@ -272,10 +272,19 @@ pub async fn cancel(home: &Path, j: &Journal, m: &Market, id: &str) -> Result<()
         "lot is terminal"
     );
     ensure!(l.active.is_none(), "cannot cancel active swap");
+    // The swap rows are authoritative (`active` may lag them after a crash or timeout).
+    ensure!(!live_maker_swap(j, id).await?, "cannot cancel active swap");
     l.cancelled = true;
     j.put("listing", id, &l).await?;
     mint::release(home, &l.plan, &l.reservation).await?;
     finish_listing(j, m, &mut l, Status::Cancelled).await
+}
+/// Whether lot `id` has a non-terminal maker swap (from the swap rows, not `listing.active`).
+async fn live_maker_swap(j: &Journal, id: &str) -> Result<bool> {
+    Ok(j.all::<Swap>("swap")
+        .await?
+        .iter()
+        .any(|s| s.role == "maker" && s.lot.id.to_hex() == id && !terminal(s)))
 }
 async fn finish_listing(j: &Journal, m: &Market, l: &mut Listing, status: Status) -> Result<()> {
     if lifecycle(&l.event, &l.statuses)? == Status::Available {
@@ -1469,6 +1478,17 @@ async fn enqueue_recovery(
     j: &Journal,
     sched: &mut crate::sched::Scheduler<'_, Unit>,
 ) -> Result<()> {
+    // Listings first (review of #1155, F2): a lot with a live maker swap gets its swap unit
+    // queued below, which would leave `lot:<id>` never free and `listing.active` never restored.
+    // Queued ahead, a listing unit only rewrites `active` (it publishes nothing for a lot that is
+    // published and not cancelled), and the lot's urgent swap unit may still overtake it.
+    for l in j.all::<Listing>("listing").await? {
+        let id = l.event.id.to_hex();
+        let keys = vec!["listings".to_string(), format!("lot:{id}")];
+        if sched.free(&keys) {
+            let _ = sched.push(format!("listing:{id}"), keys, Unit::Listing(id));
+        }
+    }
     let mut rows = j.all::<Retained>("inbox_retry").await?;
     rows.sort_by_key(|r| r.since);
     for r in rows {
@@ -1476,10 +1496,11 @@ async fn enqueue_recovery(
             Some(s) => vec![swap_key(&s)],
             None => vec![],
         };
-        let _ = sched.push(
+        let _ = sched.push_as(
             format!("retained:{}", r.event.id.to_hex()),
             keys,
             Unit::Retained(Box::new(r)),
+            true,
         );
     }
     let mut swaps = j.all::<Swap>("swap").await?;
@@ -1489,10 +1510,11 @@ async fn enqueue_recovery(
         if terminal(&s) && !listing_due {
             continue;
         }
-        let _ = sched.push(
+        let _ = sched.push_as(
             format!("swap:{}", s.id),
             vec![swap_key(&s)],
             Unit::Swap(s.id),
+            true,
         );
     }
     for mint in crate::money::recovery_mints(j).await? {
@@ -1501,14 +1523,6 @@ async fn enqueue_recovery(
             vec![format!("wallet:{mint}")],
             Unit::Money(mint),
         );
-    }
-    for l in j.all::<Listing>("listing").await? {
-        let id = l.event.id.to_hex();
-        let keys = vec!["listings".to_string(), format!("lot:{id}")];
-        // Bookkeeping only: never queued behind (and so never ahead of) a busy lot or `list`.
-        if sched.free(&keys) {
-            let _ = sched.push(format!("listing:{id}"), keys, Unit::Listing(id));
-        }
     }
     let _ = sched.push(
         "publications".into(),
@@ -1557,8 +1571,16 @@ async fn run_units(
         if let Some(stop) = crate::shutdown::stop() {
             const WHY: &str = "serve is stopping; request not started, nothing was applied";
             for unit in sched.drain_queued() {
-                if let Unit::Job(job) = unit {
-                    crate::serve::refuse(job, WHY);
+                match unit {
+                    Unit::Job(job) => crate::serve::refuse(job, WHY),
+                    // Not started, so nothing of it ran; a restart re-reads the last hour from
+                    // the relays. Say so instead of dropping it silently.
+                    Unit::Message(e) => eprintln!(
+                        "{}",
+                        serde_json::json!({"serve_stop":"message_not_started","event":e.id.to_hex(),
+                            "note":"redelivered from relay history on restart (last hour)"})
+                    ),
+                    _ => {}
                 }
             }
             // While running units finish, a request that still arrives is answered "not
@@ -1607,11 +1629,15 @@ async fn run_units(
             }
             Next::Message(Some(e)) => {
                 let keys = message_keys(j, m, &e).await;
+                // A step of a live swap is urgent (claim/refund bearing); a quote request (it
+                // takes `admit`) is not, so it never holds another lot's claim while it waits.
+                let urgent = !keys.iter().any(|k| k == "admit");
                 // A relay duplicate of a message already queued or running is not doubled.
-                let _ = sched.push(
+                let _ = sched.push_as(
                     format!("message:{}", e.id.to_hex()),
                     keys,
                     Unit::Message(Box::new(e)),
+                    urgent,
                 );
             }
             Next::Job(job) => {
@@ -2105,5 +2131,93 @@ mod budget_tests {
         let e = nostr_timing_fits(2811, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap_err();
         assert!(e.to_string().contains("refused"), "{e}");
         nostr_timing_fits(2812, SHORT_SECONDS, CLAIM_CUTOFF_SECONDS).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod t7_review_regressions {
+    use super::*;
+    fn plan() -> Plan {
+        Plan {
+            mint: "http://127.0.0.1:1".into(),
+            inputs: vec![],
+            keyset: "009a1f293253e41e".parse().unwrap(),
+            ppk: 0,
+            net: 10,
+            gross: 10,
+            lock_fee: 0,
+            claim_fee: 0,
+            debit: 10,
+        }
+    }
+    /// Review of #1155, F2: in the crash/timeout window the request handler names (swap saved,
+    /// `listing.active` not yet), listing recovery is still queued while the lot's swap is live,
+    /// and `cancel`'s guard sees the live swap from the swap rows.
+    #[tokio::test]
+    async fn listing_recovery_is_queued_and_cancel_refused_for_a_lot_with_a_live_maker_swap() {
+        let home = tempfile::tempdir().unwrap();
+        let j = Journal::open(home.path()).await.unwrap();
+        let keys = Keys::generate();
+        let leg = |mint: &str| Leg {
+            asset: Asset::new(mint).unwrap(),
+            net: 10,
+        };
+        let event = lot_event(&keys, leg("http://127.0.0.1:1"), leg("http://127.0.0.1:2")).unwrap();
+        let lot_id = event.id.to_hex();
+        let p = plan();
+        j.put(
+            "listing",
+            &lot_id,
+            &Listing {
+                published: 1,
+                max_fees: 0,
+                event: event.clone(),
+                statuses: vec![],
+                plan: p.clone(),
+                reservation: uuid::Uuid::new_v4().to_string(),
+                active: None,
+                cancelled: false,
+            },
+        )
+        .await
+        .unwrap();
+        let swap = Swap {
+            created: now(),
+            id: uuid::Uuid::new_v4().to_string(),
+            lot: event,
+            role: "maker".into(),
+            peer: Keys::generate().public_key().to_hex(),
+            key: secret(),
+            preimage: None,
+            request: Request {
+                hash: "00".repeat(32),
+                taker_key: pubkey(&secret()).unwrap(),
+                funding: Terms::from(&p),
+                max_give: 10,
+                min_receive: 10,
+                max_fees: 0,
+            },
+            quote: None,
+            plan: p,
+            state: "quoted".into(),
+            outgoing: vec![],
+            incoming: vec![],
+            max_fees: 0,
+            refund_generation: 0,
+        };
+        j.put("swap", &swap.id, &swap).await.unwrap();
+        let mut sched: crate::sched::Scheduler<'_, Unit> = crate::sched::Scheduler::default();
+        for _ in 0..3 {
+            enqueue_recovery(&j, &mut sched).await.unwrap();
+            assert!(sched.contains(&format!("swap:{}", swap.id)));
+            assert!(
+                sched.contains(&format!("listing:{lot_id}")),
+                "listing recovery (restores listing.active) never queued while its lot has a live swap"
+            );
+        }
+        assert!(
+            live_maker_swap(&j, &lot_id).await.unwrap(),
+            "SAFETY: cancel must refuse a lot with a live maker swap"
+        );
     }
 }

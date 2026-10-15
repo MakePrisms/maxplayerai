@@ -46,8 +46,11 @@ work is additional. A timeout does not undo a delivered RPC or release reservati
 independent units. Each unit writes only its own records: one lot (a listing and its maker
 swaps), the taker swap, one mint's wallet work (funding, withdrawal, receive, send), or new
 listings/takes. Units sharing records run one at a time in arrival order; others run side by
-side. A slow or silent mint therefore delays only the units that use it: another swap's claim
-or refund is never queued behind it. Budgets, deadlines and journal-first ordering per item are
+side. A live swap's recovery and its claim/refund steps may go ahead of quote requests and
+handed-off `list`/`take`/`cancel` that are still waiting (those re-check the journal when they
+start). A slow or silent mint therefore delays another swap's claim or refund only while a unit
+of that same lot is actually running, never through a queue of waiting requests. Two swaps on
+the same mint still share that mint's capacity. Budgets, deadlines and journal-first ordering per item are
 unchanged, and serve remains the only writer of the home.
 
 - **0:** successful command; recovery has all items terminal, no deferred work or quarantine.

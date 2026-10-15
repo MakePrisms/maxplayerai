@@ -480,7 +480,7 @@ async fn stale_socket_and_bounded_protocol() {
     let other = run(&f.maker, "ws://127.0.0.1:9", &["cancel", &lot]).await;
     assert_eq!(other.status.code(), Some(1));
     assert!(
-        text(&other).1.contains("same --relay set"),
+        text(&other).1.contains("exactly serve's --relay list"),
         "{}",
         text(&other).1
     );
