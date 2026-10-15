@@ -725,4 +725,5 @@ pub mod diagnostics;
 
 pub mod clock;
 pub mod progress;
+pub mod sched;
 pub mod shutdown;

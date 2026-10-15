@@ -204,8 +204,12 @@ async fn preflight_impl(
     );
     Ok(keysets)
 }
+/// serve runs units concurrently (`sched`): creating `wallet.seed` and opening (migrating) a
+/// wallet database happen one at a time, so two first uses of a mint never race.
+static OPEN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 pub async fn wallet(home: &std::path::Path, mint: &str) -> Result<Wallet> {
     crate::Asset::new(mint)?.fence()?;
+    let opening = OPEN.lock().await;
     let path = home.join("wallet.seed");
     if !path.exists() {
         let a = cashu::nuts::SecretKey::generate();
@@ -233,6 +237,7 @@ pub async fn wallet(home: &std::path::Path, mint: &str) -> Result<Wallet> {
         .mode(0o600)
         .open(&db_path)?;
     let db = cdk_sqlite::WalletSqliteDatabase::new(db_path).await?;
+    drop(opening);
     let builder = WalletBuilder::new()
         .mint_url(mint.parse()?)
         .unit(CurrencyUnit::Sat)
@@ -255,6 +260,7 @@ pub async fn database(
 ) -> Result<Arc<cdk_sqlite::WalletSqliteDatabase>> {
     let _ = wallet(home, mint).await?;
     let asset = hex::encode(Sha256::digest(format!("{mint}|sat")));
+    let _opening = OPEN.lock().await;
     Ok(Arc::new(
         cdk_sqlite::WalletSqliteDatabase::new(home.join(format!("{asset}.sqlite"))).await?,
     ))

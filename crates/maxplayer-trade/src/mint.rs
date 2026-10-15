@@ -191,6 +191,17 @@ pub async fn unspent(mint: &str, p: &Proofs) -> Result<()> {
     Ok(())
 }
 pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Plan> {
+    plan_excluding(home, mint, net, max_fee, &HashSet::new()).await
+}
+/// [`plan`] that never selects `exclude` (inputs named by journaled intents whose reservation may
+/// not be applied yet: serve admits new work while recovery of older intents still runs).
+pub async fn plan_excluding(
+    home: &Path,
+    mint: &str,
+    net: u64,
+    max_fee: u64,
+    exclude: &HashSet<cashu::nuts::PublicKey>,
+) -> Result<Plan> {
     let w = wallet(home, mint).await?;
     crate::wallet::bounded_for(mint, w.refresh_keysets())
         .await
@@ -209,7 +220,9 @@ pub async fn plan(home: &Path, mint: &str, net: u64, max_fee: u64) -> Result<Pla
             None,
         )
         .await?;
-    available.retain(|p| p.used_by_operation.is_none() && p.spending_condition.is_none());
+    available.retain(|p| {
+        p.used_by_operation.is_none() && p.spending_condition.is_none() && !exclude.contains(&p.y)
+    });
     available.sort_by_key(|p| p.proof.amount);
     let mut inputs = vec![];
     let mut total = 0u64;

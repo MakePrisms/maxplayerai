@@ -13,6 +13,11 @@ pub struct Market {
     pub keys: Keys,
     urls: Vec<String>,
     pub inbox: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    /// serve runs units concurrently (`sched`): one publication row (read, send, write back) and
+    /// the relay gate rows each keep a single writer at a time.
+    publishing:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    gates: tokio::sync::Mutex<()>,
 }
 /// Per-event, per-relay receipts survive CLI restarts. An ACK is not a storage proof.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -148,6 +153,8 @@ impl Market {
             urls: urls.to_vec(),
             keys,
             inbox,
+            publishing: Default::default(),
+            gates: Default::default(),
         })
     }
     /// Unjournaled one-shot for diagnostics/fixtures; trading uses publish_durable.
@@ -176,6 +183,31 @@ impl Market {
     /// from timeout, live delivery, retry exhaustion, or a negative OK response.
     pub async fn publish_durable(&self, j: &Journal, e: &Event) -> Result<Vec<String>> {
         let id = e.id.to_hex();
+        let lock = self
+            .publishing
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(id.clone())
+            .or_default()
+            .clone();
+        let result = {
+            let _held = lock.lock().await;
+            self.publish_durable_locked(j, e, &id).await
+        };
+        let mut map = self.publishing.lock().unwrap_or_else(|p| p.into_inner());
+        // Only the map and this call hold it: nobody waits, drop the entry.
+        if std::sync::Arc::strong_count(&lock) == 2 {
+            map.remove(&id);
+        }
+        result
+    }
+    async fn publish_durable_locked(
+        &self,
+        j: &Journal,
+        e: &Event,
+        id: &str,
+    ) -> Result<Vec<String>> {
+        let id = id.to_owned();
         let mut row = j
             .get::<Publication>("publication", &id)
             .await?
@@ -186,10 +218,12 @@ impl Market {
         let now = crate::coordinator::now();
         let mut pending = Vec::new();
         for (url, client) in self.urls.iter().zip(&self.clients) {
-            let gate = j
-                .get::<RelayGate>("relay_gate", &hex::encode(url))
-                .await?
-                .unwrap_or_default();
+            let gate = {
+                let _g = self.gates.lock().await;
+                j.get::<RelayGate>("relay_gate", &hex::encode(url))
+                    .await?
+                    .unwrap_or_default()
+            };
             let d = row.relays.entry(url.clone()).or_default();
             if d.ack
                 || d.attempts >= MAX_PUBLICATION_ATTEMPTS
@@ -241,6 +275,7 @@ impl Market {
                 d.ack = true;
             } else {
                 let lower = reason.to_ascii_lowercase();
+                let _g = self.gates.lock().await;
                 let mut gate = j
                     .get::<RelayGate>("relay_gate", &hex::encode(&url))
                     .await?

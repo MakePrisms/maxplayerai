@@ -81,6 +81,24 @@ impl Command {
             Command::Receive { .. } => "receive",
         }
     }
+    /// The serve work keys this request may write (see `sched`): proof selection and new
+    /// swaps/listings take `admit`; a take also every taker swap; a cancel its lot; a receive
+    /// only its mint's wallet journal.
+    pub fn keys(&self) -> Vec<String> {
+        match self {
+            // `listings`: the new row is written before it is reserved and published; no listing
+            // recovery unit may run on it meanwhile (review of #1155, F3).
+            Command::List { .. } => vec!["admit".into(), "listings".into()],
+            Command::Take { .. } => vec!["admit".into(), "taker".into()],
+            Command::Cancel { lot } => vec!["admit".into(), format!("lot:{lot}")],
+            Command::Receive { mint, .. } => vec![format!(
+                "wallet:{}",
+                Asset::from_cli(mint)
+                    .map(|a| a.mint_url)
+                    .unwrap_or_else(|_| mint.clone())
+            )],
+        }
+    }
     /// Which of the client's relay sets this command depends on, so serve can refuse a request
     /// it would otherwise run on different relays: `(market, mint)`. Market relays: list, take
     /// and cancel publish or read lots; a receive never touches the market. Mint relays: any
@@ -897,6 +915,22 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Review of #1155, F3: `list` writes a new listing row before it is reserved and published,
+    /// so it takes `listings` and no listing recovery unit runs on that row meanwhile.
+    #[test]
+    fn list_takes_the_listings_key() {
+        let list = Command::List {
+            give_mint: "http://127.0.0.1:1".into(),
+            give: 1,
+            want_mint: "http://127.0.0.1:2".into(),
+            want: 1,
+            max_fees: 0,
+        };
+        assert_eq!(
+            list.keys(),
+            vec!["admit".to_string(), "listings".to_string()]
+        );
+    }
     #[test]
     fn request_rejects_unknown_fields_and_keeps_bounds() {
         let r = Request {

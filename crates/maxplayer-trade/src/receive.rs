@@ -697,8 +697,16 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
 
 /// One bounded pass over non-terminal receives. True when any remain unresolved.
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
+    recover_for(home, j, None).await
+}
+/// [`recover`] limited to one mint's attempts (`None`: all), so serve can recover each mint's
+/// wallet work as its own unit (a slow mint never delays another mint's items).
+pub async fn recover_for(home: &Path, j: &Journal, mint: Option<&str>) -> Result<bool> {
     let mut failed = false;
     for mut r in j.all::<Receipt>("receive").await? {
+        if mint.is_some_and(|m| m != r.mint) {
+            continue;
+        }
         if r.terminal() {
             if let Err(error) = release(home, j, &mut r).await {
                 failed = true;

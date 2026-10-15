@@ -863,9 +863,34 @@ async fn resume_withdraw_inner(
     Ok(())
 }
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
+    recover_for(home, j, None).await
+}
+/// Every mint with wallet work [`recover_for`] would visit (one serve unit each).
+pub async fn recovery_mints(j: &Journal) -> Result<std::collections::BTreeSet<String>> {
+    let mut mints = std::collections::BTreeSet::new();
+    for f in j.all::<Funding>("funding").await? {
+        if !f.expired_unpaid {
+            mints.insert(f.mint);
+        }
+    }
+    for a in j.all::<Withdrawal>("withdrawal").await? {
+        mints.insert(a.mint);
+    }
+    for r in j.all::<crate::receive::Receipt>("receive").await? {
+        mints.insert(r.mint);
+    }
+    for r in j.all::<crate::send::SendAttempt>("send").await? {
+        mints.insert(r.mint);
+    }
+    Ok(mints)
+}
+/// [`recover`] limited to one mint's funding, withdrawal, receive and send items (`None`: all).
+/// Items of one mint touch only that mint's wallet database and their own journal rows.
+pub async fn recover_for(home: &Path, j: &Journal, mint: Option<&str>) -> Result<bool> {
     let mut failed = false;
+    let other = |m: &str| mint.is_some_and(|x| x != m);
     for mut f in j.all::<Funding>("funding").await? {
-        if f.expired_unpaid {
+        if f.expired_unpaid || other(&f.mint) {
             continue;
         }
         if !crate::backoff::ready(&f.id, &[&f.mint], None).await {
@@ -887,6 +912,9 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         }
     }
     for mut a in j.all::<Withdrawal>("withdrawal").await? {
+        if other(&a.mint) {
+            continue;
+        }
         if !a.terminal() && !crate::backoff::ready(&a.id, &[&a.mint], None).await {
             failed = true;
             continue;
@@ -906,8 +934,8 @@ pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
         }
     }
     // Receives share the item budget and pass; see receive::RECOVERY_ITEM_SECONDS.
-    let receives = crate::receive::recover(home, j).await?;
-    let sends = crate::send::recover(home, j).await?;
+    let receives = crate::receive::recover_for(home, j, mint).await?;
+    let sends = crate::send::recover_for(home, j, mint).await?;
     Ok(pending(j).await? || failed || receives || sends)
 }
 
