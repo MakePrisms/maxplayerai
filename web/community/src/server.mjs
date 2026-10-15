@@ -36,7 +36,8 @@ export function config(env=process.env) {
   const url=env.RELAY_URL??'wss://relay.maxplayer.ai';if(!['ws:','wss:'].includes(new URL(url).protocol))throw Error('Invalid RELAY_URL');
   const port=Number(env.PORT??4910);if(!Number.isInteger(port)||port<0||port>65535)throw Error('Invalid PORT');
   const origin=env.CORS_ORIGIN??'https://www.maxplayer.ai';if(new URL(origin).origin!==origin)throw Error('CORS_ORIGIN must be an exact origin');
-  return {buyer,url,port,origin,keyFile:resolve(env.APP_AUTH_KEY_FILE??fileURLToPath(new URL('../.state/auth-key',import.meta.url)))};
+  const host=env.HOST||undefined;
+  return {buyer,url,port,host,origin,keyFile:resolve(env.APP_AUTH_KEY_FILE??fileURLToPath(new URL('../.state/auth-key',import.meta.url)))};
 }
 export function authKey(path,buyer) {
   mkdirSync(dirname(path),{recursive:true,mode:0o700});
@@ -49,6 +50,6 @@ if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   const c=config(),store=new EventStore();let reader;
   const app=createApp({origin:c.origin,snapshot:()=>({...store.snapshot(c.buyer),relay:reader.status})});
   reader=new RelayReader({...c,key:authKey(c.keyFile,c.buyer),store,onChange:()=>app.send()});
-  app.server.listen(c.port,()=>console.log(`community listening on ${c.port}`));reader.start();
+  app.server.listen(c.port,c.host,()=>console.log(`community listening on ${c.host??'*'}:${c.port}`));reader.start();
   const stop=()=>{reader.stop();app.server.closeAllConnections();app.server.close();};process.on('SIGTERM',stop);process.on('SIGINT',stop);
 }

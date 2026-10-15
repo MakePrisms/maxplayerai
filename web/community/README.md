@@ -19,6 +19,7 @@ npm test --prefix web/community
 | `CHALLENGE_BUYER_PUBKEY` | `94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5`; npub or lowercase hex |
 | `APP_AUTH_KEY_FILE` | `web/community/.state/auth-key`; app-only hex key, generated locally with mode 0600 |
 | `PORT` | `4910` |
+| `HOST` | unset = all interfaces; set e.g. `127.0.0.1` to bind one address |
 | `CORS_ORIGIN` | `https://www.maxplayer.ai`; one exact origin |
 
 Never supply a buyer key. The only signing function constructs kind 22242 for NIP-42
