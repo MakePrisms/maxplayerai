@@ -29,18 +29,31 @@ export function sellerMinutes(s: Snapshot,a: Seller,now: number): number {
   return a.minutesUsed+s.jobs.filter(j=>j.seller===a.pubkey&&j.running).reduce((sum,j)=>sum+(Math.max(0,Math.min(s.asOf+elapsed,j.deadline)-j.start)/60-j.usedMinutes),0);
 }
 export function sellerLine(s: Snapshot,a: Seller,now: number): string {
-  const running=s.jobs.filter(j=>j.seller===a.pubkey&&j.running&&now<j.deadline).length;
-  return `${Math.floor(sellerMinutes(s,a,now))} of ${a.minutesOffered} min · ${running?`${running} running`:a.state}`;
+  return `${Math.floor(sellerMinutes(s,a,now))} / ${a.minutesOffered} min`;
 }
+const running=(s: Snapshot,a: Seller,now: number)=>s.jobs.some(j=>j.seller===a.pubkey&&j.running&&now<j.deadline);
+export function sellerState(s: Snapshot,a: Seller,now: number): string {
+  if(a.state==='withdrawn')return 'Withdrew';
+  if(running(s,a,now))return 'Working now';
+  if(a.eligible&&sellerMinutes(s,a,now)>=a.minutesOffered)return 'Done';
+  if(a.state==='done')return 'Done';
+  return a.eligible?'Ready':'Applied';
+}
+const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
+// Public page: denied applicants are not listed. Remote text only ever reaches textContent.
 export function renderSellers(doc: Document,s: Snapshot,now: number): void {
   const list=doc.getElementById('challenge-sellers')!;const fragment=doc.createDocumentFragment();
-  for(const a of s.sellers) {
-    const row=doc.createElement('li');const name=doc.createElement('strong');name.textContent=a.name||a.npub;
-    const identity=doc.createElement('span');identity.className='challenge-meta';identity.textContent=a.npub;
-    const progress=doc.createElement('span');progress.textContent=sellerLine(s,a,now);
-    const state=doc.createElement('span');state.className='challenge-meta';state.textContent=`${a.eligible?'Accepted · eligible for work':a.state} · ${Math.ceil(a.minutesOffered-sellerMinutes(s,a,now))} min remaining`;
-    row.append(name,identity,progress,state);fragment.append(row);
+  const shown=s.sellers.filter(a=>a.decision!=='denied');
+  for(const a of shown) {
+    const row=doc.createElement('li');const state=sellerState(s,a,now);
+    if(state==='Done'||state==='Withdrew')row.className='off';
+    const name=doc.createElement('strong');name.textContent=a.name||shortNpub(a.npub);
+    const mins=doc.createElement('span');mins.className='c-mins';mins.textContent=sellerLine(s,a,now);
+    const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
+    const st=doc.createElement('span');st.className='c-state';st.textContent=state;
+    row.append(name,mins,id,st);fragment.append(row);
   }
   list.replaceChildren(fragment);
-  doc.getElementById('seller-summary')!.textContent=s.sellers.length?`${s.sellers.filter(a=>a.eligible).length} accepted · ${s.jobs.filter(j=>j.running&&now<j.deadline).length} running jobs`:'No applicants yet.';
+  const working=shown.filter(a=>running(s,a,now)).length;
+  doc.getElementById('seller-summary')!.textContent=shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No applicants yet.';
 }
