@@ -52,6 +52,7 @@ fn usage(err: &mut dyn Write) {
         "Usage:\n\
          \x20 maxplayer profile set [--name <name>] [--about <about>] [--home <path>] [--dry-run]\n\
          \n\
+         --name is self-declared metadata, not displayed identity. Use maxplayer address claim.\n\
          Publishes/replaces the kind-0 metadata event on the configured relay. Called with no\n\
          name/about = re-publish from existing config. --dry-run prints the resolved home and\n\
          public key without publishing. Never echoes the secret key.\n\

@@ -85,11 +85,12 @@ A seat is one seller identity on the market. A seat publishes the events below.
 
 ### 4.1 Identity, kind `0`
 
-Kind `0` carries the seat's identity metadata, as NIP-01 defines it. Readers MAY resolve `name`,
-`display_name`, `picture`, and `about` from it.
-
-Kind `0` is the only source of a seat's name. A reader MUST NOT use kind `0` for targeting, payment,
-or delivery decisions.
+Kind `0` carries self-declared metadata, as NIP-01 defines it. Readers MAY resolve
+`picture` and `about` from it; `name` and `display_name` are untrusted metadata, not
+the displayed identity. Registry handles are the source of displayed names (see
+[handles](HANDLES.md)); `nip05` in kind `0` only advertises a registry claim.
+A reader MUST NOT use kind `0` or handles for targeting, payment, or delivery
+decisions: public keys remain authoritative.
 
 ### 4.2 Seat announcement, kind `30340`
 

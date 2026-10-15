@@ -1,21 +1,18 @@
-//! Buyer kind-0 (NIP-01 metadata) publish + best-effort read.
+//! Buyer kind-0 (NIP-01 metadata) publish + clobber-safe metadata merge.
 //!
 //! **Composition rule:** kind-0 `name` is untrusted display metadata. It must never
 //! feed targeting, accept-bind, D2 tip-match, or budget decisions — those stay keyed
 //! on hex pubkey alone. This module is intentionally separate from
 //! `authorize_pay` / `budget` / `delivery` / `payment`.
 
-use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::home::{self, HomeError, MaxplayerHome, ProfileConfig};
 
 const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 8;
-/// Cap hostile kind-0 payloads (same order as web network parser).
-const PROFILE_CONTENT_MAX: usize = 64 * 1024;
 const PROFILE_NAME_MAX: usize = 128;
 const PROFILE_ABOUT_MAX: usize = 512;
 
@@ -190,30 +187,6 @@ pub async fn publish_seller_discoverability_async(
     })
 }
 
-/// Best-effort resolve of kind-0 `name` per pubkey. Missing/unparseable → `None`.
-///
-/// Returns a map keyed by lowercase hex pubkey. Never used for payment decisions.
-pub fn resolve_display_names(
-    home: &MaxplayerHome,
-    pubkeys: impl IntoIterator<Item = impl AsRef<str>>,
-) -> HashMap<String, Option<String>> {
-    let mut unique = HashSet::new();
-    for key in pubkeys {
-        let hex = key.as_ref().trim().to_ascii_lowercase();
-        if hex.len() == 64 && hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
-            unique.insert(hex);
-        }
-    }
-    if unique.is_empty() {
-        return HashMap::new();
-    }
-
-    match fetch_names(home, &unique) {
-        Ok(map) => map,
-        Err(_) => unique.into_iter().map(|k| (k, None)).collect(),
-    }
-}
-
 fn clamp_field(raw: &str, max: usize) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -239,7 +212,25 @@ async fn publish_metadata_merged_async(
     keys: &nostr_sdk::Keys,
     profile: &ProfileConfig,
 ) -> Result<String, ProfileError> {
-    use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind, Metadata};
+    publish_metadata_patch_async(home, keys, Some(profile), None).await
+}
+
+/// Advertise or clear a registry claim without replacing other kind-0 fields.
+pub async fn set_nip05_async(
+    home: &MaxplayerHome,
+    address: Option<&str>,
+) -> Result<String, ProfileError> {
+    let keys = buyer_keys(home)?;
+    publish_metadata_patch_async(home, &keys, None, Some(address)).await
+}
+
+async fn publish_metadata_patch_async(
+    home: &MaxplayerHome,
+    keys: &nostr_sdk::Keys,
+    profile: Option<&ProfileConfig>,
+    nip05: Option<Option<&str>>,
+) -> Result<String, ProfileError> {
+    use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind};
 
     let client = Client::new(keys.clone());
     client
@@ -264,44 +255,29 @@ async fn publish_metadata_merged_async(
         }
     };
 
-    use nostr_sdk::JsonUtil;
-    let mut metadata = Metadata::new();
-    // Preserve existing fields when present; local config wins for name/about.
-    if let Some(existing) = fetched.into_iter().next() {
-        if let Ok(parsed) = Metadata::from_json(&existing.content) {
-            metadata = parsed;
-        } else {
-            // Defensive fallback: at least keep name/about if content is partial JSON.
-            if let Some(name) = parse_kind0_name(&existing.content) {
-                metadata = metadata.name(name);
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing.content) {
-                if let Some(about) = value
-                    .get("about")
-                    .and_then(|v| v.as_str())
-                    .and_then(|a| clamp_field(a, PROFILE_ABOUT_MAX))
-                {
-                    metadata = metadata.about(about);
-                }
-            }
-        }
-    }
-    if let Some(name) = &profile.name {
-        metadata = metadata.name(name);
-    }
-    if let Some(about) = &profile.about {
-        metadata = metadata.about(about);
-    }
-
-    let event = EventBuilder::metadata(&metadata)
+    let existing = fetched.into_iter().next();
+    // NIP-01 breaks equal-timestamp ties by event id. Ensure an immediate claim/release
+    // replaces our previous advertisement instead of randomly leaving it visible.
+    let created_at = nostr_sdk::Timestamp::from(
+        existing
+            .as_ref()
+            .map(|e| e.created_at.as_secs().saturating_add(1))
+            .unwrap_or(0)
+            .max(nostr_sdk::Timestamp::now().as_secs()),
+    );
+    let content = merge_metadata(
+        existing.as_ref().map(|e| e.content.as_str()),
+        profile,
+        nip05,
+    )?;
+    let event = EventBuilder::new(Kind::Metadata, content)
+        .custom_created_at(created_at)
         .sign_with_keys(keys)
         .map_err(|error| {
             // disconnect best-effort before returning
             ProfileError::Relay(format!("sign kind-0: {error}"))
         })?;
-    let output = client
-        .send_event_to([&home.config.relay_url], &event)
-        .await;
+    let output = client.send_event_to([&home.config.relay_url], &event).await;
     client.disconnect().await;
     let output = output.map_err(|error| ProfileError::Relay(format!("send kind-0: {error}")))?;
     if output.success.is_empty() {
@@ -316,6 +292,43 @@ async fn publish_metadata_merged_async(
         )));
     }
     Ok(output.val.to_hex())
+}
+
+fn merge_metadata(
+    existing: Option<&str>,
+    profile: Option<&ProfileConfig>,
+    nip05: Option<Option<&str>>,
+) -> Result<String, ProfileError> {
+    let mut value = match existing {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw).map_err(|_| {
+            ProfileError::Input("invalid existing kind-0; refusing overwrite".into())
+        })?,
+        None => serde_json::json!({}),
+    };
+    let obj = value
+        .as_object_mut()
+        .ok_or_else(|| ProfileError::Input("kind-0 must be an object".into()))?;
+    if let Some(profile) = profile {
+        if let Some(name) = &profile.name {
+            obj.insert("name".into(), name.clone().into());
+        }
+        if let Some(about) = &profile.about {
+            obj.insert("about".into(), about.clone().into());
+        }
+    }
+    if let Some(address) = nip05 {
+        match address {
+            Some(address) => {
+                obj.insert("nip05".into(), address.into());
+            }
+            None => {
+                obj.remove("nip05");
+            }
+        }
+        // Feature 1 never advertises a Lightning endpoint, including stale metadata.
+        obj.remove("lud16");
+    }
+    Ok(value.to_string())
 }
 
 fn apply_profile_updates(profile: &mut ProfileConfig, name: Option<String>, about: Option<String>) {
@@ -474,127 +487,86 @@ async fn send_signed_event(
     Ok(output.val.to_hex())
 }
 
-fn fetch_names(
-    home: &MaxplayerHome,
-    pubkeys: &HashSet<String>,
-) -> Result<HashMap<String, Option<String>>, ProfileError> {
-    // Sync entry only — must not be called from inside an existing Tokio runtime
-    // (nested block_on panics). Async callers use [`fetch_names_async`].
-    crate::runtime_guard::refuse_nested_block_on("fetch_names")
-        .map_err(ProfileError::Relay)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| ProfileError::Relay(error.to_string()))?;
-    runtime.block_on(fetch_names_async(home, pubkeys))
-}
-
-/// Async kind-0 name fetch for callers already on a Tokio runtime (e.g. `get_job`).
-pub async fn fetch_names_async(
-    home: &MaxplayerHome,
-    pubkeys: &HashSet<String>,
-) -> Result<HashMap<String, Option<String>>, ProfileError> {
-    use nostr_sdk::prelude::{Client, Filter, Kind, PublicKey};
-
-    let keys = buyer_keys(home)?;
-    let authors: Result<Vec<PublicKey>, ProfileError> = pubkeys
-        .iter()
-        .map(|hex| {
-            PublicKey::from_hex(hex)
-                .map_err(|error| ProfileError::Input(format!("pubkey {hex}: {error}")))
-        })
-        .collect();
-    let authors = authors?;
-
-    let client = Client::new(keys);
-    client
-        .add_relay(&home.config.relay_url)
-        .await
-        .map_err(|error| ProfileError::Relay(format!("add relay: {error}")))?;
-    client.connect().await;
-
-    let filter = Filter::new().authors(authors).kind(Kind::Metadata);
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
-    let events = client.fetch_events(filter, timeout).await;
-    client.disconnect().await;
-    let events =
-        events.map_err(|error| ProfileError::Relay(format!("fetch kind-0: {error}")))?;
-
-    // Newest replaceable kind-0 wins per author.
-    let mut newest: HashMap<String, (u64, String)> = HashMap::new();
-    for event in events {
-        let author = event.pubkey.to_hex().to_ascii_lowercase();
-        let created = event.created_at.as_secs();
-        if newest
-            .get(&author)
-            .map(|(prev, _)| created > *prev)
-            .unwrap_or(true)
-        {
-            newest.insert(author, (created, event.content.clone()));
-        }
-    }
-
-    let mut out = HashMap::new();
-    for hex in pubkeys {
-        let name = newest
-            .get(hex)
-            .and_then(|(_, content)| parse_kind0_name(content));
-        out.insert(hex.clone(), name);
-    }
-    Ok(out)
-}
-
-/// Defensive kind-0 content parse — `name` only (cosmetic).
-fn parse_kind0_name(content: &str) -> Option<String> {
-    let raw = if content.len() > PROFILE_CONTENT_MAX {
-        // Truncate on a char boundary — a plain `content[..PROFILE_CONTENT_MAX]` byte slice
-        // panics when a multibyte char straddles the cap. Walk down to the nearest boundary
-        // (a byte-cap over-fetch only feeds the JSON parser, which fails closed on garbage).
-        let mut end = PROFILE_CONTENT_MAX;
-        while end > 0 && !content.is_char_boundary(end) {
-            end -= 1;
-        }
-        &content[..end]
-    } else {
-        content
-    };
-    let parsed: Kind0Content = serde_json::from_str(raw).ok()?;
-    clamp_field(parsed.name.as_deref()?, PROFILE_NAME_MAX)
-}
-
-#[derive(Debug, Deserialize)]
-struct Kind0Content {
-    #[serde(default)]
-    name: Option<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_kind0_name_reads_name_field() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nip05_publish_path_preserves_fields_on_local_relay() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind, Timestamp};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let root = profile_test_root("nip05-local");
+        let mut home = home::bootstrap(&root).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        let keys = buyer_keys(&home).unwrap();
+        let client = Client::new(keys.clone());
+        client.add_relay(&home.config.relay_url).await.unwrap();
+        client.connect().await;
+        let original = serde_json::json!({"name":"self-declared","picture":"https://example.org/p.png","custom":{"nested":true}});
+        let event = EventBuilder::new(Kind::Metadata, original.to_string())
+            .custom_created_at(Timestamp::from(Timestamp::now().as_secs() - 10))
+            .sign_with_keys(&keys)
+            .unwrap();
+        client.send_event(&event).await.unwrap();
+        set_nip05_async(&home, Some("alice@maxplayer.ai"))
+            .await
+            .unwrap();
+        let filter = Filter::new()
+            .author(keys.public_key())
+            .kind(Kind::Metadata)
+            .limit(1);
+        let events = client
+            .fetch_events(filter.clone(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut expected = original.clone();
+        expected["nip05"] = "alice@maxplayer.ai".into();
         assert_eq!(
-            parse_kind0_name(r#"{"name":"seller-a","about":"x"}"#).as_deref(),
-            Some("seller-a")
+            serde_json::from_str::<serde_json::Value>(&events.into_iter().next().unwrap().content)
+                .unwrap(),
+            expected
         );
-        assert_eq!(parse_kind0_name(r#"{"about":"only"}"#), None);
-        assert_eq!(parse_kind0_name("not-json"), None);
-        assert_eq!(parse_kind0_name(r#"{"name":"   "}"#), None);
+        // Immediate release must replace the claim, even within the same second.
+        set_nip05_async(&home, None).await.unwrap();
+        let events = client
+            .fetch_events(filter, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&events.into_iter().next().unwrap().content)
+                .unwrap(),
+            original
+        );
+        client.disconnect().await;
+        relay.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
-    // Finding D: parse_kind0_name must not panic when the PROFILE_CONTENT_MAX byte cap falls in
-    // the middle of a multibyte char. A plain `content[..MAX]` byte slice panics on that boundary.
     #[test]
-    fn parse_kind0_name_survives_multibyte_char_on_byte_cap() {
-        // '😀' is 4 bytes; placing it so it starts at PROFILE_CONTENT_MAX-1 makes byte index
-        // PROFILE_CONTENT_MAX land INSIDE the char (not a char boundary).
-        let mut content = "a".repeat(PROFILE_CONTENT_MAX - 1);
-        content.push('😀');
-        content.push_str("bbbb");
-        assert!(!content.is_char_boundary(PROFILE_CONTENT_MAX));
-        // Must return without panicking (the over-cap content is not valid JSON → None).
-        assert_eq!(parse_kind0_name(&content), None);
+    fn nip05_patch_preserves_unknown_profile_fields_and_clears() {
+        let original = serde_json::json!({"name":"self-declared", "about":"about", "picture":"https://example.org/p.png", "custom":{"x":1}, "lud16":"old@example.org"});
+        let set: serde_json::Value = serde_json::from_str(
+            &merge_metadata(
+                Some(&original.to_string()),
+                None,
+                Some(Some("alice@maxplayer.ai")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(set["nip05"], "alice@maxplayer.ai");
+        assert!(set.get("lud16").is_none());
+        let cleared: serde_json::Value = serde_json::from_str(
+            &merge_metadata(Some(&set.to_string()), None, Some(None)).unwrap(),
+        )
+        .unwrap();
+        let mut expected = original;
+        expected.as_object_mut().unwrap().remove("lud16");
+        assert_eq!(cleared, expected);
+        assert!(merge_metadata(Some("[]"), None, Some(None)).is_err());
+        assert!(merge_metadata(Some("broken"), None, Some(None)).is_err());
     }
 
     // Finding D: the delivery-repo announce runs the transport allowlist BEFORE any publish and
@@ -629,23 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_display_names_skips_invalid_hex_without_relay() {
-        let root = std::env::temp_dir().join(format!(
-            "maxplayer-profile-resolve-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = home::bootstrap(&root).expect("home");
-        let map = resolve_display_names(&home, ["not-a-key", ""]);
-        assert!(map.is_empty());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
     fn set_profile_writes_config_without_inventing_on_bootstrap() {
         let root = std::env::temp_dir().join(format!(
             "maxplayer-profile-set-{}-{}",
@@ -672,33 +627,6 @@ mod tests {
         let profile = home.config.profile.expect("present");
         assert_eq!(profile.name.as_deref(), Some("buyer-x"));
         assert_eq!(profile.about.as_deref(), Some("about-x"));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn fetch_names_sync_refuses_inside_runtime() {
-        let root = std::env::temp_dir().join(format!(
-            "maxplayer-fetch-names-nested-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let home = home::bootstrap(&root).expect("home");
-        let mut pubkeys = HashSet::new();
-        pubkeys.insert("aa".repeat(32));
-        let err = fetch_names(&home, &pubkeys).expect_err("must refuse nested block_on");
-        assert!(
-            err.to_string().contains("nested block_on refused"),
-            "unexpected: {err}"
-        );
-        assert!(
-            err.to_string().contains("fetch_names"),
-            "op name missing: {err}"
-        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

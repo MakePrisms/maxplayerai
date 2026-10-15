@@ -110,6 +110,8 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i tables/public/_operator_global_tables.sql
 \i tables/public/git_repo_names.sql
 \i tables/public/private_job_repositories.sql
+\i tables/public/handles.sql
+\i tables/public/reserved_handles.sql
 \i tables/public/parameterized_event_watermarks.sql
 \i tables/public/product_feedback.sql
 \i tables/public/push_leases.sql
@@ -165,6 +167,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 \i triggers/personal_read_accounts.sql
 \i triggers/personal_read_frontiers.sql
 \i triggers/private_job_repositories.sql
+\i triggers/handles.sql
 \i triggers/pubkey_allowlist.sql
 \i triggers/push_leases.sql
 \i triggers/push_match_queue.sql

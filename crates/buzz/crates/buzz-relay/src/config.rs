@@ -168,6 +168,8 @@ pub struct Config {
     pub db_read_pool_size: Option<u32>,
     /// Public WebSocket URL of this relay, advertised in NIP-11.
     pub relay_url: String,
+    /// Optional handle-domain alias for the deployment community.
+    pub nip05_domain: Option<String>,
     /// Public WebSocket URL of the dedicated device-pairing relay, when configured.
     pub pairing_relay_url: Option<String>,
     /// Maximum number of concurrent WebSocket connections.
@@ -1480,6 +1482,12 @@ impl Config {
             redis_pool_size,
             db_pool_size,
             db_read_pool_size,
+            nip05_domain: std::env::var("NIP05_DOMAIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| buzz_core::tenant::validate_community_host(&s)
+                    .map_err(|e| ConfigError::InvalidValue(format!("NIP05_DOMAIN: {e}"))))
+                .transpose()?,
             relay_url,
             pairing_relay_url,
             max_connections,

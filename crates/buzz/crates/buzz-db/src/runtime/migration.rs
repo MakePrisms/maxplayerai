@@ -762,9 +762,10 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        // MAXPLAYER: upstream's 60 plus the two private-job migrations, which
-        // sort after every upstream version.
-        assert_eq!(migrations.len(), 62);
+        // MAXPLAYER: upstream's 60 plus private-job and handle registry migrations.
+        assert_eq!(migrations.len(), 63);
+        assert_eq!(migrations[62].version, 100_027);
+        assert!(migrations[62].sql.as_str().contains("CREATE TABLE handles"));
         assert_eq!(migrations[60].version, PRIVATE_JOB_REPOSITORIES_VERSION);
         assert_eq!(migrations[61].version, PRIVATE_JOB_REPOSITORIES_VERSION + 1);
         assert_eq!(migrations[58].version, 59);
@@ -2381,6 +2382,27 @@ mod postgres_tests {
                 .as_ref(),
         );
         expected_fences.extend(private_jobs_fence.fence_attachments);
+        let handles = surface(
+            MIGRATOR
+                .iter()
+                .find(|m| m.version == 100_027)
+                .expect("handle registry migration")
+                .sql
+                .as_ref(),
+        );
+        for (table, definition) in handles.tables {
+            assert_eq!(
+                schema.tables.get(&table), Some(&definition),
+                "handle registry table {table} differs between schema and migration"
+            );
+        }
+        for index in handles.indexes {
+            assert!(
+                schema.indexes.contains(&index),
+                "handle registry index drifted: {index}"
+            );
+        }
+        expected_fences.extend(handles.fence_attachments);
         assert_eq!(
             expected_fences, schema.fence_attachments,
             "write-fence attachment targets differ after recovery policy"

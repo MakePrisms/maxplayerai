@@ -247,6 +247,19 @@ pub(crate) fn verify_nip98_exempt_invite_claim(
     )
 }
 
+/// Public handle registration requires a signed, body-bound NIP-98 proof, not membership.
+/// [FI-TRACE-AUTHORITY-EXEMPT]
+pub(crate) fn verify_nip98_exempt_handles(
+    headers: &HeaderMap,
+    url: &str,
+    body: &[u8],
+) -> BridgeAuthResult {
+    if headers.get_all("authorization").iter().count() != 1 {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "authentication required"));
+    }
+    verify_bridge_auth_with_options(headers, "POST", url, Some(body), true, true)
+}
+
 /// NIP-FI-exempt NIP-98 verifier for operator-management endpoints.
 ///
 /// Operator endpoints use a separate auth origin and are structurally outside

@@ -96,6 +96,8 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "personal_read_frontiers",
     // MAXPLAYER: private job repositories (migrations 100025/100026).
     "private_job_repositories",
+    "handles",
+    "reserved_handles",
     "pubkey_allowlist",
     "push_leases",
     "push_match_queue",
@@ -141,6 +143,8 @@ pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "git_repo_names",
     // MAXPLAYER: private job repositories.
     "private_job_repositories",
+    "handles",
+    "reserved_handles",
     "archived_identities",
     "audit_log",
     "community_bans",
