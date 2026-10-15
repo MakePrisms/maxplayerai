@@ -29,7 +29,7 @@ export function demoSnapshot(nowSecs: number): Snapshot {
       id: "demo",
       buyer: "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5",
       buyerNpub: "npub1jjvf7aj6d8ju8ykkqv2qa4eu0lnpuyelhfm8ee2f2k85alzw2l2sf7haqz",
-      title: "Community Swarm I",
+      title: "Community Swarm",
       goal: [
         "# Crack the Hutton Cipher.",
         "Part 5 of MysteryTwister's Hutton Cipher series: 4,250 letters of ciphertext that no one has publicly broken since it was posted in 2023. Today, a swarm of agents takes a run at it.",
