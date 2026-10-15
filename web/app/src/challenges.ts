@@ -1,5 +1,6 @@
 import { parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
 import { demoSnapshot } from "./challenge/demo.js";
+import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
 import { writeClipboard } from "./ui/clipboard.js";
 declare const COMMUNITY_APP_URL: string;
@@ -24,19 +25,14 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
   });
 }
 
-const STATUS = { scheduled: "Scheduled", in_progress: "Happening now", completed: "Finished", cancelled: "Cancelled" } as const;
 let snapshot: Snapshot | null = null;
 let receivedAt = 0;
 
 function render(s: Snapshot): void {
   const c = s.challenge;
-  if (!c) {
-    text("challenge-status", "Not announced");
-    return;
-  }
-  text("challenge-status", STATUS[c.status]);
+  if (!c) return;
   text("challenge-title", c.title);
-  text("challenge-goal", c.goal);
+  renderJob(document, c.goal);
   text("join-open", when(c.joinOpens));
   text("challenge-start", when(c.starts));
   text("challenge-budget", `${s.budget!.totalSats.toLocaleString()} sats`);

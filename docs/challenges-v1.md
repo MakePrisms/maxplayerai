@@ -37,7 +37,7 @@ All three are NIP-01 addressable (30000–39999): the relay keeps only the newes
 | `budget` | `<sats>`, `"sat"` — total spend cap, non-negative integer |
 | `status` | `scheduled` \| `in_progress` \| `completed` \| `cancelled` |
 
-`content`: the goal, plain text / markdown. Optional `["update", <text>]`: latest progress note.
+`content`: the job description shown in the page's "The job" section. Optional first line `# <headline>`; paragraphs separated by blank lines; a paragraph whose lines all start with `- ` is a list; bare `https://` URLs become links. Nothing else is interpreted (no HTML). `title` is the swarm name, e.g. `Community Swarm I`. Optional `["update", <text>]`: latest progress note.
 Optional `["result", <text-or-url>]`: final outcome.
 
 Coordinate: `30341:<buyer>:<d>`.
