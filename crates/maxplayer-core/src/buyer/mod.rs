@@ -1593,9 +1593,20 @@ fn auto_award_deadline(context: &BuyerContext, job_id: &str) -> Option<u64> {
         let offer = crate::private_content::store::ContentStore::open(&path)
             .and_then(|store| store.event(job_id));
         if let Ok(Some(offer)) = offer {
-            if offer.id.to_hex() == job_id && offer.verify().is_ok() {
-                if let Ok(parsed) = crate::gateway::parse_offer(&job_lifecycle::event_to_draft(&offer)) {
-                    return Some(parsed.deadline_unix);
+            if offer.id.to_hex() == job_id
+                && offer.kind.as_u16() == crate::kinds::JOB_OFFER_KIND
+                && offer.verify().is_ok()
+            {
+                // Private offers deliberately omit the plaintext `i` task tag,
+                // so the public offer parser cannot read them. The deadline is
+                // signed outer metadata in BOTH lanes; require exactly one value.
+                let mut deadlines = offer.tags.iter().map(|tag| tag.as_slice())
+                    .filter(|tag| tag.first().map(String::as_str) == Some("param")
+                        && tag.get(1).map(String::as_str) == Some("deadline"));
+                if let Some(tag) = deadlines.next() {
+                    if tag.len() == 3 && deadlines.next().is_none() {
+                        if let Ok(deadline) = tag[2].parse() { return Some(deadline); }
+                    }
                 }
             }
         }
@@ -4689,6 +4700,21 @@ mod tests {
                 } else { nostr_relay_builder::prelude::PolicyResult::Accept }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn auto_award_retry_deadline_reads_signed_private_outer_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let home = bootstrap_home(root.path()).unwrap();
+        let deadline = now_unix() as u64 + 3600;
+        let (e, _, buyer, policy) = crate::private_content::evidence::inline_fixture_with_deadline(false, true, deadline);
+        assert!(crate::gateway::parse_offer(&job_lifecycle::event_to_draft(&e.offer)).is_err(),
+            "fixture must omit the plaintext task, like real private posting");
+        // Cache the already-authenticated offer with the same store API as posting.
+        let mut store = crate::private_content::store::ContentStore::open(&home.root.join("private-content.sqlite")).unwrap();
+        store.remember_event(&e.offer, &e.offer, &buyer.public_key().to_hex(), &policy.service, &policy.host).unwrap();
+        let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        assert_eq!(auto_award_deadline(&context, &e.offer.id.to_hex()), Some(deadline));
     }
 
     #[derive(Debug)]
