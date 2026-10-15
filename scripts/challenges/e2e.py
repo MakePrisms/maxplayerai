@@ -47,10 +47,20 @@ def port():
         return s.getsockname()[1]
 
 def command(argv, env=None, timeout=100):
-    p = subprocess.run(list(map(str, argv)), cwd=ROOT, env=env or ENV, text=True, capture_output=True, timeout=timeout)
+    p = subprocess.Popen(list(map(str, argv)), cwd=ROOT, env=env or ENV, text=True,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    try:
+        stdout, stderr = p.communicate(timeout=timeout)
+    except BaseException:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        p.communicate()
+        raise
     if p.returncode:
-        raise RuntimeError(f'{Path(str(argv[0])).name} {argv[1:3]} exited {p.returncode}: {p.stderr[-4000:]} {p.stdout[-2000:]}')
-    return p.stdout
+        raise RuntimeError(f'{Path(str(argv[0])).name} {argv[1:3]} exited {p.returncode}: {stderr[-4000:]} {stdout[-2000:]}')
+    return stdout
 
 def start(name, argv, env=None):
     log = open(RUN / (name + '.log'), 'w')
@@ -93,7 +103,7 @@ def home(name, relay, buyer=None):
     if buyer:
         config += f'\n[seller]\nagent_command = ["node", {json.dumps(str(ROOT / "scripts/challenges/stub-acp-agent.mjs"))}]\nrate_sats = 0\ntakes_no_payment = true\ngit_remote = "http://127.0.0.1:1/unused.git"\naccept_offers_only_from = ["{buyer}"]\naccept_open_targeted = false\nclaim_open_pool = false\n'
     (path / 'config.toml').write_text(config)
-    env = {**ENV, 'MAXPLAYER_HOME': str(path)}
+    env = {**ENV, 'MAXPLAYER_HOME': str(path), 'E2E_STUB_RELEASE': str(RUN / 'release')}
     out = command([BIN, 'whoami'], env)
     return env, re.search(r'pubkey: ([0-9a-f]{64})', out)[1]
 
@@ -146,9 +156,10 @@ try:
         url = f'http://127.0.0.1:{appport}/api/challenges/current'
         snapshot = lambda: read_json(url)
         now = int(time.time())
+        starts = now + 45
         goal = RUN / 'goal.md'
         goal.write_text('Return the fixture answer 42. No paid work.\n')
-        cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--join-opens', iso(now - 3600), '--starts', iso(now), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
+        cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--join-opens', iso(starts - 3600), '--starts', iso(starts), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
         wait('challenge visible in app', lambda: snapshot()['challenge'])
         stream_frames = []
         def consume_stream():
@@ -168,6 +179,10 @@ try:
         cli(buyer_env, 'decide', '--challenge', 'local-e2e', '--seller', SELLER, '--accept')
         cli(buyer_env, 'decide', '--challenge', 'local-e2e', '--seller', DENIED, '--deny')
         s = wait('accepted/denied tally and authenticated history', lambda: (s if {x['state'] for x in s['sellers']} == {'accepted','denied'} and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
+        if int(time.time()) < starts:
+            check('coordinator blocks before work window', not plan(s)['postingAllowed'])
+        wait('challenge work window open', lambda: int(time.time()) >= starts)
+        s = snapshot()
         p = plan(s)
         check('coordinator permits only accepted idle seller', p['postingAllowed'] and [x['seller_pubkey'] for x in p['sellers']] == [SELLER] and p['budgetHeadroomSats'] == 0)
         deadline = p['sellers'][0]['deadlineUnix']
@@ -176,10 +191,21 @@ try:
     posted = mcp(buyer_env, 'post_job', {'task':'Return exactly the fixture answer 42.', 'output':'text/plain', 'payment':'none', 'amount_sats':0, 'max_sats':0, 'visibility':'public', 'seller_pubkey':SELLER, 'deadline_unix':deadline, 'request_id':'challenge-e2e-free'})
     job = posted['job_id']
     check('coordinator task posted through existing buyer MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
+    def claimed():
+        state = mcp(buyer_env, 'get_job', {'job_id': job})
+        return state if any(c['seller_pubkey'] == SELLER and c['live'] for c in state['claims']) else None
+    state = wait('accepted seller live claim observed', claimed)
+    claim = next(c for c in state['claims'] if c['seller_pubkey'] == SELLER and c['live'])
+    if not state.get('awarded'):
+        mcp(buyer_env, 'award_claim', {'job_id': job, 'claim_id': claim['claim_id'], 'max_sats': 0})
+        print('PASS existing manual award override committed', flush=True)
+    else:
+        check('existing buyer auto-award committed', state['awarded']['seller_pubkey'] == SELLER)
     if not ARGS.baseline:
         s = wait('claim and award yield running tally', lambda: (s if any(j['id'] == job and j['running'] and j['claim'] and j['award'] for j in s['jobs']) else None) if (s := snapshot()) else None)
         check('running seller not assignable', not plan(s)['postingAllowed'])
         wait('SSE running job received', lambda: any(any(j['id'] == job and j['running'] for j in f['jobs']) for f in stream_frames))
+    (RUN / 'release').write_text('deliver now\n')
     def delivery():
         state = mcp(buyer_env, 'get_job', {'job_id':job})
         return state if state.get('results') else None

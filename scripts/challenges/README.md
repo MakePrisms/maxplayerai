@@ -38,11 +38,11 @@ through the harness's `post_job` guard, with `payment=none`, amount/max zero and
 seller-targeting. The fixture uses a minimal ACP stub (adapted from the existing mint E2E),
 not an installed model harness. External offer/delivery reviewer services are disabled in
 these isolated homes; the runner reviews the exact stub answer before calling collect. This
-proves the trade integrity/collect path, not a deployed reviewer service. It delays each result eight seconds to make running state
-observable. No new money path is introduced.
+proves the trade integrity/collect path, not a deployed reviewer service. It holds delivery behind a bounded local file gate until the runner has observed the
+running HTTP/SSE state, then waits two seconds to make positive minute usage observable. No new money path is introduced.
 
 Assertions: publish → 60/30-minute applications → accept/deny → authenticated HTTP tally →
-coordinator selects only accepted seller → real MCP post → seller claim / buyer auto-award →
+coordinator selects only accepted seller → real MCP post → seller claim / buyer award (auto or existing manual override) →
 running tally and no concurrent assignment → delivered result / free collect → exact minute
 tally and done → denied seller idle → withdrawal blocks new assignment while preserving work.
 `--baseline` tests only the existing free-job trade loop and must not be cited as full challenge
@@ -53,3 +53,7 @@ The coordinator itself prints JSON and does not post: [buyer runbook](../../docs
 It shares the app tally by consuming the snapshot, not by copying its event projection.
 Paid assignment requires an explicit reconciled buyer budget input because the public app
 cannot prove settlement. Serialise assignment and track pending offers as the runbook describes.
+
+The runner uses `award_claim` with max_sats=0 if `get_job` sees a live claim but no
+committed award. The selected claim is identical on retries; this is the existing manual
+override, not a new award path. See [INTEGRATION.md](INTEGRATION.md) for observed failures.

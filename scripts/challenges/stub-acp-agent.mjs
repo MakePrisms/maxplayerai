@@ -35,7 +35,14 @@ rl.on("line", async (line) => {
       if (probe) {
         fs.writeFileSync(path.join(cwd, "probe.txt"), probe[1].trim() + "\n");
       } else {
-        await new Promise(resolve => setTimeout(resolve, 8000));
+        const release = process.env.E2E_STUB_RELEASE;
+        const until = Date.now() + 90000;
+        while (release && !fs.existsSync(release)) {
+          if (Date.now() >= until) throw Error('Fixture release gate timed out');
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        // Ensure a positive metered duration even on a fast machine.
+        await new Promise(resolve => setTimeout(resolve, 2000));
         send({
           method: "session/update",
           params: {
