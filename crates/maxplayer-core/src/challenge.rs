@@ -1,6 +1,6 @@
 //! Community challenges v1 (docs/challenges-v1.md). Pure drafts and verified readers.
 use crate::gateway::{EventDraft, TagSpec};
-pub use crate::kinds::{CHALLENGE_APPLICATION_KIND, CHALLENGE_DECISION_KIND, CHALLENGE_KIND};
+pub use crate::kinds::{CHALLENGE_DECISION_KIND, CHALLENGE_KIND, CHALLENGE_MEMBERSHIP_KIND};
 use serde::Serialize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,8 +77,6 @@ pub struct Challenge {
     pub id: String,
     pub title: String,
     pub goal: String,
-    pub join_opens: u64,
-    pub join_closes: u64,
     pub starts: u64,
     pub ends: u64,
     pub budget_sats: u64,
@@ -94,8 +92,6 @@ impl Challenge {
         let mut t = tags(&self.id);
         for (k, v) in [
             ("title", self.title.clone()),
-            ("join_opens", self.join_opens.to_string()),
-            ("join_closes", self.join_closes.to_string()),
             ("starts", self.starts.to_string()),
             ("ends", self.ends.to_string()),
             ("status", self.status.clone()),
@@ -117,14 +113,6 @@ impl Challenge {
         parse_challenge_draft(&d, &self.buyer, &self.buyer)?;
         Ok(d)
     }
-    /// CLI admission is stricter than reader timestamp drift tolerance.
-    pub fn check_join(&self, now: u64) -> Result<()> {
-        require(self.status != "cancelled", "challenge is cancelled")?;
-        require(
-            now >= self.join_opens && now <= self.join_closes,
-            "challenge join window is closed",
-        )
-    }
 }
 fn parse_challenge_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Challenge> {
     base(d, CHALLENGE_KIND)?;
@@ -134,14 +122,9 @@ fn parse_challenge_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Ch
     )?;
     let id = value(d, "d")?;
     require(valid_id(id), "bad challenge d")?;
-    let join_opens = number(value(d, "join_opens")?)?;
-    let join_closes = number(value(d, "join_closes")?)?;
     let starts = number(value(d, "starts")?)?;
     let ends = number(value(d, "ends")?)?;
-    require(
-        join_opens.checked_add(3600) == Some(join_closes) && starts >= join_closes && ends > starts,
-        "invalid challenge times",
-    )?;
+    require(ends > starts, "invalid challenge times")?;
     let b = tag(d, "budget")?;
     require(b.len() == 3 && b[2] == "sat", "invalid budget unit")?;
     let budget_sats = number(&b[1])?;
@@ -160,8 +143,6 @@ fn parse_challenge_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Ch
         id: id.into(),
         title: title.into(),
         goal: d.content.clone(),
-        join_opens,
-        join_closes,
         starts,
         ends,
         budget_sats,
@@ -172,52 +153,44 @@ fn parse_challenge_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Ch
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct Application {
+pub struct Membership {
+    pub since: u64,
     pub seller: String,
     pub minutes: u64,
     pub status: String,
     pub note: String,
 }
-impl Application {
-    pub fn to_event_draft(&self, c: &Challenge, created_at: u64) -> Result<EventDraft> {
-        let mut t = tags(&format!("{}:{}", c.buyer, c.id));
-        add(&mut t, "a", c.coordinate());
-        add(&mut t, "p", &c.buyer);
+impl Membership {
+    pub fn to_event_draft(&self, buyer: &str) -> Result<EventDraft> {
+        let mut t = tags(buyer);
+        add(&mut t, "p", buyer);
+        add(&mut t, "since", self.since);
         add(&mut t, "minutes", self.minutes);
         add(&mut t, "status", &self.status);
-        let d = EventDraft::new(CHALLENGE_APPLICATION_KIND, t, &self.note);
-        parse_application_draft(&d, &self.seller, created_at, c)?;
+        let d = EventDraft::new(CHALLENGE_MEMBERSHIP_KIND, t, &self.note);
+        parse_membership_draft(&d, &self.seller, buyer)?;
         Ok(d)
     }
 }
-fn parse_application_draft(
-    d: &EventDraft,
-    author: &str,
-    created_at: u64,
-    c: &Challenge,
-) -> Result<Application> {
-    base(d, CHALLENGE_APPLICATION_KIND)?;
+fn parse_membership_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Membership> {
+    base(d, CHALLENGE_MEMBERSHIP_KIND)?;
     require(valid_hex(author), "invalid seller key")?;
+    require(valid_hex(buyer) && value(d, "p")? == buyer, "wrong buyer")?;
+    require(value(d, "d")? == buyer, "bad membership d")?;
     require(
-        value(d, "a")? == c.coordinate() && value(d, "p")? == c.buyer,
-        "unknown challenge or wrong buyer",
+        !d.tags.iter().any(|t| t.first() == Some("a")),
+        "membership has a challenge reference",
     )?;
-    require(
-        value(d, "d")? == format!("{}:{}", c.buyer, c.id),
-        "bad application d",
-    )?;
-    require(
-        created_at <= c.join_closes.saturating_add(900),
-        "late application",
-    )?;
+    let since = number(value(d, "since")?)?;
     let minutes = number(value(d, "minutes")?)?;
     require((1..=480).contains(&minutes), "minutes must be 1..=480")?;
     let status = value(d, "status")?;
     require(
-        matches!(status, "applied" | "withdrawn"),
-        "unknown application status",
+        matches!(status, "joined" | "left"),
+        "unknown membership status",
     )?;
-    Ok(Application {
+    Ok(Membership {
+        since,
         seller: author.into(),
         minutes,
         status: status.into(),
@@ -228,47 +201,46 @@ fn parse_application_draft(
 pub struct Decision {
     pub seller: String,
     pub decision: String,
-    pub application_event_id: Option<String>,
+    pub membership_event_id: Option<String>,
     pub reason: String,
 }
 impl Decision {
-    pub fn to_event_draft(&self, c: &Challenge) -> Result<EventDraft> {
-        let mut t = tags(&format!("{}:{}", c.id, self.seller));
-        add(&mut t, "a", c.coordinate());
+    pub fn to_event_draft(&self, buyer: &str) -> Result<EventDraft> {
+        let mut t = tags(&self.seller);
         add(&mut t, "p", &self.seller);
         add(&mut t, "decision", &self.decision);
-        if let Some(e) = &self.application_event_id {
+        if let Some(e) = &self.membership_event_id {
             add(&mut t, "e", e);
         }
         let d = EventDraft::new(CHALLENGE_DECISION_KIND, t, &self.reason);
-        parse_decision_draft(&d, &c.buyer, c)?;
+        parse_decision_draft(&d, buyer, buyer)?;
         Ok(d)
     }
 }
-fn parse_decision_draft(d: &EventDraft, author: &str, c: &Challenge) -> Result<Decision> {
+fn parse_decision_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<Decision> {
     base(d, CHALLENGE_DECISION_KIND)?;
-    require(author == c.buyer, "wrong decision author")?;
-    require(value(d, "a")? == c.coordinate(), "unknown challenge")?;
+    require(valid_hex(buyer) && author == buyer, "wrong decision author")?;
+    require(
+        !d.tags.iter().any(|t| t.first() == Some("a")),
+        "decision has a challenge reference",
+    )?;
     let seller = value(d, "p")?;
     require(valid_hex(seller), "invalid seller key")?;
-    require(
-        value(d, "d")? == format!("{}:{}", c.id, seller),
-        "bad decision d",
-    )?;
+    require(value(d, "d")? == seller, "bad decision d")?;
     let decision = value(d, "decision")?;
     require(
         matches!(decision, "accepted" | "denied"),
         "unknown decision",
     )?;
-    let application_event_id = optional(d, "e")?;
+    let membership_event_id = optional(d, "e")?;
     require(
-        application_event_id.as_deref().is_none_or(valid_hex),
-        "invalid application event id",
+        membership_event_id.as_deref().is_none_or(valid_hex),
+        "invalid membership event id",
     )?;
     Ok(Decision {
         seller: seller.into(),
         decision: decision.into(),
-        application_event_id,
+        membership_event_id,
         reason: d.content.clone(),
     })
 }
@@ -293,11 +265,11 @@ mod signed {
     pub fn parse_challenge(e: &Event, buyer: &str) -> Result<Challenge> {
         parse_challenge_draft(&verified(e)?, &e.pubkey.to_hex(), buyer)
     }
-    pub fn parse_application(e: &Event, c: &Challenge) -> Result<Application> {
-        parse_application_draft(&verified(e)?, &e.pubkey.to_hex(), e.created_at.as_secs(), c)
+    pub fn parse_membership(e: &Event, buyer: &str) -> Result<Membership> {
+        parse_membership_draft(&verified(e)?, &e.pubkey.to_hex(), buyer)
     }
-    pub fn parse_decision(e: &Event, c: &Challenge) -> Result<Decision> {
-        parse_decision_draft(&verified(e)?, &e.pubkey.to_hex(), c)
+    pub fn parse_decision(e: &Event, buyer: &str) -> Result<Decision> {
+        parse_decision_draft(&verified(e)?, &e.pubkey.to_hex(), buyer)
     }
     /// Verify before replacement. Protocol resolvers additionally filter invalid payloads
     /// before calling this primitive, as required by the v1 ignore-invalid rule.
@@ -321,22 +293,20 @@ mod signed {
     pub fn eligible_sellers<'a>(
         c: &Challenge,
         events: impl IntoIterator<Item = &'a Event>,
-    ) -> Vec<Application> {
-        let latest = latest_per_coordinate(
-            events
-                .into_iter()
-                .filter(|e| parse_application(e, c).is_ok() || parse_decision(e, c).is_ok()),
-        );
+    ) -> Vec<Membership> {
+        let latest = latest_per_coordinate(events.into_iter().filter(|e| {
+            parse_membership(e, &c.buyer).is_ok() || parse_decision(e, &c.buyer).is_ok()
+        }));
         let accepted: std::collections::BTreeSet<_> = latest
             .iter()
-            .filter_map(|e| parse_decision(e, c).ok())
+            .filter_map(|e| parse_decision(e, &c.buyer).ok())
             .filter(|d| d.decision == "accepted")
             .map(|d| d.seller)
             .collect();
         latest
             .iter()
-            .filter_map(|e| parse_application(e, c).ok())
-            .filter(|a| a.status == "applied" && accepted.contains(&a.seller))
+            .filter_map(|e| parse_membership(e, &c.buyer).ok())
+            .filter(|a| a.status == "joined" && a.since <= c.starts && accepted.contains(&a.seller))
             .collect()
     }
 }
@@ -352,8 +322,6 @@ mod tests {
             id: "today".into(),
             title: "Build".into(),
             goal: "Goal".into(),
-            join_opens: 100,
-            join_closes: 3700,
             starts: 3700,
             ends: 7300,
             budget_sats: 100,
@@ -362,19 +330,20 @@ mod tests {
             result: None,
         }
     }
-    fn application() -> Application {
-        Application {
+    fn membership() -> Membership {
+        Membership {
+            since: 100,
             seller: "cd".repeat(32),
             minutes: 60,
-            status: "applied".into(),
+            status: "joined".into(),
             note: String::new(),
         }
     }
     fn decision() -> Decision {
         Decision {
-            seller: application().seller,
+            seller: membership().seller,
             decision: "accepted".into(),
-            application_event_id: None,
+            membership_event_id: None,
             reason: String::new(),
         }
     }
@@ -389,35 +358,39 @@ mod tests {
             c
         );
         assert_eq!(
-            parse_application_draft(
-                &application().to_event_draft(&c, 100).unwrap(),
-                &application().seller,
-                100,
-                &c
+            parse_membership_draft(
+                &membership().to_event_draft(&c.buyer).unwrap(),
+                &membership().seller,
+                &c.buyer
             )
             .unwrap(),
-            application()
+            membership()
         );
         assert_eq!(
-            parse_decision_draft(&decision().to_event_draft(&c).unwrap(), &c.buyer, &c).unwrap(),
+            parse_decision_draft(
+                &decision().to_event_draft(&c.buyer).unwrap(),
+                &c.buyer,
+                &c.buyer
+            )
+            .unwrap(),
             decision()
         );
     }
     #[test]
     fn every_required_tag_and_duplicates_refused() {
         let c = challenge();
-        let a = application();
+        let a = membership();
         for original in [
             c.to_event_draft().unwrap(),
-            a.to_event_draft(&c, 100).unwrap(),
-            decision().to_event_draft(&c).unwrap(),
+            a.to_event_draft(&c.buyer).unwrap(),
+            decision().to_event_draft(&c.buyer).unwrap(),
         ] {
             let parse = |d: &EventDraft| match original.kind {
                 CHALLENGE_KIND => parse_challenge_draft(d, &c.buyer, &c.buyer).map(|_| ()),
-                CHALLENGE_APPLICATION_KIND => {
-                    parse_application_draft(d, &a.seller, 100, &c).map(|_| ())
+                CHALLENGE_MEMBERSHIP_KIND => {
+                    parse_membership_draft(d, &a.seller, &c.buyer).map(|_| ())
                 }
-                _ => parse_decision_draft(d, &c.buyer, &c).map(|_| ()),
+                _ => parse_decision_draft(d, &c.buyer, &c.buyer).map(|_| ()),
             };
             for i in 0..original.tags.len() {
                 let mut d = original.clone();
@@ -440,48 +413,52 @@ mod tests {
     #[test]
     fn wrong_authors_coordinates_and_keys_refused() {
         let c = challenge();
-        let a = application();
+        let a = membership();
         assert!(parse_challenge_draft(&c.to_event_draft().unwrap(), &a.seller, &c.buyer).is_err());
-        assert!(
-            parse_decision_draft(&decision().to_event_draft(&c).unwrap(), &a.seller, &c).is_err()
-        );
-        for (k, v) in [("a", "30341:unknown:today"), ("p", &a.seller)] {
-            let mut d = a.to_event_draft(&c, 100).unwrap();
+        assert!(parse_decision_draft(
+            &decision().to_event_draft(&c.buyer).unwrap(),
+            &a.seller,
+            &c.buyer
+        )
+        .is_err());
+        for (k, v) in [
+            ("d", "30341:unknown:today"),
+            ("p", &a.seller),
+            ("since", "-1"),
+        ] {
+            let mut d = a.to_event_draft(&c.buyer).unwrap();
             set(&mut d, k, v);
-            assert!(parse_application_draft(&d, &a.seller, 100, &c).is_err());
+            assert!(parse_membership_draft(&d, &a.seller, &c.buyer).is_err());
         }
-        let mut d = decision().to_event_draft(&c).unwrap();
+        let mut d = decision().to_event_draft(&c.buyer).unwrap();
         set(&mut d, "p", "NOT-HEX");
-        assert!(parse_decision_draft(&d, &c.buyer, &c).is_err());
-        let mut d = decision().to_event_draft(&c).unwrap();
-        set(&mut d, "a", "wrong");
-        assert!(parse_decision_draft(&d, &c.buyer, &c).is_err());
+        assert!(parse_decision_draft(&d, &c.buyer, &c.buyer).is_err());
+        let mut d = decision().to_event_draft(&c.buyer).unwrap();
+        d.tags.push(TagSpec::new(["a", "wrong"]));
+        assert!(parse_decision_draft(&d, &c.buyer, &c.buyer).is_err());
         let mut d = decision();
-        d.application_event_id = Some("bad".into());
-        assert!(d.to_event_draft(&c).is_err());
+        d.membership_event_id = Some("bad".into());
+        assert!(d.to_event_draft(&c.buyer).is_err());
     }
     #[test]
     fn numbers_times_statuses_and_ids_refused() {
         let c = challenge();
-        let a = application();
+        let a = membership();
         for bad in ["0", "481", "-1", "+1", "1.5", "18446744073709551616", ""] {
-            let mut d = a.to_event_draft(&c, 100).unwrap();
+            let mut d = a.to_event_draft(&c.buyer).unwrap();
             set(&mut d, "minutes", bad);
             assert!(
-                parse_application_draft(&d, &a.seller, 100, &c).is_err(),
+                parse_membership_draft(&d, &a.seller, &c.buyer).is_err(),
                 "{bad}"
             );
         }
         for n in [1, 480] {
             let mut a = a.clone();
             a.minutes = n;
-            assert!(a.to_event_draft(&c, 100).is_ok());
+            assert!(a.to_event_draft(&c.buyer).is_ok());
         }
         for (k, v) in [
-            ("join_opens", "-1"),
-            ("join_closes", "100"),
-            ("join_closes", "3701"),
-            ("starts", "3699"),
+            ("starts", "-1"),
             ("ends", "3700"),
             ("budget", "-1"),
             ("status", "unknown"),
@@ -506,22 +483,10 @@ mod tests {
         assert!(parse_challenge_draft(&d, &c.buyer, &c.buyer).is_err());
         let mut a = a;
         a.status = "unknown".into();
-        assert!(a.to_event_draft(&c, 100).is_err());
+        assert!(a.to_event_draft(&c.buyer).is_err());
         let mut d = decision();
         d.decision = "maybe".into();
-        assert!(d.to_event_draft(&c).is_err());
-    }
-    #[test]
-    fn late_application_and_closed_join_refused() {
-        let mut c = challenge();
-        assert!(application().to_event_draft(&c, 4600).is_ok());
-        assert!(application().to_event_draft(&c, 4601).is_err());
-        assert!(c.check_join(99).is_err());
-        assert!(c.check_join(100).is_ok());
-        assert!(c.check_join(3700).is_ok());
-        assert!(c.check_join(3701).is_err());
-        c.status = "cancelled".into();
-        assert!(c.check_join(100).is_err());
+        assert!(d.to_event_draft(&c.buyer).is_err());
     }
     #[cfg(feature = "gateway")]
     mod verified {
@@ -545,15 +510,61 @@ mod tests {
             assert!(parse_challenge(&e, &seller.public_key().to_hex()).is_err());
             e.content.push('x');
             assert!(parse_challenge(&e, &c.buyer).is_err());
-            let mut a = application();
+            let mut a = membership();
             a.seller = seller.public_key().to_hex();
-            let mut e = sign(a.to_event_draft(&c, 100).unwrap(), &seller, 100);
-            assert!(parse_application(&e, &c).is_ok());
+            let mut e = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 100);
+            assert!(parse_membership(&e, &c.buyer).is_ok());
             let mut other = c.clone();
             other.id = "other".into();
-            assert!(parse_application(&e, &other).is_err());
+            assert!(parse_membership(&e, &other.buyer).is_ok());
             e.sig = sign(c.to_event_draft().unwrap(), &buyer, 100).sig;
-            assert!(parse_application(&e, &c).is_err());
+            assert!(parse_membership(&e, &c.buyer).is_err());
+        }
+        #[test]
+        fn membership_persists_across_days_late_join_waits_and_late_leave_wins() {
+            let buyer = Keys::generate();
+            let seller = Keys::generate();
+            let mut c = challenge();
+            c.buyer = buyer.public_key().to_hex();
+            let mut a = membership();
+            a.seller = seller.public_key().to_hex();
+            let d = Decision {
+                seller: a.seller.clone(),
+                ..decision()
+            };
+            let accepted = sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 100);
+            let joined = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 100);
+            let mut day2 = c.clone();
+            day2.id = "tomorrow".into();
+            day2.starts += 86400;
+            day2.ends += 86400;
+            for day in [&c, &day2] {
+                assert_eq!(eligible_sellers(day, [&joined, &accepted]), vec![a.clone()]);
+            }
+            // Replacement time does not make an existing member late when changing minutes.
+            a.minutes = 120;
+            let changed = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 9000);
+            assert_eq!(
+                eligible_sellers(&c, [&joined, &changed, &accepted]),
+                vec![a.clone()]
+            );
+            a.since = c.starts;
+            let boundary = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 10000);
+            assert_eq!(eligible_sellers(&c, [&boundary, &accepted]).len(), 1);
+            a.since += 1;
+            let late = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 10001);
+            assert!(eligible_sellers(&c, [&joined, &late, &accepted]).is_empty());
+            assert_eq!(eligible_sellers(&day2, [&late, &accepted]).len(), 1);
+            a.status = "left".into();
+            let left = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 10002);
+            assert!(eligible_sellers(&day2, [&late, &left, &accepted]).is_empty());
+            let mut invalid = left.clone();
+            invalid.content.push('x');
+            assert_eq!(
+                eligible_sellers(&day2, [&late, &invalid, &accepted]).len(),
+                1
+            );
+            assert!(parse_membership(&joined, &seller.public_key().to_hex()).is_err());
         }
         #[test]
         fn latest_tie_break_and_eligible_sellers() {
@@ -561,20 +572,20 @@ mod tests {
             let seller = Keys::generate();
             let mut c = challenge();
             c.buyer = buyer.public_key().to_hex();
-            let mut a = application();
+            let mut a = membership();
             a.seller = seller.public_key().to_hex();
-            let applied = sign(a.to_event_draft(&c, 100).unwrap(), &seller, 100);
+            let joined = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 100);
             let mut d = decision();
             d.seller = a.seller.clone();
-            let accepted = sign(d.to_event_draft(&c).unwrap(), &buyer, 100);
-            assert_eq!(eligible_sellers(&c, [&applied, &accepted]), vec![a.clone()]);
-            a.status = "withdrawn".into();
-            let withdrawn = sign(a.to_event_draft(&c, 101).unwrap(), &seller, 101);
-            assert!(eligible_sellers(&c, [&applied, &accepted, &withdrawn]).is_empty());
+            let accepted = sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 100);
+            assert_eq!(eligible_sellers(&c, [&joined, &accepted]), vec![a.clone()]);
+            a.status = "left".into();
+            let left = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 101);
+            assert!(eligible_sellers(&c, [&joined, &accepted, &left]).is_empty());
             d.decision = "denied".into();
-            let denied = sign(d.to_event_draft(&c).unwrap(), &buyer, 101);
-            assert!(eligible_sellers(&c, [&applied, &accepted, &denied]).is_empty());
-            let tied = sign(d.to_event_draft(&c).unwrap(), &buyer, 100);
+            let denied = sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 101);
+            assert!(eligible_sellers(&c, [&joined, &accepted, &denied]).is_empty());
+            let tied = sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 100);
             let winner = if tied.id < accepted.id {
                 &tied
             } else {
@@ -582,12 +593,12 @@ mod tests {
             };
             assert_eq!(latest_per_coordinate([&tied, &accepted]), vec![winner]);
             assert_eq!(latest_per_coordinate([&accepted, &tied]), vec![winner]);
-            let wrong = sign(d.to_event_draft(&c).unwrap(), &seller, 200);
-            assert_eq!(eligible_sellers(&c, [&applied, &accepted, &wrong]).len(), 1);
-            let mut invalid = withdrawn.clone();
+            let wrong = sign(d.to_event_draft(&c.buyer).unwrap(), &seller, 200);
+            assert_eq!(eligible_sellers(&c, [&joined, &accepted, &wrong]).len(), 1);
+            let mut invalid = left.clone();
             invalid.content.push('x');
             assert_eq!(
-                eligible_sellers(&c, [&applied, &accepted, &invalid]).len(),
+                eligible_sellers(&c, [&joined, &accepted, &invalid]).len(),
                 1
             );
         }

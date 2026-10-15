@@ -91,7 +91,8 @@ access-controlled: anyone with the URL can read it.
 Edit `src/challenge/content.ts` to publish a complete `Challenge` (see the type in
 `src/challenge/model.ts`); leave it `null` until the organizer confirms the goal,
 buyer, schedule and budget. Timestamps use canonical UTC ISO strings with `.000Z`.
-`joinOpensAt` opens a one-hour window; `startsAt` must be at or after its close.
+Sellers can join any time. Membership beginning at or before work starts is eligible
+that day; later joins are eligible from the next day, subject to buyer acceptance.
 Dates render in the visitor's timezone with UTC alongside. Status and the update
 are maintained by the organizer: reaching the scheduled time does not prove work
 started. Updating the content requires a site build/deployment.

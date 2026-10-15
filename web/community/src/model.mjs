@@ -1,4 +1,4 @@
-import {verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validApplication,validDecision,npubEncode} from './events.mjs';
+import {verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode} from './events.mjs';
 const latest = (events,key) => { const map=new Map(); for(const e of events) if(newer(e,map.get(key(e)))) map.set(key(e),e); return [...map.values()]; };
 const ascending = (a,b) => a.created_at-b.created_at || a.id.localeCompare(b.id);
 export class EventStore {
@@ -12,7 +12,7 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
   const c=selectedChallenge??challenges.find(e=>tag(e,'status')!=='cancelled')??challenges[0];
   const empty={asOf:now,challenge:null,sellers:[],budget:null,jobs:[],updates:[]};
   if(!c) return empty;
-  const apps=latest(events.filter(e=>validApplication(e,c)),e=>e.pubkey);
+  const apps=latest(events.filter(e=>validMembership(e,c)),e=>e.pubkey);
   const decisions=latest(events.filter(e=>validDecision(e,c)),e=>tag(e,'p'));
   const trade=events.filter(tradeNamespace);
   const jobs=[];
@@ -39,15 +39,15 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
   const sellers=apps.map(app=>{
     const own=jobs.filter(j=>j.seller===app.pubkey),running=own.filter(j=>j.running);
     const decision=decisions.find(e=>tag(e,'p')===app.pubkey);
-    const decisionState=decision?tag(decision,'decision'):'applied';
-    const eligible=tag(app,'status')==='applied'&&decisionState==='accepted';
+    const decisionState=decision?tag(decision,'decision'):'joined';
+    const eligible=tag(app,'status')==='joined'&&+tag(app,'since')<=+tag(c,'starts')&&decisionState==='accepted';
     const used=own.reduce((n,j)=>n+j.usedMinutes,0),offered=+tag(app,'minutes');
     const profile=latest(events.filter(e=>e.kind===0&&e.pubkey===app.pubkey),e=>e.pubkey)[0];
     let name=''; try { const p=JSON.parse(profile?.content??'{}'); name=typeof p.display_name==='string'?p.display_name:typeof p.name==='string'?p.name:''; } catch {}
     const beat=latest(trade.filter(e=>e.kind===30340&&e.pubkey===app.pubkey&&tag(e,'d')==='maxplayer-seller'),e=>e.pubkey)[0];
     const capabilities=beat?.tags.filter(t=>['agents','harness_family','harness_model','capabilities','harness_variant','hardware'].includes(t[0]))??[];
-    const state=tag(app,'status')==='withdrawn'?'withdrawn':decisionState==='denied'?'denied':running.length?'working':eligible&&own.length?'done':decisionState;
-    return {pubkey:app.pubkey,npub:npubEncode(app.pubkey),name,minutesOffered:offered,minutesUsed:used,minutesRemaining:offered-used,state,eligible,decision:decisionState,currentJobStart:running.length?Math.min(...running.map(j=>j.start)):null,capabilities,heartbeatAt:beat?.created_at??null,note:app.content,pastJobs:[...new Map([...priorJobs.filter(j=>j.seller===app.pubkey),...own.map(j=>({...j,challengeId:tag(c,'d')}))].filter(j=>!j.running).map(j=>[j.id,j])).values()]};
+    const state=tag(app,'status')==='left'?'left':decisionState==='denied'?'denied':running.length?'working':eligible&&own.length?'done':decisionState;
+    return {since:+tag(app,'since'),membershipStatus:tag(app,'status'),pubkey:app.pubkey,npub:npubEncode(app.pubkey),name,minutesOffered:offered,minutesUsed:used,minutesRemaining:offered-used,state,eligible,decision:decisionState,currentJobStart:running.length?Math.min(...running.map(j=>j.start)):null,capabilities,heartbeatAt:beat?.created_at??null,note:app.content,pastJobs:[...new Map([...priorJobs.filter(j=>j.seller===app.pubkey),...own.map(j=>({...j,challengeId:tag(c,'d')}))].filter(j=>!j.running).map(j=>[j.id,j])).values()]};
   }).sort((a,b)=>a.npub.localeCompare(b.npub));
-  return {asOf:now,challenge:{id:tag(c,'d'),eventId:c.id,buyer,buyerNpub:npubEncode(buyer),title:tag(c,'title'),goal:c.content,joinOpens:+tag(c,'join_opens'),joinCloses:+tag(c,'join_closes'),starts:+tag(c,'starts'),ends:+tag(c,'ends'),status:tag(c,'status'),result:tag(c,'result')??''},sellers,jobs,budget:{totalSats:+tag(c,'budget'),committedSats:jobs.filter(j=>!j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.filter(j=>j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),estimated:true,unknownAmounts:jobs.filter(j=>j.amountSats===null).length,note:'Estimates from awarded offer prices; 3406 authorises payment, not proof of settlement. Private payments and fees are not visible.'},updates:tag(c,'update')?[tag(c,'update')]:[]};
+  return {asOf:now,challenge:{id:tag(c,'d'),eventId:c.id,buyer,buyerNpub:npubEncode(buyer),title:tag(c,'title'),goal:c.content,starts:+tag(c,'starts'),ends:+tag(c,'ends'),status:tag(c,'status'),result:tag(c,'result')??''},sellers,jobs,budget:{totalSats:+tag(c,'budget'),committedSats:jobs.filter(j=>!j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.filter(j=>j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),estimated:true,unknownAmounts:jobs.filter(j=>j.amountSats===null).length,note:'Estimates from awarded offer prices; 3406 authorises payment, not proof of settlement. Private payments and fees are not visible.'},updates:tag(c,'update')?[tag(c,'update')]:[]};
 }

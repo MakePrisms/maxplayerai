@@ -17,20 +17,21 @@ export function signAuth(key, relay, challenge, now = Math.floor(Date.now()/1000
   const e = {pubkey:Buffer.from(schnorr.getPublicKey(key)).toString('hex'),created_at:now,kind:22242,tags:[['relay',relay],['challenge',challenge]],content:''};
   e.id=eventId(e); e.sig=Buffer.from(schnorr.sign(e.id,key)).toString('hex'); return e;
 }
+const scalar = (e,k) => one(e,k) && e.tags.find(t=>t[0]===k).length===2;
 export function validChallenge(e,buyer) {
   if (e.kind !== 30341 || e.pubkey !== buyer || !namespace(e)) return false;
-  if (!['d','title','join_opens','join_closes','starts','ends','budget','status'].every(k=>one(e,k))) return false;
-  const [opens,closes,starts,ends,budget] = ['join_opens','join_closes','starts','ends','budget'].map(k=>number(tag(e,k)));
-  return /^[a-z0-9-]{1,64}$/.test(tag(e,'d')) && !!tag(e,'title')?.trim() && [opens,closes,starts,ends,budget].every(n=>n!==null) && closes===opens+3600 && starts>=closes && ends>starts && e.tags.find(t=>t[0]==='budget')[2]==='sat' && ['scheduled','in_progress','completed','cancelled'].includes(tag(e,'status'));
+  if (!['d','title','starts','ends','status'].every(k=>scalar(e,k)) || !one(e,'budget') || e.tags.find(t=>t[0]==='budget').length!==3 || ['update','result'].some(k=>e.tags.some(t=>t[0]===k)&&!scalar(e,k))) return false;
+  const [starts,ends,budget] = ['starts','ends','budget'].map(k=>number(tag(e,k)));
+  return /^[a-z0-9-]{1,64}$/.test(tag(e,'d')) && !!tag(e,'title')?.trim() && [starts,ends,budget].every(n=>n!==null) && ends>starts && e.tags.find(t=>t[0]==='budget')[2]==='sat' && ['scheduled','in_progress','completed','cancelled'].includes(tag(e,'status'));
 }
 // Challenge events remain v1; existing buyer public jobs use the public-v2 envelope.
 export const tradeNamespace = e => namespace(e) || ([3401,3402,3403,3405,3406].includes(e.kind) && e.tags.some(t=>t[0]==='t'&&t[1]==='maxplayer') && one(e,'v') && tag(e,'v')==='2' && one(e,'visibility') && tag(e,'visibility')==='public' && one(e,'job') && hex(tag(e,'job')));
-export const namespace = e => e.tags.some(t=>t[0]==='t'&&t[1]==='maxplayer') && one(e,'v') && tag(e,'v')==='1';
-export function validApplication(e,c) {
-  const buyer=c.pubkey,d=tag(c,'d'),minutes=number(tag(e,'minutes'));
-  return e.kind===30342 && namespace(e) && ['d','a','p','minutes','status'].every(k=>one(e,k)) && tag(e,'d')===`${buyer}:${d}` && tag(e,'a')===`30341:${buyer}:${d}` && tag(e,'p')===buyer && e.created_at<=number(tag(c,'join_closes'))+900 && minutes!==null && minutes>=1 && minutes<=480 && ['applied','withdrawn'].includes(tag(e,'status'));
+export const namespace = e => scalar(e,'t') && tag(e,'t')==='maxplayer' && scalar(e,'v') && tag(e,'v')==='1';
+export function validMembership(e,c) {
+  const buyer=c.pubkey,minutes=number(tag(e,'minutes')),since=number(tag(e,'since'));
+  return e.kind===30342 && namespace(e) && ['d','p','minutes','status','since'].every(k=>scalar(e,k)) && !e.tags.some(t=>t[0]==='a') && tag(e,'d')===buyer && tag(e,'p')===buyer && since!==null && minutes!==null && minutes>=1 && minutes<=480 && ['joined','left'].includes(tag(e,'status'));
 }
 export function validDecision(e,c) {
-  const seller=tag(e,'p'),d=tag(c,'d');
-  return e.kind===30343 && e.pubkey===c.pubkey && namespace(e) && ['d','a','p','decision'].every(k=>one(e,k)) && hex(seller) && tag(e,'d')===`${d}:${seller}` && tag(e,'a')===`30341:${c.pubkey}:${d}` && ['accepted','denied'].includes(tag(e,'decision'));
+  const seller=tag(e,'p');
+  return e.kind===30343 && e.pubkey===c.pubkey && namespace(e) && ['d','p','decision'].every(k=>scalar(e,k)) && !e.tags.some(t=>t[0]==='a') && hex(seller) && tag(e,'d')===seller && ['accepted','denied'].includes(tag(e,'decision')) && (!e.tags.some(t=>t[0]==='e') || (scalar(e,'e') && hex(tag(e,'e'))));
 }

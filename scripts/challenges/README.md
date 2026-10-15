@@ -41,10 +41,10 @@ these isolated homes; the runner reviews the exact stub answer before calling co
 proves the trade integrity/collect path, not a deployed reviewer service. It holds delivery behind a bounded local file gate until the runner has observed the
 running HTTP/SSE state, then waits two seconds to make positive minute usage observable. No new money path is introduced.
 
-Assertions: publish → 60/30-minute applications → accept/deny → authenticated HTTP tally →
+Assertions: publish → 60/30-minute memberships → accept/deny → authenticated HTTP tally →
 coordinator selects only accepted seller → real MCP post → seller claim / buyer award (auto or existing manual override) →
 running tally and no concurrent assignment → delivered result / free collect → exact minute
-tally and done → denied seller idle → withdrawal blocks new assignment while preserving work.
+tally and done → denied seller idle → leave blocks new assignment while preserving work.
 `--baseline` tests only the existing free-job trade loop and must not be cited as full challenge
 coverage. Failed assertions exit nonzero and print the private artifact location. Successful
 runs end in `PASS ALL community challenge E2E`.
@@ -62,3 +62,5 @@ Known `lifecycle wire history incomplete` failures get at most three identical a
 for `get_job`, `award_claim` or `collect` (the existing idempotent operations). Each retry
 is printed and captured; all other errors and retry exhaustion fail immediately. This is
 not proof that the buyer/relay transient-history bug is fixed.
+
+Membership coverage: join at any time with an exact work-start eligibility boundary; one join and acceptance across two published days; per-day minute reset; leave blocks assignments; late join waits until next day; changing minutes preserves since.

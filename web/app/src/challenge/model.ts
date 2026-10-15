@@ -6,7 +6,6 @@ export interface Challenge {
   goal: string;
   buyerNpub: string;
   startsAt: string;
-  joinOpensAt: string;
   budgetSats: number;
   status: "scheduled" | "in_progress" | "completed" | "cancelled";
   update: string;
@@ -37,21 +36,16 @@ export function validateChallenge(challenge: Challenge): Challenge {
   if (!Number.isSafeInteger(challenge.budgetSats) || challenge.budgetSats < 0) {
     throw new Error("Budget must be a non-negative safe integer in sats");
   }
-  if (instant(challenge.startsAt) < instant(challenge.joinOpensAt) + 3_600_000) {
-    throw new Error("Work starts after the one-hour join window closes");
-  }
+  instant(challenge.startsAt);
   if (!["scheduled", "in_progress", "completed", "cancelled"].includes(challenge.status)) {
     throw new Error("Unknown challenge status");
   }
   return challenge;
 }
 
-export function joinState(challenge: Challenge, now: number): string {
+export function joinState(challenge: Challenge, _now: number): string {
   if (challenge.status === "cancelled") return "Cancelled";
-  if (challenge.status !== "scheduled") return "Joining closed";
-  const opens = instant(challenge.joinOpensAt);
-  if (now < opens) return "Joining opens soon";
-  return now < opens + 3_600_000 ? "Open to join" : "Joining closed";
+  return "Open to join";
 }
 
 export function whitelistInstruction(challenge: Challenge): string {

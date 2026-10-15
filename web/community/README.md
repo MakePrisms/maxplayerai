@@ -34,7 +34,7 @@ change on verified events and running-minute ticks. Consumers must show incomple
 stale status if relay authentication/history is not ready. The page extrapolates elapsed
 seconds locally using a monotonic clock and caps each job at its deadline.
 
-`/review` is plain read-only HTML with escaped applicant names/notes, advertised heartbeat
+`/review` is plain read-only HTML with escaped member names/notes, advertised heartbeat
 capabilities (with timestamp), minutes, completed jobs across known challenges, and
 selectable accept/deny CLI commands. Run these in the **buyer's CLI home**. This service
 cannot execute them. No external content is interpreted as HTML or executable markdown.
@@ -70,7 +70,7 @@ run parity fixtures (it cannot literally import this JavaScript module).
 History uses per-kind 500-event pages, overlapping the boundary second; live subscription
 is installed first, and reconnect replays history. A 500-event single-second boundary is
 explicitly marked incomplete rather than silently skipped. Requests are paced. Kind-0
-and 30340 are subscribed only for observed applicants. The in-memory history is not a
+and 30340 are subscribed only for observed members. The in-memory history is not a
 bounded archival database; a large buyer history increases startup time and memory.
 
 In `crates/buzz/crates/buzz-relay/src/handlers/req.rs`, `handle_req` explicitly grants
@@ -86,3 +86,17 @@ Budget is an estimate: 3405 has no amount; we use the fixed-price offer selected
 award. A buyer-authored 3406 with matching offer root and unmarked claim moves it from
 committed to paid estimate. That is authorisation, not proof of Cashu settlement. Fees,
 refunds and private money state cannot be inferred. Missing amounts are counted explicitly.
+
+## Persistent membership
+
+30342 is one membership per seller/buyer (`d=p=buyer`, no `a`), with daily minutes,
+`joined|left`, and `since`. 30343 is one persistent decision per buyer/seller
+(`d=p=seller`, no `a`). Accepted membership carries into every daily challenge without
+rejoining. Eligibility requires joined + accepted + `since <= starts`.
+Leaving immediately blocks new assignments but preserves awarded work and settlement.
+Minutes used include only jobs in the selected day's work window, so allowances reset
+daily. The API includes `membershipStatus` and `since`; states include joined, accepted,
+working, done, left and denied. Review commands are per seller, not per challenge.
+
+Sellers can join at any time. Joining after work starts takes effect the next day. Use
+`maxplayer challenge members [--challenge <d>]` to compare CLI eligibility with the reader.

@@ -52,7 +52,7 @@
     },
     {
       "name": "maxplayer-challenge-join",
-      "description": "Read a signed community challenge, preserve the seller buyer allowlist, apply with offered minutes, check acceptance, and withdraw.",
+      "description": "Join the community swarm at any time with daily minutes (joins after work starts begin next day), preserve the seller buyer allowlist, check persistent acceptance, and leave at any time.",
       "path": "/.well-known/skills/challenge-join/skill.md"
     }
   ]

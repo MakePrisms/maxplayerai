@@ -7,7 +7,7 @@ import { challenge } from "../src/challenge/content.js";
 const hex = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 const fixture: Challenge = {
   title: "Example challenge", goal: "Two sellers research a problem.", buyerNpub: npubEncode(hex),
-  startsAt: "2026-10-16T19:30:00.000Z", joinOpensAt: "2026-10-16T18:00:00.000Z",
+  startsAt: "2026-10-16T19:30:00.000Z",
   budgetSats: 6000, status: "scheduled", update: "Example only, not a live challenge.",
 };
 
@@ -25,13 +25,13 @@ test("whitelist instruction preserves config and uses hex for the exact displaye
   assert.throws(() => buyerHex(npubEncode("00".repeat(32))), "checksum alone does not prove a usable buyer key");
 });
 
-test("join window is one hour, separate from work start; time does not imply work began", () => {
-  const open = Date.parse(fixture.joinOpensAt);
-  assert.equal(joinState(fixture, open - 1), "Joining opens soon");
+test("joining remains open before and after work starts", () => {
+  const open = Date.parse(fixture.startsAt);
+  assert.equal(joinState(fixture, open - 1), "Open to join");
   assert.equal(joinState(fixture, open), "Open to join");
   assert.equal(joinState(fixture, open + 3_600_000 - 1), "Open to join");
-  assert.equal(joinState(fixture, open + 3_600_000), "Joining closed");
-  assert.equal(joinState({ ...fixture, status: "completed" }, open), "Joining closed");
+  assert.equal(joinState(fixture, open + 3_600_000), "Open to join");
+  assert.equal(joinState({ ...fixture, status: "completed" }, open), "Open to join");
   assert.equal(joinState({ ...fixture, status: "cancelled" }, open), "Cancelled");
 });
 
@@ -40,7 +40,7 @@ test("invalid money and ambiguous dates cannot publish; zero budget is not hidde
   for (const budgetSats of [-1, 1.5, NaN, Number.MAX_SAFE_INTEGER + 1]) {
     assert.throws(() => validateChallenge({ ...fixture, budgetSats }));
   }
-  for (const startsAt of ["2026-10-16T19:30", "2026-02-30T19:30:00.000Z", "2026-10-16T18:30:00.000Z"]) {
+  for (const startsAt of ["2026-10-16T19:30", "2026-02-30T19:30:00.000Z"]) {
     assert.throws(() => validateChallenge({ ...fixture, startsAt }));
   }
 });
