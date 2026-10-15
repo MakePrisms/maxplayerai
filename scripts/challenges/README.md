@@ -14,6 +14,9 @@ installed Postgres/Redis in `/nix/store` if absent from PATH. Else supply them o
 `nix shell --extra-experimental-features 'nix-command flakes' nixpkgs#postgresql_17 nixpkgs#redis`
 provides those dependencies. Use the repository devshell if the native build needs OpenSSL.
 No Docker, global DB, production config, real LLM or mint is used.
+Buzz’s Git object-store startup probe is disabled (`BUZZ_GIT_CONFORMANCE_PROBE=false`)
+because this is an inline-delivery test with no Git/media object store. S3 points at closed
+loopback port 1. This harness does not verify Git/S3 delivery or its conformance gate.
 
 ```sh
 # Reuse binaries built above after no Rust changes:
@@ -33,7 +36,9 @@ surfaces disabled and `accept_offers_only_from=[buyer]`, `takes_no_payment=true`
 Mint lists are empty, real mints and fee auto-remit disabled. Only the local buyer is allowed
 through the harness's `post_job` guard, with `payment=none`, amount/max zero and public
 seller-targeting. The fixture uses a minimal ACP stub (adapted from the existing mint E2E),
-not an installed model harness. It delays each result eight seconds to make running state
+not an installed model harness. External offer/delivery reviewer services are disabled in
+these isolated homes; the runner reviews the exact stub answer before calling collect. This
+proves the trade integrity/collect path, not a deployed reviewer service. It delays each result eight seconds to make running state
 observable. No new money path is introduced.
 
 Assertions: publish → 60/30-minute applications → accept/deny → authenticated HTTP tally →

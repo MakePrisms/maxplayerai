@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 
@@ -129,7 +130,7 @@ try:
     pgisready = str(Path(initdb).with_name('pg_isready'))
     wait('Postgres ready', lambda: subprocess.run([pgisready, '-h', '127.0.0.1', '-p', str(pgport)], stdout=subprocess.DEVNULL).returncode == 0)
     relay = f'ws://127.0.0.1:{relayport}'
-    start('buzz', [BUZZ], {**ENV, 'DATABASE_URL': f'postgresql://{os.environ["USER"]}@127.0.0.1:{pgport}/postgres', 'REDIS_URL': f'redis://127.0.0.1:{redisport}', 'BUZZ_BIND_ADDR': f'127.0.0.1:{relayport}', 'BUZZ_HEALTH_PORT': '0', 'BUZZ_METRICS_PORT': '0', 'BUZZ_RELAY_PRIVATE_KEY': secrets.token_hex(32), 'BUZZ_AUTO_MIGRATE': 'true', 'BUZZ_OPEN_READ': 'true', 'BUZZ_GIT_REPO_PATH': str(RUN / 'git'), 'BUZZ_GIT_PACK_CACHE_PATH': str(RUN / 'packs')})
+    start('buzz', [BUZZ], {**ENV, 'RELAY_URL': relay, 'DATABASE_URL': f'postgresql://{os.environ["USER"]}@127.0.0.1:{pgport}/postgres', 'REDIS_URL': f'redis://127.0.0.1:{redisport}', 'BUZZ_BIND_ADDR': f'127.0.0.1:{relayport}', 'BUZZ_HEALTH_PORT': '0', 'BUZZ_METRICS_PORT': '0', 'BUZZ_RELAY_PRIVATE_KEY': secrets.token_hex(32), 'BUZZ_AUTO_MIGRATE': 'true', 'BUZZ_OPEN_READ': 'true', 'BUZZ_GIT_CONFORMANCE_PROBE': 'false', 'BUZZ_S3_ENDPOINT': 'http://127.0.0.1:1', 'BUZZ_GIT_REPO_PATH': str(RUN / 'git'), 'BUZZ_GIT_PACK_CACHE_PATH': str(RUN / 'packs')})
     wait('local Buzz ready', lambda: urllib.request.urlopen(f'http://127.0.0.1:{relayport}/health', timeout=2).status == 200)
     buyer_env, BUYER = home('b', relay)
     seller_env, SELLER = home('s', relay, BUYER)
@@ -149,6 +150,17 @@ try:
         goal.write_text('Return the fixture answer 42. No paid work.\n')
         cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--join-opens', iso(now - 3600), '--starts', iso(now), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
         wait('challenge visible in app', lambda: snapshot()['challenge'])
+        stream_frames = []
+        def consume_stream():
+            try:
+                with urllib.request.urlopen(url + '/stream', timeout=120) as response:
+                    for line in response:
+                        if line.startswith(b'data: '):
+                            stream_frames.append(json.loads(line[6:]))
+            except (OSError, ValueError):
+                pass  # Missing lifecycle frames fail the assertions below.
+        threading.Thread(target=consume_stream, daemon=True).start()
+        wait('SSE initial snapshot received', lambda: stream_frames and stream_frames[0]['challenge']['id'] == 'local-e2e')
         cli(seller_env, 'apply', '--buyer', BUYER, '--challenge', 'local-e2e', '--minutes', '60')
         cli(denied_env, 'apply', '--buyer', BUYER, '--challenge', 'local-e2e', '--minutes', '30')
         s = wait('both applications visible (60 and 30 minutes)', lambda: (s if sorted(x['minutesOffered'] for x in s['sellers']) == [30, 60] else None) if (s := snapshot()) else None)
@@ -167,11 +179,12 @@ try:
     if not ARGS.baseline:
         s = wait('claim and award yield running tally', lambda: (s if any(j['id'] == job and j['running'] and j['claim'] and j['award'] for j in s['jobs']) else None) if (s := snapshot()) else None)
         check('running seller not assignable', not plan(s)['postingAllowed'])
+        wait('SSE running job received', lambda: any(any(j['id'] == job and j['running'] for j in f['jobs']) for f in stream_frames))
     def delivery():
         state = mcp(buyer_env, 'get_job', {'job_id':job})
         return state if state.get('results') else None
     delivered = wait('seller delivered result', delivery)
-    check('delivery belongs to accepted seller', delivered['awarded']['seller_pubkey'] == SELLER and all(r['seller_pubkey'] == SELLER for r in delivered['results']))
+    check('only accepted seller claimed and delivered', delivered['awarded']['seller_pubkey'] == SELLER and delivered['claims'] and all(c['seller_pubkey'] == SELLER for c in delivered['claims']) and all(r['seller_pubkey'] == SELLER for r in delivered['results']))
     check('review fixture answer before collect', 'Challenge fixture result: 42.' in json.dumps(delivered['results']))
     collected = mcp(buyer_env, 'collect', {'job_id':job})
     check('collect has no payment and zero sats', collected['pay']['state'] == 'none' and collected['pay']['amount_sats'] == 0 and collected['pay']['attempt_id'] is None)
@@ -187,6 +200,7 @@ try:
         s = wait('withdraw visible', lambda: (s if any(x['pubkey'] == SELLER and x['state'] == 'withdrawn' for x in s['sellers']) else None) if (s := snapshot()) else None)
         p = plan(s)
         check('withdraw stops further assignment', not p['postingAllowed'] and p['sellers'] == [])
+        wait('SSE withdrawal received', lambda: any(any(x['pubkey'] == SELLER and x['state'] == 'withdrawn' for x in f['sellers']) for f in stream_frames))
         check('withdraw preserves settled job/minutes', len(s['jobs']) == 1 and next(x for x in s['sellers'] if x['pubkey'] == SELLER)['minutesUsed'] == own['minutesUsed'])
         (RUN / 'final-snapshot.json').write_text(json.dumps(s, indent=2))
     print('PASS ALL ' + ('baseline free-job flow' if ARGS.baseline else 'community challenge E2E'), flush=True)
