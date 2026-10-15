@@ -440,20 +440,15 @@ pub async fn announce_seller_delivery_repo_async(
     send_signed_event(home, &keys, &event, "NIP-34").await
 }
 
-async fn send_signed_event(
+pub(crate) async fn send_signed_event(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
     event: &nostr_sdk::Event,
     label: &str,
 ) -> Result<String, ProfileError> {
-    use nostr_sdk::prelude::Client;
-
-    let client = Client::new(keys.clone());
-    client
-        .add_relay(&home.config.relay_url)
+    let client = crate::relay_auth::connect_authenticated(keys, &home.config.relay_url)
         .await
-        .map_err(|error| ProfileError::Relay(format!("add relay: {error}")))?;
-    client.connect().await;
+        .map_err(|error| ProfileError::Relay(error.to_string()))?;
     let output = client
         .send_event_to([&home.config.relay_url], event)
         .await;

@@ -9,6 +9,7 @@ pub mod budget;
 // the gate itself rather than dragging the whole module behind it.
 pub mod capability;
 pub mod checks;
+pub mod challenge;
 #[cfg(feature = "wallet")]
 pub mod collect;
 #[cfg(all(feature = "wallet", feature = "gateway"))]

@@ -49,6 +49,11 @@
       "name": "maxplayer-mint-and-trade",
       "description": "Set up a seller's own token mint and standalone token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs both binaries, connects the mint and trading home, and prepares an approved issuance and listing.",
       "path": "/.well-known/skills/mint-and-trade/skill.md"
+    },
+    {
+      "name": "maxplayer-challenge-join",
+      "description": "Read a signed community challenge, preserve the seller buyer allowlist, apply with offered minutes, check acceptance, and withdraw.",
+      "path": "/.well-known/skills/challenge-join/SKILL.md"
     }
   ]
 }
