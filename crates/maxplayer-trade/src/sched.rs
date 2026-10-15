@@ -26,8 +26,9 @@
 //!
 //! Keys (see `coordinator::*_keys`): `lot:<id>` (a maker lot: its listing row and every maker
 //! swap on it), `taker` (this home's taker swaps: at most one is open), `admit` (anything that
-//! selects wallet proofs or creates a swap or listing), `listings` (every listing row write that
-//! is not a single known lot, including `list`), `wallet:<mint>` (one mint's funding,
+//! selects wallet proofs or creates a swap or listing), `listings` (held by `list` while its new
+//! row is not yet reserved and published; listing recovery is not queued meanwhile, and each
+//! listing recovery unit then keys only its own `lot:<id>`), `wallet:<mint>` (one mint's funding,
 //! withdrawal, receive and send journals),
 //! `publications` (the durable publication retry pass). Units are deduplicated by id while
 //! queued or running.
