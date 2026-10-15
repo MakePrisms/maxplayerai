@@ -1,4 +1,4 @@
-import {verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,validChallenge,validApplication,validDecision,npubEncode} from './events.mjs';
+import {verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validApplication,validDecision,npubEncode} from './events.mjs';
 const latest = (events,key) => { const map=new Map(); for(const e of events) if(newer(e,map.get(key(e)))) map.set(key(e),e); return [...map.values()]; };
 const ascending = (a,b) => a.created_at-b.created_at || a.id.localeCompare(b.id);
 export class EventStore {
@@ -14,7 +14,7 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
   if(!c) return empty;
   const apps=latest(events.filter(e=>validApplication(e,c)),e=>e.pubkey);
   const decisions=latest(events.filter(e=>validDecision(e,c)),e=>tag(e,'p'));
-  const trade=events.filter(namespace);
+  const trade=events.filter(tradeNamespace);
   const jobs=[];
   for(const offer of trade.filter(e=>e.kind===3401 && e.pubkey===buyer && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
     const seller=tag(offer,'p');

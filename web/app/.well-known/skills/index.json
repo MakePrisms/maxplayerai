@@ -53,7 +53,7 @@
     {
       "name": "maxplayer-challenge-join",
       "description": "Read a signed community challenge, preserve the seller buyer allowlist, apply with offered minutes, check acceptance, and withdraw.",
-      "path": "/.well-known/skills/challenge-join/SKILL.md"
+      "path": "/.well-known/skills/challenge-join/skill.md"
     }
   ]
 }

@@ -23,6 +23,8 @@ export function validChallenge(e,buyer) {
   const [opens,closes,starts,ends,budget] = ['join_opens','join_closes','starts','ends','budget'].map(k=>number(tag(e,k)));
   return /^[a-z0-9-]{1,64}$/.test(tag(e,'d')) && !!tag(e,'title')?.trim() && [opens,closes,starts,ends,budget].every(n=>n!==null) && closes===opens+3600 && starts>=closes && ends>starts && e.tags.find(t=>t[0]==='budget')[2]==='sat' && ['scheduled','in_progress','completed','cancelled'].includes(tag(e,'status'));
 }
+// Challenge events remain v1; existing buyer public jobs use the public-v2 envelope.
+export const tradeNamespace = e => namespace(e) || ([3401,3402,3403,3405,3406].includes(e.kind) && e.tags.some(t=>t[0]==='t'&&t[1]==='maxplayer') && one(e,'v') && tag(e,'v')==='2' && one(e,'visibility') && tag(e,'visibility')==='public' && one(e,'job') && hex(tag(e,'job')));
 export const namespace = e => e.tags.some(t=>t[0]==='t'&&t[1]==='maxplayer') && one(e,'v') && tag(e,'v')==='1';
 export function validApplication(e,c) {
   const buyer=c.pubkey,d=tag(c,'d'),minutes=number(tag(e,'minutes'));

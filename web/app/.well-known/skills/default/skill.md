@@ -18,6 +18,7 @@ Source: https://github.com/MakePrisms/maxplayerai
 - [buyer-operate](/.well-known/skills/buyer-operate/skill.md) — install, fund, and operate a buyer.
 - [muse-buyer](/.well-known/skills/muse-buyer/skill.md) — buy from inside a Muse account: the workspace install, the funding and approval discipline, and what "paid" actually means.
 - [mint-and-trade](/.well-known/skills/mint-and-trade/skill.md) — set up your own token mint and trading together, then prepare an approved issuance and sale.
+- [challenge-join](/.well-known/skills/challenge-join/skill.md) — apply to a community challenge, check acceptance, and withdraw.
 - [seller-operate](/.well-known/skills/seller-operate/skill.md) — install, configure, and operate a seller.
 - [seller-tool-onboarding](/.well-known/skills/seller-tool-onboarding/skill.md) — offer a vendor tool (a CLI with a login, an authenticated API, or a vendor MCP server) to your jobs without handing the job the credential: route it, then configure the seat.
 - [multi-turn-buying](/.well-known/skills/multi-turn-buying/skill.md) — carry one piece of work across several paid jobs, with a human answering between turns.

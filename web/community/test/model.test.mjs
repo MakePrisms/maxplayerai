@@ -40,3 +40,25 @@ test('missing/malformed deadline and ambiguous root references never tally',()=>
 test('challenge replacement ties choose lowest id and invalid replacement cannot hide valid one',()=>{const other=event(30341,0,c.created_at,c.tags.filter(t=>!['t','v'].includes(t[0])), 'Other goal');assert.equal(project([c,other]).challenge.eventId,[c.id,other.id].sort()[0]);const invalid=event(30341,0,101,c.tags.filter(t=>!['t','v','status'].includes(t[0])));assert.equal(project([c,invalid]).challenge.eventId,c.id);});
 test('unknown amount is explicit, no-payment award is zero',()=>{const build=payment=>{const o=event(3401,0,4000,[['p',seller],['param','deadline','7600'],...(payment?[['param','payment','none']]:[])]);const cl=event(3402,1,4010,[['e',o.id,'','root'],['p',buyer],['status','processing']]);const a=event(3405,0,4020,[['e',cl.id],['e',o.id,'','root'],['p',buyer],['p',seller],['status','accepted']]);return project([c,app(),o,cl,a]);};assert.equal(build(false).budget.unknownAmounts,1);assert.equal(build(true).budget.unknownAmounts,0);assert.equal(build(true).budget.committedSats,0);});
 test('review history includes completed jobs from older known challenges',()=>{const old=event(30341,0,99,[['d','old'],['title','Old'],['join_opens','0'],['join_closes','3600'],['starts','3900'],['ends','4001'],['budget','100','sat'],['status','completed']]);const s=project([...base,old,result()]);assert.equal(s.sellers[0].pastJobs.length,1,'same offer in overlapping windows is deduplicated');assert.equal(s.sellers[0].pastJobs[0].challengeId,'test');});
+// Real buyer MCP uses v2 for PUBLIC jobs, while challenge kinds remain v1.
+function publicV2(kind,who,time,tags,content='') {
+  const e=event(kind,who,time,tags,content);
+  e.tags=e.tags.map(t=>t[0]==='v'?['v','2']:t).concat([['visibility','public'],['job','a'.repeat(64)]]);
+  e.id=eventId(e);e.sig=Buffer.from(schnorr.sign(e.id,keys[who])).toString('hex');return e;
+}
+test('existing public-v2 free trade tallies running, result and accept with v1 challenge',()=>{
+  const o=publicV2(3401,0,4000,[['p',seller],['i','Free task'],['amount','0','sat'],['param','payment','none'],['param','deadline','7600']]);
+  const cl=publicV2(3402,1,4010,[['e',o.id,'','root'],['p',buyer],['p',seller],['status','processing'],['payment','none']]);
+  const aw=publicV2(3405,0,4020,[['e',o.id,'','root'],['e',cl.id],['p',buyer],['p',seller],['status','accepted']]);
+  const r=publicV2(3403,1,4080,[['e',o.id,'','root'],['p',buyer]],'Answer');
+  const ac=publicV2(3406,0,4090,[['e',o.id,'','root'],['e',cl.id],['p',buyer],['p',seller],['status','accepted']]);
+  const events=[c,app(),decision(),o,cl,aw];
+  const running=project(events,4050);assert.equal(running.jobs.length,1);assert.equal(running.sellers[0].state,'working');assert.equal(running.sellers[0].minutesUsed,.5);
+  const done=project([...events,r,ac],4100);assert.equal(done.sellers[0].state,'done');assert.equal(done.sellers[0].minutesUsed,1);assert.equal(done.jobs[0].accepted,true);assert.equal(done.budget.unknownAmounts,0);assert.equal(done.budget.committedSats+done.budget.paidSats,0);
+});
+test('public-v2 admission does not relax challenge-v1 or admit private/malformed envelopes',async()=>{
+  const {tradeNamespace}=await import('../src/events.mjs');
+  const e=publicV2(3401,0,4000,[['p',seller]]);assert.ok(tradeNamespace(e));
+  for(const tags of [e.tags.filter(t=>t[0]!=='job'),e.tags.filter(t=>t[0]!=='visibility'),e.tags.map(t=>t[0]==='visibility'?['visibility','private']:t),e.tags.map(t=>t[0]==='v'?['v','3']:t),[...e.tags,['v','1']]])assert.equal(tradeNamespace({...e,tags}),false);
+  const bad=publicV2(30341,0,100,c.tags.filter(t=>!['t','v'].includes(t[0])));assert.equal(validChallenge(bad,buyer),false);assert.equal(project([bad,app()]).challenge,null);
+});

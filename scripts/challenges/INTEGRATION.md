@@ -34,3 +34,46 @@ The first Buzz boot failed at its default Git/S3 conformance probe against local
 Inline-only harness now sets `BUZZ_GIT_CONFORMANCE_PROBE=false` and points S3 at loopback
 port 1. Real Git/S3 delivery is out of scope; Postgres, Redis and the real Buzz event pipeline
 remain in use. No production relay setting was changed.
+
+## Core/app skill-discovery mismatch (small integration fix)
+
+After merging core `ceb29d53` and app `c1c9df12` at integration head `1fe0260b`,
+`npm test --prefix web/app` reported **329 passed, 1 failed**:
+
+```text
+test at test/build.test.mjs:58:1
+AssertionError [ERR_ASSERTION]: maxplayer-challenge-join has the published skill path shape, got /.well-known/skills/challenge-join/SKILL.md
+```
+
+The existing discovery test requires lowercase `skill.md` and a companion link from the
+homepage skill. Small fixes only: rename the new challenge-join artifact to `skill.md`,
+update its index path and the two CLI-test path literals, and add the missing companion link.
+No behavior in the core CLI, protocol, app service or page was rewritten.
+
+## App drops actual public-v2 jobs (small integration fix)
+
+First full run (`.scratch/ce-dgcd293m`, integration source `1fe0260b`) passed challenge
+publication, applications, decisions and work-window gating, then failed:
+
+```text
+PASS accepted seller live claim observed
+PASS existing manual award override committed
+FAIL claim and award yield running tally: timeout; last=None
+```
+
+Persisted Buzz rows prove the public trade existed:
+
+- OFFER `d92e448f3374e13a62343f79d60be748c2a3432573dfb448eca693a53fadfde6` (3401)
+- CLAIM `0db062c7d957b4dfa2e23d933d8940382858de04d3dcd425a06cd93e88b9be5b` (3402)
+- AWARD `d1c0fdf96dbcb93e3da4cff8beba77844bfd331b126d7032fa4469ee2855d8e1` (3405)
+
+All three carry `t=maxplayer`, `v=2`, `visibility=public`, and the same `job` coordinate.
+The offer has `amount=0 sat`, `param payment=none`, and deadline `1792093043`. The award's
+root points at the offer and unmarked `e` points at the claim. Seller log at 19:35:24Z says
+`awarded ... — executing`; app was authenticated/history-complete but had `jobs:[]`.
+`web/community/src/model.mjs` filtered trades using the v1-only `namespace` predicate.
+
+Small fix: a separate trade predicate admits existing public-v2 envelopes (known trade
+kinds, one version/public-visibility/hex job tag); challenge validation stays strictly v1.
+Two signed-event regression tests cover v2 running/result/accept tally and reject private,
+malformed, unknown-version envelopes and v2 challenges. No app tally algorithm was rewritten.

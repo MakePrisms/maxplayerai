@@ -179,8 +179,10 @@ try:
         cli(buyer_env, 'decide', '--challenge', 'local-e2e', '--seller', SELLER, '--accept')
         cli(buyer_env, 'decide', '--challenge', 'local-e2e', '--seller', DENIED, '--deny')
         s = wait('accepted/denied tally and authenticated history', lambda: (s if {x['state'] for x in s['sellers']} == {'accepted','denied'} and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
+        rows = json.loads(cli(buyer_env, 'applicants', '--challenge', 'local-e2e', '--json'))['applicants']
+        check('Rust CLI and app agree on eligibility', len(rows) == 2 and [r['application']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
-            check('coordinator blocks before work window', not plan(s)['postingAllowed'])
+            check('coordinator blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
         wait('challenge work window open', lambda: int(time.time()) >= starts)
         s = snapshot()
         p = plan(s)
@@ -228,6 +230,8 @@ try:
         check('withdraw stops further assignment', not p['postingAllowed'] and p['sellers'] == [])
         wait('SSE withdrawal received', lambda: any(any(x['pubkey'] == SELLER and x['state'] == 'withdrawn' for x in f['sellers']) for f in stream_frames))
         check('withdraw preserves settled job/minutes', len(s['jobs']) == 1 and next(x for x in s['sellers'] if x['pubkey'] == SELLER)['minutesUsed'] == own['minutesUsed'])
+        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'local-e2e', '--json'))['applicants']
+        check('Rust CLI confirms withdrawn ineligible seller', len(rows) == 1 and not rows[0]['eligible'] and rows[0]['application']['status'] == 'withdrawn')
         (RUN / 'final-snapshot.json').write_text(json.dumps(s, indent=2))
     print('PASS ALL ' + ('baseline free-job flow' if ARGS.baseline else 'community challenge E2E'), flush=True)
 except Exception as e:
