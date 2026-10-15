@@ -82,6 +82,7 @@ wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk"]
 stub-pay = []
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 maxplayer-core = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -102,6 +103,7 @@ name = "sandbox_reap_dry_run"
 required-features = ["acp"]
 
 [dev-dependencies]
+nostr-relay-builder = "0.44.1"
 cashu = "=0.17.2"
 cdk = { version = "=0.17.2", default-features = false, features = ["wallet"] }
 cdk-sqlite = "=0.17.2"
