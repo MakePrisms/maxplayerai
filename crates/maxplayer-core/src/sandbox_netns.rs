@@ -4197,7 +4197,7 @@ exit 0
     /// EACH JOB IS JUDGED AGAINST ITS OWN DEADLINE, NOT A SHARED AGE.
     ///
     /// The whole reason the expiry is written onto the container: a seat runs a ten-minute job and an
-    /// eight hour one at the same time, and a single global age would either strangle the long job or
+    /// eight-hour one at the same time, and a single global age would either strangle the long job or
     /// keep the short one's leftovers for the long one's lifetime. At one instant the short job's
     /// container is expired and the long job's is not.
     #[test]
