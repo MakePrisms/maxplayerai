@@ -80,3 +80,26 @@ event steps past everything the shallower filter never got to return.
 gift-wrap, so a trade can settle with no public receipt ever published. Every
 settlement figure is a FLOOR, and anything user-facing must say so
 (`src/market/trades.ts`).
+
+## Unlisted challenge announcement
+
+`/challenges` shows one organizer-maintained challenge: goal, scheduled work start,
+planned total budget in sats, joining window, buyer npub and latest update. It has
+no inbound navigation/footer/discovery links and is noindexed. Unlisted is not
+access-controlled: anyone with the URL can read it.
+
+Edit `src/challenge/content.ts` to publish a complete `Challenge` (see the type in
+`src/challenge/model.ts`); leave it `null` until the organizer confirms the goal,
+buyer, schedule and budget. Timestamps use canonical UTC ISO strings with `.000Z`.
+`joinOpensAt` opens a one-hour window; `startsAt` must be at or after its close.
+Dates render in the visitor's timezone with UTC alongside. Status and the update
+are maintained by the organizer: reaching the scheduled time does not prove work
+started. Updating the content requires a site build/deployment.
+
+There is no signup, wallet, posting, spending or automated challenge backend here.
+The displayed budget is planned, not spent or escrowed. Seller approval remains
+buyer-level, not challenge-specific. The copy instruction converts the npub to
+hex for `seller.accept_offers_only_from` and asks the operator's agent to preserve
+existing entries, rates and admission settings. Existing review/payment paths are
+unchanged. The tests validate configured content and reject malformed identity,
+budget and schedule values. No real challenge is shipped by default.

@@ -91,9 +91,9 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
-    const script = page === "tokens.html" ? "tokens.js" : "terminal.js";
+    const script = page === "tokens.html" ? "tokens.js" : page === "challenges.html" ? "challenges.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
       assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
       assert.ok(!pageHtml.includes(`"./${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
@@ -162,7 +162,7 @@ test("the live market ships at /market and the homepage links it", () => {
 });
 
 test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
-  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html"];
+  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "challenges.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -194,7 +194,7 @@ test("all site pages share navigation and footer links, with a current page and 
     const sub = footer.match(/<div class="foot-row foot-sub">([\s\S]*?)<\/div>/)?.[1] ?? "";
     assert.deepEqual(links(sub).map(([, text]) => text), ["Skill", "GitHub", "@maxplayerai"], `${page}: footer second row`);
     const current = [...nav.matchAll(/aria-current="page"/g)].length;
-    if (page === "chat.html" || page === "mint.html" || page === "tokens.html") {
+    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "challenges.html") {
       assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
     } else {
       const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
@@ -324,4 +324,18 @@ test("FAQ sections pin their heading so opening an answer never moves it", () =>
     assert.match(html, /class="h-section h-faq[" ]/, `${page} has an FAQ`);
     assert.match(html, /src="\.\/terminal\.js/, `${page} loads the bundle that pins it`);
   }
+});
+
+test("challenge page stays unlisted, noindexed and isolated from the main bundle", () => {
+  const html = readFileSync(join(root, "dist/challenges.html"), "utf8");
+  const { stamp } = JSON.parse(readFileSync(join(root, "dist/.buildstamp"), "utf8"));
+  assert.match(html, /name="robots" content="noindex, nofollow"/);
+  assert.ok(html.includes(`./challenges.css?v=${stamp}`));
+  assert.ok(!html.includes("terminal.js"));
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "llms.txt", "skill.md"]) {
+    assert.ok(!readFileSync(join(root, "dist", page), "utf8").includes("/challenges"), `${page} does not advertise the route`);
+  }
+  const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  assert.ok(cfg.headers.some((r) => r.source === "/challenges" && r.headers.some((h) => h.key === "X-Robots-Tag" && h.value === "noindex, nofollow")));
+  assert.ok(!readFileSync(join(root, "dist/terminal.js"), "utf8").includes("data-challenge-copy"));
 });
