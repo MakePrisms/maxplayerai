@@ -1,4 +1,7 @@
-# Verification — 2026-10-15 (local only)
+# Historical challenge integration verification — 2026-10-15 (local only)
+
+This record predates the auto-award fix. For the current no-manual-award harness,
+root cause and reproduction, see [INTEGRATION.md](INTEGRATION.md).
 
 Run from this checkout:
 
@@ -99,7 +102,7 @@ PR, or merge into `feat/community-challenges` occurred.
 
 Exact events, logs, causes and the list of small cross-agent fixes: [INTEGRATION.md](INTEGRATION.md).
 
-## Remaining
+## Remaining at that historical integration head
 
 The buyer/relay incomplete-history and stalled auto-award behavior remains an implementation
 follow-up, not fixed here; the harness uses the existing idempotent award override and bounded

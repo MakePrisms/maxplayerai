@@ -1,3 +1,68 @@
+# Auto-award regression follow-up — 2026-10-15
+
+The harness now **never calls `award_claim`**: it requires the buyer daemon's
+award within 60 seconds after observing the claim. Historical evidence below
+predates this change.
+
+A full unmodified-transport run and five repeated baseline runs passed, confirming
+that ordinary scheduling does not reproduce the original failure consistently.
+The loopback-only `--duplicate-history` fixture deterministically models Buzz's
+live/history overlap: `req.rs` registers live fan-out before querying historical
+rows, allowing the same signed claim to arrive twice before EOSE.
+
+Reproduce with the base buyer (2b434ad6 plus count-only diagnostics):
+
+```sh
+bash scripts/challenges/run-e2e.sh --skip-build --baseline --duplicate-history
+```
+
+Captured on the base buyer, without a manual award:
+
+```text
+lifecycle wire history incomplete: rows=2 accepted=1 ended=true failed=false
+22:12:47Z buyer: auto-award for 7ec203017a136da343e5fe9f80a420023674625caaf76e93df87e8b69496127f did not complete (job lifecycle relay: lifecycle wire history incomplete); left pending for re-arm
+```
+
+The wire guard counts frames; `history::collect` formerly deduplicated IDs before
+that comparison. It now retains validated frames until completeness/saturation
+checks, and `paginate` deduplicates the final history. Invalid events, missing
+EOSE, notification loss, partial auth restarts and saturated pages still fail
+closed. Original deployment frames were not retained, so this proves a matching
+failure mechanism, not that every historical incident had the same cause.
+
+Transient driver errors now retry after 1/2/4/8/16/30 seconds (30-second cap), bounded
+by the locally retained signed offer deadline. Retries use the same reserve-first
+and pinned-award path. An unavailable local cache is retried without inventing an expiry; the deadline is
+re-read on every failure. Unknown history never releases reservations or falsely
+marks an offer absent.
+
+## Final auto-award verification
+
+Production/test implementation: `33034fa6`. All commands used `--locked`,
+`CARGO_BUILD_JOBS=4`, `CARGO_PROFILE_DEV_DEBUG=0` and the authorized warm target.
+
+| Gate | Passed | Ignored | Failed |
+| --- | ---: | ---: | ---: |
+| `cargo test -p maxplayer-core --locked` | 558 | 0 | 0 |
+| `cargo test -p maxplayer-core --features wallet --locked` | 2144 | 8 | 0 |
+| `cargo test -p maxplayer --no-default-features --features wallet,acp --locked` | 268 | 1 | 0 |
+| Focused wire/history regressions (`--features wallet --lib private_content::history`) | 12 | 0 | 0 |
+| Focused retry/deadline regressions (`--features wallet --lib auto_award_retr`) | 6 | 0 | 0 |
+
+Full local Buzz/community E2E passed **twice normally**, then **once with
+`--duplicate-history`**, on the final implementation. Each run emitted 49 PASS
+lines, authenticated with NIP-42, and needed zero read retries. The fault run
+replayed **18 historical claim frames**. All three required automatic awards;
+there is no `award_claim` call in the harness. Free collection completed with zero
+sats and no payment attempt.
+
+The copied Buzz binary's source tree matched this branch's bundled Buzz tree.
+E2Es used a private copy of the rebuilt buyer binary, isolated ports, disposable
+homes/Postgres/Redis, and the stub ACP agent. No real relay writes, money,
+deployments, shared test environment or `ct-*` units were involved.
+
+---
+
 # Local integration evidence
 
 ## Existing buyer auto-award: intermittent incomplete history

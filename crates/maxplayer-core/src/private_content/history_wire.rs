@@ -109,6 +109,7 @@ impl PageGuard {
             .get(&self.key)
             .ok_or(Error("lifecycle wire history missing"))?;
         if page.failed || !page.ended || page.rows != accepted {
+            crate::opline!("lifecycle wire history incomplete: rows={} accepted={} ended={} failed={}", page.rows, accepted, page.ended, page.failed);
             return Err(Error("lifecycle wire history incomplete"));
         }
         Ok(())

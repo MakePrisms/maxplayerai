@@ -106,7 +106,11 @@ async fn collect(
     id: &SubscriptionId,
     filter: &Filter,
 ) -> Result<Vec<Event>> {
-    let mut events = BTreeMap::new();
+    // Account for accepted EVENT frames, not unique IDs. Live fan-out can overlap
+    // historical delivery before EOSE (Buzz registers the subscription first).
+    // Deduplication belongs in paginate AFTER frame completeness and saturation
+    // checks; doing it here makes two valid copies look like a dropped event.
+    let mut events = Vec::new();
     loop {
         match notifications
             .recv()
@@ -121,7 +125,7 @@ async fn collect(
                     },
             } if subscription_id.as_ref() == id => {
                 if filter.match_event(&event, Default::default()) && event.verify().is_ok() {
-                    events.insert(event.id, event.into_owned());
+                    events.push(event.into_owned());
                     if events.len() > PAGE_LIMIT {
                         return Err(Error("lifecycle history page overflow"));
                     }
@@ -129,7 +133,7 @@ async fn collect(
             }
             RelayNotification::Message {
                 message: RelayMessage::EndOfStoredEvents(subscription_id),
-            } if subscription_id.as_ref() == id => return Ok(events.into_values().collect()),
+            } if subscription_id.as_ref() == id => return Ok(events),
             RelayNotification::Message {
                 message:
                     RelayMessage::Closed {
@@ -241,6 +245,77 @@ mod tests {
             Err(Error("lifecycle history pagination budget exhausted"))
         ));
     }
+    #[tokio::test]
+    async fn wire_reader_accepts_duplicate_valid_frames_but_rejects_dropped_invalid_frames() {
+        use futures_util::{SinkExt, StreamExt};
+        for invalid in [false, true] {
+            let event = events_at(&Keys::generate(), 10, 1).pop().unwrap();
+            let expected = event.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else { continue; };
+                    let value: serde_json::Value = serde_json::from_str(text).unwrap();
+                    if value[0] != "REQ" { continue; }
+                    let mut second = serde_json::to_value(&event).unwrap();
+                    if invalid { second["content"] = "tampered".into(); }
+                    for frame in [serde_json::json!(["EVENT", value[1], event]),
+                        serde_json::json!(["EVENT", value[1], second]),
+                        serde_json::json!(["EOSE", value[1]])] {
+                        ws.send(tokio_tungstenite::tungstenite::Message::Text(frame.to_string().into())).await.unwrap();
+                    }
+                }
+            });
+            let (client, wire) = WireHistory::client(&Keys::generate());
+            client.add_relay(&url).await.unwrap();
+            client.connect().await;
+            let relay = client.relay(&url).await.unwrap();
+            relay.wait_for_connection(Duration::from_secs(2)).await;
+            let result = fetch(&wire, &relay, Filter::new().kind(expected.kind), Duration::from_secs(2)).await;
+            if invalid { assert!(result.is_err(), "invalid duplicate cannot satisfy wire completeness"); }
+            else { assert_eq!(result.unwrap(), vec![expected]); }
+            client.disconnect().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn duplicate_frames_count_before_dedup_and_stop_at_exact_eose() {
+        let id = SubscriptionId::new("duplicates");
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let event = events_at(&Keys::generate(), 10, 1).pop().unwrap();
+        for _ in 0..2 {
+            tx.send(RelayNotification::Message { message: RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()), event: Cow::Owned(event.clone()),
+            }}).unwrap();
+        }
+        tx.send(RelayNotification::Message { message:
+            RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone())) }).unwrap();
+        tx.send(RelayNotification::Message { message: RelayMessage::Event {
+            subscription_id: Cow::Owned(id.clone()), event: Cow::Owned(event.clone()),
+        }}).unwrap();
+        let frames = collect(&mut rx, &id, &Filter::new()).await.unwrap();
+        assert_eq!(frames, vec![event.clone(), event.clone()]);
+        let events = paginate(Filter::new(), |_| {
+            let frames = frames.clone();
+            async { Ok(frames) }
+        }).await.unwrap();
+        assert_eq!(events, vec![event]);
+    }
+
+    #[tokio::test]
+    async fn duplicate_filled_page_cannot_certify_unsaturated_history() {
+        let event = events_at(&Keys::generate(), 10, 1).pop().unwrap();
+        let result = paginate(Filter::new(), |_| {
+            let frames = vec![event.clone(); PAGE_LIMIT];
+            async { Ok(frames) }
+        }).await;
+        assert!(matches!(result, Err(Error("lifecycle history timestamp saturated"))));
+    }
+
     #[tokio::test]
     async fn partial_result_history_never_certifies_absence() {
         let id = SubscriptionId::new("results");

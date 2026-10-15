@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('--skip-build', action='store_true', help='use binaries already built by run-e2e.sh')
 parser.add_argument('--baseline', action='store_true', help='exercise existing free-job flow before challenge CLI lands')
+parser.add_argument('--duplicate-history', action='store_true', help='replay historical claim frames to reproduce live/history overlap')
 ARGS = parser.parse_args()
 # Turn termination into normal exception unwinding so recorded processes are cleaned up.
 def interrupted(signum, frame):
@@ -81,6 +82,10 @@ def wait(label, fn, seconds=90):
             if result:
                 print('PASS ' + label, flush=True)
                 return result
+        except RuntimeError as e:
+            if "lifecycle wire history incomplete" not in str(e):
+                raise
+            last = str(e)
         except (ConnectionError, OSError, ValueError) as e:
             last = str(e)
         time.sleep(.5)
@@ -118,7 +123,7 @@ def mcp(env, tool, args):
         except RuntimeError as error:
             # These existing operations are idempotent. Never retry arbitrary errors or
             # change a claim/request in response to a transient incomplete read.
-            if tool not in ('get_job', 'award_claim', 'collect') or 'lifecycle wire history incomplete' not in str(error) or attempt == 2:
+            if tool not in ('get_job', 'collect') or 'lifecycle wire history incomplete' not in str(error) or attempt == 2:
                 raise
             print(f'RETRY {tool}: incomplete relay history ({attempt + 1}/3)', flush=True)
             with open(RUN / (tool + '-retries.log'), 'a') as log:
@@ -151,7 +156,10 @@ try:
     start('redis', [redis, '--bind', '127.0.0.1', '--port', redisport, '--save', '', '--appendonly', 'no'])
     pgisready = str(Path(initdb).with_name('pg_isready'))
     wait('Postgres ready', lambda: subprocess.run([pgisready, '-h', '127.0.0.1', '-p', str(pgport)], stdout=subprocess.DEVNULL).returncode == 0)
-    relay = f'ws://127.0.0.1:{relayport}'
+    frontport = port() if ARGS.duplicate_history else relayport
+    relay = f'ws://127.0.0.1:{frontport}'
+    if ARGS.duplicate_history:
+        start('duplicate-history', ['python3', ROOT / 'scripts/challenges/duplicate-history.py', frontport, relayport])
     start('buzz', [BUZZ], {**ENV, 'RELAY_URL': relay, 'DATABASE_URL': f'postgresql://{os.environ["USER"]}@127.0.0.1:{pgport}/postgres', 'REDIS_URL': f'redis://127.0.0.1:{redisport}', 'BUZZ_BIND_ADDR': f'127.0.0.1:{relayport}', 'BUZZ_HEALTH_PORT': '0', 'BUZZ_METRICS_PORT': '0', 'BUZZ_RELAY_PRIVATE_KEY': secrets.token_hex(32), 'BUZZ_AUTO_MIGRATE': 'true', 'BUZZ_OPEN_READ': 'true', 'BUZZ_GIT_CONFORMANCE_PROBE': 'false', 'BUZZ_S3_ENDPOINT': 'http://127.0.0.1:1', 'BUZZ_GIT_REPO_PATH': str(RUN / 'git'), 'BUZZ_GIT_PACK_CACHE_PATH': str(RUN / 'packs')})
     wait('local Buzz ready', lambda: urllib.request.urlopen(f'http://127.0.0.1:{relayport}/health', timeout=2).status == 200)
     buyer_env, BUYER = home('b', relay)
@@ -210,12 +218,11 @@ try:
         state = mcp(buyer_env, 'get_job', {'job_id': job})
         return state if any(c['seller_pubkey'] == SELLER and c['live'] for c in state['claims']) else None
     state = wait('accepted seller live claim observed', claimed)
-    claim = next(c for c in state['claims'] if c['seller_pubkey'] == SELLER and c['live'])
-    if not state.get('awarded'):
-        mcp(buyer_env, 'award_claim', {'job_id': job, 'claim_id': claim['claim_id'], 'max_sats': 0})
-        print('PASS existing manual award override committed', flush=True)
-    else:
-        check('existing buyer auto-award committed', state['awarded']['seller_pubkey'] == SELLER)
+    def awarded():
+        state = mcp(buyer_env, 'get_job', {'job_id': job})
+        return state if state.get('awarded') else None
+    state = wait('buyer auto-award committed without manual override', awarded, seconds=60)
+    check('auto-award selected accepted seller', state['awarded']['seller_pubkey'] == SELLER)
     if not ARGS.baseline:
         s = wait('claim and award yield running tally', lambda: (s if any(j['id'] == job and j['running'] and j['claim'] and j['award'] for j in s['jobs']) else None) if (s := snapshot()) else None)
         check('running seller not assignable', not plan(s)['postingAllowed'])
