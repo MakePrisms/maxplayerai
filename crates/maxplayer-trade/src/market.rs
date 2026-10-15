@@ -115,6 +115,12 @@ impl Market {
                     }
                 }
             });
+            // Before connecting, so the first sign-in is not missed. A sign-in-required relay
+            // never delivers live TRADE messages to a REQ it saw before sign-in, so the REQ is
+            // re-sent after every sign-in (reconnects included). Open relays are unaffected.
+            for relay in c.relays().await.into_values() {
+                maxplayer_core::relay_auth::resubscribe_on_auth(relay, "maxplayer-trade market");
+            }
             c.connect().await;
             clients.push(c);
         }
