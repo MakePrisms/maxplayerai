@@ -1,4 +1,5 @@
 import { parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
+import { demoSnapshot } from "./challenge/demo.js";
 declare const COMMUNITY_APP_URL: string;
 import { buyerHex, whitelistInstruction } from "./challenge/model.js";
 import { writeClipboard } from "./ui/clipboard.js";
@@ -90,5 +91,9 @@ async function connect(): Promise<void> {
   stream.onmessage=e=>{try{receive(JSON.parse(e.data));}catch{unavailable();}};
   stream.onerror=unavailable;
 }
-void connect();
+const demo=new URLSearchParams(location.search).has("demo");
+if(demo){
+  receive(demoSnapshot(Date.now()/1000));
+  text("connection-status","Demo data. Not a real challenge.");
+} else void connect();
 setInterval(tick,1000);
