@@ -2,6 +2,8 @@
 //!
 //! Every check that can refuse a request runs BEFORE the mint is called, so the named refusals
 //! (`bad_request`, `expired`, `rate_limited`, `unsupported`) keep their promise that nothing ran.
+//! For `rate_limited` that promise is per copy only: it is refused before the replay record, so
+//! another copy of the same event may still run until `exp`, and clients treat it as ambiguous.
 //! Events that can't be answered safely (forged, not for us, undecryptable, no request id) are
 //! dropped without a reply.
 
@@ -14,6 +16,7 @@ use maxplayer_core::mint_wire::{
     ErrorBody, ErrorCode, MAX_PLAINTEXT_BYTES, Outcome, PROTOCOL_VERSION, REQUEST_KIND,
     RESPONSE_KIND, Request, Response, code, request_expired,
 };
+use maxplayer_core::relay_auth::resubscribe_on_auth;
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::{
     Client, Event, EventBuilder, Filter, Keys, Kind, RelayMessage, RelayPoolNotification, Tag,
@@ -55,6 +58,11 @@ impl Server {
                 .add_relay(relay.as_str())
                 .await
                 .with_context(|| format!("add relay {relay}"))?;
+        }
+        // Before connecting, so the first sign-in is not missed: a REQ the relay saw before
+        // sign-in never gets live requests, so it is re-sent after every sign-in (reconnects too).
+        for relay in client.relays().await.into_values() {
+            resubscribe_on_auth(relay, "maxplayer-mint");
         }
         client.connect().await;
         client.wait_for_connection(Duration::from_secs(10)).await;

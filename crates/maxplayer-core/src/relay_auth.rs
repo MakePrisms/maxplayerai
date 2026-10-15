@@ -84,3 +84,58 @@ pub async fn wait_for_nip42_auth(
     // (Authenticated, or a fatal active failure).
     within_window.unwrap_or(Ok(AuthWait::NoChallenge))
 }
+
+/// Re-send every long-lived subscription on `relay` each time the relay completes NIP-42 sign-in.
+///
+/// A sign-in-required relay (relay.maxplayer.ai, buzz with open reads) answers a REQ sent before
+/// sign-in with stored history and EOSE, and never delivers live events to it. nostr-sdk 0.44
+/// re-sends a subscription after sign-in only if the relay CLOSED it or it predates the current
+/// socket, so one that got EOSE on this socket stays deaf forever. Ephemeral kinds (the mint's
+/// 23410/23411, trade's 23412) are never stored, so such a subscription receives nothing at all.
+///
+/// Subscribing right away and re-sending the same REQ (same id, which replaces it on the relay)
+/// once signed in keeps relays that never ask for sign-in exactly as fast as before, and covers
+/// every reconnect: the relay challenges again on each new socket. Call this BEFORE
+/// `Client::connect` so the first `Authenticated` is not missed. A failed sign-in is logged as an
+/// auth error under `label`.
+///
+/// The task ends on `Relay::disconnect()`/`Client::disconnect()` as well as on shutdown (both
+/// send `Shutdown`): call it again after reconnecting a disconnected client, and for every relay
+/// added later. Subscriptions are re-sent with their original filters (including `since`), so it
+/// is meant for ephemeral or low-volume filters. Use auto-closing subscriptions for one-shot
+/// queries: they are not re-sent. Not safe against a concurrent `unsubscribe` of a long-lived
+/// subscription: its CLOSE can go out before the re-sent REQ and leave an orphan on the relay.
+pub fn resubscribe_on_auth(
+    relay: nostr_sdk::prelude::Relay,
+    label: &'static str,
+) -> tokio::task::JoinHandle<()> {
+    use nostr_sdk::pool::RelayNotification;
+    use nostr_sdk::prelude::ClientMessage;
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut notifications = relay.notifications();
+    tokio::spawn(async move {
+        loop {
+            match notifications.recv().await {
+                // A lagged receiver may have missed an `Authenticated`: re-sending is harmless.
+                Ok(RelayNotification::Authenticated) | Err(RecvError::Lagged(_)) => {
+                    for (id, filters) in relay.subscriptions().await {
+                        // Skip one that was closed since the snapshot: re-sending it would
+                        // leave a subscription on the relay that the client no longer tracks.
+                        if filters.is_empty() || relay.subscription(&id).await.is_none() {
+                            continue;
+                        }
+                        let _ = relay.send_msg(ClientMessage::req(id, filters));
+                    }
+                }
+                Ok(RelayNotification::AuthenticationFailed) => eprintln!(
+                    "{label}: relay {}: NIP-42 sign-in failed (auth error); no live events from \
+                     this relay until sign-in succeeds",
+                    relay.url()
+                ),
+                Ok(RelayNotification::Shutdown) | Err(RecvError::Closed) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+}

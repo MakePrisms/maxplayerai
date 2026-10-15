@@ -43,6 +43,9 @@ cdk-fake-wallet = "=0.17.2"
 cdk-axum = "=0.17.2"
 axum = "0.8"
 nostr-relay-builder = "=0.44.0"
+# tests/auth_gated.rs: the shared sign-in-gated relay front (maxplayer-core tests/support).
+tokio-tungstenite = "=0.26.2"
+futures-util = "0.3"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 # tests/nostr.rs: the real Maxplayer credits sidecar (its own workspace) served in-process on a

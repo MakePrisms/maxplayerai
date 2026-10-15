@@ -352,7 +352,7 @@ fn nostr_refusal(e: cdk::Error) -> std::result::Result<crate::mint::MintRefusal,
 /// core to the cdk error HTTPS would give), which definitively refuses THIS request. Every
 /// transport code stays ambiguous, even though core calls some of them "definitive": `expired`
 /// and `bad_request` (core: HttpError 400; a wallet/mint clock skew can expire a valid request),
-/// `rate_limited` (429), `unsupported` (404), `internal` (500), unknown codes, an oversized
+/// `rate_limited` (core: 503, ambiguous), `unsupported` (404), `internal` (500), unknown codes, an oversized
 /// request (413), timeouts and relay failures. Ambiguous means: not executed or unknown, so the
 /// caller keeps the attempt and later replays the identical request. HTTP status codes cannot
 /// tell these apart here, so no `HttpError` is ever a NUT refusal on this transport.

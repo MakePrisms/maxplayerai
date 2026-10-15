@@ -30,8 +30,9 @@ cdk = { version = "=0.17.2", default-features = false, features = ["mint"] }
 cdk-common = { version = "=0.17.2", default-features = false, features = ["mint"] }
 cdk-sqlite = { version = "=0.17.2", default-features = false, features = ["mint"] }
 getrandom = "0.3"
-# Default features only: `mint_wire` (the envelope types) needs serde and nothing else.
-maxplayer-core = { path = "../maxplayer-core" }
+# `mint_wire` (the envelope types) needs serde only; `gateway` adds `relay_auth`, which re-sends
+# the request subscription after NIP-42 sign-in (nostr-sdk is already a direct dependency).
+maxplayer-core = { path = "../maxplayer-core", features = ["gateway"] }
 nostr-sdk = { version = "0.44.1", features = ["nip44"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

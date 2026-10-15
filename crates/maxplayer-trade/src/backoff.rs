@@ -583,6 +583,11 @@ pub fn record_reqwest(mint: &str, e: &reqwest::Error) {
 fn classify_cdk(e: &cdk::Error) -> Option<Reason> {
     Some(match e {
         cdk::Error::HttpError(Some(429), _) => Reason::RateLimited,
+        // The nostr connector reports `rate_limited` as an ambiguous 503 (money safety); keep the
+        // operator-facing label. Text pinned by `nostr_rate_limited_keeps_its_label`.
+        cdk::Error::HttpError(Some(503), msg) if msg.starts_with("mint answered rate_limited") => {
+            Reason::RateLimited
+        }
         cdk::Error::HttpError(Some(503), _) => Reason::Unavailable,
         cdk::Error::HttpError(Some(502 | 504), _) => Reason::Gateway,
         cdk::Error::Timeout => Reason::Timeout,
@@ -1040,6 +1045,21 @@ mod tests {
             &mut log,
         );
         assert_eq!(b.remaining(M, i).unwrap().as_secs(), 900);
+    }
+
+    #[test]
+    fn nostr_rate_limited_keeps_its_label() {
+        use maxplayer_core::mint_wire::{ErrorBody, ErrorCode, code};
+        let e = maxplayer_core::nostr_mint::map_error(ErrorBody {
+            code: ErrorCode::Named(code::RATE_LIMITED.into()),
+            detail: String::new(),
+        });
+        assert!(
+            matches!(classify_cdk(&e), Some(Reason::RateLimited)),
+            "{e:?}"
+        );
+        assert!(cdk_unanswered(&e));
+        assert!(!e.is_definitive_failure(), "rate_limited stays ambiguous");
     }
 
     /// L3: pin the CDK transport-error text `classify_cdk` matches (cdk 0.17.2 flattens the
