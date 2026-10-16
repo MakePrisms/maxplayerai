@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import {challengeTaskPrefix} from '../../web/app/src/challenge/shared/events.mjs';
 import { parseChallengeRelays } from '../../web/app/src/challenge/shared/relay.mjs';
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
@@ -208,7 +209,7 @@ export class Swarm {
           const candidate=check.sellers.find(x=>x.seller_pubkey===seller);
           if(!candidate?.postingAllowed){if(check.reasons.includes('budget_exceeded'))budgetRejected++;reject([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])].join(', '));continue;}
           const sequence=jobs.filter(j=>j.seller===seller).length+1;
-          const args={task,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
+          const args={task:challengeTaskPrefix(c.buyer,c.id)+task,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
           const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args};
           this.state.jobs.push(j);jobs.push(j);this.save();
           const posted=await this.io.mcp('post_job',args);j.id=posted.job_id??posted.preparation_id;

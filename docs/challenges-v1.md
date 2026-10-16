@@ -260,3 +260,11 @@ A RESULT timestamp at or before its AWARD is untrusted for duration: charge the
 full deadline-minus-award interval, not zero. Other results are clamped no earlier
 than award and capped at deadline. The coordinator and swarm stop assigning when
 no task fits the remaining offered minutes.
+
+Challenge offers carry the exact buyer-signed task prefix
+`[challenge:<buyer hex>:<challenge id>]` followed by a newline. Only offers with
+that prefix enter that challenge's tally, minutes and public budget estimate.
+Ordinary jobs from the same buyer in an overlapping window do not count. This
+uses the existing signed `i` task field, not a new trade/MCP parameter. Pre-prefix
+offers are intentionally excluded; existing runner journal reservations remain
+conservative. Challenge IDs must not be reused for a different challenge.

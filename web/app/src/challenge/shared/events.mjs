@@ -37,3 +37,6 @@ export function validDecision(e,c) {
   const seller=tag(e,'p');
   return e.kind===DECISION && e.pubkey===c.pubkey && namespace(e) && ['d','p','decision'].every(k=>scalar(e,k)) && !e.tags.some(t=>t[0]==='a') && hex(seller) && tag(e,'d')===seller && ['accepted','denied'].includes(tag(e,'decision')) && (!e.tags.some(t=>t[0]==='e') || (scalar(e,'e') && hex(tag(e,'e'))));
 }
+
+// Buyer-signed task prefix binds an offer without changing the trade protocol.
+export const challengeTaskPrefix = (buyer,id) => `[challenge:${buyer}:${id}]\n`;

@@ -5,7 +5,7 @@ import { eventId,verify,signAuth,npubEncode,validChallenge,validMembership,valid
 import { EventStore } from '../src/challenge/shared/model.mjs';
 const keys=[1,2,3].map(n=>n.toString(16).padStart(64,'0'));
 const [buyer,seller,stranger]=keys.map(k=>Buffer.from(schnorr.getPublicKey(k)).toString('hex'));
-function event(kind,who,time,tags,content='') {const e={kind,pubkey:[buyer,seller,stranger][who],created_at:time,tags:[['t','maxplayer'],['v','1'],...tags],content};e.id=eventId(e);e.sig=Buffer.from(schnorr.sign(e.id,keys[who])).toString('hex');return e;}
+function event(kind,who,time,tags,content='') {const e={kind,pubkey:[buyer,seller,stranger][who],created_at:time,tags:[['t','maxplayer'],['v','1'],...tags.map(t=>kind===3401&&t[0]==='i'?['i',`[challenge:${buyer}:test]\n${t[1]}`]:t),...(kind===3401&&!tags.some(t=>t[0]==='i')?[['i',`[challenge:${buyer}:test]\nTask`]]:[])],content};e.id=eventId(e);e.sig=Buffer.from(schnorr.sign(e.id,keys[who])).toString('hex');return e;}
 const c=event(30341,0,100,[['d','test'],['title','Test'],['starts','4000'],['ends','10000'],['budget','1000','sat'],['status','in_progress']]);
 const app=(time=200,status='joined',minutes='60')=>event(30342,1,time,[['d',buyer],['since',String(time)],['p',buyer],['minutes',minutes],['status',status]]);
 const decision=(time=300,value='accepted',who=0)=>event(30343,who,time,[['d',seller],['p',seller],['decision',value]]);

@@ -1,5 +1,5 @@
 import { OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE } from '../../model/kinds.ts';
-import {verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode} from './events.mjs';
+import {verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode,challengeTaskPrefix} from './events.mjs';
 const latest = (events,key) => { const map=new Map(); for(const e of events) if(newer(e,map.get(key(e)))) map.set(key(e),e); return [...map.values()]; };
 const ascending = (a,b) => a.created_at-b.created_at || a.id.localeCompare(b.id);
 export class EventStore {
@@ -19,7 +19,7 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     ([OFFER,AWARD,ACCEPT].includes(e.kind) ? e.pubkey===buyer :
       [CLAIM,RESULT].includes(e.kind) ? mentions(e,buyer) : true));
   const jobs=[];
-  for(const offer of trade.filter(e=>e.kind===OFFER && e.pubkey===buyer && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
+  for(const offer of trade.filter(e=>e.kind===OFFER && e.pubkey===buyer && one(e,'i') && tag(e,'i').startsWith(challengeTaskPrefix(buyer,tag(c,'d'))) && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
     const seller=tag(offer,'p');
     const deadlines=offer.tags.filter(t=>t[0]==='param'&&t[1]==='deadline');
     const deadline=deadlines.length===1?number(deadlines[0][2]):null;
