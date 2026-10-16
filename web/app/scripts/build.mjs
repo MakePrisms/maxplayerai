@@ -24,6 +24,10 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const SITE_ORIGIN = "https://www.maxplayer.ai";
 
+const buyer = process.env.CHALLENGE_BUYER_PUBKEY ?? "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5";
+if (!/^[0-9a-f]{64}$/.test(buyer)) throw Error("CHALLENGE_BUYER_PUBKEY must be lowercase hex");
+const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
+if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
 const watch = process.argv.includes("--watch");
 const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"];
 
@@ -36,7 +40,8 @@ const options = {
   // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
   // server flags and stays 404 in previews, so nothing is written to the relay.
   define: {
-    COMMUNITY_APP_URL: JSON.stringify(process.env.COMMUNITY_APP_URL ?? ""),
+    CHALLENGE_BUYER_PUBKEY: JSON.stringify(buyer),
+    CONFIGURED_RELAY_URL: JSON.stringify(relay),
     WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
     TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
     TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),

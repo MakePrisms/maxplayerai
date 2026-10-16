@@ -8,8 +8,7 @@ bash scripts/challenges/run-e2e.sh
 ```
 
 The harness builds **this integration checkout** with wallet+ACP and Buzz in dedicated
-`target/challenges-e2e` and `target/challenges-buzz` directories, installs the community
-service's locked Node dependencies, and runs the assertions. On this Nix host it discovers
+`target/challenges-e2e` and `target/challenges-buzz` directories, installs the web app's locked Node dependencies, and runs the assertions. On this Nix host it discovers
 installed Postgres/Redis in `/nix/store` if absent from PATH. Else supply them on PATH;
 `nix shell --extra-experimental-features 'nix-command flakes' nixpkgs#postgresql_17 nixpkgs#redis`
 provides those dependencies. Use the repository devshell if the native build needs OpenSSL.
@@ -41,9 +40,9 @@ seller-targeting. The fixture uses a minimal ACP stub (adapted from the existing
 not an installed model harness. External offer/delivery reviewer services are disabled in
 these isolated homes; the runner reviews the exact stub answer before calling collect. This
 proves the trade integrity/collect path, not a deployed reviewer service. It holds delivery behind a bounded local file gate until the runner has observed the
-running HTTP/SSE state, then waits two seconds to make positive minute usage observable. No new money path is introduced.
+running direct-relay state, then waits two seconds to make positive minute usage observable. No new money path is introduced.
 
-Assertions: publish → 60/30-minute memberships → accept/deny → authenticated HTTP tally →
+Assertions: publish → 60/30-minute memberships → accept/deny → authenticated shared-model tally →
 the buyer selects only accepted sellers → real MCP post → seller claim / automatic buyer award →
 running tally and no concurrent assignment → delivered result / free collect → exact minute
 tally and done → denied seller idle → leave blocks new assignment while preserving work.
@@ -52,8 +51,8 @@ coverage. Failed assertions exit nonzero and print the private artifact location
 runs end in `PASS ALL community challenge E2E`.
 
 The standalone pure admission function prints JSON and does not post; the automatic runner below consumes it. Standalone [buyer runbook](../../docs/challenge-coordinate.md).
-It shares the app tally by consuming the snapshot, not by copying its event projection.
-Paid assignment requires an explicit reconciled buyer budget input because the public app
+It shares the browser tally through `web/app/src/challenge/shared/model.mjs`, not a copied event projection.
+Paid assignment requires an explicit reconciled buyer budget input because the public projection
 cannot prove settlement. Serialise assignment and track pending offers as the runbook describes.
 
 The runner never calls `award_claim`. Once a live claim is observed, the daemon must
@@ -70,6 +69,21 @@ is responsible for recovering an interrupted automatic award.
 
 Membership coverage: join at any time with an exact work-start eligibility boundary; one join and acceptance across two published days; per-day minute reset; leave blocks assignments; late join waits until next day; changing minutes preserves since.
 
+## Browser and shared-model checks
+
+```sh
+npm ci --prefix web/app
+npm test --prefix web/app
+node --test scripts/challenges/*.test.mjs
+npm run build --prefix web/app
+```
+
+The page reads history anonymously and authenticates live subscriptions with a random
+in-memory per-tab key. Refused AUTH falls back to 15-second overlapping polls. The buyer
+runner still fails closed without authenticated, complete history. No buyer key is loaded
+by the reader. Set `CHALLENGE_BUYER_PUBKEY` (hex) and `RELAY_URL` at build time for a local
+fixture; do not point a fixture browser at the production relay. No API server is required.
+
 ## Automatic swarm runner
 
 Hand-whitelist sellers once with `maxplayer challenge decide --seller HEX --accept`, then
@@ -79,16 +93,16 @@ the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer 
 ```sh
 MAXPLAYER_HOME=/absolute/buyer-home \
 SWARM_MAXPLAYER_BINARY=/absolute/bin/maxplayer \
-COMMUNITY_APP_URL=http://127.0.0.1:8787 \
+RELAY_URL=ws://127.0.0.1:8080 \
 node scripts/challenges/swarm.mjs
 ```
 
-The runner stays alive for future days. It uses the community snapshot and `coordinate()` for
+The runner stays alive for future days. It reads the relay through the shared browser/Node model and `coordinate()` for
 eligibility/minutes, posts public seller-targeted work through buyer MCP, collects verified
 inline `answer.txt` results (settling priced work through the existing collect flow), and sends
 **all** results to every planner invocation. Failed/expired work is represented as a bracketed
 outcome in the result history. This v1 runner requests text/inline answers, not Git artifacts.
-The app must project the **same buyer** and trusted relay as this buyer home. Dedicate the buyer
+The reader derives the buyer public key from this home; configure the **same trusted relay** as the home. Dedicate the buyer
 to this runner: unrelated private/unawarded jobs are not visible in the public projection.
 
 Flags (environment equivalents):
@@ -97,7 +111,7 @@ Flags (environment equivalents):
 | --- | --- | --- |
 | `--home` | `MAXPLAYER_HOME` | required, explicit |
 | `--binary` | `SWARM_MAXPLAYER_BINARY` | `maxplayer` |
-| `--app-url` | `COMMUNITY_APP_URL` | required |
+| `--relay-url` | `RELAY_URL` | required |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
 | — | `SWARM_MIN_DURATION` | 120 |
@@ -206,7 +220,7 @@ For deterministic no-model tests:
 
 ```sh
 SWARM_STUB_SOLVE_AFTER=4 node scripts/challenges/swarm.mjs \
-  --home /absolute/fixture-buyer --app-url http://127.0.0.1:8787 \
+  --home /absolute/fixture-buyer --relay-url ws://127.0.0.1:8080 \
   --planner 'node scripts/challenges/planner-stub.mjs'
 ```
 
@@ -217,7 +231,7 @@ fix is pending. No Rust buyer/private-content implementation is changed here.
 ### Service example (not installed by this change)
 
 Save as `~/.config/systemd/user/maxplayer-swarm.service`, adjusting all absolute paths and ports.
-The buyer daemon and community app must already be running. Use a dedicated OS user for real
+The buyer daemon and relay must already be running. No community server is needed. Use a dedicated OS user for real
 isolation; these options do not claim filesystem confinement.
 
 ```ini
@@ -230,7 +244,7 @@ Type=simple
 WorkingDirectory=/absolute/maxplayerai
 Environment=MAXPLAYER_HOME=/absolute/buyer-home
 Environment=SWARM_MAXPLAYER_BINARY=/absolute/bin/maxplayer
-Environment=COMMUNITY_APP_URL=http://127.0.0.1:8787
+Environment=RELAY_URL=ws://127.0.0.1:8080
 Environment=SWARM_LLM_BINARY=/absolute/bin/claude
 ExecStart=/absolute/bin/node /absolute/maxplayerai/scripts/challenges/swarm.mjs
 Restart=on-failure

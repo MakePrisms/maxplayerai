@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Consume the community projection: deliberately do NOT implement a second minute tally.
+// Consume the shared relay projection: deliberately do NOT implement a second minute tally.
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';

@@ -4,7 +4,8 @@
 import type { Transport } from "./source/source.js";
 
 /** The launch relay, baked in. Read-only: no key is ever loaded. */
-export const RELAY_URL = "wss://relay.maxplayer.ai";
+declare const CONFIGURED_RELAY_URL: string;
+export const RELAY_URL = typeof CONFIGURED_RELAY_URL === "undefined" ? "wss://relay.maxplayer.ai" : CONFIGURED_RELAY_URL;
 
 /**
  * THE SWITCH. Today's relay answers stored-event queries but never streams

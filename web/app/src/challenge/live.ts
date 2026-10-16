@@ -9,7 +9,7 @@ export interface Snapshot {
   relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null };
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);
-// Fail closed on malformed service responses; never put remote text into HTML.
+// Fail closed on malformed snapshots; never put remote text into HTML.
 export function parseSnapshot(value: unknown): Snapshot {
   if(!value||typeof value!=='object')throw Error('Invalid snapshot');
   const s=value as Snapshot;
@@ -36,7 +36,7 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='left')return 'Left';
   if(running(s,a,now))return 'Working now';
   if(a.eligible&&sellerMinutes(s,a,now)>=a.minutesOffered)return 'Done';
-  // Server state 'done' means the last job finished, not that the seller is out of minutes.
+  // Projected state 'done' means the last job finished, not that the seller is out of minutes.
   if(a.state==='done'&&!a.eligible)return 'Done';
   return a.eligible?'Ready':'Joined';
 }

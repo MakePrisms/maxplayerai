@@ -13,7 +13,7 @@ Status: building on `feat/community-challenges` for an end-to-end test. Not live
   sellers, **one task at a time per seller**, unlimited in parallel across sellers. It only assigns
   a task whose `deadline` fits the seller's remaining minutes. Pricing, award, review, delivery
   and payment are the existing job flow, unchanged.
-- **The community app** reads the relay, tallies minutes per seller, and streams it to the page.
+- **The browser** reads the relay directly and tallies minutes with the same shared model as the buyer runner. No community server is needed.
   Neither the buyer nor the seller publishes any metering.
 - Seller prerequisite (unchanged mechanism): the seller lists the buyer's hex key in
   `seller.accept_offers_only_from`.
@@ -83,7 +83,7 @@ Acceptance persists across challenges until the buyer republishes `denied`.
    The ±900-second drift tolerance applies only to event `created_at` validation,
    never to membership eligibility.
 
-## Minute tally (community app and the buyer must implement the same algorithm)
+## Minute tally (one shared browser/Node model)
 
 For a challenge `C` with buyer `B`, seller `S`:
 
@@ -164,16 +164,30 @@ Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amount
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
 
-## Community app
+## Direct relay reader
 
-- Stays authenticated to the relay (anonymous REQs get stored events but no live events on
-  relay.maxplayer.ai).
-- Serves `GET /api/challenges/current` (JSON snapshot) and `GET /api/challenges/current/stream`
-  (Server-Sent Events; same JSON on every change, plus a heartbeat). Page counts running jobs
-  up locally from `start`.
-- Review screen: lists members and eligibility (npub, profile name, advertised seat capabilities from the
-  30340 heartbeat, minutes offered, past challenge jobs) and the exact
-  `maxplayer challenge decide …` command to accept/deny. The app holds no buyer secret; its app-only key is used exclusively for relay AUTH.
+`web/app/src/challenge/shared/{events,model,relay}.mjs` is used by the browser,
+the buyer runner and local E2E. Install its dependencies with `npm ci --prefix web/app`.
+The community HTTP/SSE server and review page have been removed; use
+`maxplayer challenge members` and `maxplayer challenge decide` for membership review.
+
+- History starts anonymously, paged separately by kind with overlapping timestamp boundaries.
+- Live subscriptions are installed after NIP-42 AUTH succeeds, signed with a new in-memory
+  per-tab key, never the buyer key. No EVENT is sent by the reader.
+- Refused/absent AUTH or a closed live subscription leaves history available and polling active.
+  Polling runs every 15 seconds from each filter's newest timestamp minus 900 seconds, also
+  repairing late events while streaming. Disconnects reconnect with bounded backoff and reload history.
+- Signatures and IDs are verified locally. Buyer-authored kinds are author-scoped;
+  memberships, claims and results are `#p`-scoped to the buyer. Profiles/heartbeats are
+  requested only for discovered members. A saturated pagination second is reported as
+  incomplete history, never silently certified complete.
+- Build the page with `CHALLENGE_BUYER_PUBKEY` (lowercase hex; default
+  `94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5`).
+  `RELAY_URL` feeds the existing app config (default `wss://relay.maxplayer.ai`). Custom
+  hosted relay origins must also be allowed in `web/app/vercel.json` CSP.
+- The buyer runner takes `--relay-url` / `RELAY_URL` and derives the buyer public key
+  from its configured CLI home. Its admission gate still requires authenticated,
+  complete relay history; anonymous fallback is for the read-only page.
 
 ## CLI (`maxplayer challenge …`)
 
@@ -187,15 +201,15 @@ key; none prints a secret.
 
 ## Community reader implementation notes
 
-- The app holds a locally generated **app-only NIP-42 authentication key**, never the buyer
+- The browser holds a locally generated **ephemeral per-tab NIP-42 authentication key**, never the buyer
   secret. It sends AUTH only; no membership, decision, job or other EVENT is published.
 - Protocol v1 AWARD (3405) has no amount tag. Public committed/paid figures therefore use the
   selected offer's fixed price. A matching buyer ACCEPT (3406, offer root + unmarked claim
   reference) moves that amount from committed to paid **estimate**; it proves authorisation,
   not Cashu settlement. Fees, refunds and private payment state are not visible.
-- Tally timestamps are seconds; API minutes are fractional seconds / 60 (no rounding before
+- Tally timestamps are seconds; snapshot minutes are fractional seconds / 60 (no rounding before
   summation). Remaining is offered minus used, including negative overruns. Leave/deny
-  prevents eligibility but never erases awarded work. The API reports eligibility separately
+  prevents eligibility but never erases awarded work. The shared model reports eligibility separately
   from display state. Left/denied take display precedence over working/done.
 - Current means the newest non-cancelled challenge (newest cancelled if none); ties use lowest
   event id. Duplicate awards for an offer select the earliest valid award, then lowest id.

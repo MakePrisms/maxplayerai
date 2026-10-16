@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real local Buzz + actual CLI/MCP/sellers + community HTTP projection. No paid jobs."""
+"""Real local Buzz + actual CLI/MCP/sellers + shared direct-relay projection. No paid jobs."""
 import argparse
 import datetime as dt
 import glob
@@ -13,7 +13,6 @@ import signal
 import socket
 import subprocess
 import tempfile
-import threading
 import time
 import urllib.request
 
@@ -96,10 +95,6 @@ def check(label, value):
         raise AssertionError(label)
     print('PASS ' + label, flush=True)
 
-def read_json(url):
-    with urllib.request.urlopen(url, timeout=3) as r:
-        return json.load(r)
-
 def home(name, relay, buyer=None):
     path = RUN / name
     path.mkdir(mode=0o700)
@@ -150,7 +145,7 @@ try:
     initdb = executable('initdb', '/nix/store/*-postgresql-17.*/bin/initdb')
     postgres = str(Path(initdb).with_name('postgres'))
     redis = executable('redis-server', '/nix/store/*-redis-*/bin/redis-server')
-    pgport, redisport, relayport, appport = [port() for _ in range(4)]
+    pgport, redisport, relayport = [port() for _ in range(3)]
     command([initdb, '-D', RUN / 'pg', '--auth=trust', '--no-locale', '--encoding=UTF8'])
     start('postgres', [postgres, '-D', RUN / 'pg', '-h', '127.0.0.1', '-p', pgport, '-c', 'unix_socket_directories='])
     start('redis', [redis, '--bind', '127.0.0.1', '--port', redisport, '--save', '', '--appendonly', 'no'])
@@ -166,33 +161,32 @@ try:
     seller_env, SELLER = home('s', relay, BUYER)
     denied_env, DENIED = home('d', relay, BUYER)
     check('three distinct disposable identities', len({BUYER, SELLER, DENIED}) == 3)
+    if not ARGS.baseline:
+        # Build a static page pinned to this disposable relay and buyer, never production.
+        command(['npm', 'run', 'build', '--prefix', ROOT / 'web/app'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_BUYER_PUBKEY': BUYER})
+        siteport = port()
+        start('site', ['python3', '-m', 'http.server', siteport, '--bind', '127.0.0.1', '--directory', ROOT / 'web/app/dist'])
+        print(f'Browser fixture: http://127.0.0.1:{siteport}/challenges.html', flush=True)
+        (RUN / 'browser.json').write_text(json.dumps({'url': f'http://127.0.0.1:{siteport}/challenges.html', 'relay': relay, 'buyer': BUYER}))
     start('buyer', [BIN, 'buyer', 'serve'], buyer_env)
     for name, env in [('seller', seller_env), ('denied', denied_env)]:
         start(name, [BIN, 'seller', '--non-interactive', '--skip-doctor'], env)
     # Buyer foreground service owns its daemon lifecycle; no operator home is consulted.
     time.sleep(2)
     if not ARGS.baseline:
-        start('app', ['node', ROOT / 'web/community/src/server.mjs'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_BUYER_PUBKEY': BUYER, 'APP_AUTH_KEY_FILE': str(RUN / 'app-key'), 'PORT': str(appport), 'CORS_ORIGIN': f'http://127.0.0.1:{appport}'})
-        url = f'http://127.0.0.1:{appport}/api/challenges/current'
-        snapshot = lambda: read_json(url)
+        projection = RUN / 'relay-snapshot.json'
+        start('projection', ['node', ROOT / 'scripts/challenges/relay-snapshot.mjs', relay, BUYER, projection])
+        snapshot = lambda: json.loads(projection.read_text())
         now = int(time.time())
         starts = now + 45
         goal = RUN / 'goal.md'
         goal.write_text('Return the fixture answer 42. No paid work.\n')
         cli(buyer_env, 'publish', '--id', 'local-e2e', '--title', 'Free local challenge', '--goal-file', str(goal), '--starts', iso(starts), '--ends', iso(now + 900), '--budget-sats', '0', '--status', 'in_progress')
-        c = wait('challenge visible in app', lambda: snapshot()['challenge'])
+        c = wait('challenge visible from relay', lambda: snapshot()['challenge'])
         check('challenge exposes only supported snapshot fields', set(c) == {'id','eventId','buyer','buyerNpub','title','goal','starts','ends','status','result'} and c['starts'] == starts)
-        stream_frames = []
-        def consume_stream():
-            try:
-                with urllib.request.urlopen(url + '/stream', timeout=120) as response:
-                    for line in response:
-                        if line.startswith(b'data: '):
-                            stream_frames.append(json.loads(line[6:]))
-            except (OSError, ValueError):
-                pass  # Missing lifecycle frames fail the assertions below.
-        threading.Thread(target=consume_stream, daemon=True).start()
-        wait('SSE initial snapshot received', lambda: stream_frames and stream_frames[0]['challenge']['id'] == 'local-e2e')
+        def frames():
+            return [json.loads(line) for line in (RUN / 'projection.log').read_text().splitlines() if line.startswith('{')]
+        wait('relay initial snapshot received', lambda: any(f['challenge'] and f['challenge']['id'] == 'local-e2e' for f in frames()))
         cli(seller_env, 'join', '--buyer', BUYER, '--minutes', '60')
         cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '30')
         s = wait('both memberships visible (60 and 30 minutes)', lambda: (s if sorted(x['minutesOffered'] for x in s['sellers']) == [30, 60] else None) if (s := snapshot()) else None)
@@ -201,7 +195,7 @@ try:
         cli(buyer_env, 'decide', '--seller', DENIED, '--deny')
         s = wait('accepted/denied tally and authenticated history', lambda: (s if {x['state'] for x in s['sellers']} == {'accepted','denied'} and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
         rows = json.loads(cli(buyer_env, 'members', '--challenge', 'local-e2e', '--json'))['members']
-        check('Rust CLI and app agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
+        check('Rust CLI and shared model agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
             check('the buyer blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
         wait('challenge work window open', lambda: int(time.time()) >= starts)
@@ -227,7 +221,7 @@ try:
     if not ARGS.baseline:
         s = wait('claim and award yield running tally', lambda: (s if any(j['id'] == job and j['running'] and j['claim'] and j['award'] for j in s['jobs']) else None) if (s := snapshot()) else None)
         check('running seller not assignable', not plan(s)['postingAllowed'])
-        wait('SSE running job received', lambda: any(any(j['id'] == job and j['running'] for j in f['jobs']) for f in stream_frames))
+        wait('relay streaming running job received', lambda: any(any(j['id'] == job and j['running'] for j in f['jobs']) for f in frames()))
     (RUN / 'release').write_text('deliver now\n')
     def delivery():
         state = mcp(buyer_env, 'get_job', {'job_id':job})
@@ -262,7 +256,7 @@ try:
         s = wait('leave visible', lambda: (s if any(x['pubkey'] == SELLER and x['state'] == 'left' for x in s['sellers']) else None) if (s := snapshot()) else None)
         p = plan(s)
         check('leave stops further assignment', not p['postingAllowed'] and p['sellers'] == [])
-        wait('SSE leave received', lambda: any(any(x['pubkey'] == SELLER and x['state'] == 'left' for x in f['sellers']) for f in stream_frames))
+        wait('relay streaming leave received', lambda: any(any(x['pubkey'] == SELLER and x['state'] == 'left' for x in f['sellers']) for f in frames()))
         check('leave preserves settled job/minutes', len(s['jobs']) == 1 and next(x for x in s['sellers'] if x['pubkey'] == SELLER)['minutesUsed'] == own['minutesUsed'])
         rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'local-e2e', '--json'))['members']
         check('Rust CLI confirms left ineligible seller', len(rows) == 1 and not rows[0]['eligible'] and rows[0]['membership']['status'] == 'left')
@@ -296,7 +290,7 @@ try:
             begin = int(time.time()) + 3
             publish_day(day, begin, begin + 600)
             runner = start(day + '-runner', ['node', ROOT / 'scripts/challenges/swarm.mjs',
-                '--binary', BIN, '--app-url', f'http://127.0.0.1:{appport}',
+                '--binary', BIN, '--relay-url', relay,
                 '--planner', 'node scripts/challenges/planner-free-e2e.mjs',
                 '--duration-seconds', str(duration), '--poll-seconds', '1'],
                 {**buyer_env, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration)})

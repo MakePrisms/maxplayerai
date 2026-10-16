@@ -4,7 +4,10 @@ import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
 import { writeClipboard } from "./ui/clipboard.js";
 import { usd, onSpotChange, startSpot } from "./ui/spot.js";
-declare const COMMUNITY_APP_URL: string;
+import { EventStore } from "./challenge/shared/model.mjs";
+import { RelayReader } from "./challenge/shared/relay.mjs";
+import { RELAY_URL } from "./config.js";
+declare const CHALLENGE_BUYER_PUBKEY: string;
 
 const el = (id: string) => document.getElementById(id)!;
 const text = (id: string, value: string) => { el(id).textContent = value; };
@@ -12,7 +15,7 @@ const when = (secs: number) => new Intl.DateTimeFormat(undefined, {
   weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short",
 }).format(new Date(secs * 1000));
 
-// Shared chrome, same behaviour as /sell. No wallet, relay connection or job posting here.
+// Shared chrome, same behaviour as /sell. No wallet or job posting here.
 const toggle = el("nav-toggle");
 const nav = el("nav-links");
 toggle.addEventListener("click", () => toggle.setAttribute("aria-expanded", String(nav.classList.toggle("open"))));
@@ -67,22 +70,20 @@ function receive(value: unknown, status: string): void {
   receivedAt = performance.now();
   render(snapshot);
   const r = snapshot.relay;
-  text("connection-status", r && (!r.connected || !r.authenticated) ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Catching up · totals may be low" : status);
+  text("connection-status", r && (!r.connected) ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Catching up · totals may be low" : status);
 }
 function unavailable(): void {
   text("connection-status", snapshot ? "Reconnecting · showing last known" : "Live view unavailable · check back soon");
 }
 
-async function connect(): Promise<void> {
-  const base = COMMUNITY_APP_URL.replace(/\/$/, "");
-  try {
-    const response = await fetch(`${base}/api/challenges/current`, { signal: AbortSignal.timeout(8000) });
-    if (!response.ok) throw Error("Unavailable");
-    receive(await response.json(), "Live");
-  } catch { unavailable(); }
-  const stream = new EventSource(`${base}/api/challenges/current/stream`);
-  stream.onmessage = (e) => { try { receive(JSON.parse(e.data), "Live"); } catch { unavailable(); } };
-  stream.onerror = unavailable;
+function connect(): void {
+  const store = new EventStore();
+  const reader = new RelayReader({url: RELAY_URL, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: () => {
+    try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: reader.status}, reader.status.authenticated ? "Live" : "Polling"); }
+    catch { unavailable(); }
+  }});
+  reader.start();
+  addEventListener("pagehide", () => reader.stop(), {once: true});
 }
 
 if (new URLSearchParams(location.search).has("demo")) receive(demoSnapshot(Date.now() / 1000), "Demo data · not a real challenge");

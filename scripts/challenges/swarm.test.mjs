@@ -90,9 +90,9 @@ test('JSONL survives torn final writes and rejects corrupt committed data',()=>{
 test('planner responses, configuration and idempotency key validation',()=>{
   for(const p of [{},{task:'x',solved:true,result:'x'},{solved:true},{task:4},{task:' '}])assert.throws(()=>validatePlan(p));
   assert.deepEqual(validatePlan({wait:true}),{wait:true});
-  const c=config([],{MAXPLAYER_HOME:'/tmp/buyer',COMMUNITY_APP_URL:'http://localhost'});assert.equal(c.awardFallback,false);assert.equal(c.amount,undefined);
-  assert.throws(()=>config([],{MAXPLAYER_HOME:'/tmp/b',COMMUNITY_APP_URL:'http://localhost',SWARM_AMOUNT_SATS:'0'}));
-  assert.throws(()=>config(['--amount-sats','-1'],{MAXPLAYER_HOME:'/tmp/b',COMMUNITY_APP_URL:'http://localhost'}));
+  const c=config([],{MAXPLAYER_HOME:'/tmp/buyer',RELAY_URL:'ws://localhost'});assert.equal(c.awardFallback,false);assert.equal(c.amount,undefined);
+  assert.throws(()=>config([],{MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://localhost',SWARM_AMOUNT_SATS:'0'}));
+  assert.throws(()=>config(['--amount-sats','-1'],{MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://localhost'}));
   assert.equal(requestId({buyer:'a',id:'b'},'c',1),requestId({buyer:'a',id:'b'},'c',1));assert.notEqual(requestId({buyer:'a',id:'b'},'c',1),requestId({buyer:'a',id:'b'},'c',2));
 });
 test('lost reply is recovered read-only after deadline and collected without another post',async()=>{
@@ -122,7 +122,7 @@ test('one failed collection does not block settlement for another seller',async(
   const orig=f.io.mcp;f.io.mcp=async(t,a)=>{if(t==='collect'&&a.job_id==='job-0')throw Error('temporary failure');return orig(t,a);};
   await f.runner.tick();assert.equal(f.journal.state.jobs.filter(j=>j.done).length,1);assert.equal(f.journal.state.jobs.find(j=>j.done).id,'job-1');
 });
-test('settlement continues when community HTTP is unavailable',async()=>{
+test('settlement continues when relay is unavailable',async()=>{
   const f=fixture();await f.runner.tick();for(const j of f.remote.values())j.results=[{}];
   f.io.snapshot=async()=>{throw Error('HTTP unavailable');};await assert.rejects(f.runner.tick(),/HTTP unavailable/);
   assert.equal(f.journal.state.jobs.filter(j=>j.done).length,2);
@@ -235,7 +235,7 @@ test('pending work from a previous challenge still blocks a seller',async()=>{
 test('maxplayer child env carries only MAXPLAYER_HOME from the MAXPLAYER_* namespace',()=>{
   const e=childEnv({PATH:'/bin',MAXPLAYER_BINARY:'/x',MAXPLAYER_RELAY_URL:'ws://y',MAXPLAYER_HOME:'/old'},'/buyer');
   assert.deepEqual(e,{PATH:'/bin',MAXPLAYER_HOME:'/buyer'});
-  assert.equal(config([],{SWARM_MAXPLAYER_BINARY:'/bin/mp',MAXPLAYER_HOME:'/h',COMMUNITY_APP_URL:'http://a'}).binary,'/bin/mp');
+  assert.equal(config([],{SWARM_MAXPLAYER_BINARY:'/bin/mp',MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a'}).binary,'/bin/mp');
 });
 
 const priced=(input,amount=5)=>({assignments:assignments(input).assignments.map(a=>({...a,amountSats:amount}))});

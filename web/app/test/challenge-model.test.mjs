@@ -1,9 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { schnorr } from '@noble/curves/secp256k1';
-import { eventId,verify,signAuth,npubEncode,validChallenge,validMembership,validDecision } from '../src/events.mjs';
-import { EventStore } from '../src/model.mjs';
-import { config,review } from '../src/server.mjs';
+import { eventId,verify,signAuth,npubEncode,validChallenge,validMembership,validDecision } from '../src/challenge/shared/events.mjs';
+import { EventStore } from '../src/challenge/shared/model.mjs';
 const keys=[1,2,3].map(n=>n.toString(16).padStart(64,'0'));
 const [buyer,seller,stranger]=keys.map(k=>Buffer.from(schnorr.getPublicKey(k)).toString('hex'));
 function event(kind,who,time,tags,content='') {const e={kind,pubkey:[buyer,seller,stranger][who],created_at:time,tags:[['t','maxplayer'],['v','1'],...tags],content};e.id=eventId(e);e.sig=Buffer.from(schnorr.sign(e.id,keys[who])).toString('hex');return e;}
@@ -31,8 +30,6 @@ test('local verification rejects tampered id signature content timestamp and tag
 test('validation rejects malformed required tags, unknown values and numbers',()=>{assert.ok(validChallenge(c,buyer));assert.equal(validChallenge(c,stranger),false);for(const key of ['d','title','starts','ends','budget','status'])assert.equal(validChallenge({...c,tags:c.tags.filter(t=>t[0]!==key)},buyer),false);for(const v of ['0','481','-1','1.5','NaN','9007199254740992'])assert.equal(validMembership(app(200,'joined',v),c),false);assert.equal(validMembership(app(200,'other'),c),false);assert.equal(validDecision(decision(300,'other'),c),false);assert.equal(validDecision(decision(300,'accepted',2),c),false);});
 test('out-of-order ingestion is recomputed after challenge arrives',()=>assert.equal(project([...base].reverse()).sellers.length,1));
 test('NIP42 auth is signed with app key and has no EVENT payload',()=>{const e=signAuth(keys[2],'wss://relay.maxplayer.ai','nonce');assert.ok(verify(e));assert.equal(e.kind,22242);assert.equal(e.pubkey,stranger);});
-test('config supports hex and npub; malformed keys fail',()=>{assert.equal(config({CHALLENGE_BUYER_PUBKEY:npubEncode(buyer)}).buyer,buyer);assert.throws(()=>config({CHALLENGE_BUYER_PUBKEY:'nsec1bad'}));});
-test('review escapes seller text and offers exact scoped commands',()=>{const s=project();s.sellers[0].name='<script>alert(1)</script>';const html=review(s);assert.ok(!html.includes('<script>'));assert.ok(html.includes(`maxplayer challenge decide --seller ${npubEncode(seller)} --accept`));});
 test('missing/malformed deadline and ambiguous root references never tally',()=>{
   const bad={...offer,tags:offer.tags.filter(t=>t[0]!=='param')};bad.id=eventId(bad);bad.sig=Buffer.from(schnorr.sign(bad.id,keys[0])).toString('hex');assert.equal(project([c,app(),decision(),bad,claim,award()]).jobs.length,0);
   const a=award();a.tags=[...a.tags,['e','f'.repeat(64),'','root']];a.id=eventId(a);a.sig=Buffer.from(schnorr.sign(a.id,keys[0])).toString('hex');assert.equal(project([...base.slice(0,-1),a]).jobs.length,0);
@@ -57,7 +54,7 @@ test('existing public-v2 free trade tallies running, result and accept with v1 c
   const done=project([...events,r,ac],4100);assert.equal(done.sellers[0].state,'done');assert.equal(done.sellers[0].minutesUsed,1);assert.equal(done.jobs[0].accepted,true);assert.equal(done.budget.unknownAmounts,0);assert.equal(done.budget.committedSats+done.budget.paidSats,0);
 });
 test('public-v2 admission does not relax challenge-v1 or admit private/malformed envelopes',async()=>{
-  const {tradeNamespace}=await import('../src/events.mjs');
+  const {tradeNamespace}=await import('../src/challenge/shared/events.mjs');
   const e=publicV2(3401,0,4000,[['p',seller]]);assert.ok(tradeNamespace(e));
   for(const tags of [e.tags.filter(t=>t[0]!=='job'),e.tags.filter(t=>t[0]!=='visibility'),e.tags.map(t=>t[0]==='visibility'?['visibility','private']:t),e.tags.map(t=>t[0]==='v'?['v','3']:t),[...e.tags,['v','1']]])assert.equal(tradeNamespace({...e,tags}),false);
   const bad=publicV2(30341,0,100,c.tags.filter(t=>!['t','v'].includes(t[0])));assert.equal(validChallenge(bad,buyer),false);assert.equal(project([bad,app()]).challenge,null);

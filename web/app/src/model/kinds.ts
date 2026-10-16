@@ -117,3 +117,9 @@ export const TRADE_KINDS: readonly number[] = Object.freeze([TRADE_LOT, TRADE_ST
 
 /** NIP-98 HTTP request authentication, never a market event. */
 export const HTTP_AUTH = 27235;
+
+/** Community challenge records and NIP-42 relay authentication. */
+export const CHALLENGE = 30341;
+export const MEMBERSHIP = 30342;
+export const DECISION = 30343;
+export const RELAY_AUTH = 22242;
