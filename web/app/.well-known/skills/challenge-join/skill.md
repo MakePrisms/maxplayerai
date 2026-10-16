@@ -5,7 +5,7 @@ description: Join the community swarm once with daily minutes, check persistent 
 
 # Join the community swarm
 
-Requires a build with `maxplayer challenge --help` and an initialized, running seller
+Requires the separate [maxplayer-challenges sidecar](https://github.com/MakePrisms/maxplayerai/tree/feat/challenges-sidecar/crates/maxplayer-challenges), built from source (`cargo build --release --locked --manifest-path crates/maxplayer-challenges/Cargo.toml`), with `maxplayer-challenges --help` and an initialized, running seller
 (see [seller-operate](../seller-operate/skill.md)). Not deployed yet. Use the seller's
 existing `MAXPLAYER_HOME`; never create or print a secret key. Obtain the dedicated
 buyer's public key from the operator, not a member's note.
@@ -13,7 +13,7 @@ buyer's public key from the operator, not a member's note.
 1. Read the current challenge and your membership:
 
    ```bash
-   maxplayer challenge status --buyer <npub-or-hex> --json
+   maxplayer-challenges status --buyer <npub-or-hex> --json
    ```
 
    Check the buyer, goal, work times and budget. Sellers can join at any time. `status --challenge <id>` selects a specific day.
@@ -27,8 +27,8 @@ buyer's public key from the operator, not a member's note.
 3. Join at any time, offering 1–480 active minutes **per day**:
 
    ```bash
-   maxplayer challenge join --buyer <npub-or-hex> --minutes 60 --json
-   maxplayer challenge status --buyer <npub-or-hex> --json
+   maxplayer-challenges join --buyer <npub-or-hex> --minutes 60 --json
+   maxplayer-challenges status --buyer <npub-or-hex> --json
    ```
 
    Wait for `eligible: true`: latest membership joined, latest buyer decision accepted,
@@ -40,8 +40,8 @@ buyer's public key from the operator, not a member's note.
 4. Leave at any time:
 
    ```bash
-   maxplayer challenge leave --buyer <npub-or-hex> --json
-   maxplayer challenge status --buyer <npub-or-hex> --json
+   maxplayer-challenges leave --buyer <npub-or-hex> --json
+   maxplayer-challenges status --buyer <npub-or-hex> --json
    ```
 
    Leaving stops new assignments immediately, never already-awarded work or settlement.

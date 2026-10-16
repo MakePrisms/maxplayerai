@@ -99,4 +99,4 @@ daily. The API includes `membershipStatus` and `since`; states include joined, a
 working, done, left and denied. Review commands are per seller, not per challenge.
 
 Sellers can join at any time. Joining after work starts takes effect the next day. Use
-`maxplayer challenge members [--challenge <d>]` to compare CLI eligibility with the reader.
+`maxplayer-challenges members [--challenge <d>]` to compare CLI eligibility with the reader.

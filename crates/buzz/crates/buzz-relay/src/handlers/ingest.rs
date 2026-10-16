@@ -72,9 +72,6 @@ const KIND_MOBEE_TRADE_ACCEPT: u32 = 3406;
 const KIND_MAXPLAYER_REVIEW: u32 = 3408;
 const KIND_MAXPLAYER_REVIEW_REQUEST: u32 = 3409;
 const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
-const KIND_MAXPLAYER_CHALLENGE: u32 = 30341;
-const KIND_MAXPLAYER_CHALLENGE_APPLICATION: u32 = 30342;
-const KIND_MAXPLAYER_CHALLENGE_DECISION: u32 = 30343;
 const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
 // NIP-17 DM-relay list (standard kind 10050). Pre-allowed by mobee for future
 // DM-inbox discovery; size-bounded like the gift wrap below, but with no `p`-tag
@@ -670,10 +667,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_TRADE_ACCEPT
         | KIND_MAXPLAYER_REVIEW
         | KIND_MAXPLAYER_REVIEW_REQUEST
-        | KIND_MOBEE_SELLER_HEARTBEAT
-        | KIND_MAXPLAYER_CHALLENGE
-        | KIND_MAXPLAYER_CHALLENGE_APPLICATION
-        | KIND_MAXPLAYER_CHALLENGE_DECISION => Ok(Scope::MessagesWrite),
+        | KIND_MOBEE_SELLER_HEARTBEAT => Ok(Scope::MessagesWrite),
         // Mobee self-describing discovery/config kinds — the NIP-89 handler
         // advertisement and the NIP-17 DM-relay list. Grouped with kind-0's
         // UsersWrite (identity/discovery) class per keeper:mobee, so an
@@ -4229,9 +4223,6 @@ mod postgres_tests {
             KIND_MOBEE_TRADE_AWARD,      // 3405
             KIND_MOBEE_TRADE_ACCEPT,     // 3406 (pay-bind, #329)
             KIND_MOBEE_SELLER_HEARTBEAT, // 30340
-            KIND_MAXPLAYER_CHALLENGE,
-            KIND_MAXPLAYER_CHALLENGE_APPLICATION,
-            KIND_MAXPLAYER_CHALLENGE_DECISION,
         ] {
             assert_eq!(
                 required_scope_for_kind(kind, &dummy).unwrap(),
@@ -4239,7 +4230,6 @@ mod postgres_tests {
                 "mobee kind {kind} should require MessagesWrite scope"
             );
         }
-        assert!(required_scope_for_kind(30344, &dummy).is_err());
         // Self-describing discovery/config kinds are UsersWrite (kind-0's class),
         // per keeper:mobee.
         for kind in [

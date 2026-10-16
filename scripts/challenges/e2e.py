@@ -31,6 +31,8 @@ RUN = Path(tempfile.mkdtemp(prefix='ce-', dir=ROOT / '.scratch'))
 os.chmod(RUN, 0o700)
 # Keep buyer Unix socket below sockaddr_un's 108-byte path limit.
 BIN = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target/challenges-e2e')) / 'debug/maxplayer'
+CHALLENGES = ROOT / 'crates/maxplayer-challenges/target/debug/maxplayer-challenges'
+LOCAL_RELAY = ROOT / 'crates/maxplayer-challenges/target/debug/examples/local_relay'
 BUZZ = ROOT / 'target/challenges-buzz/debug/buzz-relay'
 PROCESSES = []
 ENV = {k: v for k, v in os.environ.items() if k in ['PATH', 'HOME', 'USER', 'LANG', 'LD_LIBRARY_PATH', 'SSL_CERT_FILE', 'NIX_SSL_CERT_FILE']}
@@ -137,7 +139,7 @@ def iso(t):
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
 def cli(env, *args):
-    return command([BIN, 'challenge', *args], env)
+    return command([CHALLENGES, *args, '--relay', CHALLENGE_RELAY], env)
 
 def plan(snapshot):
     path = RUN / 'snapshot.json'
@@ -162,6 +164,10 @@ try:
         start('duplicate-history', ['python3', ROOT / 'scripts/challenges/duplicate-history.py', frontport, relayport])
     start('buzz', [BUZZ], {**ENV, 'RELAY_URL': relay, 'DATABASE_URL': f'postgresql://{os.environ["USER"]}@127.0.0.1:{pgport}/postgres', 'REDIS_URL': f'redis://127.0.0.1:{redisport}', 'BUZZ_BIND_ADDR': f'127.0.0.1:{relayport}', 'BUZZ_HEALTH_PORT': '0', 'BUZZ_METRICS_PORT': '0', 'BUZZ_RELAY_PRIVATE_KEY': secrets.token_hex(32), 'BUZZ_AUTO_MIGRATE': 'true', 'BUZZ_OPEN_READ': 'true', 'BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC': '1000', 'BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN': '10000', 'BUZZ_GIT_CONFORMANCE_PROBE': 'false', 'BUZZ_S3_ENDPOINT': 'http://127.0.0.1:1', 'BUZZ_GIT_REPO_PATH': str(RUN / 'git'), 'BUZZ_GIT_PACK_CACHE_PATH': str(RUN / 'packs')})
     wait('local Buzz ready', lambda: urllib.request.urlopen(f'http://127.0.0.1:{relayport}/health', timeout=2).status == 200)
+    challenge_port = port()
+    CHALLENGE_RELAY = f'ws://127.0.0.1:{challenge_port}'
+    start('challenge-relay', [LOCAL_RELAY, challenge_port])
+    wait('local generic challenge relay ready', lambda: socket.create_connection(('127.0.0.1', challenge_port), timeout=1).close() is None)
     buyer_env, BUYER = home('b', relay)
     seller_env, SELLER = home('s', relay, BUYER)
     denied_env, DENIED = home('d', relay, BUYER)
@@ -172,7 +178,7 @@ try:
     # Buyer foreground service owns its daemon lifecycle; no operator home is consulted.
     time.sleep(2)
     if not ARGS.baseline:
-        start('app', ['node', ROOT / 'web/community/src/server.mjs'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_BUYER_PUBKEY': BUYER, 'APP_AUTH_KEY_FILE': str(RUN / 'app-key'), 'PORT': str(appport), 'CORS_ORIGIN': f'http://127.0.0.1:{appport}'})
+        start('app', ['node', ROOT / 'web/community/src/server.mjs'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_RELAYS': CHALLENGE_RELAY, 'CHALLENGE_BUYER_PUBKEY': BUYER, 'APP_AUTH_KEY_FILE': str(RUN / 'app-key'), 'PORT': str(appport), 'CORS_ORIGIN': f'http://127.0.0.1:{appport}'})
         url = f'http://127.0.0.1:{appport}/api/challenges/current'
         snapshot = lambda: read_json(url)
         now = int(time.time())
@@ -299,7 +305,7 @@ try:
                 '--binary', BIN, '--app-url', f'http://127.0.0.1:{appport}',
                 '--planner', 'node scripts/challenges/planner-free-e2e.mjs',
                 '--duration-seconds', str(duration), '--poll-seconds', '1'],
-                {**buyer_env, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration)})
+                {**buyer_env, 'SWARM_CHALLENGES_BINARY': str(CHALLENGES), 'SWARM_CHALLENGE_RELAYS': CHALLENGE_RELAY, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration)})
             final = wait(day + ' status completed', lambda: (s if s['challenge']['id'] == day and s['challenge']['status'] == 'completed' else None) if (s := snapshot()) else None, seconds=240)
             def settled():
                 log = Path(buyer_env['MAXPLAYER_HOME']) / 'swarm/events.jsonl'

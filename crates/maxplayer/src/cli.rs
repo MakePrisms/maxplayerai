@@ -79,7 +79,6 @@ where
         #[cfg(feature = "acp")]
         Some("sandbox-reap") => crate::sandbox_reap::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
-        Some("challenge") => crate::challenge_cli::run(&args[2..], out, err),
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),
         // Where the agent documentation lives. Pure print — no home, key, wallet or network — so
@@ -341,7 +340,7 @@ fn usage(err: &mut dyn Write) -> i32 {
 fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
-        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer challenge <apply|status|withdraw|publish|applicants|decide> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n"
     );
     #[cfg(feature = "stub-pay")]
     let _ = write!(

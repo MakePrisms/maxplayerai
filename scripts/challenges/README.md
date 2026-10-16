@@ -9,7 +9,9 @@ bash scripts/challenges/run-e2e.sh
 
 The harness builds **this integration checkout** with wallet+ACP and Buzz in dedicated
 `target/challenges-e2e` and `target/challenges-buzz` directories, installs the community
-service's locked Node dependencies, and runs the assertions. On this Nix host it discovers
+service's locked Node dependencies, and runs the assertions. It also builds the separate
+`crates/maxplayer-challenges` workspace (binary and generic local relay fixture) into
+its own target. Challenge metadata goes only to that generic relay; jobs stay on Buzz. On this Nix host it discovers
 installed Postgres/Redis in `/nix/store` if absent from PATH. Else supply them on PATH;
 `nix shell --extra-experimental-features 'nix-command flakes' nixpkgs#postgresql_17 nixpkgs#redis`
 provides those dependencies. Use the repository devshell if the native build needs OpenSSL.
@@ -72,13 +74,15 @@ Membership coverage: join at any time with an exact work-start eligibility bound
 
 ## Automatic swarm runner
 
-Hand-whitelist sellers once with `maxplayer challenge decide --seller HEX --accept`, then
+Hand-whitelist sellers once with `maxplayer-challenges decide --seller HEX --accept`, then
 publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
 the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:
 
 ```sh
 MAXPLAYER_HOME=/absolute/buyer-home \
 SWARM_MAXPLAYER_BINARY=/absolute/bin/maxplayer \
+SWARM_CHALLENGES_BINARY=/absolute/bin/maxplayer-challenges \
+SWARM_CHALLENGE_RELAYS=wss://nos.lol,wss://relay.primal.net,wss://offchain.pub \
 COMMUNITY_APP_URL=http://127.0.0.1:8787 \
 node scripts/challenges/swarm.mjs
 ```
@@ -97,6 +101,8 @@ Flags (environment equivalents):
 | --- | --- | --- |
 | `--home` | `MAXPLAYER_HOME` | required, explicit |
 | `--binary` | `SWARM_MAXPLAYER_BINARY` | `maxplayer` |
+| — | `SWARM_CHALLENGES_BINARY` | `maxplayer-challenges` |
+| — | `SWARM_CHALLENGE_RELAYS` | comma list: `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
 | `--app-url` | `COMMUNITY_APP_URL` | required |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
@@ -272,3 +278,8 @@ The repo's reusable CDK mint is an in-process Rust fixture in
 this E2E needs a loopback-only test-mint launcher/funding API, funded disposable buyer wallet,
 a priced seller accepting that mint, disabled external fee remittance, and receipt/spend
 assertions after both paid and free deliveries. No production relay or real funds are needed.
+
+Build the [challenge sidecar](../../crates/maxplayer-challenges/README.md) from source before
+running the swarm. Publication uses `maxplayer-challenges publish`; job MCP stays on
+`maxplayer`. The legacy HTTP projection uses `CHALLENGE_RELAYS` for the same comma list
+and `RELAY_URL` for jobs. The sidecar never uses the configured job relay for challenges.

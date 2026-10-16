@@ -8,7 +8,7 @@ import { EventStore } from './model.mjs';
 import { RelayReader } from './relay.mjs';
 const escape=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export function review(s) {
-  return `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Challenge review</title></head><body><h1>Challenge members</h1><p>Read-only. Run decisions in the buyer’s CLI home. Names, notes and capabilities are seller-advertised.</p><p>${escape(s.challenge?.title??'No challenge published')}</p>${s.sellers.map(a=>`<section><h2>${escape(a.name||a.npub)}</h2><p>${escape(a.npub)}</p><p>${a.minutesUsed.toFixed(1)} of ${a.minutesOffered} minutes today · ${escape(a.state)} · Eligible: ${a.eligible === true ? 'yes' : 'no'}</p><p>${escape(a.note)}</p><pre>${escape(JSON.stringify(a.capabilities,null,2))}</pre><p>Heartbeat: ${escape(a.heartbeatAt??'unknown')}</p><p>Past challenge jobs: ${a.pastJobs.length}</p><ul>${a.pastJobs.map(j=>`<li>${escape(j.task)} · ${j.usedMinutes.toFixed(1)} min · ${escape(j.id)}</li>`).join('')}</ul>${['accept','deny'].map(action=>`<p><code>${escape(`maxplayer challenge decide --seller ${a.npub} --${action}`)}</code></p>`).join('')}</section>`).join('')}</body></html>`;
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width"><title>Challenge review</title></head><body><h1>Challenge members</h1><p>Read-only. Run decisions in the buyer’s CLI home. Names, notes and capabilities are seller-advertised.</p><p>${escape(s.challenge?.title??'No challenge published')}</p>${s.sellers.map(a=>`<section><h2>${escape(a.name||a.npub)}</h2><p>${escape(a.npub)}</p><p>${a.minutesUsed.toFixed(1)} of ${a.minutesOffered} minutes today · ${escape(a.state)} · Eligible: ${a.eligible === true ? 'yes' : 'no'}</p><p>${escape(a.note)}</p><pre>${escape(JSON.stringify(a.capabilities,null,2))}</pre><p>Heartbeat: ${escape(a.heartbeatAt??'unknown')}</p><p>Past challenge jobs: ${a.pastJobs.length}</p><ul>${a.pastJobs.map(j=>`<li>${escape(j.task)} · ${j.usedMinutes.toFixed(1)} min · ${escape(j.id)}</li>`).join('')}</ul>${['accept','deny'].map(action=>`<p><code>${escape(`maxplayer-challenges decide --seller ${a.npub} --${action}`)}</code></p>`).join('')}</section>`).join('')}</body></html>`;
 }
 export function createApp({snapshot,origin}) {
   const clients=new Set();let last='';
@@ -48,8 +48,13 @@ export function authKey(path,buyer) {
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   const c=config(),store=new EventStore();let reader;
-  const app=createApp({origin:c.origin,snapshot:()=>({...store.snapshot(c.buyer),relay:reader.status})});
-  reader=new RelayReader({...c,key:authKey(c.keyFile,c.buyer),store,onChange:()=>app.send()});
-  app.server.listen(c.port,c.host,()=>console.log(`community listening on ${c.host??'*'}:${c.port}`));reader.start();
-  const stop=()=>{reader.stop();app.server.closeAllConnections();app.server.close();};process.on('SIGTERM',stop);process.on('SIGINT',stop);
+  const readers=[];
+  const status=()=>({connected:readers.every(r=>r.status.connected),authenticated:readers.every(r=>r.status.authenticated),historyComplete:readers.every(r=>r.status.historyComplete),error:readers.find(r=>r.status.error)?.status.error??null});
+  const app=createApp({origin:c.origin,snapshot:()=>({...store.snapshot(c.buyer),relay:status()})});
+  const key=authKey(c.keyFile,c.buyer);
+  reader=new RelayReader({...c,key,store,kinds:[3401,3402,3405,3403,3406],onChange:()=>app.send()});
+  readers.push(reader);
+  for(const url of (process.env.CHALLENGE_RELAYS??'wss://nos.lol,wss://relay.primal.net,wss://offchain.pub').split(',').map(s=>s.trim()).filter(Boolean)) readers.push(new RelayReader({...c,url,key,store,kinds:[30341,30342,30343],profileReader:reader,onChange:()=>app.send()}));
+  app.server.listen(c.port,c.host,()=>console.log(`community listening on ${c.host??'*'}:${c.port}`));readers.forEach(r=>r.start());
+  const stop=()=>{readers.forEach(r=>r.stop());app.server.closeAllConnections();app.server.close();};process.on('SIGTERM',stop);process.on('SIGINT',stop);
 }

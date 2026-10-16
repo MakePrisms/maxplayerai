@@ -16,3 +16,20 @@ test('relay authenticates before REQ, repeats subscriptions after reconnect, sen
 test('normal CLOSED acknowledgement does not reconnect; active subscription rejection does',()=>{
   const reader=new RelayReader({url:'wss://example.test',key:'03'.padStart(64,'0'),buyer:'a'.repeat(64),store:new EventStore(),WebSocketImpl:Socket});reader.start();const socket=Socket.all.at(-1);socket.message(['AUTH','nonce']);socket.message(['OK',socket.sent[0][1].id,true,'']);socket.message(['EOSE','history-30341']);socket.message(['CLOSED','history-30341','']);assert.equal(reader.status.authenticated,true);socket.message(['CLOSED','live','restricted: fixture']);assert.equal(reader.status.authenticated,false);reader.stop();
 });
+test('split relays keep live membership history complete and dedupe trade profile subscriptions',()=>{
+  const store={events:new Map(),add(e){this.events.set(e.id,e);return true;}};
+  const options={url:'wss://example.test',key:'03'.padStart(64,'0'),buyer:'a'.repeat(64),store,WebSocketImpl:Socket};
+  const trade=new RelayReader({...options,kinds:[3401,3402,3405,3403,3406]});
+  const challenges=[1,2].map(()=>new RelayReader({...options,kinds:[30341,30342,30343],profileReader:trade}));
+  const readers=[trade,...challenges],sockets=[];
+  try {
+    for(const reader of readers){reader.start();const socket=Socket.all.at(-1);sockets.push(socket);socket.message(['AUTH','nonce']);socket.message(['OK',socket.sent[0][1].id,true,'']);for(const kind of reader.kinds)socket.message(['EOSE',`history-${kind}`]);assert.equal(reader.status.historyComplete,true);}
+    assert.ok(trade.queue.filter(m=>m[0]==='REQ').every(m=>!JSON.stringify(m).includes('30341')));
+    const member={id:'membership',kind:30342,pubkey:'b'.repeat(64)};
+    for(const socket of sockets.slice(1))socket.message(['EVENT','live',member]);
+    assert.ok(challenges.every(r=>r.status.historyComplete));
+    assert.equal(trade.pending,2);assert.equal(trade.status.historyComplete,false);
+    for(const kind of [0,30340])sockets[0].message(['EOSE',`profile-${kind}-${member.pubkey}`]);
+    assert.equal(trade.status.historyComplete,true);
+  } finally {readers.forEach(r=>r.stop());}
+});

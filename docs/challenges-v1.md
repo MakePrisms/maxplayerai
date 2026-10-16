@@ -1,6 +1,11 @@
 # Community challenges v1
 
-Status: building on `feat/community-challenges` for an end-to-end test. Not live.
+Status: opt-in `maxplayer-challenges` sidecar, built from source. Not live.
+
+See [the crate README](../crates/maxplayer-challenges/README.md) for installation.
+It has its own Cargo workspace and lockfile; build with `--manifest-path
+crates/maxplayer-challenges/Cargo.toml`. The main `maxplayer` CLI has no challenge
+subcommand. The buyer auto-award and job protocol are unchanged.
 
 ## Model
 
@@ -17,6 +22,21 @@ Status: building on `feat/community-challenges` for an end-to-end test. Not live
   Neither the buyer nor the seller publishes any metering.
 - Seller prerequisite (unchanged mechanism): the seller lists the buyer's hex key in
   `seller.accept_offers_only_from`.
+
+## Relay separation
+
+Kinds 30341–30343 use public relays, by default `wss://nos.lol`,
+`wss://relay.primal.net`, and `wss://offchain.pub`. Repeat `--relay URL` after the
+sidecar command to override. Only loopback permits `ws://`; `relay.maxplayer.ai`
+is refused. Publish attempts all relays, requiring at least one acknowledgement,
+with per-relay outcomes on stderr. Reads union verified events and deduplicate ids,
+then select latest per coordinate. No EOSE is a per-relay error (discard that
+partial response); no completed relay response is a command error. Partial relay
+failures are reported, not treated as complete global history.
+
+Jobs remain on the configured trade relay. Buzz's allowlist is unchanged from main:
+no 30341–30343 support is added and production relay deployment is unnecessary.
+The local E2E runs a separate generic Nostr relay for challenge metadata.
 
 ## Events
 
@@ -166,20 +186,21 @@ See [runner configuration, planner contract, restart behavior and service exampl
 
 ## Community app
 
-- Stays authenticated to the relay (anonymous REQs get stored events but no live events on
-  relay.maxplayer.ai).
+- Reads challenge metadata from public challenge relays and job/profile events from the
+  configured trade relay. Stays authenticated to the trade relay (anonymous REQs get
+  stored events but no live events on relay.maxplayer.ai).
 - Serves `GET /api/challenges/current` (JSON snapshot) and `GET /api/challenges/current/stream`
   (Server-Sent Events; same JSON on every change, plus a heartbeat). Page counts running jobs
   up locally from `start`.
 - Review screen: lists members and eligibility (npub, profile name, advertised seat capabilities from the
   30340 heartbeat, minutes offered, past challenge jobs) and the exact
-  `maxplayer challenge decide …` command to accept/deny. The app holds no buyer secret; its app-only key is used exclusively for relay AUTH.
+  `maxplayer-challenges decide …` command to accept/deny. The app holds no buyer secret; its app-only key is used exclusively for relay AUTH.
 
-## CLI (`maxplayer challenge …`)
+## CLI (`maxplayer-challenges …`)
 
 Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
 `status --buyer … [--challenge <d>]`, `leave --buyer …`.
-Buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
+The buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 --ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
 `members [--challenge <d>]`, `decide --seller <npub|hex> --accept|--deny`.
 `--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's

@@ -1,10 +1,10 @@
 import { signAuth } from './events.mjs';
 // Each kind has an independent history cursor; live subscription is installed first.
 export class RelayReader {
-  constructor({url,key,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket}) { Object.assign(this,{url,key,buyer,store,onChange,WebSocketImpl}); this.status={connected:false,authenticated:false,historyComplete:false,error:null}; this.stopped=false; this.retry=1000; }
+  constructor({url,key,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,kinds=[30341,30342,30343,3401,3402,3405,3403,3406],profileReader=null}) { Object.assign(this,{url,key,buyer,store,onChange,WebSocketImpl,kinds,profileReader}); this.status={connected:false,authenticated:false,historyComplete:false,error:null}; this.stopped=false; this.retry=1000; }
   start() {
     if(this.stopped)return;
-    this.status={connected:false,authenticated:false,historyComplete:false,error:null}; this.pages=new Map(); this.pending=0; this.profileAuthors=new Set(); this.queue=[]; clearInterval(this.queueTimer); this.queueTimer=setInterval(()=>{if(ws.readyState===undefined||ws.readyState===1){const frame=this.queue.shift();if(frame)ws.send(JSON.stringify(frame));}},300);
+    this.status={connected:false,authenticated:false,historyComplete:false,error:null}; this.pages=new Map(); this.pending=0; this.profileAuthors=new Set();this.profileRequests=new Set(); this.queue=[]; clearInterval(this.queueTimer); this.queueTimer=setInterval(()=>{if(ws.readyState===undefined||ws.readyState===1){const frame=this.queue.shift();if(frame)ws.send(JSON.stringify(frame));}},300);
     const ws=this.ws=new this.WebSocketImpl(this.url);
     const timeout=setTimeout(()=>ws.close(),20000);
     ws.addEventListener('open',()=>{this.status.connected=true;this.onChange();});
@@ -16,7 +16,7 @@ export class RelayReader {
           if(!m[2]) {this.status.error='Relay authentication refused';ws.close();return;}
           clearTimeout(timeout);this.status.authenticated=true;this.retry=1000;
           const filters=[];
-          for(const kind of [30341,30342,30343,3401,3402,3405,3403,3406]) {
+          for(const kind of this.kinds) {
             const filter={kinds:[kind]};
             if([30341,30343,3401,3405,3406].includes(kind))filter.authors=[this.buyer];
             if([30342,3402,3403].includes(kind))filter['#p']=[this.buyer];
@@ -30,8 +30,8 @@ export class RelayReader {
           const added=this.store.add(m[2]);
           const e=this.store.events.get(m[2]?.id);
           if(e&&e.kind===30342&&!this.profileAuthors.has(e.pubkey)) {
-            this.profileAuthors.add(e.pubkey);this.status.historyComplete=false;
-            for(const kind of [0,30340]){const filter={kinds:[kind],authors:[e.pubkey]};this.pending++;this.page(`profile-${kind}-${e.pubkey}`,filter);}
+            this.profileAuthors.add(e.pubkey);
+            (this.profileReader??this).profiles(e.pubkey);
           }
           if(added)this.onChange();
         } else if(m[0]==='EOSE'&&this.pages.has(m[1])) {
@@ -49,6 +49,7 @@ export class RelayReader {
     ws.addEventListener('error',()=>{this.status.error??='Relay connection error';console.warn(this.status.error);ws.close();});
     ws.addEventListener('close',()=>{clearTimeout(timeout);clearInterval(this.queueTimer);this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.onChange();if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,30000);}});
   }
+  profiles(author) { if(this.profileRequests.has(author))return;this.profileRequests.add(author);for(const kind of [0,30340]) { this.pending++;this.status.historyComplete=false;this.page(`profile-${kind}-${author}`,{kinds:[kind],authors:[author]}); } }
   page(id,filter) {this.pages.set(id,{filter,events:[]});this.queue.push(['REQ',id,{...filter,limit:500}]);}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);this.ws?.close();}
 }

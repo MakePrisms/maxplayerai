@@ -32,7 +32,7 @@ test('validation rejects malformed required tags, unknown values and numbers',()
 test('out-of-order ingestion is recomputed after challenge arrives',()=>assert.equal(project([...base].reverse()).sellers.length,1));
 test('NIP42 auth is signed with app key and has no EVENT payload',()=>{const e=signAuth(keys[2],'wss://relay.maxplayer.ai','nonce');assert.ok(verify(e));assert.equal(e.kind,22242);assert.equal(e.pubkey,stranger);});
 test('config supports hex and npub; malformed keys fail',()=>{assert.equal(config({CHALLENGE_BUYER_PUBKEY:npubEncode(buyer)}).buyer,buyer);assert.throws(()=>config({CHALLENGE_BUYER_PUBKEY:'nsec1bad'}));});
-test('review escapes seller text and offers exact scoped commands',()=>{const s=project();s.sellers[0].name='<script>alert(1)</script>';const html=review(s);assert.ok(!html.includes('<script>'));assert.ok(html.includes(`maxplayer challenge decide --seller ${npubEncode(seller)} --accept`));});
+test('review escapes seller text and offers exact scoped commands',()=>{const s=project();s.sellers[0].name='<script>alert(1)</script>';const html=review(s);assert.ok(!html.includes('<script>'));assert.ok(html.includes(`maxplayer-challenges decide --seller ${npubEncode(seller)} --accept`));});
 test('missing/malformed deadline and ambiguous root references never tally',()=>{
   const bad={...offer,tags:offer.tags.filter(t=>t[0]!=='param')};bad.id=eventId(bad);bad.sig=Buffer.from(schnorr.sign(bad.id,keys[0])).toString('hex');assert.equal(project([c,app(),decision(),bad,claim,award()]).jobs.length,0);
   const a=award();a.tags=[...a.tags,['e','f'.repeat(64),'','root']];a.id=eventId(a);a.sig=Buffer.from(schnorr.sign(a.id,keys[0])).toString('hex');assert.equal(project([...base.slice(0,-1),a]).jobs.length,0);

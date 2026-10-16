@@ -55,7 +55,7 @@ function render(s: Snapshot): void {
   text("challenge-budget", usd(s.budget!.totalSats));
   text("buyer-npub", c.buyerNpub);
   text("buyer-hex", buyerHex(c.buyerNpub));
-  text("apply-command", `maxplayer challenge join --buyer ${c.buyerNpub} --minutes 60`);
+  text("apply-command", `maxplayer-challenges join --buyer ${c.buyerNpub} --minutes 60`);
   tick();
 }
 function tick(): void {

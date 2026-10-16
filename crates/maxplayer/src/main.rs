@@ -15,7 +15,6 @@ mod doctor;
 mod exec;
 mod mcp;
 mod profile_cli;
-mod challenge_cli;
 // The `sell` surface is the seller advertise path: it publishes the kind-0 identity and boots the
 // heartbeat loop that announces capability. `acp` compiles in the agent-execution that lets a seat
 // actually deliver;
