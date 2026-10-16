@@ -138,7 +138,7 @@ export class Swarm {
         // Deadline alone is not proof of nonpayment. A confirmed empty/expired claim history,
         // matching expired offer and successful local award lookup prove never awarded.
         // Unresolved claims/awards/accepts or incomplete reads stay reserved and are polled again.
-        const neverAwarded=state.read_confirmed===true && state.award_read_confirmed===true && state.reservation_state==='none' && state.auto_award_state==='parked' &&
+        const neverAwarded=state.read_confirmed===true && state.award_read_confirmed===true && state.reservation_state==='none' && (state.auto_award_state==='parked' || state.auto_award_state==null) &&
           state.offer?.deadline_unix===j.args.deadline_unix && Array.isArray(state.claims) && state.claims.every(c=>c.live===false&&c.status==='expired') &&
           Array.isArray(state.results) && !state.results.length && state.accepted===null && !state.awarded && !state.awarded_delivery_pending;
         const reconciled=state.reservation_state==='released' && state.read_confirmed===true &&

@@ -254,9 +254,11 @@ test('invalid and over-budget prices are dropped with reasons',async()=>{
   }
 });
 test('confirmed expired never-awarded job releases reservation, incomplete/possibly payable states do not',async()=>{
-  for(const uncertainty of [null,'read','award-read','awarded','accepted','claims','results','offer','reservation','auto-award']){
+  for(const uncertainty of [null,'unarmed-null','unarmed-missing','read','award-read','awarded','accepted','claims','results','offer','reservation','auto-award']){
     const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>priced(input));await f.runner.tick();
     const state=[...f.remote.values()][0];Object.assign(state,{read_confirmed:true,award_read_confirmed:true,reservation_state:'none',auto_award_state:'parked',offer:{deadline_unix:130},claims:[],results:[],accepted:null});
+    if(uncertainty==='unarmed-null')state.auto_award_state=null;
+    if(uncertainty==='unarmed-missing')delete state.auto_award_state;
     if(uncertainty==='auto-award')state.auto_award_state='pending';
     if(uncertainty==='reservation')state.reservation_state='reserved';
     if(uncertainty==='read')state.read_confirmed=false;
@@ -267,8 +269,8 @@ test('confirmed expired never-awarded job releases reservation, incomplete/possi
     if(uncertainty==='results')delete state.results;
     if(uncertainty==='offer')delete state.offer;
     f.time(131);f.setPlan(()=>({wait:true}));await f.runner.tick();
-    assert.equal(reservedBudget(f.snap,f.journal.state.jobs,131).committedSats,uncertainty?5:0,uncertainty);
-    assert.equal(f.journal.state.jobs[0].done,!uncertainty);
+    assert.equal(reservedBudget(f.snap,f.journal.state.jobs,131).committedSats,uncertainty&&!uncertainty.startsWith('unarmed')?5:0,uncertainty);
+    assert.equal(f.journal.state.jobs[0].done,!uncertainty||uncertainty.startsWith('unarmed'));
   }
 });
 test('expired awarded job stays polled and a late collect still consumes budget exactly once',async()=>{
