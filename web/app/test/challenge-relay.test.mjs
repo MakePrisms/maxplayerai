@@ -165,7 +165,9 @@ test('relay A hiding newer left while down blocks swarm despite relay B old join
   reader.challenges[0].ws.close();
   const snap={...store.snapshot(buyer,400),relay:reader.status};assert.equal(snap.sellers[0].eligible,true);
   let posts=0;
-  const io={now:()=>400,snapshot:async()=>snap,mcp:async tool=>{if(tool==='post_job')posts++;},plan:async()=>{throw Error('must not plan with incomplete history');},publish:async()=>{throw Error('must not publish');}};
+  const io={now:()=>400,snapshot:async()=>snap,mcp:async tool=>{if(tool==='post_job')posts++;return {job_id:'fixture-job'};},
+    plan:async input=>input.mode==='analyze'?{approach:'split',workstreams:[{id:'piece',description:'piece',needs:{skills:[]},estMinutes:1,dependsOn:[]}],verification:'check'}:
+      {assignments:[{seller:buyer,workstream:'piece',task:'piece',durationSeconds:30}]},publish:async()=>{}};
   await new Swarm({minDuration:30,maxDuration:60,updateEvery:180},io,{state:{jobs:[],days:{}},save(){}}).tick();
   assert.equal(posts,0);assert.equal(snap.relay.historyComplete,false);assert.match(snap.relay.error,/ws:\/\/a/);
 });
@@ -188,4 +190,13 @@ test('signed membership flood cannot expand one trade subscription per key',t=>{
   assert.equal(reader.members.size,256);assert.equal(store.events.size,256);
   assert.equal(reader.filters.size,520);assert.equal(reader.status.historyComplete,false);
   assert.match(reader.status.error,/pubkey limit/);
+});
+
+test('AUTH recovery cannot clear a different hard history refusal',t=>{
+  const {reader,socket}=setup(t);
+  socket.message(['CLOSED','3401','restricted: not permitted']);
+  socket.message(['CLOSED','3402','auth-required: authentication required']);
+  socket.message(['AUTH','nonce']);socket.message(['OK',reader.authId,true,'']);
+  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
+  assert.equal(reader.status.historyComplete,false);assert.match(reader.status.error,/refused/);
 });

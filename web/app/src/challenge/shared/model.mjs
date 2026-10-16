@@ -19,7 +19,7 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     ([OFFER,AWARD,ACCEPT].includes(e.kind) ? e.pubkey===buyer :
       [CLAIM,RESULT].includes(e.kind) ? mentions(e,buyer) : true));
   const jobs=[];
-  for(const offer of trade.filter(e=>e.kind===OFFER && e.pubkey===buyer && one(e,'i') && tag(e,'i').startsWith(challengeTaskPrefix(buyer,tag(c,'d'))) && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
+  for(const offer of trade.filter(e=>e.kind===OFFER && e.pubkey===buyer && one(e,'i') && typeof tag(e,'i')==='string' && tag(e,'i').startsWith(challengeTaskPrefix(buyer,tag(c,'d'))) && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
     const seller=tag(offer,'p');
     const deadlines=offer.tags.filter(t=>t[0]==='param'&&t[1]==='deadline');
     const deadline=deadlines.length===1?number(deadlines[0][2]):null;

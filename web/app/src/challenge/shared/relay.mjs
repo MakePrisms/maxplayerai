@@ -94,7 +94,9 @@ export class RelayReader {
         if(this.pages.has(m[1])) {
           const auth=typeof m[2]==='string'&&m[2].startsWith('auth-required:');
           if(auth)this.authClosed.set(m[1],this.pages.get(m[1]).filter);
-          this.pages.delete(m[1]);this.status.error=auth?m[2]:'Relay history subscription refused';this.status.historyComplete=false;
+          this.pages.delete(m[1]);
+          if(!this.status.error||this.status.error.startsWith('auth-required:'))this.status.error=auth?m[2]:'Relay history subscription refused';
+          this.status.historyComplete=false;
         }
         this.onChange();
       }

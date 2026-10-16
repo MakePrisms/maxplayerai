@@ -123,3 +123,9 @@ test('seller result just after award cannot close the meter before buyer ACCEPT'
   const ac=event(3406,0,4140,[['e',claim.id],['e',offer.id,'','root'],['p',buyer],['p',seller],['status','accepted']]);
   assert.equal(project([...base,early,ac],4200).jobs[0].usedMinutes,2);
 });
+
+test('malformed task tag cannot crash challenge projection',()=>{
+  const bad={...offer,tags:offer.tags.map(t=>t[0]==='i'?['i']:t)};
+  bad.id=eventId(bad);bad.sig=Buffer.from(schnorr.sign(bad.id,keys[0])).toString('hex');
+  assert.equal(project([...base,bad]).jobs.length,1);
+});
