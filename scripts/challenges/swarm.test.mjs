@@ -349,3 +349,11 @@ test('mixed successful collections reduce budget by exactly paid sats, never pub
   assert.equal(f.inputs.at(-1).budgetHeadroomSats,5);
   assert.deepEqual(f.inputs.at(-1).sellers.map(s=>s.challengeSpend),[{paidSats:0,reservedSats:0},{paidSats:5,reservedSats:0}]);
 });
+
+test('runner uses public challenge defaults independently of the trade URL',()=>{
+  const env={MAXPLAYER_HOME:'/tmp/buyer',RELAY_URL:'ws://trade'};
+  assert.deepEqual(config([],env).challengeRelays,['wss://nos.lol','wss://relay.primal.net','wss://offchain.pub']);
+  const c=config([],{...env,SWARM_CHALLENGE_RELAYS:'ws://challenge-a, ws://challenge-b,ws://challenge-a'});
+  assert.equal(c.url,'ws://trade');assert.deepEqual(c.challengeRelays,['ws://challenge-a','ws://challenge-b']);
+  assert.throws(()=>config([],{...env,SWARM_CHALLENGE_RELAYS:'https://bad'}));
+});

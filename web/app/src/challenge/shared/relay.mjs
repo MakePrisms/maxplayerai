@@ -10,16 +10,18 @@ const matches = (e,f) => f.kinds.includes(e.kind) && (!f.authors || f.authors.in
 // Read-only transport. The only signed frame is NIP-42 AUTH, using an in-memory
 // throwaway key (one reader per tab). Never loads a wallet or publishes EVENT.
 export class RelayReader {
-  constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900}) {
-    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap});
-    this.key=schnorr.utils.randomPrivateKey();
+  constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,filters=challengeFilters(buyer),onMember=null,key=schnorr.utils.randomPrivateKey()}) {
+    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,onMember});
+    this.initialFilters=filters; this.members=new Set();
+    this.key=key;
     this.status={connected:false,authenticated:false,historyComplete:false,error:null};
     this.stopped=false; this.retry=1000;
   }
   start() {
     if(this.stopped)return;
     this.status={connected:false,authenticated:false,historyComplete:false,error:null};
-    this.filters=new Map(challengeFilters(this.buyer).map(f=>[String(f.kinds[0]),f]));
+    this.filters=new Map(this.initialFilters.map(f=>[String(f.kinds[0]),f]));
+    for(const pk of this.members)for(const kind of [PROFILE,HEARTBEAT])this.filters.set(`${kind}-${pk}`,{kinds:[kind],authors:[pk]});
     this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.live=new Map();
     const ws=this.ws=new this.WebSocketImpl(this.url);
     const send=frame=>{if(ws.readyState===1)ws.send(JSON.stringify(frame));};
@@ -43,6 +45,7 @@ export class RelayReader {
       clearTimeout(timeout);this.status.connected=true;this.retry=1000;
       // History must work even if AUTH is absent or explicitly refused.
       for(const [id,f] of this.filters)this.page(id,f);
+      subscribe();
       this.onChange();
     });
     ws.addEventListener('message',({data})=>{
@@ -61,12 +64,9 @@ export class RelayReader {
         const id=p?m[1]:m[1].slice(5);
         this.newest.set(id,Math.max(this.newest.get(id)??0,e.created_at));
         const added=this.store.add(e);
-        if(e.kind===MEMBERSHIP)for(const kind of [PROFILE,HEARTBEAT]) {
-          const profile=`${kind}-${e.pubkey}`;
-          if(!this.filters.has(profile)) {
-            const filter={kinds:[kind],authors:[e.pubkey]};this.filters.set(profile,filter);this.page(profile,filter);
-            if(this.status.authenticated){this.live.set(`live-${profile}`,filter);this.queue.push(['REQ',`live-${profile}`,filter]);}
-          }
+        if(e.kind===MEMBERSHIP) {
+          if(this.onMember)this.onMember(e.pubkey);
+          else this.addMember(e.pubkey);
         }
         if(added)this.onChange();
       } else if(m[0]==='EOSE'&&this.pages.has(m[1])) {
@@ -91,6 +91,48 @@ export class RelayReader {
       if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,30000);}
     });
   }
+  addMember(pk) {
+    this.members.add(pk);
+    if(!this.filters)return;
+    for(const kind of [PROFILE,HEARTBEAT]) {
+      const id=`${kind}-${pk}`,filter={kinds:[kind],authors:[pk]};
+      if(this.filters.has(id))continue;
+      this.filters.set(id,filter);this.page(id,filter);
+      this.live.set(`live-${id}`,filter);this.queue.push(['REQ',`live-${id}`,filter]);
+    }
+  }
   page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,events:[]});this.queue.push(['REQ',id,{...filter,limit:500}]);}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.ws?.close();}
+}
+
+export const DEFAULT_CHALLENGE_RELAYS = ['wss://nos.lol','wss://relay.primal.net','wss://offchain.pub'];
+export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
+  const urls=[...new Set((Array.isArray(value)?value:value.split(',')).map(url=>url.trim()).filter(Boolean))];
+  if(!urls.length)throw Error('At least one challenge relay is required');
+  for(const url of urls)if(!['ws:','wss:'].includes(new URL(url).protocol))throw Error('Invalid challenge relay URL');
+  return urls;
+}
+// Each transport validates signatures and scope; EventStore unions/deduplicates IDs
+// and resolves replaceable events across all sources, independent of arrival order.
+export class ChallengeReader {
+  constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...options}) {
+    const filters=challengeFilters(buyer);
+    const common={...options,buyer,store,onChange,key:schnorr.utils.randomPrivateKey()};
+    this.trade=new RelayReader({...common,url,filters:filters.filter(f=>![CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0]))});
+    this.challenges=parseChallengeRelays(challengeRelays).map(url=>new RelayReader({...common,url,
+      filters:filters.filter(f=>[CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0])),
+      onMember:pk=>this.trade.addMember(pk)}));
+  }
+  get status() {
+    const relays=[{role:'trade',url:this.trade.url,...this.trade.status},...this.challenges.map(r=>({role:'challenge',url:r.url,...r.status}))];
+    const available=this.challenges.filter(r=>r.status.connected&&!r.status.error);
+    const ready=available.length>0&&available.every(r=>r.status.historyComplete);
+    const failedRelays=relays.filter(r=>!r.connected||r.error).map(r=>r.url);
+    return {connected:this.trade.status.connected&&available.length>0,
+      authenticated:this.trade.status.authenticated,
+      historyComplete:this.trade.status.historyComplete&&ready,
+      error:this.trade.status.error??(available.length?null:'No challenge relay available'),failedRelays,relays};
+  }
+  start(){this.trade.start();for(const r of this.challenges)r.start();}
+  stop(){this.trade.stop();for(const r of this.challenges)r.stop();}
 }

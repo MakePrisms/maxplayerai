@@ -171,9 +171,14 @@ the buyer runner and local E2E. Install its dependencies with `npm ci --prefix w
 The community HTTP/SSE server and review page have been removed; use
 `maxplayer challenge members` and `maxplayer challenge decide` for membership review.
 
+- Challenge kinds 30341/30342/30343 are read from every configured public challenge relay.
+  Jobs 3401–3406 and member profiles/heartbeats stay on the trade relay. Signed events are
+  unioned and deduplicated by ID before latest-per-d projection. Each relay has independent
+  paging/reconnect state; unavailable relay URLs are reported without discarding healthy sources.
 - History starts anonymously, paged separately by kind with overlapping timestamp boundaries.
-- Live subscriptions are installed after NIP-42 AUTH succeeds, signed with a new in-memory
-  per-tab key, never the buyer key. No EVENT is sent by the reader.
+- Live subscriptions start anonymously for public relays and are reinstalled after NIP-42
+  AUTH succeeds on restricted relays. AUTH uses one new in-memory per-tab key across connections,
+  never the buyer key. No EVENT is sent by the reader.
 - Refused/absent AUTH or a closed live subscription leaves history available and polling active.
   Polling runs every 15 seconds from each filter's newest timestamp minus 900 seconds, also
   repairing late events while streaming. Disconnects reconnect with bounded backoff and reload history.
@@ -183,11 +188,14 @@ The community HTTP/SSE server and review page have been removed; use
   incomplete history, never silently certified complete.
 - Build the page with `CHALLENGE_BUYER_PUBKEY` (lowercase hex; default
   `94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5`).
+  `CHALLENGE_RELAYS` is a comma list, default `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub`.
   `RELAY_URL` feeds the existing app config (default `wss://relay.maxplayer.ai`). Custom
   hosted relay origins must also be allowed in `web/app/vercel.json` CSP.
 - The buyer runner takes `--relay-url` / `RELAY_URL` and derives the buyer public key
   from its configured CLI home. Its admission gate still requires authenticated,
-  complete relay history; anonymous fallback is for the read-only page.
+  complete trade-relay history and complete history from healthy challenge relays.
+  `SWARM_CHALLENGE_RELAYS` selects the same default public relay list; public relays need no AUTH.
+  Partial coverage is exposed as `relay.failedRelays` and per-source `relay.relays` status.
 
 ## CLI (`maxplayer challenge …`)
 

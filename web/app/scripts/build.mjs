@@ -28,6 +28,8 @@ const buyer = process.env.CHALLENGE_BUYER_PUBKEY ?? "94989f765a69e5c392d603140ed
 if (!/^[0-9a-f]{64}$/.test(buyer)) throw Error("CHALLENGE_BUYER_PUBKEY must be lowercase hex");
 const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
 if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
+const challengeRelays = [...new Set((process.env.CHALLENGE_RELAYS ?? "wss://nos.lol,wss://relay.primal.net,wss://offchain.pub").split(",").map(s=>s.trim()).filter(Boolean))];
+if (!challengeRelays.length || challengeRelays.some(url=>!["ws:","wss:"].includes(new URL(url).protocol))) throw Error("Invalid CHALLENGE_RELAYS");
 const watch = process.argv.includes("--watch");
 const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"];
 
@@ -41,6 +43,7 @@ const options = {
   // server flags and stays 404 in previews, so nothing is written to the relay.
   define: {
     CHALLENGE_BUYER_PUBKEY: JSON.stringify(buyer),
+    CHALLENGE_RELAYS: JSON.stringify(challengeRelays),
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
     WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
     TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),

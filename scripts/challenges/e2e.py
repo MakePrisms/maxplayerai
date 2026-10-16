@@ -157,13 +157,15 @@ try:
         start('duplicate-history', ['python3', ROOT / 'scripts/challenges/duplicate-history.py', frontport, relayport])
     start('buzz', [BUZZ], {**ENV, 'RELAY_URL': relay, 'DATABASE_URL': f'postgresql://{os.environ["USER"]}@127.0.0.1:{pgport}/postgres', 'REDIS_URL': f'redis://127.0.0.1:{redisport}', 'BUZZ_BIND_ADDR': f'127.0.0.1:{relayport}', 'BUZZ_HEALTH_PORT': '0', 'BUZZ_METRICS_PORT': '0', 'BUZZ_RELAY_PRIVATE_KEY': secrets.token_hex(32), 'BUZZ_AUTO_MIGRATE': 'true', 'BUZZ_OPEN_READ': 'true', 'BUZZ_RATE_LIMIT_HUMAN_WS_EVENTS_PER_SEC': '1000', 'BUZZ_RATE_LIMIT_HUMAN_MESSAGES_PER_MIN': '10000', 'BUZZ_GIT_CONFORMANCE_PROBE': 'false', 'BUZZ_S3_ENDPOINT': 'http://127.0.0.1:1', 'BUZZ_GIT_REPO_PATH': str(RUN / 'git'), 'BUZZ_GIT_PACK_CACHE_PATH': str(RUN / 'packs')})
     wait('local Buzz ready', lambda: urllib.request.urlopen(f'http://127.0.0.1:{relayport}/health', timeout=2).status == 200)
+    challenge_relays = os.environ.get('E2E_CHALLENGE_RELAYS', relay)
+    ENV['SWARM_CHALLENGE_RELAYS'] = challenge_relays
     buyer_env, BUYER = home('b', relay)
     seller_env, SELLER = home('s', relay, BUYER)
     denied_env, DENIED = home('d', relay, BUYER)
     check('three distinct disposable identities', len({BUYER, SELLER, DENIED}) == 3)
     if not ARGS.baseline:
         # Build a static page pinned to this disposable relay and buyer, never production.
-        command(['npm', 'run', 'build', '--prefix', ROOT / 'web/app'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_BUYER_PUBKEY': BUYER})
+        command(['npm', 'run', 'build', '--prefix', ROOT / 'web/app'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_BUYER_PUBKEY': BUYER, 'CHALLENGE_RELAYS': challenge_relays})
         siteport = port()
         start('site', ['python3', '-m', 'http.server', siteport, '--bind', '127.0.0.1', '--directory', ROOT / 'web/app/dist'])
         print(f'Browser fixture: http://127.0.0.1:{siteport}/challenges.html', flush=True)
@@ -175,7 +177,7 @@ try:
     time.sleep(2)
     if not ARGS.baseline:
         projection = RUN / 'relay-snapshot.json'
-        start('projection', ['node', ROOT / 'scripts/challenges/relay-snapshot.mjs', relay, BUYER, projection])
+        start('projection', ['node', ROOT / 'scripts/challenges/relay-snapshot.mjs', relay, BUYER, projection, challenge_relays])
         snapshot = lambda: json.loads(projection.read_text())
         now = int(time.time())
         starts = now + 45

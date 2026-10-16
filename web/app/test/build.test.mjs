@@ -344,6 +344,6 @@ test('challenge relay connection is allowed on the unlisted route', () => {
   const {headers}=JSON.parse(readFileSync(join(root,'vercel.json'),'utf8'));
   const csp=path=>headers.filter(h=>new RegExp(`^${h.source}$`).test(path)).flatMap(h=>h.headers.filter(x=>x.key==='Content-Security-Policy').map(x=>x.value));
   assert.equal(csp('/challenges').length,1);
-  assert.match(csp('/challenges')[0],/connect-src 'self' wss:\/\/relay\.maxplayer\.ai https:\/\/api\.coinbase\.com;/);
+  assert.match(csp('/challenges')[0],/connect-src 'self' wss:\/\/relay\.maxplayer\.ai wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub https:\/\/api\.coinbase\.com;/);
   for(const path of ['/','/market','/challenges.js'])assert.ok(!csp(path)[0].includes('community.maxplayer.ai'));
 });

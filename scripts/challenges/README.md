@@ -81,7 +81,7 @@ npm run build --prefix web/app
 The page reads history anonymously and authenticates live subscriptions with a random
 in-memory per-tab key. Refused AUTH falls back to 15-second overlapping polls. The buyer
 runner still fails closed without authenticated, complete history. No buyer key is loaded
-by the reader. Set `CHALLENGE_BUYER_PUBKEY` (hex) and `RELAY_URL` at build time for a local
+by the reader. Set `CHALLENGE_BUYER_PUBKEY` (hex), `CHALLENGE_RELAYS` (comma list), and `RELAY_URL` at build time for a local
 fixture; do not point a fixture browser at the production relay. No API server is required.
 
 ## Automatic swarm runner
@@ -102,7 +102,7 @@ eligibility/minutes, posts public seller-targeted work through buyer MCP, collec
 inline `answer.txt` results (settling priced work through the existing collect flow), and sends
 **all** results to every planner invocation. Failed/expired work is represented as a bracketed
 outcome in the result history. This v1 runner requests text/inline answers, not Git artifacts.
-The reader derives the buyer public key from this home; configure the **same trusted relay** as the home. Dedicate the buyer
+The reader derives the buyer public key from this home; configure the **same trade relay** as the home. Dedicate the buyer
 to this runner: unrelated private/unawarded jobs are not visible in the public projection.
 
 Flags (environment equivalents):
@@ -111,7 +111,8 @@ Flags (environment equivalents):
 | --- | --- | --- |
 | `--home` | `MAXPLAYER_HOME` | required, explicit |
 | `--binary` | `SWARM_MAXPLAYER_BINARY` | `maxplayer` |
-| `--relay-url` | `RELAY_URL` | required |
+| `--relay-url` | `RELAY_URL` | required trade relay |
+| — | `SWARM_CHALLENGE_RELAYS` | `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
 | — | `SWARM_MIN_DURATION` | 120 |
@@ -286,3 +287,18 @@ The repo's reusable CDK mint is an in-process Rust fixture in
 this E2E needs a loopback-only test-mint launcher/funding API, funded disposable buyer wallet,
 a priced seller accepting that mint, disabled external fee remittance, and receipt/spend
 assertions after both paid and free deliveries. No production relay or real funds are needed.
+
+### Separate challenge relays
+
+Challenge announcements/memberships/decisions are unioned across `SWARM_CHALLENGE_RELAYS`;
+job events and member heartbeats are read only from `RELAY_URL`. The page uses build-time
+`CHALLENGE_RELAYS` with the same three public defaults. Only the challenges page CSP adds
+these hosts; custom hosted relay lists also require a matching `vercel.json` CSP update.
+Failures are identified by URL in `relay.failedRelays`/`relay.relays`; a healthy public relay
+can keep the view available while another fails. Latest-per-d selection and ID deduplication
+are shared with the browser. The runner still requires authenticated trade history.
+
+Local E2E sets both lists to its disposable relay unless `E2E_CHALLENGE_RELAYS` overrides
+the challenge list (comma-separated). An override must point to disposable local relay(s)
+containing the fixture's challenge events; configuring reads does not reroute CLI publication.
+Separate-relay CLI publication is provided by the sidecar work, not this browser branch.

@@ -5,9 +5,10 @@ import { buyerHex } from "./challenge/model.js";
 import { writeClipboard } from "./ui/clipboard.js";
 import { usd, onSpotChange, startSpot } from "./ui/spot.js";
 import { EventStore } from "./challenge/shared/model.mjs";
-import { RelayReader } from "./challenge/shared/relay.mjs";
+import { ChallengeReader } from "./challenge/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
 declare const CHALLENGE_BUYER_PUBKEY: string;
+declare const CHALLENGE_RELAYS: string[];
 
 const el = (id: string) => document.getElementById(id)!;
 const text = (id: string, value: string) => { el(id).textContent = value; };
@@ -78,8 +79,8 @@ function unavailable(): void {
 
 function connect(): void {
   const store = new EventStore();
-  const reader = new RelayReader({url: RELAY_URL, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: () => {
-    try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: reader.status}, reader.status.authenticated ? "Live" : "Polling"); }
+  const reader = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: () => {
+    try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: reader.status}, reader.status.failedRelays.length ? `Partial relay coverage · unavailable: ${reader.status.failedRelays.join(", ")}` : reader.status.authenticated ? "Live" : "Polling"); }
     catch { unavailable(); }
   }});
   reader.start();
