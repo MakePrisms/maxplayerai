@@ -359,3 +359,28 @@ test('runner uses public challenge defaults independently of the trade URL',()=>
   assert.equal(c.url,'ws://trade');assert.deepEqual(c.challengeRelays,['ws://challenge-a','ws://challenge-b']);
   assert.throws(()=>config([],{...env,SWARM_CHALLENGE_RELAYS:'https://bad'}));
 });
+
+// Exercise the same pure projection as the page (transport signature checks are separate).
+async function projectedFixture({lateMember=false,backdated=false,ordinary=false}={}) {
+  const {snapshot}=await import('../../web/app/src/challenge/shared/model.mjs');
+  const buyer='b'.repeat(64),seller='a'.repeat(64),offer='1'.repeat(64),claim='2'.repeat(64);
+  const e=(kind,pubkey,created_at,tags,content='')=>({kind,pubkey,created_at,tags:[['t','maxplayer'],['v','1'],...tags],content,id:String(kind).padStart(64,'0')});
+  const events=[e(30341,buyer,1,[['d','day'],['title','Test'],['starts','100'],['ends','1000'],['budget','10','sat'],['status','in_progress']]),
+    e(30342,seller,lateMember?101:1,[['d',buyer],['p',buyer],['since','1'],['minutes','1'],['status','joined']]),
+    e(30343,buyer,2,[['d',seller],['p',seller],['decision','accepted']])];
+  if(backdated||ordinary)events.push({...e(3401,buyer,100,[['p',seller],['i',ordinary?'Normal job':`[challenge:${buyer}:day]\nTask`],['param','deadline','160'],['param','payment','none']]),id:offer},
+    {...e(3402,seller,100,[['e',offer,'','root'],['p',buyer],['status','processing']]),id:claim},
+    e(3405,buyer,100,[['e',offer,'','root'],['e',claim],['p',buyer],['p',seller],['status','accepted']]),
+    e(3403,seller,99,[['e',offer,'','root'],['p',buyer]],'Done'));
+  const f=fixture();Object.assign(f.snap,snapshot(events,buyer,200));f.time(200);
+  return f;
+}
+test('late membership with old since and prior acceptance cannot post',async()=>{
+  const f=await projectedFixture({lateMember:true});await f.runner.tick();assert.equal(f.remote.size,0);
+});
+test('backdated result consumes offered minutes and swarm posts no further job',async()=>{
+  const f=await projectedFixture({backdated:true});await f.runner.tick();assert.equal(f.remote.size,0);assert.equal(f.snap.sellers[0].minutesUsed,1);
+});
+test('ordinary buyer jobs do not consume challenge tally or minutes',async()=>{
+  const f=await projectedFixture({ordinary:true});assert.equal(f.snap.jobs.length,0);assert.equal(f.snap.sellers[0].minutesUsed,0);
+});

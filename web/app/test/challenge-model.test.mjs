@@ -22,7 +22,7 @@ test('wrong award author ignored',()=>assert.equal(project([...base.slice(0,-1),
 test('late membership retained but ineligible, exact start boundary accepted',()=>{assert.equal(project([c,app(4001),decision()]).sellers[0].eligible,false);assert.equal(project([c,app(4000),decision()]).sellers[0].eligible,true);});
 test('leave keeps awarded work but stops eligibility',()=>{const s=project([...base,app(400,'left')]);assert.equal(s.sellers[0].state,'left');assert.equal(s.sellers[0].eligible,false);assert.ok(s.sellers[0].minutesUsed>0);});
 test('decision flip uses latest signed buyer decision',()=>{const s=project([...base,decision(500,'denied'),decision(600,'accepted',2)]);assert.equal(s.sellers[0].state,'denied');assert.equal(s.sellers[0].eligible,false);});
-test('late result is capped at deadline, negative durations floor at zero',()=>{assert.equal(project([...base,result(1,9000)]).jobs[0].usedMinutes,3580/60);assert.equal(project([...base,result(1,4010)]).jobs[0].usedMinutes,0);});
+test('late result is capped at deadline, backdated results charge full deadline',()=>{assert.equal(project([...base,result(1,9000)]).jobs[0].usedMinutes,3580/60);assert.equal(project([...base,result(1,4010)]).jobs[0].usedMinutes,3580/60);});
 test('ties select lowest id regardless of ingestion order',()=>{const a=app(200,'joined','30'),b=app(200,'left');const expected=a.id<b.id?a:b;for(const list of [[a,b],[b,a]]){const s=project([c,...list]);assert.equal(s.sellers[0].minutesOffered,+expected.tags.find(t=>t[0]==='minutes')[1]);assert.equal(s.sellers[0].state,expected===b?'left':'joined');}});
 test('accept joins offer and claim, not result; fake buyer cannot mark paid',()=>{const accept=who=>event(3406,who,6100,[['e',claim.id],['e',offer.id,'','root'],['p',buyer],['p',seller],['status','accepted']]);assert.equal(project([...base,result(),accept(2)]).budget.paidSats,0);const b=project([...base,result(),accept(0)]).budget;assert.equal(b.committedSats,0);assert.equal(b.paidSats,50);assert.equal(b.estimated,true);});
 test('missing claim or mismatched offer cannot start work; duplicate awards count once',()=>{assert.equal(project(base.filter(e=>e!==claim)).jobs.length,0);assert.equal(project([...base,award(0,4030)]).jobs.length,1);});
@@ -76,7 +76,7 @@ test('membership and decision persist, daily minutes reset, late join waits for 
 });
 test('membership replacement preserves since independently of event timestamp and rejects challenge-scoped records',()=>{
   const changed=event(30342,1,9000,[['d',buyer],['p',buyer],['minutes','120'],['since','200'],['status','joined']]);
-  const s=project([...base,changed]);assert.equal(s.sellers[0].eligible,true);assert.equal(s.sellers[0].minutesOffered,120);
+  const s=project([...base,changed]);assert.equal(s.sellers[0].eligible,false);assert.equal(s.sellers[0].minutesOffered,120);
   for(const key of ['d','p','minutes','since','status']) {
     assert.equal(validMembership({...changed,tags:changed.tags.filter(t=>t[0]!==key)},c),false);
     assert.equal(validMembership({...changed,tags:[...changed.tags,changed.tags.find(t=>t[0]===key)]},c),false);

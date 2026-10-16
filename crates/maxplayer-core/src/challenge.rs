@@ -305,6 +305,7 @@ mod signed {
             .collect();
         latest
             .iter()
+            .filter(|e| e.created_at.as_secs() <= c.starts)
             .filter_map(|e| parse_membership(e, &c.buyer).ok())
             .filter(|a| a.status == "joined" && a.since <= c.starts && accepted.contains(&a.seller))
             .collect()
@@ -541,15 +542,15 @@ mod tests {
             for day in [&c, &day2] {
                 assert_eq!(eligible_sellers(day, [&joined, &accepted]), vec![a.clone()]);
             }
-            // Replacement time does not make an existing member late when changing minutes.
+            // A late replacement cannot borrow an earlier seller-chosen epoch.
             a.minutes = 120;
             let changed = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 9000);
             assert_eq!(
                 eligible_sellers(&c, [&joined, &changed, &accepted]),
-                vec![a.clone()]
+                vec![]
             );
             a.since = c.starts;
-            let boundary = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 10000);
+            let boundary = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, c.starts);
             assert_eq!(eligible_sellers(&c, [&boundary, &accepted]).len(), 1);
             a.since += 1;
             let late = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 10001);

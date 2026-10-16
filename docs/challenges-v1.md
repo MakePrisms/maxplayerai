@@ -248,3 +248,15 @@ key; none prints a secret.
 Paid settlement is not covered by the local challenge E2E (no test mint/funded wallet).
 Priced posting/accounting are unit-tested; the full E2E exercises free deliveries/receipts.
 See the runner README for the loopback test-mint/funding infrastructure needed to extend it.
+
+### Advisor r1: membership and minute safety
+
+Eligibility requires the latest membership event's `created_at` **and** `since`
+to be no later than the challenge start. A late replacement (including a minutes
+change or rejoin) waits for the next challenge; an old acceptance cannot override
+that boundary. Sidecar, page and runner use the same rule.
+
+A RESULT timestamp at or before its AWARD is untrusted for duration: charge the
+full deadline-minus-award interval, not zero. Other results are clamped no earlier
+than award and capped at deadline. The coordinator and swarm stop assigning when
+no task fits the remaining offered minutes.

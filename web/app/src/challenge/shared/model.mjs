@@ -29,7 +29,8 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     const award=awards[0]; if(!award) continue;
     const result=trade.filter(e=>e.kind===RESULT&&e.pubkey===seller&&root(e)===offer.id).sort(ascending)[0];
     const running=!result&&now<deadline;
-    const end=result?.created_at??(running?now:deadline);
+    // A seller timestamp at/before award is not evidence of zero work.
+    const end=result ? (result.created_at<=award.created_at?deadline:Math.max(award.created_at,result.created_at)) : (running?now:deadline);
     const usedSeconds=Math.max(0,Math.min(end-award.created_at,deadline-award.created_at));
     const accepted=trade.some(e=>e.kind===ACCEPT&&e.pubkey===buyer&&root(e)===offer.id&&claimRef(e)===claimRef(award)&&mentions(e,buyer)&&mentions(e,seller)&&tag(e,'status')==='accepted');
     // AWARD has no amount in protocol v1. The selected fixed-price offer is the public estimate.
@@ -43,7 +44,7 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     const own=jobs.filter(j=>j.seller===app.pubkey),running=own.filter(j=>j.running);
     const decision=decisions.find(e=>tag(e,'p')===app.pubkey);
     const decisionState=decision?tag(decision,'decision'):'joined';
-    const eligible=tag(app,'status')==='joined'&&+tag(app,'since')<=+tag(c,'starts')&&decisionState==='accepted';
+    const eligible=tag(app,'status')==='joined'&&app.created_at<=+tag(c,'starts')&&+tag(app,'since')<=+tag(c,'starts')&&decisionState==='accepted';
     const used=own.reduce((n,j)=>n+j.usedMinutes,0),offered=+tag(app,'minutes');
     const profile=latest(events.filter(e=>e.kind===PROFILE&&e.pubkey===app.pubkey),e=>e.pubkey)[0];
     let name=''; try { const p=JSON.parse(profile?.content??'{}'); name=typeof p.display_name==='string'?p.display_name:typeof p.name==='string'?p.name:''; } catch {}
