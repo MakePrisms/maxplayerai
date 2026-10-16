@@ -27,6 +27,9 @@ export class RelayReader {
       if([...this.pages.values()].some(p=>p.sentAt&&Date.now()-p.sentAt>20000)){this.status.error='Relay history timed out';ws.close();}},this.queueMs);
     const timeout=setTimeout(()=>ws.close(),20000);
     this.pollTimer=setInterval(()=>{
+      // Finish the entire round before polling again, including member profiles.
+      // Otherwise a large history can keep refilling faster than it drains.
+      if(this.pages.size)return;
       // Poll also repairs late/backdated writes even when streaming succeeds.
       for(const [id,f] of this.filters) if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)});
     },this.pollMs);

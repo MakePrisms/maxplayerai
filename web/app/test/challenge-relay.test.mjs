@@ -68,3 +68,13 @@ test('reconnect uses same per-tab key and starts full history again; stop cancel
   assert.equal(next.sent.find(m=>m[0]==='AUTH')[1].pubkey,pubkey);assert.equal(reader.pages.size,8);
   reader.stop();const count=Socket.all.length;await pause(20);assert.equal(Socket.all.length,count);
 });
+
+test('polling waits for the whole history round, including slower filters',async t=>{
+  const {reader,socket}=setup(t,{pollMs:20});
+  await until(()=>socket.sent.filter(m=>m[0]==='REQ').length===8);
+  socket.message(['EOSE','30341']);
+  await pause(80);
+  assert.equal(reader.pages.has('30341'),false);
+  assert.equal(socket.sent.filter(m=>m[0]==='REQ'&&m[1]==='30341').length,1);
+  assert.equal(reader.status.historyComplete,false);
+});
