@@ -99,7 +99,7 @@ For a challenge `C` with buyer `B`, seller `S`:
 Known limit: `created_at` is signer-chosen (relay drift ±900 s); a seller can shift its RESULT
 time. Acceptable for "about an hour"; the deadline cap bounds it.
 
-## Coordinator rules
+## The buyer’s rules
 
 - Post only while `now ∈ [C.starts, C.ends]` and `C.status = in_progress`.
 - Target only eligible sellers with no running job, and only a task with

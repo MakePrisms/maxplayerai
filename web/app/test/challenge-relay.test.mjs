@@ -14,30 +14,31 @@ class Socket extends EventTarget {
   close(){this.readyState=3;this.dispatchEvent(new Event('close'));}
 }
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
+async function until(predicate) {for(let i=0;i<400;i++){if(predicate())return;await pause(10);}assert.ok(predicate(),'timed out waiting for socket state');}
 function setup(t,options={}) {const store=new EventStore(),reader=new RelayReader({url:'ws://localhost:1234',buyer,store,WebSocketImpl:Socket,queueMs:1,pollMs:100000,...options});reader.start();const socket=Socket.all.at(-1);socket.dispatchEvent(new Event('open'));t.after(()=>reader.stop());return {reader,socket,store};}
 test('anonymous history starts before AUTH; filters scope every kind to the buyer',async t=>{
-  const {reader,socket}=setup(t);await pause(30);
+  const {reader,socket}=setup(t);await until(()=>socket.sent.filter(m=>m[0]==='REQ').length===8);
   assert.equal(socket.sent.filter(m=>m[0]==='REQ').length,8);
   assert.deepEqual(challengeFilters(buyer).filter(f=>f.authors).flatMap(f=>f.kinds),[30341,30343,3401,3405,3406]);
   assert.deepEqual(challengeFilters(buyer).filter(f=>f['#p']).flatMap(f=>f.kinds),[30342,3402,3403]);
   for(const [id] of [...reader.pages])socket.message(['EOSE',id]);
   assert.equal(reader.status.historyComplete,true);assert.equal(reader.status.authenticated,false);
 });
-test('AUTH uses an ephemeral key and reinstalls live subscriptions after OK',t=>{
+test('AUTH uses an ephemeral key and reinstalls live subscriptions after OK',async t=>{
   const {reader,socket}=setup(t);socket.message(['AUTH','nonce']);const auth=socket.sent.find(m=>m[0]==='AUTH')[1];
   assert.ok(verify(auth));assert.notEqual(auth.pubkey,buyer);assert.equal(auth.kind,22242);
   socket.message(['OK',auth.id,true,'']);assert.equal(reader.status.authenticated,true);
-  assert.equal(socket.sent.filter(m=>m[0]==='REQ'&&m[1].startsWith('live-')).length,8);
+  await until(()=>socket.sent.filter(m=>m[0]==='REQ'&&m[1].startsWith('live-')).length===8);assert.equal(socket.sent.filter(m=>m[0]==='REQ'&&m[1].startsWith('live-')).length,8);
   assert.ok(socket.sent.every(m=>['AUTH','REQ','CLOSE'].includes(m[0])));
   const other=setup(t);other.socket.message(['AUTH','nonce']);assert.notEqual(other.socket.sent.find(m=>m[0]==='AUTH')[1].pubkey,auth.pubkey);
 });
 test('AUTH refusal preserves history and polls since newest minus overlap',async t=>{
-  const {reader,socket,store}=setup(t,{pollMs:80,overlap:30});await pause(30);
+  const {reader,socket,store}=setup(t,{pollMs:80,overlap:30});await until(()=>socket.sent.filter(m=>m[0]==='REQ').length>=8);
   socket.message(['AUTH','nonce']);socket.message(['OK',reader.authId,false,'restricted']);
   socket.message(['EVENT','30341',signed(30341,100)]);
   for(const [id] of [...reader.pages])socket.message(['EOSE',id]);
   assert.equal(store.events.size,1);assert.equal(reader.status.historyComplete,true);assert.equal(reader.status.authenticated,false);
-  await pause(90);const poll=socket.sent.filter(m=>m[0]==='REQ'&&m[1]==='30341').at(-1);assert.equal(poll[2].since,70);
+  await until(()=>socket.sent.some(m=>m[0]==='REQ'&&m[1]==='30341'&&m[2].since===70));const poll=socket.sent.filter(m=>m[0]==='REQ'&&m[1]==='30341').at(-1);assert.equal(poll[2].since,70);
 });
 test('rejects invalid signatures, wrong authors, wrong p scope and unsolicited frames',t=>{
   const {socket,store}=setup(t);
@@ -52,6 +53,7 @@ test('pagination overlaps timestamp boundary and flags saturated second',t=>{
   const {reader,socket}=setup(t);const e=signed(30341);
   for(let n=0;n<500;n++)socket.message(['EVENT','30341',e]);
   socket.message(['EOSE','30341']);assert.equal(reader.pages.get('30341').filter.until,100);
+  assert.equal(socket.sent.some(m=>m[0]==='CLOSE'&&m[1]==='30341'),false,'replacement REQ must not receive an old CLOSE acknowledgement');
   for(let n=0;n<500;n++)socket.message(['EVENT','30341',e]);
   socket.message(['EOSE','30341']);assert.match(reader.status.error,/History truncated/);assert.equal(reader.status.historyComplete,false);
 });
@@ -62,7 +64,7 @@ test('post-EOSE events update the store; CLOSED live feed falls back to polling'
 });
 test('reconnect uses same per-tab key and starts full history again; stop cancels retries',async t=>{
   const {reader,socket}=setup(t);socket.message(['AUTH','one']);const pubkey=socket.sent.find(m=>m[0]==='AUTH')[1].pubkey;
-  reader.retry=1;socket.close();await pause(20);const next=Socket.all.at(-1);assert.notEqual(next,socket);next.dispatchEvent(new Event('open'));next.message(['AUTH','two']);
+  reader.retry=1;socket.close();await until(()=>Socket.all.at(-1)!==socket);const next=Socket.all.at(-1);assert.notEqual(next,socket);next.dispatchEvent(new Event('open'));next.message(['AUTH','two']);
   assert.equal(next.sent.find(m=>m[0]==='AUTH')[1].pubkey,pubkey);assert.equal(reader.pages.size,8);
   reader.stop();const count=Socket.all.length;await pause(20);assert.equal(Socket.all.length,count);
 });

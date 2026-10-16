@@ -199,7 +199,7 @@ try:
         if int(time.time()) < starts:
             check('the buyer blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
         wait('challenge work window open', lambda: int(time.time()) >= starts)
-        s = snapshot()
+        s = wait('fresh complete relay snapshot before assignment', lambda: (s if s['relay']['historyComplete'] and s['relay']['authenticated'] and int(time.time()) - s['asOf'] <= 2 else None) if (s := snapshot()) else None)
         p = plan(s)
         check('the buyer permits only accepted idle seller', p['postingAllowed'] and [x['seller_pubkey'] for x in p['sellers']] == [SELLER] and p['budgetHeadroomSats'] == 0)
         deadline = p['sellers'][0]['deadlineUnix']

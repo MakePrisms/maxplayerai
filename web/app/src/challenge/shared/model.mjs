@@ -15,7 +15,9 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
   if(!c) return empty;
   const apps=latest(events.filter(e=>validMembership(e,c)),e=>e.pubkey);
   const decisions=latest(events.filter(e=>validDecision(e,c)),e=>tag(e,'p'));
-  const trade=events.filter(tradeNamespace);
+  const trade=events.filter(e=>tradeNamespace(e) &&
+    ([OFFER,AWARD,ACCEPT].includes(e.kind) ? e.pubkey===buyer :
+      [CLAIM,RESULT].includes(e.kind) ? mentions(e,buyer) : true));
   const jobs=[];
   for(const offer of trade.filter(e=>e.kind===OFFER && e.pubkey===buyer && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
     const seller=tag(offer,'p');

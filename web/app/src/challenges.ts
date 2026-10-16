@@ -83,7 +83,7 @@ function connect(): void {
     catch { unavailable(); }
   }});
   reader.start();
-  addEventListener("pagehide", () => reader.stop(), {once: true});
+  addEventListener("pagehide", (event) => { if (!event.persisted) reader.stop(); });
 }
 
 if (new URLSearchParams(location.search).has("demo")) receive(demoSnapshot(Date.now() / 1000), "Demo data · not a real challenge");

@@ -251,6 +251,7 @@ async function main() {
   const identity=await command(c.binary,['whoami'],{env});
   const buyer=identity.match(/pubkey: ([0-9a-f]{64})/)?.[1];
   if(!buyer)throw Error('Cannot identify configured buyer');
+  const journal=new Journal(join(c.home,'swarm/events.jsonl'));
   const source=openSnapshot({url:c.url,buyer});
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>source.snapshot(),
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
@@ -261,8 +262,10 @@ async function main() {
       const args=['challenge','publish','--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
       if(result)args.push('--result',result);await command(c.binary,args,{env});
     }};
-  const runner=new Swarm(c,io,new Journal(join(c.home,'swarm/events.jsonl')));
+  const runner=new Swarm(c,io,journal);
   let quitting=false;for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{quitting=true;source.stop();});
-  while(!quitting){try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}
+  try {
+    while(!quitting){try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}
+  } finally {source.stop();}
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{console.error(e.message);process.exitCode=1;});

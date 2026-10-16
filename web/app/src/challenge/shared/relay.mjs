@@ -33,7 +33,7 @@ export class RelayReader {
     const subscribe=()=>{
       for(const [id,f] of this.filters) {
         const sub=`live-${id}`; this.live.set(sub,f);
-        send(['CLOSE',sub]); send(['REQ',sub,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)}]);
+        this.queue.push(['REQ',sub,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)}]);
       }
     };
     ws.addEventListener('open',()=>{
@@ -62,17 +62,18 @@ export class RelayReader {
           const profile=`${kind}-${e.pubkey}`;
           if(!this.filters.has(profile)) {
             const filter={kinds:[kind],authors:[e.pubkey]};this.filters.set(profile,filter);this.page(profile,filter);
-            if(this.status.authenticated){this.live.set(`live-${profile}`,filter);send(['REQ',`live-${profile}`,filter]);}
+            if(this.status.authenticated){this.live.set(`live-${profile}`,filter);this.queue.push(['REQ',`live-${profile}`,filter]);}
           }
         }
         if(added)this.onChange();
       } else if(m[0]==='EOSE'&&this.pages.has(m[1])) {
-        const p=this.pages.get(m[1]);this.pages.delete(m[1]);send(['CLOSE',m[1]]);
+        const p=this.pages.get(m[1]);this.pages.delete(m[1]);
         if(p.events.length>=500) {
           const oldest=Math.min(...p.events.map(e=>e.created_at));
           if(p.filter.until===oldest)this.status.error='History truncated: 500+ events in one second';
           else this.page(m[1],{...p.filter,until:oldest});
         }
+        if(!this.pages.has(m[1]))send(['CLOSE',m[1]]);
         this.status.historyComplete=this.pages.size===0&&!this.status.error;this.onChange();
       } else if(m[0]==='CLOSED') {
         if(this.live.has(m[1])) {this.live.delete(m[1]);this.status.authenticated=false;}

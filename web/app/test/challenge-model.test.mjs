@@ -29,7 +29,7 @@ test('missing claim or mismatched offer cannot start work; duplicate awards coun
 test('local verification rejects tampered id signature content timestamp and tags',()=>{assert.ok(verify(c));for(const mutation of [{id:'0'.repeat(64)},{sig:'0'.repeat(128)},{content:'changed'},{created_at:1.1},{tags:[['d',3]]}])assert.equal(new EventStore().add({...c,...mutation}),false);});
 test('validation rejects malformed required tags, unknown values and numbers',()=>{assert.ok(validChallenge(c,buyer));assert.equal(validChallenge(c,stranger),false);for(const key of ['d','title','starts','ends','budget','status'])assert.equal(validChallenge({...c,tags:c.tags.filter(t=>t[0]!==key)},buyer),false);for(const v of ['0','481','-1','1.5','NaN','9007199254740992'])assert.equal(validMembership(app(200,'joined',v),c),false);assert.equal(validMembership(app(200,'other'),c),false);assert.equal(validDecision(decision(300,'other'),c),false);assert.equal(validDecision(decision(300,'accepted',2),c),false);});
 test('out-of-order ingestion is recomputed after challenge arrives',()=>assert.equal(project([...base].reverse()).sellers.length,1));
-test('NIP42 auth is signed with app key and has no EVENT payload',()=>{const e=signAuth(keys[2],'wss://relay.maxplayer.ai','nonce');assert.ok(verify(e));assert.equal(e.kind,22242);assert.equal(e.pubkey,stranger);});
+test('NIP42 auth is signed with an ephemeral reader key and has no EVENT payload',()=>{const e=signAuth(keys[2],'wss://relay.maxplayer.ai','nonce');assert.ok(verify(e));assert.equal(e.kind,22242);assert.equal(e.pubkey,stranger);});
 test('missing/malformed deadline and ambiguous root references never tally',()=>{
   const bad={...offer,tags:offer.tags.filter(t=>t[0]!=='param')};bad.id=eventId(bad);bad.sig=Buffer.from(schnorr.sign(bad.id,keys[0])).toString('hex');assert.equal(project([c,app(),decision(),bad,claim,award()]).jobs.length,0);
   const a=award();a.tags=[...a.tags,['e','f'.repeat(64),'','root']];a.id=eventId(a);a.sig=Buffer.from(schnorr.sign(a.id,keys[0])).toString('hex');assert.equal(project([...base.slice(0,-1),a]).jobs.length,0);
@@ -104,4 +104,15 @@ test('seller heartbeat pricing survives projection for the buyer planner',()=>{
   const profile=project([c,app(),decision(),beat]).sellers[0];
   assert.ok(profile.capabilities.some(t=>t[0]==='rate'&&t[1]==='5'));
   assert.ok(profile.capabilities.some(t=>t[0]==='takes_payment'&&t[1]==='none'));
+});
+
+test('the pure projection also rejects results outside the buyer p scope',()=>{
+  const r=result();r.tags=r.tags.filter(t=>t[0]!=='p');
+  r.id=eventId(r);r.sig=Buffer.from(schnorr.sign(r.id,keys[1])).toString('hex');
+  assert.equal(project([...base,r]).jobs[0].running,true);
+});
+test('latest signed challenge replacement supplies goal, updates and result',()=>{
+  const updated=event(30341,0,101,[...c.tags.filter(t=>!['t','v'].includes(t[0])),['update','Progress'],['result','Answer']], 'New goal');
+  const s=project([...base,updated]);assert.equal(s.challenge.goal,'New goal');
+  assert.deepEqual(s.updates,['Progress']);assert.equal(s.challenge.result,'Answer');
 });
