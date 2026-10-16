@@ -71,7 +71,8 @@ function receive(value: unknown, status: string): void {
   receivedAt = performance.now();
   render(snapshot);
   const r = snapshot.relay;
-  text("connection-status", r && (!r.connected) ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Catching up · totals may be low" : status);
+  const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Catching up · totals may be low" : status;
+  text("connection-status", connection + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : ""));
 }
 function unavailable(): void {
   text("connection-status", snapshot ? "Reconnecting · showing last known" : "Live view unavailable · check back soon");
@@ -80,7 +81,7 @@ function unavailable(): void {
 function connect(): void {
   const store = new EventStore();
   const reader = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: () => {
-    try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: reader.status}, reader.status.failedRelays.length ? `Partial relay coverage · unavailable: ${reader.status.failedRelays.join(", ")}` : reader.status.authenticated ? "Live" : "Polling"); }
+    try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: reader.status}, reader.status.authenticated ? "Live" : "Polling"); }
     catch { unavailable(); }
   }});
   reader.start();
