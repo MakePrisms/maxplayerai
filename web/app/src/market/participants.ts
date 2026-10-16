@@ -455,7 +455,10 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
   }
 
   for (const job of inProgressJobs(activeEvents, now)) {
-    const row = get(job.seller);
+    // Historical overdue work enriches an existing row, but is not evidence
+    // of activity in this window. Only current work may add a missing seller.
+    const row = rows.get(job.seller) ?? (job.state === JOB_WORKING ? get(job.seller) : null);
+    if (!row) continue;
     row.inProgressJobs.push(job);
     if (job.state === JOB_WORKING) row.workingJobs.push(job);
   }
