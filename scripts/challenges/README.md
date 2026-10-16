@@ -8,7 +8,10 @@ bash scripts/challenges/run-e2e.sh
 ```
 
 The harness builds **this integration checkout** with wallet+ACP and Buzz in dedicated
-`target/challenges-e2e` and `target/challenges-buzz` directories, installs the web app's locked Node dependencies, and runs the assertions. On this Nix host it discovers
+`target/challenges-e2e` and `target/challenges-buzz` directories, installs the web app's locked
+Node dependencies, and builds the separate `crates/maxplayer-challenges` workspace (binary and
+generic local relay fixture) into its own target. Challenge metadata goes only to that generic
+relay; jobs stay on Buzz. On this Nix host it discovers
 installed Postgres/Redis in `/nix/store` if absent from PATH. Else supply them on PATH;
 `nix shell --extra-experimental-features 'nix-command flakes' nixpkgs#postgresql_17 nixpkgs#redis`
 provides those dependencies. Use the repository devshell if the native build needs OpenSSL.
@@ -86,7 +89,7 @@ fixture; do not point a fixture browser at the production relay. No API server i
 
 ## Automatic swarm runner
 
-Hand-whitelist sellers once with `maxplayer challenge decide --seller HEX --accept`, then
+Hand-whitelist sellers once with `maxplayer-challenges decide --seller HEX --accept`, then
 publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
 the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:
 
@@ -94,6 +97,8 @@ the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer 
 MAXPLAYER_HOME=/absolute/buyer-home \
 SWARM_MAXPLAYER_BINARY=/absolute/bin/maxplayer \
 RELAY_URL=ws://127.0.0.1:8080 \
+SWARM_CHALLENGES_BINARY=/absolute/bin/maxplayer-challenges \
+SWARM_CHALLENGE_RELAYS=wss://nos.lol,wss://relay.primal.net,wss://offchain.pub \
 node scripts/challenges/swarm.mjs
 ```
 
@@ -112,7 +117,8 @@ Flags (environment equivalents):
 | `--home` | `MAXPLAYER_HOME` | required, explicit |
 | `--binary` | `SWARM_MAXPLAYER_BINARY` | `maxplayer` |
 | `--relay-url` | `RELAY_URL` | required trade relay |
-| — | `SWARM_CHALLENGE_RELAYS` | `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
+| — | `SWARM_CHALLENGES_BINARY` | `maxplayer-challenges` |
+| — | `SWARM_CHALLENGE_RELAYS` | comma list: `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
 | — | `SWARM_MIN_DURATION` | 120 |
@@ -290,15 +296,16 @@ assertions after both paid and free deliveries. No production relay or real fund
 
 ### Separate challenge relays
 
-Challenge announcements/memberships/decisions are unioned across `SWARM_CHALLENGE_RELAYS`;
-job events and member heartbeats are read only from `RELAY_URL`. The page uses build-time
-`CHALLENGE_RELAYS` with the same three public defaults. Only the challenges page CSP adds
-these hosts; custom hosted relay lists also require a matching `vercel.json` CSP update.
-Failures are identified by URL in `relay.failedRelays`/`relay.relays`; a healthy public relay
-can keep the view available while another fails. Latest-per-d selection and ID deduplication
-are shared with the browser. The runner still requires authenticated trade history.
+Challenge announcements/memberships/decisions are published with `maxplayer-challenges` and
+unioned across `SWARM_CHALLENGE_RELAYS`; job events and member heartbeats are read only from
+`RELAY_URL`, and job MCP stays on `maxplayer`. The page uses build-time `CHALLENGE_RELAYS`
+with the same three public defaults. Only the challenges page CSP adds these hosts; custom
+hosted relay lists also require a matching `vercel.json` CSP update. Failures are identified
+by URL in `relay.failedRelays`/`relay.relays`; a healthy public relay can keep the view
+available while another fails. Latest-per-d selection and ID deduplication are shared with
+the browser. The runner still requires authenticated trade history.
 
-Local E2E sets both lists to its disposable relay unless `E2E_CHALLENGE_RELAYS` overrides
-the challenge list (comma-separated). An override must point to disposable local relay(s)
-containing the fixture's challenge events; configuring reads does not reroute CLI publication.
-Separate-relay CLI publication is provided by the sidecar work, not this browser branch.
+Build the [challenge sidecar](../../crates/maxplayer-challenges/README.md) from source before
+running the swarm. Local E2E runs a separate generic local relay for challenge events and
+Buzz for jobs; `E2E_CHALLENGE_RELAYS` overrides the challenge read list (disposable local
+relays only). The sidecar never uses the configured job relay for challenges.

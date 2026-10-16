@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const HELP: &str = "Usage: maxplayer challenge <command> [--home <path>] [--json]
+const HELP: &str = "Usage: maxplayer-challenges <command> [--home <path>] [--json] [--relay URL ...]
   join --buyer <npub|hex> --minutes <1..480> [--note <text>]
   status --buyer <npub|hex> [--challenge <d>]
   leave --buyer <npub|hex>
@@ -12,12 +12,16 @@ const HELP: &str = "Usage: maxplayer challenge <command> [--home <path>] [--json
 Join or leave at any time. Joining after work starts means eligibility from the next day.
 Membership and acceptance persist across days. Minutes are offered per day.
 Status/members default to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
+Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://relay.primal.net, wss://offchain.pub.
+Repeat --relay URL after the command to override. ws:// is loopback-only; relay.maxplayer.ai is forbidden.
+Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 ";
 #[derive(Debug)]
 struct Opts {
     command: String,
     values: BTreeMap<String, String>,
     json: bool,
+    relays: Vec<String>,
 }
 impl Opts {
     fn get(&self, k: &str) -> Option<&str> {
@@ -52,11 +56,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         command: command.into(),
         values: BTreeMap::new(),
         json: false,
+        relays: Vec::new(),
     };
     let mut i = 1;
     while i < args.len() {
         let k = args[i].as_str();
-        if !allowed.contains(&k) && !["--home", "--json"].contains(&k) {
+        if !allowed.contains(&k) && !["--home", "--json", "--relay"].contains(&k) {
             return Err("unknown challenge option".into());
         }
         let v = if ["--accept", "--deny", "--json"].contains(&k) {
@@ -68,6 +73,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 .ok_or_else(|| format!("{k} requires a value"))?
                 .clone()
         };
+        if k == "--relay" {
+            o.relays.push(v);
+            i += 1;
+            continue;
+        }
         if o.values.insert(k.into(), v).is_some() {
             return Err(format!("duplicate {k}"));
         }
@@ -111,7 +121,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(o)
 }
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    if crate::cli::is_help_request(args) {
+    if is_help_request(args) {
         let _ = write!(out, "{HELP}");
         return 0;
     }
@@ -122,7 +132,6 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return 1;
         }
     };
-    #[cfg(feature = "wallet")]
     {
         match execute(&opts) {
             Ok((body, warning)) => {
@@ -142,14 +151,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             }
         }
     }
-    #[cfg(not(feature = "wallet"))]
-    {
-        let _ = opts;
-        let _ = writeln!(err, "challenge requires the wallet feature");
-        1
-    }
 }
-#[cfg(feature = "wallet")]
 fn human(body: &serde_json::Value) -> String {
     if let Some(id) = body.get("event_id").and_then(|v| v.as_str()) {
         return format!("Published challenge event {id}");
@@ -157,7 +159,7 @@ fn human(body: &serde_json::Value) -> String {
     let mut lines = Vec::new();
     if let Some(c) = body.get("challenge").filter(|c| !c.is_null()) {
         lines.push(format!(
-            "Challenge {}: {} ({})\nBuyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",
+            "Challenge {}: {} ({})\nThe buyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",
             c["id"].as_str().unwrap_or(""),
             c["title"].as_str().unwrap_or(""),
             c["status"].as_str().unwrap_or(""),
@@ -186,7 +188,6 @@ fn human(body: &serde_json::Value) -> String {
     }
     lines.join("\n")
 }
-#[cfg(feature = "wallet")]
 fn public_key(s: &str) -> Result<nostr_sdk::PublicKey, String> {
     use nostr_sdk::prelude::*;
     // Explicitly restrict to the two documented encodings (not nsec, NIP-05, or URLs).
@@ -197,12 +198,10 @@ fn public_key(s: &str) -> Result<nostr_sdk::PublicKey, String> {
     }
     .map_err(|_| "invalid public key: expected npub or hex".into())
 }
-#[cfg(feature = "wallet")]
 fn timestamp(s: &str) -> Result<u64, String> {
     let dt = chrono::DateTime::parse_from_rfc3339(s).map_err(|_| "invalid RFC3339 timestamp")?;
     u64::try_from(dt.timestamp()).map_err(|_| "timestamp must be after unix epoch".into())
 }
-#[cfg(feature = "wallet")]
 fn execute(o: &Opts) -> Result<(serde_json::Value, Option<String>), String> {
     use maxplayer_core::home;
     let root = o
@@ -226,7 +225,6 @@ fn execute(o: &Opts) -> Result<(serde_json::Value, Option<String>), String> {
     }
     Ok(result)
 }
-#[cfg(feature = "wallet")]
 fn select_challenge(
     events: &[nostr_sdk::Event],
     buyer: &str,
@@ -246,16 +244,15 @@ fn select_challenge(
         .map(|(_, c)| c)
         .ok_or_else(|| "challenge not found or not verified for this buyer".into())
 }
-#[cfg(feature = "wallet")]
 async fn execute_async(
     o: &Opts,
     home: &maxplayer_core::home::MaxplayerHome,
 ) -> Result<(serde_json::Value, Option<String>), String> {
-    use maxplayer_core::challenge::relay;
-    use maxplayer_core::{challenge::*, home as homes};
+    let relay = crate::relay::Relays::new(&o.relays)?;
+    use maxplayer_core::challenge::*;
     use nostr_sdk::prelude::*;
     use serde_json::json;
-    let own = homes::public_key_hex(home).map_err(|_| "could not derive public key")?;
+    let own = crate::relay::keys(home)?.public_key().to_hex();
     let buyer = o
         .get("--buyer")
         .map(public_key)
@@ -282,31 +279,34 @@ async fn execute_async(
             result: o.get("--result").map(str::to_owned),
         };
         let draft = c.to_event_draft().map_err(|e| e.to_string())?;
-        let previous = relay::fetch(
-            home,
-            Filter::new()
-                .author(public_key(&c.buyer)?)
-                .kind(Kind::from(CHALLENGE_KIND))
-                .identifier(&c.id),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let previous = relay
+            .fetch(
+                home,
+                Filter::new()
+                    .author(public_key(&c.buyer)?)
+                    .kind(Kind::from(CHALLENGE_KIND))
+                    .identifier(&c.id),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         let created = replacement_timestamp(now, &previous, &own, CHALLENGE_KIND, &c.id)?;
-        let id = relay::publish(home, draft, created)
+        let id = relay
+            .publish(home, draft, created)
             .await
             .map_err(|e| e.to_string())?;
         return Ok((json!({"ok":true,"event_id":id,"challenge":c}), None));
     }
     // Membership operations do not depend on any daily challenge existing.
     let c = if matches!(o.command.as_str(), "status" | "members") {
-        let challenges = relay::fetch(
-            home,
-            Filter::new()
-                .author(public_key(&buyer)?)
-                .kind(Kind::from(CHALLENGE_KIND)),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+        let challenges = relay
+            .fetch(
+                home,
+                Filter::new()
+                    .author(public_key(&buyer)?)
+                    .kind(Kind::from(CHALLENGE_KIND)),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         if challenges.is_empty() && o.get("--challenge").is_none() {
             None
         } else {
@@ -315,23 +315,25 @@ async fn execute_async(
     } else {
         None
     };
-    let mut events = relay::fetch(
-        home,
-        Filter::new()
-            .kind(Kind::from(CHALLENGE_MEMBERSHIP_KIND))
-            .pubkey(public_key(&buyer)?),
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    events.extend(
-        relay::fetch(
+    let mut events = relay
+        .fetch(
             home,
             Filter::new()
-                .kind(Kind::from(CHALLENGE_DECISION_KIND))
-                .author(public_key(&buyer)?),
+                .kind(Kind::from(CHALLENGE_MEMBERSHIP_KIND))
+                .pubkey(public_key(&buyer)?),
         )
         .await
-        .map_err(|e| e.to_string())?,
+        .map_err(|e| e.to_string())?;
+    events.extend(
+        relay
+            .fetch(
+                home,
+                Filter::new()
+                    .kind(Kind::from(CHALLENGE_DECISION_KIND))
+                    .author(public_key(&buyer)?),
+            )
+            .await
+            .map_err(|e| e.to_string())?,
     );
     let latest = latest_per_coordinate(
         events
@@ -402,13 +404,13 @@ async fn execute_async(
             return Ok((json!({"challenge": c, "members": rows}), None));
         }
     }.map_err(|e| e.to_string())?;
-    let id = relay::publish(home, draft, created)
+    let id = relay
+        .publish(home, draft, created)
         .await
         .map_err(|e| e.to_string())?;
     Ok((json!({"ok":true,"event_id":id,"challenge":c}), warning))
 }
 
-#[cfg(feature = "wallet")]
 fn replacement_timestamp(
     now: u64,
     events: &[nostr_sdk::Event],
@@ -431,6 +433,13 @@ fn replacement_timestamp(
         return Err("existing event timestamp is too far in the future".into());
     }
     Ok(created)
+}
+
+fn is_help_request(args: &[String]) -> bool {
+    match args.split_last() {
+        Some((last, rest)) if last == "--help" => rest.iter().all(|s| !s.starts_with('-')),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -485,9 +494,11 @@ mod tests {
                 0
             );
             assert!(err.is_empty());
-            assert!(String::from_utf8(out)
-                .unwrap()
-                .contains("maxplayer challenge"));
+            assert!(
+                String::from_utf8(out)
+                    .unwrap()
+                    .contains("maxplayer-challenges")
+            );
         }
     }
     #[test]
@@ -495,10 +506,10 @@ mod tests {
         let skill = include_str!("../../../web/app/.well-known/skills/challenge-join/skill.md");
         for line in skill
             .lines()
-            .filter(|line| line.trim().starts_with("maxplayer challenge "))
+            .filter(|line| line.trim().starts_with("maxplayer-challenges "))
         {
             let tokens: Vec<_> = line.split_whitespace().collect();
-            assert!(["status", "join", "leave"].contains(&tokens[2]));
+            assert!(["status", "join", "leave"].contains(&tokens[1]));
             for flag in tokens.iter().filter(|word| word.starts_with("--")) {
                 assert!(HELP.contains(*flag), "undocumented skill flag {flag}");
             }
@@ -507,13 +518,14 @@ mod tests {
             "../../../web/app/.well-known/skills/index.json"
         ))
         .unwrap();
-        assert!(index["skills"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["path"] == "/.well-known/skills/challenge-join/skill.md"));
+        assert!(
+            index["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["path"] == "/.well-known/skills/challenge-join/skill.md")
+        );
     }
-    #[cfg(feature = "wallet")]
     mod wallet {
         use super::*;
         use maxplayer_core::{challenge::*, home};
@@ -649,8 +661,13 @@ mod tests {
             for h in [&mut buyer, &mut seller] {
                 home::save_config(h, |c| c.relay_url = relay_url.clone()).unwrap();
             }
-            let buyer_key = home::public_key_hex(&buyer).unwrap();
-            let seller_key = home::public_key_hex(&seller).unwrap();
+            let buyer_key = crate::relay::keys(&buyer).unwrap().public_key().to_hex();
+            let seller_key = crate::relay::keys(&seller).unwrap().public_key().to_hex();
+            let parse = |a: &[String]| {
+                let mut o = super::parse(a)?;
+                o.relays = vec![relay_url.clone()];
+                Ok::<_, String>(o)
+            };
             let now = Timestamp::now().as_secs();
             let goal = root.join("goal.md");
             std::fs::write(&goal, "Build a thing").unwrap();

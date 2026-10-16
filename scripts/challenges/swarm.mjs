@@ -248,6 +248,9 @@ async function main() {
     for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.kill(sig));
     child.on('error',e=>{console.error(e.message);process.exitCode=1;});child.on('exit',code=>{process.exitCode=code??1;});return;
   }
+  const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
+  const challengeRelays=(process.env.SWARM_CHALLENGE_RELAYS??'wss://nos.lol,wss://relay.primal.net,wss://offchain.pub').split(',').map(s=>s.trim()).filter(Boolean);
+  if(!challengeRelays.length)throw Error('SWARM_CHALLENGE_RELAYS must not be empty');
   const env=childEnv(process.env,c.home);
   const identity=await command(c.binary,['whoami'],{env});
   const buyer=identity.match(/pubkey: ([0-9a-f]{64})/)?.[1];
@@ -264,8 +267,8 @@ async function main() {
     answer:async collected=>readFileSync(join(collected.path,'answer.txt'),'utf8'),
     publish:async(challenge,budget,status,update,result)=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
-      const args=['challenge','publish','--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
-      if(result)args.push('--result',result);await command(c.binary,args,{env});
+      const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),'--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
+      if(result)args.push('--result',result);await command(challengesBinary,args,{env});
     }};
   const runner=new Swarm(c,io,journal);
   let quitting=false;for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{quitting=true;source.stop();});

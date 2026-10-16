@@ -264,6 +264,23 @@ jobs:
             exit 1
           fi
 
+  maxplayer-challenges:
+    name: maxplayer-challenges sidecar
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/maxplayer-challenges -> target
+      - run: cargo fmt --manifest-path crates/maxplayer-challenges/Cargo.toml --check
+      - run: cargo clippy --manifest-path crates/maxplayer-challenges/Cargo.toml --locked --all-targets --no-deps -- -D warnings
+      - run: cargo test --manifest-path crates/maxplayer-challenges/Cargo.toml --locked
+
   # The standalone Cashu trade CLI. It is its OWN cargo workspace (`[workspace]` in its manifest)
   # with its own Cargo.lock, so no root-workspace job above builds or tests it: before this job a
   # green CI said nothing about crates/maxplayer-trade. Its integration dev-dependencies start
