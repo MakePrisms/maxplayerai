@@ -28,10 +28,10 @@ subcommand. The buyer auto-award and job protocol are unchanged.
 Kinds 30341–30343 use public relays, by default `wss://nos.lol`,
 `wss://relay.primal.net`, and `wss://offchain.pub`. Repeat `--relay URL` after the
 sidecar command to override. Only loopback permits `ws://`; `relay.maxplayer.ai`
-is refused. Publish attempts all relays, requiring at least one acknowledgement,
+is refused. Publish attempts all relays, requiring acknowledgement from **every configured relay**,
 with per-relay outcomes on stderr. Reads union verified events and deduplicate ids,
 then select latest per coordinate. No EOSE is a per-relay error (discard that
-partial response); no completed relay response is a command error. Partial relay
+partial response); any missing EOSE is a command error. Partial relay
 failures are reported, not treated as complete global history.
 
 Jobs remain on the configured trade relay. Buzz's allowlist is unchanged from main:
@@ -96,7 +96,7 @@ Acceptance persists across challenges until the buyer republishes `denied`.
    `created_at`; ties use the lowest id (NIP-01).
 5. Unknown values, missing/duplicate required tags, or out-of-range numbers are invalid.
 6. For challenge C, eligibility requires the latest membership to be `joined`,
-   `since <= C.starts`, and the latest buyer decision to be `accepted`.
+   `created_at <= C.starts` and `since <= C.starts`, and the latest buyer decision to be `accepted`.
    Sellers can join at any time. Joining after work starts takes effect from the next
    daily challenge; there is no grace period after starts. Late memberships remain valid.
    Leaving has **no timestamp cutoff** and stops new assignments immediately.
@@ -268,3 +268,13 @@ Ordinary jobs from the same buyer in an overlapping window do not count. This
 uses the existing signed `i` task field, not a new trade/MCP parameter. Pre-prefix
 offers are intentionally excluded; existing runner journal reservations remain
 conservative. Challenge IDs must not be reused for a different challenge.
+
+All sidecar publishes (not only leave, deny, cancel and budget updates) require
+ACK from every configured challenge relay. Partial delivery can already have
+written some relays: the command fails and identifies failed URLs; retry repairs
+coverage. Reads require EOSE from every configured relay. The page keeps healthy
+relay data visible with an incomplete/failed-URL indicator; the runner never posts
+from that partial history. AUTH-required CLOSED history requests are retried after
+AUTH OK. Reader membership discovery is limited to 256 distinct keys, 4096 content
+characters and 16384 serialized tag characters before subscription expansion;
+exceeding a limit marks the read incomplete rather than silently trusting a subset.

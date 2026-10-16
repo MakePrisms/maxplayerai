@@ -22,7 +22,7 @@ export class RelayReader {
     this.status={connected:false,authenticated:false,historyComplete:false,error:null};
     this.filters=new Map(this.initialFilters.map(f=>[String(f.kinds[0]),f]));
     for(const pk of this.members)for(const kind of [PROFILE,HEARTBEAT])this.filters.set(`${kind}-${pk}`,{kinds:[kind],authors:[pk]});
-    this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.live=new Map();
+    this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.live=new Map();
     const ws=this.ws=new this.WebSocketImpl(this.url);
     const send=frame=>{if(ws.readyState===1)ws.send(JSON.stringify(frame));};
     this.queueTimer=setInterval(()=>{if(this.queue.length&&ws.readyState===1){const frame=this.queue.shift();send(frame);const p=this.pages.get(frame[1]);if(p)p.sentAt=Date.now();}
@@ -55,7 +55,14 @@ export class RelayReader {
         const e=signAuth(this.key,this.url,m[1]);this.authId=e.id;send(['AUTH',e]);
       } else if(m[0]==='OK'&&m[1]===this.authId) {
         this.status.authenticated=m[2]===true;
-        if(this.status.authenticated)subscribe();
+        if(this.status.authenticated) {
+          if(this.authClosed.size) {
+            if(this.status.error?.startsWith('auth-required:'))this.status.error=null;
+            for(const [id,filter] of this.authClosed)this.page(id,filter);
+            this.authClosed.clear();
+          }
+          subscribe();
+        }
         this.onChange();
       } else if(m[0]==='EVENT') {
         const p=this.pages.get(m[1]),f=p?.filter??this.live.get(m[1]),e=m[2];
@@ -63,11 +70,15 @@ export class RelayReader {
         if(p)p.events.push(e);
         const id=p?m[1]:m[1].slice(5);
         this.newest.set(id,Math.max(this.newest.get(id)??0,e.created_at));
-        const added=this.store.add(e);
         if(e.kind===MEMBERSHIP) {
-          if(this.onMember)this.onMember(e.pubkey);
-          else this.addMember(e.pubkey);
+          if(e.content.length>4096 || JSON.stringify(e.tags).length>16384) {
+            this.status.error='Membership content limit exceeded';this.status.historyComplete=false;this.onChange();return;
+          }
+          if((this.onMember?this.onMember(e.pubkey):this.addMember(e.pubkey))===false) {
+            this.status.error='Membership pubkey limit exceeded';this.status.historyComplete=false;this.onChange();return;
+          }
         }
+        const added=this.store.add(e);
         if(added)this.onChange();
       } else if(m[0]==='EOSE'&&this.pages.has(m[1])) {
         const p=this.pages.get(m[1]);this.pages.delete(m[1]);
@@ -80,7 +91,11 @@ export class RelayReader {
         this.status.historyComplete=this.pages.size===0&&!this.status.error;this.onChange();
       } else if(m[0]==='CLOSED') {
         if(this.live.has(m[1])) {this.live.delete(m[1]);this.status.authenticated=false;}
-        if(this.pages.has(m[1])) {this.pages.delete(m[1]);this.status.error='Relay history subscription refused';this.status.historyComplete=false;}
+        if(this.pages.has(m[1])) {
+          const auth=typeof m[2]==='string'&&m[2].startsWith('auth-required:');
+          if(auth)this.authClosed.set(m[1],this.pages.get(m[1]).filter);
+          this.pages.delete(m[1]);this.status.error=auth?m[2]:'Relay history subscription refused';this.status.historyComplete=false;
+        }
         this.onChange();
       }
     });
@@ -92,14 +107,16 @@ export class RelayReader {
     });
   }
   addMember(pk) {
+    if(!this.members.has(pk)&&this.members.size>=256)return false;
     this.members.add(pk);
-    if(!this.filters)return;
+    if(!this.filters)return true;
     for(const kind of [PROFILE,HEARTBEAT]) {
       const id=`${kind}-${pk}`,filter={kinds:[kind],authors:[pk]};
       if(this.filters.has(id))continue;
       this.filters.set(id,filter);this.page(id,filter);
       this.live.set(`live-${id}`,filter);this.queue.push(['REQ',`live-${id}`,filter]);
     }
+    return true;
   }
   page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,events:[]});this.queue.push(['REQ',id,{...filter,limit:500}]);}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.ws?.close();}
@@ -126,12 +143,12 @@ export class ChallengeReader {
   get status() {
     const relays=[{role:'trade',url:this.trade.url,...this.trade.status},...this.challenges.map(r=>({role:'challenge',url:r.url,...r.status}))];
     const available=this.challenges.filter(r=>r.status.connected&&!r.status.error);
-    const ready=available.length>0&&available.every(r=>r.status.historyComplete);
+    const ready=available.length===this.challenges.length&&available.every(r=>r.status.historyComplete);
     const failedRelays=relays.filter(r=>!r.connected||r.error).map(r=>r.url);
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
       historyComplete:this.trade.status.historyComplete&&ready,
-      error:this.trade.status.error??(available.length?null:'No challenge relay available'),failedRelays,relays};
+      error:this.trade.status.error??(failedRelays.length?`Challenge history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}
   stop(){this.trade.stop();for(const r of this.challenges)r.stop();}

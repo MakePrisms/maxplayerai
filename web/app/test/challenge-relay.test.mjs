@@ -97,10 +97,10 @@ test('split sources union IDs, reject cross-kind events, and tolerate a failed p
   assert.ok(!reader.challenges[0].filters.has(`30340-${buyer}`));
   for(const r of [reader.trade,...reader.challenges.slice(0,2)])for(const id of [...r.pages.keys()])r.ws.message(['EOSE',id]);
   reader.challenges[2].ws.close();
-  assert.equal(reader.status.connected,true);assert.equal(reader.status.historyComplete,true);
-  assert.deepEqual(reader.status.failedRelays,['ws://bad']);assert.equal(reader.status.error,null);
+  assert.equal(reader.status.connected,true);assert.equal(reader.status.historyComplete,false);
+  assert.deepEqual(reader.status.failedRelays,['ws://bad']);assert.match(reader.status.error,/ws:\/\/bad/);
   reader.challenges[0].ws.close();reader.challenges[1].ws.close();
-  assert.equal(reader.status.connected,false);assert.match(reader.status.error,/No challenge relay/);
+  assert.equal(reader.status.connected,false);assert.match(reader.status.error,/incomplete/);
 });
 test('public relays stream post-EOSE without AUTH and share the per-tab ephemeral identity',t=>{
   const store=new EventStore(),reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a'],buyer,store,WebSocketImpl:Socket});
@@ -128,4 +128,44 @@ test('latest challenge replacement wins across relays regardless of duplicate ar
   reader.challenges[0].ws.message(['EVENT','30341',older]);
   reader.challenges[0].ws.message(['EVENT','30341',newer]);
   assert.equal(store.events.size,2);assert.equal(store.snapshot(buyer,200).challenge.eventId,newer.id);
+});
+
+test('auth-required CLOSED before AUTH OK reissues history and clears error',async t=>{
+  const {reader,socket}=setup(t);await until(()=>socket.sent.some(m=>m[0]==='REQ'&&m[1]==='3401'));
+  socket.message(['CLOSED','3401','auth-required: authentication required']);
+  socket.message(['AUTH','nonce']);socket.message(['OK',reader.authId,true,'']);
+  assert.equal(reader.status.error,null);assert.ok(reader.pages.has('3401'));
+  await until(()=>socket.sent.filter(m=>m[0]==='REQ'&&m[1]==='3401').length>=2);
+  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
+  assert.equal(reader.status.historyComplete,true);
+});
+test('membership flood and oversized notes are bounded before subscriptions',t=>{
+  const {reader,socket,store}=setup(t);
+  const huge=signed(30342,100,[['p',buyer],['note','x'.repeat(20000)]]);
+  socket.message(['EVENT','30342',huge]);assert.equal(store.events.size,0);assert.equal(reader.members.size,0);
+  for(let i=0;i<3000;i++)reader.addMember(i.toString(16).padStart(64,'0'));
+  assert.equal(reader.members.size,256);assert.ok(reader.filters.size<=8+512);
+});
+
+test('relay A hiding newer left while down blocks swarm despite relay B old joined',async t=>{
+  const {Swarm}=await import('../../../scripts/challenges/swarm.mjs');
+  const store=new EventStore(),reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a','ws://b'],buyer,store,WebSocketImpl:Socket});
+  reader.start();t.after(()=>reader.stop());
+  for(const r of [reader.trade,...reader.challenges])r.ws.dispatchEvent(new Event('open'));
+  const ns=[['t','maxplayer'],['v','1']];
+  const joined=signed(30342,100,[...ns,['d',buyer],['p',buyer],['since','100'],['minutes','60'],['status','joined']]);
+  const left=signed(30342,300,[...joined.tags.filter(t=>t[0]!=='status'),['status','left']]);
+  assert.ok(left.created_at>joined.created_at); // only unavailable A has this replacement
+  const b=reader.challenges[1];
+  b.ws.message(['EVENT','30342',joined]);
+  b.ws.message(['EVENT','30343',signed(30343,101,[...ns,['d',buyer],['p',buyer],['decision','accepted']])]);
+  b.ws.message(['EVENT','30341',signed(30341,102,[...ns,['d','day'],['title','Day'],['starts','200'],['ends','1000'],['budget','0','sat'],['status','in_progress']])]);
+  reader.trade.status.authenticated=true;
+  for(const r of [reader.trade,b])for(const id of [...r.pages.keys()])r.ws.message(['EOSE',id]);
+  reader.challenges[0].ws.close();
+  const snap={...store.snapshot(buyer,400),relay:reader.status};assert.equal(snap.sellers[0].eligible,true);
+  let posts=0;
+  const io={now:()=>400,snapshot:async()=>snap,mcp:async tool=>{if(tool==='post_job')posts++;},plan:async()=>{throw Error('must not plan with incomplete history');},publish:async()=>{throw Error('must not publish');}};
+  await new Swarm({minDuration:30,maxDuration:60,updateEvery:180},io,{state:{jobs:[],days:{}},save(){}}).tick();
+  assert.equal(posts,0);assert.equal(snap.relay.historyComplete,false);assert.match(snap.relay.error,/ws:\/\/a/);
 });

@@ -67,7 +67,7 @@ impl Relays {
     }
     pub async fn fetch(&self, home: &MaxplayerHome, filter: Filter) -> Result<Vec<Event>, String> {
         let mut union = BTreeMap::new();
-        let mut completed = 0;
+        let mut failed = Vec::new();
         for url in &self.urls {
             let client = Self::client(home, url).await?;
             let result = tokio::time::timeout(TIMEOUT, async {
@@ -118,7 +118,6 @@ impl Relays {
             client.disconnect().await;
             match result {
                 Ok(Ok(events)) => {
-                    completed += 1;
                     eprintln!("relay {url}: read complete (EOSE, {} events)", events.len());
                     for e in events {
                         union.insert(e.id, e);
@@ -126,13 +125,12 @@ impl Relays {
                 }
                 _ => {
                     eprintln!("relay {url}: read failed (no complete EOSE)");
+                    failed.push(url.clone());
                 }
             }
         }
-        if completed == 0 {
-            return Err(
-                "challenge relay read incomplete; per-relay outcomes reported above".into(),
-            );
+        if !failed.is_empty() {
+            return Err(format!("challenge relay read incomplete; failed: {}", failed.join(", ")));
         }
         // Keep all verified versions for eligibility and replacement-timestamp checks; callers
         // select latest per (kind, author, d), never collapse distinct authors sharing a d-tag.
@@ -155,13 +153,13 @@ impl Relays {
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(&keys(home)?)
             .map_err(|_| "challenge signing failed")?;
-        let mut accepted = false;
+        let mut failed = Vec::new();
         for url in &self.urls {
             let client = Self::client(home, url).await?;
             let result = tokio::time::timeout(TIMEOUT, client.send_event(&event)).await;
             client.disconnect().await;
             let ok = matches!(result, Ok(Ok(ref output)) if !output.success.is_empty());
-            accepted |= ok;
+            if !ok { failed.push(url.clone()); }
             eprintln!(
                 "relay {url}: publish {}",
                 if ok {
@@ -171,8 +169,8 @@ impl Relays {
                 }
             );
         }
-        if !accepted {
-            return Err("no relay accepted challenge event".into());
+        if !failed.is_empty() {
+            return Err(format!("challenge publish incomplete; failed: {}", failed.join(", ")));
         }
         Ok(event.id.to_hex())
     }
@@ -315,12 +313,13 @@ mod transport_tests {
         }
         .to_event_draft()
         .unwrap();
-        let id = relays
+        let error = relays
             .publish(&home, draft.clone(), Timestamp::now().as_secs())
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.contains(&a.url));
         assert_eq!(a.writes.lock().unwrap().len(), 1);
-        assert_eq!(b.writes.lock().unwrap()[0].id.to_hex(), id);
+        assert_eq!(b.writes.lock().unwrap().len(), 1);
         let refused = Relays::new(std::slice::from_ref(&a.url)).unwrap();
         assert!(
             refused
@@ -348,9 +347,8 @@ mod transport_tests {
         let partial = Relays::new(&[incomplete.url.clone(), complete.url.clone()])
             .unwrap()
             .fetch(&home, Filter::new().kind(Kind::Custom(30341)))
-            .await
-            .unwrap();
-        assert!(partial.is_empty());
+            .await;
+        assert!(partial.unwrap_err().contains(&incomplete.url));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

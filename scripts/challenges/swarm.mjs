@@ -160,7 +160,7 @@ export class Swarm {
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
     const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:j.args.task,amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,ts:j.ts??now}));
-    const ready=snap.relay?.connected&&snap.relay?.authenticated&&snap.relay?.historyComplete&&!snap.relay?.error && now-snap.asOf<=5 && now>=snap.asOf;
+    const ready=snap.relay?.connected&&snap.relay?.authenticated&&snap.relay?.historyComplete&&!snap.relay?.error&&!snap.relay?.failedRelays?.length && now-snap.asOf<=5 && now>=snap.asOf;
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
     const min=this.c.minDuration??120, max=this.c.maxDuration??1800;
