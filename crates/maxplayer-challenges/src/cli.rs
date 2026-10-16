@@ -413,9 +413,19 @@ async fn execute_async(
     Ok((json!({"ok":true,"event_id":id,"challenge":c}), warning))
 }
 
-fn reject_secret_in_draft(home: &maxplayer_core::home::MaxplayerHome, draft: &maxplayer_core::gateway::EventDraft) -> Result<(), String> {
-    let secret = maxplayer_core::home::read_secret_key_hex(home).map_err(|_| "could not read home key")?;
-    if !secret.is_empty() && (draft.content.contains(&secret) || draft.tags.iter().any(|tag| tag.0.iter().any(|value| value.contains(&secret)))) {
+fn reject_secret_in_draft(
+    home: &maxplayer_core::home::MaxplayerHome,
+    draft: &maxplayer_core::gateway::EventDraft,
+) -> Result<(), String> {
+    let secret =
+        maxplayer_core::home::read_secret_key_hex(home).map_err(|_| "could not read home key")?;
+    if !secret.is_empty()
+        && (draft.content.contains(&secret)
+            || draft
+                .tags
+                .iter()
+                .any(|tag| tag.0.iter().any(|value| value.contains(&secret))))
+    {
         return Err("event would publish secret key".into());
     }
     Ok(())
@@ -658,18 +668,32 @@ mod tests {
         #[tokio::test]
         async fn secret_in_content_or_tags_never_writes_relay() {
             let relay = crate::relay::transport_tests::fixture(vec![], true, true).await;
-            let root = std::env::temp_dir().join(format!("challenge-secret-{}", Keys::generate().public_key()));
+            let root = std::env::temp_dir().join(format!(
+                "challenge-secret-{}",
+                Keys::generate().public_key()
+            ));
             let home = home::bootstrap(&root).unwrap();
             let secret = home::read_secret_key_hex(&home).unwrap();
             let goal = root.join("goal.md");
             let now = Timestamp::now().as_secs();
             for in_content in [true, false] {
-                std::fs::write(&goal, if in_content { secret.as_str() } else { "Safe goal" }).unwrap();
+                std::fs::write(
+                    &goal,
+                    if in_content {
+                        secret.as_str()
+                    } else {
+                        "Safe goal"
+                    },
+                )
+                .unwrap();
                 let title = if in_content { "Safe" } else { secret.as_str() };
                 let mut o = super::parse(&args(&format!("publish --id test --title {title} --goal-file {} --starts {} --ends {} --budget-sats 0", goal.display(), Timestamp::from(now+3600).to_human_datetime(), Timestamp::from(now+7200).to_human_datetime()))).unwrap();
                 o.relays = vec![relay.url.clone()];
                 let result = execute_async(&o, &home).await;
-                assert!(relay.writes.lock().unwrap().is_empty(), "secret-bearing event reached relay");
+                assert!(
+                    relay.writes.lock().unwrap().is_empty(),
+                    "secret-bearing event reached relay"
+                );
                 assert!(result.is_err());
             }
             std::fs::remove_dir_all(root).unwrap();

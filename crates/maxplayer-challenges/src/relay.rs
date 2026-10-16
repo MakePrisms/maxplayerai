@@ -32,9 +32,13 @@ impl Relays {
                 .to_ascii_lowercase();
             // One canonical list shared with the browser, runner and site build.
             let source = include_str!("../../../web/app/src/challenge/shared/relay.mjs");
-            let literal = source.lines().find_map(|line| line.strip_prefix("export const CHALLENGE_RELAY_DENYLIST = "))
-                .ok_or("missing challenge relay denylist")?.trim_end_matches(';');
-            let denied: Vec<String> = serde_json::from_str(literal).map_err(|_| "invalid challenge relay denylist")?;
+            let literal = source
+                .lines()
+                .find_map(|line| line.strip_prefix("export const CHALLENGE_RELAY_DENYLIST = "))
+                .ok_or("missing challenge relay denylist")?
+                .trim_end_matches(';');
+            let denied: Vec<String> =
+                serde_json::from_str(literal).map_err(|_| "invalid challenge relay denylist")?;
             if denied.contains(&host) {
                 return Err("production relay forbidden for challenges".into());
             }
@@ -135,7 +139,10 @@ impl Relays {
             }
         }
         if !failed.is_empty() {
-            return Err(format!("challenge relay read incomplete; failed: {}", failed.join(", ")));
+            return Err(format!(
+                "challenge relay read incomplete; failed: {}",
+                failed.join(", ")
+            ));
         }
         // Keep all verified versions for eligibility and replacement-timestamp checks; callers
         // select latest per (kind, author, d), never collapse distinct authors sharing a d-tag.
@@ -164,7 +171,9 @@ impl Relays {
             let result = tokio::time::timeout(TIMEOUT, client.send_event(&event)).await;
             client.disconnect().await;
             let ok = matches!(result, Ok(Ok(ref output)) if !output.success.is_empty());
-            if !ok { failed.push(url.clone()); }
+            if !ok {
+                failed.push(url.clone());
+            }
             eprintln!(
                 "relay {url}: publish {}",
                 if ok {
@@ -175,7 +184,10 @@ impl Relays {
             );
         }
         if !failed.is_empty() {
-            return Err(format!("challenge publish incomplete; failed: {}", failed.join(", ")));
+            return Err(format!(
+                "challenge publish incomplete; failed: {}",
+                failed.join(", ")
+            ));
         }
         Ok(event.id.to_hex())
     }
