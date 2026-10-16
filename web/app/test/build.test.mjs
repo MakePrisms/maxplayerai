@@ -347,3 +347,7 @@ test('challenge relay connection is allowed on the unlisted route', () => {
   assert.match(csp('/challenges')[0],/connect-src 'self' wss:\/\/relay\.maxplayer\.ai wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub https:\/\/api\.coinbase\.com;/);
   for(const path of ['/','/market','/challenges.js'])assert.ok(!csp(path)[0].includes('community.maxplayer.ai'));
 });
+
+ test("build refuses the production challenge relay hostname", () => {
+  assert.throws(() => execFileSync(process.execPath, ["scripts/build.mjs"], {cwd:root,env:{...process.env,CHALLENGE_RELAYS:"wss://RELAY.MAXPLAYER.AI./"},stdio:"pipe"}), /production relay forbidden/);
+});

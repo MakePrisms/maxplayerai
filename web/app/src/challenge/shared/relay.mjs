@@ -122,11 +122,17 @@ export class RelayReader {
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.ws?.close();}
 }
 
+// Canonical hostname denylist; the Rust sidecar reads this JSON literal at compile time.
+export const CHALLENGE_RELAY_DENYLIST = ["relay.maxplayer.ai"];
 export const DEFAULT_CHALLENGE_RELAYS = ['wss://nos.lol','wss://relay.primal.net','wss://offchain.pub'];
 export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
   const urls=[...new Set((Array.isArray(value)?value:value.split(',')).map(url=>url.trim()).filter(Boolean))];
   if(!urls.length)throw Error('At least one challenge relay is required');
-  for(const url of urls)if(!['ws:','wss:'].includes(new URL(url).protocol))throw Error('Invalid challenge relay URL');
+  for(const url of urls) {
+    const parsed=new URL(url);
+    if(!['ws:','wss:'].includes(parsed.protocol))throw Error('Invalid challenge relay URL');
+    if(CHALLENGE_RELAY_DENYLIST.includes(parsed.hostname.toLowerCase().replace(/\.+$/,'')))throw Error('production relay forbidden for challenges');
+  }
   return urls;
 }
 // Each transport validates signatures and scope; EventStore unions/deduplicates IDs

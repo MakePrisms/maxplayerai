@@ -14,6 +14,7 @@
  * to cache. The files themselves keep their names; the query string is the
  * only difference.
  */
+import { parseChallengeRelays } from "../src/challenge/shared/relay.mjs";
 import { build, context } from "esbuild";
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -28,8 +29,7 @@ const buyer = process.env.CHALLENGE_BUYER_PUBKEY ?? "94989f765a69e5c392d603140ed
 if (!/^[0-9a-f]{64}$/.test(buyer)) throw Error("CHALLENGE_BUYER_PUBKEY must be lowercase hex");
 const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
 if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
-const challengeRelays = [...new Set((process.env.CHALLENGE_RELAYS ?? "wss://nos.lol,wss://relay.primal.net,wss://offchain.pub").split(",").map(s=>s.trim()).filter(Boolean))];
-if (!challengeRelays.length || challengeRelays.some(url=>!["ws:","wss:"].includes(new URL(url).protocol))) throw Error("Invalid CHALLENGE_RELAYS");
+const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
 const watch = process.argv.includes("--watch");
 const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"];
 

@@ -107,17 +107,19 @@ Acceptance persists across challenges until the buyer republishes `denied`.
 
 For a challenge `C` with buyer `B`, seller `S`:
 
-1. Jobs: OFFER (3401) authored by `B` with `p=S` and `created_at` in `[C.starts, C.ends]`.
+1. Jobs: OFFER (3401) authored by `B` with `p=S`, the challenge task prefix described below, and `created_at` in `[C.starts, C.ends]`.
 2. Start: the AWARD (3405) authored by `B` for that offer whose claim is authored by `S`.
    Start time = award `created_at`.
 3. End: the earliest RESULT (3403) for that offer authored by `S`; else, if the offer's
    `deadline` has passed, the deadline; else the job is **running** (end = now).
+   A RESULT at or before AWARD is untrusted: use the full deadline as end.
 4. Job minutes = `min(end − start, offer.deadline − start)`, floored at 0.
 5. Seller used = sum over its jobs. Remaining = `membership.minutes − used` (reset for each daily challenge).
 6. Ignore RESULTs by anyone other than `S`, and AWARDs by anyone other than `B`.
 
-Known limit: `created_at` is signer-chosen (relay drift ±900 s); a seller can shift its RESULT
-time. Acceptable for "about an hour"; the deadline cap bounds it.
+Known limit: `created_at` is signer-chosen, not independently measured CPU time.
+Backdated results at/before award charge the full deadline; other durations remain
+public estimates, capped at deadline.
 
 ## The buyer’s rules
 
@@ -278,3 +280,8 @@ from that partial history. AUTH-required CLOSED history requests are retried aft
 AUTH OK. Reader membership discovery is limited to 256 distinct keys, 4096 content
 characters and 16384 serialized tag characters before subscription expansion;
 exceeding a limit marks the read incomplete rather than silently trusting a subset.
+
+The production-relay fence is a normalized **hostname string** denylist, shared by
+the sidecar, page, swarm parser and site build (canonical JSON literal in
+`shared/relay.mjs`). It is not DNS/IP resolution: aliases and literal IP addresses
+are not proven to be different servers. Do not configure production aliases.

@@ -30,7 +30,12 @@ impl Relays {
                 .ok_or("relay URL needs host")?
                 .trim_end_matches('.')
                 .to_ascii_lowercase();
-            if host == "relay.maxplayer.ai" {
+            // One canonical list shared with the browser, runner and site build.
+            let source = include_str!("../../../web/app/src/challenge/shared/relay.mjs");
+            let literal = source.lines().find_map(|line| line.strip_prefix("export const CHALLENGE_RELAY_DENYLIST = "))
+                .ok_or("missing challenge relay denylist")?.trim_end_matches(';');
+            let denied: Vec<String> = serde_json::from_str(literal).map_err(|_| "invalid challenge relay denylist")?;
+            if denied.contains(&host) {
                 return Err("production relay forbidden for challenges".into());
             }
             let loopback = host == "localhost"
@@ -202,15 +207,15 @@ mod tests {
 }
 
 #[cfg(test)]
-mod transport_tests {
+pub(crate) mod transport_tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::Message;
 
-    struct Fixture {
-        url: String,
-        writes: Arc<Mutex<Vec<Event>>>,
+    pub(crate) struct Fixture {
+        pub(crate) url: String,
+        pub(crate) writes: Arc<Mutex<Vec<Event>>>,
         task: tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture {
@@ -218,7 +223,7 @@ mod transport_tests {
             self.task.abort();
         }
     }
-    async fn fixture(events: Vec<Event>, eose: bool, accept: bool) -> Fixture {
+    pub(crate) async fn fixture(events: Vec<Event>, eose: bool, accept: bool) -> Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let writes = Arc::new(Mutex::new(Vec::new()));

@@ -169,3 +169,10 @@ test('relay A hiding newer left while down blocks swarm despite relay B old join
   await new Swarm({minDuration:30,maxDuration:60,updateEvery:180},io,{state:{jobs:[],days:{}},save(){}}).tick();
   assert.equal(posts,0);assert.equal(snap.relay.historyComplete,false);assert.match(snap.relay.error,/ws:\/\/a/);
 });
+
+test('challenge relay hostname denylist covers case trailing dot and encoded dot',()=>{
+  for(const url of ['wss://relay.maxplayer.ai','wss://RELAY.MAXPLAYER.AI./','wss://relay.maxplayer.ai%2e']) {
+    assert.throws(()=>parseChallengeRelays(url),/production relay/);
+    assert.throws(()=>new ChallengeReader({url:'ws://trade',buyer,store:new EventStore(),challengeRelays:[url],WebSocketImpl:Socket}),/production relay/);
+  }
+});
