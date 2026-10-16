@@ -1,3 +1,41 @@
+# Advisor r1 fix verification — 2026-10-16
+
+## Fixes for advisor review r1
+
+Author-led fixes to advisor review of `4489e27978fd2ccadaefedb066c87e1d12544afd`
+(base `666c87936dbcbd5699e2d6db9a0e72bfa66163f8`). All seven findings confirmed and fixed;
+none rejected. No new advisor job or independent re-review was requested.
+
+| Finding | Fix and regression evidence |
+| --- | --- |
+| 1 — seller-chosen since | Latest membership `created_at` and `since` must both be at/before start in JS and Rust. Late changes wait until the next challenge. `membership replacement preserves since independently of event timestamp and rejects challenge-scoped records`, `membership_persists_across_days_late_join_waits_and_late_leave_wins`, and `late membership with old since and prior acceptance cannot post`; JS and Rust guard-removal mutants failed, restored tests passed. |
+| 2 — seller RESULT minutes | Seller RESULT never stops the meter: accrue until buyer ACCEPT or now, capped at deadline; RESULT at/before award charges the full deadline interval. `backdated result consumes offered minutes and swarm posts no further job` and `seller result just after award cannot close the meter before buyer ACCEPT`; old timestamp calculation mutant failed. |
+| 3 — partial relay history/ACK | Every configured challenge relay must finish EOSE; every sidecar publish requires all ACKs, with failed URLs reported. Page retains partial data with incomplete status; coordinator/swarm refuse posting. `relay A hiding newer left while down blocks swarm despite relay B old joined` mutant actually posted once; fixed version posts zero. Rust `missing_eose_is_error_and_partial_events_are_discarded` and `union_dedup_latest_and_publish_all_with_partial_rejection` both failed under any-relay mutation and passed restored. |
+| 4 — unarmed queued reservation | Confirmed expired, never-awarded, reservation-none jobs may release when auto-award is null/missing, retaining all existing read/award/result/claim guards. `confirmed expired never-awarded job releases reservation, incomplete/possibly payable states do not`: expanded null/missing expiry table failed before fix (5 sats remained), passed after. |
+| 5 — AUTH and flood limits | Reissue auth-required CLOSED history after AUTH OK, without clearing hard refusals. Cap discovery at 256 keys, 4096 content characters and 16384 serialized tag characters before expansion; overflow marks incomplete. `auth-required CLOSED before AUTH OK reissues history and clears error`, `membership flood and oversized notes are bounded before subscriptions`, `signed membership flood cannot expand one trade subscription per key`; each relevant mutant failed. `AUTH recovery cannot clear a different hard history refusal` failed before hard-error preservation and passed after. |
+| 6 — shared host fence | Canonical JSON-literal hostname denylist in shared relay module, consumed by Rust sidecar, page, swarm parser and build. `challenge relay hostname denylist covers case trailing dot and encoded dot` and `build refuses the production challenge relay hostname`; removed fence failed both. Documented hostname-only, not DNS/IP equivalence. |
+| 7 — secret publication | Scan draft content and every tag value before either CLI publish path. `secret_in_content_or_tags_never_writes_relay` observed a relay write before fix, zero writes after for both content and tags. |
+| Extra — unrelated buyer jobs | Confirmed ordinary jobs were counted. Runner adds a buyer-signed challenge task prefix; projection counts only that buyer/challenge ID and hides the prefix in display text. No MCP/trade/money-path change. `ordinary buyer jobs do not consume challenge tally or minutes` fails without binding, passes with it. Malformed task tags also have a fail-before/pass-after regression. |
+
+Manual join copy now warns to disable open-pool/open-targeted, matching the join skill.
+All changed paths were already part of this PR. No Buzz, trade, mint, buyer money-path,
+Vercel configuration, main push, merge, Discord message, or paid job changes/actions.
+
+### Verification
+
+- `web/app npm test`: **383 passed, 0 failed**, including typecheck.
+- `scripts/challenges/*.test.mjs`: **52 passed, 0 failed**.
+- `maxplayer-challenges --locked`: **11 passed, 0 failed**.
+- `maxplayer-core --lib --features acp,gateway,git-delivery,wallet challenge::`: **7 passed, 0 failed** after Rust mutation restoration.
+- Loopback challenge E2E: **66 checks passed, 0 failed** (free jobs, real local Buzz plus separate challenge relay). Final-source repeat is being verified before completion report.
+- Gateway-only core attempt failed to compile due to existing `private_content/tests.rs:1672` use of feature-gated `repositories`; documented complete feature combination above passed. This failed compile is not counted as a test pass.
+- Local mutation/revert evidence covers each finding; deliberate failing mutant runs are excluded from the passing suite counts.
+
+Unverified: paid settlement, real public relay operators, real LLM planner, independent
+advisor re-review. CI is monitored separately on the pushed head; no deployment requested.
+
+---
+
 # Historical challenge integration verification — 2026-10-15 (local only)
 
 This record predates the auto-award fix. For the current no-manual-award harness,
