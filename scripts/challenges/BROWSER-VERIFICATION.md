@@ -54,3 +54,30 @@ AUTH refusal/poll fallback, signature/scope rejection, pagination boundaries, re
 shared model behavior and history-round starvation are covered by regression tests.
 Production relay behavior, deployment and paid settlement were not exercised. No real relay
 writes, money operations, PR, merge, or deployment; no shared test environment or ct-* units changed.
+
+## Split challenge/trade reader follow-up
+
+Implementation: `31692c51`; failure-URL display follow-up: `d9b8d7f4`.
+
+- **374 app tests, 49 challenge-script tests passed**. Final display follow-up passed
+  TypeScript checking and the default production build.
+- Full local E2E (`bash scripts/challenges/run-e2e.sh --skip-build`, using previously
+  built binaries): **65 PASS lines**, exit 0, ending `PASS ALL community challenge E2E`.
+  Both solved and exhausted runner scenarios passed, including zero payment and no
+  posting after completion. Local artifacts: `.scratch/ce-ng5vv4hj`.
+- Headless Chrome exercised two logical reader connections (challenge/trade) to that
+  same disposable relay: 90 DOM samples, fixture buyer matched throughout, **59
+  post-EOSE live events**, live Ready/Working/Left changes without navigation, no
+  challenge API requests, only AUTH/REQ/CLOSE outbound frames, one shared ephemeral
+  AUTH identity distinct from the buyer. No overflow at 1440px or 390px.
+  Evidence: `.scratch/browser-split-proof/{evidence.json,mobile.json,desktop-8.png,mobile.png}`.
+  Chrome and disposable E2E services exited. Browser-tool navigation was not repeated;
+  the prior localhost policy restriction remains an unverified tool-specific path.
+- Mock-socket regressions separately verify distinct relay destinations/kind routing,
+  cross-relay ID deduplication/latest replacement, failed-public-relay tolerance, member
+  heartbeat routing to trade only, anonymous public streaming, and shared ephemeral AUTH.
+- Public-relay interoperability and physically separate challenge/trade relay E2E remain
+  unverified. `E2E_CHALLENGE_RELAYS` configures reads; it does not reroute the existing CLI
+  publisher. The Rust sidecar/publisher migration belongs to the other branch.
+- No crates, publication invocation, protected environment, deployment, or real-money
+  behavior changed. Only the requested browser branch is pushed.
