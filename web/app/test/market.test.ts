@@ -370,3 +370,28 @@ test("same-second events sort by lifecycle order, not by random id", () => {
   assert.deepEqual(activity.map((e) => e.stage), ["receipt", "claim", "offer"],
     "participant activity reads newest-first in reverse lifecycle order");
 });
+
+
+test("overdue historical jobs do not resurrect sellers outside the selected window", () => {
+  const o = offer(T0, { deadline: T0 + 1000 });
+  const events = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+  const now = T0 + 30 * 86400;
+  for (const window of ["24h", "week"]) {
+    assert.equal(sellerBoard(withinWindow(events, window, now), now, events).length, 0);
+  }
+  const historical = sellerBoard(events, now, events)[0]!;
+  assert.equal(historical.inProgressJobs[0]!.state, JOB_OVERDUE, "all-time history remains intact");
+  const beat = ev(HEARTBEAT, SELLER, now, [["d", "seat"]]);
+  const returned = sellerBoard([beat], now, [...events, beat])[0]!;
+  assert.equal(returned.online, true);
+  assert.equal(returned.inProgressJobs.length, 1, "recently active sellers retain overdue job context");
+});
+
+test("current work can still add a seller whose award predates the window", () => {
+  const now = T0 + 30 * 86400;
+  const o = offer(T0, { deadline: now + 1000 });
+  const events = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+  const rows = sellerBoard(withinWindow(events, "week", now), now, events);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0]!.workingJobs.length, 1);
+});
