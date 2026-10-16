@@ -9,8 +9,8 @@ subcommand. The buyer auto-award and job protocol are unchanged.
 
 ## Model
 
-- **One buyer**, a dedicated maxplayer buyer identity run by us and used for nothing
-  else. Every job it posts during a challenge's work window belongs to that challenge.
+- **One buyer**, a pinned maxplayer buyer identity. Only jobs carrying the signed
+  challenge task prefix belong to a challenge; ordinary buyer jobs are excluded.
 - **Daily challenge.** The buyer publishes one signed CHALLENGE event per day.
 - **Sellers join once over Nostr** with their own seller key, offering minutes per day until they leave.
 - **We accept or deny** each member once; acceptance persists until denied with a signed DECISION event.
@@ -110,16 +110,17 @@ For a challenge `C` with buyer `B`, seller `S`:
 1. Jobs: OFFER (3401) authored by `B` with `p=S`, the challenge task prefix described below, and `created_at` in `[C.starts, C.ends]`.
 2. Start: the AWARD (3405) authored by `B` for that offer whose claim is authored by `S`.
    Start time = award `created_at`.
-3. End: the earliest RESULT (3403) for that offer authored by `S`; else, if the offer's
-   `deadline` has passed, the deadline; else the job is **running** (end = now).
+3. End: the earliest buyer-signed ACCEPT for the selected claim at/after AWARD,
+   otherwise now, capped at deadline. A seller RESULT never closes the minute meter;
+   without a result the job is **running** until deadline.
    A RESULT at or before AWARD is untrusted: use the full deadline as end.
 4. Job minutes = `min(end − start, offer.deadline − start)`, floored at 0.
 5. Seller used = sum over its jobs. Remaining = `membership.minutes − used` (reset for each daily challenge).
 6. Ignore RESULTs by anyone other than `S`, and AWARDs by anyone other than `B`.
 
 Known limit: `created_at` is signer-chosen, not independently measured CPU time.
-Backdated results at/before award charge the full deadline; other durations remain
-public estimates, capped at deadline.
+Backdated results at/before award charge the full deadline; otherwise only a
+buyer-signed ACCEPT stops accrual. All durations are capped at deadline.
 
 ## The buyer’s rules
 
@@ -259,8 +260,7 @@ change or rejoin) waits for the next challenge; an old acceptance cannot overrid
 that boundary. Sidecar, page and runner use the same rule.
 
 A RESULT timestamp at or before its AWARD is untrusted for duration: charge the
-full deadline-minus-award interval, not zero. Other results are clamped no earlier
-than award and capped at deadline. The coordinator and swarm stop assigning when
+full deadline-minus-award interval, not zero. Other results continue charging until buyer ACCEPT (or now), capped at deadline. The coordinator and swarm stop assigning when
 no task fits the remaining offered minutes.
 
 Challenge offers carry the exact buyer-signed task prefix

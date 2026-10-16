@@ -176,3 +176,16 @@ test('challenge relay hostname denylist covers case trailing dot and encoded dot
     assert.throws(()=>new ChallengeReader({url:'ws://trade',buyer,store:new EventStore(),challengeRelays:[url],WebSocketImpl:Socket}),/production relay/);
   }
 });
+
+test('signed membership flood cannot expand one trade subscription per key',t=>{
+  const {reader,socket,store}=setup(t);
+  for(let i=1;i<=260;i++) {
+    const privateKey=i.toString(16).padStart(64,'0');
+    const e={kind:30342,pubkey:Buffer.from(schnorr.getPublicKey(privateKey)).toString('hex'),created_at:100,tags:[['p',buyer]],content:''};
+    e.id=eventId(e);e.sig=Buffer.from(schnorr.sign(e.id,privateKey)).toString('hex');
+    socket.message(['EVENT','30342',e]);
+  }
+  assert.equal(reader.members.size,256);assert.equal(store.events.size,256);
+  assert.equal(reader.filters.size,520);assert.equal(reader.status.historyComplete,false);
+  assert.match(reader.status.error,/pubkey limit/);
+});

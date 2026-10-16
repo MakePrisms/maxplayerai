@@ -29,15 +29,17 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     const award=awards[0]; if(!award) continue;
     const result=trade.filter(e=>e.kind===RESULT&&e.pubkey===seller&&root(e)===offer.id).sort(ascending)[0];
     const running=!result&&now<deadline;
-    // A seller timestamp at/before award is not evidence of zero work.
-    const end=result ? (result.created_at<=award.created_at?deadline:Math.max(award.created_at,result.created_at)) : (running?now:deadline);
+    const acceptance=trade.filter(e=>e.kind===ACCEPT&&e.pubkey===buyer&&root(e)===offer.id&&claimRef(e)===claimRef(award)&&mentions(e,buyer)&&mentions(e,seller)&&tag(e,'status')==='accepted'&&e.created_at>=award.created_at).sort(ascending)[0];
+    // Seller time never closes the meter. Charge until buyer ACCEPT (or now/deadline).
+    // An impossible result timestamp conservatively consumes the whole award window.
+    const end=result&&result.created_at<=award.created_at ? deadline : acceptance?.created_at??(result?Math.max(now,result.created_at):(running?now:deadline));
     const usedSeconds=Math.max(0,Math.min(end-award.created_at,deadline-award.created_at));
-    const accepted=trade.some(e=>e.kind===ACCEPT&&e.pubkey===buyer&&root(e)===offer.id&&claimRef(e)===claimRef(award)&&mentions(e,buyer)&&mentions(e,seller)&&tag(e,'status')==='accepted');
+    const accepted=!!acceptance;
     // AWARD has no amount in protocol v1. The selected fixed-price offer is the public estimate.
     const amountTag=offer.tags.find(t=>t[0]==='amount');
     const noPayment=offer.tags.some(t=>t[0]==='param'&&t[1]==='payment'&&t[2]==='none');
     const amount=noPayment?0:(one(offer,'amount')&&amountTag?.[2]==='sat'?number(amountTag[1]):null);
-    jobs.push({id:offer.id,seller,npub:npubEncode(seller),task:tag(offer,'i')??'',start:award.created_at,deadline,end:running?null:end,running,usedMinutes:usedSeconds/60,award:award.id,claim:claimRef(award),result:result?{id:result.id,content:result.content}:null,accepted,amountSats:amount});
+    jobs.push({id:offer.id,seller,npub:npubEncode(seller),task:tag(offer,'i').slice(challengeTaskPrefix(buyer,tag(c,'d')).length),start:award.created_at,deadline,end:running?null:end,running,usedMinutes:usedSeconds/60,award:award.id,claim:claimRef(award),result:result?{id:result.id,content:result.content}:null,accepted,amountSats:amount});
   }
   const priorJobs=includeHistory?challenges.filter(old=>old.id!==c.id).flatMap(old=>snapshot(events,buyer,now,old,false).jobs.map(j=>({...j,challengeId:tag(old,'d')}))):[];
   const sellers=apps.map(app=>{

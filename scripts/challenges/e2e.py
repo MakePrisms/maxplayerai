@@ -213,7 +213,7 @@ try:
         deadline = p['sellers'][0]['deadlineUnix']
     else:
         deadline = int(time.time()) + 120
-    posted = mcp(buyer_env, 'post_job', {'task':'Return exactly the fixture answer 42.', 'output':'text/plain', 'payment':'none', 'amount_sats':0, 'max_sats':0, 'visibility':'public', 'seller_pubkey':SELLER, 'deadline_unix':deadline, 'request_id':'challenge-e2e-free'})
+    posted = mcp(buyer_env, 'post_job', {'task':f'[challenge:{BUYER}:local-e2e]\nReturn exactly the fixture answer 42.', 'output':'text/plain', 'payment':'none', 'amount_sats':0, 'max_sats':0, 'visibility':'public', 'seller_pubkey':SELLER, 'deadline_unix':deadline, 'request_id':'challenge-e2e-free'})
     job = posted['job_id']
     check('the buyer posts through existing MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
     def claimed():
@@ -241,10 +241,10 @@ try:
     check('collect has no payment and zero sats', collected['pay']['state'] == 'none' and collected['pay']['amount_sats'] == 0 and collected['pay']['attempt_id'] is None)
     check('collect materialized result', Path(collected['path']).exists())
     if not ARGS.baseline:
-        s = wait('completed tally has positive minutes used', lambda: (s if any(x['pubkey'] == SELLER and x['state'] == 'done' and x['minutesUsed'] > 0 for x in s['sellers']) else None) if (s := snapshot()) else None)
+        s = wait('completed tally has positive minutes used', lambda: (s if any(x['pubkey'] == SELLER and x['state'] == 'done' and x['minutesUsed'] > 0 for x in s['sellers']) and any(j['id'] == job and j['accepted'] for j in s['jobs']) else None) if (s := snapshot()) else None)
         own = next(x for x in s['sellers'] if x['pubkey'] == SELLER)
         j = next(j for j in s['jobs'] if j['id'] == job)
-        check('minutes exactly match award/result timestamps', abs(own['minutesUsed'] - max(0,min(j['end']-j['start'],j['deadline']-j['start']))/60) < 1e-9 and abs(own['minutesRemaining'] + own['minutesUsed'] - 60) < 1e-9)
+        check('minutes exactly match award/buyer-accept timestamps', abs(own['minutesUsed'] - max(0,min(j['end']-j['start'],j['deadline']-j['start']))/60) < 1e-9 and abs(own['minutesRemaining'] + own['minutesUsed'] - 60) < 1e-9)
         check('denied seller got no job/minutes', not any(j['seller'] == DENIED for j in s['jobs']) and next(x for x in s['sellers'] if x['pubkey'] == DENIED)['minutesUsed'] == 0)
         check('completed seller can receive next task', plan(s)['postingAllowed'])
         # A separately published second day reuses the very same membership and decision.

@@ -32,10 +32,10 @@ buyer's public key from the operator, not a member's note.
    ```
 
    Wait for `eligible: true`: latest membership joined, latest buyer decision accepted,
-   and `since <= starts` for that day.
+   and both membership `created_at <= starts` and `since <= starts` for that day.
    Later joins start next day. Membership and buyer acceptance persist across days;
    minutes reset daily. Run `join` again to change daily minutes; it preserves `since`
-   while joined. No daily re-join or re-acceptance is needed.
+   while joined, but a replacement after work starts waits until the next challenge. No daily re-join or re-acceptance is needed.
 
 4. Leave at any time:
 

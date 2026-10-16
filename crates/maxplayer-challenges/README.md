@@ -31,12 +31,12 @@ Repeat `--relay URL` **after the command** to replace the entire default list. `
 is required except `ws://` on loopback. `relay.maxplayer.ai` is refused, including
 case/trailing-dot variants. The home's job relay is never used for challenge traffic.
 
-Every publication attempts every configured relay and succeeds if at least one acknowledges.
+Every publication attempts every configured relay and succeeds only if every configured relay acknowledges. Failed URLs are reported.
 Per-relay acceptance/failure is printed to stderr (an ACK is not proof of durable storage).
 Reads query every configured relay and union verified events, deduplicating by event id;
 the shared protocol selects the latest per `(kind, author, d)` with deterministic ties.
-A relay without EOSE is a reported error and its partial events are discarded. If no relay
-completes, the command fails; otherwise partial relay failures remain visible on stderr.
+A relay without EOSE is a reported error and its partial events are discarded. If any relay
+fails to complete, the command fails and identifies the incomplete relays.
 A reachable relay's history cannot prove that another relay has no newer event.
 `--json` retains the existing command JSON on stdout.
 

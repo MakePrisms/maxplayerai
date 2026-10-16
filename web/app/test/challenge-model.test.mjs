@@ -15,7 +15,7 @@ const award=(who=0,time=4020)=>event(3405,who,time,[['e',claim.id],['e',offer.id
 const result=(who=1,time=5940)=>event(3403,who,time,[['e',offer.id,'','root'],['p',buyer]],'Done');
 const base=[c,app(),decision(),offer,claim,award()];
 function project(events=base,now=6000){const store=new EventStore();for(const e of events)store.add(e);return store.snapshot(buyer,now);}
-test('normal result tallies 32 of 60 minutes and public committed price',()=>{const s=project([...base,result()]);assert.equal(s.sellers[0].minutesUsed,32);assert.equal(s.sellers[0].minutesRemaining,28);assert.equal(s.sellers[0].state,'done');assert.equal(s.budget.committedSats,50);});
+test('unaccepted result tallies through now: 33 of 60 minutes and public committed price',()=>{const s=project([...base,result()]);assert.equal(s.sellers[0].minutesUsed,33);assert.equal(s.sellers[0].minutesRemaining,27);assert.equal(s.sellers[0].state,'done');assert.equal(s.budget.committedSats,50);});
 test('no result before deadline runs and after deadline caps',()=>{assert.equal(project(base,4080).jobs[0].usedMinutes,1);assert.equal(project(base,4080).jobs[0].running,true);assert.equal(project(base,8000).jobs[0].usedMinutes,3580/60);assert.equal(project(base,8000).jobs[0].running,false);});
 test('wrong result author ignored',()=>assert.equal(project([...base,result(2)],6000).jobs[0].running,true));
 test('wrong award author ignored',()=>assert.equal(project([...base.slice(0,-1),award(2)]).jobs.length,0));
@@ -51,7 +51,7 @@ test('existing public-v2 free trade tallies running, result and accept with v1 c
   const ac=publicV2(3406,0,4090,[['e',o.id,'','root'],['e',cl.id],['p',buyer],['p',seller],['status','accepted']]);
   const events=[c,app(),decision(),o,cl,aw];
   const running=project(events,4050);assert.equal(running.jobs.length,1);assert.equal(running.sellers[0].state,'working');assert.equal(running.sellers[0].minutesUsed,.5);
-  const done=project([...events,r,ac],4100);assert.equal(done.sellers[0].state,'done');assert.equal(done.sellers[0].minutesUsed,1);assert.equal(done.jobs[0].accepted,true);assert.equal(done.budget.unknownAmounts,0);assert.equal(done.budget.committedSats+done.budget.paidSats,0);
+  const done=project([...events,r,ac],4100);assert.equal(done.sellers[0].state,'done');assert.equal(done.sellers[0].minutesUsed,70/60);assert.equal(done.jobs[0].accepted,true);assert.equal(done.budget.unknownAmounts,0);assert.equal(done.budget.committedSats+done.budget.paidSats,0);
 });
 test('public-v2 admission does not relax challenge-v1 or admit private/malformed envelopes',async()=>{
   const {tradeNamespace}=await import('../src/challenge/shared/events.mjs');
@@ -115,4 +115,11 @@ test('latest signed challenge replacement supplies goal, updates and result',()=
   const updated=event(30341,0,101,[...c.tags.filter(t=>!['t','v'].includes(t[0])),['update','Progress'],['result','Answer']], 'New goal');
   const s=project([...base,updated]);assert.equal(s.challenge.goal,'New goal');
   assert.deepEqual(s.updates,['Progress']);assert.equal(s.challenge.result,'Answer');
+});
+
+test('seller result just after award cannot close the meter before buyer ACCEPT',()=>{
+  const early=result(1,4021);
+  assert.equal(project([...base,early],4080).jobs[0].usedMinutes,1);
+  const ac=event(3406,0,4140,[['e',claim.id],['e',offer.id,'','root'],['p',buyer],['p',seller],['status','accepted']]);
+  assert.equal(project([...base,early,ac],4200).jobs[0].usedMinutes,2);
 });
