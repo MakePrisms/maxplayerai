@@ -3,8 +3,17 @@ use maxplayer_core::{
     gateway::EventDraft,
     home::{self, MaxplayerHome},
 };
+use nostr_sdk::pool::transport::{
+    error::TransportError,
+    websocket::{DefaultWebsocketTransport, WebSocketSink, WebSocketStream, WebSocketTransport},
+};
 use nostr_sdk::prelude::*;
-use std::{collections::BTreeMap, time::Duration};
+use nostr_sdk::util::BoxedFuture;
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 pub const DEFAULT_RELAYS: [&str; 3] = [
     "wss://nos.lol",
@@ -14,6 +23,109 @@ pub const DEFAULT_RELAYS: [&str; 3] = [
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Events per history REQ (the common public-relay cap; same as the page's `PAGE_LIMIT`).
 pub const PAGE_LIMIT: usize = 500;
+/// Most pages one trusted `fetch` may request from one relay. Reaching it with a still-full page
+/// fails the read with `history truncated` (nothing is published): 20 pages walk up to ~10,000
+/// events (500 + 19 x 499 new, the oldest second is re-read) in at most 20 x `TIMEOUT` (200 s),
+/// far beyond any real roster's membership history.
+pub const MAX_TRUSTED_PAGES: usize = 20;
+/// Raw view of one subscription: every `EVENT` frame the relay sent for it, and the oldest
+/// verified, filter-matching one among them.
+#[derive(Debug)]
+struct RawPage {
+    filter: Filter,
+    frames: usize,
+    oldest: Option<Timestamp>,
+}
+/// Counts `EVENT` frames per registered subscription id on the raw websocket, before nostr-sdk
+/// parses, verifies, expires (NIP-40), size-checks or deduplicates them. Those drops never
+/// reach `notifications()`, so saturation counted there would make a full page look short.
+#[derive(Debug, Default)]
+struct FrameCounter(Mutex<HashMap<String, RawPage>>);
+impl FrameCounter {
+    fn register(&self, id: &SubscriptionId, filter: &Filter) {
+        let page = RawPage {
+            filter: filter.clone(),
+            frames: 0,
+            oldest: None,
+        };
+        self.0.lock().unwrap().insert(id.to_string(), page);
+    }
+    fn take(&self, id: &SubscriptionId) -> (usize, Option<Timestamp>) {
+        self.0
+            .lock()
+            .unwrap()
+            .remove(id.as_str())
+            .map_or((0, None), |p| (p.frames, p.oldest))
+    }
+    /// Text the SDK might handle (`as_text` also converts binary/ping frames, which only ever
+    /// over-counts: fail closed). Unregistered ids are ignored, so the map stays bounded.
+    fn observe(&self, text: &str) {
+        if self.0.lock().unwrap().is_empty() || !text.contains("EVENT") {
+            return;
+        }
+        let Ok(serde_json::Value::Array(mut m)) = serde_json::from_str(text) else {
+            return;
+        };
+        if m.len() < 2 || m[0].as_str() != Some("EVENT") {
+            return;
+        }
+        let Some(id) = m[1].as_str().map(str::to_owned) else {
+            return;
+        };
+        // Like the web reader, the cursor may move to any verified frame that matches the
+        // page's filter, even one the SDK then drops (e.g. expired): those still used up the
+        // relay's limit, and paging past them is how older history is reached.
+        let event = m
+            .get_mut(2)
+            .map(serde_json::Value::take)
+            .and_then(|v| serde_json::from_value::<Event>(v).ok());
+        let mut pages = self.0.lock().unwrap();
+        let Some(page) = pages.get_mut(&id) else {
+            return;
+        };
+        page.frames += 1;
+        if let Some(event) = event
+            && page.filter.match_event(&event, Default::default())
+            && event.verify().is_ok()
+        {
+            page.oldest = Some(
+                page.oldest
+                    .map_or(event.created_at, |o| o.min(event.created_at)),
+            );
+        }
+    }
+}
+/// The default transport, with every received frame shown to a [`FrameCounter`] first. The SDK
+/// reads frames in order, so by the time it notifies a subscription's EOSE every `EVENT` frame
+/// the relay sent before it has been counted.
+#[derive(Debug)]
+struct CountingTransport(Arc<FrameCounter>);
+impl WebSocketTransport for CountingTransport {
+    fn support_ping(&self) -> bool {
+        DefaultWebsocketTransport.support_ping()
+    }
+    fn connect<'a>(
+        &'a self,
+        url: &'a Url,
+        mode: &'a nostr_sdk::pool::ConnectionMode,
+        timeout: Duration,
+    ) -> BoxedFuture<'a, Result<(WebSocketSink, WebSocketStream), TransportError>> {
+        Box::pin(async move {
+            let (sink, stream) = DefaultWebsocketTransport
+                .connect(url, mode, timeout)
+                .await?;
+            let counter = self.0.clone();
+            let stream: WebSocketStream = Box::pin(stream.inspect(move |frame| {
+                if let Ok(frame) = frame
+                    && let Some(text) = frame.as_text()
+                {
+                    counter.observe(text);
+                }
+            }));
+            Ok((sink, stream))
+        })
+    }
+}
 struct Page {
     events: Vec<Event>,
     received: usize,
@@ -68,16 +180,29 @@ impl Relays {
         }
         Ok(Self { urls: normalized })
     }
-    async fn client(home: &MaxplayerHome, url: &str) -> Result<Client, String> {
-        // Event size/tag limits off: a frame the SDK dropped would not count toward a full
-        // page, so a short-looking page could hide older history. Message size stays capped.
+    async fn client(
+        home: &MaxplayerHome,
+        url: &str,
+    ) -> Result<(Client, Arc<FrameCounter>), String> {
+        // Saturation is counted on raw frames (`CountingTransport`), so an SDK drop can no
+        // longer shorten a page; event size/tag limits stay off so fewer valid frames are lost.
         let limits = RelayLimits {
             events: nostr_sdk::pool::relay::limits::RelayEventLimits::disable(),
             ..Default::default()
         };
+        let counter = Arc::new(FrameCounter::default());
+        // An id-tracker database (no event store): it never answers `Rejected(Replaced)`, so a
+        // newer same-coordinate event (even an invalid membership) cannot make the SDK swallow
+        // an older valid one. The caller picks the latest *valid* event per coordinate.
+        let database = MemoryDatabase::with_opts(MemoryDatabaseOptions {
+            events: false,
+            ..Default::default()
+        });
         let client = Client::builder()
             .signer(keys(home)?)
             .opts(ClientOptions::new().relay_limits(limits))
+            .websocket_transport(CountingTransport(counter.clone()))
+            .database(database)
             .build();
         client.automatic_authentication(true);
         client
@@ -88,12 +213,13 @@ impl Relays {
             maxplayer_core::relay_auth::resubscribe_on_auth(relay, "maxplayer-challenges");
         }
         client.connect().await;
-        Ok(client)
+        Ok((client, counter))
     }
     /// Full history for `filter` on every relay, paged like the page's trusted reader
     /// (`web/app/src/challenge/shared/relay.mjs`): each REQ carries `limit: PAGE_LIMIT`, and a
-    /// full page is never treated as complete. It re-reads from the oldest in-range second
-    /// (inclusive `until`) and fails the read unless that cursor moves strictly older.
+    /// full page (counted in raw relay frames) is never treated as complete. It re-reads from
+    /// the oldest in-range second (inclusive `until`), fails the read unless that cursor moves
+    /// strictly older, and fails once `MAX_TRUSTED_PAGES` pages were all full.
     pub async fn fetch(&self, home: &MaxplayerHome, filter: Filter) -> Result<Vec<Event>, String> {
         self.read(home, filter.limit(PAGE_LIMIT), true)
             .await
@@ -119,8 +245,8 @@ impl Relays {
         let mut failed = Vec::new();
         let mut saturated = false;
         for url in &self.urls {
-            let client = Self::client(home, url).await?;
-            let result = Self::read_relay(&client, &filter, paged).await;
+            let (client, counter) = Self::client(home, url).await?;
+            let result = Self::read_relay(&client, &counter, &filter, paged).await;
             client.disconnect().await;
             match result {
                 Ok((events, pages, full)) => {
@@ -152,6 +278,7 @@ impl Relays {
     /// Reasons are fixed strings: no relay-supplied text reaches diagnostics.
     async fn read_relay(
         client: &Client,
+        counter: &FrameCounter,
         filter: &Filter,
         paged: bool,
     ) -> Result<(Vec<Event>, usize, bool), &'static str> {
@@ -161,7 +288,7 @@ impl Relays {
         let mut pages = 0;
         loop {
             pages += 1;
-            let page = tokio::time::timeout(TIMEOUT, Self::read_page(client, &cursor))
+            let page = tokio::time::timeout(TIMEOUT, Self::read_page(client, counter, &cursor))
                 .await
                 .map_err(|_| "no EOSE before timeout")??;
             events.extend(page.events);
@@ -180,15 +307,27 @@ impl Relays {
                 }
                 Some(oldest) => cursor.until(oldest),
             };
+            if pages >= MAX_TRUSTED_PAGES {
+                return Err("history truncated: trusted page cap reached");
+            }
         }
     }
-    async fn read_page(client: &Client, filter: &Filter) -> Result<Page, &'static str> {
+    async fn read_page(
+        client: &Client,
+        counter: &FrameCounter,
+        filter: &Filter,
+    ) -> Result<Page, &'static str> {
         let mut rx = client.notifications();
         let id = SubscriptionId::generate();
-        client
+        counter.register(&id, filter);
+        if client
             .subscribe_with_id(id.clone(), filter.clone(), None)
             .await
-            .map_err(|_| "subscription failed")?;
+            .is_err()
+        {
+            counter.take(&id);
+            return Err("subscription failed");
+        }
         let mut page = Page {
             events: Vec::new(),
             received: 0,
@@ -205,8 +344,8 @@ impl Relays {
                         },
                     ..
                 }) if subscription_id.as_ref() == &id => {
-                    // Saturation counts every frame the relay spent its limit on, including
-                    // events outside the requested window or filter.
+                    // Delivered frames; the raw count below also includes the ones the SDK
+                    // dropped (expired, bad signature, oversized, replaced).
                     page.received += 1;
                     if event.verify().is_ok() && filter.match_event(&event, Default::default()) {
                         page.oldest = Some(
@@ -234,7 +373,17 @@ impl Relays {
             }
         };
         client.unsubscribe(&id).await;
-        result.map(|()| page)
+        // Saturation counts every EVENT frame the relay spent its limit on, including events
+        // outside the requested window or filter and events the SDK never delivered.
+        let (frames, raw_oldest) = counter.take(&id);
+        result.map(|()| Page {
+            received: page.received.max(frames),
+            oldest: match (page.oldest, raw_oldest) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+            ..page
+        })
     }
     pub async fn publish(
         &self,
@@ -255,7 +404,7 @@ impl Relays {
             .map_err(|_| "challenge signing failed")?;
         let mut failed = Vec::new();
         for url in &self.urls {
-            let client = Self::client(home, url).await?;
+            let (client, _) = Self::client(home, url).await?;
             let result = tokio::time::timeout(TIMEOUT, client.send_event(&event)).await;
             client.disconnect().await;
             let ok = matches!(result, Ok(Ok(ref output)) if !output.success.is_empty());
