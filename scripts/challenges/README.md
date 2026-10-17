@@ -126,7 +126,7 @@ Flags (environment equivalents):
 | `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
 | `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
 | `--award-after-seconds` | `SWARM_AWARD_AFTER_SECONDS` | 30 |
-| — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a relay-deferred assignment) |
+| — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
 The buyer chooses **each assignment's** optional `amountSats` (safe integer ≥0, default 0).
@@ -167,21 +167,25 @@ collecting outstanding deliveries until completion/expiry. Completion publicatio
 ordinary progress updates default to at most one per three minutes. Leave/deny/status changes
 and deadlines are rechecked after planning, immediately before posting.
 
-**Relay-deferred assignments.** If that fresh recheck fails *only* with `relay_not_ready`
-(trade or challenge relay disconnected, unauthenticated, history incomplete, in error, or any
-`failedRelays`), the assignment is not dropped. It is journaled as a `deferred` intent with
-its permanent request ID. No offer is posted and no budget is reserved, but the seller counts
-as busy: it is left out of the `assign` roster, appears in `running` with `deferred:true`, and
-cannot receive a second assignment. Each tick retries it. While the snapshot stays not ready it
-only waits. Once the snapshot is ready, it reruns the full admission check (challenge identity
-and window, eligibility, leave/deny, minutes, budget headroom and one job per seller) and
-either posts with a fresh deadline or drops the assignment with the logged reason.
-The deferred assignment is also dropped (`abandoned deferred assignment: <reason>`, released)
-when the day stops or when its duration no longer fits the work window. It is also dropped
-after `SWARM_MAX_DEFER_SECONDS` (default 120) if it is still not ready. The exact arguments
-are journaled before the first post, so a lost reply or a restart is recovered by the normal
-read-only preparation lookup and never posted twice. Any other rejection reason still drops
-the assignment immediately.
+**Relay-deferred assignments.** If that fresh recheck fails *only* with transient readiness
+reasons — `relay_not_ready` (trade or challenge relay disconnected, unauthenticated, history
+incomplete, in error, or any `failedRelays`) and/or `stale_snapshot` (the read is older than 5 s,
+e.g. right after a slow planner call) — the assignment is not dropped. It is journaled as a
+`deferred` intent with its permanent request ID. No offer is posted and no budget is reserved,
+but the seller counts as busy: it is left out of the `assign` roster, appears in `running` with
+`deferred:true`, and cannot receive a second assignment. Each tick retries it with a new
+snapshot. While that snapshot is not ready (relay not ready, or not fresh by the same 5-second
+`stale_snapshot` rule) it only waits. Once the snapshot is ready, it first reruns the full
+admission check (challenge identity and window, eligibility, leave/deny, minutes, budget headroom
+and one job per seller) and either posts with a fresh deadline or drops the assignment with the
+logged reason. The deferred assignment is also dropped (`abandoned deferred assignment: <reason>`,
+released) when the day stops or when its duration no longer fits the work window.
+`SWARM_MAX_DEFER_SECONDS` (default 120) applies only while the snapshot is still not ready: a
+tick past that age with an unready snapshot drops it as `relay snapshot still not ready after
+Ns`, while a ready snapshot always gets admission first. The exact arguments are journaled
+before the first post, so a lost reply or a restart is recovered by the normal read-only
+preparation lookup and never posted twice. Any other rejection reason, alone or together with a
+transient one, still drops the assignment immediately.
 
 ### Choosing the planner
 

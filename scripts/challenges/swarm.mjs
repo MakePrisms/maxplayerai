@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync, readSync, fstatSync, lstatSync, readdirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate, relayReady } from './coordinator.mjs';
+import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 export function command(bin, args, {input='', env=process.env, timeout=120000}={}) {
@@ -172,19 +172,23 @@ export class Swarm {
     const candidate=check.sellers.find(x=>x.seller_pubkey===seller);
     return candidate?.postingAllowed?[]:[...new Set([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])])];
   }
-  // A deferred assignment was journaled when the ONLY failing reason was relay_not_ready and has
-  // never been offered, so it needs no preparation lookup and is dropped without one. While the
-  // relay stays not ready it only waits (an unready snapshot, e.g. right after restart, is not
-  // evidence against it), bounded by stop, its journaled work window and the max wait. Once ready,
-  // a fresh full admission either posts it or drops it with the reason. Returns true when no
+  // A deferred assignment was journaled when its ONLY failing reasons were transient readiness
+  // (relay_not_ready and/or stale_snapshot) and has never been offered, so it needs no preparation
+  // lookup and is dropped without one. While the snapshot is not ready (relay not ready, or not
+  // genuinely fresh: same stale_snapshot rule as coordinate()) it only waits; an unready snapshot,
+  // e.g. right after restart, is not evidence against it. That wait is bounded by stop, its
+  // journaled work window and, only while still not ready, the max wait. Once ready, a fresh full
+  // admission runs first and either posts it or drops it with the reason. Returns true when no
   // offer was posted this tick.
   async retryDeferred(j) {
     const fresh=await this.io.snapshot(),at=this.io.now(),maxWait=this.c.maxDefer??120;
     const drop=reason=>{j.released=true;j.done=true;j.outcome=`abandoned deferred assignment: ${reason}`;j.ts=at;this.save();this.io.report?.(`Dropped deferred assignment for ${j.seller}: ${reason}`);return true;};
     if(this.state.days[j.key]?.stop)return drop('challenge stopped');
     if(at+j.durationSeconds>j.challenge.ends)return drop('work window exceeded');
-    if(at-j.deferredAt>maxWait)return drop(`relay snapshot not ready within ${maxWait}s`);
-    if(!relayReady(fresh))return true;
+    if(!relayReady(fresh)||!snapshotFresh(fresh,at)) {
+      if(at-j.deferredAt>maxWait)return drop(`relay snapshot still not ready after ${maxWait}s`);
+      return true;
+    }
     const reasons=this.admission(fresh,j.challenge,j.seller,j.durationSeconds,j.args.amount_sats,at,j);
     if(reasons.length)return drop(reasons.join(', '));
     // Freeze the exact arguments durably BEFORE the first post; from here on this is an ordinary
@@ -271,7 +275,7 @@ export class Swarm {
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
     const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),ts:j.ts??now}));
-    const ready=snap.relay?.connected&&snap.relay?.authenticated&&snap.relay?.historyComplete&&!snap.relay?.error&&!snap.relay?.failedRelays?.length && now-snap.asOf<=5 && now>=snap.asOf;
+    const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
     const min=this.c.minDuration??120, max=this.c.maxDuration??1800;
@@ -315,15 +319,16 @@ export class Swarm {
           // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
           const fresh=await this.io.snapshot(),at=this.io.now();
           const reasons=this.admission(fresh,c,seller,durationSeconds,amountSats,at);
-          // A transient relay gap alone defers (journaled, no offer, no budget held); else drop.
-          const deferred=reasons.length>0&&reasons.every(r=>r==='relay_not_ready');
+          // Transient readiness alone (relay gap and/or a stale read after a slow plan) defers
+          // (journaled, no offer, no budget held); any other reason drops.
+          const deferred=reasons.length>0&&reasons.every(r=>TRANSIENT_REASONS.includes(r));
           if(reasons.length&&!deferred){if(reasons.includes('budget_exceeded'))budgetRejected++;reject(reasons.join(', '));continue;}
           const sequence=jobs.filter(j=>j.seller===seller).length+1;
           const args={task:challengeTaskPrefix(c.buyer,c.id)+task+DELIVERY_NOTE,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
           const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args};
           if(deferred) {
             Object.assign(j,{deferred:true,deferredAt:at});this.state.jobs.push(j);jobs.push(j);this.save();
-            this.io.report?.(`Deferred assignment for ${seller}: relay_not_ready; retrying once the relay snapshot is ready`);continue;
+            this.io.report?.(`Deferred assignment for ${seller}: ${reasons.join(', ')}; retrying once the relay snapshot is ready and fresh`);continue;
           }
           this.state.jobs.push(j);jobs.push(j);this.save();
           const posted=await this.io.mcp('post_job',args);j.id=posted.job_id??posted.preparation_id;

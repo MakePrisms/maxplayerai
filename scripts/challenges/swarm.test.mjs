@@ -451,7 +451,7 @@ test('deferred: retry re-runs the full serial budget admission; a deferral reser
   assert.equal(reservedBudget(f.snap,f.journal.state.jobs,105).committedSats,6);
 });
 test('deferred: relay not ready past max wait or work window, or another reason appears, drops it unposted',async()=>{
-  for(const [bound,expected] of [['wait',/not ready within 60s/],['window',/work window exceeded/],['minutes',/insufficient_minutes/],['stop',/not_in_progress/]]){
+  for(const [bound,expected] of [['wait',/still not ready after 60s/],['window',/work window exceeded/],['minutes',/insufficient_minutes/],['stop',/not_in_progress/]]){
     const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.maxDefer=60;
     if(bound==='window')f.snap.challenge.ends=150;
     f.setPlan(gapOnce(f));await f.runner.tick();
@@ -565,4 +565,47 @@ test('delivery: readDeliveredAnswer prefers answer.txt, else hardened determinis
     fs.symlinkSync(outside,join(dir,'answer.txt'));assert.ok(!readDeliveredAnswer(dir).includes('TOP SECRET'));
     const empty=join(base,'empty');fs.mkdirSync(empty);assert.match(readDeliveredAnswer(empty),/no readable text files/);
   } finally {rmSync(base,{recursive:true});}
+});
+
+// Bug 2 (first live run, 15:49Z): after a long planner call the per-assignment fresh read was
+// stale, and stale_snapshot dropped planned assignments instead of holding them.
+const staleAfterPlan=(f,{relay=false}={})=>{let stale=false;const snapshot=f.io.snapshot;
+  f.io.snapshot=async()=>{const s=await snapshot();if(stale){s.asOf-=10;if(relay)s.relay.failedRelays=['ws://challenge'];}return s;};
+  const plan=f.io.plan;f.io.plan=async x=>{const r=await plan(x);if(x.mode==='assign')stale=true;return r;};
+  return {heal:()=>{stale=false;}};};
+test('deferred: stale_snapshot (alone or with relay_not_ready) is held, re-checked on a genuinely fresh read, posted once',async()=>{
+  for(const relay of [false,true]){
+    const f=fixture(),reports=[];f.io.report=m=>reports.push(m);const s=staleAfterPlan(f,{relay});
+    await f.runner.tick();
+    assert.equal(posts(f).length,0,`${relay}`);
+    assert.ok(f.journal.state.jobs.length===2&&f.journal.state.jobs.every(j=>j.deferred&&!j.done),`${relay}`);
+    assert.ok(reports.some(r=>r.includes('Deferred assignment for a: ')&&r.includes('stale_snapshot')),`${relay}`);
+    assert.ok(!reports.some(r=>r.includes('Rejected assignment')),`${relay}`);
+    // Still stale (and relay healthy if relay=false): waits, never posts on a stale read.
+    f.setPlan(()=>({wait:true}));f.time(103);await f.runner.tick();assert.equal(posts(f).length,0,`${relay}`);
+    s.heal();f.time(105);await f.runner.tick();
+    assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix]),[['a',135],['b',135]],`${relay}`);
+    f.time(106);await f.runner.tick();assert.equal(posts(f).length,2,`${relay}`);
+  }
+});
+test('deferred: stale plus a real reason drops immediately; stale past the max wait drops unposted',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);staleAfterPlan(f);
+  f.setPlan(input=>{f.snap.sellers.forEach(s=>s.minutesRemaining=.1);return assignments(input);});
+  await f.runner.tick();assert.equal(f.journal.state.jobs.length,0);assert.ok(reports.some(r=>r.includes('insufficient_minutes')&&r.includes('stale_snapshot')));
+  const g=fixture();g.c.maxDefer=60;staleAfterPlan(g);await g.runner.tick();
+  g.setPlan(()=>({wait:true}));g.time(161);await g.runner.tick();
+  assert.ok(g.journal.state.jobs.every(j=>j.done&&j.released&&/still not ready after 60s/.test(j.outcome)));
+  assert.equal(posts(g).length,0);
+});
+// #1164 review nit (a): the max wait applies only while the snapshot is still not ready.
+test('deferred: a ready snapshot after the max wait runs admission first and posts',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.maxDefer=60;f.setPlan(gapOnce(f));
+  await f.runner.tick();assert.ok(f.journal.state.jobs.every(j=>j.deferred));
+  f.snap.relay.failedRelays=[];f.time(200);await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix]),[['a',230],['b',230]]);
+  assert.ok(!reports.some(r=>r.startsWith('Dropped deferred')));
+  // ...and a ready-but-inadmissible one past the cap drops with its real reason, not "not ready".
+  const g=fixture();g.c.maxDefer=60;g.setPlan(gapOnce(g));await g.runner.tick();
+  g.snap.relay.failedRelays=[];g.snap.sellers.forEach(s=>s.minutesRemaining=.1);g.time(200);await g.runner.tick();
+  assert.ok(g.journal.state.jobs.every(j=>j.done&&/insufficient_minutes/.test(j.outcome)&&!/not ready/.test(j.outcome)));
 });

@@ -6,13 +6,17 @@ import { fileURLToPath } from 'node:url';
 const nonnegative = n => Number.isFinite(n) && n >= 0;
 // Exactly the relay_not_ready condition: connected, authenticated, complete, no error/failed relay.
 export const relayReady = snapshot => !!(snapshot.relay?.connected && snapshot.relay?.authenticated && snapshot.relay?.historyComplete && !snapshot.relay?.error && !snapshot.relay?.failedRelays?.length);
+// Freshness of a snapshot at `now`: the exact stale_snapshot rule (taken at or before now, at most 5 s old).
+export const snapshotFresh = (snapshot, now) => Number.isSafeInteger(snapshot?.asOf) && now >= snapshot.asOf && now - snapshot.asOf <= 5;
+// Reasons that only say "this read cannot be trusted yet", never anything about the assignment.
+export const TRANSIENT_REASONS = ['relay_not_ready','stale_snapshot'];
 export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 300, amountSats = 0, budgetState = null, pendingSellers = [] } = {}) {
   if (!Number.isSafeInteger(now) || !Number.isSafeInteger(durationSeconds) || durationSeconds <= 0 || !Number.isSafeInteger(amountSats) || amountSats < 0) throw Error('now, durationSeconds and amountSats must be valid integers');
   const c = snapshot.challenge, b = budgetState ?? snapshot.budget, reasons = [];
   if (!c) reasons.push('no_challenge');
   if (c && c.status !== 'in_progress') reasons.push('not_in_progress');
   if (c && !(now >= c.starts && now <= c.ends)) reasons.push('outside_work_window');
-  if (!Number.isSafeInteger(snapshot.asOf) || now < snapshot.asOf || now - snapshot.asOf > 5) reasons.push('stale_snapshot');
+  if (!snapshotFresh(snapshot, now)) reasons.push('stale_snapshot');
   if (!relayReady(snapshot)) reasons.push('relay_not_ready');
   const validBudget = b && [b.totalSats,b.committedSats,b.paidSats].every(n => Number.isSafeInteger(n) && nonnegative(n)) && !snapshot.budget?.unknownAmounts;
   const headroom = validBudget ? b.totalSats - b.committedSats - b.paidSats : null;
