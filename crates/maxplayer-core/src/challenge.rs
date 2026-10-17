@@ -300,25 +300,40 @@ mod signed {
         }
         latest.into_values().collect()
     }
+    /// The trusted roster: sellers whose latest valid buyer-signed decision is `accepted`.
+    /// Readers fetch memberships only for these authors; nothing a stranger signs changes it.
+    pub fn accepted_sellers<'a>(
+        buyer: &str,
+        events: impl IntoIterator<Item = &'a Event>,
+    ) -> std::collections::BTreeSet<String> {
+        latest_per_coordinate(
+            events
+                .into_iter()
+                .filter(|e| parse_decision(e, buyer).is_ok()),
+        )
+        .into_iter()
+        .filter_map(|e| parse_decision(e, buyer).ok())
+        .filter(|d| d.decision == "accepted")
+        .map(|d| d.seller)
+        .collect()
+    }
+    /// Latest buyer decision accepted + latest valid membership from that pubkey joined, with
+    /// `since` and `created_at` at or before the challenge start. Memberships from any other
+    /// author are ignored before replacement, so they cannot hide or replace a roster entry.
     pub fn eligible_sellers<'a>(
         c: &Challenge,
         events: impl IntoIterator<Item = &'a Event>,
     ) -> Vec<Membership> {
-        let latest = latest_per_coordinate(events.into_iter().filter(|e| {
-            parse_membership(e, &c.buyer).is_ok() || parse_decision(e, &c.buyer).is_ok()
-        }));
-        let accepted: std::collections::BTreeSet<_> = latest
-            .iter()
-            .filter_map(|e| parse_decision(e, &c.buyer).ok())
-            .filter(|d| d.decision == "accepted")
-            .map(|d| d.seller)
-            .collect();
-        latest
-            .iter()
-            .filter(|e| e.created_at.as_secs() <= c.starts)
-            .filter_map(|e| parse_membership(e, &c.buyer).ok())
-            .filter(|a| a.status == "joined" && a.since <= c.starts && accepted.contains(&a.seller))
-            .collect()
+        let events: Vec<&Event> = events.into_iter().collect();
+        let accepted = accepted_sellers(&c.buyer, events.iter().copied());
+        latest_per_coordinate(events.into_iter().filter(|e| {
+            accepted.contains(&e.pubkey.to_hex()) && parse_membership(e, &c.buyer).is_ok()
+        }))
+        .into_iter()
+        .filter(|e| e.created_at.as_secs() <= c.starts)
+        .filter_map(|e| parse_membership(e, &c.buyer).ok())
+        .filter(|a| a.status == "joined" && a.since <= c.starts)
+        .collect()
     }
 }
 #[cfg(feature = "gateway")]
@@ -570,6 +585,66 @@ mod tests {
             };
             events.push(sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 100));
             assert_eq!(eligible_sellers(&c, &events), vec![a]);
+        }
+        #[test]
+        fn eligible_sellers_match_shared_js_roster_fixture() {
+            // Same file as web/app/test/challenge-roster.test.mjs (generated and signed in JS).
+            let f: serde_json::Value = serde_json::from_str(include_str!(
+                "../../../web/app/test/fixtures/challenge-roster.json"
+            ))
+            .unwrap();
+            let buyer = f["buyer"].as_str().unwrap();
+            let events: Vec<Event> = f["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| serde_json::from_value(e.clone()).unwrap())
+                .collect();
+            let c = events
+                .iter()
+                .find_map(|e| parse_challenge(e, buyer).ok())
+                .unwrap();
+            let mut got: Vec<String> = eligible_sellers(&c, &events)
+                .into_iter()
+                .map(|a| a.seller)
+                .collect();
+            got.sort();
+            let want: Vec<String> = f["eligible"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(got, want);
+            let accepted = accepted_sellers(buyer, &events);
+            assert!(want.iter().all(|pk| accepted.contains(pk)));
+            // Strangers (undecided, self-accepted, non-buyer decision) never enter the roster.
+            assert_eq!(accepted.len(), 4);
+        }
+        #[test]
+        fn stranger_membership_cannot_replace_accepted_seller_membership() {
+            let buyer = Keys::generate();
+            let seller = Keys::generate();
+            let mut c = challenge();
+            c.buyer = buyer.public_key().to_hex();
+            let mut a = membership();
+            a.seller = seller.public_key().to_hex();
+            let joined = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 100);
+            let d = Decision {
+                seller: a.seller.clone(),
+                ..decision()
+            };
+            let accepted = sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 100);
+            let mut events = vec![joined, accepted];
+            for _ in 0..300 {
+                let key = Keys::generate();
+                let mut s = membership();
+                s.seller = key.public_key().to_hex();
+                s.status = "left".into();
+                events.push(sign(s.to_event_draft(&c.buyer).unwrap(), &key, 100));
+            }
+            assert_eq!(eligible_sellers(&c, &events), vec![a]);
+            assert_eq!(accepted_sellers(&c.buyer, &events).len(), 1);
         }
         #[test]
         fn signatures_ids_authors_and_known_challenge_required() {

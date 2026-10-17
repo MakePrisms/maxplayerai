@@ -130,3 +130,13 @@ test('applicant list shows new joiners; a flood there never changes runner readi
   assert.equal(snap.relay.historyComplete,true);assert.equal(snap.relay.error,null);assert.deepEqual(snap.relay.warnings,[]);
   assert.equal(coordinate(snap,{now:300,durationSeconds:30}).postingAllowed,true);
 });
+
+test('shared roster fixture: JS eligible set ignores strangers (crates/maxplayer-core checks the same file)',async()=>{
+  const {readFileSync}=await import('node:fs');
+  const f=JSON.parse(readFileSync(new URL('./fixtures/challenge-roster.json',import.meta.url),'utf8'));
+  const store=new EventStore();for(const e of f.events)store.add(e);
+  const s=store.snapshot(f.buyer,300);
+  assert.deepEqual(s.sellers.filter(x=>x.eligible).map(x=>x.pubkey).sort(),f.eligible);
+  const {acceptedSellers}=await import('../src/challenge/shared/model.mjs');
+  assert.ok(acceptedSellers(f.events,f.buyer).every(pk=>s.sellers.some(x=>x.pubkey===pk)||!f.events.some(e=>e.kind===30342&&e.pubkey===pk)));
+});
