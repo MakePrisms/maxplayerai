@@ -283,16 +283,23 @@ successfully reading that relay, or after a person has checked it holds no newer
 replaceable event (challenge, membership, or decision). Otherwise removing it can
 resurrect an older joined membership, budget, or challenge state.
 
-Reader membership discovery ignores invalid events, content over 4096 UTF-16 code
-units, and tags over 16384 serialized UTF-16 code units, without setting a history
-error. The sidecar refuses join notes over the same content limit before publishing.
-Only valid memberships count toward the 256 distinct-key profile subscription cap.
-Overflow events are skipped; EOSE still completes. `relay.warnings` names every
-excluded pubkey, and `relay.excludedMembers` prevents those sellers from assignment,
-even if an older joined record was cached. Exclusions persist for this reader's
-lifetime, including reconnects. Other sellers continue normally. This is bounded
-roster availability, not a claim that all sellers are displayed; increase capacity
-or reduce the roster deliberately rather than treating excluded sellers as absent.
+Reader membership discovery ignores structurally invalid events. Every valid membership
+is retained, including replacements with content over 4096 UTF-16 code units or tags
+over 16384 serialized UTF-16 code units; only the projected note is dropped in those
+cases, in both JS and Rust. Signed envelopes remain unchanged. Join refuses oversized
+notes before publishing; leave drops oversized prior notes.
+
+The 256-key budget applies only to trade-relay profile/heartbeat subscriptions. After
+challenge history EOSE, latest-per-pubkey memberships and buyer decisions determine
+metadata priority (accepted sellers first, then pubkey order). Replacements update
+that selection. Memberships outside this metadata budget remain visible and eligible;
+no assignment exclusion is inferred from missing metadata. A deduplicated warning
+indicates partial metadata. The swarm never declares seller exhaustion while warnings
+or explicit membership exclusions remain. Invalid memberships do not count toward
+accepted-page saturation: full discarded pages advance to the preceding second.
+A full page of 500 accepted events tied at the boundary still reports truncation.
+As with any timestamp-only relay cursor, discarded-page advancement cannot recover
+additional unseen events at that same second; the next earlier second is scanned.
 
 The production-relay fence is a normalized **hostname string** denylist, shared by
 the sidecar, page, swarm parser and site build (canonical JSON literal in

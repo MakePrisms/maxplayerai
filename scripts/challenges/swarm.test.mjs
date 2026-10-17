@@ -412,3 +412,9 @@ test('planner running roster includes collected work while projected meter runs'
   assert.equal(f.inputs.at(-1).running.length,2);
   assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
 });
+
+for(const field of ['warnings','excludedMembers'])test(`membership ${field} prevents exhausted completion`,async()=>{
+  const f=fixture();f.snap.sellers=[];f.snap.relay[field]=['unavailable member'];f.setPlan(()=>({wait:true}));
+  await f.runner.tick();assert.ok(!f.publishes.some(p=>p[2]==='completed'));
+  delete f.snap.relay[field];await f.runner.tick();assert.equal(f.publishes.at(-1)[2],'completed');
+});

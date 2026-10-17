@@ -319,8 +319,12 @@ Remove a relay only after a successful read of it, or after a person has checked
 it contains no newer replaceable challenge, membership, or decision. Removing an
 unread relay can resurrect an old join or budget.
 
-Invalid/oversized membership events are skipped without poisoning history. Join
-notes are limited to 4096 UTF-16 code units. Only valid members consume the 256-key
-profile cap. Overflow pubkeys appear in `relay.warnings` and `excludedMembers`;
-those sellers cannot be assigned (even with an older cached join), while history
-and other sellers continue. Exclusions persist until the reader is restarted.
+Structurally invalid memberships are skipped without poisoning history. Valid oversized
+replacements retain status/minutes/since/time; only their note is dropped (4096 UTF-16
+content units or 16384 serialized tag units). Join refuses oversized notes; leave
+bounds the prior note. The 256-key cap limits profile/heartbeat requests only, selected
+after challenge EOSE from latest memberships with buyer-accepted sellers first.
+All valid members remain in the roster and can be assigned without metadata. A
+metadata warning prevents an exhausted completion, as do explicit excluded members.
+Full discarded history pages advance to the prior second; 500 accepted events in one
+second still fail closed as truncated. See the protocol document for cursor limits.

@@ -1,6 +1,6 @@
 import { CHALLENGE, MEMBERSHIP, DECISION, OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE } from '../../model/kinds.ts';
 import { schnorr } from '@noble/curves/secp256k1';
-import { signAuth, verify, mentions, validMembership } from './events.mjs';
+import { signAuth, verify, mentions, validMembership, validDecision, newer, tag } from './events.mjs';
 
 export function challengeFilters(buyer) {
   return [CHALLENGE,MEMBERSHIP,DECISION,OFFER,CLAIM,AWARD,RESULT,ACCEPT].map(kind =>
@@ -67,30 +67,24 @@ export class RelayReader {
       } else if(m[0]==='EVENT') {
         const p=this.pages.get(m[1]),f=p?.filter??this.live.get(m[1]),e=m[2];
         if(!f||!verify(e)||!matches(e,f))return;
-        if(p)p.events.push(e);
+        if(p){p.received++;p.oldest=Math.min(p.oldest,e.created_at);}
         const id=p?m[1]:m[1].slice(5);
         this.newest.set(id,Math.max(this.newest.get(id)??0,e.created_at));
-        if(e.kind===MEMBERSHIP) {
-          if(e.content.length>4096 || JSON.stringify(e.tags).length>16384 || !validMembership(e,{pubkey:this.buyer}))return;
-          if((this.onMember?this.onMember(e.pubkey):this.addMember(e.pubkey))===false) {
-            // Preserve history availability, but never assign a seller whose latest
-            // membership may have been dropped (including an older cached join).
-            this.excludedMembers.add(e.pubkey);
-            this.status.excludedMembers=[...this.excludedMembers];
-            this.status.warnings=this.status.excludedMembers.map(pk=>`Membership profile cap: excluded seller ${pk}`);
-            this.onChange();return;
-          }
-        }
+        if(e.kind===MEMBERSHIP&&!validMembership(e,{pubkey:this.buyer}))return;
+        if(p)p.events.push(e);
         const added=this.store.add(e);
-        if(added)this.onChange();
+        if(added){if(!this.pages.size)this.refreshMembers();this.onChange();}
       } else if(m[0]==='EOSE'&&this.pages.has(m[1])) {
         const p=this.pages.get(m[1]);this.pages.delete(m[1]);
-        if(p.events.length>=500) {
-          const oldest=Math.min(...p.events.map(e=>e.created_at));
+        if(p.received>=500 && p.events.length<500) {
+          if(p.oldest>0)this.page(m[1],{...p.filter,until:p.oldest-1});
+        } else if(p.events.length>=500) {
+          const oldest=p.oldest;
           if(p.filter.until===oldest)this.status.error='History truncated: 500+ events in one second';
           else this.page(m[1],{...p.filter,until:oldest});
         }
         if(!this.pages.has(m[1]))send(['CLOSE',m[1]]);
+        this.refreshMembers();
         this.status.historyComplete=this.pages.size===0&&!this.status.error;this.onChange();
       } else if(m[0]==='CLOSED') {
         if(this.live.has(m[1])) {this.live.delete(m[1]);this.status.authenticated=false;}
@@ -111,6 +105,32 @@ export class RelayReader {
       if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,30000);}
     });
   }
+  refreshMembers() {
+    if(this.onMember){this.onMember();return;}
+    if([...this.pages.keys()].some(id=>[String(MEMBERSHIP),String(DECISION),String(CHALLENGE)].includes(id)))return;
+    this.selectMembers();
+  }
+  selectMembers() {
+    const apps=new Map(),decisions=new Map(),c={pubkey:this.buyer};
+    for(const e of this.store.events.values()) {
+      if(validMembership(e,c)&&newer(e,apps.get(e.pubkey)))apps.set(e.pubkey,e);
+      if(validDecision(e,c)&&newer(e,decisions.get(tag(e,'p'))))decisions.set(tag(e,'p'),e);
+    }
+    const keys=[...apps.keys()].sort((a,b)=>Number(tag(decisions.get(b)??{tags:[]},'decision')==='accepted')-Number(tag(decisions.get(a)??{tags:[]},'decision')==='accepted')||a.localeCompare(b));
+    const selected=new Set(keys.slice(0,256));
+    // This budget limits metadata requests only, never membership or assignment.
+    this.status.warnings=keys.length>256?['Membership profile cap: some profiles/heartbeats unavailable']:[];
+    for(const pk of this.members)if(!selected.has(pk)) {
+      this.members.delete(pk);
+      for(const kind of [PROFILE,HEARTBEAT]) {
+        const id=`${kind}-${pk}`;
+        this.filters?.delete(id);this.pages?.delete(id);this.live?.delete(`live-${id}`);
+        if(this.queue)this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==`live-${id}`);
+        if(this.ws?.readyState===1)for(const sub of [id,`live-${id}`])this.ws.send(JSON.stringify(['CLOSE',sub]));
+      }
+    }
+    for(const pk of selected)this.addMember(pk);
+  }
   addMember(pk) {
     if(!this.members.has(pk)&&this.members.size>=256)return false;
     this.members.add(pk);
@@ -123,7 +143,7 @@ export class RelayReader {
     }
     return true;
   }
-  page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,events:[]});this.queue.push(['REQ',id,{...filter,limit:500}]);}
+  page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,events:[],received:0,oldest:Infinity});this.queue.push(['REQ',id,{...filter,limit:500}]);}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.ws?.close();}
 }
 
@@ -145,11 +165,15 @@ export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
 export class ChallengeReader {
   constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...options}) {
     const filters=challengeFilters(buyer);
-    const common={...options,buyer,store,onChange};
-    this.trade=new RelayReader({...common,url,filters:filters.filter(f=>![CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0]))});
+    const changed=()=>{
+      if(this.challenges?.every(r=>r.status.historyComplete))this.trade.selectMembers();
+      onChange();
+    };
+    const common={...options,buyer,store,onChange:changed};
+    this.trade=new RelayReader({...common,url,onMember:()=>{},filters:filters.filter(f=>![CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0]))});
     this.challenges=parseChallengeRelays(challengeRelays).map(url=>new RelayReader({...common,url,
       filters:filters.filter(f=>[CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0])),
-      onMember:pk=>this.trade.addMember(pk)}));
+      onMember:()=>{}}));
   }
   get status() {
     const relays=[{role:'trade',url:this.trade.url,...this.trade.status},...this.challenges.map(r=>({role:'challenge',url:r.url,...r.status}))];
@@ -159,7 +183,7 @@ export class ChallengeReader {
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
       historyComplete:this.trade.status.historyComplete&&ready,
-      warnings:relays.flatMap(r=>r.warnings),excludedMembers:[...new Set(relays.flatMap(r=>r.excludedMembers))],
+      warnings:[...new Set(relays.flatMap(r=>r.warnings))],excludedMembers:[...new Set(relays.flatMap(r=>r.excludedMembers))],
       error:this.trade.status.error??(failedRelays.length?`Challenge history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}

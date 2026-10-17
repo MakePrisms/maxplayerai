@@ -94,7 +94,7 @@ test('split sources union IDs, reject cross-kind events, and tolerate a failed p
   assert.equal(store.events.size,1);
   // Membership from public relays expands only trade-relay heartbeat/profile reads.
   reader.challenges[0].ws.message(['EVENT','30342',signed(30342,100,memberTags)]);
-  assert.ok(reader.trade.filters.has(`30340-${buyer}`));
+  assert.ok(!reader.trade.filters.has(`30340-${buyer}`),'metadata waits for challenge history');
   assert.ok(!reader.challenges[0].filters.has(`30340-${buyer}`));
   for(const r of [reader.trade,...reader.challenges.slice(0,2)])for(const id of [...r.pages.keys()])r.ws.message(['EOSE',id]);
   reader.challenges[2].ws.close();
@@ -210,12 +210,15 @@ test('oversized membership alongside valid history does not poison EOSE',t=>{
   socket.message(['EVENT','30342',huge]);
   socket.message(['EVENT','30342',signed(30342,100,memberTags)]);
   socket.message(['EVENT','30341',signed(30341,100,[['t','maxplayer'],['v','1'],['d','day'],['title','Day'],['starts','200'],['ends','1000'],['budget','0','sat'],['status','in_progress']])]);
-  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
+  finish(reader,socket);
   assert.equal(reader.status.historyComplete,true);assert.equal(reader.status.error,null);
   assert.equal(store.events.size,2);assert.equal(store.snapshot(buyer,300).sellers.length,1);
 });
-test('valid membership overflow warns without blocking history and excludes seller from assignments',async t=>{
+const dayTags=[['t','maxplayer'],['v','1'],['d','day'],['title','Day'],['starts','200'],['ends','1000'],['budget','0','sat'],['status','in_progress']];
+function finish(reader,socket) { while(reader.pages.size)for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]); }
+test('256 unaccepted joins cannot exclude an accepted last arrival or exhaust the swarm',async t=>{
   const {coordinate}=await import('../../../scripts/challenges/coordinator.mjs');
+  const {Swarm}=await import('../../../scripts/challenges/swarm.mjs');
   const {reader,socket,store}=setup(t);
   for(let i=2;i<=257;i++) {
     const privateKey=i.toString(16).padStart(64,'0');
@@ -224,12 +227,53 @@ test('valid membership overflow warns without blocking history and excludes sell
     socket.message(['EVENT','30342',e]);
   }
   socket.message(['EVENT','30342',signed(30342,100,memberTags)]);
-  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
-  assert.equal(reader.status.error,null);assert.equal(reader.status.historyComplete,true);
-  assert.equal(store.events.size,256);assert.equal(reader.members.size,256);
-  assert.deepEqual(reader.status.excludedMembers,[buyer]);
-  assert.ok(reader.status.warnings.some(w=>w.includes(buyer)));
-  // A cached older membership must not become usable when a replacement was dropped.
-  const snap={asOf:300,challenge:{id:'day',starts:200,ends:1000,status:'in_progress'},budget:{totalSats:0,committedSats:0,paidSats:0},relay:{...reader.status,authenticated:true},sellers:[{pubkey:buyer,eligible:true,decision:'accepted',state:'accepted',minutesRemaining:60,currentJobStart:null}],jobs:[]};
-  assert.equal(coordinate(snap,{now:300,durationSeconds:30}).postingAllowed,false);
+  socket.message(['EVENT','30341',signed(30341,100,dayTags)]);
+  socket.message(['EVENT','30343',signed(30343,100,[['t','maxplayer'],['v','1'],['d',buyer],['p',buyer],['decision','accepted']])]);
+  finish(reader,socket);reader.status.authenticated=true;
+  const snap={...store.snapshot(buyer,300),relay:reader.status};
+  assert.equal(coordinate(snap,{now:300,durationSeconds:30}).sellers.find(s=>s.seller_pubkey===buyer)?.postingAllowed,true);
+  assert.equal(snap.sellers.length,257);assert.equal(snap.sellers.filter(s=>s.eligible).length,1);
+  assert.equal(reader.members.size,256);assert.ok(reader.members.has(buyer));
+  assert.deepEqual(reader.status.excludedMembers,[]);
+  assert.equal(coordinate(snap,{now:300,durationSeconds:30}).sellers.find(s=>s.seller_pubkey===buyer).postingAllowed,true);
+  const publishes=[];
+  const io={now:()=>300,snapshot:async()=>snap,plan:async x=>x.mode==='analyze'?{approach:'split',workstreams:[{id:'piece',description:'piece',needs:{skills:[]},estMinutes:1,dependsOn:[]}],verification:'check'}:{wait:true},publish:async(...args)=>publishes.push(args)};
+  await new Swarm({minDuration:30,maxDuration:60,updateEvery:180},io,{state:{jobs:[],days:{}},save(){}}).tick();
+  assert.ok(!publishes.some(p=>p[2]==='completed'));
+});
+test('500 discarded memberships page past a saturated second to valid older history',t=>{
+  const {reader,socket,store}=setup(t);
+  for(let i=0;i<500;i++)socket.message(['EVENT','30342',signed(30342,101,[['p',buyer],['junk',String(i)]])]);
+  socket.message(['EOSE','30342']);
+  assert.equal(reader.pages.get('30342').filter.until,100);
+  const valid=signed(30342,100,memberTags);socket.message(['EVENT','30342',valid]);
+  finish(reader,socket);
+  assert.equal(reader.status.historyComplete,true);assert.equal(reader.status.error,null);assert.ok(store.events.has(valid.id));
+});
+for(const oversized of ['content','tags'])test(`oversized ${oversized} replacement preserves left state and minutes in page/swarm snapshot`,t=>{
+  const {reader,socket,store}=setup(t);
+  socket.message(['EVENT','30341',signed(30341,100,dayTags)]);
+  socket.message(['EVENT','30343',signed(30343,100,[['t','maxplayer'],['v','1'],['d',buyer],['p',buyer],['decision','accepted']])]);
+  socket.message(['EVENT','30342',signed(30342,100,memberTags)]);
+  const left=signed(30342,101,memberTags.map(t=>t[0]==='status'?['status','left']:t[0]==='minutes'?['minutes','20']:t));
+  left.content=oversized==='content'?'x'.repeat(4097):'short note';
+  if(oversized==='tags')left.tags.push(['extra','x'.repeat(16385)]);
+  left.id=eventId(left);left.sig=Buffer.from(schnorr.sign(left.id,key)).toString('hex');
+  socket.message(['EVENT','30342',left]);finish(reader,socket);
+  const seller=store.snapshot(buyer,300).sellers[0];
+  assert.equal(seller.state,'left');assert.equal(seller.eligible,false);assert.equal(seller.minutesOffered,20);assert.equal(seller.note,'');
+  assert.ok(verify(store.events.get(left.id)),'signed envelope is never modified');
+});
+test('split reader waits for all challenge EOSE and deduplicates relay warnings',t=>{
+  const store=new EventStore(),reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a','ws://b'],buyer,store,WebSocketImpl:Socket});
+  reader.start();t.after(()=>reader.stop());
+  for(const r of [reader.trade,...reader.challenges])r.ws.dispatchEvent(new Event('open'));
+  const [a,b]=reader.challenges;
+  a.ws.message(['EVENT','30342',signed(30342,100,memberTags)]);
+  finish(a,a.ws);finish(reader.trade,reader.trade.ws);
+  assert.equal(reader.trade.members.size,0,'other relay still resolving latest decisions');
+  finish(b,b.ws);assert.ok(reader.trade.members.has(buyer));finish(reader.trade,reader.trade.ws);
+  assert.equal(reader.status.historyComplete,true);
+  a.status.warnings=['same warning'];b.status.warnings=['same warning'];
+  assert.deepEqual(reader.status.warnings,['same warning']);
 });
