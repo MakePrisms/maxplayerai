@@ -506,5 +506,63 @@ test('deferred: seller stays busy (not in assign roster, shown running, no secon
   assert.equal(posts(f).length,0);assert.equal(f.journal.state.jobs.length,2);
   // Within one gap batch a duplicate for the deferred seller is busy, not deferred twice.
   const g=fixture();g.setPlan(gapOnce(g,()=>({assignments:['first','second'].map(task=>({seller:'a',workstream:'piece',task,durationSeconds:30}))})));
-  await g.runner.tick();assert.deepEqual(g.journal.state.jobs.map(j=>[j.seller,j.args.task.split('\n').at(-1)]),[['a','first']]);
+  await g.runner.tick();assert.deepEqual(g.journal.state.jobs.map(j=>[j.seller,j.args.task.split('\n')[1]]),[['a','first']]);
+});
+
+// Bug 1 (first live run): real sellers deliver files and no inline answer.txt.
+test('delivery: collect succeeds but the answer read fails -> recorded once, seller freed, planner sees the error',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  f.io.answer=async()=>{throw Object.assign(Error("ENOENT: no such file or directory, open '/r/answer.txt'"),{code:'ENOENT'});};
+  f.setPlan(()=>({wait:true}));
+  for(let t=101;t<=105;t++){f.time(t);await f.runner.tick();}
+  const collects=f.calls.filter(([t])=>t==='collect');
+  assert.equal(collects.length,1,'collect (and payment) runs exactly once');
+  const j=f.journal.state.jobs[0];
+  assert.equal(j.done,true);assert.equal(j.outcome,'collected');assert.match(j.answerError,/ENOENT/);
+  assert.match(j.answer,/^\[collected, answer unreadable: ENOENT/);
+  const r=f.inputs.at(-1).results[0];assert.match(r.answer,/answer unreadable/);assert.match(r.answerError,/ENOENT/);
+  assert.ok(reports.some(m=>m.includes('answer unreadable')));
+  // The seller is released through the normal ACCEPT projection and gets its next job.
+  f.snap.jobs=[{id:j.id,seller:'a',result:{},accepted:true,running:false}];f.setPlan(assignments);f.time(106);await f.runner.tick();
+  assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
+});
+test('delivery: task keeps the exact challenge prefix, carries the inline-answer note; planner sees only its own task',async()=>{
+  const {challengeTaskPrefix}=await import('../../web/app/src/challenge/shared/events.mjs');
+  const {DELIVERY_NOTE,plannerTask}=await import('./swarm.mjs');
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();
+  const task=f.calls.find(([t])=>t==='post_job')[1].task;
+  assert.ok(task.startsWith(challengeTaskPrefix('b','day')+'piece'));assert.ok(task.endsWith(DELIVERY_NOTE));
+  assert.match(DELIVERY_NOTE,/\nMAXPLAYER-ANSWER-V1 alone on its line|line MAXPLAYER-ANSWER-V1 alone on its line/);
+  f.setPlan(()=>({wait:true}));f.time(101);await f.runner.tick();
+  assert.equal(f.inputs.at(-1).running[0].task,challengeTaskPrefix('b','day')+'piece');assert.equal(plannerTask('legacy task'),'legacy task');
+});
+test('delivery: readDeliveredAnswer prefers answer.txt, else hardened deterministic text-file fallback',async()=>{
+  const {readDeliveredAnswer}=await import('./swarm.mjs');
+  const fs=await import('node:fs'),{execFileSync}=await import('node:child_process');
+  const base=mkdtempSync(join(tmpdir(),'swarm-delivery-')),dir=join(base,'result'),outside=join(base,'secret.txt');
+  try {
+    fs.mkdirSync(dir);fs.writeFileSync(outside,'TOP SECRET');
+    fs.writeFileSync(join(dir,'answer.txt'),'inline answer');
+    assert.equal(readDeliveredAnswer(dir),'inline answer');
+    fs.rmSync(join(dir,'answer.txt'));
+    fs.writeFileSync(join(dir,'REPORT.txt'),'report body');fs.writeFileSync(join(dir,'MAXPLAYER_EXECUTION_SENTINEL'),'sentinel');
+    fs.mkdirSync(join(dir,'src'));fs.writeFileSync(join(dir,'src','main.rs'),'fn main(){}');
+    for(const d of ['.git','target','node_modules']){fs.mkdirSync(join(dir,d));fs.writeFileSync(join(dir,d,'x.txt'),'skip-'+d);}
+    fs.writeFileSync(join(dir,'blob.bin'),Buffer.from([1,0,2]));
+    fs.symlinkSync(outside,join(dir,'link.txt'));fs.symlinkSync(base,join(dir,'linkdir'));
+    execFileSync('mkfifo',[join(dir,'pipe')]);
+    fs.writeFileSync(join(dir,'big.txt'),'x'.repeat(100));
+    const out=readDeliveredAnswer(dir,{maxFileBytes:20});
+    assert.ok(!out.includes('TOP SECRET')&&!out.includes('sentinel')&&!out.includes('skip-'),'never follows links or reads skipped trees');
+    assert.ok(out.indexOf('===== REPORT.txt')<out.indexOf('===== src/main.rs'),'files before subdirectories, sorted');
+    assert.ok(out.indexOf('===== REPORT.txt')<out.indexOf('===== big.txt'),'code-unit sort order');
+    assert.match(out,/fn main\(\)\{\}/);assert.match(out,/\[truncated: first 20 of 100 bytes shown\]/);assert.ok(!out.includes('report body\n[truncated'));
+    assert.match(out,/blob\.bin \(binary\)/);assert.match(out,/link\.txt \(not a regular file\)/);assert.match(out,/pipe \(not a regular file\)/);
+    assert.equal(readDeliveredAnswer(dir,{maxFileBytes:20}),out,'deterministic');
+    assert.match(readDeliveredAnswer(dir,{maxTotalChars:40}),/\[truncated: \d+ more file\(s\) omitted after 40 chars\]/);
+    // A symlinked answer.txt is not followed either.
+    fs.symlinkSync(outside,join(dir,'answer.txt'));assert.ok(!readDeliveredAnswer(dir).includes('TOP SECRET'));
+    const empty=join(base,'empty');fs.mkdirSync(empty);assert.match(readDeliveredAnswer(empty),/no readable text files/);
+  } finally {rmSync(base,{recursive:true});}
 });

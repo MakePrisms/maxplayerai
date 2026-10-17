@@ -4,8 +4,8 @@ import { parseChallengeRelays } from '../../web/app/src/challenge/shared/relay.m
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync } from 'node:fs';
-import { resolve, dirname, join } from 'node:path';
+import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync, readSync, fstatSync, lstatSync, readdirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
@@ -23,6 +23,71 @@ export function command(bin, args, {input='', env=process.env, timeout=120000}={
     child.on('close',code=>{clearTimeout(timer);code===0&&!failure?resolve(out):reject(failure??Error(`${bin} exited ${code}: ${err}`));});
   });
 }
+// Delivery entries that are never answer text (execution proof, VCS and build/dependency trees).
+export const DELIVERY_SKIP = new Set(['MAXPLAYER_EXECUTION_SENTINEL','.git','target','node_modules']);
+// The planner-visible answer of a collected delivery. An inline answer is materialized by the
+// buyer as answer.txt and returned unchanged. Real harnesses often deliver files instead (a
+// report, a data file, a source tree) with no inline answer, so otherwise the delivered text
+// files are concatenated: regular files only (lstat + O_NOFOLLOW, symlinks/devices/FIFOs never
+// followed or opened), confined to the result directory, binary (NUL) files skipped, skipped
+// names above ignored, files before subdirectories in sorted order, per-file and total caps with
+// stated truncation markers, and a bounded walk.
+export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=200000, maxEntries=2000, maxDepth=12}={}) {
+  const root=realpathSync(dir);
+  if(!lstatSync(root).isDirectory())throw Error('delivery path is not a directory');
+  const inside=p=>{const parent=realpathSync(dirname(p));return parent===root||parent.startsWith(root+sep);};
+  const read=p=>{
+    let fd;
+    try {fd=openSync(p,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);}
+    catch(e) {if(['ELOOP','ENOENT','EMLINK','ENXIO','EACCES'].includes(e.code))return null;throw e;}
+    try {
+      const st=fstatSync(fd);if(!st.isFile())return null;
+      const buf=Buffer.alloc(Math.min(st.size,maxFileBytes));let n=0;
+      while(n<buf.length){const r=readSync(fd,buf,n,buf.length-n,n);if(!r)break;n+=r;}
+      const bytes=buf.subarray(0,n);
+      if(bytes.includes(0))return {binary:true,size:st.size};
+      const text=bytes.toString('utf8');
+      return {text:st.size>n?`${text}\n[truncated: first ${n} of ${st.size} bytes shown]`:text,size:st.size};
+    } finally {closeSync(fd);}
+  };
+  const inline=join(root,'answer.txt');
+  let st;try{st=lstatSync(inline);}catch(e){if(e.code!=='ENOENT')throw e;}
+  if(st?.isFile()&&inside(inline)){const r=read(inline);if(r&&!r.binary)return r.text;}
+  const files=[],skipped=[];let entries=0,stopped=false;
+  const walk=(abs,rel,depth)=>{
+    if(stopped)return;
+    if(depth>maxDepth){skipped.push(`${rel}/ (too deep)`);return;}
+    const dirs=[];
+    for(const name of readdirSync(abs).sort()) {
+      if(++entries>maxEntries){stopped=true;return;}
+      if(DELIVERY_SKIP.has(name)||(depth===0&&name==='answer.txt'))continue;
+      const p=join(abs,name),r=rel?`${rel}/${name}`:name,s=lstatSync(p);
+      if(s.isDirectory())dirs.push([p,r]);else if(s.isFile())files.push([p,r]);else skipped.push(`${r} (not a regular file)`);
+    }
+    for(const [p,r] of dirs)walk(p,r,depth+1);
+  };
+  walk(root,'',0);
+  let out='',total=0,omitted=0;
+  for(const [p,r] of files) {
+    if(omitted){omitted++;continue;}
+    const got=inside(p)?read(p):null;
+    if(!got){skipped.push(`${r} (unreadable)`);continue;}
+    if(got.binary){skipped.push(`${r} (binary)`);continue;}
+    const block=`===== ${r} =====\n${got.text}\n`;
+    if(total+block.length>maxTotalChars){omitted=1;continue;}
+    out+=block;total+=block.length;
+  }
+  const notes=[];
+  if(omitted)notes.push(`[truncated: ${omitted} more file(s) omitted after ${maxTotalChars} chars]`);
+  if(stopped)notes.push(`[truncated: delivery walk stopped after ${maxEntries} entries]`);
+  if(skipped.length)notes.push(`[skipped: ${skipped.slice(0,20).join(', ')}${skipped.length>20?`, and ${skipped.length-20} more`:''}]`);
+  if(!out)return `[delivery contained no readable text files]${notes.length?'\n'+notes.join('\n'):''}`;
+  return `Delivered files (no inline answer):\n${out}${notes.join('\n')}`;
+}
+// Appended after the challenge prefix (which stays exactly as the shared projection matches it).
+export const DELIVERY_NOTE = '\n\n---\nDELIVERY: give your final answer inline. Start your final message with the line MAXPLAYER-ANSWER-V1 alone on its line, then the answer (or, if it is long, a short summary of it) as plain text. If you also leave files, write the same answer or summary to answer.txt at the top level.';
+// The planner sees the task it wrote: the delivery note is runner boilerplate (older journals lack it).
+export const plannerTask = task => typeof task==='string'&&task.endsWith(DELIVERY_NOTE)?task.slice(0,-DELIVERY_NOTE.length):task;
 export class Journal {
   constructor(path) {
     this.path=path; this.state={jobs:[],days:{}};
@@ -72,7 +137,7 @@ export function jobBudget(j) {
 export function sellerProfile(s,jobs) {
   const tags=s.capabilities??[], values=name=>tags.filter(t=>t[0]===name).flatMap(t=>t.slice(1));
   const own=jobs.filter(j=>j.seller===s.pubkey);
-  const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:j.args.task,workstream:j.workstream??null,
+  const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:plannerTask(j.args.task),workstream:j.workstream??null,
     outcome:j.outcome,delivered:j.outcome==='collected',turnaroundSeconds:(j.ts??j.created)-j.created}));
   return {pubkey:s.pubkey,npub:s.npub??'',name:s.name??'',agents:values('agents'),
     harness:{family:values('harness_family'),model:values('harness_model'),variant:values('harness_variant')},
@@ -172,8 +237,14 @@ export class Swarm {
       }
       if(state.results?.length) {
         const collected=await this.io.mcp('collect',{job_id:j.id});
+        // collect succeeded (and settled): record it exactly once, whatever the answer read does.
+        // An unreadable answer is an error the planner sees, never a reason to collect again.
+        let answer,answerError;
+        try {answer=await this.io.answer(collected);if(typeof answer!=='string')throw Error('answer is not text');}
+        catch(e) {answerError=String(e?.message??e).slice(0,500);answer=`[collected, answer unreadable: ${answerError}]`;
+          this.io.report?.(`Job ${j.id}: collected (pay ${collected?.pay?.state}) but answer unreadable: ${answerError}`);}
         // done records collection, not release of the seller slot; pending() waits for meter closure.
-        j.answer=await this.io.answer(collected);j.ts=now;j.done=true;j.outcome='collected';j.pay=collected.pay;this.save();
+        Object.assign(j,{answer,ts:now,done:true,outcome:'collected',pay:collected?.pay,...(answerError?{answerError}:{})});this.save();
       } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.released=true;j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
       else if(now>j.args.deadline_unix) {
         // Deadline alone is not proof of nonpayment. A confirmed empty/expired claim history,
@@ -199,14 +270,14 @@ export class Swarm {
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
-    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:j.args.task,amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,ts:j.ts??now}));
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),ts:j.ts??now}));
     const ready=snap.relay?.connected&&snap.relay?.authenticated&&snap.relay?.historyComplete&&!snap.relay?.error&&!snap.relay?.failedRelays?.length && now-snap.asOf<=5 && now>=snap.asOf;
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
     const min=this.c.minDuration??120, max=this.c.maxDuration??1800;
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
-      ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:j.args.task,since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
+      ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:plannerTask(j.args.task),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
     const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
       const p=validatePlan(await this.io.plan({mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
@@ -248,7 +319,7 @@ export class Swarm {
           const deferred=reasons.length>0&&reasons.every(r=>r==='relay_not_ready');
           if(reasons.length&&!deferred){if(reasons.includes('budget_exceeded'))budgetRejected++;reject(reasons.join(', '));continue;}
           const sequence=jobs.filter(j=>j.seller===seller).length+1;
-          const args={task:challengeTaskPrefix(c.buyer,c.id)+task,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
+          const args={task:challengeTaskPrefix(c.buyer,c.id)+task+DELIVERY_NOTE,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
           const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args};
           if(deferred) {
             Object.assign(j,{deferred:true,deferredAt:at});this.state.jobs.push(j);jobs.push(j);this.save();
@@ -310,7 +381,7 @@ async function main() {
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>source.snapshot(),
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
     plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:input.mode==='analyze'?360000:180000})),
-    answer:async collected=>readFileSync(join(collected.path,'answer.txt'),'utf8'),
+    answer:async collected=>readDeliveredAnswer(collected.path),
     publish:async(challenge,budget,status,update,result)=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
       const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),'--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
