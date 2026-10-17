@@ -208,9 +208,21 @@ The community HTTP/SSE server and review page have been removed; use
 - Live subscriptions start anonymously for public relays and are reinstalled after NIP-42
   AUTH succeeds on restricted relays. AUTH uses one new in-memory per-tab key across connections,
   never the buyer key. No EVENT is sent by the reader.
-- Refused/absent AUTH or a closed live subscription leaves history available and polling active.
-  Polling runs every 15 seconds from each filter's newest timestamp minus 900 seconds, also
-  repairing late events while streaming. Disconnects reconnect with bounded backoff and reload history.
+- Refused/absent AUTH leaves history available and polling active; so does a relay CLOSED of a
+  live subscription on an anonymous connection or of a display-only feed (applicants,
+  profiles/heartbeats). Polling runs every 15 seconds from each filter's newest timestamp minus
+  900 seconds, also repairing late events while streaming. Disconnects reconnect with bounded
+  backoff and reload history.
+- A relay CLOSED on a trusted read is never a dead end. When the relay closes an authenticated
+  live subscription, refuses a trusted history page, or answers `auth-required:` when AUTH is
+  then refused or does not complete within 15 seconds, the reader sets `error` to the relay's
+  reason and closes the socket. The backoff reconnect then runs a full fresh round (AUTH, trusted
+  history, live). Until a recovered connection has stayed ready for 60 seconds, CLOSED-driven
+  reconnects keep doubling the backoff (cap 5 minutes), a `Recovering after relay CLOSED (…)`
+  warning names the last reason, and `historyComplete` also requires an EOSE on every trusted
+  live subscription. A relay that closes every live subscription therefore stays not ready
+  without a reconnect storm. An `auth-required:` refusal of a REQ sent before AUTH is re-read in
+  place after AUTH OK.
 - Signatures and IDs are verified locally. Buyer-authored kinds are author-scoped;
   claims and results are `#p`-scoped to the buyer. Memberships are read in two separate ways
   (see *Trusted roster and applicant list* below): the trusted roster read is scoped by
