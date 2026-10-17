@@ -16,6 +16,9 @@ Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://re
 Repeat --relay URL after the command to override. ws:// is loopback-only; relay.maxplayer.ai is forbidden.
 Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 ";
+/// Authors per roster membership REQ, and the newest-first applicant sample size (matches the page).
+const ROSTER_AUTHOR_CHUNK: usize = 100;
+const APPLICANT_LIMIT: usize = 256;
 #[derive(Debug)]
 struct Opts {
     command: String,
@@ -319,29 +322,69 @@ async fn execute_async(
     } else {
         None
     };
-    let mut events = relay
+    // Decisions first: the buyer-accepted roster scopes every membership read the eligible
+    // view depends on (authors filter), so strangers' memberships cannot hide or crowd it out.
+    let decision_events = relay
         .fetch(
             home,
             Filter::new()
-                .kind(Kind::from(CHALLENGE_MEMBERSHIP_KIND))
-                .pubkey(public_key(&buyer)?),
+                .kind(Kind::from(CHALLENGE_DECISION_KIND))
+                .author(public_key(&buyer)?),
         )
         .await
         .map_err(|e| e.to_string())?;
-    events.extend(
-        relay
+    let mut authors = accepted_sellers(&buyer, &decision_events);
+    match o.command.as_str() {
+        "join" | "leave" | "status" => {
+            authors.insert(own.clone());
+        }
+        "decide" => {
+            authors.insert(public_key(o.required("--seller")?)?.to_hex());
+        }
+        _ => {}
+    }
+    let mut events = Vec::new();
+    let authors: Vec<_> = authors
+        .iter()
+        .map(|a| public_key(a))
+        .collect::<Result<_, _>>()?;
+    for chunk in authors.chunks(ROSTER_AUTHOR_CHUNK) {
+        events.extend(
+            relay
+                .fetch(
+                    home,
+                    Filter::new()
+                        .kind(Kind::from(CHALLENGE_MEMBERSHIP_KIND))
+                        .authors(chunk.iter().copied())
+                        .pubkey(public_key(&buyer)?),
+                )
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    events.extend(decision_events);
+    // Untrusted applicant sample for `members` only: newest APPLICANT_LIMIT joins so the buyer
+    // can decide. It never feeds eligibility; a flood can only truncate this list.
+    let (applicants, applicants_incomplete) = if o.command == "members" {
+        let sample = relay
             .fetch(
                 home,
                 Filter::new()
-                    .kind(Kind::from(CHALLENGE_DECISION_KIND))
-                    .author(public_key(&buyer)?),
+                    .kind(Kind::from(CHALLENGE_MEMBERSHIP_KIND))
+                    .pubkey(public_key(&buyer)?)
+                    .limit(APPLICANT_LIMIT),
             )
             .await
-            .map_err(|e| e.to_string())?,
-    );
+            .map_err(|e| e.to_string())?;
+        let incomplete = sample.len() >= APPLICANT_LIMIT;
+        (sample, incomplete)
+    } else {
+        (Vec::new(), false)
+    };
     let latest = latest_per_coordinate(
         events
             .iter()
+            .chain(&applicants)
             .filter(|e| parse_membership(e, &buyer).is_ok() || parse_decision(e, &buyer).is_ok()),
     );
     let memberships: Vec<_> = latest
@@ -398,6 +441,7 @@ async fn execute_async(
             }.to_event_draft(&buyer)
         }
         _ => {
+            // Trusted events only (decisions + roster-scoped memberships), never the sample.
             let eligible = c.as_ref().map(|c| eligible_sellers(c, &events)).unwrap_or_default();
             let rows: Vec<_> = memberships.iter()
                 .filter(|(_, a)| o.command == "members" || a.seller == own)
@@ -406,7 +450,11 @@ async fn execute_async(
                     json!({"event_id": e.id.to_hex(), "membership": a, "decision": decision,
                         "eligible": eligible.iter().any(|s| s.seller == a.seller)})
                 }).collect();
-            return Ok((json!({"challenge": c, "members": rows}), None));
+            let mut body = json!({"challenge": c, "members": rows});
+            if o.command == "members" {
+                body["applicants_incomplete"] = json!(applicants_incomplete);
+            }
+            return Ok((body, None));
         }
     }.map_err(|e| e.to_string())?;
     reject_secret_in_draft(home, &draft)?;
@@ -699,6 +747,95 @@ mod tests {
             assert_eq!(writes.len(), 1);
             assert!(writes[0].content.encode_utf16().count() <= 4096);
             assert_eq!(parse_membership(&writes[0], &buyer).unwrap().status, "left");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        #[tokio::test]
+        async fn members_reads_memberships_only_for_accepted_authors_and_ignores_flood() {
+            fn sign(d: maxplayer_core::gateway::EventDraft, k: &Keys, t: u64) -> Event {
+                EventBuilder::new(Kind::from(d.kind), d.content)
+                    .tags(d.tags.into_iter().map(|t| Tag::parse(t.0).unwrap()))
+                    .custom_created_at(Timestamp::from(t))
+                    .sign_with_keys(k)
+                    .unwrap()
+            }
+            let root = std::env::temp_dir().join(format!(
+                "challenge-roster-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let buyer_keys = crate::relay::keys(&home).unwrap();
+            let buyer = buyer_keys.public_key().to_hex();
+            let seller = Keys::generate();
+            let c = Challenge {
+                buyer: buyer.clone(),
+                id: "day".into(),
+                title: "Day".into(),
+                goal: "Goal".into(),
+                starts: 1000,
+                ends: 2000,
+                budget_sats: 0,
+                status: "in_progress".into(),
+                update: None,
+                result: None,
+            };
+            let member = |k: &Keys, status: &str| Membership {
+                since: 100,
+                seller: k.public_key().to_hex(),
+                minutes: 60,
+                status: status.into(),
+                note: String::new(),
+            };
+            let mut events = vec![
+                sign(c.to_event_draft().unwrap(), &buyer_keys, 900),
+                sign(
+                    Decision {
+                        seller: seller.public_key().to_hex(),
+                        decision: "accepted".into(),
+                        membership_event_id: None,
+                        reason: String::new(),
+                    }
+                    .to_event_draft(&buyer)
+                    .unwrap(),
+                    &buyer_keys,
+                    110,
+                ),
+                sign(
+                    member(&seller, "joined").to_event_draft(&buyer).unwrap(),
+                    &seller,
+                    100,
+                ),
+            ];
+            // 300 stranger joins at the same second, served before the real one.
+            for _ in 0..300 {
+                let k = Keys::generate();
+                events.insert(
+                    0,
+                    sign(member(&k, "left").to_event_draft(&buyer).unwrap(), &k, 100),
+                );
+            }
+            let relay = crate::relay::transport_tests::fixture(events, true, true).await;
+            let mut o = super::parse(&args("members --json")).unwrap();
+            o.relays = vec![relay.url.clone()];
+            let (body, _) = execute_async(&o, &home).await.unwrap();
+            let rows = body["members"].as_array().unwrap();
+            let eligible: Vec<_> = rows
+                .iter()
+                .filter(|r| r["eligible"] == true)
+                .map(|r| r["membership"]["seller"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(eligible, vec![seller.public_key().to_hex()]);
+            assert_eq!(body["applicants_incomplete"], true);
+            // Every unlimited (trusted) membership REQ is scoped to the accepted author.
+            let reqs = relay.reqs.lock().unwrap();
+            let trusted: Vec<_> = reqs
+                .iter()
+                .filter(|f| f["kinds"][0] == CHALLENGE_MEMBERSHIP_KIND && f.get("limit").is_none())
+                .collect();
+            assert_eq!(trusted.len(), 1);
+            assert_eq!(
+                trusted[0]["authors"],
+                serde_json::json!([seller.public_key().to_hex()])
+            );
             std::fs::remove_dir_all(root).unwrap();
         }
         #[tokio::test]

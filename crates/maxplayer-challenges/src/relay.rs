@@ -228,6 +228,7 @@ pub(crate) mod transport_tests {
     pub(crate) struct Fixture {
         pub(crate) url: String,
         pub(crate) writes: Arc<Mutex<Vec<Event>>>,
+        pub(crate) reqs: Arc<Mutex<Vec<serde_json::Value>>>,
         task: tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture {
@@ -240,10 +241,13 @@ pub(crate) mod transport_tests {
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let writes = Arc::new(Mutex::new(Vec::new()));
         let recorded = writes.clone();
+        let reqs = Arc::new(Mutex::new(Vec::new()));
+        let filters = reqs.clone();
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let events = events.clone();
                 let recorded = recorded.clone();
+                let filters = filters.clone();
                 tokio::spawn(async move {
                     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
                     while let Some(Ok(message)) = ws.next().await {
@@ -253,6 +257,7 @@ pub(crate) mod transport_tests {
                         let m: serde_json::Value = serde_json::from_str(&text).unwrap();
                         match m[0].as_str() {
                             Some("REQ") => {
+                                filters.lock().unwrap().push(m[2].clone());
                                 for event in &events {
                                     ws.send(Message::text(
                                         serde_json::json!(["EVENT", m[1], event]).to_string(),
@@ -284,7 +289,12 @@ pub(crate) mod transport_tests {
                 });
             }
         });
-        Fixture { url, writes, task }
+        Fixture {
+            url,
+            writes,
+            reqs,
+            task,
+        }
     }
     fn event(keys: &Keys, d: &str, t: u64) -> Event {
         EventBuilder::new(Kind::Custom(30341), "fixture")
