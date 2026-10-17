@@ -241,7 +241,7 @@ try:
     check('collect has no payment and zero sats', collected['pay']['state'] == 'none' and collected['pay']['amount_sats'] == 0 and collected['pay']['attempt_id'] is None)
     check('collect materialized result', Path(collected['path']).exists())
     if not ARGS.baseline:
-        s = wait('completed tally has positive minutes used', lambda: (s if any(x['pubkey'] == SELLER and x['state'] == 'done' and x['minutesUsed'] > 0 for x in s['sellers']) and any(j['id'] == job and j['accepted'] for j in s['jobs']) else None) if (s := snapshot()) else None)
+        s = wait('completed tally has positive minutes used', lambda: (s if s['relay']['historyComplete'] and s['relay']['authenticated'] and not s['relay']['error'] and 0 <= int(time.time()) - s['asOf'] <= 2 and any(x['pubkey'] == SELLER and x['state'] == 'done' and x['minutesUsed'] > 0 for x in s['sellers']) and any(j['id'] == job and j['accepted'] for j in s['jobs']) else None) if (s := snapshot()) else None)
         own = next(x for x in s['sellers'] if x['pubkey'] == SELLER)
         j = next(j for j in s['jobs'] if j['id'] == job)
         check('minutes exactly match award/buyer-accept timestamps', abs(own['minutesUsed'] - max(0,min(j['end']-j['start'],j['deadline']-j['start']))/60) < 1e-9 and abs(own['minutesRemaining'] + own['minutesUsed'] - 60) < 1e-9)
