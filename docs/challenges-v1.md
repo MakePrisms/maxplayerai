@@ -303,6 +303,9 @@ dropped before replacement. The sidecar reads decisions first and then membershi
 `--seller` being decided). Its trusted reads page like the web reader (`limit` 500, inclusive
 `until` re-read of the oldest second, fail closed when the cursor does not move), so a
 truncated history makes the command fail and publish nothing rather than act on a subset.
+Like the web reader, the sidecar counts every `EVENT` frame the relay sent toward the page
+limit, including frames its nostr-sdk client drops before delivery (expired, bad signature,
+oversized), and it stops after 20 pages per relay with `history truncated`.
 `web/app/test/fixtures/challenge-roster.json` is checked by both stacks.
 
 The **applicant list** shows people who asked to join and have no decision yet, so the buyer can
