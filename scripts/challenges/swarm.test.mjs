@@ -403,3 +403,12 @@ test('collected journal job waits for ACCEPT projection rather than RESULT proje
   f.snap.jobs=[...f.remote.values()].map(j=>({id:j.id,result:{},running:false,accepted:false}));
   await f.runner.tick();assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
 });
+
+test('planner running roster includes collected work while projected meter runs',async()=>{
+  const f=fixture();await f.runner.tick();
+  for(const job of f.remote.values())job.results=[{}];
+  f.snap.jobs=f.journal.state.jobs.map(j=>({id:j.id,seller:j.seller,result:{},running:true,accepted:false,start:100,deadline:1000}));
+  await f.runner.tick();
+  assert.equal(f.inputs.at(-1).running.length,2);
+  assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
+});
