@@ -126,6 +126,7 @@ Flags (environment equivalents):
 | `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
 | `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
 | `--award-after-seconds` | `SWARM_AWARD_AFTER_SECONDS` | 30 |
+| — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a relay-deferred assignment) |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
 The buyer chooses **each assignment's** optional `amountSats` (safe integer ≥0, default 0).
@@ -142,8 +143,9 @@ move the actual amount from reserved to paid; public ACCEPT is never proof of pa
 Expired jobs release only on confirmed evidence: an expired matching offer, complete empty/expired
 claim history and empty results, no accepted bind, a successful local award lookup with no award, and
 no buyer reservation and parked auto-award intent; or the existing buyer ledger has reconciled the reservation to released
-with no delivery/accept pending. Free terminal jobs, abandoned never-posted intents and
-permanently refused publications also release. Any uncertain/possibly payable paid job stays
+with no delivery/accept pending. Free terminal jobs, abandoned never-posted intents (including
+dropped relay-deferred assignments) and permanently refused publications also release; a
+deferred assignment reserves nothing until it is actually posted. Any uncertain/possibly payable paid job stays
 reserved and continues polling, including after stop. An old journal lacking proof stays reserved.
 Known external public awards are additionally reserved; unknown amounts fail closed. Dedicate
 the buyer to this runner and never remove its journal to reclaim budget.
@@ -164,6 +166,22 @@ publication retries after restart. It never posts further jobs for that stopped 
 collecting outstanding deliveries until completion/expiry. Completion publication is immediate;
 ordinary progress updates default to at most one per three minutes. Leave/deny/status changes
 and deadlines are rechecked after planning, immediately before posting.
+
+**Relay-deferred assignments.** If that fresh recheck fails *only* with `relay_not_ready`
+(trade or challenge relay disconnected, unauthenticated, history incomplete, in error, or any
+`failedRelays`), the assignment is not dropped. It is journaled as a `deferred` intent with
+its permanent request ID. No offer is posted and no budget is reserved, but the seller counts
+as busy: it is left out of the `assign` roster, appears in `running` with `deferred:true`, and
+cannot receive a second assignment. Each tick retries it. While the snapshot stays not ready it
+only waits. Once the snapshot is ready, it reruns the full admission check (challenge identity
+and window, eligibility, leave/deny, minutes, budget headroom and one job per seller) and
+either posts with a fresh deadline or drops the assignment with the logged reason.
+The deferred assignment is also dropped (`abandoned deferred assignment: <reason>`, released)
+when the day stops or when its duration no longer fits the work window. It is also dropped
+after `SWARM_MAX_DEFER_SECONDS` (default 120) if it is still not ready. The exact arguments
+are journaled before the first post, so a lost reply or a restart is recovered by the normal
+read-only preparation lookup and never posted twice. Any other rejection reason still drops
+the assignment immediately.
 
 ### Choosing the planner
 
@@ -186,7 +204,8 @@ All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `re
   `needs` contains skills/harness/hardware hints. Analysis is journaled before assignments;
   a restart reuses it. Timeout: 350 seconds for Claude, 360 for the outer command.
 - `assign`: one batch call per eligible tick with all free sellers, running jobs
-  (`seller,workstream,task,since,deadline` where available), and all settled results.
+  (`seller,workstream,task,since,deadline` where available; `deferred:true` marks an
+  assignment waiting for the relay snapshot, not yet offered), and all settled results.
   Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?}]}`, `{wait:true}`, or
   `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
   May deliberately leave any seller idle. Each assignment is validated separately and invalid
