@@ -420,3 +420,91 @@ test('metadata/applicant warnings do not block exhaustion; incomplete trusted hi
   Object.assign(f.snap.relay,{historyComplete:true,warnings:['Profile cap: metadata shown for 256 of 300 accepted sellers'],applicantsIncomplete:true});
   await f.runner.tick();assert.equal(f.publishes.at(-1)?.[2],'completed','display warnings must not block exhaustion');assert.match(f.publishes.at(-1)[3],/exhausted/);
 });
+
+// A relay coverage gap between planning and posting (relay_not_ready only) defers the assignment.
+const gapOnce=(f,plan=assignments)=>{let first=true;return input=>{if(!first)return {wait:true};first=false;f.snap.relay.failedRelays=['ws://challenge'];return plan(input);};};
+const posts=f=>f.calls.filter(([t])=>t==='post_job');
+test('deferred: relay gap between planning and posting posts exactly once after the relay is ready again',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.setPlan(gapOnce(f));
+  await f.runner.tick();
+  assert.equal(posts(f).length,0);
+  assert.deepEqual(f.journal.saved.jobs.map(j=>[j.seller,j.deferred,j.id]),[['a',true,undefined],['b',true,undefined]]);
+  assert.ok(reports.some(r=>r.includes('Deferred assignment for a: relay_not_ready')));
+  f.time(103);await f.runner.tick();assert.equal(posts(f).length,0,'never posts while relay_not_ready holds');
+  // An unready snapshot (e.g. reader restarting, history not yet loaded) is not evidence against it.
+  const snapshot=f.io.snapshot;f.io.snapshot=async()=>({...await snapshot(),challenge:null,sellers:[],budget:null});
+  f.time(104);await f.runner.tick();f.io.snapshot=snapshot;
+  assert.equal(posts(f).length,0);assert.ok(f.journal.state.jobs.every(j=>j.deferred&&!j.done));
+  f.snap.relay.failedRelays=[];f.time(105);await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix,a.request_id]),[['a',135,requestId(f.snap.challenge,'a',1)],['b',135,requestId(f.snap.challenge,'b',1)]]);
+  assert.ok(f.journal.state.jobs.every(j=>j.id&&j.deferred===false&&j.created===105));
+  f.time(106);await f.runner.tick();assert.equal(posts(f).length,2);
+});
+test('deferred: retry re-runs the full serial budget admission; a deferral reserves nothing',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.setPlan(gapOnce(f,input=>priced(input,6)));
+  await f.runner.tick();
+  assert.equal(f.journal.state.jobs.filter(j=>j.deferred).length,2);
+  assert.equal(reservedBudget(f.snap,f.journal.state.jobs,100).committedSats,0);
+  f.snap.relay.failedRelays=[];f.time(105);await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.max_sats]),[['a',6]]);
+  assert.match(f.journal.state.jobs[1].outcome,/abandoned deferred assignment: .*budget_exceeded/);
+  assert.equal(reservedBudget(f.snap,f.journal.state.jobs,105).committedSats,6);
+});
+test('deferred: relay not ready past max wait or work window, or another reason appears, drops it unposted',async()=>{
+  for(const [bound,expected] of [['wait',/not ready within 60s/],['window',/work window exceeded/],['minutes',/insufficient_minutes/],['stop',/not_in_progress/]]){
+    const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.maxDefer=60;
+    if(bound==='window')f.snap.challenge.ends=150;
+    f.setPlan(gapOnce(f));await f.runner.tick();
+    assert.ok(f.journal.state.jobs.length===2&&f.journal.state.jobs.every(j=>j.deferred&&!j.done),bound);
+    // Other reasons are judged only on a ready snapshot.
+    if(bound==='minutes'){f.snap.sellers.forEach(s=>s.minutesRemaining=.1);f.snap.relay.failedRelays=[];}
+    if(bound==='stop'){f.snap.challenge.status='completed';f.snap.relay.failedRelays=[];}
+    f.time({wait:161,window:121,minutes:105,stop:105}[bound]);await f.runner.tick();
+    assert.ok(f.journal.state.jobs.every(j=>j.done&&j.released&&expected.test(j.outcome)),bound);
+    assert.ok(reports.some(r=>r.startsWith('Dropped deferred assignment for a')),bound);
+    f.snap.relay.failedRelays=[];await f.runner.tick();assert.equal(posts(f).length,0,bound);
+  }
+});
+test('deferred: seller leaving, denied or ineligible while deferred is dropped; others still post',async()=>{
+  for(const change of [s=>{s.state='left';},s=>{s.decision='denied';},s=>{s.eligible=false;}]){
+    const f=fixture();f.setPlan(gapOnce(f));await f.runner.tick();
+    // The change lands during the gap; nothing is judged or posted until the relay is ready.
+    change(f.snap.sellers[0]);f.time(102);await f.runner.tick();
+    assert.ok(f.journal.state.jobs.every(j=>j.deferred&&!j.done));assert.equal(posts(f).length,0);
+    f.snap.relay.failedRelays=[];f.time(104);await f.runner.tick();
+    assert.match(f.journal.state.jobs[0].outcome,/abandoned deferred assignment: .*seller busy or ineligible/);
+    assert.equal(f.journal.state.jobs[0].id,undefined);
+    assert.deepEqual(posts(f).map(([,a])=>a.seller_pubkey),['b']);
+  }
+});
+test('deferred: restart with a journaled deferral posts once; a lost reply after un-deferral recovers read-only',async()=>{
+  const f=fixture(),dir=mkdtempSync(join(tmpdir(),'swarm-defer-')),path=join(dir,'events.jsonl');
+  try {
+    f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(gapOnce(f));
+    await new Swarm(f.c,f.io,new Journal(path)).tick();
+    assert.equal(new Journal(path).state.jobs[0].deferred,true);assert.equal(posts(f).length,0);
+    f.snap.relay.failedRelays=[];f.time(105);
+    const orig=f.io.mcp;let fail=true;
+    f.io.mcp=async(t,a)=>{const r=await orig(t,a);if(t==='post_job'&&fail){fail=false;throw Error('lost reply');}return r;};
+    await new Swarm(f.c,f.io,new Journal(path)).tick();
+    const intent=new Journal(path).state.jobs[0];assert.equal(intent.deferred,false);assert.equal(intent.id,undefined);
+    f.time(106);await new Swarm(f.c,f.io,new Journal(path)).tick();
+    f.time(107);await new Swarm(f.c,f.io,new Journal(path)).tick();
+    assert.equal(posts(f).length,1);assert.equal(f.remote.size,1);
+    assert.deepEqual(posts(f)[0][1],intent.args);assert.equal(new Journal(path).state.jobs[0].id,'job-0');
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('deferred: seller stays busy (not in assign roster, shown running, no second assignment)',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.setPlan(gapOnce(f));await f.runner.tick();
+  // Retry reads still see the gap; the planning snapshot is ready.
+  let reads=0;const snapshot=f.io.snapshot;f.io.snapshot=async()=>{const s=await snapshot();if(reads++<2)s.relay.failedRelays=['ws://challenge'];return s;};
+  f.snap.relay.failedRelays=[];f.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:'second',durationSeconds:30}]}));
+  f.time(101);await f.runner.tick();
+  const assign=f.inputs.filter(i=>i.mode==='assign').at(-1);
+  assert.deepEqual(assign.sellers,[]);assert.deepEqual(assign.running.map(r=>[r.seller,r.deferred]),[['a',true],['b',true]]);
+  assert.ok(reports.some(r=>r.includes('Rejected assignment for a: seller busy')));
+  assert.equal(posts(f).length,0);assert.equal(f.journal.state.jobs.length,2);
+  // Within one gap batch a duplicate for the deferred seller is busy, not deferred twice.
+  const g=fixture();g.setPlan(gapOnce(g,()=>({assignments:['first','second'].map(task=>({seller:'a',workstream:'piece',task,durationSeconds:30}))})));
+  await g.runner.tick();assert.deepEqual(g.journal.state.jobs.map(j=>[j.seller,j.args.task.split('\n').at(-1)]),[['a','first']]);
+});

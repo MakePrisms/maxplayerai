@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate } from './coordinator.mjs';
+import { coordinate, relayReady } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 export function command(bin, args, {input='', env=process.env, timeout=120000}={}) {
@@ -61,7 +61,8 @@ export function validatePlan(p, mode='assign') {
 }
 // Old journals without a release/receipt stay fully reserved (fail closed).
 export function jobBudget(j) {
-  if(j.released) return {reservedSats:0,paidSats:0};
+  // A deferred assignment has never been offered (no post_job call), so it holds nothing yet.
+  if(j.released||j.deferred) return {reservedSats:0,paidSats:0};
   const pay=j.pay;
   if(j.done && pay?.state==='none' && pay.amount_sats===0) return {reservedSats:0,paidSats:0};
   if(j.done && typeof pay?.state==='string' && /^Closed \{/.test(pay.state) && Number.isSafeInteger(pay.amount_sats) && pay.amount_sats>=0)
@@ -92,12 +93,50 @@ export function reservedBudget(snapshot,jobs,now) {
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
+  // One task per seller: any unfinished intent/job (deferred included, other challenges too) and
+  // collected work whose ACCEPT/deadline is not yet projected keep the seller busy.
+  pendingSellers(snap,key,now,except=null) {
+    return this.state.jobs.filter(j=>j!==except&&(!j.done||(j.key===key&&j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&(p.accepted||now>=p.deadline))))).map(j=>j.seller);
+  }
+  // Full fresh admission for one assignment: challenge identity and window, eligibility,
+  // leave/deny, minutes, budget headroom and one-job-per-seller. Returns failing reasons.
+  admission(fresh,c,seller,durationSeconds,amountSats,at,except=null) {
+    if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+durationSeconds>fresh.challenge.ends)return ['challenge changed or work window exceeded'];
+    const key=JSON.stringify([c.buyer,c.id]);
+    const check=coordinate(fresh,{now:at,durationSeconds,amountSats,budgetState:reservedBudget(fresh,this.state.jobs.filter(j=>j.key===key&&j!==except),at),pendingSellers:this.pendingSellers(fresh,key,at,except)});
+    const candidate=check.sellers.find(x=>x.seller_pubkey===seller);
+    return candidate?.postingAllowed?[]:[...new Set([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])])];
+  }
+  // A deferred assignment was journaled when the ONLY failing reason was relay_not_ready and has
+  // never been offered, so it needs no preparation lookup and is dropped without one. While the
+  // relay stays not ready it only waits (an unready snapshot, e.g. right after restart, is not
+  // evidence against it), bounded by stop, its journaled work window and the max wait. Once ready,
+  // a fresh full admission either posts it or drops it with the reason. Returns true when no
+  // offer was posted this tick.
+  async retryDeferred(j) {
+    const fresh=await this.io.snapshot(),at=this.io.now(),maxWait=this.c.maxDefer??120;
+    const drop=reason=>{j.released=true;j.done=true;j.outcome=`abandoned deferred assignment: ${reason}`;j.ts=at;this.save();this.io.report?.(`Dropped deferred assignment for ${j.seller}: ${reason}`);return true;};
+    if(this.state.days[j.key]?.stop)return drop('challenge stopped');
+    if(at+j.durationSeconds>j.challenge.ends)return drop('work window exceeded');
+    if(at-j.deferredAt>maxWait)return drop(`relay snapshot not ready within ${maxWait}s`);
+    if(!relayReady(fresh))return true;
+    const reasons=this.admission(fresh,j.challenge,j.seller,j.durationSeconds,j.args.amount_sats,at,j);
+    if(reasons.length)return drop(reasons.join(', '));
+    // Freeze the exact arguments durably BEFORE the first post; from here on this is an ordinary
+    // unposted intent (preparation lookup before any retry), so the request is never re-posted.
+    j.deferred=false;j.created=at;j.args={...j.args,deadline_unix:at+j.durationSeconds};this.save();
+    const posted=await this.io.mcp('post_job',j.args);j.id=posted.job_id??posted.preparation_id;
+    if(!j.id)throw Error('Post returned no job or preparation id');this.save();
+    this.io.report?.(`Posted deferred assignment for ${j.seller} after ${at-j.deferredAt}s`);
+    return false;
+  }
   async tick() {
     let snap; let now=this.io.now();
     // Settle even after a stop or a change of challenge day.
     for(const j of this.state.jobs.filter(j=>!j.done)) {
       try {
-      if(!j.id) {
+      if(!j.id&&j.deferred) {if(await this.retryDeferred(j))continue;}
+      else if(!j.id) {
         let recovered;
         try { recovered=await this.io.mcp('get_job',{job_id:preparationId(j.args.request_id)}); }
         catch(e) {
@@ -167,7 +206,7 @@ export class Swarm {
     const min=this.c.minDuration??120, max=this.c.maxDuration??1800;
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
-      ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:j.args.task,since:j.created,deadline:j.args.deadline_unix})),
+      ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:j.args.task,since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
     const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
       const p=validatePlan(await this.io.plan({mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
@@ -187,8 +226,7 @@ export class Swarm {
       day.assessed=resultVersion;this.save();
     }
     if(!day.stop && ready && c.status==='in_progress' && now>=c.starts) {
-      const awaitingProjection=jobs.filter(j=>j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&(p.accepted||now>=p.deadline)));
-      const pending=()=>[...this.state.jobs.filter(j=>!j.done),...awaitingProjection].map(j=>j.seller);
+      const pending=()=>this.pendingSellers(snap,key,now);
       const decision=coordinate(snap,{now,durationSeconds:min,amountSats:0,budgetState:reservedBudget(snap,jobs,now),pendingSellers:pending()});
       if(now>=c.ends)stop('Unsolved: work window ended');
       else if(!decision.reasons.length) {
@@ -205,13 +243,17 @@ export class Swarm {
           if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject('duration outside configured bounds');continue;}
           // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
           const fresh=await this.io.snapshot(),at=this.io.now();
-          const check=coordinate(fresh,{now:at,durationSeconds,amountSats,budgetState:fresh.challenge?reservedBudget(fresh,jobs,at):null,pendingSellers:pending()});
-          if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+durationSeconds>fresh.challenge.ends){reject('challenge changed or work window exceeded');continue;}
-          const candidate=check.sellers.find(x=>x.seller_pubkey===seller);
-          if(!candidate?.postingAllowed){if(check.reasons.includes('budget_exceeded'))budgetRejected++;reject([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])].join(', '));continue;}
+          const reasons=this.admission(fresh,c,seller,durationSeconds,amountSats,at);
+          // A transient relay gap alone defers (journaled, no offer, no budget held); else drop.
+          const deferred=reasons.length>0&&reasons.every(r=>r==='relay_not_ready');
+          if(reasons.length&&!deferred){if(reasons.includes('budget_exceeded'))budgetRejected++;reject(reasons.join(', '));continue;}
           const sequence=jobs.filter(j=>j.seller===seller).length+1;
           const args={task:challengeTaskPrefix(c.buyer,c.id)+task,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
           const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args};
+          if(deferred) {
+            Object.assign(j,{deferred:true,deferredAt:at});this.state.jobs.push(j);jobs.push(j);this.save();
+            this.io.report?.(`Deferred assignment for ${seller}: relay_not_ready; retrying once the relay snapshot is ready`);continue;
+          }
           this.state.jobs.push(j);jobs.push(j);this.save();
           const posted=await this.io.mcp('post_job',args);j.id=posted.job_id??posted.preparation_id;
           if(!j.id)throw Error('Post returned no job or preparation id');this.save();
@@ -237,10 +279,10 @@ export function childEnv(env,home) {
 export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),awardFallback:values['--award-fallback']===true};
+  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),awardFallback:values['--award-fallback']===true};
   if(!c.home||!c.url)throw Error('Explicit buyer home and relay URL required');
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
-  for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
+  for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter','maxDefer'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
   c.home=resolve(c.home);return c;
 }
