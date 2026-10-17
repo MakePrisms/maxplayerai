@@ -38,9 +38,9 @@ function network(relays) {
 }
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(predicate,ms=20000){const end=Date.now()+ms;while(Date.now()<end){if(predicate())return;await pause(10);}assert.ok(predicate(),'timed out');}
-function open(t,{challenge=[],trade=[],options={}}={}) {
+function open(t,{challenge=[],trade=[],options={},pollMs=600000}={}) {
   const relays={'ws://a':new FakeRelay(challenge,options),'ws://trade':new FakeRelay(trade)};
-  const store=new EventStore(),reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a'],buyer,store,WebSocketImpl:network(relays),queueMs:1,pollMs:600000});
+  const store=new EventStore(),reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a'],buyer,store,WebSocketImpl:network(relays),queueMs:1,pollMs});
   reader.start();t.after(()=>reader.stop());
   return {store,reader,relays};
 }
@@ -85,6 +85,30 @@ test('R4-2: a relay repeating an identical full page gets at most two requests, 
   assert.match(a.error,/History truncated/);assert.equal(reader.status.historyComplete,false);
   assert.match(reader.status.error,/ws:\/\/a/);
   assert.equal(relays['ws://a'].reqs.filter(m=>m[0]==='REQ'&&m[1]==='applicants').length,1,'applicant sample: one page per round');
+});
+
+test('R5-2: after truncation the production 15s poll sends no further trusted REQs; error and ready=false hold',async t=>{
+  // Only setInterval (the reader's queue and poll timers) is faked; the fake relay's
+  // setTimeout delivery stays real. advance() moves virtual time and lets frames land.
+  t.mock.timers.enable({apis:['setInterval']});
+  const own=Array.from({length:500},(_,i)=>junk(SELLER_KEY,100,i));
+  const {reader,relays}=open(t,{challenge:[day,accept(seller),...own],options:{ignoreUntil:true},pollMs:15000});
+  const reqs=relays['ws://a'].reqs;
+  const history=()=>reqs.filter(m=>m[0]==='REQ'&&m[2].kinds[0]===30342&&m[2].limit===500);
+  const trustedReqs=()=>reqs.filter(m=>m[0]==='REQ'&&!String(m[1]).startsWith('live-')&&m[1]!=='applicants');
+  let virtual=0;
+  const advance=async ms=>{for(const end=virtual+ms;virtual<end;virtual+=50){t.mock.timers.tick(50);await pause(1);}};
+  for(let i=0;i<200&&!reader.challenges[0].status.error;i++)await advance(50);
+  const a=()=>reader.status.relays.find(r=>r.url==='ws://a');
+  assert.match(a().error??'',/History truncated/,'trusted history fails closed first');
+  assert.equal(history().length,2);
+  const sent=trustedReqs().length,sockets=reader.challenges[0].ws;
+  await advance(3*15000+1000); // three production poll intervals
+  assert.equal(trustedReqs().length,sent,'no trusted REQ after truncation at the 15s poll');
+  assert.equal(history().length,2,'no third membership history REQ');
+  assert.equal(reader.challenges[0].ws,sockets,'no reconnect either: the socket stays failed');
+  assert.match(a().error,/History truncated/);
+  assert.equal(reader.status.historyComplete,false);
 });
 
 test('R4-3: 257 stranger joins cannot block exhaustion of the only accepted seller',async t=>{

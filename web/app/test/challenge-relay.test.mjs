@@ -179,6 +179,19 @@ test('metadata subscriptions cover accepted sellers only, capped at 256 in pubke
   assert.equal([...reader.filters.keys()].filter(id=>id.startsWith('roster-')).length,1,'roster re-subscribes when decisions change');
 });
 
+test('a roster change keeps an earlier incomplete profile/heartbeat warning',t=>{
+  const {reader,socket}=setup(t);
+  const pks=Array.from({length:300},(_,i)=>(i+2).toString(16).padStart(64,'0'));
+  reader.setRoster(pks.slice(0,1));
+  socket.message(['CLOSED',`0-${pks[0]}`,'restricted: no']);
+  assert.deepEqual(reader.status.warnings,['Profile/heartbeat read incomplete']);
+  reader.setRoster(pks);
+  assert.ok(reader.status.warnings.includes('Profile/heartbeat read incomplete'),'incomplete-read warning kept');
+  assert.match(reader.status.warnings[0],/256 of 300/);
+  reader.setRoster(pks.slice(0,2));
+  assert.deepEqual(reader.status.warnings,['Profile/heartbeat read incomplete'],'only the cap warning is replaced');
+});
+
 test('relay A hiding newer left while down blocks swarm despite relay B old joined',async t=>{
   const {Swarm}=await import('../../../scripts/challenges/swarm.mjs');
   const store=new EventStore(),reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a','ws://b'],buyer,store,WebSocketImpl:Socket});

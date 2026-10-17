@@ -64,7 +64,9 @@ export class RelayReader {
     this.pollTimer=setInterval(()=>{
       // Finish the entire trusted round before polling again, including member profiles.
       // Otherwise a large history can keep refilling faster than it drains.
-      if(this.trustedPending())return;
+      // A failed trusted history (truncated, refused) stays failed until a reconnect re-reads
+      // it in full; polling it again would only resend the same requests every interval.
+      if(this.status.error||this.trustedPending())return;
       // Poll also repairs late/backdated writes even when streaming succeeds.
       for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)});
       if(this.applicants&&!this.pages.has(APPLICANTS))this.pageApplicants();
@@ -171,7 +173,8 @@ export class RelayReader {
       this.members=new Set(selected);
       // Display only: a seller without profile/heartbeat stays eligible and assignable.
       this.metaWarnings=sorted.length>METADATA_CAP?[`Profile cap: metadata shown for ${METADATA_CAP} of ${sorted.length} accepted sellers`]:[];
-      this.status.warnings=[...this.metaWarnings];
+      // Replace only the cap warning; keep any other (e.g. an incomplete profile/heartbeat read).
+      this.status.warnings=[...this.metaWarnings,...this.status.warnings.filter(w=>!w.startsWith('Profile cap:'))];
       this.replaceExtra(metadataId,new Map(selected.flatMap(pk=>[PROFILE,HEARTBEAT].map(kind=>[`${kind}-${pk}`,{kinds:[kind],authors:[pk]}]))));
     }
   }
