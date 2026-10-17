@@ -197,11 +197,11 @@ try:
         wait('relay initial snapshot received', lambda: any(f['challenge'] and f['challenge']['id'] == 'local-e2e' for f in frames()))
         cli(seller_env, 'join', '--buyer', BUYER, '--minutes', '60')
         cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '30')
-        s = wait('both memberships visible (60 and 30 minutes)', lambda: (s if sorted(x['minutesOffered'] for x in s['sellers']) == [30, 60] else None) if (s := snapshot()) else None)
-        check('both initially joined', all(x['state'] == 'joined' for x in s['sellers']))
+        s = wait('both joins visible as applicants (60 and 30 minutes)', lambda: (s if sorted(x['minutesOffered'] for x in s.get('applicants', [])) == [30, 60] else None) if (s := snapshot()) else None)
+        check('undecided joins are applicants, never sellers', s['sellers'] == [] and {x['pubkey'] for x in s['applicants']} == {SELLER, DENIED})
         cli(buyer_env, 'decide', '--seller', SELLER, '--accept')
         cli(buyer_env, 'decide', '--seller', DENIED, '--deny')
-        s = wait('accepted/denied tally and authenticated history', lambda: (s if {x['state'] for x in s['sellers']} == {'accepted','denied'} and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
+        s = wait('accepted roster read and authenticated history', lambda: (s if [(x['pubkey'], x['state']) for x in s['sellers']] == [(SELLER, 'accepted')] and not s['applicants'] and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
         rows = json.loads(cli(buyer_env, 'members', '--challenge', 'local-e2e', '--json'))['members']
         check('Rust CLI and shared model agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
@@ -245,7 +245,7 @@ try:
         own = next(x for x in s['sellers'] if x['pubkey'] == SELLER)
         j = next(j for j in s['jobs'] if j['id'] == job)
         check('minutes exactly match award/buyer-accept timestamps', abs(own['minutesUsed'] - max(0,min(j['end']-j['start'],j['deadline']-j['start']))/60) < 1e-9 and abs(own['minutesRemaining'] + own['minutesUsed'] - 60) < 1e-9)
-        check('denied seller got no job/minutes', not any(j['seller'] == DENIED for j in s['jobs']) and next(x for x in s['sellers'] if x['pubkey'] == DENIED)['minutesUsed'] == 0)
+        check('denied seller got no job and is outside the roster', not any(j['seller'] == DENIED for j in s['jobs']) and not any(x['pubkey'] == DENIED for x in s['sellers']))
         check('completed seller can receive next task', plan(s)['postingAllowed'])
         # A separately published second day reuses the very same membership and decision.
         def publish_day(day, begin, end):
