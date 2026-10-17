@@ -43,3 +43,6 @@ export const challengeTaskPrefix = (buyer,id) => `[challenge:${buyer}:${id}]\n`;
 
 // Keep authenticated membership state; bound only its display note.
 export const membershipNote = e => e.content.length>4096 || JSON.stringify(e.tags).length>16384 ? '' : e.content;
+// Stored copy of a verified membership: tags/status/minutes/since/created_at unchanged, but a
+// note the projection would drop is not retained either (its signature was checked on ingest).
+export const boundMembership = e => membershipNote(e)===e.content ? e : {...e,content:''};

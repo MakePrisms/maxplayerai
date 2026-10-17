@@ -1,20 +1,65 @@
-import { OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE } from '../../model/kinds.ts';
-import {membershipNote,verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode,challengeTaskPrefix} from './events.mjs';
+import { OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE, MEMBERSHIP, DECISION } from '../../model/kinds.ts';
+import {boundMembership,membershipNote,verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode,challengeTaskPrefix} from './events.mjs';
 const latest = (events,key) => { const map=new Map(); for(const e of events) if(newer(e,map.get(key(e)))) map.set(key(e),e); return [...map.values()]; };
 const ascending = (a,b) => a.created_at-b.created_at || a.id.localeCompare(b.id);
+// Trusted roster: the latest buyer-signed decision per seller. Only these pubkeys' memberships
+// are read for eligibility (relay.mjs rosterFilters); nothing a stranger signs can change it.
+export function acceptedSellers(events,buyer) {
+  const c={pubkey:buyer},latestBy=new Map();
+  for(const e of events) if(e.kind===DECISION&&validDecision(e,c)&&newer(e,latestBy.get(tag(e,'p'))))latestBy.set(tag(e,'p'),e);
+  return [...latestBy].filter(([,e])=>tag(e,'decision')==='accepted').map(([pk])=>pk).sort();
+}
 export class EventStore {
   events=new Map();
-  add(e) { if(!verify(e)||this.events.has(e.id)) return false; this.events.set(e.id,e); return true; }
-  snapshot(buyer,now=Math.floor(Date.now()/1000)) { return snapshot([...this.events.values()],buyer,now); }
+  // One stored membership per (seller, d): older versions are evicted on replacement.
+  memberships=new Map();
+  // Untrusted "waiting for approval" sample, latest per pubkey, newest `applicantCap` kept.
+  applicants=new Map(); applicantsTruncated=false;
+  constructor({applicantCap=256}={}) { this.applicantCap=applicantCap; }
+  add(e) {
+    if(!verify(e)||this.events.has(e.id)) return false;
+    if(e.kind===MEMBERSHIP) {
+      // An invalid replacement must never evict a valid one.
+      if(!validMembership(e,{pubkey:tag(e,'d')})) return false;
+      const key=`${e.pubkey}:${tag(e,'d')}`,old=this.memberships.get(key);
+      if(old) { if(!newer(e,old)) return false; this.events.delete(old.id); }
+      const kept=boundMembership(e); this.memberships.set(key,kept); this.events.set(e.id,kept); return true;
+    }
+    this.events.set(e.id,e); return true;
+  }
+  // Never consulted by eligibility, minutes or the runner; display of pending joins only.
+  addApplicant(e) {
+    if(e.kind!==MEMBERSHIP||!validMembership(e,{pubkey:tag(e,'d')})||!verify(e)) return false;
+    const old=this.applicants.get(e.pubkey);
+    if(old&&!newer(e,old)) return false;
+    this.applicants.set(e.pubkey,boundMembership(e));
+    if(this.applicants.size<=this.applicantCap) return true;
+    let oldest; for(const a of this.applicants.values()) if(!oldest||newer(oldest,a)) oldest=a;
+    this.applicants.delete(oldest.pubkey); this.applicantsTruncated=true;
+    return oldest.id!==e.id;
+  }
+  snapshot(buyer,now=Math.floor(Date.now()/1000)) { return snapshot([...this.events.values()],buyer,now,null,true,[...this.applicants.values()]); }
+}
+// Pending joins: valid joined memberships with no buyer decision. Accepted sellers come from
+// the trusted roster instead; denied ones are not listed publicly.
+function applicantRows(events,buyer,decided) {
+  return latest(events.filter(e=>validMembership(e,{pubkey:buyer})&&tag(e,'status')==='joined'&&!decided.has(e.pubkey)),e=>e.pubkey)
+    .sort((a,b)=>b.created_at-a.created_at||a.pubkey.localeCompare(b.pubkey))
+    .map(e=>({pubkey:e.pubkey,npub:npubEncode(e.pubkey),minutesOffered:+tag(e,'minutes'),since:+tag(e,'since'),joinedAt:e.created_at,note:membershipNote(e)}));
 }
 // Inputs to this pure projection must already have passed EventStore.add (signature + id).
-export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=true) {
+export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=true,applicantEvents=[]) {
+  const decisions=latest(events.filter(e=>validDecision(e,{pubkey:buyer})),e=>tag(e,'p'));
+  const applicants=applicantRows(applicantEvents,buyer,new Set(decisions.map(e=>tag(e,'p'))));
   const challenges=latest(events.filter(e=>validChallenge(e,buyer)),e=>tag(e,'d')).sort((a,b)=>b.created_at-a.created_at||a.id.localeCompare(b.id));
   const c=selectedChallenge??challenges.find(e=>tag(e,'status')!=='cancelled')??challenges[0];
-  const empty={asOf:now,challenge:null,sellers:[],budget:null,jobs:[],updates:[]};
+  const empty={asOf:now,challenge:null,sellers:[],budget:null,jobs:[],updates:[],applicants};
   if(!c) return empty;
-  const apps=latest(events.filter(e=>validMembership(e,c)),e=>e.pubkey);
-  const decisions=latest(events.filter(e=>validDecision(e,c)),e=>tag(e,'p'));
+  // Sellers are exactly the trusted roster: buyer-accepted pubkeys (latest decision), whose
+  // memberships are read through an authors filter. Undecided joins are applicants; denied
+  // sellers are not listed (their awarded jobs still count in jobs and budget).
+  const roster=new Set(decisions.filter(d=>tag(d,'decision')==='accepted').map(d=>tag(d,'p')));
+  const apps=latest(events.filter(e=>validMembership(e,c)&&roster.has(e.pubkey)),e=>e.pubkey);
   const trade=events.filter(e=>tradeNamespace(e) &&
     ([OFFER,AWARD,ACCEPT].includes(e.kind) ? e.pubkey===buyer :
       [CLAIM,RESULT].includes(e.kind) ? mentions(e,buyer) : true));
@@ -55,5 +100,5 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     const state=tag(app,'status')==='left'?'left':decisionState==='denied'?'denied':running.length?(running.every(j=>j.result)?'awaiting acceptance':'working'):eligible&&own.length?'done':decisionState;
     return {since:+tag(app,'since'),membershipStatus:tag(app,'status'),pubkey:app.pubkey,npub:npubEncode(app.pubkey),name,minutesOffered:offered,minutesUsed:used,minutesRemaining:offered-used,state,eligible,decision:decisionState,currentJobStart:running.length?Math.min(...running.map(j=>j.start)):null,capabilities,heartbeatAt:beat?.created_at??null,note:membershipNote(app),pastJobs:[...new Map([...priorJobs.filter(j=>j.seller===app.pubkey),...own.map(j=>({...j,challengeId:tag(c,'d')}))].filter(j=>!j.running).map(j=>[j.id,j])).values()]};
   }).sort((a,b)=>a.npub.localeCompare(b.npub));
-  return {asOf:now,challenge:{id:tag(c,'d'),eventId:c.id,buyer,buyerNpub:npubEncode(buyer),title:tag(c,'title'),goal:c.content,starts:+tag(c,'starts'),ends:+tag(c,'ends'),status:tag(c,'status'),result:tag(c,'result')??''},sellers,jobs,budget:{totalSats:+tag(c,'budget'),committedSats:jobs.filter(j=>!j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.filter(j=>j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),estimated:true,unknownAmounts:jobs.filter(j=>j.amountSats===null).length,note:'Estimates from awarded offer prices; ACCEPT authorises payment, not proof of settlement. Private payments and fees are not visible.'},updates:tag(c,'update')?[tag(c,'update')]:[]};
+  return {asOf:now,applicants,challenge:{id:tag(c,'d'),eventId:c.id,buyer,buyerNpub:npubEncode(buyer),title:tag(c,'title'),goal:c.content,starts:+tag(c,'starts'),ends:+tag(c,'ends'),status:tag(c,'status'),result:tag(c,'result')??''},sellers,jobs,budget:{totalSats:+tag(c,'budget'),committedSats:jobs.filter(j=>!j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.filter(j=>j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),estimated:true,unknownAmounts:jobs.filter(j=>j.amountSats===null).length,note:'Estimates from awarded offer prices; ACCEPT authorises payment, not proof of settlement. Private payments and fees are not visible.'},updates:tag(c,'update')?[tag(c,'update')]:[]};
 }
