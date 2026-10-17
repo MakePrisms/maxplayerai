@@ -101,7 +101,7 @@ test('R4-3: 257 stranger joins cannot block exhaustion of the only accepted sell
   assert.equal(own.eligible,true);assert.equal(own.minutesRemaining,0);
   assert.deepEqual(snap.relay.warnings,[]);
   const {publishes}=await tick(snap,300);
-  assert.equal(publishes.at(-1)?.[2],'completed');assert.match(publishes.at(-1)[3],/all eligible sellers exhausted/);
+  assert.equal(publishes.at(-1)?.[2],'completed','exhausted stop must publish');assert.match(publishes.at(-1)[3],/all eligible sellers exhausted/);
 });
 
 test('R4-4: one stored membership per seller, oversized content dropped, newer tags win',()=>{

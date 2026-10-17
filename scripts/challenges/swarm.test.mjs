@@ -418,5 +418,5 @@ test('metadata/applicant warnings do not block exhaustion; incomplete trusted hi
   const f=fixture();f.snap.sellers=[];f.setPlan(()=>({wait:true}));
   f.snap.relay.historyComplete=false;await f.runner.tick();assert.ok(!f.publishes.some(p=>p[2]==='completed'));
   Object.assign(f.snap.relay,{historyComplete:true,warnings:['Profile cap: metadata shown for 256 of 300 accepted sellers'],applicantsIncomplete:true});
-  await f.runner.tick();assert.equal(f.publishes.at(-1)[2],'completed');assert.match(f.publishes.at(-1)[3],/exhausted/);
+  await f.runner.tick();assert.equal(f.publishes.at(-1)?.[2],'completed','display warnings must not block exhaustion');assert.match(f.publishes.at(-1)[3],/exhausted/);
 });
