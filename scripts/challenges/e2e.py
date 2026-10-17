@@ -294,14 +294,23 @@ try:
         cli(buyer_env, 'decide', '--seller', DENIED, '--accept')
         # Capability tokens are startup-probed, not configurable. Deterministic Rust-only
         # routing and unequal durations are asserted in swarm.test.mjs.
-        def swarm_day(day, solve_after, duration):
+        def swarm_day(day, solve_after, duration, gap=False):
             begin = int(time.time()) + 3
             publish_day(day, begin, begin + 600)
+            runner_relay, extra = CHALLENGE_RELAY, {}
+            if gap:
+                # The runner reads/publishes challenge events through a loopback proxy that drops
+                # once, triggered by the planner after its first assign batch (coverage gap).
+                gap_port = port()
+                trigger = RUN / (day + '-gap')
+                start(day + '-gap-proxy', ['python3', ROOT / 'scripts/challenges/gap-proxy.py', gap_port, challenge_port, trigger, '4'])
+                wait(day + ' gap proxy ready', lambda: socket.create_connection(('127.0.0.1', gap_port), timeout=1).close() is None)
+                runner_relay, extra = f'ws://127.0.0.1:{gap_port}', {'SWARM_E2E_GAP_TRIGGER': str(trigger)}
             runner = start(day + '-runner', ['node', ROOT / 'scripts/challenges/swarm.mjs',
                 '--binary', BIN, '--relay-url', relay,
                 '--planner', 'node scripts/challenges/planner-free-e2e.mjs',
                 '--duration-seconds', str(duration), '--poll-seconds', '1'],
-                {**buyer_env, 'SWARM_CHALLENGES_BINARY': str(CHALLENGES), 'SWARM_CHALLENGE_RELAYS': CHALLENGE_RELAY, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration)})
+                {**buyer_env, 'SWARM_CHALLENGES_BINARY': str(CHALLENGES), 'SWARM_CHALLENGE_RELAYS': runner_relay, 'SWARM_STUB_SOLVE_AFTER': str(solve_after), 'SWARM_MIN_DURATION': str(duration), **extra})
             final = wait(day + ' status completed', lambda: (s if s['challenge']['id'] == day and s['challenge']['status'] == 'completed' else None) if (s := snapshot()) else None, seconds=240)
             def settled():
                 log = Path(buyer_env['MAXPLAYER_HOME']) / 'swarm/events.jsonl'
@@ -314,11 +323,19 @@ try:
             count = len(jobs)
             time.sleep(3)
             check(day + ' never posts after stopping', len(settled()) == count)
+            if gap:
+                log = (RUN / (day + '-runner.log')).read_text()
+                check(day + ' coverage gap opened after planning and closed', 'gap closed' in (RUN / (day + '-gap-proxy.log')).read_text() and Path(str(trigger) + '.done').exists())
+                deferred = set(re.findall(r'Deferred assignment for ([0-9a-f]{64}): relay_not_ready', log))
+                posted = set(re.findall(r'Posted deferred assignment for ([0-9a-f]{64})', log))
+                check(day + ' relay gap deferred the planned batch instead of dropping it', deferred == {SELLER, DENIED} and 'relay_not_ready' not in ''.join(l for l in log.splitlines() if 'Rejected assignment' in l))
+                check(day + ' every deferred assignment posted once after the gap, none dropped', posted == deferred and 'Dropped deferred' not in log)
+                check(day + ' each request ID posted once (no duplicate intents)', len({j['args']['request_id'] for j in jobs}) == len(jobs))
             os.killpg(runner.pid, signal.SIGTERM)
             runner.wait(timeout=15)
             PROCESSES.remove((day + '-runner', runner))
             return final
-        solved = swarm_day('swarm-solved', 4, 30)
+        solved = swarm_day('swarm-solved', 4, 30, gap=True)
         check('swarm solved: completed + result visible', solved['challenge']['result'] == 'Challenge fixture result: 42.')
         (RUN / 'delay-ms').write_text('10000')
         exhausted = swarm_day('swarm-exhausted', 100000, 40)

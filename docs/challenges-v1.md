@@ -159,7 +159,12 @@ all assignments in the batch within headroom.
 Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
 and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
 and prefer useful past deliveries. Every assignment is revalidated against fresh eligibility,
-availability, budget, donated minutes and work-window limits. Durations must fall within
+availability, budget, donated minutes and work-window limits. An assignment whose only failing
+check is relay readiness (`relay_not_ready`) is journaled as deferred rather than dropped: it
+posts nothing and reserves no budget, but it still blocks a second assignment to that seller.
+It is retried with full admission once the snapshot is ready again. It is dropped with a
+logged reason when another check fails, the day stops, the work window no longer fits, or
+`SWARM_MAX_DEFER_SECONDS` (120) passes. Durations must fall within
 `SWARM_MIN_DURATION` (120 seconds) and `SWARM_MAX_DURATION` (1800 seconds).
 Exhaustion means no free seller can fit the minimum duration and no work is running; choosing
 wait alone never exhausts a challenge. Bundled planners are a deterministic capability-routing

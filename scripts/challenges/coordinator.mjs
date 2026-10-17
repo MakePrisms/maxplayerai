@@ -4,6 +4,8 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const nonnegative = n => Number.isFinite(n) && n >= 0;
+// Exactly the relay_not_ready condition: connected, authenticated, complete, no error/failed relay.
+export const relayReady = snapshot => !!(snapshot.relay?.connected && snapshot.relay?.authenticated && snapshot.relay?.historyComplete && !snapshot.relay?.error && !snapshot.relay?.failedRelays?.length);
 export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 300, amountSats = 0, budgetState = null, pendingSellers = [] } = {}) {
   if (!Number.isSafeInteger(now) || !Number.isSafeInteger(durationSeconds) || durationSeconds <= 0 || !Number.isSafeInteger(amountSats) || amountSats < 0) throw Error('now, durationSeconds and amountSats must be valid integers');
   const c = snapshot.challenge, b = budgetState ?? snapshot.budget, reasons = [];
@@ -11,7 +13,7 @@ export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 30
   if (c && c.status !== 'in_progress') reasons.push('not_in_progress');
   if (c && !(now >= c.starts && now <= c.ends)) reasons.push('outside_work_window');
   if (!Number.isSafeInteger(snapshot.asOf) || now < snapshot.asOf || now - snapshot.asOf > 5) reasons.push('stale_snapshot');
-  if (!snapshot.relay?.connected || !snapshot.relay?.authenticated || !snapshot.relay?.historyComplete || snapshot.relay?.error || snapshot.relay?.failedRelays?.length) reasons.push('relay_not_ready');
+  if (!relayReady(snapshot)) reasons.push('relay_not_ready');
   const validBudget = b && [b.totalSats,b.committedSats,b.paidSats].every(n => Number.isSafeInteger(n) && nonnegative(n)) && !snapshot.budget?.unknownAmounts;
   const headroom = validBudget ? b.totalSats - b.committedSats - b.paidSats : null;
   if (!validBudget) reasons.push('unknown_budget');
