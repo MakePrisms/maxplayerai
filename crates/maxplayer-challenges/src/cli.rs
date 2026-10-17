@@ -384,6 +384,7 @@ async fn execute_async(
             let mut a = memberships.iter().find(|(_, a)| a.seller == own)
                 .map(|(_, a)| a.clone()).ok_or("no verified membership to leave")?;
             a.status = "left".into();
+            if a.note.encode_utf16().count() > 4096 { a.note.clear(); }
             a.to_event_draft(&buyer)
         }
         "decide" => {
@@ -667,6 +668,38 @@ mod tests {
                     .status
                     == "cancelled"
             );
+        }
+        #[tokio::test]
+        async fn leave_with_oversized_prior_note_publishes_bounded_note() {
+            let root = std::env::temp_dir().join(format!(
+                "challenge-leave-note-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let keys = crate::relay::keys(&home).unwrap();
+            let buyer = Keys::generate().public_key().to_hex();
+            let a = Membership {
+                seller: keys.public_key().to_hex(),
+                since: 100,
+                minutes: 60,
+                status: "joined".into(),
+                note: "x".repeat(4097),
+            };
+            let d = a.to_event_draft(&buyer).unwrap();
+            let joined = EventBuilder::new(Kind::from(d.kind), d.content)
+                .tags(d.tags.into_iter().map(|t| Tag::parse(t.0).unwrap()))
+                .custom_created_at(Timestamp::from(100))
+                .sign_with_keys(&keys)
+                .unwrap();
+            let relay = crate::relay::transport_tests::fixture(vec![joined], true, true).await;
+            let mut o = super::parse(&args(&format!("leave --buyer {buyer}"))).unwrap();
+            o.relays = vec![relay.url.clone()];
+            execute_async(&o, &home).await.unwrap();
+            let writes = relay.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            assert!(writes[0].content.encode_utf16().count() <= 4096);
+            assert_eq!(parse_membership(&writes[0], &buyer).unwrap().status, "left");
+            std::fs::remove_dir_all(root).unwrap();
         }
         #[tokio::test]
         async fn oversized_join_note_is_refused_before_publish() {

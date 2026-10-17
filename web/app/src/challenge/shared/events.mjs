@@ -40,3 +40,6 @@ export function validDecision(e,c) {
 
 // Buyer-signed task prefix binds an offer without changing the trade protocol.
 export const challengeTaskPrefix = (buyer,id) => `[challenge:${buyer}:${id}]\n`;
+
+// Keep authenticated membership state; bound only its display note.
+export const membershipNote = e => e.content.length>4096 || JSON.stringify(e.tags).length>16384 ? '' : e.content;

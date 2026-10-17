@@ -194,7 +194,17 @@ fn parse_membership_draft(d: &EventDraft, author: &str, buyer: &str) -> Result<M
         seller: author.into(),
         minutes,
         status: status.into(),
-        note: d.content.clone(),
+        note: if d.content.encode_utf16().count() > 4096
+            || serde_json::to_string(&d.tags.iter().map(|t| &t.0).collect::<Vec<_>>())
+                .expect("string tags")
+                .encode_utf16()
+                .count()
+                > 16384
+        {
+            String::new()
+        } else {
+            d.content.clone()
+        },
     })
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -416,12 +426,14 @@ mod tests {
         let c = challenge();
         let a = membership();
         assert!(parse_challenge_draft(&c.to_event_draft().unwrap(), &a.seller, &c.buyer).is_err());
-        assert!(parse_decision_draft(
-            &decision().to_event_draft(&c.buyer).unwrap(),
-            &a.seller,
-            &c.buyer
-        )
-        .is_err());
+        assert!(
+            parse_decision_draft(
+                &decision().to_event_draft(&c.buyer).unwrap(),
+                &a.seller,
+                &c.buyer
+            )
+            .is_err()
+        );
         for (k, v) in [
             ("d", "30341:unknown:today"),
             ("p", &a.seller),
@@ -501,6 +513,65 @@ mod tests {
                 .unwrap()
         }
         #[test]
+        fn oversized_replacement_preserves_left_and_minutes_but_drops_note() {
+            let buyer = Keys::generate();
+            let seller = Keys::generate();
+            let mut c = challenge();
+            c.buyer = buyer.public_key().to_hex();
+            let mut a = membership();
+            a.seller = seller.public_key().to_hex();
+            let joined = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 100);
+            let d = Decision {
+                seller: a.seller.clone(),
+                ..decision()
+            };
+            let accepted = sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 100);
+            assert_eq!(eligible_sellers(&c, [&joined, &accepted]).len(), 1);
+            a.status = "left".into();
+            a.minutes = 20;
+            for padded_tags in [false, true] {
+                let mut draft = a.to_event_draft(&c.buyer).unwrap();
+                draft.content = if padded_tags {
+                    "short".into()
+                } else {
+                    "x".repeat(4097)
+                };
+                if padded_tags {
+                    draft.tags.push(TagSpec::new(["extra", &"x".repeat(16385)]));
+                }
+                let left = sign(draft, &seller, 101);
+                let parsed = parse_membership(&left, &c.buyer).unwrap();
+                assert_eq!(parsed.status, "left");
+                assert_eq!(parsed.minutes, 20);
+                assert_eq!(parsed.since, a.since);
+                assert!(parsed.note.is_empty());
+                assert!(eligible_sellers(&c, [&joined, &accepted, &left]).is_empty());
+            }
+        }
+        #[test]
+        fn accepted_seller_after_256_unaccepted_memberships_remains_eligible() {
+            let buyer = Keys::generate();
+            let seller = Keys::generate();
+            let mut c = challenge();
+            c.buyer = buyer.public_key().to_hex();
+            let mut events = Vec::new();
+            for _ in 0..256 {
+                let key = Keys::generate();
+                let mut a = membership();
+                a.seller = key.public_key().to_hex();
+                events.push(sign(a.to_event_draft(&c.buyer).unwrap(), &key, 100));
+            }
+            let mut a = membership();
+            a.seller = seller.public_key().to_hex();
+            events.push(sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 100));
+            let d = Decision {
+                seller: a.seller.clone(),
+                ..decision()
+            };
+            events.push(sign(d.to_event_draft(&c.buyer).unwrap(), &buyer, 100));
+            assert_eq!(eligible_sellers(&c, &events), vec![a]);
+        }
+        #[test]
         fn signatures_ids_authors_and_known_challenge_required() {
             let buyer = Keys::generate();
             let seller = Keys::generate();
@@ -545,10 +616,7 @@ mod tests {
             // A late replacement cannot borrow an earlier seller-chosen epoch.
             a.minutes = 120;
             let changed = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, 9000);
-            assert_eq!(
-                eligible_sellers(&c, [&joined, &changed, &accepted]),
-                vec![]
-            );
+            assert_eq!(eligible_sellers(&c, [&joined, &changed, &accepted]), vec![]);
             a.since = c.starts;
             let boundary = sign(a.to_event_draft(&c.buyer).unwrap(), &seller, c.starts);
             assert_eq!(eligible_sellers(&c, [&boundary, &accepted]).len(), 1);
