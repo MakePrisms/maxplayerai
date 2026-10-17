@@ -24,3 +24,11 @@ test('delivered running job is awaiting acceptance and conservative charge never
   assert.equal(sellerState(snap,a,2980),'Awaiting acceptance');
   assert.equal(sellerMinutes(snap,a,2980),60);
 });
+
+test('awaiting acceptance is excluded from working-now summary',()=>{
+  const list=new Element(),summary=new Element();
+  const doc={getElementById:(id:string)=>id==='challenge-sellers'?list:summary,createElement:()=>new Element(),createDocumentFragment:()=>new Element()};
+  renderSellers(doc as unknown as Document,{...s,sellers:[{...seller,state:'awaiting acceptance'}]},2920);
+  assert.equal(list.children[0]!.children[0]!.children[3]!.textContent,'Awaiting acceptance');
+  assert.equal(summary.textContent,'1 agent · 0 working now');
+});

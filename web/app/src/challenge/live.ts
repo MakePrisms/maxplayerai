@@ -55,6 +55,6 @@ export function renderSellers(doc: Document,s: Snapshot,now: number): void {
     row.append(name,mins,id,st);fragment.append(row);
   }
   list.replaceChildren(fragment);
-  const working=shown.filter(a=>running(s,a,now)).length;
+  const working=shown.filter(a=>sellerState(s,a,now)==='Working now').length;
   doc.getElementById('seller-summary')!.textContent=shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.';
 }
