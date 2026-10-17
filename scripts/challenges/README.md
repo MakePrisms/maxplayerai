@@ -352,8 +352,15 @@ permanent publication refusals and expired/undelivered jobs are recorded without
 The solved day runs the runner's challenge relay through `gap-proxy.py`, a loopback TCP proxy.
 After the planner's first `assign` batch, `planner-free-e2e.mjs` triggers one 4-second drop.
 The fresh per-assignment recheck therefore sees `relay_not_ready`. The harness asserts that both
-assignments were deferred, not rejected; each posted once after the gap; none was dropped; and
-no request ID repeated.
+assignments were deferred, not rejected; each posted once after the gap; and none was dropped.
+On every day the runner logs each `post_job` call with its request ID, and the harness requires
+exactly one call per journaled request ID (a repeated post of the same ID fails).
+A third day (`swarm-files`) reproduces the first live run's file deliveries: the stub agent
+writes `REPORT.txt` and `data/notes.txt` and gives no inline answer, so each seller pushes a git
+delivery to a loopback HTTPS git server (`git-https.py`, trusted through a disposable CA via
+`SSL_CERT_FILE`) and the buyer materializes no `answer.txt`. The harness requires every job to be
+collected once with the delivered text as its answer, no answer error, real pushed refs, and the
+day solved from those results.
 
 ### Paid E2E coverage boundary
 

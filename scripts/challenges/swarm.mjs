@@ -213,6 +213,8 @@ export function reservedBudget(snapshot,jobs,now) {
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
+  // Every post_job goes through here, so the log has one line per post call per request id.
+  async post(args){this.io.report?.(`post_job request ${args.request_id} seller ${args.seller_pubkey}`);return this.io.mcp('post_job',args);}
   // Does this buyer's get_job report the fields that let an expired PAID job be proven released?
   // Without them such a job stays reserved forever (fail closed), so priced work is refused while
   // free work continues. A definite answer is cached for the process; a failed probe is retried.
@@ -261,7 +263,7 @@ export class Swarm {
     // Freeze the exact arguments durably BEFORE the first post; from here on this is an ordinary
     // unposted intent (preparation lookup before any retry), so the request is never re-posted.
     j.deferred=false;j.created=at;j.args={...j.args,deadline_unix:at+j.durationSeconds};this.save();
-    const posted=await this.io.mcp('post_job',j.args);j.id=posted.job_id??posted.preparation_id;
+    const posted=await this.post(j.args);j.id=posted.job_id??posted.preparation_id;
     if(!j.id)throw Error('Post returned no job or preparation id');this.save();
     this.io.report?.(`Posted deferred assignment for ${j.seller} after ${at-j.deferredAt}s`);
     return false;
@@ -294,7 +296,7 @@ export class Swarm {
             if(valid.reasons.some(r=>['stale_snapshot','relay_not_ready','unknown_budget'].includes(r)))continue;
             j.released=true;j.done=true;j.outcome='abandoned intent';j.ts=at;this.save();continue;
           }
-          const posted=await this.io.mcp('post_job',j.args);j.id=posted.job_id??posted.preparation_id;this.save();
+          const posted=await this.post(j.args);j.id=posted.job_id??posted.preparation_id;this.save();
         }
       }
       const state=await this.io.mcp('get_job',{job_id:j.id});
@@ -411,7 +413,7 @@ export class Swarm {
             this.io.report?.(`Deferred assignment for ${seller}: ${reasons.join(', ')}; retrying once the relay snapshot is ready and fresh`);continue;
           }
           this.state.jobs.push(j);jobs.push(j);this.save();
-          const posted=await this.io.mcp('post_job',args);j.id=posted.job_id??posted.preparation_id;
+          const posted=await this.post(args);j.id=posted.job_id??posted.preparation_id;
           if(!j.id)throw Error('Post returned no job or preparation id');this.save();
         }
         if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
