@@ -112,14 +112,15 @@ For a challenge `C` with buyer `B`, seller `S`:
    Start time = award `created_at`.
 3. End: the earliest buyer-signed ACCEPT for the selected claim at/after AWARD,
    otherwise now, capped at deadline. A seller RESULT never closes the minute meter;
-   without a result the job is **running** until deadline.
-   A RESULT at or before AWARD is untrusted: use the full deadline as end.
+   the job stays **running** (seller occupied) until ACCEPT or deadline, even after RESULT.
+   A RESULT at or before AWARD is untrusted: use the full deadline only when no valid
+   ACCEPT exists. ACCEPT takes precedence. A future RESULT never charges beyond now.
 4. Job minutes = `min(end − start, offer.deadline − start)`, floored at 0.
 5. Seller used = sum over its jobs. Remaining = `membership.minutes − used` (reset for each daily challenge).
 6. Ignore RESULTs by anyone other than `S`, and AWARDs by anyone other than `B`.
 
 Known limit: `created_at` is signer-chosen, not independently measured CPU time.
-Backdated results at/before award charge the full deadline; otherwise only a
+Backdated results at/before award without ACCEPT charge the full deadline; otherwise only a
 buyer-signed ACCEPT stops accrual. All durations are capped at deadline.
 
 ## The buyer’s rules

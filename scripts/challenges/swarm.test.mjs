@@ -104,7 +104,7 @@ test('lost reply is recovered read-only after deadline and collected without ano
 test('collected work waits for projection tally before receiving successive jobs',async()=>{
   const f=fixture();await f.runner.tick();for(const j of f.remote.values())j.results=[{}];
   await f.runner.tick();assert.equal(f.remote.size,2);assert.equal(f.publishes.filter(x=>x[2]==='completed').length,0);
-  f.snap.jobs=[...f.remote.values()].map((j,i)=>({id:j.id,result:{},seller:i?'b':'a',running:false,amountSats:0}));
+  f.snap.jobs=[...f.remote.values()].map((j,i)=>({id:j.id,result:{},accepted:true,seller:i?'b':'a',running:false,amountSats:0}));
   await f.runner.tick();assert.equal(f.remote.size,4);assert.ok(f.inputs.at(-1).results.every(r=>r.answer==='verified answer'));
 });
 test('progress is throttled independently from immediate completion publication',async()=>{
@@ -211,7 +211,7 @@ test('stub routes Rust work only to advertised Rust seller with distinct duratio
   assert.deepEqual(f.journal.state.jobs.map(j=>j.args.amount_sats),[5,0]);
   const profile=f.inputs[0].sellers[0];assert.equal(profile.npub,'npub-a');assert.deepEqual(profile.harness.family,['codex']);assert.equal(profile.note,'hello');
   for(const j of f.remote.values())j.results=[{}];
-  f.snap.jobs=[...f.remote.values()].map(j=>({id:j.id,result:{},running:false}));
+  f.snap.jobs=[...f.remote.values()].map(j=>({id:j.id,result:{},running:false,accepted:true}));
   f.time(110);await f.runner.tick();
   assert.equal(f.inputs.at(-1).sellers[0].trackRecord.delivered,1);
   assert.equal(f.inputs.at(-1).sellers[0].trackRecord.tasks[0].turnaroundSeconds,10);
@@ -361,18 +361,19 @@ test('runner uses public challenge defaults independently of the trade URL',()=>
 });
 
 // Exercise the same pure projection as the page (transport signature checks are separate).
-async function projectedFixture({lateMember=false,backdated=false,ordinary=false}={}) {
+async function projectedFixture({lateMember=false,backdated=false,ordinary=false,honest=false,accepted=false}={}) {
   const {snapshot}=await import('../../web/app/src/challenge/shared/model.mjs');
   const buyer='b'.repeat(64),seller='a'.repeat(64),offer='1'.repeat(64),claim='2'.repeat(64);
   const e=(kind,pubkey,created_at,tags,content='')=>({kind,pubkey,created_at,tags:[['t','maxplayer'],['v','1'],...tags],content,id:String(kind).padStart(64,'0')});
   const events=[e(30341,buyer,1,[['d','day'],['title','Test'],['starts','100'],['ends','1000'],['budget','10','sat'],['status','in_progress']]),
-    e(30342,seller,lateMember?101:1,[['d',buyer],['p',buyer],['since','1'],['minutes','1'],['status','joined']]),
+    e(30342,seller,lateMember?101:1,[['d',buyer],['p',buyer],['since','1'],['minutes',honest?'60':'1'],['status','joined']]),
     e(30343,buyer,2,[['d',seller],['p',seller],['decision','accepted']])];
-  if(backdated||ordinary)events.push({...e(3401,buyer,100,[['p',seller],['i',ordinary?'Normal job':`[challenge:${buyer}:day]\nTask`],['param','deadline','160'],['param','payment','none']]),id:offer},
+  if(backdated||ordinary||honest)events.push({...e(3401,buyer,100,[['p',seller],['i',ordinary?'Normal job':`[challenge:${buyer}:day]\nTask`],['param','deadline',honest?'1000':'160'],['param','payment','none']]),id:offer},
     {...e(3402,seller,100,[['e',offer,'','root'],['p',buyer],['status','processing']]),id:claim},
     e(3405,buyer,100,[['e',offer,'','root'],['e',claim],['p',buyer],['p',seller],['status','accepted']]),
-    e(3403,seller,99,[['e',offer,'','root'],['p',buyer]],'Done'));
-  const f=fixture();Object.assign(f.snap,snapshot(events,buyer,200));f.time(200);
+    e(3403,seller,honest?101:99,[['e',offer,'','root'],['p',buyer]],'Done'));
+  if(accepted)events.push(e(3406,buyer,160,[['e',offer,'','root'],['e',claim],['p',buyer],['p',seller],['status','accepted']]));
+  const f=fixture();f.project=now=>snapshot(events,buyer,now);Object.assign(f.snap,snapshot(events,buyer,200));f.time(200);
   return f;
 }
 test('late membership with old since and prior acceptance cannot post',async()=>{
@@ -383,4 +384,22 @@ test('backdated result consumes offered minutes and swarm posts no further job',
 });
 test('ordinary buyer jobs do not consume challenge tally or minutes',async()=>{
   const f=await projectedFixture({ordinary:true});assert.equal(f.snap.jobs.length,0);assert.equal(f.snap.sellers[0].minutesUsed,0);
+});
+
+test('honest result without ACCEPT keeps seller busy and prevents post_job',async()=>{
+  const f=await projectedFixture({honest:true});await f.runner.tick();
+  assert.equal(f.calls.filter(([t])=>t==='post_job').length,0);
+  assert.equal(f.snap.sellers[0].state,'awaiting acceptance');
+});
+test('ACCEPT freezes first job minutes and later assignment fits donated remainder',async()=>{
+  const f=await projectedFixture({honest:true,accepted:true});await f.runner.tick();
+  assert.equal(f.snap.jobs[0].usedMinutes,1);assert.equal(f.project(900).jobs[0].usedMinutes,1);
+  const posts=f.calls.filter(([t])=>t==='post_job');assert.equal(posts.length,1);
+  assert.ok(f.snap.jobs[0].usedMinutes+(posts[0][1].deadline_unix-200)/60<=60);
+});
+test('collected journal job waits for ACCEPT projection rather than RESULT projection',async()=>{
+  const f=fixture();await f.runner.tick();
+  for(const job of f.remote.values())job.results=[{}];
+  f.snap.jobs=[...f.remote.values()].map(j=>({id:j.id,result:{},running:false,accepted:false}));
+  await f.runner.tick();assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
 });

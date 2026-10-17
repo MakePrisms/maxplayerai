@@ -18,6 +18,7 @@ export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 30
   if (headroom !== null && amountSats > 0 && amountSats > headroom) reasons.push('budget_exceeded');
   // Public ACCEPT is not settlement. Paid assignment requires a reconciled buyer ledger.
   if (amountSats > 0 && (!budgetState || budgetState.challengeId !== c?.id || budgetState.asOf !== now || budgetState.totalSats !== snapshot.budget?.totalSats)) reasons.push('buyer_budget_required');
+  // running/currentJobStart include delivered jobs awaiting buyer ACCEPT.
   const pending = new Set(pendingSellers);
   const sellers = (snapshot.sellers ?? []).filter(s => s.eligible === true && s.decision === 'accepted' && !['left','denied'].includes(s.state) && nonnegative(s.minutesRemaining) && s.minutesRemaining > 0 && !pending.has(s.pubkey) && !(snapshot.jobs ?? []).some(j => j.seller === s.pubkey && j.running) && s.currentJobStart == null).map(s => {
     const deadlineUnix = now + durationSeconds;

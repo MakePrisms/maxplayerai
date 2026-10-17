@@ -28,11 +28,11 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     const awards=trade.filter(e=>e.kind===AWARD&&e.pubkey===buyer&&root(e)===offer.id&&tag(e,'status')==='accepted'&&mentions(e,buyer)&&mentions(e,seller)&&claims.some(cl=>cl.id===claimRef(e))).sort(ascending);
     const award=awards[0]; if(!award) continue;
     const result=trade.filter(e=>e.kind===RESULT&&e.pubkey===seller&&root(e)===offer.id).sort(ascending)[0];
-    const running=!result&&now<deadline;
     const acceptance=trade.filter(e=>e.kind===ACCEPT&&e.pubkey===buyer&&root(e)===offer.id&&claimRef(e)===claimRef(award)&&mentions(e,buyer)&&mentions(e,seller)&&tag(e,'status')==='accepted'&&e.created_at>=award.created_at).sort(ascending)[0];
+    const running=!acceptance&&now<deadline;
     // Seller time never closes the meter. Charge until buyer ACCEPT (or now/deadline).
     // An impossible result timestamp conservatively consumes the whole award window.
-    const end=result&&result.created_at<=award.created_at ? deadline : acceptance?.created_at??(result?Math.max(now,result.created_at):(running?now:deadline));
+    const end=acceptance?.created_at??(result&&result.created_at<=award.created_at?deadline:now);
     const usedSeconds=Math.max(0,Math.min(end-award.created_at,deadline-award.created_at));
     const accepted=!!acceptance;
     // AWARD has no amount in protocol v1. The selected fixed-price offer is the public estimate.
@@ -52,7 +52,7 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     let name=''; try { const p=JSON.parse(profile?.content??'{}'); name=typeof p.display_name==='string'?p.display_name:typeof p.name==='string'?p.name:''; } catch {}
     const beat=latest(trade.filter(e=>e.kind===HEARTBEAT&&e.pubkey===app.pubkey&&tag(e,'d')==='maxplayer-seller'),e=>e.pubkey)[0];
     const capabilities=beat?.tags.filter(t=>['agents','harness_family','harness_model','capabilities','harness_variant','hardware','rate','takes_payment'].includes(t[0]))??[];
-    const state=tag(app,'status')==='left'?'left':decisionState==='denied'?'denied':running.length?'working':eligible&&own.length?'done':decisionState;
+    const state=tag(app,'status')==='left'?'left':decisionState==='denied'?'denied':running.length?(running.every(j=>j.result)?'awaiting acceptance':'working'):eligible&&own.length?'done':decisionState;
     return {since:+tag(app,'since'),membershipStatus:tag(app,'status'),pubkey:app.pubkey,npub:npubEncode(app.pubkey),name,minutesOffered:offered,minutesUsed:used,minutesRemaining:offered-used,state,eligible,decision:decisionState,currentJobStart:running.length?Math.min(...running.map(j=>j.start)):null,capabilities,heartbeatAt:beat?.created_at??null,note:app.content,pastJobs:[...new Map([...priorJobs.filter(j=>j.seller===app.pubkey),...own.map(j=>({...j,challengeId:tag(c,'d')}))].filter(j=>!j.running).map(j=>[j.id,j])).values()]};
   }).sort((a,b)=>a.npub.localeCompare(b.npub));
   return {asOf:now,challenge:{id:tag(c,'d'),eventId:c.id,buyer,buyerNpub:npubEncode(buyer),title:tag(c,'title'),goal:c.content,starts:+tag(c,'starts'),ends:+tag(c,'ends'),status:tag(c,'status'),result:tag(c,'result')??''},sellers,jobs,budget:{totalSats:+tag(c,'budget'),committedSats:jobs.filter(j=>!j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.filter(j=>j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),estimated:true,unknownAmounts:jobs.filter(j=>j.amountSats===null).length,note:'Estimates from awarded offer prices; ACCEPT authorises payment, not proof of settlement. Private payments and fees are not visible.'},updates:tag(c,'update')?[tag(c,'update')]:[]};

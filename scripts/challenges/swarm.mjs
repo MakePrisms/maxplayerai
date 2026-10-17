@@ -133,6 +133,7 @@ export class Swarm {
       }
       if(state.results?.length) {
         const collected=await this.io.mcp('collect',{job_id:j.id});
+        // done records collection, not release of the seller slot; pending() waits for meter closure.
         j.answer=await this.io.answer(collected);j.ts=now;j.done=true;j.outcome='collected';j.pay=collected.pay;this.save();
       } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.released=true;j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
       else if(now>j.args.deadline_unix) {
@@ -186,7 +187,7 @@ export class Swarm {
       day.assessed=resultVersion;this.save();
     }
     if(!day.stop && ready && c.status==='in_progress' && now>=c.starts) {
-      const awaitingProjection=jobs.filter(j=>j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&p.result));
+      const awaitingProjection=jobs.filter(j=>j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&(p.accepted||now>=p.deadline)));
       const pending=()=>[...this.state.jobs.filter(j=>!j.done),...awaitingProjection].map(j=>j.seller);
       const decision=coordinate(snap,{now,durationSeconds:min,amountSats:0,budgetState:reservedBudget(snap,jobs,now),pendingSellers:pending()});
       if(now>=c.ends)stop('Unsolved: work window ended');
