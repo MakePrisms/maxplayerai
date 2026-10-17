@@ -431,6 +431,10 @@ test('deferred: relay gap between planning and posting posts exactly once after 
   assert.deepEqual(f.journal.saved.jobs.map(j=>[j.seller,j.deferred,j.id]),[['a',true,undefined],['b',true,undefined]]);
   assert.ok(reports.some(r=>r.includes('Deferred assignment for a: relay_not_ready')));
   f.time(103);await f.runner.tick();assert.equal(posts(f).length,0,'never posts while relay_not_ready holds');
+  // An unready snapshot (e.g. reader restarting, history not yet loaded) is not evidence against it.
+  const snapshot=f.io.snapshot;f.io.snapshot=async()=>({...await snapshot(),challenge:null,sellers:[],budget:null});
+  f.time(104);await f.runner.tick();f.io.snapshot=snapshot;
+  assert.equal(posts(f).length,0);assert.ok(f.journal.state.jobs.every(j=>j.deferred&&!j.done));
   f.snap.relay.failedRelays=[];f.time(105);await f.runner.tick();
   assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix,a.request_id]),[['a',135,requestId(f.snap.challenge,'a',1)],['b',135,requestId(f.snap.challenge,'b',1)]]);
   assert.ok(f.journal.state.jobs.every(j=>j.id&&j.deferred===false&&j.created===105));
@@ -452,8 +456,9 @@ test('deferred: relay not ready past max wait or work window, or another reason 
     if(bound==='window')f.snap.challenge.ends=150;
     f.setPlan(gapOnce(f));await f.runner.tick();
     assert.ok(f.journal.state.jobs.length===2&&f.journal.state.jobs.every(j=>j.deferred&&!j.done),bound);
-    if(bound==='minutes')f.snap.sellers.forEach(s=>s.minutesRemaining=.1);
-    if(bound==='stop')f.snap.challenge.status='completed';
+    // Other reasons are judged only on a ready snapshot.
+    if(bound==='minutes'){f.snap.sellers.forEach(s=>s.minutesRemaining=.1);f.snap.relay.failedRelays=[];}
+    if(bound==='stop'){f.snap.challenge.status='completed';f.snap.relay.failedRelays=[];}
     f.time({wait:161,window:121,minutes:105,stop:105}[bound]);await f.runner.tick();
     assert.ok(f.journal.state.jobs.every(j=>j.done&&j.released&&expected.test(j.outcome)),bound);
     assert.ok(reports.some(r=>r.startsWith('Dropped deferred assignment for a')),bound);
@@ -463,10 +468,12 @@ test('deferred: relay not ready past max wait or work window, or another reason 
 test('deferred: seller leaving, denied or ineligible while deferred is dropped; others still post',async()=>{
   for(const change of [s=>{s.state='left';},s=>{s.decision='denied';},s=>{s.eligible=false;}]){
     const f=fixture();f.setPlan(gapOnce(f));await f.runner.tick();
+    // The change lands during the gap; nothing is judged or posted until the relay is ready.
     change(f.snap.sellers[0]);f.time(102);await f.runner.tick();
-    assert.match(f.journal.state.jobs[0].outcome,/abandoned deferred assignment: .*seller busy or ineligible/);
-    assert.equal(f.journal.state.jobs[1].deferred,true);
+    assert.ok(f.journal.state.jobs.every(j=>j.deferred&&!j.done));assert.equal(posts(f).length,0);
     f.snap.relay.failedRelays=[];f.time(104);await f.runner.tick();
+    assert.match(f.journal.state.jobs[0].outcome,/abandoned deferred assignment: .*seller busy or ineligible/);
+    assert.equal(f.journal.state.jobs[0].id,undefined);
     assert.deepEqual(posts(f).map(([,a])=>a.seller_pubkey),['b']);
   }
 });

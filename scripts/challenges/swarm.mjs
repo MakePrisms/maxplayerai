@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate } from './coordinator.mjs';
+import { coordinate, relayReady } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 export function command(bin, args, {input='', env=process.env, timeout=120000}={}) {
@@ -108,17 +108,20 @@ export class Swarm {
     return candidate?.postingAllowed?[]:[...new Set([...check.reasons,...(candidate?.reasons??['seller busy or ineligible'])])];
   }
   // A deferred assignment was journaled when the ONLY failing reason was relay_not_ready and has
-  // never been offered, so it needs no preparation lookup and is dropped without one. It is
-  // retried each tick and posts only after a fresh full admission; any other reason, a stop,
-  // the work window or the max wait drops it. Returns true when no offer was posted this tick.
+  // never been offered, so it needs no preparation lookup and is dropped without one. While the
+  // relay stays not ready it only waits (an unready snapshot, e.g. right after restart, is not
+  // evidence against it), bounded by stop, its journaled work window and the max wait. Once ready,
+  // a fresh full admission either posts it or drops it with the reason. Returns true when no
+  // offer was posted this tick.
   async retryDeferred(j) {
     const fresh=await this.io.snapshot(),at=this.io.now(),maxWait=this.c.maxDefer??120;
     const drop=reason=>{j.released=true;j.done=true;j.outcome=`abandoned deferred assignment: ${reason}`;j.ts=at;this.save();this.io.report?.(`Dropped deferred assignment for ${j.seller}: ${reason}`);return true;};
     if(this.state.days[j.key]?.stop)return drop('challenge stopped');
     if(at+j.durationSeconds>j.challenge.ends)return drop('work window exceeded');
     if(at-j.deferredAt>maxWait)return drop(`relay snapshot not ready within ${maxWait}s`);
+    if(!relayReady(fresh))return true;
     const reasons=this.admission(fresh,j.challenge,j.seller,j.durationSeconds,j.args.amount_sats,at,j);
-    if(reasons.length)return reasons.every(r=>r==='relay_not_ready')||drop(reasons.join(', '));
+    if(reasons.length)return drop(reasons.join(', '));
     // Freeze the exact arguments durably BEFORE the first post; from here on this is an ordinary
     // unposted intent (preparation lookup before any retry), so the request is never re-posted.
     j.deferred=false;j.created=at;j.args={...j.args,deadline_unix:at+j.durationSeconds};this.save();
