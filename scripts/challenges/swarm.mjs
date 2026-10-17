@@ -165,7 +165,7 @@ export class Swarm {
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
     const min=this.c.minDuration??120, max=this.c.maxDuration??1800;
-    const eligible=s=>(!snap.relay?.excludedMembers?.includes(s.pubkey)&&s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
+    const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
       ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:j.args.task,since:j.created,deadline:j.args.deadline_unix})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
@@ -217,7 +217,9 @@ export class Swarm {
           if(!j.id)throw Error('Post returned no job or preparation id');this.save();
         }
         if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
-        if(!day.stop&&!snap.relay?.excludedMembers?.length&&!snap.relay?.warnings?.length&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
+        // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
+        // history) and those sellers' state. Metadata caps and the applicant list never block it.
+        if(!day.stop&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
