@@ -38,6 +38,9 @@ the shared protocol selects the latest per `(kind, author, d)` with deterministi
 A relay without EOSE is a reported error and its partial events are discarded. If any relay
 fails to complete, the command fails and identifies the incomplete relays.
 A reachable relay's history cannot prove that another relay has no newer event.
+`status`/`members` read buyer decisions first, then memberships only from accepted sellers
+(plus the caller), so the eligible view ignores strangers' memberships. `members` adds a
+capped newest-256 applicant sample for review and reports `applicants_incomplete`.
 `--json` retains the existing command JSON on stdout.
 
 ## Sellers: join once

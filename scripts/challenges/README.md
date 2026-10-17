@@ -319,12 +319,18 @@ Remove a relay only after a successful read of it, or after a person has checked
 it contains no newer replaceable challenge, membership, or decision. Removing an
 unread relay can resurrect an old join or budget.
 
-Structurally invalid memberships are skipped without poisoning history. Valid oversized
-replacements retain status/minutes/since/time; only their note is dropped (4096 UTF-16
-content units or 16384 serialized tag units). Join refuses oversized notes; leave
-bounds the prior note. The 256-key cap limits profile/heartbeat requests only, selected
-after challenge EOSE from latest memberships with buyer-accepted sellers first.
-All valid members remain in the roster and can be assigned without metadata. A
-metadata warning prevents an exhausted completion, as do explicit excluded members.
-Full discarded history pages advance to the prior second; 500 accepted events in one
-second still fail closed as truncated. See the protocol document for cursor limits.
+The runner trusts only the buyer's roster. Decisions (buyer-signed, latest per seller) are
+read first; memberships are then read with `authors` = the accepted sellers. Eligibility,
+minutes, leave, readiness and the "all eligible sellers exhausted" stop use only that set, so a
+stranger's join flood cannot hide or delay an accepted seller's join/leave or block the stop.
+New joiners appear in a separate, capped applicant list (newest 256, display only) for the
+buyer to approve with `maxplayer-challenges decide`; a flood there can only truncate that list,
+which the page marks as possibly incomplete. It never affects runner readiness.
+
+Valid oversized replacements retain status/minutes/since/time; the stored copy drops the note
+(4096 UTF-16 content units or 16384 serialized tag units) and older versions are evicted.
+Profiles/heartbeats are read for accepted sellers only (cap 256, pubkey order); missing metadata
+never makes a seller ineligible and its warning never blocks exhaustion. A full roster page
+re-reads its oldest second; if the cursor does not move strictly older (500+ accepted-seller
+events in one second, or a relay repeating a page) history fails closed as truncated. See the
+protocol document's *Trusted roster and applicant list* section.

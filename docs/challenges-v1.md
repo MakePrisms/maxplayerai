@@ -207,9 +207,11 @@ The community HTTP/SSE server and review page have been removed; use
   Polling runs every 15 seconds from each filter's newest timestamp minus 900 seconds, also
   repairing late events while streaming. Disconnects reconnect with bounded backoff and reload history.
 - Signatures and IDs are verified locally. Buyer-authored kinds are author-scoped;
-  memberships, claims and results are `#p`-scoped to the buyer. Profiles/heartbeats are
-  requested only for discovered members. A saturated pagination second is reported as
-  incomplete history, never silently certified complete.
+  claims and results are `#p`-scoped to the buyer. Memberships are read in two separate ways
+  (see *Trusted roster and applicant list* below): the trusted roster read is scoped by
+  `authors` to buyer-accepted sellers, and a capped applicant read feeds only the
+  "waiting for approval" list. Profiles/heartbeats are requested only for accepted sellers.
+  A saturated pagination second is reported as incomplete history, never silently certified complete.
 - Build the page with `CHALLENGE_BUYER_PUBKEY` (lowercase hex; default
   `94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5`).
   `CHALLENGE_RELAYS` is a comma list, default `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub`.
@@ -283,23 +285,56 @@ successfully reading that relay, or after a person has checked it holds no newer
 replaceable event (challenge, membership, or decision). Otherwise removing it can
 resurrect an older joined membership, budget, or challenge state.
 
-Reader membership discovery ignores structurally invalid events. Every valid membership
-is retained, including replacements with content over 4096 UTF-16 code units or tags
-over 16384 serialized UTF-16 code units; only the projected note is dropped in those
-cases, in both JS and Rust. Signed envelopes remain unchanged. Join refuses oversized
-notes before publishing; leave drops oversized prior notes.
+### Trusted roster and applicant list (advisor r4)
 
-The 256-key budget applies only to trade-relay profile/heartbeat subscriptions. After
-challenge history EOSE, latest-per-pubkey memberships and buyer decisions determine
-metadata priority (accepted sellers first, then pubkey order). Replacements update
-that selection. Memberships outside this metadata budget remain visible and eligible;
-no assignment exclusion is inferred from missing metadata. A deduplicated warning
-indicates partial metadata. The swarm never declares seller exhaustion while warnings
-or explicit membership exclusions remain. Invalid memberships do not count toward
-accepted-page saturation: full discarded pages advance to the preceding second.
-A full page of 500 accepted events tied at the boundary still reports truncation.
-As with any timestamp-only relay cursor, discarded-page advancement cannot recover
-additional unseen events at that same second; the next earlier second is scanned.
+The runner's safety never depends on data strangers can publish. The **trusted roster** is
+defined only by the buyer's signed decisions (kind 30343, latest per seller, `accepted`).
+Readers fetch decisions first, then memberships with `authors` = those accepted pubkeys
+(chunked at 100 authors per filter), and re-subscribe whenever decisions change. Eligibility,
+minutes, leave and the runner's exhaustion stop are computed only from decisions plus these
+accepted-author memberships. `historyComplete` (and therefore runner readiness) covers exactly
+that set; a roster relay is not complete until its decision history defined the roster.
+
+Rust `eligible_sellers` and the sidecar's `status`/`members` give the same eligible set: latest
+buyer decision `accepted` and the latest valid membership *from that pubkey* `joined`, with
+`since` and `created_at` at or before the challenge start. Memberships from other authors are
+dropped before replacement. The sidecar reads decisions first and then memberships with an
+`authors` filter (accepted sellers plus the caller, or the `--seller` being decided).
+`web/app/test/fixtures/challenge-roster.json` is checked by both stacks.
+
+The **applicant list** shows people who asked to join and have no decision yet, so the buyer can
+approve them. It comes from one separate, untrusted read per round: newest-first, `limit` 256,
+latest per pubkey, bounded note. It is never paged, never stored with trusted events and never
+affects `historyComplete`, `error` or the runner. A refused, silent or saturated applicant read
+sets only `applicantsIncomplete`; the page then marks the list as possibly incomplete. The
+`members` command reports the same flag as `applicants_incomplete`.
+
+What a membership flood can and cannot do:
+
+- It **can** clutter or truncate the waiting-for-approval list (newest 256 shown), so an older
+  applicant may be missing until the buyer approves newer ones or the flood ages out.
+- It **cannot** hide, delay, replace or block an accepted seller's join or leave, block the
+  exhaustion stop, or keep the runner from becoming ready: strangers' events never match the
+  roster filter. Only an accepted seller can affect its own roster entries.
+
+Paging the trusted roster: the reader filters locally on `kinds`/`authors`/`#p`/`since`/`until`.
+A full 500-event page re-reads its oldest second with an inclusive `until` (no second that could
+still hold unread events is skipped). The cursor must move strictly older; a page that repeats
+the same oldest second (500+ events from accepted sellers in one second, or a relay repeating a
+page), or a full page with no in-window event, fails closed as `History truncated`. Saturation
+counts every frame the relay sent, valid or not.
+
+Store hygiene: the store keeps only the latest valid membership per `(seller, buyer)`; an older
+or invalid version never replaces it. A stored membership whose note the projection would drop
+(content over 4096 UTF-16 units or tags over 16384 serialized units) is kept with content `''`;
+tags, status, minutes, since and `created_at` are unchanged. Memory is about one membership per
+accepted seller plus at most 256 applicants. Join refuses oversized notes; leave drops an
+oversized prior note.
+
+Profiles/heartbeats are requested for accepted sellers only, at most 256 in pubkey order. They
+are display/planner metadata: a missing profile or heartbeat never makes an accepted seller
+ineligible, and the cap warning never blocks readiness or exhaustion. The former
+`excludedMembers` field is removed.
 
 The production-relay fence is a normalized **hostname string** denylist, shared by
 the sidecar, page, swarm parser and site build (canonical JSON literal in
