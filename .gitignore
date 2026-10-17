@@ -42,3 +42,5 @@ evidence/**/*.tar.err
 
 .claude
 .idea
+
+node_modules/

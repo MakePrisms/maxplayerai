@@ -1,0 +1,34 @@
+/* /challenges reuses the /sell layout (styles.css h-*). Only the bits /sell doesn't have live here. */
+.c-facts { display: flex; justify-content: center; flex-wrap: wrap; gap: 14px 44px; margin: 34px 0 0; }
+.c-facts dt { font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+.c-facts dd { margin: 6px 0 0; font-family: var(--sans); font-size: 16px; color: var(--ink); }
+.c-sellers { list-style: none; margin: 36px 0 0; padding: 0; text-align: left; }
+.c-sellers li {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 18px; align-items: baseline;
+  padding: 16px 2px; border-bottom: 1px solid var(--line); font-family: var(--sans);
+}
+.c-sellers li:first-child { border-top: 1px solid var(--line); }
+.c-sellers strong { font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
+.c-sellers .c-mins { font-family: var(--mono); font-size: 13px; color: var(--neon); white-space: nowrap; }
+.c-sellers .c-id, .c-sellers .c-state { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.c-sellers .c-state { text-align: right; }
+.c-sellers li.off .c-mins { color: var(--muted); }
+.c-note { margin: 22px 0 0; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+.h-faq details p code { font-size: 12px; overflow-wrap: anywhere; }
+@media (max-width: 760px) {
+  .c-facts { gap: 14px 28px; }
+  .c-sellers li { grid-template-columns: 1fr; }
+  .c-sellers .c-state { text-align: left; }
+}
+/* challenge titles are dynamic: let them wrap instead of the wordmark's single line */
+.h-hero h1#challenge-title { white-space: normal; text-wrap: balance; max-width: 980px; margin: 18px auto 0; font-size: clamp(32px, 6vw, 80px); overflow-wrap: anywhere; }
+/* the job: the challenge event's content, read like an article */
+.c-job .h-in { text-align: left; }
+.c-job .eyebrow, .c-job h2 { display: block; text-align: center; }
+.c-job h2 { margin-bottom: 34px; text-wrap: balance; }
+.c-job-body p, .c-job-body li { font-family: var(--sans); font-size: 17px; line-height: 1.65; color: var(--ink-2); }
+.c-job-body p { margin: 0 0 20px; }
+.c-job-body ul { margin: 0 0 20px; padding-left: 22px; }
+.c-job-body li { margin: 4px 0; }
+.c-job-body li::marker { color: var(--neon); }
+.c-job-body a { color: var(--neon); overflow-wrap: anywhere; }

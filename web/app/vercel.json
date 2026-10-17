@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "node scripts/build.mjs && (node scripts/bake-snapshot.mjs || echo 'snapshot bake skipped — client falls back to skeletons + relay')",
+  "buildCommand": "node scripts/build.mjs && (node scripts/bake-snapshot.mjs || echo 'snapshot bake skipped \u2014 client falls back to skeletons + relay')",
   "outputDirectory": "dist",
   "framework": null,
   "cleanUrls": true,
@@ -27,7 +27,7 @@
       ]
     },
     {
-      "source": "/((?!tokens$).*)",
+      "source": "/((?!(?:tokens|challenges)$).*)",
       "headers": [
         {
           "key": "Content-Security-Policy",
@@ -45,6 +45,19 @@
         {
           "key": "X-Robots-Tag",
           "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/challenges",
+      "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        },
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' wss://relay.maxplayer.ai wss://nos.lol wss://relay.primal.net wss://offchain.pub https://api.coinbase.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
         }
       ]
     }

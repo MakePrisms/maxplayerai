@@ -14,6 +14,7 @@
  * to cache. The files themselves keep their names; the query string is the
  * only difference.
  */
+import { parseChallengeRelays } from "../src/challenge/shared/relay.mjs";
 import { build, context } from "esbuild";
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -24,18 +25,26 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const SITE_ORIGIN = "https://www.maxplayer.ai";
 
+const buyer = process.env.CHALLENGE_BUYER_PUBKEY ?? "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5";
+if (!/^[0-9a-f]{64}$/.test(buyer)) throw Error("CHALLENGE_BUYER_PUBKEY must be lowercase hex");
+const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
+if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
+const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
 const watch = process.argv.includes("--watch");
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"];
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
   // so the token-trade reader never ships in (or changes) the jobs bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts") },
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), challenges: join(root, "src/challenges.ts") },
   bundle: true,
   // Vercel preview deployments show the Try it UI so it can be reviewed.
   // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
   // server flags and stays 404 in previews, so nothing is written to the relay.
   define: {
+    CHALLENGE_BUYER_PUBKEY: JSON.stringify(buyer),
+    CHALLENGE_RELAYS: JSON.stringify(challengeRelays),
+    CONFIGURED_RELAY_URL: JSON.stringify(relay),
     WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
     TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
     TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
@@ -64,11 +73,12 @@ if (watch) {
   // One stamp derived from every shipped byte the HTML/CSS reference.
   const fontNames = readdirSync(join(root, "public/fonts"));
   const hash = createHash("sha256");
-  for (const rel of [...PAGES, "styles.css", "fonts.css", ...fontNames.map((f) => join("fonts", f))]) {
+  for (const rel of [...PAGES, "styles.css", "fonts.css", "challenges.css", ...fontNames.map((f) => join("fonts", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
   hash.update(readFileSync(join(dist, "terminal.js")));
   hash.update(readFileSync(join(dist, "tokens.js")));
+  hash.update(readFileSync(join(dist, "challenges.js")));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset
@@ -85,7 +95,7 @@ if (watch) {
     writeFileSync(
       join(dist, page),
       readFileSync(join(root, "public", page), "utf8")
-        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
+        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|challenges\.js|challenges\.css|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
     );
   }
 
