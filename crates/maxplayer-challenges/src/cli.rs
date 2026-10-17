@@ -1189,6 +1189,62 @@ mod tests {
             std::fs::remove_dir_all(root).unwrap();
         }
         #[tokio::test]
+        async fn r6_trusted_paging_stops_at_page_cap_and_publishes_nothing() {
+            use crate::relay::{MAX_TRUSTED_PAGES, PAGE_LIMIT};
+            let root = std::env::temp_dir().join(format!(
+                "challenge-r6-cap-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let seller = crate::relay::keys(&home).unwrap();
+            let buyer_keys = Keys::generate();
+            let buyer = buyer_keys.public_key().to_hex();
+            // One junk event per second, more than MAX_TRUSTED_PAGES pages can walk (each page
+            // after the first adds PAGE_LIMIT - 1 new seconds); the real `joined` is older.
+            let span = PAGE_LIMIT * (MAX_TRUSTED_PAGES + 1);
+            let mut events: Vec<_> = (0..span)
+                .map(|i| junk(&seller, &buyer, i, 1001 + i as u64))
+                .collect();
+            events.extend([
+                day(&buyer_keys, 90),
+                decision(&buyer_keys, &seller, "accepted", 110),
+                membership(&seller, &buyer, "joined", 100, 100),
+            ]);
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            for command in [
+                format!("join --buyer {buyer} --minutes 60"),
+                format!("status --buyer {buyer}"),
+            ] {
+                relay.reqs.lock().unwrap().clear();
+                let mut o = super::parse(&args(&command)).unwrap();
+                o.relays = vec![relay.url.clone()];
+                let result = execute_async(&o, &home).await;
+                assert!(
+                    relay.writes.lock().unwrap().is_empty(),
+                    "{command} published past the page cap"
+                );
+                match result {
+                    Ok((body, _)) => panic!("{command}: read past the page cap: {body}"),
+                    Err(error) => assert!(
+                        error.contains("history truncated: trusted page cap reached"),
+                        "{command}: {error}"
+                    ),
+                }
+                let membership_reqs = relay
+                    .reqs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| f["kinds"][0] == CHALLENGE_MEMBERSHIP_KIND)
+                    .count();
+                assert_eq!(
+                    membership_reqs, MAX_TRUSTED_PAGES,
+                    "{command}: REQs past the cap"
+                );
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        #[tokio::test]
         async fn r5_members_sample_never_overrides_trusted_row() {
             let root = std::env::temp_dir().join(format!(
                 "challenge-r5-sample-{}",

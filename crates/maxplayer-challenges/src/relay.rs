@@ -23,6 +23,11 @@ pub const DEFAULT_RELAYS: [&str; 3] = [
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Events per history REQ (the common public-relay cap; same as the page's `PAGE_LIMIT`).
 pub const PAGE_LIMIT: usize = 500;
+/// Most pages one trusted `fetch` may request from one relay. Reaching it with a still-full page
+/// fails the read with `history truncated` (nothing is published): 20 pages walk up to ~10,000
+/// events (500 + 19 x 499 new, the oldest second is re-read) in at most 20 x `TIMEOUT` (200 s),
+/// far beyond any real roster's membership history.
+pub const MAX_TRUSTED_PAGES: usize = 20;
 /// Raw view of one subscription: every `EVENT` frame the relay sent for it, and the oldest
 /// verified, filter-matching one among them.
 #[derive(Debug)]
@@ -214,7 +219,7 @@ impl Relays {
     /// (`web/app/src/challenge/shared/relay.mjs`): each REQ carries `limit: PAGE_LIMIT`, and a
     /// full page (counted in raw relay frames) is never treated as complete. It re-reads from
     /// the oldest in-range second (inclusive `until`), fails the read unless that cursor moves
-    /// strictly older.
+    /// strictly older, and fails once `MAX_TRUSTED_PAGES` pages were all full.
     pub async fn fetch(&self, home: &MaxplayerHome, filter: Filter) -> Result<Vec<Event>, String> {
         self.read(home, filter.limit(PAGE_LIMIT), true)
             .await
@@ -302,6 +307,9 @@ impl Relays {
                 }
                 Some(oldest) => cursor.until(oldest),
             };
+            if pages >= MAX_TRUSTED_PAGES {
+                return Err("history truncated: trusted page cap reached");
+            }
         }
     }
     async fn read_page(
