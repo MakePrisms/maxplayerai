@@ -347,6 +347,52 @@ pub(crate) mod transport_tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
+    async fn partial_publish_names_failed_url_and_remains_on_live_relay() {
+        use nostr_relay_builder::prelude::*;
+        let live = LocalRelay::new(RelayBuilder::default());
+        live.run().await.unwrap();
+        let live_url = live.url().await.to_string();
+        let failed = fixture(vec![], true, false).await;
+        let dir = std::env::temp_dir().join(format!(
+            "challenge-partial-{}",
+            Keys::generate().public_key()
+        ));
+        let home = home::bootstrap(&dir).unwrap();
+        let draft = maxplayer_core::challenge::Challenge {
+            buyer: keys(&home).unwrap().public_key().to_hex(),
+            id: "partial".into(),
+            title: "Test".into(),
+            goal: "Goal".into(),
+            starts: 100,
+            ends: 200,
+            budget_sats: 0,
+            status: "scheduled".into(),
+            update: None,
+            result: None,
+        }
+        .to_event_draft()
+        .unwrap();
+        let error = Relays::new(&[live_url.clone(), failed.url.clone()])
+            .unwrap()
+            .publish(&home, draft, Timestamp::now().as_secs())
+            .await
+            .unwrap_err();
+        assert!(error.contains(&failed.url), "{error}");
+        let stored = Relays::new(&[live_url])
+            .unwrap()
+            .fetch(&home, Filter::new().kind(Kind::Custom(30341)))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored.len(),
+            1,
+            "partial publish must remain readable on live relay"
+        );
+        assert_eq!(stored[0].content, "Goal");
+        live.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
     async fn missing_eose_is_error_and_partial_events_are_discarded() {
         let dir =
             std::env::temp_dir().join(format!("challenges-eose-{}", Keys::generate().public_key()));
