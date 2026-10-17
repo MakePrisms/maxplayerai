@@ -59,10 +59,13 @@ test('pagination overlaps timestamp boundary and flags saturated second',t=>{
   for(let n=0;n<500;n++)socket.message(['EVENT','30341',e]);
   socket.message(['EOSE','30341']);assert.match(reader.status.error,/History truncated/);assert.equal(reader.status.historyComplete,false);
 });
-test('post-EOSE events update the store; CLOSED live feed falls back to polling',t=>{
-  const {reader,socket,store}=setup(t);socket.message(['AUTH','nonce']);socket.message(['OK',reader.authId,true,'']);
+test('post-EOSE events update the store; anonymous CLOSED live feed falls back to polling',t=>{
+  const {reader,socket,store}=setup(t);
+  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
   socket.message(['EOSE','live-30341']);socket.message(['EVENT','live-30341',signed(30341)]);assert.equal(store.events.size,1);
-  socket.message(['CLOSED','live-30341','restricted']);assert.equal(reader.status.authenticated,false);assert.equal(reader.status.connected,true);
+  socket.message(['CLOSED','live-30341','restricted']);assert.equal(reader.status.connected,true);
+  assert.equal(reader.status.historyComplete,true,'anonymous: history stays complete through polls');
+  assert.ok(reader.status.warnings.some(w=>/live-?30341|30341 closed by relay \(restricted\)/.test(w)),'reason surfaced');
 });
 test('reconnect uses same per-tab key and starts full history again; stop cancels retries',async t=>{
   const {reader,socket}=setup(t);socket.message(['AUTH','one']);const pubkey=socket.sent.find(m=>m[0]==='AUTH')[1].pubkey;
