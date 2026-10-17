@@ -277,3 +277,15 @@ test('split reader waits for all challenge EOSE and deduplicates relay warnings'
   a.status.warnings=['same warning'];b.status.warnings=['same warning'];
   assert.deepEqual(reader.status.warnings,['same warning']);
 });
+
+test('mixed accepted and discarded saturated boundary remains incomplete',t=>{
+  const {reader,socket}=setup(t);
+  const valid=signed(30342,100,memberTags),junk=signed(30342,100,[['p',buyer]]);
+  for(let page=0;page<2;page++) {
+    socket.message(['EVENT','30342',valid]);
+    for(let i=0;i<499;i++)socket.message(['EVENT','30342',junk]);
+    socket.message(['EOSE','30342']);
+  }
+  assert.equal(reader.status.historyComplete,false);
+  assert.match(reader.status.error,/History truncated/,'never skip unseen valid ties in a mixed page');
+});

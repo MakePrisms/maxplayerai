@@ -76,9 +76,9 @@ export class RelayReader {
         if(added){if(!this.pages.size)this.refreshMembers();this.onChange();}
       } else if(m[0]==='EOSE'&&this.pages.has(m[1])) {
         const p=this.pages.get(m[1]);this.pages.delete(m[1]);
-        if(p.received>=500 && p.events.length<500) {
+        if(p.received>=500 && !p.events.length) {
           if(p.oldest>0)this.page(m[1],{...p.filter,until:p.oldest-1});
-        } else if(p.events.length>=500) {
+        } else if(p.received>=500) {
           const oldest=p.oldest;
           if(p.filter.until===oldest)this.status.error='History truncated: 500+ events in one second';
           else this.page(m[1],{...p.filter,until:oldest});
