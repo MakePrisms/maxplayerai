@@ -299,7 +299,10 @@ Rust `eligible_sellers` and the sidecar's `status`/`members` give the same eligi
 buyer decision `accepted` and the latest valid membership *from that pubkey* `joined`, with
 `since` and `created_at` at or before the challenge start. Memberships from other authors are
 dropped before replacement. The sidecar reads decisions first and then memberships with an
-`authors` filter (accepted sellers plus the caller, or the `--seller` being decided).
+`authors` filter (accepted sellers; `join`/`leave`/`status` add the caller, `decide` adds the
+`--seller` being decided). Its trusted reads page like the web reader (`limit` 500, inclusive
+`until` re-read of the oldest second, fail closed when the cursor does not move), so a
+truncated history makes the command fail and publish nothing rather than act on a subset.
 `web/app/test/fixtures/challenge-roster.json` is checked by both stacks.
 
 The **applicant list** shows people who asked to join and have no decision yet, so the buyer can

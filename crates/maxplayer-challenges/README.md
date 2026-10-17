@@ -38,9 +38,17 @@ the shared protocol selects the latest per `(kind, author, d)` with deterministi
 A relay without EOSE is a reported error and its partial events are discarded. If any relay
 fails to complete, the command fails and identifies the incomplete relays.
 A reachable relay's history cannot prove that another relay has no newer event.
-`status`/`members` read buyer decisions first, then memberships only from accepted sellers
-(plus the caller), so the eligible view ignores strangers' memberships. `members` adds a
-capped newest-256 applicant sample for review and reports `applicants_incomplete`.
+History reads page like the web reader: each request carries `limit: 500`; a full page is
+never treated as complete, the oldest second is re-read (inclusive `until`), and the command
+fails without publishing if that cursor does not move strictly older or a full page has no
+in-range event.
+Every membership command reads buyer decisions first, then memberships only from accepted
+sellers, so the eligible view ignores strangers' memberships. `join`, `leave` and `status`
+also read the caller's own memberships; `decide` also reads the `--seller` being decided;
+`members` reads accepted sellers only. `members` then adds a capped newest-256 applicant
+sample for review (one page, never paged) and reports `applicants_incomplete`. A sample event
+only fills a seller row the trusted read did not return (for example a denied or undecided
+seller); it never replaces an accepted seller's roster membership.
 `--json` retains the existing command JSON on stdout.
 
 ## Sellers: join once

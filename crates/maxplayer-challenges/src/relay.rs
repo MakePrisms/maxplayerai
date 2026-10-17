@@ -530,11 +530,16 @@ pub(crate) mod transport_tests {
             })
             .collect();
         let relay = fixture(other, true, true).await;
-        let error = Relays::new(std::slice::from_ref(&relay.url))
-            .unwrap()
-            .fetch(&home, filter.clone())
-            .await
-            .unwrap_err();
+        let refused = |r: Result<Vec<Event>, String>| match r {
+            Ok(events) => panic!("full page read as complete ({} events)", events.len()),
+            Err(error) => error,
+        };
+        let error = refused(
+            Relays::new(std::slice::from_ref(&relay.url))
+                .unwrap()
+                .fetch(&home, filter.clone())
+                .await,
+        );
         assert!(
             error.contains("full page without an in-range event"),
             "{error}"
@@ -544,11 +549,12 @@ pub(crate) mod transport_tests {
             .map(|i| event(&keys, &format!("d{i}"), 100))
             .collect();
         let relay = relay_like(tied, vec![]).await;
-        let error = Relays::new(std::slice::from_ref(&relay.url))
-            .unwrap()
-            .fetch(&home, filter)
-            .await
-            .unwrap_err();
+        let error = refused(
+            Relays::new(std::slice::from_ref(&relay.url))
+                .unwrap()
+                .fetch(&home, filter)
+                .await,
+        );
         assert!(error.contains("500+ events in one second"), "{error}");
         let reqs = relay.reqs.lock().unwrap();
         assert_eq!(reqs.len(), 2, "one re-read of the saturated second");
