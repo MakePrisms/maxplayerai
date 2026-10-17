@@ -50,7 +50,10 @@ Every membership command reads buyer decisions first, then memberships only from
 sellers, so the eligible view ignores strangers' memberships. `join`, `leave` and `status`
 also read the caller's own memberships; `decide` also reads the `--seller` being decided;
 `members` reads accepted sellers only. `members` then adds a capped newest-256 applicant
-sample for review (one page, never paged) and reports `applicants_incomplete`. A sample event
+sample for review (one page, never paged) and reports `applicants_incomplete`. The cap counts
+every `EVENT` frame the relay sends, including ones the client then drops (expired, oversized,
+bad signature), so `applicants_incomplete` can be true with fewer than 256 rows shown; it never
+affects the roster or what is published. A sample event
 only fills a seller row the trusted read did not return (for example a denied or undecided
 seller); it never replaces an accepted seller's roster membership.
 `--json` retains the existing command JSON on stdout.
