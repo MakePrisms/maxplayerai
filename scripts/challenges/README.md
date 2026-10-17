@@ -300,6 +300,11 @@ The disposable Buzz fixture raises its per-principal WS/message limits to 1000/s
 This tests orchestration/settlement, not production quota behavior. Production limits are unchanged.
 Sticky failed preparations that name a queued offer are recovered by inspecting that offer;
 permanent publication refusals and expired/undelivered jobs are recorded without reposting them.
+The solved day runs the runner's challenge relay through `gap-proxy.py`, a loopback TCP proxy.
+After the planner's first `assign` batch, `planner-free-e2e.mjs` triggers one 4-second drop.
+The fresh per-assignment recheck therefore sees `relay_not_ready`. The harness asserts that both
+assignments were deferred, not rejected; each posted once after the gap; none was dropped; and
+no request ID repeated.
 
 ### Paid E2E coverage boundary
 
