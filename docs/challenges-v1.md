@@ -278,9 +278,21 @@ written some relays: the command fails and identifies failed URLs; retry repairs
 coverage. Reads require EOSE from every configured relay. The page keeps healthy
 relay data visible with an incomplete/failed-URL indicator; the runner never posts
 from that partial history. AUTH-required CLOSED history requests are retried after
-AUTH OK. Reader membership discovery is limited to 256 distinct keys, 4096 content
-characters and 16384 serialized tag characters before subscription expansion;
-exceeding a limit marks the read incomplete rather than silently trusting a subset.
+AUTH OK. A dead relay blocks the runner on purpose. Removing it is safe only after
+successfully reading that relay, or after a person has checked it holds no newer
+replaceable event (challenge, membership, or decision). Otherwise removing it can
+resurrect an older joined membership, budget, or challenge state.
+
+Reader membership discovery ignores invalid events, content over 4096 UTF-16 code
+units, and tags over 16384 serialized UTF-16 code units, without setting a history
+error. The sidecar refuses join notes over the same content limit before publishing.
+Only valid memberships count toward the 256 distinct-key profile subscription cap.
+Overflow events are skipped; EOSE still completes. `relay.warnings` names every
+excluded pubkey, and `relay.excludedMembers` prevents those sellers from assignment,
+even if an older joined record was cached. Exclusions persist for this reader's
+lifetime, including reconnects. Other sellers continue normally. This is bounded
+roster availability, not a claim that all sellers are displayed; increase capacity
+or reduce the roster deliberately rather than treating excluded sellers as absent.
 
 The production-relay fence is a normalized **hostname string** denylist, shared by
 the sidecar, page, swarm parser and site build (canonical JSON literal in

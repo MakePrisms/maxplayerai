@@ -1,6 +1,6 @@
 import { CHALLENGE, MEMBERSHIP, DECISION, OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE } from '../../model/kinds.ts';
 import { schnorr } from '@noble/curves/secp256k1';
-import { signAuth, verify, mentions } from './events.mjs';
+import { signAuth, verify, mentions, validMembership } from './events.mjs';
 
 export function challengeFilters(buyer) {
   return [CHALLENGE,MEMBERSHIP,DECISION,OFFER,CLAIM,AWARD,RESULT,ACCEPT].map(kind =>
@@ -8,18 +8,18 @@ export function challengeFilters(buyer) {
 }
 const matches = (e,f) => f.kinds.includes(e.kind) && (!f.authors || f.authors.includes(e.pubkey)) && (!f['#p'] || f['#p'].some(pk=>mentions(e,pk)));
 // Read-only transport. The only signed frame is NIP-42 AUTH, using an in-memory
-// throwaway key (one reader per tab). Never loads a wallet or publishes EVENT.
+// throwaway key (one key per relay connection). Never loads a wallet or publishes EVENT.
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,filters=challengeFilters(buyer),onMember=null,key=schnorr.utils.randomPrivateKey()}) {
     Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,onMember});
     this.initialFilters=filters; this.members=new Set();
-    this.key=key;
-    this.status={connected:false,authenticated:false,historyComplete:false,error:null};
+    this.key=key; this.excludedMembers=new Set();
+    this.status={connected:false,authenticated:false,historyComplete:false,error:null,warnings:[...this.excludedMembers].map(pk=>`Membership profile cap: excluded seller ${pk}`),excludedMembers:[...this.excludedMembers]};
     this.stopped=false; this.retry=1000;
   }
   start() {
     if(this.stopped)return;
-    this.status={connected:false,authenticated:false,historyComplete:false,error:null};
+    this.status={connected:false,authenticated:false,historyComplete:false,error:null,warnings:[...this.excludedMembers].map(pk=>`Membership profile cap: excluded seller ${pk}`),excludedMembers:[...this.excludedMembers]};
     this.filters=new Map(this.initialFilters.map(f=>[String(f.kinds[0]),f]));
     for(const pk of this.members)for(const kind of [PROFILE,HEARTBEAT])this.filters.set(`${kind}-${pk}`,{kinds:[kind],authors:[pk]});
     this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.live=new Map();
@@ -71,11 +71,14 @@ export class RelayReader {
         const id=p?m[1]:m[1].slice(5);
         this.newest.set(id,Math.max(this.newest.get(id)??0,e.created_at));
         if(e.kind===MEMBERSHIP) {
-          if(e.content.length>4096 || JSON.stringify(e.tags).length>16384) {
-            this.status.error='Membership content limit exceeded';this.status.historyComplete=false;this.onChange();return;
-          }
+          if(e.content.length>4096 || JSON.stringify(e.tags).length>16384 || !validMembership(e,{pubkey:this.buyer}))return;
           if((this.onMember?this.onMember(e.pubkey):this.addMember(e.pubkey))===false) {
-            this.status.error='Membership pubkey limit exceeded';this.status.historyComplete=false;this.onChange();return;
+            // Preserve history availability, but never assign a seller whose latest
+            // membership may have been dropped (including an older cached join).
+            this.excludedMembers.add(e.pubkey);
+            this.status.excludedMembers=[...this.excludedMembers];
+            this.status.warnings=this.status.excludedMembers.map(pk=>`Membership profile cap: excluded seller ${pk}`);
+            this.onChange();return;
           }
         }
         const added=this.store.add(e);
@@ -142,7 +145,7 @@ export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
 export class ChallengeReader {
   constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...options}) {
     const filters=challengeFilters(buyer);
-    const common={...options,buyer,store,onChange,key:schnorr.utils.randomPrivateKey()};
+    const common={...options,buyer,store,onChange};
     this.trade=new RelayReader({...common,url,filters:filters.filter(f=>![CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0]))});
     this.challenges=parseChallengeRelays(challengeRelays).map(url=>new RelayReader({...common,url,
       filters:filters.filter(f=>[CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0])),
@@ -156,6 +159,7 @@ export class ChallengeReader {
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
       historyComplete:this.trade.status.historyComplete&&ready,
+      warnings:relays.flatMap(r=>r.warnings),excludedMembers:[...new Set(relays.flatMap(r=>r.excludedMembers))],
       error:this.trade.status.error??(failedRelays.length?`Challenge history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}

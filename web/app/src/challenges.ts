@@ -72,7 +72,7 @@ function receive(value: unknown, status: string): void {
   render(snapshot);
   const r = snapshot.relay;
   const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : status;
-  text("connection-status", connection + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : ""));
+  text("connection-status", connection + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : ""));
 }
 function unavailable(): void {
   text("connection-status", snapshot ? "Reconnecting · showing last known" : "Live view unavailable · check back soon");

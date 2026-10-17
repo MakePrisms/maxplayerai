@@ -165,7 +165,7 @@ export class Swarm {
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
     const min=this.c.minDuration??120, max=this.c.maxDuration??1800;
-    const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
+    const eligible=s=>(!snap.relay?.excludedMembers?.includes(s.pubkey)&&s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
       ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:j.args.task,since:j.created,deadline:j.args.deadline_unix})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];

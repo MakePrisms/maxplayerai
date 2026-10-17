@@ -82,7 +82,7 @@ npm run build --prefix web/app
 ```
 
 The page reads history anonymously and authenticates live subscriptions with a random
-in-memory per-tab key. Refused AUTH falls back to 15-second overlapping polls. The buyer
+in-memory per-relay key. Refused AUTH falls back to 15-second overlapping polls. The buyer
 runner still fails closed without authenticated, complete history. No buyer key is loaded
 by the reader. Set `CHALLENGE_BUYER_PUBKEY` (hex), `CHALLENGE_RELAYS` (comma list), and `RELAY_URL` at build time for a local
 fixture; do not point a fixture browser at the production relay. No API server is required.
@@ -309,3 +309,18 @@ Build the [challenge sidecar](../../crates/maxplayer-challenges/README.md) from 
 running the swarm. Local E2E runs a separate generic local relay for challenge events and
 Buzz for jobs; `E2E_CHALLENGE_RELAYS` overrides the challenge read list (disposable local
 relays only). The sidecar never uses the configured job relay for challenges.
+
+### Relay coverage and membership limits
+
+A dead configured challenge relay blocks the runner on purpose: posting requires
+N-of-N complete history, and sidecar publishing requires N-of-N acknowledgements.
+A failed publish may already be stored on live relays; retry to repair coverage.
+Remove a relay only after a successful read of it, or after a person has checked
+it contains no newer replaceable challenge, membership, or decision. Removing an
+unread relay can resurrect an old join or budget.
+
+Invalid/oversized membership events are skipped without poisoning history. Join
+notes are limited to 4096 UTF-16 code units. Only valid members consume the 256-key
+profile cap. Overflow pubkeys appear in `relay.warnings` and `excludedMembers`;
+those sellers cannot be assigned (even with an older cached join), while history
+and other sellers continue. Exclusions persist until the reader is restarted.

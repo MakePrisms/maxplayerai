@@ -13,6 +13,7 @@ class Socket extends EventTarget {
   message(data){this.dispatchEvent(new MessageEvent('message',{data:JSON.stringify(data)}));}
   close(){this.readyState=3;this.dispatchEvent(new Event('close'));}
 }
+const memberTags=[['t','maxplayer'],['v','1'],['d',buyer],['p',buyer],['since','100'],['minutes','60'],['status','joined']];
 const pause=ms=>new Promise(r=>setTimeout(r,ms));
 async function until(predicate) {for(let i=0;i<400;i++){if(predicate())return;await pause(10);}assert.ok(predicate(),'timed out waiting for socket state');}
 function setup(t,options={}) {const store=new EventStore(),reader=new RelayReader({url:'ws://localhost:1234',buyer,store,WebSocketImpl:Socket,queueMs:1,pollMs:100000,...options});reader.start();const socket=Socket.all.at(-1);socket.dispatchEvent(new Event('open'));t.after(()=>reader.stop());return {reader,socket,store};}
@@ -92,7 +93,7 @@ test('split sources union IDs, reject cross-kind events, and tolerate a failed p
   reader.challenges[0].ws.message(['EVENT','3401',signed(3401)]);
   assert.equal(store.events.size,1);
   // Membership from public relays expands only trade-relay heartbeat/profile reads.
-  reader.challenges[0].ws.message(['EVENT','30342',signed(30342,100,[['p',buyer]])]);
+  reader.challenges[0].ws.message(['EVENT','30342',signed(30342,100,memberTags)]);
   assert.ok(reader.trade.filters.has(`30340-${buyer}`));
   assert.ok(!reader.challenges[0].filters.has(`30340-${buyer}`));
   for(const r of [reader.trade,...reader.challenges.slice(0,2)])for(const id of [...r.pages.keys()])r.ws.message(['EOSE',id]);
@@ -102,7 +103,7 @@ test('split sources union IDs, reject cross-kind events, and tolerate a failed p
   reader.challenges[0].ws.close();reader.challenges[1].ws.close();
   assert.equal(reader.status.connected,false);assert.match(reader.status.error,/incomplete/);
 });
-test('public relays stream post-EOSE without AUTH and share the per-tab ephemeral identity',t=>{
+test('public relays stream post-EOSE without AUTH and use distinct per-relay ephemeral identities',t=>{
   const store=new EventStore(),reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a'],buyer,store,WebSocketImpl:Socket});
   reader.start();t.after(()=>reader.stop());
   for(const r of [reader.trade,...reader.challenges])r.ws.dispatchEvent(new Event('open'));
@@ -110,7 +111,7 @@ test('public relays stream post-EOSE without AUTH and share the per-tab ephemera
   publicRelay.ws.message(['EOSE','live-30341']);publicRelay.ws.message(['EVENT','live-30341',signed(30341)]);
   assert.equal(store.events.size,1);
   for(const r of [reader.trade,publicRelay])r.ws.message(['AUTH','nonce']);
-  assert.equal(reader.trade.ws.sent.find(m=>m[0]==='AUTH')[1].pubkey,publicRelay.ws.sent.find(m=>m[0]==='AUTH')[1].pubkey);
+  assert.notEqual(reader.trade.ws.sent.find(m=>m[0]==='AUTH')[1].pubkey,publicRelay.ws.sent.find(m=>m[0]==='AUTH')[1].pubkey);
 });
 test('challenge relay config validates, trims and deduplicates',()=>{
   assert.deepEqual(parseChallengeRelays(' ws://a ,ws://b,ws://a '),['ws://a','ws://b']);
@@ -187,9 +188,10 @@ test('signed membership flood cannot expand one trade subscription per key',t=>{
     e.id=eventId(e);e.sig=Buffer.from(schnorr.sign(e.id,privateKey)).toString('hex');
     socket.message(['EVENT','30342',e]);
   }
-  assert.equal(reader.members.size,256);assert.equal(store.events.size,256);
-  assert.equal(reader.filters.size,520);assert.equal(reader.status.historyComplete,false);
-  assert.match(reader.status.error,/pubkey limit/);
+  assert.equal(reader.members.size,0);assert.equal(store.events.size,0);
+  assert.equal(reader.filters.size,8);assert.equal(reader.status.error,null);
+  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
+  assert.equal(reader.status.historyComplete,true);
 });
 
 test('AUTH recovery cannot clear a different hard history refusal',t=>{
@@ -199,4 +201,35 @@ test('AUTH recovery cannot clear a different hard history refusal',t=>{
   socket.message(['AUTH','nonce']);socket.message(['OK',reader.authId,true,'']);
   for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
   assert.equal(reader.status.historyComplete,false);assert.match(reader.status.error,/refused/);
+});
+
+test('oversized membership alongside valid history does not poison EOSE',t=>{
+  const {reader,socket,store}=setup(t);
+  const huge={...signed(30342,100,[['p',buyer]]),content:'x'.repeat(4097)};
+  huge.id=eventId(huge);huge.sig=Buffer.from(schnorr.sign(huge.id,key)).toString('hex');
+  socket.message(['EVENT','30342',huge]);
+  socket.message(['EVENT','30342',signed(30342,100,memberTags)]);
+  socket.message(['EVENT','30341',signed(30341,100,[['t','maxplayer'],['v','1'],['d','day'],['title','Day'],['starts','200'],['ends','1000'],['budget','0','sat'],['status','in_progress']])]);
+  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
+  assert.equal(reader.status.historyComplete,true);assert.equal(reader.status.error,null);
+  assert.equal(store.events.size,2);assert.equal(store.snapshot(buyer,300).sellers.length,1);
+});
+test('valid membership overflow warns without blocking history and excludes seller from assignments',async t=>{
+  const {coordinate}=await import('../../../scripts/challenges/coordinator.mjs');
+  const {reader,socket,store}=setup(t);
+  for(let i=2;i<=257;i++) {
+    const privateKey=i.toString(16).padStart(64,'0');
+    const e={kind:30342,pubkey:Buffer.from(schnorr.getPublicKey(privateKey)).toString('hex'),created_at:100,tags:memberTags,content:''};
+    e.id=eventId(e);e.sig=Buffer.from(schnorr.sign(e.id,privateKey)).toString('hex');
+    socket.message(['EVENT','30342',e]);
+  }
+  socket.message(['EVENT','30342',signed(30342,100,memberTags)]);
+  for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
+  assert.equal(reader.status.error,null);assert.equal(reader.status.historyComplete,true);
+  assert.equal(store.events.size,256);assert.equal(reader.members.size,256);
+  assert.deepEqual(reader.status.excludedMembers,[buyer]);
+  assert.ok(reader.status.warnings.some(w=>w.includes(buyer)));
+  // A cached older membership must not become usable when a replacement was dropped.
+  const snap={asOf:300,challenge:{id:'day',starts:200,ends:1000,status:'in_progress'},budget:{totalSats:0,committedSats:0,paidSats:0},relay:{...reader.status,authenticated:true},sellers:[{pubkey:buyer,eligible:true,decision:'accepted',state:'accepted',minutesRemaining:60,currentJobStart:null}],jobs:[]};
+  assert.equal(coordinate(snap,{now:300,durationSeconds:30}).postingAllowed,false);
 });

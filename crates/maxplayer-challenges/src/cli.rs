@@ -248,6 +248,9 @@ async fn execute_async(
     o: &Opts,
     home: &maxplayer_core::home::MaxplayerHome,
 ) -> Result<(serde_json::Value, Option<String>), String> {
+    if o.command == "join" && o.get("--note").unwrap_or("").encode_utf16().count() > 4096 {
+        return Err("join note exceeds 4096 UTF-16 code units (reader limit)".into());
+    }
     let relay = crate::relay::Relays::new(&o.relays)?;
     use maxplayer_core::challenge::*;
     use nostr_sdk::prelude::*;
@@ -664,6 +667,28 @@ mod tests {
                     .status
                     == "cancelled"
             );
+        }
+        #[tokio::test]
+        async fn oversized_join_note_is_refused_before_publish() {
+            let relay = crate::relay::transport_tests::fixture(vec![], true, true).await;
+            let root = std::env::temp_dir()
+                .join(format!("challenge-note-{}", Keys::generate().public_key()));
+            let home = home::bootstrap(&root).unwrap();
+            let buyer = crate::relay::keys(&home).unwrap().public_key().to_hex();
+            for note in ["x".repeat(4097), "😀".repeat(2049)] {
+                let mut o = super::parse(&args(&format!(
+                    "join --buyer {buyer} --minutes 60 --note {note}"
+                )))
+                .unwrap();
+                o.relays = vec![relay.url.clone()];
+                let result = execute_async(&o, &home).await;
+                assert!(
+                    relay.writes.lock().unwrap().is_empty(),
+                    "oversized note published"
+                );
+                assert!(result.unwrap_err().contains("4096 UTF-16"));
+            }
+            std::fs::remove_dir_all(root).unwrap();
         }
         #[tokio::test]
         async fn secret_in_content_or_tags_never_writes_relay() {

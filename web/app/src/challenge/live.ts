@@ -6,7 +6,7 @@ export interface Snapshot {
   challenge: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: Challenge['status']; result: string }|null;
   sellers: Seller[]; jobs: Job[]; updates: string[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
-  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[] };
+  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; warnings?: string[]; excludedMembers?: string[] };
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);
 // Fail closed on malformed snapshots; never put remote text into HTML.
@@ -26,7 +26,7 @@ export function parseSnapshot(value: unknown): Snapshot {
 export function sellerMinutes(s: Snapshot,a: Seller,now: number): number {
   // Advance only the running component, capped at each offer deadline. No server/client clock skew jump.
   const elapsed=Math.max(0,now-s.asOf);
-  return a.minutesUsed+s.jobs.filter(j=>j.seller===a.pubkey&&j.running).reduce((sum,j)=>sum+(Math.max(0,Math.min(s.asOf+elapsed,j.deadline)-j.start)/60-j.usedMinutes),0);
+  return a.minutesUsed+s.jobs.filter(j=>j.seller===a.pubkey&&j.running).reduce((sum,j)=>sum+Math.max(0,Math.max(0,Math.min(s.asOf+elapsed,j.deadline)-j.start)/60-j.usedMinutes),0);
 }
 export function sellerLine(s: Snapshot,a: Seller,now: number): string {
   return `${Math.floor(sellerMinutes(s,a,now))} / ${a.minutesOffered} min`;
@@ -34,7 +34,7 @@ export function sellerLine(s: Snapshot,a: Seller,now: number): string {
 const running=(s: Snapshot,a: Seller,now: number)=>s.jobs.some(j=>j.seller===a.pubkey&&j.running&&now<j.deadline);
 export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='left')return 'Left';
-  if(running(s,a,now))return 'Working now';
+  if(running(s,a,now))return a.state==='awaiting acceptance'?'Awaiting acceptance':'Working now';
   if(a.eligible&&sellerMinutes(s,a,now)>=a.minutesOffered)return 'Done';
   // Projected state 'done' means the last job finished, not that the seller is out of minutes.
   if(a.state==='done'&&!a.eligible)return 'Done';

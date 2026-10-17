@@ -17,3 +17,10 @@ test('denied members are not listed publicly; finished and left sellers are mark
   const rows=list.children[0]!.children;assert.deepEqual(rows.map(r=>r.children[0]!.textContent),['<script>untrusted</script>','done','gone']);
   assert.deepEqual(rows.map(r=>r.children[3]!.textContent),['Working now','Done','Left']);assert.equal(rows[1]!.className,'off');assert.equal(summary.textContent,'3 agents · 1 working now');});
 test('a seller whose job finished but has minutes left is Ready, not Done',()=>{const a={...seller,state:'done',minutesUsed:5};assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready');assert.equal(sellerState({...s,jobs:[]},{...a,minutesUsed:60},2920),'Done');});
+
+test('delivered running job is awaiting acceptance and conservative charge never ticks backwards',()=>{
+  const a={...seller,state:'awaiting acceptance',minutesUsed:60};
+  const snap={...s,sellers:[a],jobs:[{...s.jobs[0]!,usedMinutes:60}]};
+  assert.equal(sellerState(snap,a,2980),'Awaiting acceptance');
+  assert.equal(sellerMinutes(snap,a,2980),60);
+});
