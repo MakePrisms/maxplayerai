@@ -1,52 +1,88 @@
 import { CHALLENGE, MEMBERSHIP, DECISION, OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE } from '../../model/kinds.ts';
 import { schnorr } from '@noble/curves/secp256k1';
-import { signAuth, verify, mentions, validMembership, validDecision, newer, tag } from './events.mjs';
+import { sha256 } from '@noble/hashes/sha256';
+import { bytesToHex } from '@noble/hashes/utils';
+import { signAuth, verify, mentions, validMembership } from './events.mjs';
+import { acceptedSellers } from './model.mjs';
 
+// Per-REQ page size, applicant sample size, metadata budget and authors chunk size.
+export const PAGE_LIMIT=500, APPLICANT_LIMIT=256, METADATA_CAP=256, AUTHOR_CHUNK=100;
+const APPLICANTS='applicants';
+const CHALLENGE_KINDS=[CHALLENGE,MEMBERSHIP,DECISION];
+// Fixed filters. Memberships are deliberately absent: the runner reads them only through
+// rosterFilters (authors = buyer-accepted sellers); the untrusted applicantFilter is display-only.
 export function challengeFilters(buyer) {
-  return [CHALLENGE,MEMBERSHIP,DECISION,OFFER,CLAIM,AWARD,RESULT,ACCEPT].map(kind =>
-    [MEMBERSHIP,CLAIM,RESULT].includes(kind) ? {kinds:[kind],'#p':[buyer]} : {kinds:[kind],authors:[buyer]});
+  return [CHALLENGE,DECISION,OFFER,CLAIM,AWARD,RESULT,ACCEPT].map(kind =>
+    [CLAIM,RESULT].includes(kind) ? {kinds:[kind],'#p':[buyer]} : {kinds:[kind],authors:[buyer]});
 }
-const matches = (e,f) => f.kinds.includes(e.kind) && (!f.authors || f.authors.includes(e.pubkey)) && (!f['#p'] || f['#p'].some(pk=>mentions(e,pk)));
+export function rosterFilters(buyer,accepted) {
+  const sorted=[...accepted].sort(),out=[];
+  for(let i=0;i<sorted.length;i+=AUTHOR_CHUNK)out.push({kinds:[MEMBERSHIP],authors:sorted.slice(i,i+AUTHOR_CHUNK),'#p':[buyer]});
+  return out;
+}
+export const applicantFilter=buyer=>({kinds:[MEMBERSHIP],'#p':[buyer]});
+export const matches = (e,f) => f.kinds.includes(e.kind) && (!f.authors || f.authors.includes(e.pubkey)) && (!f['#p'] || f['#p'].some(pk=>mentions(e,pk))) &&
+  (f.since===undefined || e.created_at>=f.since) && (f.until===undefined || e.created_at<=f.until);
+const metadataId=id=>id.startsWith(`${PROFILE}-`)||id.startsWith(`${HEARTBEAT}-`);
+const soft=id=>id===APPLICANTS||metadataId(id);
 // Read-only transport. The only signed frame is NIP-42 AUTH, using an in-memory
 // throwaway key (one key per relay connection). Never loads a wallet or publishes EVENT.
+//
+// Trusted state (historyComplete, error) covers only the fixed filters and the roster
+// membership filters. The applicant sample never affects it: a flood there can only
+// truncate the "waiting for approval" list (status.applicantsIncomplete).
 export class RelayReader {
-  constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,filters=challengeFilters(buyer),onMember=null,key=schnorr.utils.randomPrivateKey()}) {
-    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,onMember});
-    this.initialFilters=filters; this.members=new Set();
-    this.key=key; this.excludedMembers=new Set();
-    this.status={connected:false,authenticated:false,historyComplete:false,error:null,warnings:[...this.excludedMembers].map(pk=>`Membership profile cap: excluded seller ${pk}`),excludedMembers:[...this.excludedMembers]};
+  constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,filters=challengeFilters(buyer),
+    roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey()}) {
+    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,readsRoster:roster,readsMetadata:metadata,applicants});
+    this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
+    this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
+    this.key=key;
+    this.status=this.freshStatus();
     this.stopped=false; this.retry=1000;
   }
+  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,error:null,warnings:[...this.metaWarnings],applicantsIncomplete:false};}
+  // Applicant and profile/heartbeat reads are display-only: they never gate readiness.
+  trustedPending(){for(const id of this.pages.keys())if(!soft(id))return true;return false;}
+  softFailure(id){this.pages.delete(id);if(id===APPLICANTS)this.status.applicantsIncomplete=true;else this.metaIncomplete();}
+  metaIncomplete(){const w='Profile/heartbeat read incomplete';if(!this.status.warnings.includes(w))this.status.warnings.push(w);}
+  // A roster reader is complete only after its roster (from complete decision history) was read.
+  updateComplete(){this.status.historyComplete=!!this.opened&&!this.trustedPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null);}
   start() {
     if(this.stopped)return;
-    this.status={connected:false,authenticated:false,historyComplete:false,error:null,warnings:[...this.excludedMembers].map(pk=>`Membership profile cap: excluded seller ${pk}`),excludedMembers:[...this.excludedMembers]};
-    this.filters=new Map(this.initialFilters.map(f=>[String(f.kinds[0]),f]));
-    for(const pk of this.members)for(const kind of [PROFILE,HEARTBEAT])this.filters.set(`${kind}-${pk}`,{kinds:[kind],authors:[pk]});
+    this.status=this.freshStatus(); this.opened=false;
+    this.filters=new Map([...this.initialFilters.map(f=>[String(f.kinds[0]),f]),...this.extra]);
     this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.live=new Map();
     const ws=this.ws=new this.WebSocketImpl(this.url);
     const send=frame=>{if(ws.readyState===1)ws.send(JSON.stringify(frame));};
     this.queueTimer=setInterval(()=>{if(this.queue.length&&ws.readyState===1){const frame=this.queue.shift();send(frame);const p=this.pages.get(frame[1]);if(p)p.sentAt=Date.now();}
-      if([...this.pages.values()].some(p=>p.sentAt&&Date.now()-p.sentAt>20000)){this.status.error='Relay history timed out';ws.close();}},this.queueMs);
+      const late=[...this.pages].filter(([,p])=>p.sentAt&&Date.now()-p.sentAt>20000);
+      // A silent display-only read truncates that display; never the trusted history.
+      for(const [id] of late)if(soft(id)){this.softFailure(id);this.updateComplete();this.onChange();}
+      if(late.some(([id])=>!soft(id))){this.status.error='Relay history timed out';ws.close();}},this.queueMs);
     const timeout=setTimeout(()=>ws.close(),20000);
     this.pollTimer=setInterval(()=>{
-      // Finish the entire round before polling again, including member profiles.
+      // Finish the entire trusted round before polling again, including member profiles.
       // Otherwise a large history can keep refilling faster than it drains.
-      if(this.pages.size)return;
+      if(this.trustedPending())return;
       // Poll also repairs late/backdated writes even when streaming succeeds.
-      for(const [id,f] of this.filters) if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)});
+      for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)});
+      if(this.applicants&&!this.pages.has(APPLICANTS))this.pageApplicants();
     },this.pollMs);
     const subscribe=()=>{
       for(const [id,f] of this.filters) {
         const sub=`live-${id}`; this.live.set(sub,f);
         this.queue.push(['REQ',sub,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)}]);
       }
+      if(this.applicants){const f=applicantFilter(this.buyer);this.live.set(`live-${APPLICANTS}`,f);this.queue.push(['REQ',`live-${APPLICANTS}`,{...f,since:Math.max(0,Math.floor(Date.now()/1000)-this.overlap)}]);}
     };
     ws.addEventListener('open',()=>{
-      clearTimeout(timeout);this.status.connected=true;this.retry=1000;
+      clearTimeout(timeout);this.status.connected=true;this.retry=1000;this.opened=true;
       // History must work even if AUTH is absent or explicitly refused.
       for(const [id,f] of this.filters)this.page(id,f);
+      if(this.applicants)this.pageApplicants();
       subscribe();
-      this.onChange();
+      this.updateComplete();this.onChange();
     });
     ws.addEventListener('message',({data})=>{
       let m; try {m=JSON.parse(String(data));}catch{return;}
@@ -66,29 +102,43 @@ export class RelayReader {
         this.onChange();
       } else if(m[0]==='EVENT') {
         const p=this.pages.get(m[1]),f=p?.filter??this.live.get(m[1]),e=m[2];
+        // Saturation counts every frame the relay spent its page limit on, including events
+        // outside the requested window: a relay ignoring since/until must not look complete.
+        if(p)p.received++;
         if(!f||!verify(e)||!matches(e,f))return;
-        if(p){p.received++;p.oldest=Math.min(p.oldest,e.created_at);}
         const id=p?m[1]:m[1].slice(5);
+        if(id===APPLICANTS) {
+          if(validMembership(e,{pubkey:this.buyer})&&this.store.addApplicant(e))this.onChange();
+          return;
+        }
+        if(p)p.oldest=Math.min(p.oldest,e.created_at);
         this.newest.set(id,Math.max(this.newest.get(id)??0,e.created_at));
         if(e.kind===MEMBERSHIP&&!validMembership(e,{pubkey:this.buyer}))return;
-        if(p)p.events.push(e);
-        const added=this.store.add(e);
-        if(added){if(!this.pages.size)this.refreshMembers();this.onChange();}
+        // Decisions first: the roster is applied once this relay's decision history is read,
+        // then on every later (live/poll) decision.
+        if(this.store.add(e)){if(e.kind===DECISION&&!this.pages.has(String(DECISION)))this.onRoster();this.onChange();}
       } else if(m[0]==='EOSE'&&this.pages.has(m[1])) {
         const p=this.pages.get(m[1]);this.pages.delete(m[1]);
-        if(p.received>=500 && !p.events.length) {
-          if(p.oldest>0)this.page(m[1],{...p.filter,until:p.oldest-1});
-        } else if(p.received>=500) {
-          const oldest=p.oldest;
-          if(p.filter.until===oldest)this.status.error='History truncated: 500+ events in one second';
-          else this.page(m[1],{...p.filter,until:oldest});
+        if(m[1]===APPLICANTS) {
+          // One newest-first page per round, never paged: a flood truncates, it cannot stall.
+          this.status.applicantsIncomplete=p.received>=APPLICANT_LIMIT;
+        } else if(p.received>=PAGE_LIMIT&&metadataId(m[1])) {
+          this.metaIncomplete(); // one author's replaceable metadata; never worth failing history
+        } else if(p.received>=PAGE_LIMIT) {
+          // Re-read the oldest second (inclusive until): a second that may still hold unread
+          // events is never skipped. The cursor must move strictly older or history fails closed.
+          if(p.oldest===Infinity)this.status.error='History truncated: full page without an in-range event';
+          else if(p.filter.until!==undefined&&p.oldest>=p.filter.until)this.status.error='History truncated: 500+ events in one second';
+          else this.page(m[1],{...p.filter,until:p.oldest});
         }
         if(!this.pages.has(m[1]))send(['CLOSE',m[1]]);
-        this.refreshMembers();
-        this.status.historyComplete=this.pages.size===0&&!this.status.error;this.onChange();
+        if(m[1]===String(DECISION)&&!this.pages.has(m[1]))this.onRoster();
+        this.updateComplete();this.onChange();
       } else if(m[0]==='CLOSED') {
-        if(this.live.has(m[1])) {this.live.delete(m[1]);this.status.authenticated=false;}
-        if(this.pages.has(m[1])) {
+        if(m[1]===`live-${APPLICANTS}`){this.live.delete(m[1]);}
+        else if(this.live.has(m[1])) {this.live.delete(m[1]);this.status.authenticated=false;}
+        if(soft(m[1])&&this.pages.has(m[1])) {this.softFailure(m[1]);this.updateComplete();}
+        else if(this.pages.has(m[1])) {
           const auth=typeof m[2]==='string'&&m[2].startsWith('auth-required:');
           if(auth)this.authClosed.set(m[1],this.pages.get(m[1]).filter);
           this.pages.delete(m[1]);
@@ -105,45 +155,46 @@ export class RelayReader {
       if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,30000);}
     });
   }
-  refreshMembers() {
-    if(this.onMember){this.onMember();return;}
-    if([...this.pages.keys()].some(id=>[String(MEMBERSHIP),String(DECISION),String(CHALLENGE)].includes(id)))return;
-    this.selectMembers();
-  }
-  selectMembers() {
-    const apps=new Map(),decisions=new Map(),c={pubkey:this.buyer};
-    for(const e of this.store.events.values()) {
-      if(validMembership(e,c)&&newer(e,apps.get(e.pubkey)))apps.set(e.pubkey,e);
-      if(validDecision(e,c)&&newer(e,decisions.get(tag(e,'p'))))decisions.set(tag(e,'p'),e);
+  // Accepted sellers (buyer-signed decisions only) drive roster membership reads and
+  // profile/heartbeat reads. Re-subscribes whenever the accepted set changes.
+  setRoster(accepted) {
+    const sorted=[...new Set(accepted)].sort(),key=sorted.join(',');
+    if(key===this.rosterKey)return;
+    this.rosterKey=key;
+    if(this.readsRoster) {
+      // Ids derive from each chunk's author list: unchanged chunks keep their subscription, and
+      // a late EOSE for an older author set can never complete a different one.
+      this.replaceExtra(id=>id.startsWith('roster-'),new Map(rosterFilters(this.buyer,sorted).map(f=>[`roster-${bytesToHex(sha256(f.authors.join(','))).slice(0,16)}`,f])));
     }
-    const keys=[...apps.keys()].sort((a,b)=>Number(tag(decisions.get(b)??{tags:[]},'decision')==='accepted')-Number(tag(decisions.get(a)??{tags:[]},'decision')==='accepted')||a.localeCompare(b));
-    const selected=new Set(keys.slice(0,256));
-    // This budget limits metadata requests only, never membership or assignment.
-    this.status.warnings=keys.length>256?['Membership profile cap: some profiles/heartbeats unavailable']:[];
-    for(const pk of this.members)if(!selected.has(pk)) {
-      this.members.delete(pk);
-      for(const kind of [PROFILE,HEARTBEAT]) {
-        const id=`${kind}-${pk}`;
-        this.filters?.delete(id);this.pages?.delete(id);this.live?.delete(`live-${id}`);
-        if(this.queue)this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==`live-${id}`);
-        if(this.ws?.readyState===1)for(const sub of [id,`live-${id}`])this.ws.send(JSON.stringify(['CLOSE',sub]));
-      }
+    if(this.readsMetadata) {
+      const selected=sorted.slice(0,METADATA_CAP);
+      this.members=new Set(selected);
+      // Display only: a seller without profile/heartbeat stays eligible and assignable.
+      this.metaWarnings=sorted.length>METADATA_CAP?[`Profile cap: metadata shown for ${METADATA_CAP} of ${sorted.length} accepted sellers`]:[];
+      this.status.warnings=[...this.metaWarnings];
+      this.replaceExtra(metadataId,new Map(selected.flatMap(pk=>[PROFILE,HEARTBEAT].map(kind=>[`${kind}-${pk}`,{kinds:[kind],authors:[pk]}]))));
     }
-    for(const pk of selected)this.addMember(pk);
   }
-  addMember(pk) {
-    if(!this.members.has(pk)&&this.members.size>=256)return false;
-    this.members.add(pk);
-    if(!this.filters)return true;
-    for(const kind of [PROFILE,HEARTBEAT]) {
-      const id=`${kind}-${pk}`,filter={kinds:[kind],authors:[pk]};
-      if(this.filters.has(id))continue;
-      this.filters.set(id,filter);this.page(id,filter);
-      this.live.set(`live-${id}`,filter);this.queue.push(['REQ',`live-${id}`,filter]);
-    }
-    return true;
+  replaceExtra(owns,entries) {
+    for(const id of [...this.extra.keys()])if(owns(id)&&!entries.has(id)){this.extra.delete(id);this.dropFilter(id);}
+    for(const [id,f] of entries)if(!this.extra.has(id)){this.extra.set(id,f);this.addFilter(id,f);}
+    if(this.pages)this.updateComplete();
   }
-  page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,events:[],received:0,oldest:Infinity});this.queue.push(['REQ',id,{...filter,limit:500}]);}
+  addFilter(id,filter) {
+    if(!this.filters)return;
+    this.filters.set(id,filter);
+    if(!this.opened)return; // the open handler pages and subscribes every filter
+    this.page(id,filter);
+    this.live.set(`live-${id}`,filter);this.queue.push(['REQ',`live-${id}`,filter]);
+  }
+  dropFilter(id) {
+    if(!this.filters)return;
+    this.filters.delete(id);this.pages.delete(id);this.live.delete(`live-${id}`);this.newest.delete(id);this.authClosed.delete(id);
+    this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==`live-${id}`);
+    if(this.ws?.readyState===1)for(const sub of [id,`live-${id}`])this.ws.send(JSON.stringify(['CLOSE',sub]));
+  }
+  page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
+  pageApplicants() {const filter=applicantFilter(this.buyer);this.pages.set(APPLICANTS,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',APPLICANTS,{...filter,limit:APPLICANT_LIMIT}]);}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.ws?.close();}
 }
 
@@ -162,18 +213,17 @@ export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
 }
 // Each transport validates signatures and scope; EventStore unions/deduplicates IDs
 // and resolves replaceable events across all sources, independent of arrival order.
+// The accepted roster is recomputed from the shared store whenever a buyer decision arrives
+// on any relay and pushed to every reader (roster memberships + trade metadata).
 export class ChallengeReader {
   constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...options}) {
     const filters=challengeFilters(buyer);
-    const changed=()=>{
-      if(this.challenges?.every(r=>r.status.historyComplete))this.trade.selectMembers();
-      onChange();
-    };
-    const common={...options,buyer,store,onChange:changed};
-    this.trade=new RelayReader({...common,url,onMember:()=>{},filters:filters.filter(f=>![CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0]))});
-    this.challenges=parseChallengeRelays(challengeRelays).map(url=>new RelayReader({...common,url,
-      filters:filters.filter(f=>[CHALLENGE,MEMBERSHIP,DECISION].includes(f.kinds[0])),
-      onMember:()=>{}}));
+    const onRoster=()=>{const accepted=acceptedSellers(store.events.values(),buyer);for(const r of [this.trade,...this.challenges])r.setRoster(accepted);};
+    const common={...options,buyer,store,onChange,onRoster};
+    this.store=store;
+    this.trade=new RelayReader({...common,url,roster:false,metadata:true,applicants:false,filters:filters.filter(f=>!CHALLENGE_KINDS.includes(f.kinds[0]))});
+    this.challenges=parseChallengeRelays(challengeRelays).map(url=>new RelayReader({...common,url,roster:true,metadata:false,applicants:true,
+      filters:filters.filter(f=>CHALLENGE_KINDS.includes(f.kinds[0]))}));
   }
   get status() {
     const relays=[{role:'trade',url:this.trade.url,...this.trade.status},...this.challenges.map(r=>({role:'challenge',url:r.url,...r.status}))];
@@ -183,7 +233,9 @@ export class ChallengeReader {
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
       historyComplete:this.trade.status.historyComplete&&ready,
-      warnings:[...new Set(relays.flatMap(r=>r.warnings))],excludedMembers:[...new Set(relays.flatMap(r=>r.excludedMembers))],
+      warnings:[...new Set(relays.flatMap(r=>r.warnings))],
+      // Display only; never part of readiness or the runner's exhaustion stop.
+      applicantsIncomplete:this.challenges.some(r=>r.status.applicantsIncomplete)||!!this.store.applicantsTruncated,
       error:this.trade.status.error??(failedRelays.length?`Challenge history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}

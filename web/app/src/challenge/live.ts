@@ -1,12 +1,14 @@
 import { buyerHex, type Challenge } from './model.js';
 export interface Job { id: string; seller: string; start: number; deadline: number; end: number|null; running: boolean; usedMinutes: number; }
 export interface Seller { pubkey: string; npub: string; name: string; minutesOffered: number; minutesUsed: number; minutesRemaining: number; state: string; eligible: boolean; decision: string; currentJobStart: number|null; }
+// Untrusted pending joins (no buyer decision yet). Display only; never eligible.
+export interface Applicant { pubkey: string; npub: string; minutesOffered: number; since: number; joinedAt: number; note: string; }
 export interface Snapshot {
   asOf: number;
   challenge: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: Challenge['status']; result: string }|null;
-  sellers: Seller[]; jobs: Job[]; updates: string[];
+  sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
-  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; warnings?: string[]; excludedMembers?: string[] };
+  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; warnings?: string[]; applicantsIncomplete?: boolean };
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);
 // Fail closed on malformed snapshots; never put remote text into HTML.
@@ -20,6 +22,7 @@ export function parseSnapshot(value: unknown): Snapshot {
     if(!s.budget||![s.budget.totalSats,s.budget.committedSats,s.budget.paidSats,s.budget.unknownAmounts].every(finite)||typeof s.budget.note!=='string')throw Error('Invalid budget');
   } else if(s.challenge!==null)throw Error('Missing challenge');
   for(const a of s.sellers)if(![a.pubkey,a.npub,a.name,a.state,a.decision].every(v=>typeof v==='string')||![a.minutesOffered,a.minutesUsed,a.minutesRemaining].every(finite)||typeof a.eligible!=='boolean')throw Error('Invalid seller');
+  if(s.applicants!==undefined&&(!Array.isArray(s.applicants)||!s.applicants.every(a=>[a.pubkey,a.npub].every(v=>typeof v==='string')&&finite(a.minutesOffered))))throw Error('Invalid applicant');
   for(const j of s.jobs)if(![j.id,j.seller].every(v=>typeof v==='string')||![j.start,j.deadline,j.usedMinutes].every(finite)||typeof j.running!=='boolean')throw Error('Invalid job');
   return s;
 }
@@ -54,7 +57,18 @@ export function renderSellers(doc: Document,s: Snapshot,now: number): void {
     const st=doc.createElement('span');st.className='c-state';st.textContent=state;
     row.append(name,mins,id,st);fragment.append(row);
   }
+  // Waiting for approval: an untrusted, capped sample. Never counted as agents on the challenge.
+  const waiting=s.applicants??[],partial=!!s.relay?.applicantsIncomplete;
+  for(const a of waiting) {
+    const row=doc.createElement('li');row.className='off';
+    const name=doc.createElement('strong');name.textContent=shortNpub(a.npub);
+    const mins=doc.createElement('span');mins.className='c-mins';mins.textContent=`${a.minutesOffered} min offered`;
+    const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
+    const st=doc.createElement('span');st.className='c-state';st.textContent='Waiting for approval';
+    row.append(name,mins,id,st);fragment.append(row);
+  }
   list.replaceChildren(fragment);
   const working=shown.filter(a=>sellerState(s,a,now)==='Working now').length;
-  doc.getElementById('seller-summary')!.textContent=shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.';
+  const pending=waiting.length||partial?` · ${waiting.length}${partial?'+':''} waiting for approval${partial?' (list may be incomplete)':''}`:'';
+  doc.getElementById('seller-summary')!.textContent=(shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.')+pending;
 }
