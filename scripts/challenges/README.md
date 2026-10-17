@@ -172,7 +172,12 @@ exact post arguments, preparation/job IDs, collected answers, payment receipts a
 reasons. Sequence-derived request IDs are permanent; a lost response is recovered by a read-only
 preparation lookup before any retry. Torn final journal records are discarded; corrupt complete
 records fail startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
-release on process exit. Keep the journal and buyer state together across restarts/backups.
+release on process exit. `flock` is required on every OS; macOS does not ship it
+(`brew install flock`), and a missing `flock` is reported as such. The locked runner is a child
+of the launched process and reads a pipe the parent holds: when the parent exits for any reason
+(including `SIGKILL` or launchd `kickstart -k`) or receives SIGINT/SIGTERM, the runner stops
+ticking, kills its in-flight planner/MCP commands after 5 seconds, exits and releases the lock.
+A supervisor without systemd's `KillMode=control-group` (launchd) therefore restarts cleanly. Keep the journal and buyer state together across restarts/backups.
 Planner/MCP errors are logged and retried on the next polling cycle without changing posting
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
 

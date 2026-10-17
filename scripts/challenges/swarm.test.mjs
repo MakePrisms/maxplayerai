@@ -706,3 +706,32 @@ test('min duration: default floor 300 s; sellers below the floor are not offered
   assert.deepEqual(f.snap.sellers.map(s=>s.minutesRemaining),before.map(s=>s.minutesRemaining),'runner never edits minutes');
   const prompt=(await import('node:fs')).readFileSync('scripts/challenges/planner-llm.mjs','utf8');assert.match(prompt,/starting its\s+sandbox and agent/);
 });
+
+// Bug 7 (first live run, macOS/launchd): killing the parent left the flock'd --lock-held runner
+// alive with the lock (and a stuck reader), so every restart exited 1 for about an hour.
+test('parent death: watchParent stops the runner, then kills in-flight commands and exits after the grace',async()=>{
+  const {watchParent}=await import('./swarm.mjs');const {PassThrough}=await import('node:stream');
+  const stream=new PassThrough(),events=[];let resolveExit;const exited=new Promise(r=>{resolveExit=r;});
+  const gone=watchParent(stream,()=>events.push('stop'),{graceMs:20,kill:()=>events.push('kill'),exit:code=>{events.push(`exit ${code}`);resolveExit();}});
+  stream.write('ignored');assert.equal(gone(),false);stream.end();
+  await exited;assert.deepEqual(events,['stop','kill','exit 1']);assert.equal(gone(),true);
+});
+test('parent death: SIGKILL of the runner parent releases the home lock and stops the locked child',{skip:!require_flock()},async()=>{
+  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-parent-')),home=join(dir,'home'),bin=join(dir,'fake-maxplayer'),pids=join(dir,'pids');
+  try {
+    // The locked runner's first command (whoami) hangs: it records its own and its parent's pid.
+    fs.writeFileSync(bin,`#!/bin/sh\necho "$$ $PPID" > ${JSON.stringify(pids)}\nexec sleep 60\n`,{mode:0o700});
+    const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url','ws://127.0.0.1:1'],{stdio:['ignore','ignore','pipe']});
+    let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
+    const until=async(f,ms)=>{const end=Date.now()+ms;while(Date.now()<end){if(f())return true;await new Promise(r=>setTimeout(r,50));}return false;};
+    assert.ok(await until(()=>fs.existsSync(pids)&&fs.readFileSync(pids,'utf8').trim(),10000),'locked runner started its first command');
+    const [sleeper,runner]=fs.readFileSync(pids,'utf8').trim().split(' ').map(Number);
+    const lock=join(home,'swarm/runner.lock'),free=()=>spawnSync('flock',['-n',lock,'true']).status===0;
+    assert.equal(free(),false,'lock held while the runner lives');
+    parent.kill('SIGKILL');
+    const alive=pid=>{try{process.kill(pid,0);return true;}catch{return false;}};
+    assert.ok(await until(()=>!alive(runner)&&!alive(sleeper)&&free(),15000),`runner ${alive(runner)} command ${alive(sleeper)} lock free ${free()}; ${stderr}`);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+function require_flock(){try{return (globalThis.__flock??=(()=>{const r=process.getBuiltinModule('node:child_process').spawnSync('flock',['--version']);return r.status===0;})());}catch{return false;}}

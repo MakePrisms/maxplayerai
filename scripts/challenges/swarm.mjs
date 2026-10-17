@@ -10,9 +10,13 @@ import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
+// Process groups of in-flight commands, so a runner told to stop can kill them (planner, MCP).
+const activeGroups=new Set();
+export function killActiveCommands() {for(const pid of activeGroups){try{process.kill(-pid,'SIGKILL');}catch{}}activeGroups.clear();}
 export function command(bin, args, {input='', env=process.env, timeout=120000}={}) {
   return new Promise((resolve,reject) => {
     const child=spawn(bin,args,{env,detached:true,stdio:['pipe','pipe','pipe']});
+    if(child.pid)activeGroups.add(child.pid);child.on('close',()=>activeGroups.delete(child.pid));
     let out='',err='',failure;
     const kill=()=>{try{process.kill(-child.pid,'SIGKILL');}catch{}};
     const timer=setTimeout(()=>{failure=Error('Command timed out');kill();},timeout);
@@ -441,14 +445,35 @@ export function config(argv,env=process.env) {
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
   c.home=resolve(c.home);return c;
 }
+// The locked runner is a grandchild (parent -> flock -> runner) holding the home lock. Signals to
+// the parent never reached it, and a killed parent (launchd `kickstart -k`, SIGKILL) left it alive
+// with the lock, so every restart exited 1. The parent therefore holds the write end of the
+// runner's stdin pipe: when the parent dies for ANY reason, or is asked to stop, the pipe closes
+// and the runner stops: no new tick, then after PARENT_GONE_GRACE_MS it kills its in-flight
+// commands and exits, releasing the lock. Journaled state is crash-safe, so this is no worse
+// than a crash (request-id preparation recovery, torn-tail truncation).
+export const PARENT_GONE_GRACE_MS = 5000;
+export function watchParent(stream,onStop,{graceMs=PARENT_GONE_GRACE_MS,exit=code=>process.exit(code),kill=killActiveCommands}={}) {
+  let gone=false;
+  const fire=()=>{if(gone)return;gone=true;console.error(new Date().toISOString(),'Runner parent exited or asked to stop; stopping');
+    try{onStop();}catch{}
+    setTimeout(()=>{kill();exit(1);},graceMs).unref();};
+  stream.on('end',fire);stream.on('close',fire);stream.on('error',fire);stream.resume();
+  return ()=>gone;
+}
 async function main() {
   const args=process.argv.slice(2),locked=args[0]==='--lock-held';if(locked)args.shift();
   const c=config(args);mkdirSync(join(c.home,'swarm'),{recursive:true,mode:0o700});
   if(!locked) {
-    const child=spawn('flock',['-n',join(c.home,'swarm/runner.lock'),process.execPath,fileURLToPath(import.meta.url),'--lock-held',...args],{stdio:'inherit'});
-    for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.kill(sig));
-    child.on('error',e=>{console.error(e.message);process.exitCode=1;});child.on('exit',code=>{process.exitCode=code??1;});return;
+    const child=spawn('flock',['-n',join(c.home,'swarm/runner.lock'),process.execPath,fileURLToPath(import.meta.url),'--lock-held',...args],{stdio:['pipe','inherit','inherit'],env:{...process.env,SWARM_PARENT_PIPE:'stdin'}});
+    child.stdin.on('error',()=>{});
+    // Stop = close the pipe; the runner sees EOF (see watchParent). Never kill flock alone.
+    for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.stdin.end());
+    child.on('error',e=>{console.error(e.code==='ENOENT'?'flock not found: install util-linux flock (macOS: brew install flock)':e.message);process.exitCode=1;});
+    child.on('exit',code=>{process.exitCode=code??1;});return;
   }
+  let stopRunner=()=>{};
+  if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;watchParent(process.stdin,()=>stopRunner());}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
   const challengeRelays=(process.env.SWARM_CHALLENGE_RELAYS??'wss://nos.lol,wss://relay.primal.net,wss://offchain.pub').split(',').map(s=>s.trim()).filter(Boolean);
   if(!challengeRelays.length)throw Error('SWARM_CHALLENGE_RELAYS must not be empty');
@@ -474,7 +499,7 @@ async function main() {
   io.probeBuyer=()=>io.mcp('get_job',{job_id:PROBE_JOB_ID});
   const runner=new Swarm(c,io,journal);
   try{await runner.releaseSupport();}catch(e){io.report(`WARNING: could not probe buyer get_job release fields (${e.message}); priced assignments wait for a successful probe`);}
-  let quitting=false;for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{quitting=true;source.stop();});
+  let quitting=false;stopRunner=()=>{quitting=true;source.stop();};for(const sig of ['SIGINT','SIGTERM'])process.on(sig,stopRunner);
   try {
     while(!quitting){try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}
   } finally {source.stop();}
