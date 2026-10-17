@@ -1024,6 +1024,170 @@ mod tests {
             );
             std::fs::remove_dir_all(root).unwrap();
         }
+        /// Like `junk`, but already expired (NIP-40): nostr-sdk drops it before notifying, so
+        /// only a raw frame count sees that the relay spent its page limit on it.
+        fn expired_junk(seller: &Keys, buyer: &str, i: usize, t: u64) -> Event {
+            EventBuilder::new(Kind::from(CHALLENGE_MEMBERSHIP_KIND), "")
+                .tags([
+                    Tag::identifier(format!("expired-{i}")),
+                    Tag::public_key(PublicKey::from_hex(buyer).unwrap()),
+                    Tag::expiration(Timestamp::from(t + 1)),
+                ])
+                .custom_created_at(Timestamp::from(t))
+                .sign_with_keys(seller)
+                .unwrap()
+        }
+        /// Every membership command against `relay`, as the seller (join/leave/status) and as the
+        /// buyer (members). Returns each command's result; never panics on an `Ok`.
+        async fn run_all(
+            seller_home: &home::MaxplayerHome,
+            buyer_home: &home::MaxplayerHome,
+            buyer: &str,
+            url: &str,
+        ) -> Vec<(String, Result<serde_json::Value, String>)> {
+            let mut out = Vec::new();
+            for (command, h) in [
+                (format!("join --buyer {buyer} --minutes 60"), seller_home),
+                (format!("leave --buyer {buyer}"), seller_home),
+                (format!("status --buyer {buyer}"), seller_home),
+                ("members".to_owned(), buyer_home),
+            ] {
+                let mut o = super::parse(&args(&command)).unwrap();
+                o.relays = vec![url.to_owned()];
+                out.push((command, execute_async(&o, h).await.map(|(body, _)| body)));
+            }
+            out
+        }
+        #[tokio::test]
+        async fn r6_expired_junk_page_never_reads_as_complete() {
+            let root = std::env::temp_dir().join(format!(
+                "challenge-r6-expired-{}",
+                Keys::generate().public_key()
+            ));
+            let seller_home = home::bootstrap(root.join("seller")).unwrap();
+            let buyer_home = home::bootstrap(root.join("buyer")).unwrap();
+            let seller = crate::relay::keys(&seller_home).unwrap();
+            let buyer_keys = crate::relay::keys(&buyer_home).unwrap();
+            let buyer = buyer_keys.public_key().to_hex();
+            let real = || {
+                vec![
+                    day(&buyer_keys, 90),
+                    decision(&buyer_keys, &seller, "accepted", 110),
+                    membership(&seller, &buyer, "joined", 100, 100),
+                ]
+            };
+            // (a) 500 expired frames in one second newer than the real `joined`: the SDK
+            // delivers none of them, yet the page is full, so every command fails closed.
+            let mut events: Vec<_> = (0..500)
+                .map(|i| expired_junk(&seller, &buyer, i, 3000))
+                .collect();
+            events.extend(real());
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            for (command, result) in run_all(&seller_home, &buyer_home, &buyer, &relay.url).await {
+                let writes = relay.writes.lock().unwrap().len();
+                assert_eq!(writes, 0, "{command} published after an unread full page");
+                match result {
+                    Ok(body) => panic!("{command}: expired full page read as complete: {body}"),
+                    Err(error) => {
+                        assert!(error.contains("history truncated"), "{command}: {error}")
+                    }
+                }
+            }
+            // (b) The same 500 expired frames on distinct newer seconds: the raw cursor pages
+            // past them to the real `joined`, so every command reads the real membership.
+            let mut events: Vec<_> = (0..500)
+                .map(|i| expired_junk(&seller, &buyer, i, 1001 + i as u64))
+                .collect();
+            events.extend(real());
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            let results = run_all(&seller_home, &buyer_home, &buyer, &relay.url).await;
+            for (command, result) in &results {
+                if let Err(error) = result {
+                    panic!("{command}: {error}");
+                }
+            }
+            let writes = relay.writes.lock().unwrap();
+            assert_eq!(writes.len(), 2, "join and leave publish once each");
+            let joined = parse_membership(&writes[0], &buyer).unwrap();
+            assert_eq!(
+                (joined.status.as_str(), joined.since),
+                ("joined", 100),
+                "join republished since = now instead of the real since"
+            );
+            let left = parse_membership(&writes[1], &buyer).unwrap();
+            assert_eq!((left.status.as_str(), left.since), ("left", 100));
+            // The fixture never serves back what join/leave wrote, so status and members
+            // read the real (older) `joined` behind the expired page.
+            for (command, result) in &results[2..] {
+                let body = result.as_ref().unwrap();
+                let row = &body["members"][0];
+                assert_eq!(row["membership"]["status"], "joined", "{command}: {body}");
+                assert_eq!(row["membership"]["since"], 100, "{command}");
+                assert_eq!(row["eligible"], true, "{command}: {body}");
+            }
+            let paged = relay
+                .reqs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.get("authors").is_some() && f["until"] == 1001)
+                .count();
+            assert!(paged >= 1, "second page starts at the oldest raw frame");
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        #[tokio::test]
+        async fn r6_newer_same_d_event_does_not_hide_older_valid_membership() {
+            let root = std::env::temp_dir().join(format!(
+                "challenge-r6-replaced-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let seller = crate::relay::keys(&home).unwrap();
+            let buyer_keys = Keys::generate();
+            let buyer = buyer_keys.public_key().to_hex();
+            // Same (kind, author, d) as the real `joined`, newer, but not a valid membership
+            // (no since/minutes/status). A store that applied replacement would reject the
+            // older valid event as `Replaced` and never deliver it.
+            let invalid = EventBuilder::new(Kind::from(CHALLENGE_MEMBERSHIP_KIND), "")
+                .tags([
+                    Tag::identifier(buyer.clone()),
+                    Tag::public_key(buyer_keys.public_key()),
+                ])
+                .custom_created_at(Timestamp::from(300))
+                .sign_with_keys(&seller)
+                .unwrap();
+            let events = vec![
+                invalid,
+                day(&buyer_keys, 90),
+                decision(&buyer_keys, &seller, "accepted", 110),
+                membership(&seller, &buyer, "joined", 100, 100),
+            ];
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            let mut o = super::parse(&args(&format!("status --buyer {buyer}"))).unwrap();
+            o.relays = vec![relay.url.clone()];
+            let (body, _) = execute_async(&o, &home).await.unwrap();
+            assert_eq!(
+                body["members"][0]["membership"]["status"], "joined",
+                "{body}"
+            );
+            assert_eq!(body["members"][0]["membership"]["since"], 100);
+            let mut o = super::parse(&args(&format!("join --buyer {buyer} --minutes 90"))).unwrap();
+            o.relays = vec![relay.url.clone()];
+            execute_async(&o, &home).await.unwrap();
+            let writes = relay.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            let a = parse_membership(&writes[0], &buyer).unwrap();
+            assert_eq!(
+                (a.since, a.minutes),
+                (100, 90),
+                "join lost the original since"
+            );
+            assert_eq!(
+                writes[0].created_at.as_secs(),
+                Timestamp::now().as_secs().max(301)
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
         #[tokio::test]
         async fn r5_members_sample_never_overrides_trusted_row() {
             let root = std::env::temp_dir().join(format!(
