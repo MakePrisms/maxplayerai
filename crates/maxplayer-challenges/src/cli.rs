@@ -366,8 +366,8 @@ async fn execute_async(
     // Untrusted applicant sample for `members` only: newest APPLICANT_LIMIT joins so the buyer
     // can decide. It never feeds eligibility; a flood can only truncate this list.
     let (applicants, applicants_incomplete) = if o.command == "members" {
-        let sample = relay
-            .fetch(
+        let (sample, incomplete) = relay
+            .fetch_sample(
                 home,
                 Filter::new()
                     .kind(Kind::from(CHALLENGE_MEMBERSHIP_KIND))
@@ -376,15 +376,28 @@ async fn execute_async(
             )
             .await
             .map_err(|e| e.to_string())?;
-        let incomplete = sample.len() >= APPLICANT_LIMIT;
         (sample, incomplete)
     } else {
         (Vec::new(), false)
     };
+    // A sample event only fills a coordinate the trusted reads did not return (e.g. a denied
+    // or undecided seller); it never replaces a roster membership.
+    let coordinate = |e: &Event| {
+        (
+            e.pubkey,
+            e.kind,
+            e.tags.identifier().unwrap_or_default().to_owned(),
+        )
+    };
+    let trusted: std::collections::BTreeSet<_> = events.iter().map(coordinate).collect();
     let latest = latest_per_coordinate(
         events
             .iter()
-            .chain(&applicants)
+            .chain(
+                applicants
+                    .iter()
+                    .filter(|e| !trusted.contains(&coordinate(e))),
+            )
             .filter(|e| parse_membership(e, &buyer).is_ok() || parse_decision(e, &buyer).is_ok()),
     );
     let memberships: Vec<_> = latest
@@ -825,17 +838,234 @@ mod tests {
                 .collect();
             assert_eq!(eligible, vec![seller.public_key().to_hex()]);
             assert_eq!(body["applicants_incomplete"], true);
-            // Every unlimited (trusted) membership REQ is scoped to the accepted author.
+            // Every trusted (paged, limit 500) membership REQ is scoped to the accepted author.
             let reqs = relay.reqs.lock().unwrap();
             let trusted: Vec<_> = reqs
                 .iter()
-                .filter(|f| f["kinds"][0] == CHALLENGE_MEMBERSHIP_KIND && f.get("limit").is_none())
+                .filter(|f| {
+                    f["kinds"][0] == CHALLENGE_MEMBERSHIP_KIND
+                        && f["limit"] == crate::relay::PAGE_LIMIT
+                })
                 .collect();
             assert_eq!(trusted.len(), 1);
             assert_eq!(
                 trusted[0]["authors"],
                 serde_json::json!([seller.public_key().to_hex()])
             );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        fn signed(d: maxplayer_core::gateway::EventDraft, k: &Keys, t: u64) -> Event {
+            EventBuilder::new(Kind::from(d.kind), d.content)
+                .tags(d.tags.into_iter().map(|t| Tag::parse(t.0).unwrap()))
+                .custom_created_at(Timestamp::from(t))
+                .sign_with_keys(k)
+                .unwrap()
+        }
+        fn membership(k: &Keys, buyer: &str, status: &str, since: u64, t: u64) -> Event {
+            let a = Membership {
+                seller: k.public_key().to_hex(),
+                since,
+                minutes: 60,
+                status: status.into(),
+                note: String::new(),
+            };
+            signed(a.to_event_draft(buyer).unwrap(), k, t)
+        }
+        fn decision(buyer: &Keys, seller: &Keys, verdict: &str, t: u64) -> Event {
+            let d = Decision {
+                seller: seller.public_key().to_hex(),
+                decision: verdict.into(),
+                membership_event_id: None,
+                reason: String::new(),
+            };
+            signed(
+                d.to_event_draft(&buyer.public_key().to_hex()).unwrap(),
+                buyer,
+                t,
+            )
+        }
+        fn day(buyer: &Keys, t: u64) -> Event {
+            let c = Challenge {
+                buyer: buyer.public_key().to_hex(),
+                id: "day".into(),
+                title: "Day".into(),
+                goal: "Goal".into(),
+                starts: 5000,
+                ends: 6000,
+                budget_sats: 0,
+                status: "scheduled".into(),
+                update: None,
+                result: None,
+            };
+            signed(c.to_event_draft().unwrap(), buyer, t)
+        }
+        /// Kind-30342 events from the seller that mention the buyer but are not memberships
+        /// (distinct `d`, so a real relay keeps every one); they match the authors filter.
+        fn junk(seller: &Keys, buyer: &str, i: usize, t: u64) -> Event {
+            EventBuilder::new(Kind::from(CHALLENGE_MEMBERSHIP_KIND), "")
+                .tags([
+                    Tag::identifier(format!("junk-{i}")),
+                    Tag::public_key(PublicKey::from_hex(buyer).unwrap()),
+                ])
+                .custom_created_at(Timestamp::from(t))
+                .sign_with_keys(seller)
+                .unwrap()
+        }
+        #[tokio::test]
+        async fn r5_full_junk_page_hiding_older_left_fails_and_publishes_nothing() {
+            let root = std::env::temp_dir().join(format!(
+                "challenge-r5-junk-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let seller = crate::relay::keys(&home).unwrap();
+            let buyer_keys = Keys::generate();
+            let buyer = buyer_keys.public_key().to_hex();
+            // 500 newer junk events at one second fill the authors page; the real `left`
+            // (and the original `joined`) are older and never fit in it.
+            let mut events: Vec<_> = (0..500).map(|i| junk(&seller, &buyer, i, 3000)).collect();
+            events.extend([
+                day(&buyer_keys, 90),
+                decision(&buyer_keys, &seller, "accepted", 110),
+                membership(&seller, &buyer, "joined", 100, 100),
+                membership(&seller, &buyer, "left", 100, 200),
+            ]);
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            for command in [
+                format!("join --buyer {buyer} --minutes 60"),
+                format!("leave --buyer {buyer}"),
+                format!("status --buyer {buyer}"),
+            ] {
+                let mut o = super::parse(&args(&command)).unwrap();
+                o.relays = vec![relay.url.clone()];
+                let result = execute_async(&o, &home).await;
+                assert!(
+                    relay.writes.lock().unwrap().is_empty(),
+                    "{command} published (join with since=now) after a truncated read"
+                );
+                let error = result.expect_err("truncated accepted-author history must fail");
+                assert!(
+                    error.contains("500+ events in one second"),
+                    "{command}: {error}"
+                );
+            }
+            // `members` as the buyer, with the same truncated accepted-author history.
+            let buyer_root = root.join("buyer");
+            let buyer_home = home::bootstrap(&buyer_root).unwrap();
+            let buyer_keys = crate::relay::keys(&buyer_home).unwrap();
+            let buyer = buyer_keys.public_key().to_hex();
+            let mut events: Vec<_> = (0..500).map(|i| junk(&seller, &buyer, i, 3000)).collect();
+            events.extend([
+                day(&buyer_keys, 90),
+                decision(&buyer_keys, &seller, "accepted", 110),
+                membership(&seller, &buyer, "left", 100, 200),
+            ]);
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            let mut o = super::parse(&args("members")).unwrap();
+            o.relays = vec![relay.url.clone()];
+            let result = execute_async(&o, &buyer_home).await;
+            assert!(relay.writes.lock().unwrap().is_empty());
+            let error = result.expect_err("members must not list a truncated roster");
+            assert!(
+                error.contains("500+ events in one second"),
+                "members: {error}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        #[tokio::test]
+        async fn r5_paging_past_full_page_reads_older_membership_and_keeps_since() {
+            let root = std::env::temp_dir().join(format!(
+                "challenge-r5-page-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let seller = crate::relay::keys(&home).unwrap();
+            let buyer_keys = Keys::generate();
+            let buyer = buyer_keys.public_key().to_hex();
+            // 600 newer junk events, one per second, the oldest at 1001: the first page is full
+            // and its cursor moves strictly older, so the second page reaches the real join.
+            let mut events: Vec<_> = (0..600)
+                .map(|i| junk(&seller, &buyer, i, 1001 + i as u64))
+                .collect();
+            events.extend([
+                day(&buyer_keys, 90),
+                decision(&buyer_keys, &seller, "accepted", 110),
+                membership(&seller, &buyer, "joined", 100, 100),
+            ]);
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            let mut o = super::parse(&args(&format!("status --buyer {buyer}"))).unwrap();
+            o.relays = vec![relay.url.clone()];
+            let (body, _) = execute_async(&o, &home).await.unwrap();
+            assert_eq!(body["members"][0]["membership"]["status"], "joined");
+            assert_eq!(body["members"][0]["membership"]["since"], 100);
+            assert_eq!(body["members"][0]["eligible"], true);
+            let paged = relay
+                .reqs
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|f| f.get("authors").is_some() && f["until"] == 1101)
+                .count();
+            assert_eq!(
+                paged, 1,
+                "second page starts at the first page's oldest second"
+            );
+            let mut o =
+                super::parse(&args(&format!("join --buyer {buyer} --minutes 120"))).unwrap();
+            o.relays = vec![relay.url.clone()];
+            execute_async(&o, &home).await.unwrap();
+            let writes = relay.writes.lock().unwrap();
+            assert_eq!(writes.len(), 1);
+            let a = parse_membership(&writes[0], &buyer).unwrap();
+            assert_eq!(
+                (a.since, a.minutes),
+                (100, 120),
+                "join keeps the original since"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        #[tokio::test]
+        async fn r5_members_sample_never_overrides_trusted_row() {
+            let root = std::env::temp_dir().join(format!(
+                "challenge-r5-sample-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let buyer_keys = crate::relay::keys(&home).unwrap();
+            let buyer = buyer_keys.public_key().to_hex();
+            let accepted = Keys::generate();
+            let denied = Keys::generate();
+            let events = vec![
+                day(&buyer_keys, 90),
+                decision(&buyer_keys, &accepted, "accepted", 110),
+                decision(&buyer_keys, &denied, "denied", 110),
+                membership(&accepted, &buyer, "joined", 100, 200),
+                membership(&denied, &buyer, "joined", 100, 150),
+            ];
+            // Only the untrusted sample sees a newer `left` for the accepted seller.
+            let sample_only = vec![membership(&accepted, &buyer, "left", 100, 300)];
+            let relay = crate::relay::transport_tests::relay_like(events, sample_only).await;
+            let mut o = super::parse(&args("members --json")).unwrap();
+            o.relays = vec![relay.url.clone()];
+            let (body, _) = execute_async(&o, &home).await.unwrap();
+            let rows = body["members"].as_array().unwrap();
+            let row = |k: &Keys| {
+                rows.iter()
+                    .find(|r| r["membership"]["seller"] == k.public_key().to_hex())
+                    .unwrap_or_else(|| panic!("missing row: {body}"))
+            };
+            assert_eq!(rows.len(), 2);
+            let a = row(&accepted);
+            assert_eq!(
+                a["membership"]["status"], "joined",
+                "sample replaced roster row"
+            );
+            assert_eq!(a["eligible"], true);
+            assert_eq!(a["decision"], "accepted");
+            // The denied seller is never fetched by the trusted read; it shows from the sample.
+            let d = row(&denied);
+            assert_eq!(d["decision"], "denied");
+            assert_eq!(d["eligible"], false);
             std::fs::remove_dir_all(root).unwrap();
         }
         #[tokio::test]

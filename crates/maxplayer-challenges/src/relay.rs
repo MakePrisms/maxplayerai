@@ -12,6 +12,13 @@ pub const DEFAULT_RELAYS: [&str; 3] = [
     "wss://offchain.pub",
 ];
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Events per history REQ (the common public-relay cap; same as the page's `PAGE_LIMIT`).
+pub const PAGE_LIMIT: usize = 500;
+struct Page {
+    events: Vec<Event>,
+    received: usize,
+    oldest: Option<Timestamp>,
+}
 pub struct Relays {
     urls: Vec<String>,
 }
@@ -62,7 +69,16 @@ impl Relays {
         Ok(Self { urls: normalized })
     }
     async fn client(home: &MaxplayerHome, url: &str) -> Result<Client, String> {
-        let client = Client::new(keys(home)?);
+        // Event size/tag limits off: a frame the SDK dropped would not count toward a full
+        // page, so a short-looking page could hide older history. Message size stays capped.
+        let limits = RelayLimits {
+            events: nostr_sdk::pool::relay::limits::RelayEventLimits::disable(),
+            ..Default::default()
+        };
+        let client = Client::builder()
+            .signer(keys(home)?)
+            .opts(ClientOptions::new().relay_limits(limits))
+            .build();
         client.automatic_authentication(true);
         client
             .add_relay(url)
@@ -74,67 +90,52 @@ impl Relays {
         client.connect().await;
         Ok(client)
     }
+    /// Full history for `filter` on every relay, paged like the page's trusted reader
+    /// (`web/app/src/challenge/shared/relay.mjs`): each REQ carries `limit: PAGE_LIMIT`, and a
+    /// full page is never treated as complete. It re-reads from the oldest in-range second
+    /// (inclusive `until`) and fails the read unless that cursor moves strictly older.
     pub async fn fetch(&self, home: &MaxplayerHome, filter: Filter) -> Result<Vec<Event>, String> {
+        self.read(home, filter.limit(PAGE_LIMIT), true)
+            .await
+            .map(|(events, _)| events)
+    }
+    /// One newest-first page per relay at the filter's own `limit`, never paged (untrusted,
+    /// display-only reads). The flag is true when any relay filled that page.
+    pub async fn fetch_sample(
+        &self,
+        home: &MaxplayerHome,
+        filter: Filter,
+    ) -> Result<(Vec<Event>, bool), String> {
+        let limit = filter.limit.unwrap_or(PAGE_LIMIT);
+        self.read(home, filter.limit(limit), false).await
+    }
+    async fn read(
+        &self,
+        home: &MaxplayerHome,
+        filter: Filter,
+        paged: bool,
+    ) -> Result<(Vec<Event>, bool), String> {
         let mut union = BTreeMap::new();
         let mut failed = Vec::new();
+        let mut saturated = false;
         for url in &self.urls {
             let client = Self::client(home, url).await?;
-            let result = tokio::time::timeout(TIMEOUT, async {
-                let mut rx = client.notifications();
-                let id = SubscriptionId::generate();
-                client
-                    .subscribe_with_id(id.clone(), filter.clone(), None)
-                    .await
-                    .map_err(|_| "subscription failed")?;
-                let mut events = Vec::new();
-                loop {
-                    match rx.recv().await.map_err(|_| "notification stream ended")? {
-                        RelayPoolNotification::Message {
-                            message:
-                                RelayMessage::Event {
-                                    subscription_id,
-                                    event,
-                                },
-                            ..
-                        } if subscription_id.as_ref() == &id => {
-                            if event.verify().is_ok()
-                                && filter.match_event(&event, Default::default())
-                            {
-                                events.push(event.into_owned());
-                            }
-                        }
-                        RelayPoolNotification::Message {
-                            message: RelayMessage::EndOfStoredEvents(subscription_id),
-                            ..
-                        } if subscription_id.as_ref() == &id => return Ok::<_, &str>(events),
-                        RelayPoolNotification::Message {
-                            message:
-                                RelayMessage::Closed {
-                                    subscription_id,
-                                    message,
-                                },
-                            ..
-                        } if subscription_id.as_ref() == &id
-                            && !message.starts_with("auth-required:") =>
-                        {
-                            return Err("subscription closed before EOSE");
-                        }
-                        _ => {}
-                    }
-                }
-            })
-            .await;
+            let result = Self::read_relay(&client, &filter, paged).await;
             client.disconnect().await;
             match result {
-                Ok(Ok(events)) => {
-                    eprintln!("relay {url}: read complete (EOSE, {} events)", events.len());
+                Ok((events, pages, full)) => {
+                    eprintln!(
+                        "relay {url}: read complete (EOSE, {} events, {pages} page(s))",
+                        events.len()
+                    );
+                    saturated |= full;
                     for e in events {
                         union.insert(e.id, e);
                     }
                 }
-                _ => {
-                    eprintln!("relay {url}: read failed (no complete EOSE)");
-                    failed.push(url.clone());
+                Err(reason) => {
+                    eprintln!("relay {url}: read failed ({reason})");
+                    failed.push(format!("{url} ({reason})"));
                 }
             }
         }
@@ -146,7 +147,94 @@ impl Relays {
         }
         // Keep all verified versions for eligibility and replacement-timestamp checks; callers
         // select latest per (kind, author, d), never collapse distinct authors sharing a d-tag.
-        Ok(union.into_values().collect())
+        Ok((union.into_values().collect(), saturated))
+    }
+    /// Reasons are fixed strings: no relay-supplied text reaches diagnostics.
+    async fn read_relay(
+        client: &Client,
+        filter: &Filter,
+        paged: bool,
+    ) -> Result<(Vec<Event>, usize, bool), &'static str> {
+        let limit = filter.limit.unwrap_or(PAGE_LIMIT);
+        let mut cursor = filter.clone();
+        let mut events = Vec::new();
+        let mut pages = 0;
+        loop {
+            pages += 1;
+            let page = tokio::time::timeout(TIMEOUT, Self::read_page(client, &cursor))
+                .await
+                .map_err(|_| "no EOSE before timeout")??;
+            events.extend(page.events);
+            if page.received < limit {
+                return Ok((events, pages, false));
+            }
+            if !paged {
+                return Ok((events, pages, true));
+            }
+            // A full page: the relay may have cut it at its limit. Re-read the oldest second
+            // (inclusive) so a tie there is never skipped; the cursor must move strictly older.
+            cursor = match page.oldest {
+                None => return Err("history truncated: full page without an in-range event"),
+                Some(oldest) if cursor.until.is_some_and(|until| oldest >= until) => {
+                    return Err("history truncated: 500+ events in one second");
+                }
+                Some(oldest) => cursor.until(oldest),
+            };
+        }
+    }
+    async fn read_page(client: &Client, filter: &Filter) -> Result<Page, &'static str> {
+        let mut rx = client.notifications();
+        let id = SubscriptionId::generate();
+        client
+            .subscribe_with_id(id.clone(), filter.clone(), None)
+            .await
+            .map_err(|_| "subscription failed")?;
+        let mut page = Page {
+            events: Vec::new(),
+            received: 0,
+            oldest: None,
+        };
+        let result = loop {
+            match rx.recv().await {
+                Err(_) => break Err("notification stream ended"),
+                Ok(RelayPoolNotification::Message {
+                    message:
+                        RelayMessage::Event {
+                            subscription_id,
+                            event,
+                        },
+                    ..
+                }) if subscription_id.as_ref() == &id => {
+                    // Saturation counts every frame the relay spent its limit on, including
+                    // events outside the requested window or filter.
+                    page.received += 1;
+                    if event.verify().is_ok() && filter.match_event(&event, Default::default()) {
+                        page.oldest = Some(
+                            page.oldest
+                                .map_or(event.created_at, |o: Timestamp| o.min(event.created_at)),
+                        );
+                        page.events.push(event.into_owned());
+                    }
+                }
+                Ok(RelayPoolNotification::Message {
+                    message: RelayMessage::EndOfStoredEvents(subscription_id),
+                    ..
+                }) if subscription_id.as_ref() == &id => break Ok(()),
+                Ok(RelayPoolNotification::Message {
+                    message:
+                        RelayMessage::Closed {
+                            subscription_id,
+                            message,
+                        },
+                    ..
+                }) if subscription_id.as_ref() == &id && !message.starts_with("auth-required:") => {
+                    break Err("subscription closed before EOSE");
+                }
+                Ok(_) => {}
+            }
+        };
+        client.unsubscribe(&id).await;
+        result.map(|()| page)
     }
     pub async fn publish(
         &self,
@@ -236,7 +324,31 @@ pub(crate) mod transport_tests {
             self.task.abort();
         }
     }
+    type Answer = Arc<dyn Fn(&serde_json::Value) -> Vec<Event> + Send + Sync>;
+    /// Every REQ gets every event, whatever its filter (models a relay ignoring filters).
     pub(crate) async fn fixture(events: Vec<Event>, eose: bool, accept: bool) -> Fixture {
+        fixture_with(Arc::new(move |_| events.clone()), eose, accept).await
+    }
+    /// Answers like a public relay: honours kinds/authors/#p/since/until, newest first (ties in
+    /// the given order, so junk listed first wins a tie), at most `limit` (default cap 500).
+    /// `sample_only` events are served only to REQs without `authors` (the applicant sample),
+    /// modelling a relay that returned an event to one query and not to the trusted one.
+    pub(crate) async fn relay_like(events: Vec<Event>, sample_only: Vec<Event>) -> Fixture {
+        let answer = move |raw: &serde_json::Value| {
+            let filter: Filter = serde_json::from_value(raw.clone()).unwrap();
+            let mut out: Vec<Event> = events
+                .iter()
+                .chain(sample_only.iter().filter(|_| filter.authors.is_none()))
+                .filter(|e| filter.match_event(e, MatchEventOptions::new()))
+                .cloned()
+                .collect();
+            out.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+            out.truncate(filter.limit.unwrap_or(PAGE_LIMIT));
+            out
+        };
+        fixture_with(Arc::new(answer), true, true).await
+    }
+    async fn fixture_with(answer: Answer, eose: bool, accept: bool) -> Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let writes = Arc::new(Mutex::new(Vec::new()));
@@ -245,7 +357,7 @@ pub(crate) mod transport_tests {
         let filters = reqs.clone();
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let events = events.clone();
+                let answer = answer.clone();
                 let recorded = recorded.clone();
                 let filters = filters.clone();
                 tokio::spawn(async move {
@@ -258,7 +370,7 @@ pub(crate) mod transport_tests {
                         match m[0].as_str() {
                             Some("REQ") => {
                                 filters.lock().unwrap().push(m[2].clone());
-                                for event in &events {
+                                for event in &answer(&m[2]) {
                                     ws.send(Message::text(
                                         serde_json::json!(["EVENT", m[1], event]).to_string(),
                                     ))
@@ -400,6 +512,48 @@ pub(crate) mod transport_tests {
         );
         assert_eq!(stored[0].content, "Goal");
         live.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn full_page_is_never_complete_without_older_cursor() {
+        let dir =
+            std::env::temp_dir().join(format!("challenges-page-{}", Keys::generate().public_key()));
+        let home = home::bootstrap(&dir).unwrap();
+        let keys = keys(&home).unwrap();
+        let filter = Filter::new().kind(Kind::Custom(30341));
+        // 500 frames the filter rejects (wrong kind): a full page with no in-range event.
+        let other: Vec<_> = (0..PAGE_LIMIT)
+            .map(|i| {
+                EventBuilder::new(Kind::TextNote, format!("{i}"))
+                    .sign_with_keys(&keys)
+                    .unwrap()
+            })
+            .collect();
+        let relay = fixture(other, true, true).await;
+        let error = Relays::new(std::slice::from_ref(&relay.url))
+            .unwrap()
+            .fetch(&home, filter.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("full page without an in-range event"),
+            "{error}"
+        );
+        // 500 matching events in one second: re-read once with inclusive until, then fail.
+        let tied: Vec<_> = (0..PAGE_LIMIT)
+            .map(|i| event(&keys, &format!("d{i}"), 100))
+            .collect();
+        let relay = relay_like(tied, vec![]).await;
+        let error = Relays::new(std::slice::from_ref(&relay.url))
+            .unwrap()
+            .fetch(&home, filter)
+            .await
+            .unwrap_err();
+        assert!(error.contains("500+ events in one second"), "{error}");
+        let reqs = relay.reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2, "one re-read of the saturated second");
+        assert_eq!(reqs[0]["limit"], PAGE_LIMIT);
+        assert_eq!(reqs[1]["until"], 100);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
