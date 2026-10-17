@@ -104,8 +104,8 @@ node scripts/challenges/swarm.mjs
 
 The runner stays alive for future days. It reads the relay through the shared browser/Node model and `coordinate()` for
 eligibility/minutes, posts public seller-targeted work through buyer MCP, collects verified
-inline `answer.txt` results (settling priced work through the existing collect flow), and sends
-**all** results to every planner invocation. Failed/expired work is represented as a bracketed
+results (settling priced work through the existing collect flow), and sends every result to
+each planner invocation within a bounded input (see *Planner input bounds* below). Failed/expired work is represented as a bracketed
 outcome in the result history. This v1 runner requests text/inline answers, not Git artifacts.
 The reader derives the buyer public key from this home; configure the **same trade relay** as the home. Dedicate the buyer
 to this runner: unrelated private/unawarded jobs are not visible in the public projection.
@@ -126,6 +126,11 @@ Flags (environment equivalents):
 | `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
 | `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
 | `--award-after-seconds` | `SWARM_AWARD_AFTER_SECONDS` | 30 |
+| — | `SWARM_ANALYZE_TIMEOUT_SECONDS` | 360 (runner kills the `analyze` planner command; bundled LLM call gets 10 s less) |
+| — | `SWARM_PLANNER_TIMEOUT_SECONDS` | 180 (same, for `assign`/`assess`) |
+| — | `SWARM_PLANNER_FULL_RESULTS` | 8 (newest results sent with full answer text) |
+| — | `SWARM_PLANNER_DIGEST_CHARS` | 600 (head kept from each older result's answer/task) |
+| — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
@@ -206,7 +211,8 @@ All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `re
 - `analyze`: once per challenge, with the full eligible roster (including busy sellers).
   Returns `{approach, workstreams:[{id,description,needs,estMinutes,dependsOn}], verification}`.
   `needs` contains skills/harness/hardware hints. Analysis is journaled before assignments;
-  a restart reuses it. Timeout: 350 seconds for Claude, 360 for the outer command.
+  a restart reuses it. Timeout: `SWARM_ANALYZE_TIMEOUT_SECONDS` (360) for the outer command; the
+  bundled `planner-llm.mjs` stops its own LLM call 10 seconds earlier (350).
 - `assign`: one batch call per eligible tick with all free sellers, running jobs
   (`seller,workstream,task,since,deadline` where available; `deferred:true` marks an
   assignment waiting for the relay snapshot, not yet offered), and all settled results.
@@ -217,7 +223,23 @@ All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `re
   minutes and window; fresh admission and serial budget reservations apply before each post.
 - `assess`: checks newly settled results, including after posting stops; returns wait or solved.
   `assign` and `assess` may include `plan` containing a complete revised analysis plan, saved
-  and passed to later calls. Their outer timeout is 180 seconds (Claude: 170).
+  and passed to later calls. Their outer timeout is `SWARM_PLANNER_TIMEOUT_SECONDS` (180; the
+  bundled LLM call: 170). Both timeouts must be integers above 10.
+
+**Planner input bounds.** Every call also includes `history:{results,fullText,digested,
+answersOmitted,resultsDropped,fullResultsKept,digestChars,maxInputChars,marker}`. `results` stays
+oldest-to-newest. The newest `SWARM_PLANNER_FULL_RESULTS` keep their full answer. Older entries
+keep their metadata but their `answer` and `task` are cut to the first `SWARM_PLANNER_DIGEST_CHARS`
+characters, followed by a line starting `[truncated:`, and carry `answerChars` (the original
+length). If the serialized input still exceeds `SWARM_PLANNER_MAX_INPUT_CHARS`, the runner
+degrades in a fixed order until it fits: the newest answers become digests too (oldest first),
+then older answers are replaced by an `[truncated: answer omitted …]` marker (`answerOmitted:true`),
+then the oldest result entries are dropped (`history.resultsDropped`). If it still cannot fit,
+the call fails, is logged and is retried on a later tick; unbounded text is never sent. Each call
+logs `Planner <mode> ok|failed in <s>s; input <chars> chars, results …`. A planner should treat
+truncated text as incomplete and may re-request detail as a task. The full answers stay in the
+journal. A collected result whose answer could not be read is `[collected, answer unreadable: …]`
+with `answerError`.
 
 Profiles contain `pubkey`, `npub`, `name`, `agents`, `harness:{family,model,variant}` (arrays),
 `capabilities` (tokens), `hardware`, `minutesRemaining`, `note`, and `trackRecord` with

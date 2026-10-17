@@ -88,6 +88,45 @@ export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=2000
 export const DELIVERY_NOTE = '\n\n---\nDELIVERY: give your final answer inline. Start your final message with the line MAXPLAYER-ANSWER-V1 alone on its line, then the answer (or, if it is long, a short summary of it) as plain text. If you also leave files, write the same answer or summary to answer.txt at the top level.';
 // The planner sees the task it wrote: the delivery note is runner boilerplate (older journals lack it).
 export const plannerTask = task => typeof task==='string'&&task.endsWith(DELIVERY_NOTE)?task.slice(0,-DELIVERY_NOTE.length):task;
+// Planner call timeouts (seconds; SWARM_ANALYZE_TIMEOUT_SECONDS / SWARM_PLANNER_TIMEOUT_SECONDS).
+// The runner kills the planner command at `runner`; the bundled planner-llm.mjs kills its own LLM
+// call PLANNER_LLM_MARGIN_SECONDS earlier, so it can still report the failure before being killed.
+export const PLANNER_LLM_MARGIN_SECONDS = 10;
+export function plannerTimeouts(env=process.env) {
+  const t={analyze:+(env.SWARM_ANALYZE_TIMEOUT_SECONDS??360),assign:+(env.SWARM_PLANNER_TIMEOUT_SECONDS??180)};
+  for(const [k,v] of Object.entries(t))if(!Number.isSafeInteger(v)||v<=PLANNER_LLM_MARGIN_SECONDS)throw Error(`Invalid ${k==='analyze'?'SWARM_ANALYZE_TIMEOUT_SECONDS':'SWARM_PLANNER_TIMEOUT_SECONDS'}: must be an integer > ${PLANNER_LLM_MARGIN_SECONDS}`);
+  const ms=mode=>(mode==='analyze'?t.analyze:t.assign)*1000;
+  return {...t,runnerMs:ms,llmMs:mode=>ms(mode)-PLANNER_LLM_MARGIN_SECONDS*1000};
+}
+// Bounded planner history. Results stay oldest-to-newest; the newest `fullResults` keep their full
+// answer, older ones get a `digestChars` head. If the serialized input still exceeds
+// `maxInputChars`, it degrades in this fixed order until it fits: newest answers to digests (oldest
+// first), older answers omitted, then older result entries dropped (oldest first). Every cut is
+// marked in the text and counted in input.history. Returns null when even that cannot fit.
+export const TRUNCATION_MARKER = '[truncated:';
+export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000}={}) {
+  const all=input.results??[],total=all.length;
+  const cut=(text,n,why)=>typeof text==='string'&&text.length>n?`${text.slice(0,n)}\n${TRUNCATION_MARKER} ${why}; first ${n} of ${text.length} chars shown]`:text;
+  const digest=r=>({...r,task:cut(r.task,digestChars,'older task'),answer:cut(r.answer,digestChars,'older result digest'),...(typeof r.answer==='string'&&r.answer.length>digestChars?{answerChars:r.answer.length}:{})});
+  let results=all.map((r,i)=>i<total-fullResults?digest(r):r);
+  let dropped=0;
+  const build=()=>{
+    const full=results.filter(r=>!r.answerChars&&!r.answerOmitted).length;
+    const history={results:total,fullText:Math.min(full,total-dropped),digested:results.filter(r=>r.answerChars).length,answersOmitted:results.filter(r=>r.answerOmitted).length,resultsDropped:dropped,fullResultsKept:fullResults,digestChars,maxInputChars,marker:TRUNCATION_MARKER};
+    return {...input,results,history};
+  };
+  const size=x=>JSON.stringify(x).length;
+  let out=build();
+  // Newest answers to digests, oldest of them first.
+  for(let i=Math.max(0,total-fullResults);size(out)>maxInputChars&&i<results.length;i++){results[i]=digest(results[i]);out=build();}
+  // Older answers omitted, oldest first (the newest digests stay).
+  for(let i=0;size(out)>maxInputChars&&i<Math.max(0,results.length-fullResults);i++){
+    const r=results[i];results[i]={...r,task:cut(r.task,200,'older task'),answer:`${TRUNCATION_MARKER} answer omitted to fit the planner input budget; ${typeof all[i].answer==='string'?all[i].answer.length:0} chars]`,answerOmitted:true};delete results[i].answerChars;out=build();
+  }
+  // Older entries dropped, oldest first.
+  while(size(out)>maxInputChars&&results.length){results=results.slice(1);dropped++;out=build();}
+  return size(out)>maxInputChars?null:out;
+}
 export class Journal {
   constructor(path) {
     this.path=path; this.state={jobs:[],days:{}};
@@ -284,12 +323,20 @@ export class Swarm {
       ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:plannerTask(j.args.task),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
     const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
-      const p=validatePlan(await this.io.plan({mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
+      const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
         running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
-        budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now()}),mode);
-      if(mode==='analyze'){day.plan=p;this.save();}
-      else if(p.plan){day.plan=p.plan;this.save();}
-      return p;
+        budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now()};
+      const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
+      if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result answer omitted`);
+      const chars=JSON.stringify(input).length,h=input.history,started=Date.now();let ok=false;
+      try {
+        const p=validatePlan(await this.io.plan(input),mode);ok=true;
+        if(mode==='analyze'){day.plan=p;this.save();}
+        else if(p.plan){day.plan=p.plan;this.save();}
+        return p;
+      } finally {
+        this.io.report?.(`Planner ${mode} ${ok?'ok':'failed'} in ${((Date.now()-started)/1000).toFixed(1)}s; input ${chars} chars, results ${h.results} (${h.fullText} full, ${h.digested} digested, ${h.answersOmitted} answers omitted, ${h.resultsDropped} dropped)`);
+      }
     };
     if(!day.plan&&!day.stop&&ready&&c.status==='in_progress'&&now>=c.starts&&now<c.ends)
       await ask('analyze',snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)));
@@ -355,7 +402,10 @@ export function childEnv(env,home) {
 export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),awardFallback:values['--award-fallback']===true};
+  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??120),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  c.plannerTimeouts=plannerTimeouts(env);
+  if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
+  for(const k of ['plannerDigestChars','plannerMaxInputChars'])if(!Number.isSafeInteger(c[k])||c[k]<100)throw Error(`Invalid ${k}`);
   if(!c.home||!c.url)throw Error('Explicit buyer home and relay URL required');
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
   for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter','maxDefer'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
@@ -385,7 +435,7 @@ async function main() {
   }});
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>source.snapshot(),
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
-    plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:input.mode==='analyze'?360000:180000})),
+    plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:c.plannerTimeouts.runnerMs(input.mode)})),
     answer:async collected=>readDeliveredAnswer(collected.path),
     publish:async(challenge,budget,status,update,result)=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});

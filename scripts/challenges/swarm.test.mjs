@@ -194,7 +194,7 @@ test('batch rejects invalid duration, busy/duplicate, ineligible and oversized m
     {seller:'b',workstream:'piece',task:'short',durationSeconds:29},
     {seller:'denied',workstream:'piece',task:'ineligible',durationSeconds:30}
   ]}));
-  await f.runner.tick();assert.equal(f.remote.size,1);assert.equal(reports.length,5);
+  await f.runner.tick();assert.equal(f.remote.size,1);assert.equal(reports.filter(r=>r.startsWith('Rejected assignment')).length,5);
   assert.ok(reports.some(r=>r.includes('insufficient_minutes')));
   assert.ok(reports.some(r=>r.includes('busy')));
   await f.runner.tick();assert.equal(f.remote.size,1);
@@ -608,4 +608,56 @@ test('deferred: a ready snapshot after the max wait runs admission first and pos
   const g=fixture();g.c.maxDefer=60;g.setPlan(gapOnce(g));await g.runner.tick();
   g.snap.relay.failedRelays=[];g.snap.sellers.forEach(s=>s.minutesRemaining=.1);g.time(200);await g.runner.tick();
   assert.ok(g.journal.state.jobs.every(j=>j.done&&/insufficient_minutes/.test(j.outcome)&&!/not ready/.test(j.outcome)));
+});
+
+// Bug 4 (first live run): every full answer went to every planner call (~639k chars) and the
+// planner timeouts were hard-coded.
+test('planner input: newest N full, older digested, hard char budget with markers; duration and size logged',async()=>{
+  const {boundPlannerInput,TRUNCATION_MARKER}=await import('./swarm.mjs');
+  const results=Array.from({length:12},(_,i)=>({seller:'a',task:`task ${i}`,outcome:'collected',answer:`answer-${i} `+'x'.repeat(5000)}));
+  const out=boundPlannerInput({mode:'assign',results},{fullResults:3,digestChars:100,maxInputChars:1e6});
+  assert.equal(out.results.length,12);
+  assert.deepEqual(out.results.slice(-3).map(r=>r.answer),results.slice(-3).map(r=>r.answer),'newest N are full text');
+  assert.ok(out.results.slice(0,9).every((r,i)=>r.answer.startsWith(`answer-${i} `)&&r.answer.includes(TRUNCATION_MARKER)&&r.answer.length<200&&r.answerChars===5009));
+  assert.deepEqual([out.history.fullText,out.history.digested,out.history.resultsDropped],[3,9,0]);
+  // Hard budget: degrade until it fits, never exceed it, always mark the cut.
+  for(const budget of [12000,3000,700]){
+    const b=boundPlannerInput({mode:'assign',results},{fullResults:3,digestChars:100,maxInputChars:budget});
+    assert.ok(JSON.stringify(b).length<=budget,`${budget}`);
+    assert.ok(JSON.stringify(b.results).includes(TRUNCATION_MARKER)||b.history.resultsDropped>0,`${budget}`);
+    assert.equal(b.history.results,12);assert.equal(b.results.at(-1)?.task??'task 11','task 11');
+  }
+  assert.equal(boundPlannerInput({mode:'assign',goal:'g'.repeat(500),results},{maxInputChars:300}),null);
+  // The runner applies it to every call and logs duration and size.
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);Object.assign(f.c,{plannerFullResults:1,plannerDigestChars:100,plannerMaxInputChars:100000});
+  f.snap.sellers=f.snap.sellers.slice(0,1);f.io.answer=async()=>'y'.repeat(5000);
+  for(let n=0;n<3;n++){await f.runner.tick();for(const j of f.remote.values())j.results=[{}];f.time(101+3*n);await f.runner.tick();
+    f.snap.jobs=f.journal.state.jobs.filter(j=>j.id).map(j=>({id:j.id,seller:'a',result:{},accepted:true,running:false}));f.time(102+3*n);}
+  const last=f.inputs.at(-1);assert.ok(last.results.length>=2);
+  assert.equal(last.results.at(-1).answer.length,5000);assert.ok(last.results.slice(0,-1).every(r=>r.answer.includes(TRUNCATION_MARKER)));
+  assert.ok(f.inputs.every(i=>JSON.stringify(i).length<=100000&&i.history));
+  assert.ok(reports.some(r=>/^Planner assign ok in \d+\.\ds; input \d+ chars, results \d+ \(\d+ full, \d+ digested/.test(r)));
+  // An over-budget input fails the call (logged and retried later), never sends unbounded text.
+  const g=fixture();g.c.plannerMaxInputChars=100;await assert.rejects(g.runner.tick(),/SWARM_PLANNER_MAX_INPUT_CHARS/);assert.equal(g.inputs.length,0);
+});
+test('planner timeouts: env-configurable, defaults kept, bundled LLM timeout stays below the runner',async()=>{
+  const {plannerTimeouts,PLANNER_LLM_MARGIN_SECONDS}=await import('./swarm.mjs');
+  const d=plannerTimeouts({});assert.deepEqual([d.runnerMs('analyze'),d.runnerMs('assign'),d.runnerMs('assess')],[360000,180000,180000]);
+  assert.deepEqual([d.llmMs('analyze'),d.llmMs('assign')],[350000,170000]);
+  const e=plannerTimeouts({SWARM_ANALYZE_TIMEOUT_SECONDS:'900',SWARM_PLANNER_TIMEOUT_SECONDS:'600'});
+  assert.deepEqual([e.runnerMs('analyze'),e.llmMs('analyze'),e.runnerMs('assign'),e.llmMs('assign')],[900000,890000,600000,590000]);
+  for(const bad of ['0','10','x','1.5'])assert.throws(()=>plannerTimeouts({SWARM_PLANNER_TIMEOUT_SECONDS:bad}),/SWARM_PLANNER_TIMEOUT_SECONDS/);
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
+  assert.equal(config([],{...base,SWARM_PLANNER_TIMEOUT_SECONDS:'600'}).plannerTimeouts.runnerMs('assign'),600000);
+  assert.throws(()=>config([],{...base,SWARM_PLANNER_MAX_INPUT_CHARS:'50'}),/plannerMaxInputChars/);
+  assert.ok(PLANNER_LLM_MARGIN_SECONDS>0);
+  // planner-llm.mjs really uses the env-derived timeout: a hanging fake LLM is killed at 1 s.
+  const {writeFileSync}=await import('node:fs'),{command}=await import('./swarm.mjs');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-llm-timeout-')),bin=join(dir,'slow');
+  try {
+    writeFileSync(bin,'#!/bin/sh\nsleep 30\n',{mode:0o700});
+    const started=Date.now();
+    await assert.rejects(command(process.execPath,['scripts/challenges/planner-llm.mjs'],{input:JSON.stringify({mode:'assign',results:[]}),env:{...process.env,SWARM_LLM_BINARY:bin,SWARM_PLANNER_TIMEOUT_SECONDS:'11'},timeout:20000}),/Command timed out/);
+    assert.ok(Date.now()-started<5000,'llm timeout = runner timeout - margin = 1 s');
+  } finally {rmSync(dir,{recursive:true});}
 });
