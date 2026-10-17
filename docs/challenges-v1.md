@@ -167,7 +167,8 @@ second assignment to that seller. It is retried with full admission once a new s
 and fresh. It is dropped with a logged reason when another check fails, the day stops, the work
 window no longer fits, or `SWARM_MAX_DEFER_SECONDS` (120) passes while the snapshot is still not
 ready. Durations must fall within
-`SWARM_MIN_DURATION` (120 seconds) and `SWARM_MAX_DURATION` (1800 seconds).
+`SWARM_MIN_DURATION` (300 seconds, a floor that covers seller sandbox/agent startup; a seller
+whose remaining minutes cannot fit it gets no assignment) and `SWARM_MAX_DURATION` (1800 seconds).
 Exhaustion means no free seller can fit the minimum duration and no work is running; choosing
 wait alone never exhausts a challenge. Bundled planners are a deterministic capability-routing
 stub and non-interactive Claude; verified-solution rules remain, including both Hutton keywords

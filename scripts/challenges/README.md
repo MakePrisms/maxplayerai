@@ -133,7 +133,7 @@ Flags (environment equivalents):
 | — | `SWARM_CHALLENGE_RELAYS` | comma list: `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
-| — | `SWARM_MIN_DURATION` | 120 |
+| — | `SWARM_MIN_DURATION` | 300 (task floor, covers seller container/agent startup; sellers with fewer remaining minutes are not offered) |
 | — | `SWARM_MAX_DURATION` | 1800 |
 | `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
 | `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
@@ -219,6 +219,12 @@ To use a different model/provider, supply any **trusted shell command** via `--p
 
 All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
 `now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`.
+`minDurationSeconds` (`SWARM_MIN_DURATION`, default 300) is the shortest task the runner will
+post. It includes seller startup: a real harness spends minutes starting its sandbox and agent
+before working, and the first live run's 120–200 second tasks expired undelivered. Free sellers
+whose remaining donated minutes cannot fit it are not in the `assign` roster. The bundled LLM
+prompt tells the planner to size tasks for that overhead. With a priced buyer lacking the release
+fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
 
 - `analyze`: once per challenge, with the full eligible roster (including busy sellers).
   Returns `{approach, workstreams:[{id,description,needs,estMinutes,dependsOn}], verification}`.

@@ -687,3 +687,22 @@ test('buyer capability: get_job without release fields refuses priced work, keep
   g.time(101);await g.runner.tick();assert.deepEqual(posts(g).map(([,a])=>a.amount_sats),[5]);
   assert.equal(g.inputs.at(-1).paidWorkRefused,undefined);
 });
+
+// Bug 6 (first live run): 120-200 s tasks expired while real agents were still starting.
+test('min duration: default floor 300 s; sellers below the floor are not offered; minutes accounting unchanged',async()=>{
+  const {DEFAULT_MIN_DURATION}=await import('./swarm.mjs');
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
+  assert.equal(DEFAULT_MIN_DURATION,300);assert.equal(config([],base).minDuration,300);assert.equal(config([],{...base,SWARM_MIN_DURATION:'600'}).minDuration,600);
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);delete f.c.minDuration;f.c.maxDuration=1800;
+  f.snap.sellers[0].minutesRemaining=4.99;f.snap.sellers[1].minutesRemaining=5;
+  const before=structuredClone(f.snap.sellers);
+  f.setPlan(input=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:300},{seller:'b',workstream:'piece',task:'short',durationSeconds:200},{seller:'b',workstream:'piece',task:'t',durationSeconds:300}]}));
+  await f.runner.tick();
+  const assign=f.inputs.find(i=>i.mode==='assign');
+  assert.equal(assign.minDurationSeconds,300);assert.deepEqual(assign.sellers.map(s=>s.pubkey),['b'],'seller below the floor is not offered');
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix]),[['b',400]]);
+  assert.ok(reports.some(r=>r.includes('Rejected assignment for a: seller busy or ineligible')));
+  assert.ok(reports.some(r=>r.includes('Rejected assignment for b: duration outside configured bounds')));
+  assert.deepEqual(f.snap.sellers.map(s=>s.minutesRemaining),before.map(s=>s.minutesRemaining),'runner never edits minutes');
+  const prompt=(await import('node:fs')).readFileSync('scripts/challenges/planner-llm.mjs','utf8');assert.match(prompt,/starting its\s+sandbox and agent/);
+});
