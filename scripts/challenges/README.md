@@ -89,6 +89,18 @@ fixture; do not point a fixture browser at the production relay. No API server i
 
 ## Automatic swarm runner
 
+**Minimum buyer build.** Priced assignments need a `maxplayer` buyer whose MCP `get_job`
+reports `award_read_confirmed`, `reservation_state`, `auto_award_state` and `claim_prices`. These
+reached `main` in #1162 (merge `7a14298d`; commits `942b40e7` and `49925c79`) and are in **no
+release tag yet**: v0.6.1 (and its release candidates) lack them, and `maxplayer --version` prints
+`0.6.1` on both, so the version string cannot tell them apart. At startup the runner calls
+`get_job` once on a fixed probe id and checks those fields. If they are missing it logs a
+`WARNING`, refuses every assignment with `amountSats > 0` (logged as `priced work refused`) and
+tells the planner `paidWorkRefused`; free work continues. Without the fields an expired paid job
+can never be proven released and would stay reserved forever. If the probe itself fails, priced
+work waits until a later probe succeeds. Use a buyer built from `main` at or after `7a14298d`
+(or the first release that contains it).
+
 Hand-whitelist sellers once with `maxplayer-challenges decide --seller HEX --accept`, then
 publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
 the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:

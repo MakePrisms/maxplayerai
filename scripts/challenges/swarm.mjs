@@ -127,6 +127,12 @@ export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputC
   while(size(out)>maxInputChars&&results.length){results=results.slice(1);dropped++;out=build();}
   return size(out)>maxInputChars?null:out;
 }
+// get_job fields the budget release proofs (expired paid jobs) depend on. They first reached main
+// in #1162 (merge 7a14298d, from 942b40e7 and 49925c79) and are in NO release tag: v0.6.1 lacks
+// them and prints the same version string as main, so the runner probes the buyer instead.
+export const RELEASE_FIELDS = ['award_read_confirmed','reservation_state','auto_award_state','claim_prices'];
+export const PROBE_JOB_ID = createHash('sha256').update('maxplayer-swarm get_job capability probe').digest('hex');
+export const missingReleaseFields = view => RELEASE_FIELDS.filter(k=>!(view&&typeof view==='object'&&k in view));
 export class Journal {
   constructor(path) {
     this.path=path; this.state={jobs:[],days:{}};
@@ -197,6 +203,18 @@ export function reservedBudget(snapshot,jobs,now) {
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
+  // Does this buyer's get_job report the fields that let an expired PAID job be proven released?
+  // Without them such a job stays reserved forever (fail closed), so priced work is refused while
+  // free work continues. A definite answer is cached for the process; a failed probe is retried.
+  async releaseSupport() {
+    if(this.releaseMissing!==undefined)return !this.releaseMissing.length;
+    if(!this.io.probeBuyer){this.releaseMissing=[];return true;}
+    this.releaseMissing=missingReleaseFields(await this.io.probeBuyer());
+    this.io.report?.(this.releaseMissing.length
+      ?`WARNING: buyer get_job lacks ${this.releaseMissing.join(', ')}; priced assignments will be refused (free work continues). Use a buyer built from main at or after 7a14298d (no release tag yet; v0.6.1 is too old).`
+      :`Buyer get_job reports the budget release fields (${RELEASE_FIELDS.join(', ')})`);
+    return !this.releaseMissing.length;
+  }
   // One task per seller: any unfinished intent/job (deferred included, other challenges too) and
   // collected work whose ACCEPT/deadline is not yet projected keep the seller busy.
   pendingSellers(snap,key,now,except=null) {
@@ -325,7 +343,8 @@ export class Swarm {
     const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
       const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
         running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
-        budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now()};
+        budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now(),
+        ...(this.releaseMissing?.length?{paidWorkRefused:`buyer get_job lacks ${this.releaseMissing.join(', ')}; assign only amountSats 0`}:{})};
       const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
       if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result answer omitted`);
       const chars=JSON.stringify(input).length,h=input.history,started=Date.now();let ok=false;
@@ -360,6 +379,10 @@ export class Swarm {
           const {seller,workstream,task,durationSeconds,amountSats=0}=assignment??{};
           const reject=reason=>this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
           if(!Number.isSafeInteger(amountSats)||amountSats<0){reject('amountSats must be a nonnegative safe integer');continue;}
+          if(amountSats>0) {
+            let ok;try{ok=await this.releaseSupport();}catch(e){reject(`priced work refused: cannot verify buyer get_job release fields (${e.message})`);continue;}
+            if(!ok){reject(`priced work refused: buyer get_job lacks ${this.releaseMissing.join(', ')} (needs a buyer built from main at or after 7a14298d)`);continue;}
+          }
           if(!candidates.some(s=>s.seller_pubkey===seller)){reject('seller busy or ineligible (not in free roster)');continue;}
           if(typeof task!=='string'||!task.trim()||!day.plan.workstreams.some(w=>w.id===workstream)){reject('invalid task or workstream');continue;}
           if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject('duration outside configured bounds');continue;}
@@ -442,7 +465,9 @@ async function main() {
       const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),'--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
       if(result)args.push('--result',result);await command(challengesBinary,args,{env});
     }};
+  io.probeBuyer=()=>io.mcp('get_job',{job_id:PROBE_JOB_ID});
   const runner=new Swarm(c,io,journal);
+  try{await runner.releaseSupport();}catch(e){io.report(`WARNING: could not probe buyer get_job release fields (${e.message}); priced assignments wait for a successful probe`);}
   let quitting=false;for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{quitting=true;source.stop();});
   try {
     while(!quitting){try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}

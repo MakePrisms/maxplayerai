@@ -661,3 +661,29 @@ test('planner timeouts: env-configurable, defaults kept, bundled LLM timeout sta
     assert.ok(Date.now()-started<5000,'llm timeout = runner timeout - margin = 1 s');
   } finally {rmSync(dir,{recursive:true});}
 });
+
+// Bug 5 (first live run): a v0.6.1 buyer's get_job lacks the release-proof fields, so expired
+// paid jobs stayed reserved forever. Detect it and refuse priced work; free work continues.
+test('buyer capability: get_job without release fields refuses priced work, keeps free work, warns once',async()=>{
+  const {RELEASE_FIELDS,PROBE_JOB_ID,missingReleaseFields}=await import('./swarm.mjs');
+  assert.deepEqual(RELEASE_FIELDS,['award_read_confirmed','reservation_state','auto_award_state','claim_prices']);
+  const oldView={job_id:'x',read_confirmed:true,claims:[],results:[],awarded:null};
+  assert.deepEqual(missingReleaseFields(oldView),RELEASE_FIELDS);
+  assert.deepEqual(missingReleaseFields({...oldView,award_read_confirmed:true,reservation_state:null,auto_award_state:null,claim_prices:[]}),[]);
+  const f=fixture(),reports=[],probes=[];f.io.report=m=>reports.push(m);
+  f.io.probeBuyer=async()=>{probes.push(PROBE_JOB_ID);return oldView;};
+  f.setPlan(input=>({assignments:assignments(input).assignments.map((a,i)=>({...a,amountSats:i?5:0}))}));
+  await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>a.amount_sats),[0],'free posts, priced refused');
+  assert.ok(reports.some(r=>r.startsWith('WARNING: buyer get_job lacks award_read_confirmed')));
+  assert.ok(reports.some(r=>/Rejected assignment for b: priced work refused: buyer get_job lacks/.test(r)));
+  assert.equal(reservedBudget(f.snap,f.journal.state.jobs,100).committedSats,0,'nothing reserved for refused work');
+  f.time(101);await f.runner.tick();
+  assert.equal(probes.length,1,'definite answer cached');assert.match(f.inputs.at(-1).paidWorkRefused,/assign only amountSats 0/);
+  // A current buyer passes; a failed probe refuses priced work and is retried later.
+  const g=fixture();let fail=true;g.io.probeBuyer=async()=>{if(fail){fail=false;throw Error('relay down');}return {...oldView,award_read_confirmed:true,reservation_state:'none',auto_award_state:null,claim_prices:[]};};
+  g.setPlan(input=>priced(input,5));g.snap.sellers=g.snap.sellers.slice(0,1);
+  await g.runner.tick();assert.equal(posts(g).length,0);
+  g.time(101);await g.runner.tick();assert.deepEqual(posts(g).map(([,a])=>a.amount_sats),[5]);
+  assert.equal(g.inputs.at(-1).paidWorkRefused,undefined);
+});
