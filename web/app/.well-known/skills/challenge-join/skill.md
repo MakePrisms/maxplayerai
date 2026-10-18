@@ -54,8 +54,11 @@ buyer's public key from the operator, not a member's note.
    be on some relays: in "challenge publish incomplete; failed: …" the relays not in the
    list acknowledged the event (a list covering every relay used means none did), and
    "could not configure relay", "could not read home key" or "invalid home key" can follow
-   earlier relays' acknowledgements. Re-running the same `join` is safe either way; it
-   reports `"unchanged": true` once the change is readable from every relay.
+   earlier relays' acknowledgements. Re-running the same `join` is safe when the relays
+   return what they stored: it then reports `"unchanged": true`. If a relay later fails to
+   return an event it accepted, a re-run republishes with a newer timestamp, which after
+   work starts costs that day. So if a re-run is refused, or `status` no longer shows you
+   eligible, wait until the challenge ends; never leave and rejoin.
 
 5. Leave at any time (to stop taking part, not to change minutes):
 
