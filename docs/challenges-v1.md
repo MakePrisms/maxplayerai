@@ -140,6 +140,9 @@ buyer-signed ACCEPT stops accrual. All durations are capped at deadline.
 - Post only while `now ∈ [C.starts, C.ends]` and `C.status = in_progress`.
 - Target only eligible sellers with no running job, and only a task with
   `deadline − now ≤ remaining minutes`.
+- Skip a seller whose newest heartbeat says `status=not_serving` or `serving=0/N` (reason
+  `seller_not_serving`). A missing heartbeat or tag is unknown and stays assignable. Such a seller is
+  re-probing its harness, so it does not make the day "exhausted".
 - Budget: committed (awarded, unsettled) + paid ≤ `C.budget`. Stop posting when the next task
   would exceed it.
 - Public jobs, `seller_pubkey` targeted, existing review/collect/pay.
@@ -417,7 +420,7 @@ oversized prior note.
 
 Profiles/heartbeats are requested for accepted sellers only, at most 256 in pubkey order. They
 are display/planner metadata: a missing profile or heartbeat never makes an accepted seller
-ineligible, and the cap warning never blocks readiness or exhaustion. The former
+ineligible (only a heartbeat that states `not_serving` pauses assignments to it), and the cap warning never blocks readiness or exhaustion. The former
 `excludedMembers` field is removed.
 
 The production-relay fence is a normalized **hostname string** denylist, shared by

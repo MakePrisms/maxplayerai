@@ -105,6 +105,8 @@ replaces it on every beat. Every fact below is current as of that beat, EXCEPT `
 | `["rate", sats]` | 1 | yes | Lowest price the seat accepts, in satoshis |
 | `["accepting", "y"` or `"n"]` | 1 | yes | The seat is alive and serving. NOT a free-slot signal |
 | `["queue_depth", n]` | 1 | yes | Jobs the seat holds in `Awarded` or `Executing` — its live load |
+| `["serving", "a/n"]` | 0..1 | no | Harnesses able to run a job now (`a`) out of those resolved at boot (`n`). Absent is UNKNOWN |
+| `["status", "not_serving"]` | 0..1 | no | Emitted exactly when `serving` is `0/n`: running, but no harness can take a job |
 | `["accepted_mints", url, ...]` | 1 | yes | Every mint the seat accepts payment on |
 | `["takes_payment","none"]` | 0..1 | no | The seat takes NO payment. Absent is UNSTATED, never `"no"` |
 | `["agents", id, ...]` | 0..1 | no | Harnesses the seat can run |
@@ -207,6 +209,21 @@ reader MUST NOT compute free capacity from `queue_depth`.
 does NOT say the seat has a free execution slot: a seat holding one job of its three slots publishes
 `accepting=y`, and so does a seat holding all three. Read `accepting` and `queue_depth` together —
 `y` with a depth is "open, carrying that much load"; `n` is "not serving", whatever the depth.
+
+`serving` and `status` say whether the seat can run a job at all, and how much of its roster is
+left. A harness that fails in a way the seat cannot attribute is dropped from service and re-probed
+by the seat itself on a bounded backoff (1 minute, doubling to a 10-minute cap); `serving` counts the
+harnesses not currently dropped, including an unlabelled one that `agents` cannot name. A seat whose
+count reaches `0` also publishes `["status","not_serving"]` and `accepting=n`. Whenever the count
+changes the seat republishes within seconds rather than waiting for its next beat.
+
+A reader SHOULD NOT assign work to a seat whose newest announcement says `status=not_serving` or
+`serving=0/n`. `status=not_serving` wins over a count that says otherwise. **An absent tag, a value
+that is not two decimal integers around one `/`, `a > n`, or `n = 0` means UNKNOWN**: every seat
+built before these tags publishes neither, and a reader MUST treat such a seat exactly as it did
+before they existed. `accepting=n` with `serving=a/n` for `a > 0` and no `status` is a seat leaving
+the role (below), not a seat that cannot work. Like `accepting`, both are the seat's own statement
+and a reader MUST NOT treat them as a guarantee.
 
 A seat at capacity signals fullness by not claiming, not by a tag. Capacity is enforced at claim
 time, on the seat, and no announcement field carries the slot count.

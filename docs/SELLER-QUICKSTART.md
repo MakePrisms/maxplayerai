@@ -1108,8 +1108,19 @@ On start (after `[seller]` is written) the daemon publishes:
   `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
   ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
-  plus `agents` when your seat states a harness roster and `takes_payment` when it works for free. Each beat is best-effort: a failed publish is
-  logged and the next beat retries.
+  plus `agents` when your seat states a harness roster and `takes_payment` when it works for free,
+  and `serving` = `<harnesses able to run a job>/<harnesses configured>` (with `status=not_serving`
+  when that is `0/<n>`). Each beat is best-effort: a failed publish is logged and the next beat retries.
+
+**When a harness drops.** A harness that fails a job in a way the daemon cannot attribute is
+`DROPPED`: the seat stops claiming for it and logs `seller node harness DROPPED <name>: … — now
+advertising [...] of <n> resolved`. It then re-probes that harness itself after 1 minute, doubling to
+a 10-minute cap while the probes keep failing, and logs `harness RESTORED` when one passes. Each
+change republishes the beat within seconds (`seller node serving changed: now serving a/n harness(es)
+— republishing kind-30340 now`), so buyers see `serving=0/1` / `status=not_serving` while you are
+down and stop sending you work, and see `serving=1/1` again as soon as you are back. A restart is no
+longer needed to recover from a transient drop; it still is for an `INCAPABLE` harness (a missing
+build feature or configuration), which is never re-probed.
 
 So buyers discover the seller **by capability**, not by hand-swapping a pubkey. The heartbeat is
 addressable (same `d` every beat), so each one supersedes the last in place — republishing on that
