@@ -1258,7 +1258,7 @@ button.chip { cursor: pointer; }
    fixed slot keeps the rest of the nav from sliding when it does. */
 @media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
 /* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
-/* Experimental pages (/chat, /mint, /tokens) get a small yellow boxed "Lab" superscript on
+/* Experimental pages (/chat, /mint, /tokens, /challenges) get a small yellow boxed "Lab" superscript on
    their footer link (bob); same rule as feat/trade-market-page. */
 .lab-sup {
   display: inline-block; margin-left: 4px; vertical-align: super;
@@ -1267,7 +1267,7 @@ button.chip { cursor: pointer; }
   color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
 }
 .foot-nav a:hover .lab-sup { border-color: var(--neon); }
-/* /chat and /mint carry the /tokens experimental notice strip (bob); same rules as
+/* /chat, /mint and /challenges carry the /tokens experimental notice strip (bob); same rules as
    feat/trade-market-page, so a later merge keeps one copy. */
 .labs-strip {
   display: flex; align-items: center; gap: 10px;

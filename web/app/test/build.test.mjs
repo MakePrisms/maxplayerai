@@ -213,6 +213,11 @@ test("all site pages share navigation and footer links, with a current page and 
   }
 });
 
+test("/challenges carries the /tokens experimental notice under the nav (bob)", () => {
+  const html = readFileSync(join(root, "dist", "challenges.html"), "utf8");
+  assert.match(html, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>[^<]+<\/span><\/p>/, "experimental strip under the nav, like /tokens");
+});
+
 test("/chat carries the /tokens experimental notice under the nav", () => {
   const chat = readFileSync(join(root, "dist", "chat.html"), "utf8");
   assert.match(chat, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
