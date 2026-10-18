@@ -49,26 +49,30 @@
 //! BUYER would pay for it. The probe is ours to run and ours to pay for.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::seller_agents::{normalize_request, AgentRegistry, RegisteredAgent};
 
-/// Escalating delays before a dropped harness is probed again: 15m, 1h, then 4h for every strike
-/// after. A harness that fails once is probably transient and worth re-testing soon; one that keeps
-/// failing its probes is worth testing rarely, since each probe spends our own tokens.
-const PROBE_BACKOFF: [Duration; 3] = [
-    Duration::from_secs(15 * 60),
-    Duration::from_secs(60 * 60),
-    Duration::from_secs(4 * 60 * 60),
-];
+/// Bounded backoff before a dropped harness is probed again: 1m, 2m, 4m, 8m, then 10m for every strike
+/// after. Short at the start because a drop is most often transient, and every minute a seat's only
+/// harness sits dropped the seat declines every offer while buyers keep targeting it (R3-2: a seat
+/// whose single harness dropped on strike 2 waited a full HOUR for its first probe under the old
+/// 15m/1h/4h schedule, and a manual restart was what brought it back). Capped at ten minutes so a
+/// harness that stays broken is re-checked a few times an hour, not a few times a day: the fix (a
+/// topped-up account, a configured provider) happens outside the process, and one probe is one tiny
+/// turn of our own tokens.
+const PROBE_BACKOFF_BASE: Duration = Duration::from_secs(60);
+const PROBE_BACKOFF_CAP: Duration = Duration::from_secs(10 * 60);
 
-/// The delay before strike `strikes` is probed. Saturates at the last step rather than growing
-/// without bound — a permanently broken harness should still be re-checked a few times a day, since
-/// the fix (a topped-up account, a configured provider) happens outside the process.
+/// The delay before strike `strikes` is probed: [`PROBE_BACKOFF_BASE`] doubled per strike after the
+/// first, saturating at [`PROBE_BACKOFF_CAP`] rather than growing without bound.
 fn probe_delay(strikes: u32) -> Duration {
-    let index = strikes.max(1) as usize - 1;
-    PROBE_BACKOFF[index.min(PROBE_BACKOFF.len() - 1)]
+    let doublings = strikes.max(1).saturating_sub(1).min(16);
+    PROBE_BACKOFF_BASE
+        .saturating_mul(1u32 << doublings)
+        .min(PROBE_BACKOFF_CAP)
 }
 
 /// A capability a harness needs and does not have.
@@ -213,6 +217,12 @@ pub struct LiveRoster {
     /// the single-snapshot rule is what makes [`Advertisement::capability`] a route no emitter can
     /// partially take.
     capabilities: Mutex<Vec<String>>,
+    /// Bumped on every SERVING TRANSITION — a serving harness dropped, or a dropped one restored
+    /// (R3-2). The run loop compares it with the value it last announced and republishes the
+    /// kind-30340 beat on its next housekeeping tick instead of an interval later, so a seat that
+    /// stops (or resumes) serving says so within seconds. A counter rather than a flag so a reader
+    /// cannot lose a transition by clearing it: anything other than "the value I announced" is news.
+    generation: AtomicU64,
 }
 
 /// A harness selected to run a job: which registry index it is, and the entry itself.
@@ -253,6 +263,11 @@ pub struct Advertisement {
     /// probed — which is exactly why the probe and its zero-control had to ship together. Absent
     /// means unstated, never "none confirmed".
     pub capabilities: Vec<String>,
+    /// How many of the seat's resolved harnesses can run a job right now, out of how many it
+    /// resolved at boot — the kind-30340 `serving` tag (R3-2). Counted in the SAME locked pass as
+    /// [`Self::serving`], so `harnesses.available > 0` and `serving` cannot disagree. Unlike
+    /// [`Self::names`] it counts the unlabelled hatch too.
+    pub harnesses: crate::heartbeat::ServingCount,
 }
 
 impl Advertisement {
@@ -295,7 +310,19 @@ impl LiveRoster {
             registry,
             state: Mutex::new(BTreeMap::new()),
             capabilities: Mutex::new(Vec::new()),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// The serving-transition counter (see [`LiveRoster::generation`] on the field). Read it BEFORE
+    /// taking the [`Self::advertisement`] snapshot you publish: a transition landing between the two
+    /// then leaves the recorded value behind the roster, which costs one extra beat, never a missed one.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    fn bump_generation(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Record the capability tokens the boot probe PROVED, replacing whatever was there.
@@ -324,12 +351,17 @@ impl LiveRoster {
                 .lock()
                 .expect("live roster poisoned")
                 .clone(),
+            harnesses: crate::heartbeat::ServingCount {
+                available: 0,
+                configured: u32::try_from(self.registry.entries().len()).unwrap_or(u32::MAX),
+            },
         };
         for (index, entry) in self.registry.entries().iter().enumerate() {
             if !Self::serving(&state, &index) {
                 continue;
             }
             ad.serving = true;
+            ad.harnesses.available = ad.harnesses.available.saturating_add(1);
             let Some(name) = entry.name.clone() else {
                 // The unlabelled `--agent-argv` hatch serves without a name. It may well have an
                 // observed model, but a model tag is keyed by the harness it belongs to, so a model
@@ -438,6 +470,7 @@ impl LiveRoster {
         });
         // Whatever a probe was testing, its answer arrived: this fault IS the answer.
         entry.probing = false;
+        let was_serving = entry.unavailable.is_none();
         let unavailable = match fault {
             Fault::Incapable(capability) => Unavailable::Incapable(capability),
             Fault::Unproven => {
@@ -449,6 +482,10 @@ impl LiveRoster {
             }
         };
         entry.unavailable = Some(unavailable.clone());
+        drop(state);
+        if was_serving {
+            self.bump_generation();
+        }
         unavailable
     }
 
@@ -456,16 +493,24 @@ impl LiveRoster {
     /// a self-probe actually passed — never on a timer, because a timer would make the next real
     /// award the test and a buyer would pay for our diagnostic.
     ///
-    /// Strike history survives, so a harness that flaps escalates instead of resetting to 15m.
+    /// Strike history survives, so a harness that flaps escalates instead of resetting to 1m.
     pub fn restore(&self, index: usize) {
-        if let Some(entry) = self
+        let restored = match self
             .state
             .lock()
             .expect("live roster poisoned")
             .get_mut(&index)
         {
-            entry.unavailable = None;
-            entry.probing = false;
+            Some(entry) => {
+                entry.probing = false;
+                entry.unavailable.take().is_some()
+            }
+            None => false,
+        };
+        // Only a real transition is news: restoring a harness that was already serving changes
+        // nothing a beat says.
+        if restored {
+            self.bump_generation();
         }
     }
 
@@ -946,13 +991,22 @@ mod tests {
 
     #[test]
     fn repeated_failures_escalate_the_probe_delay_and_saturate() {
+        // R3-2: the schedule starts SHORT and is CAPPED. The expected column is written by hand on
+        // purpose — computing it from `probe_delay` would prove only that the code equals itself.
+        // The old 15m/1h/4h schedule fails the first row: a seat whose only harness dropped waited an
+        // hour for its first probe, declining every offer in the meantime.
         let roster = named(&["claude"]);
         let now = Instant::now();
-
-        for (strike, expected) in [(1, PROBE_BACKOFF[0]), (2, PROBE_BACKOFF[1]), (3, PROBE_BACKOFF[2])]
-        {
-            let state = roster.fault(0, Fault::Unproven, now);
-            match state {
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        for (strike, expected) in [
+            (1, minutes(1)),
+            (2, minutes(2)),
+            (3, minutes(4)),
+            (4, minutes(8)),
+            (5, minutes(10)),
+            (6, minutes(10)),
+        ] {
+            match roster.fault(0, Fault::Unproven, now) {
                 Unavailable::Dropped {
                     probe_due_at,
                     strikes,
@@ -963,13 +1017,9 @@ mod tests {
                 other => panic!("unproven must drop, got {other:?}"),
             }
         }
-        // A fourth strike saturates rather than growing without bound.
-        match roster.fault(0, Fault::Unproven, now) {
-            Unavailable::Dropped { probe_due_at, .. } => {
-                assert_eq!(probe_due_at, now + PROBE_BACKOFF[2]);
-            }
-            other => panic!("expected a drop, got {other:?}"),
-        }
+        // Far past the cap it stays saturated rather than growing (or overflowing).
+        assert_eq!(probe_delay(u32::MAX), minutes(10));
+        assert_eq!(probe_delay(40), minutes(10));
     }
 
     #[test]
@@ -987,7 +1037,7 @@ mod tests {
                 probe_due_at,
             } => {
                 assert_eq!(strikes, 2, "a restore must not forget the history");
-                assert_eq!(probe_due_at, now + PROBE_BACKOFF[1]);
+                assert_eq!(probe_due_at, now + probe_delay(2));
             }
             other => panic!("expected a drop, got {other:?}"),
         }
@@ -1131,8 +1181,8 @@ mod tests {
         // one thing this whole module exists to prevent.
         let roster = named(&["claude"]);
         let now = Instant::now();
-        roster.fault(0, Fault::Unproven, now); // strike 1, 15m window
-        let due = now + PROBE_BACKOFF[0];
+        roster.fault(0, Fault::Unproven, now); // strike 1, 1m window
+        let due = now + probe_delay(1);
         assert_eq!(roster.claim_due_probes(due), vec![0], "the window is due, claim marks probing");
         assert!(
             roster.claim_due_probes(due).is_empty(),
@@ -1149,7 +1199,7 @@ mod tests {
                 assert_eq!(strikes, 2, "a panicking probe advances a strike so it backs off");
                 assert_eq!(
                     probe_due_at,
-                    due + PROBE_BACKOFF[1],
+                    due + probe_delay(2),
                     "the window is re-armed from the abandonment, not left in the past"
                 );
             }
@@ -1163,7 +1213,7 @@ mod tests {
             "the re-armed window has not passed yet"
         );
         assert_eq!(
-            roster.claim_due_probes(due + PROBE_BACKOFF[1]),
+            roster.claim_due_probes(due + probe_delay(2)),
             vec![0],
             "once the re-armed window passes the harness is re-probed — probing WAS released"
         );
@@ -1178,7 +1228,7 @@ mod tests {
         // Happy path: a probe passed → restore cleared probing. Abandon after must not re-drop it.
         let restored = named(&["claude"]);
         restored.fault(0, Fault::Unproven, now);
-        let due = now + PROBE_BACKOFF[0];
+        let due = now + probe_delay(1);
         assert_eq!(restored.claim_due_probes(due), vec![0]);
         restored.restore(0);
         restored.abandon_probe(0, due);
@@ -1224,4 +1274,45 @@ mod tests {
         assert!(roster.serves(Some(" Claude ")));
         assert_eq!(roster.advertised(), vec!["claude"]);
     }
+
+    // BEGIN R3-2 roster tests
+    #[test]
+    fn the_advertisement_counts_serving_harnesses_against_the_resolved_total() {
+        use crate::heartbeat::ServingCount;
+        let roster = roster(&[Some("claude"), None]);
+        let count = |r: &LiveRoster| r.advertisement().harnesses;
+        assert_eq!(count(&roster), ServingCount { available: 2, configured: 2 }, "the hatch counts too");
+        roster.fault(1, Fault::Unproven, Instant::now());
+        assert_eq!(count(&roster), ServingCount { available: 1, configured: 2 });
+        roster.fault(0, Fault::Incapable(MissingCapability::AcpFeature), Instant::now());
+        let ad = roster.advertisement();
+        assert_eq!(ad.harnesses, ServingCount { available: 0, configured: 2 });
+        assert!(!ad.serving, "a zero count and `serving` come from one snapshot");
+        roster.restore(1);
+        assert_eq!(count(&roster), ServingCount { available: 1, configured: 2 });
+    }
+
+    #[test]
+    fn the_generation_moves_on_every_serving_transition_and_nothing_else() {
+        let roster = named(&["claude"]);
+        let now = Instant::now();
+        let g0 = roster.generation();
+        roster.record_model(0, Some("m".into()));
+        assert_eq!(roster.generation(), g0, "a model observation is not a serving transition");
+        roster.restore(0);
+        assert_eq!(roster.generation(), g0, "restoring a serving harness changes nothing");
+
+        roster.fault(0, Fault::Unproven, now);
+        let g1 = roster.generation();
+        assert_ne!(g1, g0, "a drop is news");
+        roster.fault(0, Fault::Unproven, now);
+        assert_eq!(roster.generation(), g1, "a failed probe on a dropped harness is not a transition");
+        roster.claim_due_probes(now + Duration::from_secs(3600));
+        roster.abandon_probe(0, now);
+        assert_eq!(roster.generation(), g1, "an abandoned probe proved nothing");
+
+        roster.restore(0);
+        assert_ne!(roster.generation(), g1, "a restore is news");
+    }
+    // END R3-2 roster tests
 }
