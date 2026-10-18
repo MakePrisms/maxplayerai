@@ -152,13 +152,20 @@ export const DEFAULT_MIN_DURATION = 300;
 // - A delivery published late is still payable: derive_claim_liveness marks a past-deadline claim
 //   `delivered` (accept_claim treats it like `processing`) for DELIVERY_PAY_WINDOW_SECS (7 days)
 //   after the delivery, on main and v0.6.1.
+// deadline + 420 s is the kill INSTANT, not a completed stop: the container loop kills only when
+// now > deadline + 420 and teardown (client kill, capture, removal) starts after that. So the grace
+// must exceed the execution tail by a teardown margin (minimum 420 + 60 = 480 s), and the slot is
+// freed only strictly after deadline + grace. Residual: libgit2's delta search ignores the push
+// deadline, so a pathological pack can outlive any grace; that is not bounded here.
 // So once deadline + this grace has passed and a confirmed read shows no delivery, the old job
-// can no longer be executing: its seller slot is freed for new work. The job itself stays open
+// should no longer be executing: its seller slot is freed for new work. The job itself stays open
 // (not done): it is still polled, a late delivery is collected exactly once, and its sats stay
 // reserved until collected or proven released. Minutes are untouched (the shared projection
 // already charged award -> deadline).
 export const EXPIRED_SLOT_GRACE_SECONDS = 600;
 export const SELLER_EXECUTION_TAIL_SECONDS = 420;
+export const SLOT_TEARDOWN_MARGIN_SECONDS = 60;
+export const MIN_EXPIRED_SLOT_GRACE_SECONDS = SELLER_EXECUTION_TAIL_SECONDS + SLOT_TEARDOWN_MARGIN_SECONDS;
 export class Journal {
   constructor(path) {
     this.path=path; this.state={jobs:[],days:{}};
@@ -351,7 +358,7 @@ export class Swarm {
         // Not provably released: keep the sats reserved and keep polling, but free the seller slot
         // once it cannot still be executing and a confirmed read shows no delivery.
         const grace=this.c.expiredSlotGrace??EXPIRED_SLOT_GRACE_SECONDS;
-        if(!j.done&&!j.slotFreed&&now>=j.args.deadline_unix+grace&&state.read_confirmed===true&&Array.isArray(state.results)&&!state.results.length&&!state.awarded_delivery_pending) {
+        if(!j.done&&!j.slotFreed&&now>j.args.deadline_unix+grace&&state.read_confirmed===true&&Array.isArray(state.results)&&!state.results.length&&!state.awarded_delivery_pending) {
           j.slotFreed=now;
           this.io.report?.(`Job ${j.id}: expired undelivered ${grace}s past its deadline; seller ${j.seller} freed for new work, ${jobBudget(j).reservedSats} sats stay reserved until collected or proven released`);
         }
@@ -470,7 +477,7 @@ export function config(argv,env=process.env) {
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
   for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter','maxDefer'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
-  if(!Number.isSafeInteger(c.expiredSlotGrace)||c.expiredSlotGrace<SELLER_EXECUTION_TAIL_SECONDS)throw Error(`Invalid SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= ${SELLER_EXECUTION_TAIL_SECONDS}`);
+  if(!Number.isSafeInteger(c.expiredSlotGrace)||c.expiredSlotGrace<MIN_EXPIRED_SLOT_GRACE_SECONDS)throw Error(`Invalid SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= ${MIN_EXPIRED_SLOT_GRACE_SECONDS} (seller execution tail ${SELLER_EXECUTION_TAIL_SECONDS} s + teardown margin ${SLOT_TEARDOWN_MARGIN_SECONDS} s)`);
   c.home=resolve(c.home);return c;
 }
 // The locked runner is a grandchild (parent -> flock -> runner) holding the home lock. Signals to

@@ -759,15 +759,16 @@ test('expired paid job without release fields: seller freed after deadline + gra
   // A v0.6.1-shaped view: confirmed read, no results, none of the release-proof fields.
   Object.assign(old(),{read_confirmed:true,results:[],claims:[],accepted:null});
   const deadline=130,grace=EXPIRED_SLOT_GRACE_SECONDS;
-  for(const t of [131,deadline+grace-1]){f.time(t);await f.runner.tick();assert.equal(posts(f).length,1,`still busy at ${t}`);}
+  // Advisor r1 F2: deadline + grace itself is not past it (strict >, like the seller's kill check).
+  for(const t of [131,deadline+grace-1,deadline+grace]){f.time(t);await f.runner.tick();assert.equal(posts(f).length,1,`still busy at ${t}`);}
   const j=f.journal.state.jobs[0];assert.equal(j.done,false);assert.equal(j.slotFreed,undefined);
-  f.time(deadline+grace);await f.runner.tick();
-  assert.equal(j.slotFreed,deadline+grace);assert.equal(j.done,false,'job stays open and polled');assert.equal(j.released,false);
+  f.time(deadline+grace+1);await f.runner.tick();
+  assert.equal(j.slotFreed,deadline+grace+1);assert.equal(j.done,false,'job stays open and polled');assert.equal(j.released,false);
   assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.amount_sats]),[['a',5],['a',0]],'seller gets a new assignment');
   assert.ok(reports.some(r=>/expired undelivered 600s past its deadline; seller a freed for new work, 5 sats stay reserved/.test(r)));
   const jobs=f.journal.state.jobs;assert.equal(reservedBudget(f.snap,jobs,f.io.now()).committedSats,5,'old sats still reserved');
   assert.ok(!f.inputs.at(-1).running?.some(r=>r.deadline===deadline),'freed job not shown as running');
-  for(let t=deadline+grace+1;t<deadline+grace+4;t++){f.time(t);await f.runner.tick();}
+  for(let t=deadline+grace+2;t<deadline+grace+5;t++){f.time(t);await f.runner.tick();}
   assert.equal(f.calls.filter(([t])=>t==='collect').length,0,'nothing collected or paid');
   assert.equal(posts(f).length,2,'one new job at a time: the new job keeps the seller busy');
   assert.equal(reservedBudget(f.snap,jobs,f.io.now()).committedSats,5);
@@ -776,10 +777,10 @@ test('expired paid job: late delivery after the slot was freed is collected exac
   const {f,old}=expiredPaid();const mcp=f.io.mcp;
   f.io.mcp=async(t,a)=>t==='collect'&&a.job_id===old().id?(f.calls.push([t,a]),{pay:{state:'Closed { receipt }',amount_sats:5}}):mcp(t,a);
   await f.runner.tick();Object.assign(old(),{read_confirmed:true,results:[],claims:[],accepted:null});
-  f.time(730);await f.runner.tick();assert.equal(posts(f).length,2);
+  f.time(731);await f.runner.tick();assert.equal(posts(f).length,2);
   // Core keeps a past-deadline delivery payable (claim `delivered`, 7-day pay window).
   old().results=[{}];
-  for(const t of [731,732,733]){f.time(t);await f.runner.tick();}
+  for(const t of [732,733,734]){f.time(t);await f.runner.tick();}
   assert.deepEqual(f.calls.filter(([t])=>t==='collect').map(([,a])=>a.job_id),[old().id],'collected (and paid) exactly once');
   const j=f.journal.state.jobs[0];assert.equal(j.outcome,'collected');assert.equal(j.done,true);
   assert.deepEqual(jobBudget(j),{reservedSats:0,paidSats:5});
@@ -793,5 +794,9 @@ test('expired paid job: slot stays held on an unconfirmed read or a pending awar
   }
   const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
   assert.equal(config([],base).expiredSlotGrace,600);assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'900'}).expiredSlotGrace,900);
-  assert.throws(()=>config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'419'}),/SWARM_EXPIRED_SLOT_GRACE_SECONDS/);
+  // Advisor r1 F2: 420 s is the seller's container kill instant, so the floor is 420 + a 60 s teardown margin.
+  const {MIN_EXPIRED_SLOT_GRACE_SECONDS,SELLER_EXECUTION_TAIL_SECONDS,SLOT_TEARDOWN_MARGIN_SECONDS}=await import('./swarm.mjs');
+  assert.deepEqual([SELLER_EXECUTION_TAIL_SECONDS,SLOT_TEARDOWN_MARGIN_SECONDS,MIN_EXPIRED_SLOT_GRACE_SECONDS],[420,60,480]);
+  for(const bad of ['419','420','479'])assert.throws(()=>config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:bad}),/SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= 480/,bad);
+  assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'480'}).expiredSlotGrace,480);
 });
