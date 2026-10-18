@@ -211,8 +211,9 @@ The community HTTP/SSE server and review page have been removed; use
   closed, so an EOSE for a replaced subscription never counts. AUTH uses one new in-memory
   per-tab key across connections, never the buyer key. No EVENT is sent by the reader.
 - Refused AUTH, or no AUTH challenge at all, leaves history available and polling active; so
-  does a relay CLOSED of a live subscription on such an anonymous connection. A challenge that is
-  never answered within 15 seconds is treated like a refusal, with a warning. A relay CLOSED of a
+  does a relay CLOSED of a live subscription on such an anonymous connection. Refused AUTH adds an
+  `AUTH refused (…)` warning; a challenge that is never answered within 15 seconds is treated like
+  a refusal, with an `AUTH not answered (…)` warning. A relay CLOSED of a
   display-only feed (applicants, profiles/heartbeats) never affects readiness; it adds a warning
   with the relay's reason. Polling runs every 15 seconds from each filter's newest timestamp minus
   900 seconds, also repairing late events while streaming. Disconnects reconnect with bounded
@@ -221,6 +222,11 @@ The community HTTP/SSE server and review page have been removed; use
   CLOSED, `historyComplete` also requires AUTH OK and an EOSE for every trusted filter's live
   subscription sent after AUTH OK on this connection, whether or not that subscription is still
   installed. A newly sent replacement subscription makes the reader not ready until its own EOSE.
+- Once a relay has accepted the reader's AUTH (and has not since refused it, or stopped
+  challenging, outside recovery), a recovery round on it is ready only with AUTH OK: AUTH refused
+  on the reconnect, even with every live subscription installed and answered, or no AUTH challenge
+  within 15 seconds of the reconnect, reconnects again instead of completing on anonymous EOSEs.
+  Relays that never challenge, or refuse AUTH outside recovery, still recover anonymously.
 - A relay CLOSED on a trusted read is never a dead end. When the relay closes an authenticated
   live subscription, closes any trusted live subscription while AUTH is expected or the reader is
   recovering (even before AUTH OK), refuses a trusted history page, or answers `auth-required:`

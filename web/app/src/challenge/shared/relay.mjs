@@ -46,6 +46,12 @@ const RECOVERING='Recovering after relay CLOSED';
 // A trusted live CLOSED in a strict round recovers, even before AUTH OK. A relay that closes
 // each live REQ therefore stays not ready instead of flapping.
 //
+// Recovery on a relay whose current posture is AUTH (it accepted this reader's AUTH and has not
+// since refused it or stopped challenging outside recovery) is ready only with AUTH OK: AUTH
+// refused, even with every live REQ still installed, or no AUTH challenge within authWaitMs on a
+// connection opened expecting one, recovers again like an unanswered challenge. A relay that never
+// challenges, or refuses AUTH, outside recovery keeps the anonymous path, in recovery too.
+//
 // Live REQ ids: `live-<id>` for a filter's first live REQ on a connection, `live-<id>~<n>` for
 // a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
 export class RelayReader {
@@ -56,6 +62,7 @@ export class RelayReader {
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
     this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
+    this.authAccepted=false; // the relay accepted our AUTH and has not since refused it or stopped challenging outside recovery
     this.status=this.freshStatus();
     this.stopped=false; this.retry=retryMs;
   }
@@ -67,6 +74,10 @@ export class RelayReader {
   metaIncomplete(){const w='Profile/heartbeat read incomplete';if(!this.status.warnings.includes(w))this.status.warnings.push(w);}
   authExpected(){return !!this.challenged&&this.authRefused===null;}
   strict(){return this.closedStreak>0||this.authExpected();}
+  // Recovering on a relay whose posture is AUTH: only AUTH OK can complete the round. Such a
+  // connection opens with expectAuth (authAccepted implies an earlier challenge), so its live REQs
+  // are held until a challenge; AUTH refused or no challenge then recovers (see OK and holdTimer).
+  needsAuth(){return this.closedStreak>0&&this.authAccepted;}
   // Every trusted filter, whether or not its live REQ is still installed, needs an EOSE on this
   // connection; once AUTH is expected, on a REQ sent after AUTH OK.
   liveConfirmed(){
@@ -171,7 +182,12 @@ export class RelayReader {
       for(const [id,f] of this.filters)this.page(id,f);
       if(this.applicants)this.pageApplicants();
       for(const id of this.liveIds())this.subscribe(id);
-      if(this.expectAuth)this.holdTimer=setTimeout(()=>{this.holdTimer=null;if(!this.challenged){this.holdExpired=true;this.expectAuth=false;}},this.authWaitMs);
+      // No challenge within authWaitMs: live REQs fall back to anonymous and the relay's posture
+      // becomes anonymous, unless recovery needs AUTH OK; then this recovers like an unanswered
+      // challenge (expectAuth stays set for the retry).
+      if(this.expectAuth)this.holdTimer=setTimeout(()=>{this.holdTimer=null;if(this.challenged||this.dead)return;
+        if(this.needsAuth())return this.recover(`Relay sent no AUTH challenge within ${this.authWaitMs/1000}s while recovering`);
+        this.holdExpired=true;this.expectAuth=false;this.authAccepted=false;},this.authWaitMs);
       this.updateComplete();this.onChange();
     });
     ws.addEventListener('message',({data})=>{
@@ -187,6 +203,7 @@ export class RelayReader {
         this.status.authenticated=m[2]===true;
         clearTimeout(this.authTimer);this.authTimer=null;
         if(this.status.authenticated) {
+          this.authAccepted=true;
           // A late OK after the no-answer fallback still counts: AUTH is expected again.
           if(this.authRefused==='not answered'){this.authRefused=null;this.status.warnings=this.status.warnings.filter(w=>!w.startsWith('AUTH not answered'));}
           if(this.authClosed.size) {
@@ -201,9 +218,12 @@ export class RelayReader {
           this.authRefused=m[3]||'no reason given';
           // The relay demanded AUTH for trusted history, then refused it: retry on a fresh connection.
           if(this.authClosed.size)return this.recover(`${this.status.error??'auth-required'}; AUTH refused: ${this.authRefused}`);
-          // Recovering, and a trusted live REQ was refused for lack of AUTH: nothing can reinstall it here.
-          if(this.closedStreak&&[...this.filters.keys()].some(id=>!soft(id)&&!this.liveSub.has(id)))
+          // Recovering, and either the streak needs AUTH OK (even with every live REQ still installed)
+          // or a trusted live REQ was refused for lack of AUTH: nothing can complete this round here.
+          if(this.needsAuth()||this.closedStreak&&[...this.filters.keys()].some(id=>!soft(id)&&!this.liveSub.has(id)))
             return this.recover(`${this.authReason??'auth-required'}; AUTH refused: ${this.authRefused}`);
+          this.authAccepted=false; // refused outside recovery: anonymous posture from now on
+          this.warn('AUTH refused',this.authRefused); // anonymous reads, like the no-answer fallback
         }
         this.updateComplete();this.onChange();
       } else if(m[0]==='EVENT') {
@@ -277,6 +297,7 @@ export class RelayReader {
             this.authClosed.set(sub,p.filter);
             if(!this.status.error||this.status.error.startsWith('auth-required:'))this.status.error=reason;
             this.awaitAuth(reason); // AUTH OK re-reads it; otherwise a fresh connection retries
+            this.updateComplete(); // the error also restarts the stable period now
           }
         }
         this.onChange();
