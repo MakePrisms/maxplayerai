@@ -73,8 +73,51 @@ Append the buyer's hex public key to `seller.accept_offers_only_from` without re
 existing entries, then restart the seller. Joining warns if it is missing; joining does
 not edit this list. The buyer must accept the membership. Minutes (1–480) are offered
 per day; membership and acceptance persist. Joining after work starts becomes eligible
-on the next day. Updating minutes preserves the join time; leaving then rejoining starts
-a new membership period. Leave prevents new assignments, not completion of awarded jobs.
+on the next day. Leaving then rejoining starts a new membership period. Leave prevents new
+assignments, not completion of awarded jobs.
+
+### Changing minutes: not while a challenge you are in is running
+
+`join` on an existing `joined` membership keeps `since` (the membership period), but it
+**republishes** the membership. Memberships are replaceable events, so the new event's
+`created_at` is now, and eligibility requires the latest membership's `created_at` to be at
+or before the challenge start (that check stops a seller backdating a join, so it stays).
+A republish after the start therefore makes you ineligible for that day.
+
+So `join` refuses the change, publishing nothing and exiting non-zero, while a challenge
+that still counts your membership is running: a buyer-signed challenge whose latest version
+is `scheduled` or `in_progress`, your latest buyer decision is `accepted`, your membership's
+`created_at` and `since` are at or before `starts`, the replacement would be dated after
+`starts`, and `now <= ends + 900`. The buyer may post through `ends` inclusive, and relays
+accept an event dated up to 900 seconds ahead of their clock, so a fast seller clock could
+otherwise forfeit the last minutes; the refusal therefore lasts until 15 minutes after `ends`:
+
+```text
+challenge: You're in today's challenge (<id>, ends <time>). Change your minutes (or note)
+after <ends + 15 min> (15 minutes after it ends, allowing for clock drift); they apply from
+the next day. Re-publishing now would make you ineligible for today. Do not leave and rejoin
+to change minutes: that also forfeits today. Nothing was published.
+```
+
+- Same minutes, with `--note` omitted or equal to the current note, is a no-op: nothing is
+  published, `--json` reports `"unchanged": true`. On a real change, omitting `--note` keeps
+  the current note and `--note ''` clears it. A note-only change (including `--note ''`
+  against a non-empty note) republishes too and is refused the same way.
+- The replacement's `created_at` is the later of now and the previous membership's
+  `created_at + 1` (NIP-01 replacement). It publishes when that time is at or before the
+  start (so a change at the start second itself is allowed), after `ends + 900`, or once the
+  challenge is `completed`/`cancelled`. A wall clock before the start is not enough: if the
+  previous membership is dated at the start, the bumped timestamp would land after it, so
+  the change is refused.
+- If you are not counted today anyway, there is nothing to lose and it publishes: your
+  latest buyer decision is pending or `denied`, or your membership was already replaced
+  after the start (`created_at > starts`) or its period began after it (`since > starts`).
+- If the buyer's challenges cannot be read completely from every relay (refused, timed out,
+  or truncated history), the change fails closed: nothing is published and the error says
+  the challenge state could not be read.
+- A first join (or a rejoin after `left`), `leave` and `status` are unaffected and never
+  read challenges for this check: leaving always works. Do not leave and rejoin to edit
+  minutes mid-challenge: leaving drops eligibility, and the rejoin starts a new period.
 
 ## The buyer: publish and decide
 

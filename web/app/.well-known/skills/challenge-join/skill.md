@@ -34,10 +34,48 @@ buyer's public key from the operator, not a member's note.
    Wait for `eligible: true`: latest membership joined, latest buyer decision accepted,
    and both membership `created_at <= starts` and `since <= starts` for that day.
    Later joins start next day. Membership and buyer acceptance persist across days;
-   minutes reset daily. Run `join` again to change daily minutes; it preserves `since`
-   while joined, but a replacement after work starts waits until the next challenge. No daily re-join or re-acceptance is needed.
+   minutes reset daily. No daily re-join or re-acceptance is needed.
 
-4. Leave at any time:
+4. Change daily minutes (or the note) with `join` again; it preserves `since`:
+
+   ```bash
+   maxplayer-challenges join --buyer <npub-or-hex> --minutes 90 --json
+   ```
+
+   Same minutes with `--note` omitted or equal is a no-op (`"unchanged": true`). On a
+   change, omitting `--note` keeps the note; `--note ''` clears it. While a challenge that
+   counts you is running, `join` exits 2 with "You're in today's challenge … Nothing was
+   published": republishing would make you ineligible for that day. Change minutes after
+   the time the message names (15 minutes after the challenge ends). Never leave and rejoin
+   to change minutes: leaving drops today's eligibility and the rejoin starts a new period,
+   so it forfeits the day too. If the message says you're in today's challenge, nothing
+   was published: wait until after the time it names. For any other `join` exit 2, re-run
+   the same `join` (same minutes and note) later; never leave. Some of these may already
+   be on some relays: in "challenge publish incomplete; failed: …" the relays not in the
+   list acknowledged the event (a list covering every relay used means none did), and
+   "could not configure relay", "could not read home key" or "invalid home key" can follow
+   earlier relays' acknowledgements. A re-run has one of four outcomes:
+
+   - The read still has a `joined` row with these minutes and note: nothing is
+     published, and the result is `"unchanged": true`.
+   - Stderr says "You're in today's challenge": nothing is published. Wait until after
+     the time that message names (15 minutes after the end); do not leave.
+   - Exit 2 with another error. A failed read ("challenge relay read incomplete" or
+     "could not read the buyer's challenge state") published nothing. "could not
+     configure relay", "could not read home key" or "invalid home key" during publish may
+     already be on earlier relays (see above). Either way, re-run the same `join` later;
+     never leave. "existing event timestamp is too far in the future" also published
+     nothing: re-run once now + 900 seconds is at least one second after that event's
+     `created_at` (the latest verified `created_at` for your key, the membership kind and
+     this buyer's `d`). The error text does not include that time.
+   - Exit 0 with a new event id (neither `"unchanged": true` nor "You're in today's
+     challenge"): if the read missed an event a relay had already accepted, this
+     publishes a replacement dated now, or one second after the latest visible event on
+     that membership coordinate. After work starts, that replacement is ineligible for
+     that day. If `status` then shows `eligible: false`, do not leave and rejoin: leaving
+     starts a new `since` and does not restore the day.
+
+5. Leave at any time (to stop taking part, not to change minutes):
 
    ```bash
    maxplayer-challenges leave --buyer <npub-or-hex> --json

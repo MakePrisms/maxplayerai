@@ -71,7 +71,11 @@ Coordinate: `30341:<buyer>:<d>`.
 | `since` | unix seconds of first join in the current membership period |
 
 No `a` tag or challenge id. `content`: optional seller note (untrusted).
-Republish `joined` to change minutes, preserving `since`. Joining after `left` starts a
+Republish `joined` to change minutes, preserving `since`. Republishing replaces the event,
+so its `created_at` moves to now: a change after a challenge's start makes the seller
+ineligible for that challenge (rule below) and takes effect from the next one. The sidecar
+therefore refuses minutes/note changes while such a challenge is running (see the CLI
+section below). Joining after `left` starts a
 new membership period with a fresh `since`. Leave at any time by republishing `left`:
 no new assignments, but already-awarded jobs finish, deliver and settle normally.
 
@@ -282,6 +286,29 @@ The buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 `--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's
 key; none prints a secret.
 
+**Minutes changes during a running challenge.** `join` on an existing `joined` membership
+with different `--minutes` (or a different `--note`) republishes the membership. The sidecar
+refuses it, publishing nothing and exiting non-zero, when it would forfeit an eligible day:
+some buyer-signed challenge's latest version is `scheduled`/`in_progress`, the seller's
+latest buyer decision is `accepted`, the current membership's `created_at` and `since` are at
+or before `starts`, the replacement would be dated after `starts` (its `created_at` is
+`max(now, previous + 1)`), and `now <= ends + 900`. The buyer posts through `ends` inclusive,
+and the 900-second `created_at` tolerance lets a fast seller clock publish before the
+buyer's `ends`, so the refusal lasts until 15 minutes after `ends`:
+"You're in today's challenge (<id>, ends <time>). Change your minutes (or note) after
+<ends + 15 min> …; they apply from the next day. Re-publishing now would make you ineligible
+for today. Do not leave and rejoin to change minutes: that also forfeits today."
+The same minutes with `--note` omitted or equal is a no-op (nothing published,
+`"unchanged": true`). On a real change, omitting `--note` keeps the current note and
+`--note ''` clears it. Pending or denied sellers, and memberships already replaced after the
+start, are not counted that day, so their changes publish. The challenge read is the
+trusted, paged, every-relay read; if it is incomplete (refused, timed out, truncated) the
+change fails closed (nothing published). It must stay an every-relay read even if other
+reads move to a quorum: the relay left out could be the only one holding the running
+challenge. First joins, rejoins after `left`, `leave` and `status` are unaffected.
+This is client policy only: the event format and the eligibility rule are unchanged, and
+another client can still republish (and forfeit the day).
+
 ## Community reader implementation notes
 
 - The browser holds a locally generated **ephemeral per-tab NIP-42 authentication key**, never the buyer
@@ -309,7 +336,9 @@ See the runner README for the loopback test-mint/funding infrastructure needed t
 Eligibility requires the latest membership event's `created_at` **and** `since`
 to be no later than the challenge start. A late replacement (including a minutes
 change or rejoin) waits for the next challenge; an old acceptance cannot override
-that boundary. Sidecar, page and runner use the same rule.
+that boundary. Sidecar, page and runner use the same rule. The sidecar refuses a
+minutes/note change while a challenge that still counts the membership is running,
+rather than forfeit that day (run 2, issue #14).
 
 A RESULT timestamp at or before its AWARD is untrusted for duration: charge the
 full deadline-minus-award interval, not zero. Other results continue charging until buyer ACCEPT (or now), capped at deadline. The coordinator and swarm stop assigning when
