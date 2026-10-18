@@ -225,6 +225,9 @@ process-group signal (Ctrl-C, `kill -TERM -<pgid>`, a supervisor) reaches only t
 - **Parent gone** (any exit, including `SIGKILL` or launchd `kickstart -k`), or a second signal:
   the runner stops ticking, kills its in-flight planner/MCP commands after 5 seconds, exits and
   releases the lock.
+- **Startup failure** in the locked runner (no buyer pubkey from `whoami`, a corrupt journal):
+  the error is logged and the runner exits 1 at once, so `flock` and the parent exit 1 and the
+  lock is free for the next start.
 A supervisor without systemd's `KillMode=control-group` (launchd) therefore restarts cleanly. Keep the journal and buyer state together across restarts/backups.
 Planner/MCP errors are logged and retried on the next polling cycle without changing posting
 intent. A pending or unprojected completed job blocks that seller from receiving another job.

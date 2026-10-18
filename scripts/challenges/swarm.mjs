@@ -564,16 +564,20 @@ export const STOP_GRACE_MS = 100000;
 // cancels it once its loop has stopped cleanly, so a clean stop exits (and releases the lock) at
 // once instead of holding the lock for the whole grace.
 export function watchParent(stream,onStop,{graceMs=PARENT_GONE_GRACE_MS,stopGraceMs=STOP_GRACE_MS,exit=code=>process.exit(code),kill=killActiveCommands}={}) {
-  let gone=false,stopping=false,timer,due=Infinity;
-  const arm=(ms,why)=>{const at=Date.now()+ms;if(at>=due)return;clearTimeout(timer);due=at;
-    timer=setTimeout(()=>{console.error(new Date().toISOString(),`${why}; killing in-flight commands and exiting`);kill();exit(1);},ms);};
+  let gone=false,stopping=false,cancelled=false,timer,due=Infinity;
+  const arm=(ms,why)=>{const at=Date.now()+ms;if(cancelled||at>=due)return;clearTimeout(timer);due=at;
+    timer=setTimeout(()=>{if(cancelled)return;console.error(new Date().toISOString(),`${why}; killing in-flight commands and exiting`);kill();exit(1);},ms);};
   const stop=()=>{if(stopping)return;stopping=true;try{onStop();}catch{}};
-  const request=()=>{if(stopping||gone)return;console.error(new Date().toISOString(),'Runner asked to stop; finishing the in-flight tick');
+  const request=()=>{if(cancelled||stopping||gone)return;console.error(new Date().toISOString(),'Runner asked to stop; finishing the in-flight tick');
     stop();arm(stopGraceMs,`Stop grace (${stopGraceMs} ms) elapsed`);};
-  const fire=()=>{if(gone)return;gone=true;console.error(new Date().toISOString(),'Runner parent exited or closed the pipe; stopping');
+  const fire=()=>{if(cancelled||gone)return;gone=true;console.error(new Date().toISOString(),'Runner parent exited or closed the pipe; stopping');
     stop();arm(graceMs,`Parent-gone grace (${graceMs} ms) elapsed`);};
   stream.on('data',request);stream.on('end',fire);stream.on('close',fire);stream.on('error',fire);stream.resume();
-  const status=()=>gone;status.cancel=()=>{clearTimeout(timer);timer=undefined;due=Infinity;stream.pause();stream.removeAllListeners?.('data');stream.removeAllListeners?.('end');stream.destroy?.();};
+  // cancel() is final: destroy() emits close (and may emit error), which must not arm the
+  // parent-gone exit it just cleared (advisor r3 #2). The no-op error listener keeps a late pipe
+  // error from becoming an uncaught exception.
+  const status=()=>gone;status.cancel=()=>{cancelled=true;clearTimeout(timer);timer=undefined;due=Infinity;stream.pause();
+    for(const e of ['data','end','close','error'])stream.removeAllListeners?.(e);stream.on('error',()=>{});stream.destroy?.();};
   return status;
 }
 async function main() {
@@ -636,4 +640,9 @@ async function main() {
     if(parentWatch){parentWatch.cancel();setImmediate(()=>process.exit(process.exitCode??0));}
   }
 }
-if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{console.error(e.message);process.exitCode=1;});
+if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{
+  // Every failure exits (advisor r3 #1). A startup throw in the locked runner (empty relay list, no
+  // buyer pubkey, corrupt journal) happens before the loop's exiting finally, and the parent pipe
+  // keeps stdin flowing, so only setting exitCode left the runner alive holding the lock (and flock
+  // and the parent waiting on it). Nothing is in flight at that point; the journal is fsynced.
+  console.error(e.message);process.exit(1);});

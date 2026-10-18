@@ -365,7 +365,9 @@ try:
                 check(day + ' every deferred assignment posted once after the gap, none dropped', posted == deferred and 'Dropped deferred' not in log)
 
             os.killpg(runner.pid, signal.SIGTERM)
-            runner.wait(timeout=15)
+            # The parent exits only once the locked runner has finished its in-flight tick, which
+            # swarm.mjs bounds by STOP_GRACE_MS (100 s); wait past that, not a shorter guess.
+            runner.wait(timeout=110)
             PROCESSES.remove((day + '-runner', runner))
             return final
         solved = swarm_day('swarm-solved', 4, 30, gap=True)

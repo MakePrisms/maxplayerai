@@ -920,6 +920,53 @@ test('stop: watchParent bounds a stop request by its own grace, and pipe EOF sho
   const dead=await run({stopGraceMs:60000,graceMs:20,end:true});
   assert.deepEqual(dead.events,['stop','kill','exit 1']);assert.ok(dead.ms<5000);assert.equal(dead.gone,true);
 });
+// Advisor r3 #2: cancel() removed data/end but destroy() still emitted close, and close called
+// fire(), which armed the parent-gone exit cancel() had just cleared (masked in main() only by its
+// same-turn process.exit). cancel() is final: nothing is killed and nothing exits afterwards.
+test('stop: watchParent cancel() after a stop byte never kills or exits',async()=>{
+  const {watchParent}=await import('./swarm.mjs');const {PassThrough}=await import('node:stream');
+  const stream=new PassThrough(),events=[];
+  const gone=watchParent(stream,()=>events.push('stop'),{graceMs:30,stopGraceMs:60,kill:()=>events.push('kill'),exit:code=>events.push(`exit ${code}`)});
+  stream.write('stop\n');await new Promise(r=>setTimeout(r,10));assert.deepEqual(events,['stop']);
+  gone.cancel();assert.equal(stream.destroyed,true);
+  await new Promise(r=>setTimeout(r,250));
+  assert.deepEqual(events,['stop'],'no kill/exit after cancel()');assert.equal(gone(),false);
+  // Same with real process.exit: once cancelled, the process drains and exits 0 by itself.
+  const {spawnSync}=await import('node:child_process');
+  const script=`import {watchParent} from ${JSON.stringify(new URL('./swarm.mjs',import.meta.url).href)};import {PassThrough} from 'node:stream';
+    const s=new PassThrough();const w=watchParent(s,()=>console.log('stop'),{graceMs:50,stopGraceMs:100,kill:()=>console.log('kill')});
+    s.write('stop\\n');setTimeout(()=>w.cancel(),10);`;
+  const r=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:20000});
+  assert.deepEqual([r.stdout.trim().split('\n'),r.status],[['stop'],0],r.stderr);
+});
+// Advisor r3 #1: a throw during locked-runner startup (no buyer pubkey, corrupt journal) only set
+// exitCode; the parent pipe kept stdin flowing, so the runner stayed alive with the lock and flock +
+// the parent never exited. Every startup failure must exit and free the lock. (An empty relay list
+// is refused by config() in the parent, before flock, so it never reaches the locked runner.)
+test('stop: a locked-runner startup failure exits non-zero and frees the lock',{skip:!require_flock()},async t=>{
+  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-startup-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const good=`echo "pubkey: ${'a'.repeat(64)}"`;
+  const cases=[
+    {name:'whoami prints no pubkey',whoami:'echo "not configured"',error:/Cannot identify configured buyer/},
+    {name:'corrupt committed journal',whoami:good,journal:'bad\n',error:/JSON/},
+  ];
+  for(const c of cases){
+    const home=join(dir,c.name.replace(/\W+/g,'-')),bin=home+'-bin';
+    fs.writeFileSync(bin,`#!/bin/sh\nif [ "$1" = whoami ]; then ${c.whoami}; exit 0; fi\nexit 1\n`,{mode:0o700});
+    if(c.journal){fs.mkdirSync(join(home,'swarm'),{recursive:true});fs.writeFileSync(join(home,'swarm/events.jsonl'),c.journal);}
+    const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url','ws://127.0.0.1:1'],
+      {stdio:['ignore','ignore','pipe'],env:{...process.env,SWARM_CHALLENGE_RELAYS:'ws://127.0.0.1:1'}});
+    t.after(()=>{try{parent.kill('SIGKILL');}catch{}});
+    let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
+    const lockFree=()=>spawnSync('flock',['-n',join(home,'swarm/runner.lock'),'true']).status===0;
+    const out=await Promise.race([new Promise(r=>parent.on('exit',code=>r({code,lockFreeAtExit:lockFree()}))),new Promise(r=>setTimeout(()=>r({code:'timeout'}),10000))]);
+    assert.notEqual(out.code,'timeout',`${c.name}: parent still alive after 10 s; ${stderr}`);
+    assert.notEqual(out.code,0,`${c.name}: exit code`);
+    assert.equal(out.lockFreeAtExit,true,`${c.name}: lock free when the parent exits`);
+    assert.match(stderr,c.error,c.name);
+  }
+});
 function require_flock(){try{return (globalThis.__flock??=(()=>{const r=process.getBuiltinModule('node:child_process').spawnSync('flock',['--version']);return r.status===0;})());}catch{return false;}}
 
 // Bug 5, upgraded (Rocky's revised report): on a v0.6.1 buyer an expired, never-delivered PAID
