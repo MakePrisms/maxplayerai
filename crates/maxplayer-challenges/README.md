@@ -56,7 +56,9 @@ command re-sends it (never re-signed) to those relays that answered in that comm
 still-dead relay costs nothing; `Re-sent missed event <id> -> <relay>` goes to stderr. It is
 bounded (64 entries, 10 failed attempts per relay, 7 days) and idempotent; a newer event for
 the same coordinate supersedes an older queued one. Queued events also count in this home's
-own trusted reads until delivered.
+own trusted reads until delivered (an expired entry stops counting on the command that expires
+it). The file is not locked: two sidecar commands for the same home running at once can drop
+each other's outbox changes (best-effort repair only), so run one at a time.
 
 **Strict reads.** Two reads still need every relay: the challenge read before a minutes/note
 change during a running challenge (see below), and the pre-publish read of a `scheduled` or
@@ -140,7 +142,8 @@ to change minutes: that also forfeits today. Nothing was published.
   or truncated history), the change fails closed: nothing is published and the error says
   the challenge state could not be read. This read ignores the quorum: one relay down is
   enough to refuse, because the relay left out could be the only one holding the running
-  challenge.
+  challenge. While any relay is missing, the buyer's decisions are re-read from every relay
+  too before "not accepted" is trusted (the acceptance could be only on the missing relay).
 - A first join (or a rejoin after `left`), `leave` and `status` are unaffected and never
   read challenges for this check: leaving always works. Do not leave and rejoin to edit
   minutes mid-challenge: leaving drops eligibility, and the rejoin starts a new period.

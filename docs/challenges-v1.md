@@ -426,8 +426,13 @@ all of them to agree. Consequences and mitigations:
 - The home that published the event keeps it in its outbox until every relay has it and
   counts it in its own trusted reads, so the sidecar never republishes over its own pending
   leave/close (e.g. an `in_progress` update over its own pending completion is refused).
-- Reads whose mistake cannot be undone stay every-relay: the minutes-change challenge read,
-  a degraded non-terminal challenge update, and runner progress re-sends.
+- Reads whose mistake cannot be undone stay every-relay: the minutes-change challenge read
+  (and, while degraded, its decision read: a quorum read that omits the buyer's acceptance
+  must not skip the challenge check), a degraded non-terminal challenge update, and runner
+  progress re-sends.
+- Routine polls never count a relay as missing: a relay that finished its round keeps
+  counting toward the quorum while a poll is in flight (R3-4); it drops out only on a
+  disconnect, a recover, or a failed (refused, truncated, timed-out) round.
 - Not covered: another client reading at a bare quorum, or a relay that acknowledged and then
   dropped the event before re-send. Operators who need the old guarantee set `q = n`.
 
