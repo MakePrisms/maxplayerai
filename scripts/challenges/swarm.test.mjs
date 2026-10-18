@@ -1032,7 +1032,7 @@ test('expired paid job: slot stays held on an unconfirmed read or a pending awar
 });
 
 // Run 2 #9: the journal appended a full state copy per save until startup died (649 MB).
-const realFs=()=>{const fs=process.getBuiltinModule('node:fs');return {openSync:fs.openSync,readSync:fs.readSync,writeSync:fs.writeSync,fsyncSync:fs.fsyncSync,closeSync:fs.closeSync,renameSync:fs.renameSync,fstatSync:fs.fstatSync};};
+const realFs=()=>{const fs=process.getBuiltinModule('node:fs');return {openSync:fs.openSync,readSync:fs.readSync,writeSync:fs.writeSync,fsyncSync:fs.fsyncSync,closeSync:fs.closeSync,renameSync:fs.renameSync,unlinkSync:fs.unlinkSync,fstatSync:fs.fstatSync};};
 test('journal: many saves keep exactly one record; restart reads the latest state',()=>{
   const dir=mkdtempSync(join(tmpdir(),'swarm-journal-one-')),path=join(dir,'events.jsonl');
   try {
@@ -1228,4 +1228,93 @@ test('close: the latest-challenge read passes the sidecar status its required --
   const {latestChallengeArgs}=await import('./swarm.mjs');
   assert.deepEqual(latestChallengeArgs(['ws://a','ws://b'],{buyer:'f'.repeat(64),id:'day-1'}),
     ['status','--relay','ws://a','--relay','ws://b','--buyer','f'.repeat(64),'--challenge','day-1','--json']);
+});
+
+// Advisor r1 #1: the runner's status read was in_progress, the close landed before the sidecar's own
+// pre-publish fetch, and the sidecar refused (exit 3). The refusal is a close: journaled, nothing more.
+test('close: a sidecar "challenge closed" publish refusal is journaled as the buyer close; nothing more is published',async()=>{
+  const {closedRefusal,SIDECAR_CLOSED_EXIT}=await import('./swarm.mjs');
+  const refusal=Object.assign(Error('maxplayer-challenges exited 3: challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published'),
+    {exitCode:SIDECAR_CLOSED_EXIT,stderr:'challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published\n'});
+  assert.equal(closedRefusal(refusal),'cancelled');
+  assert.equal(closedRefusal({...refusal,exitCode:2}),null,'only the dedicated exit code counts');
+  assert.equal(closedRefusal(Object.assign(Error('x'),{exitCode:3,stderr:'challenge: relay read incomplete'})),null);
+  for(const kind of ['progress','completion']) {
+    const f=fixture(),reports=[];f.io.report=m=>reports.push(m);let attempts=0;
+    // The runner's read still says in_progress; the sidecar's own fetch sees the cancel and refuses.
+    f.io.publish=async(...a)=>{attempts++;f.calls.push(['publish',a]);return {closed:'cancelled'};};
+    f.setPlan(kind==='progress'?()=>({wait:true}):()=>({solved:true,result:'answer'}));
+    f.time(200);await f.runner.tick();
+    assert.equal(attempts,1,kind);
+    const day=Object.values(f.journal.state.days)[0];
+    assert.equal(day.closed.status,'cancelled',kind);
+    if(kind==='progress')assert.deepEqual(day.stop,{external:true});
+    else {assert.equal(day.published,true);assert.equal(day.stop.supersededBy,'cancelled');}
+    assert.ok(reports.some(m=>m.includes('already cancelled on the relays')),kind);
+    const postsBefore=posts(f).length;
+    for(const t of [400,600,900]){f.time(t);await f.runner.tick();}
+    assert.equal(attempts,1,`${kind}: never published again`);
+    assert.equal(posts(f).length,postsBefore,`${kind}: no new work after the close`);
+  }
+});
+test('close: progress passes the latest read status through unchanged (never the tick-start snapshot status)',async()=>{
+  const f=fixture();f.snap.challenge.status='in_progress';
+  f.io.latestChallenge=async()=>({...structuredClone(f.snap.challenge),status:'scheduled',budgetSats:10});
+  f.setPlan(()=>({wait:true}));f.time(200);await f.runner.tick();
+  assert.equal(f.publishes.at(-1)[2],'scheduled','the relay status is re-sent as read');
+});
+// Advisor r1 #2: lastUpdate was saved before the publish, so a failed re-read waited a full updateEvery.
+test('progress: a failed latest-challenge read is retried on the next tick; a cancel seen then is journaled, nothing published',async()=>{
+  const f=fixture();let fail=true,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>{if(fail){fail=false;throw Error('challenge relay read incomplete');}return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.lastUpdate,0,'interval not restarted by a failed publish');
+  relay={...relay,status:'cancelled'};f.time(201);await f.runner.tick();
+  assert.equal(f.publishes.length,0);assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
+  // A successful progress publish does restart the interval.
+  const g=fixture();g.setPlan(()=>({wait:true}));g.time(200);await g.runner.tick();
+  assert.equal(g.publishes.length,1);assert.equal(Object.values(g.journal.state.days)[0].lastUpdate,200);
+  g.time(250);await g.runner.tick();assert.equal(g.publishes.length,1,'next progress waits updateEvery');
+});
+test('journal: a failed save removes its temp file; the durable record is untouched',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-tmp-')),path=join(dir,'events.jsonl');
+  try {
+    const j=new Journal(path);j.state.jobs.push({id:'kept'});j.save();
+    const fs=realFs();
+    for(const fault of ['fsyncSync','renameSync','writeSync']) {
+      const bad=new Journal(path,{fs:{...fs,[fault]:()=>{throw Object.assign(Error(fault),{code:'EIO'});}}});
+      bad.state.jobs.push({id:fault});assert.throws(()=>bad.save(),e=>e.journalFailure===true);
+      assert.equal(process.getBuiltinModule('node:fs').existsSync(`${path}.tmp`),false,`${fault}: temp removed`);
+      assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept']);
+    }
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('collect: a permanent refusal after long stderr is still recognised; the recorded reason starts at the marker',async()=>{
+  const {permanentCollectRefusal,collectFailureReason}=await import('./swarm.mjs');
+  const message=`node exited 1: ${'warning: noisy stderr line\n'.repeat(40)}{"isError":true,"content":[{"type":"text","text":"${refusal}"}]}`;
+  assert.ok(message.indexOf('review: permanent input error')>500);
+  assert.ok(permanentCollectRefusal(message));
+  assert.ok(collectFailureReason(message).startsWith('review: permanent input error (unsupported_input)'));
+  assert.ok(collectFailureReason(message).length<=500);
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  const orig=f.io.mcp;f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);throw Error(message);}return orig(t,a);};
+  f.setPlan(()=>({wait:true}));for(let t=101;t<=140;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,1);
+  assert.equal(f.journal.state.jobs[0].outcome,'collect refused');
+  assert.match(f.journal.state.jobs[0].collectRefused,/^review: permanent input error/);
+  // Not permanent: timeouts keep their full prefix text.
+  assert.equal(collectFailureReason('collect: review: timeout'),'collect: review: timeout');
+});
+test('relay health: a tick that is both a change and a heartbeat says so',async t=>{
+  const {startRelayHealthLog}=await import('./swarm.mjs');
+  t.mock.timers.enable({apis:['setInterval','Date']});
+  const d={status:{connected:true,authenticated:true,historyComplete:true,error:null,warnings:[],failedRelays:[],relays:[]},sockets:{}};
+  const logs=[];const h=startRelayHealthLog(()=>structuredClone(d),m=>logs.push(m),{checkMs:5000,heartbeatMs:60000});
+  assert.match(logs[0],/^Relay change \+ heartbeat: relay overall/);
+  t.mock.timers.tick(55000);d.status.error='x';t.mock.timers.tick(5000);
+  assert.match(logs.at(-1),/^Relay change \+ heartbeat: .*error="x"/);
+  h.stop();
 });

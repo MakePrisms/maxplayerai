@@ -213,7 +213,9 @@ exact post arguments, preparation/job IDs, collected answers, payment receipts a
 reasons. Sequence-derived request IDs are permanent; a lost response is recovered by a read-only
 preparation lookup before any retry. It holds exactly ONE state record: every save writes the full
 state to `events.jsonl.tmp`, fsyncs it, renames it over the journal and fsyncs the directory, so a
-crash leaves either the previous or the new record and the file never grows past one state.
+crash leaves either the previous or the new record and the file never grows past one state. A
+save that fails before the rename removes its `events.jsonl.tmp` (a crash can still leave one; the
+next save truncates it) and stops the runner.
 Journals written by older runners (one appended copy per save; run 2 reached 649 MB) are migrated
 on startup: the file is scanned in 1 MiB chunks, never read as one string, the last complete record
 is kept (a torn final append is discarded) and rewritten as one record. A corrupt last complete
@@ -238,12 +240,16 @@ Planner/MCP errors are logged and retried on the next polling cycle without chan
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
 
 Before every challenge publish (progress or completion) the runner re-reads the latest
-buyer-signed challenge from the challenge relays (`maxplayer-challenges status --challenge <d>`),
+buyer-signed challenge from the challenge relays (`maxplayer-challenges status --buyer <hex> --challenge <d> --json`),
 not the tick-start snapshot. If it is `completed` or `cancelled` — closed by the operator, or by
 anything else holding the buyer key — nothing is published, the close is journaled as an external
 stop (no new work, outstanding jobs still collected) and restarts publish nothing either. A status
 never moves backwards; progress re-sends the relay's own status, title, budget and result. If that
-read fails nothing is published and the publish is retried on a later tick.
+read fails nothing is published and the publish is retried on the next tick (the progress interval
+restarts only after a successful publish). That read can still be stale by the time the sidecar
+signs, so `maxplayer-challenges publish` checks again: if its own pre-publish fetch shows the
+challenge `completed` or `cancelled` it signs nothing and exits 3 (`challenge: challenge closed
+(<status>): …`). The runner treats that refusal exactly like a close seen in its read.
 
 Once the planner verifies success, completion includes `--result`. If no eligible seller can fit
 another task and none is running, the work window ends, or zero headroom rejects an idle paid-only batch, the
@@ -337,7 +343,8 @@ truncated text as incomplete and may re-request detail as a task. The full answe
 journal. A collected result whose answer could not be read is `[collected, answer unreadable: …]`
 with `answerError`.
 
-**Collect failures.** A `collect` error containing `review: permanent input error` (the buyer's
+**Collect failures.** A `collect` error containing `review: permanent input error` anywhere in its
+text (stderr may precede the tool-error JSON; the recorded reason starts at that marker) (the buyer's
 pre-collect delivery review refused the delivery itself — binary/non-UTF-8 files, symlinks,
 submodules, oversized or invalid input; maxplayer-core `review.rs` `permanent_code`) cannot succeed
 on retry. It is recorded once as outcome `collect refused` with `collectRefused`/`answerError`, the
@@ -345,6 +352,9 @@ planner sees it, the seller is released in the runner, nothing is paid, and coll
 again for that job (a priced job's sats stay reserved: there is no receipt or release proof). Every
 other collect error is transient and retried with a doubling backoff (10 s, 20 s … capped at 600 s)
 until it succeeds; the seller stays busy meanwhile. Each failure is logged with its attempt number.
+Known retry-forever cases: core does not mark `policy_refused` (`review/state.rs` 125-126) or
+`review: encrypted message too large` (`review/private.rs` 84) permanent, so such a job keeps its
+seller busy until an operator intervenes.
 
 **Delivered answers.** A non-empty `answer.txt` (the buyer's materialized inline answer) is the
 answer, capped like every file at 64 KiB with a `[truncated: first N of M bytes shown]` marker, so
@@ -490,7 +500,8 @@ relays only). The sidecar never uses the configured job relay for challenges.
 The runner logs relay readiness from its own 5 s timer, independent of ticks (a slow planner
 call cannot hide a stall): `Relay change: …` whenever a relay's `connected`, `authenticated`,
 `historyComplete`, `error`, `warnings` or socket state changes, and a `Relay heartbeat: …` line per
-relay every 60 s with reconnect count, message count and the age of its last received frame. A
+relay every 60 s with reconnect count, message count and the age of its last received frame
+(`Relay change + heartbeat: …` when one check is both). A
 relay that stays "ready" while its last frame grows old is a silent stall. Live-subscription,
 pending-page and EOSE counts are not part of the reader's exposed status and are not logged.
 

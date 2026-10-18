@@ -27,6 +27,8 @@ export function openSnapshot({url,challengeRelays,buyer,onChange=()=>{},WebSocke
   const reader=new ChallengeReader({url,challengeRelays,buyer,store,WebSocketImpl:sockets.WebSocketImpl,onChange:()=>onChange(snapshot())});
   const snapshot=()=>({...store.snapshot(buyer),relay:{...reader.status}});
   reader.start();
+  // Ref'd on purpose (the E2E artifact writer has nothing else keeping it alive); the runner clears it
+  // in stop() before exiting, so it never delays a runner shutdown.
   const timer=setInterval(()=>onChange(snapshot()),1000);
   // Diagnostics only: the reader's exposed status plus socket activity. Never used for readiness.
   const diagnostics=()=>({status:reader.status,sockets:sockets.activity()});
