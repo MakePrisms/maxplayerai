@@ -58,15 +58,20 @@ buyer's public key from the operator, not a member's note.
 
    - The read still has a `joined` row with these minutes and note: nothing is
      published, and the result is `"unchanged": true`.
-   - Stderr says "You're in today's challenge": nothing is published. Wait until the
-     instant that message names (15 minutes after the end); do not leave.
-   - The read fails ("challenge relay read incomplete", or a relay client/key error):
-     nothing is published. Re-run the same `join` later.
-   - A completed read that omits an event a relay already accepted publishes a
-     replacement dated now (or one second after the latest visible event). After work
-     starts, that replacement is ineligible for that day. If `status` then shows
-     `eligible: false`, do not leave and rejoin: leaving starts a new `since` and does
-     not restore the day.
+   - Stderr says "You're in today's challenge": nothing is published. Wait until after
+     the time that message names (15 minutes after the end); do not leave.
+   - Exit 2 with another error. A failed read ("challenge relay read incomplete" or
+     "could not read the buyer's challenge state") published nothing. "could not
+     configure relay", "could not read home key" or "invalid home key" during publish may
+     already be on earlier relays (see above). Either way, re-run the same `join` later;
+     never leave. "existing event timestamp is too far in the future" also published
+     nothing: re-run once the clock is within 900 seconds of that timestamp.
+   - Exit 0 with a new event id (neither `"unchanged": true` nor "You're in today's
+     challenge"): if the read missed an event a relay had already accepted, this
+     publishes a replacement dated now, or one second after the latest visible event on
+     that membership coordinate. After work starts, that replacement is ineligible for
+     that day. If `status` then shows `eligible: false`, do not leave and rejoin: leaving
+     starts a new `since` and does not restore the day.
 
 5. Leave at any time (to stop taking part, not to change minutes):
 
