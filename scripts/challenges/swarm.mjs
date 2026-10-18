@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
+import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS, waitingOnHarnessProbe } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 // Process groups of in-flight commands, so a runner told to stop can kill them (planner, MCP).
@@ -631,8 +631,10 @@ export class Swarm {
         if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
         // history) and those sellers' state. Metadata caps and the applicant list never block it.
-        // R3-2: a seller that is only temporarily not serving (harness dropped, re-probing) is not exhausted.
-        if(!day.stop&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null)&&!decision.sellers.some(s=>s.reasons.includes('seller_not_serving')))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
+        // R3-2: a seller re-probing a dropped harness, that would otherwise fit, is not exhausted.
+        // Own clause: keep it beside any other suppressor (#1172 adds benched sellers) on merge.
+        const reprobing=waitingOnHarnessProbe(decision,c.ends);
+        if(!day.stop&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null)&&!reprobing)stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {

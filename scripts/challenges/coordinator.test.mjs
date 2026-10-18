@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { coordinate } from './coordinator.mjs';
+import { coordinate, waitingOnHarnessProbe } from './coordinator.mjs';
 const fixture = () => ({asOf:100,relay:{connected:true,authenticated:true,historyComplete:true},challenge:{id:'test',starts:100,ends:200,status:'in_progress'},budget:{totalSats:10,committedSats:3,paidSats:2,unknownAmounts:0},jobs:[],sellers:[{pubkey:'a'.repeat(64),eligible:true,decision:'accepted',state:'accepted',minutesRemaining:1,currentJobStart:null}]});
 test('inclusive work window, fractional minutes and deterministic output',()=>{const s=fixture();assert.deepEqual(coordinate(s),coordinate(s));assert.equal(coordinate(s,{durationSeconds:60}).postingAllowed,true);assert.equal(coordinate(s,{durationSeconds:61}).postingAllowed,false);s.asOf=200;assert.equal(coordinate(s,{now:200,durationSeconds:1}).postingAllowed,true);assert.equal(coordinate(s,{now:201}).postingAllowed,false);});
 test('deny, leave, busy and pending exclude sellers',()=>{for(const change of [{eligible:false},{state:'left'},{decision:'denied'},{currentJobStart:100}]){const s=fixture();Object.assign(s.sellers[0],change);assert.equal(coordinate(s).sellers.length,0);}const s=fixture();s.jobs=[{seller:s.sellers[0].pubkey,running:true}];assert.equal(coordinate(s).sellers.length,0);s.jobs=[];assert.equal(coordinate(s,{pendingSellers:[s.sellers[0].pubkey]}).sellers.length,0);});
@@ -14,4 +14,14 @@ test('R3-2: a seller whose heartbeat says not_serving or serving=0/N is ineligib
   for(const change of [{},{servingState:'unknown',serving:null},{servingState:'serving',serving:{available:1,configured:2}}]){
     const r=allowed(change);assert.equal(r.postingAllowed,true,JSON.stringify(change));assert.deepEqual(r.reasons,[]);
   }
+});
+test('R3-2 advisor r1: only a seller whose SOLE reason is seller_not_serving and whose task fits the window holds the day open',()=>{
+  const d=(reasons,deadlineUnix=500,roster=[])=>({reasons:roster,sellers:[{reasons,deadlineUnix}]});
+  assert.equal(waitingOnHarnessProbe(d(['seller_not_serving']),1000),true);
+  assert.equal(waitingOnHarnessProbe(d(['seller_not_serving'],1000),1000),true,'deadline exactly at ends still fits');
+  assert.equal(waitingOnHarnessProbe(d(['insufficient_minutes','seller_not_serving']),1000),false,'short of minutes');
+  assert.equal(waitingOnHarnessProbe(d(['seller_not_serving'],1001),1000),false,'task cannot finish before ends');
+  assert.equal(waitingOnHarnessProbe(d(['seller_not_serving'],500,['relay_not_ready']),1000),false,'roster-wide reason');
+  assert.equal(waitingOnHarnessProbe(d([]),1000),false);
+  assert.equal(waitingOnHarnessProbe({reasons:[],sellers:[]},1000),false);
 });

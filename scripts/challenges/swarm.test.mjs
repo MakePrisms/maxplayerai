@@ -1398,3 +1398,17 @@ test('R3-2: a not-serving seller gets no assignment and does not count as exhaus
   const g=fixture();g.setPlan(()=>({wait:true}));g.snap.sellers[0].servingState='not_serving';g.snap.sellers[1].minutesRemaining=.1;
   await g.runner.tick();assert.ok(!g.publishes.some(p=>/exhausted/.test(p[3]??'')),'a temporarily not-serving seller is not exhausted');
 });
+test('R3-2 advisor r1: a not-serving seller with too few minutes for minDuration does not hold the day open',async()=>{
+  const f=fixture();f.setPlan(()=>({wait:true}));
+  f.snap.sellers[0].servingState='not_serving';f.snap.sellers[0].serving={available:0,configured:1};
+  f.snap.sellers.forEach(s=>s.minutesRemaining=.1); // 6s < minDuration 30s
+  await f.runner.tick();
+  assert.match(f.publishes.at(-1)?.[3]??'',/Unsolved: all eligible sellers exhausted/);
+});
+test('R3-2 advisor r1: a not-serving seller whose minimum task cannot finish before ends does not hold the day open',async()=>{
+  const f=fixture();f.setPlan(()=>({wait:true}));
+  f.snap.sellers[0].servingState='not_serving';f.snap.sellers[0].serving={available:0,configured:1};
+  f.time(980); // 980 + minDuration 30 > ends 1000, still inside the window
+  await f.runner.tick();
+  assert.match(f.publishes.at(-1)?.[3]??'',/Unsolved: all eligible sellers exhausted/);
+});
