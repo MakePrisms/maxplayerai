@@ -1389,3 +1389,57 @@ test('progress: a backward clock step during the planner cannot suppress a re-re
   const day=Object.values(f.journal.state.days)[0];
   assert.equal(day.closed.status,'cancelled');assert.equal(f.publishes.length,0);
 });
+
+// Run 2 #13: challenge relay quorum in the runner.
+test('quorum: coverage log line says degraded (WARNING), below quorum, or trade relay down',async()=>{
+  const {relayCoverageLine}=await import('./swarm.mjs');
+  const trade={role:'trade',url:'ws://trade',connected:true,error:null};
+  const base={failedRelays:[],missingRelays:[],quorum:{required:2,complete:3,total:3},degraded:false,relays:[trade]};
+  assert.equal(relayCoverageLine(base),'All configured relays available');
+  assert.equal(relayCoverageLine({...base,failedRelays:['ws://c'],missingRelays:['ws://c'],quorum:{required:2,complete:2,total:3},degraded:true}),
+    'WARNING: relay coverage degraded (2 of 3 challenge relays complete, quorum 2); missing: ws://c');
+  assert.equal(relayCoverageLine({...base,failedRelays:['ws://b','ws://c'],missingRelays:['ws://b','ws://c'],quorum:{required:2,complete:1,total:3}}),
+    'Relay coverage below quorum (1 of 3 challenge relays complete, need 2); unavailable: ws://b, ws://c');
+  assert.match(relayCoverageLine({...base,failedRelays:['ws://trade'],relays:[{...trade,connected:false}]}),/trade relay unavailable: ws:\/\/trade \(required\)/);
+});
+test('quorum: sidecar degraded warnings and re-sends from --json reach the runner log',async()=>{
+  const {sidecarQuorumLines,latestChallengeArgs,quorumArgs}=await import('./swarm.mjs');
+  assert.deepEqual(sidecarQuorumLines({relay_quorum:{warnings:['degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/'],resent:['ab -> ws://c/']}}),
+    ['WARNING: challenge relays degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/','Re-sent missed challenge event ab -> ws://c/']);
+  assert.deepEqual(sidecarQuorumLines({}),[]);assert.deepEqual(sidecarQuorumLines(null),[]);
+  assert.deepEqual(quorumArgs(undefined),[]);
+  assert.deepEqual(latestChallengeArgs(['ws://a','ws://b','ws://c'],{buyer:'f'.repeat(64),id:'d'},2),
+    ['status','--relay','ws://a','--relay','ws://b','--relay','ws://c','--quorum','2','--buyer','f'.repeat(64),'--challenge','d','--json']);
+});
+test('quorum: SWARM_CHALLENGE_QUORUM defaults to 2 and must be a majority of the challenge relays',()=>{
+  const argv=['--home','/tmp/q-home','--relay-url','ws://trade'];
+  assert.equal(config(argv,{}).challengeQuorum,2);
+  assert.equal(config(argv,{SWARM_CHALLENGE_QUORUM:'3'}).challengeQuorum,3);
+  assert.equal(config(argv,{SWARM_CHALLENGE_RELAYS:'ws://a'}).challengeQuorum,1);
+  for(const q of ['1','4','x'])assert.throws(()=>config(argv,{SWARM_CHALLENGE_QUORUM:q}),/Invalid challenge relay quorum/,q);
+});
+test('quorum: a challenge publish needs our trade relay even when the challenge quorum is met',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  Object.assign(f.snap.relay,{quorum:{required:2,complete:3,total:3},relays:[{role:'trade',url:'ws://trade',connected:false,authenticated:false,historyComplete:false,error:'Relay history timed out'}]});
+  const day={};
+  await assert.rejects(f.runner.publishChallenge(day,f.snap.challenge,'completed','u','r'),/trade relay not ready; not publishing completed/);
+  await assert.rejects(f.runner.publishChallenge(day,f.snap.challenge,null,'progress'),/trade relay not ready; not publishing progress/);
+  assert.equal(f.publishes.length,0);
+  f.snap.relay.relays[0]={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null};
+  assert.equal(await f.runner.publishChallenge(day,f.snap.challenge,'completed','u','r'),true);assert.equal(f.publishes.length,1);
+});
+test('quorum: progress re-sends need every relay (strict); completion uses the quorum; while degraded progress waits and says so once',async()=>{
+  const f=fixture(),reports=[],reads=[];f.io.report=m=>reports.push(m);f.setPlan(()=>({wait:true}));
+  const latest=f.io.latestChallenge;f.io.latestChallenge=async(c,o)=>{reads.push(o);return latest(c,o);};
+  Object.assign(f.snap.relay,{degraded:true,missingRelays:['ws://c'],quorum:{required:2,complete:2,total:3}});
+  await f.runner.tick();f.time(300);await f.runner.tick();f.time(301);await f.runner.tick();
+  assert.equal(f.publishes.length,0,'no progress while degraded');
+  assert.equal(reports.filter(r=>r.startsWith('Progress update for day postponed: challenge relays degraded (ws://c missing)')).length,1);
+  Object.assign(f.snap.relay,{degraded:false,missingRelays:[],quorum:{required:2,complete:3,total:3}});
+  f.time(302);await f.runner.tick();
+  assert.equal(f.publishes.length,1);assert.deepEqual(f.publishes[0][5],{strict:true});assert.deepEqual(reads.at(-1),{strict:true});
+  // Completion while degraded still publishes, at the quorum.
+  Object.assign(f.snap.relay,{degraded:true,missingRelays:['ws://c'],quorum:{required:2,complete:2,total:3}});
+  f.snap.sellers.forEach(s=>s.minutesRemaining=.1);f.time(303);await f.runner.tick();
+  assert.equal(f.publishes.at(-1)[2],'completed');assert.deepEqual(f.publishes.at(-1)[5],{strict:false});assert.deepEqual(reads.at(-1),{strict:false});
+});
