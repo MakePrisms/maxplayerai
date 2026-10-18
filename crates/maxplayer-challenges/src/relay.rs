@@ -473,17 +473,33 @@ pub(crate) mod transport_tests {
             self.task.abort();
         }
     }
-    type Answer = Arc<dyn Fn(&serde_json::Value) -> Vec<Event> + Send + Sync>;
+    /// `None` answers the REQ with `CLOSED` (a refused read) instead of events + EOSE.
+    type Answer = Arc<dyn Fn(&serde_json::Value) -> Option<Vec<Event>> + Send + Sync>;
     /// Every REQ gets every event, whatever its filter (models a relay ignoring filters).
     pub(crate) async fn fixture(events: Vec<Event>, eose: bool, accept: bool) -> Fixture {
-        fixture_with(Arc::new(move |_| events.clone()), eose, accept).await
+        fixture_with(Arc::new(move |_| Some(events.clone())), eose, accept).await
     }
     /// Answers like a public relay: honours kinds/authors/#p/since/until, newest first (ties in
     /// the given order, so junk listed first wins a tie), at most `limit` (default cap 500).
     /// `sample_only` events are served only to REQs without `authors` (the applicant sample),
     /// modelling a relay that returned an event to one query and not to the trusted one.
     pub(crate) async fn relay_like(events: Vec<Event>, sample_only: Vec<Event>) -> Fixture {
+        relay_like_closing(events, sample_only, None).await
+    }
+    /// `relay_like`, but every REQ whose `kinds` include `closed_kind` is refused with `CLOSED`.
+    pub(crate) async fn relay_like_closing(
+        events: Vec<Event>,
+        sample_only: Vec<Event>,
+        closed_kind: Option<u16>,
+    ) -> Fixture {
         let answer = move |raw: &serde_json::Value| {
+            if closed_kind.is_some_and(|k| {
+                raw["kinds"]
+                    .as_array()
+                    .is_some_and(|kinds| kinds.iter().any(|v| v == k))
+            }) {
+                return None;
+            }
             let filter: Filter = serde_json::from_value(raw.clone()).unwrap();
             let mut out: Vec<Event> = events
                 .iter()
@@ -493,7 +509,7 @@ pub(crate) mod transport_tests {
                 .collect();
             out.sort_by_key(|a| std::cmp::Reverse(a.created_at));
             out.truncate(filter.limit.unwrap_or(PAGE_LIMIT));
-            out
+            Some(out)
         };
         fixture_with(Arc::new(answer), true, true).await
     }
@@ -519,7 +535,20 @@ pub(crate) mod transport_tests {
                         match m[0].as_str() {
                             Some("REQ") => {
                                 filters.lock().unwrap().push(m[2].clone());
-                                for event in &answer(&m[2]) {
+                                let Some(events) = answer(&m[2]) else {
+                                    ws.send(Message::text(
+                                        serde_json::json!([
+                                            "CLOSED",
+                                            m[1],
+                                            "error: fixture refused"
+                                        ])
+                                        .to_string(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                                    continue;
+                                };
+                                for event in &events {
                                     ws.send(Message::text(
                                         serde_json::json!(["EVENT", m[1], event]).to_string(),
                                     ))
