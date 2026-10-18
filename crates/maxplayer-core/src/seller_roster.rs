@@ -49,8 +49,8 @@
 //! BUYER would pay for it. The probe is ours to run and ours to pay for.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::seller_agents::{normalize_request, AgentRegistry, RegisteredAgent};
@@ -1281,15 +1281,47 @@ mod tests {
         use crate::heartbeat::ServingCount;
         let roster = roster(&[Some("claude"), None]);
         let count = |r: &LiveRoster| r.advertisement().harnesses;
-        assert_eq!(count(&roster), ServingCount { available: 2, configured: 2 }, "the hatch counts too");
+        assert_eq!(
+            count(&roster),
+            ServingCount {
+                available: 2,
+                configured: 2
+            },
+            "the hatch counts too"
+        );
         roster.fault(1, Fault::Unproven, Instant::now());
-        assert_eq!(count(&roster), ServingCount { available: 1, configured: 2 });
-        roster.fault(0, Fault::Incapable(MissingCapability::AcpFeature), Instant::now());
+        assert_eq!(
+            count(&roster),
+            ServingCount {
+                available: 1,
+                configured: 2
+            }
+        );
+        roster.fault(
+            0,
+            Fault::Incapable(MissingCapability::AcpFeature),
+            Instant::now(),
+        );
         let ad = roster.advertisement();
-        assert_eq!(ad.harnesses, ServingCount { available: 0, configured: 2 });
-        assert!(!ad.serving, "a zero count and `serving` come from one snapshot");
+        assert_eq!(
+            ad.harnesses,
+            ServingCount {
+                available: 0,
+                configured: 2
+            }
+        );
+        assert!(
+            !ad.serving,
+            "a zero count and `serving` come from one snapshot"
+        );
         roster.restore(1);
-        assert_eq!(count(&roster), ServingCount { available: 1, configured: 2 });
+        assert_eq!(
+            count(&roster),
+            ServingCount {
+                available: 1,
+                configured: 2
+            }
+        );
     }
 
     #[test]
@@ -1298,15 +1330,27 @@ mod tests {
         let now = Instant::now();
         let g0 = roster.generation();
         roster.record_model(0, Some("m".into()));
-        assert_eq!(roster.generation(), g0, "a model observation is not a serving transition");
+        assert_eq!(
+            roster.generation(),
+            g0,
+            "a model observation is not a serving transition"
+        );
         roster.restore(0);
-        assert_eq!(roster.generation(), g0, "restoring a serving harness changes nothing");
+        assert_eq!(
+            roster.generation(),
+            g0,
+            "restoring a serving harness changes nothing"
+        );
 
         roster.fault(0, Fault::Unproven, now);
         let g1 = roster.generation();
         assert_ne!(g1, g0, "a drop is news");
         roster.fault(0, Fault::Unproven, now);
-        assert_eq!(roster.generation(), g1, "a failed probe on a dropped harness is not a transition");
+        assert_eq!(
+            roster.generation(),
+            g1,
+            "a failed probe on a dropped harness is not a transition"
+        );
         roster.claim_due_probes(now + Duration::from_secs(3600));
         roster.abandon_probe(0, now);
         assert_eq!(roster.generation(), g1, "an abandoned probe proved nothing");

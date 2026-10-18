@@ -363,8 +363,7 @@ pub enum ServingState {
 /// say "I cannot work" must not assign it work on the strength of a number beside it.
 pub fn serving_from_tags(tags: &[TagSpec]) -> (Option<ServingCount>, ServingState) {
     let count = first_tag_value(tags, SERVING_TAG).and_then(ServingCount::from_wire);
-    let not_serving =
-        first_tag_value(tags, STATUS_TAG).map(str::trim) == Some(STATUS_NOT_SERVING);
+    let not_serving = first_tag_value(tags, STATUS_TAG).map(str::trim) == Some(STATUS_NOT_SERVING);
     let state = match count {
         _ if not_serving => ServingState::NotServing,
         Some(count) if count.available == 0 => ServingState::NotServing,
@@ -2735,9 +2734,21 @@ mod free_lane_tests {
 
     // BEGIN R3-2 serving tests
     fn served(available: u32, configured: u32) -> EventDraft {
-        heartbeat_for_state(0, available > 0, 5, false, mints(), Vec::new(), SeatCapability::default(), policy())
-            .with_serving(ServingCount { available, configured })
-            .to_event_draft()
+        heartbeat_for_state(
+            0,
+            available > 0,
+            5,
+            false,
+            mints(),
+            Vec::new(),
+            SeatCapability::default(),
+            policy(),
+        )
+        .with_serving(ServingCount {
+            available,
+            configured,
+        })
+        .to_event_draft()
     }
 
     /// R3-2 — the tag in each state the live roster can be in. Expected values written by hand.
@@ -2746,7 +2757,11 @@ mod free_lane_tests {
         // Fully serving: one of one.
         let full = served(1, 1);
         assert_eq!(first_tag_value(&full.tags, SERVING_TAG), Some("1/1"));
-        assert_eq!(first_tag_value(&full.tags, STATUS_TAG), None, "a serving seat states no status");
+        assert_eq!(
+            first_tag_value(&full.tags, STATUS_TAG),
+            None,
+            "a serving seat states no status"
+        );
         assert_eq!(first_tag_value(&full.tags, "accepting"), Some("y"));
 
         // Partly serving: one of two dropped. Still eligible, and the count says so.
@@ -2767,7 +2782,10 @@ mod free_lane_tests {
         assert_eq!(state(&dark), ServingState::NotServing);
         assert_eq!(
             parse_heartbeat(&partial).unwrap().serving,
-            Some(ServingCount { available: 1, configured: 2 })
+            Some(ServingCount {
+                available: 1,
+                configured: 2
+            })
         );
     }
 
@@ -2775,22 +2793,48 @@ mod free_lane_tests {
     /// UNKNOWN, never not-serving. A malformed value is unknown too.
     #[test]
     fn an_absent_or_malformed_serving_tag_is_unknown_never_not_serving() {
-        let old = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), policy())
-            .to_event_draft();
-        assert!(old.tags.iter().all(|t| t.first() != Some(SERVING_TAG) && t.first() != Some(STATUS_TAG)),
-            "a draft that was not given a count emits exactly the old tag set");
+        let old = heartbeat_for_state(
+            0,
+            true,
+            5,
+            false,
+            mints(),
+            Vec::new(),
+            SeatCapability::default(),
+            policy(),
+        )
+        .to_event_draft();
+        assert!(
+            old.tags
+                .iter()
+                .all(|t| t.first() != Some(SERVING_TAG) && t.first() != Some(STATUS_TAG)),
+            "a draft that was not given a count emits exactly the old tag set"
+        );
         let parsed = parse_heartbeat(&old).expect("an older beat still parses");
         assert_eq!(parsed.serving, None);
         assert_eq!(parsed.serving_state, ServingState::Unknown);
 
-        for bad in ["", "1", "1/", "/1", "2/1", "0/0", "a/b", "-1/2", "1/2/3", " 1 / 2", "+1/2"] {
+        for bad in [
+            "", "1", "1/", "/1", "2/1", "0/0", "a/b", "-1/2", "1/2/3", " 1 / 2", "+1/2",
+        ] {
             let mut event = old.clone();
             event.tags.push(TagSpec::new([SERVING_TAG, bad]));
-            let parsed = parse_heartbeat(&event).expect("a malformed serving tag never fails the parse");
-            assert_eq!(parsed.serving_state, ServingState::Unknown, "{bad:?} must read unknown");
+            let parsed =
+                parse_heartbeat(&event).expect("a malformed serving tag never fails the parse");
+            assert_eq!(
+                parsed.serving_state,
+                ServingState::Unknown,
+                "{bad:?} must read unknown"
+            );
         }
         // Surrounding whitespace on the whole value is tolerated, like the other readers.
-        assert_eq!(ServingCount::from_wire(" 1/2 "), Some(ServingCount { available: 1, configured: 2 }));
+        assert_eq!(
+            ServingCount::from_wire(" 1/2 "),
+            Some(ServingCount {
+                available: 1,
+                configured: 2
+            })
+        );
     }
 
     /// `status=not_serving` wins over a count that says otherwise, and on its own (no count) it still
@@ -2798,22 +2842,48 @@ mod free_lane_tests {
     #[test]
     fn a_stated_not_serving_wins_over_a_contradicting_count() {
         let mut event = served(1, 1);
-        event.tags.push(TagSpec::new([STATUS_TAG, STATUS_NOT_SERVING]));
+        event
+            .tags
+            .push(TagSpec::new([STATUS_TAG, STATUS_NOT_SERVING]));
         assert_eq!(serving_from_tags(&event.tags).1, ServingState::NotServing);
 
-        let mut bare = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), policy())
-            .to_event_draft();
-        bare.tags.push(TagSpec::new([STATUS_TAG, STATUS_NOT_SERVING]));
-        assert_eq!(serving_from_tags(&bare.tags), (None, ServingState::NotServing));
+        let mut bare = heartbeat_for_state(
+            0,
+            true,
+            5,
+            false,
+            mints(),
+            Vec::new(),
+            SeatCapability::default(),
+            policy(),
+        )
+        .to_event_draft();
+        bare.tags
+            .push(TagSpec::new([STATUS_TAG, STATUS_NOT_SERVING]));
+        assert_eq!(
+            serving_from_tags(&bare.tags),
+            (None, ServingState::NotServing)
+        );
     }
 
     /// The terminal beat carries the count unchanged, so a reader can tell a seat LEAVING with working
     /// harnesses (`accepting=n`, `serving=1/1`, no status) from one that cannot work.
     #[test]
     fn a_retraction_with_working_harnesses_is_not_not_serving() {
-        let terminal = retraction_for_state(0, 5, false, mints(), vec!["claude".into()], SeatCapability::from_roster(&["claude".to_owned()], &[]), policy())
-            .with_serving(ServingCount { available: 1, configured: 1 })
-            .to_event_draft();
+        let terminal = retraction_for_state(
+            0,
+            5,
+            false,
+            mints(),
+            vec!["claude".into()],
+            SeatCapability::from_roster(&["claude".to_owned()], &[]),
+            policy(),
+        )
+        .with_serving(ServingCount {
+            available: 1,
+            configured: 1,
+        })
+        .to_event_draft();
         let parsed = parse_heartbeat(&terminal).expect("parses");
         assert!(!parsed.accepting);
         assert_eq!(parsed.serving_state, ServingState::Serving);

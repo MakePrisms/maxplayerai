@@ -18170,7 +18170,9 @@ mod tests {
         local
             .run_until(async {
                 assert!(
-                    fixture.wait_until_published(FIXTURE_WAIT, beat_with("1/1", None)).await,
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, beat_with("1/1", None))
+                        .await,
                     "the boot beat states serving=1/1"
                 );
                 roster.fault(0, Fault::Unproven, Instant::now());
@@ -18192,7 +18194,10 @@ mod tests {
                         .wait_until_published(FIXTURE_WAIT, |events| {
                             let beats = seat_announcements(events);
                             beats.len() > before
-                                && beats.last().unwrap().tag_value(crate::heartbeat::SERVING_TAG)
+                                && beats
+                                    .last()
+                                    .unwrap()
+                                    .tag_value(crate::heartbeat::SERVING_TAG)
                                     == Some("1/1")
                         })
                         .await,
@@ -20665,7 +20670,9 @@ mod supervised_probe_tests {
         let dark = roster.advertisement().harnesses;
         assert_eq!((dark.available, dark.configured), (0, 1));
         assert!(
-            roster.claim_due_probes(now + Duration::from_secs(119)).is_empty(),
+            roster
+                .claim_due_probes(now + Duration::from_secs(119))
+                .is_empty(),
             "strike 2 waits two minutes"
         );
         assert_eq!(
@@ -20678,8 +20685,16 @@ mod supervised_probe_tests {
             supervise_harness_probe(Arc::clone(&roster), 0, std::future::ready(Ok(None))).await;
         assert!(matches!(outcome, ProbeOutcome::Restored), "{outcome:?}");
         let back = roster.advertisement().harnesses;
-        assert_eq!((back.available, back.configured), (1, 1), "serving is restored");
-        assert_ne!(roster.generation(), generation, "the restore must flag a prompt republish");
+        assert_eq!(
+            (back.available, back.configured),
+            (1, 1),
+            "serving is restored"
+        );
+        assert_ne!(
+            roster.generation(),
+            generation,
+            "the restore must flag a prompt republish"
+        );
     }
     // END R3-2 restore tests
 
