@@ -822,6 +822,36 @@ test('parent death: SIGKILL of the runner parent releases the home lock and stop
     assert.ok(await until(()=>!alive(runner)&&!alive(sleeper)&&free(),15000),`runner ${alive(runner)} command ${alive(sleeper)} lock free ${free()}; ${stderr}`);
   } finally {rmSync(dir,{recursive:true,force:true});}
 });
+// Found by the E2E after F1: with a ref'd grace timer a CLEANLY stopped runner still held the home
+// lock for the whole grace, so the next start (flock -n) exited 1. A clean stop must exit 0 at once.
+test('parent death: a clean stop exits 0 promptly and frees the lock (grace timer cancelled)',{skip:!require_flock()},async t=>{
+  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-stop-')),home=join(dir,'home'),bin=join(dir,'fake-maxplayer'),ready=join(dir,'ready');
+  try {
+    // whoami answers, every other call (mcp) exits at once: the runner reaches its poll loop.
+    fs.writeFileSync(bin,`#!/bin/sh\nif [ "$1" = whoami ]; then touch ${JSON.stringify(ready)}; echo "pubkey: ${'a'.repeat(64)}"; fi\n`,{mode:0o700});
+    // Relay: completes the WebSocket handshake, then stays silent (never ready). Stopping while a
+    // socket is still CONNECTING trips relay.mjs's error->close handler, which overflows the stack
+    // on Node 22 (shared reader, out of scope for this PR), so the fixture opens the socket.
+    const net=await import('node:net'),{createHash}=await import('node:crypto'),sockets=[];
+    const hold=net.createServer(c=>{sockets.push(c);let buf='';c.on('error',()=>{});c.on('data',b=>{if(buf===null)return;buf+=b;const key=buf.match(/Sec-WebSocket-Key: *(\S+)/i)?.[1];
+      if(key&&buf.includes('\r\n\r\n')){buf=null;c.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')}\r\n\r\n`);}});});
+    await new Promise(r=>hold.listen(0,'127.0.0.1',r));
+    const relay=`ws://127.0.0.1:${hold.address().port}`;
+    t.after(()=>{sockets.forEach(c=>c.destroy());hold.close();});
+    const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url',relay,'--poll-seconds','1'],{stdio:['ignore','ignore','pipe'],env:{...process.env,SWARM_CHALLENGE_RELAYS:relay}});
+    let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
+    const exited=new Promise(r=>parent.on('exit',code=>r(code)));
+    const until=async(f,ms)=>{const end=Date.now()+ms;while(Date.now()<end){if(f())return true;await new Promise(r=>setTimeout(r,50));}return false;};
+    assert.ok(await until(()=>fs.existsSync(ready)&&sockets.length>0,10000),stderr);
+    await new Promise(r=>setTimeout(r,1500));
+    const stopped=Date.now();parent.kill('SIGTERM');
+    const code=await Promise.race([exited,new Promise(r=>setTimeout(()=>r('timeout'),15000))]);
+    assert.equal(code,0,`clean stop exit code; ${stderr}`);
+    assert.ok(Date.now()-stopped<4000,`stopped in ${Date.now()-stopped} ms (grace is 5000)`);
+    assert.equal(spawnSync('flock',['-n',join(home,'swarm/runner.lock'),'true']).status,0,'lock free');
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
 function require_flock(){try{return (globalThis.__flock??=(()=>{const r=process.getBuiltinModule('node:child_process').spawnSync('flock',['--version']);return r.status===0;})());}catch{return false;}}
 
 // Bug 5, upgraded (Rocky's revised report): on a v0.6.1 buyer an expired, never-delivered PAID

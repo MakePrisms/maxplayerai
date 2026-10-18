@@ -544,13 +544,17 @@ export function config(argv,env=process.env) {
 // it fires (an unref'd timer let the loop end first, so in-flight commands were never killed and
 // node --test on Node 22 cancelled the test and every test after it).
 export const PARENT_GONE_GRACE_MS = 5000;
+// Returns gone(); gone.cancel() clears a pending grace timer. main() cancels it once its loop has
+// stopped cleanly, so a clean stop exits (and releases the lock) at once instead of holding the
+// lock for the whole grace (a restart right after a stop then found the lock taken and exited 1).
 export function watchParent(stream,onStop,{graceMs=PARENT_GONE_GRACE_MS,exit=code=>process.exit(code),kill=killActiveCommands}={}) {
-  let gone=false;
+  let gone=false,timer;
   const fire=()=>{if(gone)return;gone=true;console.error(new Date().toISOString(),'Runner parent exited or asked to stop; stopping');
     try{onStop();}catch{}
-    setTimeout(()=>{kill();exit(1);},graceMs);};
+    timer=setTimeout(()=>{kill();exit(1);},graceMs);};
   stream.on('end',fire);stream.on('close',fire);stream.on('error',fire);stream.resume();
-  return ()=>gone;
+  const status=()=>gone;status.cancel=()=>{clearTimeout(timer);timer=undefined;stream.pause();stream.removeAllListeners?.('end');stream.destroy?.();};
+  return status;
 }
 async function main() {
   const args=process.argv.slice(2),locked=args[0]==='--lock-held';if(locked)args.shift();
@@ -563,8 +567,8 @@ async function main() {
     child.on('error',e=>{console.error(e.code==='ENOENT'?'flock not found: install util-linux flock (macOS: brew install flock)':e.message);process.exitCode=1;});
     child.on('exit',code=>{process.exitCode=code??1;});return;
   }
-  let stopRunner=()=>{};
-  if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;watchParent(process.stdin,()=>stopRunner());}
+  let stopRunner=()=>{},parentWatch;
+  if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,()=>stopRunner());}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
   const challengeRelays=(process.env.SWARM_CHALLENGE_RELAYS??'wss://nos.lol,wss://relay.primal.net,wss://offchain.pub').split(',').map(s=>s.trim()).filter(Boolean);
   if(!challengeRelays.length)throw Error('SWARM_CHALLENGE_RELAYS must not be empty');
@@ -593,6 +597,12 @@ async function main() {
   let quitting=false;stopRunner=()=>{quitting=true;source.stop();};for(const sig of ['SIGINT','SIGTERM'])process.on(sig,stopRunner);
   try {
     while(!quitting){try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}
-  } finally {source.stop();}
+  } finally {
+    source.stop();
+    // Locked runner: the loop has ended (stop asked, or a fatal journal error that main().catch
+    // records as exitCode 1). The journal is fsynced and nothing is in flight, so cancel the grace
+    // timer and exit now with that code, releasing the lock; never wait on relay socket teardown.
+    if(parentWatch){parentWatch.cancel();setImmediate(()=>process.exit(process.exitCode??0));}
+  }
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{console.error(e.message);process.exitCode=1;});
