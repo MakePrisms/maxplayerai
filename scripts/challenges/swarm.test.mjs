@@ -909,7 +909,9 @@ test('stop: watchParent bounds a stop request by its own grace, and pipe EOF sho
     const gone=watchParent(stream,()=>events.push('stop'),{graceMs,stopGraceMs,kill:()=>events.push('kill'),exit:code=>{events.push(`exit ${code}`);resolveExit();}});
     const started=Date.now();stream.write('stop\n');await new Promise(r=>setTimeout(r,30));
     assert.deepEqual(events,['stop'],'stop request: onStop once, no kill yet');assert.equal(gone(),false);
-    if(end)stream.end();await exited;return {events,ms:Date.now()-started,gone:gone()};
+    if(end)stream.end();
+    assert.equal(await Promise.race([exited.then(()=>'exited'),new Promise(r=>setTimeout(()=>r('timeout'),5000))]),'exited','a timer kills and exits');
+    return {events,ms:Date.now()-started,gone:gone()};
   };
   const hung=await run({stopGraceMs:150,graceMs:60000});
   assert.deepEqual(hung.events,['stop','kill','exit 1']);assert.ok(hung.ms>=150);
