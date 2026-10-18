@@ -4,7 +4,7 @@ import { parseChallengeRelays } from '../../web/app/src/challenge/shared/relay.m
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync, readSync, fstatSync, lstatSync, readdirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
@@ -30,16 +30,28 @@ export function command(bin, args, {input='', env=process.env, timeout=120000}={
 // Delivery entries that are never answer text (execution proof, VCS and build/dependency trees).
 export const DELIVERY_SKIP = new Set(['MAXPLAYER_EXECUTION_SENTINEL','.git','target','node_modules']);
 // The planner-visible answer of a collected delivery. An inline answer is materialized by the
-// buyer as answer.txt and returned unchanged. Real harnesses often deliver files instead (a
-// report, a data file, a source tree) with no inline answer, so otherwise the delivered text
-// files are concatenated: regular files only (lstat + O_NOFOLLOW, symlinks/devices/FIFOs never
-// followed or opened), confined to the result directory, binary (NUL) files skipped, skipped
-// names above ignored, files before subdirectories in sorted order, per-file and total caps with
-// stated truncation markers, and a bounded walk.
-export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=200000, maxEntries=2000, maxDepth=12}={}) {
+// buyer as answer.txt and returned as read: like every file it is capped at maxFileBytes (64 KiB)
+// with a stated `[truncated: first N of M bytes shown]` marker. An EMPTY (or binary/unreadable)
+// answer.txt is not an answer, so it falls through to the delivered files like a missing one.
+// Real harnesses often deliver files instead (a report, a data file, a source tree) with no inline
+// answer, so otherwise the delivered text files are concatenated: regular files only (lstat +
+// O_NOFOLLOW, symlinks/devices/FIFOs never followed or opened), confined to the result directory,
+// binary (NUL) files skipped, skipped names above ignored, files before subdirectories, per-file
+// and total caps with stated truncation markers. The walk is bounded: directories are streamed
+// (opendir), so at most maxEntries names are ever read in total and an oversized directory is
+// never listed in full; the names read from each directory are sorted, so output is deterministic
+// for what was read (the unseen tail is not sorted or listed). The whole read also has a deadline
+// (deadlineMs): past it the function throws, and the runner records that once as answerError
+// (collect is never repeated). Names with control characters are shown JSON-quoted so they cannot
+// break the ===== framing.
+export const DELIVERY_READ_DEADLINE_MS = 10000;
+export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=200000, maxEntries=2000, maxDepth=12, deadlineMs=DELIVERY_READ_DEADLINE_MS, clock=Date.now, opendir=opendirSync}={}) {
+  const deadline=clock()+deadlineMs;
+  const check=()=>{if(clock()>deadline)throw Error(`delivery read exceeded its ${deadlineMs} ms deadline`);};
   const root=realpathSync(dir);
   if(!lstatSync(root).isDirectory())throw Error('delivery path is not a directory');
   const inside=p=>{const parent=realpathSync(dirname(p));return parent===root||parent.startsWith(root+sep);};
+  const show=r=>/[\u0000-\u001f\u007f]/.test(r)?JSON.stringify(r):r;
   const read=p=>{
     let fd;
     try {fd=openSync(p,fsConstants.O_RDONLY|fsConstants.O_NOFOLLOW|fsConstants.O_NONBLOCK);}
@@ -56,17 +68,25 @@ export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=2000
   };
   const inline=join(root,'answer.txt');
   let st;try{st=lstatSync(inline);}catch(e){if(e.code!=='ENOENT')throw e;}
-  if(st?.isFile()&&inside(inline)){const r=read(inline);if(r&&!r.binary)return r.text;}
+  if(st?.isFile()&&inside(inline)){const r=read(inline);if(r&&!r.binary&&r.text)return r.text;}
   const files=[],skipped=[];let entries=0,stopped=false;
   const walk=(abs,rel,depth)=>{
     if(stopped)return;
-    if(depth>maxDepth){skipped.push(`${rel}/ (too deep)`);return;}
+    if(depth>maxDepth){skipped.push(`${show(rel)}/ (too deep)`);return;}
+    const names=[],d=opendir(abs);
+    try {
+      for(let e;(e=d.readSync())!==null;) {
+        check();
+        if(++entries>maxEntries){stopped=true;break;}
+        names.push(e.name);
+      }
+    } finally {d.closeSync();}
     const dirs=[];
-    for(const name of readdirSync(abs).sort()) {
-      if(++entries>maxEntries){stopped=true;return;}
+    for(const name of names.sort()) {
+      check();
       if(DELIVERY_SKIP.has(name)||(depth===0&&name==='answer.txt'))continue;
       const p=join(abs,name),r=rel?`${rel}/${name}`:name,s=lstatSync(p);
-      if(s.isDirectory())dirs.push([p,r]);else if(s.isFile())files.push([p,r]);else skipped.push(`${r} (not a regular file)`);
+      if(s.isDirectory())dirs.push([p,r]);else if(s.isFile())files.push([p,r]);else skipped.push(`${show(r)} (not a regular file)`);
     }
     for(const [p,r] of dirs)walk(p,r,depth+1);
   };
@@ -74,10 +94,11 @@ export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=2000
   let out='',total=0,omitted=0;
   for(const [p,r] of files) {
     if(omitted){omitted++;continue;}
+    check();
     const got=inside(p)?read(p):null;
-    if(!got){skipped.push(`${r} (unreadable)`);continue;}
-    if(got.binary){skipped.push(`${r} (binary)`);continue;}
-    const block=`===== ${r} =====\n${got.text}\n`;
+    if(!got){skipped.push(`${show(r)} (unreadable)`);continue;}
+    if(got.binary){skipped.push(`${show(r)} (binary)`);continue;}
+    const block=`===== ${show(r)} =====\n${got.text}\n`;
     if(total+block.length>maxTotalChars){omitted=1;continue;}
     out+=block;total+=block.length;
   }

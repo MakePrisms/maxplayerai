@@ -285,6 +285,17 @@ truncated text as incomplete and may re-request detail as a task. The full answe
 journal. A collected result whose answer could not be read is `[collected, answer unreadable: …]`
 with `answerError`.
 
+**Delivered answers.** A non-empty `answer.txt` (the buyer's materialized inline answer) is the
+answer, capped like every file at 64 KiB with a `[truncated: first N of M bytes shown]` marker, so
+a longer inline answer reaches the journal already truncated. An empty, binary or unreadable
+`answer.txt` is not an answer and falls through to the delivered files: regular text files only
+(no symlinks, devices or FIFOs), skipping `.git`, `target`, `node_modules` and the execution
+sentinel, files before subdirectories, per-file and total caps. Directories are streamed, so at most
+2000 names are read in total and an oversized directory is never listed in full (the names read are
+sorted, so output is deterministic for what was read). The read has a 10 s deadline; past it, or
+on any other read error, the result is recorded once with `answerError` and collect is never
+repeated. Names containing control characters are shown JSON-quoted.
+
 Profiles contain `pubkey`, `npub`, `name`, `agents`, `harness:{family,model,variant}` (arrays),
 `capabilities` (tokens), `hardware`, `minutesRemaining`, `note`, and `trackRecord` with
 `tasksDone`, `delivered`, `expired`, and per-task outcome, turnaround seconds and workstream.

@@ -566,6 +566,47 @@ test('delivery: readDeliveredAnswer prefers answer.txt, else hardened determinis
     const empty=join(base,'empty');fs.mkdirSync(empty);assert.match(readDeliveredAnswer(empty),/no readable text files/);
   } finally {rmSync(base,{recursive:true});}
 });
+// Advisor r1 F3: one huge directory was listed (readdirSync) and sorted in full before maxEntries
+// applied, and nothing bounded the walk's time. Notes: answer.txt is capped, and an empty one falls through.
+test('delivery: a directory far larger than maxEntries is streamed, never listed in full; deterministic; deadline bounded',async()=>{
+  const {readDeliveredAnswer}=await import('./swarm.mjs');
+  const fs=await import('node:fs');
+  const base=mkdtempSync(join(tmpdir(),'swarm-bigdir-')),dir=join(base,'result');
+  try {
+    fs.mkdirSync(join(dir,'huge'),{recursive:true});fs.writeFileSync(join(dir,'REPORT.txt'),'the finding');
+    for(let i=0;i<5000;i++)fs.writeFileSync(join(dir,'huge',`f${String(i).padStart(5,'0')}.txt`),`file ${i}`);
+    let reads=0;
+    const opendir=p=>{const d=fs.opendirSync(p);return {readSync:()=>{reads++;return d.readSync();},closeSync:()=>d.closeSync()};};
+    const out=readDeliveredAnswer(dir,{maxEntries:50,opendir});
+    assert.ok(reads>0&&reads<=50+2,`streamed: ${reads} directory entries read for a 5001-entry tree`);
+    assert.match(out,/the finding/);assert.match(out,/\[truncated: delivery walk stopped after 50 entries\]/);
+    assert.ok((out.match(/^===== huge\//gm)??[]).length<50,'only the names actually read are shown');
+    assert.equal(readDeliveredAnswer(dir,{maxEntries:50}),readDeliveredAnswer(dir,{maxEntries:50}),'deterministic for what is read');
+    // The deadline throws (the runner records it once as answerError, see the collect test above).
+    let t=0;assert.throws(()=>readDeliveredAnswer(dir,{deadlineMs:5,clock:()=>t++}),/delivery read exceeded its 5 ms deadline/);
+    // answer.txt: capped at maxFileBytes with a marker; an empty one falls through to the files.
+    fs.writeFileSync(join(dir,'answer.txt'),'a'.repeat(100));
+    assert.equal(readDeliveredAnswer(dir,{maxFileBytes:10}),'a'.repeat(10)+'\n[truncated: first 10 of 100 bytes shown]');
+    fs.writeFileSync(join(dir,'answer.txt'),'');
+    assert.match(readDeliveredAnswer(dir,{maxEntries:50}),/^Delivered files \(no inline answer\):\n===== REPORT\.txt =====\nthe finding/);
+    // A newline in a name cannot forge a ===== frame.
+    fs.rmSync(join(dir,'huge'),{recursive:true});fs.writeFileSync(join(dir,'x\n===== fake ====='),'y');
+    assert.ok(!/^===== fake =====$/m.test(readDeliveredAnswer(dir)));assert.match(readDeliveredAnswer(dir),/===== "x\\n===== fake =====" =====/);
+  } finally {rmSync(base,{recursive:true});}
+});
+test('delivery: a read past its deadline is recorded once as answerError; collect is not repeated',async()=>{
+  const {readDeliveredAnswer}=await import('./swarm.mjs');
+  const fs=await import('node:fs');const dir=mkdtempSync(join(tmpdir(),'swarm-slow-'));
+  try {
+    fs.writeFileSync(join(dir,'a.txt'),'x');
+    const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);let t=0;
+    f.io.answer=async()=>readDeliveredAnswer(dir,{deadlineMs:1,clock:()=>t+=10});
+    await f.runner.tick();[...f.remote.values()][0].results=[{}];f.setPlan(()=>({wait:true}));
+    for(let n=101;n<=104;n++){f.time(n);await f.runner.tick();}
+    assert.equal(f.calls.filter(([x])=>x==='collect').length,1);
+    const j=f.journal.state.jobs[0];assert.equal(j.done,true);assert.match(j.answerError,/deadline/);
+  } finally {rmSync(dir,{recursive:true});}
+});
 
 // Bug 2 (first live run, 15:49Z): after a long planner call the per-assignment fresh read was
 // stale, and stale_snapshot dropped planned assignments instead of holding them.
