@@ -22,14 +22,21 @@ export function trackSockets(Base=globalThis.WebSocket,{clock=Date.now}={}) {
   const view=()=>Object.fromEntries([...activity].map(([url,a])=>[url,{sockets:a.sockets,openedAt:a.openedAt,closedAt:a.closedAt,lastMessageAt:a.lastMessageAt,messages:a.messages,readyState:a.socket?.readyState??null}]));
   return {WebSocketImpl:Tracked,activity:view};
 }
-export function openSnapshot({url,challengeRelays,quorum=undefined,buyer,onChange=()=>{},WebSocketImpl=globalThis.WebSocket,clock=Date.now}) {
+// R3-6: the reader calls back on EVERY stored frame. A full projection (store.snapshot) per frame is
+// quadratic in history size: after a restart it was most of the runner's minutes of CPU (measured:
+// 2,009 events with every signature already cached still took 21 s of CPU, ~99% in the projection).
+// So the projection is built per frame only for an onChange consumer (the E2E artifact writer); the
+// runner passes onRelay, which gets only the cheap relay status. The runner itself projects once per
+// tick through snapshot().
+export function openSnapshot({url,challengeRelays,quorum=undefined,buyer,onChange=null,onRelay=null,WebSocketImpl=globalThis.WebSocket,clock=Date.now}) {
   const store=new EventStore(),sockets=trackSockets(WebSocketImpl,{clock});
-  const reader=new ChallengeReader({url,challengeRelays,quorum,buyer,store,WebSocketImpl:sockets.WebSocketImpl,onChange:()=>onChange(snapshot())});
+  const changed=()=>{if(onRelay)onRelay({...reader.status});if(onChange)onChange(snapshot());};
+  const reader=new ChallengeReader({url,challengeRelays,quorum,buyer,store,WebSocketImpl:sockets.WebSocketImpl,onChange:changed});
   const snapshot=()=>({...store.snapshot(buyer),relay:{...reader.status}});
   reader.start();
   // Ref'd on purpose (the E2E artifact writer has nothing else keeping it alive); the runner clears it
   // in stop() before exiting, so it never delays a runner shutdown.
-  const timer=setInterval(()=>onChange(snapshot()),1000);
+  const timer=setInterval(changed,1000);
   // Diagnostics only: the reader's exposed status plus socket activity. Never used for readiness.
   const diagnostics=()=>({status:reader.status,sockets:sockets.activity()});
   return {snapshot,diagnostics,stop:()=>{clearInterval(timer);reader.stop();}};

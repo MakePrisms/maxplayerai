@@ -32,17 +32,37 @@ export function eventId(e) { return bytesToHex(sha256(new TextEncoder().encode(J
 //   of cap+1 events into 100% misses: each miss evicts the key the scan needs next. Random
 //   replacement degrades gracefully instead: a repeated scan of cap+1 events pays a mean of 2
 //   Schnorr checks per pass, and a repeated scan of 1.5x the cap still hits ~40%.
+// - R3-6: the Node runner persists these keys next to its journal (scripts/challenges/
+//   verify-cache-file.mjs) so a restart does not re-verify the whole history. primeVerifyCache is
+//   the only way in without a Schnorr check; it takes exact keys (the same id+pubkey+sig
+//   concatenation, format-checked here), so a primed key can only ever accept that exact triple.
+//   The browser never primes or listens.
 export const VERIFY_CACHE_LIMIT = 100000;
+export const VERIFY_KEY = /^[0-9a-f]{256}$/;
 const verified = new Set(), slots = []; // same keys; slots gives O(1) random choice
+let onAdd = null;
 export const verifyCacheSize = () => slots.length;
 export const clearVerifyCache = () => { verified.clear(); slots.length = 0; };
+export const verifyCacheKeys = () => [...slots];
+// Called with each key newly added after a successful Schnorr check (never for primed keys).
+export const setVerifyCacheListener = fn => { onAdd = typeof fn === 'function' ? fn : null; };
+function remember(key) {
+  let slot = slots.length;
+  if (slot >= VERIFY_CACHE_LIMIT) { slot = Math.floor(Math.random() * slots.length); verified.delete(slots[slot]); }
+  slots[slot] = key; verified.add(key);
+}
+// Seeds keys verified by an earlier process. Malformed keys are skipped; returns how many were added.
+export function primeVerifyCache(keys) {
+  let added = 0;
+  for (const key of keys) if (typeof key === 'string' && VERIFY_KEY.test(key) && !verified.has(key)) { remember(key); added++; }
+  return added;
+}
 function signatureValid(e) {
   const key = e.id + e.pubkey + e.sig;
   if (verified.has(key)) return true;
   if (!schnorr.verify(e.sig, e.id, e.pubkey)) return false;
-  let slot = slots.length;
-  if (slot >= VERIFY_CACHE_LIMIT) { slot = Math.floor(Math.random() * slots.length); verified.delete(slots[slot]); }
-  slots[slot] = key; verified.add(key);
+  remember(key);
+  try { onAdd?.(key); } catch {}
   return true;
 }
 export function verify(e) {

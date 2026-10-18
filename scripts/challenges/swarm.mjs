@@ -2,6 +2,7 @@
 import {challengeTaskPrefix} from '../../web/app/src/challenge/shared/events.mjs';
 import { parseChallengeRelays, parseChallengeQuorum } from '../../web/app/src/challenge/shared/relay.mjs';
 import { openSnapshot } from './relay-snapshot.mjs';
+import { persistVerifyCache, VERIFY_CACHE_FILE } from './verify-cache-file.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, linkSync, readdirSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
@@ -1093,7 +1094,7 @@ async function main() {
     child.on('exit',(code,signal)=>{process.exitCode=code??1;if(signal)console.error(`Locked runner ended by ${signal}`);child.stdin.destroy();});return;
   }
   // A stop can arrive during startup (whoami, buyer probe): it is recorded here and the loop never starts.
-  let quitting=false,source,wake,health;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();wake?.();};
+  let quitting=false,source,wake,health,sigCache;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();sigCache?.stop();wake?.();};
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
@@ -1105,9 +1106,11 @@ async function main() {
   const journal=new Journal(join(c.home,'swarm/events.jsonl'));
   console.error(new Date().toISOString(),c.taskContext?`Task context (appended to every posted task): ${JSON.stringify(c.taskContext)}`:'No task context configured (SWARM_TASK_CONTEXT / SWARM_TASK_CONTEXT_FILE)');
   if(journal.migrated)console.error(new Date().toISOString(),`Migrated legacy append journal (${journal.migrated.records} records${journal.migrated.torn?', torn final append discarded':''}) to one record; the legacy file is kept unchanged at ${journal.migrated.legacyPath}`);
+  // R3-6: load the persisted verified-signature cache BEFORE the first relay frame arrives.
+  sigCache=persistVerifyCache(join(c.home,'swarm',VERIFY_CACHE_FILE),{report:message=>console.error(new Date().toISOString(),message)});
   let relayCoverage;
-  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,quorum:c.challengeQuorum,buyer,onChange:s=>{
-    const line=relayCoverageLine(s.relay);
+  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,quorum:c.challengeQuorum,buyer,onRelay:relay=>{
+    const line=relayCoverageLine(relay);
     if(line!==relayCoverage){relayCoverage=line;console.error(new Date().toISOString(),line);}
   }});
   health=startRelayHealthLog(source.diagnostics,message=>console.error(new Date().toISOString(),message));
@@ -1146,7 +1149,7 @@ async function main() {
       if(!quitting)await new Promise(r=>{const t=setTimeout(r,c.poll*1000);wake=()=>{clearTimeout(t);r();};});wake=undefined;
     }
   } finally {
-    health.stop();source.stop();
+    health.stop();source.stop();sigCache.stop();
     // Locked runner: the loop has ended. On a stop request nothing is in flight and the last save
     // is durable, so cancel the grace timer and exit 0 on the next turn, releasing the lock; never
     // wait on relay socket teardown. On a fatal journal error the throw continues past this block
