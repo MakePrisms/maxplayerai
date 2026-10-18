@@ -142,8 +142,12 @@ test('auth-required CLOSED before AUTH OK reissues history and clears error',asy
   assert.equal(reader.status.error,null);assert.ok(reader.pages.has('3401'));
   await until(()=>socket.sent.filter(m=>m[0]==='REQ'&&m[1]==='3401').length>=2);
   for(const id of [...reader.pages.keys()])socket.message(['EOSE',id]);
+  // AUTH was offered and succeeded: the round also needs the live REQs sent after AUTH OK.
+  await answerAll(reader,socket);
   assert.equal(reader.status.historyComplete,true);
 });
+// EOSE every REQ the reader sends (history pages and live, any generation) until it is complete.
+async function answerAll(reader,socket){const done=new Set();await until(()=>{for(const m of socket.sent)if(m[0]==='REQ'&&!done.has(m)){done.add(m);socket.message(['EOSE',m[1]]);}return reader.status.historyComplete;});}
 const ns=[['t','maxplayer'],['v','1']];
 const dayTags=[...ns,['d','day'],['title','Day'],['starts','200'],['ends','1000'],['budget','0','sat'],['status','in_progress']];
 const acceptTags=[...ns,['d',buyer],['p',buyer],['decision','accepted']];

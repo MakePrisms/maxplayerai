@@ -35,12 +35,19 @@ const RECOVERING='Recovering after relay CLOSED';
 //
 // A relay CLOSED on a trusted read is never a dead end. A CLOSED on an authenticated live
 // subscription, a refused trusted history page, an auth-required refusal after AUTH, or AUTH
-// that does not complete after an auth-required refusal all close the socket. The backoff
-// reconnect then runs one full fresh round (AUTH, trusted history, live). CLOSED-driven
-// reconnects keep doubling the backoff (up to closedMaxRetryMs, 5 min) until a recovered
-// connection has stayed ready for stableMs. During recovery, historyComplete also needs an EOSE on every
-// trusted live subscription (or the round times out), so a relay that closes each one stays
-// not ready instead of flapping.
+// that does not complete in authWaitMs all close the socket. The backoff reconnect then runs
+// one full fresh round (AUTH, trusted history, live). CLOSED-driven reconnects keep doubling
+// the backoff (up to closedMaxRetryMs, 5 min) until a recovered connection has stayed ready
+// for stableMs.
+//
+// Strict rounds: while recovering from a CLOSED, and whenever AUTH is expected (the relay sent
+// a challenge that was not refused), historyComplete also needs AUTH OK and an EOSE on a live
+// REQ for every trusted filter on this connection, sent after AUTH OK when AUTH is expected.
+// A trusted live CLOSED in a strict round recovers, even before AUTH OK. A relay that closes
+// each live REQ therefore stays not ready instead of flapping.
+//
+// Live REQ ids: `live-<id>` for a filter's first live REQ on a connection, `live-<id>~<n>` for
+// a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,
     retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,filters=challengeFilters(buyer),
@@ -48,7 +55,7 @@ export class RelayReader {
     Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,readsRoster:roster,readsMetadata:metadata,applicants});
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
-    this.key=key; this.closedStreak=0; this.lastClosed=null;
+    this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
     this.status=this.freshStatus();
     this.stopped=false; this.retry=retryMs;
   }
@@ -58,21 +65,39 @@ export class RelayReader {
   trustedPending(){for(const id of this.pages.keys())if(!soft(id))return true;return false;}
   softFailure(id){this.pages.delete(id);if(id===APPLICANTS)this.status.applicantsIncomplete=true;else this.metaIncomplete();}
   metaIncomplete(){const w='Profile/heartbeat read incomplete';if(!this.status.warnings.includes(w))this.status.warnings.push(w);}
-  // A roster reader is complete only after its roster (from complete decision history) was read.
-  // While recovering from a CLOSED, a round is complete only once every trusted live REQ got EOSE.
-  liveConfirmed(){for(const id of this.filters.keys()){const sub=`live-${id}`;if(!soft(id)&&this.live.has(sub)&&!this.liveEose.has(sub))return false;}return true;}
-  // During recovery a trusted live REQ left unanswered for 20s fails the round, like a silent history read.
-  liveLate(){if(!this.closedStreak)return false;for(const [sub,at] of this.liveSent)if(!soft(sub.slice(5))&&this.live.has(sub)&&!this.liveEose.has(sub)&&Date.now()-at>20000)return true;return false;}
+  authExpected(){return !!this.challenged&&this.authRefused===null;}
+  strict(){return this.closedStreak>0||this.authExpected();}
+  // Every trusted filter, whether or not its live REQ is still installed, needs an EOSE on this
+  // connection; once AUTH is expected, on a REQ sent after AUTH OK.
+  liveConfirmed(){
+    if(this.authExpected()&&!this.status.authenticated)return false;
+    for(const id of this.filters.keys()){
+      if(soft(id))continue;
+      const e=this.live.get(this.liveSub.get(id));
+      if(!e?.eose||(this.status.authenticated&&!e.authed))return false;
+    }
+    return true;
+  }
+  // In a strict round a trusted live REQ left unanswered for 20s fails the round, like a silent history read.
+  liveLate(){
+    if(!this.strict())return false;
+    for(const [id,sub] of this.liveSub){const e=this.live.get(sub);if(!soft(id)&&e?.sentAt&&!e.eose&&Date.now()-e.sentAt>20000)return true;}
+    return false;
+  }
   // One warning per prefix, replaced by the latest relay reason.
   warn(prefix,why){this.status.warnings=[...this.status.warnings.filter(w=>!w.startsWith(prefix)),`${prefix} (${why}); polling`];}
   updateComplete(){
-    const done=!!this.opened&&this.status.connected&&!this.trustedPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.closedStreak||this.liveConfirmed());
+    const done=!!this.opened&&this.status.connected&&!this.trustedPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.strict()||this.liveConfirmed());
     this.status.historyComplete=done;
-    // Started once per recovered connection; only a socket close (any CLOSED recovers) cancels it.
-    if(done&&this.closedStreak&&!this.stableTimer)this.stableTimer=setTimeout(()=>this.settle(),this.stableMs);
+    // The stable period restarts when the connection stops being healthy (an error, or a trusted
+    // live REQ no longer confirmed), with or without a socket close. A routine poll page in
+    // flight is not a failure and does not restart it.
+    if(!this.healthy()){clearTimeout(this.stableTimer);this.stableTimer=null;}
+    else if(done&&this.closedStreak&&!this.stableTimer)this.stableTimer=setTimeout(()=>this.settle(),this.stableMs);
   }
-  // A recovered connection stayed ready for stableMs: reset the CLOSED backoff and recovery note.
-  settle(){this.stableTimer=null;if(this.dead||!this.status.connected||this.status.error)return;this.closedStreak=0;this.retry=this.retryMs;this.status.warnings=this.status.warnings.filter(w=>!w.startsWith(RECOVERING));this.updateComplete();this.onChange();}
+  healthy(){return !this.dead&&this.status.connected&&!this.status.error&&(!this.strict()||this.liveConfirmed());}
+  // A recovered connection stayed healthy for stableMs: reset the CLOSED backoff and recovery note.
+  settle(){this.stableTimer=null;if(!this.healthy())return;this.closedStreak=0;this.retry=this.retryMs;this.status.warnings=this.status.warnings.filter(w=>!w.startsWith(RECOVERING));this.updateComplete();this.onChange();}
   // Fail closed now (error, not ready), then reconnect through the backoff for a full fresh round.
   recover(error){
     if(this.dead)return;
@@ -80,20 +105,49 @@ export class RelayReader {
     Object.assign(this.status,{error,historyComplete:false,authenticated:false});
     this.onChange();this.ws.close();
   }
+  // Something needs AUTH (a challenge, or an auth-required refusal). If it neither completes nor is
+  // refused within authWaitMs: while recovering, or when trusted history was refused for lack of
+  // AUTH, retry on a fresh connection (never ready meanwhile). Otherwise (a relay that challenges
+  // but never answers) treat it as refused and fall back to anonymous reads, as for an AUTH refusal.
+  awaitAuth(reason){
+    if(!this.authReason||reason.startsWith('auth-required:'))this.authReason=reason;
+    this.authTimer??=setTimeout(()=>{this.authTimer=null;
+      if(this.dead||this.status.authenticated||this.authRefused!==null)return;
+      const why=`${this.authReason} (AUTH did not complete within ${this.authWaitMs/1000}s)`;
+      if(this.closedStreak||this.authClosed.size)return this.recover(why);
+      this.authRefused='not answered';this.warn('AUTH not answered',why);this.updateComplete();this.onChange();},this.authWaitMs);
+  }
+  sendNow(frame){if(this.ws?.readyState===1){this.ws.send(JSON.stringify(frame));if(frame[0]==='CLOSE')this.closing.add(frame[1]);}}
+  // Queue a live REQ for one filter (or the applicant sample), replacing any earlier one under a new id.
+  subscribe(id) {
+    const old=this.liveSub.get(id),n=this.liveGen.get(id)??0;
+    if(old){const e=this.live.get(old);this.live.delete(old);if(e?.sentAt)this.sendNow(['CLOSE',old]);else this.queue=this.queue.filter(m=>m[1]!==old);}
+    const sub=n?`live-${id}~${n}`:`live-${id}`,applicants=id===APPLICANTS,filter=applicants?applicantFilter(this.buyer):this.filters.get(id);
+    this.liveGen.set(id,n+1);this.liveSub.set(id,sub);this.live.set(sub,{id,filter,sentAt:0,authed:false,eose:false});
+    this.queue.push(['REQ',sub,{...filter,since:Math.max(0,(applicants?Math.floor(Date.now()/1000):this.newest.get(id)??0)-this.overlap)}]);
+  }
+  liveIds(){return [...this.filters.keys(),...(this.applicants?[APPLICANTS]:[])];}
   start() {
     if(this.stopped)return;
     this.status=this.freshStatus(); this.opened=false;
     this.filters=new Map([...this.initialFilters.map(f=>[String(f.kinds[0]),f]),...this.extra]);
-    this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.live=new Map();
-    // liveSent: send time per live REQ; preAuth: live REQs sent before AUTH OK and not yet answered;
+    this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map();
+    // live: per live REQ id {id, filter, sentAt, authed (sent after AUTH OK), eose}; liveSub: filter id -> current REQ id.
     // closing: our own CLOSEs, whose empty-reason CLOSED acknowledgement is not a refusal.
-    this.liveSent=new Map(); this.liveEose=new Set(); this.preAuth=new Set(); this.closing=new Set(); this.dead=false; this.authRefused=null;
+    this.live=new Map(); this.liveSub=new Map(); this.liveGen=new Map(); this.closing=new Set();
+    this.dead=false; this.authRefused=null; this.challenged=false; this.authReason=null; this.holdExpired=false;
     const ws=this.ws=new this.WebSocketImpl(this.url);
     const send=frame=>{if(ws.readyState===1){ws.send(JSON.stringify(frame));if(frame[0]==='CLOSE')this.closing.add(frame[1]);}};
-    this.queueTimer=setInterval(()=>{if(this.queue.length&&ws.readyState===1){const frame=this.queue.shift();send(frame);const p=this.pages.get(frame[1]);
+    // Once AUTH is expected, live REQs wait for its outcome: an anonymous live REQ would only be
+    // replaced (or refused) after AUTH OK. History pages go out at once either way.
+    // A relay that challenged an earlier connection is given authWaitMs to challenge this one first.
+    const held=f=>f[0]==='REQ'&&this.live.has(f[1])&&!this.status.authenticated&&(this.authExpected()||this.expectAuth&&!this.challenged&&!this.holdExpired);
+    this.queueTimer=setInterval(()=>{const i=this.queue.findIndex(f=>!held(f));if(i>=0&&ws.readyState===1){const [frame]=this.queue.splice(i,1);send(frame);const p=this.pages.get(frame[1]),e=this.live.get(frame[1]);
         // Whether each REQ left before or after AUTH decides what a later auth-required CLOSED means.
         if(p){p.sentAt=Date.now();p.authed=this.status.authenticated;}
-        if(this.live.has(frame[1])){this.liveSent.set(frame[1],Date.now());this.liveEose.delete(frame[1]);if(!this.status.authenticated)this.preAuth.add(frame[1]);}}
+        // A live REQ is unconfirmed from the moment subscribe() creates it (every caller then runs
+        // updateComplete), so readiness already dropped when it was queued, before this send.
+        if(e)Object.assign(e,{sentAt:Date.now(),authed:this.status.authenticated});}
       const late=[...this.pages].filter(([,p])=>p.sentAt&&Date.now()-p.sentAt>20000);
       // A silent display-only read truncates that display; never the trusted history.
       for(const [id] of late)if(soft(id)){this.softFailure(id);this.updateComplete();this.onChange();}
@@ -110,20 +164,14 @@ export class RelayReader {
       for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)});
       if(this.applicants&&!this.pages.has(APPLICANTS))this.pageApplicants();
     },this.pollMs);
-    const subscribe=()=>{
-      for(const [id,f] of this.filters) {
-        const sub=`live-${id}`; this.live.set(sub,f); this.liveEose.delete(sub);
-        this.queue.push(['REQ',sub,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)}]);
-      }
-      if(this.applicants){const f=applicantFilter(this.buyer);this.live.set(`live-${APPLICANTS}`,f);this.queue.push(['REQ',`live-${APPLICANTS}`,{...f,since:Math.max(0,Math.floor(Date.now()/1000)-this.overlap)}]);}
-    };
     ws.addEventListener('open',()=>{
       // A CLOSED-driven reconnect keeps its backoff until the recovered connection settles.
       clearTimeout(timeout);this.status.connected=true;if(!this.closedStreak)this.retry=this.retryMs;this.opened=true;
       // History must work even if AUTH is absent or explicitly refused.
       for(const [id,f] of this.filters)this.page(id,f);
       if(this.applicants)this.pageApplicants();
-      subscribe();
+      for(const id of this.liveIds())this.subscribe(id);
+      if(this.expectAuth)this.holdTimer=setTimeout(()=>{this.holdTimer=null;if(!this.challenged){this.holdExpired=true;this.expectAuth=false;}},this.authWaitMs);
       this.updateComplete();this.onChange();
     });
     ws.addEventListener('message',({data})=>{
@@ -131,30 +179,40 @@ export class RelayReader {
       let m; try {m=JSON.parse(String(data));}catch{return;}
       if(!Array.isArray(m))return;
       if(m[0]==='AUTH'&&typeof m[1]==='string') {
+        // From here on AUTH is expected: no trusted round completes until it does (or is refused).
+        if(!this.challenged){this.challenged=this.expectAuth=true;this.awaitAuth('Relay did not answer AUTH');}
         const e=signAuth(this.key,this.url,m[1]);this.authId=e.id;send(['AUTH',e]);
+        this.updateComplete();this.onChange();
       } else if(m[0]==='OK'&&m[1]===this.authId) {
         this.status.authenticated=m[2]===true;
-        if(!this.status.authenticated)this.authRefused=m[3]||'no reason given';
+        clearTimeout(this.authTimer);this.authTimer=null;
         if(this.status.authenticated) {
-          clearTimeout(this.authTimer);this.authTimer=null;
+          // A late OK after the no-answer fallback still counts: AUTH is expected again.
+          if(this.authRefused==='not answered'){this.authRefused=null;this.status.warnings=this.status.warnings.filter(w=>!w.startsWith('AUTH not answered'));}
           if(this.authClosed.size) {
             if(this.status.error?.startsWith('auth-required:'))this.status.error=null;
             for(const [id,filter] of this.authClosed)this.page(id,filter);
             this.authClosed.clear();
           }
-          subscribe();this.updateComplete(); // recovering: wait for the reinstalled live EOSEs
-        } else if(this.authClosed.size) {
+          // A live REQ that already left anonymously is replaced (an open-read relay gave it
+          // history only); one still queued simply leaves authenticated.
+          for(const id of this.liveIds()){const e=this.live.get(this.liveSub.get(id));if(!e||e.sentAt&&!e.authed)this.subscribe(id);}
+        } else {
+          this.authRefused=m[3]||'no reason given';
           // The relay demanded AUTH for trusted history, then refused it: retry on a fresh connection.
-          return this.recover(`${this.status.error??'auth-required'}; AUTH refused: ${this.authRefused}`);
+          if(this.authClosed.size)return this.recover(`${this.status.error??'auth-required'}; AUTH refused: ${this.authRefused}`);
+          // Recovering, and a trusted live REQ was refused for lack of AUTH: nothing can reinstall it here.
+          if(this.closedStreak&&[...this.filters.keys()].some(id=>!soft(id)&&!this.liveSub.has(id)))
+            return this.recover(`${this.authReason??'auth-required'}; AUTH refused: ${this.authRefused}`);
         }
-        this.onChange();
+        this.updateComplete();this.onChange();
       } else if(m[0]==='EVENT') {
-        const p=this.pages.get(m[1]),f=p?.filter??this.live.get(m[1]),e=m[2];
+        const p=this.pages.get(m[1]),l=this.live.get(m[1]),f=p?.filter??l?.filter,e=m[2];
         // Saturation counts every frame the relay spent its page limit on, including events
         // outside the requested window: a relay ignoring since/until must not look complete.
         if(p)p.received++;
         if(!f||!verify(e)||!matches(e,f))return;
-        const id=p?m[1]:m[1].slice(5);
+        const id=p?m[1]:l.id;
         if(id===APPLICANTS) {
           if(validMembership(e,{pubkey:this.buyer})&&this.store.addApplicant(e))this.onChange();
           return;
@@ -182,26 +240,30 @@ export class RelayReader {
         if(!this.pages.has(m[1]))send(['CLOSE',m[1]]);
         if(m[1]===String(DECISION)&&!this.pages.has(m[1]))this.onRoster();
         this.updateComplete();this.onChange();
-      } else if(m[0]==='EOSE'&&this.live.has(m[1])) {
-        this.preAuth.delete(m[1]);this.liveEose.add(m[1]);
-        if(this.closedStreak){this.updateComplete();this.onChange();}
+      } else if(m[0]==='EOSE'&&this.live.get(m[1])?.sentAt) {
+        this.live.get(m[1]).eose=true;
+        this.updateComplete();this.onChange();
       } else if(m[0]==='CLOSED') {
         const sub=m[1],reason=typeof m[2]==='string'?m[2]:'',why=reason||'no reason given',auth=reason.startsWith('auth-required:');
         // Buzz acknowledges our own CLOSE with an empty-reason CLOSED; it never refuses a newer REQ.
         if(!reason&&this.closing.delete(sub))return;
-        if(this.live.has(sub)) {
-          const id=sub.slice(5);
+        const l=this.live.get(sub);
+        if(l) {
+          const id=l.id,early=auth&&!l.authed; // auth-required for a REQ sent before AUTH OK: AUTH OK reinstalls it
           if(soft(id)) {
             // Display-only feeds (applicants, profiles/heartbeats) never gate readiness; polls cover them.
-            this.live.delete(sub);
-            if(id!==APPLICANTS)this.warn('Profile/heartbeat live feed closed by relay',why);
+            this.live.delete(sub);this.liveSub.delete(id);
+            if(!early)this.warn(id===APPLICANTS?'Applicant live feed closed by relay':'Profile/heartbeat live feed closed by relay',why);
+          } else if(early&&!this.status.authenticated) {
+            this.live.delete(sub);this.liveSub.delete(id);
+            if(this.strict())this.awaitAuth(reason);
+            this.updateComplete();
           }
-          // auth-required for a live REQ sent before AUTH: AUTH OK reinstalls it (or already has).
-          else if(auth&&this.preAuth.delete(sub)){if(!this.status.authenticated)this.live.delete(sub);}
-          // Authenticated live feed lost: only a new connection can re-AUTH and resubscribe.
-          else if(this.status.authenticated)return this.recover(`Relay closed live subscription ${id}: ${why}`);
-          // Anonymous (no AUTH yet or none offered): the overlapping polls keep history complete.
-          else {this.preAuth.delete(sub);this.live.delete(sub);this.warn(`Live subscription ${id} closed by relay`,why);}
+          // Authenticated live feed lost, or any trusted live CLOSED in a strict round: only a new
+          // connection can re-AUTH and resubscribe.
+          else if(this.status.authenticated||this.strict())return this.recover(`Relay closed live subscription ${id}: ${why}`);
+          // Anonymous (no AUTH offered, or refused): the overlapping polls keep history complete.
+          else {this.live.delete(sub);this.liveSub.delete(id);this.warn(`Live subscription ${id} closed by relay`,why);}
         } else if(soft(sub)&&this.pages.has(sub)) {this.softFailure(sub);this.updateComplete();}
         else if(this.pages.has(sub)) {
           const p=this.pages.get(sub);
@@ -214,9 +276,7 @@ export class RelayReader {
           else {
             this.authClosed.set(sub,p.filter);
             if(!this.status.error||this.status.error.startsWith('auth-required:'))this.status.error=reason;
-            // AUTH OK re-reads it. If AUTH never completes, retry on a fresh connection.
-            this.authTimer??=setTimeout(()=>{this.authTimer=null;
-              if(!this.status.authenticated&&this.authClosed.size)this.recover(`${reason} (AUTH did not complete within ${this.authWaitMs/1000}s)`);},this.authWaitMs);
+            this.awaitAuth(reason); // AUTH OK re-reads it; otherwise a fresh connection retries
           }
         }
         this.onChange();
@@ -259,18 +319,18 @@ export class RelayReader {
     if(!this.filters)return;
     this.filters.set(id,filter);
     if(!this.opened)return; // the open handler pages and subscribes every filter
-    this.page(id,filter);
-    this.live.set(`live-${id}`,filter);this.liveEose.delete(`live-${id}`);this.queue.push(['REQ',`live-${id}`,filter]);
+    this.page(id,filter);this.subscribe(id);
   }
   dropFilter(id) {
     if(!this.filters)return;
-    this.filters.delete(id);this.pages.delete(id);this.live.delete(`live-${id}`);this.liveSent.delete(`live-${id}`);this.liveEose.delete(`live-${id}`);this.newest.delete(id);this.authClosed.delete(id);
-    this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==`live-${id}`);
-    if(this.ws?.readyState===1)for(const sub of [id,`live-${id}`]){this.ws.send(JSON.stringify(['CLOSE',sub]));this.closing?.add(sub);}
+    const sub=this.liveSub.get(id)??`live-${id}`;
+    this.filters.delete(id);this.pages.delete(id);this.live.delete(sub);this.liveSub.delete(id);this.newest.delete(id);this.authClosed.delete(id);
+    this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==sub);
+    for(const s of [id,sub])this.sendNow(['CLOSE',s]);
   }
   page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
   pageApplicants() {const filter=applicantFilter(this.buyer);this.pages.set(APPLICANTS,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',APPLICANTS,{...filter,limit:APPLICANT_LIMIT}]);}
-  clearRecoveryTimers(){clearTimeout(this.authTimer);this.authTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
+  clearRecoveryTimers(){clearTimeout(this.authTimer);this.authTimer=null;clearTimeout(this.holdTimer);this.holdTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.ws?.close();}
 }
 
