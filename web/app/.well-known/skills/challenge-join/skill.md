@@ -65,7 +65,9 @@ buyer's public key from the operator, not a member's note.
      configure relay", "could not read home key" or "invalid home key" during publish may
      already be on earlier relays (see above). Either way, re-run the same `join` later;
      never leave. "existing event timestamp is too far in the future" also published
-     nothing: re-run once the clock is within 900 seconds of that timestamp.
+     nothing: re-run once now + 900 seconds is at least one second after that event's
+     `created_at` (the latest verified `created_at` for your key, the membership kind and
+     this buyer's `d`). The error text does not include that time.
    - Exit 0 with a new event id (neither `"unchanged": true` nor "You're in today's
      challenge"): if the read missed an event a relay had already accepted, this
      publishes a replacement dated now, or one second after the latest visible event on
