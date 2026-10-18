@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {parseSnapshot,sellerLine,sellerMinutes,sellerState,renderSellers,type Snapshot} from '../src/challenge/live.js';
+import {connectionLine,isLive,parseSnapshot,sellerLine,sellerMinutes,sellerState,renderSellers,UPDATING,type Snapshot} from '../src/challenge/live.js';
 import {npubEncode} from '../src/trade/nip19.js';
 const buyer='79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 const seller={pubkey:buyer,npub:npubEncode(buyer),name:'<script>untrusted</script>',minutesOffered:60,minutesUsed:32,minutesRemaining:28,state:'working',eligible:true,decision:'accepted',currentJobStart:1000};
@@ -31,4 +31,28 @@ test('awaiting acceptance is excluded from working-now summary',()=>{
   renderSellers(doc as unknown as Document,{...s,sellers:[{...seller,state:'awaiting acceptance'}]},2920);
   assert.equal(list.children[0]!.children[0]!.children[3]!.textContent,'Awaiting acceptance');
   assert.equal(summary.textContent,'1 agent · 0 working now');
+});
+
+test('until the live data is in, the status line is only "Updating…" with no disclaimers',()=>{
+  const base={connected:true,authenticated:true,historyComplete:true,error:null};
+  for(const r of [{...base,connected:false},{...base,historyComplete:false},{...base,historyComplete:false,error:'Relay history timed out',failedRelays:['wss://x'],warnings:['Profile/heartbeat read incomplete']}])
+    assert.equal(connectionLine(r,'Live'),'Updating…');
+  assert.equal(UPDATING,'Updating…');
+  // Once live, unchanged: status plus the relay's own reasons.
+  assert.equal(connectionLine(base,'Live'),'Live');
+  assert.equal(connectionLine({...base,failedRelays:['wss://a'],warnings:['w']},'Polling'),'Polling · Unavailable: wss://a · w');
+  assert.equal(connectionLine(undefined,'Demo data'),'Demo data');
+  assert.equal(isLive({...base,historyComplete:false}),false);
+});
+
+test('while loading the summary is empty; once live it shows counts without the "may be incomplete" caveat',()=>{
+  const list=new Element(),summary=new Element();
+  const doc={getElementById:(id:string)=>id==='challenge-sellers'?list:summary,createElement:()=>new Element(),createDocumentFragment:()=>new Element()};
+  const snap={...s,applicants:[],relay:{connected:true,authenticated:true,historyComplete:false,error:null,applicantsIncomplete:true}};
+  renderSellers(doc as unknown as Document,snap,2920,true);
+  assert.equal(summary.textContent,'');
+  renderSellers(doc as unknown as Document,{...snap,relay:{...snap.relay,historyComplete:true}},2920);
+  const line:string=summary.textContent;
+  assert.equal(line,'1 agent · 1 working now · 0+ waiting for approval');
+  assert.ok(!line.includes('incomplete'));
 });

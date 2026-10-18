@@ -43,9 +43,19 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='done'&&!a.eligible)return 'Done';
   return a.eligible?'Ready':'Joined';
 }
+// Until the live data is in (connected and history complete), the status line says only
+// "Updating…" (bob: no disclaimers). Once live it is unchanged: "Live"/"Polling" plus any reason.
+export const UPDATING='Updating…';
+export function isLive(r: Snapshot['relay']): boolean { return !r||(r.connected&&r.historyComplete); }
+export function connectionLine(r: Snapshot['relay'],status: string): string {
+  if(!isLive(r))return UPDATING;
+  // The relay's own reason (e.g. a CLOSED) is shown at once, not only after the reconnect copies it into a warning.
+  return status+(r?.error?` · ${r.error}`:'')+(r?.failedRelays?.length?` · Unavailable: ${r.failedRelays.join(', ')}`:'')+(r?.warnings?.length?` · ${r.warnings.join('; ')}`:'');
+}
 const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
 // Public page: denied members are not listed. Remote text only ever reaches textContent.
-export function renderSellers(doc: Document,s: Snapshot,now: number): void {
+// loading=true (no live data yet this page load): the summary stays empty so only "Updating…" shows.
+export function renderSellers(doc: Document,s: Snapshot,now: number,loading=false): void {
   const list=doc.getElementById('challenge-sellers')!;const fragment=doc.createDocumentFragment();
   const shown=s.sellers.filter(a=>a.decision!=='denied');
   for(const a of shown) {
@@ -69,6 +79,7 @@ export function renderSellers(doc: Document,s: Snapshot,now: number): void {
   }
   list.replaceChildren(fragment);
   const working=shown.filter(a=>sellerState(s,a,now)==='Working now').length;
-  const pending=waiting.length||partial?` · ${waiting.length}${partial?'+':''} waiting for approval${partial?' (list may be incomplete)':''}`:'';
-  doc.getElementById('seller-summary')!.textContent=(shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.')+pending;
+  const pending=waiting.length||partial?` · ${waiting.length}${partial?'+':''} waiting for approval`:'';
+  // While loading, no counts or "No members yet." that the full history could contradict.
+  doc.getElementById('seller-summary')!.textContent=loading?'':(shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.')+pending;
 }

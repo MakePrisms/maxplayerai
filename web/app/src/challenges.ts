@@ -1,4 +1,6 @@
-import { parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
+import { connectionLine, isLive, parseSnapshot, renderSellers, UPDATING, type Snapshot } from "./challenge/live.js";
+import { renderStart, startFact } from "./challenge/hero.js";
+import { wireMore } from "./challenge/more.js";
 import { demoSnapshot } from "./challenge/demo.js";
 import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
@@ -48,14 +50,24 @@ jobFloat.addEventListener("click", (e) => {
   jobSection.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
 });
 
+// The job is capped at about one screen with a "See more" toggle (bob). Collapsing scrolls the
+// section back into view so the reader isn't left below it.
+const jobMore = wireMore(el("job-body"), el("job-more") as HTMLButtonElement, () => {
+  if (jobSection.getBoundingClientRect().top < 0) jobSection.scrollIntoView({ block: "start" });
+});
+addEventListener("resize", () => jobMore.update());
+void document.fonts?.ready.then(() => jobMore.update());
+
 let snapshot: Snapshot | null = null;
 let receivedAt = 0;
+// Once the data has been live on this page load, a reconnect keeps showing the last counts.
+let wasLive = false;
 
 function render(s: Snapshot): void {
   const c = s.challenge;
   if (!c) return;
   renderJob(document, c.goal);
-  text("challenge-start", when(c.starts));
+  jobMore.update();
   text("challenge-budget", usd(s.budget!.totalSats));
   text("buyer-npub", c.buyerNpub);
   text("buyer-hex", buyerHex(c.buyerNpub));
@@ -64,19 +76,20 @@ function render(s: Snapshot): void {
 }
 function tick(): void {
   if (!snapshot) return;
-  renderSellers(document, snapshot, snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000));
+  const now = snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000);
+  // "Work starts" becomes "Running now" (linking the live list) once the window opens (bob).
+  if (snapshot.challenge) renderStart(document, startFact(snapshot.challenge, now, when));
+  renderSellers(document, snapshot, now, !wasLive);
 }
 function receive(value: unknown, status: string): void {
   snapshot = parseSnapshot(value);
   receivedAt = performance.now();
+  wasLive ||= isLive(snapshot.relay);
   render(snapshot);
-  const r = snapshot.relay;
-  const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : status;
-  // The relay's own reason (e.g. a CLOSED) is shown at once, not only after the reconnect copies it into a warning.
-  text("connection-status", connection + (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : ""));
+  text("connection-status", connectionLine(snapshot.relay, status));
 }
 function unavailable(): void {
-  text("connection-status", snapshot ? "Reconnecting · showing last known" : "Live view unavailable · check back soon");
+  text("connection-status", snapshot ? UPDATING : "Live view unavailable · check back soon");
 }
 
 function connect(): void {

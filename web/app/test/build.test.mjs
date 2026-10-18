@@ -178,21 +178,26 @@ test("all site pages share navigation and footer links, with a current page and 
     assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
     // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
     assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
-    assert.match(footer, /href="\/market">Market<\/a>\s*<div class="foot-labs">\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat is in the footer after Market, marked Lab`);
+    assert.match(footer, /href="\/market">Market<\/a>\s*<\/div>\s*<div class="foot-row foot-labs">\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat opens the Lab row under Buy, Sell, Market, marked Lab`);
     // Mint is a Lab page too: footer only, right after Chat.
     assert.ok(!nav.includes('href="/mint"'), `${page}: /mint is not in the top nav`);
     assert.match(footer, /<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /mint is in the footer after Chat, marked Lab`);
     // Tokens is a Lab page too: footer only, right after Mint.
     assert.ok(!nav.includes('href="/tokens"'), `${page}: /tokens is not in the top nav`);
     assert.match(footer, /<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /tokens is in the footer after Mint, marked Lab`);
-    // bob: Skill and GitHub leave the top bar; they sit with @maxplayerai on the
-    // footer's second, dimmer row.
+    // bob (2026-10-18): Swarm (/challenges) is a Lab page too, right after Tokens.
+    assert.ok(!nav.includes('href="/challenges"'), `${page}: /challenges is not in the top nav`);
+    assert.match(footer, /<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/challenges">Swarm<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: Swarm is in the footer after Tokens, marked Lab`);
+    // bob: Skill and GitHub leave the top bar; since 2026-10-18 they are the footer's
+    // third, dimmer row, under the Lab links.
     assert.deepEqual(links(nav).map(([href]) => href), ["/", "/sell", "/market"], `${page}: top nav is Buy, Sell, Market`);
-    // bob: the Lab pages are grouped, so phones can put them on their own row.
-    const labs = footer.match(/<div class="foot-labs">([\s\S]*?)<\/div>/)?.[1] ?? "";
-    assert.deepEqual(links(labs).map(([href]) => href), ["/chat", "/mint", "/tokens"], `${page}: Lab links grouped`);
-    const sub = footer.match(/<div class="foot-row foot-sub">([\s\S]*?)<\/div>/)?.[1] ?? "";
-    assert.deepEqual(links(sub).map(([, text]) => text), ["Skill", "GitHub", "@maxplayerai"], `${page}: footer second row`);
+    // bob (2026-10-18): three rows on the right: Buy · Sell · Market, the Labs, then Skill · GitHub.
+    const rows = [...footer.matchAll(/<div class="foot-row[^"]*">([\s\S]*?)<\/div>/g)].map((m) => links(m[1]).map(([, text]) => text));
+    assert.deepEqual(rows, [["Buy", "Sell", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub"]], `${page}: footer rows`);
+    // ...and the @maxplayerai handle moves to the left, under "The Multiplayer Marketplace".
+    const brand = html.match(/<div class="foot-brand">([\s\S]*?)<\/div>/)?.[1] ?? "";
+    assert.match(brand, /<p>The Multiplayer Marketplace<\/p>\s*<a class="foot-x" href="https:\/\/x\.com\/maxplayerai"[^>]*>@maxplayerai<\/a>/, `${page}: X handle under the tagline`);
+    assert.ok(!footer.includes("x.com/maxplayerai"), `${page}: X handle is not in the link rows`);
     const current = [...nav.matchAll(/aria-current="page"/g)].length;
     if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "challenges.html") {
       assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
@@ -326,13 +331,19 @@ test("FAQ sections pin their heading so opening an answer never moves it", () =>
   }
 });
 
-test("challenge page stays unlisted, noindexed and isolated from the main bundle", () => {
+test("challenge page stays noindexed, linked only as the footer's Swarm Lab, and isolated from the main bundle", () => {
   const html = readFileSync(join(root, "dist/challenges.html"), "utf8");
   const { stamp } = JSON.parse(readFileSync(join(root, "dist/.buildstamp"), "utf8"));
   assert.match(html, /name="robots" content="noindex, nofollow"/);
   assert.ok(html.includes(`./challenges.css?v=${stamp}`));
   assert.ok(!html.includes("terminal.js"));
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "llms.txt", "skill.md"]) {
+  // bob (2026-10-18) put Swarm in the footer; that one link is the only place pages name the route.
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"]) {
+    const text = readFileSync(join(root, "dist", page), "utf8");
+    assert.equal([...text.matchAll(/\/challenges/g)].length, 1, `${page} names /challenges once`);
+    assert.ok(text.includes('<a href="/challenges">Swarm<sup class="lab-sup">Lab</sup></a>'), `${page}: only the footer Swarm link`);
+  }
+  for (const page of ["llms.txt", "skill.md"]) {
     assert.ok(!readFileSync(join(root, "dist", page), "utf8").includes("/challenges"), `${page} does not advertise the route`);
   }
   const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
