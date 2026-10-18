@@ -163,6 +163,9 @@ pub struct Relays {
     report: Mutex<Report>,
 }
 impl Relays {
+    /// Default quorum. Production always goes through [`Self::with_quorum`] with the `--quorum`
+    /// flag; this is the tests' shorthand.
+    #[cfg(test)]
     pub fn new(urls: &[String]) -> Result<Self, String> {
         Self::with_quorum(urls, None)
     }
