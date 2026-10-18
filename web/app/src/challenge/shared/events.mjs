@@ -12,8 +12,31 @@ export const claimRef = e => { const refs=e.tags.filter(t=>t[0]==='e'&&!t[3]); r
 export const mentions = (e, pk) => e.tags.some(t => t[0] === 'p' && t[1] === pk);
 export const newer = (a,b) => !b || a.created_at > b.created_at || (a.created_at === b.created_at && a.id < b.id);
 export function eventId(e) { return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([0,e.pubkey,e.created_at,e.kind,e.tags,e.content])))); }
+// Schnorr verification is pure JS (~1-2 ms per event). Readers re-read their poll overlap every
+// interval and verify each frame twice (relay ingest, then EventStore.add), so a day of history
+// pinned a runner at 99% CPU (run 2, issue #12). Successful verifications are cached:
+// - key = id + pubkey + sig (fixed-length lowercase hex, checked before the lookup, so the
+//   concatenation is unambiguous) — exactly the inputs schnorr.verify(sig,id,pubkey) checks;
+// - the id is ALWAYS recomputed from the event (eventId) before the lookup, so a hit can only
+//   accept an event whose canonical serialization hashes to the id whose signature was checked;
+//   changed content/tags/kind/created_at/pubkey with a reused id+sig still fails;
+// - failures are never cached (a forged signature is re-checked and rejected every time);
+// - bounded LRU of VERIFY_CACHE_LIMIT keys (~256-char strings, a few MB at the cap): a relay
+//   flooding unique valid events can only evict older entries, never grow the cache.
+export const VERIFY_CACHE_LIMIT = 20000;
+const verified = new Set();
+export const verifyCacheSize = () => verified.size;
+export const clearVerifyCache = () => verified.clear();
+function signatureValid(e) {
+  const key = e.id + e.pubkey + e.sig;
+  if (verified.has(key)) { verified.delete(key); verified.add(key); return true; }
+  if (!schnorr.verify(e.sig, e.id, e.pubkey)) return false;
+  verified.add(key);
+  if (verified.size > VERIFY_CACHE_LIMIT) verified.delete(verified.values().next().value);
+  return true;
+}
 export function verify(e) {
-  try { return hex(e.id) && hex(e.pubkey) && /^[0-9a-f]{128}$/.test(e.sig) && Number.isSafeInteger(e.kind) && e.kind >= 0 && e.kind <= 65535 && Number.isSafeInteger(e.created_at) && e.created_at >= 0 && typeof e.content === 'string' && Array.isArray(e.tags) && e.tags.every(t => Array.isArray(t) && t.every(v => typeof v === 'string')) && eventId(e) === e.id && schnorr.verify(e.sig,e.id,e.pubkey); } catch { return false; }
+  try { return hex(e.id) && hex(e.pubkey) && /^[0-9a-f]{128}$/.test(e.sig) && Number.isSafeInteger(e.kind) && e.kind >= 0 && e.kind <= 65535 && Number.isSafeInteger(e.created_at) && e.created_at >= 0 && typeof e.content === 'string' && Array.isArray(e.tags) && e.tags.every(t => Array.isArray(t) && t.every(v => typeof v === 'string')) && eventId(e) === e.id && signatureValid(e); } catch { return false; }
 }
 export function signAuth(key, relay, challenge, now = Math.floor(Date.now()/1000)) {
   const e = {pubkey:bytesToHex(schnorr.getPublicKey(key)),created_at:now,kind:RELAY_AUTH,tags:[['relay',relay],['challenge',challenge]],content:''};

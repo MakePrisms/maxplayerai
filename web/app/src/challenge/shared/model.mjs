@@ -17,7 +17,8 @@ export class EventStore {
   applicants=new Map(); applicantsTruncated=false;
   constructor({applicantCap=256}={}) { this.applicantCap=applicantCap; }
   add(e) {
-    if(!verify(e)||this.events.has(e.id)) return false;
+    // Already-stored ids return false either way; checking them first skips the id hash on re-reads.
+    if(this.events.has(e?.id)||!verify(e)) return false;
     if(e.kind===MEMBERSHIP) {
       // An invalid replacement must never evict a valid one.
       if(!validMembership(e,{pubkey:tag(e,'d')})) return false;
