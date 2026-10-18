@@ -795,15 +795,20 @@ async function main() {
     }
   } finally {
     health.stop();source.stop();
-    // Locked runner: the loop has ended (stop asked, or a fatal journal error that main().catch
-    // records as exitCode 1). The journal is fsynced and nothing is in flight, so cancel the grace
-    // timer and exit now with that code, releasing the lock; never wait on relay socket teardown.
+    // Locked runner: the loop has ended. On a stop request nothing is in flight and the last save
+    // is durable, so cancel the grace timer and exit 0 on the next turn, releasing the lock; never
+    // wait on relay socket teardown. On a fatal journal error the throw continues past this block
+    // into main().catch, which calls process.exit(1) before this setImmediate runs (the exit code
+    // comes from that explicit exit, not from process.exitCode). Do not turn that catch back into
+    // an exitCode-only handler: see its comment.
     if(parentWatch){parentWatch.cancel();setImmediate(()=>process.exit(process.exitCode??0));}
   }
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{
-  // Every failure exits (advisor r3 #1). A startup throw in the locked runner (empty relay list, no
-  // buyer pubkey, corrupt journal) happens before the loop's exiting finally, and the parent pipe
-  // keeps stdin flowing, so only setting exitCode left the runner alive holding the lock (and flock
-  // and the parent waiting on it). Nothing is in flight at that point; the journal is fsynced.
+  // Every failure exits explicitly with 1 (advisor r3 #1). A startup throw in the locked runner
+  // (empty relay list, no buyer pubkey, corrupt journal) happens before the loop's exiting finally,
+  // and the parent pipe keeps stdin flowing, so only setting exitCode left the runner alive holding
+  // the lock (and flock and the parent waiting on it). A fatal journal error from the loop also
+  // lands here. No command is in flight at either point. The journal on disk is the last SUCCESSFUL
+  // save: a failed save never replaced it (its temp is removed), so that save's state is lost.
   console.error(e.message);process.exit(1);});
