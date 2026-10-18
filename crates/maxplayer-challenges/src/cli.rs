@@ -10,8 +10,10 @@ const HELP: &str = "Usage: maxplayer-challenges <command> [--home <path>] [--jso
   members [--challenge <d>]
   decide --seller <npub|hex> --accept|--deny
 Join or leave at any time. Joining after work starts means eligibility from the next day.
-While a running challenge counts your membership, join refuses to change minutes or note
-(republishing would forfeit that day); change them after it ends. Same minutes is a no-op.
+While a running challenge counts your accepted membership, join refuses to change minutes or
+note (republishing would forfeit that day); change them 15 minutes after it ends (clock drift).
+Never leave and rejoin to change minutes: that forfeits the day too. Same minutes with --note
+omitted or equal is a no-op; on a change, omitting --note keeps the note, --note '' clears it.
 Membership and acceptance persist across days. Minutes are offered per day.
 Status/members default to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
 Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://relay.primal.net, wss://offchain.pub.
@@ -21,6 +23,24 @@ Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 /// Authors per roster membership REQ, and the newest-first applicant sample size (matches the page).
 const ROSTER_AUTHOR_CHUNK: usize = 100;
 const APPLICANT_LIMIT: usize = 256;
+/// The protocol's `created_at` drift tolerance (`docs/challenges-v1.md`): relays and readers
+/// accept an event dated up to this far ahead of their own clock.
+const CREATED_AT_TOLERANCE: u64 = 900;
+#[cfg(not(test))]
+fn now_secs() -> u64 {
+    nostr_sdk::Timestamp::now().as_secs()
+}
+#[cfg(test)]
+thread_local! {
+    /// Test-only wall clock override for boundary tests (the current thread's runtime).
+    static TEST_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+fn now_secs() -> u64 {
+    TEST_CLOCK
+        .with(std::cell::Cell::get)
+        .unwrap_or_else(|| nostr_sdk::Timestamp::now().as_secs())
+}
 #[derive(Debug)]
 struct Opts {
     command: String,
@@ -273,7 +293,7 @@ async fn execute_async(
         .transpose()?
         .unwrap_or(public_key(&own)?)
         .to_hex();
-    let now = Timestamp::now().as_secs();
+    let now = now_secs();
     if o.command == "publish" {
         let starts = timestamp(o.required("--starts")?)?;
         let c = Challenge {
@@ -416,7 +436,7 @@ async fn execute_async(
         .iter()
         .filter_map(|e| parse_decision(e, &buyer).ok())
         .collect();
-    let now = Timestamp::now().as_secs();
+    let now = now_secs();
     let (kind, coordinate_d) = match o.command.as_str() {
         "decide" => (
             CHALLENGE_DECISION_KIND,
@@ -459,21 +479,34 @@ async fn execute_async(
             // Memberships are replaceable: the republished event's `created_at` would be
             // `created`, and eligibility needs it at or before the start. Refuse while a running
             // challenge still counts the current membership; fail closed if that is unreadable.
-            let challenges = relay
-                .fetch(
-                    home,
-                    Filter::new()
-                        .author(public_key(&buyer)?)
-                        .kind(Kind::from(CHALLENGE_KIND)),
-                )
-                .await
-                .map_err(|e| format!("could not read the buyer's challenge state reliably ({e}); refusing to change your membership, because republishing it during a running challenge would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
-            if let Some(c) = blocking_challenge(&challenges, &buyer, event, current, now, created) {
-                return Err(format!(
-                    "You're in today's challenge ({}, ends {}). Change your minutes (or note) after it ends; they apply from the next day. Re-publishing now would make you ineligible for today. Nothing was published.",
-                    c.id,
-                    Timestamp::from(c.ends).to_human_datetime()
-                ));
+            // Eligibility also needs the latest buyer decision `accepted` (trusted read above):
+            // a pending or denied seller is not counted today, so its edit forfeits nothing.
+            let accepted = decisions
+                .iter()
+                .any(|d| d.seller == own && d.decision == "accepted");
+            if accepted {
+                // Strict every-relay read. Keep it strict even if ordinary reads move to a
+                // quorum: the relay left out could be the only one holding the running challenge.
+                let challenges = relay
+                    .fetch(
+                        home,
+                        Filter::new()
+                            .author(public_key(&buyer)?)
+                            .kind(Kind::from(CHALLENGE_KIND)),
+                    )
+                    .await
+                    .map_err(|e| format!("could not read the buyer's challenge state reliably ({e}); refusing to change your membership, because republishing it during a running challenge would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
+                if let Some(c) =
+                    blocking_challenge(&challenges, &buyer, event, current, now, created)
+                {
+                    return Err(format!(
+                        "You're in today's challenge ({}, ends {}). Change your minutes (or note) after {} (15 minutes after it ends, allowing for clock drift); they apply from the next day. Re-publishing now would make you ineligible for today. Do not leave and rejoin to change minutes: that also forfeits today. Nothing was published.",
+                        c.id,
+                        Timestamp::from(c.ends).to_human_datetime(),
+                        Timestamp::from(c.ends.saturating_add(CREATED_AT_TOLERANCE))
+                            .to_human_datetime()
+                    ));
+                }
             }
         }
     }
@@ -563,8 +596,13 @@ async fn execute_async(
 /// The running challenge (latest-ending, if several) that the caller's current membership still
 /// counts for, and that a republish at `created` would forfeit. Only buyer-signed challenges
 /// (`parse_challenge` verifies author and signature), latest per coordinate, `scheduled` or
-/// `in_progress`, inside `[starts, ends)` (or about to be passed by `created`) and with the
-/// membership's `created_at` and `since` at or before `starts` (the eligibility rule).
+/// `in_progress`, with the membership's `created_at` and `since` at or before `starts` (the
+/// eligibility rule). Time window: the republish forfeits only if it is dated after `starts`
+/// (`created > starts`; `created >= now`, so this covers the whole open interval after the
+/// start, and a bumped timestamp before it), and the buyer may post through `ends` inclusive.
+/// A seller clock up to `CREATED_AT_TOLERANCE` fast still gets its event accepted, so the
+/// window stays closed until `now > ends + CREATED_AT_TOLERANCE`; a slow clock dates the event
+/// earlier, which never forfeits.
 fn blocking_challenge(
     challenges: &[nostr_sdk::Event],
     buyer: &str,
@@ -582,7 +620,7 @@ fn blocking_challenge(
     .into_iter()
     .filter_map(|e| parse_challenge(e, buyer).ok())
     .filter(|c| matches!(c.status.as_str(), "scheduled" | "in_progress"))
-    .filter(|c| (now >= c.starts || created > c.starts) && now < c.ends)
+    .filter(|c| created > c.starts && now <= c.ends.saturating_add(CREATED_AT_TOLERANCE))
     .filter(|c| membership.created_at.as_secs() <= c.starts && current.since <= c.starts)
     .max_by(|a, b| a.ends.cmp(&b.ends).then(b.id.cmp(&a.id)))
 }
@@ -623,7 +661,7 @@ fn replacement_timestamp(
         .map(|e| e.created_at.as_secs())
         .max();
     let created = previous.map_or(now, |t| now.max(t.saturating_add(1)));
-    if created > now.saturating_add(900) {
+    if created > now.saturating_add(CREATED_AT_TOLERANCE) {
         return Err("existing event timestamp is too far in the future".into());
     }
     Ok(created)
@@ -1598,9 +1636,13 @@ mod tests {
             }
             /// The seller's `joined` membership, signed at `t` with `since = t`.
             fn joined(s: &Setup, minutes: u64, note: &str, t: u64) -> Event {
+                joined_since(s, minutes, note, t, t)
+            }
+            /// The seller's `joined` membership with `since` and `created_at` set separately.
+            fn joined_since(s: &Setup, minutes: u64, note: &str, since: u64, t: u64) -> Event {
                 let a = Membership {
                     seller: s.seller.public_key().to_hex(),
-                    since: t,
+                    since,
                     minutes,
                     status: "joined".into(),
                     note: note.into(),
@@ -1633,6 +1675,45 @@ mod tests {
             }
             fn writes(relay: &crate::relay::transport_tests::Fixture) -> Vec<Event> {
                 relay.writes.lock().unwrap().clone()
+            }
+            /// `join` with an exact argv (so `--note ''` can be an empty argument).
+            async fn join_argv(
+                s: &Setup,
+                url: &str,
+                extra: &[&str],
+            ) -> Result<serde_json::Value, String> {
+                let mut argv = args(&format!("join --buyer {}", s.buyer));
+                argv.extend(extra.iter().map(|a| (*a).to_owned()));
+                let mut o = super::super::parse(&argv).unwrap();
+                o.relays = vec![url.to_owned()];
+                execute_async(&o, &s.home).await.map(|(body, _)| body)
+            }
+            /// Pins the sidecar's wall clock (`now_secs`) on this thread until dropped.
+            struct Clock;
+            impl Clock {
+                fn at(t: u64) -> Self {
+                    crate::cli::TEST_CLOCK.with(|c| c.set(Some(t)));
+                    Clock
+                }
+            }
+            impl Drop for Clock {
+                fn drop(&mut self) {
+                    crate::cli::TEST_CLOCK.with(|c| c.set(None));
+                }
+            }
+            /// How many REQs asked for the buyer's challenges (kind 30340).
+            fn challenge_reqs(relay: &crate::relay::transport_tests::Fixture) -> usize {
+                relay
+                    .reqs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|f| {
+                        f["kinds"]
+                            .as_array()
+                            .is_some_and(|k| k.iter().any(|v| v == CHALLENGE_KIND))
+                    })
+                    .count()
             }
             #[test]
             fn midday_minutes_change_is_refused_exit_nonzero_and_publishes_nothing() {
@@ -1725,11 +1806,12 @@ mod tests {
                 assert!(writes(&relay).is_empty());
             }
             #[tokio::test]
-            async fn midday_minutes_change_before_start_after_end_or_not_running_is_published() {
+            async fn midday_minutes_change_wall_clock_before_start_after_end_or_not_counted_is_published()
+             {
                 let s = setup("allowed");
                 let n = s.now;
                 let member = joined(&s, 60, "hello", n - 20_000);
-                let cases = [
+                let cases: [(&str, Vec<Event>); 4] = [
                     (
                         "before start",
                         vec![challenge(
@@ -1770,22 +1852,33 @@ mod tests {
                             challenge(&s, "day", n - 100, n + 3600, "cancelled", n - 50),
                         ],
                     ),
-                    // Already ineligible today (membership replaced after the start): nothing to lose.
+                ];
+                // Already ineligible today, so there is nothing to lose: each conjunct alone.
+                let running_day =
+                    || challenge(&s, "day", n - 100, n + 3600, "in_progress", n - 30_000);
+                let replaced = [
                     (
-                        "membership already after start",
-                        vec![challenge(
-                            &s,
-                            "day",
-                            n - 20_100,
-                            n + 3600,
-                            "in_progress",
-                            n - 30_000,
-                        )],
+                        "membership replaced after start (since <= starts < created_at)",
+                        joined_since(&s, 60, "hello", n - 20_000, n - 50),
+                        n - 20_000,
+                    ),
+                    (
+                        "membership period began after start (created_at <= starts < since)",
+                        joined_since(&s, 60, "hello", n - 50, n - 20_000),
+                        n - 50,
                     ),
                 ];
-                for (case, mut events) in cases {
+                let all = cases
+                    .into_iter()
+                    .map(|(case, events)| (case, events, member.clone(), n - 20_000))
+                    .chain(
+                        replaced
+                            .into_iter()
+                            .map(|(case, m, since)| (case, vec![running_day()], m, since)),
+                    );
+                for (case, mut events, member, since) in all {
                     events.push(decision(&s.buyer_keys, &s.seller, "accepted", n - 19_000));
-                    events.push(member.clone());
+                    events.push(member);
                     let relay = relay_like(events, vec![]).await;
                     let line = format!("join --buyer {} --minutes 120", s.buyer);
                     let body = command(&s, &relay.url, &line)
@@ -1797,7 +1890,7 @@ mod tests {
                     let a = parse_membership(&w[0], &s.buyer).unwrap();
                     assert_eq!(
                         (a.status.as_str(), a.minutes, a.since),
-                        ("joined", 120, n - 20_000),
+                        ("joined", 120, since),
                         "{case}"
                     );
                     assert_eq!(a.note, "hello", "{case}: omitting --note keeps the note");
@@ -1883,6 +1976,233 @@ mod tests {
                     true
                 );
                 assert!(writes(&relay).is_empty());
+            }
+            /// Fixed-clock day: starts `S`, ends `E`, accepted seller joined well before `S`.
+            fn pinned(s: &Setup, minutes_note: &str) -> (u64, u64, Vec<Event>) {
+                let (starts, ends) = (s.now - 50_000, s.now - 40_000);
+                let events = vec![
+                    challenge(s, "day", starts, ends, "in_progress", starts - 10_000),
+                    decision(&s.buyer_keys, &s.seller, "accepted", starts - 9_000),
+                    joined(s, 60, minutes_note, starts - 8_000),
+                ];
+                (starts, ends, events)
+            }
+            #[tokio::test]
+            async fn midday_end_bound_refuses_through_ends_plus_drift_tolerance() {
+                let s = setup("end-bound");
+                let (_, ends, events) = pinned(&s, "hello");
+                // The buyer may post through `ends` inclusive, and a seller clock up to 900 s
+                // fast still has its event accepted: refuse through `ends + 900`.
+                for now in [ends, ends + CREATED_AT_TOLERANCE] {
+                    let relay = relay_like(events.clone(), vec![]).await;
+                    let _clock = Clock::at(now);
+                    let error = join_argv(&s, &relay.url, &["--minutes", "120"])
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error.contains("You're in today's challenge (day,"),
+                        "{now}: {error}"
+                    );
+                    let after = Timestamp::from(ends + CREATED_AT_TOLERANCE).to_human_datetime();
+                    assert!(error.contains(&format!("after {after}")), "{error}");
+                    assert!(error.contains("Do not leave and rejoin"), "{error}");
+                    assert!(writes(&relay).is_empty(), "now = {now}: published");
+                }
+                // Just past the bound: the change publishes, dated at the (pinned) clock.
+                let relay = relay_like(events.clone(), vec![]).await;
+                let _clock = Clock::at(ends + CREATED_AT_TOLERANCE + 1);
+                join_argv(&s, &relay.url, &["--minutes", "120"])
+                    .await
+                    .unwrap();
+                let w = writes(&relay);
+                assert_eq!(w.len(), 1);
+                assert_eq!(w[0].created_at.as_secs(), ends + CREATED_AT_TOLERANCE + 1);
+                assert_eq!(parse_membership(&w[0], &s.buyer).unwrap().minutes, 120);
+            }
+            #[tokio::test]
+            async fn midday_start_second_is_allowed_and_stays_eligible() {
+                let s = setup("start-second");
+                let (starts, _, events) = pinned(&s, "hello");
+                let accepted = events[1].clone();
+                let day = parse_challenge(&events[0], &s.buyer).unwrap();
+                // now == starts == created: the signed event still satisfies created_at <= starts.
+                let relay = relay_like(events.clone(), vec![]).await;
+                {
+                    let _clock = Clock::at(starts);
+                    join_argv(&s, &relay.url, &["--minutes", "120"])
+                        .await
+                        .unwrap();
+                }
+                let w = writes(&relay);
+                assert_eq!(w.len(), 1);
+                assert_eq!(w[0].created_at.as_secs(), starts);
+                assert_eq!(eligible_sellers(&day, [&w[0], &accepted]).len(), 1);
+                // One second later the event would be dated after the start: refused.
+                let relay = relay_like(events, vec![]).await;
+                let _clock = Clock::at(starts + 1);
+                let error = join_argv(&s, &relay.url, &["--minutes", "120"])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("You're in today's challenge (day,"),
+                    "{error}"
+                );
+                assert!(writes(&relay).is_empty());
+            }
+            #[tokio::test]
+            async fn midday_bumped_created_after_start_is_refused_before_start() {
+                let s = setup("bumped");
+                let (starts, ends) = (s.now - 50_000, s.now - 40_000);
+                // The previous membership is dated exactly at `starts` (still eligible), so the
+                // NIP-01 bump signs `starts + 1` even though the wall clock is before the start.
+                let events = vec![
+                    challenge(&s, "day", starts, ends, "scheduled", starts - 10_000),
+                    decision(&s.buyer_keys, &s.seller, "accepted", starts - 9_000),
+                    joined(&s, 60, "hello", starts),
+                ];
+                let relay = relay_like(events, vec![]).await;
+                let _clock = Clock::at(starts - 10);
+                let error = join_argv(&s, &relay.url, &["--minutes", "120"])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("You're in today's challenge (day,"),
+                    "{error}"
+                );
+                assert!(writes(&relay).is_empty(), "bumped replacement published");
+            }
+            #[tokio::test]
+            async fn midday_pending_or_denied_seller_can_edit_minutes() {
+                let s = setup("not-accepted");
+                let n = s.now;
+                let day = challenge(&s, "day", n - 100, n + 3600, "in_progress", n - 30_000);
+                let member = joined(&s, 60, "hello", n - 20_000);
+                let cases = [
+                    ("pending (no decision)", vec![]),
+                    (
+                        "denied",
+                        vec![decision(&s.buyer_keys, &s.seller, "denied", n - 19_000)],
+                    ),
+                    (
+                        "accepted, then denied (latest wins)",
+                        vec![
+                            decision(&s.buyer_keys, &s.seller, "accepted", n - 19_000),
+                            decision(&s.buyer_keys, &s.seller, "denied", n - 18_000),
+                        ],
+                    ),
+                ];
+                for (case, decisions) in cases {
+                    let mut events = vec![day.clone(), member.clone()];
+                    events.extend(decisions);
+                    // Not counted today, so nothing to forfeit: no challenge read is needed,
+                    // and an unreadable challenge kind does not block the edit.
+                    let relay = relay_like_closing(events, vec![], Some(CHALLENGE_KIND)).await;
+                    let line = format!("join --buyer {} --minutes 120", s.buyer);
+                    let body = command(&s, &relay.url, &line)
+                        .await
+                        .unwrap_or_else(|e| panic!("{case}: {e}"));
+                    assert!(body["event_id"].is_string(), "{case}: {body}");
+                    let w = writes(&relay);
+                    assert_eq!(w.len(), 1, "{case}");
+                    let a = parse_membership(&w[0], &s.buyer).unwrap();
+                    assert_eq!((a.minutes, a.since), (120, n - 20_000), "{case}");
+                    assert_eq!(challenge_reqs(&relay), 0, "{case}");
+                }
+                // The accepted seller in the same state is still refused.
+                let events = vec![
+                    day,
+                    member,
+                    decision(&s.buyer_keys, &s.seller, "accepted", n - 19_000),
+                ];
+                let relay = relay_like(events, vec![]).await;
+                let line = format!("join --buyer {} --minutes 120", s.buyer);
+                assert!(command(&s, &relay.url, &line).await.is_err());
+                assert!(writes(&relay).is_empty());
+            }
+            #[tokio::test]
+            async fn midday_empty_note_clears_and_counts_as_a_change() {
+                let s = setup("empty-note");
+                let n = s.now;
+                // Running: `--note ''` against note "hello" is a change, so it is refused.
+                let relay = relay_like(running(&s), vec![]).await;
+                let error = join_argv(&s, &relay.url, &["--minutes", "60", "--note", ""])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("You're in today's challenge (day,"),
+                    "{error}"
+                );
+                assert!(writes(&relay).is_empty());
+                // Before the start: it publishes with the note cleared.
+                let events = vec![
+                    challenge(&s, "day", n + 3600, n + 7200, "scheduled", n - 30_000),
+                    decision(&s.buyer_keys, &s.seller, "accepted", n - 19_000),
+                    joined(&s, 60, "hello", n - 20_000),
+                ];
+                let relay = relay_like(events, vec![]).await;
+                join_argv(&s, &relay.url, &["--minutes", "60", "--note", ""])
+                    .await
+                    .unwrap();
+                let w = writes(&relay);
+                assert_eq!(w.len(), 1);
+                let a = parse_membership(&w[0], &s.buyer).unwrap();
+                assert_eq!((a.minutes, a.note.as_str()), (60, ""));
+                // Already empty: `--note ''` with the same minutes is a no-op.
+                let mut events = running(&s);
+                events[2] = joined(&s, 60, "", n - 20_000);
+                let relay = relay_like(events, vec![]).await;
+                let body = join_argv(&s, &relay.url, &["--minutes", "60", "--note", ""])
+                    .await
+                    .unwrap();
+                assert_eq!(body["unchanged"], true, "{body}");
+                assert!(writes(&relay).is_empty());
+            }
+            #[tokio::test]
+            async fn midday_timeout_or_truncated_challenge_read_refuses_minutes_change() {
+                use crate::relay::transport_tests::{Refusal, relay_like_refusing};
+                let s = setup("timeout-truncated");
+                // No EOSE: the reader waits out its timeout, then fails closed.
+                let relay = relay_like_refusing(
+                    running(&s),
+                    vec![],
+                    Some((CHALLENGE_KIND, Refusal::NoEose)),
+                )
+                .await;
+                let error = join_argv(&s, &relay.url, &["--minutes", "120"])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("could not read the buyer's challenge state reliably"),
+                    "{error}"
+                );
+                assert!(error.contains("no EOSE before timeout"), "{error}");
+                assert!(
+                    writes(&relay).is_empty(),
+                    "published after a timed-out read"
+                );
+                // Truncated history: a full page of buyer kind-30340 events in one second.
+                let flood = s.now - 10;
+                let mut events = running(&s);
+                events.extend((0..crate::relay::PAGE_LIMIT).map(|i| {
+                    EventBuilder::new(Kind::from(CHALLENGE_KIND), "")
+                        .tags([Tag::identifier(format!("flood-{i}"))])
+                        .custom_created_at(Timestamp::from(flood))
+                        .sign_with_keys(&s.buyer_keys)
+                        .unwrap()
+                }));
+                let relay = relay_like(events, vec![]).await;
+                let error = join_argv(&s, &relay.url, &["--minutes", "120"])
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.contains("could not read the buyer's challenge state reliably"),
+                    "{error}"
+                );
+                assert!(error.contains("history truncated"), "{error}");
+                assert!(
+                    writes(&relay).is_empty(),
+                    "published after a truncated read"
+                );
             }
         }
         // END midday-minutes tests
