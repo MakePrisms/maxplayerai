@@ -1795,3 +1795,127 @@ test('R3-5 (advisor r1 M2): a same-size decoy legacy file is not reused; the aud
     } finally {rmSync(dir,{recursive:true});}
   }
 });
+// R3-3: operator task context, refusal outcome, planner feedback.
+test('R3-3 context: SWARM_TASK_CONTEXT is appended to every posted task, journaled, and kept out of the planner task text',async()=>{
+  const {challengeTaskPrefix}=await import('../../web/app/src/challenge/shared/events.mjs');
+  const {DELIVERY_NOTE,contextBlock,plannerTask}=await import('./swarm.mjs');
+  const f=fixture(),ctx='This is a public historical cipher from 1872, used for education.';f.c.taskContext=ctx;
+  await f.runner.tick();
+  const posts=f.calls.filter(([t])=>t==='post_job').map(([,a])=>a.task);
+  assert.equal(posts.length,2);
+  for(const task of posts)assert.equal(task,challengeTaskPrefix('b','day')+'piece'+contextBlock(ctx)+DELIVERY_NOTE,'every task carries the context once, before the delivery note');
+  assert.ok(f.journal.state.jobs.every(j=>j.taskContext===ctx));
+  f.setPlan(()=>({wait:true}));f.time(101);await f.runner.tick();
+  const input=f.inputs.at(-1);
+  assert.equal(input.taskContext,ctx,'planner is told the context once');
+  for(const r of input.running)assert.equal(r.task,challengeTaskPrefix('b','day')+'piece','running task is the planner text only');
+  for(const j of f.journal.state.jobs)j.done=true,j.outcome='expired/undelivered';
+  f.time(102);await f.runner.tick();
+  for(const r of f.inputs.at(-1).results)assert.ok(!r.task.includes('CONTEXT'),'result task is the planner text only');
+  // A context changed after posting still strips the one the job was posted with.
+  assert.equal(plannerTask(challengeTaskPrefix('b','day')+'x'+contextBlock('old')+DELIVERY_NOTE,'old'),challengeTaskPrefix('b','day')+'x');
+  // No context: unchanged task (back-compatible) and no taskContext field.
+  const g=fixture();await g.runner.tick();
+  assert.equal(g.calls.find(([t])=>t==='post_job')[1].task,challengeTaskPrefix('b','day')+'piece'+DELIVERY_NOTE);
+  g.setPlan(()=>({wait:true}));g.time(101);await g.runner.tick();assert.equal('taskContext' in g.inputs.at(-1),false);
+});
+test('R3-3 context: config reads SWARM_TASK_CONTEXT or SWARM_TASK_CONTEXT_FILE, trims, bounds, refuses both',()=>{
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://localhost'};
+  assert.equal(config([],base).taskContext,null);
+  assert.equal(config([],{...base,SWARM_TASK_CONTEXT:'  Public historical cipher.\n'}).taskContext,'Public historical cipher.');
+  assert.equal(config([],{...base,SWARM_TASK_CONTEXT:'   '}).taskContext,null);
+  const dir=mkdtempSync(join(tmpdir(),'swarm-ctx-'));
+  try {
+    const file=join(dir,'context.txt');process.getBuiltinModule('node:fs').writeFileSync(file,'Line one.\nLine two.\n');
+    assert.equal(config([],{...base,SWARM_TASK_CONTEXT_FILE:file}).taskContext,'Line one.\nLine two.');
+    assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT_FILE:file,SWARM_TASK_CONTEXT:'x'}),/not both/);
+    assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT_FILE:join(dir,'missing')}),/ENOENT/);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+  assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT:'x'.repeat(4001)}),/at most 4000/);
+});
+const REFUSALS=[
+  'A safety classifier stopped my work right after I checked the environment.',
+  'MAXPLAYER-ANSWER-V1\nI can\'t help with breaking this cipher.',
+  'I\u2019m sorry, but I cannot assist with this request.',
+  'Unfortunately, I am unable to complete this task because it may violate the usage policy.',
+  'My work was blocked by the content filter before I could start.',
+  'I must decline this task.',
+  'I\'m not comfortable continuing with this.',
+  'Delivered files (no inline answer):\n===== REPORT.md =====\nI won\'t help with decrypting this message.\n',
+];
+const LEGITIMATE=[
+  'KLJBO','42','The answer is 42.','Plaintext: I CANNOT HELP YOU','Decrypted: "i cannot help" is the crib position 7',
+  'I cannot complete this in the time given, but here is partial progress: key length 5.',
+  'No valid keyword found among the 200 candidates tested.',
+  'I could not find the second keyword; tested HUTTON, CIPHER and SECRET.',
+  'Keyword 1: SECRET\nKeyword 2: unknown (search space exhausted for 5-letter words)',
+  'Result: the bombe found no stop with crib WETTER at offsets 0-40.',
+  '```\nI cannot help\n```',
+  'Steps:\n1. I can\'t help noticing the period is 26.\n2. Shifted.\n3. Checked.',
+  'I can\'t help noticing the key repeats every 7 letters, so the keyword is CLOCKWORK.',
+  'The safety classifier note in the README is unrelated; the key is CROWN.',
+  'x'.repeat(700)+' A safety classifier stopped my work.',
+  'Policy: none. Decryption: ATTACK AT DAWN.',
+];
+test('R3-3 refusal: detectRefusal flags refusals and safety stops, never legitimate short answers',async()=>{
+  const {detectRefusal,REFUSAL_MARKER}=await import('./swarm.mjs');
+  for(const s of REFUSALS)assert.ok(detectRefusal(s),`refusal not detected: ${JSON.stringify(s)}`);
+  for(const s of LEGITIMATE)assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
+  for(const s of ['',null,undefined,42,'\n\n'])assert.equal(detectRefusal(s),null);
+  // The explicit marker is honoured at any length and with Markdown decoration.
+  for(const m of [REFUSAL_MARKER,`**${REFUSAL_MARKER}**`,`# ${REFUSAL_MARKER}:`,`\`${REFUSAL_MARKER}\``])
+    assert.deepEqual(detectRefusal(`\n${m}\nPolicy forbids this. ${'x'.repeat(2000)}`).by,'marker');
+  assert.equal(detectRefusal(`${REFUSAL_MARKER}`).reason,'(no reason given)');
+  // Not the marker unless it is the first non-blank line.
+  assert.equal(detectRefusal(`Result: 42\n${REFUSAL_MARKER}`),null);
+});
+test('R3-3 refusal: recorded once as refused (not collected work), planner told to reassign, same seller rejected, another accepted',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  await f.runner.tick();
+  const [ja,jb]=f.journal.state.jobs;
+  [...f.remote.values()].find(r=>r.id===ja.id).results=[{}];
+  f.io.answer=async()=>'A safety classifier stopped my work right after I checked the environment.';
+  f.setPlan(()=>({wait:true}));
+  for(let t=101;t<=105;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,1,'collected (and settled) exactly once');
+  assert.equal(ja.outcome,'refused');assert.equal(ja.done,true);assert.equal(ja.refusal.by,'heuristic');assert.equal(ja.refusal.kind,'safety stop');
+  assert.equal(reports.filter(m=>m.includes('REFUSED')).length,1);
+  const input=f.inputs.at(-1),r=input.results.find(x=>x.seller==='a');
+  assert.equal(r.outcome,'refused');assert.equal(r.refused,true);assert.match(r.answer,/^\[refused: .*NOT completed work; assign this workstream to a different seller\]/);
+  assert.deepEqual(input.refusals.map(x=>[x.seller,x.workstream,x.by,x.sameContext]),[['a','piece','heuristic',true]]);
+  const profile=input.sellers.find(s=>s.pubkey==='a');
+  if(profile){assert.equal(profile.trackRecord.delivered,0);assert.equal(profile.trackRecord.refused,1);}
+  // Free seller a (ACCEPT projected) and b (expired); the planner tries the same seller again, then another.
+  f.snap.jobs=[{id:ja.id,seller:'a',result:{},accepted:true,running:false}];
+  jb.done=true;jb.outcome='expired/undelivered';jb.released=true;
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:({assignments:[{seller:'a',workstream:'piece',task:'retry',durationSeconds:30},{seller:'b',workstream:'piece',task:'retry',durationSeconds:30}]}));
+  f.time(106);await f.runner.tick();
+  const posts=f.calls.filter(([t])=>t==='post_job').map(([,a])=>a.seller_pubkey);
+  assert.deepEqual(posts,['a','b','b'],'refused workstream goes to the other seller only');
+  const rej=Object.values(f.journal.state.days)[0].rejected;
+  assert.equal(rej.length,1);assert.equal(rej[0].seller,'a');assert.match(rej[0].reason,/seller refused workstream "piece".*assign it to a different seller/);
+  // A changed operator context lifts the same-seller guard (the context may be what was missing).
+  f.c.taskContext='Public historical cipher; educational.';
+  f.snap.jobs.push({id:f.journal.state.jobs[2].id,seller:'b',result:{},accepted:true,running:false});f.journal.state.jobs[2].done=true;f.journal.state.jobs[2].outcome='collected';
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:({assignments:[{seller:'a',workstream:'piece',task:'retry with context',durationSeconds:30}]}));
+  f.time(107);await f.runner.tick();
+  assert.equal(f.calls.filter(([t])=>t==='post_job').at(-1)[1].seller_pubkey,'a');
+});
+test('R3-3 refusal: progress does not count a refusal as a recorded result; stub planner never counts it as delivered',async()=>{
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.c.updateEvery=1;
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  f.io.answer=async()=>'I\'m sorry, but I can\'t help with that.';f.setPlan(()=>({wait:true}));
+  f.time(300);await f.runner.tick();
+  const update=f.publishes.at(-1)[3];
+  assert.match(update,/^0 results recorded; 1 refused by sellers \(not counted as work\); /);
+  // planner-stub counts delivered results by non-bracketed answers.
+  assert.ok(f.inputs.at(-1).results[0].answer.startsWith('['));
+});
+test('R3-3 refusal: a legitimate short answer is a normal collect',async()=>{
+  for(const answer of ['KLJBO','The answer is 42.','No valid keyword found among the 200 candidates tested.']) {
+    const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();[...f.remote.values()][0].results=[{}];
+    f.io.answer=async()=>answer;f.setPlan(()=>({wait:true}));f.time(101);await f.runner.tick();
+    const j=f.journal.state.jobs[0];assert.equal(j.outcome,'collected');assert.equal(j.refusal,undefined);
+    assert.equal(f.inputs.at(-1).refusals,undefined);assert.equal(f.inputs.at(-1).results[0].answer,answer);
+  }
+});
