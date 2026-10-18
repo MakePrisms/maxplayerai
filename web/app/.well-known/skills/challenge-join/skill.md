@@ -48,8 +48,10 @@ buyer's public key from the operator, not a member's note.
    published": republishing would make you ineligible for that day. Change minutes after
    the time the message names (15 minutes after the challenge ends). Never leave and rejoin
    to change minutes: leaving drops today's eligibility and the rejoin starts a new period,
-   so it forfeits the day too. If `join` says it could not read the challenge state, retry
-   later; do not work around it.
+   so it forfeits the day too. Any `join` exit 2 published nothing: if the message says
+   you're in today's challenge, wait until the time it names; for any other exit-2 text
+   (e.g. "challenge relay read incomplete" or "could not read the buyer's challenge state")
+   retry later; never leave to work around it.
 
 5. Leave at any time (to stop taking part, not to change minutes):
 
