@@ -149,8 +149,10 @@ pending/running task per seller, including offers not yet visible in the public 
 The planner is an external JSON stdin/stdout command. Once per challenge, `analyze` receives
 its goal and full eligible roster and returns an approach, workstreams (needs, estimates,
 dependencies), and verification plan. The durable journal preserves this analysis across restarts.
-Each tick `assign` receives the plan, all free eligible seller profiles, running jobs and all
-results, and returns a batch of assignments
+Each tick `assign` receives the plan, all free eligible seller profiles, running jobs and the
+result history (bounded: the newest results in full, older ones as marked head-and-tail digests,
+under a hard per-call character budget described in the runner README; a result dropped to fit
+still leaves a seller/outcome/time index line, and seller-supplied profile text is capped), and returns a batch of assignments
 `{seller,workstream,task,durationSeconds,amountSats?}`, wait, or verified solved answer.
 The buyer decides whether each seller is worth paying. `amountSats` is a safe integer ≥0,
 default 0: zero posts `payment=none, amount_sats=0, max_sats=0`; N>0 posts a normal
@@ -168,12 +170,18 @@ Profiles include npub/name, self-reported harness/capabilities/hardware, remaini
 and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
 and prefer useful past deliveries. Every assignment is revalidated against fresh eligibility,
 availability, budget, donated minutes and work-window limits. An assignment whose only failing
-check is relay readiness (`relay_not_ready`) is journaled as deferred rather than dropped: it
-posts nothing and reserves no budget, but it still blocks a second assignment to that seller.
-It is retried with full admission once the snapshot is ready again. It is dropped with a
-logged reason when another check fails, the day stops, the work window no longer fits, or
-`SWARM_MAX_DEFER_SECONDS` (120) passes. Durations must fall within
-`SWARM_MIN_DURATION` (120 seconds) and `SWARM_MAX_DURATION` (1800 seconds).
+checks are transient readiness (`relay_not_ready` and/or `stale_snapshot`) is journaled as
+deferred rather than dropped: it posts nothing and reserves no budget, but it still blocks a
+second assignment to that seller. It is retried with full admission once a new snapshot is ready
+and fresh. It is dropped with a logged reason when another check fails, the day stops, the work
+window no longer fits, or `SWARM_MAX_DEFER_SECONDS` (120) passes while the snapshot is still not
+ready. An expired, never-delivered job that cannot yet be proven
+released keeps its sats reserved, but frees its seller for new work after
+`SWARM_EXPIRED_SLOT_GRACE_SECONDS` (600; minimum 480, the seller's 420 s container kill instant
+plus a teardown margin) strictly past its deadline once a confirmed read shows no delivery;
+a late delivery is still collected exactly once. Minutes are not recounted. Durations must fall within
+`SWARM_MIN_DURATION` (300 seconds, a floor that covers seller sandbox/agent startup; a seller
+whose remaining minutes cannot fit it gets no assignment) and `SWARM_MAX_DURATION` (1800 seconds).
 Exhaustion means no free seller can fit the minimum duration and no work is running; choosing
 wait alone never exhausts a challenge. Bundled planners are a deterministic capability-routing
 stub and non-interactive Claude; verified-solution rules remain, including both Hutton keywords

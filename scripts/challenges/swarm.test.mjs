@@ -194,7 +194,7 @@ test('batch rejects invalid duration, busy/duplicate, ineligible and oversized m
     {seller:'b',workstream:'piece',task:'short',durationSeconds:29},
     {seller:'denied',workstream:'piece',task:'ineligible',durationSeconds:30}
   ]}));
-  await f.runner.tick();assert.equal(f.remote.size,1);assert.equal(reports.length,5);
+  await f.runner.tick();assert.equal(f.remote.size,1);assert.equal(reports.filter(r=>r.startsWith('Rejected assignment')).length,5);
   assert.ok(reports.some(r=>r.includes('insufficient_minutes')));
   assert.ok(reports.some(r=>r.includes('busy')));
   await f.runner.tick();assert.equal(f.remote.size,1);
@@ -451,7 +451,7 @@ test('deferred: retry re-runs the full serial budget admission; a deferral reser
   assert.equal(reservedBudget(f.snap,f.journal.state.jobs,105).committedSats,6);
 });
 test('deferred: relay not ready past max wait or work window, or another reason appears, drops it unposted',async()=>{
-  for(const [bound,expected] of [['wait',/not ready within 60s/],['window',/work window exceeded/],['minutes',/insufficient_minutes/],['stop',/not_in_progress/]]){
+  for(const [bound,expected] of [['wait',/still not ready after 60s/],['window',/work window exceeded/],['minutes',/insufficient_minutes/],['stop',/not_in_progress/]]){
     const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.maxDefer=60;
     if(bound==='window')f.snap.challenge.ends=150;
     f.setPlan(gapOnce(f));await f.runner.tick();
@@ -506,5 +506,527 @@ test('deferred: seller stays busy (not in assign roster, shown running, no secon
   assert.equal(posts(f).length,0);assert.equal(f.journal.state.jobs.length,2);
   // Within one gap batch a duplicate for the deferred seller is busy, not deferred twice.
   const g=fixture();g.setPlan(gapOnce(g,()=>({assignments:['first','second'].map(task=>({seller:'a',workstream:'piece',task,durationSeconds:30}))})));
-  await g.runner.tick();assert.deepEqual(g.journal.state.jobs.map(j=>[j.seller,j.args.task.split('\n').at(-1)]),[['a','first']]);
+  await g.runner.tick();assert.deepEqual(g.journal.state.jobs.map(j=>[j.seller,j.args.task.split('\n')[1]]),[['a','first']]);
+});
+
+// Bug 1 (first live run): real sellers deliver files and no inline answer.txt.
+test('delivery: collect succeeds but the answer read fails -> recorded once, seller freed, planner sees the error',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  f.io.answer=async()=>{throw Object.assign(Error("ENOENT: no such file or directory, open '/r/answer.txt'"),{code:'ENOENT'});};
+  f.setPlan(()=>({wait:true}));
+  for(let t=101;t<=105;t++){f.time(t);await f.runner.tick();}
+  const collects=f.calls.filter(([t])=>t==='collect');
+  assert.equal(collects.length,1,'collect (and payment) runs exactly once');
+  const j=f.journal.state.jobs[0];
+  assert.equal(j.done,true);assert.equal(j.outcome,'collected');assert.match(j.answerError,/ENOENT/);
+  assert.match(j.answer,/^\[collected, answer unreadable: ENOENT/);
+  const r=f.inputs.at(-1).results[0];assert.match(r.answer,/answer unreadable/);assert.match(r.answerError,/ENOENT/);
+  assert.ok(reports.some(m=>m.includes('answer unreadable')));
+  // The seller is released through the normal ACCEPT projection and gets its next job.
+  f.snap.jobs=[{id:j.id,seller:'a',result:{},accepted:true,running:false}];f.setPlan(assignments);f.time(106);await f.runner.tick();
+  assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
+});
+test('delivery: task keeps the exact challenge prefix, carries the inline-answer note; planner sees only its own task',async()=>{
+  const {challengeTaskPrefix}=await import('../../web/app/src/challenge/shared/events.mjs');
+  const {DELIVERY_NOTE,plannerTask}=await import('./swarm.mjs');
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();
+  const task=f.calls.find(([t])=>t==='post_job')[1].task;
+  assert.ok(task.startsWith(challengeTaskPrefix('b','day')+'piece'));assert.ok(task.endsWith(DELIVERY_NOTE));
+  assert.match(DELIVERY_NOTE,/\nMAXPLAYER-ANSWER-V1 alone on its line|line MAXPLAYER-ANSWER-V1 alone on its line/);
+  f.setPlan(()=>({wait:true}));f.time(101);await f.runner.tick();
+  assert.equal(f.inputs.at(-1).running[0].task,challengeTaskPrefix('b','day')+'piece');assert.equal(plannerTask('legacy task'),'legacy task');
+});
+test('delivery: readDeliveredAnswer prefers answer.txt, else hardened deterministic text-file fallback',async()=>{
+  const {readDeliveredAnswer}=await import('./swarm.mjs');
+  const fs=await import('node:fs'),{execFileSync}=await import('node:child_process');
+  const base=mkdtempSync(join(tmpdir(),'swarm-delivery-')),dir=join(base,'result'),outside=join(base,'secret.txt');
+  try {
+    fs.mkdirSync(dir);fs.writeFileSync(outside,'TOP SECRET');
+    fs.writeFileSync(join(dir,'answer.txt'),'inline answer');
+    assert.equal(readDeliveredAnswer(dir),'inline answer');
+    fs.rmSync(join(dir,'answer.txt'));
+    fs.writeFileSync(join(dir,'REPORT.txt'),'report body');fs.writeFileSync(join(dir,'MAXPLAYER_EXECUTION_SENTINEL'),'sentinel');
+    fs.mkdirSync(join(dir,'src'));fs.writeFileSync(join(dir,'src','main.rs'),'fn main(){}');
+    for(const d of ['.git','target','node_modules']){fs.mkdirSync(join(dir,d));fs.writeFileSync(join(dir,d,'x.txt'),'skip-'+d);}
+    fs.writeFileSync(join(dir,'blob.bin'),Buffer.from([1,0,2]));
+    fs.symlinkSync(outside,join(dir,'link.txt'));fs.symlinkSync(base,join(dir,'linkdir'));
+    execFileSync('mkfifo',[join(dir,'pipe')]);
+    fs.writeFileSync(join(dir,'big.txt'),'x'.repeat(100));
+    const out=readDeliveredAnswer(dir,{maxFileBytes:20});
+    assert.ok(!out.includes('TOP SECRET')&&!out.includes('sentinel')&&!out.includes('skip-'),'never follows links or reads skipped trees');
+    assert.ok(out.indexOf('===== REPORT.txt')<out.indexOf('===== src/main.rs'),'files before subdirectories, sorted');
+    assert.ok(out.indexOf('===== REPORT.txt')<out.indexOf('===== big.txt'),'code-unit sort order');
+    assert.match(out,/fn main\(\)\{\}/);assert.match(out,/\[truncated: first 20 of 100 bytes shown\]/);assert.ok(!out.includes('report body\n[truncated'));
+    assert.match(out,/blob\.bin \(binary\)/);assert.match(out,/link\.txt \(not a regular file\)/);assert.match(out,/pipe \(not a regular file\)/);
+    assert.equal(readDeliveredAnswer(dir,{maxFileBytes:20}),out,'deterministic');
+    assert.match(readDeliveredAnswer(dir,{maxTotalChars:40}),/\[truncated: \d+ more file\(s\) omitted after 40 chars\]/);
+    // A symlinked answer.txt is not followed either.
+    fs.symlinkSync(outside,join(dir,'answer.txt'));assert.ok(!readDeliveredAnswer(dir).includes('TOP SECRET'));
+    const empty=join(base,'empty');fs.mkdirSync(empty);assert.match(readDeliveredAnswer(empty),/no readable text files/);
+  } finally {rmSync(base,{recursive:true});}
+});
+// Advisor r1 F3: one huge directory was listed (readdirSync) and sorted in full before maxEntries
+// applied, and nothing bounded the walk's time. Notes: answer.txt is capped, and an empty one falls through.
+test('delivery: a directory far larger than maxEntries is streamed, never listed in full; deterministic; deadline bounded',async()=>{
+  const {readDeliveredAnswer}=await import('./swarm.mjs');
+  const fs=await import('node:fs');
+  const base=mkdtempSync(join(tmpdir(),'swarm-bigdir-')),dir=join(base,'result');
+  try {
+    fs.mkdirSync(join(dir,'huge'),{recursive:true});fs.writeFileSync(join(dir,'REPORT.txt'),'the finding');
+    for(let i=0;i<5000;i++)fs.writeFileSync(join(dir,'huge',`f${String(i).padStart(5,'0')}.txt`),`file ${i}`);
+    let reads=0;
+    const opendir=p=>{const d=fs.opendirSync(p);return {readSync:()=>{reads++;return d.readSync();},closeSync:()=>d.closeSync()};};
+    const out=readDeliveredAnswer(dir,{maxEntries:50,opendir});
+    assert.ok(reads>0&&reads<=50+2,`streamed: ${reads} directory entries read for a 5001-entry tree`);
+    assert.match(out,/the finding/);assert.match(out,/\[truncated: delivery walk stopped after 50 entries\]/);
+    assert.ok((out.match(/^===== huge\//gm)??[]).length<50,'only the names actually read are shown');
+    assert.equal(readDeliveredAnswer(dir,{maxEntries:50}),readDeliveredAnswer(dir,{maxEntries:50}),'deterministic for what is read');
+    // The deadline throws (the runner records it once as answerError, see the collect test above).
+    let t=0;assert.throws(()=>readDeliveredAnswer(dir,{deadlineMs:5,clock:()=>t++}),/delivery read exceeded its 5 ms deadline/);
+    // answer.txt: capped at maxFileBytes with a marker; an empty one falls through to the files.
+    fs.writeFileSync(join(dir,'answer.txt'),'a'.repeat(100));
+    assert.equal(readDeliveredAnswer(dir,{maxFileBytes:10}),'a'.repeat(10)+'\n[truncated: first 10 of 100 bytes shown]');
+    fs.writeFileSync(join(dir,'answer.txt'),'');
+    assert.match(readDeliveredAnswer(dir,{maxEntries:50}),/^Delivered files \(no inline answer\):\n===== REPORT\.txt =====\nthe finding/);
+    // A newline in a name cannot forge a ===== frame.
+    fs.rmSync(join(dir,'huge'),{recursive:true});fs.writeFileSync(join(dir,'x\n===== fake ====='),'y');
+    assert.ok(!/^===== fake =====$/m.test(readDeliveredAnswer(dir)));assert.match(readDeliveredAnswer(dir),/===== "x\\n===== fake =====" =====/);
+  } finally {rmSync(base,{recursive:true});}
+});
+test('delivery: a read past its deadline is recorded once as answerError; collect is not repeated',async()=>{
+  const {readDeliveredAnswer}=await import('./swarm.mjs');
+  const fs=await import('node:fs');const dir=mkdtempSync(join(tmpdir(),'swarm-slow-'));
+  try {
+    fs.writeFileSync(join(dir,'a.txt'),'x');
+    const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);let t=0;
+    f.io.answer=async()=>readDeliveredAnswer(dir,{deadlineMs:1,clock:()=>t+=10});
+    await f.runner.tick();[...f.remote.values()][0].results=[{}];f.setPlan(()=>({wait:true}));
+    for(let n=101;n<=104;n++){f.time(n);await f.runner.tick();}
+    assert.equal(f.calls.filter(([x])=>x==='collect').length,1);
+    const j=f.journal.state.jobs[0];assert.equal(j.done,true);assert.match(j.answerError,/deadline/);
+  } finally {rmSync(dir,{recursive:true});}
+});
+
+// Bug 2 (first live run, 15:49Z): after a long planner call the per-assignment fresh read was
+// stale, and stale_snapshot dropped planned assignments instead of holding them.
+const staleAfterPlan=(f,{relay=false}={})=>{let stale=false;const snapshot=f.io.snapshot;
+  f.io.snapshot=async()=>{const s=await snapshot();if(stale){s.asOf-=10;if(relay)s.relay.failedRelays=['ws://challenge'];}return s;};
+  const plan=f.io.plan;f.io.plan=async x=>{const r=await plan(x);if(x.mode==='assign')stale=true;return r;};
+  return {heal:()=>{stale=false;}};};
+test('deferred: stale_snapshot (alone or with relay_not_ready) is held, re-checked on a genuinely fresh read, posted once',async()=>{
+  for(const relay of [false,true]){
+    const f=fixture(),reports=[];f.io.report=m=>reports.push(m);const s=staleAfterPlan(f,{relay});
+    await f.runner.tick();
+    assert.equal(posts(f).length,0,`${relay}`);
+    assert.ok(f.journal.state.jobs.length===2&&f.journal.state.jobs.every(j=>j.deferred&&!j.done),`${relay}`);
+    assert.ok(reports.some(r=>r.includes('Deferred assignment for a: ')&&r.includes('stale_snapshot')),`${relay}`);
+    assert.ok(!reports.some(r=>r.includes('Rejected assignment')),`${relay}`);
+    // Still stale (and relay healthy if relay=false): waits, never posts on a stale read.
+    f.setPlan(()=>({wait:true}));f.time(103);await f.runner.tick();assert.equal(posts(f).length,0,`${relay}`);
+    s.heal();f.time(105);await f.runner.tick();
+    assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix]),[['a',135],['b',135]],`${relay}`);
+    f.time(106);await f.runner.tick();assert.equal(posts(f).length,2,`${relay}`);
+  }
+});
+test('deferred: stale plus a real reason drops immediately; stale past the max wait drops unposted',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);staleAfterPlan(f);
+  f.setPlan(input=>{f.snap.sellers.forEach(s=>s.minutesRemaining=.1);return assignments(input);});
+  await f.runner.tick();assert.equal(f.journal.state.jobs.length,0);assert.ok(reports.some(r=>r.includes('insufficient_minutes')&&r.includes('stale_snapshot')));
+  const g=fixture();g.c.maxDefer=60;staleAfterPlan(g);await g.runner.tick();
+  g.setPlan(()=>({wait:true}));g.time(161);await g.runner.tick();
+  assert.ok(g.journal.state.jobs.every(j=>j.done&&j.released&&/still not ready after 60s/.test(j.outcome)));
+  assert.equal(posts(g).length,0);
+});
+// #1164 review nit (a): the max wait applies only while the snapshot is still not ready.
+test('deferred: a ready snapshot after the max wait runs admission first and posts',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.maxDefer=60;f.setPlan(gapOnce(f));
+  await f.runner.tick();assert.ok(f.journal.state.jobs.every(j=>j.deferred));
+  f.snap.relay.failedRelays=[];f.time(200);await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix]),[['a',230],['b',230]]);
+  assert.ok(!reports.some(r=>r.startsWith('Dropped deferred')));
+  // ...and a ready-but-inadmissible one past the cap drops with its real reason, not "not ready".
+  const g=fixture();g.c.maxDefer=60;g.setPlan(gapOnce(g));await g.runner.tick();
+  g.snap.relay.failedRelays=[];g.snap.sellers.forEach(s=>s.minutesRemaining=.1);g.time(200);await g.runner.tick();
+  assert.ok(g.journal.state.jobs.every(j=>j.done&&/insufficient_minutes/.test(j.outcome)&&!/not ready/.test(j.outcome)));
+});
+
+// Bug 4 (first live run): every full answer went to every planner call (~639k chars) and the
+// planner timeouts were hard-coded.
+test('planner input: newest N full, older digested, hard char budget with markers; duration and size logged',async()=>{
+  const {boundPlannerInput,TRUNCATION_MARKER}=await import('./swarm.mjs');
+  const results=Array.from({length:12},(_,i)=>({seller:'a',task:`task ${i}`,outcome:'collected',answer:`answer-${i} `+'x'.repeat(5000)}));
+  const out=boundPlannerInput({mode:'assign',results},{fullResults:3,digestChars:100,maxInputChars:1e6});
+  assert.equal(out.results.length,12);
+  assert.deepEqual(out.results.slice(-3).map(r=>r.answer),results.slice(-3).map(r=>r.answer),'newest N are full text');
+  assert.ok(out.results.slice(0,9).every((r,i)=>r.answer.startsWith(`answer-${i} `)&&r.answer.includes(TRUNCATION_MARKER)&&r.answer.length<250&&r.answerChars===5009));
+  assert.deepEqual([out.history.fullText,out.history.digested,out.history.resultsDropped],[3,9,0]);
+  // Hard budget: degrade until it fits, never exceed it, always mark the cut.
+  // (Below ~1200 chars the never-removed dropped-entry index of 12 results itself no longer fits.)
+  for(const budget of [12000,3000,1200]){
+    const b=boundPlannerInput({mode:'assign',results},{fullResults:3,digestChars:100,maxInputChars:budget});
+    assert.ok(JSON.stringify(b).length<=budget,`${budget}`);
+    assert.ok(JSON.stringify(b.results).includes(TRUNCATION_MARKER)||b.history.resultsDropped>0,`${budget}`);
+    assert.equal(b.history.results,12);assert.equal(b.results.at(-1)?.task??'task 11','task 11');
+  }
+  assert.equal(boundPlannerInput({mode:'assign',goal:'g'.repeat(500),results},{maxInputChars:300}),null);
+  // The runner applies it to every call and logs duration and size.
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);Object.assign(f.c,{plannerFullResults:1,plannerDigestChars:100,plannerMaxInputChars:100000});
+  f.snap.sellers=f.snap.sellers.slice(0,1);f.io.answer=async()=>'y'.repeat(5000);
+  for(let n=0;n<3;n++){await f.runner.tick();for(const j of f.remote.values())j.results=[{}];f.time(101+3*n);await f.runner.tick();
+    f.snap.jobs=f.journal.state.jobs.filter(j=>j.id).map(j=>({id:j.id,seller:'a',result:{},accepted:true,running:false}));f.time(102+3*n);}
+  const last=f.inputs.at(-1);assert.ok(last.results.length>=2);
+  assert.equal(last.results.at(-1).answer.length,5000);assert.ok(last.results.slice(0,-1).every(r=>r.answer.includes(TRUNCATION_MARKER)));
+  assert.ok(f.inputs.every(i=>JSON.stringify(i).length<=100000&&i.history));
+  assert.ok(reports.some(r=>/^Planner assign ok in \d+\.\ds; input \d+ chars, results \d+ \(\d+ full, \d+ digested/.test(r)));
+  // An over-budget input fails the call (logged and retried later), never sends unbounded text.
+  const g=fixture();g.c.plannerMaxInputChars=100;await assert.rejects(g.runner.tick(),/SWARM_PLANNER_MAX_INPUT_CHARS/);assert.equal(g.inputs.length,0);
+});
+// Advisor r1 F4: older answers kept only a head, and a hard-budget drop left only a count.
+test('planner input: an old long answer keeps its tail (the conclusion); a dropped result stays in the index',async()=>{
+  const {boundPlannerInput,TRUNCATION_MARKER}=await import('./swarm.mjs');
+  const results=[{seller:'s0',task:'find it',outcome:'collected',ts:111,answer:'preamble '.repeat(1000)+'CONCLUSION: the key is 42'},
+    ...Array.from({length:10},(_,i)=>({seller:'s'+(i+1),task:'t'+i,outcome:'expired/undelivered',ts:200+i,answer:'noise '.repeat(800)}))];
+  const out=boundPlannerInput({mode:'assess',results},{fullResults:8,digestChars:600,maxInputChars:1e6});
+  const old=out.results[0];
+  assert.ok(old.answer.startsWith('preamble ')&&old.answer.endsWith('CONCLUSION: the key is 42'),'head and tail');
+  assert.ok(old.answer.includes(TRUNCATION_MARKER)&&old.answer.length<700&&old.answerChars===results[0].answer.length);
+  // Squeeze until the oldest entry is dropped: its index line survives every later step.
+  const tight=boundPlannerInput({mode:'assess',results},{fullResults:8,digestChars:600,maxInputChars:2500});
+  assert.ok(tight&&JSON.stringify(tight).length<=2500);assert.ok(tight.history.resultsDropped>=1);
+  assert.equal(tight.history.droppedIndex[0],`s0 | collected | ts 111 | ${results[0].answer.length} answer chars`);
+  assert.equal(tight.history.droppedIndex.length,tight.history.resultsDropped);
+  assert.ok(!tight.results.some(r=>r.seller==='s0'));
+});
+// Advisor r2 note: a dropped result's outcome (e.g. a relay publish_refused string) kept raw
+// newlines inside its index line, and a huge non-hex seller string was not cut at all.
+test('planner input: droppedIndex lines are single-line and bounded',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  const results=[{seller:'x'.repeat(250000),task:'t',outcome:'publish_refused: line one\nline two\r\u0000',ts:1,answer:'a'.repeat(3000)},
+    ...Array.from({length:3},(_,i)=>({seller:'s'+i,task:'t',outcome:'collected',ts:2+i,answer:'b'.repeat(3000)}))];
+  const out=boundPlannerInput({mode:'assess',results},{fullResults:8,digestChars:600,maxInputChars:4000});
+  assert.ok(out&&out.history.resultsDropped>=1,'the huge entry was dropped and the rest fits');
+  const line=out.history.droppedIndex[0];
+  assert.doesNotMatch(line,/[\u0000-\u001f\u007f]/);assert.match(line,/line one\\nline two\\r\\u0000/);
+  assert.ok(line.length<700,`index line ${line.length} chars`);
+});
+// Review note: trackRecord tasks (and other non-result inputs) were not bounded.
+test('planner input: a huge seller task, note or running task is bounded and cannot break later calls',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  const huge='T'.repeat(300000);
+  const tasks=Array.from({length:30},(_,i)=>({task:i===29?huge:`task ${i}`,outcome:'collected',delivered:true}));
+  const input={mode:'assign',goal:'g',sellers:[{pubkey:'a',name:huge,note:huge,capabilities:Array(100).fill(huge),harness:{family:[huge]},trackRecord:{tasksDone:30,delivered:30,expired:0,tasks}}],
+    running:[{seller:'a',task:huge}],results:[]};
+  const out=boundPlannerInput(input,{maxInputChars:200000});
+  assert.ok(out&&JSON.stringify(out).length<50000,`${out&&JSON.stringify(out).length}`);
+  const tr=out.sellers[0].trackRecord;
+  assert.deepEqual([tr.tasksDone,tr.tasks.length,tr.tasksOmitted,tr.tasks[0].task],[30,10,20,'task 20'],'newest 10 kept; counts exact');
+  assert.ok(tr.tasks.at(-1).task.length<700&&out.running[0].task.length<2200&&out.sellers[0].note.length<2200&&out.sellers[0].capabilities.length===32);
+  assert.ok(out.history.fieldsCut>=5);
+  // End to end: a 300k-char past task no longer fails every later planner call.
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>({assignments:[{seller:'a',workstream:'piece',task:huge,durationSeconds:30}]}));
+  await f.runner.tick();for(const j of f.remote.values())j.results=[{}];f.time(101);f.setPlan(()=>({wait:true}));await f.runner.tick();
+  f.snap.jobs=f.journal.state.jobs.map(j=>({id:j.id,seller:'a',result:{},accepted:true,running:false}));f.time(102);
+  const before=f.inputs.length;await f.runner.tick();
+  assert.ok(f.inputs.length>before&&f.inputs.slice(before).every(i=>JSON.stringify(i).length<=200000));
+  assert.ok(f.inputs.at(-1).sellers[0].trackRecord.tasks[0].task.length<700);
+});
+test('planner timeouts: env-configurable, defaults kept, bundled LLM timeout stays below the runner',async()=>{
+  const {plannerTimeouts,PLANNER_LLM_MARGIN_SECONDS}=await import('./swarm.mjs');
+  const d=plannerTimeouts({});assert.deepEqual([d.runnerMs('analyze'),d.runnerMs('assign'),d.runnerMs('assess')],[360000,180000,180000]);
+  assert.deepEqual([d.llmMs('analyze'),d.llmMs('assign')],[350000,170000]);
+  const e=plannerTimeouts({SWARM_ANALYZE_TIMEOUT_SECONDS:'900',SWARM_PLANNER_TIMEOUT_SECONDS:'600'});
+  assert.deepEqual([e.runnerMs('analyze'),e.llmMs('analyze'),e.runnerMs('assign'),e.llmMs('assign')],[900000,890000,600000,590000]);
+  for(const bad of ['0','10','x','1.5'])assert.throws(()=>plannerTimeouts({SWARM_PLANNER_TIMEOUT_SECONDS:bad}),/SWARM_PLANNER_TIMEOUT_SECONDS/);
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
+  assert.equal(config([],{...base,SWARM_PLANNER_TIMEOUT_SECONDS:'600'}).plannerTimeouts.runnerMs('assign'),600000);
+  assert.throws(()=>config([],{...base,SWARM_PLANNER_MAX_INPUT_CHARS:'50'}),/plannerMaxInputChars/);
+  assert.ok(PLANNER_LLM_MARGIN_SECONDS>0);
+  // planner-llm.mjs really uses the env-derived timeout: a hanging fake LLM is killed at 1 s.
+  const {writeFileSync}=await import('node:fs'),{command}=await import('./swarm.mjs');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-llm-timeout-')),bin=join(dir,'slow');
+  try {
+    writeFileSync(bin,'#!/bin/sh\nsleep 30\n',{mode:0o700});
+    const started=Date.now();
+    await assert.rejects(command(process.execPath,['scripts/challenges/planner-llm.mjs'],{input:JSON.stringify({mode:'assign',results:[]}),env:{...process.env,SWARM_LLM_BINARY:bin,SWARM_PLANNER_TIMEOUT_SECONDS:'11'},timeout:20000}),/Command timed out/);
+    assert.ok(Date.now()-started<5000,'llm timeout = runner timeout - margin = 1 s');
+  } finally {rmSync(dir,{recursive:true});}
+});
+
+// Bug 5 (first live run): a v0.6.1 buyer's get_job lacks the release-proof fields, so expired
+// paid jobs stayed reserved forever. Detect it and refuse priced work; free work continues.
+test('buyer capability: get_job without release fields refuses priced work, keeps free work, warns once',async()=>{
+  const {RELEASE_FIELDS,PROBE_JOB_ID,missingReleaseFields}=await import('./swarm.mjs');
+  assert.deepEqual(RELEASE_FIELDS,['award_read_confirmed','reservation_state','auto_award_state','claim_prices']);
+  const oldView={job_id:'x',read_confirmed:true,claims:[],results:[],awarded:null};
+  assert.deepEqual(missingReleaseFields(oldView),RELEASE_FIELDS);
+  assert.deepEqual(missingReleaseFields({...oldView,award_read_confirmed:true,reservation_state:null,auto_award_state:null,claim_prices:[]}),[]);
+  const f=fixture(),reports=[],probes=[];f.io.report=m=>reports.push(m);
+  f.io.probeBuyer=async()=>{probes.push(PROBE_JOB_ID);return oldView;};
+  f.setPlan(input=>({assignments:assignments(input).assignments.map((a,i)=>({...a,amountSats:i?5:0}))}));
+  await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>a.amount_sats),[0],'free posts, priced refused');
+  assert.ok(reports.some(r=>r.startsWith('WARNING: buyer get_job lacks award_read_confirmed')));
+  assert.ok(reports.some(r=>/Rejected assignment for b: priced work refused: buyer get_job lacks/.test(r)));
+  assert.equal(reservedBudget(f.snap,f.journal.state.jobs,100).committedSats,0,'nothing reserved for refused work');
+  f.time(101);await f.runner.tick();
+  assert.equal(probes.length,1,'definite answer cached');assert.match(f.inputs.at(-1).paidWorkRefused,/assign only amountSats 0/);
+  // A current buyer passes; a failed probe refuses priced work and is retried later.
+  const g=fixture();let fail=true;g.io.probeBuyer=async()=>{if(fail){fail=false;throw Error('relay down');}return {...oldView,award_read_confirmed:true,reservation_state:'none',auto_award_state:null,claim_prices:[]};};
+  g.setPlan(input=>priced(input,5));g.snap.sellers=g.snap.sellers.slice(0,1);
+  await g.runner.tick();assert.equal(posts(g).length,0);
+  g.time(101);await g.runner.tick();assert.deepEqual(posts(g).map(([,a])=>a.amount_sats),[5]);
+  assert.equal(g.inputs.at(-1).paidWorkRefused,undefined);
+});
+
+// Bug 6 (first live run): 120-200 s tasks expired while real agents were still starting.
+test('min duration: default floor 300 s; sellers below the floor are not offered; minutes accounting unchanged',async()=>{
+  const {DEFAULT_MIN_DURATION}=await import('./swarm.mjs');
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
+  assert.equal(DEFAULT_MIN_DURATION,300);assert.equal(config([],base).minDuration,300);assert.equal(config([],{...base,SWARM_MIN_DURATION:'600'}).minDuration,600);
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);delete f.c.minDuration;f.c.maxDuration=1800;
+  f.snap.sellers[0].minutesRemaining=4.99;f.snap.sellers[1].minutesRemaining=5;
+  const before=structuredClone(f.snap.sellers);
+  f.setPlan(input=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:300},{seller:'b',workstream:'piece',task:'short',durationSeconds:200},{seller:'b',workstream:'piece',task:'t',durationSeconds:300}]}));
+  await f.runner.tick();
+  const assign=f.inputs.find(i=>i.mode==='assign');
+  assert.equal(assign.minDurationSeconds,300);assert.deepEqual(assign.sellers.map(s=>s.pubkey),['b'],'seller below the floor is not offered');
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.deadline_unix]),[['b',400]]);
+  assert.ok(reports.some(r=>r.includes('Rejected assignment for a: seller busy or ineligible')));
+  assert.ok(reports.some(r=>r.includes('Rejected assignment for b: duration outside configured bounds')));
+  assert.deepEqual(f.snap.sellers.map(s=>s.minutesRemaining),before.map(s=>s.minutesRemaining),'runner never edits minutes');
+  const prompt=(await import('node:fs')).readFileSync('scripts/challenges/planner-llm.mjs','utf8');assert.match(prompt,/starting its\s+sandbox and agent/);
+});
+
+// Bug 7 (first live run, macOS/launchd): killing the parent left the flock'd --lock-held runner
+// alive with the lock (and a stuck reader), so every restart exited 1 for about an hour.
+test('parent death: watchParent stops the runner, then kills in-flight commands and exits after the grace',async()=>{
+  const {watchParent}=await import('./swarm.mjs');const {PassThrough}=await import('node:stream');
+  const stream=new PassThrough(),events=[];let resolveExit;const exited=new Promise(r=>{resolveExit=r;});
+  const gone=watchParent(stream,()=>events.push('stop'),{graceMs:20,kill:()=>events.push('kill'),exit:code=>{events.push(`exit ${code}`);resolveExit();}});
+  stream.write('ignored');assert.equal(gone(),false);stream.end();
+  await exited;assert.deepEqual(events,['stop','kill','exit 1']);assert.equal(gone(),true);
+});
+// Advisor r1 F1: the grace timer was unref'd, so with nothing else pending the event loop ended
+// before kill + exit ran (and node --test on Node 22 cancelled this file's remaining tests).
+test('parent death: the grace timer alone keeps the process alive until it kills and exits 1',async()=>{
+  const {spawnSync}=await import('node:child_process');
+  const script=`import {watchParent} from ${JSON.stringify(new URL('./swarm.mjs',import.meta.url).href)};import {PassThrough} from 'node:stream';
+    const s=new PassThrough();watchParent(s,()=>console.log('stop'),{graceMs:50,kill:()=>console.log('kill')});s.end();`;
+  const r=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:20000});
+  assert.deepEqual([r.stdout.trim().split('\n'),r.status],[['stop','kill'],1],r.stderr);
+});
+test('parent death: SIGKILL of the runner parent releases the home lock and stops the locked child',{skip:!require_flock()},async()=>{
+  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-parent-')),home=join(dir,'home'),bin=join(dir,'fake-maxplayer'),pids=join(dir,'pids');
+  try {
+    // The locked runner's first command (whoami) hangs: it records its own and its parent's pid.
+    fs.writeFileSync(bin,`#!/bin/sh\necho "$$ $PPID" > ${JSON.stringify(pids)}\nexec sleep 60\n`,{mode:0o700});
+    const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url','ws://127.0.0.1:1'],{stdio:['ignore','ignore','pipe']});
+    let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
+    const until=async(f,ms)=>{const end=Date.now()+ms;while(Date.now()<end){if(f())return true;await new Promise(r=>setTimeout(r,50));}return false;};
+    assert.ok(await until(()=>fs.existsSync(pids)&&fs.readFileSync(pids,'utf8').trim(),10000),'locked runner started its first command');
+    const [sleeper,runner]=fs.readFileSync(pids,'utf8').trim().split(' ').map(Number);
+    const lock=join(home,'swarm/runner.lock'),free=()=>spawnSync('flock',['-n',lock,'true']).status===0;
+    assert.equal(free(),false,'lock held while the runner lives');
+    parent.kill('SIGKILL');
+    const alive=pid=>{try{process.kill(pid,0);return true;}catch{return false;}};
+    assert.ok(await until(()=>!alive(runner)&&!alive(sleeper)&&free(),15000),`runner ${alive(runner)} command ${alive(sleeper)} lock free ${free()}; ${stderr}`);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+// Starts a real parent -> flock -> locked runner against a relay that completes the WebSocket
+// handshake and then stays silent (never ready). Stopping while a socket is still CONNECTING trips
+// relay.mjs's error->close handler, which overflows the stack on Node 22 (shared reader, out of
+// scope), so the fixture opens the socket. `mcp` is the fake `maxplayer mcp` shell body.
+async function lockedRunner(t,{poll,mcp='',detached=false}) {
+  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-stop-')),home=join(dir,'home'),bin=join(dir,'fake-maxplayer'),ready=join(dir,'ready'),mcpMark=join(dir,'mcp');
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  fs.writeFileSync(bin,`#!/bin/sh\nif [ "$1" = whoami ]; then touch ${JSON.stringify(ready)}; echo "pubkey: ${'a'.repeat(64)}"; exit 0; fi\nif [ "$1" = mcp ]; then touch ${JSON.stringify(mcpMark)}; ${mcp}\nfi\n`,{mode:0o700});
+  const net=await import('node:net'),{createHash}=await import('node:crypto'),sockets=[];
+  const hold=net.createServer(c=>{sockets.push(c);let buf='';c.on('error',()=>{});c.on('data',b=>{if(buf===null)return;buf+=b;const key=buf.match(/Sec-WebSocket-Key: *(\S+)/i)?.[1];
+    if(key&&buf.includes('\r\n\r\n')){buf=null;c.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')}\r\n\r\n`);}});});
+  await new Promise(r=>hold.listen(0,'127.0.0.1',r));
+  const relay=`ws://127.0.0.1:${hold.address().port}`;
+  t.after(()=>{sockets.forEach(c=>c.destroy());hold.close();});
+  // detached: the parent leads its own process group, as e2e.py's start_new_session does.
+  const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url',relay,'--poll-seconds',String(poll)],{detached,stdio:['ignore','ignore','pipe'],env:{...process.env,SWARM_CHALLENGE_RELAYS:relay}});
+  t.after(()=>{try{process.kill(detached?-parent.pid:parent.pid,'SIGKILL');}catch{}});
+  let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
+  const lockFree=()=>spawnSync('flock',['-n',join(home,'swarm/runner.lock'),'true']).status===0;
+  // The lock is sampled in the exit handler itself: the parent must never exit while it is held.
+  const exited=new Promise(r=>parent.on('exit',code=>r({code,lockFreeAtExit:lockFree(),at:Date.now()})));
+  const until=async(f,ms)=>{const end=Date.now()+ms;while(Date.now()<end){if(f())return true;await new Promise(r=>setTimeout(r,50));}return false;};
+  assert.ok(await until(()=>fs.existsSync(ready)&&sockets.length>0,10000),stderr);
+  const result=async ms=>Promise.race([exited,new Promise(r=>setTimeout(()=>r({code:'timeout'}),ms))]);
+  return {parent,stderr:()=>stderr,lockFree,until,result,mcpStarted:()=>fs.existsSync(mcpMark)};
+}
+// Found by the E2E after F1: with a ref'd grace timer a CLEANLY stopped runner still held the home
+// lock for the whole grace, so the next start (flock -n) exited 1. A clean stop must exit 0 at once.
+// Advisor r2 F1: poll 30 also pins that the poll sleep ends as soon as the runner is asked to stop.
+test('parent death: a clean stop exits 0 promptly and frees the lock (grace timer cancelled, poll sleep cut short)',{skip:!require_flock()},async t=>{
+  const r=await lockedRunner(t,{poll:30});
+  await new Promise(res=>setTimeout(res,1500));
+  assert.equal(r.lockFree(),false,'lock held while the runner lives');
+  const stopped=Date.now();r.parent.kill('SIGTERM');
+  const out=await r.result(15000);
+  assert.equal(out.code,0,`clean stop exit code; ${r.stderr()}`);
+  assert.ok(out.at-stopped<4000,`stopped in ${out.at-stopped} ms (grace is 5000, poll 30000)`);
+  assert.equal(out.lockFreeAtExit,true,'lock free when the parent exits');
+});
+// Advisor r2 F1: e2e.py (and a process-group supervisor) stops the runner with killpg. flock was in
+// the parent's group, died on that SIGTERM, and the parent exited 1 at once while the locked runner
+// still held the lock (~900 ms), so an immediate restart hit flock -n and exited 1.
+// The signal lands during an in-flight MCP call (2 s), so the runner really holds the lock for a
+// while after it: a parent that exits before flock has reaped the runner is caught.
+test('stop: a process-group SIGTERM keeps the parent alive until the lock is free, then exits 0',{skip:!require_flock()},async t=>{
+  const r=await lockedRunner(t,{poll:30,detached:true,mcp:'sleep 2; exit 0'});
+  assert.ok(await r.until(r.mcpStarted,10000),'MCP call started');
+  assert.equal(r.lockFree(),false,'lock held while the runner lives');
+  const stopped=Date.now();process.kill(-r.parent.pid,'SIGTERM');
+  const out=await r.result(15000);
+  assert.equal(out.code,0,`exit code after killpg; ${r.stderr()}`);
+  assert.equal(out.lockFreeAtExit,true,'parent exited while the runner still held the lock');
+  assert.ok(out.at-stopped>=1000&&out.at-stopped<10000,`stopped in ${out.at-stopped} ms (after the in-flight call, before any grace)`);
+});
+// Advisor r2 F1: a parent-only SIGTERM during an MCP call longer than the 5 s parent-gone grace
+// hit the grace kill (exit 1). A stop request lets the in-flight call finish, then exits 0.
+test('stop: a SIGTERM during an MCP call longer than the parent-gone grace lets it finish and exits 0',{skip:!require_flock()},async t=>{
+  const {PARENT_GONE_GRACE_MS}=await import('./swarm.mjs');
+  const r=await lockedRunner(t,{poll:5,mcp:`sleep ${(PARENT_GONE_GRACE_MS+1500)/1000}; exit 0`});
+  assert.ok(await r.until(r.mcpStarted,10000),'MCP call started');
+  const stopped=Date.now();r.parent.kill('SIGTERM');
+  const out=await r.result(20000);
+  assert.equal(out.code,0,`exit code; ${r.stderr()}`);
+  assert.equal(out.lockFreeAtExit,true,'lock free when the parent exits');
+  assert.ok(out.at-stopped>=PARENT_GONE_GRACE_MS,`the in-flight call ran to completion (${out.at-stopped} ms)`);
+  assert.doesNotMatch(r.stderr(),/killing in-flight/);
+});
+// A stop request is bounded too: a genuinely hung tick is killed after the stop grace, and the
+// parent's death (or a second signal, which closes the pipe) shortens that to the parent-gone grace.
+test('stop: watchParent bounds a stop request by its own grace, and pipe EOF shortens it',async()=>{
+  const {watchParent}=await import('./swarm.mjs');const {PassThrough}=await import('node:stream');
+  const run=async({stopGraceMs,graceMs,end})=>{
+    const stream=new PassThrough(),events=[];let resolveExit;const exited=new Promise(r=>{resolveExit=r;});
+    const gone=watchParent(stream,()=>events.push('stop'),{graceMs,stopGraceMs,kill:()=>events.push('kill'),exit:code=>{events.push(`exit ${code}`);resolveExit();}});
+    const started=Date.now();stream.write('stop\n');await new Promise(r=>setTimeout(r,30));
+    assert.deepEqual(events,['stop'],'stop request: onStop once, no kill yet');assert.equal(gone(),false);
+    if(end)stream.end();
+    assert.equal(await Promise.race([exited.then(()=>'exited'),new Promise(r=>setTimeout(()=>r('timeout'),5000))]),'exited','a timer kills and exits');
+    return {events,ms:Date.now()-started,gone:gone()};
+  };
+  const hung=await run({stopGraceMs:150,graceMs:60000});
+  assert.deepEqual(hung.events,['stop','kill','exit 1']);assert.ok(hung.ms>=150);
+  const dead=await run({stopGraceMs:60000,graceMs:20,end:true});
+  assert.deepEqual(dead.events,['stop','kill','exit 1']);assert.ok(dead.ms<5000);assert.equal(dead.gone,true);
+});
+// Advisor r3 #2: cancel() removed data/end but destroy() still emitted close, and close called
+// fire(), which armed the parent-gone exit cancel() had just cleared (masked in main() only by its
+// same-turn process.exit). cancel() is final: nothing is killed and nothing exits afterwards.
+test('stop: watchParent cancel() after a stop byte never kills or exits',async()=>{
+  const {watchParent}=await import('./swarm.mjs');const {PassThrough}=await import('node:stream');
+  const stream=new PassThrough(),events=[];
+  const gone=watchParent(stream,()=>events.push('stop'),{graceMs:30,stopGraceMs:60,kill:()=>events.push('kill'),exit:code=>events.push(`exit ${code}`)});
+  stream.write('stop\n');await new Promise(r=>setTimeout(r,10));assert.deepEqual(events,['stop']);
+  gone.cancel();assert.equal(stream.destroyed,true);
+  await new Promise(r=>setTimeout(r,250));
+  assert.deepEqual(events,['stop'],'no kill/exit after cancel()');assert.equal(gone(),false);
+  // Same with real process.exit: once cancelled, the process drains and exits 0 by itself.
+  const {spawnSync}=await import('node:child_process');
+  const script=`import {watchParent} from ${JSON.stringify(new URL('./swarm.mjs',import.meta.url).href)};import {PassThrough} from 'node:stream';
+    const s=new PassThrough();const w=watchParent(s,()=>console.log('stop'),{graceMs:50,stopGraceMs:100,kill:()=>console.log('kill')});
+    s.write('stop\\n');setTimeout(()=>w.cancel(),10);`;
+  const r=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:20000});
+  assert.deepEqual([r.stdout.trim().split('\n'),r.status],[['stop'],0],r.stderr);
+});
+// Advisor r3 #1: a throw during locked-runner startup (no buyer pubkey, corrupt journal) only set
+// exitCode; the parent pipe kept stdin flowing, so the runner stayed alive with the lock and flock +
+// the parent never exited. Every startup failure must exit and free the lock. (An empty relay list
+// is refused by config() in the parent, before flock, so it never reaches the locked runner.)
+test('stop: a locked-runner startup failure exits non-zero and frees the lock',{skip:!require_flock()},async t=>{
+  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-startup-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const good=`echo "pubkey: ${'a'.repeat(64)}"`;
+  const cases=[
+    {name:'whoami prints no pubkey',whoami:'echo "not configured"',error:/Cannot identify configured buyer/},
+    {name:'corrupt committed journal',whoami:good,journal:'bad\n',error:/JSON/},
+  ];
+  for(const c of cases){
+    const home=join(dir,c.name.replace(/\W+/g,'-')),bin=home+'-bin';
+    fs.writeFileSync(bin,`#!/bin/sh\nif [ "$1" = whoami ]; then ${c.whoami}; exit 0; fi\nexit 1\n`,{mode:0o700});
+    if(c.journal){fs.mkdirSync(join(home,'swarm'),{recursive:true});fs.writeFileSync(join(home,'swarm/events.jsonl'),c.journal);}
+    const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url','ws://127.0.0.1:1'],
+      {stdio:['ignore','ignore','pipe'],env:{...process.env,SWARM_CHALLENGE_RELAYS:'ws://127.0.0.1:1'}});
+    t.after(()=>{try{parent.kill('SIGKILL');}catch{}});
+    let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
+    const lockFree=()=>spawnSync('flock',['-n',join(home,'swarm/runner.lock'),'true']).status===0;
+    const out=await Promise.race([new Promise(r=>parent.on('exit',code=>r({code,lockFreeAtExit:lockFree()}))),new Promise(r=>setTimeout(()=>r({code:'timeout'}),10000))]);
+    assert.notEqual(out.code,'timeout',`${c.name}: parent still alive after 10 s; ${stderr}`);
+    assert.notEqual(out.code,0,`${c.name}: exit code`);
+    assert.equal(out.lockFreeAtExit,true,`${c.name}: lock free when the parent exits`);
+    assert.match(stderr,c.error,c.name);
+  }
+});
+function require_flock(){try{return (globalThis.__flock??=(()=>{const r=process.getBuiltinModule('node:child_process').spawnSync('flock',['--version']);return r.status===0;})());}catch{return false;}}
+
+// Bug 5, upgraded (Rocky's revised report): on a v0.6.1 buyer an expired, never-delivered PAID
+// job never reaches done, so pending() blocked that seller for the rest of the day (argon ~7.5 h).
+const expiredPaid=()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  let n=0;f.setPlan(input=>input.mode==='assess'?{wait:true}:n++?assignments(input):priced(input,5));
+  return {f,reports,old:()=>[...f.remote.values()][0]};
+};
+test('expired paid job without release fields: seller freed after deadline + grace, sats stay reserved, never collected or paid',async()=>{
+  const {EXPIRED_SLOT_GRACE_SECONDS}=await import('./swarm.mjs');
+  const {f,reports,old}=expiredPaid();
+  await f.runner.tick();assert.deepEqual(posts(f).map(([,a])=>[a.amount_sats,a.deadline_unix]),[[5,130]]);
+  // A v0.6.1-shaped view: confirmed read, no results, none of the release-proof fields.
+  Object.assign(old(),{read_confirmed:true,results:[],claims:[],accepted:null});
+  const deadline=130,grace=EXPIRED_SLOT_GRACE_SECONDS;
+  // Advisor r1 F2: deadline + grace itself is not past it (strict >, like the seller's kill check).
+  for(const t of [131,deadline+grace-1,deadline+grace]){f.time(t);await f.runner.tick();assert.equal(posts(f).length,1,`still busy at ${t}`);}
+  const j=f.journal.state.jobs[0];assert.equal(j.done,false);assert.equal(j.slotFreed,undefined);
+  f.time(deadline+grace+1);await f.runner.tick();
+  assert.equal(j.slotFreed,deadline+grace+1);assert.equal(j.done,false,'job stays open and polled');assert.equal(j.released,false);
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.amount_sats]),[['a',5],['a',0]],'seller gets a new assignment');
+  assert.ok(reports.some(r=>/expired undelivered 600s past its deadline; seller a freed for new work, 5 sats stay reserved/.test(r)));
+  const jobs=f.journal.state.jobs;assert.equal(reservedBudget(f.snap,jobs,f.io.now()).committedSats,5,'old sats still reserved');
+  assert.ok(!f.inputs.at(-1).running?.some(r=>r.deadline===deadline),'freed job not shown as running');
+  for(let t=deadline+grace+2;t<deadline+grace+5;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,0,'nothing collected or paid');
+  assert.equal(posts(f).length,2,'one new job at a time: the new job keeps the seller busy');
+  assert.equal(reservedBudget(f.snap,jobs,f.io.now()).committedSats,5);
+});
+test('expired paid job: late delivery after the slot was freed is collected exactly once and settles its reservation',async()=>{
+  const {f,old}=expiredPaid();const mcp=f.io.mcp;
+  f.io.mcp=async(t,a)=>t==='collect'&&a.job_id===old().id?(f.calls.push([t,a]),{pay:{state:'Closed { receipt }',amount_sats:5}}):mcp(t,a);
+  await f.runner.tick();Object.assign(old(),{read_confirmed:true,results:[],claims:[],accepted:null});
+  f.time(731);await f.runner.tick();assert.equal(posts(f).length,2);
+  // Core keeps a past-deadline delivery payable (claim `delivered`, 7-day pay window).
+  old().results=[{}];
+  for(const t of [732,733,734]){f.time(t);await f.runner.tick();}
+  assert.deepEqual(f.calls.filter(([t])=>t==='collect').map(([,a])=>a.job_id),[old().id],'collected (and paid) exactly once');
+  const j=f.journal.state.jobs[0];assert.equal(j.outcome,'collected');assert.equal(j.done,true);
+  assert.deepEqual(jobBudget(j),{reservedSats:0,paidSats:5});
+  assert.equal(posts(f).length,2,'late collection does not hand the seller a second live job');
+});
+test('expired paid job: slot stays held on an unconfirmed read or a pending awarded delivery; grace is validated',async()=>{
+  // No read_confirmed key at all (a buyer older than #603) also holds the slot: fail closed.
+  for(const view of [{read_confirmed:false,results:[]},{read_confirmed:true,results:[],awarded_delivery_pending:true},{read_confirmed:true},{results:[]}]){
+    const {f,old}=expiredPaid();await f.runner.tick();Object.assign(old(),view);if(!('results' in view))delete old().results;
+    f.time(2000);f.snap.challenge.ends=5000;await f.runner.tick();
+    assert.equal(f.journal.state.jobs[0].slotFreed,undefined,JSON.stringify(view));assert.equal(posts(f).length,1,JSON.stringify(view));
+  }
+  // Pre-existing rule, pinned for the README: an expired FREE job is done (seller freed) on the first
+  // poll after its deadline, whatever get_job reports (read_confirmed absent here); it never had sats.
+  {const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();
+    const j=f.journal.state.jobs[0];assert.equal(j.args.payment,'none');f.time(j.args.deadline_unix+1);f.setPlan(()=>({wait:true}));await f.runner.tick();
+    assert.deepEqual([j.done,j.released,j.outcome,j.slotFreed],[true,true,'expired/undelivered',undefined]);}
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
+  assert.equal(config([],base).expiredSlotGrace,600);assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'900'}).expiredSlotGrace,900);
+  // Advisor r1 F2: 420 s is the seller's container kill instant, so the floor is 420 + a 60 s teardown margin.
+  const {MIN_EXPIRED_SLOT_GRACE_SECONDS,SELLER_EXECUTION_TAIL_SECONDS,SLOT_TEARDOWN_MARGIN_SECONDS}=await import('./swarm.mjs');
+  assert.deepEqual([SELLER_EXECUTION_TAIL_SECONDS,SLOT_TEARDOWN_MARGIN_SECONDS,MIN_EXPIRED_SLOT_GRACE_SECONDS],[420,60,480]);
+  for(const bad of ['419','420','479'])assert.throws(()=>config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:bad}),/SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= 480/,bad);
+  assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'480'}).expiredSlotGrace,480);
 });

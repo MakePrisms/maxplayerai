@@ -89,6 +89,58 @@ fixture; do not point a fixture browser at the production relay. No API server i
 
 ## Automatic swarm runner
 
+**Minimum buyer build.** Priced assignments need a `maxplayer` buyer whose MCP `get_job`
+reports `award_read_confirmed`, `reservation_state`, `auto_award_state` and `claim_prices`. These
+reached `main` in #1162 (merge `7a14298d`; commits `942b40e7` and `49925c79`) and are in **no
+release tag yet**: v0.6.1 (and its release candidates) lack them, and `maxplayer --version` prints
+`0.6.1` on both, so the version string cannot tell them apart. At startup the runner calls
+`get_job` once on a fixed probe id and checks those fields. If they are missing it logs a
+`WARNING`, refuses every assignment with `amountSats > 0` (logged as `priced work refused`) and
+tells the planner `paidWorkRefused`; free work continues. Without the fields an expired paid job
+can never be proven released and would stay reserved forever. If the probe itself fails, priced
+work waits until a later probe succeeds. Use a buyer built from `main` at or after `7a14298d`
+(or the first release that contains it).
+
+**Expired paid jobs: seller slot vs sats.** An expired, never-delivered paid job that cannot be
+proven released (always the case on a v0.6.1 buyer) keeps its sats reserved, but no longer blocks
+its seller for the rest of the day. Once `deadline + SWARM_EXPIRED_SLOT_GRACE_SECONDS` (default
+600, minimum 480) has **strictly** passed and a confirmed `get_job` read shows no delivery and no
+pending awarded delivery, the runner frees the seller for new assignments and logs `seller … freed
+for new work, N sats stay reserved`. The old job stays open and is still polled every tick. The
+grace rests on the seller's execution clocks: host delivery stops the agent at the offer deadline
+and bounds the push at 150 s; container delivery is killed once `now > deadline + 420 s`
+(`PUSH_MARGIN_SECS` 300 + `CONTAINER_EXIT_GRACE_SECS` 120), so 420 s is the kill *instant*, and
+client kill, capture and container removal start only after it; a restarted seller never re-runs
+or finalizes a lapsed job. The minimum is therefore that 420 s tail plus a 60 s teardown margin,
+and the default leaves three minutes after the kill. Within those documented clocks a freed seller
+does not have two executing jobs. One residual is not bounded by any grace: libgit2's delta search
+during a push ignores the push deadline, so a pathological pack can keep the old job's push alive
+longer. After the container kill, the seller's `docker logs` capture (before `docker rm`) has no
+deadline either: a short capture fits the margin, but a container with a huge log can still be
+capturing at `deadline + 480 s` (the default 600 leaves about three minutes). A delivery
+published late is still payable in core (the claim is `delivered` for 7 days after delivery), so if
+one appears the runner collects it exactly once and its reservation becomes the paid amount;
+otherwise the sats stay reserved until release is proven. Minutes are unchanged: the shared
+projection already charged the expired job from award to deadline.
+
+**Exactly what happens on a v0.6.1 buyer** (checked against tag `v0.6.1`, `d5e9e5d`). Its
+`get_job` does report `read_confirmed` (always serialized, since #603) and omits
+`awarded_delivery_pending` when false; it lacks only the four release fields above.
+- *Expired paid job, no delivery:* the seller is freed strictly after `deadline + grace` on a read
+  with `read_confirmed: true`, `results: []` and no pending awarded delivery. Its `max_sats` stay
+  reserved **forever** on such a buyer (neither release proof can ever succeed: one needs
+  `award_read_confirmed`, the other `reservation_state: "released"`), unless a late delivery is
+  collected, which turns the reservation into the paid amount. Restart does not change this; the
+  reservation is journaled. Only a newer buyer, or ending the challenge day, ends it.
+- *Expired paid job, read not confirmed* (`read_confirmed` false or absent, `results` missing, or
+  `get_job` failing): the seller stays held and the job is polled again. Nothing is freed on a read
+  that proves nothing.
+- *Expired free job:* unchanged by this rule. It is marked done (`expired/undelivered`, nothing
+  reserved) on the first poll after its deadline, whatever `get_job` reports, so its seller can get
+  new work at the deadline, without waiting for the grace. A free job's container may therefore
+  still be within its 420 s tail when the next free job is offered (the runner's one-job-per-seller
+  rule counts jobs the runner tracks, not the seller's containers).
+
 Hand-whitelist sellers once with `maxplayer-challenges decide --seller HEX --accept`, then
 publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
 the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:
@@ -104,8 +156,8 @@ node scripts/challenges/swarm.mjs
 
 The runner stays alive for future days. It reads the relay through the shared browser/Node model and `coordinate()` for
 eligibility/minutes, posts public seller-targeted work through buyer MCP, collects verified
-inline `answer.txt` results (settling priced work through the existing collect flow), and sends
-**all** results to every planner invocation. Failed/expired work is represented as a bracketed
+results (settling priced work through the existing collect flow), and sends every result to
+each planner invocation within a bounded input (see *Planner input bounds* below). Failed/expired work is represented as a bracketed
 outcome in the result history. This v1 runner requests text/inline answers, not Git artifacts.
 The reader derives the buyer public key from this home; configure the **same trade relay** as the home. Dedicate the buyer
 to this runner: unrelated private/unawarded jobs are not visible in the public projection.
@@ -121,12 +173,18 @@ Flags (environment equivalents):
 | — | `SWARM_CHALLENGE_RELAYS` | comma list: `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
-| — | `SWARM_MIN_DURATION` | 120 |
+| — | `SWARM_MIN_DURATION` | 300 (task floor, covers seller container/agent startup; sellers with fewer remaining minutes are not offered) |
 | — | `SWARM_MAX_DURATION` | 1800 |
 | `--poll-seconds` | `SWARM_POLL_SECONDS` | 5 |
 | `--update-seconds` | `SWARM_UPDATE_SECONDS` | 180 |
 | `--award-after-seconds` | `SWARM_AWARD_AFTER_SECONDS` | 30 |
-| — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a relay-deferred assignment) |
+| — | `SWARM_ANALYZE_TIMEOUT_SECONDS` | 360 (runner kills the `analyze` planner command; bundled LLM call gets 10 s less) |
+| — | `SWARM_PLANNER_TIMEOUT_SECONDS` | 180 (same, for `assign`/`assess`) |
+| — | `SWARM_PLANNER_FULL_RESULTS` | 8 (newest results sent with full answer text) |
+| — | `SWARM_PLANNER_DIGEST_CHARS` | 600 (head kept from each older result's answer/task) |
+| — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
+| — | `SWARM_EXPIRED_SLOT_GRACE_SECONDS` | 600 (strictly after an expired undelivered job's deadline + this, free its seller; sats stay reserved; minimum 480 = 420 s seller kill instant + 60 s teardown) |
+| — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
 The buyer chooses **each assignment's** optional `amountSats` (safe integer ≥0, default 0).
@@ -155,7 +213,22 @@ exact post arguments, preparation/job IDs, collected answers, payment receipts a
 reasons. Sequence-derived request IDs are permanent; a lost response is recovered by a read-only
 preparation lookup before any retry. Torn final journal records are discarded; corrupt complete
 records fail startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
-release on process exit. Keep the journal and buyer state together across restarts/backups.
+release on process exit. `flock` is required on every OS; macOS does not ship it
+(`brew install flock`), and a missing `flock` is reported as such. `flock` and the locked runner
+run in their own process group under the launched process and read a pipe the parent holds, so a
+process-group signal (Ctrl-C, `kill -TERM -<pgid>`, a supervisor) reaches only the parent:
+- **First SIGINT/SIGTERM to the parent:** the runner starts no new tick, cuts its poll sleep
+  short, lets the in-flight tick (e.g. a `collect`) finish and exits 0. The parent stays alive
+  until `flock` has reaped the runner and exits with its code, so the lock is already free when
+  the parent's exit is observed and an immediate restart starts cleanly. A genuinely hung tick is
+  killed after 100 seconds (above the 90 s MCP call timeout) and the runner exits 1.
+- **Parent gone** (any exit, including `SIGKILL` or launchd `kickstart -k`), or a second signal:
+  the runner stops ticking, kills its in-flight planner/MCP commands after 5 seconds, exits and
+  releases the lock.
+- **Startup failure** in the locked runner (no buyer pubkey from `whoami`, a corrupt journal):
+  the error is logged and the runner exits 1 at once, so `flock` and the parent exit 1 and the
+  lock is free for the next start.
+A supervisor without systemd's `KillMode=control-group` (launchd) therefore restarts cleanly. Keep the journal and buyer state together across restarts/backups.
 Planner/MCP errors are logged and retried on the next polling cycle without changing posting
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
 
@@ -167,21 +240,25 @@ collecting outstanding deliveries until completion/expiry. Completion publicatio
 ordinary progress updates default to at most one per three minutes. Leave/deny/status changes
 and deadlines are rechecked after planning, immediately before posting.
 
-**Relay-deferred assignments.** If that fresh recheck fails *only* with `relay_not_ready`
-(trade or challenge relay disconnected, unauthenticated, history incomplete, in error, or any
-`failedRelays`), the assignment is not dropped. It is journaled as a `deferred` intent with
-its permanent request ID. No offer is posted and no budget is reserved, but the seller counts
-as busy: it is left out of the `assign` roster, appears in `running` with `deferred:true`, and
-cannot receive a second assignment. Each tick retries it. While the snapshot stays not ready it
-only waits. Once the snapshot is ready, it reruns the full admission check (challenge identity
-and window, eligibility, leave/deny, minutes, budget headroom and one job per seller) and
-either posts with a fresh deadline or drops the assignment with the logged reason.
-The deferred assignment is also dropped (`abandoned deferred assignment: <reason>`, released)
-when the day stops or when its duration no longer fits the work window. It is also dropped
-after `SWARM_MAX_DEFER_SECONDS` (default 120) if it is still not ready. The exact arguments
-are journaled before the first post, so a lost reply or a restart is recovered by the normal
-read-only preparation lookup and never posted twice. Any other rejection reason still drops
-the assignment immediately.
+**Relay-deferred assignments.** If that fresh recheck fails *only* with transient readiness
+reasons — `relay_not_ready` (trade or challenge relay disconnected, unauthenticated, history
+incomplete, in error, or any `failedRelays`) and/or `stale_snapshot` (the read is older than 5 s,
+e.g. right after a slow planner call) — the assignment is not dropped. It is journaled as a
+`deferred` intent with its permanent request ID. No offer is posted and no budget is reserved,
+but the seller counts as busy: it is left out of the `assign` roster, appears in `running` with
+`deferred:true`, and cannot receive a second assignment. Each tick retries it with a new
+snapshot. While that snapshot is not ready (relay not ready, or not fresh by the same 5-second
+`stale_snapshot` rule) it only waits. Once the snapshot is ready, it first reruns the full
+admission check (challenge identity and window, eligibility, leave/deny, minutes, budget headroom
+and one job per seller) and either posts with a fresh deadline or drops the assignment with the
+logged reason. The deferred assignment is also dropped (`abandoned deferred assignment: <reason>`,
+released) when the day stops or when its duration no longer fits the work window.
+`SWARM_MAX_DEFER_SECONDS` (default 120) applies only while the snapshot is still not ready: a
+tick past that age with an unready snapshot drops it as `relay snapshot still not ready after
+Ns`, while a ready snapshot always gets admission first. The exact arguments are journaled
+before the first post, so a lost reply or a restart is recovered by the normal read-only
+preparation lookup and never posted twice. Any other rejection reason, alone or together with a
+transient one, still drops the assignment immediately.
 
 ### Choosing the planner
 
@@ -198,11 +275,18 @@ To use a different model/provider, supply any **trusted shell command** via `--p
 
 All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
 `now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`.
+`minDurationSeconds` (`SWARM_MIN_DURATION`, default 300) is the shortest task the runner will
+post. It includes seller startup: a real harness spends minutes starting its sandbox and agent
+before working, and the first live run's 120–200 second tasks expired undelivered. Free sellers
+whose remaining donated minutes cannot fit it are not in the `assign` roster. The bundled LLM
+prompt tells the planner to size tasks for that overhead. With a priced buyer lacking the release
+fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
 
 - `analyze`: once per challenge, with the full eligible roster (including busy sellers).
   Returns `{approach, workstreams:[{id,description,needs,estMinutes,dependsOn}], verification}`.
   `needs` contains skills/harness/hardware hints. Analysis is journaled before assignments;
-  a restart reuses it. Timeout: 350 seconds for Claude, 360 for the outer command.
+  a restart reuses it. Timeout: `SWARM_ANALYZE_TIMEOUT_SECONDS` (360) for the outer command; the
+  bundled `planner-llm.mjs` stops its own LLM call 10 seconds earlier (350).
 - `assign`: one batch call per eligible tick with all free sellers, running jobs
   (`seller,workstream,task,since,deadline` where available; `deferred:true` marks an
   assignment waiting for the relay snapshot, not yet offered), and all settled results.
@@ -213,7 +297,45 @@ All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `re
   minutes and window; fresh admission and serial budget reservations apply before each post.
 - `assess`: checks newly settled results, including after posting stops; returns wait or solved.
   `assign` and `assess` may include `plan` containing a complete revised analysis plan, saved
-  and passed to later calls. Their outer timeout is 180 seconds (Claude: 170).
+  and passed to later calls. Their outer timeout is `SWARM_PLANNER_TIMEOUT_SECONDS` (180; the
+  bundled LLM call: 170). Both timeouts must be integers above 10.
+
+**Planner input bounds.** Every call also includes `history:{results,fullText,digested,
+answersOmitted,resultsDropped,droppedIndex,fieldsCut,fullResultsKept,digestChars,maxInputChars,marker}`.
+`results` stays oldest-to-newest. The newest `SWARM_PLANNER_FULL_RESULTS` keep their full answer.
+Older entries keep their metadata, but their `answer` and `task` become a `SWARM_PLANNER_DIGEST_CHARS`
+digest: the **head and the tail** of the text (long reports often end with the conclusion) around a
+line starting `[truncated:`, and they carry `answerChars` (the original length). If the serialized
+input still exceeds `SWARM_PLANNER_MAX_INPUT_CHARS`, the runner degrades in a fixed order until it
+fits: the newest answers become digests too (oldest first), then older answers are replaced by an
+`[truncated: answer omitted …]` marker (`answerOmitted:true`), then the oldest result entries are
+dropped (`history.resultsDropped`). Each dropped entry leaves one line in `history.droppedIndex`
+(`seller | outcome | ts <unix> | <n> answer chars`; seller and outcome cut to 100/200 characters
+with control characters escaped, so each line is one line), which no later step removes. Seller-controlled
+and other non-result inputs are bounded before that, whatever the budget, so one huge string
+cannot make every later call fail: each profile's `trackRecord.tasks` keeps the newest 10 tasks
+(counts stay exact; `tasksOmitted` says how many older ones were left out) with each task digested,
+`running[].task`, seller `name` and `note` are cut to 2000 characters, and advertised tag arrays to
+32 values of 200 characters (`history.fieldsCut` counts these cuts). `goal`, `challenge` and `plan`
+are not cut. If it still cannot fit,
+the call fails, is logged and is retried on a later tick; unbounded text is never sent. Each call
+logs `Planner <mode> ok|failed in <s>s; input <chars> chars, results …`. A planner should treat
+truncated text as incomplete and may re-request detail as a task. The full answers stay in the
+journal. A collected result whose answer could not be read is `[collected, answer unreadable: …]`
+with `answerError`.
+
+**Delivered answers.** A non-empty `answer.txt` (the buyer's materialized inline answer) is the
+answer, capped like every file at 64 KiB with a `[truncated: first N of M bytes shown]` marker, so
+a longer inline answer reaches the journal already truncated. An empty, binary or unreadable
+`answer.txt` is not an answer and falls through to the delivered files: regular text files only
+(no symlinks, devices or FIFOs), skipping `.git`, `target`, `node_modules` and the execution
+sentinel, files before subdirectories, per-file and total caps. Directories are streamed, so at most
+2000 names are read in total and an oversized directory is never listed in full (the names read are
+sorted, so output is deterministic for what was read). The read has a 10 s deadline, checked
+between reads (before each directory entry, name and file) rather than inside one read, so a
+single stalled read (e.g. a hung network filesystem) can overrun it; FIFOs and devices are never
+read. Past the deadline, or on any other read error, the result is recorded once with
+`answerError` and collect is never repeated. Names containing control characters are shown JSON-quoted.
 
 Profiles contain `pubkey`, `npub`, `name`, `agents`, `harness:{family,model,variant}` (arrays),
 `capabilities` (tokens), `hardware`, `minutesRemaining`, `note`, and `trackRecord` with
@@ -303,8 +425,15 @@ permanent publication refusals and expired/undelivered jobs are recorded without
 The solved day runs the runner's challenge relay through `gap-proxy.py`, a loopback TCP proxy.
 After the planner's first `assign` batch, `planner-free-e2e.mjs` triggers one 4-second drop.
 The fresh per-assignment recheck therefore sees `relay_not_ready`. The harness asserts that both
-assignments were deferred, not rejected; each posted once after the gap; none was dropped; and
-no request ID repeated.
+assignments were deferred, not rejected; each posted once after the gap; and none was dropped.
+On every day the runner logs each `post_job` call with its request ID, and the harness requires
+exactly one call per journaled request ID (a repeated post of the same ID fails).
+A third day (`swarm-files`) reproduces the first live run's file deliveries: the stub agent
+writes `REPORT.txt` and `data/notes.txt` and gives no inline answer, so each seller pushes a git
+delivery to a loopback HTTPS git server (`git-https.py`, trusted through a disposable CA via
+`SSL_CERT_FILE`) and the buyer materializes no `answer.txt`. The harness requires every job to be
+collected once with the delivered text as its answer, no answer error, real pushed refs, and the
+day solved from those results.
 
 ### Paid E2E coverage boundary
 

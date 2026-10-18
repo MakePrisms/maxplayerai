@@ -97,15 +97,17 @@ def check(label, value):
         raise AssertionError(label)
     print('PASS ' + label, flush=True)
 
+GIT_REMOTES = {}
+
 def home(name, relay, buyer=None):
     path = RUN / name
     path.mkdir(mode=0o700)
     config = f'relay_url = "{relay}"\naccepted_mints = []\nallow_real_mints = false\nper_job_budget_sats = 0\n'
     config += '\n[review]\nseller_offer = false\nbuyer_delivery = false\n[review.reviewers]\n\n[platform_fee]\nauto_remit = false\n[seller_preflight]\nboot_push_preflight = false\n'
     if buyer:
-        config += f'\n[seller]\nagent_command = ["node", {json.dumps(str(ROOT / "scripts/challenges/stub-acp-agent.mjs"))}]\nrate_sats = 0\ntakes_no_payment = true\ngit_remote = "http://127.0.0.1:1/unused.git"\naccept_offers_only_from = ["{buyer}"]\naccept_open_targeted = false\nclaim_open_pool = false\n'
+        config += f'\n[seller]\nagent_command = ["node", {json.dumps(str(ROOT / "scripts/challenges/stub-acp-agent.mjs"))}]\nrate_sats = 0\ntakes_no_payment = true\ngit_remote = "{GIT_REMOTES.get(name, 'http://127.0.0.1:1/unused.git')}"\naccept_offers_only_from = ["{buyer}"]\naccept_open_targeted = false\nclaim_open_pool = false\n'
     (path / 'config.toml').write_text(config)
-    env = {**ENV, 'MAXPLAYER_HOME': str(path), 'E2E_STUB_RELEASE': str(RUN / 'release'), 'E2E_STUB_DELAY_FILE': str(RUN / 'delay-ms')}
+    env = {**ENV, 'MAXPLAYER_HOME': str(path), 'E2E_STUB_RELEASE': str(RUN / 'release'), 'E2E_STUB_DELAY_FILE': str(RUN / 'delay-ms'), 'E2E_STUB_FILE_MODE': str(RUN / 'file-mode')}
     out = command([BIN, 'whoami'], env)
     return env, re.search(r'pubkey: ([0-9a-f]{64})', out)[1]
 
@@ -165,6 +167,25 @@ try:
     wait('local generic challenge relay ready', lambda: socket.create_connection(('127.0.0.1', challenge_port), timeout=1).close() is None)
     challenge_relays = os.environ.get('E2E_CHALLENGE_RELAYS', CHALLENGE_RELAY)
     ENV['SWARM_CHALLENGE_RELAYS'] = challenge_relays
+    # Loopback HTTPS git remote for file (git) deliveries, trusted through a disposable CA only.
+    pki = RUN / 'pki'
+    pki.mkdir(mode=0o700)
+    command(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-days', '2',
+             '-subj', '/CN=swarm e2e CA', '-keyout', pki / 'ca.key', '-out', pki / 'ca.pem',
+             '-addext', 'basicConstraints=critical,CA:TRUE', '-addext', 'keyUsage=critical,keyCertSign,cRLSign'])
+    command(['openssl', 'req', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-subj', '/CN=127.0.0.1',
+             '-keyout', pki / 'leaf.key', '-out', pki / 'leaf.csr'])
+    (pki / 'leaf.ext').write_text('basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=IP:127.0.0.1\n')
+    command(['openssl', 'x509', '-req', '-in', pki / 'leaf.csr', '-CA', pki / 'ca.pem', '-CAkey', pki / 'ca.key', '-CAcreateserial',
+             '-days', '2', '-extfile', pki / 'leaf.ext', '-out', pki / 'leaf.pem'])
+    ENV['SSL_CERT_FILE'] = str(pki / 'ca.pem')
+    git_root, gitport = RUN / 'gitroot', port()
+    git_root.mkdir()
+    for name in ('s', 'd'):
+        command(['git', 'init', '-q', '--bare', git_root / f'{name}.git'])
+        GIT_REMOTES[name] = f'https://127.0.0.1:{gitport}/{name}.git'
+    start('git-https', ['python3', ROOT / 'scripts/challenges/git-https.py', gitport, git_root, pki / 'leaf.pem', pki / 'leaf.key'])
+    wait('loopback HTTPS git remote ready', lambda: socket.create_connection(('127.0.0.1', gitport), timeout=1).close() is None)
     buyer_env, BUYER = home('b', relay)
     seller_env, SELLER = home('s', relay, BUYER)
     denied_env, DENIED = home('d', relay, BUYER)
@@ -294,7 +315,7 @@ try:
         cli(buyer_env, 'decide', '--seller', DENIED, '--accept')
         # Capability tokens are startup-probed, not configurable. Deterministic Rust-only
         # routing and unequal durations are asserted in swarm.test.mjs.
-        def swarm_day(day, solve_after, duration, gap=False):
+        def swarm_day(day, solve_after, duration, gap=False, files=False):
             begin = int(time.time()) + 3
             publish_day(day, begin, begin + 600)
             runner_relay, extra = CHALLENGE_RELAY, {}
@@ -323,20 +344,39 @@ try:
             count = len(jobs)
             time.sleep(3)
             check(day + ' never posts after stopping', len(settled()) == count)
+            # Count actual post_job calls per request id (the runner logs every call), not sellers.
+            runner_log = (RUN / (day + '-runner.log')).read_text()
+            post_calls = {}
+            for request in re.findall(r'post_job request (swarm-[0-9a-f]{64}) seller', runner_log):
+                post_calls[request] = post_calls.get(request, 0) + 1
+            check(day + ' each request ID posted exactly once', len(jobs) == len({j['args']['request_id'] for j in jobs}) and post_calls == {j['args']['request_id']: 1 for j in jobs})
+            if files:
+                check(day + ' file deliveries collected once with delivered text, no answer.txt and no answer error',
+                      all(j['answer'].startswith('Delivered files (no inline answer):') and '===== REPORT.txt =====' in j['answer'] and 'Challenge fixture result: 42.' in j['answer']
+                          and '===== data/notes.txt =====' in j['answer'] and 'answerError' not in j for j in jobs)
+                      and 'answer unreadable' not in runner_log and 'ENOENT' not in runner_log)
+                check(day + ' sellers really pushed git deliveries', all(subprocess.run(['git', '--git-dir', str(git_root / f'{n}.git'), 'for-each-ref'], capture_output=True, text=True).stdout.strip() for n in ('s', 'd')))
             if gap:
                 log = (RUN / (day + '-runner.log')).read_text()
                 check(day + ' coverage gap opened after planning and closed', 'gap closed' in (RUN / (day + '-gap-proxy.log')).read_text() and Path(str(trigger) + '.done').exists())
-                deferred = set(re.findall(r'Deferred assignment for ([0-9a-f]{64}): relay_not_ready', log))
+                deferred = set(re.findall(r'Deferred assignment for ([0-9a-f]{64}): [a-z_, ]*relay_not_ready', log))
                 posted = set(re.findall(r'Posted deferred assignment for ([0-9a-f]{64})', log))
                 check(day + ' relay gap deferred the planned batch instead of dropping it', deferred == {SELLER, DENIED} and 'relay_not_ready' not in ''.join(l for l in log.splitlines() if 'Rejected assignment' in l))
                 check(day + ' every deferred assignment posted once after the gap, none dropped', posted == deferred and 'Dropped deferred' not in log)
-                check(day + ' each request ID posted once (no duplicate intents)', len({j['args']['request_id'] for j in jobs}) == len(jobs))
+
             os.killpg(runner.pid, signal.SIGTERM)
-            runner.wait(timeout=15)
+            # The parent exits only once the locked runner has finished its in-flight tick, which
+            # swarm.mjs bounds by STOP_GRACE_MS (100 s); wait past that, not a shorter guess.
+            runner.wait(timeout=110)
             PROCESSES.remove((day + '-runner', runner))
             return final
         solved = swarm_day('swarm-solved', 4, 30, gap=True)
         check('swarm solved: completed + result visible', solved['challenge']['result'] == 'Challenge fixture result: 42.')
+        # Live-run regression: sellers deliver files and no inline answer (git delivery).
+        (RUN / 'file-mode').write_text('on\n')
+        files_day = swarm_day('swarm-files', 4, 30, files=True)
+        check('swarm files: solved from delivered files', files_day['challenge']['result'] == 'Challenge fixture result: 42.')
+        (RUN / 'file-mode').unlink()
         (RUN / 'delay-ms').write_text('10000')
         exhausted = swarm_day('swarm-exhausted', 100000, 40)
         check('swarm exhausted: completed + unsolved update visible', not exhausted['challenge']['result'] and any('Unsolved: all eligible sellers exhausted' in u for u in exhausted['updates']))
