@@ -357,6 +357,10 @@ export const collectRetryDelay = failures => Math.min(COLLECT_RETRY_MAX_SECONDS,
 // and never publishes at all once the buyer-signed challenge is completed/cancelled (a close by
 // the operator, or by anyone holding the buyer key, is final for the runner).
 export const TERMINAL_STATUSES = ['completed','cancelled'];
+// A failed progress re-read (relay error, or a `status` that hung until the command timeout) is
+// retried after min(updateEvery, this) seconds measured from when it FAILED, so a hung challenge
+// relay cannot occupy back-to-back ticks (collects and posting keep the poll cadence meanwhile).
+export const PROGRESS_RETRY_SECONDS = 30;
 const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
 // The sidecar `publish` refuses to sign over a completed/cancelled challenge it sees in its own
 // pre-publish fetch: exit 3, stderr `challenge: challenge closed (<status>): …`, nothing published.
@@ -632,10 +636,17 @@ export class Swarm {
     }
     if(day.stop&&!day.stop.external&&!day.published) {
       if(await this.publishChallenge(day,day.challenge,'completed',day.stop.update,day.stop.result)){day.published=true;this.save();}
-    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery) {
+    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&!(now<day.progressRetryAt)) {
       // Progress never changes the status: it re-sends the latest buyer-signed one (null). The
-      // interval restarts only after a publish; a failed re-read is retried on the next tick.
-      if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=now;this.save();}
+      // interval restarts only after a publish; a failed re-read is retried after a short backoff
+      // (PROGRESS_RETRY_SECONDS from the failure), not a full updateEvery and not every tick.
+      try {
+        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=now;delete day.progressRetryAt;this.save();}
+      } catch(e) {
+        if(e.journalFailure)throw e;
+        day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();
+        throw e;
+      }
     }
   }
 }

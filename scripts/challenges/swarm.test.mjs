@@ -1264,14 +1264,15 @@ test('close: progress passes the latest read status through unchanged (never the
   assert.equal(f.publishes.at(-1)[2],'scheduled','the relay status is re-sent as read');
 });
 // Advisor r1 #2: lastUpdate was saved before the publish, so a failed re-read waited a full updateEvery.
-test('progress: a failed latest-challenge read is retried on the next tick; a cancel seen then is journaled, nothing published',async()=>{
+test('progress: a failed latest-challenge read is retried after a short backoff; a cancel seen then is journaled, nothing published',async()=>{
   const f=fixture();let fail=true,relay={...structuredClone(f.snap.challenge),budgetSats:10};
   f.io.latestChallenge=async()=>{if(fail){fail=false;throw Error('challenge relay read incomplete');}return structuredClone(relay);};
   f.setPlan(()=>({wait:true}));f.time(200);
   await assert.rejects(f.runner.tick(),/read incomplete/);
   const day=Object.values(f.journal.state.days)[0];
   assert.equal(day.lastUpdate,0,'interval not restarted by a failed publish');
-  relay={...relay,status:'cancelled'};f.time(201);await f.runner.tick();
+  assert.equal(day.progressRetryAt,230,'retried after a short backoff, not a full updateEvery');
+  relay={...relay,status:'cancelled'};f.time(230);await f.runner.tick();
   assert.equal(f.publishes.length,0);assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
   // A successful progress publish does restart the interval.
   const g=fixture();g.setPlan(()=>({wait:true}));g.time(200);await g.runner.tick();
@@ -1317,4 +1318,29 @@ test('relay health: a tick that is both a change and a heartbeat says so',async 
   t.mock.timers.tick(55000);d.status.error='x';t.mock.timers.tick(5000);
   assert.match(logs.at(-1),/^Relay change \+ heartbeat: .*error="x"/);
   h.stop();
+});
+// Advisor r2 #1: a progress re-read that hangs until the command timeout must not occupy every tick.
+test('progress: a re-read that hangs past its timeout does not hold back-to-back ticks; collects keep cadence; a later cancel is journaled',async()=>{
+  const {PROGRESS_RETRY_SECONDS}=await import('./swarm.mjs');
+  // One job whose deadline (t=600) outlives the hang, so it is still being collected after it.
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.snap.sellers[0].minutesRemaining=10;f.c.maxDuration=600;
+  f.setPlan(input=>({assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'piece',durationSeconds:500}))}));
+  await f.runner.tick();const job=[...f.remote.values()][0];
+  assert.equal(f.journal.state.jobs[0].args.deadline_unix,600);
+  let reads=0,hang=true,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  // A hung `status`: the command runs 120 s (the clock moves), then fails with the timeout.
+  f.io.latestChallenge=async()=>{reads++;if(hang){f.time(f.io.now()+120);throw Error('Command timed out');}return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));
+  f.time(200);await assert.rejects(f.runner.tick(),/timed out/);
+  assert.equal(reads,1);const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.progressRetryAt,320+PROGRESS_RETRY_SECONDS,'backoff counts from the failure, after the hang');
+  // Next ticks at the poll cadence: no re-read, and a delivered result is collected at once.
+  job.results=[{}];const collects=()=>f.calls.filter(([t])=>t==='collect').length;
+  for(const t of [325,330,335,340,345]){f.time(t);await f.runner.tick();}
+  assert.equal(reads,1,'no re-read inside the backoff (no back-to-back hangs)');
+  assert.equal(collects(),1,'collect ran on the first tick after the hang');
+  // The relay recovers and the buyer has cancelled: the retry journals the close, publishes nothing.
+  hang=false;relay={...relay,status:'cancelled'};f.time(350);await f.runner.tick();
+  assert.equal(reads,2);assert.equal(f.publishes.length,0);
+  assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
 });
