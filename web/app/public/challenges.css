@@ -62,3 +62,4 @@
     max-height: max(220px, calc(100svh - var(--nav-h) - 330px));
   }
 }
+.eyebrow.is-off { visibility: hidden; }

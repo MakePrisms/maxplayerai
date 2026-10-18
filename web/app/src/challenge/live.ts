@@ -43,20 +43,46 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='done'&&!a.eligible)return 'Done';
   return a.eligible?'Ready':'Joined';
 }
-// Until the live data is in (connected and history complete), the status line says only
-// "Updating…" (bob: no disclaimers). Once live it is unchanged: "Live"/"Polling" plus any reason.
+// Until the live data is in (connected and history complete), the agents section says only
+// "Updating…" (bob: no disclaimers). Latched: once the data has been live on this page load
+// (wasLive), a routine poll or catch-up (historyComplete false while connected) stays "live";
+// only an actual disconnect (or no relay status at all) goes back to "Updating…".
 export const UPDATING='Updating…';
-export function isLive(r: Snapshot['relay']): boolean { return !r||(r.connected&&r.historyComplete); }
-export function connectionLine(r: Snapshot['relay'],status: string): string {
-  if(!isLive(r))return UPDATING;
+type Relay=Snapshot['relay'];
+export type LiveState='live'|'updating';
+export function isLive(r: Relay): boolean { return !!r&&r.connected&&r.historyComplete; }
+export function liveState(r: Relay,wasLive: boolean): LiveState { return !!r&&r.connected&&(wasLive||r.historyComplete)?'live':'updating'; }
+// Fully ready: the bar the swarm coordinator uses before it assigns work (connected,
+// authenticated, history complete, no error, no failed relay).
+export function relayReady(r: Relay): boolean { return isLive(r)&&r!.authenticated&&!r!.error&&!r!.failedRelays?.length; }
+// Called on every read of the relay status (each receive and each 1s tick). readyAt is the
+// last time the relay was fully ready; a disconnect or an error clears it at once. readyAgeS
+// lets the hero drop "Running now" when the data stops being ready, without the 15s poll
+// (which clears historyComplete for about a second) making it flicker.
+export interface Tracker { wasLive: boolean; readyAt: number|null }
+export interface Observed extends Tracker { state: LiveState; readyAgeS: number|null }
+export function observe(t: Tracker,r: Relay,nowMs: number): Observed {
+  const wasLive=t.wasLive||isLive(r);
+  const readyAt=!r||!r.connected||r.error?null:relayReady(r)?nowMs:t.readyAt;
+  return {wasLive,readyAt,state:liveState(r,wasLive),readyAgeS:readyAt===null?null:Math.max(0,nowMs-readyAt)/1000};
+}
+// The section eyebrow says "Live" only while the section is live; it keeps its space otherwise.
+export function renderLiveState(doc: Document,state: LiveState): void {
+  doc.getElementById('agents-eyebrow')!.classList.toggle('is-off',state!=='live');
+}
+export function connectionLine(r: Relay,status: string,wasLive=false): string {
+  if(liveState(r,wasLive)!=='live')return UPDATING;
   // The relay's own reason (e.g. a CLOSED) is shown at once, not only after the reconnect copies it into a warning.
   return status+(r?.error?` · ${r.error}`:'')+(r?.failedRelays?.length?` · Unavailable: ${r.failedRelays.join(', ')}`:'')+(r?.warnings?.length?` · ${r.warnings.join('; ')}`:'');
 }
 const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
 // Public page: denied members are not listed. Remote text only ever reaches textContent.
-// loading=true (no live data yet this page load): the summary stays empty so only "Updating…" shows.
+// loading=true (not live: before the first live data, or disconnected): no rows and no counts,
+// so nothing reads as current; only "Updating…" shows.
 export function renderSellers(doc: Document,s: Snapshot,now: number,loading=false): void {
-  const list=doc.getElementById('challenge-sellers')!;const fragment=doc.createDocumentFragment();
+  const list=doc.getElementById('challenge-sellers')!;
+  if(loading){list.replaceChildren();doc.getElementById('seller-summary')!.textContent='';return;}
+  const fragment=doc.createDocumentFragment();
   const shown=s.sellers.filter(a=>a.decision!=='denied');
   for(const a of shown) {
     const row=doc.createElement('li');const state=sellerState(s,a,now);
@@ -80,6 +106,5 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading=fals
   list.replaceChildren(fragment);
   const working=shown.filter(a=>sellerState(s,a,now)==='Working now').length;
   const pending=waiting.length||partial?` · ${waiting.length}${partial?'+':''} waiting for approval`:'';
-  // While loading, no counts or "No members yet." that the full history could contradict.
-  doc.getElementById('seller-summary')!.textContent=loading?'':(shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.')+pending;
+  doc.getElementById('seller-summary')!.textContent=(shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.')+pending;
 }
