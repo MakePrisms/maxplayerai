@@ -44,9 +44,11 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   return a.eligible?'Ready':'Joined';
 }
 // Until the live data is in (connected and history complete), the agents section says only
-// "Updating…" (bob: no disclaimers). Latched: once the data has been live on this page load
-// (wasLive), a routine poll or catch-up (historyComplete false while connected) stays "live";
-// only an actual disconnect (or no relay status at all) goes back to "Updating…".
+// "Updating…" (bob: no disclaimers). Latched: once the data has been live (wasLive), a routine
+// poll that only clears historyComplete while the relay stays connected keeps "live", so the
+// section doesn't blank every 15s. A disconnect (or no relay status at all) clears the latch:
+// the section shows "Updating…" and, after the reconnect, waits for a fresh historyComplete
+// before "Live", the eyebrow and the rows come back.
 export const UPDATING='Updating…';
 type Relay=Snapshot['relay'];
 export type LiveState='live'|'updating';
@@ -62,7 +64,7 @@ export function relayReady(r: Relay): boolean { return isLive(r)&&r!.authenticat
 export interface Tracker { wasLive: boolean; readyAt: number|null }
 export interface Observed extends Tracker { state: LiveState; readyAgeS: number|null }
 export function observe(t: Tracker,r: Relay,nowMs: number): Observed {
-  const wasLive=t.wasLive||isLive(r);
+  const wasLive=!!r&&r.connected&&(t.wasLive||isLive(r));
   const readyAt=!r||!r.connected||r.error?null:relayReady(r)?nowMs:t.readyAt;
   return {wasLive,readyAt,state:liveState(r,wasLive),readyAgeS:readyAt===null?null:Math.max(0,nowMs-readyAt)/1000};
 }

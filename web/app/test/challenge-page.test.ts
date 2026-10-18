@@ -64,3 +64,27 @@ test("page: stuck incomplete after being live keeps Live but drops Running now o
   assert.equal(ids["challenge-start-label"]!.textContent, "Work starts");
   assert.equal(ids["connection-status"]!.textContent, "Live");
 });
+
+test("page: after a disconnect, the reconnect waits for a fresh complete history before Live and the rows return", () => {
+  const { doc, ids } = page();
+  let t = paint(doc, s, live, { wasLive: false, readyAt: null }, clock(0));
+  assert.equal(ids["connection-status"]!.textContent, "Live");
+  t = paint(doc, s, { ...live, connected: false, authenticated: false, historyComplete: false }, t, clock(1000));
+  assert.equal(ids["connection-status"]!.textContent, "Updating…");
+  // Reconnected, catch-up still running: not live yet, no pre-drop rows.
+  for (const ms of [2000, 3000]) {
+    t = paint(doc, s, { ...live, historyComplete: false }, t, clock(ms));
+    assert.equal(ids["connection-status"]!.textContent, "Updating…", `catch-up at ${ms}`);
+    assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"));
+    assert.equal(ids["challenge-sellers"]!.children.length, 0);
+    assert.equal(ids["seller-summary"]!.textContent, "");
+    assert.equal(ids["challenge-start-label"]!.textContent, "Work starts");
+  }
+  t = paint(doc, s, live, t, clock(4000));
+  assert.equal(ids["connection-status"]!.textContent, "Live");
+  assert.ok(!ids["agents-eyebrow"]!.cls.has("is-off"));
+  assert.equal(ids["seller-summary"]!.textContent, "1 agent · 1 working now");
+  // And the latch is back: a routine poll afterwards stays Live.
+  paint(doc, s, { ...live, historyComplete: false }, t, clock(5000));
+  assert.equal(ids["connection-status"]!.textContent, "Live");
+});
