@@ -190,6 +190,10 @@ impl Relays {
     pub fn quorum(&self) -> (usize, usize) {
         (self.quorum, self.urls.len())
     }
+    /// Relays missing from any read or publish so far in this invocation.
+    pub fn missing(&self) -> BTreeSet<String> {
+        self.report.lock().unwrap().missing.clone()
+    }
     pub fn take_report(&self) -> Report {
         std::mem::take(&mut *self.report.lock().unwrap())
     }
@@ -380,6 +384,16 @@ impl Relays {
         }
         if !failed.is_empty() {
             self.degraded("read", ok, &failed, &missing);
+        }
+        // An event this home published at a bare quorum, whose missing relay has not had it re-sent
+        // yet, is still in the outbox: a quorum read that omits it (the overlapping relay lost it)
+        // still sees it. Trusted reads only; outbox events are own-key and signature-checked.
+        if paged {
+            for e in Outbox::load(home).entries {
+                if filter.match_event(&e.event, Default::default()) {
+                    union.entry(e.event.id).or_insert(e.event);
+                }
+            }
         }
         // Keep all verified versions for eligibility and replacement-timestamp checks; callers
         // select latest per (kind, author, d), never collapse distinct authors sharing a d-tag.
@@ -626,9 +640,13 @@ impl Outbox {
     pub fn path(home: &MaxplayerHome) -> PathBuf {
         home.root.join("challenges").join("outbox.json")
     }
-    /// A missing or unreadable file is an empty outbox; entries whose event fails verification are
-    /// dropped (a tampered file can never make the sidecar send something it did not sign).
+    /// A missing or unreadable file is an empty outbox; entries whose event fails verification or
+    /// is not signed by this home's key are dropped (a tampered file can never make the sidecar
+    /// send, or read as published, something it did not sign).
     pub fn load(home: &MaxplayerHome) -> Self {
+        let Ok(own) = keys(home).map(|k| k.public_key()) else {
+            return Self::default();
+        };
         let Ok(raw) = std::fs::read_to_string(Self::path(home)) else {
             return Self::default();
         };
@@ -640,6 +658,7 @@ impl Outbox {
             .filter_map(|row| {
                 let event: Event = serde_json::from_value(row.get("event")?.clone()).ok()?;
                 event.verify().ok()?;
+                (event.pubkey == own).then_some(())?;
                 let missing = serde_json::from_value(row.get("missing")?.clone()).ok()?;
                 let queued_at = row.get("queued_at")?.as_u64()?;
                 Some(OutboxEntry {
@@ -756,6 +775,10 @@ pub(crate) mod transport_tests {
         pub(crate) url: String,
         pub(crate) writes: Arc<Mutex<Vec<Event>>>,
         pub(crate) reqs: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// false: every new connection is dropped before the WebSocket handshake (relay down).
+        pub(crate) online: Arc<std::sync::atomic::AtomicBool>,
+        /// The `OK` verdict for every EVENT (false: the relay refuses writes).
+        pub(crate) accept: Arc<std::sync::atomic::AtomicBool>,
         task: tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture {
@@ -845,12 +868,22 @@ pub(crate) mod transport_tests {
         let recorded = writes.clone();
         let reqs = Arc::new(Mutex::new(Vec::new()));
         let filters = reqs.clone();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let online = Arc::new(AtomicBool::new(true));
+        let accept = Arc::new(AtomicBool::new(accept));
+        let (up, verdict) = (online.clone(), accept.clone());
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
+                if !up.load(Ordering::SeqCst) {
+                    drop(tcp);
+                    continue;
+                }
                 let answer = answer.clone();
                 let recorded = recorded.clone();
                 let filters = filters.clone();
+                let verdict = verdict.clone();
                 tokio::spawn(async move {
+                    let accept = verdict.load(Ordering::SeqCst);
                     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
                     while let Some(Ok(message)) = ws.next().await {
                         let Message::Text(text) = message else {
@@ -912,6 +945,8 @@ pub(crate) mod transport_tests {
             url,
             writes,
             reqs,
+            online,
+            accept,
             task,
         }
     }

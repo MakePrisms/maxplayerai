@@ -1,4 +1,4 @@
-import { parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
+import { connectionText, parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
 import { demoSnapshot } from "./challenge/demo.js";
 import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
@@ -71,11 +71,7 @@ function receive(value: unknown, status: string): void {
   snapshot = parseSnapshot(value);
   receivedAt = performance.now();
   render(snapshot);
-  const r = snapshot.relay;
-  // Degraded (run 2 #13): the challenge relay quorum is met but a relay is missing; still live, but say so.
-  const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : r?.degraded ? `${status} · Degraded: ${r.quorum?.complete} of ${r.quorum?.total} challenge relays` : status;
-  // The relay's own reason (e.g. a CLOSED) is shown at once, not only after the reconnect copies it into a warning.
-  text("connection-status", connection + (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : ""));
+  text("connection-status", connectionText(snapshot.relay, status));
 }
 function unavailable(): void {
   text("connection-status", snapshot ? "Reconnecting · showing last known" : "Live view unavailable · check back soon");
