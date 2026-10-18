@@ -205,24 +205,34 @@ The community HTTP/SSE server and review page have been removed; use
   unioned and deduplicated by ID before latest-per-d projection. Each relay has independent
   paging/reconnect state; unavailable relay URLs are reported without discarding healthy sources.
 - History starts anonymously, paged separately by kind with overlapping timestamp boundaries.
-- Live subscriptions start anonymously for public relays and are reinstalled after NIP-42
-  AUTH succeeds on restricted relays. AUTH uses one new in-memory per-tab key across connections,
-  never the buyer key. No EVENT is sent by the reader.
-- Refused/absent AUTH leaves history available and polling active; so does a relay CLOSED of a
-  live subscription on an anonymous connection or of a display-only feed (applicants,
-  profiles/heartbeats). Polling runs every 15 seconds from each filter's newest timestamp minus
+- Live subscriptions start anonymously on relays that send no AUTH challenge. Once a relay
+  challenges, live subscriptions wait for the AUTH outcome and are sent after AUTH OK; one that
+  already left anonymously is replaced under a new id (`live-<kind>~<n>`) and the old one is
+  closed, so an EOSE for a replaced subscription never counts. AUTH uses one new in-memory
+  per-tab key across connections, never the buyer key. No EVENT is sent by the reader.
+- Refused AUTH, or no AUTH challenge at all, leaves history available and polling active; so
+  does a relay CLOSED of a live subscription on such an anonymous connection. A challenge that is
+  never answered within 15 seconds is treated like a refusal, with a warning. A relay CLOSED of a
+  display-only feed (applicants, profiles/heartbeats) never affects readiness; it adds a warning
+  with the relay's reason. Polling runs every 15 seconds from each filter's newest timestamp minus
   900 seconds, also repairing late events while streaming. Disconnects reconnect with bounded
   backoff and reload history.
+- When a relay sent an AUTH challenge that was not refused, and while it is recovering from a
+  CLOSED, `historyComplete` also requires AUTH OK and an EOSE for every trusted filter's live
+  subscription sent after AUTH OK on this connection, whether or not that subscription is still
+  installed. A newly sent replacement subscription makes the reader not ready until its own EOSE.
 - A relay CLOSED on a trusted read is never a dead end. When the relay closes an authenticated
-  live subscription, refuses a trusted history page, or answers `auth-required:` when AUTH is
-  then refused or does not complete within 15 seconds, the reader sets `error` to the relay's
-  reason and closes the socket. The backoff reconnect then runs a full fresh round (AUTH, trusted
-  history, live). Until a recovered connection has stayed ready for 60 seconds, CLOSED-driven
-  reconnects keep doubling the backoff (cap 5 minutes), a `Recovering after relay CLOSED (…)`
-  warning names the last reason, and `historyComplete` also requires an EOSE on every trusted
-  live subscription. A relay that closes every live subscription therefore stays not ready
-  without a reconnect storm. An `auth-required:` refusal of a REQ sent before AUTH is re-read in
-  place after AUTH OK.
+  live subscription, closes any trusted live subscription while AUTH is expected or the reader is
+  recovering (even before AUTH OK), refuses a trusted history page, or answers `auth-required:`
+  when AUTH is then refused or does not complete within 15 seconds, the reader sets `error` to the
+  relay's reason and closes the socket; the page shows that reason at once. While recovering, AUTH
+  that does not complete within 15 seconds also reconnects. The backoff reconnect then runs a full
+  fresh round (AUTH, trusted history, live). Until a recovered connection has stayed ready for 60
+  seconds without interruption (the period restarts whenever a trusted live subscription becomes
+  unconfirmed), CLOSED-driven reconnects keep doubling the backoff (cap 5 minutes) and a
+  `Recovering after relay CLOSED (…)` warning names the last reason. A relay that closes every
+  live subscription therefore stays not ready without a reconnect storm. An `auth-required:`
+  refusal of a REQ sent before AUTH is re-read in place after AUTH OK.
 - Signatures and IDs are verified locally. Buyer-authored kinds are author-scoped;
   claims and results are `#p`-scoped to the buyer. Memberships are read in two separate ways
   (see *Trusted roster and applicant list* below): the trusted roster read is scoped by
