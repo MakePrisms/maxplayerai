@@ -1217,3 +1217,10 @@ test('relay health: openSnapshot records per-relay socket activity through the r
   assert.equal(d.sockets['ws://c1'].lastMessageAt,null);
   assert.equal(d.status.relays.length,2);assert.equal(d.status.connected,false,'readiness still comes only from the reader');
 });
+test('close: without a direct relay read the publish guard re-reads a fresh snapshot, not the tick-start one',async()=>{
+  const f=fixture();delete f.io.latestChallenge;
+  f.setPlan(input=>{if(input.mode==='assign')f.snap.challenge.status='cancelled';return {wait:true};});
+  f.time(200);await f.runner.tick();
+  assert.equal(f.publishes.length,0,'the cancel seen by the fresh read stops the progress publish');
+  assert.equal(Object.values(f.journal.state.days)[0].closed.status,'cancelled');
+});

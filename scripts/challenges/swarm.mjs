@@ -358,7 +358,9 @@ export class Swarm {
   // that read and changes only the update (and, for the runner's own stop, status/result). A
   // failed read publishes nothing (throws; the caller retries on a later tick).
   async publishChallenge(day,c,status,update,result) {
-    const latest=await this.io.latestChallenge(c);
+    // main() always reads the relays directly (sidecar). An injected io without that read (embedders,
+    // older tests) falls back to a FRESH snapshot taken now, never the tick-start one.
+    const latest=this.io.latestChallenge?await this.io.latestChallenge(c):await this.io.snapshot().then(x=>x?.challenge&&{...x.challenge,budgetSats:x.budget?.totalSats});
     if(!latest||latest.id!==c.id||latest.buyer!==c.buyer||typeof latest.status!=='string')throw Error(`Challenge ${c.id}: latest buyer-signed challenge unreadable; not publishing`);
     if(TERMINAL_STATUSES.includes(latest.status)) {
       day.closed={status:latest.status,seenAt:this.io.now()};
