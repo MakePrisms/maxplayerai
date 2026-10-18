@@ -735,3 +735,54 @@ test('parent death: SIGKILL of the runner parent releases the home lock and stop
   } finally {rmSync(dir,{recursive:true,force:true});}
 });
 function require_flock(){try{return (globalThis.__flock??=(()=>{const r=process.getBuiltinModule('node:child_process').spawnSync('flock',['--version']);return r.status===0;})());}catch{return false;}}
+
+// Bug 5, upgraded (Rocky's revised report): on a v0.6.1 buyer an expired, never-delivered PAID
+// job never reaches done, so pending() blocked that seller for the rest of the day (argon ~7.5 h).
+const expiredPaid=()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  let n=0;f.setPlan(input=>input.mode==='assess'?{wait:true}:n++?assignments(input):priced(input,5));
+  return {f,reports,old:()=>[...f.remote.values()][0]};
+};
+test('expired paid job without release fields: seller freed after deadline + grace, sats stay reserved, never collected or paid',async()=>{
+  const {EXPIRED_SLOT_GRACE_SECONDS}=await import('./swarm.mjs');
+  const {f,reports,old}=expiredPaid();
+  await f.runner.tick();assert.deepEqual(posts(f).map(([,a])=>[a.amount_sats,a.deadline_unix]),[[5,130]]);
+  // A v0.6.1-shaped view: confirmed read, no results, none of the release-proof fields.
+  Object.assign(old(),{read_confirmed:true,results:[],claims:[],accepted:null});
+  const deadline=130,grace=EXPIRED_SLOT_GRACE_SECONDS;
+  for(const t of [131,deadline+grace-1]){f.time(t);await f.runner.tick();assert.equal(posts(f).length,1,`still busy at ${t}`);}
+  const j=f.journal.state.jobs[0];assert.equal(j.done,false);assert.equal(j.slotFreed,undefined);
+  f.time(deadline+grace);await f.runner.tick();
+  assert.equal(j.slotFreed,deadline+grace);assert.equal(j.done,false,'job stays open and polled');assert.equal(j.released,false);
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.amount_sats]),[['a',5],['a',0]],'seller gets a new assignment');
+  assert.ok(reports.some(r=>/expired undelivered 600s past its deadline; seller a freed for new work, 5 sats stay reserved/.test(r)));
+  const jobs=f.journal.state.jobs;assert.equal(reservedBudget(f.snap,jobs,f.io.now()).committedSats,5,'old sats still reserved');
+  assert.ok(!f.inputs.at(-1).running?.some(r=>r.deadline===deadline),'freed job not shown as running');
+  for(let t=deadline+grace+1;t<deadline+grace+4;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,0,'nothing collected or paid');
+  assert.equal(posts(f).length,2,'one new job at a time: the new job keeps the seller busy');
+  assert.equal(reservedBudget(f.snap,jobs,f.io.now()).committedSats,5);
+});
+test('expired paid job: late delivery after the slot was freed is collected exactly once and settles its reservation',async()=>{
+  const {f,old}=expiredPaid();const mcp=f.io.mcp;
+  f.io.mcp=async(t,a)=>t==='collect'&&a.job_id===old().id?(f.calls.push([t,a]),{pay:{state:'Closed { receipt }',amount_sats:5}}):mcp(t,a);
+  await f.runner.tick();Object.assign(old(),{read_confirmed:true,results:[],claims:[],accepted:null});
+  f.time(730);await f.runner.tick();assert.equal(posts(f).length,2);
+  // Core keeps a past-deadline delivery payable (claim `delivered`, 7-day pay window).
+  old().results=[{}];
+  for(const t of [731,732,733]){f.time(t);await f.runner.tick();}
+  assert.deepEqual(f.calls.filter(([t])=>t==='collect').map(([,a])=>a.job_id),[old().id],'collected (and paid) exactly once');
+  const j=f.journal.state.jobs[0];assert.equal(j.outcome,'collected');assert.equal(j.done,true);
+  assert.deepEqual(jobBudget(j),{reservedSats:0,paidSats:5});
+  assert.equal(posts(f).length,2,'late collection does not hand the seller a second live job');
+});
+test('expired paid job: slot stays held on an unconfirmed read or a pending awarded delivery; grace is validated',async()=>{
+  for(const view of [{read_confirmed:false,results:[]},{read_confirmed:true,results:[],awarded_delivery_pending:true},{read_confirmed:true}]){
+    const {f,old}=expiredPaid();await f.runner.tick();Object.assign(old(),view);if(!('results' in view))delete old().results;
+    f.time(2000);f.snap.challenge.ends=5000;await f.runner.tick();
+    assert.equal(f.journal.state.jobs[0].slotFreed,undefined,JSON.stringify(view));assert.equal(posts(f).length,1,JSON.stringify(view));
+  }
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
+  assert.equal(config([],base).expiredSlotGrace,600);assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'900'}).expiredSlotGrace,900);
+  assert.throws(()=>config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'419'}),/SWARM_EXPIRED_SLOT_GRACE_SECONDS/);
+});

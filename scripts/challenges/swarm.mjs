@@ -143,6 +143,22 @@ export const missingReleaseFields = view => RELEASE_FIELDS.filter(k=>!(view&&typ
 // seller whose remaining donated minutes cannot fit it is not offered to the planner, and no-fit
 // exhaustion uses it. Minutes are still counted only by the shared projection.
 export const DEFAULT_MIN_DURATION = 300;
+// Seller slot vs sats for an expired job that is still reserved (no release proof yet, e.g. a
+// v0.6.1 buyer whose get_job lacks the release fields). Core facts this rule rests on:
+// - The seller stops executing at the offer deadline: host delivery stops the agent at the
+//   deadline (DeadlineExceeded) and bounds its push at 150 s; container delivery is killed at
+//   deadline + PUSH_MARGIN_SECS (300) + CONTAINER_EXIT_GRACE_SECS (120) = 420 s; a restart never
+//   re-runs or finalizes a lapsed job (ResumeAction::SkipLapsed).
+// - A delivery published late is still payable: derive_claim_liveness marks a past-deadline claim
+//   `delivered` (accept_claim treats it like `processing`) for DELIVERY_PAY_WINDOW_SECS (7 days)
+//   after the delivery, on main and v0.6.1.
+// So once deadline + this grace has passed and a confirmed read shows no delivery, the old job
+// can no longer be executing: its seller slot is freed for new work. The job itself stays open
+// (not done): it is still polled, a late delivery is collected exactly once, and its sats stay
+// reserved until collected or proven released. Minutes are untouched (the shared projection
+// already charged award -> deadline).
+export const EXPIRED_SLOT_GRACE_SECONDS = 600;
+export const SELLER_EXECUTION_TAIL_SECONDS = 420;
 export class Journal {
   constructor(path) {
     this.path=path; this.state={jobs:[],days:{}};
@@ -228,9 +244,10 @@ export class Swarm {
     return !this.releaseMissing.length;
   }
   // One task per seller: any unfinished intent/job (deferred included, other challenges too) and
-  // collected work whose ACCEPT/deadline is not yet projected keep the seller busy.
+  // collected work whose ACCEPT/deadline is not yet projected keep the seller busy. An expired
+  // job whose slot was freed (see EXPIRED_SLOT_GRACE_SECONDS) cannot be executing any more.
   pendingSellers(snap,key,now,except=null) {
-    return this.state.jobs.filter(j=>j!==except&&(!j.done||(j.key===key&&j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&(p.accepted||now>=p.deadline))))).map(j=>j.seller);
+    return this.state.jobs.filter(j=>j!==except&&((!j.done&&!j.slotFreed)||(j.key===key&&j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&(p.accepted||now>=p.deadline))))).map(j=>j.seller);
   }
   // Full fresh admission for one assignment: challenge identity and window, eligibility,
   // leave/deny, minutes, budget headroom and one-job-per-seller. Returns failing reasons.
@@ -330,7 +347,15 @@ export class Swarm {
           state.offer?.deadline_unix===j.args.deadline_unix && Array.isArray(state.results) &&
           !state.results.length && state.accepted===null && !state.awarded_delivery_pending;
         j.done=j.args.payment==='none'||neverAwarded||reconciled;
-        j.released=j.done;j.outcome=j.priceAsked?`price too high: asked ${j.priceAsked}`:'expired/undelivered';j.ts=now;this.save();
+        j.released=j.done;j.outcome=j.priceAsked?`price too high: asked ${j.priceAsked}`:'expired/undelivered';j.ts=now;
+        // Not provably released: keep the sats reserved and keep polling, but free the seller slot
+        // once it cannot still be executing and a confirmed read shows no delivery.
+        const grace=this.c.expiredSlotGrace??EXPIRED_SLOT_GRACE_SECONDS;
+        if(!j.done&&!j.slotFreed&&now>=j.args.deadline_unix+grace&&state.read_confirmed===true&&Array.isArray(state.results)&&!state.results.length&&!state.awarded_delivery_pending) {
+          j.slotFreed=now;
+          this.io.report?.(`Job ${j.id}: expired undelivered ${grace}s past its deadline; seller ${j.seller} freed for new work, ${jobBudget(j).reservedSats} sats stay reserved until collected or proven released`);
+        }
+        this.save();
       }
       else if(this.c.awardFallback && now-j.created>=this.c.awardAfter && !state.awarded) {
         const claim=state.claims?.find(c=>c.live&&c.seller_pubkey===j.seller);
@@ -350,7 +375,7 @@ export class Swarm {
     const min=this.c.minDuration??DEFAULT_MIN_DURATION, max=this.c.maxDuration??1800;
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
-      ...jobs.filter(j=>!j.done).map(j=>({seller:j.seller,workstream:j.workstream??null,task:plannerTask(j.args.task),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
+      ...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>({seller:j.seller,workstream:j.workstream??null,task:plannerTask(j.args.task),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
     const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
       const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
@@ -425,7 +450,7 @@ export class Swarm {
     if(day.stop&&!day.stop.external&&!day.published) {
       await this.io.publish(day.challenge,day.budget,'completed',day.stop.update,day.stop.result);day.published=true;this.save();
     } else if(!day.stop&&ready&&now-day.lastUpdate>=this.c.updateEvery) {
-      await this.io.publish(c,snap.budget.totalSats,c.status,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done).length} jobs running`,c.result);day.lastUpdate=now;this.save();
+      await this.io.publish(c,snap.budget.totalSats,c.status,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`,c.result);day.lastUpdate=now;this.save();
     }
   }
 }
@@ -437,7 +462,7 @@ export function childEnv(env,home) {
 export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
   for(const k of ['plannerDigestChars','plannerMaxInputChars'])if(!Number.isSafeInteger(c[k])||c[k]<100)throw Error(`Invalid ${k}`);
@@ -445,6 +470,7 @@ export function config(argv,env=process.env) {
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
   for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter','maxDefer'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
+  if(!Number.isSafeInteger(c.expiredSlotGrace)||c.expiredSlotGrace<SELLER_EXECUTION_TAIL_SECONDS)throw Error(`Invalid SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= ${SELLER_EXECUTION_TAIL_SECONDS}`);
   c.home=resolve(c.home);return c;
 }
 // The locked runner is a grandchild (parent -> flock -> runner) holding the home lock. Signals to

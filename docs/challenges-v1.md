@@ -166,7 +166,10 @@ deferred rather than dropped: it posts nothing and reserves no budget, but it st
 second assignment to that seller. It is retried with full admission once a new snapshot is ready
 and fresh. It is dropped with a logged reason when another check fails, the day stops, the work
 window no longer fits, or `SWARM_MAX_DEFER_SECONDS` (120) passes while the snapshot is still not
-ready. Durations must fall within
+ready. An expired, never-delivered job that cannot yet be proven
+released keeps its sats reserved, but frees its seller for new work after
+`SWARM_EXPIRED_SLOT_GRACE_SECONDS` (600) past its deadline once a confirmed read shows no delivery;
+a late delivery is still collected exactly once. Minutes are not recounted. Durations must fall within
 `SWARM_MIN_DURATION` (300 seconds, a floor that covers seller sandbox/agent startup; a seller
 whose remaining minutes cannot fit it gets no assignment) and `SWARM_MAX_DURATION` (1800 seconds).
 Exhaustion means no free seller can fit the minimum duration and no work is running; choosing

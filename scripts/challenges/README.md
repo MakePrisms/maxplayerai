@@ -101,6 +101,20 @@ can never be proven released and would stay reserved forever. If the probe itsel
 work waits until a later probe succeeds. Use a buyer built from `main` at or after `7a14298d`
 (or the first release that contains it).
 
+**Expired paid jobs: seller slot vs sats.** An expired, never-delivered paid job that cannot be
+proven released (always the case on a v0.6.1 buyer) keeps its sats reserved, but no longer blocks
+its seller for the rest of the day. Once `deadline + SWARM_EXPIRED_SLOT_GRACE_SECONDS` (default
+600, minimum 420) has passed and a confirmed `get_job` read shows no delivery and no pending
+awarded delivery, the runner frees the seller for new assignments and logs `seller … freed for new
+work, N sats stay reserved`. The old job stays open and is still polled every tick. This is safe
+because the seller stops executing at the offer deadline: host delivery stops the agent there and
+bounds the push at 150 s, container delivery is killed by deadline + 420 s, and a restarted seller
+never re-runs or finalizes a lapsed job. So two **executing** jobs never overlap. A delivery
+published late is still payable in core (the claim is `delivered` for 7 days after delivery), so if
+one appears the runner collects it exactly once and its reservation becomes the paid amount;
+otherwise the sats stay reserved until release is proven. Minutes are unchanged: the shared
+projection already charged the expired job from award to deadline.
+
 Hand-whitelist sellers once with `maxplayer-challenges decide --seller HEX --accept`, then
 publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
 the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:
@@ -143,6 +157,7 @@ Flags (environment equivalents):
 | — | `SWARM_PLANNER_FULL_RESULTS` | 8 (newest results sent with full answer text) |
 | — | `SWARM_PLANNER_DIGEST_CHARS` | 600 (head kept from each older result's answer/task) |
 | — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
+| — | `SWARM_EXPIRED_SLOT_GRACE_SECONDS` | 600 (after an expired undelivered job's deadline, free its seller; sats stay reserved; minimum 420) |
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
