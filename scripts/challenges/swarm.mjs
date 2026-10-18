@@ -4,7 +4,7 @@ import { parseChallengeRelays, parseChallengeQuorum } from '../../web/app/src/ch
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
@@ -374,6 +374,20 @@ export const PERMANENT_COLLECT_REFUSAL = 'review: permanent input error';
 // the recorded reason starts at the marker so it is never cut out by the 500-character cap.
 export const permanentCollectRefusal = message => String(message).includes(PERMANENT_COLLECT_REFUSAL);
 export const collectFailureReason = message => {const m=String(message),at=m.indexOf(PERMANENT_COLLECT_REFUSAL);return (at<0?m:m.slice(at)).slice(0,500);};
+// R3-8: a paid collect the buyer's WALLET refuses to reconcile. maxplayer-core payment_wallet.rs
+// PaymentWalletError::Reconcile displays as "wallet reconciliation refused: <reason>" (e.g. "wallet
+// has an incomplete ProofsReserved operation that could not be retired safely" from
+// recover_unmapped_sagas, which every pay attempt runs first). Retrying the same collect cannot
+// clear it: the incomplete wallet operation must be retired by `maxplayer wallet reconcile`. The
+// whole error text is searched (stderr may precede the tool-error JSON), like the permanent refusal.
+export const PAYMENT_STUCK_MARKER = 'wallet reconciliation refused:';
+export const paymentStuck = message => String(message).includes(PAYMENT_STUCK_MARKER);
+export const paymentStuckReason = message => {const m=String(message),at=m.indexOf(PAYMENT_STUCK_MARKER);return (at<0?m:m.slice(at)).slice(0,500);};
+export const reconcileCommand = home => `maxplayer wallet reconcile --home ${home??'<buyer home>'}`;
+// A stuck payment is re-checked (ONE collect) only: on the first tick of a new runner process
+// (restart), after a later paid collect succeeded, or when the buyer wallet database changed
+// (`maxplayer wallet reconcile` writes it) - and never more often than this.
+export const PAYMENT_STUCK_RECHECK_MIN_SECONDS = 60;
 // Not permanent in core, so they stay on the bounded retry loop (seller kept busy) even though an
 // unchanged delivery may never pass: policy_refused (review/state.rs:125-126) and
 // "review: encrypted message too large" (review/private.rs:84) lack the permanent prefix.
@@ -405,7 +419,17 @@ export function sidecarQuorumLines(body) {
     ...(Array.isArray(q.resent)?q.resent:[]).map(r=>`Re-sent missed challenge event ${String(r)}`)];
 }
 export class Swarm {
-  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
+  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;this.stuckRechecked=new Set();}
+  // R3-8: is a stuck payment due for its one re-check collect? (See PAYMENT_STUCK_RECHECK_MIN_SECONDS.)
+  stuckRecheckDue(j,now) {
+    const s=j.paymentStuck;
+    if(now-(s.checkedAt??0)<PAYMENT_STUCK_RECHECK_MIN_SECONDS)return null;
+    if(!this.stuckRechecked.has(j.id))return 'runner (re)started';
+    if(this.walletPaidAt!==undefined&&this.walletPaidAt>s.checkedAt)return 'a later paid collect succeeded';
+    let wallet;try{wallet=this.io.walletSignature?.();}catch{}
+    if(wallet!==undefined&&wallet!==s.wallet)return 'buyer wallet changed (reconcile?)';
+    return null;
+  }
   save(){this.journal.save();}
   // Run 2 #10: every challenge publish re-reads the LATEST buyer-signed challenge from the
   // challenge relays first (never the tick-start snapshot, which can be minutes old after planner
@@ -529,6 +553,9 @@ export class Swarm {
           const posted=await this.post(j.args);j.id=posted.job_id??posted.preparation_id;this.save();
         }
       }
+      // R3-8: a stuck payment is not polled or collected again until a re-check is due.
+      let recheck=null;
+      if(j.paymentStuck){recheck=this.stuckRecheckDue(j,now);if(!recheck)continue;this.stuckRechecked.add(j.id);}
       const state=await this.io.mcp('get_job',{job_id:j.id});
       now=this.io.now();
       if(state.status==='preparing')continue;
@@ -545,6 +572,18 @@ export class Swarm {
         catch(e) {
           if(e.journalFailure)throw e;
           const message=String(e?.message??e),reason=collectFailureReason(message);
+          if(paymentStuck(message)) {
+            let wallet;try{wallet=this.io.walletSignature?.();}catch{}
+            const first=!j.paymentStuck;
+            j.paymentStuck={reason:paymentStuckReason(message),since:j.paymentStuck?.since??now,checkedAt:now,checks:(j.paymentStuck?.checks??0)+1,...(wallet!==undefined?{wallet}:{})};
+            // The delivery is in; the seller is not executing. Its sats stay reserved (not done).
+            j.outcome='payment stuck';j.ts=now;j.slotFreed??=now;delete j.collectRetryAt;delete j.collectError;this.save();
+            this.stuckRechecked.add(j.id);
+            this.io.report?.(first
+              ?`WARNING: Job ${j.id}: payment stuck (seller ${j.seller} delivered, not paid, ${jobBudget(j).reservedSats} sats stay reserved); collect is NOT retried. Run \`${reconcileCommand(this.c.home)}\`; the runner re-checks after the wallet changes, after a later paid collect succeeds, or on restart. ${j.paymentStuck.reason}`
+              :`Job ${j.id}: payment still stuck after re-check (${recheck??'re-check'}); run \`${reconcileCommand(this.c.home)}\``);
+            continue;
+          }
           if(permanentCollectRefusal(message)) {
             // Recorded once, never collected (or paid) again. done frees the seller in this runner;
             // the sats stay reserved (no receipt, no release proof: jobBudget fails closed).
@@ -558,6 +597,8 @@ export class Swarm {
           continue;
         }
         delete j.collectRetryAt;delete j.collectError;
+        if(j.paymentStuck){this.io.report?.(`Job ${j.id}: stuck payment cleared (${recheck??'re-check'}); collected`);j.paymentUnstuck={...j.paymentStuck,clearedAt:now};delete j.paymentStuck;}
+        if(typeof collected?.pay?.state==='string'&&/^Closed \{/.test(collected.pay.state)&&collected.pay.amount_sats>0)this.walletPaidAt=now;
         // collect succeeded (and settled): record it exactly once, whatever the answer read does.
         // An unreadable answer is an error the planner sees, never a reason to collect again.
         let answer,answerError;
@@ -599,7 +640,7 @@ export class Swarm {
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
-    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),ts:j.ts??now}));
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),...(j.paymentStuck?{paymentStuck:j.paymentStuck.reason}:{}),ts:j.ts??now}));
     const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && TERMINAL_STATUSES.includes(c.status)) {day.stop={external:true};day.closed={status:c.status,seenAt:now};this.save();}
@@ -719,7 +760,8 @@ export class Swarm {
       // otherwise lastUpdate records the tick-start now.
       const crossed=now<day.progressRetryAt;
       try {
-        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
+        const stuck=this.state.jobs.filter(j=>j.key===key&&j.paymentStuck).length;
+        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running${stuck?`; ${stuck} payment${stuck>1?'s':''} stuck awaiting the operator (wallet reconcile)`:''}`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
       } catch(e) {
         if(e.journalFailure)throw e;
         day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();
@@ -772,6 +814,13 @@ export function startRelayHealthLog(diagnostics,report,{checkMs=RELAY_HEALTH_CHE
   };
   check();const timer=setInterval(check,checkMs);timer.unref?.();
   return {check,stop:()=>clearInterval(timer)};
+}
+// R3-8: size + mtime of the buyer's CDK wallet database and its WAL (maxplayer-core
+// buyer_fund.rs: <home>/wallet/cdk-wallet.sqlite). Only a change signal for the stuck-payment
+// re-check; never read, never trusted as proof of anything.
+export function walletSignature(home,{stat=p=>{try{const s=statSync(p);return `${s.size}:${s.mtimeMs}`;}catch(e){if(e.code==='ENOENT')return '-';throw e;}}}={}) {
+  const db=join(home,'wallet','cdk-wallet.sqlite');
+  return [db,`${db}-wal`].map(stat).join('|');
 }
 // maxplayer rejects unknown MAXPLAYER_* variables, so only MAXPLAYER_HOME reaches it from here.
 export function childEnv(env,home) {
@@ -871,6 +920,8 @@ async function main() {
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
     plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:c.plannerTimeouts.runnerMs(input.mode)})),
     answer:async collected=>readDeliveredAnswer(collected.path),
+    // R3-8: changes when the buyer wallet database is written (`maxplayer wallet reconcile`, a payment).
+    walletSignature:()=>walletSignature(c.home),
     publish:async(challenge,budget,status,update,result,{strict=false}={})=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
       const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),...quorumArgs(strict?challengeRelays.length:c.challengeQuorum),'--json','--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];

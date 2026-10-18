@@ -364,6 +364,22 @@ Known retry-forever cases: core does not mark `policy_refused` (`review/state.rs
 `review: encrypted message too large` (`review/private.rs` 84) permanent, so such a job keeps its
 seller busy until an operator intervenes.
 
+**Payment stuck (R3-8).** A paid `collect` refused by the buyer's own wallet reconciliation
+(the error contains `wallet reconciliation refused:`, maxplayer-core `payment_wallet.rs`
+`PaymentWalletError::Reconcile`, e.g. `wallet has an incomplete ProofsReserved operation that could
+not be retired safely` when the mint's check-state fails) cannot be cleared by retrying the same
+collect. The runner records the job once as outcome `payment stuck` (`paymentStuck:{reason,since,
+checkedAt,checks}` in the journal; `paymentStuck` in the planner's result), logs one `WARNING: Job
+<id>: payment stuck … Run \`maxplayer wallet reconcile --home <home>\``, adds `N payment(s) stuck
+awaiting the operator (wallet reconcile)` to the published progress update, and stops the collect
+retry loop. The delivery is in, so the seller is free for new work; the job's sats stay reserved
+(nothing is paid). It is re-checked with ONE collect, at most once per 60 s, when: the runner
+restarts; the buyer wallet database (`<home>/wallet/cdk-wallet.sqlite` or its `-wal`, size/mtime
+only) changes, which `maxplayer wallet reconcile` does; or another paid collect succeeds. A
+re-check that succeeds settles the job normally (`stuck payment cleared (…)`); one still refused
+stays stuck and is logged once more. To resume after reconciling, do nothing (the wallet change
+is seen) or restart the runner.
+
 **Delivered answers.** A non-empty `answer.txt` (the buyer's materialized inline answer) is the
 answer, capped like every file at 64 KiB with a `[truncated: first N of M bytes shown]` marker, so
 a longer inline answer reaches the journal already truncated. An empty, binary or unreadable

@@ -219,6 +219,10 @@ publications release too. Uncertainty retains reservations across restarts and k
 possibly payable work. At zero headroom, free work remains possible; budget stops only on
 an idle paid-only rejected batch. Wait/empty assignments alone never imply exhaustion.
 Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amounts fail closed.
+A paid collect refused by the buyer wallet's reconciliation (`wallet reconciliation refused: …`)
+is a distinct `payment stuck` state, not a retry loop: logged and journaled once, shown in progress,
+seller freed, sats kept reserved, and re-checked once after `maxplayer wallet reconcile --home <home>`
+changes the wallet, after a later paid collect succeeds, or on restart.
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
 

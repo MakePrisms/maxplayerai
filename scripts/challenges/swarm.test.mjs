@@ -1544,3 +1544,52 @@ test('R3-7: workstreams validate against the plan sent with the assign call (or 
   const h=fixture(),hr=[];h.io.report=m=>hr.push(m);h.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:' ',durationSeconds:30}]}));await h.runner.tick();
   assert.ok(hr.some(r=>r==='Rejected assignment for a: invalid task (empty or not text)'));
 });
+
+// R3-8 (round 3): a paid collect refused by the buyer wallet's reconciliation retried forever.
+const stuckError='node exited 1: {"isError":true,"content":[{"type":"text","text":"collect: authorize_pay payment: payment effect failed: wallet reconciliation refused: wallet has an incomplete ProofsReserved operation that could not be retired safely; resolver: s1: check-state failed (fail-closed, no retire): timeout"}]}';
+test('R3-8: a wallet-reconcile refusal is a distinct payment-stuck state: no retry loop, logged and journaled once, shown, resumed after reconcile/restart',async()=>{
+  const {paymentStuck,paymentStuckReason,walletSignature,PAYMENT_STUCK_RECHECK_MIN_SECONDS}=await import('./swarm.mjs');
+  assert.ok(paymentStuck(stuckError));assert.ok(!paymentStuck('collect: review: timeout'));
+  assert.ok(paymentStuckReason(stuckError).startsWith('wallet reconciliation refused: wallet has an incomplete ProofsReserved operation that could not be retired safely'));
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.home='/buyer';f.snap.sellers=f.snap.sellers.slice(0,1);
+  let wallet='w1';f.io.walletSignature=()=>wallet;
+  f.setPlan(input=>priced(input,5));await f.runner.tick();f.setPlan(()=>({wait:true}));
+  [...f.remote.values()][0].results=[{}];
+  let stuck=true;const orig=f.io.mcp;
+  f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);if(stuck)throw Error(stuckError);return {pay:{state:'Closed { attempt_id: "x" }',amount_sats:5}};}return orig(t,a);};
+  const collects=()=>f.calls.filter(([t])=>t==='collect').length;
+  for(let t=101;t<=2000;t+=5){f.time(t);await f.runner.tick();}
+  assert.equal(collects(),1,'collect is not retried on a backoff');
+  const j=f.journal.state.jobs[0];
+  assert.equal(j.outcome,'payment stuck');assert.ok(!j.done,'not settled');assert.equal(j.paymentStuck.checks,1);
+  assert.match(j.paymentStuck.reason,/^wallet reconciliation refused: wallet has an incomplete ProofsReserved/);
+  assert.equal(jobBudget(j).reservedSats,5,'sats stay reserved');
+  const warnings=reports.filter(r=>r.includes('payment stuck'));
+  assert.equal(warnings.length,1,'logged once');assert.match(warnings[0],/^WARNING: .*Run `maxplayer wallet reconcile --home \/buyer`/);
+  assert.ok(f.inputs.at(-1).results.some(r=>r.outcome==='payment stuck'&&/ProofsReserved/.test(r.paymentStuck)),'planner sees it');
+  assert.ok(f.publishes.some(p=>/1 payment stuck awaiting the operator \(wallet reconcile\)/.test(p[3])),'shown in the published progress status');
+  // The seller delivered and is not executing: it can get new work.
+  assert.ok(!f.runner.pendingSellers(f.snap,JSON.stringify(['b','day']),2000).includes('a'));
+  // Restart: one re-check; still stuck -> nothing more until something changes.
+  const restarted=new Swarm(f.c,f.io,f.journal);
+  f.time(2005);await restarted.tick();assert.equal(collects(),2,'restart re-checks once');
+  for(let t=2010;t<=2300;t+=5){f.time(t);await restarted.tick();}
+  assert.equal(collects(),2);assert.equal(f.journal.state.jobs[0].paymentStuck.checks,2);
+  // The operator runs `maxplayer wallet reconcile` (the wallet database changes): re-check, collected, paid.
+  stuck=false;wallet='w2';f.time(2400);await restarted.tick();
+  assert.equal(collects(),3);
+  const done=f.journal.state.jobs[0];assert.equal(done.outcome,'collected');assert.equal(done.paymentStuck,undefined);assert.ok(done.paymentUnstuck.clearedAt);
+  assert.deepEqual(jobBudget(done),{reservedSats:0,paidSats:5});
+  assert.ok(reports.some(r=>r.includes('stuck payment cleared (buyer wallet changed (reconcile?))')));
+  // Re-checks never run more often than the floor, and a later successful paid collect also re-checks.
+  assert.equal(PAYMENT_STUCK_RECHECK_MIN_SECONDS,60);
+  const g=fixture();g.snap.sellers=g.snap.sellers.slice(0,1);g.io.walletSignature=()=>'same';g.setPlan(input=>priced(input,5));await g.runner.tick();g.setPlan(()=>({wait:true}));
+  [...g.remote.values()][0].results=[{}];const go=g.io.mcp;let gs=true;
+  g.io.mcp=async(t,a)=>{if(t==='collect'){g.calls.push([t,a]);if(gs)throw Error(stuckError);return {pay:{state:'Closed { attempt_id: "y" }',amount_sats:5}};}return go(t,a);};
+  g.time(101);await g.runner.tick();g.runner.walletPaidAt=130;g.time(140);await g.runner.tick();
+  assert.equal(g.calls.filter(([t])=>t==='collect').length,1,'within the floor: no re-check');
+  gs=false;g.time(161);await g.runner.tick();
+  assert.equal(g.calls.filter(([t])=>t==='collect').length,2);assert.equal(g.journal.state.jobs[0].outcome,'collected');
+  // The wallet signature reads the buyer CDK database and its WAL (missing files are '-').
+  assert.equal(walletSignature('/nonexistent-home'),'-|-');
+});
