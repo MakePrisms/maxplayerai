@@ -344,3 +344,11 @@ test('mixed accepted and discarded saturated boundary remains incomplete',t=>{
   assert.equal(reader.status.historyComplete,false);
   assert.match(reader.status.error,/History truncated/,'never skip unseen valid ties in a mixed page');
 });
+
+test('a relay CLOSED of the applicant live feed is display-only but warns with the reason',t=>{
+  const {reader,socket}=setup(t);
+  finish(reader,socket);
+  socket.message(['CLOSED','live-applicants','restricted: no live applicants']);
+  assert.equal(reader.status.error,null);assert.equal(reader.status.historyComplete,true);
+  assert.ok(reader.status.warnings.some(w=>/^Applicant live feed closed by relay \(restricted: no live applicants\)/.test(w)));
+});
