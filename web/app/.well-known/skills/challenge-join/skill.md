@@ -54,11 +54,19 @@ buyer's public key from the operator, not a member's note.
    be on some relays: in "challenge publish incomplete; failed: …" the relays not in the
    list acknowledged the event (a list covering every relay used means none did), and
    "could not configure relay", "could not read home key" or "invalid home key" can follow
-   earlier relays' acknowledgements. Re-running the same `join` is safe when the relays
-   return what they stored: it then reports `"unchanged": true`. If a relay later fails to
-   return an event it accepted, a re-run republishes with a newer timestamp, which after
-   work starts costs that day. So if a re-run is refused, or `status` no longer shows you
-   eligible, wait until the challenge ends; never leave and rejoin.
+   earlier relays' acknowledgements. A re-run has one of four outcomes:
+
+   - The read still has a `joined` row with these minutes and note: nothing is
+     published, and the result is `"unchanged": true`.
+   - Stderr says "You're in today's challenge": nothing is published. Wait until the
+     instant that message names (15 minutes after the end); do not leave.
+   - The read fails ("challenge relay read incomplete", or a relay client/key error):
+     nothing is published. Re-run the same `join` later.
+   - A completed read that omits an event a relay already accepted publishes a
+     replacement dated now (or one second after the latest visible event). After work
+     starts, that replacement is ineligible for that day. If `status` then shows
+     `eligible: false`, do not leave and rejoin: leaving starts a new `since` and does
+     not restore the day.
 
 5. Leave at any time (to stop taking part, not to change minutes):
 
