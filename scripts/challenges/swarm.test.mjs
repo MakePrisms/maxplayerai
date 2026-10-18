@@ -659,10 +659,11 @@ test('planner input: newest N full, older digested, hard char budget with marker
   const out=boundPlannerInput({mode:'assign',results},{fullResults:3,digestChars:100,maxInputChars:1e6});
   assert.equal(out.results.length,12);
   assert.deepEqual(out.results.slice(-3).map(r=>r.answer),results.slice(-3).map(r=>r.answer),'newest N are full text');
-  assert.ok(out.results.slice(0,9).every((r,i)=>r.answer.startsWith(`answer-${i} `)&&r.answer.includes(TRUNCATION_MARKER)&&r.answer.length<200&&r.answerChars===5009));
+  assert.ok(out.results.slice(0,9).every((r,i)=>r.answer.startsWith(`answer-${i} `)&&r.answer.includes(TRUNCATION_MARKER)&&r.answer.length<250&&r.answerChars===5009));
   assert.deepEqual([out.history.fullText,out.history.digested,out.history.resultsDropped],[3,9,0]);
   // Hard budget: degrade until it fits, never exceed it, always mark the cut.
-  for(const budget of [12000,3000,700]){
+  // (Below ~1200 chars the never-removed dropped-entry index of 12 results itself no longer fits.)
+  for(const budget of [12000,3000,1200]){
     const b=boundPlannerInput({mode:'assign',results},{fullResults:3,digestChars:100,maxInputChars:budget});
     assert.ok(JSON.stringify(b).length<=budget,`${budget}`);
     assert.ok(JSON.stringify(b.results).includes(TRUNCATION_MARKER)||b.history.resultsDropped>0,`${budget}`);
@@ -680,6 +681,43 @@ test('planner input: newest N full, older digested, hard char budget with marker
   assert.ok(reports.some(r=>/^Planner assign ok in \d+\.\ds; input \d+ chars, results \d+ \(\d+ full, \d+ digested/.test(r)));
   // An over-budget input fails the call (logged and retried later), never sends unbounded text.
   const g=fixture();g.c.plannerMaxInputChars=100;await assert.rejects(g.runner.tick(),/SWARM_PLANNER_MAX_INPUT_CHARS/);assert.equal(g.inputs.length,0);
+});
+// Advisor r1 F4: older answers kept only a head, and a hard-budget drop left only a count.
+test('planner input: an old long answer keeps its tail (the conclusion); a dropped result stays in the index',async()=>{
+  const {boundPlannerInput,TRUNCATION_MARKER}=await import('./swarm.mjs');
+  const results=[{seller:'s0',task:'find it',outcome:'collected',ts:111,answer:'preamble '.repeat(1000)+'CONCLUSION: the key is 42'},
+    ...Array.from({length:10},(_,i)=>({seller:'s'+(i+1),task:'t'+i,outcome:'expired/undelivered',ts:200+i,answer:'noise '.repeat(800)}))];
+  const out=boundPlannerInput({mode:'assess',results},{fullResults:8,digestChars:600,maxInputChars:1e6});
+  const old=out.results[0];
+  assert.ok(old.answer.startsWith('preamble ')&&old.answer.endsWith('CONCLUSION: the key is 42'),'head and tail');
+  assert.ok(old.answer.includes(TRUNCATION_MARKER)&&old.answer.length<700&&old.answerChars===results[0].answer.length);
+  // Squeeze until the oldest entry is dropped: its index line survives every later step.
+  const tight=boundPlannerInput({mode:'assess',results},{fullResults:8,digestChars:600,maxInputChars:2500});
+  assert.ok(tight&&JSON.stringify(tight).length<=2500);assert.ok(tight.history.resultsDropped>=1);
+  assert.equal(tight.history.droppedIndex[0],`s0 | collected | ts 111 | ${results[0].answer.length} answer chars`);
+  assert.equal(tight.history.droppedIndex.length,tight.history.resultsDropped);
+  assert.ok(!tight.results.some(r=>r.seller==='s0'));
+});
+// Review note: trackRecord tasks (and other non-result inputs) were not bounded.
+test('planner input: a huge seller task, note or running task is bounded and cannot break later calls',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  const huge='T'.repeat(300000);
+  const tasks=Array.from({length:30},(_,i)=>({task:i===29?huge:`task ${i}`,outcome:'collected',delivered:true}));
+  const input={mode:'assign',goal:'g',sellers:[{pubkey:'a',name:huge,note:huge,capabilities:Array(100).fill(huge),harness:{family:[huge]},trackRecord:{tasksDone:30,delivered:30,expired:0,tasks}}],
+    running:[{seller:'a',task:huge}],results:[]};
+  const out=boundPlannerInput(input,{maxInputChars:200000});
+  assert.ok(out&&JSON.stringify(out).length<50000,`${out&&JSON.stringify(out).length}`);
+  const tr=out.sellers[0].trackRecord;
+  assert.deepEqual([tr.tasksDone,tr.tasks.length,tr.tasksOmitted,tr.tasks[0].task],[30,10,20,'task 20'],'newest 10 kept; counts exact');
+  assert.ok(tr.tasks.at(-1).task.length<700&&out.running[0].task.length<2200&&out.sellers[0].note.length<2200&&out.sellers[0].capabilities.length===32);
+  assert.ok(out.history.fieldsCut>=5);
+  // End to end: a 300k-char past task no longer fails every later planner call.
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>({assignments:[{seller:'a',workstream:'piece',task:huge,durationSeconds:30}]}));
+  await f.runner.tick();for(const j of f.remote.values())j.results=[{}];f.time(101);f.setPlan(()=>({wait:true}));await f.runner.tick();
+  f.snap.jobs=f.journal.state.jobs.map(j=>({id:j.id,seller:'a',result:{},accepted:true,running:false}));f.time(102);
+  const before=f.inputs.length;await f.runner.tick();
+  assert.ok(f.inputs.length>before&&f.inputs.slice(before).every(i=>JSON.stringify(i).length<=200000));
+  assert.ok(f.inputs.at(-1).sellers[0].trackRecord.tasks[0].task.length<700);
 });
 test('planner timeouts: env-configurable, defaults kept, bundled LLM timeout stays below the runner',async()=>{
   const {plannerTimeouts,PLANNER_LLM_MARGIN_SECONDS}=await import('./swarm.mjs');

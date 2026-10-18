@@ -124,21 +124,49 @@ export function plannerTimeouts(env=process.env) {
   return {...t,runnerMs:ms,llmMs:mode=>ms(mode)-PLANNER_LLM_MARGIN_SECONDS*1000};
 }
 // Bounded planner history. Results stay oldest-to-newest; the newest `fullResults` keep their full
-// answer, older ones get a `digestChars` head. If the serialized input still exceeds
+// answer, older ones get a `digestChars` digest: the head AND the tail of the text (long reports
+// often put the conclusion last), joined by a marked cut. If the serialized input still exceeds
 // `maxInputChars`, it degrades in this fixed order until it fits: newest answers to digests (oldest
-// first), older answers omitted, then older result entries dropped (oldest first). Every cut is
-// marked in the text and counted in input.history. Returns null when even that cannot fit.
+// first), older answers omitted, then older result entries dropped (oldest first). A dropped entry
+// leaves one compact line in history.droppedIndex (seller | outcome | ts | answer chars), which no
+// later step removes. Every cut is marked in the text and counted in input.history.
+// Non-result inputs are bounded first, whatever the budget, so one huge string cannot push every
+// later call over it: each seller's trackRecord keeps its newest `trackRecordTasks` tasks (counts
+// stay exact; `tasksOmitted`), each with a digested task; running tasks are digested to
+// `fieldChars`; seller name/note to `fieldChars`; advertised tag arrays to 32 values of 200 chars.
+// goal, challenge and plan are buyer/planner-authored and are not cut. Returns null when even that
+// cannot fit.
 export const TRUNCATION_MARKER = '[truncated:';
-export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000}={}) {
+export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000,fieldChars=2000,trackRecordTasks=10}={}) {
   const all=input.results??[],total=all.length;
-  const cut=(text,n,why)=>typeof text==='string'&&text.length>n?`${text.slice(0,n)}\n${TRUNCATION_MARKER} ${why}; first ${n} of ${text.length} chars shown]`:text;
+  let fieldsCut=0;
+  const cut=(text,n,why)=>{
+    if(typeof text!=='string'||text.length<=n)return text;
+    const tail=Math.floor(n/2),head=n-tail;
+    return `${text.slice(0,head)}\n${TRUNCATION_MARKER} ${why}; first ${head} and last ${tail} of ${text.length} chars shown]\n${tail?text.slice(-tail):''}`;
+  };
+  const field=(text,n,why)=>{const out=cut(text,n,why);if(out!==text)fieldsCut++;return out;};
+  const tags=v=>Array.isArray(v)?(v.length>32||v.some(x=>typeof x==='string'&&x.length>200)?(fieldsCut++,v.slice(0,32).map(x=>typeof x==='string'?x.slice(0,200):x)):v):v;
+  const seller=p=>{
+    if(!p||typeof p!=='object')return p;
+    const tr=p.trackRecord,tasks=Array.isArray(tr?.tasks)?tr.tasks:null;
+    const kept=tasks?tasks.slice(-trackRecordTasks).map(t=>t&&typeof t==='object'?{...t,task:field(t.task,digestChars,'track-record task')}:t):tasks;
+    return {...p,name:field(p.name,fieldChars,'seller name'),note:field(p.note,fieldChars,'seller note'),
+      agents:tags(p.agents),capabilities:tags(p.capabilities),hardware:tags(p.hardware),
+      ...(p.harness&&typeof p.harness==='object'?{harness:Object.fromEntries(Object.entries(p.harness).map(([k,v])=>[k,tags(v)]))}:{}),
+      ...(p.pricing&&typeof p.pricing==='object'?{pricing:Object.fromEntries(Object.entries(p.pricing).map(([k,v])=>[k,tags(v)]))}:{}),
+      ...(tr&&typeof tr==='object'?{trackRecord:{...tr,...(tasks?{tasks:kept,...(tasks.length>kept.length?{tasksOmitted:tasks.length-kept.length}:{})}:{})}}:{})};
+  };
+  const base={...input,
+    ...(Array.isArray(input.sellers)?{sellers:input.sellers.map(seller)}:{}),
+    ...(Array.isArray(input.running)?{running:input.running.map(r=>r&&typeof r==='object'?{...r,task:field(r.task,fieldChars,'running task')}:r)}:{})};
   const digest=r=>({...r,task:cut(r.task,digestChars,'older task'),answer:cut(r.answer,digestChars,'older result digest'),...(typeof r.answer==='string'&&r.answer.length>digestChars?{answerChars:r.answer.length}:{})});
   let results=all.map((r,i)=>i<total-fullResults?digest(r):r);
-  let dropped=0;
+  let dropped=0;const droppedIndex=[];
   const build=()=>{
     const full=results.filter(r=>!r.answerChars&&!r.answerOmitted).length;
-    const history={results:total,fullText:Math.min(full,total-dropped),digested:results.filter(r=>r.answerChars).length,answersOmitted:results.filter(r=>r.answerOmitted).length,resultsDropped:dropped,fullResultsKept:fullResults,digestChars,maxInputChars,marker:TRUNCATION_MARKER};
-    return {...input,results,history};
+    const history={results:total,fullText:Math.min(full,total-dropped),digested:results.filter(r=>r.answerChars).length,answersOmitted:results.filter(r=>r.answerOmitted).length,resultsDropped:dropped,droppedIndex,fieldsCut,fullResultsKept:fullResults,digestChars,maxInputChars,marker:TRUNCATION_MARKER};
+    return {...base,results,history};
   };
   const size=x=>JSON.stringify(x).length;
   let out=build();
@@ -148,8 +176,12 @@ export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputC
   for(let i=0;size(out)>maxInputChars&&i<Math.max(0,results.length-fullResults);i++){
     const r=results[i];results[i]={...r,task:cut(r.task,200,'older task'),answer:`${TRUNCATION_MARKER} answer omitted to fit the planner input budget; ${typeof all[i].answer==='string'?all[i].answer.length:0} chars]`,answerOmitted:true};delete results[i].answerChars;out=build();
   }
-  // Older entries dropped, oldest first.
-  while(size(out)>maxInputChars&&results.length){results=results.slice(1);dropped++;out=build();}
+  // Older entries dropped, oldest first; each leaves its index line.
+  while(size(out)>maxInputChars&&results.length){
+    const o=all[dropped];
+    droppedIndex.push(`${String(o?.seller)} | ${String(o?.outcome).slice(0,200)} | ts ${o?.ts} | ${typeof o?.answer==='string'?o.answer.length:0} answer chars`);
+    results=results.slice(1);dropped++;out=build();
+  }
   return size(out)>maxInputChars?null:out;
 }
 // get_job fields the budget release proofs (expired paid jobs) depend on. They first reached main

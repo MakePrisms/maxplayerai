@@ -271,14 +271,22 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
   bundled LLM call: 170). Both timeouts must be integers above 10.
 
 **Planner input bounds.** Every call also includes `history:{results,fullText,digested,
-answersOmitted,resultsDropped,fullResultsKept,digestChars,maxInputChars,marker}`. `results` stays
-oldest-to-newest. The newest `SWARM_PLANNER_FULL_RESULTS` keep their full answer. Older entries
-keep their metadata but their `answer` and `task` are cut to the first `SWARM_PLANNER_DIGEST_CHARS`
-characters, followed by a line starting `[truncated:`, and carry `answerChars` (the original
-length). If the serialized input still exceeds `SWARM_PLANNER_MAX_INPUT_CHARS`, the runner
-degrades in a fixed order until it fits: the newest answers become digests too (oldest first),
-then older answers are replaced by an `[truncated: answer omitted …]` marker (`answerOmitted:true`),
-then the oldest result entries are dropped (`history.resultsDropped`). If it still cannot fit,
+answersOmitted,resultsDropped,droppedIndex,fieldsCut,fullResultsKept,digestChars,maxInputChars,marker}`.
+`results` stays oldest-to-newest. The newest `SWARM_PLANNER_FULL_RESULTS` keep their full answer.
+Older entries keep their metadata, but their `answer` and `task` become a `SWARM_PLANNER_DIGEST_CHARS`
+digest: the **head and the tail** of the text (long reports often end with the conclusion) around a
+line starting `[truncated:`, and they carry `answerChars` (the original length). If the serialized
+input still exceeds `SWARM_PLANNER_MAX_INPUT_CHARS`, the runner degrades in a fixed order until it
+fits: the newest answers become digests too (oldest first), then older answers are replaced by an
+`[truncated: answer omitted …]` marker (`answerOmitted:true`), then the oldest result entries are
+dropped (`history.resultsDropped`). Each dropped entry leaves one line in `history.droppedIndex`
+(`seller | outcome | ts <unix> | <n> answer chars`), which no later step removes. Seller-controlled
+and other non-result inputs are bounded before that, whatever the budget, so one huge string
+cannot make every later call fail: each profile's `trackRecord.tasks` keeps the newest 10 tasks
+(counts stay exact; `tasksOmitted` says how many older ones were left out) with each task digested,
+`running[].task`, seller `name` and `note` are cut to 2000 characters, and advertised tag arrays to
+32 values of 200 characters (`history.fieldsCut` counts these cuts). `goal`, `challenge` and `plan`
+are not cut. If it still cannot fit,
 the call fails, is logged and is retried on a later tick; unbounded text is never sent. Each call
 logs `Planner <mode> ok|failed in <s>s; input <chars> chars, results …`. A planner should treat
 truncated text as incomplete and may re-request detail as a task. The full answers stay in the

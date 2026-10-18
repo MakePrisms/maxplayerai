@@ -142,8 +142,9 @@ The planner is an external JSON stdin/stdout command. Once per challenge, `analy
 its goal and full eligible roster and returns an approach, workstreams (needs, estimates,
 dependencies), and verification plan. The durable journal preserves this analysis across restarts.
 Each tick `assign` receives the plan, all free eligible seller profiles, running jobs and the
-result history (bounded: the newest results in full, older ones as marked digests, under a hard
-per-call character budget described in the runner README), and returns a batch of assignments
+result history (bounded: the newest results in full, older ones as marked head-and-tail digests,
+under a hard per-call character budget described in the runner README; a result dropped to fit
+still leaves a seller/outcome/time index line, and seller-supplied profile text is capped), and returns a batch of assignments
 `{seller,workstream,task,durationSeconds,amountSats?}`, wait, or verified solved answer.
 The buyer decides whether each seller is worth paying. `amountSats` is a safe integer ≥0,
 default 0: zero posts `payment=none, amount_sats=0, max_sats=0`; N>0 posts a normal
