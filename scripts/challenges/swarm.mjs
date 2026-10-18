@@ -617,6 +617,38 @@ export class Swarm {
     }
   }
 }
+// Run 2 #4: relay readiness log. Driven by its OWN timer (never by tick(), so a planner call of
+// several minutes cannot hide a stall). Every `checkMs` it compares each relay's readiness fields
+// (connected, authenticated, historyComplete, error, warnings, socket readyState) with the last
+// logged ones and logs on any change; it also logs a full heartbeat every `heartbeatMs` with the
+// age of each relay's last received frame. Live-subscription / pending-page / EOSE counts are not
+// part of the reader's exposed status (relay.mjs), so they are not logged here.
+export const RELAY_HEALTH_CHECK_MS = 5000;
+export const RELAY_HEALTH_HEARTBEAT_MS = 60000;
+const age=(at,now)=>at==null?'never':`${Math.max(0,Math.round((now-at)/1000))}s`;
+export function relayHealthLines({status,sockets={}},now) {
+  const rows=[{role:'overall',url:'',...status},...(status?.relays??[])];
+  return rows.map(r=>{
+    const s=r.role==='overall'?null:sockets[r.url];
+    const fields={connected:!!r.connected,authenticated:!!r.authenticated,historyComplete:!!r.historyComplete,error:r.error??null,warnings:r.warnings??[],
+      ...(r.role==='overall'?{failedRelays:r.failedRelays??[]}:{socket:s?.readyState??null,sockets:s?.sockets??0})};
+    const key=JSON.stringify([r.role,r.url,fields]);
+    const text=`relay ${r.role}${r.url?` ${r.url}`:''}: connected=${fields.connected} authenticated=${fields.authenticated} historyComplete=${fields.historyComplete} error=${JSON.stringify(fields.error)} warnings=${JSON.stringify(fields.warnings)}`+
+      (r.role==='overall'?` failed=${JSON.stringify(fields.failedRelays)}`:` socket=${fields.socket} reconnects=${Math.max(0,fields.sockets-1)} lastMessage=${age(s?.lastMessageAt,now)} ago messages=${s?.messages??0}`);
+    return {id:`${r.role} ${r.url}`,key,text};
+  });
+}
+export function startRelayHealthLog(diagnostics,report,{checkMs=RELAY_HEALTH_CHECK_MS,heartbeatMs=RELAY_HEALTH_HEARTBEAT_MS,clock=Date.now}={}) {
+  const last=new Map();let beat=-Infinity;
+  const check=()=>{
+    let lines;try{const now=clock();lines=relayHealthLines(diagnostics(),now);
+      const heartbeat=now-beat>=heartbeatMs;if(heartbeat)beat=now;
+      for(const l of lines){const changed=last.get(l.id)!==l.key;last.set(l.id,l.key);if(changed||heartbeat)report(`${changed?'Relay change':'Relay heartbeat'}: ${l.text}`);}
+    }catch(e){report(`Relay health read failed: ${e.message}`);}
+  };
+  check();const timer=setInterval(check,checkMs);timer.unref?.();
+  return {check,stop:()=>clearInterval(timer)};
+}
 // maxplayer rejects unknown MAXPLAYER_* variables, so only MAXPLAYER_HOME reaches it from here.
 export function childEnv(env,home) {
   const out={};for(const [k,v] of Object.entries(env)) if(!k.startsWith('MAXPLAYER_')) out[k]=v;
@@ -693,7 +725,7 @@ async function main() {
     child.on('exit',(code,signal)=>{process.exitCode=code??1;if(signal)console.error(`Locked runner ended by ${signal}`);child.stdin.destroy();});return;
   }
   // A stop can arrive during startup (whoami, buyer probe): it is recorded here and the loop never starts.
-  let quitting=false,source,wake;const stopRunner=()=>{quitting=true;source?.stop();wake?.();};
+  let quitting=false,source,wake,health;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();wake?.();};
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
@@ -709,6 +741,7 @@ async function main() {
     const failed=s.relay.failedRelays.join(', ');
     if(failed!==relayCoverage){relayCoverage=failed;console.error(new Date().toISOString(),failed?`Relay coverage incomplete; unavailable: ${failed}`:'All configured relays available');}
   }});
+  health=startRelayHealthLog(source.diagnostics,message=>console.error(new Date().toISOString(),message));
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>source.snapshot(),
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
     plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:c.plannerTimeouts.runnerMs(input.mode)})),
@@ -737,7 +770,7 @@ async function main() {
       if(!quitting)await new Promise(r=>{const t=setTimeout(r,c.poll*1000);wake=()=>{clearTimeout(t);r();};});wake=undefined;
     }
   } finally {
-    source.stop();
+    health.stop();source.stop();
     // Locked runner: the loop has ended (stop asked, or a fatal journal error that main().catch
     // records as exitCode 1). The journal is fsynced and nothing is in flight, so cancel the grace
     // timer and exit now with that code, releasing the lock; never wait on relay socket teardown.

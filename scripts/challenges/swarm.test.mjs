@@ -1176,3 +1176,44 @@ test('close: the runner never turns a cancel into completed, never moves status 
   h.io.latestChallenge=async()=>({...structuredClone(h.snap.challenge),budgetSats:10});await h.runner.tick();
   assert.equal(h.publishes.at(-1)[2],'completed');assert.equal(h.publishes.at(-1)[4],'answer');
 });
+
+// Run 2 #4: the trade reader stalled with no CLOSED and the runner logged nothing about why.
+test('relay health: timer-driven change log + 60 s heartbeat with last-frame age, even while a tick is blocked',async t=>{
+  const {startRelayHealthLog,RELAY_HEALTH_HEARTBEAT_MS}=await import('./swarm.mjs');
+  t.mock.timers.enable({apis:['setInterval','Date']});
+  const relay=(role,url,o={})=>({role,url,connected:true,authenticated:role==='trade',historyComplete:true,error:null,warnings:[],...o});
+  const d={status:{connected:true,authenticated:true,historyComplete:true,error:null,warnings:[],failedRelays:[],relays:[relay('trade','ws://trade'),relay('challenge','ws://c1')]},
+    sockets:{'ws://trade':{readyState:1,sockets:1,lastMessageAt:0,messages:5},'ws://c1':{readyState:1,sockets:1,lastMessageAt:0,messages:2}}};
+  const logs=[];const h=startRelayHealthLog(()=>structuredClone(d),m=>logs.push([Date.now(),m]));
+  assert.equal(logs.length,3,'initial state logged: overall + each relay');
+  // A tick that never returns (slow planner) cannot block this: nothing here calls tick().
+  const blockedTick=new Promise(()=>{});void blockedTick;
+  t.mock.timers.tick(30000);assert.equal(logs.length,3,'no change, no heartbeat yet');
+  // The trade feed goes silent and readiness drops: logged within one check interval.
+  d.status.relays[0].historyComplete=false;d.status.relays[0].error='Relay history timed out';d.status.historyComplete=false;
+  t.mock.timers.tick(5000);
+  const changes=logs.slice(3);
+  assert.ok(changes.some(([,m])=>m.startsWith('Relay change: relay trade ws://trade')&&m.includes('historyComplete=false')&&m.includes('"Relay history timed out"')));
+  assert.ok(changes.some(([,m])=>m.startsWith('Relay change: relay overall')));
+  assert.ok(!changes.some(([,m])=>m.includes('ws://c1')),'unchanged relays are not repeated on change');
+  // Heartbeat: every relay, with its last-frame age, once per minute.
+  const n=logs.length;t.mock.timers.tick(RELAY_HEALTH_HEARTBEAT_MS);
+  const beats=logs.slice(n).filter(([,m])=>m.startsWith('Relay heartbeat'));
+  assert.equal(beats.length,3);
+  assert.ok(beats.some(([,m])=>m.includes('ws://trade')&&/lastMessage=9\ds ago/.test(m)&&m.includes('messages=5')),beats.map(b=>b[1]).join('\n'));
+  h.stop();const after=logs.length;t.mock.timers.tick(300000);assert.equal(logs.length,after,'stopped');
+});
+test('relay health: openSnapshot records per-relay socket activity through the reader without changing readiness',async t=>{
+  const {openSnapshot}=await import('./relay-snapshot.mjs');
+  const sockets=[];
+  class Fake extends EventTarget {readyState=0;sent=[];constructor(url){super();this.url=url;sockets.push(this);}send(d){this.sent.push(d);}close(){this.readyState=3;this.dispatchEvent(new Event('close'));}}
+  let clock=1000;const src=openSnapshot({url:'ws://trade',challengeRelays:['ws://c1'],buyer:'b'.repeat(64),WebSocketImpl:Fake,clock:()=>clock});
+  t.after(()=>src.stop());
+  assert.deepEqual(sockets.map(s=>s.url).sort(),['ws://c1','ws://trade']);
+  const trade=sockets.find(s=>s.url==='ws://trade');trade.readyState=1;trade.dispatchEvent(new Event('open'));
+  clock=4000;trade.dispatchEvent(new MessageEvent('message',{data:'["NOTICE","x"]'}));
+  const d=src.diagnostics();
+  assert.equal(d.sockets['ws://trade'].lastMessageAt,4000);assert.equal(d.sockets['ws://trade'].messages,1);assert.equal(d.sockets['ws://trade'].readyState,1);
+  assert.equal(d.sockets['ws://c1'].lastMessageAt,null);
+  assert.equal(d.status.relays.length,2);assert.equal(d.status.connected,false,'readiness still comes only from the reader');
+});
