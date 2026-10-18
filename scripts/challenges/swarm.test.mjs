@@ -1097,3 +1097,38 @@ test('journal: a large legacy append journal is streamed in chunks (never one st
     fs.writeFileSync(path,JSON.stringify(big)+'\nbad\n');assert.throws(()=>new Journal(path,{chunkBytes:1000}));
   } finally {rmSync(dir,{recursive:true});}
 });
+
+// Run 2 #8: a permanently refused collect (buyer pre-collect review refused binary files) looped.
+const refusal='collect: job lifecycle input: review: permanent input error (unsupported_input); changed binary/non-UTF-8 files, symlinks and submodules are not supported; retrying unchanged input cannot help; correct the input or update the reviewer before explicitly retrying';
+test('collect: a permanent review refusal is recorded once, never retried or paid; seller released; planner sees it',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  const orig=f.io.mcp;f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);throw Error(refusal);}return orig(t,a);};
+  f.setPlan(()=>({wait:true}));
+  for(let t=101;t<=140;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,1,'collect is attempted exactly once');
+  const j=f.journal.state.jobs[0];
+  assert.equal(j.done,true);assert.equal(j.outcome,'collect refused');assert.match(j.collectRefused,/permanent input error/);
+  assert.equal(j.pay,undefined,'nothing paid');
+  const r=f.inputs.at(-1).results[0];assert.equal(r.outcome,'collect refused');assert.match(r.collectRefused,/unsupported_input/);assert.match(r.answer,/not paid/);
+  assert.equal(reports.filter(m=>m.includes('permanently refused')).length,1);
+  // The seller is free in this runner: once the projection frees it (deadline passed) it gets new work.
+  f.snap.jobs=[{id:j.id,seller:'a',result:{},accepted:false,running:false}];f.setPlan(assignments);f.time(141);await f.runner.tick();
+  assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
+});
+test('collect: transient failures keep retrying with a bounded doubling backoff, then collect once',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  let fail=4;const orig=f.io.mcp;
+  f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);if(fail-->0)throw Error('collect: review: timeout; next step blocked; retry available; retry the same collect or accept operation (no new job needed)');}return orig(t,a);};
+  f.setPlan(()=>({wait:true}));
+  const attempts=[];
+  for(let t=101;t<=300;t++){f.time(t);const before=f.calls.filter(([x])=>x==='collect').length;await f.runner.tick();if(f.calls.filter(([x])=>x==='collect').length>before)attempts.push(t);}
+  assert.deepEqual(attempts,[101,111,131,171,251],'retries at +10, +20, +40, +80 s');
+  const j=f.journal.state.jobs[0];assert.equal(j.done,true);assert.equal(j.outcome,'collected');assert.equal(j.collectRetryAt,undefined);
+  assert.equal(reports.filter(m=>m.includes('collect failed (attempt')).length,4);
+  // The delay doubles from 10 s and is capped at 600 s (bounded, never gives up on transient errors).
+  const mod=await import('./swarm.mjs');
+  assert.deepEqual([1,2,3,4,5,6,7,8,50].map(n=>mod.collectRetryDelay(n)),[10,20,40,80,160,320,600,600,600]);
+  assert.equal(mod.COLLECT_RETRY_MAX_SECONDS,600);
+});

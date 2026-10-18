@@ -329,6 +329,20 @@ export function reservedBudget(snapshot,jobs,now) {
   return {challengeId:snapshot.challenge.id,asOf:now,totalSats:snapshot.budget.totalSats,
     committedSats:jobs.reduce((n,j)=>n+jobBudget(j).reservedSats,0)+(snapshot.jobs??[]).filter(j=>!known.has(j.id)).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.reduce((n,j)=>n+jobBudget(j).paidSats,0)};
 }
+// collect failure classes (maxplayer-core, read-only; see the PR for file:line). The buyer's
+// pre-collect delivery review turns a reviewer refusal of the input itself (binary/non-UTF-8 files,
+// symlinks, submodules, too large, integrity...) into an error starting "review: permanent input
+// error" (review.rs reviewer_error/permanent_code; permanent_error() is that prefix). check_buyer
+// returns it WITHOUT the "retry the same collect" advice it appends to every other error, records
+// the subject as input_refused (review/state.rs), and the daemon's own settlement sweep stops
+// retrying it (blocked_job). The same delivery can never pass: retrying only re-asks the reviewer.
+// Everything else (reviewer timeouts/unavailable, relay, wallet, integrity fetch) is retryable.
+export const PERMANENT_COLLECT_REFUSAL = 'review: permanent input error';
+export const permanentCollectRefusal = message => String(message).includes(PERMANENT_COLLECT_REFUSAL);
+// Transient collect failures retry with a doubling delay, capped, until they succeed.
+export const COLLECT_RETRY_BASE_SECONDS = 10;
+export const COLLECT_RETRY_MAX_SECONDS = 600;
+export const collectRetryDelay = failures => Math.min(COLLECT_RETRY_MAX_SECONDS,COLLECT_RETRY_BASE_SECONDS*2**Math.min(30,Math.max(0,failures-1)));
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
@@ -429,7 +443,25 @@ export class Swarm {
         this.io.report?.(`Job ${j.id}: ${j.outcome}`);
       }
       if(state.results?.length) {
-        const collected=await this.io.mcp('collect',{job_id:j.id});
+        if(j.collectRetryAt&&now<j.collectRetryAt)continue;
+        let collected;
+        try {collected=await this.io.mcp('collect',{job_id:j.id});}
+        catch(e) {
+          if(e.journalFailure)throw e;
+          const reason=String(e?.message??e).slice(0,500);
+          if(permanentCollectRefusal(reason)) {
+            // Recorded once, never collected (or paid) again. done frees the seller in this runner;
+            // the sats stay reserved (no receipt, no release proof: jobBudget fails closed).
+            Object.assign(j,{done:true,outcome:'collect refused',collectRefused:reason,answerError:reason,answer:`[collect refused permanently, not paid: ${reason}]`,ts:now});
+            delete j.collectRetryAt;this.save();
+            this.io.report?.(`Job ${j.id}: collect permanently refused (not paid, not retried); seller ${j.seller} released: ${reason}`);
+            continue;
+          }
+          j.collectFailures=(j.collectFailures??0)+1;j.collectRetryAt=now+collectRetryDelay(j.collectFailures);j.collectError=reason;this.save();
+          this.io.report?.(`Job ${j.id}: collect failed (attempt ${j.collectFailures}, retrying in ${j.collectRetryAt-now}s): ${reason}`);
+          continue;
+        }
+        delete j.collectRetryAt;delete j.collectError;
         // collect succeeded (and settled): record it exactly once, whatever the answer read does.
         // An unreadable answer is an error the planner sees, never a reason to collect again.
         let answer,answerError;
@@ -471,7 +503,7 @@ export class Swarm {
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
-    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),ts:j.ts??now}));
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),ts:j.ts??now}));
     const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
