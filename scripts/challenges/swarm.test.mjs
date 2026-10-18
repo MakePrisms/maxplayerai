@@ -11,7 +11,7 @@ function fixture() {
   const snap={asOf:100,relay:{connected:true,authenticated:true,historyComplete:true},challenge:{buyer:'b',id:'day',starts:100,ends:1000,status:'in_progress',goal:'solve',title:'test'},budget:{totalSats:10,unknownAmounts:0,committedSats:0,paidSats:0},jobs:[],sellers:['a','b'].map(pubkey=>({pubkey,eligible:true,decision:'accepted',state:'accepted',minutesRemaining:1,currentJobStart:null}))};
   const calls=[],publishes=[],inputs=[],remote=new Map();let planner=assignments;
   const journal={state:{jobs:[],days:{}},save(){this.saved=structuredClone(this.state);}};
-  const io={now:()=>now,snapshot:async()=>({...structuredClone(snap),asOf:now}),plan:async x=>{inputs.push(x);return x.mode==='analyze'?structuredClone(analysis):x.mode==='assess'&&planner===assignments?{wait:true}:planner(x);},answer:async()=> 'verified answer',publish:async(...a)=>publishes.push(a),mcp:async(tool,args)=>{
+  const io={now:()=>now,snapshot:async()=>({...structuredClone(snap),asOf:now}),plan:async x=>{inputs.push(x);return x.mode==='analyze'?structuredClone(analysis):x.mode==='assess'&&planner===assignments?{wait:true}:planner(x);},answer:async()=> 'verified answer',publish:async(...a)=>publishes.push(a),latestChallenge:async()=>({...structuredClone(snap.challenge),budgetSats:snap.budget.totalSats}),mcp:async(tool,args)=>{
     calls.push([tool,structuredClone(args)]);
     if(tool==='post_job') {if(!remote.has(args.request_id))remote.set(args.request_id,{id:`job-${remote.size}`,results:[]});return {job_id:remote.get(args.request_id).id};}
     if(tool==='get_job') {
@@ -1131,4 +1131,48 @@ test('collect: transient failures keep retrying with a bounded doubling backoff,
   const mod=await import('./swarm.mjs');
   assert.deepEqual([1,2,3,4,5,6,7,8,50].map(n=>mod.collectRetryDelay(n)),[10,20,40,80,160,320,600,600,600]);
   assert.equal(mod.COLLECT_RETRY_MAX_SECONDS,600);
+});
+
+// Run 2 #10: the runner republished a closed challenge as in_progress.
+test('close: a buyer close during a slow tick is never overwritten; journaled; restart publishes nothing',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  // The relay: the latest buyer-signed challenge (the sidecar's read) changes when anyone publishes.
+  let relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>structuredClone(relay);
+  f.io.publish=async(ch,budget,status,update,result)=>{f.publishes.push([ch,budget,status,update,result]);relay={...relay,status,update,result};};
+  f.setPlan(()=>({wait:true}));f.time(200);await f.runner.tick();
+  assert.equal(f.publishes.at(-1)[2],'in_progress','first progress update');
+  // Next progress tick: the snapshot is read at tick start (in_progress), then the planner runs
+  // for minutes; the operator closes the challenge meanwhile. The reader has not seen it.
+  f.setPlan(input=>{if(input.mode==='assign'){relay={...relay,status:'completed',update:'closed by operator'};f.time(500);}return {wait:true};});
+  f.time(400);const before=f.publishes.length;await f.runner.tick();
+  assert.equal(f.publishes.length,before,'no publish after the buyer close');
+  assert.equal(relay.status,'completed');assert.equal(relay.update,'closed by operator');
+  const day=Object.values(f.journal.state.days)[0];
+  assert.deepEqual(day.stop,{external:true});assert.equal(day.closed.status,'completed');
+  assert.ok(reports.some(m=>m.includes('already completed on the relays')));
+  // Restart with the same journal while the reader still shows in_progress: still nothing.
+  for(const t of [700,800,950]){f.time(t);await new Swarm(f.c,f.io,f.journal).tick();}
+  assert.equal(f.publishes.length,before);assert.equal(relay.status,'completed');
+  assert.equal(posts(f).length,0,'and no new work');
+});
+test('close: the runner never turns a cancel into completed, never moves status backwards, and a failed read publishes nothing',async()=>{
+  // Its own solved stop while the buyer cancelled: the cancel stands.
+  const f=fixture();let relay={...structuredClone(f.snap.challenge),budgetSats:10,status:'cancelled'};
+  f.io.latestChallenge=async()=>structuredClone(relay);
+  f.setPlan(()=>({solved:true,result:'answer'}));await f.runner.tick();
+  assert.equal(f.publishes.length,0);const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.published,true);assert.equal(day.stop.supersededBy,'cancelled');
+  await f.runner.tick();assert.equal(f.publishes.length,0);
+  // A stale scheduled snapshot never moves the relay's in_progress back; buyer fields come from the read.
+  const g=fixture();g.snap.challenge.status='scheduled';g.snap.challenge.starts=50;
+  g.io.latestChallenge=async()=>({...structuredClone(g.snap.challenge),status:'in_progress',title:'renamed',budgetSats:7,result:''});
+  g.setPlan(()=>({wait:true}));g.time(200);await g.runner.tick();
+  assert.equal(g.publishes.at(-1)[2],'in_progress');assert.equal(g.publishes.at(-1)[0].title,'renamed');assert.equal(g.publishes.at(-1)[1],7);
+  // An unreadable latest challenge: no publish (fail closed); the completion is retried later.
+  const h=fixture();h.io.latestChallenge=async()=>{throw Error('relay read incomplete');};
+  h.setPlan(()=>({solved:true,result:'answer'}));await assert.rejects(h.runner.tick(),/relay read incomplete/);
+  assert.equal(h.publishes.length,0);assert.equal(Object.values(h.journal.state.days)[0].published,undefined);
+  h.io.latestChallenge=async()=>({...structuredClone(h.snap.challenge),budgetSats:10});await h.runner.tick();
+  assert.equal(h.publishes.at(-1)[2],'completed');assert.equal(h.publishes.at(-1)[4],'answer');
 });

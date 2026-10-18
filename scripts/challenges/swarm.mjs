@@ -343,9 +343,35 @@ export const permanentCollectRefusal = message => String(message).includes(PERMA
 export const COLLECT_RETRY_BASE_SECONDS = 10;
 export const COLLECT_RETRY_MAX_SECONDS = 600;
 export const collectRetryDelay = failures => Math.min(COLLECT_RETRY_MAX_SECONDS,COLLECT_RETRY_BASE_SECONDS*2**Math.min(30,Math.max(0,failures-1)));
+// Challenge status order. The runner never publishes a status that moves a challenge backwards,
+// and never publishes at all once the buyer-signed challenge is completed/cancelled (a close by
+// the operator, or by anyone holding the buyer key, is final for the runner).
+export const TERMINAL_STATUSES = ['completed','cancelled'];
+const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
+  // Run 2 #10: every challenge publish re-reads the LATEST buyer-signed challenge from the
+  // challenge relays first (never the tick-start snapshot, which can be minutes old after planner
+  // calls, or behind a lagging reader). If it is completed/cancelled the publish is skipped and
+  // the close is journaled as an external stop; otherwise the event keeps every buyer field from
+  // that read and changes only the update (and, for the runner's own stop, status/result). A
+  // failed read publishes nothing (throws; the caller retries on a later tick).
+  async publishChallenge(day,c,status,update,result) {
+    const latest=await this.io.latestChallenge(c);
+    if(!latest||latest.id!==c.id||latest.buyer!==c.buyer||typeof latest.status!=='string')throw Error(`Challenge ${c.id}: latest buyer-signed challenge unreadable; not publishing`);
+    if(TERMINAL_STATUSES.includes(latest.status)) {
+      day.closed={status:latest.status,seenAt:this.io.now()};
+      if(!day.stop)day.stop={external:true};
+      else if(!day.stop.external){day.published=true;day.stop.supersededBy=latest.status;}
+      this.save();
+      this.io.report?.(`Challenge ${c.id} is already ${latest.status} on the relays; not publishing ${status} (a buyer close is never overwritten)`);
+      return false;
+    }
+    if((STATUS_RANK[status]??-1)<(STATUS_RANK[latest.status]??-1))status=latest.status;
+    await this.io.publish(latest,latest.budgetSats,status,update,result===undefined?latest.result:result);
+    return true;
+  }
   // Every post_job goes through here, so the log has one line per post call per request id.
   async post(args){this.io.report?.(`post_job request ${args.request_id} seller ${args.seller_pubkey}`);return this.io.mcp('post_job',args);}
   // Does this buyer's get_job report the fields that let an expired PAID job be proven released?
@@ -506,7 +532,7 @@ export class Swarm {
     const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),ts:j.ts??now}));
     const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
-    if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
+    if(!day.stop && TERMINAL_STATUSES.includes(c.status)) {day.stop={external:true};day.closed={status:c.status,seenAt:now};this.save();}
     const min=this.c.minDuration??DEFAULT_MIN_DURATION, max=this.c.maxDuration??1800;
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
@@ -583,9 +609,11 @@ export class Swarm {
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
-      await this.io.publish(day.challenge,day.budget,'completed',day.stop.update,day.stop.result);day.published=true;this.save();
-    } else if(!day.stop&&ready&&now-day.lastUpdate>=this.c.updateEvery) {
-      await this.io.publish(c,snap.budget.totalSats,c.status,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`,c.result);day.lastUpdate=now;this.save();
+      if(await this.publishChallenge(day,day.challenge,'completed',day.stop.update,day.stop.result)){day.published=true;this.save();}
+    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery) {
+      // Progress never changes the status: it re-sends the latest buyer-signed one.
+      day.lastUpdate=now;this.save();
+      await this.publishChallenge(day,c,c.status,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`);
     }
   }
 }
@@ -689,6 +717,13 @@ async function main() {
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
       const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),'--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
       if(result)args.push('--result',result);await command(challengesBinary,args,{env});
+    },
+    // The latest buyer-signed challenge with this id, read directly from every challenge relay by
+    // the sidecar (fails unless all relays answer); includes completed/cancelled ones.
+    latestChallenge:async challenge=>{
+      const body=JSON.parse(await command(challengesBinary,['status',...challengeRelays.flatMap(url=>['--relay',url]),'--challenge',challenge.id,'--json'],{env}));
+      const x=body?.challenge;if(!x||typeof x!=='object')throw Error(`challenge ${challenge.id} not found on the challenge relays`);
+      return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
     }};
   io.probeBuyer=()=>io.mcp('get_job',{job_id:PROBE_JOB_ID});
   const runner=new Swarm(c,io,journal);
