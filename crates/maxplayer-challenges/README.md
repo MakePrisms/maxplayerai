@@ -133,7 +133,9 @@ maxplayer-challenges decide --seller <npub-or-hex> --deny --json
 ```
 
 `publish` also accepts `--update`, `--result`, and status `in_progress`, `completed`, or
-`cancelled`. `status`/`members` default to the latest non-cancelled challenge. Publishing
+`cancelled`. A `completed` or `cancelled` challenge is final: if `publish`'s own fetch finds the
+latest buyer-signed event for that id closed, it signs nothing and exits 3 with `challenge:
+challenge closed (<status>): …`. `status`/`members` default to the latest non-cancelled challenge. Publishing
 metadata does not fund a budget or post a job. The buyer's ordinary `maxplayer` daemon
 and MCP still handle all jobs and settlement.
 

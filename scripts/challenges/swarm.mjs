@@ -4,7 +4,7 @@ import { parseChallengeRelays } from '../../web/app/src/challenge/shared/relay.m
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
@@ -24,7 +24,7 @@ export function command(bin, args, {input='', env=process.env, timeout=120000}={
     child.stdout.on('data',b=>{out+=b;if(out.length>4*1024*1024){failure=Error('Command output too large');kill();}});
     child.stderr.on('data',b=>{err=(err+b).slice(-4000);});
     child.stdin.on('error',()=>{}); child.stdin.end(input);
-    child.on('close',code=>{clearTimeout(timer);code===0&&!failure?resolve(out):reject(failure??Error(`${bin} exited ${code}: ${err}`));});
+    child.on('close',code=>{clearTimeout(timer);code===0&&!failure?resolve(out):reject(failure??Object.assign(Error(`${bin} exited ${code}: ${err}`),{exitCode:code,stderr:err}));});
   });
 }
 // Delivery entries that are never answer text (execution proof, VCS and build/dependency trees).
@@ -225,25 +225,66 @@ export const EXPIRED_SLOT_GRACE_SECONDS = 600;
 export const SELLER_EXECUTION_TAIL_SECONDS = 420;
 export const SLOT_TEARDOWN_MARGIN_SECONDS = 60;
 export const MIN_EXPIRED_SLOT_GRACE_SECONDS = SELLER_EXECUTION_TAIL_SECONDS + SLOT_TEARDOWN_MARGIN_SECONDS;
+// Durable runner state: ONE fsynced JSON record, replaced atomically on every save (temp file,
+// fsync, rename over the journal, fsync the directory). A crash at any point leaves either the
+// previous complete record or the new one, never a mix, and the file never grows past one state.
+// Older runners APPENDED a full copy per save (run 2 reached 649 MB and startup died on Node's
+// string-size limit). Such a journal is migrated on open: it is scanned in fixed-size chunks
+// (never read as one string), the last complete record is authoritative (earlier records are
+// superseded copies; a torn final append was never acknowledged), and it is rewritten atomically
+// as a single record. A corrupt LAST complete record still fails startup.
+export const JOURNAL_CHUNK_BYTES = 1<<20;
 export class Journal {
-  constructor(path) {
-    this.path=path; this.state={jobs:[],days:{}};
-    let text='';try{text=readFileSync(path,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;}
-    // A torn final append was never acknowledged. All prior durable records remain authoritative.
-    const end=text.lastIndexOf('\n')+1;
-    if(end<text.length)truncateSync(path,Buffer.byteLength(text.slice(0,end)));
-    for(const line of text.slice(0,end).split('\n').filter(Boolean))this.state=JSON.parse(line);
+  constructor(path,{fs={openSync,readSync,writeSync,fsyncSync,closeSync,renameSync,unlinkSync,fstatSync},chunkBytes=JOURNAL_CHUNK_BYTES}={}) {
+    this.path=path; this.fs=fs; this.state={jobs:[],days:{}};
+    let fd;try{fd=fs.openSync(path,'r');}catch(e){if(e.code!=='ENOENT')throw e;}
+    if(fd===undefined)return;
+    let records=0,last=null,torn=false;
+    try {
+      const size=fs.fstatSync(fd).size,buf=Buffer.alloc(chunkBytes);
+      // Byte offsets of the newest non-empty complete line, and of the line being scanned.
+      let pos=0,lineStart=0,lineHasData=false;
+      while(pos<size) {
+        const n=fs.readSync(fd,buf,0,Math.min(chunkBytes,size-pos),pos);if(!n)break;
+        for(let i=0;i<n;) {
+          const nl=buf.indexOf(10,i);
+          const end=nl<0||nl>=n?n:nl;
+          if(end>i)lineHasData=true;
+          if(nl<0||nl>=n){i=n;break;}
+          if(lineHasData){records++;last=[lineStart,pos+nl];}
+          lineStart=pos+nl+1;lineHasData=false;i=nl+1;
+        }
+        pos+=n;
+      }
+      torn=lineHasData;
+      if(last) {
+        const rec=Buffer.alloc(last[1]-last[0]);
+        for(let off=0;off<rec.length;){const n=fs.readSync(fd,rec,off,rec.length-off,last[0]+off);if(!n)throw Error('Journal shrank while reading');off+=n;}
+        this.state=JSON.parse(rec.toString('utf8'));
+      }
+    } finally {fs.closeSync(fd);}
+    // Legacy append journal (several records) or a torn tail: rewrite as one atomic record.
+    if(records>1||torn){this.migrated={records,torn};this.save();}
   }
   save() {
-    let fd;
+    const {fs}=this,tmp=`${this.path}.tmp`;let fd,renamed=false;
     try {
-      fd=openSync(this.path,'a',0o600);
+      fd=fs.openSync(tmp,'w',0o600);
       const record=Buffer.from(JSON.stringify(this.state)+'\n');
-      for(let offset=0;offset<record.length;){const n=writeSync(fd,record,offset,record.length-offset);if(!n)throw Error('Short journal write');offset+=n;}
-      fsyncSync(fd);
+      for(let offset=0;offset<record.length;){const n=fs.writeSync(fd,record,offset,record.length-offset);if(!n)throw Error('Short journal write');offset+=n;}
+      fs.fsyncSync(fd);fs.closeSync(fd);fd=undefined;
+      fs.renameSync(tmp,this.path);renamed=true;
+      let dir;
+      try{dir=fs.openSync(dirname(this.path),'r');fs.fsyncSync(dir);}
+      catch(e){if(!['EINVAL','EPERM','EISDIR','ENOTSUP'].includes(e.code))throw e;}
+      finally{if(dir!==undefined)fs.closeSync(dir);}
     }
     catch(e) {e.journalFailure=true;throw e;}
-    finally {if(fd!==undefined)closeSync(fd);}
+    finally {
+      if(fd!==undefined)try{fs.closeSync(fd);}catch{}
+      // A failed save never leaves its partial temp record behind (the durable journal is untouched).
+      if(!renamed)try{fs.unlinkSync?.(tmp);}catch{}
+    }
   }
 }
 export function validateAnalysis(p) {
@@ -292,9 +333,71 @@ export function reservedBudget(snapshot,jobs,now) {
   return {challengeId:snapshot.challenge.id,asOf:now,totalSats:snapshot.budget.totalSats,
     committedSats:jobs.reduce((n,j)=>n+jobBudget(j).reservedSats,0)+(snapshot.jobs??[]).filter(j=>!known.has(j.id)).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.reduce((n,j)=>n+jobBudget(j).paidSats,0)};
 }
+// collect failure classes (maxplayer-core, read-only; see the PR for file:line). The buyer's
+// pre-collect delivery review turns a reviewer refusal of the input itself (binary/non-UTF-8 files,
+// symlinks, submodules, too large, integrity...) into an error starting "review: permanent input
+// error" (review.rs reviewer_error/permanent_code; permanent_error() is that prefix). check_buyer
+// returns it WITHOUT the "retry the same collect" advice it appends to every other error, records
+// the subject as input_refused (review/state.rs), and the daemon's own settlement sweep stops
+// retrying it (blocked_job). The same delivery can never pass: retrying only re-asks the reviewer.
+// Everything else (reviewer timeouts/unavailable, relay, wallet, integrity fetch) is retryable.
+export const PERMANENT_COLLECT_REFUSAL = 'review: permanent input error';
+// The WHOLE error text is searched (the MCP wrapper may put stderr before the tool-error JSON), and
+// the recorded reason starts at the marker so it is never cut out by the 500-character cap.
+export const permanentCollectRefusal = message => String(message).includes(PERMANENT_COLLECT_REFUSAL);
+export const collectFailureReason = message => {const m=String(message),at=m.indexOf(PERMANENT_COLLECT_REFUSAL);return (at<0?m:m.slice(at)).slice(0,500);};
+// Not permanent in core, so they stay on the bounded retry loop (seller kept busy) even though an
+// unchanged delivery may never pass: policy_refused (review/state.rs:125-126) and
+// "review: encrypted message too large" (review/private.rs:84) lack the permanent prefix.
+// Transient collect failures retry with a doubling delay, capped, until they succeed.
+export const COLLECT_RETRY_BASE_SECONDS = 10;
+export const COLLECT_RETRY_MAX_SECONDS = 600;
+export const collectRetryDelay = failures => Math.min(COLLECT_RETRY_MAX_SECONDS,COLLECT_RETRY_BASE_SECONDS*2**Math.min(30,Math.max(0,failures-1)));
+// Challenge status order. The runner never publishes a status that moves a challenge backwards,
+// and never publishes at all once the buyer-signed challenge is completed/cancelled (a close by
+// the operator, or by anyone holding the buyer key, is final for the runner).
+export const TERMINAL_STATUSES = ['completed','cancelled'];
+// A failed progress re-read (relay error, or a `status` that hung until the command timeout) is
+// retried after min(updateEvery, this) seconds measured from when it FAILED, so a hung challenge
+// relay cannot occupy back-to-back ticks (collects and posting keep the poll cadence meanwhile).
+export const PROGRESS_RETRY_SECONDS = 30;
+const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
+// The sidecar `publish` refuses to sign over a completed/cancelled challenge it sees in its own
+// pre-publish fetch: exit 3, stderr `challenge: challenge closed (<status>): …`, nothing published.
+export const SIDECAR_CLOSED_EXIT = 3;
+export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.stderr??e.message).match(/challenge closed \((completed|cancelled)\)/)?.[1]??null:null;
+// Sidecar argv for the latest buyer-signed challenge (`status` requires --buyer; --json on stdout).
+export const latestChallengeArgs = (relays,challenge) => ['status',...relays.flatMap(url=>['--relay',url]),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
+  // Run 2 #10: every challenge publish re-reads the LATEST buyer-signed challenge from the
+  // challenge relays first (never the tick-start snapshot, which can be minutes old after planner
+  // calls, or behind a lagging reader). If it is completed/cancelled the publish is skipped and
+  // the close is journaled as an external stop; otherwise the event keeps every buyer field from
+  // that read and changes only the update (and, for the runner's own stop, status/result). A
+  // failed read publishes nothing (throws; the caller retries on a later tick).
+  // status null (progress) re-sends the read's own status unchanged. The sidecar publish makes its
+  // own fetch and refuses ({closed}) if the close landed after this read; handled the same way.
+  closeSeen(day,c,status,closed) {
+    day.closed={status:closed,seenAt:this.io.now()};
+    if(!day.stop)day.stop={external:true};
+    else if(!day.stop.external){day.published=true;day.stop.supersededBy=closed;}
+    this.save();
+    this.io.report?.(`Challenge ${c.id} is already ${closed} on the relays; not publishing ${status??'progress'} (a buyer close is never overwritten)`);
+    return false;
+  }
+  async publishChallenge(day,c,status,update,result) {
+    // main() always reads the relays directly (sidecar). An injected io without that read (embedders,
+    // older tests) falls back to a FRESH snapshot taken now, never the tick-start one.
+    const latest=this.io.latestChallenge?await this.io.latestChallenge(c):await this.io.snapshot().then(x=>x?.challenge&&{...x.challenge,budgetSats:x.budget?.totalSats});
+    if(!latest||latest.id!==c.id||latest.buyer!==c.buyer||typeof latest.status!=='string')throw Error(`Challenge ${c.id}: latest buyer-signed challenge unreadable; not publishing`);
+    if(TERMINAL_STATUSES.includes(latest.status))return this.closeSeen(day,c,status,latest.status);
+    const outgoing=status==null||(STATUS_RANK[status]??-1)<(STATUS_RANK[latest.status]??-1)?latest.status:status;
+    const sent=await this.io.publish(latest,latest.budgetSats,outgoing,update,result===undefined?latest.result:result);
+    if(TERMINAL_STATUSES.includes(sent?.closed))return this.closeSeen(day,c,status,sent.closed);
+    return true;
+  }
   // Every post_job goes through here, so the log has one line per post call per request id.
   async post(args){this.io.report?.(`post_job request ${args.request_id} seller ${args.seller_pubkey}`);return this.io.mcp('post_job',args);}
   // Does this buyer's get_job report the fields that let an expired PAID job be proven released?
@@ -392,7 +495,25 @@ export class Swarm {
         this.io.report?.(`Job ${j.id}: ${j.outcome}`);
       }
       if(state.results?.length) {
-        const collected=await this.io.mcp('collect',{job_id:j.id});
+        if(j.collectRetryAt&&now<j.collectRetryAt)continue;
+        let collected;
+        try {collected=await this.io.mcp('collect',{job_id:j.id});}
+        catch(e) {
+          if(e.journalFailure)throw e;
+          const message=String(e?.message??e),reason=collectFailureReason(message);
+          if(permanentCollectRefusal(message)) {
+            // Recorded once, never collected (or paid) again. done frees the seller in this runner;
+            // the sats stay reserved (no receipt, no release proof: jobBudget fails closed).
+            Object.assign(j,{done:true,outcome:'collect refused',collectRefused:reason,answerError:reason,answer:`[collect refused permanently, not paid: ${reason}]`,ts:now});
+            delete j.collectRetryAt;this.save();
+            this.io.report?.(`Job ${j.id}: collect permanently refused (not paid, not retried); seller ${j.seller} released: ${reason}`);
+            continue;
+          }
+          j.collectFailures=(j.collectFailures??0)+1;j.collectRetryAt=now+collectRetryDelay(j.collectFailures);j.collectError=reason;this.save();
+          this.io.report?.(`Job ${j.id}: collect failed (attempt ${j.collectFailures}, retrying in ${j.collectRetryAt-now}s): ${reason}`);
+          continue;
+        }
+        delete j.collectRetryAt;delete j.collectError;
         // collect succeeded (and settled): record it exactly once, whatever the answer read does.
         // An unreadable answer is an error the planner sees, never a reason to collect again.
         let answer,answerError;
@@ -434,10 +555,10 @@ export class Swarm {
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
-    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),ts:j.ts??now}));
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),ts:j.ts??now}));
     const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
-    if(!day.stop && ['completed','cancelled'].includes(c.status)) {day.stop={external:true};this.save();}
+    if(!day.stop && TERMINAL_STATUSES.includes(c.status)) {day.stop={external:true};day.closed={status:c.status,seenAt:now};this.save();}
     const min=this.c.minDuration??DEFAULT_MIN_DURATION, max=this.c.maxDuration??1800;
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
@@ -514,11 +635,59 @@ export class Swarm {
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
-      await this.io.publish(day.challenge,day.budget,'completed',day.stop.update,day.stop.result);day.published=true;this.save();
-    } else if(!day.stop&&ready&&now-day.lastUpdate>=this.c.updateEvery) {
-      await this.io.publish(c,snap.budget.totalSats,c.status,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`,c.result);day.lastUpdate=now;this.save();
+      if(await this.publishChallenge(day,day.challenge,'completed',day.stop.update,day.stop.result)){day.published=true;this.save();}
+    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&(!(now<day.progressRetryAt)||!(this.io.now()<day.progressRetryAt))) {
+      // Progress never changes the status: it re-sends the latest buyer-signed one (null). The
+      // interval restarts only after a publish; a failed re-read is retried after a short backoff
+      // (PROGRESS_RETRY_SECONDS from the failure), not a full updateEvery and not every tick. The
+      // backoff opens when EITHER the tick-start sample or the current clock has reached
+      // progressRetryAt: a planner call that crosses it re-reads in this tick, and a backward clock
+      // step cannot take back a re-read the sample already earned. A publish reached only because
+      // the live clock crossed the backoff stamps lastUpdate with the live clock (the tick-start
+      // sample may be a whole planner call old, which would make the next tick due again);
+      // otherwise lastUpdate records the tick-start now.
+      const crossed=now<day.progressRetryAt;
+      try {
+        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
+      } catch(e) {
+        if(e.journalFailure)throw e;
+        day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();
+        throw e;
+      }
     }
   }
+}
+// Run 2 #4: relay readiness log. Driven by its OWN timer (never by tick(), so a planner call of
+// several minutes cannot hide a stall). Every `checkMs` it compares each relay's readiness fields
+// (connected, authenticated, historyComplete, error, warnings, socket readyState) with the last
+// logged ones and logs on any change; it also logs a full heartbeat every `heartbeatMs` with the
+// age of each relay's last received frame. Live-subscription / pending-page / EOSE counts are not
+// part of the reader's exposed status (relay.mjs), so they are not logged here.
+export const RELAY_HEALTH_CHECK_MS = 5000;
+export const RELAY_HEALTH_HEARTBEAT_MS = 60000;
+const age=(at,now)=>at==null?'never':`${Math.max(0,Math.round((now-at)/1000))}s`;
+export function relayHealthLines({status,sockets={}},now) {
+  const rows=[{role:'overall',url:'',...status},...(status?.relays??[])];
+  return rows.map(r=>{
+    const s=r.role==='overall'?null:sockets[r.url];
+    const fields={connected:!!r.connected,authenticated:!!r.authenticated,historyComplete:!!r.historyComplete,error:r.error??null,warnings:r.warnings??[],
+      ...(r.role==='overall'?{failedRelays:r.failedRelays??[]}:{socket:s?.readyState??null,sockets:s?.sockets??0})};
+    const key=JSON.stringify([r.role,r.url,fields]);
+    const text=`relay ${r.role}${r.url?` ${r.url}`:''}: connected=${fields.connected} authenticated=${fields.authenticated} historyComplete=${fields.historyComplete} error=${JSON.stringify(fields.error)} warnings=${JSON.stringify(fields.warnings)}`+
+      (r.role==='overall'?` failed=${JSON.stringify(fields.failedRelays)}`:` socket=${fields.socket} reconnects=${Math.max(0,fields.sockets-1)} lastMessage=${age(s?.lastMessageAt,now)} ago messages=${s?.messages??0}`);
+    return {id:`${r.role} ${r.url}`,key,text};
+  });
+}
+export function startRelayHealthLog(diagnostics,report,{checkMs=RELAY_HEALTH_CHECK_MS,heartbeatMs=RELAY_HEALTH_HEARTBEAT_MS,clock=Date.now}={}) {
+  const last=new Map();let beat=-Infinity;
+  const check=()=>{
+    let lines;try{const now=clock();lines=relayHealthLines(diagnostics(),now);
+      const heartbeat=now-beat>=heartbeatMs;if(heartbeat)beat=now;
+      for(const l of lines){const changed=last.get(l.id)!==l.key;last.set(l.id,l.key);if(changed||heartbeat)report(`${changed&&heartbeat?'Relay change + heartbeat':changed?'Relay change':'Relay heartbeat'}: ${l.text}`);}
+    }catch(e){report(`Relay health read failed: ${e.message}`);}
+  };
+  check();const timer=setInterval(check,checkMs);timer.unref?.();
+  return {check,stop:()=>clearInterval(timer)};
 }
 // maxplayer rejects unknown MAXPLAYER_* variables, so only MAXPLAYER_HOME reaches it from here.
 export function childEnv(env,home) {
@@ -596,7 +765,7 @@ async function main() {
     child.on('exit',(code,signal)=>{process.exitCode=code??1;if(signal)console.error(`Locked runner ended by ${signal}`);child.stdin.destroy();});return;
   }
   // A stop can arrive during startup (whoami, buyer probe): it is recorded here and the loop never starts.
-  let quitting=false,source,wake;const stopRunner=()=>{quitting=true;source?.stop();wake?.();};
+  let quitting=false,source,wake,health;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();wake?.();};
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
@@ -612,6 +781,7 @@ async function main() {
     const failed=s.relay.failedRelays.join(', ');
     if(failed!==relayCoverage){relayCoverage=failed;console.error(new Date().toISOString(),failed?`Relay coverage incomplete; unavailable: ${failed}`:'All configured relays available');}
   }});
+  health=startRelayHealthLog(source.diagnostics,message=>console.error(new Date().toISOString(),message));
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>source.snapshot(),
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
     plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:c.plannerTimeouts.runnerMs(input.mode)})),
@@ -619,7 +789,16 @@ async function main() {
     publish:async(challenge,budget,status,update,result)=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
       const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),'--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
-      if(result)args.push('--result',result);await command(challengesBinary,args,{env});
+      if(result)args.push('--result',result);
+      try{await command(challengesBinary,args,{env});}
+      catch(e){const closed=closedRefusal(e);if(closed)return {closed};throw e;}
+    },
+    // The latest buyer-signed challenge with this id, read directly from every challenge relay by
+    // the sidecar (fails unless all relays answer); includes completed/cancelled ones.
+    latestChallenge:async challenge=>{
+      const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge),{env}));
+      const x=body?.challenge;if(!x||typeof x!=='object')throw Error(`challenge ${challenge.id} not found on the challenge relays`);
+      return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
     }};
   io.probeBuyer=()=>io.mcp('get_job',{job_id:PROBE_JOB_ID});
   const runner=new Swarm(c,io,journal);
@@ -633,16 +812,21 @@ async function main() {
       if(!quitting)await new Promise(r=>{const t=setTimeout(r,c.poll*1000);wake=()=>{clearTimeout(t);r();};});wake=undefined;
     }
   } finally {
-    source.stop();
-    // Locked runner: the loop has ended (stop asked, or a fatal journal error that main().catch
-    // records as exitCode 1). The journal is fsynced and nothing is in flight, so cancel the grace
-    // timer and exit now with that code, releasing the lock; never wait on relay socket teardown.
+    health.stop();source.stop();
+    // Locked runner: the loop has ended. On a stop request nothing is in flight and the last save
+    // is durable, so cancel the grace timer and exit 0 on the next turn, releasing the lock; never
+    // wait on relay socket teardown. On a fatal journal error the throw continues past this block
+    // into main().catch, which calls process.exit(1) before this setImmediate runs (the exit code
+    // comes from that explicit exit, not from process.exitCode). Do not turn that catch back into
+    // an exitCode-only handler: see its comment.
     if(parentWatch){parentWatch.cancel();setImmediate(()=>process.exit(process.exitCode??0));}
   }
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))main().catch(e=>{
-  // Every failure exits (advisor r3 #1). A startup throw in the locked runner (empty relay list, no
-  // buyer pubkey, corrupt journal) happens before the loop's exiting finally, and the parent pipe
-  // keeps stdin flowing, so only setting exitCode left the runner alive holding the lock (and flock
-  // and the parent waiting on it). Nothing is in flight at that point; the journal is fsynced.
+  // Every failure exits explicitly with 1 (advisor r3 #1). A startup throw in the locked runner
+  // (empty relay list, no buyer pubkey, corrupt journal) happens before the loop's exiting finally,
+  // and the parent pipe keeps stdin flowing, so only setting exitCode left the runner alive holding
+  // the lock (and flock and the parent waiting on it). A fatal journal error from the loop also
+  // lands here. No command is in flight at either point. The journal on disk is the last SUCCESSFUL
+  // save: a failed save never replaced it (its temp is removed), so that save's state is lost.
   console.error(e.message);process.exit(1);});

@@ -11,7 +11,7 @@ function fixture() {
   const snap={asOf:100,relay:{connected:true,authenticated:true,historyComplete:true},challenge:{buyer:'b',id:'day',starts:100,ends:1000,status:'in_progress',goal:'solve',title:'test'},budget:{totalSats:10,unknownAmounts:0,committedSats:0,paidSats:0},jobs:[],sellers:['a','b'].map(pubkey=>({pubkey,eligible:true,decision:'accepted',state:'accepted',minutesRemaining:1,currentJobStart:null}))};
   const calls=[],publishes=[],inputs=[],remote=new Map();let planner=assignments;
   const journal={state:{jobs:[],days:{}},save(){this.saved=structuredClone(this.state);}};
-  const io={now:()=>now,snapshot:async()=>({...structuredClone(snap),asOf:now}),plan:async x=>{inputs.push(x);return x.mode==='analyze'?structuredClone(analysis):x.mode==='assess'&&planner===assignments?{wait:true}:planner(x);},answer:async()=> 'verified answer',publish:async(...a)=>publishes.push(a),mcp:async(tool,args)=>{
+  const io={now:()=>now,snapshot:async()=>({...structuredClone(snap),asOf:now}),plan:async x=>{inputs.push(x);return x.mode==='analyze'?structuredClone(analysis):x.mode==='assess'&&planner===assignments?{wait:true}:planner(x);},answer:async()=> 'verified answer',publish:async(...a)=>publishes.push(a),latestChallenge:async()=>({...structuredClone(snap.challenge),budgetSats:snap.budget.totalSats}),mcp:async(tool,args)=>{
     calls.push([tool,structuredClone(args)]);
     if(tool==='post_job') {if(!remote.has(args.request_id))remote.set(args.request_id,{id:`job-${remote.size}`,results:[]});return {job_id:remote.get(args.request_id).id};}
     if(tool==='get_job') {
@@ -1029,4 +1029,363 @@ test('expired paid job: slot stays held on an unconfirmed read or a pending awar
   assert.deepEqual([SELLER_EXECUTION_TAIL_SECONDS,SLOT_TEARDOWN_MARGIN_SECONDS,MIN_EXPIRED_SLOT_GRACE_SECONDS],[420,60,480]);
   for(const bad of ['419','420','479'])assert.throws(()=>config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:bad}),/SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= 480/,bad);
   assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'480'}).expiredSlotGrace,480);
+});
+
+// Run 2 #9: the journal appended a full state copy per save until startup died (649 MB).
+const realFs=()=>{const fs=process.getBuiltinModule('node:fs');return {openSync:fs.openSync,readSync:fs.readSync,writeSync:fs.writeSync,fsyncSync:fs.fsyncSync,closeSync:fs.closeSync,renameSync:fs.renameSync,unlinkSync:fs.unlinkSync,fstatSync:fs.fstatSync};};
+test('journal: many saves keep exactly one record; restart reads the latest state',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-one-')),path=join(dir,'events.jsonl');
+  try {
+    const j=new Journal(path);
+    for(let i=0;i<500;i++){j.state.jobs.push({id:`job-${i}`,answer:'x'.repeat(200)});j.save();}
+    const text=readFileSync(path,'utf8');
+    assert.equal(text.split('\n').filter(Boolean).length,1,'one record, not one per save');
+    assert.ok(text.length<200*1000,`file holds one state (${text.length} bytes), not 500 copies`);
+    assert.equal(new Journal(path).state.jobs.length,500);
+    assert.equal(new Journal(path).state.jobs.at(-1).id,'job-499');
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('journal: a torn or failed temp write never loses the previous durable state',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-torn-')),path=join(dir,'events.jsonl');
+  try {
+    const j=new Journal(path);j.state.jobs.push({id:'kept'});j.save();
+    // Crash mid-write of the next record: a partial write, then the process dies (no rename).
+    const fs=realFs();let writes=0;
+    const torn=new Journal(path,{fs:{...fs,writeSync:(fd,b,o,l)=>{if(++writes>1)throw Object.assign(Error('crash'),{code:'EIO'});return fs.writeSync(fd,b,o,Math.max(1,Math.floor(l/2)));}}});
+    torn.state.jobs.push({id:'lost',answer:'y'.repeat(5000)});
+    assert.throws(()=>torn.save(),e=>e.journalFailure===true);
+    assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept'],'previous record intact');
+    // fsync or rename failure: same guarantee.
+    for(const fault of ['fsyncSync','renameSync']) {
+      const bad=new Journal(path,{fs:{...fs,[fault]:()=>{throw Object.assign(Error(fault),{code:'EIO'});}}});
+      bad.state.jobs.push({id:fault});assert.throws(()=>bad.save(),e=>e.journalFailure===true);
+      assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept']);
+    }
+    // A stale torn temp file from the crash is ignored and replaced by the next save.
+    appendFileSync(`${path}.tmp`,'{"half":');
+    const next=new Journal(path);next.state.jobs.push({id:'next'});next.save();
+    assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept','next']);
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('journal: a large legacy append journal is streamed in chunks (never one string) and migrated to one record',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-legacy-')),path=join(dir,'events.jsonl');
+  try {
+    // Synthesise the old format: one full state per line, growing, plus a torn final append.
+    // 3000 records of ~3-4 KB = ~10 MB with a 16 KiB chunk: the same shape as 649 MB at 1 MiB.
+    const fs=process.getBuiltinModule('node:fs'),fd=fs.openSync(path,'w',0o600);
+    const state={jobs:[],days:{}};
+    for(let i=0;i<3000;i++){state.jobs=[{id:`job-${i}`,answer:`${i}:`+'z'.repeat(3000+(i%700))}];fs.writeSync(fd,JSON.stringify(state)+'\n');}
+    fs.writeSync(fd,'{"jobs":[{"id":"torn"');fs.closeSync(fd);
+    const size=fs.statSync(path).size,chunk=16384;
+    const real=realFs();let maxRead=0,reads=0;
+    const spy={...real,readSync:(f,b,o,l,p)=>{reads++;maxRead=Math.max(maxRead,l);return real.readSync(f,b,o,l,p);}};
+    const j=new Journal(path,{fs:spy,chunkBytes:chunk});
+    assert.ok(reads>size/chunk,`streamed in ${reads} reads`);
+    // Only the last complete record (one state) is ever materialised, never the file.
+    assert.ok(maxRead<=Math.max(chunk,4000),`largest single read ${maxRead} bytes of a ${size}-byte file`);
+    assert.equal(j.state.jobs[0].id,'job-2999','last complete record wins; torn append discarded');
+    assert.deepEqual(j.migrated,{records:3000,torn:true});
+    const text=readFileSync(path,'utf8');
+    assert.equal(text.split('\n').filter(Boolean).length,1);assert.ok(text.endsWith('\n'));
+    // Restart after migration is idempotent: same state, no further rewrite.
+    const again=new Journal(path);assert.equal(again.state.jobs[0].id,'job-2999');assert.equal(again.migrated,undefined);
+    // A record spanning many chunks is reassembled exactly.
+    const big={jobs:[{id:'big',answer:'q'.repeat(100000)}],days:{}};
+    fs.writeFileSync(path,JSON.stringify({jobs:[],days:{}})+'\n'+JSON.stringify(big)+'\n');
+    assert.deepEqual(new Journal(path,{chunkBytes:1000}).state,big);
+    // Corrupt last complete record still fails startup.
+    fs.writeFileSync(path,JSON.stringify(big)+'\nbad\n');assert.throws(()=>new Journal(path,{chunkBytes:1000}));
+  } finally {rmSync(dir,{recursive:true});}
+});
+
+// Run 2 #8: a permanently refused collect (buyer pre-collect review refused binary files) looped.
+const refusal='collect: job lifecycle input: review: permanent input error (unsupported_input); changed binary/non-UTF-8 files, symlinks and submodules are not supported; retrying unchanged input cannot help; correct the input or update the reviewer before explicitly retrying';
+test('collect: a permanent review refusal is recorded once, never retried or paid; seller released; planner sees it',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  const orig=f.io.mcp;f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);throw Error(refusal);}return orig(t,a);};
+  f.setPlan(()=>({wait:true}));
+  for(let t=101;t<=140;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,1,'collect is attempted exactly once');
+  const j=f.journal.state.jobs[0];
+  assert.equal(j.done,true);assert.equal(j.outcome,'collect refused');assert.match(j.collectRefused,/permanent input error/);
+  assert.equal(j.pay,undefined,'nothing paid');
+  const r=f.inputs.at(-1).results[0];assert.equal(r.outcome,'collect refused');assert.match(r.collectRefused,/unsupported_input/);assert.match(r.answer,/not paid/);
+  assert.equal(reports.filter(m=>m.includes('permanently refused')).length,1);
+  // The seller is free in this runner: once the projection frees it (deadline passed) it gets new work.
+  f.snap.jobs=[{id:j.id,seller:'a',result:{},accepted:false,running:false}];f.setPlan(assignments);f.time(141);await f.runner.tick();
+  assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
+});
+test('collect: transient failures keep retrying with a bounded doubling backoff, then collect once',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  let fail=4;const orig=f.io.mcp;
+  f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);if(fail-->0)throw Error('collect: review: timeout; next step blocked; retry available; retry the same collect or accept operation (no new job needed)');}return orig(t,a);};
+  f.setPlan(()=>({wait:true}));
+  const attempts=[];
+  for(let t=101;t<=300;t++){f.time(t);const before=f.calls.filter(([x])=>x==='collect').length;await f.runner.tick();if(f.calls.filter(([x])=>x==='collect').length>before)attempts.push(t);}
+  assert.deepEqual(attempts,[101,111,131,171,251],'retries at +10, +20, +40, +80 s');
+  const j=f.journal.state.jobs[0];assert.equal(j.done,true);assert.equal(j.outcome,'collected');assert.equal(j.collectRetryAt,undefined);
+  assert.equal(reports.filter(m=>m.includes('collect failed (attempt')).length,4);
+  // The delay doubles from 10 s and is capped at 600 s (bounded, never gives up on transient errors).
+  const mod=await import('./swarm.mjs');
+  assert.deepEqual([1,2,3,4,5,6,7,8,50].map(n=>mod.collectRetryDelay(n)),[10,20,40,80,160,320,600,600,600]);
+  assert.equal(mod.COLLECT_RETRY_MAX_SECONDS,600);
+});
+
+// Run 2 #10: the runner republished a closed challenge as in_progress.
+test('close: a buyer close during a slow tick is never overwritten; journaled; restart publishes nothing',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  // The relay: the latest buyer-signed challenge (the sidecar's read) changes when anyone publishes.
+  let relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>structuredClone(relay);
+  f.io.publish=async(ch,budget,status,update,result)=>{f.publishes.push([ch,budget,status,update,result]);relay={...relay,status,update,result};};
+  f.setPlan(()=>({wait:true}));f.time(200);await f.runner.tick();
+  assert.equal(f.publishes.at(-1)[2],'in_progress','first progress update');
+  // Next progress tick: the snapshot is read at tick start (in_progress), then the planner runs
+  // for minutes; the operator closes the challenge meanwhile. The reader has not seen it.
+  f.setPlan(input=>{if(input.mode==='assign'){relay={...relay,status:'completed',update:'closed by operator'};f.time(500);}return {wait:true};});
+  f.time(400);const before=f.publishes.length;await f.runner.tick();
+  assert.equal(f.publishes.length,before,'no publish after the buyer close');
+  assert.equal(relay.status,'completed');assert.equal(relay.update,'closed by operator');
+  const day=Object.values(f.journal.state.days)[0];
+  assert.deepEqual(day.stop,{external:true});assert.equal(day.closed.status,'completed');
+  assert.ok(reports.some(m=>m.includes('already completed on the relays')));
+  // Restart with the same journal while the reader still shows in_progress: still nothing.
+  for(const t of [700,800,950]){f.time(t);await new Swarm(f.c,f.io,f.journal).tick();}
+  assert.equal(f.publishes.length,before);assert.equal(relay.status,'completed');
+  assert.equal(posts(f).length,0,'and no new work');
+});
+test('close: the runner never turns a cancel into completed, never moves status backwards, and a failed read publishes nothing',async()=>{
+  // Its own solved stop while the buyer cancelled: the cancel stands.
+  const f=fixture();let relay={...structuredClone(f.snap.challenge),budgetSats:10,status:'cancelled'};
+  f.io.latestChallenge=async()=>structuredClone(relay);
+  f.setPlan(()=>({solved:true,result:'answer'}));await f.runner.tick();
+  assert.equal(f.publishes.length,0);const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.published,true);assert.equal(day.stop.supersededBy,'cancelled');
+  await f.runner.tick();assert.equal(f.publishes.length,0);
+  // A stale scheduled snapshot never moves the relay's in_progress back; buyer fields come from the read.
+  const g=fixture();g.snap.challenge.status='scheduled';g.snap.challenge.starts=50;
+  g.io.latestChallenge=async()=>({...structuredClone(g.snap.challenge),status:'in_progress',title:'renamed',budgetSats:7,result:''});
+  g.setPlan(()=>({wait:true}));g.time(200);await g.runner.tick();
+  assert.equal(g.publishes.at(-1)[2],'in_progress');assert.equal(g.publishes.at(-1)[0].title,'renamed');assert.equal(g.publishes.at(-1)[1],7);
+  // An unreadable latest challenge: no publish (fail closed); the completion is retried later.
+  const h=fixture();h.io.latestChallenge=async()=>{throw Error('relay read incomplete');};
+  h.setPlan(()=>({solved:true,result:'answer'}));await assert.rejects(h.runner.tick(),/relay read incomplete/);
+  assert.equal(h.publishes.length,0);assert.equal(Object.values(h.journal.state.days)[0].published,undefined);
+  h.io.latestChallenge=async()=>({...structuredClone(h.snap.challenge),budgetSats:10});await h.runner.tick();
+  assert.equal(h.publishes.at(-1)[2],'completed');assert.equal(h.publishes.at(-1)[4],'answer');
+});
+
+// Run 2 #4: the trade reader stalled with no CLOSED and the runner logged nothing about why.
+test('relay health: timer-driven change log + 60 s heartbeat with last-frame age, even while a tick is blocked',async t=>{
+  const {startRelayHealthLog,RELAY_HEALTH_HEARTBEAT_MS}=await import('./swarm.mjs');
+  t.mock.timers.enable({apis:['setInterval','Date']});
+  const relay=(role,url,o={})=>({role,url,connected:true,authenticated:role==='trade',historyComplete:true,error:null,warnings:[],...o});
+  const d={status:{connected:true,authenticated:true,historyComplete:true,error:null,warnings:[],failedRelays:[],relays:[relay('trade','ws://trade'),relay('challenge','ws://c1')]},
+    sockets:{'ws://trade':{readyState:1,sockets:1,lastMessageAt:0,messages:5},'ws://c1':{readyState:1,sockets:1,lastMessageAt:0,messages:2}}};
+  const logs=[];const h=startRelayHealthLog(()=>structuredClone(d),m=>logs.push([Date.now(),m]));
+  assert.equal(logs.length,3,'initial state logged: overall + each relay');
+  // A tick that never returns (slow planner) cannot block this: nothing here calls tick().
+  const blockedTick=new Promise(()=>{});void blockedTick;
+  t.mock.timers.tick(30000);assert.equal(logs.length,3,'no change, no heartbeat yet');
+  // The trade feed goes silent and readiness drops: logged within one check interval.
+  d.status.relays[0].historyComplete=false;d.status.relays[0].error='Relay history timed out';d.status.historyComplete=false;
+  t.mock.timers.tick(5000);
+  const changes=logs.slice(3);
+  assert.ok(changes.some(([,m])=>m.startsWith('Relay change: relay trade ws://trade')&&m.includes('historyComplete=false')&&m.includes('"Relay history timed out"')));
+  assert.ok(changes.some(([,m])=>m.startsWith('Relay change: relay overall')));
+  assert.ok(!changes.some(([,m])=>m.includes('ws://c1')),'unchanged relays are not repeated on change');
+  // Heartbeat: every relay, with its last-frame age, once per minute.
+  const n=logs.length;t.mock.timers.tick(RELAY_HEALTH_HEARTBEAT_MS);
+  const beats=logs.slice(n).filter(([,m])=>m.startsWith('Relay heartbeat'));
+  assert.equal(beats.length,3);
+  assert.ok(beats.some(([,m])=>m.includes('ws://trade')&&/lastMessage=9\ds ago/.test(m)&&m.includes('messages=5')),beats.map(b=>b[1]).join('\n'));
+  h.stop();const after=logs.length;t.mock.timers.tick(300000);assert.equal(logs.length,after,'stopped');
+});
+test('relay health: openSnapshot records per-relay socket activity through the reader without changing readiness',async t=>{
+  const {openSnapshot}=await import('./relay-snapshot.mjs');
+  const sockets=[];
+  class Fake extends EventTarget {readyState=0;sent=[];constructor(url){super();this.url=url;sockets.push(this);}send(d){this.sent.push(d);}close(){this.readyState=3;this.dispatchEvent(new Event('close'));}}
+  let clock=1000;const src=openSnapshot({url:'ws://trade',challengeRelays:['ws://c1'],buyer:'b'.repeat(64),WebSocketImpl:Fake,clock:()=>clock});
+  t.after(()=>src.stop());
+  assert.deepEqual(sockets.map(s=>s.url).sort(),['ws://c1','ws://trade']);
+  const trade=sockets.find(s=>s.url==='ws://trade');trade.readyState=1;trade.dispatchEvent(new Event('open'));
+  clock=4000;trade.dispatchEvent(new MessageEvent('message',{data:'["NOTICE","x"]'}));
+  const d=src.diagnostics();
+  assert.equal(d.sockets['ws://trade'].lastMessageAt,4000);assert.equal(d.sockets['ws://trade'].messages,1);assert.equal(d.sockets['ws://trade'].readyState,1);
+  assert.equal(d.sockets['ws://c1'].lastMessageAt,null);
+  assert.equal(d.status.relays.length,2);assert.equal(d.status.connected,false,'readiness still comes only from the reader');
+});
+test('close: without a direct relay read the publish guard re-reads a fresh snapshot, not the tick-start one',async()=>{
+  const f=fixture();delete f.io.latestChallenge;
+  f.setPlan(input=>{if(input.mode==='assign')f.snap.challenge.status='cancelled';return {wait:true};});
+  f.time(200);await f.runner.tick();
+  assert.equal(f.publishes.length,0,'the cancel seen by the fresh read stops the progress publish');
+  assert.equal(Object.values(f.journal.state.days)[0].closed.status,'cancelled');
+});
+test('close: the latest-challenge read passes the sidecar status its required --buyer and the exact id',async()=>{
+  const {latestChallengeArgs}=await import('./swarm.mjs');
+  assert.deepEqual(latestChallengeArgs(['ws://a','ws://b'],{buyer:'f'.repeat(64),id:'day-1'}),
+    ['status','--relay','ws://a','--relay','ws://b','--buyer','f'.repeat(64),'--challenge','day-1','--json']);
+});
+
+// Advisor r1 #1: the runner's status read was in_progress, the close landed before the sidecar's own
+// pre-publish fetch, and the sidecar refused (exit 3). The refusal is a close: journaled, nothing more.
+test('close: a sidecar "challenge closed" publish refusal is journaled as the buyer close; nothing more is published',async()=>{
+  const {closedRefusal,SIDECAR_CLOSED_EXIT}=await import('./swarm.mjs');
+  const refusal=Object.assign(Error('maxplayer-challenges exited 3: challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published'),
+    {exitCode:SIDECAR_CLOSED_EXIT,stderr:'challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published\n'});
+  assert.equal(closedRefusal(refusal),'cancelled');
+  assert.equal(closedRefusal({...refusal,exitCode:2}),null,'only the dedicated exit code counts');
+  assert.equal(closedRefusal(Object.assign(Error('x'),{exitCode:3,stderr:'challenge: relay read incomplete'})),null);
+  for(const kind of ['progress','completion']) {
+    const f=fixture(),reports=[];f.io.report=m=>reports.push(m);let attempts=0;
+    // The runner's read still says in_progress; the sidecar's own fetch sees the cancel and refuses.
+    f.io.publish=async(...a)=>{attempts++;f.calls.push(['publish',a]);return {closed:'cancelled'};};
+    f.setPlan(kind==='progress'?()=>({wait:true}):()=>({solved:true,result:'answer'}));
+    f.time(200);await f.runner.tick();
+    assert.equal(attempts,1,kind);
+    const day=Object.values(f.journal.state.days)[0];
+    assert.equal(day.closed.status,'cancelled',kind);
+    if(kind==='progress')assert.deepEqual(day.stop,{external:true});
+    else {assert.equal(day.published,true);assert.equal(day.stop.supersededBy,'cancelled');}
+    assert.ok(reports.some(m=>m.includes('already cancelled on the relays')),kind);
+    const postsBefore=posts(f).length;
+    for(const t of [400,600,900]){f.time(t);await f.runner.tick();}
+    assert.equal(attempts,1,`${kind}: never published again`);
+    assert.equal(posts(f).length,postsBefore,`${kind}: no new work after the close`);
+  }
+});
+test('close: progress passes the latest read status through unchanged (never the tick-start snapshot status)',async()=>{
+  const f=fixture();f.snap.challenge.status='in_progress';
+  f.io.latestChallenge=async()=>({...structuredClone(f.snap.challenge),status:'scheduled',budgetSats:10});
+  f.setPlan(()=>({wait:true}));f.time(200);await f.runner.tick();
+  assert.equal(f.publishes.at(-1)[2],'scheduled','the relay status is re-sent as read');
+});
+// Advisor r1 #2: lastUpdate was saved before the publish, so a failed re-read waited a full updateEvery.
+test('progress: a failed latest-challenge read is retried after a short backoff; a cancel seen then is journaled, nothing published',async()=>{
+  const f=fixture();let fail=true,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>{if(fail){fail=false;throw Error('challenge relay read incomplete');}return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.lastUpdate,0,'interval not restarted by a failed publish');
+  assert.equal(day.progressRetryAt,230,'retried after a short backoff, not a full updateEvery');
+  relay={...relay,status:'cancelled'};f.time(230);await f.runner.tick();
+  assert.equal(f.publishes.length,0);assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
+  // A successful progress publish does restart the interval.
+  const g=fixture();g.setPlan(()=>({wait:true}));g.time(200);await g.runner.tick();
+  assert.equal(g.publishes.length,1);assert.equal(Object.values(g.journal.state.days)[0].lastUpdate,200);
+  g.time(250);await g.runner.tick();assert.equal(g.publishes.length,1,'next progress waits updateEvery');
+});
+test('journal: a failed save removes its temp file; the durable record is untouched',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-tmp-')),path=join(dir,'events.jsonl');
+  try {
+    const j=new Journal(path);j.state.jobs.push({id:'kept'});j.save();
+    const fs=realFs();
+    for(const fault of ['fsyncSync','renameSync','writeSync']) {
+      const bad=new Journal(path,{fs:{...fs,[fault]:()=>{throw Object.assign(Error(fault),{code:'EIO'});}}});
+      bad.state.jobs.push({id:fault});assert.throws(()=>bad.save(),e=>e.journalFailure===true);
+      assert.equal(process.getBuiltinModule('node:fs').existsSync(`${path}.tmp`),false,`${fault}: temp removed`);
+      assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept']);
+    }
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('collect: a permanent refusal after long stderr is still recognised; the recorded reason starts at the marker',async()=>{
+  const {permanentCollectRefusal,collectFailureReason}=await import('./swarm.mjs');
+  const message=`node exited 1: ${'warning: noisy stderr line\n'.repeat(40)}{"isError":true,"content":[{"type":"text","text":"${refusal}"}]}`;
+  assert.ok(message.indexOf('review: permanent input error')>500);
+  assert.ok(permanentCollectRefusal(message));
+  assert.ok(collectFailureReason(message).startsWith('review: permanent input error (unsupported_input)'));
+  assert.ok(collectFailureReason(message).length<=500);
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  const orig=f.io.mcp;f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);throw Error(message);}return orig(t,a);};
+  f.setPlan(()=>({wait:true}));for(let t=101;t<=140;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,1);
+  assert.equal(f.journal.state.jobs[0].outcome,'collect refused');
+  assert.match(f.journal.state.jobs[0].collectRefused,/^review: permanent input error/);
+  // Not permanent: timeouts keep their full prefix text.
+  assert.equal(collectFailureReason('collect: review: timeout'),'collect: review: timeout');
+});
+test('relay health: a tick that is both a change and a heartbeat says so',async t=>{
+  const {startRelayHealthLog}=await import('./swarm.mjs');
+  t.mock.timers.enable({apis:['setInterval','Date']});
+  const d={status:{connected:true,authenticated:true,historyComplete:true,error:null,warnings:[],failedRelays:[],relays:[]},sockets:{}};
+  const logs=[];const h=startRelayHealthLog(()=>structuredClone(d),m=>logs.push(m),{checkMs:5000,heartbeatMs:60000});
+  assert.match(logs[0],/^Relay change \+ heartbeat: relay overall/);
+  t.mock.timers.tick(55000);d.status.error='x';t.mock.timers.tick(5000);
+  assert.match(logs.at(-1),/^Relay change \+ heartbeat: .*error="x"/);
+  h.stop();
+});
+// Advisor r2 #1: a progress re-read that hangs until the command timeout must not occupy every tick.
+test('progress: a re-read that hangs past its timeout does not hold back-to-back ticks; collects keep cadence; a later cancel is journaled',async()=>{
+  const {PROGRESS_RETRY_SECONDS}=await import('./swarm.mjs');
+  // One job whose deadline (t=600) outlives the hang, so it is still being collected after it.
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.snap.sellers[0].minutesRemaining=10;f.c.maxDuration=600;
+  f.setPlan(input=>({assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'piece',durationSeconds:500}))}));
+  await f.runner.tick();const job=[...f.remote.values()][0];
+  assert.equal(f.journal.state.jobs[0].args.deadline_unix,600);
+  let reads=0,hang=true,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  // A hung `status`: the command runs 120 s (the clock moves), then fails with the timeout.
+  f.io.latestChallenge=async()=>{reads++;if(hang){f.time(f.io.now()+120);throw Error('Command timed out');}return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));
+  f.time(200);await assert.rejects(f.runner.tick(),/timed out/);
+  assert.equal(reads,1);const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.progressRetryAt,320+PROGRESS_RETRY_SECONDS,'backoff counts from the failure, after the hang');
+  // Next ticks at the poll cadence: no re-read, and a delivered result is collected at once.
+  job.results=[{}];const collects=()=>f.calls.filter(([t])=>t==='collect').length;
+  for(const t of [325,330,335,340,345]){f.time(t);await f.runner.tick();}
+  assert.equal(reads,1,'no re-read inside the backoff (no back-to-back hangs)');
+  assert.equal(collects(),1,'collect ran on the first tick after the hang');
+  // The relay recovers and the buyer has cancelled: the retry journals the close, publishes nothing.
+  hang=false;relay={...relay,status:'cancelled'};f.time(350);await f.runner.tick();
+  assert.equal(reads,2);assert.equal(f.publishes.length,0);
+  assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
+});
+// Advisor r3 #1: the backoff gate used the tick-start clock, so a tick whose planner call crossed
+// progressRetryAt skipped the re-read until the end of the NEXT planner call.
+test('progress: a backoff that expires during the planner call re-reads in that same tick',async()=>{
+  const f=fixture();let reads=0,fail=true,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>{reads++;if(fail)throw Error('challenge relay read incomplete');return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  const day=Object.values(f.journal.state.days)[0];assert.equal(day.progressRetryAt,230);assert.equal(reads,1);
+  // The tick starts 1 s before the backoff ends; the planner call takes 5 s and crosses it.
+  fail=false;relay={...relay,status:'cancelled'};
+  let planned=0;f.setPlan(()=>{planned++;f.time(234);return {wait:true};});
+  f.time(229);await f.runner.tick();
+  assert.ok(planned>0,'the planner ran in this tick');
+  assert.equal(reads,2,'the same tick re-reads after the planner call crossed the backoff');
+  assert.equal(f.publishes.length,0);assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
+  // lastUpdate still comes from tick-start now on a successful progress publish.
+  const g=fixture();g.setPlan(()=>{g.time(205);return {wait:true};});g.time(200);await g.runner.tick();
+  assert.equal(g.publishes.length,1);assert.equal(Object.values(g.journal.state.days)[0].lastUpdate,200);
+});
+// Advisor r4 #1: a publish reached only because a long planner call crossed the backoff stamped
+// lastUpdate with the tick-start sample, so the next fast tick published again.
+test('progress: a publish after the planner crosses the backoff stamps lastUpdate with the live clock; no double publish',async()=>{
+  const f=fixture();f.c.updateEvery=60;let fail=true;
+  f.io.latestChallenge=async()=>{if(fail)throw Error('challenge relay read incomplete');return {...structuredClone(f.snap.challenge),budgetSats:10};};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  const day=Object.values(f.journal.state.days)[0];assert.equal(day.progressRetryAt,230);
+  // Tick starts inside the backoff (229); a 61 s assign call ends at 290, past both the backoff and updateEvery.
+  fail=false;f.setPlan(()=>{f.time(290);return {wait:true};});f.time(229);await f.runner.tick();
+  assert.equal(f.publishes.length,1);assert.equal(day.lastUpdate,290);assert.equal(day.progressRetryAt,undefined);
+  f.setPlan(()=>({wait:true}));f.time(295);await f.runner.tick();
+  assert.equal(f.publishes.length,1,'the next fast tick publishes nothing');
+  f.time(350);await f.runner.tick();assert.equal(f.publishes.length,2,'next progress one updateEvery after 290');
+});
+test('progress: a backward clock step during the planner cannot suppress a re-read the tick-start sample earned',async()=>{
+  const f=fixture();let fail=true,reads=0,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>{reads++;if(fail)throw Error('challenge relay read incomplete');return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  fail=false;relay={...relay,status:'cancelled'};
+  f.setPlan(()=>{f.time(200);return {wait:true};});f.time(231);await f.runner.tick();
+  assert.equal(reads,2,'re-read despite the clock stepping back below progressRetryAt');
+  const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.closed.status,'cancelled');assert.equal(f.publishes.length,0);
 });
