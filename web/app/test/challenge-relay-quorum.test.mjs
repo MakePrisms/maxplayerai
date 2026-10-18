@@ -122,3 +122,34 @@ test('real WebSocket: stop while the TCP connection never completes the handshak
   await pause(100);
   assert.equal(reader.status.connected,false);assert.equal(reader.dead,true);
 });
+
+// Advisor r1 H1: a routine multi-filter poll of a relay that already finished its round must not
+// count that relay as missing. All three up: degraded never set. One relay down: aggregate
+// historyComplete (and relayReady) never drops while the two live relays are polled.
+async function pollRounds(t,{down}) {
+  const seen=[];
+  const reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a','ws://b','ws://c'],buyer,store:new EventStore(),WebSocketImpl:Socket,queueMs:1,pollMs:20,
+    onChange:()=>{if(reader?.status&&ready)seen.push({complete:reader.status.historyComplete,degraded:reader.status.degraded,quorum:reader.status.quorum.complete});}});
+  let ready=false;
+  reader.start();t.after(()=>reader.stop());
+  for(const r of [reader.trade,...reader.challenges])r.ws.dispatchEvent(new Event('open'));
+  tradeUp(reader);
+  const live=down?reader.challenges.slice(0,2):reader.challenges;
+  for(const r of live)finish(r);
+  if(down)reader.challenges[2].ws.close();
+  assert.equal(reader.status.historyComplete,true);assert.equal(reader.status.degraded,!!down);
+  ready=true;
+  for(let round=0;round<3;round++) {
+    // A poll round in flight on every live relay: several trusted filters pending at once.
+    await until(()=>live.every(r=>[...r.pages.keys()].filter(id=>/^\d+$|^roster-/.test(id)).length>=2));
+    assert.equal(reader.status.historyComplete,true,`round ${round}: poll in flight`);
+    assert.equal(reader.status.degraded,!!down);assert.equal(relayReady(snap(reader)),true);
+    // EOSE one filter at a time, so the first EOSE's onChange fires while the others are pending.
+    for(const r of live)for(const id of [...r.pages.keys()])r.ws.message(['EOSE',id]);
+    finish(reader.trade);
+  }
+  assert.ok(seen.length>0);
+  assert.deepEqual(seen.filter(s=>!s.complete||s.degraded!==!!down||s.quorum!==live.length),[],'no dip during any poll');
+}
+test('H1: polls of finished relays never set degraded while all three are up',t=>pollRounds(t,{down:false}));
+test('H1: with one relay down, polls of the two live relays never drop aggregate readiness',t=>pollRounds(t,{down:true}));
