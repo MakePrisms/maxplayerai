@@ -1,4 +1,5 @@
 import { OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE, MEMBERSHIP, DECISION } from '../../model/kinds.ts';
+import { servingFromTags } from '../../model/serving.mjs';
 import {boundMembership,membershipNote,verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode,challengeTaskPrefix} from './events.mjs';
 const latest = (events,key) => { const map=new Map(); for(const e of events) if(newer(e,map.get(key(e)))) map.set(key(e),e); return [...map.values()]; };
 const ascending = (a,b) => a.created_at-b.created_at || a.id.localeCompare(b.id);
@@ -98,8 +99,10 @@ export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=
     let name=''; try { const p=JSON.parse(profile?.content??'{}'); name=typeof p.display_name==='string'?p.display_name:typeof p.name==='string'?p.name:''; } catch {}
     const beat=latest(trade.filter(e=>e.kind===HEARTBEAT&&e.pubkey===app.pubkey&&tag(e,'d')==='maxplayer-seller'),e=>e.pubkey)[0];
     const capabilities=beat?.tags.filter(t=>['agents','harness_family','harness_model','capabilities','harness_variant','hardware','rate','takes_payment'].includes(t[0]))??[];
+    // R3-2: the newest beat's serving statement. No beat or no tag ⇒ 'unknown' (eligible as before).
+    const served=servingFromTags(beat?.tags);
     const state=tag(app,'status')==='left'?'left':decisionState==='denied'?'denied':running.length?(running.every(j=>j.result)?'awaiting acceptance':'working'):eligible&&own.length?'done':decisionState;
-    return {since:+tag(app,'since'),membershipStatus:tag(app,'status'),pubkey:app.pubkey,npub:npubEncode(app.pubkey),name,minutesOffered:offered,minutesUsed:used,minutesRemaining:offered-used,state,eligible,decision:decisionState,currentJobStart:running.length?Math.min(...running.map(j=>j.start)):null,capabilities,heartbeatAt:beat?.created_at??null,note:membershipNote(app),pastJobs:[...new Map([...priorJobs.filter(j=>j.seller===app.pubkey),...own.map(j=>({...j,challengeId:tag(c,'d')}))].filter(j=>!j.running).map(j=>[j.id,j])).values()]};
+    return {since:+tag(app,'since'),membershipStatus:tag(app,'status'),pubkey:app.pubkey,npub:npubEncode(app.pubkey),name,minutesOffered:offered,minutesUsed:used,minutesRemaining:offered-used,state,eligible,decision:decisionState,currentJobStart:running.length?Math.min(...running.map(j=>j.start)):null,capabilities,serving:served.count,servingState:served.state,heartbeatAt:beat?.created_at??null,note:membershipNote(app),pastJobs:[...new Map([...priorJobs.filter(j=>j.seller===app.pubkey),...own.map(j=>({...j,challengeId:tag(c,'d')}))].filter(j=>!j.running).map(j=>[j.id,j])).values()]};
   }).sort((a,b)=>a.npub.localeCompare(b.npub));
   return {asOf:now,applicants,challenge:{id:tag(c,'d'),eventId:c.id,buyer,buyerNpub:npubEncode(buyer),title:tag(c,'title'),goal:c.content,starts:+tag(c,'starts'),ends:+tag(c,'ends'),status:tag(c,'status'),result:tag(c,'result')??''},sellers,jobs,budget:{totalSats:+tag(c,'budget'),committedSats:jobs.filter(j=>!j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),paidSats:jobs.filter(j=>j.accepted).reduce((n,j)=>n+(j.amountSats??0),0),estimated:true,unknownAmounts:jobs.filter(j=>j.amountSats===null).length,note:'Estimates from awarded offer prices; ACCEPT authorises payment, not proof of settlement. Private payments and fees are not visible.'},updates:tag(c,'update')?[tag(c,'update')]:[]};
 }

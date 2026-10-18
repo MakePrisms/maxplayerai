@@ -10,6 +10,7 @@ import {
   ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, OFFER, PROFILE, RECEIPT,
   RESULT, SELF_TRADE_TAG, TRADE_STAGES, type Stage,
 } from "./kinds.js";
+import { servingFromTags } from "./serving.mjs";
 
 /** A raw NIP-01 event as the relay sends it. Untrusted input. */
 export interface RawEvent {
@@ -77,6 +78,9 @@ export interface ParsedEvent {
   version?: string | null;
   accepting?: string | null;
   queueDepth?: number | null;
+  /** R3-2 `["serving","a/n"]`, or null when the beat states none (unknown, never "not serving"). */
+  serving?: { available: number; configured: number } | null;
+  servingState?: "serving" | "not_serving" | "unknown";
   rateSats?: number | null;
   acceptedMints?: string[];
   harnessFamilies?: string[];
@@ -453,6 +457,9 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                version: firstTag(event, "v"),
                accepting: firstTag(event, "accepting"),
                queueDepth: firstNumber(event, "queue_depth"),
+               // R3-2: harnesses able to run a job now, out of those the seat resolved.
+               serving: servingFromTags(event.tags).count,
+               servingState: servingFromTags(event.tags).state,
                rateSats: firstNumber(event, "rate"),
                acceptedMints: tagValues(event, "accepted_mints"),
                agents: tagValues(event, "agents"),
