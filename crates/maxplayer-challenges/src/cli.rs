@@ -2889,6 +2889,39 @@ mod tests {
                 );
             }
 
+            /// Advisor r2: an entry past its age or attempt bound is not re-sent by the command
+            /// that expires it, even when the relay that missed it answers again.
+            #[tokio::test]
+            async fn expired_outbox_entry_is_not_resent_by_the_expiring_command() {
+                for (name, by_age) in [("expired-age", true), ("expired-attempts", false)] {
+                    let s = setup(name);
+                    let r = three(roster(&s)).await;
+                    r[2].online.store(false, Ordering::SeqCst);
+                    command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                        .await
+                        .unwrap();
+                    let mut outbox = Outbox::load(&s.home);
+                    let id = outbox.entries[0].event.id;
+                    if by_age {
+                        outbox.entries[0].queued_at =
+                            Timestamp::now().as_secs() - OUTBOX_MAX_AGE_SECS - 10;
+                    } else {
+                        for n in outbox.entries[0].missing.values_mut() {
+                            *n = OUTBOX_MAX_ATTEMPTS;
+                        }
+                    }
+                    outbox.save(&s.home).unwrap();
+                    r[2].online.store(true, Ordering::SeqCst);
+                    let status = format!("status --buyer {} --json", s.buyer);
+                    command(&s.home, &r, &status).await.unwrap();
+                    assert!(
+                        writes(&r[2]).iter().all(|e| e.id != id),
+                        "{name}: expired entry re-sent"
+                    );
+                    assert!(Outbox::load(&s.home).entries.is_empty(), "{name}");
+                }
+            }
+
             /// Advisor r1 H2: the buyer's acceptance is only on the relay that is down. The quorum
             /// decision read then shows "not accepted"; that must not skip the every-relay check.
             #[tokio::test]

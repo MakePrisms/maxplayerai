@@ -60,8 +60,9 @@ own trusted reads until delivered (an expired entry stops counting on the comman
 it). The file is not locked: two sidecar commands for the same home running at once can drop
 each other's outbox changes (best-effort repair only), so run one at a time.
 
-**Strict reads.** Two reads still need every relay: the challenge read before a minutes/note
-change during a running challenge (see below), and the pre-publish read of a `scheduled` or
+**Strict reads.** Three reads still need every relay: the challenge read before a minutes/note
+change during a running challenge (see below); while degraded, that change's decision read (an
+acceptance held only by the missing relay must not skip the challenge check); and the pre-publish read of a `scheduled` or
 `in_progress` update over an existing challenge while degraded (a close held only by the
 missing relay must never be overwritten; `completed`/`cancelled` publish at the quorum).
 History reads page like the web reader: each request carries `limit: 500`; a full page is

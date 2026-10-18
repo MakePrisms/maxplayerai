@@ -535,9 +535,11 @@ page still recovers (the filter is read again in full before it counts), a filte
 connection (initial read, a new roster chunk, a re-read after AUTH) still blocks readiness until it
 completes, and quorum / trade-relay-required readiness (#1170) is unchanged.
 
-A dead configured challenge relay blocks the runner on purpose: posting requires
-N-of-N complete history, and sidecar publishing requires N-of-N acknowledgements.
-A failed publish may already be stored on live relays; retry to repair coverage.
+Below the quorum the runner stops on purpose: posting requires complete history from
+the trade relay and at least `q` challenge relays (default 2 of 3), and a sidecar publish
+requires `q` acknowledgements. One dead relay at 2-of-3 only degrades (WARNING); events it
+missed are re-sent from the outbox once it answers. A publish that missed the quorum may
+already be stored on the relays that accepted it; retry to repair coverage.
 Remove a relay only after a successful read of it, or after a person has checked
 it contains no newer replaceable challenge, membership, or decision. Removing an
 unread relay can resurrect an old join or budget.

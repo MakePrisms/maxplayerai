@@ -591,10 +591,14 @@ impl Relays {
     /// `OUTBOX_MAX_AGE_SECS` per entry; idempotent: a relay already holding the event just
     /// acknowledges it again, and an acknowledged relay is removed from the entry.
     pub async fn resend(&self, home: &MaxplayerHome) {
+        let at = now();
         let mut outbox = Outbox::load(home);
         if outbox.entries.is_empty() {
             return;
         }
+        // Prune first, with the same `at` as after the sends: an entry past its age or attempt
+        // bound is never sent again, including on the command that expires it (advisor r2).
+        outbox.prune(at);
         let answered = self.report.lock().unwrap().answered.clone();
         let mut resent = Vec::new();
         for entry in &mut outbox.entries {
@@ -619,7 +623,7 @@ impl Relays {
                 }
             }
         }
-        outbox.prune(now());
+        outbox.prune(at);
         if let Err(e) = outbox.save(home) {
             eprintln!("Warning: could not save the challenge re-send outbox ({e})");
         }
