@@ -53,22 +53,54 @@ test('a forged signature is rejected every time, including for a cached id and p
   assert.equal(verify(e), true);
 });
 
-test(`cache stays within VERIFY_CACHE_LIMIT (${VERIFY_CACHE_LIMIT}) under a flood of unique events, evicting least recently used`, t => {
-  // Stub schnorr to "valid" so a flood larger than the cap is cheap; eventId is still real.
-  clearVerifyCache(); t.after(clearVerifyCache);
-  const calls = t.mock.method(schnorr, 'verify', () => true);
+// Distinct events with real ids, built once (schnorr is stubbed in the tests that use them).
+let bulk;
+function events(n) {
   const pubkey = pub(key), sig = 'cd'.repeat(64);
-  const make = n => { const e = { pubkey, kind: 1, created_at: n, tags: [], content: String(n), sig }; e.id = eventId(e); return e; };
-  const first = make(0), second = make(1);
-  verify(first); verify(second);
-  for (let n = 2; n < VERIFY_CACHE_LIMIT + 500; n++) {
-    if (n === VERIFY_CACHE_LIMIT - 100) verify(first); // refresh: most recently used
-    assert.equal(verify(make(n)), true);
-    assert.ok(verifyCacheSize() <= VERIFY_CACHE_LIMIT);
-  }
+  bulk ??= [];
+  for (let i = bulk.length; i < n; i++) { const e = { pubkey, kind: 1, created_at: i, tags: [], content: String(i), sig }; e.id = eventId(e); bulk.push(e); }
+  return bulk.slice(0, n);
+}
+function stubbed(t, random) {
+  clearVerifyCache(); t.after(clearVerifyCache);
+  if (random) t.mock.method(Math, 'random', random);
+  return t.mock.method(schnorr, 'verify', () => true);
+}
+const pass = (calls, list) => { const before = calls.mock.callCount(); for (const e of list) assert.equal(verify(e), true); return calls.mock.callCount() - before; };
+
+test(`cache stays within VERIFY_CACHE_LIMIT (${VERIFY_CACHE_LIMIT}) under a flood of unique events, replacing a random slot`, t => {
+  // Pin the random choice to the middle slot so the evicted entry is known.
+  const calls = stubbed(t, () => 0.5), list = events(VERIFY_CACHE_LIMIT + 500), mid = VERIFY_CACHE_LIMIT / 2;
+  for (const e of list) { assert.equal(verify(e), true); assert.ok(verifyCacheSize() <= VERIFY_CACHE_LIMIT); }
   assert.equal(verifyCacheSize(), VERIFY_CACHE_LIMIT);
   const count = calls.mock.callCount();
-  assert.equal(verify(first), true); assert.equal(calls.mock.callCount(), count, 'recently used entry survived');
-  assert.equal(verify(second), true); assert.equal(calls.mock.callCount(), count + 1, 'least recently used entry was evicted');
+  assert.equal(count, VERIFY_CACHE_LIMIT + 500);
+  // The oldest entry survives (no FIFO/LRU eviction), as does every unchosen slot.
+  for (const i of [0, 1, mid - 1, mid + 1, VERIFY_CACHE_LIMIT - 1, VERIFY_CACHE_LIMIT + 499]) assert.equal(verify(list[i]), true);
+  assert.equal(calls.mock.callCount(), count, 'only the randomly chosen slot was replaced');
+  assert.equal(verify(list[mid]), true);
+  assert.equal(calls.mock.callCount(), count + 1, 'the chosen slot\'s entry was evicted');
   assert.equal(verifyCacheSize(), VERIFY_CACHE_LIMIT);
+});
+
+// Review r1 F1: with LRU, a stable re-scan of cap+1 events missed every entry on every pass.
+for (const [name, random] of [['first slot', () => 0], ['last slot', () => 0.999999]]) {
+  test(`a second pass over VERIFY_CACHE_LIMIT + 1 events costs exactly 2 schnorr checks, not cap+1 (random choice pinned to the ${name})`, t => {
+    const calls = stubbed(t, random), list = events(VERIFY_CACHE_LIMIT + 1);
+    assert.equal(pass(calls, list), VERIFY_CACHE_LIMIT + 1, 'first pass verifies everything');
+    // One entry was displaced by the last insert: re-verifying it displaces one more, which the
+    // pass then re-verifies too when it is still ahead (both pinned choices hit that case).
+    assert.equal(pass(calls, list), 2, 'second pass of cap+1');
+    assert.equal(pass(calls, list), 2, 'third pass of cap+1');
+    assert.equal(verifyCacheSize(), VERIFY_CACHE_LIMIT);
+  });
+}
+
+test('repeated passes over VERIFY_CACHE_LIMIT + 1 events stay near e-1 schnorr checks per pass with real randomness', t => {
+  const calls = stubbed(t), list = events(VERIFY_CACHE_LIMIT + 1);
+  pass(calls, list);
+  let total = 0;
+  for (let i = 0; i < 3; i++) total += pass(calls, list);
+  // Expected ~3 * (e - 1) ≈ 5.2; LRU would be 3 * (cap + 1).
+  assert.ok(total < 100, `3 re-passes cost ${total} schnorr checks`);
 });

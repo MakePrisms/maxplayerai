@@ -13,26 +13,36 @@ export const mentions = (e, pk) => e.tags.some(t => t[0] === 'p' && t[1] === pk)
 export const newer = (a,b) => !b || a.created_at > b.created_at || (a.created_at === b.created_at && a.id < b.id);
 export function eventId(e) { return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([0,e.pubkey,e.created_at,e.kind,e.tags,e.content])))); }
 // Schnorr verification is pure JS (~1-2 ms per event). Readers re-read their poll overlap every
-// interval and verify each frame twice (relay ingest, then EventStore.add), so a day of history
-// pinned a runner at 99% CPU (run 2, issue #12). Successful verifications are cached:
+// interval, re-read full history on every reconnect, and verify each frame twice (relay ingest,
+// then EventStore.add), so a day of history pinned a runner at 99% CPU (run 2, issue #12).
+// Successful verifications are cached:
 // - key = id + pubkey + sig (fixed-length lowercase hex, checked before the lookup, so the
 //   concatenation is unambiguous) — exactly the inputs schnorr.verify(sig,id,pubkey) checks;
 // - the id is ALWAYS recomputed from the event (eventId) before the lookup, so a hit can only
 //   accept an event whose canonical serialization hashes to the id whose signature was checked;
 //   changed content/tags/kind/created_at/pubkey with a reused id+sig still fails;
 // - failures are never cached (a forged signature is re-checked and rejected every time);
-// - bounded LRU of VERIFY_CACHE_LIMIT keys (~256-char strings, a few MB at the cap): a relay
-//   flooding unique valid events can only evict older entries, never grow the cache.
-export const VERIFY_CACHE_LIMIT = 20000;
-const verified = new Set();
-export const verifyCacheSize = () => verified.size;
-export const clearVerifyCache = () => verified.clear();
+// - at most VERIFY_CACHE_LIMIT keys, process-wide (every relay of a reader shares them; the same
+//   event on several relays is one key). A re-read costs one hash per event, with no Schnorr
+//   check, only while the distinct verified events fit. Measured ~0.4 KB of retained heap per
+//   entry (Node 24: 8.2 MB at 20,000, 40.4 MB at 100,000); a relay flooding unique valid events
+//   can replace entries but never grow the cache. 100,000 is ~20,000 jobs' lifecycle events
+//   (offer/claim/award/result/accept) plus challenge/roster events; past it, see below.
+// - RANDOM replacement when full, no reordering on a hit. LRU (or FIFO) turns a stable re-scan
+//   of cap+1 events into 100% misses: each miss evicts the key the scan needs next. Random
+//   replacement degrades gracefully instead: a repeated scan of cap+1 events pays about 2 Schnorr
+//   checks per pass (e-1 on average), and a repeated scan of 1.5x the cap still hits ~40%.
+export const VERIFY_CACHE_LIMIT = 100000;
+const verified = new Set(), slots = []; // same keys; slots gives O(1) random choice
+export const verifyCacheSize = () => slots.length;
+export const clearVerifyCache = () => { verified.clear(); slots.length = 0; };
 function signatureValid(e) {
   const key = e.id + e.pubkey + e.sig;
-  if (verified.has(key)) { verified.delete(key); verified.add(key); return true; }
+  if (verified.has(key)) return true;
   if (!schnorr.verify(e.sig, e.id, e.pubkey)) return false;
-  verified.add(key);
-  if (verified.size > VERIFY_CACHE_LIMIT) verified.delete(verified.values().next().value);
+  let slot = slots.length;
+  if (slot >= VERIFY_CACHE_LIMIT) { slot = Math.floor(Math.random() * slots.length); verified.delete(slots[slot]); }
+  slots[slot] = key; verified.add(key);
   return true;
 }
 export function verify(e) {
