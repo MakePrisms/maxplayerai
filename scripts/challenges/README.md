@@ -223,7 +223,17 @@ next save truncates it) and stops the runner.
 Journals written by older runners (one appended copy per save; run 2 reached 649 MB) are migrated
 on startup: the file is scanned in 1 MiB chunks, never read as one string, the last complete record
 is kept (a torn final append is discarded) and rewritten as one record. A corrupt last complete
-record fails startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
+record fails startup. **The legacy file itself is kept unchanged (R3-5)**: it is the audit history
+(every task, answer and receipt over time), so before the rewrite it is preserved as
+`events.jsonl.legacy-<UTC timestamp>` (e.g. `events.jsonl.legacy-20261018T160000Z`) by a hard link
+(same inode: instant, no extra disk for a GB-sized file), or, where links are unsupported, by a
+chunked copy that is fsynced and renamed into place; the directory is fsynced before the journal
+is replaced. Startup logs `Migrated legacy append journal (N records…) to one record; the legacy
+file is kept unchanged at <path>`. A crash between keeping and rewriting leaves the journal still
+in the legacy format; the next start finds the kept file (same inode, or same size for a copy) and
+reuses it, and a partial copy (`….tmp`) from a crash during the copy is discarded, so a migration
+never leaves two copies. A migrated journal is one record and is never migrated again. The kept
+file is never read by the runner; archive or delete it yourself once you no longer need it. `flock` (util-linux) prevents simultaneous runners on the same home; locks
 release on process exit. `flock` is required on every OS; macOS does not ship it
 (`brew install flock`), and a missing `flock` is reported as such. `flock` and the locked runner
 run in their own process group under the launched process and read a pipe the parent holds, so a

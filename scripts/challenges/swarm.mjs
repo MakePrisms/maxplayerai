@@ -4,7 +4,7 @@ import { parseChallengeRelays, parseChallengeQuorum } from '../../web/app/src/ch
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, linkSync, readdirSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
@@ -233,9 +233,20 @@ export const MIN_EXPIRED_SLOT_GRACE_SECONDS = SELLER_EXECUTION_TAIL_SECONDS + SL
 // (never read as one string), the last complete record is authoritative (earlier records are
 // superseded copies; a torn final append was never acknowledged), and it is rewritten atomically
 // as a single record. A corrupt LAST complete record still fails startup.
+// R3-5: the legacy file is the audit history (every task, answer and receipt over time), so it is
+// KEPT, never rewritten: before the rewrite it is hard-linked (same inode, no copy of a GB-sized
+// file; a chunked copy + fsync + rename where links are unsupported) to
+// <journal>.legacy-<UTC timestamp>, and the directory is fsynced; only then is the journal
+// replaced. A crash between the two leaves the journal still legacy and the kept file in place: the
+// next open finds that file (same inode, or same size for a copy) and reuses it, so a migration
+// never produces a second kept copy. After the rewrite the journal is one record, so it is never
+// migrated again. `migrated.legacyPath` names the kept file; the runner logs it.
 export const JOURNAL_CHUNK_BYTES = 1<<20;
+export const legacyJournalName = (path,ms) => `${path}.legacy-${new Date(ms).toISOString().replace(/[-:]/g,'').replace(/\.\d+Z$/,'Z')}`;
 export class Journal {
-  constructor(path,{fs={openSync,readSync,writeSync,fsyncSync,closeSync,renameSync,unlinkSync,fstatSync},chunkBytes=JOURNAL_CHUNK_BYTES}={}) {
+  constructor(path,{fs={},chunkBytes=JOURNAL_CHUNK_BYTES,now=Date.now}={}) {
+    // Injected fs functions override node:fs ones; anything not injected is the real one.
+    fs={openSync,readSync,writeSync,fsyncSync,closeSync,renameSync,unlinkSync,fstatSync,linkSync,readdirSync,statSync,...fs};
     this.path=path; this.fs=fs; this.state={jobs:[],days:{}};
     let fd;try{fd=fs.openSync(path,'r');}catch(e){if(e.code!=='ENOENT')throw e;}
     if(fd===undefined)return;
@@ -264,7 +275,36 @@ export class Journal {
       }
     } finally {fs.closeSync(fd);}
     // Legacy append journal (several records) or a torn tail: rewrite as one atomic record.
-    if(records>1||torn){this.migrated={records,torn};this.save();}
+    if(records>1||torn){this.migrated={records,torn,legacyPath:this.keepLegacy(chunkBytes,now)};this.save();}
+  }
+  // R3-5: keep the legacy journal before it is replaced (see above). Returns the kept path.
+  keepLegacy(chunkBytes,now) {
+    const {fs,path}=this,dir=dirname(path),base=path.slice(dir.length+1);
+    const cur=fs.statSync(path);
+    // A partial copy from a crashed earlier attempt was never renamed into place; the journal is
+    // still the untouched legacy original, so the partial copy is discarded.
+    for(const name of fs.readdirSync(dir).filter(n=>n.startsWith(`${base}.legacy-`)&&n.endsWith('.tmp')))fs.unlinkSync(join(dir,name));
+    // An earlier, interrupted migration of this same file already kept it: reuse that copy.
+    for(const name of fs.readdirSync(dir).filter(n=>n.startsWith(`${base}.legacy-`)&&!n.endsWith('.tmp')).sort()) {
+      const st=fs.statSync(join(dir,name));
+      if((st.ino===cur.ino&&st.dev===cur.dev)||st.size===cur.size)return join(dir,name);
+    }
+    const syncDir=()=>{let d;try{d=fs.openSync(dir,'r');fs.fsyncSync(d);}catch(e){if(!['EINVAL','EPERM','EISDIR','ENOTSUP'].includes(e.code))throw e;}finally{if(d!==undefined)fs.closeSync(d);}};
+    let target=legacyJournalName(path,now());
+    for(let n=1;;n++) {
+      try{fs.statSync(target);}catch(e){if(e.code==='ENOENT')break;throw e;}
+      target=`${legacyJournalName(path,now())}-${n}`;
+    }
+    try {fs.linkSync(path,target);syncDir();return target;}
+    catch(e) {if(!['EPERM','ENOTSUP','EOPNOTSUPP','EXDEV','EMLINK','ENOSYS'].includes(e.code))throw e;}
+    // No hard links here: a chunked copy, fsynced, then renamed into place (never a partial copy).
+    const tmp=`${target}.tmp`,buf=Buffer.alloc(chunkBytes);let src,dst;
+    try {
+      src=fs.openSync(path,'r');dst=fs.openSync(tmp,'w',0o600);
+      for(let pos=0;;) {const n=fs.readSync(src,buf,0,chunkBytes,pos);if(!n)break;for(let o=0;o<n;)o+=fs.writeSync(dst,buf,o,n-o);pos+=n;}
+      fs.fsyncSync(dst);
+    } finally {if(src!==undefined)fs.closeSync(src);if(dst!==undefined)fs.closeSync(dst);}
+    fs.renameSync(tmp,target);syncDir();return target;
   }
   save() {
     const {fs}=this,tmp=`${this.path}.tmp`;let fd,renamed=false;
@@ -959,6 +999,7 @@ async function main() {
   const buyer=identity.match(/pubkey: ([0-9a-f]{64})/)?.[1];
   if(!buyer)throw Error('Cannot identify configured buyer');
   const journal=new Journal(join(c.home,'swarm/events.jsonl'));
+  if(journal.migrated)console.error(new Date().toISOString(),`Migrated legacy append journal (${journal.migrated.records} records${journal.migrated.torn?', torn final append discarded':''}) to one record; the legacy file is kept unchanged at ${journal.migrated.legacyPath}`);
   let relayCoverage;
   source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,quorum:c.challengeQuorum,buyer,onChange:s=>{
     const line=relayCoverageLine(s.relay);

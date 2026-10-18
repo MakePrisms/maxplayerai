@@ -1084,7 +1084,8 @@ test('journal: a large legacy append journal is streamed in chunks (never one st
     // Only the last complete record (one state) is ever materialised, never the file.
     assert.ok(maxRead<=Math.max(chunk,4000),`largest single read ${maxRead} bytes of a ${size}-byte file`);
     assert.equal(j.state.jobs[0].id,'job-2999','last complete record wins; torn append discarded');
-    assert.deepEqual(j.migrated,{records:3000,torn:true});
+    assert.deepEqual({records:j.migrated.records,torn:j.migrated.torn},{records:3000,torn:true});
+    assert.equal(fs.statSync(j.migrated.legacyPath).size,size,'legacy file kept (R3-5)');
     const text=readFileSync(path,'utf8');
     assert.equal(text.split('\n').filter(Boolean).length,1);assert.ok(text.endsWith('\n'));
     // Restart after migration is idempotent: same state, no further rewrite.
@@ -1661,4 +1662,48 @@ test('R3-2: N consecutive unclaimed expiries bench a seller for a cooldown; the 
   await k.runner.tick();
   assert.ok(k.journal.state.bench?.a?.until>kt,'the only seller is benched');
   assert.equal(Object.values(k.journal.state.days)[0].stop,undefined,kr.join('\n'));
+});
+
+// R3-5 (round 3): the migration rewrote a 1.27 GB legacy append journal in place, discarding the audit history.
+test('R3-5: migration keeps the legacy journal as events.jsonl.legacy-<timestamp> (link, or copy), reuses it after a crash, never migrates twice',async()=>{
+  const {legacyJournalName}=await import('./swarm.mjs');
+  const fs=process.getBuiltinModule('node:fs');
+  const legacy=dir=>fs.readdirSync(dir).filter(n=>n.includes('.legacy-')).sort();
+  const write=(path,n)=>{const lines=[];for(let i=0;i<n;i++)lines.push(JSON.stringify({jobs:[{id:`job-${i}`}],days:{}}));fs.writeFileSync(path,lines.join('\n')+'\n{"torn":');return fs.readFileSync(path);};
+  const at=Date.UTC(2026,9,18,16,0,0),crash=()=>{throw Object.assign(Error('crash'),{code:'EIO'});};
+  assert.equal(legacyJournalName('/h/events.jsonl',at),'/h/events.jsonl.legacy-20261018T160000Z');
+  for(const mode of ['link','copy']) {
+    const dir=mkdtempSync(join(tmpdir(),`swarm-r35-${mode}-`)),path=join(dir,'events.jsonl');
+    const noLink=mode==='copy'?{linkSync:()=>{throw Object.assign(Error('no links'),{code:'EPERM'});}}:{};
+    try {
+      // 1. Migration keeps the legacy file byte for byte and logs (returns) its path.
+      const original=write(path,50);
+      const j=new Journal(path,{now:()=>at,chunkBytes:64,fs:noLink});
+      assert.equal(j.state.jobs[0].id,'job-49');
+      assert.equal(j.migrated.legacyPath,join(dir,'events.jsonl.legacy-20261018T160000Z'));
+      assert.deepEqual(legacy(dir),['events.jsonl.legacy-20261018T160000Z'],`${mode}: one kept file, no temp`);
+      assert.deepEqual(fs.readFileSync(j.migrated.legacyPath),original,'legacy history kept byte for byte');
+      assert.equal(fs.readFileSync(path,'utf8').split('\n').filter(Boolean).length,1,'journal is one record');
+      // 2. Never migrated twice: a one-record journal is not migrated, nothing new is kept.
+      assert.equal(new Journal(path,{now:()=>at+5000,fs:noLink}).migrated,undefined);assert.equal(legacy(dir).length,1);
+      // 3. Crash AFTER the legacy file was kept, BEFORE the journal rewrite: the reopen reuses that kept file.
+      fs.rmSync(path);const second=write(path,20);
+      const failSave={...noLink,renameSync:(a,b)=>{if(b===path)crash();return fs.renameSync(a,b);}};
+      assert.throws(()=>new Journal(path,{now:()=>at+1000,fs:failSave}),e=>e.journalFailure===true);
+      assert.deepEqual(fs.readFileSync(path),second,'journal untouched by the crashed migration');
+      assert.deepEqual(legacy(dir),['events.jsonl.legacy-20261018T160000Z','events.jsonl.legacy-20261018T160001Z']);
+      const reopened=new Journal(path,{now:()=>at+2000,fs:noLink});
+      assert.equal(reopened.migrated.legacyPath,join(dir,'events.jsonl.legacy-20261018T160001Z'),'reused, no second copy');
+      assert.equal(legacy(dir).length,2);assert.deepEqual(fs.readFileSync(reopened.migrated.legacyPath),second);
+      // 4. Copy mode only: a crash DURING the copy leaves a partial temp; the reopen discards it.
+      if(mode==='copy') {
+        fs.rmSync(path);const third=write(path,10);let writes=0;
+        assert.throws(()=>new Journal(path,{now:()=>at+3000,chunkBytes:64,fs:{...noLink,writeSync:(...a)=>{if(++writes>2)crash();return fs.writeSync(...a);}}}));
+        assert.ok(legacy(dir).some(n=>n.endsWith('.tmp')),'partial copy left by the crash');
+        const r=new Journal(path,{now:()=>at+4000,chunkBytes:64,fs:noLink});
+        assert.ok(!legacy(dir).some(n=>n.endsWith('.tmp')),'partial copy discarded');
+        assert.equal(legacy(dir).length,3);assert.deepEqual(fs.readFileSync(r.migrated.legacyPath),third);
+      }
+    } finally {rmSync(dir,{recursive:true});}
+  }
 });
