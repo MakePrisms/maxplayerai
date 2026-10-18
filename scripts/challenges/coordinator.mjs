@@ -4,8 +4,22 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const nonnegative = n => Number.isFinite(n) && n >= 0;
-// Exactly the relay_not_ready condition: connected, authenticated, complete, no error/failed relay.
-export const relayReady = snapshot => !!(snapshot.relay?.connected && snapshot.relay?.authenticated && snapshot.relay?.historyComplete && !snapshot.relay?.error && !snapshot.relay?.failedRelays?.length);
+// Our trade relay alone: connected, authenticated, history complete, no error. Required for every
+// read the runner trusts and before every challenge publish, whatever the challenge quorum says.
+export const tradeReady = snapshot => {
+  const r = snapshot.relay, t = r?.relays?.find(x => x.role === 'trade') ?? r;
+  return !!(t?.connected && t?.authenticated && t?.historyComplete && !t?.error);
+};
+// Exactly the relay_not_ready condition: connected, authenticated, complete, no error, our trade
+// relay ready, and the challenge relay quorum met (run 2 #13). Quorum met with a relay missing
+// (degraded) is ready. A snapshot without quorum fields (older reader) needs every relay.
+export const relayReady = snapshot => {
+  const r = snapshot.relay;
+  if (!(r?.connected && r?.authenticated && r?.historyComplete && !r?.error && tradeReady(snapshot))) return false;
+  if (r.relays && r.failedRelays?.includes(r.relays.find(x => x.role === 'trade')?.url)) return false;
+  if (r.quorum === undefined) return !r.failedRelays?.length;
+  return Number.isSafeInteger(r.quorum?.required) && r.quorum.required >= 1 && Number.isSafeInteger(r.quorum.complete) && r.quorum.complete >= r.quorum.required;
+};
 // Freshness of a snapshot at `now`: the exact stale_snapshot rule (taken at or before now, at most 5 s old).
 export const snapshotFresh = (snapshot, now) => Number.isSafeInteger(snapshot?.asOf) && now >= snapshot.asOf && now - snapshot.asOf <= 5;
 // Reasons that only say "this read cannot be trusted yet", never anything about the assignment.

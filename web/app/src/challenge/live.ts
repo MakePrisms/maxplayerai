@@ -8,7 +8,7 @@ export interface Snapshot {
   challenge: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: Challenge['status']; result: string }|null;
   sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
-  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; warnings?: string[]; applicantsIncomplete?: boolean };
+  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; missingRelays?: string[]; degraded?: boolean; quorum?: {required: number; complete: number; total: number}; warnings?: string[]; applicantsIncomplete?: boolean };
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);
 // Fail closed on malformed snapshots; never put remote text into HTML.

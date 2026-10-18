@@ -56,9 +56,9 @@ const RECOVERING='Recovering after relay CLOSED';
 // a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,
-    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,filters=challengeFilters(buyer),
+    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,filters=challengeFilters(buyer),
     roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey()}) {
-    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,readsRoster:roster,readsMetadata:metadata,applicants});
+    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,readsRoster:roster,readsMetadata:metadata,applicants});
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
     this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
@@ -114,7 +114,7 @@ export class RelayReader {
     if(this.dead)return;
     this.dead=true;this.closedStreak++;this.lastClosed=error;
     Object.assign(this.status,{error,historyComplete:false,authenticated:false});
-    this.onChange();this.ws.close();
+    this.onChange();this.closeSocket();
   }
   // Something needs AUTH (a challenge, or an auth-required refusal). If it neither completes nor is
   // refused within authWaitMs: while recovering, or when trusted history was refused for lack of
@@ -148,6 +148,21 @@ export class RelayReader {
     this.live=new Map(); this.liveSub=new Map(); this.liveGen=new Map(); this.closing=new Set();
     this.dead=false; this.authRefused=null; this.challenged=false; this.authReason=null; this.holdExpired=false;
     const ws=this.ws=new this.WebSocketImpl(this.url);
+    // Every teardown goes through close() and ends the connection exactly once (end()), without
+    // waiting for the socket's own close event. Node 22's WebSocket, closed while still CONNECTING,
+    // dispatches 'error' synchronously from close() and never dispatches 'close': the old
+    // error -> ws.close() handler recursed until the stack overflowed, and a connect timeout could
+    // never reach the reconnect. `closing` stops the re-entry; end() is idempotent, so a late close
+    // event (Node 24) is ignored.
+    let closing=false,ended=false,timeout;
+    const end=()=>{
+      if(ended)return;ended=true;
+      clearTimeout(timeout);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.dead=true;
+      this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.onChange();
+      if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,this.closedStreak?this.closedMaxRetryMs:this.maxRetryMs);}
+    };
+    const close=()=>{if(!closing){closing=true;try{ws.close();}catch{}}end();};
+    this.closeSocket=close;
     const send=frame=>{if(ws.readyState===1){ws.send(JSON.stringify(frame));if(frame[0]==='CLOSE')this.closing.add(frame[1]);}};
     // Once AUTH is expected, live REQs wait for its outcome: an anonymous live REQ would only be
     // replaced (or refused) after AUTH OK. History pages go out at once either way.
@@ -162,9 +177,9 @@ export class RelayReader {
       const late=[...this.pages].filter(([,p])=>p.sentAt&&Date.now()-p.sentAt>20000);
       // A silent display-only read truncates that display; never the trusted history.
       for(const [id] of late)if(soft(id)){this.softFailure(id);this.updateComplete();this.onChange();}
-      if(late.some(([id])=>!soft(id))){this.status.error='Relay history timed out';ws.close();}
+      if(late.some(([id])=>!soft(id))){this.status.error='Relay history timed out';close();}
       else if(this.liveLate())this.recover('Relay live subscription timed out (no EOSE within 20s)');},this.queueMs);
-    const timeout=setTimeout(()=>ws.close(),20000);
+    timeout=setTimeout(close,this.connectMs);
     this.pollTimer=setInterval(()=>{
       // Finish the entire trusted round before polling again, including member profiles.
       // Otherwise a large history can keep refilling faster than it drains.
@@ -176,6 +191,7 @@ export class RelayReader {
       if(this.applicants&&!this.pages.has(APPLICANTS))this.pageApplicants();
     },this.pollMs);
     ws.addEventListener('open',()=>{
+      if(ended)return; // closed while connecting (stop, connect timeout): never a live round
       // A CLOSED-driven reconnect keeps its backoff until the recovered connection settles.
       clearTimeout(timeout);this.status.connected=true;if(!this.closedStreak)this.retry=this.retryMs;this.opened=true;
       // History must work even if AUTH is absent or explicitly refused.
@@ -303,12 +319,8 @@ export class RelayReader {
         this.onChange();
       }
     });
-    ws.addEventListener('error',()=>ws.close());
-    ws.addEventListener('close',()=>{
-      clearTimeout(timeout);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.dead=true;
-      this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.onChange();
-      if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,this.closedStreak?this.closedMaxRetryMs:this.maxRetryMs);}
-    });
+    ws.addEventListener('error',close);
+    ws.addEventListener('close',end);
   }
   // Accepted sellers (buyer-signed decisions only) drive roster membership reads and
   // profile/heartbeat reads. Re-subscribes whenever the accepted set changes.
@@ -352,12 +364,29 @@ export class RelayReader {
   page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
   pageApplicants() {const filter=applicantFilter(this.buyer);this.pages.set(APPLICANTS,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',APPLICANTS,{...filter,limit:APPLICANT_LIMIT}]);}
   clearRecoveryTimers(){clearTimeout(this.authTimer);this.authTimer=null;clearTimeout(this.holdTimer);this.holdTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
-  stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.ws?.close();}
+  stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.closeSocket?.();}
 }
 
 // Canonical hostname denylist; the Rust sidecar reads this JSON literal at compile time.
 export const CHALLENGE_RELAY_DENYLIST = ["relay.maxplayer.ai"];
 export const DEFAULT_CHALLENGE_RELAYS = ['wss://nos.lol','wss://relay.primal.net','wss://offchain.pub'];
+// Challenge relay quorum (run 2 #13): how many challenge relays must complete a read, and must
+// acknowledge a publish (sidecar), for it to count. The same number is used for both, and it must
+// be a strict majority of the configured relays: every quorum read then shares at least one relay
+// with every quorum publish, so a read still sees every published leave, deny or close as long as
+// that shared relay does not hide it. Default 2 (for the three default relays), raised to a
+// majority for longer lists and lowered to the list size for one relay. Our trade relay is never
+// part of the quorum and is always required on top of it.
+export const DEFAULT_CHALLENGE_QUORUM = 2;
+export const majority = n => Math.floor(n/2)+1;
+export function parseChallengeQuorum(value,relayCount) {
+  if(!Number.isSafeInteger(relayCount)||relayCount<1)throw Error('At least one challenge relay is required');
+  if(value===undefined||value===null||value==='')return Math.min(relayCount,Math.max(DEFAULT_CHALLENGE_QUORUM,majority(relayCount)));
+  const q=typeof value==='number'?value:/^[0-9]+$/.test(String(value).trim())?Number(String(value).trim()):NaN;
+  if(!Number.isSafeInteger(q)||q<majority(relayCount)||q>relayCount)
+    throw Error(`Invalid challenge relay quorum ${JSON.stringify(String(value))}: must be an integer from ${majority(relayCount)} (a majority) to ${relayCount} (every relay)`);
+  return q;
+}
 export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
   const urls=[...new Set((Array.isArray(value)?value:value.split(',')).map(url=>url.trim()).filter(Boolean))];
   if(!urls.length)throw Error('At least one challenge relay is required');
@@ -373,27 +402,43 @@ export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
 // The accepted roster is recomputed from the shared store whenever a buyer decision arrives
 // on any relay and pushed to every reader (roster memberships + trade metadata).
 export class ChallengeReader {
-  constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...options}) {
+  constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...rest}) {
+    // quorum: challenge relays that must complete (default: parseChallengeQuorum). The rest are RelayReader options.
+    const {quorum,...options}=rest;
     const filters=challengeFilters(buyer);
     const onRoster=()=>{const accepted=acceptedSellers(store.events.values(),buyer);for(const r of [this.trade,...this.challenges])r.setRoster(accepted);};
     const common={...options,buyer,store,onChange,onRoster};
     this.store=store;
     this.trade=new RelayReader({...common,url,roster:false,metadata:true,applicants:false,filters:filters.filter(f=>!CHALLENGE_KINDS.includes(f.kinds[0]))});
-    this.challenges=parseChallengeRelays(challengeRelays).map(url=>new RelayReader({...common,url,roster:true,metadata:false,applicants:true,
+    const urls=parseChallengeRelays(challengeRelays);
+    this.quorum=parseChallengeQuorum(quorum,urls.length);
+    this.challenges=urls.map(url=>new RelayReader({...common,url,roster:true,metadata:false,applicants:true,
       filters:filters.filter(f=>CHALLENGE_KINDS.includes(f.kinds[0]))}));
   }
+  // Ready (historyComplete) needs our trade relay complete AND at least `quorum` challenge relays
+  // complete. The store unions every relay's events, so a relay that is still connected keeps
+  // contributing. Below quorum, or with the trade relay incomplete, the view is never ready: the
+  // runner posts and publishes nothing. Quorum met with a relay missing is "degraded": ready, with a
+  // visible warning (page, runner log) naming the missing relays.
   get status() {
     const relays=[{role:'trade',url:this.trade.url,...this.trade.status},...this.challenges.map(r=>({role:'challenge',url:r.url,...r.status}))];
     const available=this.challenges.filter(r=>r.status.connected&&!r.status.error);
-    const ready=available.length===this.challenges.length&&available.every(r=>r.status.historyComplete);
+    const complete=available.filter(r=>r.status.historyComplete);
+    const missingRelays=this.challenges.filter(r=>!complete.includes(r)).map(r=>r.url);
+    const quorum={required:this.quorum,complete:complete.length,total:this.challenges.length};
+    const quorumMet=complete.length>=this.quorum,degraded=quorumMet&&missingRelays.length>0;
     const failedRelays=relays.filter(r=>!r.connected||r.error).map(r=>r.url);
+    const degradedWarning=`Degraded: ${complete.length} of ${quorum.total} challenge relays complete (quorum ${this.quorum}); missing: ${missingRelays.join(', ')}`;
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
-      historyComplete:this.trade.status.historyComplete&&ready,
-      warnings:[...new Set(relays.flatMap(r=>r.warnings))],
+      historyComplete:this.trade.status.historyComplete&&quorumMet,
+      warnings:[...new Set([...relays.flatMap(r=>r.warnings),...(degraded?[degradedWarning]:[])])],
       // Display only; never part of readiness or the runner's exhaustion stop.
       applicantsIncomplete:this.challenges.some(r=>r.status.applicantsIncomplete)||!!this.store.applicantsTruncated,
-      error:this.trade.status.error??(failedRelays.length?`Challenge history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
+      // An error only once the quorum cannot be met by the relays still up (a relay still catching
+      // up is not a failure; historyComplete stays false meanwhile).
+      error:this.trade.status.error??(available.length<this.quorum?`Challenge history incomplete; quorum not met (${available.length} of ${quorum.total} challenge relays available, need ${this.quorum}); relay failed: ${failedRelays.filter(u=>u!==this.trade.url).join(', ')}`:null),
+      failedRelays,missingRelays,quorum,degraded,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}
   stop(){this.trade.stop();for(const r of this.challenges)r.stop();}

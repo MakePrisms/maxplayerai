@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const HELP: &str = "Usage: maxplayer-challenges <command> [--home <path>] [--json] [--relay URL ...]
+const HELP: &str = "Usage: maxplayer-challenges <command> [--home <path>] [--json] [--relay URL ...] [--quorum N]
   join --buyer <npub|hex> --minutes <1..480> [--note <text>]
   status --buyer <npub|hex> [--challenge <d>]
   leave --buyer <npub|hex>
@@ -18,6 +18,10 @@ Membership and acceptance persist across days. Minutes are offered per day.
 Status/members default to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
 Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://relay.primal.net, wss://offchain.pub.
 Repeat --relay URL after the command to override. ws:// is loopback-only; relay.maxplayer.ai is forbidden.
+Reads and publishes need a quorum of relays: --quorum N (default 2, at least a majority of the relays
+and at most all of them). Quorum met with a relay missing is degraded: a warning on stderr and in
+--json (relay_quorum), and the event is re-sent unchanged to that relay once it answers again.
+A minutes/note change during a running challenge still needs every relay.
 Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 ";
 /// A publish refused because the challenge is already closed on the relays exits with
@@ -51,6 +55,7 @@ struct Opts {
     values: BTreeMap<String, String>,
     json: bool,
     relays: Vec<String>,
+    quorum: Option<usize>,
 }
 impl Opts {
     fn get(&self, k: &str) -> Option<&str> {
@@ -86,11 +91,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         values: BTreeMap::new(),
         json: false,
         relays: Vec::new(),
+        quorum: None,
     };
     let mut i = 1;
     while i < args.len() {
         let k = args[i].as_str();
-        if !allowed.contains(&k) && !["--home", "--json", "--relay"].contains(&k) {
+        if !allowed.contains(&k) && !["--home", "--json", "--relay", "--quorum"].contains(&k) {
             return Err("unknown challenge option".into());
         }
         let v = if ["--accept", "--deny", "--json"].contains(&k) {
@@ -104,6 +110,14 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         };
         if k == "--relay" {
             o.relays.push(v);
+            i += 1;
+            continue;
+        }
+        if k == "--quorum" {
+            let q = v.parse::<usize>().map_err(|_| "invalid --quorum")?;
+            if o.quorum.replace(q).is_some() {
+                return Err("duplicate --quorum".into());
+            }
             i += 1;
             continue;
         }
@@ -166,6 +180,19 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             Ok((body, warning)) => {
                 if let Some(warning) = warning {
                     let _ = writeln!(err, "Warning: {warning}");
+                }
+                // Degraded quorum (met, with a relay missing) and re-sends: always on stderr, and
+                // in --json as `relay_quorum`.
+                let quorum = &body["relay_quorum"];
+                for w in quorum["warnings"].as_array().into_iter().flatten() {
+                    let _ = writeln!(err, "Warning: {}", w.as_str().unwrap_or_default());
+                }
+                for r in quorum["resent"].as_array().into_iter().flatten() {
+                    let _ = writeln!(
+                        err,
+                        "Re-sent missed event {}",
+                        r.as_str().unwrap_or_default()
+                    );
                 }
                 if opts.json {
                     let _ = writeln!(out, "{body}");
@@ -283,6 +310,9 @@ fn select_challenge(
         .map(|(_, c)| c)
         .ok_or_else(|| "challenge not found or not verified for this buyer".into())
 }
+/// Runs the command, then re-sends queued events to relays that answered in this run (also after a
+/// refusal: the queued events already met quorum when they were published), and reports the
+/// relay quorum (degraded warnings, missing relays, re-sends) in the JSON body.
 async fn execute_async(
     o: &Opts,
     home: &maxplayer_core::home::MaxplayerHome,
@@ -290,7 +320,33 @@ async fn execute_async(
     if o.command == "join" && o.get("--note").unwrap_or("").encode_utf16().count() > 4096 {
         return Err("join note exceeds 4096 UTF-16 code units (reader limit)".into());
     }
-    let relay = crate::relay::Relays::new(&o.relays)?;
+    let relay = crate::relay::Relays::with_quorum(&o.relays, o.quorum)?;
+    let result = command_async(o, home, &relay).await;
+    relay.resend(home).await;
+    let (body, warning) = result?;
+    let report = relay.take_report();
+    let (required, total) = relay.quorum();
+    let mut body = body;
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "relay_quorum".into(),
+            serde_json::json!({
+                "required": required,
+                "total": total,
+                "degraded": !report.warnings.is_empty(),
+                "warnings": report.warnings,
+                "missing": report.missing,
+                "resent": report.resent,
+            }),
+        );
+    }
+    Ok((body, warning))
+}
+async fn command_async(
+    o: &Opts,
+    home: &maxplayer_core::home::MaxplayerHome,
+    relay: &crate::relay::Relays,
+) -> Result<(serde_json::Value, Option<String>), String> {
     use maxplayer_core::challenge::*;
     use nostr_sdk::prelude::*;
     use serde_json::json;
@@ -501,10 +557,11 @@ async fn execute_async(
                 .iter()
                 .any(|d| d.seller == own && d.decision == "accepted");
             if accepted {
-                // Strict every-relay read. Keep it strict even if ordinary reads move to a
-                // quorum: the relay left out could be the only one holding the running challenge.
+                // Strict every-relay read, not the quorum read: a challenge published to a bare
+                // quorum is on only some relays, and the relay left out could be the only one
+                // holding the running challenge (then this would publish a forfeiting replacement).
                 let challenges = relay
-                    .fetch(
+                    .fetch_all(
                         home,
                         Filter::new()
                             .author(public_key(&buyer)?)
