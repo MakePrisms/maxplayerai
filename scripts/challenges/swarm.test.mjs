@@ -877,15 +877,17 @@ test('parent death: a clean stop exits 0 promptly and frees the lock (grace time
 // Advisor r2 F1: e2e.py (and a process-group supervisor) stops the runner with killpg. flock was in
 // the parent's group, died on that SIGTERM, and the parent exited 1 at once while the locked runner
 // still held the lock (~900 ms), so an immediate restart hit flock -n and exited 1.
+// The signal lands during an in-flight MCP call (2 s), so the runner really holds the lock for a
+// while after it: a parent that exits before flock has reaped the runner is caught.
 test('stop: a process-group SIGTERM keeps the parent alive until the lock is free, then exits 0',{skip:!require_flock()},async t=>{
-  const r=await lockedRunner(t,{poll:30,detached:true});
-  await new Promise(res=>setTimeout(res,1500));
+  const r=await lockedRunner(t,{poll:30,detached:true,mcp:'sleep 2; exit 0'});
+  assert.ok(await r.until(r.mcpStarted,10000),'MCP call started');
   assert.equal(r.lockFree(),false,'lock held while the runner lives');
   const stopped=Date.now();process.kill(-r.parent.pid,'SIGTERM');
   const out=await r.result(15000);
   assert.equal(out.code,0,`exit code after killpg; ${r.stderr()}`);
   assert.equal(out.lockFreeAtExit,true,'parent exited while the runner still held the lock');
-  assert.ok(out.at-stopped<4000,`stopped in ${out.at-stopped} ms`);
+  assert.ok(out.at-stopped>=1000&&out.at-stopped<10000,`stopped in ${out.at-stopped} ms (after the in-flight call, before any grace)`);
 });
 // Advisor r2 F1: a parent-only SIGTERM during an MCP call longer than the 5 s parent-gone grace
 // hit the grace kill (exit 1). A stop request lets the in-flight call finish, then exits 0.
