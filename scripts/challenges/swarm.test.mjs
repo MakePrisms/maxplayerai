@@ -1389,3 +1389,12 @@ test('progress: a backward clock step during the planner cannot suppress a re-re
   const day=Object.values(f.journal.state.days)[0];
   assert.equal(day.closed.status,'cancelled');assert.equal(f.publishes.length,0);
 });
+test('R3-2: a not-serving seller gets no assignment and does not count as exhausted',async()=>{
+  const f=fixture();f.snap.sellers[0].servingState='not_serving';f.snap.sellers[0].serving={available:0,configured:1};
+  await f.runner.tick();
+  const posted=f.calls.filter(x=>x[0]==='post_job').map(x=>x[1].seller_pubkey);
+  assert.deepEqual(posted,['b'],'only the serving seller is assigned');
+  // Every seller out of work except the not-serving one: waiting for it to re-probe is not exhaustion.
+  const g=fixture();g.setPlan(()=>({wait:true}));g.snap.sellers[0].servingState='not_serving';g.snap.sellers[1].minutesRemaining=.1;
+  await g.runner.tick();assert.ok(!g.publishes.some(p=>/exhausted/.test(p[3]??'')),'a temporarily not-serving seller is not exhausted');
+});

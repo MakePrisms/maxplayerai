@@ -29,7 +29,11 @@ export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 30
   const sellers = (snapshot.sellers ?? []).filter(s => s.eligible === true && s.decision === 'accepted' && !['left','denied'].includes(s.state) && nonnegative(s.minutesRemaining) && s.minutesRemaining > 0 && !pending.has(s.pubkey) && !(snapshot.jobs ?? []).some(j => j.seller === s.pubkey && j.running) && s.currentJobStart == null).map(s => {
     const deadlineUnix = now + durationSeconds;
     const fits = durationSeconds <= s.minutesRemaining * 60;
-    return { seller_pubkey:s.pubkey, remainingMinutes:s.minutesRemaining, deadlineUnix, postingAllowed:reasons.length === 0 && fits, reasons:fits ? [...reasons] : [...reasons,'insufficient_minutes'] };
+    // R3-2: a seller whose newest heartbeat says it can run nothing (status=not_serving or
+    // serving=0/N) is not assigned work. Absent/unknown stays eligible, exactly as before.
+    const notServing = s.servingState === 'not_serving' || s.serving?.available === 0;
+    const own = [...(fits ? [] : ['insufficient_minutes']), ...(notServing ? ['seller_not_serving'] : [])];
+    return { seller_pubkey:s.pubkey, remainingMinutes:s.minutesRemaining, deadlineUnix, postingAllowed:reasons.length === 0 && own.length === 0, reasons:[...reasons, ...own] };
   }).sort((a,b) => a.seller_pubkey.localeCompare(b.seller_pubkey));
   return { asOf:now, challengeId:c?.id ?? null, budgetHeadroomSats:headroom, budgetSource:budgetState ? 'buyer' : 'public_estimate', amountSats, durationSeconds, postingAllowed:reasons.length === 0 && sellers.some(s => s.postingAllowed), reasons, sellers };
 }
