@@ -115,7 +115,9 @@ or finalizes a lapsed job. The minimum is therefore that 420 s tail plus a 60 s 
 and the default leaves three minutes after the kill. Within those documented clocks a freed seller
 does not have two executing jobs. One residual is not bounded by any grace: libgit2's delta search
 during a push ignores the push deadline, so a pathological pack can keep the old job's push alive
-longer. A delivery
+longer. After the container kill, the seller's `docker logs` capture (before `docker rm`) has no
+deadline either: a short capture fits the margin, but a container with a huge log can still be
+capturing at `deadline + 480 s` (the default 600 leaves about three minutes). A delivery
 published late is still payable in core (the claim is `delivered` for 7 days after delivery), so if
 one appears the runner collects it exactly once and its reservation becomes the paid amount;
 otherwise the sats stay reserved until release is proven. Minutes are unchanged: the shared
@@ -212,10 +214,17 @@ reasons. Sequence-derived request IDs are permanent; a lost response is recovere
 preparation lookup before any retry. Torn final journal records are discarded; corrupt complete
 records fail startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
 release on process exit. `flock` is required on every OS; macOS does not ship it
-(`brew install flock`), and a missing `flock` is reported as such. The locked runner is a child
-of the launched process and reads a pipe the parent holds: when the parent exits for any reason
-(including `SIGKILL` or launchd `kickstart -k`) or receives SIGINT/SIGTERM, the runner stops
-ticking, kills its in-flight planner/MCP commands after 5 seconds, exits and releases the lock.
+(`brew install flock`), and a missing `flock` is reported as such. `flock` and the locked runner
+run in their own process group under the launched process and read a pipe the parent holds, so a
+process-group signal (Ctrl-C, `kill -TERM -<pgid>`, a supervisor) reaches only the parent:
+- **First SIGINT/SIGTERM to the parent:** the runner starts no new tick, cuts its poll sleep
+  short, lets the in-flight tick (e.g. a `collect`) finish and exits 0. The parent stays alive
+  until `flock` has reaped the runner and exits with its code, so the lock is already free when
+  the parent's exit is observed and an immediate restart starts cleanly. A genuinely hung tick is
+  killed after 100 seconds (above the 90 s MCP call timeout) and the runner exits 1.
+- **Parent gone** (any exit, including `SIGKILL` or launchd `kickstart -k`), or a second signal:
+  the runner stops ticking, kills its in-flight planner/MCP commands after 5 seconds, exits and
+  releases the lock.
 A supervisor without systemd's `KillMode=control-group` (launchd) therefore restarts cleanly. Keep the journal and buyer state together across restarts/backups.
 Planner/MCP errors are logged and retried on the next polling cycle without changing posting
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
@@ -298,7 +307,8 @@ input still exceeds `SWARM_PLANNER_MAX_INPUT_CHARS`, the runner degrades in a fi
 fits: the newest answers become digests too (oldest first), then older answers are replaced by an
 `[truncated: answer omitted …]` marker (`answerOmitted:true`), then the oldest result entries are
 dropped (`history.resultsDropped`). Each dropped entry leaves one line in `history.droppedIndex`
-(`seller | outcome | ts <unix> | <n> answer chars`), which no later step removes. Seller-controlled
+(`seller | outcome | ts <unix> | <n> answer chars`; seller and outcome cut to 100/200 characters
+with control characters escaped, so each line is one line), which no later step removes. Seller-controlled
 and other non-result inputs are bounded before that, whatever the budget, so one huge string
 cannot make every later call fail: each profile's `trackRecord.tasks` keeps the newest 10 tasks
 (counts stay exact; `tasksOmitted` says how many older ones were left out) with each task digested,
@@ -318,9 +328,11 @@ a longer inline answer reaches the journal already truncated. An empty, binary o
 (no symlinks, devices or FIFOs), skipping `.git`, `target`, `node_modules` and the execution
 sentinel, files before subdirectories, per-file and total caps. Directories are streamed, so at most
 2000 names are read in total and an oversized directory is never listed in full (the names read are
-sorted, so output is deterministic for what was read). The read has a 10 s deadline; past it, or
-on any other read error, the result is recorded once with `answerError` and collect is never
-repeated. Names containing control characters are shown JSON-quoted.
+sorted, so output is deterministic for what was read). The read has a 10 s deadline, checked
+between reads (before each directory entry, name and file) rather than inside one read, so a
+single stalled read (e.g. a hung network filesystem) can overrun it; FIFOs and devices are never
+read. Past the deadline, or on any other read error, the result is recorded once with
+`answerError` and collect is never repeated. Names containing control characters are shown JSON-quoted.
 
 Profiles contain `pubkey`, `npub`, `name`, `agents`, `harness:{family,model,variant}` (arrays),
 `capabilities` (tokens), `hardware`, `minutesRemaining`, `note`, and `trackRecord` with
