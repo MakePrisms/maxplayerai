@@ -208,11 +208,16 @@ reserved and continues polling, including after stop. An old journal lacking pro
 Known external public awards are additionally reserved; unknown amounts fail closed. Dedicate
 the buyer to this runner and never remove its journal to reclaim budget.
 
-`$MAXPLAYER_HOME/swarm/events.jsonl` is an fsynced, private write-ahead journal containing tasks,
+`$MAXPLAYER_HOME/swarm/events.jsonl` is an fsynced, private journal containing tasks,
 exact post arguments, preparation/job IDs, collected answers, payment receipts and durable stop
 reasons. Sequence-derived request IDs are permanent; a lost response is recovered by a read-only
-preparation lookup before any retry. Torn final journal records are discarded; corrupt complete
-records fail startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
+preparation lookup before any retry. It holds exactly ONE state record: every save writes the full
+state to `events.jsonl.tmp`, fsyncs it, renames it over the journal and fsyncs the directory, so a
+crash leaves either the previous or the new record and the file never grows past one state.
+Journals written by older runners (one appended copy per save; run 2 reached 649 MB) are migrated
+on startup: the file is scanned in 1 MiB chunks, never read as one string, the last complete record
+is kept (a torn final append is discarded) and rewritten as one record. A corrupt last complete
+record fails startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
 release on process exit. `flock` is required on every OS; macOS does not ship it
 (`brew install flock`), and a missing `flock` is reported as such. `flock` and the locked runner
 run in their own process group under the launched process and read a pipe the parent holds, so a
@@ -231,6 +236,14 @@ process-group signal (Ctrl-C, `kill -TERM -<pgid>`, a supervisor) reaches only t
 A supervisor without systemd's `KillMode=control-group` (launchd) therefore restarts cleanly. Keep the journal and buyer state together across restarts/backups.
 Planner/MCP errors are logged and retried on the next polling cycle without changing posting
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
+
+Before every challenge publish (progress or completion) the runner re-reads the latest
+buyer-signed challenge from the challenge relays (`maxplayer-challenges status --challenge <d>`),
+not the tick-start snapshot. If it is `completed` or `cancelled` — closed by the operator, or by
+anything else holding the buyer key — nothing is published, the close is journaled as an external
+stop (no new work, outstanding jobs still collected) and restarts publish nothing either. A status
+never moves backwards; progress re-sends the relay's own status, title, budget and result. If that
+read fails nothing is published and the publish is retried on a later tick.
 
 Once the planner verifies success, completion includes `--result`. If no eligible seller can fit
 another task and none is running, the work window ends, or zero headroom rejects an idle paid-only batch, the
@@ -323,6 +336,15 @@ logs `Planner <mode> ok|failed in <s>s; input <chars> chars, results …`. A pla
 truncated text as incomplete and may re-request detail as a task. The full answers stay in the
 journal. A collected result whose answer could not be read is `[collected, answer unreadable: …]`
 with `answerError`.
+
+**Collect failures.** A `collect` error containing `review: permanent input error` (the buyer's
+pre-collect delivery review refused the delivery itself — binary/non-UTF-8 files, symlinks,
+submodules, oversized or invalid input; maxplayer-core `review.rs` `permanent_code`) cannot succeed
+on retry. It is recorded once as outcome `collect refused` with `collectRefused`/`answerError`, the
+planner sees it, the seller is released in the runner, nothing is paid, and collect is never called
+again for that job (a priced job's sats stay reserved: there is no receipt or release proof). Every
+other collect error is transient and retried with a doubling backoff (10 s, 20 s … capped at 600 s)
+until it succeeds; the seller stays busy meanwhile. Each failure is logged with its attempt number.
 
 **Delivered answers.** A non-empty `answer.txt` (the buyer's materialized inline answer) is the
 answer, capped like every file at 64 KiB with a `[truncated: first N of M bytes shown]` marker, so
@@ -464,6 +486,13 @@ Buzz for jobs; `E2E_CHALLENGE_RELAYS` overrides the challenge read list (disposa
 relays only). The sidecar never uses the configured job relay for challenges.
 
 ### Relay coverage and membership limits
+
+The runner logs relay readiness from its own 5 s timer, independent of ticks (a slow planner
+call cannot hide a stall): `Relay change: …` whenever a relay's `connected`, `authenticated`,
+`historyComplete`, `error`, `warnings` or socket state changes, and a `Relay heartbeat: …` line per
+relay every 60 s with reconnect count, message count and the age of its last received frame. A
+relay that stays "ready" while its last frame grows old is a silent stall. Live-subscription,
+pending-page and EOSE counts are not part of the reader's exposed status and are not logged.
 
 A dead configured challenge relay blocks the runner on purpose: posting requires
 N-of-N complete history, and sidecar publishing requires N-of-N acknowledgements.
