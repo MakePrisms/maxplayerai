@@ -145,7 +145,9 @@ buyer-signed ACCEPT stops accrual. All durations are capped at deadline.
   holds the day open (not "exhausted") only while `seller_not_serving` is its sole reason and a
   minimum task still fits the work window; short of minutes or out of window, it does not.
   The wire cannot yet tell a re-probed dropped harness from a never-probed incapable one, so a
-  permanently incapable seat holds the day open until the window ends.
+  permanently incapable seat that would otherwise be a candidate (its sole reason is
+  `seller_not_serving` and its minimum task fits before the window ends) holds the day open
+  until the window ends.
 - Budget: committed (awarded, unsettled) + paid ≤ `C.budget`. Stop posting when the next task
   would exceed it.
 - Public jobs, `seller_pubkey` targeted, existing review/collect/pay.
