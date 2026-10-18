@@ -698,6 +698,18 @@ test('planner input: an old long answer keeps its tail (the conclusion); a dropp
   assert.equal(tight.history.droppedIndex.length,tight.history.resultsDropped);
   assert.ok(!tight.results.some(r=>r.seller==='s0'));
 });
+// Advisor r2 note: a dropped result's outcome (e.g. a relay publish_refused string) kept raw
+// newlines inside its index line, and a huge non-hex seller string was not cut at all.
+test('planner input: droppedIndex lines are single-line and bounded',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  const results=[{seller:'x'.repeat(250000),task:'t',outcome:'publish_refused: line one\nline two\r\u0000',ts:1,answer:'a'.repeat(3000)},
+    ...Array.from({length:3},(_,i)=>({seller:'s'+i,task:'t',outcome:'collected',ts:2+i,answer:'b'.repeat(3000)}))];
+  const out=boundPlannerInput({mode:'assess',results},{fullResults:8,digestChars:600,maxInputChars:4000});
+  assert.ok(out&&out.history.resultsDropped>=1,'the huge entry was dropped and the rest fits');
+  const line=out.history.droppedIndex[0];
+  assert.doesNotMatch(line,/[\u0000-\u001f\u007f]/);assert.match(line,/line one\\nline two\\r\\u0000/);
+  assert.ok(line.length<700,`index line ${line.length} chars`);
+});
 // Review note: trackRecord tasks (and other non-result inputs) were not bounded.
 test('planner input: a huge seller task, note or running task is bounded and cannot break later calls',async()=>{
   const {boundPlannerInput}=await import('./swarm.mjs');
@@ -822,35 +834,87 @@ test('parent death: SIGKILL of the runner parent releases the home lock and stop
     assert.ok(await until(()=>!alive(runner)&&!alive(sleeper)&&free(),15000),`runner ${alive(runner)} command ${alive(sleeper)} lock free ${free()}; ${stderr}`);
   } finally {rmSync(dir,{recursive:true,force:true});}
 });
+// Starts a real parent -> flock -> locked runner against a relay that completes the WebSocket
+// handshake and then stays silent (never ready). Stopping while a socket is still CONNECTING trips
+// relay.mjs's error->close handler, which overflows the stack on Node 22 (shared reader, out of
+// scope), so the fixture opens the socket. `mcp` is the fake `maxplayer mcp` shell body.
+async function lockedRunner(t,{poll,mcp='',detached=false}) {
+  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-stop-')),home=join(dir,'home'),bin=join(dir,'fake-maxplayer'),ready=join(dir,'ready'),mcpMark=join(dir,'mcp');
+  t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  fs.writeFileSync(bin,`#!/bin/sh\nif [ "$1" = whoami ]; then touch ${JSON.stringify(ready)}; echo "pubkey: ${'a'.repeat(64)}"; exit 0; fi\nif [ "$1" = mcp ]; then touch ${JSON.stringify(mcpMark)}; ${mcp}\nfi\n`,{mode:0o700});
+  const net=await import('node:net'),{createHash}=await import('node:crypto'),sockets=[];
+  const hold=net.createServer(c=>{sockets.push(c);let buf='';c.on('error',()=>{});c.on('data',b=>{if(buf===null)return;buf+=b;const key=buf.match(/Sec-WebSocket-Key: *(\S+)/i)?.[1];
+    if(key&&buf.includes('\r\n\r\n')){buf=null;c.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')}\r\n\r\n`);}});});
+  await new Promise(r=>hold.listen(0,'127.0.0.1',r));
+  const relay=`ws://127.0.0.1:${hold.address().port}`;
+  t.after(()=>{sockets.forEach(c=>c.destroy());hold.close();});
+  // detached: the parent leads its own process group, as e2e.py's start_new_session does.
+  const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url',relay,'--poll-seconds',String(poll)],{detached,stdio:['ignore','ignore','pipe'],env:{...process.env,SWARM_CHALLENGE_RELAYS:relay}});
+  t.after(()=>{try{process.kill(detached?-parent.pid:parent.pid,'SIGKILL');}catch{}});
+  let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
+  const lockFree=()=>spawnSync('flock',['-n',join(home,'swarm/runner.lock'),'true']).status===0;
+  // The lock is sampled in the exit handler itself: the parent must never exit while it is held.
+  const exited=new Promise(r=>parent.on('exit',code=>r({code,lockFreeAtExit:lockFree(),at:Date.now()})));
+  const until=async(f,ms)=>{const end=Date.now()+ms;while(Date.now()<end){if(f())return true;await new Promise(r=>setTimeout(r,50));}return false;};
+  assert.ok(await until(()=>fs.existsSync(ready)&&sockets.length>0,10000),stderr);
+  const result=async ms=>Promise.race([exited,new Promise(r=>setTimeout(()=>r({code:'timeout'}),ms))]);
+  return {parent,stderr:()=>stderr,lockFree,until,result,mcpStarted:()=>fs.existsSync(mcpMark)};
+}
 // Found by the E2E after F1: with a ref'd grace timer a CLEANLY stopped runner still held the home
 // lock for the whole grace, so the next start (flock -n) exited 1. A clean stop must exit 0 at once.
-test('parent death: a clean stop exits 0 promptly and frees the lock (grace timer cancelled)',{skip:!require_flock()},async t=>{
-  const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
-  const dir=mkdtempSync(join(tmpdir(),'swarm-stop-')),home=join(dir,'home'),bin=join(dir,'fake-maxplayer'),ready=join(dir,'ready');
-  try {
-    // whoami answers, every other call (mcp) exits at once: the runner reaches its poll loop.
-    fs.writeFileSync(bin,`#!/bin/sh\nif [ "$1" = whoami ]; then touch ${JSON.stringify(ready)}; echo "pubkey: ${'a'.repeat(64)}"; fi\n`,{mode:0o700});
-    // Relay: completes the WebSocket handshake, then stays silent (never ready). Stopping while a
-    // socket is still CONNECTING trips relay.mjs's error->close handler, which overflows the stack
-    // on Node 22 (shared reader, out of scope for this PR), so the fixture opens the socket.
-    const net=await import('node:net'),{createHash}=await import('node:crypto'),sockets=[];
-    const hold=net.createServer(c=>{sockets.push(c);let buf='';c.on('error',()=>{});c.on('data',b=>{if(buf===null)return;buf+=b;const key=buf.match(/Sec-WebSocket-Key: *(\S+)/i)?.[1];
-      if(key&&buf.includes('\r\n\r\n')){buf=null;c.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${createHash('sha1').update(key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')}\r\n\r\n`);}});});
-    await new Promise(r=>hold.listen(0,'127.0.0.1',r));
-    const relay=`ws://127.0.0.1:${hold.address().port}`;
-    t.after(()=>{sockets.forEach(c=>c.destroy());hold.close();});
-    const parent=spawn(process.execPath,['scripts/challenges/swarm.mjs','--home',home,'--binary',bin,'--relay-url',relay,'--poll-seconds','1'],{stdio:['ignore','ignore','pipe'],env:{...process.env,SWARM_CHALLENGE_RELAYS:relay}});
-    let stderr='';parent.stderr.on('data',b=>{stderr+=b;});
-    const exited=new Promise(r=>parent.on('exit',code=>r(code)));
-    const until=async(f,ms)=>{const end=Date.now()+ms;while(Date.now()<end){if(f())return true;await new Promise(r=>setTimeout(r,50));}return false;};
-    assert.ok(await until(()=>fs.existsSync(ready)&&sockets.length>0,10000),stderr);
-    await new Promise(r=>setTimeout(r,1500));
-    const stopped=Date.now();parent.kill('SIGTERM');
-    const code=await Promise.race([exited,new Promise(r=>setTimeout(()=>r('timeout'),15000))]);
-    assert.equal(code,0,`clean stop exit code; ${stderr}`);
-    assert.ok(Date.now()-stopped<4000,`stopped in ${Date.now()-stopped} ms (grace is 5000)`);
-    assert.equal(spawnSync('flock',['-n',join(home,'swarm/runner.lock'),'true']).status,0,'lock free');
-  } finally {rmSync(dir,{recursive:true,force:true});}
+// Advisor r2 F1: poll 30 also pins that the poll sleep ends as soon as the runner is asked to stop.
+test('parent death: a clean stop exits 0 promptly and frees the lock (grace timer cancelled, poll sleep cut short)',{skip:!require_flock()},async t=>{
+  const r=await lockedRunner(t,{poll:30});
+  await new Promise(res=>setTimeout(res,1500));
+  assert.equal(r.lockFree(),false,'lock held while the runner lives');
+  const stopped=Date.now();r.parent.kill('SIGTERM');
+  const out=await r.result(15000);
+  assert.equal(out.code,0,`clean stop exit code; ${r.stderr()}`);
+  assert.ok(out.at-stopped<4000,`stopped in ${out.at-stopped} ms (grace is 5000, poll 30000)`);
+  assert.equal(out.lockFreeAtExit,true,'lock free when the parent exits');
+});
+// Advisor r2 F1: e2e.py (and a process-group supervisor) stops the runner with killpg. flock was in
+// the parent's group, died on that SIGTERM, and the parent exited 1 at once while the locked runner
+// still held the lock (~900 ms), so an immediate restart hit flock -n and exited 1.
+test('stop: a process-group SIGTERM keeps the parent alive until the lock is free, then exits 0',{skip:!require_flock()},async t=>{
+  const r=await lockedRunner(t,{poll:30,detached:true});
+  await new Promise(res=>setTimeout(res,1500));
+  assert.equal(r.lockFree(),false,'lock held while the runner lives');
+  const stopped=Date.now();process.kill(-r.parent.pid,'SIGTERM');
+  const out=await r.result(15000);
+  assert.equal(out.code,0,`exit code after killpg; ${r.stderr()}`);
+  assert.equal(out.lockFreeAtExit,true,'parent exited while the runner still held the lock');
+  assert.ok(out.at-stopped<4000,`stopped in ${out.at-stopped} ms`);
+});
+// Advisor r2 F1: a parent-only SIGTERM during an MCP call longer than the 5 s parent-gone grace
+// hit the grace kill (exit 1). A stop request lets the in-flight call finish, then exits 0.
+test('stop: a SIGTERM during an MCP call longer than the parent-gone grace lets it finish and exits 0',{skip:!require_flock()},async t=>{
+  const {PARENT_GONE_GRACE_MS}=await import('./swarm.mjs');
+  const r=await lockedRunner(t,{poll:5,mcp:`sleep ${(PARENT_GONE_GRACE_MS+1500)/1000}; exit 0`});
+  assert.ok(await r.until(r.mcpStarted,10000),'MCP call started');
+  const stopped=Date.now();r.parent.kill('SIGTERM');
+  const out=await r.result(20000);
+  assert.equal(out.code,0,`exit code; ${r.stderr()}`);
+  assert.equal(out.lockFreeAtExit,true,'lock free when the parent exits');
+  assert.ok(out.at-stopped>=PARENT_GONE_GRACE_MS,`the in-flight call ran to completion (${out.at-stopped} ms)`);
+  assert.doesNotMatch(r.stderr(),/killing in-flight/);
+});
+// A stop request is bounded too: a genuinely hung tick is killed after the stop grace, and the
+// parent's death (or a second signal, which closes the pipe) shortens that to the parent-gone grace.
+test('stop: watchParent bounds a stop request by its own grace, and pipe EOF shortens it',async()=>{
+  const {watchParent}=await import('./swarm.mjs');const {PassThrough}=await import('node:stream');
+  const run=async({stopGraceMs,graceMs,end})=>{
+    const stream=new PassThrough(),events=[];let resolveExit;const exited=new Promise(r=>{resolveExit=r;});
+    const gone=watchParent(stream,()=>events.push('stop'),{graceMs,stopGraceMs,kill:()=>events.push('kill'),exit:code=>{events.push(`exit ${code}`);resolveExit();}});
+    const started=Date.now();stream.write('stop\n');await new Promise(r=>setTimeout(r,30));
+    assert.deepEqual(events,['stop'],'stop request: onStop once, no kill yet');assert.equal(gone(),false);
+    if(end)stream.end();await exited;return {events,ms:Date.now()-started,gone:gone()};
+  };
+  const hung=await run({stopGraceMs:150,graceMs:60000});
+  assert.deepEqual(hung.events,['stop','kill','exit 1']);assert.ok(hung.ms>=150);
+  const dead=await run({stopGraceMs:60000,graceMs:20,end:true});
+  assert.deepEqual(dead.events,['stop','kill','exit 1']);assert.ok(dead.ms<5000);assert.equal(dead.gone,true);
 });
 function require_flock(){try{return (globalThis.__flock??=(()=>{const r=process.getBuiltinModule('node:child_process').spawnSync('flock',['--version']);return r.status===0;})());}catch{return false;}}
 

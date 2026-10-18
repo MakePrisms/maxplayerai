@@ -42,7 +42,10 @@ export const DELIVERY_SKIP = new Set(['MAXPLAYER_EXECUTION_SENTINEL','.git','tar
 // never listed in full; the names read from each directory are sorted, so output is deterministic
 // for what was read (the unseen tail is not sorted or listed). The whole read also has a deadline
 // (deadlineMs): past it the function throws, and the runner records that once as answerError
-// (collect is never repeated). Names with control characters are shown JSON-quoted so they cannot
+// (collect is never repeated). The deadline is checked between reads (before each directory entry,
+// each name and each file), not inside one blocking readSync, and the inline answer.txt read comes
+// before the first check: a single stalled read (e.g. a hung network filesystem) can overrun it.
+// Opens use O_NONBLOCK and only regular files are read, so a FIFO or device cannot block. Names with control characters are shown JSON-quoted so they cannot
 // break the ===== framing.
 export const DELIVERY_READ_DEADLINE_MS = 10000;
 export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=200000, maxEntries=2000, maxDepth=12, deadlineMs=DELIVERY_READ_DEADLINE_MS, clock=Date.now, opendir=opendirSync}={}) {
@@ -137,6 +140,9 @@ export function plannerTimeouts(env=process.env) {
 // goal, challenge and plan are buyer/planner-authored and are not cut. Returns null when even that
 // cannot fit.
 export const TRUNCATION_MARKER = '[truncated:';
+// One droppedIndex field: cut to n chars, then control characters escaped (\n, \r, \t, \uXXXX), so
+// a relay error string cannot span lines and a non-hex seller string cannot grow the line.
+const indexField=(v,n)=>{const s=String(v),c=s.length>n?s.slice(0,n)+'…':s;return c.replace(/[\u0000-\u001f\u007f]/g,ch=>({'\n':'\\n','\r':'\\r','\t':'\\t'})[ch]??`\\u${ch.charCodeAt(0).toString(16).padStart(4,'0')}`);};
 export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000,fieldChars=2000,trackRecordTasks=10}={}) {
   const all=input.results??[],total=all.length;
   let fieldsCut=0;
@@ -179,7 +185,7 @@ export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputC
   // Older entries dropped, oldest first; each leaves its index line.
   while(size(out)>maxInputChars&&results.length){
     const o=all[dropped];
-    droppedIndex.push(`${String(o?.seller)} | ${String(o?.outcome).slice(0,200)} | ts ${o?.ts} | ${typeof o?.answer==='string'?o.answer.length:0} answer chars`);
+    droppedIndex.push(`${indexField(o?.seller,100)} | ${indexField(o?.outcome,200)} | ts ${indexField(o?.ts,20)} | ${typeof o?.answer==='string'?o.answer.length:0} answer chars`);
     results=results.slice(1);dropped++;out=build();
   }
   return size(out)>maxInputChars?null:out;
@@ -536,39 +542,59 @@ export function config(argv,env=process.env) {
 // The locked runner is a grandchild (parent -> flock -> runner) holding the home lock. Signals to
 // the parent never reached it, and a killed parent (launchd `kickstart -k`, SIGKILL) left it alive
 // with the lock, so every restart exited 1. The parent therefore holds the write end of the
-// runner's stdin pipe: when the parent dies for ANY reason, or is asked to stop, the pipe closes
-// and the runner stops: no new tick, then after PARENT_GONE_GRACE_MS it kills its in-flight
-// commands and exits, releasing the lock. Journaled state is crash-safe, so this is no worse
-// than a crash (request-id preparation recovery, torn-tail truncation). The grace timer is ref'd:
-// it is the one thing guaranteed to run kill + exit, so it must keep the event loop alive until
-// it fires (an unref'd timer let the loop end first, so in-flight commands were never killed and
-// node --test on Node 22 cancelled the test and every test after it).
+// runner's stdin pipe, and flock + runner run in their OWN process group (detached), so a
+// process-group SIGTERM (e2e.py's killpg, a supervisor, Ctrl-C) reaches only the parent:
+// - Stop request (SIGINT/SIGTERM to the parent): the parent writes one line to the pipe and stays
+//   alive. The runner starts no new tick, cuts its poll sleep short, lets the in-flight tick finish
+//   and exits 0; flock exits with it and the parent then exits with flock's code, so the lock is
+//   always free by the time the parent has exited (an immediate restart's flock -n succeeds). If
+//   the tick is genuinely hung, STOP_GRACE_MS later the runner kills its in-flight commands and
+//   exits 1. A second signal to the parent closes the pipe (below).
+// - Parent gone (EOF: the parent died for ANY reason, incl. SIGKILL, or a second signal): no new
+//   tick; after PARENT_GONE_GRACE_MS the runner kills its in-flight commands and exits 1,
+//   releasing the lock. Journaled state is crash-safe, so this is no worse than a crash
+//   (request-id preparation recovery, torn-tail truncation).
+// Both timers are ref'd: each is the one thing guaranteed to run kill + exit, so it must keep the
+// event loop alive until it fires (an unref'd timer let the loop end first, so in-flight commands
+// were never killed and node --test on Node 22 cancelled the test and every test after it).
 export const PARENT_GONE_GRACE_MS = 5000;
-// Returns gone(); gone.cancel() clears a pending grace timer. main() cancels it once its loop has
-// stopped cleanly, so a clean stop exits (and releases the lock) at once instead of holding the
-// lock for the whole grace (a restart right after a stop then found the lock taken and exited 1).
-export function watchParent(stream,onStop,{graceMs=PARENT_GONE_GRACE_MS,exit=code=>process.exit(code),kill=killActiveCommands}={}) {
-  let gone=false,timer;
-  const fire=()=>{if(gone)return;gone=true;console.error(new Date().toISOString(),'Runner parent exited or asked to stop; stopping');
-    try{onStop();}catch{}
-    timer=setTimeout(()=>{kill();exit(1);},graceMs);};
-  stream.on('end',fire);stream.on('close',fire);stream.on('error',fire);stream.resume();
-  const status=()=>gone;status.cancel=()=>{clearTimeout(timer);timer=undefined;stream.pause();stream.removeAllListeners?.('end');stream.destroy?.();};
+// Above mcp-call.mjs's own 90 s MCP timeout, so a stop never cuts a live MCP call (collect) short.
+export const STOP_GRACE_MS = 100000;
+// Returns gone() (true once the pipe has closed); gone.cancel() clears a pending timer. main()
+// cancels it once its loop has stopped cleanly, so a clean stop exits (and releases the lock) at
+// once instead of holding the lock for the whole grace.
+export function watchParent(stream,onStop,{graceMs=PARENT_GONE_GRACE_MS,stopGraceMs=STOP_GRACE_MS,exit=code=>process.exit(code),kill=killActiveCommands}={}) {
+  let gone=false,stopping=false,timer,due=Infinity;
+  const arm=(ms,why)=>{const at=Date.now()+ms;if(at>=due)return;clearTimeout(timer);due=at;
+    timer=setTimeout(()=>{console.error(new Date().toISOString(),`${why}; killing in-flight commands and exiting`);kill();exit(1);},ms);};
+  const stop=()=>{if(stopping)return;stopping=true;try{onStop();}catch{}};
+  const request=()=>{if(stopping||gone)return;console.error(new Date().toISOString(),'Runner asked to stop; finishing the in-flight tick');
+    stop();arm(stopGraceMs,`Stop grace (${stopGraceMs} ms) elapsed`);};
+  const fire=()=>{if(gone)return;gone=true;console.error(new Date().toISOString(),'Runner parent exited or closed the pipe; stopping');
+    stop();arm(graceMs,`Parent-gone grace (${graceMs} ms) elapsed`);};
+  stream.on('data',request);stream.on('end',fire);stream.on('close',fire);stream.on('error',fire);stream.resume();
+  const status=()=>gone;status.cancel=()=>{clearTimeout(timer);timer=undefined;due=Infinity;stream.pause();stream.removeAllListeners?.('data');stream.removeAllListeners?.('end');stream.destroy?.();};
   return status;
 }
 async function main() {
   const args=process.argv.slice(2),locked=args[0]==='--lock-held';if(locked)args.shift();
   const c=config(args);mkdirSync(join(c.home,'swarm'),{recursive:true,mode:0o700});
   if(!locked) {
-    const child=spawn('flock',['-n',join(c.home,'swarm/runner.lock'),process.execPath,fileURLToPath(import.meta.url),'--lock-held',...args],{stdio:['pipe','inherit','inherit'],env:{...process.env,SWARM_PARENT_PIPE:'stdin'}});
+    // detached: flock + runner lead their own process group, so a group signal reaches only this
+    // parent (see watchParent). The parent stays alive until flock has reaped the runner.
+    const child=spawn('flock',['-n',join(c.home,'swarm/runner.lock'),process.execPath,fileURLToPath(import.meta.url),'--lock-held',...args],{detached:true,stdio:['pipe','inherit','inherit'],env:{...process.env,SWARM_PARENT_PIPE:'stdin'}});
     child.stdin.on('error',()=>{});
-    // Stop = close the pipe; the runner sees EOF (see watchParent). Never kill flock alone.
-    for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>child.stdin.end());
+    // First signal: ask to stop (one line). Second: close the pipe (parent-gone grace). Never kill
+    // flock alone.
+    let signals=0;
+    for(const sig of ['SIGINT','SIGTERM'])process.on(sig,()=>{if(signals++===0)child.stdin.write('stop\n');else child.stdin.end();});
     child.on('error',e=>{console.error(e.code==='ENOENT'?'flock not found: install util-linux flock (macOS: brew install flock)':e.message);process.exitCode=1;});
-    child.on('exit',code=>{process.exitCode=code??1;});return;
+    child.on('exit',(code,signal)=>{process.exitCode=code??1;if(signal)console.error(`Locked runner ended by ${signal}`);child.stdin.destroy();});return;
   }
-  let stopRunner=()=>{},parentWatch;
-  if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,()=>stopRunner());}
+  // A stop can arrive during startup (whoami, buyer probe): it is recorded here and the loop never starts.
+  let quitting=false,source,wake;const stopRunner=()=>{quitting=true;source?.stop();wake?.();};
+  let parentWatch;
+  if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
   const challengeRelays=(process.env.SWARM_CHALLENGE_RELAYS??'wss://nos.lol,wss://relay.primal.net,wss://offchain.pub').split(',').map(s=>s.trim()).filter(Boolean);
   if(!challengeRelays.length)throw Error('SWARM_CHALLENGE_RELAYS must not be empty');
@@ -578,7 +604,7 @@ async function main() {
   if(!buyer)throw Error('Cannot identify configured buyer');
   const journal=new Journal(join(c.home,'swarm/events.jsonl'));
   let relayCoverage;
-  const source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,buyer,onChange:s=>{
+  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,buyer,onChange:s=>{
     const failed=s.relay.failedRelays.join(', ');
     if(failed!==relayCoverage){relayCoverage=failed;console.error(new Date().toISOString(),failed?`Relay coverage incomplete; unavailable: ${failed}`:'All configured relays available');}
   }});
@@ -594,9 +620,14 @@ async function main() {
   io.probeBuyer=()=>io.mcp('get_job',{job_id:PROBE_JOB_ID});
   const runner=new Swarm(c,io,journal);
   try{await runner.releaseSupport();}catch(e){io.report(`WARNING: could not probe buyer get_job release fields (${e.message}); priced assignments wait for a successful probe`);}
-  let quitting=false;stopRunner=()=>{quitting=true;source.stop();};for(const sig of ['SIGINT','SIGTERM'])process.on(sig,stopRunner);
+  for(const sig of ['SIGINT','SIGTERM'])process.on(sig,stopRunner);
+  if(quitting)source.stop();
   try {
-    while(!quitting){try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}await new Promise(r=>setTimeout(r,c.poll*1000));}
+    while(!quitting){
+      try{await runner.tick();}catch(e){if(e.journalFailure)throw e;console.error(new Date().toISOString(),e.message);}
+      // The poll sleep ends at once on a stop, so the in-flight tick is the only wait.
+      if(!quitting)await new Promise(r=>{const t=setTimeout(r,c.poll*1000);wake=()=>{clearTimeout(t);r();};});wake=undefined;
+    }
   } finally {
     source.stop();
     // Locked runner: the loop has ended (stop asked, or a fatal journal error that main().catch
