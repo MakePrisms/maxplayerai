@@ -479,13 +479,16 @@ export function config(argv,env=process.env) {
 // runner's stdin pipe: when the parent dies for ANY reason, or is asked to stop, the pipe closes
 // and the runner stops: no new tick, then after PARENT_GONE_GRACE_MS it kills its in-flight
 // commands and exits, releasing the lock. Journaled state is crash-safe, so this is no worse
-// than a crash (request-id preparation recovery, torn-tail truncation).
+// than a crash (request-id preparation recovery, torn-tail truncation). The grace timer is ref'd:
+// it is the one thing guaranteed to run kill + exit, so it must keep the event loop alive until
+// it fires (an unref'd timer let the loop end first, so in-flight commands were never killed and
+// node --test on Node 22 cancelled the test and every test after it).
 export const PARENT_GONE_GRACE_MS = 5000;
 export function watchParent(stream,onStop,{graceMs=PARENT_GONE_GRACE_MS,exit=code=>process.exit(code),kill=killActiveCommands}={}) {
   let gone=false;
   const fire=()=>{if(gone)return;gone=true;console.error(new Date().toISOString(),'Runner parent exited or asked to stop; stopping');
     try{onStop();}catch{}
-    setTimeout(()=>{kill();exit(1);},graceMs).unref();};
+    setTimeout(()=>{kill();exit(1);},graceMs);};
   stream.on('end',fire);stream.on('close',fire);stream.on('error',fire);stream.resume();
   return ()=>gone;
 }

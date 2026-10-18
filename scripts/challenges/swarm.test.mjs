@@ -716,6 +716,15 @@ test('parent death: watchParent stops the runner, then kills in-flight commands 
   stream.write('ignored');assert.equal(gone(),false);stream.end();
   await exited;assert.deepEqual(events,['stop','kill','exit 1']);assert.equal(gone(),true);
 });
+// Advisor r1 F1: the grace timer was unref'd, so with nothing else pending the event loop ended
+// before kill + exit ran (and node --test on Node 22 cancelled this file's remaining tests).
+test('parent death: the grace timer alone keeps the process alive until it kills and exits 1',async()=>{
+  const {spawnSync}=await import('node:child_process');
+  const script=`import {watchParent} from ${JSON.stringify(new URL('./swarm.mjs',import.meta.url).href)};import {PassThrough} from 'node:stream';
+    const s=new PassThrough();watchParent(s,()=>console.log('stop'),{graceMs:50,kill:()=>console.log('kill')});s.end();`;
+  const r=spawnSync(process.execPath,['--input-type=module','-e',script],{encoding:'utf8',timeout:20000});
+  assert.deepEqual([r.stdout.trim().split('\n'),r.status],[['stop','kill'],1],r.stderr);
+});
 test('parent death: SIGKILL of the runner parent releases the home lock and stops the locked child',{skip:!require_flock()},async()=>{
   const fs=await import('node:fs'),{spawn,spawnSync}=await import('node:child_process');
   const dir=mkdtempSync(join(tmpdir(),'swarm-parent-')),home=join(dir,'home'),bin=join(dir,'fake-maxplayer'),pids=join(dir,'pids');
