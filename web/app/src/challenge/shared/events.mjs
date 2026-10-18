@@ -30,8 +30,8 @@ export function eventId(e) { return bytesToHex(sha256(new TextEncoder().encode(J
 //   (offer/claim/award/result/accept) plus challenge/roster events; past it, see below.
 // - RANDOM replacement when full, no reordering on a hit. LRU (or FIFO) turns a stable re-scan
 //   of cap+1 events into 100% misses: each miss evicts the key the scan needs next. Random
-//   replacement degrades gracefully instead: a repeated scan of cap+1 events pays about 2 Schnorr
-//   checks per pass (e-1 on average), and a repeated scan of 1.5x the cap still hits ~40%.
+//   replacement degrades gracefully instead: a repeated scan of cap+1 events pays a mean of 2
+//   Schnorr checks per pass, and a repeated scan of 1.5x the cap still hits ~40%.
 export const VERIFY_CACHE_LIMIT = 100000;
 const verified = new Set(), slots = []; // same keys; slots gives O(1) random choice
 export const verifyCacheSize = () => slots.length;

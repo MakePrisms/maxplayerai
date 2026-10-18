@@ -96,11 +96,12 @@ for (const [name, random] of [['first slot', () => 0], ['last slot', () => 0.999
   });
 }
 
-test('repeated passes over VERIFY_CACHE_LIMIT + 1 events stay near e-1 schnorr checks per pass with real randomness', t => {
+test('repeated passes over VERIFY_CACHE_LIMIT + 1 events stay near a mean of 2 schnorr checks per pass with real randomness', t => {
   const calls = stubbed(t), list = events(VERIFY_CACHE_LIMIT + 1);
   pass(calls, list);
   let total = 0;
   for (let i = 0; i < 3; i++) total += pass(calls, list);
-  // Expected ~3 * (e - 1) ≈ 5.2; LRU would be 3 * (cap + 1).
-  assert.ok(total < 100, `3 re-passes cost ${total} schnorr checks`);
+  // Mean 2 per pass, so ~6 expected; LRU would be 3 * (cap + 1). The ceiling fails a
+  // regression to dozens of misses per pass while staying far above the observed tail.
+  assert.ok(total <= 30, `3 re-passes cost ${total} schnorr checks`);
 });
