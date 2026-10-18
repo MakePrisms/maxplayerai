@@ -211,7 +211,10 @@ The community HTTP/SSE server and review page have been removed; use
 - Refused/absent AUTH or a closed live subscription leaves history available and polling active.
   Polling runs every 15 seconds from each filter's newest timestamp minus 900 seconds, also
   repairing late events while streaming. Disconnects reconnect with bounded backoff and reload history.
-- Signatures and IDs are verified locally. Buyer-authored kinds are author-scoped;
+- Signatures and IDs are verified locally. The id is recomputed from every received event; a
+  successful Schnorr check is cached on (id, pubkey, sig) in a 20,000-entry LRU
+  (`VERIFY_CACHE_LIMIT`, `events.mjs`), so poll overlaps and re-reads cost one hash, not a
+  signature check. Failed checks are never cached. Buyer-authored kinds are author-scoped;
   claims and results are `#p`-scoped to the buyer. Memberships are read in two separate ways
   (see *Trusted roster and applicant list* below): the trusted roster read is scoped by
   `authors` to buyer-accepted sellers, and a capped applicant read feeds only the
