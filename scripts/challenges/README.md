@@ -245,8 +245,9 @@ not the tick-start snapshot. If it is `completed` or `cancelled` — closed by t
 anything else holding the buyer key — nothing is published, the close is journaled as an external
 stop (no new work, outstanding jobs still collected) and restarts publish nothing either. A status
 never moves backwards; progress re-sends the relay's own status, title, budget and result. If that
-read fails nothing is published and the publish is retried on the next tick (the progress interval
-restarts only after a successful publish). That read can still be stale by the time the sidecar
+read fails nothing is published. A completion publish is retried on every tick. A progress
+publish waits `min(updateEvery, 30 s)` counted from the failure, so a hung challenge relay cannot
+hold back-to-back ticks; the progress interval restarts only after a successful publish. That read can still be stale by the time the sidecar
 signs, so `maxplayer-challenges publish` checks again: if its own pre-publish fetch shows the
 challenge `completed` or `cancelled` it signs nothing and exits 3 (`challenge: challenge closed
 (<status>): …`). The runner treats that refusal exactly like a close seen in its read.

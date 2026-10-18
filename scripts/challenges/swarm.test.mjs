@@ -1344,3 +1344,22 @@ test('progress: a re-read that hangs past its timeout does not hold back-to-back
   assert.equal(reads,2);assert.equal(f.publishes.length,0);
   assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
 });
+// Advisor r3 #1: the backoff gate used the tick-start clock, so a tick whose planner call crossed
+// progressRetryAt skipped the re-read until the end of the NEXT planner call.
+test('progress: a backoff that expires during the planner call re-reads in that same tick',async()=>{
+  const f=fixture();let reads=0,fail=true,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>{reads++;if(fail)throw Error('challenge relay read incomplete');return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  const day=Object.values(f.journal.state.days)[0];assert.equal(day.progressRetryAt,230);assert.equal(reads,1);
+  // The tick starts 1 s before the backoff ends; the planner call takes 5 s and crosses it.
+  fail=false;relay={...relay,status:'cancelled'};
+  let planned=0;f.setPlan(()=>{planned++;f.time(234);return {wait:true};});
+  f.time(229);await f.runner.tick();
+  assert.ok(planned>0,'the planner ran in this tick');
+  assert.equal(reads,2,'the same tick re-reads after the planner call crossed the backoff');
+  assert.equal(f.publishes.length,0);assert.equal(day.closed.status,'cancelled');assert.deepEqual(day.stop,{external:true});
+  // lastUpdate still comes from tick-start now on a successful progress publish.
+  const g=fixture();g.setPlan(()=>{g.time(205);return {wait:true};});g.time(200);await g.runner.tick();
+  assert.equal(g.publishes.length,1);assert.equal(Object.values(g.journal.state.days)[0].lastUpdate,200);
+});

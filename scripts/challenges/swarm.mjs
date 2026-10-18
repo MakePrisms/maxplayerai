@@ -636,10 +636,12 @@ export class Swarm {
     }
     if(day.stop&&!day.stop.external&&!day.published) {
       if(await this.publishChallenge(day,day.challenge,'completed',day.stop.update,day.stop.result)){day.published=true;this.save();}
-    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&!(now<day.progressRetryAt)) {
+    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&!(this.io.now()<day.progressRetryAt)) {
       // Progress never changes the status: it re-sends the latest buyer-signed one (null). The
       // interval restarts only after a publish; a failed re-read is retried after a short backoff
-      // (PROGRESS_RETRY_SECONDS from the failure), not a full updateEvery and not every tick.
+      // (PROGRESS_RETRY_SECONDS from the failure), not a full updateEvery and not every tick. The
+      // backoff compares the CURRENT clock: a tick whose planner call crossed progressRetryAt
+      // re-reads now, not one planner call later. lastUpdate still records the tick-start now.
       try {
         if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=now;delete day.progressRetryAt;this.save();}
       } catch(e) {
