@@ -388,6 +388,16 @@ export const reconcileCommand = home => `maxplayer wallet reconcile --home ${hom
 // (restart), after a later paid collect succeeded, or when the buyer wallet database changed
 // (`maxplayer wallet reconcile` writes it) - and never more often than this.
 export const PAYMENT_STUCK_RECHECK_MIN_SECONDS = 60;
+// R3-2 (runner workaround): a seller whose node no longer runs its harness (dropped after failures)
+// still heartbeats as a normal seller but skips every offer, so each assignment expires with no
+// claim. After SWARM_BENCH_AFTER_UNCLAIMED (default 2; 0 disables) consecutive assignments that
+// expired on a confirmed read with no claim by that seller, it is benched for SWARM_BENCH_SECONDS
+// (default 1800): left out of the assign roster, assignments to it rejected with the reason, and
+// listed to the planner as benchedSellers. Any claim by it (on any of its jobs) un-benches it and
+// resets the count; so does the cooldown ending, after which ONE more unclaimed expiry benches it
+// again (probation). The proper fix (heartbeat serving state) is in the seller daemon, not here.
+export const DEFAULT_BENCH_AFTER_UNCLAIMED = 2;
+export const DEFAULT_BENCH_SECONDS = 1800;
 // Not permanent in core, so they stay on the bounded retry loop (seller kept busy) even though an
 // unchanged delivery may never pass: policy_refused (review/state.rs:125-126) and
 // "review: encrypted message too large" (review/private.rs:84) lack the permanent prefix.
@@ -429,6 +439,34 @@ export class Swarm {
     let wallet;try{wallet=this.io.walletSignature?.();}catch{}
     if(wallet!==undefined&&wallet!==s.wallet)return 'buyer wallet changed (reconcile?)';
     return null;
+  }
+  // R3-2: per-seller unclaimed-expiry streak and bench (journaled, across challenges).
+  benchAfter(){return this.c.benchAfterUnclaimed??DEFAULT_BENCH_AFTER_UNCLAIMED;}
+  sellerClaimed(seller,jobId,now) {
+    const b=this.state.bench?.[seller];if(!b)return;
+    delete this.state.bench[seller];this.save();
+    if(b.until>now)this.io.report?.(`Un-benched seller ${seller}: it claimed job ${jobId}`);
+  }
+  unclaimedExpiry(j,now) {
+    const bench=this.state.bench??={},b=bench[j.seller]??={streak:0};
+    b.streak++;b.lastJob=j.id;
+    const n=this.benchAfter();
+    if(n>0&&b.streak>=n&&!(b.until>now)) {
+      const cooldown=this.c.benchSeconds??DEFAULT_BENCH_SECONDS;
+      Object.assign(b,{benchedAt:now,until:now+cooldown,reason:`${b.streak} consecutive assignments expired with no claim (last ${j.id}); its node may not be serving (e.g. harness dropped)`});
+      this.io.report?.(`Benched seller ${j.seller} for ${cooldown}s: ${b.reason}`);
+    } else this.io.report?.(`Job ${j.id}: expired with no claim by ${j.seller} (${b.streak} in a row)`);
+  }
+  // Ends cooldowns that have passed (probation: one more unclaimed expiry benches again) and
+  // returns the sellers still benched.
+  benched(now) {
+    const out=[];
+    for(const [seller,b] of Object.entries(this.state.bench??{})) {
+      if(b.until===undefined)continue;
+      if(b.until<=now){delete b.until;delete b.benchedAt;b.streak=Math.max(0,this.benchAfter()-1);this.save();this.io.report?.(`Un-benched seller ${seller}: cooldown ended (one more unclaimed expiry benches it again)`);continue;}
+      out.push({seller,until:b.until,reason:b.reason});
+    }
+    return out;
   }
   save(){this.journal.save();}
   // Run 2 #10: every challenge publish re-reads the LATEST buyer-signed challenge from the
@@ -560,6 +598,7 @@ export class Swarm {
       now=this.io.now();
       if(state.status==='preparing')continue;
       if(state.status==='posted' && state.job_id && state.job_id!==j.id){j.id=state.job_id;this.save();continue;}
+      if(Array.isArray(state.claims)&&state.claims.some(cl=>cl?.seller_pubkey===j.seller))this.sellerClaimed(j.seller,j.id,now);
       const expensive=(state.claim_prices??[]).find(p=>p.seller_pubkey===j.seller&&Number.isSafeInteger(p.amount_sats)&&p.amount_sats>j.args.max_sats);
       if(expensive && j.priceAsked!==expensive.amount_sats) {
         j.priceAsked=expensive.amount_sats;j.outcome=`price too high: asked ${expensive.amount_sats}`;j.ts=now;this.save();
@@ -620,6 +659,8 @@ export class Swarm {
           !state.results.length && state.accepted===null && !state.awarded_delivery_pending;
         j.done=j.args.payment==='none'||neverAwarded||reconciled;
         j.released=j.done;j.outcome=j.priceAsked?`price too high: asked ${j.priceAsked}`:'expired/undelivered';j.ts=now;
+        // R3-2: counted once per job, only on a confirmed read showing no claim by the seller.
+        if(!j.unclaimedAt&&state.read_confirmed===true&&Array.isArray(state.claims)&&!state.claims.some(cl=>cl?.seller_pubkey===j.seller)&&Array.isArray(state.results)&&!state.results.length&&!state.awarded){j.unclaimedAt=now;this.unclaimedExpiry(j,now);}
         // Not provably released: keep the sats reserved and keep polling, but free the seller slot
         // once it cannot still be executing and a confirmed read shows no delivery.
         const grace=this.c.expiredSlotGrace??EXPIRED_SLOT_GRACE_SECONDS;
@@ -645,6 +686,7 @@ export class Swarm {
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && TERMINAL_STATUSES.includes(c.status)) {day.stop={external:true};day.closed={status:c.status,seenAt:now};this.save();}
     const min=this.c.minDuration??DEFAULT_MIN_DURATION, max=this.c.maxDuration??1800;
+    const bench=this.benched(now),benchedSet=new Map(bench.map(b=>[b.seller,b]));
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
       ...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>({seller:j.seller,workstream:j.workstream??null,task:plannerTask(j.args.task),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
@@ -654,6 +696,7 @@ export class Swarm {
         running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
         budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now(),
         ...(day.rejected?.length?{rejectedAssignments:day.rejected}:{}),
+        ...(bench.length?{benchedSellers:bench}:{}),
         ...(this.releaseMissing?.length?{paidWorkRefused:`buyer get_job lacks ${this.releaseMissing.join(', ')}; assign only amountSats 0`}:{})};
       const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
       if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result answer omitted`);
@@ -681,7 +724,7 @@ export class Swarm {
       const decision=coordinate(snap,{now,durationSeconds:min,amountSats:0,budgetState:reservedBudget(snap,jobs,now),pendingSellers:pending()});
       if(now>=c.ends)stop('Unsolved: work window ended');
       else if(!decision.reasons.length) {
-        const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends);
+        const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends&&!benchedSet.has(s.seller_pubkey));
         // R3-7: the plan this assign call is SENT with. A response may revise the plan (saved in
         // ask()); its assignments are valid against either the plan the planner was shown in this
         // call or the revision it returned with them, never only the post-call day.plan.
@@ -713,6 +756,7 @@ export class Swarm {
             let ok;try{ok=await this.releaseSupport();}catch(e){reject(`priced work refused: cannot verify buyer get_job release fields (${e.message})`);continue;}
             if(!ok){reject(`priced work refused: buyer get_job lacks ${this.releaseMissing.join(', ')} (needs a buyer built from main at or after 7a14298d)`);continue;}
           }
+          if(benchedSet.has(seller)){const b=benchedSet.get(seller);reject(`seller benched until ${b.until}: ${b.reason}`);continue;}
           if(!candidates.some(s=>s.seller_pubkey===seller)){reject('seller busy or ineligible (not in free roster)');continue;}
           if(typeof task!=='string'||!task.trim()){reject('invalid task (empty or not text)');continue;}
           if(!planIds.has(workstream)){reject(`unknown workstream ${JSON.stringify(String(workstream)).slice(0,120)}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})`);continue;}
@@ -739,7 +783,10 @@ export class Swarm {
         if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
         // history) and those sellers' state. Metadata caps and the applicant list never block it.
-        if(!day.stop&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
+        // R3-2 bench clause, kept as its own named check: a benched seller is not exhausted, its
+        // cooldown ends (combine with other liveness checks here rather than folding it in).
+        const benchedSellerWillReturn=bench.length>0;
+        if(!day.stop&&!candidates.length&&!benchedSellerWillReturn&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
@@ -831,7 +878,7 @@ export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
   const flag=(name,value)=>{const v=String(value??'').trim().toLowerCase();if(['','0','false','no','off'].includes(v))return false;if(['1','true','yes','on'].includes(v))return true;throw Error(`Invalid ${name}: use 1/true/yes/on or 0/false/no/off`);};
-  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),benchAfterUnclaimed:+(env.SWARM_BENCH_AFTER_UNCLAIMED??DEFAULT_BENCH_AFTER_UNCLAIMED),benchSeconds:+(env.SWARM_BENCH_SECONDS??DEFAULT_BENCH_SECONDS),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
   c.challengeQuorum=parseChallengeQuorum(env.SWARM_CHALLENGE_QUORUM,c.challengeRelays.length);
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
@@ -840,6 +887,8 @@ export function config(argv,env=process.env) {
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
   for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter','maxDefer'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
+  if(!Number.isSafeInteger(c.benchAfterUnclaimed)||c.benchAfterUnclaimed<0)throw Error('Invalid SWARM_BENCH_AFTER_UNCLAIMED: must be an integer >= 0 (0 disables benching)');
+  if(!Number.isSafeInteger(c.benchSeconds)||c.benchSeconds<1)throw Error('Invalid SWARM_BENCH_SECONDS: must be an integer >= 1');
   if(!Number.isSafeInteger(c.expiredSlotGrace)||c.expiredSlotGrace<MIN_EXPIRED_SLOT_GRACE_SECONDS)throw Error(`Invalid SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= ${MIN_EXPIRED_SLOT_GRACE_SECONDS} (seller execution tail ${SELLER_EXECUTION_TAIL_SECONDS} s + teardown margin ${SLOT_TEARDOWN_MARGIN_SECONDS} s)`);
   c.home=resolve(c.home);return c;
 }

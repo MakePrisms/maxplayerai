@@ -176,6 +176,10 @@ assignment, `rate=0` included) would never be claimed, so it is rejected with `b
 minimum N`, or, with the default-off `SWARM_AUTO_RAISE_TO_RATE`, raised to the minimum within
 headroom. Rejected assignments of the last `assign` batch, with their reasons, are returned to
 the planner as `rejectedAssignments` on its next calls.
+A seller whose assignments keep expiring with no claim (default 2 in a row on confirmed reads; a
+dropped harness looks exactly like this from the buyer) is benched for a cooldown (default 30 min):
+excluded from the assign roster and listed to the planner as `benchedSellers` with the reason. Any
+claim by it, or the cooldown ending, un-benches it; a benched seller is not counted as exhausted.
 `assess` checks newly settled results even after posting stops. Later responses may revise the plan;
 an assignment's workstream is checked against the plan sent with that `assign` call or the revision
 returned with it, never only the plan saved after the call.

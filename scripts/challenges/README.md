@@ -186,6 +186,8 @@ Flags (environment equivalents):
 | — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
 | — | `SWARM_EXPIRED_SLOT_GRACE_SECONDS` | 600 (strictly after an expired undelivered job's deadline + this, free its seller; sats stay reserved; minimum 480 = 420 s seller kill instant + 60 s teardown) |
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
+| — | `SWARM_BENCH_AFTER_UNCLAIMED` | 2 (consecutive assignments that expired with no claim before a seller is benched; 0 disables) |
+| — | `SWARM_BENCH_SECONDS` | 1800 (bench cooldown) |
 | — | `SWARM_AUTO_RAISE_TO_RATE` | **OFF** (`1`/`true`/`yes`/`on` to enable): raise an assignment priced below a paid seller's advertised minimum to that minimum, within budget headroom, instead of rejecting it |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
@@ -421,6 +423,21 @@ heartbeat says `takes_payment=none`; otherwise the minimum is its `rate`, and at
 minimum and logged (`Raising assignment for <seller> from X to N sats`); the raised price then
 goes through the normal admission, so it is still refused (with both reasons) if it exceeds the
 budget headroom or the buyer cannot do priced work.
+
+**Benched sellers (R3-2, runner workaround).** A seller whose node dropped its harness still
+heartbeats as a normal seller but skips every offer, so its assignments expire unclaimed. After
+`SWARM_BENCH_AFTER_UNCLAIMED` (default 2) consecutive assignments that expired with no claim by
+that seller (counted once per job, only on a confirmed `get_job` read: `read_confirmed`, no claim
+from the seller, no result, no award), the runner benches it for `SWARM_BENCH_SECONDS` (default
+1800): it is left out of the `assign` roster, an assignment naming it is rejected with `seller
+benched until <unix>: <reason>`, and every planner call lists it in
+`benchedSellers:[{seller,until,reason}]`. Logged as `Benched seller <pk> for Ns: …`. Any claim by
+the seller on any of its jobs un-benches it at once and resets the count (`Un-benched seller <pk>:
+it claimed job …`). When the cooldown ends it is un-benched on probation: one more unclaimed expiry
+benches it again. A benched seller never counts as exhausted (no `Unsolved: all eligible sellers
+exhausted` stop while one is benched). The bench state is journaled (`bench`), so a restart keeps
+it. The proper fix (the seller heartbeat advertising that it is not serving) belongs to the seller
+daemon and is separate.
 
 **Rejection feedback.** Every rejected assignment of the last `assign` batch (any reason: price
 floor, unknown workstream, busy seller, duration, budget …) is journaled and sent to the planner

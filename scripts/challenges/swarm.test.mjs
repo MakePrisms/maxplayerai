@@ -1593,3 +1593,72 @@ test('R3-8: a wallet-reconcile refusal is a distinct payment-stuck state: no ret
   // The wallet signature reads the buyer CDK database and its WAL (missing files are '-').
   assert.equal(walletSignature('/nonexistent-home'),'-|-');
 });
+
+// R3-2 (round 3, runner workaround): a seller whose harness was dropped still heartbeats normally
+// but skips every offer; its jobs expired unclaimed and the planner kept assigning it work.
+const everyone=input=>input.mode==='assess'?{wait:true}:{assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'t',durationSeconds:30}))};
+test('R3-2: N consecutive unclaimed expiries bench a seller for a cooldown; the planner is told; a claim or the cooldown ends it',async()=>{
+  const {DEFAULT_BENCH_AFTER_UNCLAIMED,DEFAULT_BENCH_SECONDS}=await import('./swarm.mjs');
+  assert.equal(DEFAULT_BENCH_AFTER_UNCLAIMED,2);assert.equal(DEFAULT_BENCH_SECONDS,1800);
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.benchSeconds=1000;
+  f.snap.sellers.forEach(s=>{s.minutesRemaining=100;});f.snap.challenge.ends=100000;
+  // Every seller gets one assignment whenever it is free.
+  f.setPlan(everyone);
+  const expire=(seller,claimed=false)=>{for(const j of f.remote.values())if(f.journal.state.jobs.find(x=>x.id===j.id&&x.seller===seller&&!x.done))
+    Object.assign(j,{read_confirmed:true,claims:claimed?[{seller_pubkey:seller,live:false,status:'expired'}]:[],results:[]});};
+  const postsFor=s=>posts(f).filter(([,a])=>a.seller_pubkey===s).length;
+  let t=100;const step=async n=>{t+=n;f.time(t);await f.runner.tick();};
+  await step(0);assert.equal(postsFor('a'),1);assert.equal(postsFor('b'),1);
+  // Round 1: a expires unclaimed, b claimed (and expired); both get new work.
+  expire('a');expire('b',true);await step(31);await step(1);
+  assert.equal(postsFor('a'),2);assert.equal(postsFor('b'),2);
+  assert.equal(f.journal.state.bench.a.streak,1);assert.equal(f.journal.state.bench.b,undefined);
+  // Round 2: a's second consecutive unclaimed expiry benches it; b keeps working.
+  expire('a');expire('b',true);await step(31);await step(1);
+  assert.equal(postsFor('a'),2,'benched: no new assignment');assert.equal(postsFor('b'),3);
+  assert.ok(reports.some(r=>/^Benched seller a for 1000s: 2 consecutive assignments expired with no claim/.test(r)),reports.join('\n'));
+  const benchedAt=f.journal.state.bench.a.benchedAt;
+  const after=f.inputs.filter(i=>i.mode==='assign'&&i.now>=benchedAt);
+  assert.ok(after.length&&after.every(i=>!i.sellers.some(s=>s.pubkey==='a')),'left out of the assign roster');
+  assert.ok(after.some(i=>i.sellers.some(s=>s.pubkey==='b')));
+  const input=after.at(-1);
+  assert.equal(input.benchedSellers[0].seller,'a');assert.match(input.benchedSellers[0].reason,/no claim/);
+  // An assignment naming it anyway is rejected with the reason (and fed back).
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:{assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30}]});
+  expire('b',true);await step(31);
+  assert.ok(reports.some(r=>/^Rejected assignment for a: seller benched until \d+: 2 consecutive/.test(r)));
+  assert.match(f.inputs.at(-1).rejectedAssignments?.[0]?.reason??Object.values(f.journal.state.days)[0].rejected[0].reason,/benched/);
+  // A benched seller is not "exhausted": no unsolved stop while only it is idle.
+  assert.equal(Object.values(f.journal.state.days)[0].stop,undefined);
+  // Cooldown ends: un-benched on probation; it gets work again; one more unclaimed expiry re-benches.
+  f.setPlan(everyone);
+  await step(1000);
+  assert.ok(reports.some(r=>r.startsWith('Un-benched seller a: cooldown ended')));
+  assert.equal(postsFor('a'),3);
+  expire('a');await step(31);await step(1);
+  assert.equal(postsFor('a'),3);assert.ok(f.journal.state.bench.a.until>t,'re-benched after one more unclaimed expiry');
+  // Any claim (here on its still-open last job) un-benches at once and resets the streak.
+  const last=f.journal.state.jobs.filter(j=>j.seller==='a').at(-1);
+  const remote=[...f.remote.values()].find(j=>j.id===last.id);remote.claims=[{seller_pubkey:'a',live:false,status:'expired'}];
+  last.done=false;await step(1);
+  assert.equal(f.journal.state.bench.a,undefined);assert.ok(reports.some(r=>r.startsWith('Un-benched seller a: it claimed')));
+  // An unconfirmed read never counts; SWARM_BENCH_AFTER_UNCLAIMED=0 disables; settings validated.
+  const g=fixture();g.snap.sellers=g.snap.sellers.slice(0,1);await g.runner.tick();
+  [...g.remote.values()][0].results=[];g.time(131);g.setPlan(()=>({wait:true}));await g.runner.tick();
+  assert.equal(g.journal.state.bench,undefined,'read_confirmed missing: not counted');
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a'}).benchAfterUnclaimed,2);
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_BENCH_AFTER_UNCLAIMED:'0'}).benchAfterUnclaimed,0);
+  assert.throws(()=>config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_BENCH_SECONDS:'0'}),/SWARM_BENCH_SECONDS/);
+  const h=fixture();h.c.benchAfterUnclaimed=0;h.snap.sellers=h.snap.sellers.slice(0,1);h.snap.sellers[0].minutesRemaining=100;h.snap.challenge.ends=100000;
+  h.setPlan(everyone);
+  let ht=100;for(let i=0;i<3;i++){await h.runner.tick();for(const j of h.remote.values())Object.assign(j,{read_confirmed:true,claims:[],results:[]});ht+=31;h.time(ht);await h.runner.tick();ht+=1;h.time(ht);}
+  assert.equal(posts(h).length,4,'disabled: never benched');
+  // The exhaustion check: when the only seller is benched (so there are no candidates and nothing
+  // running), the day must not stop as "all eligible sellers exhausted": its cooldown ends.
+  const k=fixture(),kr=[];k.io.report=m=>kr.push(m);k.c.benchSeconds=1000;k.snap.sellers=k.snap.sellers.slice(0,1);k.snap.sellers[0].minutesRemaining=100;k.snap.challenge.ends=100000;
+  k.setPlan(everyone);
+  let kt=100;for(let i=0;i<2;i++){await k.runner.tick();for(const j of k.remote.values())Object.assign(j,{read_confirmed:true,claims:[],results:[]});kt+=31;k.time(kt);await k.runner.tick();kt+=1;k.time(kt);}
+  await k.runner.tick();
+  assert.ok(k.journal.state.bench?.a?.until>kt,'the only seller is benched');
+  assert.equal(Object.values(k.journal.state.days)[0].stop,undefined,kr.join('\n'));
+});
