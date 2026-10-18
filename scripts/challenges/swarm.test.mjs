@@ -1224,3 +1224,8 @@ test('close: without a direct relay read the publish guard re-reads a fresh snap
   assert.equal(f.publishes.length,0,'the cancel seen by the fresh read stops the progress publish');
   assert.equal(Object.values(f.journal.state.days)[0].closed.status,'cancelled');
 });
+test('close: the latest-challenge read passes the sidecar status its required --buyer and the exact id',async()=>{
+  const {latestChallengeArgs}=await import('./swarm.mjs');
+  assert.deepEqual(latestChallengeArgs(['ws://a','ws://b'],{buyer:'f'.repeat(64),id:'day-1'}),
+    ['status','--relay','ws://a','--relay','ws://b','--buyer','f'.repeat(64),'--challenge','day-1','--json']);
+});

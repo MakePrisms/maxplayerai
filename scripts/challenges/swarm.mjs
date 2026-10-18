@@ -348,6 +348,8 @@ export const collectRetryDelay = failures => Math.min(COLLECT_RETRY_MAX_SECONDS,
 // the operator, or by anyone holding the buyer key, is final for the runner).
 export const TERMINAL_STATUSES = ['completed','cancelled'];
 const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
+// Sidecar argv for the latest buyer-signed challenge (`status` requires --buyer; --json on stdout).
+export const latestChallengeArgs = (relays,challenge) => ['status',...relays.flatMap(url=>['--relay',url]),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
@@ -756,7 +758,7 @@ async function main() {
     // The latest buyer-signed challenge with this id, read directly from every challenge relay by
     // the sidecar (fails unless all relays answer); includes completed/cancelled ones.
     latestChallenge:async challenge=>{
-      const body=JSON.parse(await command(challengesBinary,['status',...challengeRelays.flatMap(url=>['--relay',url]),'--challenge',challenge.id,'--json'],{env}));
+      const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge),{env}));
       const x=body?.challenge;if(!x||typeof x!=='object')throw Error(`challenge ${challenge.id} not found on the challenge relays`);
       return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
     }};
