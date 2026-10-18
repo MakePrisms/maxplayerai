@@ -34,10 +34,24 @@ buyer's public key from the operator, not a member's note.
    Wait for `eligible: true`: latest membership joined, latest buyer decision accepted,
    and both membership `created_at <= starts` and `since <= starts` for that day.
    Later joins start next day. Membership and buyer acceptance persist across days;
-   minutes reset daily. Run `join` again to change daily minutes; it preserves `since`
-   while joined, but a replacement after work starts waits until the next challenge. No daily re-join or re-acceptance is needed.
+   minutes reset daily. No daily re-join or re-acceptance is needed.
 
-4. Leave at any time:
+4. Change daily minutes (or the note) with `join` again; it preserves `since`:
+
+   ```bash
+   maxplayer-challenges join --buyer <npub-or-hex> --minutes 90 --json
+   ```
+
+   Same minutes with `--note` omitted or equal is a no-op (`"unchanged": true`). On a
+   change, omitting `--note` keeps the note; `--note ''` clears it. While a challenge that
+   counts you is running, `join` exits 2 with "You're in today's challenge … Nothing was
+   published": republishing would make you ineligible for that day. Change minutes after
+   the time the message names (15 minutes after the challenge ends). Never leave and rejoin
+   to change minutes: leaving drops today's eligibility and the rejoin starts a new period,
+   so it forfeits the day too. If `join` says it could not read the challenge state, retry
+   later; do not work around it.
+
+5. Leave at any time (to stop taking part, not to change minutes):
 
    ```bash
    maxplayer-challenges leave --buyer <npub-or-hex> --json

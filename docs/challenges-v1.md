@@ -244,14 +244,24 @@ key; none prints a secret.
 
 **Minutes changes during a running challenge.** `join` on an existing `joined` membership
 with different `--minutes` (or a different `--note`) republishes the membership. The sidecar
-refuses it, publishing nothing and exiting non-zero, while any buyer-signed challenge whose
-latest version is `scheduled`/`in_progress`, with `starts <= now < ends`, still counts the
-current membership (its `created_at` and `since` at or before `starts`):
-"You're in today's challenge (<id>, ends <time>). Change your minutes (or note) after it
-ends; they apply from the next day. Re-publishing now would make you ineligible for today."
-The same minutes and note is a no-op (nothing published, `"unchanged": true`). The challenge
-read is the trusted, paged, every-relay read; if it is incomplete the change fails closed
-(nothing published). First joins, rejoins after `left`, `leave` and `status` are unaffected.
+refuses it, publishing nothing and exiting non-zero, when it would forfeit an eligible day:
+some buyer-signed challenge's latest version is `scheduled`/`in_progress`, the seller's
+latest buyer decision is `accepted`, the current membership's `created_at` and `since` are at
+or before `starts`, the replacement would be dated after `starts` (its `created_at` is
+`max(now, previous + 1)`), and `now <= ends + 900`. The buyer posts through `ends` inclusive,
+and the 900-second `created_at` tolerance lets a fast seller clock publish before the
+buyer's `ends`, so the refusal lasts until 15 minutes after `ends`:
+"You're in today's challenge (<id>, ends <time>). Change your minutes (or note) after
+<ends + 15 min> …; they apply from the next day. Re-publishing now would make you ineligible
+for today. Do not leave and rejoin to change minutes: that also forfeits today."
+The same minutes with `--note` omitted or equal is a no-op (nothing published,
+`"unchanged": true`). On a real change, omitting `--note` keeps the current note and
+`--note ''` clears it. Pending or denied sellers, and memberships already replaced after the
+start, are not counted that day, so their changes publish. The challenge read is the
+trusted, paged, every-relay read; if it is incomplete (refused, timed out, truncated) the
+change fails closed (nothing published). It must stay an every-relay read even if other
+reads move to a quorum: the relay left out could be the only one holding the running
+challenge. First joins, rejoins after `left`, `leave` and `status` are unaffected.
 This is client policy only: the event format and the eligibility rule are unchanged, and
 another client can still republish (and forfeit the day).
 
