@@ -10,12 +10,11 @@ export interface Snapshot {
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
   relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; missingRelays?: string[]; degraded?: boolean; quorum?: {required: number; complete: number; total: number}; warnings?: string[]; applicantsIncomplete?: boolean };
 }
-// The page's relay status line. Degraded (run 2 #13): the challenge relay quorum is met but a relay
-// is missing; the view is still live, and the line says so and names the missing relays. The
-// relay's own reason (e.g. a CLOSED) is shown at once, not only after a reconnect copies it.
+// The page's relay status line. The relay's own reason (e.g. a CLOSED) is shown at once, not only
+// after a reconnect copies it. Degraded (run 2 #13: quorum met, a challenge relay missing) stays
+// live; the reader's "Degraded: … missing: …" warning on this line says so.
 export function connectionText(r: Snapshot['relay'], status: string): string {
-  const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low"
-    : r?.degraded ? `${status} · Degraded: ${r.quorum?.complete} of ${r.quorum?.total} challenge relays` : status;
+  const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : status;
   return connection + (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : "");
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);

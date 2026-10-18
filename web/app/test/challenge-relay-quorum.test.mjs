@@ -39,8 +39,7 @@ test('quorum met: 2 of 3 challenge relays complete is ready and degraded, with a
   assert.ok(s.warnings.includes('Degraded: 2 of 3 challenge relays complete (quorum 2); missing: ws://c'),s.warnings.join('; '));
   assert.equal(relayReady(snap(reader)),true,'the runner posts while degraded');
   // The page says so on its status line.
-  const line=connectionText(s,'Live');
-  assert.match(line,/^Live · Degraded: 2 of 3 challenge relays/);assert.match(line,/missing: ws:\/\/c/);
+  assert.equal(connectionText(s,'Live'),'Live · Degraded: 2 of 3 challenge relays complete (quorum 2); missing: ws://c');
   // The third relay catches up: no longer degraded, warning gone.
   finish(reader.challenges[2]);
   assert.equal(reader.status.degraded,false);assert.ok(!reader.status.warnings.some(w=>w.startsWith('Degraded')));
