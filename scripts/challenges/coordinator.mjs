@@ -18,7 +18,10 @@ export const relayReady = snapshot => {
   if (!(r?.connected && r?.authenticated && r?.historyComplete && !r?.error && tradeReady(snapshot))) return false;
   if (r.relays && r.failedRelays?.includes(r.relays.find(x => x.role === 'trade')?.url)) return false;
   if (r.quorum === undefined) return !r.failedRelays?.length;
-  return Number.isSafeInteger(r.quorum?.required) && r.quorum.required >= 1 && Number.isSafeInteger(r.quorum.complete) && r.quorum.complete >= r.quorum.required;
+  // Re-checks the quorum rule itself (a strict majority of the challenge relays, at most all of
+  // them), so a snapshot from anything but ChallengeReader cannot claim ready with less.
+  const q = r.quorum;
+  return [q?.required, q?.complete, q?.total].every(Number.isSafeInteger) && q.total >= 1 && q.required >= Math.floor(q.total / 2) + 1 && q.required <= q.total && q.complete >= q.required && q.complete <= q.total;
 };
 // Freshness of a snapshot at `now`: the exact stale_snapshot rule (taken at or before now, at most 5 s old).
 export const snapshotFresh = (snapshot, now) => Number.isSafeInteger(snapshot?.asOf) && now >= snapshot.asOf && now - snapshot.asOf <= 5;

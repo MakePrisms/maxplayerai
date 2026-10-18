@@ -16,3 +16,11 @@ test('relay quorum: degraded (quorum met) posts; below quorum or trade relay dow
   // A snapshot from a reader without quorum fields still needs every relay.
   assert.deepEqual(coordinate(s({failedRelays:['ws://c']}),{durationSeconds:60}).reasons,['relay_not_ready']);
 });
+// Advisor r1 nit: relayReady re-checks that the quorum is a strict majority (and complete <= total).
+test('relay quorum: a snapshot claiming a sub-majority quorum is never ready',()=>{
+  const trade={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null};
+  const s=quorum=>{const x=fixture();x.relay={...x.relay,error:null,failedRelays:[],relays:[trade],quorum};return x;};
+  assert.equal(coordinate(s({required:2,complete:2,total:3}),{durationSeconds:60}).postingAllowed,true);
+  for(const q of [{required:1,complete:1,total:3},{required:2,complete:2,total:4},{required:4,complete:4,total:3},{required:2,complete:4,total:3},{required:0,complete:0,total:0}])
+    assert.deepEqual(coordinate(s(q),{durationSeconds:60}).reasons,['relay_not_ready'],JSON.stringify(q));
+});

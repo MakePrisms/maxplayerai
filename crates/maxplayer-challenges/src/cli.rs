@@ -2867,6 +2867,28 @@ mod tests {
                 assert!(r.iter().all(|f| writes(f).is_empty()));
             }
 
+            /// Advisor r1 nit: an outbox entry past its age bound no longer counts in a read, even
+            /// on the command that expires it.
+            #[tokio::test]
+            async fn expired_outbox_entry_no_longer_counts_in_reads() {
+                let s = setup("expired");
+                let r = three(roster(&s)).await;
+                r[2].online.store(false, Ordering::SeqCst);
+                command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                    .await
+                    .unwrap();
+                let mut outbox = Outbox::load(&s.home);
+                outbox.entries[0].queued_at = Timestamp::now().as_secs() - OUTBOX_MAX_AGE_SECS - 10;
+                outbox.save(&s.home).unwrap();
+                let status = format!("status --buyer {} --json", s.buyer);
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(body["members"][0]["membership"]["status"], "joined");
+                assert!(
+                    Outbox::load(&s.home).entries.is_empty(),
+                    "pruned by that command"
+                );
+            }
+
             /// Advisor r1 H2: the buyer's acceptance is only on the relay that is down. The quorum
             /// decision read then shows "not accepted"; that must not skip the every-relay check.
             #[tokio::test]

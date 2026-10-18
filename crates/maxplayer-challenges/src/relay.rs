@@ -391,8 +391,11 @@ impl Relays {
         // An event this home published at a bare quorum, whose missing relay has not had it re-sent
         // yet, is still in the outbox: a quorum read that omits it (the overlapping relay lost it)
         // still sees it. Trusted reads only; outbox events are own-key and signature-checked.
+        // Pruned first: an entry past its age or attempt bound no longer counts (advisor r1 nit).
         if paged {
-            for e in Outbox::load(home).entries {
+            let mut outbox = Outbox::load(home);
+            outbox.prune(now());
+            for e in outbox.entries {
                 if filter.match_event(&e.event, Default::default()) {
                     union.entry(e.event.id).or_insert(e.event);
                 }
@@ -635,6 +638,11 @@ pub struct OutboxEntry {
     pub queued_at: u64,
 }
 /// `<home>/challenges/outbox.json` (directory 0700, file 0600, atomic replace).
+///
+/// Not locked: each command loads, changes and atomically replaces the whole file, so a crash never
+/// tears it, but two sidecar processes running at the same time can drop each other's changes
+/// (a queued entry, or a delivery). Both are best-effort repairs; the publish itself already met
+/// the quorum. Run one sidecar command per home at a time to keep every entry.
 #[derive(Debug, Default)]
 pub struct Outbox {
     pub entries: Vec<OutboxEntry>,
