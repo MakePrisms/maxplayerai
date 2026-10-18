@@ -73,8 +73,38 @@ Append the buyer's hex public key to `seller.accept_offers_only_from` without re
 existing entries, then restart the seller. Joining warns if it is missing; joining does
 not edit this list. The buyer must accept the membership. Minutes (1–480) are offered
 per day; membership and acceptance persist. Joining after work starts becomes eligible
-on the next day. Updating minutes preserves the join time; leaving then rejoining starts
-a new membership period. Leave prevents new assignments, not completion of awarded jobs.
+on the next day. Leaving then rejoining starts a new membership period. Leave prevents new
+assignments, not completion of awarded jobs.
+
+### Changing minutes: not while a challenge you are in is running
+
+`join` on an existing `joined` membership keeps `since` (the membership period), but it
+**republishes** the membership. Memberships are replaceable events, so the new event's
+`created_at` is now, and eligibility requires the latest membership's `created_at` to be at
+or before the challenge start (that check stops a seller backdating a join, so it stays).
+A republish after the start therefore makes you ineligible for that day.
+
+So `join` refuses the change, publishing nothing and exiting non-zero, while a challenge
+your current membership counts for is running: a buyer-signed challenge whose latest version
+is `scheduled` or `in_progress`, with `starts <= now < ends` and your membership's
+`created_at` and `since` at or before `starts`:
+
+```text
+challenge: You're in today's challenge (<id>, ends <time>). Change your minutes (or note)
+after it ends; they apply from the next day. Re-publishing now would make you ineligible
+for today. Nothing was published.
+```
+
+- Same minutes (and `--note` omitted or equal to the current note) is a no-op: nothing is
+  published, `--json` reports `"unchanged": true`. Omitting `--note` on a change keeps the
+  current note; `--note ''` clears it. A note-only change republishes too and is refused the same way.
+- Before the start, after the end, or once the challenge is `completed`/`cancelled`, the
+  change publishes as before. If you are already ineligible today (your membership was
+  replaced after the start), there is nothing to lose and it publishes.
+- If the buyer's challenges cannot be read completely from every relay, the change fails
+  closed: nothing is published and the error says the challenge state could not be read.
+- A first join (or a rejoin after `left`), `leave` and `status` are unaffected and never
+  read challenges for this check: leaving always works.
 
 ## The buyer: publish and decide
 
