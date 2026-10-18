@@ -121,6 +121,24 @@ one appears the runner collects it exactly once and its reservation becomes the 
 otherwise the sats stay reserved until release is proven. Minutes are unchanged: the shared
 projection already charged the expired job from award to deadline.
 
+**Exactly what happens on a v0.6.1 buyer** (checked against tag `v0.6.1`, `d5e9e5d`). Its
+`get_job` does report `read_confirmed` (always serialized, since #603) and omits
+`awarded_delivery_pending` when false; it lacks only the four release fields above.
+- *Expired paid job, no delivery:* the seller is freed strictly after `deadline + grace` on a read
+  with `read_confirmed: true`, `results: []` and no pending awarded delivery. Its `max_sats` stay
+  reserved **forever** on such a buyer (neither release proof can ever succeed: one needs
+  `award_read_confirmed`, the other `reservation_state: "released"`), unless a late delivery is
+  collected, which turns the reservation into the paid amount. Restart does not change this; the
+  reservation is journaled. Only a newer buyer, or ending the challenge day, ends it.
+- *Expired paid job, read not confirmed* (`read_confirmed` false or absent, `results` missing, or
+  `get_job` failing): the seller stays held and the job is polled again. Nothing is freed on a read
+  that proves nothing.
+- *Expired free job:* unchanged by this rule. It is marked done (`expired/undelivered`, nothing
+  reserved) on the first poll after its deadline, whatever `get_job` reports, so its seller can get
+  new work at the deadline, without waiting for the grace. A free job's container may therefore
+  still be within its 420 s tail when the next free job is offered (the runner's one-job-per-seller
+  rule counts jobs the runner tracks, not the seller's containers).
+
 Hand-whitelist sellers once with `maxplayer-challenges decide --seller HEX --accept`, then
 publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
 the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:

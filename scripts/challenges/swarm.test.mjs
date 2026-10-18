@@ -866,11 +866,17 @@ test('expired paid job: late delivery after the slot was freed is collected exac
   assert.equal(posts(f).length,2,'late collection does not hand the seller a second live job');
 });
 test('expired paid job: slot stays held on an unconfirmed read or a pending awarded delivery; grace is validated',async()=>{
-  for(const view of [{read_confirmed:false,results:[]},{read_confirmed:true,results:[],awarded_delivery_pending:true},{read_confirmed:true}]){
+  // No read_confirmed key at all (a buyer older than #603) also holds the slot: fail closed.
+  for(const view of [{read_confirmed:false,results:[]},{read_confirmed:true,results:[],awarded_delivery_pending:true},{read_confirmed:true},{results:[]}]){
     const {f,old}=expiredPaid();await f.runner.tick();Object.assign(old(),view);if(!('results' in view))delete old().results;
     f.time(2000);f.snap.challenge.ends=5000;await f.runner.tick();
     assert.equal(f.journal.state.jobs[0].slotFreed,undefined,JSON.stringify(view));assert.equal(posts(f).length,1,JSON.stringify(view));
   }
+  // Pre-existing rule, pinned for the README: an expired FREE job is done (seller freed) on the first
+  // poll after its deadline, whatever get_job reports (read_confirmed absent here); it never had sats.
+  {const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();
+    const j=f.journal.state.jobs[0];assert.equal(j.args.payment,'none');f.time(j.args.deadline_unix+1);f.setPlan(()=>({wait:true}));await f.runner.tick();
+    assert.deepEqual([j.done,j.released,j.outcome,j.slotFreed],[true,true,'expired/undelivered',undefined]);}
   const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://x'};
   assert.equal(config([],base).expiredSlotGrace,600);assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'900'}).expiredSlotGrace,900);
   // Advisor r1 F2: 420 s is the seller's container kill instant, so the floor is 420 + a 60 s teardown margin.
