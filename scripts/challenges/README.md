@@ -523,6 +523,18 @@ relay every 60 s with reconnect count, message count and the age of its last rec
 relay that stays "ready" while its last frame grows old is a silent stall. Live-subscription,
 pending-page and EOSE counts are not part of the reader's exposed status and are not logged.
 
+**Poll rounds do not flap readiness (R3-4).** Each relay is re-polled every 15 s, and every round
+re-pages its history. That used to drop `historyComplete` until the round finished, so each round
+logged two `Relay change` lines (713 in 47 minutes in round 3) and opened a short `relay_not_ready`
+gap that deferred assignments. Once a trusted filter's history has been read completely on a
+connection, a poll of it (and that poll's pagination) keeps `historyComplete` true; the reader
+reports the round as `pollInProgress` instead, which is not a readiness field and is not logged.
+Only real transitions and the 60 s heartbeat are logged. No fail-closed rule is weakened: a poll
+page that times out still closes the connection, a truncated page still sets an error, a refused
+page still recovers (the filter is read again in full before it counts), a filter never read on the
+connection (initial read, a new roster chunk, a re-read after AUTH) still blocks readiness until it
+completes, and quorum / trade-relay-required readiness (#1170) is unchanged.
+
 A dead configured challenge relay blocks the runner on purpose: posting requires
 N-of-N complete history, and sidecar publishing requires N-of-N acknowledgements.
 A failed publish may already be stored on live relays; retry to repair coverage.

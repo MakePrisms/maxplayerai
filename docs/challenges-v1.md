@@ -239,6 +239,13 @@ The community HTTP/SSE server and review page have been removed; use
   with the relay's reason. Polling runs every 15 seconds from each filter's newest timestamp minus
   900 seconds, also repairing late events while streaming. Disconnects reconnect with bounded
   backoff and reload history.
+- A poll round re-reads history the reader already holds, so once a trusted filter's history has
+  been read completely on a connection, its poll pages (and their pagination) keep
+  `historyComplete` true; the round is reported as `pollInProgress`, which is not a readiness field
+  (R3-4). Poll pages keep every fail-closed rule: a silent page closes the connection, a truncated
+  page sets an error, a refused page recovers and must be read again in full, and any filter not
+  yet read on the connection (initial read, a new roster chunk, a re-read after AUTH) blocks
+  readiness until it completes. The quorum and trade-relay rules are unchanged.
 - When a relay sent an AUTH challenge that was not refused, and while it is recovering from a
   CLOSED, `historyComplete` also requires AUTH OK and an EOSE for every trusted filter's live
   subscription sent after AUTH OK on this connection, whether or not that subscription is still

@@ -52,6 +52,14 @@ const RECOVERING='Recovering after relay CLOSED';
 // connection opened expecting one, recovers again like an unanswered challenge. A relay that never
 // challenges, or refuses AUTH, outside recovery keeps the anonymous path, in recovery too.
 //
+// Poll rounds (R3-4): once a trusted filter's history has been read completely on this connection
+// (`read`), a later poll page for it (and that page's pagination) is a re-read of history already
+// held, so it no longer drops historyComplete; status.pollInProgress says a trusted poll round is in
+// flight instead. Every fail-closed rule still applies to poll pages: a silent page times out and
+// closes the socket, a truncated page sets an error, a refused page recovers (and its filter must be
+// read again in full), and a filter never read on this connection (initial read, a new roster chunk,
+// a re-read after AUTH) keeps historyComplete false until it completes.
+//
 // Live REQ ids: `live-<id>` for a filter's first live REQ on a connection, `live-<id>~<n>` for
 // a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
 export class RelayReader {
@@ -66,10 +74,13 @@ export class RelayReader {
     this.status=this.freshStatus();
     this.stopped=false; this.retry=retryMs;
   }
-  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,error:null,
+  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,pollInProgress:false,error:null,
     warnings:[...this.metaWarnings,...(this.closedStreak?[`${RECOVERING} (${this.lastClosed}); reconnect ${this.closedStreak}`]:[])],applicantsIncomplete:false};}
   // Applicant and profile/heartbeat reads are display-only: they never gate readiness.
   trustedPending(){for(const id of this.pages.keys())if(!soft(id))return true;return false;}
+  // A pending trusted page that must complete before history counts as complete (R3-4): any page of
+  // a filter not yet read completely on this connection. A poll of a read filter does not block.
+  blockingPending(){for(const [id,p] of this.pages)if(!soft(id)&&!(p.poll&&this.read.has(id)))return true;return false;}
   softFailure(id){this.pages.delete(id);if(id===APPLICANTS)this.status.applicantsIncomplete=true;else this.metaIncomplete();}
   metaIncomplete(){const w='Profile/heartbeat read incomplete';if(!this.status.warnings.includes(w))this.status.warnings.push(w);}
   authExpected(){return !!this.challenged&&this.authRefused===null;}
@@ -98,8 +109,9 @@ export class RelayReader {
   // One warning per prefix, replaced by the latest relay reason.
   warn(prefix,why){this.status.warnings=[...this.status.warnings.filter(w=>!w.startsWith(prefix)),`${prefix} (${why}); polling`];}
   updateComplete(){
-    const done=!!this.opened&&this.status.connected&&!this.trustedPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.strict()||this.liveConfirmed());
+    const done=!!this.opened&&this.status.connected&&!this.blockingPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.strict()||this.liveConfirmed());
     this.status.historyComplete=done;
+    this.status.pollInProgress=this.trustedPending()&&!this.blockingPending();
     // The stable period restarts when the connection stops being healthy (an error, or a trusted
     // live REQ no longer confirmed), with or without a socket close. A routine poll page in
     // flight is not a failure and does not restart it.
@@ -142,7 +154,7 @@ export class RelayReader {
     if(this.stopped)return;
     this.status=this.freshStatus(); this.opened=false;
     this.filters=new Map([...this.initialFilters.map(f=>[String(f.kinds[0]),f]),...this.extra]);
-    this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map();
+    this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.read=new Set();
     // live: per live REQ id {id, filter, sentAt, authed (sent after AUTH OK), eose}; liveSub: filter id -> current REQ id.
     // closing: our own CLOSEs, whose empty-reason CLOSED acknowledgement is not a refusal.
     this.live=new Map(); this.liveSub=new Map(); this.liveGen=new Map(); this.closing=new Set();
@@ -187,7 +199,8 @@ export class RelayReader {
       // it in full; polling it again would only resend the same requests every interval.
       if(this.status.error||this.trustedPending())return;
       // Poll also repairs late/backdated writes even when streaming succeeds.
-      for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)});
+      for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)},{poll:true});
+      this.updateComplete();
       if(this.applicants&&!this.pages.has(APPLICANTS))this.pageApplicants();
     },this.pollMs);
     ws.addEventListener('open',()=>{
@@ -271,8 +284,10 @@ export class RelayReader {
           // events is never skipped. The cursor must move strictly older or history fails closed.
           if(p.oldest===Infinity)this.status.error='History truncated: full page without an in-range event';
           else if(p.filter.until!==undefined&&p.oldest>=p.filter.until)this.status.error='History truncated: 500+ events in one second';
-          else this.page(m[1],{...p.filter,until:p.oldest});
+          else this.page(m[1],{...p.filter,until:p.oldest},{poll:p.poll});
         }
+        // A trusted filter's history is read once its last page ends without an error (R3-4).
+        if(!soft(m[1])&&m[1]!==APPLICANTS&&!this.pages.has(m[1])&&!this.status.error)this.read.add(m[1]);
         if(!this.pages.has(m[1]))send(['CLOSE',m[1]]);
         if(m[1]===String(DECISION)&&!this.pages.has(m[1]))this.onRoster();
         this.updateComplete();this.onChange();
@@ -303,6 +318,7 @@ export class RelayReader {
         } else if(soft(sub)&&this.pages.has(sub)) {this.softFailure(sub);this.updateComplete();}
         else if(this.pages.has(sub)) {
           const p=this.pages.get(sub);
+          this.read.delete(sub); // a refused read must be re-read in full before history counts again
           // Refused trusted history: fail closed now and re-read it in full on a fresh connection.
           if(!auth||(p.authed??this.status.authenticated))return this.recover(`Relay history subscription refused (${sub}): ${why}`);
           this.pages.delete(sub);this.status.historyComplete=false;
@@ -357,11 +373,11 @@ export class RelayReader {
   dropFilter(id) {
     if(!this.filters)return;
     const sub=this.liveSub.get(id)??`live-${id}`;
-    this.filters.delete(id);this.pages.delete(id);this.live.delete(sub);this.liveSub.delete(id);this.newest.delete(id);this.authClosed.delete(id);
+    this.filters.delete(id);this.pages.delete(id);this.read?.delete(id);this.live.delete(sub);this.liveSub.delete(id);this.newest.delete(id);this.authClosed.delete(id);
     this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==sub);
     for(const s of [id,sub])this.sendNow(['CLOSE',s]);
   }
-  page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
+  page(id,filter,{poll=false}={}) {const p={filter,received:0,oldest:Infinity,poll};this.pages.set(id,p);if(this.blockingPending())this.status.historyComplete=false;this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
   pageApplicants() {const filter=applicantFilter(this.buyer);this.pages.set(APPLICANTS,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',APPLICANTS,{...filter,limit:APPLICANT_LIMIT}]);}
   clearRecoveryTimers(){clearTimeout(this.authTimer);this.authTimer=null;clearTimeout(this.holdTimer);this.holdTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.closeSocket?.();}
@@ -432,6 +448,8 @@ export class ChallengeReader {
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
       historyComplete:this.trade.status.historyComplete&&quorumMet,
+      // A poll round re-reading history already held (R3-4); never part of readiness.
+      pollInProgress:[this.trade,...this.challenges].some(r=>r.status.pollInProgress),
       warnings:[...new Set([...relays.flatMap(r=>r.warnings),...(degraded?[degradedWarning]:[])])],
       // Display only; never part of readiness or the runner's exhaustion stop.
       applicantsIncomplete:this.challenges.some(r=>r.status.applicantsIncomplete)||!!this.store.applicantsTruncated,

@@ -1443,3 +1443,19 @@ test('quorum: progress re-sends need every relay (strict); completion uses the q
   f.snap.sellers.forEach(s=>s.minutesRemaining=.1);f.time(303);await f.runner.tick();
   assert.equal(f.publishes.at(-1)[2],'completed');assert.deepEqual(f.publishes.at(-1)[5],{strict:false});assert.deepEqual(reads.at(-1),{strict:false});
 });
+
+// R3-4 (runner side): a poll round in flight is tracked as pollInProgress, which is not a readiness
+// field: it never produces a "Relay change" line; only real transitions and the heartbeat log.
+test('R3-4: relay health log ignores pollInProgress toggles; real transitions still log',async t=>{
+  const {startRelayHealthLog}=await import('./swarm.mjs');
+  t.mock.timers.enable({apis:['setInterval','Date']});
+  const relay={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,pollInProgress:false,error:null,warnings:[]};
+  const d={status:{connected:true,authenticated:true,historyComplete:true,pollInProgress:false,error:null,warnings:[],failedRelays:[],relays:[relay]},sockets:{}};
+  const logs=[];const h=startRelayHealthLog(()=>structuredClone(d),m=>logs.push(m),{checkMs:5000,heartbeatMs:60000});
+  const initial=logs.length;
+  for(let i=0;i<10;i++){d.status.pollInProgress=relay.pollInProgress=i%2===0;t.mock.timers.tick(5000);}
+  assert.equal(logs.slice(initial).filter(m=>m.startsWith('Relay change')).length,0,'poll rounds are not transitions');
+  relay.historyComplete=d.status.historyComplete=false;t.mock.timers.tick(5000);
+  assert.ok(logs.some(m=>m.startsWith('Relay change')&&m.includes('historyComplete=false')));
+  h.stop();
+});
