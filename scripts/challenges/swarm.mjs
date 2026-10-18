@@ -4,7 +4,7 @@ import { parseChallengeRelays } from '../../web/app/src/challenge/shared/relay.m
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, truncateSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
@@ -225,25 +225,62 @@ export const EXPIRED_SLOT_GRACE_SECONDS = 600;
 export const SELLER_EXECUTION_TAIL_SECONDS = 420;
 export const SLOT_TEARDOWN_MARGIN_SECONDS = 60;
 export const MIN_EXPIRED_SLOT_GRACE_SECONDS = SELLER_EXECUTION_TAIL_SECONDS + SLOT_TEARDOWN_MARGIN_SECONDS;
+// Durable runner state: ONE fsynced JSON record, replaced atomically on every save (temp file,
+// fsync, rename over the journal, fsync the directory). A crash at any point leaves either the
+// previous complete record or the new one, never a mix, and the file never grows past one state.
+// Older runners APPENDED a full copy per save (run 2 reached 649 MB and startup died on Node's
+// string-size limit). Such a journal is migrated on open: it is scanned in fixed-size chunks
+// (never read as one string), the last complete record is authoritative (earlier records are
+// superseded copies; a torn final append was never acknowledged), and it is rewritten atomically
+// as a single record. A corrupt LAST complete record still fails startup.
+export const JOURNAL_CHUNK_BYTES = 1<<20;
 export class Journal {
-  constructor(path) {
-    this.path=path; this.state={jobs:[],days:{}};
-    let text='';try{text=readFileSync(path,'utf8');}catch(e){if(e.code!=='ENOENT')throw e;}
-    // A torn final append was never acknowledged. All prior durable records remain authoritative.
-    const end=text.lastIndexOf('\n')+1;
-    if(end<text.length)truncateSync(path,Buffer.byteLength(text.slice(0,end)));
-    for(const line of text.slice(0,end).split('\n').filter(Boolean))this.state=JSON.parse(line);
+  constructor(path,{fs={openSync,readSync,writeSync,fsyncSync,closeSync,renameSync,fstatSync},chunkBytes=JOURNAL_CHUNK_BYTES}={}) {
+    this.path=path; this.fs=fs; this.state={jobs:[],days:{}};
+    let fd;try{fd=fs.openSync(path,'r');}catch(e){if(e.code!=='ENOENT')throw e;}
+    if(fd===undefined)return;
+    let records=0,last=null,torn=false;
+    try {
+      const size=fs.fstatSync(fd).size,buf=Buffer.alloc(chunkBytes);
+      // Byte offsets of the newest non-empty complete line, and of the line being scanned.
+      let pos=0,lineStart=0,lineHasData=false;
+      while(pos<size) {
+        const n=fs.readSync(fd,buf,0,Math.min(chunkBytes,size-pos),pos);if(!n)break;
+        for(let i=0;i<n;) {
+          const nl=buf.indexOf(10,i);
+          const end=nl<0||nl>=n?n:nl;
+          if(end>i)lineHasData=true;
+          if(nl<0||nl>=n){i=n;break;}
+          if(lineHasData){records++;last=[lineStart,pos+nl];}
+          lineStart=pos+nl+1;lineHasData=false;i=nl+1;
+        }
+        pos+=n;
+      }
+      torn=lineHasData;
+      if(last) {
+        const rec=Buffer.alloc(last[1]-last[0]);
+        for(let off=0;off<rec.length;){const n=fs.readSync(fd,rec,off,rec.length-off,last[0]+off);if(!n)throw Error('Journal shrank while reading');off+=n;}
+        this.state=JSON.parse(rec.toString('utf8'));
+      }
+    } finally {fs.closeSync(fd);}
+    // Legacy append journal (several records) or a torn tail: rewrite as one atomic record.
+    if(records>1||torn){this.migrated={records,torn};this.save();}
   }
   save() {
-    let fd;
+    const {fs}=this,tmp=`${this.path}.tmp`;let fd;
     try {
-      fd=openSync(this.path,'a',0o600);
+      fd=fs.openSync(tmp,'w',0o600);
       const record=Buffer.from(JSON.stringify(this.state)+'\n');
-      for(let offset=0;offset<record.length;){const n=writeSync(fd,record,offset,record.length-offset);if(!n)throw Error('Short journal write');offset+=n;}
-      fsyncSync(fd);
+      for(let offset=0;offset<record.length;){const n=fs.writeSync(fd,record,offset,record.length-offset);if(!n)throw Error('Short journal write');offset+=n;}
+      fs.fsyncSync(fd);fs.closeSync(fd);fd=undefined;
+      fs.renameSync(tmp,this.path);
+      let dir;
+      try{dir=fs.openSync(dirname(this.path),'r');fs.fsyncSync(dir);}
+      catch(e){if(!['EINVAL','EPERM','EISDIR','ENOTSUP'].includes(e.code))throw e;}
+      finally{if(dir!==undefined)fs.closeSync(dir);}
     }
     catch(e) {e.journalFailure=true;throw e;}
-    finally {if(fd!==undefined)closeSync(fd);}
+    finally {if(fd!==undefined)try{fs.closeSync(fd);}catch{}}
   }
 }
 export function validateAnalysis(p) {

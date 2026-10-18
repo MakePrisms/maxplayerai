@@ -1030,3 +1030,70 @@ test('expired paid job: slot stays held on an unconfirmed read or a pending awar
   for(const bad of ['419','420','479'])assert.throws(()=>config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:bad}),/SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= 480/,bad);
   assert.equal(config([],{...base,SWARM_EXPIRED_SLOT_GRACE_SECONDS:'480'}).expiredSlotGrace,480);
 });
+
+// Run 2 #9: the journal appended a full state copy per save until startup died (649 MB).
+const realFs=()=>{const fs=process.getBuiltinModule('node:fs');return {openSync:fs.openSync,readSync:fs.readSync,writeSync:fs.writeSync,fsyncSync:fs.fsyncSync,closeSync:fs.closeSync,renameSync:fs.renameSync,fstatSync:fs.fstatSync};};
+test('journal: many saves keep exactly one record; restart reads the latest state',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-one-')),path=join(dir,'events.jsonl');
+  try {
+    const j=new Journal(path);
+    for(let i=0;i<500;i++){j.state.jobs.push({id:`job-${i}`,answer:'x'.repeat(200)});j.save();}
+    const text=readFileSync(path,'utf8');
+    assert.equal(text.split('\n').filter(Boolean).length,1,'one record, not one per save');
+    assert.ok(text.length<200*1000,`file holds one state (${text.length} bytes), not 500 copies`);
+    assert.equal(new Journal(path).state.jobs.length,500);
+    assert.equal(new Journal(path).state.jobs.at(-1).id,'job-499');
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('journal: a torn or failed temp write never loses the previous durable state',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-torn-')),path=join(dir,'events.jsonl');
+  try {
+    const j=new Journal(path);j.state.jobs.push({id:'kept'});j.save();
+    // Crash mid-write of the next record: a partial write, then the process dies (no rename).
+    const fs=realFs();let writes=0;
+    const torn=new Journal(path,{fs:{...fs,writeSync:(fd,b,o,l)=>{if(++writes>1)throw Object.assign(Error('crash'),{code:'EIO'});return fs.writeSync(fd,b,o,Math.max(1,Math.floor(l/2)));}}});
+    torn.state.jobs.push({id:'lost',answer:'y'.repeat(5000)});
+    assert.throws(()=>torn.save(),e=>e.journalFailure===true);
+    assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept'],'previous record intact');
+    // fsync or rename failure: same guarantee.
+    for(const fault of ['fsyncSync','renameSync']) {
+      const bad=new Journal(path,{fs:{...fs,[fault]:()=>{throw Object.assign(Error(fault),{code:'EIO'});}}});
+      bad.state.jobs.push({id:fault});assert.throws(()=>bad.save(),e=>e.journalFailure===true);
+      assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept']);
+    }
+    // A stale torn temp file from the crash is ignored and replaced by the next save.
+    appendFileSync(`${path}.tmp`,'{"half":');
+    const next=new Journal(path);next.state.jobs.push({id:'next'});next.save();
+    assert.deepEqual(new Journal(path).state.jobs.map(x=>x.id),['kept','next']);
+  } finally {rmSync(dir,{recursive:true});}
+});
+test('journal: a large legacy append journal is streamed in chunks (never one string) and migrated to one record',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'swarm-journal-legacy-')),path=join(dir,'events.jsonl');
+  try {
+    // Synthesise the old format: one full state per line, growing, plus a torn final append.
+    // 3000 records of ~3-4 KB = ~10 MB with a 16 KiB chunk: the same shape as 649 MB at 1 MiB.
+    const fs=process.getBuiltinModule('node:fs'),fd=fs.openSync(path,'w',0o600);
+    const state={jobs:[],days:{}};
+    for(let i=0;i<3000;i++){state.jobs=[{id:`job-${i}`,answer:`${i}:`+'z'.repeat(3000+(i%700))}];fs.writeSync(fd,JSON.stringify(state)+'\n');}
+    fs.writeSync(fd,'{"jobs":[{"id":"torn"');fs.closeSync(fd);
+    const size=fs.statSync(path).size,chunk=16384;
+    const real=realFs();let maxRead=0,reads=0;
+    const spy={...real,readSync:(f,b,o,l,p)=>{reads++;maxRead=Math.max(maxRead,l);return real.readSync(f,b,o,l,p);}};
+    const j=new Journal(path,{fs:spy,chunkBytes:chunk});
+    assert.ok(reads>size/chunk,`streamed in ${reads} reads`);
+    // Only the last complete record (one state) is ever materialised, never the file.
+    assert.ok(maxRead<=Math.max(chunk,4000),`largest single read ${maxRead} bytes of a ${size}-byte file`);
+    assert.equal(j.state.jobs[0].id,'job-2999','last complete record wins; torn append discarded');
+    assert.deepEqual(j.migrated,{records:3000,torn:true});
+    const text=readFileSync(path,'utf8');
+    assert.equal(text.split('\n').filter(Boolean).length,1);assert.ok(text.endsWith('\n'));
+    // Restart after migration is idempotent: same state, no further rewrite.
+    const again=new Journal(path);assert.equal(again.state.jobs[0].id,'job-2999');assert.equal(again.migrated,undefined);
+    // A record spanning many chunks is reassembled exactly.
+    const big={jobs:[{id:'big',answer:'q'.repeat(100000)}],days:{}};
+    fs.writeFileSync(path,JSON.stringify({jobs:[],days:{}})+'\n'+JSON.stringify(big)+'\n');
+    assert.deepEqual(new Journal(path,{chunkBytes:1000}).state,big);
+    // Corrupt last complete record still fails startup.
+    fs.writeFileSync(path,JSON.stringify(big)+'\nbad\n');assert.throws(()=>new Journal(path,{chunkBytes:1000}));
+  } finally {rmSync(dir,{recursive:true});}
+});
