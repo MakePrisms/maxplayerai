@@ -16,6 +16,10 @@ Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://re
 Repeat --relay URL after the command to override. ws:// is loopback-only; relay.maxplayer.ai is forbidden.
 Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 ";
+/// A publish refused because the challenge is already closed on the relays exits with
+/// `CLOSED_EXIT` and an error starting with `CHALLENGE_CLOSED` (nothing is signed or sent).
+const CHALLENGE_CLOSED: &str = "challenge closed";
+const CLOSED_EXIT: i32 = 3;
 /// Authors per roster membership REQ, and the newest-first applicant sample size (matches the page).
 const ROSTER_AUTHOR_CHUNK: usize = 100;
 const APPLICANT_LIMIT: usize = 256;
@@ -150,7 +154,11 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             }
             Err(e) => {
                 let _ = writeln!(err, "challenge: {e}");
-                2
+                if e.starts_with(CHALLENGE_CLOSED) {
+                    CLOSED_EXIT
+                } else {
+                    2
+                }
             }
         }
     }
@@ -295,6 +303,14 @@ async fn execute_async(
             )
             .await
             .map_err(|e| e.to_string())?;
+        // A completed/cancelled challenge is final: never sign a replacement over it, whatever
+        // view the caller published from (its status read can be stale by the time we sign).
+        if let Some(closed) = closed_status(&previous, &c.buyer, &c.id) {
+            return Err(format!(
+                "{CHALLENGE_CLOSED} ({closed}): the latest buyer-signed challenge {} is {closed}; nothing published",
+                c.id
+            ));
+        }
         let created = replacement_timestamp(now, &previous, &own, CHALLENGE_KIND, &c.id)?;
         reject_secret_in_draft(home, &draft)?;
         let id = relay
@@ -494,6 +510,14 @@ fn reject_secret_in_draft(
         return Err("event would publish secret key".into());
     }
     Ok(())
+}
+
+/// Status of the latest valid buyer-signed CHALLENGE with this id, if it is completed/cancelled.
+fn closed_status(events: &[nostr_sdk::Event], buyer: &str, id: &str) -> Option<String> {
+    select_challenge(events, buyer, Some(id))
+        .ok()
+        .map(|c| c.status)
+        .filter(|s| s == "completed" || s == "cancelled")
 }
 
 fn replacement_timestamp(
@@ -729,6 +753,86 @@ mod tests {
                     .status
                     == "cancelled"
             );
+        }
+        /// Advisor r1 #1: the caller's status view said in_progress; the operator closed the
+        /// challenge before the sidecar's own pre-publish fetch. The publish is refused with the
+        /// closed exit code and nothing is written, so the close stays the latest event.
+        #[test]
+        fn publish_never_replaces_a_close_seen_by_its_own_fetch() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            for closed in ["cancelled", "completed"] {
+                let root = std::env::temp_dir().join(format!(
+                    "challenge-closed-{closed}-{}",
+                    Keys::generate().public_key()
+                ));
+                let home = home::bootstrap(&root).unwrap();
+                let keys = crate::relay::keys(&home).unwrap();
+                let now = Timestamp::now().as_secs();
+                let mut c = Challenge {
+                    buyer: keys.public_key().to_hex(),
+                    id: "today".into(),
+                    title: "Build".into(),
+                    goal: "goal".into(),
+                    starts: now - 60,
+                    ends: now + 3600,
+                    budget_sats: 0,
+                    status: "in_progress".into(),
+                    update: None,
+                    result: None,
+                };
+                let sign = |c: &Challenge, t: u64| {
+                    let d = c.to_event_draft().unwrap();
+                    EventBuilder::new(Kind::from(d.kind), d.content)
+                        .tags(d.tags.into_iter().map(|t| Tag::parse(t.0).unwrap()))
+                        .custom_created_at(Timestamp::from(t))
+                        .sign_with_keys(&keys)
+                        .unwrap()
+                };
+                let open = sign(&c, now - 30);
+                c.status = closed.into();
+                let close = sign(&c, now - 10);
+                let goal = root.join("goal.md");
+                std::fs::write(&goal, "goal").unwrap();
+                let iso = |t| Timestamp::from(t).to_human_datetime();
+                let publish = |url: &str| {
+                    args(&format!(
+                        "publish --home {} --relay {url} --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0 --status in_progress --update progress",
+                        root.display(),
+                        goal.display(),
+                        iso(now - 60),
+                        iso(now + 3600)
+                    ))
+                };
+                // The caller's view: only the open event (in_progress). A publish then succeeds.
+                let before = rt.block_on(crate::relay::transport_tests::fixture(
+                    vec![open.clone()],
+                    true,
+                    true,
+                ));
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                assert_eq!(run(&publish(&before.url), &mut out, &mut err), 0);
+                assert_eq!(before.writes.lock().unwrap().len(), 1);
+                // The relays now hold the close (newer than the caller's view): refused, no write.
+                let after = rt.block_on(crate::relay::transport_tests::fixture(
+                    vec![open, close],
+                    true,
+                    true,
+                ));
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                assert_eq!(run(&publish(&after.url), &mut out, &mut err), CLOSED_EXIT);
+                let err = String::from_utf8(err).unwrap();
+                assert!(
+                    err.contains(&format!("challenge: {CHALLENGE_CLOSED} ({closed})")),
+                    "{err}"
+                );
+                assert!(out.is_empty());
+                assert!(after.writes.lock().unwrap().is_empty(), "close replaced");
+                std::fs::remove_dir_all(root).unwrap();
+            }
         }
         #[tokio::test]
         async fn leave_with_oversized_prior_note_publishes_bounded_note() {
