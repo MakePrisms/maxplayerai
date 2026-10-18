@@ -1472,3 +1472,45 @@ test('M3: coverage line reports the trade relay not ready while unauthenticated 
   assert.match(relayCoverageLine({...r({...ok,historyComplete:false}),degraded:true,quorum:{required:2,complete:2,total:3}}),/trade relay not ready/);
   assert.match(relayCoverageLine(r({...ok,error:'Relay history timed out'})),/required: Relay history timed out/);
 });
+
+// R3-1 (round 3): the planner gave 0-sat tasks to sellers advertising rate=100 without
+// takes_payment=none; those sellers never claim, the jobs expired and the planner could not tell why.
+test('R3-1: an assignment below a paid seller\'s advertised rate is rejected with the reason fed back; auto-raise is opt-in and budget-bounded',async()=>{
+  const {sellerPricing,belowSellerMinimum}=await import('./swarm.mjs');
+  assert.deepEqual(sellerPricing({capabilities:[['rate','100']]}),{known:true,free:false,rateSats:100,minimumSats:100});
+  assert.deepEqual(sellerPricing({capabilities:[['rate','0'],['takes_payment',' none ']]}),{known:true,free:true,rateSats:0,minimumSats:0});
+  assert.equal(sellerPricing({capabilities:[['rate','0']]}).minimumSats,1,'rate 0 without takes_payment=none is not free');
+  assert.equal(sellerPricing({}).known,false,'no heartbeat: pricing unknown, not checked');
+  assert.match(belowSellerMinimum(sellerPricing({capabilities:[['rate','0']]}),0),/below seller minimum 1 .*rate 0 is not free/);
+  assert.equal(belowSellerMinimum(sellerPricing({capabilities:[['rate','100']]}),100),null);
+  const paid=f=>{f.snap.sellers[0].capabilities=[['rate','100']];f.snap.sellers[1].capabilities=[['rate','0'],['takes_payment','none']];};
+  // Default (auto-raise OFF): the 0-sat task to the paid seller is never posted; the free seller's is.
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);paid(f);f.snap.budget.totalSats=1000;
+  let calls=0;f.setPlan(input=>calls++?{wait:true}:{assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'t',durationSeconds:30,amountSats:0}))});
+  await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.amount_sats]),[['b',0]]);
+  assert.ok(reports.some(r=>/^Rejected assignment for a: below seller minimum 100 /.test(r)),reports.join('\n'));
+  assert.equal(f.inputs.find(i=>i.mode==='analyze').sellers.find(s=>s.pubkey==='a').pricing.minimumSats,100,'planner sees the minimum');
+  assert.equal(f.journal.saved.days[JSON.stringify(['b','day'])].rejected.length,1,'journaled');
+  f.time(101);await f.runner.tick();
+  const fed=f.inputs.at(-1).rejectedAssignments;
+  assert.equal(fed.length,1);assert.equal(fed[0].seller,'a');assert.match(fed[0].reason,/below seller minimum 100/);
+  assert.deepEqual(Object.values(f.journal.state.days)[0].rejected,[],'the next assign batch replaces the feedback');
+  // A priced offer below the rate is rejected too; at the rate it posts.
+  const g=fixture(),gr=[];g.io.report=m=>gr.push(m);paid(g);g.snap.budget.totalSats=1000;g.snap.sellers=g.snap.sellers.slice(0,1);
+  g.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30,amountSats:50}]}));await g.runner.tick();
+  assert.equal(posts(g).length,0);assert.ok(gr.some(r=>r.includes('below seller minimum 100 (offered 50)')));
+  g.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30,amountSats:100}]}));g.time(101);await g.runner.tick();
+  assert.deepEqual(posts(g).map(([,a])=>[a.payment,a.amount_sats,a.max_sats]),[['sat',100,100]]);
+  // Opt-in auto-raise: raised to the rate within headroom, refused (with both reasons) beyond it.
+  for(const [budget,posted] of [[1000,[['sat',100,100]]],[60,[]]]) {
+    const h=fixture(),hr=[];h.io.report=m=>hr.push(m);paid(h);h.snap.budget.totalSats=budget;h.snap.sellers=h.snap.sellers.slice(0,1);h.c.autoRaiseToRate=true;
+    h.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30,amountSats:0}]}));await h.runner.tick();
+    assert.deepEqual(posts(h).map(([,a])=>[a.payment,a.amount_sats,a.max_sats]),posted);
+    if(!posted.length)assert.ok(hr.some(r=>/below seller minimum 100 .*auto-raise to 100 sats refused: .*budget_exceeded/.test(r)),hr.join('\n'));
+    else assert.ok(hr.some(r=>r.startsWith('Raising assignment for a from 0 to 100 sats')));
+  }
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a'}).autoRaiseToRate,false,'OFF by default');
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_AUTO_RAISE_TO_RATE:'1'}).autoRaiseToRate,true);
+  assert.throws(()=>config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_AUTO_RAISE_TO_RATE:'maybe'}),/SWARM_AUTO_RAISE_TO_RATE/);
+});

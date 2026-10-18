@@ -170,6 +170,12 @@ parser; above-cap prices appear in results as `price too high: asked X`. Prices 
 not award authority; normal exact-price/mint/payment-mode checks remain unchanged.
 Free is fine; pay more for useful results, raise a future price or skip a seller, and keep
 all assignments in the batch within headroom.
+The runner enforces each paid seller's advertised floor in code: a seller is free only when its
+heartbeat says `takes_payment=none`; otherwise an assignment below its `rate` (and any 0-sat
+assignment, `rate=0` included) would never be claimed, so it is rejected with `below seller
+minimum N`, or, with the default-off `SWARM_AUTO_RAISE_TO_RATE`, raised to the minimum within
+headroom. Rejected assignments of the last `assign` batch, with their reasons, are returned to
+the planner as `rejectedAssignments` on its next calls.
 `assess` checks newly settled results even after posting stops. Later responses may revise the plan.
 Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
 and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle

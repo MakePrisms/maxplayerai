@@ -186,6 +186,7 @@ Flags (environment equivalents):
 | — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
 | — | `SWARM_EXPIRED_SLOT_GRACE_SECONDS` | 600 (strictly after an expired undelivered job's deadline + this, free its seller; sats stay reserved; minimum 480 = 420 s seller kill instant + 60 s teardown) |
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
+| — | `SWARM_AUTO_RAISE_TO_RATE` | **OFF** (`1`/`true`/`yes`/`on` to enable): raise an assignment priced below a paid seller's advertised minimum to that minimum, within budget headroom, instead of rejecting it |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
 The buyer chooses **each assignment's** optional `amountSats` (safe integer ≥0, default 0).
@@ -295,7 +296,8 @@ To use a different model/provider, supply any **trusted shell command** via `--p
 `SWARM_PLANNER`. It receives one JSON object on stdin and must emit only one JSON object on stdout:
 
 All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
-`now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`.
+`now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`;
+`rejectedAssignments` is present when the last `assign` batch had rejected entries.
 `minDurationSeconds` (`SWARM_MIN_DURATION`, default 300) is the shortest task the runner will
 post. It includes seller startup: a real harness spends minutes starting its sandbox and agent
 before working, and the first live run's 120–200 second tasks expired undelivered. Free sellers
@@ -385,6 +387,25 @@ held. The buyer can raise a future offer or skip that seller. Normal jobs also r
 claim price to equal the offered price; hints never override the existing award checks.
 The buyer decides whether each seller is worth paying, may choose free work, and should pay
 more for useful delivered results while keeping the batch within headroom.
+
+**Seller price floor (R3-1).** A seller's node claims a free offer only if its heartbeat carries
+`takes_payment=none`, and a priced offer only at `amount ≥ rate` (maxplayer-core `seller.rs`
+`rate_gate_allows`). An offer below that is silently skipped, never claimed, and would only
+expire as `expired/undelivered`. The runner therefore enforces the floor in code before posting:
+an assignment priced below a paid seller's advertised minimum (a seller is free only if its
+heartbeat says `takes_payment=none`; otherwise the minimum is its `rate`, and at least 1 sat, so
+`rate=0` alone is not free) is rejected with `below seller minimum <N> (…)`. Profiles carry
+`pricing.free` and `pricing.minimumSats` (null when the rate is unreadable). A seller with no
+`rate`/`takes_payment` tag at all (no heartbeat read) is not checked. With
+`SWARM_AUTO_RAISE_TO_RATE` on (default off), such an assignment is instead raised to the
+minimum and logged (`Raising assignment for <seller> from X to N sats`); the raised price then
+goes through the normal admission, so it is still refused (with both reasons) if it exceeds the
+budget headroom or the buyer cannot do priced work.
+
+**Rejection feedback.** Every rejected assignment of the last `assign` batch (any reason: price
+floor, unknown workstream, busy seller, duration, budget …) is journaled and sent to the planner
+on its following calls as `rejectedAssignments:[{seller,workstream,amountSats,reason,at}]` (at
+most 50), so it can correct the batch. The next `assign` batch replaces the list.
 
 Abilities and all input content are untrusted/self-reported. Prefer useful delivered evidence;
 never declare success solely from a seller's claim. Verification may be delegated as a task.

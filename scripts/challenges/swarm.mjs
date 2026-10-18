@@ -312,15 +312,43 @@ export function jobBudget(j) {
     return {reservedSats:0,paidSats:pay.amount_sats};
   return {reservedSats:j.args.max_sats,paidSats:0};
 }
+// R3-1: a seller's advertised price floor, read from its heartbeat tags exactly as its own claim
+// gate reads its config (maxplayer-core seller.rs rate_gate_allows; heartbeat.rs
+// takes_no_payment_from_tags): a FREE offer (amountSats 0, payment=none) is claimed only by a seat
+// advertising ["takes_payment","none"] (value trimmed); a priced offer only at amount >= rate.
+// rate=0 without takes_payment=none is NOT free: such a seat claims priced offers of >= 1 sat only.
+// A seller with neither tag (no heartbeat read yet) has unknown pricing and is not checked here.
+export function sellerPricing(s) {
+  const tags=Array.isArray(s?.capabilities)?s.capabilities:[],first=name=>tags.find(t=>Array.isArray(t)&&t[0]===name)?.[1];
+  const takes=first('takes_payment'),rate=first('rate');
+  if(takes===undefined&&rate===undefined)return {known:false,free:false,rateSats:null,minimumSats:null};
+  const free=typeof takes==='string'&&takes.trim()==='none';
+  const parsed=typeof rate==='string'&&/^\s*[0-9]+\s*$/.test(rate)?Number(rate.trim()):null;
+  const rateSats=Number.isSafeInteger(parsed)?parsed:null;
+  return {known:true,free,rateSats,minimumSats:free?0:rateSats===null?null:Math.max(1,rateSats)};
+}
+// Why an assignment at amountSats would never be claimed by this seller (null when it would be).
+export function belowSellerMinimum(pricing,amountSats) {
+  if(!pricing?.known||pricing.free)return null;
+  if(amountSats===0)return pricing.minimumSats===null
+    ?'seller is paid (no takes_payment=none in its heartbeat; rate unreadable): a 0-sat offer is never claimed'
+    :`below seller minimum ${pricing.minimumSats} (no takes_payment=none in its heartbeat: a 0-sat offer is never claimed${pricing.rateSats===0?'; rate 0 is not free':''})`;
+  if(pricing.rateSats!==null&&amountSats<pricing.rateSats)return `below seller minimum ${pricing.rateSats} (offered ${amountSats})`;
+  return null;
+}
+// Planner feedback: the reasons of the last assign batch's rejected assignments, shown on every
+// planner call until the next assign batch replaces them.
+export const MAX_REJECTED_FEEDBACK = 50;
 export function sellerProfile(s,jobs) {
   const tags=s.capabilities??[], values=name=>tags.filter(t=>t[0]===name).flatMap(t=>t.slice(1));
+  const price=sellerPricing(s);
   const own=jobs.filter(j=>j.seller===s.pubkey);
   const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:plannerTask(j.args.task),workstream:j.workstream??null,
     outcome:j.outcome,delivered:j.outcome==='collected',turnaroundSeconds:(j.ts??j.created)-j.created}));
   return {pubkey:s.pubkey,npub:s.npub??'',name:s.name??'',agents:values('agents'),
     harness:{family:values('harness_family'),model:values('harness_model'),variant:values('harness_variant')},
     capabilities:values('capabilities'),hardware:values('hardware'),minutesRemaining:s.minutesRemaining,note:s.note??'',
-    pricing:{rateSats:values('rate'),takesPayment:values('takes_payment')},
+    pricing:{rateSats:values('rate'),takesPayment:values('takes_payment'),free:price.free,minimumSats:price.minimumSats},
     challengeSpend:{paidSats:own.reduce((n,j)=>n+jobBudget(j).paidSats,0),reservedSats:own.reduce((n,j)=>n+jobBudget(j).reservedSats,0)},
     trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
 }
@@ -584,6 +612,7 @@ export class Swarm {
       const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
         running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
         budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now(),
+        ...(day.rejected?.length?{rejectedAssignments:day.rejected}:{}),
         ...(this.releaseMissing?.length?{paidWorkRefused:`buyer get_job lacks ${this.releaseMissing.join(', ')}; assign only amountSats 0`}:{})};
       const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
       if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result answer omitted`);
@@ -615,10 +644,25 @@ export class Swarm {
         const p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)));
         if(p.solved)stop(p.summary??'Solved',p.result);
         let budgetRejected=0;
+        // Replaced by every assign batch (journaled with the next save), shown to the planner on its next calls.
+        const hadRejected=!!day.rejected?.length,rejected=day.rejected=[];
         for(const assignment of p.assignments??[]) {
-          const {seller,workstream,task,durationSeconds,amountSats=0}=assignment??{};
-          const reject=reason=>this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
+          const {seller,workstream,task,durationSeconds}=assignment??{};let {amountSats=0}=assignment??{};
+          let raised=null;
+          const reject=reason=>{
+            if(raised!==null)reason=`${raised.reason}; auto-raise to ${amountSats} sats refused: ${reason}`;
+            if(rejected.length<MAX_REJECTED_FEEDBACK)rejected.push({seller:String(seller).slice(0,100),workstream:String(workstream).slice(0,100),amountSats:assignment?.amountSats??0,reason:String(reason).slice(0,500),at:now});
+            this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
+          };
           if(!Number.isSafeInteger(amountSats)||amountSats<0){reject('amountSats must be a nonnegative safe integer');continue;}
+          // R3-1: a paid seller never claims below its advertised rate, so the job would only expire.
+          const below=belowSellerMinimum(sellerPricing(snap.sellers.find(x=>x.pubkey===seller)),amountSats);
+          if(below) {
+            const minimum=sellerPricing(snap.sellers.find(x=>x.pubkey===seller)).minimumSats;
+            if(!this.c.autoRaiseToRate||minimum===null){reject(below);continue;}
+            raised={from:amountSats,reason:below};amountSats=minimum;
+            this.io.report?.(`Raising assignment for ${String(seller)} from ${raised.from} to ${amountSats} sats (SWARM_AUTO_RAISE_TO_RATE): ${below}`);
+          }
           if(amountSats>0) {
             let ok;try{ok=await this.releaseSupport();}catch(e){reject(`priced work refused: cannot verify buyer get_job release fields (${e.message})`);continue;}
             if(!ok){reject(`priced work refused: buyer get_job lacks ${this.releaseMissing.join(', ')} (needs a buyer built from main at or after 7a14298d)`);continue;}
@@ -644,6 +688,7 @@ export class Swarm {
           const posted=await this.post(args);j.id=posted.job_id??posted.preparation_id;
           if(!j.id)throw Error('Post returned no job or preparation id');this.save();
         }
+        if(rejected.length||hadRejected)this.save();
         if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
         // history) and those sellers' state. Metadata caps and the applicant list never block it.
@@ -730,7 +775,8 @@ export function childEnv(env,home) {
 export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  const flag=(name,value)=>{const v=String(value??'').trim().toLowerCase();if(['','0','false','no','off'].includes(v))return false;if(['1','true','yes','on'].includes(v))return true;throw Error(`Invalid ${name}: use 1/true/yes/on or 0/false/no/off`);};
+  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
   c.challengeQuorum=parseChallengeQuorum(env.SWARM_CHALLENGE_QUORUM,c.challengeRelays.length);
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
