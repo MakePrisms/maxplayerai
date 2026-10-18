@@ -641,7 +641,12 @@ export class Swarm {
       if(now>=c.ends)stop('Unsolved: work window ended');
       else if(!decision.reasons.length) {
         const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends);
+        // R3-7: the plan this assign call is SENT with. A response may revise the plan (saved in
+        // ask()); its assignments are valid against either the plan the planner was shown in this
+        // call or the revision it returned with them, never only the post-call day.plan.
+        const sentPlan=day.plan;
         const p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)));
+        const planIds=new Set([...(sentPlan?.workstreams??[]),...(p.plan?.workstreams??[])].map(w=>w?.id).filter(id=>typeof id==='string'));
         if(p.solved)stop(p.summary??'Solved',p.result);
         let budgetRejected=0;
         // Replaced by every assign batch (journaled with the next save), shown to the planner on its next calls.
@@ -668,7 +673,8 @@ export class Swarm {
             if(!ok){reject(`priced work refused: buyer get_job lacks ${this.releaseMissing.join(', ')} (needs a buyer built from main at or after 7a14298d)`);continue;}
           }
           if(!candidates.some(s=>s.seller_pubkey===seller)){reject('seller busy or ineligible (not in free roster)');continue;}
-          if(typeof task!=='string'||!task.trim()||!day.plan.workstreams.some(w=>w.id===workstream)){reject('invalid task or workstream');continue;}
+          if(typeof task!=='string'||!task.trim()){reject('invalid task (empty or not text)');continue;}
+          if(!planIds.has(workstream)){reject(`unknown workstream ${JSON.stringify(String(workstream)).slice(0,120)}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})`);continue;}
           if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject('duration outside configured bounds');continue;}
           // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
           const fresh=await this.io.snapshot(),at=this.io.now();

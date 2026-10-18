@@ -316,7 +316,11 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
   Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?}]}`, `{wait:true}`, or
   `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
   May deliberately leave any seller idle. Each assignment is validated separately and invalid
-  entries are dropped with a logged reason. Duration must fit configured min/max, remaining
+  entries are dropped with a logged reason (also returned as `rejectedAssignments`). A workstream
+  id is valid if it is in the plan sent with that same `assign` call or in the revised `plan` the
+  response returns, so a revision by the previous `assess` (or by this response) never invalidates
+  the ids the planner was shown (R3-7); otherwise the reason is `unknown workstream "<id>": …` with
+  the valid ids. Duration must fit configured min/max, remaining
   minutes and window; fresh admission and serial budget reservations apply before each post.
 - `assess`: checks newly settled results, including after posting stops; returns wait or solved.
   `assign` and `assess` may include `plan` containing a complete revised analysis plan, saved

@@ -1514,3 +1514,33 @@ test('R3-1: an assignment below a paid seller\'s advertised rate is rejected wit
   assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_AUTO_RAISE_TO_RATE:'1'}).autoRaiseToRate,true);
   assert.throws(()=>config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_AUTO_RAISE_TO_RATE:'maybe'}),/SWARM_AUTO_RAISE_TO_RATE/);
 });
+
+// R3-7 (round 3): an assignment naming a workstream from the plan the planner was sent was dropped
+// as "invalid task or workstream" when the same response revised the plan; the seller sat idle.
+test('R3-7: workstreams validate against the plan sent with the assign call (or its own revision); the reason reaches the planner',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  const revised={...analysis,workstreams:[{id:'next',description:'next',needs:{skills:[]},estMinutes:1,dependsOn:[]}]};
+  let call=0;
+  f.setPlan(input=>{call++;
+    if(call===1){assert.deepEqual(input.plan.workstreams.map(w=>w.id),['piece']);
+      // Revises the plan AND assigns: one task from the plan it was sent, one from its revision, one unknown.
+      return {plan:revised,assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30},{seller:'b',workstream:'gone',task:'t',durationSeconds:30}]};}
+    return {wait:true};});
+  await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>a.seller_pubkey),['a'],'the sent-plan workstream posts');
+  assert.equal(f.journal.state.jobs[0].workstream,'piece');
+  assert.equal(Object.values(f.journal.state.days)[0].plan.workstreams[0].id,'next','revision saved');
+  assert.ok(reports.some(r=>/^Rejected assignment for b: unknown workstream "gone": not in the plan sent with this assign call or the plan it returned \(ids: piece, next\)/.test(r)),reports.join('\n'));
+  f.time(101);await f.runner.tick();
+  assert.match(f.inputs.at(-1).rejectedAssignments[0].reason,/unknown workstream "gone"/);
+  assert.equal(f.inputs.at(-1).rejectedAssignments[0].seller,'b');
+  // The revision's ids are valid on the same and later calls; a stale id after the revision is not.
+  const g=fixture(),gr=[];g.io.report=m=>gr.push(m);
+  g.setPlan(()=>({plan:revised,assignments:[{seller:'a',workstream:'next',task:'t',durationSeconds:30}]}));await g.runner.tick();
+  assert.deepEqual(posts(g).map(([,a])=>a.seller_pubkey),['a']);
+  g.setPlan(()=>({assignments:[{seller:'b',workstream:'piece',task:'t',durationSeconds:30}]}));g.time(101);await g.runner.tick();
+  assert.equal(posts(g).length,1);assert.ok(gr.some(r=>/Rejected assignment for b: unknown workstream "piece": not in the plan sent with this assign call \(ids: next\)/.test(r)),gr.join('\n'));
+  // An empty task still has its own reason.
+  const h=fixture(),hr=[];h.io.report=m=>hr.push(m);h.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:' ',durationSeconds:30}]}));await h.runner.tick();
+  assert.ok(hr.some(r=>r==='Rejected assignment for a: invalid task (empty or not text)'));
+});

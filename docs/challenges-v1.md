@@ -176,7 +176,9 @@ assignment, `rate=0` included) would never be claimed, so it is rejected with `b
 minimum N`, or, with the default-off `SWARM_AUTO_RAISE_TO_RATE`, raised to the minimum within
 headroom. Rejected assignments of the last `assign` batch, with their reasons, are returned to
 the planner as `rejectedAssignments` on its next calls.
-`assess` checks newly settled results even after posting stops. Later responses may revise the plan.
+`assess` checks newly settled results even after posting stops. Later responses may revise the plan;
+an assignment's workstream is checked against the plan sent with that `assign` call or the revision
+returned with it, never only the plan saved after the call.
 Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
 and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
 and prefer useful past deliveries. Every assignment is revalidated against fresh eligibility,
