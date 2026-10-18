@@ -575,9 +575,31 @@ async fn command_async(
             // challenge still counts the current membership; fail closed if that is unreadable.
             // Eligibility also needs the latest buyer decision `accepted` (trusted read above):
             // a pending or denied seller is not counted today, so its edit forfeits nothing.
-            let accepted = decisions
+            let mut accepted = decisions
                 .iter()
                 .any(|d| d.seller == own && d.decision == "accepted");
+            // A degraded (quorum, not every-relay) read can omit the buyer's acceptance when only
+            // the missing relay holds it; then `accepted` above is wrong and the strict challenge
+            // read below would be skipped. So while degraded, re-read the decisions from every
+            // relay too, and let that strict read alone decide. Any failure refuses (nothing
+            // published).
+            if !relay.missing().is_empty() {
+                let strict = relay
+                    .fetch_all(
+                        home,
+                        Filter::new()
+                            .kind(Kind::from(CHALLENGE_DECISION_KIND))
+                            .author(public_key(&buyer)?),
+                    )
+                    .await
+                    .map_err(|e| format!("could not read the buyer's challenge state reliably ({e}); refusing to change your membership, because republishing it during a running challenge would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
+                accepted = latest_per_coordinate(
+                    strict.iter().filter(|e| parse_decision(e, &buyer).is_ok()),
+                )
+                .into_iter()
+                .filter_map(|e| parse_decision(e, &buyer).ok())
+                .any(|d| d.seller == own && d.decision == "accepted");
+            }
             if accepted {
                 // Strict every-relay read, not the quorum read: a challenge published to a bare
                 // quorum is on only some relays, and the relay left out could be the only one
@@ -2843,6 +2865,74 @@ mod tests {
                 .unwrap_err();
                 assert!(error.starts_with("You're in today's challenge"), "{error}");
                 assert!(r.iter().all(|f| writes(f).is_empty()));
+            }
+
+            /// Advisor r1 H2: the buyer's acceptance is only on the relay that is down. The quorum
+            /// decision read then shows "not accepted"; that must not skip the every-relay check.
+            #[tokio::test]
+            async fn minutes_change_refused_when_acceptance_is_only_on_the_down_relay() {
+                let s = setup("h2");
+                let now = Timestamp::now().as_secs();
+                let open = challenge_event(
+                    &s.buyer_keys,
+                    "day",
+                    now - 100,
+                    now + 3600,
+                    "in_progress",
+                    now - 30_000,
+                );
+                let joined = membership(&s.seller, &s.buyer, "joined", now - 20_000, now - 20_000);
+                let accepted = decision(&s.buyer_keys, &s.seller, "accepted", now - 19_000);
+                let r = vec![
+                    relay_like(vec![open.clone(), joined.clone()], vec![]).await,
+                    relay_like(vec![open.clone(), joined.clone()], vec![]).await,
+                    relay_like(vec![open, joined, accepted], vec![]).await,
+                ];
+                r[2].online.store(false, Ordering::SeqCst);
+                for change in ["--minutes 120", "--minutes 60 --note changed"] {
+                    let error = command(&s.home, &r, &format!("join --buyer {} {change}", s.buyer))
+                        .await
+                        .unwrap_err();
+                    assert!(error.starts_with("could not read the buyer's challenge state reliably (challenge relay read incomplete; failed: "), "{error}");
+                }
+                assert!(
+                    r.iter().all(|f| writes(f).is_empty()),
+                    "published while degraded"
+                );
+                // Relay back: the strict read sees the acceptance and the running challenge.
+                r[2].online.store(true, Ordering::SeqCst);
+                let error = command(
+                    &s.home,
+                    &r,
+                    &format!("join --buyer {} --minutes 120", s.buyer),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.starts_with("You're in today's challenge"), "{error}");
+                assert!(r.iter().all(|f| writes(f).is_empty()));
+                // Not degraded and genuinely not accepted (no decision anywhere): publishes, as before.
+                let s2 = setup("h2-pending");
+                let open = challenge_event(
+                    &s2.buyer_keys,
+                    "day",
+                    now - 100,
+                    now + 3600,
+                    "in_progress",
+                    now - 30_000,
+                );
+                let r = three(vec![
+                    open,
+                    membership(&s2.seller, &s2.buyer, "joined", now - 20_000, now - 20_000),
+                ])
+                .await;
+                command(
+                    &s2.home,
+                    &r,
+                    &format!("join --buyer {} --minutes 120", s2.buyer),
+                )
+                .await
+                .unwrap();
+                assert!(r.iter().all(|f| writes(f).len() == 1));
             }
 
             /// Closed-challenge refusal (exit 3) still works at quorum; a non-terminal update over an
