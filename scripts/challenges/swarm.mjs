@@ -683,8 +683,9 @@ export function relayCoverageLine(r) {
   if(!r)return 'Relay coverage unknown';
   const q=r.quorum,missing=r.missingRelays??r.failedRelays??[];
   const trade=r.relays?.find(x=>x.role==='trade');
-  const tradeDown=trade&&(!trade.connected||trade.error);
-  if(tradeDown)return `Relay coverage incomplete; trade relay unavailable: ${trade.url} (required); nothing is posted or published`;
+  // Same condition as tradeReady (coordinator.mjs): connected, authenticated, history complete, no error.
+  const tradeDown=trade&&!tradeReady({relay:r});
+  if(tradeDown)return `Relay coverage incomplete; trade relay not ready: ${trade.url} (required${trade.error?`: ${trade.error}`:!trade.connected?': disconnected':!trade.authenticated?': not authenticated':': history incomplete'}); nothing is posted or published`;
   if(q&&q.complete<q.required)return `Relay coverage below quorum (${q.complete} of ${q.total} challenge relays complete, need ${q.required}); unavailable: ${missing.join(', ')}`;
   if(r.degraded)return `WARNING: relay coverage degraded (${q.complete} of ${q.total} challenge relays complete, quorum ${q.required}); missing: ${missing.join(', ')}`;
   return r.failedRelays?.length?`Relay coverage incomplete; unavailable: ${r.failedRelays.join(', ')}`:'All configured relays available';

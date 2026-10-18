@@ -1393,14 +1393,14 @@ test('progress: a backward clock step during the planner cannot suppress a re-re
 // Run 2 #13: challenge relay quorum in the runner.
 test('quorum: coverage log line says degraded (WARNING), below quorum, or trade relay down',async()=>{
   const {relayCoverageLine}=await import('./swarm.mjs');
-  const trade={role:'trade',url:'ws://trade',connected:true,error:null};
+  const trade={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null};
   const base={failedRelays:[],missingRelays:[],quorum:{required:2,complete:3,total:3},degraded:false,relays:[trade]};
   assert.equal(relayCoverageLine(base),'All configured relays available');
   assert.equal(relayCoverageLine({...base,failedRelays:['ws://c'],missingRelays:['ws://c'],quorum:{required:2,complete:2,total:3},degraded:true}),
     'WARNING: relay coverage degraded (2 of 3 challenge relays complete, quorum 2); missing: ws://c');
   assert.equal(relayCoverageLine({...base,failedRelays:['ws://b','ws://c'],missingRelays:['ws://b','ws://c'],quorum:{required:2,complete:1,total:3}}),
     'Relay coverage below quorum (1 of 3 challenge relays complete, need 2); unavailable: ws://b, ws://c');
-  assert.match(relayCoverageLine({...base,failedRelays:['ws://trade'],relays:[{...trade,connected:false}]}),/trade relay unavailable: ws:\/\/trade \(required\)/);
+  assert.match(relayCoverageLine({...base,failedRelays:['ws://trade'],relays:[{...trade,connected:false}]}),/trade relay not ready: ws:\/\/trade \(required: disconnected\)/);
 });
 test('quorum: sidecar degraded warnings and re-sends from --json reach the runner log',async()=>{
   const {sidecarQuorumLines,latestChallengeArgs,quorumArgs}=await import('./swarm.mjs');
@@ -1458,4 +1458,17 @@ test('R3-4: relay health log ignores pollInProgress toggles; real transitions st
   relay.historyComplete=d.status.historyComplete=false;t.mock.timers.tick(5000);
   assert.ok(logs.some(m=>m.startsWith('Relay change')&&m.includes('historyComplete=false')));
   h.stop();
+});
+
+// Advisor r1 M3: the coverage line uses tradeReady's condition. Trade connected without an error but
+// not authenticated, or still catching up, is not ready even when the challenge quorum is met.
+test('M3: coverage line reports the trade relay not ready while unauthenticated or catching up',async()=>{
+  const {relayCoverageLine}=await import('./swarm.mjs');
+  const ok={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null};
+  const r=t=>({failedRelays:[],missingRelays:[],quorum:{required:2,complete:3,total:3},degraded:false,relays:[t]});
+  assert.equal(relayCoverageLine(r(ok)),'All configured relays available');
+  assert.equal(relayCoverageLine(r({...ok,historyComplete:false})),'Relay coverage incomplete; trade relay not ready: ws://trade (required: history incomplete); nothing is posted or published');
+  assert.equal(relayCoverageLine(r({...ok,authenticated:false})),'Relay coverage incomplete; trade relay not ready: ws://trade (required: not authenticated); nothing is posted or published');
+  assert.match(relayCoverageLine({...r({...ok,historyComplete:false}),degraded:true,quorum:{required:2,complete:2,total:3}}),/trade relay not ready/);
+  assert.match(relayCoverageLine(r({...ok,error:'Relay history timed out'})),/required: Relay history timed out/);
 });
