@@ -1156,7 +1156,7 @@ mod tests {
         ) -> Vec<(String, Result<serde_json::Value, String>)> {
             let mut out = Vec::new();
             for (command, h) in [
-                (format!("join --buyer {buyer} --minutes 60"), seller_home),
+                (format!("join --buyer {buyer} --minutes 90"), seller_home),
                 (format!("leave --buyer {buyer}"), seller_home),
                 (format!("status --buyer {buyer}"), seller_home),
                 ("members".to_owned(), buyer_home),
@@ -1218,9 +1218,10 @@ mod tests {
             let writes = relay.writes.lock().unwrap();
             assert_eq!(writes.len(), 2, "join and leave publish once each");
             let joined = parse_membership(&writes[0], &buyer).unwrap();
+            // 90 differs from the stored 60 minutes: an identical join is a no-op (no publish).
             assert_eq!(
-                (joined.status.as_str(), joined.since),
-                ("joined", 100),
+                (joined.status.as_str(), joined.since, joined.minutes),
+                ("joined", 100, 90),
                 "join republished since = now instead of the real since"
             );
             let left = parse_membership(&writes[1], &buyer).unwrap();
@@ -1282,7 +1283,9 @@ mod tests {
             assert_eq!(body["members"][0]["membership"]["since"], 100);
             let mut o = super::parse(&args(&format!("join --buyer {buyer} --minutes 90"))).unwrap();
             o.relays = vec![relay.url.clone()];
+            let before = Timestamp::now().as_secs();
             execute_async(&o, &home).await.unwrap();
+            let after = Timestamp::now().as_secs();
             let writes = relay.writes.lock().unwrap();
             assert_eq!(writes.len(), 1);
             let a = parse_membership(&writes[0], &buyer).unwrap();
@@ -1291,9 +1294,11 @@ mod tests {
                 (100, 90),
                 "join lost the original since"
             );
-            assert_eq!(
-                writes[0].created_at.as_secs(),
-                Timestamp::now().as_secs().max(301)
+            // `created` is taken mid-command (before the challenge-state read), so bound it.
+            let created = writes[0].created_at.as_secs();
+            assert!(
+                (before.max(301)..=after.max(301)).contains(&created),
+                "{before}..={after}: {created}"
             );
             std::fs::remove_dir_all(root).unwrap();
         }
