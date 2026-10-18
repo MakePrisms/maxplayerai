@@ -171,6 +171,7 @@ Flags (environment equivalents):
 | `--relay-url` | `RELAY_URL` | required trade relay |
 | — | `SWARM_CHALLENGES_BINARY` | `maxplayer-challenges` |
 | — | `SWARM_CHALLENGE_RELAYS` | comma list: `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
+| — | `SWARM_CHALLENGE_QUORUM` | 2 (challenge relays that must complete a read / accept a publish; a strict majority of `SWARM_CHALLENGE_RELAYS`, at most all) |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
 | `--duration-seconds` (legacy, ignored for assignments) | `SWARM_DURATION_SECONDS` | 300 |
 | — | `SWARM_MIN_DURATION` | 300 (task floor, covers seller container/agent startup; sellers with fewer remaining minutes are not offered) |
@@ -261,8 +262,8 @@ ordinary progress updates default to at most one per three minutes. Leave/deny/s
 and deadlines are rechecked after planning, immediately before posting.
 
 **Relay-deferred assignments.** If that fresh recheck fails *only* with transient readiness
-reasons — `relay_not_ready` (trade or challenge relay disconnected, unauthenticated, history
-incomplete, in error, or any `failedRelays`) and/or `stale_snapshot` (the read is older than 5 s,
+reasons — `relay_not_ready` (trade relay disconnected, unauthenticated, history incomplete or
+in error, or fewer than `SWARM_CHALLENGE_QUORUM` challenge relays complete) and/or `stale_snapshot` (the read is older than 5 s,
 e.g. right after a slow planner call) — the assignment is not dropped. It is journaled as a
 `deferred` intent with its permanent request ID. No offer is posted and no budget is reserved,
 but the seller counts as busy: it is left out of the `assign` roster, appears in `running` with
@@ -490,6 +491,22 @@ hosted relay lists also require a matching `vercel.json` CSP update. Failures ar
 by URL in `relay.failedRelays`/`relay.relays`; a healthy public relay can keep the view
 available while another fails. Latest-per-d selection and ID deduplication are shared with
 the browser. The runner still requires authenticated trade history.
+
+**Challenge relay quorum (run 2 #13).** The runner is ready once our trade relay is ready
+**and** at least `SWARM_CHALLENGE_QUORUM` (default 2) challenge relays have complete history;
+one dead public relay no longer stops it. Our trade relay is required on top of the quorum:
+assignments and every challenge publish wait for it. Quorum met with a relay missing is
+degraded and logged once per change as `WARNING: relay coverage degraded (2 of 3 challenge
+relays complete, quorum 2); missing: …`; below quorum it logs `Relay coverage below quorum
+(…)` and posts nothing. The relay health log's overall line adds `quorum=<complete>/<total>
+(need <q>) degraded=<bool>`. Sidecar calls pass `--quorum` and `--json`; the sidecar's
+degraded warnings and re-sends (it re-sends missed events, exactly as signed, to relays that
+come back) are copied into the log (`WARNING: challenge relays degraded publish: …`,
+`Re-sent missed challenge event …`). Completion publishes use the quorum. Progress updates
+re-send the latest buyer-signed status, so they need **every** challenge relay (a quorum read
+whose shared relay lost a buyer close would otherwise republish it as `in_progress`); while
+degraded they wait, logged once as `Progress update for <id> postponed: challenge relays
+degraded (…)`.
 
 Build the [challenge sidecar](../../crates/maxplayer-challenges/README.md) from source before
 running the swarm. Local E2E runs a separate generic local relay for challenge events and

@@ -50,20 +50,25 @@ buyer's public key from the operator, not a member's note.
    to change minutes: leaving drops today's eligibility and the rejoin starts a new period,
    so it forfeits the day too. If the message says you're in today's challenge, nothing
    was published: wait until after the time it names. For any other `join` exit 2, re-run
-   the same `join` (same minutes and note) later; never leave. Some of these may already
-   be on some relays: in "challenge publish incomplete; failed: …" the relays not in the
-   list acknowledged the event (a list covering every relay used means none did), and
-   "could not configure relay", "could not read home key" or "invalid home key" can follow
-   earlier relays' acknowledgements. A re-run has one of four outcomes:
+   the same `join` (same minutes and note) later; never leave. Reads and publishes need a
+   quorum of the challenge relays (default 2 of 3). With one relay down the command still
+   succeeds and prints "Warning: degraded …" on stderr (`relay_quorum.degraded: true` in
+   `--json`); that is fine, and the event is re-sent unchanged to the missing relay the next
+   time you run any command while it answers. "challenge publish incomplete; quorum not met
+   (…); failed: …" means too few relays acknowledged: the relays not in that list may
+   already hold the event, nothing is queued for re-send, and the command failed. "could not
+   read home key" or "invalid home key" can follow earlier relays' acknowledgements. A re-run
+   has one of four outcomes:
 
    - The read still has a `joined` row with these minutes and note: nothing is
      published, and the result is `"unchanged": true`.
    - Stderr says "You're in today's challenge": nothing is published. Wait until after
      the time that message names (15 minutes after the end); do not leave.
-   - Exit 2 with another error. A failed read ("challenge relay read incomplete" or
-     "could not read the buyer's challenge state") published nothing. "could not
-     configure relay", "could not read home key" or "invalid home key" during publish may
-     already be on earlier relays (see above). Either way, re-run the same `join` later;
+   - Exit 2 with another error. A failed read ("challenge relay read incomplete", with or
+     without "quorum not met", or "could not read the buyer's challenge state") published
+     nothing. A minutes or note change during a running challenge needs every relay, not just
+     the quorum. "could not read home key" or "invalid home key" during publish may already be
+     on earlier relays (see above). Either way, re-run the same `join` later;
      never leave. "existing event timestamp is too far in the future" also published
      nothing: re-run once now + 900 seconds is at least one second after that event's
      `created_at` (the latest verified `created_at` for your key, the membership kind and

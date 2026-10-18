@@ -31,13 +31,37 @@ Repeat `--relay URL` **after the command** to replace the entire default list. `
 is required except `ws://` on loopback. `relay.maxplayer.ai` is refused, including
 case/trailing-dot variants. The home's job relay is never used for challenge traffic.
 
-Every publication attempts every configured relay and succeeds only if every configured relay acknowledges. Failed URLs are reported.
-Per-relay acceptance/failure is printed to stderr (an ACK is not proof of durable storage).
+**Quorum (default 2).** Every publication attempts every configured relay and succeeds once
+at least `--quorum N` relays acknowledge it (default 2; for other list sizes the default is a
+strict majority, and one relay needs itself). An explicit `--quorum` must be a strict majority
+of the relays and at most all of them, so every quorum read shares a relay with every quorum
+publish. Below quorum the command fails with `challenge publish incomplete; quorum not met
+(<n> of <m> relays accepted, need <q>); failed: …`; the relays not in that list may already
+hold the event, and nothing is queued for re-send. Per-relay acceptance/failure is printed to
+stderr (an ACK is not proof of durable storage).
 Reads query every configured relay and union verified events, deduplicating by event id;
 the shared protocol selects the latest per `(kind, author, d)` with deterministic ties.
-A relay without EOSE is a reported error and its partial events are discarded. If any relay
-fails to complete, the command fails and identifies the incomplete relays.
-A reachable relay's history cannot prove that another relay has no newer event.
+A relay without EOSE is a reported error and its partial events are discarded. A read
+succeeds once at least the quorum completed; below it, the command fails with `challenge
+relay read incomplete; quorum not met (…)` and publishes nothing.
+
+**Degraded.** Quorum met with a relay missing is degraded: stderr gets `Warning: degraded
+read|publish: <n> of <m> challenge relays (quorum <q>); missing: <relays>`, and `--json`
+bodies carry `relay_quorum` (`required`, `total`, `degraded`, `warnings`, `missing`,
+`resent`). A reachable relay's history cannot prove that another relay has no newer event.
+
+**Re-send.** An event a quorum publish could not deliver everywhere is kept, exactly as
+signed, in `<home>/challenges/outbox.json` (0600) with the relays that missed it. Every later
+command re-sends it (never re-signed) to those relays that answered in that command, so a
+still-dead relay costs nothing; `Re-sent missed event <id> -> <relay>` goes to stderr. It is
+bounded (64 entries, 10 failed attempts per relay, 7 days) and idempotent; a newer event for
+the same coordinate supersedes an older queued one. Queued events also count in this home's
+own trusted reads until delivered.
+
+**Strict reads.** Two reads still need every relay: the challenge read before a minutes/note
+change during a running challenge (see below), and the pre-publish read of a `scheduled` or
+`in_progress` update over an existing challenge while degraded (a close held only by the
+missing relay must never be overwritten; `completed`/`cancelled` publish at the quorum).
 History reads page like the web reader: each request carries `limit: 500`; a full page is
 never treated as complete, the oldest second is re-read (inclusive `until`), and the command
 fails without publishing if that cursor does not move strictly older or a full page has no
@@ -114,7 +138,9 @@ to change minutes: that also forfeits today. Nothing was published.
   after the start (`created_at > starts`) or its period began after it (`since > starts`).
 - If the buyer's challenges cannot be read completely from every relay (refused, timed out,
   or truncated history), the change fails closed: nothing is published and the error says
-  the challenge state could not be read.
+  the challenge state could not be read. This read ignores the quorum: one relay down is
+  enough to refuse, because the relay left out could be the only one holding the running
+  challenge.
 - A first join (or a rejoin after `left`), `leave` and `status` are unaffected and never
   read challenges for this check: leaving always works. Do not leave and rejoin to edit
   minutes mid-challenge: leaving drops eligibility, and the rejoin starts a new period.
