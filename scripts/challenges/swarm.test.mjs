@@ -1363,3 +1363,29 @@ test('progress: a backoff that expires during the planner call re-reads in that 
   const g=fixture();g.setPlan(()=>{g.time(205);return {wait:true};});g.time(200);await g.runner.tick();
   assert.equal(g.publishes.length,1);assert.equal(Object.values(g.journal.state.days)[0].lastUpdate,200);
 });
+// Advisor r4 #1: a publish reached only because a long planner call crossed the backoff stamped
+// lastUpdate with the tick-start sample, so the next fast tick published again.
+test('progress: a publish after the planner crosses the backoff stamps lastUpdate with the live clock; no double publish',async()=>{
+  const f=fixture();f.c.updateEvery=60;let fail=true;
+  f.io.latestChallenge=async()=>{if(fail)throw Error('challenge relay read incomplete');return {...structuredClone(f.snap.challenge),budgetSats:10};};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  const day=Object.values(f.journal.state.days)[0];assert.equal(day.progressRetryAt,230);
+  // Tick starts inside the backoff (229); a 61 s assign call ends at 290, past both the backoff and updateEvery.
+  fail=false;f.setPlan(()=>{f.time(290);return {wait:true};});f.time(229);await f.runner.tick();
+  assert.equal(f.publishes.length,1);assert.equal(day.lastUpdate,290);assert.equal(day.progressRetryAt,undefined);
+  f.setPlan(()=>({wait:true}));f.time(295);await f.runner.tick();
+  assert.equal(f.publishes.length,1,'the next fast tick publishes nothing');
+  f.time(350);await f.runner.tick();assert.equal(f.publishes.length,2,'next progress one updateEvery after 290');
+});
+test('progress: a backward clock step during the planner cannot suppress a re-read the tick-start sample earned',async()=>{
+  const f=fixture();let fail=true,reads=0,relay={...structuredClone(f.snap.challenge),budgetSats:10};
+  f.io.latestChallenge=async()=>{reads++;if(fail)throw Error('challenge relay read incomplete');return structuredClone(relay);};
+  f.setPlan(()=>({wait:true}));f.time(200);
+  await assert.rejects(f.runner.tick(),/read incomplete/);
+  fail=false;relay={...relay,status:'cancelled'};
+  f.setPlan(()=>{f.time(200);return {wait:true};});f.time(231);await f.runner.tick();
+  assert.equal(reads,2,'re-read despite the clock stepping back below progressRetryAt');
+  const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.closed.status,'cancelled');assert.equal(f.publishes.length,0);
+});

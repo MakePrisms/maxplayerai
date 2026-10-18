@@ -636,14 +636,19 @@ export class Swarm {
     }
     if(day.stop&&!day.stop.external&&!day.published) {
       if(await this.publishChallenge(day,day.challenge,'completed',day.stop.update,day.stop.result)){day.published=true;this.save();}
-    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&!(this.io.now()<day.progressRetryAt)) {
+    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&(!(now<day.progressRetryAt)||!(this.io.now()<day.progressRetryAt))) {
       // Progress never changes the status: it re-sends the latest buyer-signed one (null). The
       // interval restarts only after a publish; a failed re-read is retried after a short backoff
       // (PROGRESS_RETRY_SECONDS from the failure), not a full updateEvery and not every tick. The
-      // backoff compares the CURRENT clock: a tick whose planner call crossed progressRetryAt
-      // re-reads now, not one planner call later. lastUpdate still records the tick-start now.
+      // backoff opens when EITHER the tick-start sample or the current clock has reached
+      // progressRetryAt: a planner call that crosses it re-reads in this tick, and a backward clock
+      // step cannot take back a re-read the sample already earned. A publish reached only because
+      // the live clock crossed the backoff stamps lastUpdate with the live clock (the tick-start
+      // sample may be a whole planner call old, which would make the next tick due again);
+      // otherwise lastUpdate records the tick-start now.
+      const crossed=now<day.progressRetryAt;
       try {
-        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=now;delete day.progressRetryAt;this.save();}
+        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
       } catch(e) {
         if(e.journalFailure)throw e;
         day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();
