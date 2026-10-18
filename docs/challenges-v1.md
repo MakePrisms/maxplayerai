@@ -89,6 +89,14 @@ Acceptance persists across challenges until the buyer republishes `denied`.
 ### Validation and eligibility (every reader)
 
 1. Verify event id + signature locally; never trust the relay.
+   The web/runner reader (`events.mjs` `verify`) recomputes the id from every received event,
+   then caches a successful Schnorr check on (id, pubkey, sig). The cache is process-wide (all
+   relays share it) and holds at most 100,000 entries (`VERIFY_CACHE_LIMIT`, ~40 MB of heap
+   measured on Node 24). While the distinct verified events fit, a poll overlap or a full
+   re-read after reconnect costs one hash per event and no signature check. When full, a new
+   entry replaces a random one, so a stable re-scan larger than the cap verifies only some
+   events again (about 2 per pass at cap + 1) instead of all of them, as LRU would. Failed
+   checks are never cached.
 2. CHALLENGE and DECISION count only if authored by the configured buyer.
 3. MEMBERSHIP requires `d = p = buyer`, valid minutes, status and `since`; it does not
    require any published daily challenge. MEMBERSHIP and DECISION must have no `a` tag.

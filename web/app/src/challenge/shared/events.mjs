@@ -12,8 +12,41 @@ export const claimRef = e => { const refs=e.tags.filter(t=>t[0]==='e'&&!t[3]); r
 export const mentions = (e, pk) => e.tags.some(t => t[0] === 'p' && t[1] === pk);
 export const newer = (a,b) => !b || a.created_at > b.created_at || (a.created_at === b.created_at && a.id < b.id);
 export function eventId(e) { return bytesToHex(sha256(new TextEncoder().encode(JSON.stringify([0,e.pubkey,e.created_at,e.kind,e.tags,e.content])))); }
+// Schnorr verification is pure JS (~1-2 ms per event). Readers re-read their poll overlap every
+// interval, re-read full history on every reconnect, and verify each frame twice (relay ingest,
+// then EventStore.add), so a day of history pinned a runner at 99% CPU (run 2, issue #12).
+// Successful verifications are cached:
+// - key = id + pubkey + sig (fixed-length lowercase hex, checked before the lookup, so the
+//   concatenation is unambiguous) — exactly the inputs schnorr.verify(sig,id,pubkey) checks;
+// - the id is ALWAYS recomputed from the event (eventId) before the lookup, so a hit can only
+//   accept an event whose canonical serialization hashes to the id whose signature was checked;
+//   changed content/tags/kind/created_at/pubkey with a reused id+sig still fails;
+// - failures are never cached (a forged signature is re-checked and rejected every time);
+// - at most VERIFY_CACHE_LIMIT keys, process-wide (every relay of a reader shares them; the same
+//   event on several relays is one key). A re-read costs one hash per event, with no Schnorr
+//   check, only while the distinct verified events fit. Measured ~0.4 KB of retained heap per
+//   entry (Node 24: 8.2 MB at 20,000, 40.4 MB at 100,000); a relay flooding unique valid events
+//   can replace entries but never grow the cache. 100,000 is ~20,000 jobs' lifecycle events
+//   (offer/claim/award/result/accept) plus challenge/roster events; past it, see below.
+// - RANDOM replacement when full, no reordering on a hit. LRU (or FIFO) turns a stable re-scan
+//   of cap+1 events into 100% misses: each miss evicts the key the scan needs next. Random
+//   replacement degrades gracefully instead: a repeated scan of cap+1 events pays a mean of 2
+//   Schnorr checks per pass, and a repeated scan of 1.5x the cap still hits ~40%.
+export const VERIFY_CACHE_LIMIT = 100000;
+const verified = new Set(), slots = []; // same keys; slots gives O(1) random choice
+export const verifyCacheSize = () => slots.length;
+export const clearVerifyCache = () => { verified.clear(); slots.length = 0; };
+function signatureValid(e) {
+  const key = e.id + e.pubkey + e.sig;
+  if (verified.has(key)) return true;
+  if (!schnorr.verify(e.sig, e.id, e.pubkey)) return false;
+  let slot = slots.length;
+  if (slot >= VERIFY_CACHE_LIMIT) { slot = Math.floor(Math.random() * slots.length); verified.delete(slots[slot]); }
+  slots[slot] = key; verified.add(key);
+  return true;
+}
 export function verify(e) {
-  try { return hex(e.id) && hex(e.pubkey) && /^[0-9a-f]{128}$/.test(e.sig) && Number.isSafeInteger(e.kind) && e.kind >= 0 && e.kind <= 65535 && Number.isSafeInteger(e.created_at) && e.created_at >= 0 && typeof e.content === 'string' && Array.isArray(e.tags) && e.tags.every(t => Array.isArray(t) && t.every(v => typeof v === 'string')) && eventId(e) === e.id && schnorr.verify(e.sig,e.id,e.pubkey); } catch { return false; }
+  try { return hex(e.id) && hex(e.pubkey) && /^[0-9a-f]{128}$/.test(e.sig) && Number.isSafeInteger(e.kind) && e.kind >= 0 && e.kind <= 65535 && Number.isSafeInteger(e.created_at) && e.created_at >= 0 && typeof e.content === 'string' && Array.isArray(e.tags) && e.tags.every(t => Array.isArray(t) && t.every(v => typeof v === 'string')) && eventId(e) === e.id && signatureValid(e); } catch { return false; }
 }
 export function signAuth(key, relay, challenge, now = Math.floor(Date.now()/1000)) {
   const e = {pubkey:bytesToHex(schnorr.getPublicKey(key)),created_at:now,kind:RELAY_AUTH,tags:[['relay',relay],['challenge',challenge]],content:''};
