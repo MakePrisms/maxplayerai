@@ -213,10 +213,13 @@ test("all site pages share navigation and footer links, with a current page and 
   }
 });
 
-test("/challenges hero fact starts on a neutral placeholder, not 'Work starts' (bob)", () => {
+test("/challenges hero facts start as skeletons, both labels and values, with no placeholder text (bob)", () => {
   const html = readFileSync(join(root, "dist", "challenges.html"), "utf8");
-  assert.match(html, /<dt id="challenge-start-label">Loading…<\/dt><dd id="challenge-start">&nbsp;<\/dd>/);
-  assert.ok(!html.includes(">Work starts<"), "no static 'Work starts' to flash before 'Running now'");
+  const facts = html.match(/<dl class="c-facts" id="challenge-facts" aria-busy="true">([\s\S]*?)<\/dl>/)?.[1] ?? "";
+  for (const id of ["challenge-start-label", "challenge-start", "challenge-budget-label", "challenge-budget"])
+    assert.match(facts, new RegExp(`id="${id}"><span class="skel c-skel-d[dt]"></span></d[dt]>`), `${id} is a skeleton`);
+  assert.equal([...facts.matchAll(/class="skel /g)].length, 4);
+  for (const text of ["Loading…", "Work starts", "To be announced", "Budget"]) assert.ok(!facts.includes(text), `no static "${text}"`);
 });
 
 test("/challenges carries the /tokens experimental notice under the nav (bob)", () => {

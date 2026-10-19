@@ -12,6 +12,7 @@ class El { textContent = ""; children: El[] = []; attrs: Record<string, string> 
   constructor(tag = "#text") { this.tag = tag; }
   className = ""; set href(v: string) { this.attrs.href = v; }
   getAttribute(k: string) { return this.attrs[k] ?? null; }
+  setAttribute(k: string, v: string) { this.attrs[k] = v; }
   querySelector(sel: string) { return this.children.find((c) => c.tag === sel) ?? null; }
   classList = { toggle: (c: string, on: boolean) => { on ? this.cls.add(c) : this.cls.delete(c); } };
   append(...c: El[]) { this.children.push(...c); }
@@ -22,13 +23,19 @@ function page() {
   return { doc, ids };
 }
 const live = { connected: true, authenticated: true, historyComplete: true, error: null };
-const clock = (ms: number) => ({ nowMs: ms, now: 1500, when: (x: number) => `t=${x}`, status: "Live" });
+const clock = (ms: number, budget: string | null = "$7.00") => ({ nowMs: ms, now: 1500, when: (x: number) => `t=${x}`, status: "Live", budget: () => budget });
+// Both facts (labels and values) are skeleton spans, and the block says it is busy.
+type Ids = Record<string, El>;
+const skeletons = (ids: Ids) => ids["challenge-facts"]!.getAttribute("aria-busy") === "true" &&
+  ["challenge-start-label", "challenge-start", "challenge-budget-label", "challenge-budget"].every((id) => ids[id]!.children[0]?.className.startsWith("skel ") && ids[id]!.textContent === "");
+const revealed = (ids: Ids) => ids["challenge-facts"]!.getAttribute("aria-busy") === "false" &&
+  ids["challenge-budget-label"]!.textContent === "Budget" && ids["challenge-start-label"]!.textContent !== "" && ids["challenge-budget"]!.textContent !== "";
 
 test("page: loading -> live -> 15s poll stays live -> disconnect shows Updating and drops rows and Running now", () => {
   const { doc, ids } = page();
   let t = paint(doc, s, { ...live, historyComplete: false }, { wasLive: false, readyAt: null }, clock(0));
   assert.equal(ids["connection-status"]!.textContent, "Updating…");
-  assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
+  assert.ok(skeletons(ids), "loading: both facts are skeletons");
   assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"));
   assert.equal(ids["challenge-sellers"]!.children.length, 0);
 
@@ -43,13 +50,14 @@ test("page: loading -> live -> 15s poll stays live -> disconnect shows Updating 
     t = paint(doc, s, { ...live, historyComplete: false }, t, clock(ms));
     assert.equal(ids["connection-status"]!.textContent, "Live", `poll at ${ms}`);
     assert.equal(ids["challenge-start-label"]!.textContent, "Running now", `poll at ${ms}`);
+    assert.ok(revealed(ids), `poll at ${ms} does not re-skeleton`);
     assert.equal(ids["seller-summary"]!.textContent, "1 agent · 1 working now");
   }
   t = paint(doc, s, live, t, clock(5000));
 
   t = paint(doc, s, { ...live, connected: false, authenticated: false, historyComplete: false }, t, clock(6000));
   assert.equal(ids["connection-status"]!.textContent, "Updating…");
-  assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
+  assert.ok(skeletons(ids), "disconnected: back to skeletons, no Running now");
   assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"));
   assert.equal(ids["challenge-sellers"]!.children.length, 0);
   assert.equal(ids["seller-summary"]!.textContent, "");
@@ -61,7 +69,7 @@ test("page: stuck incomplete after being live keeps Live but drops Running now o
   t = paint(doc, s, { ...live, historyComplete: false }, t, clock(5000));
   assert.equal(ids["challenge-start-label"]!.textContent, "Running now");
   paint(doc, s, { ...live, historyComplete: false }, t, clock(6000));
-  assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
+  assert.ok(skeletons(ids), "stale: back to skeletons, never Running now");
   assert.equal(ids["connection-status"]!.textContent, "Live");
 });
 
@@ -78,7 +86,7 @@ test("page: after a disconnect, the reconnect waits for a fresh complete history
     assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"));
     assert.equal(ids["challenge-sellers"]!.children.length, 0);
     assert.equal(ids["seller-summary"]!.textContent, "");
-    assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
+    assert.ok(skeletons(ids));
   }
   t = paint(doc, s, live, t, clock(4000));
   assert.equal(ids["connection-status"]!.textContent, "Live");
@@ -106,8 +114,39 @@ test("page: while a run is on, loading never shows 'Work starts', and 'Running n
     t = paint(doc, s, { connected: st.connected, authenticated: false, historyComplete: false, error: null, relays: st.relays }, t, clock(i * 1000));
     seen.push(ids["challenge-start-label"]!.textContent);
   });
-  assert.deepEqual(seen, ["Loading…", "Loading…", "Loading…", "Running now"]);
+  assert.deepEqual(seen, ["", "", "", "Running now"]);
+  assert.ok(revealed(ids));
   assert.equal(ids["challenge-start"]!.querySelector("a")?.getAttribute("href"), "#agents");
   // The agents section still waits for the full history; only the hero is earlier.
   assert.equal(ids["connection-status"]!.textContent, "Updating…");
+});
+
+test("page: no partial reveal: run state ready but budget unknown stays all skeletons, and the reverse", () => {
+  // Run state ready (fresh challenge data), budget not yet known (no rate, before the sats fallback).
+  let { doc, ids } = page();
+  let t = paint(doc, s, live, { wasLive: false, readyAt: null }, clock(0, null));
+  assert.ok(skeletons(ids), "run state known, budget not");
+  t = paint(doc, s, live, t, clock(1000, "$7.00"));
+  assert.ok(revealed(ids));
+  assert.equal(ids["challenge-start-label"]!.textContent, "Running now");
+  assert.equal(ids["challenge-budget"]!.textContent, "$7.00");
+  // Budget known, run state not (challenge history still loading).
+  ({ doc, ids } = page());
+  paint(doc, s, { ...live, historyComplete: false }, { wasLive: false, readyAt: null }, clock(0, "$7.00"));
+  assert.ok(skeletons(ids), "budget known, run state not");
+});
+
+test("page: once revealed, a poll keeps the facts on screen; stale data puts the block back to skeletons", () => {
+  const { doc, ids } = page();
+  let t = paint(doc, s, live, { wasLive: false, readyAt: null }, clock(0));
+  assert.ok(revealed(ids));
+  for (const ms of [1000, 3000, 5000]) {
+    t = paint(doc, s, { ...live, historyComplete: false }, t, clock(ms));
+    assert.ok(revealed(ids), `poll at ${ms}`);
+    assert.equal(ids["challenge-start-label"]!.textContent, "Running now");
+  }
+  t = paint(doc, s, { ...live, historyComplete: false }, t, clock(5500));
+  assert.ok(skeletons(ids), "stale: no Running now");
+  paint(doc, s, live, t, clock(6000));
+  assert.ok(revealed(ids));
 });

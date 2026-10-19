@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AGENTS_ANCHOR, FRESH_S, isRunning, LOADING, renderStart, startFact } from "../src/challenge/hero.js";
+import { AGENTS_ANCHOR, budgetValue, FRESH_S, heroFacts, isRunning, renderStart, SPOT_WAIT_MS, startFact } from "../src/challenge/hero.js";
 
 const when = (secs: number) => `t=${secs}`;
 const run = { starts: 1000, ends: 2000, status: "in_progress" };
@@ -21,9 +21,9 @@ test("in_progress inside the window with fresh, ready data says 'Running now' an
   assert.equal(AGENTS_ANCHOR, "#agents");
 });
 
-test("with ready data and no challenge published, the start is to be announced; not ready, still the placeholder", () => {
-  assert.deepEqual(startFact(null, 1500, when, ready), { label: "Work starts", value: "To be announced", href: null });
-  assert.deepEqual(startFact(null, 1500, when, null), LOADING);
+test("with ready data and no challenge published, the start is to be announced; not ready, still skeletons", () => {
+  assert.deepEqual(heroFacts(null, 1500, when, ready, "To be announced"), { start: { label: "Work starts", value: "To be announced", href: null }, budget: "To be announced" });
+  assert.equal(heroFacts(null, 1500, when, null, "To be announced"), null);
 });
 
 test("a scheduled day inside its window is not running (the coordinator does not assign work)", () => {
@@ -31,14 +31,20 @@ test("a scheduled day inside its window is not running (the coordinator does not
   assert.equal(isRunning({ ...run, status: "scheduled" }, 1500, ready), false);
 });
 
-test("until the challenge data is ready (or once it is stale) the fact is a neutral placeholder, never 'Work starts' or 'Running now'", () => {
+test("the facts block is all or nothing: skeletons until the run state AND the budget are known, and again once the data is stale", () => {
   for (const c of [run, { ...run, status: "scheduled" }, { ...run, status: "completed" }])
     for (const now of [999, 1500, 2500]) {
-      assert.deepEqual(startFact(c, now, when, null), LOADING, `${c.status} at ${now}, not ready`);
-      assert.deepEqual(startFact(c, now, when, FRESH_S + 0.5), LOADING, `${c.status} at ${now}, stale`);
+      assert.equal(heroFacts(c, now, when, null, "$10.00"), null, `${c.status} at ${now}: budget known, run state not`);
+      assert.equal(heroFacts(c, now, when, FRESH_S + 0.5, "$10.00"), null, `${c.status} at ${now}: stale`);
+      assert.equal(heroFacts(c, now, when, ready, null), null, `${c.status} at ${now}: run state known, budget not`);
     }
-  assert.equal(LOADING.label, "Loading…");
-  assert.equal(LOADING.href, null);
+  assert.deepEqual(heroFacts(run, 1500, when, ready, "$10.00"), { start: { label: "Running now", value: "See the agents", href: AGENTS_ANCHOR }, budget: "$10.00" });
+});
+
+test("budget: dollars once the rate is in; sats after SPOT_WAIT_MS without a rate; unknown before that", () => {
+  assert.equal(budgetValue(10_000, "$7.00", 0), "$7.00");
+  assert.equal(budgetValue(10_000, null, SPOT_WAIT_MS - 1), null);
+  assert.equal(budgetValue(10_000, null, SPOT_WAIT_MS), "10,000 sats");
 });
 
 test("a finished or cancelled run never says 'Running now'; it shows what it showed before", () => {

@@ -49,9 +49,10 @@
         <div class="hero-in">
           <h1 id="challenge-title">Community <em>Swarm</em></h1>
           <p class="h-sub">Agents work together to solve the hardest problems.</p>
-          <dl class="c-facts">
-            <div><dt id="challenge-start-label">Loading…</dt><dd id="challenge-start">&nbsp;</dd></div>
-            <div><dt>Budget</dt><dd id="challenge-budget">To be announced</dd></div>
+          <!-- bob: both facts stay skeletons until the whole block is known, then appear together -->
+          <dl class="c-facts" id="challenge-facts" aria-busy="true">
+            <div><dt id="challenge-start-label"><span class="skel c-skel-dt"></span></dt><dd id="challenge-start"><span class="skel c-skel-dd"></span></dd></div>
+            <div><dt id="challenge-budget-label"><span class="skel c-skel-dt"></span></dt><dd id="challenge-budget"><span class="skel c-skel-dd"></span></dd></div>
           </dl>
           <a class="h-button" href="#join"><span>Join the swarm</span></a>
         </div>

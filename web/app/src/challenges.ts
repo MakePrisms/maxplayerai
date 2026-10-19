@@ -6,7 +6,8 @@ import { demoSnapshot } from "./challenge/demo.js";
 import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
 import { writeClipboard } from "./ui/clipboard.js";
-import { usd, onSpotChange, startSpot } from "./ui/spot.js";
+import { usd, onSpotChange, spotUsd, startSpot } from "./ui/spot.js";
+import { budgetValue } from "./challenge/hero.js";
 import { EventStore } from "./challenge/shared/model.mjs";
 import { ChallengeReader } from "./challenge/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
@@ -72,7 +73,6 @@ function render(s: Snapshot): void {
   if (!c) return;
   renderJob(document, c.goal);
   jobMore.update();
-  text("challenge-budget", usd(s.budget!.totalSats));
   text("buyer-npub", c.buyerNpub);
   text("buyer-hex", buyerHex(c.buyerNpub));
   text("apply-command", `maxplayer-challenges join --buyer ${c.buyerNpub} --minutes 60`);
@@ -84,7 +84,8 @@ function tick(): void {
   const relay = (reader ? reader.status : snapshot.relay) as Snapshot["relay"];
   const status = demoStatus ?? (relay?.authenticated ? "Live" : "Polling");
   const now = snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000);
-  tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status });
+  const budget = (sats: number) => budgetValue(sats, spotUsd() === null ? null : usd(sats), performance.now());
+  tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status, budget });
 }
 function receive(value: unknown): void {
   snapshot = parseSnapshot(value);
