@@ -29,12 +29,14 @@ const TOOL_DEADLINE_SECS: u64 = 15;
 /// `post_job`'s own cap (every other tool keeps [`TOOL_DEADLINE_SECS`]). The daemon already answers
 /// a slow post within a bounded window — input fingerprinting stops at 8s, then it waits at most 1s
 /// before replying `status=preparing` with a preparation_id (`buyer/preparations.rs`) — but that
-/// window starts when the daemon DISPATCHES the request. Before that, this call runs the
-/// connect-or-spawn `status` probe (a full status read: wallet balances through the wallet actor,
-/// ledger queries) and waits for a free daemon worker; on a loaded buyer those can consume most of
-/// 15s, so the post timed out even though the daemon would have acknowledged it in time. 45s keeps
-/// the whole ack window plus room for that queueing, and stays under the client's ~60s read
-/// timeout so this graceful error, not a client-side abort, is what a caller sees.
+/// window starts when the daemon DISPATCHES the request. Before that, the call connects to
+/// `buyer.sock` (`daemon::serving`, a connect plus a non-blocking lock check — no RPC) and then waits
+/// for one of the daemon's two runtime workers, which it shares with `collect`'s delivery fetch, the
+/// delivery watcher, auto-award and reconcile; a fetch blocks its worker. On a loaded buyer that
+/// queueing can consume most of 15s, so the post timed out even though the daemon would have
+/// acknowledged it in time. 45s keeps the whole ack window plus room for that queueing, and stays
+/// under the client's ~60s read timeout so this graceful error, not a client-side abort, is what a
+/// caller sees.
 const POST_JOB_DEADLINE_SECS: u64 = 45;
 
 /// The deadline for one `tools/call`, by tool name.
@@ -619,7 +621,7 @@ mod tests {
     #[test]
     fn post_job_alone_gets_the_longer_deadline_and_errors_name_their_tool() {
         assert_eq!(tool_deadline_secs(Some("post_job")), POST_JOB_DEADLINE_SECS);
-        assert!(POST_JOB_DEADLINE_SECS > TOOL_DEADLINE_SECS && POST_JOB_DEADLINE_SECS < 60);
+        const { assert!(POST_JOB_DEADLINE_SECS > TOOL_DEADLINE_SECS && POST_JOB_DEADLINE_SECS < 60) };
         for other in [Some("get_job"), Some("collect"), Some("award_claim"), None] {
             assert_eq!(tool_deadline_secs(other), TOOL_DEADLINE_SECS);
         }

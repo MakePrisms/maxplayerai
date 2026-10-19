@@ -16,6 +16,8 @@ import tempfile
 import time
 import urllib.request
 
+from preparation import posted_job_id
+
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('--skip-build', action='store_true', help='use binaries already built by run-e2e.sh')
@@ -132,29 +134,6 @@ def mcp(env, tool, args):
     (RUN / f'{tool}-latest.json').write_text(json.dumps(result, indent=2))
     return result
 
-def posted_job_id(env, posted, seconds=120):
-    """The real job id of a post_job result. A slow post answers status=preparing with a
-    preparation_id instead of job_id: poll get_job with that handle (as swarm.mjs does) until it
-    reports status=posted. Never reposts; a terminal preparation error raises from mcp()."""
-    if posted.get('job_id'):
-        return posted['job_id']
-    handle = posted.get('preparation_id')
-    if not handle:
-        raise AssertionError(f'post_job returned neither job_id nor preparation_id: {json.dumps(posted)}')
-    end, state = time.monotonic() + seconds, posted
-    while time.monotonic() < end:
-        try:
-            state = mcp(env, 'get_job', {'job_id': handle})
-        except RuntimeError as error:
-            raise AssertionError(f'post_job preparation {handle} failed: {error}') from error
-        if state.get('status') == 'posted' and state.get('job_id'):
-            print(f'PASS post_job preparation {handle} posted as {state["job_id"]}', flush=True)
-            return state['job_id']
-        if state.get('status') != 'preparing':
-            raise AssertionError(f'post_job preparation {handle}: unexpected get_job reply {json.dumps(state)}')
-        time.sleep(1)
-    raise AssertionError(f'post_job preparation {handle} still not posted after {seconds}s; last={json.dumps(state)}')
-
 def iso(t):
     return dt.datetime.fromtimestamp(t, dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -258,7 +237,7 @@ try:
     else:
         deadline = int(time.time()) + 120
     posted = mcp(buyer_env, 'post_job', {'task':f'[challenge:{BUYER}:local-e2e]\nReturn exactly the fixture answer 42.', 'output':'text/plain', 'payment':'none', 'amount_sats':0, 'max_sats':0, 'visibility':'public', 'seller_pubkey':SELLER, 'deadline_unix':deadline, 'request_id':'challenge-e2e-free'})
-    job = posted_job_id(buyer_env, posted)
+    job = posted_job_id(lambda handle: mcp(buyer_env, 'get_job', {'job_id': handle}), posted)
     check('the buyer posts through existing MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
     def claimed():
         state = mcp(buyer_env, 'get_job', {'job_id': job})

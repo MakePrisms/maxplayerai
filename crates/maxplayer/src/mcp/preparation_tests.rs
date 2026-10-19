@@ -20,6 +20,16 @@ fn next_request(listener: &UnixListener) -> (UnixStream, String) {
     }
 }
 
+/// A fake daemon: hold the home's exclusive lock (as `buyer serve` does before it binds) and listen
+/// on its socket. `daemon::ensure` counts a listener as serving only while that lock is held.
+fn fake_daemon(home: &MaxplayerHome) -> (maxplayer_core::buyer::lock::HomeLock, UnixListener) {
+    let lock = maxplayer_core::buyer::lock::HomeLock::acquire(
+        home.root.join(maxplayer_core::buyer::LOCK_FILE),
+    )
+    .unwrap();
+    (lock, UnixListener::bind(daemon::socket_path(home)).unwrap())
+}
+
 struct TempHome(std::path::PathBuf);
 impl Drop for TempHome {
     fn drop(&mut self) {
@@ -41,7 +51,7 @@ fn temp_home(label: &str) -> TempHome {
 fn pending_post_and_poll_cross_the_mcp_daemon_boundary() {
     let dir = temp_home("preparation");
     let home = home::bootstrap(&dir.0).unwrap();
-    let listener = UnixListener::bind(daemon::socket_path(&home)).unwrap();
+    let (_lock, listener) = fake_daemon(&home);
     let server = std::thread::spawn(move || {
         for expected in ["prepare_post_job", "get_job"] {
             let (mut socket, line) = next_request(&listener);
@@ -96,7 +106,7 @@ fn slow_post_job_beats_the_general_deadline_without_a_duplicate_post() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let dir = temp_home("slow-post");
     let home = home::bootstrap(&dir.0).unwrap();
-    let listener = UnixListener::bind(daemon::socket_path(&home)).unwrap();
+    let (_lock, listener) = fake_daemon(&home);
     let posts = Arc::new(AtomicUsize::new(0));
     let counted = posts.clone();
     let stall = Duration::from_secs(TOOL_DEADLINE_SECS + 2);
