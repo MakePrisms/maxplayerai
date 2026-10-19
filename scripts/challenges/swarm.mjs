@@ -139,42 +139,65 @@ export const plannerTask = (task,context=null) => {
   return t;
 };
 const jobTask = j => plannerTask(j.args.task,j.taskContext);
-// R3-3 (b): a collected delivery that is a refusal or safety stop, not work. Two signals:
-// - Explicit: the answer's first non-blank line is REFUSAL_MARKER (Markdown decoration and a
-//   trailing colon allowed, as for the core inline-answer marker). Any length.
-// - Heuristic, deliberately conservative (a false positive would discard a real answer, so when in
-//   doubt it is a normal collect): after removing runner framing (a leading MAXPLAYER-ANSWER-V1 line,
-//   the "Delivered files" header, ===== file frames and [truncated…]/[skipped…] notes), the text
-//   must be SHORT (at most REFUSAL_MAX_CHARS), must contain a refusal or safety-stop phrase (below;
-//   first-person refusals only at a sentence start, case-sensitive, so a quoted or decrypted
-//   "I CANNOT HELP" is not one, and never the idiom "I can't help noticing/but…"), and must show no sign of work (a code block, a list of 3+ items, or
-//   words such as found / candidate / tested / partial / result: / here is / the answer is).
+// R3-3 (b): a collected delivery that is a refusal or safety stop, not work. The answer is first
+// unframed: runner framing (the "Delivered files (no inline answer):" header, ===== file frames,
+// [truncated…]/[skipped…] notes and a MAXPLAYER-ANSWER-V1 line) is removed. Then two signals:
+// - Explicit: the first non-blank line of that body is REFUSAL_MARKER (Markdown decoration and a
+//   trailing colon allowed, as for the core inline-answer marker). Any length; also when the
+//   seller wrote it to a delivered file rather than inline.
+// - Heuristic, deliberately conservative. A missed refusal costs one reassignment; a false one
+//   throws a solution away, so when in doubt it is a normal collect. The body must be SHORT (at
+//   most REFUSAL_MAX_CHARS) and must carry no ANSWER_EVIDENCE: a code block, a list of 3+ items,
+//   "here is/are", or an answer statement (answer/result/solution/plaintext/decryption/keyword/key,
+//   optionally numbered, followed by a colon, "=" or is/are/was/were; or found/recovered/cracked…
+//   a key/keyword/plaintext followed by an upper-case word). Then:
+//   * a safety stop (a safety|content|usage|moderation classifier/filter/system/policy/… directly
+//     followed by stopped/blocked/flagged/refused/…, or "stopped/refused/… by the <that noun>"),
+//     case-insensitive, counts even next to generic work words ("…before I found a key");
+//   * a first-person refusal counts only at a sentence start, case-sensitive (a decrypted
+//     "I CANNOT HELP" is not one), only with words after the verb (a bare "I cannot help." may be
+//     the plaintext), never the idioms "I can't help it/noticing/but…", and only without generic
+//     work words (found / candidate / tested / partial / keyword / plaintext / key).
 // A refused job is still collected exactly once (a priced one is paid: core cannot gate content).
 export const REFUSAL_MARKER = 'MAXPLAYER-REFUSED-V1';
 export const REFUSAL_MAX_CHARS = 600;
-export const REFUSAL_PATTERNS = [
-  ['safety stop',/\b(?:[Ss]afety|[Cc]ontent|[Uu]sage|[Pp]olicy|[Mm]oderation) (?:classifier|filter|system|check|polic(?:y|ies)|guidelines?|layer)\b[^.\n]{0,80}?\b(?:stopped|blocked|halted|flagged|prevented|interrupted|terminated|ended|refused)\b/],
-  ['safety stop',/\b(?:stopped|blocked|halted|flagged|interrupted|terminated)\b[^.\n]{0,40}?\bby (?:a|an|the|my) (?:safety|content|usage|policy|moderation) (?:classifier|filter|system|check|polic(?:y|ies)|layer)\b/],
-  ['refusal',/(?:^|[.!?]\s+|\n\s*)(?:(?:I'm sorry|I am sorry|Sorry|Unfortunately|However),?\s+(?:but\s+)?)?I (?:can't|cannot|can not|won't|will not|am unable to|'m unable to|am not able to|'m not able to) (?:help|assist|comply|continue|proceed|complete|do|provide|perform|work on|carry out|engage|participate|fulfil|fulfill)\b(?! (?:but|noticing|thinking|wondering|feeling|seeing|myself)\b)/],
-  ['refusal',/(?:^|[.!?]\s+|\n\s*)I (?:must|have to|need to|will|'ll|'m going to) (?:decline|refuse)\b/],
-  ['refusal',/(?:^|[.!?]\s+|\n\s*)I(?:'m| am) not (?:comfortable|willing)\b/],
+const SAFETY_NOUN = String.raw`(?:safety|content|usage|policy|moderation) (?:classifiers?|filters?|systems?|layers?|checks?|polic(?:y|ies)|guardrails?|models?)(?: (?:classifier|filter|system|layer|check))?`;
+const SAFETY_VERB = String.raw`(?:stopped|blocked|halted|flagged|prevented|interrupted|terminated|refused|rejected)`;
+const REFUSAL_VERB = String.raw`(?:help|assist|comply|continue|proceed|complete|do|provide|perform|work on|carry out|engage|participate|fulfil|fulfill)`;
+const SENTENCE_START = String.raw`(?:^|[.!?]\s+|\n\s*)`;
+export const SAFETY_PATTERNS = [
+  new RegExp(String.raw`\b${SAFETY_NOUN}(?: (?:has|had|have|just|was|is))? ${SAFETY_VERB}\b`,'i'),
+  new RegExp(String.raw`\b${SAFETY_VERB}\b[^.\n]{0,40}?\bby (?:a|an|the|my|its) ${SAFETY_NOUN}\b`,'i'),
 ];
-const WORK_EVIDENCE = /```|\b(?:found|candidates?|tested|partial(?:ly)?|results?:|here (?:is|are)|(?:the )?answer(?: is)?:|answer is)\b/i;
+export const REFUSAL_PATTERNS = [
+  new RegExp(String.raw`${SENTENCE_START}(?:(?:I'm sorry|I am sorry|Sorry|Unfortunately|However),?\s+(?:but\s+)?)?I (?:can't|cannot|can not|won't|will not|am unable to|'m unable to|am not able to|'m not able to) ${REFUSAL_VERB}(?= +[A-Za-z])(?! +(?:it|but|noticing|thinking|wondering|feeling|seeing|myself)\b)`),
+  new RegExp(String.raw`${SENTENCE_START}I (?:must|have to|need to|will|'ll|'m going to) (?:decline|refuse)\b`),
+  new RegExp(String.raw`${SENTENCE_START}I(?:'m| am) not (?:comfortable|willing)\b`),
+];
+const ANSWER_NOUN = String.raw`(?:answers?|results?|solutions?|plaintexts?|decryptions?|decrypted(?: text| message)?|keywords?|keys?|cribs?)`;
+const ANSWER_EVIDENCE = [
+  new RegExp(String.raw`\x60\x60\x60|\bhere (?:is|are)\b|\b${ANSWER_NOUN}(?: ?#?\d+)?\s*(?::|=|\b(?:is|are|was|were)\b)`,'i'),
+  // Case-sensitive on purpose: the recovered value must be an upper-case word ("found the key CROWN").
+  /\b(?:[Ff]ound|[Rr]ecovered|[Cc]racked|[Ss]olved|[Dd]ecrypted|[Gg]ot)\b[^.\n]{0,30}?\b(?:[Kk]eywords?|[Kk]eys?|[Pp]laintext|[Ss]olution|[Aa]nswer)\b[: ]+["'\x60]?[A-Z]{3,}\b/,
+];
+const WORK_WORDS = /\b(?:found|candidates?|tested|partial(?:ly)?|keywords?|plaintexts?|keys?)\b/i;
 const markerLine = line => {let b=line.trim().replace(/^#+/,'').trim().replace(/^[`*_]+|[`*_]+$/g,'').trim();if(b.endsWith(':'))b=b.slice(0,-1).trim();return b;};
+const framing = l => /^===== .* =====$/.test(l)||/^\[(?:truncated|skipped):/.test(l)||l.trim()==='Delivered files (no inline answer):'||markerLine(l)==='MAXPLAYER-ANSWER-V1';
 export function detectRefusal(answer) {
   if(typeof answer!=='string')return null;
-  const lines=answer.replace(/[\u2018\u2019]/g,"'").split('\n');
-  const first=lines.findIndex(l=>l.trim());
+  const body=answer.replace(/[\u2018\u2019]/g,"'").split('\n').filter(l=>!framing(l));
+  const first=body.findIndex(l=>l.trim());
   if(first<0)return null;
-  if(markerLine(lines[first])===REFUSAL_MARKER) {
-    const reason=lines.slice(first+1).join('\n').trim().slice(0,300)||'(no reason given)';
+  if(markerLine(body[first])===REFUSAL_MARKER) {
+    const reason=body.slice(first+1).join('\n').trim().slice(0,300)||'(no reason given)';
     return {by:'marker',reason};
   }
-  const body=lines.filter(l=>!/^===== .* =====$/.test(l)&&!/^\[(?:truncated|skipped):/.test(l)&&l.trim()!=='Delivered files (no inline answer):'&&markerLine(l)!=='MAXPLAYER-ANSWER-V1');
   const text=body.join('\n').trim();
-  if(!text||text.length>REFUSAL_MAX_CHARS||WORK_EVIDENCE.test(text))return null;
+  if(text.length>REFUSAL_MAX_CHARS||ANSWER_EVIDENCE.some(re=>re.test(text)))return null;
   if(body.filter(l=>/^\s*(?:[-*•]|\d+[.)])\s+\S/.test(l)).length>=3)return null;
-  for(const [kind,re] of REFUSAL_PATTERNS)if(re.test(text))return {by:'heuristic',kind,reason:text.replace(/\s+/g,' ').slice(0,300)};
+  const reason=()=>text.replace(/\s+/g,' ').slice(0,300);
+  if(SAFETY_PATTERNS.some(re=>re.test(text)))return {by:'heuristic',kind:'safety stop',reason:reason()};
+  if(!WORK_WORDS.test(text)&&REFUSAL_PATTERNS.some(re=>re.test(text)))return {by:'heuristic',kind:'refusal',reason:reason()};
   return null;
 }
 // R3-3 (c): planner feedback (newest refusals of this challenge) and the reassignment guard.

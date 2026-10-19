@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, appendFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, appendFileSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal, Swarm, childEnv, validatePlan, requestId, preparationId, config, reservedBudget, jobBudget } from './swarm.mjs';
@@ -1842,6 +1842,12 @@ const REFUSALS=[
   'I must decline this task.',
   'I\'m not comfortable continuing with this.',
   'Delivered files (no inline answer):\n===== REPORT.md =====\nI won\'t help with decrypting this message.\n',
+  // Advisor r1 M2: real stops that were counted as work.
+  'Stopped by the safety system.',
+  'This request was refused by the safety system.',
+  'A safety classifier stopped me before I found a key.',
+  'The safety system refused this task.',
+  'Refused by the content filter.',
 ];
 const LEGITIMATE=[
   'KLJBO','42','The answer is 42.','Plaintext: I CANNOT HELP YOU','Decrypted: "i cannot help" is the crib position 7',
@@ -1856,6 +1862,23 @@ const LEGITIMATE=[
   'The safety classifier note in the README is unrelated; the key is CROWN.',
   'x'.repeat(700)+' A safety classifier stopped my work.',
   'Policy: none. Decryption: ATTACK AT DAWN.',
+  // Advisor r1 H1: short solutions that were recorded as refusals.
+  'I can\'t help it: both keywords are HUTTON and CIPHER.',
+  'Policy check ended. The plaintext is ATTACK AT DAWN.',
+  'The usage policy guidelines stopped the old procedure. Keyword: SECRET.',
+  'I cannot help.',
+  'Plaintext:\nI cannot help',
+  'I must refuse to continue.\nKeyword 1: SECRET\nKeyword 2: CIPHER',
+  'I can\'t complete this.\nResult: 42',
+  'Answer: KLJBO',
+  'results: none',
+  'I CANNOT HELP',
+  'I can\'t help it.',
+  'Solution = ROSEBUD',
+  'Recovered the keyword: WETTER.',
+  'The safety filter stopped me after I found the key CROWN.',
+  'I can\'t continue past the second keyword; the first one is HUTTON.',
+  'Policy check ended without issue; decoded text ATTACK AT DAWN.',
 ];
 test('R3-3 refusal: detectRefusal flags refusals and safety stops, never legitimate short answers',async()=>{
   const {detectRefusal,REFUSAL_MARKER}=await import('./swarm.mjs');
@@ -1866,8 +1889,24 @@ test('R3-3 refusal: detectRefusal flags refusals and safety stops, never legitim
   for(const m of [REFUSAL_MARKER,`**${REFUSAL_MARKER}**`,`# ${REFUSAL_MARKER}:`,`\`${REFUSAL_MARKER}\``])
     assert.deepEqual(detectRefusal(`\n${m}\nPolicy forbids this. ${'x'.repeat(2000)}`).by,'marker');
   assert.equal(detectRefusal(`${REFUSAL_MARKER}`).reason,'(no reason given)');
-  // Not the marker unless it is the first non-blank line.
+  // Not the marker unless it is the first non-blank line of the (unframed) body.
   assert.equal(detectRefusal(`Result: 42\n${REFUSAL_MARKER}`),null);
+  // Advisor r1 M2: the marker in a delivered file (readDeliveredAnswer framing) is honoured at any length.
+  const framed=`Delivered files (no inline answer):\n===== REPORT.md =====\n${REFUSAL_MARKER}\nThe harness stopped this task. ${'reason '.repeat(200)}\n`;
+  assert.equal(detectRefusal(framed).by,'marker');assert.match(detectRefusal(framed).reason,/^The harness stopped this task\./);
+  assert.equal(detectRefusal(`MAXPLAYER-ANSWER-V1\n${REFUSAL_MARKER}\nno`).by,'marker');
+  // Only the first file's first line: a marker inside a later file (or after text) is not one.
+  assert.equal(detectRefusal(`Delivered files (no inline answer):\n===== a.md =====\nKey: CROWN\n===== b.md =====\n${REFUSAL_MARKER}\n`),null);
+});
+test('R3-3 refusal (advisor r1 M2): a marker written to a delivered file is read through readDeliveredAnswer as a refusal',async()=>{
+  const {detectRefusal,readDeliveredAnswer,REFUSAL_MARKER}=await import('./swarm.mjs');
+  const dir=mkdtempSync(join(tmpdir(),'refused-file-'));
+  try {
+    writeFileSync(join(dir,'REPORT.md'),`${REFUSAL_MARKER}\nMy harness's safety layer ended the session. ${'detail '.repeat(150)}\n`);
+    const answer=readDeliveredAnswer(dir);
+    assert.ok(answer.startsWith('Delivered files (no inline answer):'));
+    assert.deepEqual(detectRefusal(answer)?.by,'marker');
+  } finally {rmSync(dir,{recursive:true,force:true});}
 });
 test('R3-3 refusal: recorded once as refused (not collected work), planner told to reassign, same seller rejected, another accepted',async()=>{
   const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
@@ -1911,11 +1950,25 @@ test('R3-3 refusal: progress does not count a refusal as a recorded result; stub
   // planner-stub counts delivered results by non-bracketed answers.
   assert.ok(f.inputs.at(-1).results[0].answer.startsWith('['));
 });
-test('R3-3 refusal: a legitimate short answer is a normal collect',async()=>{
-  for(const answer of ['KLJBO','The answer is 42.','No valid keyword found among the 200 candidates tested.']) {
+// Advisor r1: this test must exercise the detector. Each refusal-shaped solution is collected as work
+// while a real refusal through the same path is refused (so a runner without the detector, or with a
+// detector that flags these solutions, fails it).
+test('R3-3 refusal: a refusal-shaped short solution is a normal collect; a real refusal on the same path is refused',async()=>{
+  const cases=[
+    ['I can\'t help it: both keywords are HUTTON and CIPHER.','collected'],
+    ['Policy check ended. The plaintext is ATTACK AT DAWN.','collected'],
+    ['I can\'t complete this.\nResult: 42','collected'],
+    ['I cannot help.','collected'],
+    ['Stopped by the safety system.','refused'],
+  ];
+  for(const [answer,outcome] of cases) {
     const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();[...f.remote.values()][0].results=[{}];
     f.io.answer=async()=>answer;f.setPlan(()=>({wait:true}));f.time(101);await f.runner.tick();
-    const j=f.journal.state.jobs[0];assert.equal(j.outcome,'collected');assert.equal(j.refusal,undefined);
-    assert.equal(f.inputs.at(-1).refusals,undefined);assert.equal(f.inputs.at(-1).results[0].answer,answer);
+    const j=f.journal.state.jobs[0];assert.equal(j.outcome,outcome,JSON.stringify(answer));
+    if(outcome==='collected') {
+      assert.equal(j.refusal,undefined);assert.equal(f.inputs.at(-1).refusals,undefined);assert.equal(f.inputs.at(-1).results[0].answer,answer);
+    } else {
+      assert.equal(j.refusal.kind,'safety stop');assert.equal(f.inputs.at(-1).refusals.length,1);
+    }
   }
 });
