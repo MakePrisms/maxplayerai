@@ -28,6 +28,8 @@ bash scripts/challenges/run-e2e.sh --skip-build --baseline
 # Deterministically exercise valid duplicate claims before EOSE:
 bash scripts/challenges/run-e2e.sh --skip-build --duplicate-history
 node --test scripts/challenges/coordinator.test.mjs
+# post_job preparation_id polling used by e2e.py (also run in CI, challenges sidecar job):
+python3 -m unittest discover -s scripts/challenges -p 'test_*.py'
 ```
 
 The fixture uses a private `.scratch/ce-*` directory containing logs, homes and DBs (ignored

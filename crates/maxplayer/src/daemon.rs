@@ -8,11 +8,12 @@
 //! binds the socket, and both callers connect to the winner. No manual `maxplayer buyer` command is
 //! ever needed.
 
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use maxplayer_core::buyer::{client, SOCKET_FILE};
+use maxplayer_core::buyer::{LOCK_FILE, SOCKET_FILE, client};
 use maxplayer_core::home::MaxplayerHome;
 use serde_json::Value;
 
@@ -31,7 +32,7 @@ pub fn socket_path(home: &MaxplayerHome) -> PathBuf {
 /// thin client can call. Never runs a money op itself — it only guarantees a daemon owns the home.
 pub fn ensure(home: &MaxplayerHome) -> Result<PathBuf, String> {
     let sock = socket_path(home);
-    if client::status(&sock).is_ok() {
+    if serving(&sock, &home.root.join(LOCK_FILE)) {
         return Ok(sock); // a daemon is already serving this home.
     }
     spawn_detached(&home.root)?;
@@ -55,6 +56,36 @@ pub fn ensure(home: &MaxplayerHome) -> Result<PathBuf, String> {
             ));
         }
         std::thread::sleep(SPAWN_POLL_INTERVAL);
+    }
+}
+
+/// Whether a buyer daemon is serving: something accepts on `sock` AND the home's exclusive daemon
+/// lock is held. Both checks are local syscalls (a connect and a non-blocking `flock`), never an RPC.
+///
+/// This replaced a full `status` RPC that ran on EVERY tool call before the real request (wallet
+/// balances through the wallet actor — a fresh wallet-DB open — plus ledger and award queries). On a
+/// loaded buyer that probe alone could eat most of the MCP tool deadline (R4-2).
+///
+/// What the two checks prove, and what they do not:
+/// - A dead daemon leaves a stale socket file that refuses the connect, and its lock is released by
+///   the OS on exit, so it takes the spawn path.
+/// - A listener on `buyer.sock` that does NOT hold `buyer.lock` is not a buyer daemon (the daemon
+///   takes the lock before it binds and keeps it for life). The status probe used to reject such a
+///   listener because it answered no JSON; the lock check rejects it now, and the spawned daemon
+///   replaces the socket once it holds the lock (`buyer::bind_socket`).
+/// - Neither check proves the lock holder speaks the protocol or is responsive. The status probe did
+///   not prove that either: a JSON error reply counted as serving, and a wedged daemon hangs the
+///   real call exactly as it hung the probe. A lock-holding process is never replaced here, as before.
+fn serving(sock: &Path, lock: &Path) -> bool {
+    if UnixStream::connect(sock).is_err() {
+        return false;
+    }
+    // Opened read-only and never created: a home whose daemon never started has no lock file. If the
+    // non-blocking lock SUCCEEDS nobody owns the home; it is dropped (released) at once, before any
+    // spawn, so the spawned daemon can take it.
+    match std::fs::File::open(lock) {
+        Ok(file) => matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        Err(_) => false,
     }
 }
 
@@ -102,4 +133,53 @@ pub fn call(sock: &Path, method: &str, params: Value) -> Result<Value, String> {
 pub fn ensure_then_call(home: &MaxplayerHome, method: &str, params: Value) -> Result<Value, String> {
     let sock = ensure(home)?;
     call(&sock, method, params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use maxplayer_core::buyer::lock::HomeLock;
+    use std::os::unix::net::UnixListener;
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn temp_dir(label: &str) -> TempDir {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-serving-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+
+    #[test]
+    fn serving_requires_a_listener_and_the_held_home_lock() {
+        let dir = temp_dir("probe");
+        let (sock, lock) = (dir.0.join(SOCKET_FILE), dir.0.join(LOCK_FILE));
+        assert!(!serving(&sock, &lock), "nothing there: spawn");
+
+        // A stale socket file from a dead daemon refuses the connect, even with the lock held.
+        let held = HomeLock::acquire(&lock).unwrap();
+        drop(UnixListener::bind(&sock).unwrap());
+        assert!(!serving(&sock, &lock), "stale socket file: spawn");
+        drop(held);
+        std::fs::remove_file(&sock).unwrap();
+
+        // A listener that does not hold the home lock is not a buyer daemon (finding 1, advisor r1).
+        let _listener = UnixListener::bind(&sock).unwrap();
+        assert!(!serving(&sock, &lock), "stray listener, lock free: spawn");
+        // The probe released the lock it took; a daemon can still acquire it.
+        let held = HomeLock::acquire(&lock).expect("probe must not keep the home lock");
+        assert!(serving(&sock, &lock), "listener + held home lock: serving");
+        drop(held);
+        assert!(!serving(&sock, &lock), "lock released again: spawn");
+    }
 }

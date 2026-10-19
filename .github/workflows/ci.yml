@@ -289,6 +289,9 @@ jobs:
           set -euo pipefail
           cargo build --manifest-path crates/maxplayer-challenges/Cargo.toml --locked --bins
           crates/maxplayer-challenges/target/debug/maxplayer-swarm --help | grep -q '^Usage: maxplayer-swarm <command>'
+      # scripts/challenges Python helpers (stdlib unittest, no deps; ubuntu-latest ships python3).
+      # The e2e harness itself needs a relay/Postgres/Redis and stays manual (run-e2e.sh).
+      - run: python3 -m unittest discover -s scripts/challenges -p 'test_*.py' -v
 
   # The standalone Cashu trade CLI. It is its OWN cargo workspace (`[workspace]` in its manifest)
   # with its own Cargo.lock, so no root-workspace job above builds or tests it: before this job a

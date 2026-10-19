@@ -16,6 +16,8 @@ import tempfile
 import time
 import urllib.request
 
+from preparation import posted_job_id
+
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('--skip-build', action='store_true', help='use binaries already built by run-e2e.sh')
@@ -237,7 +239,7 @@ try:
     else:
         deadline = int(time.time()) + 120
     posted = mcp(buyer_env, 'post_job', {'task':f'[challenge:{BUYER}:local-e2e]\nReturn exactly the fixture answer 42.', 'output':'text/plain', 'payment':'none', 'amount_sats':0, 'max_sats':0, 'visibility':'public', 'seller_pubkey':SELLER, 'deadline_unix':deadline, 'request_id':'challenge-e2e-free'})
-    job = posted['job_id']
+    job = posted_job_id(lambda handle: mcp(buyer_env, 'get_job', {'job_id': handle}), posted)
     check('the buyer posts through existing MCP', bool(re.fullmatch('[0-9a-f]{64}', job)))
     def claimed():
         state = mcp(buyer_env, 'get_job', {'job_id': job})
