@@ -202,7 +202,7 @@ impl Relays {
     }
     fn degraded(&self, what: &str, ok: usize, failed: &[String], missing: &[String]) {
         let warning = format!(
-            "degraded {what}: {ok} of {} challenge relays (quorum {}); missing: {}",
+            "degraded {what}: {ok} of {} swarm relays (quorum {}); missing: {}",
             self.urls.len(),
             self.quorum,
             failed.join(", ")
@@ -232,12 +232,12 @@ impl Relays {
             let literal = source
                 .lines()
                 .find_map(|line| line.strip_prefix("export const CHALLENGE_RELAY_DENYLIST = "))
-                .ok_or("missing challenge relay denylist")?
+                .ok_or("missing swarm relay denylist")?
                 .trim_end_matches(';');
             let denied: Vec<String> =
-                serde_json::from_str(literal).map_err(|_| "invalid challenge relay denylist")?;
+                serde_json::from_str(literal).map_err(|_| "invalid swarm relay denylist")?;
             if denied.contains(&host) {
-                return Err("production relay forbidden for challenges".into());
+                return Err("production relay forbidden for swarm runs".into());
             }
             let loopback = host == "localhost"
                 || host
@@ -288,7 +288,7 @@ impl Relays {
             .await
             .map_err(|_| "could not configure relay")?;
         for relay in client.relays().await.into_values() {
-            maxplayer_core::relay_auth::resubscribe_on_auth(relay, "maxplayer-challenges");
+            maxplayer_core::relay_auth::resubscribe_on_auth(relay, "maxplayer-swarm");
         }
         client.connect().await;
         Ok((client, counter))
@@ -373,13 +373,10 @@ impl Relays {
         if ok < need {
             // Below quorum (or, for a strict read, any relay missing): fail closed.
             return Err(if need == self.urls.len() {
-                format!(
-                    "challenge relay read incomplete; failed: {}",
-                    failed.join(", ")
-                )
+                format!("swarm relay read incomplete; failed: {}", failed.join(", "))
             } else {
                 format!(
-                    "challenge relay read incomplete; quorum not met ({ok} of {} relays complete, need {need}); failed: {}",
+                    "swarm relay read incomplete; quorum not met ({ok} of {} relays complete, need {need}); failed: {}",
                     self.urls.len(),
                     failed.join(", ")
                 )
@@ -531,7 +528,7 @@ impl Relays {
             .tags(tags)
             .custom_created_at(Timestamp::from(created_at))
             .sign_with_keys(&keys(home)?)
-            .map_err(|_| "challenge signing failed")?;
+            .map_err(|_| "swarm event signing failed")?;
         let mut failed = Vec::new();
         for url in &self.urls {
             let ok = Self::send(home, url, &event).await;
@@ -554,7 +551,7 @@ impl Relays {
             // Below quorum: the command fails and nothing is queued for re-send (the caller was
             // told it failed; a later re-send must never publish what they believe was not).
             return Err(format!(
-                "challenge publish incomplete; quorum not met ({accepted} of {} relays accepted, need {}); failed: {}",
+                "swarm publish incomplete; quorum not met ({accepted} of {} relays accepted, need {}); failed: {}",
                 self.urls.len(),
                 self.quorum,
                 failed.join(", ")
@@ -571,7 +568,7 @@ impl Relays {
             let mut outbox = Outbox::load(home);
             outbox.queue(&event, &failed, now());
             if let Err(e) = outbox.save(home) {
-                eprintln!("Warning: could not save the challenge re-send outbox ({e})");
+                eprintln!("Warning: could not save the swarm re-send outbox ({e})");
             }
         }
         Ok(event.id.to_hex())
@@ -625,7 +622,7 @@ impl Relays {
         }
         outbox.prune(at);
         if let Err(e) = outbox.save(home) {
-            eprintln!("Warning: could not save the challenge re-send outbox ({e})");
+            eprintln!("Warning: could not save the swarm re-send outbox ({e})");
         }
         self.report.lock().unwrap().resent.extend(resent);
     }

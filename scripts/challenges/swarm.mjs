@@ -363,13 +363,15 @@ export const TERMINAL_STATUSES = ['completed','cancelled'];
 export const PROGRESS_RETRY_SECONDS = 30;
 const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
 // The sidecar `publish` refuses to sign over a completed/cancelled challenge it sees in its own
-// pre-publish fetch: exit 3, stderr `challenge: challenge closed (<status>): …`, nothing published.
+// pre-publish fetch: exit 3, stderr `swarm: swarm run closed (<status>): …`, nothing published.
+// The pre-rename `challenge closed` text is still recognised, so a not-yet-rebuilt sidecar's
+// refusal is never mistaken for a transient failure.
 export const SIDECAR_CLOSED_EXIT = 3;
-export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.stderr??e.message).match(/challenge closed \((completed|cancelled)\)/)?.[1]??null:null;
+export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.stderr??e.message).match(/(?:swarm run|challenge) closed \((completed|cancelled)\)/)?.[1]??null:null;
 // Sidecar argv for the latest buyer-signed challenge (`status` requires --buyer; --json on stdout).
 // `quorum` is the challenge relay quorum (run 2 #13); a progress publish passes every relay (strict).
 export const quorumArgs = quorum => quorum===undefined?[]:['--quorum',String(quorum)];
-export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
+export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--run',challenge.id,'--json'];
 // Degraded-quorum warnings and re-sends the sidecar reported in its --json body (relay_quorum).
 export function sidecarQuorumLines(body) {
   const q=body?.relay_quorum;if(!q||typeof q!=='object')return [];
@@ -802,7 +804,7 @@ async function main() {
   let quitting=false,source,wake,health;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();wake?.();};
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
-  const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
+  const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-swarm';
   const challengeRelays=c.challengeRelays;
   const env=childEnv(process.env,c.home);
   const identity=await command(c.binary,['whoami'],{env});
