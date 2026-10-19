@@ -8,14 +8,18 @@ export interface Snapshot {
   challenge: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: Challenge['status']; result: string }|null;
   sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
-  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; missingRelays?: string[]; degraded?: boolean; quorum?: {required: number; complete: number; total: number}; warnings?: string[]; applicantsIncomplete?: boolean };
+  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; missingRelays?: string[]; degraded?: boolean; quorum?: {required: number; complete: number; total: number}; warnings?: string[]; applicantsIncomplete?: boolean;
+    relays?: { role: string; url: string; connected: boolean; historyComplete: boolean; error: string|null }[] };
 }
-// The page's relay status line. The relay's own reason (e.g. a CLOSED) is shown at once, not only
-// after a reconnect copies it. Degraded (run 2 #13: quorum met, a challenge relay missing) stays
-// live; the reader's "Degraded: … missing: …" warning on this line says so.
+// What follows the status word on the relay status line: the relay's own reason (e.g. a CLOSED)
+// at once, unavailable relays, and the reader's warnings. Degraded (run 2 #13: quorum met, a
+// challenge relay missing) stays live; the reader's "Degraded: … missing: …" warning says so.
+function relayDetail(r: Snapshot['relay']): string {
+  return (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : "");
+}
 export function connectionText(r: Snapshot['relay'], status: string): string {
   const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : status;
-  return connection + (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : "");
+  return connection + relayDetail(r);
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);
 // Fail closed on malformed snapshots; never put remote text into HTML.
@@ -50,10 +54,67 @@ export function sellerState(s: Snapshot,a: Seller,now: number): string {
   if(a.state==='done'&&!a.eligible)return 'Done';
   return a.eligible?'Ready':'Joined';
 }
+// Until the live data is in (connected and history complete), the agents section says only
+// "Updating…" (bob: no disclaimers). Latched: once the data has been live (wasLive), a routine
+// poll that only clears historyComplete while the relay stays connected keeps "live", so the
+// section doesn't blank every 15s. A disconnect (or no relay status at all) clears the latch:
+// the section shows "Updating…" and, after the reconnect, waits for a fresh historyComplete
+// before "Live", the eyebrow and the rows come back.
+export const UPDATING='Updating…';
+type Relay=Snapshot['relay'];
+export type LiveState='live'|'updating';
+export function isLive(r: Relay): boolean { return !!r&&r.connected&&r.historyComplete; }
+export function liveState(r: Relay,wasLive: boolean): LiveState { return !!r&&r.connected&&(wasLive||r.historyComplete)?'live':'updating'; }
+// The challenge event (status, window) comes only from the challenge relays, so the hero needs
+// only them: at least the reader's quorum (run 2 #13, default 2 of 3) of challenge relays
+// connected, history complete, no error. Degraded (quorum met, one missing) is ready, as it is for
+// the reader; below quorum is not. Without a quorum in the status, every challenge relay is
+// required. Trade auth and trade history (which finish ~8-12s later on the real relays) don't
+// gate it. Without per-relay status (demo), the aggregate stands in.
+const challengeRelays=(r: NonNullable<Relay>)=>r.relays?.filter(x=>x.role==='challenge');
+const required=(r: NonNullable<Relay>,n: number)=>Math.max(1,Math.min(n,r.quorum?.required??n));
+export function challengeReady(r: Relay): boolean {
+  if(!r)return false;
+  const ch=challengeRelays(r);
+  if(!ch)return r.connected&&r.historyComplete&&!r.error;
+  return ch.length>0&&ch.filter(x=>x.connected&&x.historyComplete&&!x.error).length>=required(r,ch.length);
+}
+// Down: fewer challenge relays up (connected, no error) than the quorum needs.
+function challengeDown(r: Relay): boolean {
+  if(!r)return true;
+  const ch=challengeRelays(r);
+  if(!ch)return !r.connected||!!r.error;
+  return ch.filter(x=>x.connected&&!x.error).length<required(r,ch.length);
+}
+// Called on every read of the relay status (each receive and each 1s tick). readyAt is the
+// last time the challenge data was ready; a challenge relay dropping or erroring clears it at
+// once. readyAgeS lets the hero drop "Running now" when the data stops being ready, without
+// the 15s poll (which clears historyComplete for about a second) making it flicker.
+export interface Tracker { wasLive: boolean; readyAt: number|null }
+export interface Observed extends Tracker { state: LiveState; readyAgeS: number|null }
+export function observe(t: Tracker,r: Relay,nowMs: number): Observed {
+  const wasLive=!!r&&r.connected&&(t.wasLive||isLive(r));
+  const readyAt=challengeDown(r)?null:challengeReady(r)?nowMs:t.readyAt;
+  return {wasLive,readyAt,state:liveState(r,wasLive),readyAgeS:readyAt===null?null:Math.max(0,nowMs-readyAt)/1000};
+}
+// The section eyebrow says "Live" only while the section is live; it keeps its space otherwise.
+export function renderLiveState(doc: Document,state: LiveState): void {
+  doc.getElementById('agents-eyebrow')!.classList.toggle('is-off',state!=='live');
+}
+export function connectionLine(r: Relay,status: string,wasLive=false): string {
+  if(liveState(r,wasLive)!=='live')return UPDATING;
+  // Same detail as connectionText (error, unavailable relays, degraded warning); the word stays
+  // "Live" through a routine poll (latched), where connectionText would say catching up.
+  return status+relayDetail(r);
+}
 const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
 // Public page: denied members are not listed. Remote text only ever reaches textContent.
-export function renderSellers(doc: Document,s: Snapshot,now: number): void {
-  const list=doc.getElementById('challenge-sellers')!;const fragment=doc.createDocumentFragment();
+// loading=true (not live: before the first live data, or disconnected): no rows and no counts,
+// so nothing reads as current; only "Updating…" shows.
+export function renderSellers(doc: Document,s: Snapshot,now: number,loading=false): void {
+  const list=doc.getElementById('challenge-sellers')!;
+  if(loading){list.replaceChildren();doc.getElementById('seller-summary')!.textContent='';return;}
+  const fragment=doc.createDocumentFragment();
   const shown=s.sellers.filter(a=>a.decision!=='denied');
   for(const a of shown) {
     const row=doc.createElement('li');const state=sellerState(s,a,now);
@@ -76,6 +137,6 @@ export function renderSellers(doc: Document,s: Snapshot,now: number): void {
   }
   list.replaceChildren(fragment);
   const working=shown.filter(a=>sellerState(s,a,now)==='Working now').length;
-  const pending=waiting.length||partial?` · ${waiting.length}${partial?'+':''} waiting for approval${partial?' (list may be incomplete)':''}`:'';
+  const pending=waiting.length||partial?` · ${waiting.length}${partial?'+':''} waiting for approval`:'';
   doc.getElementById('seller-summary')!.textContent=(shown.length?`${shown.length} ${shown.length===1?'agent':'agents'} · ${working} working now`:'No members yet.')+pending;
 }

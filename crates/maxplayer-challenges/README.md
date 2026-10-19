@@ -1,8 +1,9 @@
-# maxplayer-challenges
+# maxplayer-swarm (crate `maxplayer-challenges`)
 
-Opt-in community challenge sidecar. It is a separate Cargo workspace with its own
+Opt-in community swarm sidecar. It installs the `maxplayer-swarm` command; the crate directory
+and Cargo package keep the name `maxplayer-challenges`. It is a separate Cargo workspace with its own
 `Cargo.lock`, like `maxplayer-mint` and `maxplayer-trade`. No prebuilt release yet.
-The main `maxplayer` binary has no challenge command. No relay deployment is needed.
+The main `maxplayer` binary has no swarm command. No relay deployment is needed.
 
 ## Build from source
 
@@ -10,7 +11,7 @@ From the repository root:
 
 ```sh
 cargo build --release --locked --manifest-path crates/maxplayer-challenges/Cargo.toml
-install -m 0755 crates/maxplayer-challenges/target/release/maxplayer-challenges ~/.local/bin/
+install -m 0755 crates/maxplayer-challenges/target/release/maxplayer-swarm ~/.local/bin/
 ```
 
 Uses the existing `$MAXPLAYER_HOME` or `~/.maxplayer` (or `--home PATH`), its `<home>/key`
@@ -35,18 +36,18 @@ case/trailing-dot variants. The home's job relay is never used for challenge tra
 at least `--quorum N` relays acknowledge it (default 2; for other list sizes the default is a
 strict majority, and one relay needs itself). An explicit `--quorum` must be a strict majority
 of the relays and at most all of them, so every quorum read shares a relay with every quorum
-publish. Below quorum the command fails with `challenge publish incomplete; quorum not met
+publish. Below quorum the command fails with `swarm publish incomplete; quorum not met
 (<n> of <m> relays accepted, need <q>); failed: …`; the relays not in that list may already
 hold the event, and nothing is queued for re-send. Per-relay acceptance/failure is printed to
 stderr (an ACK is not proof of durable storage).
 Reads query every configured relay and union verified events, deduplicating by event id;
 the shared protocol selects the latest per `(kind, author, d)` with deterministic ties.
 A relay without EOSE is a reported error and its partial events are discarded. A read
-succeeds once at least the quorum completed; below it, the command fails with `challenge
+succeeds once at least the quorum completed; below it, the command fails with `swarm
 relay read incomplete; quorum not met (…)` and publishes nothing.
 
 **Degraded.** Quorum met with a relay missing is degraded: stderr gets `Warning: degraded
-read|publish: <n> of <m> challenge relays (quorum <q>); missing: <relays>`, and `--json`
+read|publish: <n> of <m> swarm relays (quorum <q>); missing: <relays>`, and `--json`
 bodies carry `relay_quorum` (`required`, `total`, `degraded`, `warnings`, `missing`,
 `resent`). A reachable relay's history cannot prove that another relay has no newer event.
 
@@ -83,17 +84,19 @@ bad signature), so `applicants_incomplete` can be true with fewer than 256 rows 
 affects the roster or what is published. A sample event
 only fills a seller row the trusted read did not return (for example a denied or undecided
 seller); it never replaces an accepted seller's roster membership.
-`--json` retains the existing command JSON on stdout.
+`--json` prints the command JSON on stdout. The run (the CHALLENGE event) is the top-level `run`
+object (`null` when there is none, and always `null` for `join`); it was `challenge` before the
+rename, with no alias.
 
 ## Sellers: join once
 
 With the initialized, running seller's home selected:
 
 ```sh
-maxplayer-challenges status --buyer <npub-or-hex> --json
-maxplayer-challenges join --buyer <npub-or-hex> --minutes 60 --json
-maxplayer-challenges status --buyer <npub-or-hex> --json
-maxplayer-challenges leave --buyer <npub-or-hex> --json
+maxplayer-swarm status --buyer <npub-or-hex> --json
+maxplayer-swarm join --buyer <npub-or-hex> --minutes 60 --json
+maxplayer-swarm status --buyer <npub-or-hex> --json
+maxplayer-swarm leave --buyer <npub-or-hex> --json
 ```
 
 Append the buyer's hex public key to `seller.accept_offers_only_from` without removing
@@ -120,7 +123,7 @@ accept an event dated up to 900 seconds ahead of their clock, so a fast seller c
 otherwise forfeit the last minutes; the refusal therefore lasts until 15 minutes after `ends`:
 
 ```text
-challenge: You're in today's challenge (<id>, ends <time>). Change your minutes (or note)
+swarm: You're in today's swarm run (<id>, ends <time>). Change your minutes (or note)
 after <ends + 15 min> (15 minutes after it ends, allowing for clock drift); they apply from
 the next day. Re-publishing now would make you ineligible for today. Do not leave and rejoin
 to change minutes: that also forfeits today. Nothing was published.
@@ -154,18 +157,19 @@ to change minutes: that also forfeits today. Nothing was published.
 Use the buyer's initialized home:
 
 ```sh
-maxplayer-challenges publish --id 2026-10-17 --title 'Community task' \
+maxplayer-swarm publish --id 2026-10-17 --title 'Community task' \
   --goal-file goal.md --starts 2026-10-17T12:00:00Z --ends 2026-10-17T14:00:00Z \
   --budget-sats 0 --status scheduled --json
-maxplayer-challenges members --challenge 2026-10-17 --json
-maxplayer-challenges decide --seller <npub-or-hex> --accept --json
-maxplayer-challenges decide --seller <npub-or-hex> --deny --json
+maxplayer-swarm members --run 2026-10-17 --json
+maxplayer-swarm decide --seller <npub-or-hex> --accept --json
+maxplayer-swarm decide --seller <npub-or-hex> --deny --json
 ```
 
 `publish` also accepts `--update`, `--result`, and status `in_progress`, `completed`, or
 `cancelled`. A `completed` or `cancelled` challenge is final: if `publish`'s own fetch finds the
-latest buyer-signed event for that id closed, it signs nothing and exits 3 with `challenge:
-challenge closed (<status>): …`. `status`/`members` default to the latest non-cancelled challenge. Publishing
+latest buyer-signed event for that id closed, it signs nothing and exits 3 with `swarm:
+swarm run closed (<status>): …`. `status`/`members` default to the latest non-cancelled swarm run
+(`--run <d>` selects one). Publishing
 metadata does not fund a budget or post a job. The buyer's ordinary `maxplayer` daemon
 and MCP still handle all jobs and settlement.
 

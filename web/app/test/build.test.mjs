@@ -91,9 +91,9 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
-    const script = page === "tokens.html" ? "tokens.js" : page === "challenges.html" ? "challenges.js" : "terminal.js";
+    const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
       assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
       assert.ok(!pageHtml.includes(`"./${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
@@ -162,7 +162,7 @@ test("the live market ships at /market and the homepage links it", () => {
 });
 
 test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
-  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "challenges.html"];
+  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -178,23 +178,28 @@ test("all site pages share navigation and footer links, with a current page and 
     assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
     // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
     assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
-    assert.match(footer, /href="\/market">Market<\/a>\s*<div class="foot-labs">\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat is in the footer after Market, marked Lab`);
+    assert.match(footer, /href="\/market">Market<\/a>\s*<\/div>\s*<div class="foot-row foot-labs">\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat opens the Lab row under Buy, Sell, Market, marked Lab`);
     // Mint is a Lab page too: footer only, right after Chat.
     assert.ok(!nav.includes('href="/mint"'), `${page}: /mint is not in the top nav`);
     assert.match(footer, /<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /mint is in the footer after Chat, marked Lab`);
     // Tokens is a Lab page too: footer only, right after Mint.
     assert.ok(!nav.includes('href="/tokens"'), `${page}: /tokens is not in the top nav`);
     assert.match(footer, /<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /tokens is in the footer after Mint, marked Lab`);
-    // bob: Skill and GitHub leave the top bar; they sit with @maxplayerai on the
-    // footer's second, dimmer row.
+    // bob (2026-10-18): Swarm is a Lab page too, right after Tokens; since 2026-10-19 it lives at /swarm.
+    assert.ok(!nav.includes('href="/swarm"'), `${page}: /swarm is not in the top nav`);
+    assert.match(footer, /<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/swarm">Swarm<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: Swarm is in the footer after Tokens, marked Lab`);
+    // bob: Skill and GitHub leave the top bar; since 2026-10-18 they are the footer's
+    // third, dimmer row, under the Lab links.
     assert.deepEqual(links(nav).map(([href]) => href), ["/", "/sell", "/market"], `${page}: top nav is Buy, Sell, Market`);
-    // bob: the Lab pages are grouped, so phones can put them on their own row.
-    const labs = footer.match(/<div class="foot-labs">([\s\S]*?)<\/div>/)?.[1] ?? "";
-    assert.deepEqual(links(labs).map(([href]) => href), ["/chat", "/mint", "/tokens"], `${page}: Lab links grouped`);
-    const sub = footer.match(/<div class="foot-row foot-sub">([\s\S]*?)<\/div>/)?.[1] ?? "";
-    assert.deepEqual(links(sub).map(([, text]) => text), ["Skill", "GitHub", "@maxplayerai"], `${page}: footer second row`);
+    // bob (2026-10-18): three rows on the right: Buy · Sell · Market, the Labs, then Skill · GitHub.
+    const rows = [...footer.matchAll(/<div class="foot-row[^"]*">([\s\S]*?)<\/div>/g)].map((m) => links(m[1]).map(([, text]) => text));
+    assert.deepEqual(rows, [["Buy", "Sell", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub"]], `${page}: footer rows`);
+    // ...and the @maxplayerai handle moves to the left, under "The Multiplayer Marketplace".
+    const brand = html.match(/<div class="foot-brand">([\s\S]*?)<\/div>/)?.[1] ?? "";
+    assert.match(brand, /<p>The Multiplayer Marketplace<\/p>\s*<a class="foot-x" href="https:\/\/x\.com\/maxplayerai"[^>]*>@maxplayerai<\/a>/, `${page}: X handle under the tagline`);
+    assert.ok(!footer.includes("x.com/maxplayerai"), `${page}: X handle is not in the link rows`);
     const current = [...nav.matchAll(/aria-current="page"/g)].length;
-    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "challenges.html") {
+    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "swarm.html") {
       assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
     } else {
       const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
@@ -206,6 +211,20 @@ test("all site pages share navigation and footer links, with a current page and 
       assert.equal(script[2].trim(), "", `${page} has no inline script`);
     }
   }
+});
+
+test("/swarm hero facts start as skeletons, both labels and values, with no placeholder text (bob)", () => {
+  const html = readFileSync(join(root, "dist", "swarm.html"), "utf8");
+  const facts = html.match(/<dl class="c-facts" id="challenge-facts" aria-busy="true">([\s\S]*?)<\/dl>/)?.[1] ?? "";
+  for (const id of ["challenge-start-label", "challenge-start", "challenge-budget-label", "challenge-budget"])
+    assert.match(facts, new RegExp(`id="${id}"><span class="skel c-skel-d[dt]"></span></d[dt]>`), `${id} is a skeleton`);
+  assert.equal([...facts.matchAll(/class="skel /g)].length, 4);
+  for (const text of ["Loading…", "Work starts", "To be announced", "Budget"]) assert.ok(!facts.includes(text), `no static "${text}"`);
+});
+
+test("/swarm carries the /tokens experimental notice under the nav (bob)", () => {
+  const html = readFileSync(join(root, "dist", "swarm.html"), "utf8");
+  assert.match(html, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>[^<]+<\/span><\/p>/, "experimental strip under the nav, like /tokens");
 });
 
 test("/chat carries the /tokens experimental notice under the nav", () => {
@@ -326,26 +345,88 @@ test("FAQ sections pin their heading so opening an answer never moves it", () =>
   }
 });
 
-test("challenge page stays unlisted, noindexed and isolated from the main bundle", () => {
-  const html = readFileSync(join(root, "dist/challenges.html"), "utf8");
+test("swarm page stays noindexed, linked only as the footer's Swarm Lab, and isolated from the main bundle", () => {
+  const html = readFileSync(join(root, "dist/swarm.html"), "utf8");
   const { stamp } = JSON.parse(readFileSync(join(root, "dist/.buildstamp"), "utf8"));
   assert.match(html, /name="robots" content="noindex, nofollow"/);
-  assert.ok(html.includes(`./challenges.css?v=${stamp}`));
+  assert.ok(html.includes(`./swarm.css?v=${stamp}`));
   assert.ok(!html.includes("terminal.js"));
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "llms.txt", "skill.md"]) {
-    assert.ok(!readFileSync(join(root, "dist", page), "utf8").includes("/challenges"), `${page} does not advertise the route`);
+  // bob (2026-10-18) put Swarm in the footer; that one link is the only place pages name the route.
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"]) {
+    const text = readFileSync(join(root, "dist", page), "utf8");
+    assert.equal([...text.matchAll(/\/swarm\b/g)].length, 1, `${page} names /swarm once`);
+    assert.ok(!text.includes("/challenges"), `${page} no longer links the old /challenges route`);
+    assert.ok(text.includes('<a href="/swarm">Swarm<sup class="lab-sup">Lab</sup></a>'), `${page}: only the footer Swarm link`);
+  }
+  for (const page of ["llms.txt", "skill.md"]) {
+    const text = readFileSync(join(root, "dist", page), "utf8");
+    assert.ok(!text.includes("/challenges") && !/maxplayer\.ai\/swarm|\]\(\/swarm\)/.test(text), `${page} does not advertise the route`);
   }
   const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
-  assert.ok(cfg.headers.some((r) => r.source === "/challenges" && r.headers.some((h) => h.key === "X-Robots-Tag" && h.value === "noindex, nofollow")));
+  assert.ok(cfg.headers.some((r) => r.source === "/swarm" && r.headers.some((h) => h.key === "X-Robots-Tag" && h.value === "noindex, nofollow")));
   assert.ok(!readFileSync(join(root, "dist/terminal.js"), "utf8").includes("data-challenge-copy"));
+});
+
+// bob (2026-10-19, #community-challenges-build): "change the url and mentions of challenge to 'swarm'".
+test("the community page builds at /swarm, every page links it there, and /challenges redirects permanently", () => {
+  assert.ok(existsSync(join(root, "dist", "swarm.html")), "/swarm builds (cleanUrls serves swarm.html)");
+  assert.ok(existsSync(join(root, "dist", "swarm.js")) && existsSync(join(root, "dist", "swarm.css")), "its bundle and styles build");
+  for (const old of ["challenges.html", "challenges.js", "challenges.css"]) {
+    assert.ok(!existsSync(join(root, "dist", old)), `dist/${old} is gone`);
+  }
+  for (const page of ["index.html", "sell.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html"]) {
+    const html = readFileSync(join(root, "dist", page), "utf8");
+    const swarmLinks = [...html.matchAll(/<a href="([^"]*)">Swarm<sup/g)].map((m) => m[1]);
+    assert.deepEqual(swarmLinks, ["/swarm"], `${page}: the Swarm link points at /swarm`);
+    assert.ok(!/href="\/challenges/.test(html), `${page}: no link to /challenges`);
+  }
+  const { redirects = [] } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  for (const source of ["/challenges", "/challenges.html"]) {
+    assert.ok(redirects.some((r) => r.source === source && r.destination === "/swarm" && r.permanent === true), `${source} redirects permanently to /swarm`);
+  }
+  // The join skill moved with the page; agents holding the old URL are redirected.
+  assert.ok(redirects.some((r) => r.source === "/.well-known/skills/challenge-join/skill.md" && r.destination === "/.well-known/skills/swarm-join/skill.md" && r.permanent === true), "old join-skill path redirects");
+  assert.ok(existsSync(join(root, "dist", ".well-known", "skills", "swarm-join", "skill.md")), "swarm-join skill ships");
+  const skill = readFileSync(join(root, ".well-known", "skills", "swarm-join", "skill.md"), "utf8");
+  assert.match(skill, /^---\nname: maxplayer-swarm-join\n/);
+  assert.ok(skill.includes("tree/main/crates/maxplayer-challenges") && !skill.includes("feat/challenges-sidecar"), "sidecar link points at main");
+  assert.ok(skill.includes("Experimental: build from source; there is\nno release binary yet.") && !skill.includes("Not deployed yet"));
+  // bob (2026-10-19 00:49): commands use maxplayer-swarm and --run; the crate dir keeps its name.
+  const commands = skill.split("\n").map((l) => l.trim()).filter((l) => /^maxplayer-(swarm|challenges) /.test(l));
+  assert.ok(commands.length >= 6 && commands.every((l) => /^maxplayer-swarm (status|join|leave) /.test(l)), "every command line runs maxplayer-swarm");
+  assert.ok(skill.includes("`status --run <id>`") && !skill.includes("--challenge"), "the day flag is --run");
+  assert.ok(skill.includes("--manifest-path crates/maxplayer-challenges/Cargo.toml") && skill.includes("target/release/maxplayer-swarm`"), "build line unchanged; binary named");
+  assert.match(skill, /old `maxplayer-challenges` binary\? That name is gone: rebuild[\s\S]*membership carries over unchanged/, "one line for existing members");
+  // Skill walkthrough fixes (2026-10-19): free-job prerequisite, tested version, strict minutes-change read.
+  assert.match(skill, /\*\*Prerequisite: free swarm jobs\.\*\* Set `takes_no_payment = true` under `\[seller\]`/, "free-job prerequisite is its own line");
+  assert.ok(skill.includes("Tested with seller 0.6.1.") && !/⟨TBD⟩|or later/.test(skill), "tested version, no invented minimum");
+  assert.ok(skill.includes("needs every relay, whether or not a swarm run is\n   in progress"), "minutes change needs every relay");
+  assert.ok(!/\b300\b/.test(skill), "no unexercised 300-second floor");
+  // bob (2026-10-19 02:08): the --json top-level `challenge` object is `run` (#1176).
+  for (const key of ["`run.buyer`", "`run.goal`", "`run.starts`/`run.ends`", "`run.budget_sats`", '`"run": null`']) {
+    assert.ok(skill.includes(key), `skill reads ${key}`);
+  }
+  assert.ok(!/`challenge\.|"challenge"|the `challenge` object/.test(skill), "no `challenge` JSON field left in the skill");
+  assert.equal([...skill.matchAll(/(?<!crates\/)maxplayer-challenges/g)].length, 1, "the old binary name appears only in the existing-members line");
+  // bob (2026-10-19 00:49): the CLI is maxplayer-swarm and the day flag is --run.
+  const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
+  assert.ok(bundle.includes("maxplayer-swarm join --buyer ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer-swarm");
+  const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
+  assert.ok(page.includes("https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md"), "the join line reads the swarm-join skill");
+  assert.match(page, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>Community swarms are early\. They may change, break or go away\.<\/span><\/p>/, "the experimental strip stays on /swarm");
+  assert.match(page, /<title>Community Swarm — MAXPLAYER AI<\/title>/);
+  // Visible copy says swarm; ids and classes (challenge-*) are internal and may stay.
+  const visible = page.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<[^>]*>/g, (tag) => [...tag.matchAll(/(?:content|aria-label|title|alt)="([^"]*)"/g)].map((m) => ` ${m[1]} `).join(""));
+  assert.ok(!/challenge/i.test(visible), `no visible "challenge" on /swarm: ${visible.match(/.{0,40}challenge.{0,40}/i)?.[0]}`);
 });
 
 test('challenge relay connection is allowed on the unlisted route', () => {
   const {headers}=JSON.parse(readFileSync(join(root,'vercel.json'),'utf8'));
   const csp=path=>headers.filter(h=>new RegExp(`^${h.source}$`).test(path)).flatMap(h=>h.headers.filter(x=>x.key==='Content-Security-Policy').map(x=>x.value));
-  assert.equal(csp('/challenges').length,1);
-  assert.match(csp('/challenges')[0],/connect-src 'self' wss:\/\/relay\.maxplayer\.ai wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub https:\/\/api\.coinbase\.com;/);
-  for(const path of ['/','/market','/challenges.js'])assert.ok(!csp(path)[0].includes('community.maxplayer.ai'));
+  assert.equal(csp('/swarm').length,1);
+  assert.match(csp('/swarm')[0],/connect-src 'self' wss:\/\/relay\.maxplayer\.ai wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub https:\/\/api\.coinbase\.com;/);
+  for(const path of ['/','/market','/swarm.js'])assert.ok(!csp(path)[0].includes('community.maxplayer.ai'));
 });
 
  test("build refuses the production challenge relay hostname", () => {

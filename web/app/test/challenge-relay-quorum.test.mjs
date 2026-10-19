@@ -71,7 +71,7 @@ test('below quorum: never ready; once the relays still up cannot meet it, an err
   assert.equal(reader.status.degraded,false);assert.equal(relayReady(snap(reader)),false);
   reader.challenges[1].ws.close();reader.challenges[2].ws.close();
   assert.equal(reader.status.historyComplete,false);
-  assert.match(reader.status.error,/^Challenge history incomplete; quorum not met \(1 of 3 challenge relays available, need 2\); relay failed: ws:\/\/b, ws:\/\/c$/);
+  assert.match(reader.status.error,/^Swarm history incomplete; quorum not met \(1 of 3 challenge relays available, need 2\); relay failed: ws:\/\/b, ws:\/\/c$/);
   assert.equal(relayReady(snap(reader)),false);
   // A degraded-looking snapshot below quorum is refused by the coordinator too.
   assert.equal(relayReady({relay:{connected:true,authenticated:true,historyComplete:true,error:null,failedRelays:['ws://b','ws://c'],quorum:{required:2,complete:1,total:3},relays:[{role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null}]}}),false);

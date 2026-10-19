@@ -33,12 +33,12 @@ const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
 // Challenge relay quorum (run 2 #13): default 2; must be a majority of CHALLENGE_RELAYS.
 const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, challengeRelays.length);
 const watch = process.argv.includes("--watch");
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"];
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
   // so the token-trade reader never ships in (or changes) the jobs bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), challenges: join(root, "src/challenges.ts") },
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts") },
   bundle: true,
   // Vercel preview deployments show the Try it UI so it can be reviewed.
   // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
@@ -76,12 +76,12 @@ if (watch) {
   // One stamp derived from every shipped byte the HTML/CSS reference.
   const fontNames = readdirSync(join(root, "public/fonts"));
   const hash = createHash("sha256");
-  for (const rel of [...PAGES, "styles.css", "fonts.css", "challenges.css", ...fontNames.map((f) => join("fonts", f))]) {
+  for (const rel of [...PAGES, "styles.css", "fonts.css", "swarm.css", ...fontNames.map((f) => join("fonts", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
   hash.update(readFileSync(join(dist, "terminal.js")));
   hash.update(readFileSync(join(dist, "tokens.js")));
-  hash.update(readFileSync(join(dist, "challenges.js")));
+  hash.update(readFileSync(join(dist, "swarm.js")));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset
@@ -93,12 +93,12 @@ if (watch) {
       .replace(/url\((['"])(\.\/fonts\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
   );
   // Every page: the buyer homepage (/), the seller page (/sell), the live
-  // market (/market), the chat page (/chat), the mint page (/mint) and the token-trade page (/tokens) — cleanUrls serves them.
+  // market (/market), the chat page (/chat), the mint page (/mint), the token-trade page (/tokens) and the community swarm (/swarm) — cleanUrls serves them.
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
       readFileSync(join(root, "public", page), "utf8")
-        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|challenges\.js|challenges\.css|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
+        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|swarm\.js|swarm\.css|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
     );
   }
 

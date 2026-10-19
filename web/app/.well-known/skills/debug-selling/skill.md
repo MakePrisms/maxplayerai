@@ -298,7 +298,9 @@ A successful beat is silent; only failures print (`seller node heartbeat publish
 **Check:** confirm the `seller node discoverable …` line appeared at your last startup, and that
 the relay was up at that moment. Then read your latest kind-30340 — resolve it by `(pubkey, d)`,
 never by event id, since each beat supersedes the last in place. If it says `accepting=n`, you are
-published but declining: the seat is busy (`queue_depth` > 0), has dropped every harness, or is the
+published but declining: the seat is busy (`queue_depth` > 0), has dropped every harness (the beat
+then also says `serving=0/<n>` and `status=not_serving`; the daemon re-probes it after 1 minute,
+doubling to 10, and republishes as soon as one passes), or is the
 **retraction** a cleanly-stopped daemon publishes on its way out — check `created_at` against your
 last stop. That is a capacity or liveness problem, not a discovery one.
 

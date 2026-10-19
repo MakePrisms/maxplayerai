@@ -1,32 +1,33 @@
-//! Community challenge commands. Untrusted relay text and keys never appear in diagnostics.
+//! `maxplayer-swarm` commands (community swarm runs; the protocol events keep their CHALLENGE
+//! kinds). Untrusted relay text and keys never appear in diagnostics.
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const HELP: &str = "Usage: maxplayer-challenges <command> [--home <path>] [--json] [--relay URL ...] [--quorum N]
+const HELP: &str = "Usage: maxplayer-swarm <command> [--home <path>] [--json] [--relay URL ...] [--quorum N]
   join --buyer <npub|hex> --minutes <1..480> [--note <text>]
-  status --buyer <npub|hex> [--challenge <d>]
+  status --buyer <npub|hex> [--run <d>]
   leave --buyer <npub|hex>
   publish --id <d> --title <text> --goal-file <path> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>] [--result <text>]
-  members [--challenge <d>]
+  members [--run <d>]
   decide --seller <npub|hex> --accept|--deny
 Join or leave at any time. Joining after work starts means eligibility from the next day.
-While a running challenge counts your accepted membership, join refuses to change minutes or
-note (republishing would forfeit that day); change them 15 minutes after it ends (clock drift).
+While a swarm run that counts your accepted membership is in progress, join refuses to change
+minutes or note (republishing would forfeit that day); change them 15 minutes after it ends (clock drift).
 Never leave and rejoin to change minutes: that forfeits the day too. Same minutes with --note
 omitted or equal is a no-op; on a change, omitting --note keeps the note, --note '' clears it.
 Membership and acceptance persist across days. Minutes are offered per day.
-Status/members default to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
+Status/members default to the buyer's latest non-cancelled swarm run. Uses the initialized home's key.
 Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://relay.primal.net, wss://offchain.pub.
 Repeat --relay URL after the command to override. ws:// is loopback-only; relay.maxplayer.ai is forbidden.
 Reads and publishes need a quorum of relays: --quorum N (default 2, at least a majority of the relays
 and at most all of them). Quorum met with a relay missing is degraded: a warning on stderr and in
 --json (relay_quorum), and the event is re-sent unchanged to that relay once it answers again.
-A minutes/note change during a running challenge still needs every relay.
+A minutes/note change while a swarm run is in progress still needs every relay.
 Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 ";
-/// A publish refused because the challenge is already closed on the relays exits with
+/// A publish refused because the swarm run is already closed on the relays exits with
 /// `CLOSED_EXIT` and an error starting with `CHALLENGE_CLOSED` (nothing is signed or sent).
-const CHALLENGE_CLOSED: &str = "challenge closed";
+const CHALLENGE_CLOSED: &str = "swarm run closed";
 const CLOSED_EXIT: i32 = 3;
 /// Authors per roster membership REQ, and the newest-first applicant sample size (matches the page).
 const ROSTER_AUTHOR_CHUNK: usize = 100;
@@ -69,7 +70,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     let command = args.first().ok_or("missing command")?.as_str();
     let allowed: &[&str] = match command {
         "join" => &["--buyer", "--minutes", "--note"],
-        "status" => &["--buyer", "--challenge"],
+        "status" => &["--buyer", "--run"],
         "leave" => &["--buyer"],
         "publish" => &[
             "--id",
@@ -82,9 +83,9 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--update",
             "--result",
         ],
-        "members" => &["--challenge"],
+        "members" => &["--run"],
         "decide" => &["--seller", "--accept", "--deny"],
-        _ => return Err("unknown challenge command".into()),
+        _ => return Err("unknown swarm command".into()),
     };
     let mut o = Opts {
         command: command.into(),
@@ -97,7 +98,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     while i < args.len() {
         let k = args[i].as_str();
         if !allowed.contains(&k) && !["--home", "--json", "--relay", "--quorum"].contains(&k) {
-            return Err("unknown challenge option".into());
+            return Err("unknown swarm option".into());
         }
         let v = if ["--accept", "--deny", "--json"].contains(&k) {
             String::new()
@@ -202,7 +203,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 0
             }
             Err(e) => {
-                let _ = writeln!(err, "challenge: {e}");
+                let _ = writeln!(err, "swarm: {e}");
                 if e.starts_with(CHALLENGE_CLOSED) {
                     CLOSED_EXIT
                 } else {
@@ -214,7 +215,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 fn human(body: &serde_json::Value) -> String {
     if let Some(id) = body.get("event_id").and_then(|v| v.as_str()) {
-        return format!("Published challenge event {id}");
+        return format!("Published swarm event {id}");
     }
     if body.get("unchanged") == Some(&serde_json::Value::Bool(true)) {
         return format!(
@@ -223,9 +224,9 @@ fn human(body: &serde_json::Value) -> String {
         );
     }
     let mut lines = Vec::new();
-    if let Some(c) = body.get("challenge").filter(|c| !c.is_null()) {
+    if let Some(c) = body.get("run").filter(|c| !c.is_null()) {
         lines.push(format!(
-            "Challenge {}: {} ({})\nThe buyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",
+            "Swarm run {}: {} ({})\nThe buyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",
             c["id"].as_str().unwrap_or(""),
             c["title"].as_str().unwrap_or(""),
             c["status"].as_str().unwrap_or(""),
@@ -277,7 +278,7 @@ fn execute(o: &Opts) -> Result<(serde_json::Value, Option<String>), String> {
         .unwrap_or_else(home::default_home_dir)
         .map_err(|_| "could not resolve home")?;
     if !home::is_initialized(&root) {
-        return Err("home is not initialized; challenge never creates an identity".into());
+        return Err("home is not initialized; maxplayer-swarm never creates an identity".into());
     }
     let home = home::bootstrap(&root).map_err(|_| "could not load home")?;
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -308,7 +309,7 @@ fn select_challenge(
         .into_iter()
         .next()
         .map(|(_, c)| c)
-        .ok_or_else(|| "challenge not found or not verified for this buyer".into())
+        .ok_or_else(|| "swarm run not found or not verified for this buyer".into())
 }
 /// Runs the command, then re-sends queued events to relays that answered in this run (also after a
 /// refusal: the queued events already met quorum when they were published), and reports the
@@ -392,7 +393,7 @@ async fn command_async(
         // A close the quorum read already sees is final: refuse it (exit 3) before any strict re-read.
         if let Some(closed) = closed_status(&previous, &c.buyer, &c.id) {
             return Err(format!(
-                "{CHALLENGE_CLOSED} ({closed}): the latest buyer-signed challenge {} is {closed}; nothing published",
+                "{CHALLENGE_CLOSED} ({closed}): the latest buyer-signed swarm run {} is {closed}; nothing published",
                 c.id
             ));
         }
@@ -402,7 +403,7 @@ async fn command_async(
         {
             relay.fetch_all(home, filter).await.map_err(|e| {
                 format!(
-                    "challenge relays degraded ({e}); a {} update over an existing challenge needs every relay, so a close held only by the missing relay is never overwritten. Nothing was published; retry when every relay answers.",
+                    "swarm relays degraded ({e}); a {} update over an existing swarm run needs every relay, so a close held only by the missing relay is never overwritten. Nothing was published; retry when every relay answers.",
                     c.status
                 )
             })?
@@ -413,7 +414,7 @@ async fn command_async(
         // view the caller published from (its status read can be stale by the time we sign).
         if let Some(closed) = closed_status(&previous, &c.buyer, &c.id) {
             return Err(format!(
-                "{CHALLENGE_CLOSED} ({closed}): the latest buyer-signed challenge {} is {closed}; nothing published",
+                "{CHALLENGE_CLOSED} ({closed}): the latest buyer-signed swarm run {} is {closed}; nothing published",
                 c.id
             ));
         }
@@ -423,7 +424,7 @@ async fn command_async(
             .publish(home, draft, created)
             .await
             .map_err(|e| e.to_string())?;
-        return Ok((json!({"ok":true,"event_id":id,"challenge":c}), None));
+        return Ok((json!({"ok":true,"event_id":id,"run":c}), None));
     }
     // Membership operations do not depend on any daily challenge existing.
     let c = if matches!(o.command.as_str(), "status" | "members") {
@@ -436,10 +437,10 @@ async fn command_async(
             )
             .await
             .map_err(|e| e.to_string())?;
-        if challenges.is_empty() && o.get("--challenge").is_none() {
+        if challenges.is_empty() && o.get("--run").is_none() {
             None
         } else {
-            Some(select_challenge(&challenges, &buyer, o.get("--challenge"))?)
+            Some(select_challenge(&challenges, &buyer, o.get("--run"))?)
         }
     } else {
         None
@@ -566,7 +567,7 @@ async fn command_async(
                 .map_err(|_| "invalid minutes")?;
             if current.minutes == minutes && o.get("--note").is_none_or(|n| n == current.note) {
                 return Ok((
-                    json!({"ok": true, "unchanged": true, "membership": current, "challenge": null}),
+                    json!({"ok": true, "unchanged": true, "membership": current, "run": null}),
                     warning,
                 ));
             }
@@ -592,7 +593,7 @@ async fn command_async(
                             .author(public_key(&buyer)?),
                     )
                     .await
-                    .map_err(|e| format!("could not read the buyer's challenge state reliably ({e}); refusing to change your membership, because republishing it during a running challenge would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
+                    .map_err(|e| format!("could not read the buyer's swarm run state reliably ({e}); refusing to change your membership, because republishing it while a swarm run is in progress would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
                 accepted = latest_per_coordinate(
                     strict.iter().filter(|e| parse_decision(e, &buyer).is_ok()),
                 )
@@ -612,12 +613,12 @@ async fn command_async(
                             .kind(Kind::from(CHALLENGE_KIND)),
                     )
                     .await
-                    .map_err(|e| format!("could not read the buyer's challenge state reliably ({e}); refusing to change your membership, because republishing it during a running challenge would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
+                    .map_err(|e| format!("could not read the buyer's swarm run state reliably ({e}); refusing to change your membership, because republishing it while a swarm run is in progress would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
                 if let Some(c) =
                     blocking_challenge(&challenges, &buyer, event, current, now, created)
                 {
                     return Err(format!(
-                        "You're in today's challenge ({}, ends {}). Change your minutes (or note) after {} (15 minutes after it ends, allowing for clock drift); they apply from the next day. Re-publishing now would make you ineligible for today. Do not leave and rejoin to change minutes: that also forfeits today. Nothing was published.",
+                        "You're in today's swarm run ({}, ends {}). Change your minutes (or note) after {} (15 minutes after it ends, allowing for clock drift); they apply from the next day. Re-publishing now would make you ineligible for today. Do not leave and rejoin to change minutes: that also forfeits today. Nothing was published.",
                         c.id,
                         Timestamp::from(c.ends).to_human_datetime(),
                         Timestamp::from(c.ends.saturating_add(CREATED_AT_TOLERANCE))
@@ -694,7 +695,7 @@ async fn command_async(
                         "eligible": eligible.iter().any(|s| s.seller == a.seller)})
                 })
                 .collect();
-            let mut body = json!({"challenge": c, "members": rows});
+            let mut body = json!({"run": c, "members": rows});
             if o.command == "members" {
                 body["applicants_incomplete"] = json!(applicants_incomplete);
             }
@@ -707,7 +708,7 @@ async fn command_async(
         .publish(home, draft, created)
         .await
         .map_err(|e| e.to_string())?;
-    Ok((json!({"ok":true,"event_id":id,"challenge":c}), warning))
+    Ok((json!({"ok":true,"event_id":id,"run":c}), warning))
 }
 
 /// The running challenge (latest-ending, if several) that the caller's current membership still
@@ -813,6 +814,8 @@ mod tests {
             "status --buyer abc",
             "leave --buyer abc",
             "members",
+            "status --buyer abc --run today",
+            "members --run today --json",
             "decide --seller abc --accept",
             "decide --seller abc --deny",
         ] {
@@ -832,12 +835,48 @@ mod tests {
             "apply --buyer abc --minutes 60",
             "withdraw --buyer abc",
             "applicants",
-            "join --buyer abc --minutes 60 --challenge today",
-            "leave --buyer abc --challenge today",
-            "decide --seller abc --accept --challenge today",
+            "join --buyer abc --minutes 60 --run today",
+            "leave --buyer abc --run today",
+            "decide --seller abc --accept --run today",
+            // Renamed: the old flag is gone (no alias).
+            "status --buyer abc --challenge today",
+            "members --challenge today",
         ] {
             assert!(parse(&args(s)).is_err(), "{s}");
         }
+    }
+    /// `--json` bodies name the run `run`; the pre-rename `challenge` key must never come back
+    /// (Bob, 2026-10-19: no alias). Checks every object key, nested ones included.
+    fn assert_no_challenge_key(body: &serde_json::Value) {
+        fn walk(v: &serde_json::Value, path: &str) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, v) in m {
+                        assert!(
+                            !k.to_ascii_lowercase().contains("challenge"),
+                            "--json key {path}.{k} names a challenge"
+                        );
+                        walk(v, &format!("{path}.{k}"));
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, path)),
+                _ => (),
+            }
+        }
+        assert!(
+            body.get("run").is_some(),
+            "--json body has no run key: {body}"
+        );
+        walk(body, "");
+    }
+    #[test]
+    fn json_human_output_reads_the_run_key() {
+        let run = serde_json::json!({"id":"d1","title":"T","status":"scheduled","buyer":"b","goal":"g","starts":1,"ends":2,"budget_sats":0});
+        assert!(
+            human(&serde_json::json!({"run": run, "members": []})).starts_with("Swarm run d1: T")
+        );
+        // A body keyed `challenge` is not a run: nothing about it is printed.
+        assert!(!human(&serde_json::json!({"challenge": run, "members": []})).contains("d1"));
     }
     #[test]
     fn challenge_help_is_side_effect_free() {
@@ -854,17 +893,25 @@ mod tests {
             assert!(
                 String::from_utf8(out)
                     .unwrap()
-                    .contains("maxplayer-challenges")
+                    .contains("Usage: maxplayer-swarm <command>")
             );
         }
     }
     #[test]
     fn challenge_skill_commands_match_help_and_registration() {
-        let skill = include_str!("../../../web/app/.well-known/skills/challenge-join/skill.md");
-        for line in skill
+        let skill = include_str!("../../../web/app/.well-known/skills/swarm-join/skill.md");
+        let commands: Vec<_> = skill
             .lines()
-            .filter(|line| line.trim().starts_with("maxplayer-challenges "))
-        {
+            .filter(|line| line.trim().starts_with("maxplayer-swarm "))
+            .collect();
+        assert!(!commands.is_empty(), "skill shows no sidecar commands");
+        assert!(
+            !skill
+                .lines()
+                .any(|line| line.trim().starts_with("maxplayer-challenges ")),
+            "skill still shows the old command name"
+        );
+        for line in commands {
             let tokens: Vec<_> = line.split_whitespace().collect();
             assert!(["status", "join", "leave"].contains(&tokens[1]));
             for flag in tokens.iter().filter(|word| word.starts_with("--")) {
@@ -880,7 +927,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|row| row["path"] == "/.well-known/skills/challenge-join/skill.md")
+                .any(|row| row["path"] == "/.well-known/skills/swarm-join/skill.md")
         );
     }
     mod wallet {
@@ -1074,7 +1121,7 @@ mod tests {
                 assert_eq!(run(&publish(&after.url), &mut out, &mut err), CLOSED_EXIT);
                 let err = String::from_utf8(err).unwrap();
                 assert!(
-                    err.contains(&format!("challenge: {CHALLENGE_CLOSED} ({closed})")),
+                    err.contains(&format!("swarm: {CHALLENGE_CLOSED} ({closed})")),
                     "{err}"
                 );
                 assert!(out.is_empty());
@@ -1732,14 +1779,18 @@ mod tests {
             execute_async(&before, &seller).await.unwrap();
             let status = parse(&args(&format!("status --buyer {buyer_key} --json"))).unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
-            assert!(body["challenge"].is_null());
+            assert!(body["run"].is_null());
+            assert_no_challenge_key(&body);
             let since = body["members"][0]["membership"]["since"].clone();
             let publish=parse(&args(&format!("publish --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now+3590),iso(now+7200)))).unwrap();
             let (published, _) = execute_async(&publish, &buyer).await.unwrap();
-            assert_eq!(published["challenge"]["starts"], now + 3590);
+            assert_eq!(published["run"]["starts"], now + 3590);
+            assert_no_challenge_key(&published);
             let join = parse(&args(&format!("join --buyer {buyer_key} --minutes 60"))).unwrap();
-            let (_, warning) = execute_async(&join, &seller).await.unwrap();
+            let (joined, warning) = execute_async(&join, &seller).await.unwrap();
             assert!(warning.is_some());
+            assert!(joined["run"].is_null());
+            assert_no_challenge_key(&joined);
             let decide = parse(&args(&format!("decide --seller {seller_key} --accept"))).unwrap();
             execute_async(&decide, &buyer).await.unwrap();
             let status = parse(&args(&format!("status --buyer {buyer_key} --json"))).unwrap();
@@ -1754,15 +1805,18 @@ mod tests {
             let tomorrow=parse(&args(&format!("publish --id tomorrow --title Build --goal-file {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now+86400),iso(now+90000)))).unwrap();
             execute_async(&tomorrow, &buyer).await.unwrap();
             let status = parse(&args(&format!(
-                "status --buyer {buyer_key} --challenge tomorrow --json"
+                "status --buyer {buyer_key} --run tomorrow --json"
             )))
             .unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
-            assert_eq!(body["challenge"]["id"], "tomorrow");
+            assert_eq!(body["run"]["id"], "tomorrow");
+            assert_no_challenge_key(&body);
             assert_eq!(body["members"][0]["eligible"], true);
             let list = parse(&args("members --json")).unwrap();
             let (body, _) = execute_async(&list, &buyer).await.unwrap();
             assert_eq!(body["members"].as_array().unwrap().len(), 1);
+            assert_eq!(body["run"]["id"], "tomorrow");
+            assert_no_challenge_key(&body);
             let leave = parse(&args(&format!("leave --buyer {buyer_key}"))).unwrap();
             execute_async(&leave, &seller).await.unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
@@ -1945,7 +1999,7 @@ mod tests {
                 );
                 let ends = Timestamp::from(s.now + 3600).to_human_datetime();
                 assert!(
-                    err.contains(&format!("You're in today's challenge (day, ends {ends})")),
+                    err.contains(&format!("You're in today's swarm run (day, ends {ends})")),
                     "{err}"
                 );
                 assert!(err.contains("apply from the next day"), "{err}");
@@ -1956,7 +2010,7 @@ mod tests {
                 let line = format!("join --buyer {} --minutes 60 --note changed", s.buyer);
                 let error = rt.block_on(command(&s, &relay.url, &line)).unwrap_err();
                 assert!(
-                    error.contains("You're in today's challenge (day,"),
+                    error.contains("You're in today's swarm run (day,"),
                     "{error}"
                 );
                 assert!(
@@ -1977,7 +2031,7 @@ mod tests {
                 let line = format!("join --buyer {} --minutes 120", s.buyer);
                 let error = rt.block_on(command(&s, &relay.url, &line)).unwrap_err();
                 assert!(
-                    error.contains("You're in today's challenge (day,"),
+                    error.contains("You're in today's swarm run (day,"),
                     "{error}"
                 );
                 assert!(writes(&relay).is_empty());
@@ -1994,6 +2048,8 @@ mod tests {
                         .await
                         .unwrap_or_else(|e| panic!("{line}: {e}"));
                     assert_eq!(body["unchanged"], true, "{line}: {body}");
+                    assert!(body["run"].is_null(), "{line}: {body}");
+                    assert_no_challenge_key(&body);
                     assert_eq!(body["membership"]["minutes"], 60);
                     assert!(body.get("event_id").is_none(), "{line}: {body}");
                     assert!(
@@ -2166,7 +2222,7 @@ mod tests {
                 let line = format!("join --buyer {} --minutes 120", s.buyer);
                 let error = command(&s, &relay.url, &line).await.unwrap_err();
                 assert!(
-                    error.contains("could not read the buyer's challenge state reliably"),
+                    error.contains("could not read the buyer's swarm run state reliably"),
                     "{error}"
                 );
                 assert!(error.contains("Nothing was published"), "{error}");
@@ -2205,7 +2261,7 @@ mod tests {
                         .await
                         .unwrap_err();
                     assert!(
-                        error.contains("You're in today's challenge (day,"),
+                        error.contains("You're in today's swarm run (day,"),
                         "{now}: {error}"
                     );
                     let after = Timestamp::from(ends + CREATED_AT_TOLERANCE).to_human_datetime();
@@ -2249,7 +2305,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(
-                    error.contains("You're in today's challenge (day,"),
+                    error.contains("You're in today's swarm run (day,"),
                     "{error}"
                 );
                 assert!(writes(&relay).is_empty());
@@ -2271,7 +2327,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(
-                    error.contains("You're in today's challenge (day,"),
+                    error.contains("You're in today's swarm run (day,"),
                     "{error}"
                 );
                 assert!(writes(&relay).is_empty(), "bumped replacement published");
@@ -2334,7 +2390,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(
-                    error.contains("You're in today's challenge (day,"),
+                    error.contains("You're in today's swarm run (day,"),
                     "{error}"
                 );
                 assert!(writes(&relay).is_empty());
@@ -2377,7 +2433,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(
-                    error.contains("could not read the buyer's challenge state reliably"),
+                    error.contains("could not read the buyer's swarm run state reliably"),
                     "{error}"
                 );
                 assert!(error.contains("no EOSE before timeout"), "{error}");
@@ -2400,7 +2456,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(
-                    error.contains("could not read the buyer's challenge state reliably"),
+                    error.contains("could not read the buyer's swarm run state reliably"),
                     "{error}"
                 );
                 assert!(error.contains("history truncated"), "{error}");
@@ -2539,7 +2595,7 @@ mod tests {
                 let w = q["warnings"][0].as_str().unwrap();
                 assert!(
                     w.starts_with(&format!(
-                        "degraded read: 2 of 3 challenge relays (quorum 2); missing: {} (",
+                        "degraded read: 2 of 3 swarm relays (quorum 2); missing: {} (",
                         norm(&r[2].url)
                     )),
                     "{w}"
@@ -2563,7 +2619,7 @@ mod tests {
                         .unwrap()
                         .iter()
                         .any(|w| w.as_str().unwrap().starts_with(&format!(
-                            "degraded publish: 2 of 3 challenge relays (quorum 2); missing: {}",
+                            "degraded publish: 2 of 3 swarm relays (quorum 2); missing: {}",
                             norm(&r[2].url)
                         )))
                 );
@@ -2606,12 +2662,18 @@ mod tests {
                 let err = String::from_utf8(err).unwrap();
                 assert!(
                     err.contains(&format!(
-                        "Warning: degraded read: 2 of 3 challenge relays (quorum 2); missing: {}",
+                        "Warning: degraded read: 2 of 3 swarm relays (quorum 2); missing: {}",
                         norm(&r[2].url)
                     )),
                     "{err}"
                 );
-                assert!(err.contains(&format!("Warning: degraded publish: 2 of 3 challenge relays (quorum 2); missing: {}", norm(&r[2].url))), "{err}");
+                assert!(
+                    err.contains(&format!(
+                        "Warning: degraded publish: 2 of 3 swarm relays (quorum 2); missing: {}",
+                        norm(&r[2].url)
+                    )),
+                    "{err}"
+                );
                 let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
                 assert_eq!(body["relay_quorum"]["degraded"], true);
                 r[2].online.store(true, Ordering::SeqCst);
@@ -2639,7 +2701,7 @@ mod tests {
                 let error = command(&s.home, &r, &format!("status --buyer {} --json", s.buyer))
                     .await
                     .unwrap_err();
-                assert!(error.starts_with("challenge relay read incomplete; quorum not met (1 of 3 relays complete, need 2); failed: "), "{error}");
+                assert!(error.starts_with("swarm relay read incomplete; quorum not met (1 of 3 relays complete, need 2); failed: "), "{error}");
                 let error = command(
                     &s.home,
                     &r,
@@ -2664,7 +2726,7 @@ mod tests {
                 let error = command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
                     .await
                     .unwrap_err();
-                assert!(error.starts_with("challenge publish incomplete; quorum not met (1 of 3 relays accepted, need 2); failed: "), "{error}");
+                assert!(error.starts_with("swarm publish incomplete; quorum not met (1 of 3 relays accepted, need 2); failed: "), "{error}");
                 assert!(
                     error.contains(&norm(&r[1].url))
                         && error.contains(&norm(&r[2].url))
@@ -2683,7 +2745,7 @@ mod tests {
                 r[2].online.store(false, Ordering::SeqCst);
                 let error = execute_async(&o, &s.home).await.unwrap_err();
                 assert!(
-                    error.starts_with("challenge relay read incomplete; failed: "),
+                    error.starts_with("swarm relay read incomplete; failed: "),
                     "{error}"
                 );
             }
@@ -2852,9 +2914,9 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-                assert!(error.starts_with("could not read the buyer's challenge state reliably (challenge relay read incomplete; failed: "), "{error}");
+                assert!(error.starts_with("could not read the buyer's swarm run state reliably (swarm relay read incomplete; failed: "), "{error}");
                 assert!(r.iter().all(|f| writes(f).is_empty()));
-                // Every relay up: the ordinary refusal ("You're in today's challenge").
+                // Every relay up: the ordinary refusal ("You're in today's swarm run").
                 r[2].online.store(true, Ordering::SeqCst);
                 let error = command(
                     &s.home,
@@ -2863,7 +2925,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-                assert!(error.starts_with("You're in today's challenge"), "{error}");
+                assert!(error.starts_with("You're in today's swarm run"), "{error}");
                 assert!(r.iter().all(|f| writes(f).is_empty()));
             }
 
@@ -2948,7 +3010,7 @@ mod tests {
                     let error = command(&s.home, &r, &format!("join --buyer {} {change}", s.buyer))
                         .await
                         .unwrap_err();
-                    assert!(error.starts_with("could not read the buyer's challenge state reliably (challenge relay read incomplete; failed: "), "{error}");
+                    assert!(error.starts_with("could not read the buyer's swarm run state reliably (swarm relay read incomplete; failed: "), "{error}");
                 }
                 assert!(
                     r.iter().all(|f| writes(f).is_empty()),
@@ -2963,7 +3025,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err();
-                assert!(error.starts_with("You're in today's challenge"), "{error}");
+                assert!(error.starts_with("You're in today's swarm run"), "{error}");
                 assert!(r.iter().all(|f| writes(f).is_empty()));
                 // Not degraded and genuinely not accepted (no decision anywhere): publishes, as before.
                 let s2 = setup("h2-pending");
@@ -3031,10 +3093,7 @@ mod tests {
                 r[2].online.store(false, Ordering::SeqCst);
                 let (code, err) = run_(publish(&r, "in_progress"));
                 assert_eq!(code, CLOSED_EXIT, "{err}");
-                assert!(
-                    err.contains("challenge: challenge closed (cancelled)"),
-                    "{err}"
-                );
+                assert!(err.contains("swarm: swarm run closed (cancelled)"), "{err}");
                 assert!(r.iter().all(|f| writes(f).is_empty()));
                 // Open challenge, one relay down: an in_progress update could resurrect a close held
                 // only by the missing relay, so it needs every relay.

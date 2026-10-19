@@ -1231,18 +1231,20 @@ test('close: without a direct relay read the publish guard re-reads a fresh snap
 test('close: the latest-challenge read passes the sidecar status its required --buyer and the exact id',async()=>{
   const {latestChallengeArgs}=await import('./swarm.mjs');
   assert.deepEqual(latestChallengeArgs(['ws://a','ws://b'],{buyer:'f'.repeat(64),id:'day-1'}),
-    ['status','--relay','ws://a','--relay','ws://b','--buyer','f'.repeat(64),'--challenge','day-1','--json']);
+    ['status','--relay','ws://a','--relay','ws://b','--buyer','f'.repeat(64),'--run','day-1','--json']);
 });
 
 // Advisor r1 #1: the runner's status read was in_progress, the close landed before the sidecar's own
 // pre-publish fetch, and the sidecar refused (exit 3). The refusal is a close: journaled, nothing more.
-test('close: a sidecar "challenge closed" publish refusal is journaled as the buyer close; nothing more is published',async()=>{
+test('close: a sidecar "swarm run closed" publish refusal is journaled as the buyer close; nothing more is published',async()=>{
   const {closedRefusal,SIDECAR_CLOSED_EXIT}=await import('./swarm.mjs');
-  const refusal=Object.assign(Error('maxplayer-challenges exited 3: challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published'),
-    {exitCode:SIDECAR_CLOSED_EXIT,stderr:'challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published\n'});
+  const refusal=Object.assign(Error('maxplayer-swarm exited 3: swarm: swarm run closed (cancelled): the latest buyer-signed swarm run day is cancelled; nothing published'),
+    {exitCode:SIDECAR_CLOSED_EXIT,stderr:'swarm: swarm run closed (cancelled): the latest buyer-signed swarm run day is cancelled; nothing published\n'});
   assert.equal(closedRefusal(refusal),'cancelled');
+  // A sidecar built before the rename still refuses with the old text: still a close.
+  assert.equal(closedRefusal({exitCode:SIDECAR_CLOSED_EXIT,stderr:'challenge: challenge closed (completed): the latest buyer-signed challenge day is completed; nothing published\n'}),'completed');
   assert.equal(closedRefusal({...refusal,exitCode:2}),null,'only the dedicated exit code counts');
-  assert.equal(closedRefusal(Object.assign(Error('x'),{exitCode:3,stderr:'challenge: relay read incomplete'})),null);
+  assert.equal(closedRefusal(Object.assign(Error('x'),{exitCode:3,stderr:'swarm: swarm relay read incomplete'})),null);
   for(const kind of ['progress','completion']) {
     const f=fixture(),reports=[];f.io.report=m=>reports.push(m);let attempts=0;
     // The runner's read still says in_progress; the sidecar's own fetch sees the cancel and refuses.
@@ -1393,6 +1395,29 @@ test('progress: a backward clock step during the planner cannot suppress a re-re
   const day=Object.values(f.journal.state.days)[0];
   assert.equal(day.closed.status,'cancelled');assert.equal(f.publishes.length,0);
 });
+test('R3-2: a not-serving seller gets no assignment and does not count as exhausted',async()=>{
+  const f=fixture();f.snap.sellers[0].servingState='not_serving';f.snap.sellers[0].serving={available:0,configured:1};
+  await f.runner.tick();
+  const posted=f.calls.filter(x=>x[0]==='post_job').map(x=>x[1].seller_pubkey);
+  assert.deepEqual(posted,['b'],'only the serving seller is assigned');
+  // Every seller out of work except the not-serving one: waiting for it to re-probe is not exhaustion.
+  const g=fixture();g.setPlan(()=>({wait:true}));g.snap.sellers[0].servingState='not_serving';g.snap.sellers[1].minutesRemaining=.1;
+  await g.runner.tick();assert.ok(!g.publishes.some(p=>/exhausted/.test(p[3]??'')),'a temporarily not-serving seller is not exhausted');
+});
+test('R3-2 advisor r1: a not-serving seller with too few minutes for minDuration does not hold the day open',async()=>{
+  const f=fixture();f.setPlan(()=>({wait:true}));
+  f.snap.sellers[0].servingState='not_serving';f.snap.sellers[0].serving={available:0,configured:1};
+  f.snap.sellers.forEach(s=>s.minutesRemaining=.1); // 6s < minDuration 30s
+  await f.runner.tick();
+  assert.match(f.publishes.at(-1)?.[3]??'',/Unsolved: all eligible sellers exhausted/);
+});
+test('R3-2 advisor r1: a not-serving seller whose minimum task cannot finish before ends does not hold the day open',async()=>{
+  const f=fixture();f.setPlan(()=>({wait:true}));
+  f.snap.sellers[0].servingState='not_serving';f.snap.sellers[0].serving={available:0,configured:1};
+  f.time(980); // 980 + minDuration 30 > ends 1000, still inside the window
+  await f.runner.tick();
+  assert.match(f.publishes.at(-1)?.[3]??'',/Unsolved: all eligible sellers exhausted/);
+});
 
 // Run 2 #13: challenge relay quorum in the runner.
 test('quorum: coverage log line says degraded (WARNING), below quorum, or trade relay down',async()=>{
@@ -1408,12 +1433,26 @@ test('quorum: coverage log line says degraded (WARNING), below quorum, or trade 
 });
 test('quorum: sidecar degraded warnings and re-sends from --json reach the runner log',async()=>{
   const {sidecarQuorumLines,latestChallengeArgs,quorumArgs}=await import('./swarm.mjs');
-  assert.deepEqual(sidecarQuorumLines({relay_quorum:{warnings:['degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/'],resent:['ab -> ws://c/']}}),
-    ['WARNING: challenge relays degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/','Re-sent missed challenge event ab -> ws://c/']);
+  assert.deepEqual(sidecarQuorumLines({relay_quorum:{warnings:['degraded publish: 2 of 3 swarm relays (quorum 2); missing: ws://c/'],resent:['ab -> ws://c/']}}),
+    ['WARNING: challenge relays degraded publish: 2 of 3 swarm relays (quorum 2); missing: ws://c/','Re-sent missed challenge event ab -> ws://c/']);
   assert.deepEqual(sidecarQuorumLines({}),[]);assert.deepEqual(sidecarQuorumLines(null),[]);
   assert.deepEqual(quorumArgs(undefined),[]);
   assert.deepEqual(latestChallengeArgs(['ws://a','ws://b','ws://c'],{buyer:'f'.repeat(64),id:'d'},2),
-    ['status','--relay','ws://a','--relay','ws://b','--relay','ws://c','--quorum','2','--buyer','f'.repeat(64),'--challenge','d','--json']);
+    ['status','--relay','ws://a','--relay','ws://b','--relay','ws://c','--quorum','2','--buyer','f'.repeat(64),'--run','d','--json']);
+});
+test('json key: the runner reads the sidecar run from `run`, never from `challenge`',async()=>{
+  const {sidecarRun}=await import('./swarm.mjs');
+  const x={buyer:'f'.repeat(64),id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:null,budget_sats:7};
+  assert.deepEqual(sidecarRun({run:x,members:[]},'d'),{buyer:x.buyer,id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:'',budgetSats:7});
+  // Pre-rename body shape: refused as not found (no alias), even with the run object present.
+  assert.throws(()=>sidecarRun({challenge:x,members:[]},'d'),/swarm run d not found/);
+  assert.throws(()=>sidecarRun({run:null},'d'),/not found/);
+  // No reader of sidecar JSON in the runner source touches a `challenge` key.
+  const {readFileSync}=await import('node:fs');
+  const src=readFileSync(new URL('./swarm.mjs',import.meta.url),'utf8');
+  assert.doesNotMatch(src,/body\??\.challenge\b|body\[['"]challenge['"]\]/);
+  const reader=src.slice(src.indexOf('latestChallenge:async'));
+  assert.ok(reader.slice(0,reader.indexOf('}};')).includes('return sidecarRun(body,challenge.id);'),'latestChallenge parses through sidecarRun');
 });
 test('quorum: SWARM_CHALLENGE_QUORUM defaults to 2 and must be a majority of the challenge relays',()=>{
   const argv=['--home','/tmp/q-home','--relay-url','ws://trade'];
@@ -1922,6 +1961,41 @@ test('R3-3 refusal (advisor r2): a copula is answer evidence only with a value; 
     'I can\'t complete this. Result was 42.','I can\'t complete this. RESULT WAS 42.'])
     assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
 });
+test('R3-3 refusal (advisor r3): copula values are numbers, ALL-CAPS or Title-case words, quoted or not; short tokens and non-answers do not veto a stop',async()=>{
+  const {detectRefusal}=await import('./swarm.mjs');
+  // Advisor r3 table 1: answers next to stop language, collected (all refused at 1defc389).
+  for(const s of ['The safety classifier stopped me, but the keyword is Hutton.',
+    'The safety classifier stopped me, but the keyword is "Hutton".',
+    'The safety classifier stopped me, but the keyword is \u201CHUTTON\u201D.',
+    'I can\'t continue past the second keyword; the first one is Hutton.',
+    'I can\'t continue past the second keyword; the first one is 7.',
+    // Quoted value after a stop: only the optional quote in the value class lets this collect.
+    'The safety classifier stopped me, but the keyword is "HUTTON".',
+    'The safety classifier stopped me, but the keyword is \u201CHutton\u201D.',
+    // A 3-letter value after an answer noun: only the noun rule (3+, not the generic 5+) collects it.
+    'The safety classifier stopped me, but the keyword is OWL.',
+    'The safety classifier stopped me, but the keyword is Owl.',
+    // No stop language: collected either way.
+    'The keyword is Hutton.','The plaintext is attack at dawn.','Stopped by the safety system. Keyword: Hutton'])
+    assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
+  // Advisor r3 table 2: explicit stops with a short token after a copula, refused (collected at 1defc389).
+  for(const s of ['The safety system refused this because the category is API.',
+    'Stopped by the safety system. The classifier is LLM-based.',
+    'I can\'t assist with cracking this. My model is GPT.',
+    'Refused by the content filter. Reason code is HTTP 403.',
+    'Refused by the content filter because the topic was NSFW.',
+    'This request was BLOCKED by the safety system.',
+    // Non-answer words are never a value, in any case.
+    'The safety filter stopped the run. The key is REDACTED.',
+    'The safety filter stopped the run. The answer is Unknown.',
+    'The safety filter stopped the run. The plaintext is Not recovered.',
+    'The safety filter stopped the run. The keyword was Never found.',
+    'The safety filter stopped me. This is OK.','The safety filter stopped me. This is AI.'])
+    assert.ok(detectRefusal(s),`stop not detected: ${JSON.stringify(s)}`);
+  // Known limit (documented): a lower-case plaintext next to stop language is refused. No clean rule
+  // separates it from "the plaintext is likely sensitive" / "is about weapons".
+  assert.ok(detectRefusal('The safety filter stopped the run. The plaintext is attack at dawn.'));
+});
 test('R3-3 refusal (advisor r1 M2): a marker written to a delivered file is read through readDeliveredAnswer as a refusal',async()=>{
   const {detectRefusal,readDeliveredAnswer,REFUSAL_MARKER}=await import('./swarm.mjs');
   const dir=mkdtempSync(join(tmpdir(),'refused-file-'));
@@ -1987,6 +2061,9 @@ test('R3-3 refusal: a refusal-shaped short solution is a normal collect; a real 
     // Advisor r2: an explicit stop that mentions the key without a value is not work.
     ['The safety classifier stopped me. No keyword was recovered.','refused'],
     ['I can\'t help you find the keyword.','refused'],
+    // Advisor r3: a Title-case value is an answer; a 3-letter token after a copula does not veto a stop.
+    ['The safety classifier stopped me, but the keyword is Hutton.','collected'],
+    ['The safety system refused this because the category is API.','refused'],
   ];
   for(const [answer,outcome] of cases) {
     const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();[...f.remote.values()][0].results=[{}];

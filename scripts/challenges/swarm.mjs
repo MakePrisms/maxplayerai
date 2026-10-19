@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, linkSync, readdirSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
+import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS, waitingOnHarnessProbe } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 // Process groups of in-flight commands, so a runner told to stop can kill them (planner, MCP).
@@ -249,10 +249,15 @@ export function quoteAnswers(ids,jobs,key,{perAnswer=QUOTED_ANSWER_MAX_CHARS,tot
 //   most REFUSAL_MAX_CHARS) and must carry no ANSWER_EVIDENCE: a code block, a list of 3+ items,
 //   "here is/are", or an answer statement: answer/result/solution/plaintext/decryption/keyword/key,
 //   optionally numbered, followed by a colon or "="; the same noun + is/are/was/were only when a
-//   VALUE follows (an upper-case word of 3+ letters other than NOT, or a number: "the key is
-//   CROWN", "the answer was 42", not "no keyword was recovered"); any is/are/was/were + such an
-//   upper-case word ("the first one is HUTTON"); or found/recovered/cracked… a
-//   key/keyword/plaintext followed by an upper-case word. Then:
+//   VALUE follows: one optional straight or curly quote, then a number, an all-caps word or a
+//   title-case word of 3+ letters, other than a non-answer (NOT, NEVER, STILL, FOUND, TRIED,
+//   RECOVERED, BLOCKED, REDACTED, UNKNOWN, EMPTY in any case): "the key is CROWN", "the keyword
+//   is Hutton", "the answer was 42", not "no keyword was recovered" or "the plaintext is NOT
+//   recovered"; any is/are/was/were + such a value of 5+ letters (or a number): "the first one is
+//   Hutton", but not "the category is API" / "the topic was NSFW"; or found/recovered/cracked… a
+//   key/keyword/plaintext followed by an upper-case word. A lower-case plaintext ("the plaintext
+//   is attack at dawn") is NOT evidence: no clean rule tells it from "the plaintext is withheld",
+//   so next to stop language it is refused. Then:
 //   * a safety stop (a safety|content|usage|moderation classifier/filter/system/policy/… directly
 //     followed by stopped/blocked/flagged/refused/…, or "stopped/refused/… by the <that noun>"),
 //     case-insensitive, counts even next to generic work words ("…before I found a key");
@@ -282,12 +287,17 @@ const ANSWER_NOUN = String.raw`(?:answers?|results?|solutions?|plaintexts?|decry
 // so a copula rule can stay case-sensitive about the VALUE while accepting "Keyword"/"KEYWORD".
 const anyCase = p => p.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
 const COPULA = String.raw`(?:is|are|was|were)`;
-const ANSWER_VALUE = String.raw`["'\x60]?(?:(?!NOT\b)[A-Z]{3,}|\d+)\b`;
+// Advisor r3: one optional straight or curly quote (curly singles are already folded to '), then a
+// number, an ALL-CAPS word or a Title-case word of at least `min` letters, never a non-answer word.
+const VALUE_QUOTE = String.raw`["'\x60\u201C\u201D]?`;
+const NON_ANSWER = anyCase('(?:not|never|still|found|tried|recovered|blocked|redacted|unknown|empty)');
+const answerValue = min => String.raw`${VALUE_QUOTE}(?!${NON_ANSWER}\b)(?:\d+|[A-Z]{${min},}|[A-Z][a-z]{${min-1},})\b`;
 const ANSWER_EVIDENCE = [
   new RegExp(String.raw`\x60\x60\x60|\bhere (?:is|are)\b|\b${ANSWER_NOUN}(?: ?#?\d+)?\s*(?::|=)`,'i'),
   // Advisor r2: a copula is an answer statement only when a value follows. Case-sensitive value.
-  new RegExp(String.raw`\b${anyCase(ANSWER_NOUN)}(?: ?#?\d+)?\s+${anyCase(COPULA)}\s+${ANSWER_VALUE}`),
-  new RegExp(String.raw`\b${anyCase(COPULA)}\s+["'\x60]?(?!NOT\b)[A-Z]{3,}\b`),
+  new RegExp(String.raw`\b${anyCase(ANSWER_NOUN)}(?: ?#?\d+)?\s+${anyCase(COPULA)}\s+${answerValue(3)}`),
+  // Any copula: 5+ letters, so API/LLM/GPT/HTTP/NSFW after a stop do not veto it.
+  new RegExp(String.raw`\b${anyCase(COPULA)}\s+${answerValue(5)}`),
   // Case-sensitive on purpose: the recovered value must be an upper-case word ("found the key CROWN").
   /\b(?:[Ff]ound|[Rr]ecovered|[Cc]racked|[Ss]olved|[Dd]ecrypted|[Gg]ot)\b[^.\n]{0,30}?\b(?:[Kk]eywords?|[Kk]eys?|[Pp]laintext|[Ss]olution|[Aa]nswer)\b[: ]+["'\x60]?[A-Z]{3,}\b/,
 ];
@@ -705,13 +715,21 @@ export const TERMINAL_STATUSES = ['completed','cancelled'];
 export const PROGRESS_RETRY_SECONDS = 30;
 const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
 // The sidecar `publish` refuses to sign over a completed/cancelled challenge it sees in its own
-// pre-publish fetch: exit 3, stderr `challenge: challenge closed (<status>): …`, nothing published.
+// pre-publish fetch: exit 3, stderr `swarm: swarm run closed (<status>): …`, nothing published.
+// The pre-rename `challenge closed` text is still recognised, so a not-yet-rebuilt sidecar's
+// refusal is never mistaken for a transient failure.
 export const SIDECAR_CLOSED_EXIT = 3;
-export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.stderr??e.message).match(/challenge closed \((completed|cancelled)\)/)?.[1]??null:null;
+export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.stderr??e.message).match(/(?:swarm run|challenge) closed \((completed|cancelled)\)/)?.[1]??null:null;
 // Sidecar argv for the latest buyer-signed challenge (`status` requires --buyer; --json on stdout).
 // `quorum` is the challenge relay quorum (run 2 #13); a progress publish passes every relay (strict).
 export const quorumArgs = quorum => quorum===undefined?[]:['--quorum',String(quorum)];
-export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
+// The run object in a sidecar `status --json` body. The key is `run` (renamed from `challenge`
+// with no alias); a body without it is "not found", never read from the old key.
+export function sidecarRun(body,id) {
+  const x=body?.run;if(!x||typeof x!=='object')throw Error(`swarm run ${id} not found on the challenge relays`);
+  return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
+}
+export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--run',challenge.id,'--json'];
 // Degraded-quorum warnings and re-sends the sidecar reported in its --json body (relay_quorum).
 export function sidecarQuorumLines(body) {
   const q=body?.relay_quorum;if(!q||typeof q!=='object')return [];
@@ -1136,10 +1154,11 @@ export class Swarm {
         if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
         // history) and those sellers' state. Metadata caps and the applicant list never block it.
-        // R3-2 bench clause, kept as its own named check: a benched seller is not exhausted, its
-        // cooldown ends (combine with other liveness checks here rather than folding it in).
+        // R3-2: neither a benched seller (cooldown ends) nor a seller re-probing a dropped harness
+        // that would otherwise fit is exhausted. Keep both named checks.
         const benchedSellerWillReturn=bench.length>0;
-        if(!day.stop&&!candidates.length&&!benchedSellerWillReturn&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
+        const reprobing=waitingOnHarnessProbe(decision,c.ends);
+        if(!day.stop&&!candidates.length&&!benchedSellerWillReturn&&!reprobing&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
@@ -1313,7 +1332,7 @@ async function main() {
   let quitting=false,source,wake,health,sigCache;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();sigCache?.stop();wake?.();};
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
-  const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
+  const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-swarm';
   const challengeRelays=c.challengeRelays;
   const env=childEnv(process.env,c.home);
   const identity=await command(c.binary,['whoami'],{env});
@@ -1350,8 +1369,7 @@ async function main() {
     latestChallenge:async (challenge,{strict=false}={})=>{
       const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge,strict?challengeRelays.length:c.challengeQuorum),{env}));
       for(const l of sidecarQuorumLines(body))io.report(l);
-      const x=body?.challenge;if(!x||typeof x!=='object')throw Error(`challenge ${challenge.id} not found on the challenge relays`);
-      return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
+      return sidecarRun(body,challenge.id);
     }};
   io.probeBuyer=()=>io.mcp('get_job',{job_id:PROBE_JOB_ID});
   const runner=new Swarm(c,io,journal);

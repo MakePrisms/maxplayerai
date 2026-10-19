@@ -554,17 +554,17 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 }
 .brand.small span { font-size: 12px; letter-spacing: 0.04em; }
 .foot-brand p { margin: 6px 0 0; font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.1em; }
-/* two rows (bob): site pages first, then Skill · GitHub · @maxplayerai, dimmer */
+/* three rows (bob, 2026-10-18): Buy · Sell · Market, then the Lab pages, then
+   Skill · GitHub, dimmer. The X handle sits under the tagline on the left. */
 .foot-nav { display: flex; flex-direction: column; align-items: flex-end; gap: 12px; }
-.foot-row { display: flex; gap: 18px; }
-/* the Lab pages: inline on desktop, their own row on phones (bob) */
-.foot-labs { display: flex; gap: 18px; }
-.foot-nav a {
+.foot-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0 18px; }
+.foot-nav a, .foot-x {
   color: var(--muted); text-decoration: none;
   font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase;
 }
-.foot-nav a:hover { color: var(--neon); }
-.foot-sub a { color: var(--faint); }
+.foot-nav a:hover, .foot-x:hover { color: var(--neon); }
+.foot-sub a, .foot-x { color: var(--faint); }
+.foot-x { display: inline-block; margin-top: 12px; }
 .foot-word {
   margin: 34px 0 max(0.16em, 18px);
   font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
@@ -1011,9 +1011,9 @@ button.chip { cursor: pointer; }
   .windows button { padding: 11px 14px; font-size: 11px; }
   .foot-cols { flex-direction: column; gap: 18px; }
   .foot-nav { align-items: flex-start; gap: 0; }
-  .foot-row { flex-wrap: wrap; gap: 0 22px; }
-  .foot-labs { flex-basis: 100%; gap: 0 18px; }
-  .foot-nav a { display: inline-block; padding: 13px 0; }
+  .foot-row { justify-content: flex-start; gap: 0 22px; }
+  .foot-nav a, .foot-x { display: inline-block; padding: 13px 0; }
+  .foot-x { margin-top: 2px; }
   .nav-links a { padding: 14px 16px; }
 }
 @media (max-width: 700px) {
@@ -1208,7 +1208,7 @@ button.chip { cursor: pointer; }
 }
 /* Keep every shared mobile link/control at least one thumb target tall. */
 @media (max-width: 700px) {
-  .nav > .brand, .foot-nav a, .windows button { min-height: 44px; }
+  .nav > .brand, .foot-nav a, .foot-x, .windows button { min-height: 44px; box-sizing: border-box; }
   .h-manual a, .h-faq p a { display: inline-flex; align-items: center; min-height: 44px; }
 }
 /* ================= /tokens: the token-trade order book (unlisted) ===
@@ -1258,7 +1258,7 @@ button.chip { cursor: pointer; }
    fixed slot keeps the rest of the nav from sliding when it does. */
 @media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
 /* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
-/* Experimental pages (/chat, /mint, /tokens) get a small yellow boxed "Lab" superscript on
+/* Experimental pages (/chat, /mint, /tokens, /swarm) get a small yellow boxed "Lab" superscript on
    their footer link (bob); same rule as feat/trade-market-page. */
 .lab-sup {
   display: inline-block; margin-left: 4px; vertical-align: super;
@@ -1267,7 +1267,7 @@ button.chip { cursor: pointer; }
   color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
 }
 .foot-nav a:hover .lab-sup { border-color: var(--neon); }
-/* /chat and /mint carry the /tokens experimental notice strip (bob); same rules as
+/* /chat, /mint and /swarm carry the /tokens experimental notice strip (bob); same rules as
    feat/trade-market-page, so a later merge keeps one copy. */
 .labs-strip {
   display: flex; align-items: center; gap: 10px;
