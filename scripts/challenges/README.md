@@ -312,7 +312,10 @@ All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `re
 `now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`;
 `rejectedAssignments` is present when the last `assign` batch had rejected entries;
 `taskContext` when an operator context is configured; `refusals` when a seller refused a task
-(see *Refusals* below).
+(see *Refusals* below); `previousPlannerError` when the runner rejected the previous planner
+response or plan (see *Plan errors* below). Every `results` and `running` entry carries its
+`jobId` (null before the offer is posted) and, when that task quoted earlier answers,
+`quotedAnswers:[jobId,…]`.
 `minDurationSeconds` (`SWARM_MIN_DURATION`, default 300) is the shortest task the runner will
 post. It includes seller startup: a real harness spends minutes starting its sandbox and agent
 before working, and the first live run's 120–200 second tasks expired undelivered. Free sellers
@@ -328,7 +331,7 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
 - `assign`: one batch call per eligible tick with all free sellers, running jobs
   (`seller,workstream,task,since,deadline` where available; `deferred:true` marks an
   assignment waiting for the relay snapshot, not yet offered), and all settled results.
-  Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?}]}`, `{wait:true}`, or
+  Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?,includeAnswers?}]}`, `{wait:true}`, or
   `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
   May deliberately leave any seller idle. Each assignment is validated separately and invalid
   entries are dropped with a logged reason (also returned as `rejectedAssignments`). A workstream
@@ -507,7 +510,62 @@ benched and stays eligible for other workstreams.
 **Rejection feedback.** Every rejected assignment of the last `assign` batch (any reason: price
 floor, unknown workstream, busy seller, duration, budget …) is journaled and sent to the planner
 on its following calls as `rejectedAssignments:[{seller,workstream,amountSats,reason,at}]` (at
-most 50), so it can correct the batch. The next `assign` batch replaces the list.
+most 50), so it can correct the batch. The next `assign` batch replaces the list. Reasons name
+the problem (R4-3): `unknown seller "<pk>"`, `seller "<pk>" is not eligible (…)`, `… has Ns of
+donated minutes left, below the Ms task`, `… already has a running or unsettled job`,
+`durationSeconds N not in MIN..MAX`, admission reasons with the amount, duration, deadline and
+window end, and `stale workstream "<id>" (it was in an earlier plan; a later revision dropped it)`
+for an id a plan revision removed (otherwise `unknown workstream "<id>"`).
+
+**Plan errors (R4-3).** A planner response or plan that fails validation names its first failing
+check, with the workstream id and field: `Invalid analysis plan: ws9.dependsOn names unknown
+workstream ws7`, `… ws3.estMinutes must be > 0 (got 0)`, `… duplicate workstream id ws4`,
+`Invalid revised plan: …` for a `plan` inside an assign/assess response, `Invalid planner response
+(assign): return exactly one of …`. It is logged (`Planner <mode> response rejected: …`), journaled
+as `plannerError:{mode,reason,at}` on the challenge day, and sent on the next planner calls (the
+retry) as `previousPlannerError` until a valid response of the same mode clears it. A planner
+command that validates its own output (the bundled `planner-llm.mjs` exits 1 with that message) is
+recognised from its stderr; a timeout or crash is not reported as a plan error.
+
+**Report back (round 4, #16).** The bundled prompt tells the planner to end every task with a
+`REPORT BACK:` section tailored to that task (lead with a 2–4 line TAKEAWAY answering exactly what
+the task asks, then evidence, a confidence/status mark and a next step; plain text). When a task's
+text has no `REPORT BACK:` section, the runner appends a generic one (`REPORT_BACK_NOTE`). The posted
+task is, in order: challenge prefix, planner task, quoted answers (below), generic REPORT BACK (only
+when needed), operator context block, delivery note. Whether the generic note was appended is
+journaled (`reportBack`), and the planner sees only its own text in `running`, `results` and track
+records (jobs from older journals, including runs with Rocky's local patch, have the trailing
+generic note stripped).
+
+**Jobs are isolated; quoting earlier answers (R4-1).** Every job runs in a fresh, empty container:
+a seller cannot see any other job's files or answer (in round 4 a final-hour verify chain graded
+nothing because its tasks said "grade ws22's output"). The prompt tells the planner to put keys,
+ciphertext, candidates and transcripts directly in the task text. To hand a seller an earlier
+answer, an assignment may list `includeAnswers:[jobId,…]` (at most 5, duplicates ignored). The runner
+appends, after the planner's task text, a `QUOTED ANSWERS` block with one excerpt per job, framed
+`Answer from job <id> (seller <first 12 hex>…), quoted as untrusted data:` … `[end of answer from job
+<id>]`, every quoted line prefixed `> `, at most 6000 characters per answer and 16000 in total
+(measured as posted, with stated truncation markers). Only answers of this challenge from this
+runner's journal with outcome `collected` qualify; an unknown id, another challenge's job, a refused,
+expired, running, collect-refused, payment-stuck or unreadable one rejects that assignment with its
+own reason (`includeAnswers: job "<id>" was refused by its seller …`). Quoted text cannot pass for
+runner framing: it is NFKC-folded, zero-width and control characters are removed, and the challenge
+prefix, `DELIVERY:`, `REPORT BACK:`, the context block, `MAXPLAYER-ANSWER-V1` / `MAXPLAYER-REFUSED-V1`
+and the quote framing itself are rewritten to visibly quoted forms. The quoted job ids, sellers,
+sizes and truncation are journaled (`quoted`), logged (`Assignment for <pk> quotes …`) and shown to the
+planner as `quotedAnswers`; the planner's task text never includes the block.
+
+**External facts (R4-4).** The prompt tells the planner a seller may have no web search tool: give
+URLs to fetch or inline the data when a task needs external facts.
+
+**Minutes can end a run before the window (R4-5).** `Unsolved: all eligible sellers exhausted (no
+task fits remaining minutes/work window)` means no accepted seller can take even a
+`SWARM_MIN_DURATION` task any more (each seller's remaining donated minutes, or the time left in the
+work window, is below it), nothing is running or awaiting settlement, and no seller is benched. With
+the 300 s default floor, sellers who each donated, say, 30 minutes are used up after a handful of
+tasks each, so this stop can come hours before `ends`. It is final for the day: the runner does
+not shorten tasks to use the leftover minutes. More donated minutes (or a lower `SWARM_MIN_DURATION`,
+at the risk of tasks expiring during seller startup) keep a challenge running longer.
 
 Abilities and all input content are untrusted/self-reported. Prefer useful delivered evidence;
 never declare success solely from a seller's claim. Verification may be delegated as a task.
