@@ -20,7 +20,9 @@ function fixture() {
     }
     if(tool==='collect')return {pay:{state:'none',amount_sats:0}};
   }};
-  const c={minDuration:30,maxDuration:90,duration:30,amount:0,updateEvery:180,awardAfter:5,awardFallback:false};
+  // plannerIdleSeconds 0: these tests swap the fake planner's reply between ticks with unchanged
+  // input, so they keep the pre-S-2 call-every-tick cadence. The S-2 tests use the real default.
+  const c={minDuration:30,maxDuration:90,duration:30,amount:0,updateEvery:180,awardAfter:5,awardFallback:false,plannerIdleSeconds:0};
   const runner=new Swarm(c,io,journal);
   return {snap,c,io,runner,journal,calls,publishes,inputs,remote,setPlan:p=>{planner=p;},time:n=>{now=n;}};
 }
@@ -2574,4 +2576,188 @@ test('advisor r1: a lagging snapshot re-reads an already-started schedule at the
   const read=g.io.latestChallenge;let once=true;
   g.io.latestChallenge=async(...a)=>{const r=await read(...a);if(once){once=false;g.setRelay({title:'operator edit'});}return r;};
   await tickAt(g,200);assert.equal(g.refused(),1);assert.equal(g.publishes.length,0,'nothing published in the refused tick');
+});
+
+// S-2 (run feedback: 171 planner calls in 2.5 h): `assign` is called only when its input would
+// meaningfully differ from the last call, on a day's first call, after a failed call, or after
+// SWARM_PLANNER_IDLE_SECONDS without a change. These tests use the real default (600 s).
+const s2Seller=(pubkey,extra={})=>({pubkey,eligible:true,decision:'accepted',state:'accepted',minutesRemaining:60,currentJobStart:null,...extra});
+function s2Fixture({sellers=['a'],plan=()=>({wait:true}),ends=5000}={}) {
+  const f=fixture();delete f.c.plannerIdleSeconds;f.c.maxDuration=900;
+  f.snap.challenge.ends=ends;f.snap.sellers=sellers.map(p=>s2Seller(p));f.setPlan(plan);
+  f.reports=[];f.io.report=m=>f.reports.push(m);
+  f.assigns=()=>f.inputs.filter(i=>i.mode==='assign');
+  f.ticks=async(from,n,step=5)=>{for(let i=0;i<n;i++){f.time(from+i*step);await f.runner.tick();}};
+  return f;
+}
+const s2TenMinutes=x=>x.mode==='assign'&&x.sellers.length?{assignments:x.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'a ten-minute task',durationSeconds:600}))}:{wait:true};
+test('S-2 simulated ticks: 60 unchanged ticks call assign once (73e0a3d2: 60), for one free seller and for every seller busy',async()=>{
+  // One free seller, the planner keeps waiting.
+  const f=s2Fixture();await f.ticks(100,60);
+  assert.equal(f.assigns().length,1,'one free seller: assign once, not on every tick');
+  // Skips are logged rate-limited (t=105, 165, 225, 285, 345), never once per tick.
+  const skips=f.reports.filter(r=>r.startsWith('Planner assign skipped: no change since the last call'));
+  assert.equal(skips.length,5,skips.join('\n'));
+  assert.match(skips[0],/1 free seller, 0 running jobs\); next call on a change, at the latest in 9m; 1 skipped this day/);
+  // Per-day planner call counts: journaled and in the progress output.
+  assert.deepEqual(Object.values(f.journal.state.days)[0].plannerCalls,{analyze:1,assign:1,assess:0});
+  assert.ok(f.reports.some(r=>/^Progress day: planner calls today: 2 \(analyze 1, assign 1, assess 0\); assign skipped \(no change\) \d+ since the runner started$/.test(r)),f.reports.filter(r=>r.startsWith('Progress')).join('\n'));
+  assert.ok(f.reports.some(r=>/^Planner assign ok in .*; assign call 1 today \(trigger: first call of the day\); planner calls today: 2/.test(r)));
+  // Both sellers busy on 10-minute jobs: an empty free roster with nothing else changed is no change.
+  const g=s2Fixture({sellers:['a','b'],plan:s2TenMinutes});await g.ticks(100,60);
+  assert.equal(g.calls.filter(x=>x[0]==='post_job').length,2,'both sellers got their 10-minute job');
+  assert.equal(g.assigns().length,1,'every seller busy: assign once, not with an empty roster on every tick');
+  assert.ok(g.journal.state.jobs.every(j=>!j.done),'the jobs are still running');
+});
+test('S-2 ceiling: with no change assign is called again after SWARM_PLANNER_IDLE_SECONDS (default 600, 0 = every tick), so the planner can still stop',async()=>{
+  const f=s2Fixture();await f.ticks(100,241);
+  assert.deepEqual(f.assigns().map(i=>i.now),[100,700,1300]);
+  assert.ok(f.reports.some(r=>/assign call 2 today \(trigger: no change for 10m \(SWARM_PLANNER_IDLE_SECONDS ceiling\)\)/.test(r)));
+  // The ceiling call can declare solved with every seller busy.
+  const g=s2Fixture({sellers:['a','b'],plan:s2TenMinutes});await g.ticks(100,100);
+  assert.equal(g.assigns().length,1);
+  g.setPlan(x=>x.mode==='assign'?{solved:true,result:'the answer',summary:'verified'}:{wait:true});
+  await g.ticks(600,21);
+  assert.deepEqual(g.assigns().map(i=>i.now),[100,700]);assert.equal(g.assigns()[1].sellers.length,0,'called with an empty roster');
+  assert.equal(g.publishes.at(-1)[2],'completed');assert.equal(g.publishes.at(-1)[4],'the answer');
+  // Configurable.
+  const h=s2Fixture();h.c.plannerIdleSeconds=60;await h.ticks(100,30);assert.deepEqual(h.assigns().map(i=>i.now),[100,160,220]);
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://localhost'};
+  assert.equal(config([],base).plannerIdleSeconds,600);assert.equal(config([],{...base,SWARM_PLANNER_IDLE_SECONDS:'0'}).plannerIdleSeconds,0);
+  for(const bad of ['-1','1.5','x'])assert.throws(()=>config([],{...base,SWARM_PLANNER_IDLE_SECONDS:bad}),/SWARM_PLANNER_IDLE_SECONDS/);
+});
+test('S-2 first call: never delayed on a day, after a runner restart, or on a new day while the old day is skipping',async()=>{
+  const f=s2Fixture();await f.ticks(100,1);
+  assert.deepEqual(f.inputs.map(i=>[i.mode,i.now]),[['analyze',100],['assign',100]],'analyze and the first assign in the first planning tick');
+  await f.ticks(105,10);assert.equal(f.assigns().length,1,'then skipped');
+  // A restarted runner calls at once (the cadence is in memory).
+  f.runner=new Swarm(f.c,f.io,f.journal);await f.ticks(155,1);assert.equal(f.assigns().length,2);
+  await f.ticks(160,5);assert.equal(f.assigns().length,2);
+  // A new day calls at once, although the previous day's last call was seconds ago.
+  f.snap.challenge.id='day2';await f.ticks(185,1);
+  assert.deepEqual(f.inputs.slice(-2).map(i=>[i.mode,i.challenge.id,i.now]),[['analyze','day2',185],['assign','day2',185]]);
+  await f.ticks(190,5);assert.equal(f.assigns().length,3);
+});
+test('S-2 window end: the unsolved stop still happens on the tick the window ends, while assign is being skipped',async()=>{
+  // A relay job keeps running, so the exhaustion stop (no task fits after t=370) cannot fire first.
+  const f=s2Fixture({ends:400});f.snap.jobs=[{id:'foreign',seller:'x',running:true,amountSats:0,start:50}];await f.ticks(100,60);
+  assert.equal(f.assigns().length,1,'skipped while nothing changed');
+  assert.ok(!f.publishes.some(p=>p[2]==='completed'));
+  await f.ticks(400,1);
+  assert.equal(f.publishes.at(-1)[2],'completed');assert.match(f.publishes.at(-1)[3],/Unsolved: work window ended/);
+  assert.equal(f.assigns().length,1,'the stop needs no planner call');
+  // Exhaustion (no planner either) still stops at once too.
+  const g=s2Fixture();await g.ticks(100,5);g.snap.sellers[0].minutesRemaining=.1;await g.ticks(125,1);
+  assert.match(g.publishes.at(-1)?.[3]??'',/Unsolved: all eligible sellers exhausted/);
+});
+// Each kind of change triggers exactly one new call (logged as the trigger), then skipping resumes.
+// Base: seller a free, seller c busy elsewhere, a relay-only running job, optionally a local job of c.
+const s2Key=JSON.stringify(['b','day']);
+const s2LocalJob=(f,deadline=700)=>{
+  f.journal.state.jobs.push({key:s2Key,id:'job-c',seller:'c',workstream:'piece',challenge:{buyer:'b',id:'day'},created:90,durationSeconds:600,
+    args:{task:'[challenge:b:day]\nlocal task',output:'text/plain',amount_sats:0,max_sats:0,payment:'none',deadline_unix:deadline,request_id:'rq-c'}});
+  f.remote.set('rq-c',{id:'job-c',results:[]});
+};
+const s2Changes=[
+  ['new result',/new result or refusal/,f=>s2LocalJob(f),f=>{f.remote.get('rq-c').results=[{}];}],
+  ['refusal',/new result or refusal/,f=>{s2LocalJob(f);f.io.answer=async()=>'MAXPLAYER-REFUSED-V1\nI cannot help with this.';},f=>{f.remote.get('rq-c').results=[{}];}],
+  ['job expired',/new result or refusal/,f=>s2LocalJob(f,112),()=>{}],
+  ['seller became free',/^seller became free$/,null,f=>{f.snap.sellers.find(s=>s.pubkey==='c').currentJobStart=null;}],
+  ['seller left',/^seller became eligible or left$/,null,f=>{f.snap.sellers.find(s=>s.pubkey==='c').state='left';}],
+  ['seller newly eligible',/^seller became eligible or left$/,null,f=>{f.snap.sellers.push(s2Seller('d',{currentJobStart:50}));}],
+  ['relay job finished',/^job finished or expired$/,null,f=>{f.snap.jobs[0].running=false;}],
+  ['plan changed',/^plan changed$/,null,f=>{Object.values(f.journal.state.days)[0].plan={...analysis,approach:'revised'};}],
+  ['budget moved',/^budget changed$/,null,f=>{f.snap.budget.totalSats=20;}],
+  ['minutes moved',/^donated minutes changed$/,null,f=>{f.snap.sellers[0].minutesRemaining=90;}],
+  ['seller benched',/^bench changed$/,null,f=>{f.journal.state.bench={c:{streak:2,benchedAt:110,until:2000,reason:'expired twice'}};}],
+  ['window moved',/^challenge or runner context changed$/,null,f=>{f.snap.challenge.ends=6000;}],
+];
+for(const [name,reason,seed,change] of s2Changes)test(`S-2 re-call after a change: ${name}`,async()=>{
+  const f=s2Fixture({sellers:['a','c']});f.snap.sellers[1].currentJobStart=50;f.snap.jobs=[{id:'foreign',seller:'x',running:true,amountSats:0,start:50}];
+  seed?.(f);
+  await f.ticks(100,3);assert.equal(f.assigns().length,1,'skipping before the change');
+  change(f);await f.ticks(115,1);
+  assert.equal(f.assigns().length,2,'the change triggers one call');
+  const trigger=f.reports.filter(r=>r.includes('assign call 2 today')).map(r=>r.match(/\(trigger: (.*?)\); planner calls/)?.[1])[0];
+  assert.match(trigger??'',reason,`trigger ${trigger}`);
+  await f.ticks(120,4);assert.equal(f.assigns().length,2,'and then skipping resumes');
+});
+test('S-2 re-call after a failed call (retried next tick, as before) and once after new rejected-assignment feedback, not for the same feedback again',async()=>{
+  const f=s2Fixture();let fail=true;
+  f.setPlan(x=>{if(x.mode==='assign'&&fail){fail=false;throw Error('planner timed out');}return {wait:true};});
+  await assert.rejects(f.ticks(100,1),/planner timed out/);
+  await f.ticks(105,1);assert.equal(f.assigns().length,2,'retried on the next tick');
+  assert.ok(f.reports.some(r=>/assign call 2 today \(trigger: retry after a failed call\)/.test(r)));
+  await f.ticks(110,5);assert.equal(f.assigns().length,2);
+  // Rejections are new input for the planner: one call shows them; the same rejections again are no change.
+  const g=s2Fixture();g.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'nope',task:'t',durationSeconds:300}]}:{wait:true});
+  await g.ticks(100,1);assert.equal(g.assigns().length,1);
+  await g.ticks(105,1);assert.equal(g.assigns().length,2);assert.match(g.assigns()[1].rejectedAssignments[0].reason,/unknown workstream "nope"/);
+  await g.ticks(110,10);assert.equal(g.assigns().length,2,'the same rejection again is no change');
+});
+// S-2 Fix 2: over the cap the input degrades further instead of failing the call.
+test('S-2 planner input: shorter digests come before omitting answers',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  const results=Array.from({length:40},(_,i)=>({seller:'s',task:'t'+i,outcome:'collected',ts:i,answer:'x'.repeat(3000)}));
+  const out=boundPlannerInput({mode:'assign',goal:'g',results},{fullResults:8,digestChars:600,maxInputChars:20000});
+  assert.ok(out&&JSON.stringify(out).length<=20000);
+  assert.equal(out.history.answersOmitted,0,'no answer omitted while shorter digests fit');
+  assert.ok(out.history.digestCharsUsed<600&&out.history.digestCharsUsed>=100,`${out.history.digestCharsUsed}`);
+  assert.equal(out.history.digested,40);
+  assert.match(out.history.summary,new RegExp(`^40 of 40 results are not shown in full: 40 digested \\(head and tail, ${out.history.digestCharsUsed} chars\\)`));
+});
+test('S-2 planner input: a history whose dropped-entry index alone exceeds the cap still fits; the planner is told how many were omitted',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  const results=Array.from({length:2500},(_,i)=>({seller:'s'+i,task:'t',outcome:'collected',ts:i,answer:'ok'}));
+  const out=boundPlannerInput({mode:'assess',goal:'g',results},{maxInputChars:30000});
+  assert.ok(out,'73e0a3d2 returned null here (the index lines never shrank)');
+  assert.ok(JSON.stringify(out).length<=30000);
+  const h=out.history;
+  assert.ok(h.resultsDropped>0&&h.droppedIndexOmitted>0);
+  assert.equal(h.droppedIndex.length+h.droppedIndexOmitted,h.resultsDropped,'every dropped result is listed or counted');
+  assert.equal(h.resultsDropped+out.results.length,2500);
+  assert.equal(h.droppedIndex[0].split(' | ')[0],`s${h.droppedIndexOmitted}`,'the oldest index lines go first');
+  assert.match(h.summary,new RegExp(`^${2500-h.fullText} of 2500 results are not shown in full: .* ${h.resultsDropped} dropped \\(${h.droppedIndex.length} listed in droppedIndex, ${h.droppedIndexOmitted} not listed at all\\)$`));
+});
+test('S-2 planner input: refusal and rejected-assignment feeds are bounded and shrink (oldest first, counted)',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  const refusals=Array.from({length:50},(_,i)=>({seller:'s'+i,workstream:'w',task:'T'.repeat(i?3000:300000),by:'marker',reason:'r',at:i,sameContext:true}));
+  const one=boundPlannerInput({mode:'assign',goal:'g',results:[],refusals},{maxInputChars:200000});
+  assert.ok(one&&one.refusals.length===50&&one.refusals[0].task.length<2200,'a huge refused task is cut, as running tasks are');
+  const tight=boundPlannerInput({mode:'assign',goal:'g',results:[],refusals},{maxInputChars:30000});
+  assert.ok(tight&&JSON.stringify(tight).length<=30000);
+  assert.equal(tight.refusals.length+tight.history.refusalsDropped,50);assert.equal(tight.refusals[0].seller,`s${tight.history.refusalsDropped}`);
+  assert.match(tight.history.summary,new RegExp(`; ${tight.history.refusalsDropped} older refusals feed entries dropped`));
+  const rejectedAssignments=Array.from({length:50},(_,i)=>({seller:'s'+i,workstream:'w',amountSats:0,reason:'R'.repeat(500),at:i}));
+  const r=boundPlannerInput({mode:'assign',goal:'g',results:[],rejectedAssignments},{maxInputChars:10000});
+  assert.ok(r&&JSON.stringify(r).length<=10000);
+  assert.equal(r.rejectedAssignments.length+r.history.rejectedDropped,50);assert.equal(r.rejectedAssignments.at(-1).seller,'s49','the newest stay');
+});
+test('S-2 planner input: only the fixed parts (goal, challenge, plan, sellers) over the cap still throw',async()=>{
+  const {boundPlannerInput}=await import('./swarm.mjs');
+  assert.equal(boundPlannerInput({mode:'assign',goal:'g'.repeat(50000),results:[{seller:'s',answer:'a'}]},{maxInputChars:20000}),null);
+  assert.ok(boundPlannerInput({mode:'assign',goal:'g'.repeat(15000),results:Array.from({length:500},()=>({seller:'s',answer:'a'.repeat(1000)}))},{maxInputChars:20000}));
+  const f=s2Fixture();f.snap.challenge.goal='g'.repeat(5000);f.c.plannerMaxInputChars=8000;
+  await assert.rejects(f.ticks(100,1),/SWARM_PLANNER_MAX_INPUT_CHARS \(8000\) even with every result, refusal and rejected assignment dropped: its fixed parts \(goal, challenge, plan, seller profiles, running jobs\) alone do not fit/);
+  assert.equal(f.inputs.length,0,'nothing unbounded is sent');
+});
+test('S-2 runner: an input over the cap shrinks and the planner is still called, with the omitted count (73e0a3d2 threw)',async()=>{
+  const f=s2Fixture();f.c.plannerMaxInputChars=12000;
+  for(let i=0;i<600;i++)f.journal.state.jobs.push({key:s2Key,id:'old-'+i,seller:'old',workstream:'piece',challenge:{buyer:'b',id:'day'},created:90,durationSeconds:30,
+    args:{task:'[challenge:b:day]\nold task',amount_sats:0,max_sats:0,payment:'none',deadline_unix:95,request_id:'old-'+i},done:true,outcome:'collected',answer:'a',pay:{state:'none',amount_sats:0},ts:95});
+  await f.ticks(100,1);
+  const modes=f.inputs.map(i=>i.mode);assert.deepEqual(modes,['analyze','assess','assign']);
+  for(const i of f.inputs){assert.ok(JSON.stringify(i).length<=12000);assert.equal(i.history.results,600);assert.ok(i.history.droppedIndexOmitted>0);}
+  const h=f.inputs.at(-1).history;
+  assert.match(h.summary,/^600 of 600 results are not shown in full: /);
+  assert.ok(f.reports.some(r=>/^Planner assign ok in .*results 600 \(0 full, .* dropped\)/.test(r)));
+});
+test('S-2 the same rejection again with only its numbers changed (deadline, time) is no change',async()=>{
+  // Headroom 5 (a foreign 5-sat reservation): a 6-sat assignment is rejected at admission with a
+  // reason naming its deadline (at+300), which moves every tick.
+  const f=s2Fixture();f.snap.jobs=[{id:'foreign',seller:'x',running:true,amountSats:5,start:50}];
+  f.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:300,amountSats:6}]}:{wait:true});
+  await f.ticks(100,2);assert.equal(f.assigns().length,2,'first call, then one call that shows the rejection');
+  assert.match(f.assigns()[1].rejectedAssignments[0].reason,/budget_exceeded .*deadline 400/);
+  await f.ticks(110,10);assert.equal(f.assigns().length,2,'the same rejection with a new deadline is not new feedback');
 });

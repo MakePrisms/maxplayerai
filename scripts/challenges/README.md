@@ -187,6 +187,7 @@ Flags (environment equivalents):
 | — | `SWARM_PLANNER_FULL_RESULTS` | 8 (newest results sent with full answer text) |
 | — | `SWARM_PLANNER_DIGEST_CHARS` | 600 (head kept from each older result's answer/task) |
 | — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
+| — | `SWARM_PLANNER_IDLE_SECONDS` | 600 (with no change, `assign` is called again after this long; `0` = every tick, the pre-S-2 cadence; see *Planner cadence*) |
 | — | `SWARM_EXPIRED_SLOT_GRACE_SECONDS` | 600 (strictly after an expired undelivered job's deadline + this, free its seller; sats stay reserved; minimum 480 = 420 s seller kill instant + 60 s teardown) |
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
 | — | `SWARM_BENCH_AFTER_UNCLAIMED` | 2 (consecutive assignments that expired with no claim before a seller is benched; 0 disables) |
@@ -255,7 +256,27 @@ process-group signal (Ctrl-C, `kill -TERM -<pgid>`, a supervisor) reaches only t
   lock is free for the next start.
 A supervisor without systemd's `KillMode=control-group` (launchd) therefore restarts cleanly. Keep the journal and buyer state together across restarts/backups.
 Planner/MCP errors are logged and retried on the next polling cycle without changing posting
-intent. A pending or unprojected completed job blocks that seller from receiving another job.
+intent.
+
+**Planner cadence (S-2).** `analyze` runs once per day and `assess` only when the results change,
+as before. `assign` used to run on every tick that passed the posting gate, including ticks where
+every seller was busy (an empty free roster) and ticks where nothing had changed; a 2.5-hour run
+made 171 planner calls. It is now called only when its input would meaningfully differ from the
+last call: a new result or refusal, a seller became free, became eligible or left, a job finished
+or expired, the plan changed, the budget or a free seller's donated minutes moved, the bench
+changed, the challenge (goal, window, status) or task context changed, or new rejected-assignment
+feedback is waiting. An empty roster with nothing else changed is no change. It is also called on
+the first planning tick of a day (and right after a runner restart), on the tick after a failed
+call, and once `SWARM_PLANNER_IDLE_SECONDS` (600) passed with no change, so the planner can still
+declare solved with every seller busy. The work-window-ended and seller-exhaustion stops do not
+need the planner and still run on every tick, including ticks where `assign` is skipped. The
+budget-exhausted stop is different: it closes only on an `assign` batch in which every returned
+assignment was budget-rejected with nothing running, so it runs only when `assign` runs; on a
+skipped tick it waits for the next real trigger or for `SWARM_PLANNER_IDLE_SECONDS`. A skipped call logs `Planner assign skipped: no
+change since the last call …` at most once a minute; each published progress update logs
+`Progress <run>: planner calls today: N (analyze …, assign …, assess …); assign skipped (no change)
+M since the runner started`. The per-day counts are journaled (`days[…].plannerCalls`); they stay
+out of the public progress text. A pending or unprojected completed job blocks that seller from receiving another job.
 
 Before every challenge publish (progress or completion) the runner re-reads the latest
 buyer-signed challenge from the challenge relays (`maxplayer-swarm status --buyer <hex> --run <d> --json`, read from its top-level `run` object),
@@ -331,7 +352,8 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
   `needs` contains skills/harness/hardware hints. Analysis is journaled before assignments;
   a restart reuses it. Timeout: `SWARM_ANALYZE_TIMEOUT_SECONDS` (360) for the outer command; the
   bundled `planner-llm.mjs` stops its own LLM call 10 seconds earlier (350).
-- `assign`: one batch call per eligible tick with all free sellers, running jobs
+- `assign`: one batch call on an eligible tick whose input changed (see *Planner cadence*;
+  at least every `SWARM_PLANNER_IDLE_SECONDS`), with all free sellers, running jobs
   (`seller,workstream,task,since,deadline` where available; `deferred:true` marks an
   assignment waiting for the relay snapshot, not yet offered), and all settled results.
   Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?,includeAnswers?}]}`, `{wait:true}`, or
@@ -349,25 +371,39 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
   bundled LLM call: 170). Both timeouts must be integers above 10.
 
 **Planner input bounds.** Every call also includes `history:{results,fullText,digested,
-answersOmitted,resultsDropped,droppedIndex,fieldsCut,fullResultsKept,digestChars,maxInputChars,marker}`.
+answersOmitted,resultsDropped,droppedIndex,droppedIndexOmitted,refusalsDropped,rejectedDropped,
+fieldsCut,fullResultsKept,digestChars,digestCharsUsed,maxInputChars,marker,summary}`
+(`fullResultsKept` and `digestChars` are the configured values; `fullText` and `digestCharsUsed`
+are what this call actually sent).
 `results` stays oldest-to-newest. The newest `SWARM_PLANNER_FULL_RESULTS` keep their full answer.
 Older entries keep their metadata, but their `answer` and `task` become a `SWARM_PLANNER_DIGEST_CHARS`
 digest: the **head and the tail** of the text (long reports often end with the conclusion) around a
 line starting `[truncated:`, and they carry `answerChars` (the original length). If the serialized
-input still exceeds `SWARM_PLANNER_MAX_INPUT_CHARS`, the runner degrades in a fixed order until it
-fits: the newest answers become digests too (oldest first), then older answers are replaced by an
-`[truncated: answer omitted …]` marker (`answerOmitted:true`), then the oldest result entries are
-dropped (`history.resultsDropped`). Each dropped entry leaves one line in `history.droppedIndex`
-(`seller | outcome | ts <unix> | <n> answer chars`; seller and outcome cut to 100/200 characters
-with control characters escaped, so each line is one line), which no later step removes. Seller-controlled
-and other non-result inputs are bounded before that, whatever the budget, so one huge string
+input still exceeds `SWARM_PLANNER_MAX_INPUT_CHARS`, the runner degrades in the fixed order below
+until it fits. Seller-controlled
+and other non-result inputs are bounded first, whatever the budget, so one huge string
 cannot make every later call fail: each profile's `trackRecord.tasks` keeps the newest 10 tasks
 (counts stay exact; `tasksOmitted` says how many older ones were left out) with each task digested,
 `running[].task`, seller `name` and `note` are cut to 2000 characters, and advertised tag arrays to
-32 values of 200 characters (`history.fieldsCut` counts these cuts). `goal`, `challenge` and `plan`
-are not cut. If it still cannot fit,
-the call fails, is logged and is retried on a later tick; unbounded text is never sent. Each call
-logs `Planner <mode> ok|failed in <s>s; input <chars> chars, results …`. A planner should treat
+32 values of 200 characters (`history.fieldsCut` counts these cuts); `refusals[].task` is cut like
+`running[].task`. If the input is still over the cap, it degrades in this fixed order (S-2):
+1. the newest answers become digests too (oldest of them first);
+2. every digest is halved, down to 100 characters (`history.digestCharsUsed`);
+3. older answers are replaced by an `[truncated: answer omitted …]` marker (`answerOmitted:true`),
+   oldest first;
+4. the oldest `refusals` feed entries are dropped (`history.refusalsDropped`; the refused results
+   stay in `results`);
+5. the oldest result entries are dropped (`history.resultsDropped`); each leaves one line in
+   `history.droppedIndex` (`seller | outcome | ts <unix> | <n> answer chars`; seller and outcome
+   cut to 100/200 characters with control characters escaped, so each line is one line);
+6. the oldest `droppedIndex` lines are dropped in turn (`history.droppedIndexOmitted` counts them),
+   so `droppedIndex[0]` is not necessarily the oldest result;
+7. the oldest `rejectedAssignments` are dropped (`history.rejectedDropped`). `history.summary` states in one sentence how many results the planner
+is not seeing in full, and why. `goal`, `challenge`, `plan`, seller profiles and running jobs are
+the fixed parts and are not cut further: only if they alone exceed the cap does the call fail (logged
+and retried on a later tick); unbounded text is never sent. Each call logs
+`Planner <mode> ok|failed in <s>s; input <chars> chars, results …; <mode> call <n> today (trigger: …);
+planner calls today: …`. A planner should treat
 truncated text as incomplete and may re-request detail as a task. The full answers stay in the
 journal. A collected result whose answer could not be read is `[collected, answer unreadable: …]`
 with `answerError`.
