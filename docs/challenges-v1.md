@@ -170,7 +170,19 @@ parser; above-cap prices appear in results as `price too high: asked X`. Prices 
 not award authority; normal exact-price/mint/payment-mode checks remain unchanged.
 Free is fine; pay more for useful results, raise a future price or skip a seller, and keep
 all assignments in the batch within headroom.
-`assess` checks newly settled results even after posting stops. Later responses may revise the plan.
+The runner enforces each paid seller's advertised floor in code: a seller is free only when its
+heartbeat says `takes_payment=none`; otherwise an assignment below its `rate` (and any 0-sat
+assignment, `rate=0` included) would never be claimed, so it is rejected with `below seller
+minimum N`, or, with the default-off `SWARM_AUTO_RAISE_TO_RATE`, raised to the minimum within
+headroom. Rejected assignments of the last `assign` batch, with their reasons, are returned to
+the planner as `rejectedAssignments` on its next calls.
+A seller whose assignments keep expiring with no claim (default 2 in a row on confirmed reads; a
+dropped harness looks exactly like this from the buyer) is benched for a cooldown (default 30 min):
+excluded from the assign roster and listed to the planner as `benchedSellers` with the reason. Any
+claim by it, or the cooldown ending, un-benches it; a benched seller is not counted as exhausted.
+`assess` checks newly settled results even after posting stops. Later responses may revise the plan;
+an assignment's workstream is checked against the plan sent with that `assign` call or the revision
+returned with it, never only the plan saved after the call.
 Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
 and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
 and prefer useful past deliveries. Every assignment is revalidated against fresh eligibility,
@@ -211,6 +223,10 @@ publications release too. Uncertainty retains reservations across restarts and k
 possibly payable work. At zero headroom, free work remains possible; budget stops only on
 an idle paid-only rejected batch. Wait/empty assignments alone never imply exhaustion.
 Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amounts fail closed.
+A paid collect refused by the buyer wallet's reconciliation (`wallet reconciliation refused: …`)
+is a distinct `payment stuck` state, not a retry loop: logged and journaled once, shown in progress,
+seller freed, sats kept reserved, and re-checked once after `maxplayer wallet reconcile --home <home>`
+changes the wallet, after a later paid collect succeeds, or on restart.
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
 
