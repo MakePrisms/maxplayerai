@@ -382,6 +382,9 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.match(skill, /^---\nname: maxplayer-swarm-join\n/);
   assert.ok(skill.includes("tree/main/crates/maxplayer-challenges") && !skill.includes("feat/challenges-sidecar"), "sidecar link points at main");
   assert.ok(skill.includes("Experimental: build from source; there is\nno release binary yet.") && !skill.includes("Not deployed yet"));
+  // bob (2026-10-19 00:49): the CLI is maxplayer-swarm and the day flag is --run.
+  const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
+  assert.ok(bundle.includes("maxplayer-swarm join --buyer ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer-swarm");
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
   assert.ok(page.includes("https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md"), "the join line reads the swarm-join skill");
   assert.match(page, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>Community swarms are early\. They may change, break or go away\.<\/span><\/p>/, "the experimental strip stays on /swarm");
@@ -389,7 +392,7 @@ test("the community page builds at /swarm, every page links it there, and /chall
   // Visible copy says swarm; ids and classes (challenge-*) are internal and may stay.
   const visible = page.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<[^>]*>/g, (tag) => [...tag.matchAll(/(?:content|aria-label|title|alt)="([^"]*)"/g)].map((m) => ` ${m[1]} `).join(""));
-  assert.ok(!/challenge/i.test(visible.replace(/maxplayer-challenges/g, "")), `no visible "challenge" on /swarm: ${visible.match(/.{0,40}challenge.{0,40}/i)?.[0]}`);
+  assert.ok(!/challenge/i.test(visible), `no visible "challenge" on /swarm: ${visible.match(/.{0,40}challenge.{0,40}/i)?.[0]}`);
 });
 
 test('challenge relay connection is allowed on the unlisted route', () => {
