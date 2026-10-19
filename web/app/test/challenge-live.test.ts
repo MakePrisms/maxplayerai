@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {connectionLine,isLive,liveState,observe,relayReady,renderLiveState,parseSnapshot,sellerLine,sellerMinutes,sellerState,renderSellers,UPDATING,type Snapshot} from '../src/challenge/live.js';
+import {connectionLine,isLive,liveState,observe,challengeReady,renderLiveState,parseSnapshot,sellerLine,sellerMinutes,sellerState,renderSellers,UPDATING,type Snapshot} from '../src/challenge/live.js';
 import {npubEncode} from '../src/trade/nip19.js';
 const buyer='79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 const seller={pubkey:buyer,npub:npubEncode(buyer),name:'<script>untrusted</script>',minutesOffered:60,minutesUsed:32,minutesRemaining:28,state:'working',eligible:true,decision:'accepted',currentJobStart:1000};
@@ -97,20 +97,28 @@ test('rows, counts and eyebrow follow the live state: kept through a routine pol
   renderLiveState(edoc,'live');assert.ok(!classes.has('is-off'));
 });
 
-test('readiness for "Running now": refreshed on each ready read, held through a poll, cleared by disconnect or error',()=>{
-  const live={connected:true,authenticated:true,historyComplete:true,error:null};
-  assert.equal(relayReady(live),true);
-  for(const r of [{...live,authenticated:false},{...live,historyComplete:false},{...live,error:'x'},{...live,failedRelays:['wss://x']}])assert.equal(relayReady(r),false);
-  let t=observe({wasLive:false,readyAt:null},{...live,historyComplete:false},0);
-  assert.equal(t.readyAgeS,null);assert.equal(t.state,'updating');
-  t=observe(t,live,1000);assert.equal(t.readyAgeS,0);assert.equal(t.wasLive,true);
-  // A poll round (history briefly incomplete) keeps the last ready time; age grows, no reset.
-  t=observe(t,{...live,historyComplete:false},2000);assert.equal(t.readyAgeS,1);assert.equal(t.state,'live');
-  // The next ready read refreshes it.
+test('readiness for "Running now": challenge relays only, refreshed on each ready read, held through a poll, cleared by a drop or error',()=>{
+  const ch=(o={})=>['wss://a','wss://b','wss://c'].map(url=>({role:'challenge',url,connected:true,historyComplete:true,error:null,...o}));
+  const trade={role:'trade',url:'wss://t',connected:true,historyComplete:false,error:null};
+  // Trade not authenticated and its history still loading: the challenge data is ready anyway.
+  const live={connected:true,authenticated:false,historyComplete:false,error:null,relays:[trade,...ch()]};
+  assert.equal(challengeReady(live),true);
+  assert.equal(challengeReady({...live,relays:[trade,...ch({historyComplete:false})]}),false);
+  assert.equal(challengeReady({...live,relays:[trade]}),false,'no challenge relay');
+  assert.equal(challengeReady(undefined),false);
+  // Without per-relay status (demo), the aggregate stands in.
+  assert.equal(challengeReady({connected:true,authenticated:true,historyComplete:true,error:null}),true);
+  assert.equal(challengeReady({connected:true,authenticated:true,historyComplete:false,error:null}),false);
+  let t=observe({wasLive:false,readyAt:null},{...live,relays:[trade,...ch({historyComplete:false})]},0);
+  assert.equal(t.readyAgeS,null);
+  t=observe(t,live,1000);assert.equal(t.readyAgeS,0);
+  // A poll round on one challenge relay keeps the last ready time; age grows, no reset.
+  const poll={...live,relays:[trade,...ch().map((r,i)=>i?r:{...r,historyComplete:false})]};
+  t=observe(t,poll,2000);assert.equal(t.readyAgeS,1);
   t=observe(t,live,16000);assert.equal(t.readyAgeS,0);
-  // Never ready again for a while: age keeps growing (the hero drops the label after FRESH_S).
-  t=observe(t,{...live,historyComplete:false},23000);assert.equal(t.readyAgeS,7);
-  // Disconnect or an error clears readiness at once; the section goes back to updating on disconnect.
-  const d=observe(t,{...live,connected:false,historyComplete:false},23001);assert.equal(d.readyAgeS,null);assert.equal(d.state,'updating');
-  assert.equal(observe({wasLive:true,readyAt:23000},{...live,error:'CLOSED'},23001).readyAgeS,null);
+  t=observe(t,poll,23000);assert.equal(t.readyAgeS,7);
+  // A challenge relay dropping or erroring clears it at once.
+  assert.equal(observe(t,{...live,relays:[trade,...ch().map((r,i)=>i?r:{...r,connected:false})]},23001).readyAgeS,null);
+  assert.equal(observe(t,{...live,relays:[trade,...ch().map((r,i)=>i?r:{...r,error:'CLOSED'})]},23001).readyAgeS,null);
+  assert.equal(observe(t,{connected:false,authenticated:false,historyComplete:false,error:null},23001).readyAgeS,null);
 });

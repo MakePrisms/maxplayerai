@@ -1084,7 +1084,8 @@ test('journal: a large legacy append journal is streamed in chunks (never one st
     // Only the last complete record (one state) is ever materialised, never the file.
     assert.ok(maxRead<=Math.max(chunk,4000),`largest single read ${maxRead} bytes of a ${size}-byte file`);
     assert.equal(j.state.jobs[0].id,'job-2999','last complete record wins; torn append discarded');
-    assert.deepEqual(j.migrated,{records:3000,torn:true});
+    assert.deepEqual({records:j.migrated.records,torn:j.migrated.torn},{records:3000,torn:true});
+    assert.equal(fs.statSync(j.migrated.legacyPath).size,size,'legacy file kept (R3-5)');
     const text=readFileSync(path,'utf8');
     assert.equal(text.split('\n').filter(Boolean).length,1);assert.ok(text.endsWith('\n'));
     // Restart after migration is idempotent: same state, no further rewrite.
@@ -1388,4 +1389,409 @@ test('progress: a backward clock step during the planner cannot suppress a re-re
   assert.equal(reads,2,'re-read despite the clock stepping back below progressRetryAt');
   const day=Object.values(f.journal.state.days)[0];
   assert.equal(day.closed.status,'cancelled');assert.equal(f.publishes.length,0);
+});
+
+// Run 2 #13: challenge relay quorum in the runner.
+test('quorum: coverage log line says degraded (WARNING), below quorum, or trade relay down',async()=>{
+  const {relayCoverageLine}=await import('./swarm.mjs');
+  const trade={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null};
+  const base={failedRelays:[],missingRelays:[],quorum:{required:2,complete:3,total:3},degraded:false,relays:[trade]};
+  assert.equal(relayCoverageLine(base),'All configured relays available');
+  assert.equal(relayCoverageLine({...base,failedRelays:['ws://c'],missingRelays:['ws://c'],quorum:{required:2,complete:2,total:3},degraded:true}),
+    'WARNING: relay coverage degraded (2 of 3 challenge relays complete, quorum 2); missing: ws://c');
+  assert.equal(relayCoverageLine({...base,failedRelays:['ws://b','ws://c'],missingRelays:['ws://b','ws://c'],quorum:{required:2,complete:1,total:3}}),
+    'Relay coverage below quorum (1 of 3 challenge relays complete, need 2); unavailable: ws://b, ws://c');
+  assert.match(relayCoverageLine({...base,failedRelays:['ws://trade'],relays:[{...trade,connected:false}]}),/trade relay not ready: ws:\/\/trade \(required: disconnected\)/);
+});
+test('quorum: sidecar degraded warnings and re-sends from --json reach the runner log',async()=>{
+  const {sidecarQuorumLines,latestChallengeArgs,quorumArgs}=await import('./swarm.mjs');
+  assert.deepEqual(sidecarQuorumLines({relay_quorum:{warnings:['degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/'],resent:['ab -> ws://c/']}}),
+    ['WARNING: challenge relays degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/','Re-sent missed challenge event ab -> ws://c/']);
+  assert.deepEqual(sidecarQuorumLines({}),[]);assert.deepEqual(sidecarQuorumLines(null),[]);
+  assert.deepEqual(quorumArgs(undefined),[]);
+  assert.deepEqual(latestChallengeArgs(['ws://a','ws://b','ws://c'],{buyer:'f'.repeat(64),id:'d'},2),
+    ['status','--relay','ws://a','--relay','ws://b','--relay','ws://c','--quorum','2','--buyer','f'.repeat(64),'--challenge','d','--json']);
+});
+test('quorum: SWARM_CHALLENGE_QUORUM defaults to 2 and must be a majority of the challenge relays',()=>{
+  const argv=['--home','/tmp/q-home','--relay-url','ws://trade'];
+  assert.equal(config(argv,{}).challengeQuorum,2);
+  assert.equal(config(argv,{SWARM_CHALLENGE_QUORUM:'3'}).challengeQuorum,3);
+  assert.equal(config(argv,{SWARM_CHALLENGE_RELAYS:'ws://a'}).challengeQuorum,1);
+  for(const q of ['1','4','x'])assert.throws(()=>config(argv,{SWARM_CHALLENGE_QUORUM:q}),/Invalid challenge relay quorum/,q);
+});
+test('quorum: a challenge publish needs our trade relay even when the challenge quorum is met',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  Object.assign(f.snap.relay,{quorum:{required:2,complete:3,total:3},relays:[{role:'trade',url:'ws://trade',connected:false,authenticated:false,historyComplete:false,error:'Relay history timed out'}]});
+  const day={};
+  await assert.rejects(f.runner.publishChallenge(day,f.snap.challenge,'completed','u','r'),/trade relay not ready; not publishing completed/);
+  await assert.rejects(f.runner.publishChallenge(day,f.snap.challenge,null,'progress'),/trade relay not ready; not publishing progress/);
+  assert.equal(f.publishes.length,0);
+  f.snap.relay.relays[0]={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null};
+  assert.equal(await f.runner.publishChallenge(day,f.snap.challenge,'completed','u','r'),true);assert.equal(f.publishes.length,1);
+});
+test('quorum: progress re-sends need every relay (strict); completion uses the quorum; while degraded progress waits and says so once',async()=>{
+  const f=fixture(),reports=[],reads=[];f.io.report=m=>reports.push(m);f.setPlan(()=>({wait:true}));
+  const latest=f.io.latestChallenge;f.io.latestChallenge=async(c,o)=>{reads.push(o);return latest(c,o);};
+  Object.assign(f.snap.relay,{degraded:true,missingRelays:['ws://c'],quorum:{required:2,complete:2,total:3}});
+  await f.runner.tick();f.time(300);await f.runner.tick();f.time(301);await f.runner.tick();
+  assert.equal(f.publishes.length,0,'no progress while degraded');
+  assert.equal(reports.filter(r=>r.startsWith('Progress update for day postponed: challenge relays degraded (ws://c missing)')).length,1);
+  Object.assign(f.snap.relay,{degraded:false,missingRelays:[],quorum:{required:2,complete:3,total:3}});
+  f.time(302);await f.runner.tick();
+  assert.equal(f.publishes.length,1);assert.deepEqual(f.publishes[0][5],{strict:true});assert.deepEqual(reads.at(-1),{strict:true});
+  // Completion while degraded still publishes, at the quorum.
+  Object.assign(f.snap.relay,{degraded:true,missingRelays:['ws://c'],quorum:{required:2,complete:2,total:3}});
+  f.snap.sellers.forEach(s=>s.minutesRemaining=.1);f.time(303);await f.runner.tick();
+  assert.equal(f.publishes.at(-1)[2],'completed');assert.deepEqual(f.publishes.at(-1)[5],{strict:false});assert.deepEqual(reads.at(-1),{strict:false});
+});
+
+// R3-4 (runner side): a poll round in flight is tracked as pollInProgress, which is not a readiness
+// field: it never produces a "Relay change" line; only real transitions and the heartbeat log.
+test('R3-4: relay health log ignores pollInProgress toggles; real transitions still log',async t=>{
+  const {startRelayHealthLog}=await import('./swarm.mjs');
+  t.mock.timers.enable({apis:['setInterval','Date']});
+  const relay={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,pollInProgress:false,error:null,warnings:[]};
+  const d={status:{connected:true,authenticated:true,historyComplete:true,pollInProgress:false,error:null,warnings:[],failedRelays:[],relays:[relay]},sockets:{}};
+  const logs=[];const h=startRelayHealthLog(()=>structuredClone(d),m=>logs.push(m),{checkMs:5000,heartbeatMs:60000});
+  const initial=logs.length;
+  for(let i=0;i<10;i++){d.status.pollInProgress=relay.pollInProgress=i%2===0;t.mock.timers.tick(5000);}
+  assert.equal(logs.slice(initial).filter(m=>m.startsWith('Relay change')).length,0,'poll rounds are not transitions');
+  relay.historyComplete=d.status.historyComplete=false;t.mock.timers.tick(5000);
+  assert.ok(logs.some(m=>m.startsWith('Relay change')&&m.includes('historyComplete=false')));
+  h.stop();
+});
+
+// Advisor r1 M3: the coverage line uses tradeReady's condition. Trade connected without an error but
+// not authenticated, or still catching up, is not ready even when the challenge quorum is met.
+test('M3: coverage line reports the trade relay not ready while unauthenticated or catching up',async()=>{
+  const {relayCoverageLine}=await import('./swarm.mjs');
+  const ok={role:'trade',url:'ws://trade',connected:true,authenticated:true,historyComplete:true,error:null};
+  const r=t=>({failedRelays:[],missingRelays:[],quorum:{required:2,complete:3,total:3},degraded:false,relays:[t]});
+  assert.equal(relayCoverageLine(r(ok)),'All configured relays available');
+  assert.equal(relayCoverageLine(r({...ok,historyComplete:false})),'Relay coverage incomplete; trade relay not ready: ws://trade (required: history incomplete); nothing is posted or published');
+  assert.equal(relayCoverageLine(r({...ok,authenticated:false})),'Relay coverage incomplete; trade relay not ready: ws://trade (required: not authenticated); nothing is posted or published');
+  assert.match(relayCoverageLine({...r({...ok,historyComplete:false}),degraded:true,quorum:{required:2,complete:2,total:3}}),/trade relay not ready/);
+  assert.match(relayCoverageLine(r({...ok,error:'Relay history timed out'})),/required: Relay history timed out/);
+});
+
+// R3-1 (round 3): the planner gave 0-sat tasks to sellers advertising rate=100 without
+// takes_payment=none; those sellers never claim, the jobs expired and the planner could not tell why.
+test('R3-1: an assignment below a paid seller\'s advertised rate is rejected with the reason fed back; auto-raise is opt-in and budget-bounded',async()=>{
+  const {sellerPricing,belowSellerMinimum}=await import('./swarm.mjs');
+  assert.deepEqual(sellerPricing({capabilities:[['rate','100']]}),{known:true,free:false,rateSats:100,minimumSats:100});
+  assert.deepEqual(sellerPricing({capabilities:[['rate','0'],['takes_payment',' none ']]}),{known:true,free:true,rateSats:0,minimumSats:0});
+  assert.equal(sellerPricing({capabilities:[['rate','0']]}).minimumSats,1,'rate 0 without takes_payment=none is not free');
+  assert.equal(sellerPricing({}).known,false,'no heartbeat: pricing unknown, not checked');
+  assert.match(belowSellerMinimum(sellerPricing({capabilities:[['rate','0']]}),0),/below seller minimum 1 .*rate 0 is not free/);
+  assert.equal(belowSellerMinimum(sellerPricing({capabilities:[['rate','100']]}),100),null);
+  const paid=f=>{f.snap.sellers[0].capabilities=[['rate','100']];f.snap.sellers[1].capabilities=[['rate','0'],['takes_payment','none']];};
+  // Default (auto-raise OFF): the 0-sat task to the paid seller is never posted; the free seller's is.
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);paid(f);f.snap.budget.totalSats=1000;
+  let calls=0;f.setPlan(input=>calls++?{wait:true}:{assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'t',durationSeconds:30,amountSats:0}))});
+  await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>[a.seller_pubkey,a.amount_sats]),[['b',0]]);
+  assert.ok(reports.some(r=>/^Rejected assignment for a: below seller minimum 100 /.test(r)),reports.join('\n'));
+  assert.equal(f.inputs.find(i=>i.mode==='analyze').sellers.find(s=>s.pubkey==='a').pricing.minimumSats,100,'planner sees the minimum');
+  assert.equal(f.journal.saved.days[JSON.stringify(['b','day'])].rejected.length,1,'journaled');
+  f.time(101);await f.runner.tick();
+  const fed=f.inputs.at(-1).rejectedAssignments;
+  assert.equal(fed.length,1);assert.equal(fed[0].seller,'a');assert.match(fed[0].reason,/below seller minimum 100/);
+  assert.deepEqual(Object.values(f.journal.state.days)[0].rejected,[],'the next assign batch replaces the feedback');
+  // A priced offer below the rate is rejected too; at the rate it posts.
+  const g=fixture(),gr=[];g.io.report=m=>gr.push(m);paid(g);g.snap.budget.totalSats=1000;g.snap.sellers=g.snap.sellers.slice(0,1);
+  g.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30,amountSats:50}]}));await g.runner.tick();
+  assert.equal(posts(g).length,0);assert.ok(gr.some(r=>r.includes('below seller minimum 100 (offered 50)')));
+  g.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30,amountSats:100}]}));g.time(101);await g.runner.tick();
+  assert.deepEqual(posts(g).map(([,a])=>[a.payment,a.amount_sats,a.max_sats]),[['sat',100,100]]);
+  // Opt-in auto-raise: raised to the rate within headroom, refused (with both reasons) beyond it.
+  for(const [budget,posted] of [[1000,[['sat',100,100]]],[60,[]]]) {
+    const h=fixture(),hr=[];h.io.report=m=>hr.push(m);paid(h);h.snap.budget.totalSats=budget;h.snap.sellers=h.snap.sellers.slice(0,1);h.c.autoRaiseToRate=true;
+    h.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30,amountSats:0}]}));await h.runner.tick();
+    assert.deepEqual(posts(h).map(([,a])=>[a.payment,a.amount_sats,a.max_sats]),posted);
+    if(!posted.length)assert.ok(hr.some(r=>/below seller minimum 100 .*auto-raise to 100 sats refused: .*budget_exceeded/.test(r)),hr.join('\n'));
+    else assert.ok(hr.some(r=>r.startsWith('Raising assignment for a from 0 to 100 sats')));
+  }
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a'}).autoRaiseToRate,false,'OFF by default');
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_AUTO_RAISE_TO_RATE:'1'}).autoRaiseToRate,true);
+  assert.throws(()=>config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_AUTO_RAISE_TO_RATE:'maybe'}),/SWARM_AUTO_RAISE_TO_RATE/);
+});
+
+// R3-7 (round 3): an assignment naming a workstream from the plan the planner was sent was dropped
+// as "invalid task or workstream" when the same response revised the plan; the seller sat idle.
+test('R3-7: workstreams validate against the plan sent with the assign call (or its own revision); the reason reaches the planner',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  const revised={...analysis,workstreams:[{id:'next',description:'next',needs:{skills:[]},estMinutes:1,dependsOn:[]}]};
+  let call=0;
+  f.setPlan(input=>{call++;
+    if(call===1){assert.deepEqual(input.plan.workstreams.map(w=>w.id),['piece']);
+      // Revises the plan AND assigns: one task from the plan it was sent, one from its revision, one unknown.
+      return {plan:revised,assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30},{seller:'b',workstream:'gone',task:'t',durationSeconds:30}]};}
+    return {wait:true};});
+  await f.runner.tick();
+  assert.deepEqual(posts(f).map(([,a])=>a.seller_pubkey),['a'],'the sent-plan workstream posts');
+  assert.equal(f.journal.state.jobs[0].workstream,'piece');
+  assert.equal(Object.values(f.journal.state.days)[0].plan.workstreams[0].id,'next','revision saved');
+  assert.ok(reports.some(r=>/^Rejected assignment for b: unknown workstream "gone": not in the plan sent with this assign call or the plan it returned \(ids: piece, next\)/.test(r)),reports.join('\n'));
+  f.time(101);await f.runner.tick();
+  assert.match(f.inputs.at(-1).rejectedAssignments[0].reason,/unknown workstream "gone"/);
+  assert.equal(f.inputs.at(-1).rejectedAssignments[0].seller,'b');
+  // The revision's ids are valid on the same and later calls; a stale id after the revision is not.
+  const g=fixture(),gr=[];g.io.report=m=>gr.push(m);
+  g.setPlan(()=>({plan:revised,assignments:[{seller:'a',workstream:'next',task:'t',durationSeconds:30}]}));await g.runner.tick();
+  assert.deepEqual(posts(g).map(([,a])=>a.seller_pubkey),['a']);
+  g.setPlan(()=>({assignments:[{seller:'b',workstream:'piece',task:'t',durationSeconds:30}]}));g.time(101);await g.runner.tick();
+  assert.equal(posts(g).length,1);assert.ok(gr.some(r=>/Rejected assignment for b: unknown workstream "piece": not in the plan sent with this assign call \(ids: next\)/.test(r)),gr.join('\n'));
+  // An empty task still has its own reason.
+  const h=fixture(),hr=[];h.io.report=m=>hr.push(m);h.setPlan(()=>({assignments:[{seller:'a',workstream:'piece',task:' ',durationSeconds:30}]}));await h.runner.tick();
+  assert.ok(hr.some(r=>r==='Rejected assignment for a: invalid task (empty or not text)'));
+});
+
+// R3-8 (round 3): a paid collect refused by the buyer wallet's reconciliation retried forever.
+const stuckError='node exited 1: {"isError":true,"content":[{"type":"text","text":"collect: authorize_pay payment: payment effect failed: wallet reconciliation refused: wallet has an incomplete ProofsReserved operation that could not be retired safely; resolver: s1: check-state failed (fail-closed, no retire): timeout"}]}';
+test('R3-8: a wallet-reconcile refusal is a distinct payment-stuck state: no retry loop, logged and journaled once, shown, resumed after reconcile/restart',async()=>{
+  const {paymentStuck,paymentStuckReason,walletSignature,PAYMENT_STUCK_RECHECK_MIN_SECONDS}=await import('./swarm.mjs');
+  assert.ok(paymentStuck(stuckError));assert.ok(!paymentStuck('collect: review: timeout'));
+  assert.ok(paymentStuckReason(stuckError).startsWith('wallet reconciliation refused: wallet has an incomplete ProofsReserved operation that could not be retired safely'));
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.home='/buyer';f.snap.sellers=f.snap.sellers.slice(0,1);
+  let wallet='w1';f.io.walletSignature=()=>wallet;
+  f.setPlan(input=>priced(input,5));await f.runner.tick();f.setPlan(()=>({wait:true}));
+  [...f.remote.values()][0].results=[{}];
+  let stuck=true;const orig=f.io.mcp;
+  f.io.mcp=async(t,a)=>{if(t==='collect'){f.calls.push([t,a]);if(stuck)throw Error(stuckError);return {pay:{state:'Closed { attempt_id: "x" }',amount_sats:5}};}return orig(t,a);};
+  const collects=()=>f.calls.filter(([t])=>t==='collect').length;
+  for(let t=101;t<=2000;t+=5){f.time(t);await f.runner.tick();}
+  assert.equal(collects(),1,'collect is not retried on a backoff');
+  const j=f.journal.state.jobs[0];
+  assert.equal(j.outcome,'payment stuck');assert.ok(!j.done,'not settled');assert.equal(j.paymentStuck.checks,1);
+  assert.match(j.paymentStuck.reason,/^wallet reconciliation refused: wallet has an incomplete ProofsReserved/);
+  assert.equal(jobBudget(j).reservedSats,5,'sats stay reserved');
+  const warnings=reports.filter(r=>r.includes('payment stuck'));
+  assert.equal(warnings.length,1,'logged once');assert.match(warnings[0],/^WARNING: .*Run `maxplayer wallet reconcile --home \/buyer`/);
+  assert.ok(f.inputs.at(-1).results.some(r=>r.outcome==='payment stuck'&&/ProofsReserved/.test(r.paymentStuck)),'planner sees it');
+  assert.ok(f.publishes.some(p=>/1 payment stuck awaiting the operator \(wallet reconcile\)/.test(p[3])),'shown in the published progress status');
+  // The seller delivered and is not executing: it can get new work.
+  assert.ok(!f.runner.pendingSellers(f.snap,JSON.stringify(['b','day']),2000).includes('a'));
+  // Restart: one re-check; still stuck -> nothing more until something changes.
+  const restarted=new Swarm(f.c,f.io,f.journal);
+  f.time(2005);await restarted.tick();assert.equal(collects(),2,'restart re-checks once');
+  for(let t=2010;t<=2300;t+=5){f.time(t);await restarted.tick();}
+  assert.equal(collects(),2);assert.equal(f.journal.state.jobs[0].paymentStuck.checks,2);
+  // The operator runs `maxplayer wallet reconcile` (the wallet database changes): re-check, collected, paid.
+  stuck=false;wallet='w2';f.time(2400);await restarted.tick();
+  assert.equal(collects(),3);
+  const done=f.journal.state.jobs[0];assert.equal(done.outcome,'collected');assert.equal(done.paymentStuck,undefined);assert.ok(done.paymentUnstuck.clearedAt);
+  assert.deepEqual(jobBudget(done),{reservedSats:0,paidSats:5});
+  assert.ok(reports.some(r=>r.includes('stuck payment cleared (buyer wallet changed (reconcile?))')));
+  // Re-checks never run more often than the floor, and a later successful paid collect also re-checks.
+  assert.equal(PAYMENT_STUCK_RECHECK_MIN_SECONDS,60);
+  const g=fixture();g.snap.sellers=g.snap.sellers.slice(0,1);g.io.walletSignature=()=>'same';g.setPlan(input=>priced(input,5));await g.runner.tick();g.setPlan(()=>({wait:true}));
+  [...g.remote.values()][0].results=[{}];const go=g.io.mcp;let gs=true;
+  g.io.mcp=async(t,a)=>{if(t==='collect'){g.calls.push([t,a]);if(gs)throw Error(stuckError);return {pay:{state:'Closed { attempt_id: "y" }',amount_sats:5}};}return go(t,a);};
+  g.time(101);await g.runner.tick();g.runner.walletPaidAt=130;g.time(140);await g.runner.tick();
+  assert.equal(g.calls.filter(([t])=>t==='collect').length,1,'within the floor: no re-check');
+  gs=false;g.time(161);await g.runner.tick();
+  assert.equal(g.calls.filter(([t])=>t==='collect').length,2);assert.equal(g.journal.state.jobs[0].outcome,'collected');
+  // The wallet signature reads the buyer CDK database and its WAL (missing files are '-').
+  assert.equal(walletSignature('/nonexistent-home'),'-|-');
+});
+
+// R3-2 (round 3, runner workaround): a seller whose harness was dropped still heartbeats normally
+// but skips every offer; its jobs expired unclaimed and the planner kept assigning it work.
+const everyone=input=>input.mode==='assess'?{wait:true}:{assignments:input.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'t',durationSeconds:30}))};
+test('R3-2: N consecutive unclaimed expiries bench a seller for a cooldown; the planner is told; a claim or the cooldown ends it',async()=>{
+  const {DEFAULT_BENCH_AFTER_UNCLAIMED,DEFAULT_BENCH_SECONDS}=await import('./swarm.mjs');
+  assert.equal(DEFAULT_BENCH_AFTER_UNCLAIMED,2);assert.equal(DEFAULT_BENCH_SECONDS,1800);
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.benchSeconds=1000;
+  f.snap.sellers.forEach(s=>{s.minutesRemaining=100;});f.snap.challenge.ends=100000;
+  // Every seller gets one assignment whenever it is free.
+  f.setPlan(everyone);
+  const expire=(seller,claimed=false)=>{for(const j of f.remote.values())if(f.journal.state.jobs.find(x=>x.id===j.id&&x.seller===seller&&!x.done))
+    Object.assign(j,{read_confirmed:true,claims:claimed?[{seller_pubkey:seller,live:false,status:'expired'}]:[],results:[]});};
+  const postsFor=s=>posts(f).filter(([,a])=>a.seller_pubkey===s).length;
+  let t=100;const step=async n=>{t+=n;f.time(t);await f.runner.tick();};
+  await step(0);assert.equal(postsFor('a'),1);assert.equal(postsFor('b'),1);
+  // Round 1: a expires unclaimed, b claimed (and expired); both get new work.
+  expire('a');expire('b',true);await step(31);await step(1);
+  assert.equal(postsFor('a'),2);assert.equal(postsFor('b'),2);
+  assert.equal(f.journal.state.bench.a.streak,1);assert.equal(f.journal.state.bench.b,undefined);
+  // Round 2: a's second consecutive unclaimed expiry benches it; b keeps working.
+  expire('a');expire('b',true);await step(31);await step(1);
+  assert.equal(postsFor('a'),2,'benched: no new assignment');assert.equal(postsFor('b'),3);
+  assert.ok(reports.some(r=>/^Benched seller a for 1000s: 2 consecutive assignments expired with no claim/.test(r)),reports.join('\n'));
+  const benchedAt=f.journal.state.bench.a.benchedAt;
+  const after=f.inputs.filter(i=>i.mode==='assign'&&i.now>=benchedAt);
+  assert.ok(after.length&&after.every(i=>!i.sellers.some(s=>s.pubkey==='a')),'left out of the assign roster');
+  assert.ok(after.some(i=>i.sellers.some(s=>s.pubkey==='b')));
+  const input=after.at(-1);
+  assert.equal(input.benchedSellers[0].seller,'a');assert.match(input.benchedSellers[0].reason,/no claim/);
+  // An assignment naming it anyway is rejected with the reason (and fed back).
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:{assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30}]});
+  expire('b',true);await step(31);
+  assert.ok(reports.some(r=>/^Rejected assignment for a: seller benched until \d+: 2 consecutive/.test(r)));
+  assert.match(f.inputs.at(-1).rejectedAssignments?.[0]?.reason??Object.values(f.journal.state.days)[0].rejected[0].reason,/benched/);
+  // A benched seller is not "exhausted": no unsolved stop while only it is idle.
+  assert.equal(Object.values(f.journal.state.days)[0].stop,undefined);
+  // Cooldown ends: un-benched on probation; it gets work again; one more unclaimed expiry re-benches.
+  f.setPlan(everyone);
+  await step(1000);
+  assert.ok(reports.some(r=>r.startsWith('Un-benched seller a: cooldown ended')));
+  assert.equal(postsFor('a'),3);
+  expire('a');await step(31);await step(1);
+  assert.equal(postsFor('a'),3);assert.ok(f.journal.state.bench.a.until>t,'re-benched after one more unclaimed expiry');
+  // Any claim (here on its still-open last job) un-benches at once and resets the streak.
+  const last=f.journal.state.jobs.filter(j=>j.seller==='a').at(-1);
+  const remote=[...f.remote.values()].find(j=>j.id===last.id);remote.claims=[{seller_pubkey:'a',live:false,status:'expired'}];
+  last.done=false;await step(1);
+  assert.equal(f.journal.state.bench.a,undefined);assert.ok(reports.some(r=>r.startsWith('Un-benched seller a: it claimed')));
+  // An unconfirmed read never counts; SWARM_BENCH_AFTER_UNCLAIMED=0 disables; settings validated.
+  const g=fixture();g.snap.sellers=g.snap.sellers.slice(0,1);await g.runner.tick();
+  [...g.remote.values()][0].results=[];g.time(131);g.setPlan(()=>({wait:true}));await g.runner.tick();
+  assert.equal(g.journal.state.bench,undefined,'read_confirmed missing: not counted');
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a'}).benchAfterUnclaimed,2);
+  assert.equal(config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_BENCH_AFTER_UNCLAIMED:'0'}).benchAfterUnclaimed,0);
+  assert.throws(()=>config([],{MAXPLAYER_HOME:'/h',RELAY_URL:'ws://a',SWARM_BENCH_SECONDS:'0'}),/SWARM_BENCH_SECONDS/);
+  const h=fixture();h.c.benchAfterUnclaimed=0;h.snap.sellers=h.snap.sellers.slice(0,1);h.snap.sellers[0].minutesRemaining=100;h.snap.challenge.ends=100000;
+  h.setPlan(everyone);
+  let ht=100;for(let i=0;i<3;i++){await h.runner.tick();for(const j of h.remote.values())Object.assign(j,{read_confirmed:true,claims:[],results:[]});ht+=31;h.time(ht);await h.runner.tick();ht+=1;h.time(ht);}
+  assert.equal(posts(h).length,4,'disabled: never benched');
+  // The exhaustion check: when the only seller is benched (so there are no candidates and nothing
+  // running), the day must not stop as "all eligible sellers exhausted": its cooldown ends.
+  const k=fixture(),kr=[];k.io.report=m=>kr.push(m);k.c.benchSeconds=1000;k.snap.sellers=k.snap.sellers.slice(0,1);k.snap.sellers[0].minutesRemaining=100;k.snap.challenge.ends=100000;
+  k.setPlan(everyone);
+  let kt=100;for(let i=0;i<2;i++){await k.runner.tick();for(const j of k.remote.values())Object.assign(j,{read_confirmed:true,claims:[],results:[]});kt+=31;k.time(kt);await k.runner.tick();kt+=1;k.time(kt);}
+  await k.runner.tick();
+  assert.ok(k.journal.state.bench?.a?.until>kt,'the only seller is benched');
+  assert.equal(Object.values(k.journal.state.days)[0].stop,undefined,kr.join('\n'));
+});
+
+// Advisor r1 H1: a claimed PAID job stays open (polled) until collected or proven released, even
+// after its slot was freed. Its old claim un-benched the seller on every poll, so a streak of later
+// unclaimed expiries never reached the bench. A claim counts once per job, on the transition.
+test('R3-2 (advisor r1 H1): a lingering claim on a slot-freed paid job does not reset the streak of later unclaimed expiries',async()=>{
+  const {EXPIRED_SLOT_GRACE_SECONDS}=await import('./swarm.mjs');
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.benchSeconds=1000;
+  f.snap.sellers=f.snap.sellers.slice(0,1);f.snap.sellers[0].minutesRemaining=100;f.snap.challenge.ends=100000;
+  let n=0;f.setPlan(input=>input.mode==='assess'?{wait:true}:n++?everyone(input):priced(input,5));
+  await f.runner.tick();assert.deepEqual(posts(f).map(([,a])=>[a.amount_sats,a.deadline_unix]),[[5,130]]);
+  // The paid job was claimed (the claim expired) and is never delivered or released: it stays open.
+  const paid=[...f.remote.values()][0];
+  Object.assign(paid,{read_confirmed:true,award_read_confirmed:true,reservation_state:'held',offer:{deadline_unix:130},claims:[{seller_pubkey:'a',live:false,status:'expired'}],results:[],accepted:null});
+  let t=131;f.time(t);await f.runner.tick();
+  const j0=f.journal.state.jobs[0];assert.equal(j0.done,false);assert.equal(j0.sawSellerClaim,131);
+  t=130+EXPIRED_SLOT_GRACE_SECONDS+1;f.time(t);await f.runner.tick();
+  assert.equal(j0.slotFreed,t);assert.equal(j0.done,false,'still open and polled');assert.equal(posts(f).length,2,'seller freed for new work');
+  // Two later assignments expire with no claim while the old paid job is still polled every tick.
+  const expireNew=()=>{for(const r of f.remote.values())if(r!==paid&&!f.journal.state.jobs.find(x=>x.id===r.id)?.done)Object.assign(r,{read_confirmed:true,claims:[],results:[]});};
+  expireNew();t+=31;f.time(t);await f.runner.tick();t+=1;f.time(t);await f.runner.tick();
+  assert.equal(f.journal.state.bench?.a?.streak,1,'first unclaimed expiry counted (not wiped by the old claim)');
+  assert.equal(posts(f).length,3);
+  expireNew();t+=31;f.time(t);await f.runner.tick();t+=1;f.time(t);await f.runner.tick();
+  assert.ok(f.journal.state.bench?.a?.until>t,`benched: ${JSON.stringify(f.journal.state.bench)}`);
+  assert.ok(reports.some(r=>/^Benched seller a for 1000s: 2 consecutive/.test(r)),reports.join('\n'));
+  assert.equal(posts(f).length,3,'benched: no new assignment');
+  assert.equal(j0.done,false,'the old paid job is still polled');
+  assert.ok(!reports.some(r=>r.startsWith('Un-benched seller a: it claimed')),'the old claim does not un-bench');
+});
+
+// Advisor r2 H1: observing a claim was two saves (the job flag, then the bench delete). A crash on
+// the second left the flag without the un-bench, so the claim was never observed again and the
+// seller stayed benched. The flag and the un-bench are one save.
+test('R3-2 (advisor r2 H1): a failed save while observing a claim leaves neither change; after restart the claim un-benches the seller',async()=>{
+  const fs=process.getBuiltinModule('node:fs');
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.challenge.ends=100000;
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:everyone(input));
+  await f.runner.tick();
+  const ja=f.journal.state.jobs.find(x=>x.seller==='a');assert.ok(ja&&!ja.done);
+  const dir=mkdtempSync(join(tmpdir(),'swarm-r2h1-')),path=join(dir,'events.jsonl');
+  try {
+    // A durable journal: seller a is benched (from earlier expiries) while its open job is polled.
+    const seed=new Journal(path);seed.state=structuredClone(f.journal.state);
+    seed.state.bench={a:{streak:2,benchedAt:90,until:5000,reason:'2 consecutive assignments expired with no claim'}};seed.save();
+    const remote=[...f.remote.values()].find(r=>r.id===ja.id);Object.assign(remote,{claims:[{seller_pubkey:'a',live:true,claim_id:'c'}],results:[]});
+    // The save that would record the un-bench fails (crash): the durable record keeps the previous state.
+    let armed=true;
+    const failing={renameSync:(from,to)=>{if(armed&&to===path&&!JSON.parse(fs.readFileSync(from,'utf8')).bench?.a){armed=false;throw Object.assign(Error('crash'),{code:'EIO'});}return fs.renameSync(from,to);}};
+    f.time(110);
+    await assert.rejects(new Swarm(f.c,f.io,new Journal(path,{fs:failing})).tick(),e=>e.journalFailure===true);
+    assert.equal(armed,false,'the un-bench save was attempted and failed');
+    const afterCrash=new Journal(path);
+    assert.ok(afterCrash.state.bench.a.until,'still benched on disk');
+    assert.equal(afterCrash.state.jobs.find(x=>x.id===ja.id).sawSellerClaim,undefined,'flag not committed without the un-bench');
+    // Restart: the claim is observed again and un-benches the seller, flag and delete together.
+    f.time(111);await new Swarm(f.c,f.io,afterCrash).tick();
+    const reopened=new Journal(path);
+    assert.equal(reopened.state.bench.a,undefined,`un-benched after restart: ${JSON.stringify(reopened.state.bench)}`);
+    assert.equal(reopened.state.jobs.find(x=>x.id===ja.id).sawSellerClaim,111);
+    assert.ok(reports.some(r=>r===`Un-benched seller a: it claimed job ${ja.id}`),reports.join('\n'));
+  } finally {rmSync(dir,{recursive:true});}
+});
+
+// R3-5 (round 3): the migration rewrote a 1.27 GB legacy append journal in place, discarding the audit history.
+test('R3-5: migration keeps the legacy journal as events.jsonl.legacy-<timestamp> (link, or copy), reuses it after a crash, never migrates twice',async()=>{
+  const {legacyJournalName}=await import('./swarm.mjs');
+  const fs=process.getBuiltinModule('node:fs');
+  const legacy=dir=>fs.readdirSync(dir).filter(n=>n.includes('.legacy-')).sort();
+  const write=(path,n)=>{const lines=[];for(let i=0;i<n;i++)lines.push(JSON.stringify({jobs:[{id:`job-${i}`}],days:{}}));fs.writeFileSync(path,lines.join('\n')+'\n{"torn":');return fs.readFileSync(path);};
+  const at=Date.UTC(2026,9,18,16,0,0),crash=()=>{throw Object.assign(Error('crash'),{code:'EIO'});};
+  assert.equal(legacyJournalName('/h/events.jsonl',at),'/h/events.jsonl.legacy-20261018T160000Z');
+  for(const mode of ['link','copy']) {
+    const dir=mkdtempSync(join(tmpdir(),`swarm-r35-${mode}-`)),path=join(dir,'events.jsonl');
+    const noLink=mode==='copy'?{linkSync:()=>{throw Object.assign(Error('no links'),{code:'EPERM'});}}:{};
+    try {
+      // 1. Migration keeps the legacy file byte for byte and logs (returns) its path.
+      const original=write(path,50);
+      const j=new Journal(path,{now:()=>at,chunkBytes:64,fs:noLink});
+      assert.equal(j.state.jobs[0].id,'job-49');
+      assert.equal(j.migrated.legacyPath,join(dir,'events.jsonl.legacy-20261018T160000Z'));
+      assert.deepEqual(legacy(dir),['events.jsonl.legacy-20261018T160000Z'],`${mode}: one kept file, no temp`);
+      assert.deepEqual(fs.readFileSync(j.migrated.legacyPath),original,'legacy history kept byte for byte');
+      assert.equal(fs.readFileSync(path,'utf8').split('\n').filter(Boolean).length,1,'journal is one record');
+      // 2. Never migrated twice: a one-record journal is not migrated, nothing new is kept.
+      assert.equal(new Journal(path,{now:()=>at+5000,fs:noLink}).migrated,undefined);assert.equal(legacy(dir).length,1);
+      // 3. Crash AFTER the legacy file was kept, BEFORE the journal rewrite: the reopen reuses that kept file.
+      fs.rmSync(path);const second=write(path,20);
+      const failSave={...noLink,renameSync:(a,b)=>{if(b===path)crash();return fs.renameSync(a,b);}};
+      assert.throws(()=>new Journal(path,{now:()=>at+1000,fs:failSave}),e=>e.journalFailure===true);
+      assert.deepEqual(fs.readFileSync(path),second,'journal untouched by the crashed migration');
+      assert.deepEqual(legacy(dir),['events.jsonl.legacy-20261018T160000Z','events.jsonl.legacy-20261018T160001Z']);
+      const reopened=new Journal(path,{now:()=>at+2000,fs:noLink});
+      assert.equal(reopened.migrated.legacyPath,join(dir,'events.jsonl.legacy-20261018T160001Z'),'reused, no second copy');
+      assert.equal(legacy(dir).length,2);assert.deepEqual(fs.readFileSync(reopened.migrated.legacyPath),second);
+      // 4. Copy mode only: a crash DURING the copy leaves a partial temp; the reopen discards it.
+      if(mode==='copy') {
+        fs.rmSync(path);const third=write(path,10);let writes=0;
+        assert.throws(()=>new Journal(path,{now:()=>at+3000,chunkBytes:64,fs:{...noLink,writeSync:(...a)=>{if(++writes>2)crash();return fs.writeSync(...a);}}}));
+        assert.ok(legacy(dir).some(n=>n.endsWith('.tmp')),'partial copy left by the crash');
+        const r=new Journal(path,{now:()=>at+4000,chunkBytes:64,fs:noLink});
+        assert.ok(!legacy(dir).some(n=>n.endsWith('.tmp')),'partial copy discarded');
+        assert.equal(legacy(dir).length,3);assert.deepEqual(fs.readFileSync(r.migrated.legacyPath),third);
+      }
+    } finally {rmSync(dir,{recursive:true});}
+  }
+});
+
+// Advisor r1 M2: reuse after a crash required only equal size, so an older same-length leftover
+// legacy file was taken as the backup and this journal's history was lost. Identity is the same
+// inode or the same bytes.
+test('R3-5 (advisor r1 M2): a same-size decoy legacy file is not reused; the audit records survive',()=>{
+  const fs=process.getBuiltinModule('node:fs');
+  const at=Date.UTC(2026,9,18,16,0,0);
+  for(const mode of ['link','copy']) {
+    const dir=mkdtempSync(join(tmpdir(),`swarm-m2-${mode}-`)),path=join(dir,'events.jsonl');
+    const noLink=mode==='copy'?{linkSync:()=>{throw Object.assign(Error('no links'),{code:'EPERM'});}}:{};
+    try {
+      const rec=tag=>JSON.stringify({jobs:[{id:tag}],days:{}});
+      fs.writeFileSync(path,rec('audit-first')+'\n'+rec('audit-last')+'\n');const original=fs.readFileSync(path);
+      // A different file of exactly the same length, left by an older migration.
+      const decoy=join(dir,'events.jsonl.legacy-OLD'),decoyBytes=Buffer.from(original.toString().replace('audit-first','decoy-first'));
+      assert.equal(decoyBytes.length,original.length);fs.writeFileSync(decoy,decoyBytes);
+      const j=new Journal(path,{now:()=>at,chunkBytes:16,fs:noLink});
+      assert.notEqual(j.migrated.legacyPath,decoy,`${mode}: decoy not taken as the backup`);
+      assert.deepEqual(fs.readFileSync(j.migrated.legacyPath),original,`${mode}: audit history kept byte for byte`);
+      assert.deepEqual(fs.readFileSync(decoy),decoyBytes,'decoy untouched');
+      const kept=fs.readdirSync(dir).filter(n=>n.includes('.legacy-')).map(n=>fs.readFileSync(join(dir,n),'utf8')).join('');
+      assert.match(kept,/audit-first/,'audit-first survives in a kept file');
+      assert.equal(j.state.jobs[0].id,'audit-last');
+    } finally {rmSync(dir,{recursive:true});}
+  }
 });

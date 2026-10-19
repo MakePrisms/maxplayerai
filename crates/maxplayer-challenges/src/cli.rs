@@ -2,7 +2,7 @@
 use std::collections::BTreeMap;
 use std::io::Write;
 
-const HELP: &str = "Usage: maxplayer-challenges <command> [--home <path>] [--json] [--relay URL ...]
+const HELP: &str = "Usage: maxplayer-challenges <command> [--home <path>] [--json] [--relay URL ...] [--quorum N]
   join --buyer <npub|hex> --minutes <1..480> [--note <text>]
   status --buyer <npub|hex> [--challenge <d>]
   leave --buyer <npub|hex>
@@ -18,6 +18,10 @@ Membership and acceptance persist across days. Minutes are offered per day.
 Status/members default to the buyer's latest non-cancelled challenge. Uses the initialized home's key.
 Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://relay.primal.net, wss://offchain.pub.
 Repeat --relay URL after the command to override. ws:// is loopback-only; relay.maxplayer.ai is forbidden.
+Reads and publishes need a quorum of relays: --quorum N (default 2, at least a majority of the relays
+and at most all of them). Quorum met with a relay missing is degraded: a warning on stderr and in
+--json (relay_quorum), and the event is re-sent unchanged to that relay once it answers again.
+A minutes/note change during a running challenge still needs every relay.
 Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 ";
 /// A publish refused because the challenge is already closed on the relays exits with
@@ -51,6 +55,7 @@ struct Opts {
     values: BTreeMap<String, String>,
     json: bool,
     relays: Vec<String>,
+    quorum: Option<usize>,
 }
 impl Opts {
     fn get(&self, k: &str) -> Option<&str> {
@@ -86,11 +91,12 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         values: BTreeMap::new(),
         json: false,
         relays: Vec::new(),
+        quorum: None,
     };
     let mut i = 1;
     while i < args.len() {
         let k = args[i].as_str();
-        if !allowed.contains(&k) && !["--home", "--json", "--relay"].contains(&k) {
+        if !allowed.contains(&k) && !["--home", "--json", "--relay", "--quorum"].contains(&k) {
             return Err("unknown challenge option".into());
         }
         let v = if ["--accept", "--deny", "--json"].contains(&k) {
@@ -104,6 +110,14 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         };
         if k == "--relay" {
             o.relays.push(v);
+            i += 1;
+            continue;
+        }
+        if k == "--quorum" {
+            let q = v.parse::<usize>().map_err(|_| "invalid --quorum")?;
+            if o.quorum.replace(q).is_some() {
+                return Err("duplicate --quorum".into());
+            }
             i += 1;
             continue;
         }
@@ -166,6 +180,19 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             Ok((body, warning)) => {
                 if let Some(warning) = warning {
                     let _ = writeln!(err, "Warning: {warning}");
+                }
+                // Degraded quorum (met, with a relay missing) and re-sends: always on stderr, and
+                // in --json as `relay_quorum`.
+                let quorum = &body["relay_quorum"];
+                for w in quorum["warnings"].as_array().into_iter().flatten() {
+                    let _ = writeln!(err, "Warning: {}", w.as_str().unwrap_or_default());
+                }
+                for r in quorum["resent"].as_array().into_iter().flatten() {
+                    let _ = writeln!(
+                        err,
+                        "Re-sent missed event {}",
+                        r.as_str().unwrap_or_default()
+                    );
                 }
                 if opts.json {
                     let _ = writeln!(out, "{body}");
@@ -283,6 +310,9 @@ fn select_challenge(
         .map(|(_, c)| c)
         .ok_or_else(|| "challenge not found or not verified for this buyer".into())
 }
+/// Runs the command, then re-sends queued events to relays that answered in this run (also after a
+/// refusal: the queued events already met quorum when they were published), and reports the
+/// relay quorum (degraded warnings, missing relays, re-sends) in the JSON body.
 async fn execute_async(
     o: &Opts,
     home: &maxplayer_core::home::MaxplayerHome,
@@ -290,7 +320,33 @@ async fn execute_async(
     if o.command == "join" && o.get("--note").unwrap_or("").encode_utf16().count() > 4096 {
         return Err("join note exceeds 4096 UTF-16 code units (reader limit)".into());
     }
-    let relay = crate::relay::Relays::new(&o.relays)?;
+    let relay = crate::relay::Relays::with_quorum(&o.relays, o.quorum)?;
+    let result = command_async(o, home, &relay).await;
+    relay.resend(home).await;
+    let (body, warning) = result?;
+    let report = relay.take_report();
+    let (required, total) = relay.quorum();
+    let mut body = body;
+    if let Some(map) = body.as_object_mut() {
+        map.insert(
+            "relay_quorum".into(),
+            serde_json::json!({
+                "required": required,
+                "total": total,
+                "degraded": !report.warnings.is_empty(),
+                "warnings": report.warnings,
+                "missing": report.missing,
+                "resent": report.resent,
+            }),
+        );
+    }
+    Ok((body, warning))
+}
+async fn command_async(
+    o: &Opts,
+    home: &maxplayer_core::home::MaxplayerHome,
+    relay: &crate::relay::Relays,
+) -> Result<(serde_json::Value, Option<String>), String> {
     use maxplayer_core::challenge::*;
     use nostr_sdk::prelude::*;
     use serde_json::json;
@@ -321,16 +377,38 @@ async fn execute_async(
             result: o.get("--result").map(str::to_owned),
         };
         let draft = c.to_event_draft().map_err(|e| e.to_string())?;
+        let filter = Filter::new()
+            .author(public_key(&c.buyer)?)
+            .kind(Kind::from(CHALLENGE_KIND))
+            .identifier(&c.id);
         let previous = relay
-            .fetch(
-                home,
-                Filter::new()
-                    .author(public_key(&c.buyer)?)
-                    .kind(Kind::from(CHALLENGE_KIND))
-                    .identifier(&c.id),
-            )
+            .fetch(home, filter.clone())
             .await
             .map_err(|e| e.to_string())?;
+        // A quorum read can complete while omitting a close that only the missing relay holds
+        // (published at a bare quorum whose other relay is the one this read shares and lost it).
+        // A completed/cancelled status is final either way, but a scheduled/in_progress update over
+        // an existing challenge would resurrect it: that needs every relay to answer.
+        // A close the quorum read already sees is final: refuse it (exit 3) before any strict re-read.
+        if let Some(closed) = closed_status(&previous, &c.buyer, &c.id) {
+            return Err(format!(
+                "{CHALLENGE_CLOSED} ({closed}): the latest buyer-signed challenge {} is {closed}; nothing published",
+                c.id
+            ));
+        }
+        let previous = if !relay.missing().is_empty()
+            && !previous.is_empty()
+            && !matches!(c.status.as_str(), "completed" | "cancelled")
+        {
+            relay.fetch_all(home, filter).await.map_err(|e| {
+                format!(
+                    "challenge relays degraded ({e}); a {} update over an existing challenge needs every relay, so a close held only by the missing relay is never overwritten. Nothing was published; retry when every relay answers.",
+                    c.status
+                )
+            })?
+        } else {
+            previous
+        };
         // A completed/cancelled challenge is final: never sign a replacement over it, whatever
         // view the caller published from (its status read can be stale by the time we sign).
         if let Some(closed) = closed_status(&previous, &c.buyer, &c.id) {
@@ -497,14 +575,37 @@ async fn execute_async(
             // challenge still counts the current membership; fail closed if that is unreadable.
             // Eligibility also needs the latest buyer decision `accepted` (trusted read above):
             // a pending or denied seller is not counted today, so its edit forfeits nothing.
-            let accepted = decisions
+            let mut accepted = decisions
                 .iter()
                 .any(|d| d.seller == own && d.decision == "accepted");
+            // A degraded (quorum, not every-relay) read can omit the buyer's acceptance when only
+            // the missing relay holds it; then `accepted` above is wrong and the strict challenge
+            // read below would be skipped. So while degraded, re-read the decisions from every
+            // relay too, and let that strict read alone decide. Any failure refuses (nothing
+            // published).
+            if !relay.missing().is_empty() {
+                let strict = relay
+                    .fetch_all(
+                        home,
+                        Filter::new()
+                            .kind(Kind::from(CHALLENGE_DECISION_KIND))
+                            .author(public_key(&buyer)?),
+                    )
+                    .await
+                    .map_err(|e| format!("could not read the buyer's challenge state reliably ({e}); refusing to change your membership, because republishing it during a running challenge would make you ineligible for that day. Nothing was published; retry when every relay answers."))?;
+                accepted = latest_per_coordinate(
+                    strict.iter().filter(|e| parse_decision(e, &buyer).is_ok()),
+                )
+                .into_iter()
+                .filter_map(|e| parse_decision(e, &buyer).ok())
+                .any(|d| d.seller == own && d.decision == "accepted");
+            }
             if accepted {
-                // Strict every-relay read. Keep it strict even if ordinary reads move to a
-                // quorum: the relay left out could be the only one holding the running challenge.
+                // Strict every-relay read, not the quorum read: a challenge published to a bare
+                // quorum is on only some relays, and the relay left out could be the only one
+                // holding the running challenge (then this would publish a forfeiting replacement).
                 let challenges = relay
-                    .fetch(
+                    .fetch_all(
                         home,
                         Filter::new()
                             .author(public_key(&buyer)?)
@@ -2310,5 +2411,689 @@ mod tests {
             }
         }
         // END midday-minutes tests
+
+        // BEGIN quorum tests
+        /// Run 2 #13: a 2-of-3 challenge relay quorum for reads and publishes, degraded warnings,
+        /// and re-sending the exact signed event to a relay that missed it.
+        mod quorum {
+            use super::*;
+            use crate::relay::transport_tests::{Fixture, relay_like};
+            use crate::relay::{
+                OUTBOX_MAX_AGE_SECS, OUTBOX_MAX_ATTEMPTS, OUTBOX_MAX_ENTRIES, Outbox, Relays,
+            };
+            use serde_json::json;
+            use std::sync::atomic::Ordering;
+            struct Setup {
+                root: std::path::PathBuf,
+                home: home::MaxplayerHome,
+                seller: Keys,
+                buyer_keys: Keys,
+                buyer: String,
+            }
+            impl Drop for Setup {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.root);
+                }
+            }
+            fn setup(name: &str) -> Setup {
+                let root = std::env::temp_dir().join(format!(
+                    "challenge-quorum-{name}-{}",
+                    Keys::generate().public_key()
+                ));
+                let home = home::bootstrap(&root).unwrap();
+                let seller = crate::relay::keys(&home).unwrap();
+                let buyer_keys = Keys::generate();
+                let buyer = buyer_keys.public_key().to_hex();
+                Setup {
+                    root,
+                    home,
+                    seller,
+                    buyer_keys,
+                    buyer,
+                }
+            }
+            /// Accepted decision + a joined membership from the seller (this home).
+            fn roster(s: &Setup) -> Vec<Event> {
+                vec![
+                    decision(&s.buyer_keys, &s.seller, "accepted", 100),
+                    membership(&s.seller, &s.buyer, "joined", 100, 100),
+                ]
+            }
+            fn challenge_event(
+                buyer: &Keys,
+                id: &str,
+                starts: u64,
+                ends: u64,
+                status: &str,
+                t: u64,
+            ) -> Event {
+                let c = Challenge {
+                    buyer: buyer.public_key().to_hex(),
+                    id: id.into(),
+                    title: id.into(),
+                    goal: "Goal".into(),
+                    starts,
+                    ends,
+                    budget_sats: 0,
+                    status: status.into(),
+                    update: None,
+                    result: None,
+                };
+                signed(c.to_event_draft().unwrap(), buyer, t)
+            }
+            async fn three(events: Vec<Event>) -> Vec<Fixture> {
+                let mut out = Vec::new();
+                for _ in 0..3 {
+                    out.push(relay_like(events.clone(), vec![]).await);
+                }
+                out
+            }
+            /// The relay URL as the sidecar reports it (normalized).
+            fn norm(url: &str) -> String {
+                url::Url::parse(url).unwrap().to_string()
+            }
+            fn writes(r: &Fixture) -> Vec<Event> {
+                r.writes.lock().unwrap().clone()
+            }
+            async fn command(
+                home: &home::MaxplayerHome,
+                r: &[Fixture],
+                line: &str,
+            ) -> Result<serde_json::Value, String> {
+                let mut o = crate::cli::parse(&args(line)).unwrap();
+                o.relays = r.iter().map(|f| f.url.clone()).collect();
+                execute_async(&o, home).await.map(|(body, _)| body)
+            }
+            fn relay_args(r: &[Fixture]) -> String {
+                r.iter()
+                    .map(|f| format!("--relay {}", f.url))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }
+            fn rt() -> tokio::runtime::Runtime {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            }
+
+            #[tokio::test]
+            async fn quorum_met_with_one_relay_down_reads_publishes_and_reports_degraded() {
+                let s = setup("met");
+                let r = three(roster(&s)).await;
+                r[2].online.store(false, Ordering::SeqCst);
+                let status = format!("status --buyer {} --json", s.buyer);
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(body["members"][0]["membership"]["status"], "joined");
+                let q = &body["relay_quorum"];
+                assert_eq!(
+                    (
+                        q["required"].clone(),
+                        q["total"].clone(),
+                        q["degraded"].clone()
+                    ),
+                    (json!(2), json!(3), json!(true))
+                );
+                assert_eq!(q["missing"], json!([norm(&r[2].url)]));
+                let w = q["warnings"][0].as_str().unwrap();
+                assert!(
+                    w.starts_with(&format!(
+                        "degraded read: 2 of 3 challenge relays (quorum 2); missing: {} (",
+                        norm(&r[2].url)
+                    )),
+                    "{w}"
+                );
+                // A publish accepted by 2 of 3 succeeds, is degraded, and is queued for the third.
+                let body = command(&s.home, &r, &format!("leave --buyer {} --json", s.buyer))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    (
+                        writes(&r[0]).len(),
+                        writes(&r[1]).len(),
+                        writes(&r[2]).len()
+                    ),
+                    (1, 1, 0)
+                );
+                assert_eq!(writes(&r[0])[0], writes(&r[1])[0]);
+                assert!(
+                    body["relay_quorum"]["warnings"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|w| w.as_str().unwrap().starts_with(&format!(
+                            "degraded publish: 2 of 3 challenge relays (quorum 2); missing: {}",
+                            norm(&r[2].url)
+                        )))
+                );
+                let outbox = Outbox::load(&s.home);
+                assert_eq!(outbox.entries.len(), 1);
+                assert_eq!(outbox.entries[0].event, writes(&r[0])[0]);
+                assert_eq!(
+                    outbox.entries[0]
+                        .missing
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    vec![norm(&r[2].url)]
+                );
+                // Every relay up: not degraded.
+                r[2].online.store(true, Ordering::SeqCst);
+                let r2 = three(roster(&s)).await;
+                let body = command(&s.home, &r2, &status).await.unwrap();
+                assert_eq!(body["relay_quorum"]["degraded"], false);
+                assert_eq!(body["relay_quorum"]["warnings"], json!([]));
+            }
+
+            /// The degraded warning reaches stderr (and stdout stays the JSON body).
+            #[test]
+            fn degraded_warning_and_resend_are_printed_on_stderr() {
+                let rt = rt();
+                let s = setup("stderr");
+                let r = rt.block_on(three(roster(&s)));
+                r[2].online.store(false, Ordering::SeqCst);
+                let line = |cmd: &str| {
+                    args(&format!(
+                        "{cmd} --buyer {} --home {} {} --json",
+                        s.buyer,
+                        s.root.display(),
+                        relay_args(&r)
+                    ))
+                };
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                assert_eq!(run(&line("leave"), &mut out, &mut err), 0);
+                let err = String::from_utf8(err).unwrap();
+                assert!(
+                    err.contains(&format!(
+                        "Warning: degraded read: 2 of 3 challenge relays (quorum 2); missing: {}",
+                        norm(&r[2].url)
+                    )),
+                    "{err}"
+                );
+                assert!(err.contains(&format!("Warning: degraded publish: 2 of 3 challenge relays (quorum 2); missing: {}", norm(&r[2].url))), "{err}");
+                let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+                assert_eq!(body["relay_quorum"]["degraded"], true);
+                r[2].online.store(true, Ordering::SeqCst);
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                assert_eq!(run(&line("status"), &mut out, &mut err), 0);
+                let err = String::from_utf8(err).unwrap();
+                assert!(
+                    err.contains(&format!(
+                        "Re-sent missed event {} -> {}",
+                        writes(&r[0])[0].id.to_hex(),
+                        norm(&r[2].url)
+                    )),
+                    "{err}"
+                );
+                assert!(!err.contains("Warning: degraded"), "{err}");
+            }
+
+            #[tokio::test]
+            async fn below_quorum_read_and_publish_fail_closed_and_queue_nothing() {
+                let s = setup("below");
+                let r = three(roster(&s)).await;
+                for f in &r[1..] {
+                    f.online.store(false, Ordering::SeqCst);
+                }
+                let error = command(&s.home, &r, &format!("status --buyer {} --json", s.buyer))
+                    .await
+                    .unwrap_err();
+                assert!(error.starts_with("challenge relay read incomplete; quorum not met (1 of 3 relays complete, need 2); failed: "), "{error}");
+                let error = command(
+                    &s.home,
+                    &r,
+                    &format!("join --buyer {} --minutes 90", s.buyer),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.contains("quorum not met (1 of 3"), "{error}");
+                let error = command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("quorum not met (1 of 3"), "{error}");
+                assert!(
+                    r.iter().all(|f| writes(f).is_empty()),
+                    "published below the read quorum"
+                );
+                // Every relay readable, two refuse the write: 1 of 3 acknowledgements.
+                for f in &r[1..] {
+                    f.online.store(true, Ordering::SeqCst);
+                    f.accept.store(false, Ordering::SeqCst);
+                }
+                let error = command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                    .await
+                    .unwrap_err();
+                assert!(error.starts_with("challenge publish incomplete; quorum not met (1 of 3 relays accepted, need 2); failed: "), "{error}");
+                assert!(
+                    error.contains(&norm(&r[1].url))
+                        && error.contains(&norm(&r[2].url))
+                        && !error.contains(&norm(&r[0].url)),
+                    "{error}"
+                );
+                assert!(
+                    !Outbox::path(&s.home).exists(),
+                    "a failed publish is never queued for re-send"
+                );
+                // An explicit --quorum 3 needs every relay.
+                let mut o =
+                    crate::cli::parse(&args(&format!("status --buyer {} --quorum 3", s.buyer)))
+                        .unwrap();
+                o.relays = r.iter().map(|f| f.url.clone()).collect();
+                r[2].online.store(false, Ordering::SeqCst);
+                let error = execute_async(&o, &s.home).await.unwrap_err();
+                assert!(
+                    error.starts_with("challenge relay read incomplete; failed: "),
+                    "{error}"
+                );
+            }
+
+            #[test]
+            fn quorum_setting_defaults_to_two_and_must_be_a_majority() {
+                let u = |n: u16| {
+                    (0..n)
+                        .map(|i| format!("ws://127.0.0.1:{}", 1000 + i))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(Relays::new(&[]).unwrap().quorum(), (2, 3), "default relays");
+                for (n, q) in [(1, 1), (2, 2), (3, 2), (4, 3), (5, 3)] {
+                    assert_eq!(
+                        Relays::new(&u(n)).unwrap().quorum(),
+                        (q, n as usize),
+                        "{n} relays"
+                    );
+                }
+                for q in [0, 1, 4] {
+                    assert!(Relays::with_quorum(&u(3), Some(q)).is_err(), "quorum {q}");
+                }
+                for q in [2, 3] {
+                    assert_eq!(
+                        Relays::with_quorum(&u(3), Some(q)).unwrap().quorum(),
+                        (q, 3)
+                    );
+                }
+                assert_eq!(
+                    crate::cli::parse(&args("status --buyer abc --quorum 3"))
+                        .unwrap()
+                        .quorum,
+                    Some(3)
+                );
+                for bad in [
+                    "status --buyer abc --quorum x",
+                    "status --buyer abc --quorum 2 --quorum 3",
+                    "status --buyer abc --quorum",
+                ] {
+                    assert!(crate::cli::parse(&args(bad)).is_err(), "{bad}");
+                }
+            }
+
+            #[tokio::test]
+            async fn resend_delivers_the_exact_signed_event_once_when_the_relay_returns() {
+                let s = setup("resend");
+                let r = three(roster(&s)).await;
+                r[2].online.store(false, Ordering::SeqCst);
+                command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                    .await
+                    .unwrap();
+                let sent = writes(&r[0])[0].clone();
+                let c = norm(&r[2].url);
+                let status = format!("status --buyer {} --json", s.buyer);
+                // Still down: never tried (only relays that answered this run are), attempts unchanged.
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(body["relay_quorum"]["resent"], json!([]));
+                assert_eq!(Outbox::load(&s.home).entries[0].missing.get(&c), Some(&0));
+                // Back, but refusing writes: one failed attempt is counted.
+                r[2].online.store(true, Ordering::SeqCst);
+                r[2].accept.store(false, Ordering::SeqCst);
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(body["relay_quorum"]["resent"], json!([]));
+                assert_eq!(writes(&r[2]).len(), 1);
+                assert_eq!(Outbox::load(&s.home).entries[0].missing.get(&c), Some(&1));
+                // Accepting: the very same signed event (id and signature), never re-signed.
+                r[2].accept.store(true, Ordering::SeqCst);
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(
+                    body["relay_quorum"]["resent"],
+                    json!([format!("{} -> {c}", sent.id.to_hex())])
+                );
+                let w = writes(&r[2]);
+                assert_eq!(w.len(), 2);
+                assert_eq!(w[1], sent);
+                assert_eq!(w[1].sig, sent.sig);
+                assert!(Outbox::load(&s.home).entries.is_empty());
+                // Idempotent: delivered entries are gone, nothing is sent again.
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(body["relay_quorum"]["resent"], json!([]));
+                assert_eq!(writes(&r[2]).len(), 2);
+                assert_eq!((writes(&r[0]).len(), writes(&r[1]).len()), (1, 1));
+            }
+
+            #[test]
+            fn outbox_is_bounded_superseding_and_own_signed_only() {
+                use std::os::unix::fs::PermissionsExt;
+                let s = setup("outbox");
+                let ev = |k: &Keys, d: &str, t: u64| {
+                    EventBuilder::new(Kind::from(CHALLENGE_MEMBERSHIP_KIND), "")
+                        .tags([Tag::identifier(d)])
+                        .custom_created_at(Timestamp::from(t))
+                        .sign_with_keys(k)
+                        .unwrap()
+                };
+                let c = vec!["ws://c/".to_owned()];
+                let mut o = Outbox::default();
+                for i in 0..70u64 {
+                    o.queue(&ev(&s.seller, &format!("d{i}"), 100), &c, 1000 + i);
+                }
+                assert_eq!(o.entries.len(), OUTBOX_MAX_ENTRIES);
+                assert_eq!(o.entries[0].queued_at, 1006, "oldest dropped first");
+                // A newer version of the same coordinate supersedes; an older one never replaces it.
+                let mut o = Outbox::default();
+                o.queue(&ev(&s.seller, "x", 100), &c, 1);
+                o.queue(&ev(&s.seller, "x", 101), &c, 2);
+                o.queue(&ev(&s.seller, "x", 99), &c, 3);
+                assert_eq!(o.entries.len(), 1);
+                assert_eq!(o.entries[0].event.created_at.as_secs(), 101);
+                o.queue(&ev(&s.seller, "x", 102), &[], 4);
+                assert!(
+                    o.entries.is_empty(),
+                    "delivered everywhere: the older entry is moot"
+                );
+                // Attempts and age are bounded.
+                o.queue(&ev(&s.seller, "y", 100), &c, 10);
+                *o.entries[0].missing.get_mut("ws://c/").unwrap() = OUTBOX_MAX_ATTEMPTS;
+                o.prune(10);
+                assert!(o.entries.is_empty());
+                o.queue(&ev(&s.seller, "y", 100), &c, 10);
+                o.prune(10 + OUTBOX_MAX_AGE_SECS + 1);
+                assert!(o.entries.is_empty());
+                // Round trip with a private file; foreign or tampered entries are dropped on load.
+                o.queue(&ev(&s.seller, "z", 100), &c, 10);
+                o.save(&s.home).unwrap();
+                let mode = std::fs::metadata(Outbox::path(&s.home))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o600);
+                assert_eq!(Outbox::load(&s.home).entries, o.entries);
+                let mut tampered = ev(&s.seller, "t", 100);
+                tampered.content = "changed".into();
+                let rows = json!([
+                    {"event": ev(&s.buyer_keys, "f", 100), "missing": {"ws://c/": 0}, "queued_at": 10},
+                    {"event": tampered, "missing": {"ws://c/": 0}, "queued_at": 10},
+                ]);
+                std::fs::write(Outbox::path(&s.home), rows.to_string()).unwrap();
+                assert!(Outbox::load(&s.home).entries.is_empty());
+            }
+
+            /// The minutes-change challenge read stays an every-relay read: quorum met is not enough.
+            #[tokio::test]
+            async fn minutes_change_still_needs_every_relay_when_quorum_is_met() {
+                let s = setup("minutes");
+                let now = Timestamp::now().as_secs();
+                let r = three(vec![
+                    challenge_event(
+                        &s.buyer_keys,
+                        "day",
+                        now - 100,
+                        now + 3600,
+                        "in_progress",
+                        now - 30_000,
+                    ),
+                    decision(&s.buyer_keys, &s.seller, "accepted", now - 19_000),
+                    membership(&s.seller, &s.buyer, "joined", now - 20_000, now - 20_000),
+                ])
+                .await;
+                r[2].online.store(false, Ordering::SeqCst);
+                let error = command(
+                    &s.home,
+                    &r,
+                    &format!("join --buyer {} --minutes 120", s.buyer),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.starts_with("could not read the buyer's challenge state reliably (challenge relay read incomplete; failed: "), "{error}");
+                assert!(r.iter().all(|f| writes(f).is_empty()));
+                // Every relay up: the ordinary refusal ("You're in today's challenge").
+                r[2].online.store(true, Ordering::SeqCst);
+                let error = command(
+                    &s.home,
+                    &r,
+                    &format!("join --buyer {} --minutes 120", s.buyer),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.starts_with("You're in today's challenge"), "{error}");
+                assert!(r.iter().all(|f| writes(f).is_empty()));
+            }
+
+            /// Advisor r1 nit: an outbox entry past its age bound no longer counts in a read, even
+            /// on the command that expires it.
+            #[tokio::test]
+            async fn expired_outbox_entry_no_longer_counts_in_reads() {
+                let s = setup("expired");
+                let r = three(roster(&s)).await;
+                r[2].online.store(false, Ordering::SeqCst);
+                command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                    .await
+                    .unwrap();
+                let mut outbox = Outbox::load(&s.home);
+                outbox.entries[0].queued_at = Timestamp::now().as_secs() - OUTBOX_MAX_AGE_SECS - 10;
+                outbox.save(&s.home).unwrap();
+                let status = format!("status --buyer {} --json", s.buyer);
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(body["members"][0]["membership"]["status"], "joined");
+                assert!(
+                    Outbox::load(&s.home).entries.is_empty(),
+                    "pruned by that command"
+                );
+            }
+
+            /// Advisor r2: an entry past its age or attempt bound is not re-sent by the command
+            /// that expires it, even when the relay that missed it answers again.
+            #[tokio::test]
+            async fn expired_outbox_entry_is_not_resent_by_the_expiring_command() {
+                for (name, by_age) in [("expired-age", true), ("expired-attempts", false)] {
+                    let s = setup(name);
+                    let r = three(roster(&s)).await;
+                    r[2].online.store(false, Ordering::SeqCst);
+                    command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                        .await
+                        .unwrap();
+                    let mut outbox = Outbox::load(&s.home);
+                    let id = outbox.entries[0].event.id;
+                    if by_age {
+                        outbox.entries[0].queued_at =
+                            Timestamp::now().as_secs() - OUTBOX_MAX_AGE_SECS - 10;
+                    } else {
+                        for n in outbox.entries[0].missing.values_mut() {
+                            *n = OUTBOX_MAX_ATTEMPTS;
+                        }
+                    }
+                    outbox.save(&s.home).unwrap();
+                    r[2].online.store(true, Ordering::SeqCst);
+                    let status = format!("status --buyer {} --json", s.buyer);
+                    command(&s.home, &r, &status).await.unwrap();
+                    assert!(
+                        writes(&r[2]).iter().all(|e| e.id != id),
+                        "{name}: expired entry re-sent"
+                    );
+                    assert!(Outbox::load(&s.home).entries.is_empty(), "{name}");
+                }
+            }
+
+            /// Advisor r1 H2: the buyer's acceptance is only on the relay that is down. The quorum
+            /// decision read then shows "not accepted"; that must not skip the every-relay check.
+            #[tokio::test]
+            async fn minutes_change_refused_when_acceptance_is_only_on_the_down_relay() {
+                let s = setup("h2");
+                let now = Timestamp::now().as_secs();
+                let open = challenge_event(
+                    &s.buyer_keys,
+                    "day",
+                    now - 100,
+                    now + 3600,
+                    "in_progress",
+                    now - 30_000,
+                );
+                let joined = membership(&s.seller, &s.buyer, "joined", now - 20_000, now - 20_000);
+                let accepted = decision(&s.buyer_keys, &s.seller, "accepted", now - 19_000);
+                let r = vec![
+                    relay_like(vec![open.clone(), joined.clone()], vec![]).await,
+                    relay_like(vec![open.clone(), joined.clone()], vec![]).await,
+                    relay_like(vec![open, joined, accepted], vec![]).await,
+                ];
+                r[2].online.store(false, Ordering::SeqCst);
+                for change in ["--minutes 120", "--minutes 60 --note changed"] {
+                    let error = command(&s.home, &r, &format!("join --buyer {} {change}", s.buyer))
+                        .await
+                        .unwrap_err();
+                    assert!(error.starts_with("could not read the buyer's challenge state reliably (challenge relay read incomplete; failed: "), "{error}");
+                }
+                assert!(
+                    r.iter().all(|f| writes(f).is_empty()),
+                    "published while degraded"
+                );
+                // Relay back: the strict read sees the acceptance and the running challenge.
+                r[2].online.store(true, Ordering::SeqCst);
+                let error = command(
+                    &s.home,
+                    &r,
+                    &format!("join --buyer {} --minutes 120", s.buyer),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.starts_with("You're in today's challenge"), "{error}");
+                assert!(r.iter().all(|f| writes(f).is_empty()));
+                // Not degraded and genuinely not accepted (no decision anywhere): publishes, as before.
+                let s2 = setup("h2-pending");
+                let open = challenge_event(
+                    &s2.buyer_keys,
+                    "day",
+                    now - 100,
+                    now + 3600,
+                    "in_progress",
+                    now - 30_000,
+                );
+                let r = three(vec![
+                    open,
+                    membership(&s2.seller, &s2.buyer, "joined", now - 20_000, now - 20_000),
+                ])
+                .await;
+                command(
+                    &s2.home,
+                    &r,
+                    &format!("join --buyer {} --minutes 120", s2.buyer),
+                )
+                .await
+                .unwrap();
+                assert!(r.iter().all(|f| writes(f).len() == 1));
+            }
+
+            /// Closed-challenge refusal (exit 3) still works at quorum; a non-terminal update over an
+            /// existing challenge while degraded needs every relay; completion does not.
+            #[test]
+            fn closed_refusal_and_degraded_updates_over_an_existing_challenge() {
+                let rt = rt();
+                let s = setup("publish");
+                let buyer = s.seller.clone(); // this home publishes as the buyer here
+                let now = Timestamp::now().as_secs();
+                let open = challenge_event(
+                    &buyer,
+                    "today",
+                    now - 60,
+                    now + 3600,
+                    "in_progress",
+                    now - 30,
+                );
+                let close =
+                    challenge_event(&buyer, "today", now - 60, now + 3600, "cancelled", now - 10);
+                let goal = s.root.join("goal.md");
+                std::fs::write(&goal, "Goal").unwrap();
+                let iso = |t| Timestamp::from(t).to_human_datetime();
+                let publish = |r: &[Fixture], status: &str| {
+                    args(&format!(
+                        "publish --home {} {} --id today --title today --goal-file {} --starts {} --ends {} --budget-sats 0 --status {status} --result done",
+                        s.root.display(),
+                        relay_args(r),
+                        goal.display(),
+                        iso(now - 60),
+                        iso(now + 3600)
+                    ))
+                };
+                let run_ = |a: Vec<String>| {
+                    let (mut out, mut err) = (Vec::new(), Vec::new());
+                    let code = run(&a, &mut out, &mut err);
+                    (code, String::from_utf8(err).unwrap())
+                };
+                // The close is on 2 of 3 relays and the third is down: still refused with exit 3.
+                let r = rt.block_on(three(vec![open.clone(), close]));
+                r[2].online.store(false, Ordering::SeqCst);
+                let (code, err) = run_(publish(&r, "in_progress"));
+                assert_eq!(code, CLOSED_EXIT, "{err}");
+                assert!(
+                    err.contains("challenge: challenge closed (cancelled)"),
+                    "{err}"
+                );
+                assert!(r.iter().all(|f| writes(f).is_empty()));
+                // Open challenge, one relay down: an in_progress update could resurrect a close held
+                // only by the missing relay, so it needs every relay.
+                let r = rt.block_on(three(vec![open.clone()]));
+                r[2].online.store(false, Ordering::SeqCst);
+                let (code, err) = run_(publish(&r, "in_progress"));
+                assert_eq!(code, 2, "{err}");
+                assert!(err.contains("needs every relay"), "{err}");
+                assert!(r.iter().all(|f| writes(f).is_empty()));
+                // Completion is final either way: published at quorum, degraded.
+                let (code, err) = run_(publish(&r, "completed"));
+                assert_eq!(code, 0, "{err}");
+                assert!(err.contains("Warning: degraded publish: 2 of 3"), "{err}");
+                assert_eq!(
+                    (
+                        writes(&r[0]).len(),
+                        writes(&r[1]).len(),
+                        writes(&r[2]).len()
+                    ),
+                    (1, 1, 0)
+                );
+                // This home's own completion is still queued for the relay that missed it, so even
+                // relays that never stored it cannot make an in_progress update overwrite it.
+                let r = rt.block_on(three(vec![open.clone()]));
+                let (code, err) = run_(publish(&r, "in_progress"));
+                assert_eq!(code, CLOSED_EXIT, "{err}");
+                assert!(r.iter().all(|f| writes(f).is_empty()));
+                // Every relay up, nothing queued: the in_progress update publishes as before.
+                std::fs::remove_file(Outbox::path(&s.home)).unwrap();
+                let r = rt.block_on(three(vec![open]));
+                let (code, err) = run_(publish(&r, "in_progress"));
+                assert_eq!(code, 0, "{err}");
+                assert!(r.iter().all(|f| writes(f).len() == 1));
+            }
+
+            /// The quorum's limit, stated as a test: a completed quorum read in which every answering
+            /// relay omits an accepted event. The fixtures never serve writes, so after a degraded
+            /// `leave` every relay that answers "omits" it. While this home still has the event
+            /// queued for the missing relay, the read includes it; without that, the read shows the
+            /// older `joined` (only an every-relay read, or an honest overlapping relay, sees it).
+            #[tokio::test]
+            async fn quorum_read_omitting_an_accepted_publish_still_sees_this_homes_queued_event() {
+                let s = setup("omit");
+                let r = three(roster(&s)).await;
+                r[2].online.store(false, Ordering::SeqCst);
+                command(&s.home, &r, &format!("leave --buyer {}", s.buyer))
+                    .await
+                    .unwrap();
+                let status = format!("status --buyer {} --json", s.buyer);
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(body["members"][0]["membership"]["status"], "left");
+                std::fs::remove_file(Outbox::path(&s.home)).unwrap();
+                let body = command(&s.home, &r, &status).await.unwrap();
+                assert_eq!(
+                    body["members"][0]["membership"]["status"], "joined",
+                    "the omission this cannot detect"
+                );
+            }
+        }
+        // END quorum tests
     }
 }
