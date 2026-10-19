@@ -1008,9 +1008,8 @@ export class Swarm {
     return `assignments rejected (immediate retry ${Math.max(...open.map(k=>counts[k]))} of ${REJECTION_RETRIES_PER_ERROR})`;
   }
   // Records an assign call: pending changes are consumed; the plan the response left is the new base.
-  // The last batch's rejections are now in front of the planner (F-5 c).
+  // (day.rejectedUnseen needs no reset here: every completed batch replaces day.rejected.)
   assignCalled(key,day,now,ok) {
-    delete day.rejectedUnseen;
     const cad=this.cadence.get(key);if(!cad)return;
     cad.pending.clear();cad.calledAt=now;cad.failed=!ok;cad.facts={...cad.facts,plan:factHash(day.plan)};
   }
@@ -1549,7 +1548,7 @@ export class Swarm {
             const posted=await this.post(args);j.id=posted.job_id??posted.preparation_id;
             if(!j.id)throw Error('Post returned no job or preparation id');this.save();
           }
-          if(rejected.length)day.rejectedUnseen=true;
+          if(rejected.length)day.rejectedUnseen=true;else delete day.rejectedUnseen;
           if(rejected.length||hadRejected)this.save();
           if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length && !awaitingAccept().length)stop('Unsolved: budget exhausted');
         }

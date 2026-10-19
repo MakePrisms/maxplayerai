@@ -2848,10 +2848,11 @@ test('F-5 (b): a finished job is never presented as running: plan fields, plan r
   assert.deepEqual(input.awaitingAccept,[{jobId:'job-ws1',seller:'a',workstream:'ws1',status:'collect refused',busyUntil:650}]);
   assert.deepEqual(input.sellers.map(s=>s.pubkey),['b','c'],'its seller stays busy until the meter closes');
   // A plan echoed back with the overlay is journaled without it; a correction set is logged once.
-  f.setPlan(x=>x.mode==='assign'?{wait:true,idleReason:'test',plan:x.plan}:{wait:true});
+  f.io.plan=async x=>{f.inputs.push(structuredClone(x));return x.mode==='assign'?{wait:true,idleReason:'test',plan:x.plan}:{wait:true};};
   f.snap.budget.totalSats=2000;await f.ticks(105,3);
   const saved=Object.values(f.journal.state.days)[0].plan;
-  assert.ok(saved.workstreams.every(w=>!('record' in w)));
+  assert.equal(saved.workstreams[0].status,'collect refused','the echoed plan was saved');
+  assert.ok(saved.workstreams.every(w=>!('record' in w)),'without the runner overlay');
   assert.equal(f.reports.filter(r=>r.startsWith('Planner plan status corrected')).length,1);
 });
 test('F-5 (c): a rejected assignment re-asks at once with validWorkstreams, at most 2 immediate retries per distinct error per day, then the normal cadence (logged)',async()=>{
@@ -2877,6 +2878,11 @@ test('F-5 (a): free payable sellers and no assignment need an idleReason: one re
   assert.throws(()=>validatePlan({wait:true,idleReason:''}),/idleReason must be a non-empty string/);
   assert.throws(()=>validatePlan({wait:true,idleReason:3}),/idleReason must be a non-empty string/);
   assert.equal(validatePlan({assignments:[],idleReason:'x'}).idleReason,'x');
+  const {affordableSellers}=await import('./swarm.mjs');
+  const free={pubkey:'f',capabilities:[['takes_payment','none'],['rate','5']]},paid={pubkey:'p',capabilities:[['rate','5']]},unread={pubkey:'u',capabilities:[]};
+  assert.deepEqual(affordableSellers([free,paid,unread],4).map(s=>s.pubkey),['f','u']);
+  assert.deepEqual(affordableSellers([free,paid,unread],5).map(s=>s.pubkey),['f','p','u']);
+  assert.deepEqual(affordableSellers([free,paid,unread],100,{paidRefused:true}).map(s=>s.pubkey),['f','u'],'a free seat needs no release proof');
   // Neither, twice: one retry in the same tick, then accepted as idle with the fallback reason.
   const f=s2Fixture({sellers:['a','b']});f.c.updateEvery=1;f.setPlan(()=>({wait:true}));
   await f.ticks(100,20);
