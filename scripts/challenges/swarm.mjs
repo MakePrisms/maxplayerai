@@ -284,10 +284,13 @@ export class Journal {
     // A partial copy from a crashed earlier attempt was never renamed into place; the journal is
     // still the untouched legacy original, so the partial copy is discarded.
     for(const name of fs.readdirSync(dir).filter(n=>n.startsWith(`${base}.legacy-`)&&n.endsWith('.tmp')))fs.unlinkSync(join(dir,name));
-    // An earlier, interrupted migration of this same file already kept it: reuse that copy.
+    // An earlier, interrupted migration of this same file already kept it: reuse that copy, but only
+    // when it IS this journal: the same inode (hard link) or a byte-for-byte copy. Equal size alone is
+    // not identity: an older same-length leftover would be taken as the backup and this history lost.
     for(const name of fs.readdirSync(dir).filter(n=>n.startsWith(`${base}.legacy-`)&&!n.endsWith('.tmp')).sort()) {
       const st=fs.statSync(join(dir,name));
-      if((st.ino===cur.ino&&st.dev===cur.dev)||st.size===cur.size)return join(dir,name);
+      if(st.ino===cur.ino&&st.dev===cur.dev)return join(dir,name);
+      if(st.size===cur.size&&this.sameBytes(path,join(dir,name),chunkBytes))return join(dir,name);
     }
     const syncDir=()=>{let d;try{d=fs.openSync(dir,'r');fs.fsyncSync(d);}catch(e){if(!['EINVAL','EPERM','EISDIR','ENOTSUP'].includes(e.code))throw e;}finally{if(d!==undefined)fs.closeSync(d);}};
     let target=legacyJournalName(path,now());
@@ -305,6 +308,19 @@ export class Journal {
       fs.fsyncSync(dst);
     } finally {if(src!==undefined)fs.closeSync(src);if(dst!==undefined)fs.closeSync(dst);}
     fs.renameSync(tmp,target);syncDir();return target;
+  }
+  // Streams both files in chunks (never one buffer) and compares them byte for byte.
+  sameBytes(a,b,chunkBytes) {
+    const {fs}=this,x=Buffer.alloc(chunkBytes),y=Buffer.alloc(chunkBytes);let fa,fb;
+    const fill=(fd,buf,pos)=>{let n=0;for(;n<buf.length;){const r=fs.readSync(fd,buf,n,buf.length-n,pos+n);if(!r)break;n+=r;}return n;};
+    try {
+      fa=fs.openSync(a,'r');fb=fs.openSync(b,'r');
+      for(let pos=0;;pos+=chunkBytes) {
+        const n=fill(fa,x,pos),m=fill(fb,y,pos);
+        if(n!==m||!x.subarray(0,n).equals(y.subarray(0,m)))return false;
+        if(n<chunkBytes)return true;
+      }
+    } finally {if(fa!==undefined)fs.closeSync(fa);if(fb!==undefined)fs.closeSync(fb);}
   }
   save() {
     const {fs}=this,tmp=`${this.path}.tmp`;let fd,renamed=false;

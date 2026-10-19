@@ -1736,3 +1736,29 @@ test('R3-5: migration keeps the legacy journal as events.jsonl.legacy-<timestamp
     } finally {rmSync(dir,{recursive:true});}
   }
 });
+
+// Advisor r1 M2: reuse after a crash required only equal size, so an older same-length leftover
+// legacy file was taken as the backup and this journal's history was lost. Identity is the same
+// inode or the same bytes.
+test('R3-5 (advisor r1 M2): a same-size decoy legacy file is not reused; the audit records survive',()=>{
+  const fs=process.getBuiltinModule('node:fs');
+  const at=Date.UTC(2026,9,18,16,0,0);
+  for(const mode of ['link','copy']) {
+    const dir=mkdtempSync(join(tmpdir(),`swarm-m2-${mode}-`)),path=join(dir,'events.jsonl');
+    const noLink=mode==='copy'?{linkSync:()=>{throw Object.assign(Error('no links'),{code:'EPERM'});}}:{};
+    try {
+      const rec=tag=>JSON.stringify({jobs:[{id:tag}],days:{}});
+      fs.writeFileSync(path,rec('audit-first')+'\n'+rec('audit-last')+'\n');const original=fs.readFileSync(path);
+      // A different file of exactly the same length, left by an older migration.
+      const decoy=join(dir,'events.jsonl.legacy-OLD'),decoyBytes=Buffer.from(original.toString().replace('audit-first','decoy-first'));
+      assert.equal(decoyBytes.length,original.length);fs.writeFileSync(decoy,decoyBytes);
+      const j=new Journal(path,{now:()=>at,chunkBytes:16,fs:noLink});
+      assert.notEqual(j.migrated.legacyPath,decoy,`${mode}: decoy not taken as the backup`);
+      assert.deepEqual(fs.readFileSync(j.migrated.legacyPath),original,`${mode}: audit history kept byte for byte`);
+      assert.deepEqual(fs.readFileSync(decoy),decoyBytes,'decoy untouched');
+      const kept=fs.readdirSync(dir).filter(n=>n.includes('.legacy-')).map(n=>fs.readFileSync(join(dir,n),'utf8')).join('');
+      assert.match(kept,/audit-first/,'audit-first survives in a kept file');
+      assert.equal(j.state.jobs[0].id,'audit-last');
+    } finally {rmSync(dir,{recursive:true});}
+  }
+});
