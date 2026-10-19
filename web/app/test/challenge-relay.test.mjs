@@ -102,9 +102,15 @@ test('split sources union IDs, reject cross-kind events, and tolerate a failed p
   assert.ok(!reader.trade.filters.has(`30340-${buyer}`),'metadata only for buyer-accepted sellers');
   for(const r of [reader.trade,...reader.challenges.slice(0,2)])for(const id of [...r.pages.keys()])r.ws.message(['EOSE',id]);
   reader.challenges[2].ws.close();
-  assert.equal(reader.status.connected,true);assert.equal(reader.status.historyComplete,false);
-  assert.deepEqual(reader.status.failedRelays,['ws://bad']);assert.match(reader.status.error,/ws:\/\/bad/);
-  reader.challenges[0].ws.close();reader.challenges[1].ws.close();
+  // Run 2 #13: 2 of 3 complete meets the default quorum: ready, degraded, with a warning naming the
+  // missing relay (it used to block everything).
+  assert.equal(reader.status.connected,true);assert.equal(reader.status.historyComplete,true);
+  assert.deepEqual(reader.status.failedRelays,['ws://bad']);assert.equal(reader.status.error,null);
+  assert.equal(reader.status.degraded,true);assert.deepEqual(reader.status.missingRelays,['ws://bad']);
+  assert.ok(reader.status.warnings.some(w=>/^Degraded: 2 of 3 challenge relays complete \(quorum 2\); missing: ws:\/\/bad$/.test(w)),reader.status.warnings.join('; '));
+  reader.challenges[1].ws.close();
+  assert.equal(reader.status.historyComplete,false,'1 of 3: below quorum');assert.match(reader.status.error,/quorum not met \(1 of 3/);
+  reader.challenges[0].ws.close();
   assert.equal(reader.status.connected,false);assert.match(reader.status.error,/incomplete/);
 });
 test('public relays stream post-EOSE without AUTH and use distinct per-relay ephemeral identities',t=>{

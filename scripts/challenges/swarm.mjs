@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import {challengeTaskPrefix} from '../../web/app/src/challenge/shared/events.mjs';
-import { parseChallengeRelays } from '../../web/app/src/challenge/shared/relay.mjs';
+import { parseChallengeRelays, parseChallengeQuorum } from '../../web/app/src/challenge/shared/relay.mjs';
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, linkSync, readdirSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS, waitingOnHarnessProbe } from './coordinator.mjs';
+import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS, waitingOnHarnessProbe } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 // Process groups of in-flight commands, so a runner told to stop can kill them (planner, MCP).
@@ -233,9 +233,20 @@ export const MIN_EXPIRED_SLOT_GRACE_SECONDS = SELLER_EXECUTION_TAIL_SECONDS + SL
 // (never read as one string), the last complete record is authoritative (earlier records are
 // superseded copies; a torn final append was never acknowledged), and it is rewritten atomically
 // as a single record. A corrupt LAST complete record still fails startup.
+// R3-5: the legacy file is the audit history (every task, answer and receipt over time), so it is
+// KEPT, never rewritten: before the rewrite it is hard-linked (same inode, no copy of a GB-sized
+// file; a chunked copy + fsync + rename where links are unsupported) to
+// <journal>.legacy-<UTC timestamp>, and the directory is fsynced; only then is the journal
+// replaced. A crash between the two leaves the journal still legacy and the kept file in place: the
+// next open finds that file (same inode and device for a link, or the same size and equal bytes for
+// a copy) and reuses it, so a migration never produces a second kept copy. After the rewrite the
+// journal is one record, so it is never migrated again. `migrated.legacyPath` names the kept file; the runner logs it.
 export const JOURNAL_CHUNK_BYTES = 1<<20;
+export const legacyJournalName = (path,ms) => `${path}.legacy-${new Date(ms).toISOString().replace(/[-:]/g,'').replace(/\.\d+Z$/,'Z')}`;
 export class Journal {
-  constructor(path,{fs={openSync,readSync,writeSync,fsyncSync,closeSync,renameSync,unlinkSync,fstatSync},chunkBytes=JOURNAL_CHUNK_BYTES}={}) {
+  constructor(path,{fs={},chunkBytes=JOURNAL_CHUNK_BYTES,now=Date.now}={}) {
+    // Injected fs functions override node:fs ones; anything not injected is the real one.
+    fs={openSync,readSync,writeSync,fsyncSync,closeSync,renameSync,unlinkSync,fstatSync,linkSync,readdirSync,statSync,...fs};
     this.path=path; this.fs=fs; this.state={jobs:[],days:{}};
     let fd;try{fd=fs.openSync(path,'r');}catch(e){if(e.code!=='ENOENT')throw e;}
     if(fd===undefined)return;
@@ -264,7 +275,52 @@ export class Journal {
       }
     } finally {fs.closeSync(fd);}
     // Legacy append journal (several records) or a torn tail: rewrite as one atomic record.
-    if(records>1||torn){this.migrated={records,torn};this.save();}
+    if(records>1||torn){this.migrated={records,torn,legacyPath:this.keepLegacy(chunkBytes,now)};this.save();}
+  }
+  // R3-5: keep the legacy journal before it is replaced (see above). Returns the kept path.
+  keepLegacy(chunkBytes,now) {
+    const {fs,path}=this,dir=dirname(path),base=path.slice(dir.length+1);
+    const cur=fs.statSync(path);
+    // A partial copy from a crashed earlier attempt was never renamed into place; the journal is
+    // still the untouched legacy original, so the partial copy is discarded.
+    for(const name of fs.readdirSync(dir).filter(n=>n.startsWith(`${base}.legacy-`)&&n.endsWith('.tmp')))fs.unlinkSync(join(dir,name));
+    // An earlier, interrupted migration of this same file already kept it: reuse that copy, but only
+    // when it IS this journal: the same inode (hard link) or a byte-for-byte copy. Equal size alone is
+    // not identity: an older same-length leftover would be taken as the backup and this history lost.
+    for(const name of fs.readdirSync(dir).filter(n=>n.startsWith(`${base}.legacy-`)&&!n.endsWith('.tmp')).sort()) {
+      const st=fs.statSync(join(dir,name));
+      if(st.ino===cur.ino&&st.dev===cur.dev)return join(dir,name);
+      if(st.size===cur.size&&this.sameBytes(path,join(dir,name),chunkBytes))return join(dir,name);
+    }
+    const syncDir=()=>{let d;try{d=fs.openSync(dir,'r');fs.fsyncSync(d);}catch(e){if(!['EINVAL','EPERM','EISDIR','ENOTSUP'].includes(e.code))throw e;}finally{if(d!==undefined)fs.closeSync(d);}};
+    let target=legacyJournalName(path,now());
+    for(let n=1;;n++) {
+      try{fs.statSync(target);}catch(e){if(e.code==='ENOENT')break;throw e;}
+      target=`${legacyJournalName(path,now())}-${n}`;
+    }
+    try {fs.linkSync(path,target);syncDir();return target;}
+    catch(e) {if(!['EPERM','ENOTSUP','EOPNOTSUPP','EXDEV','EMLINK','ENOSYS'].includes(e.code))throw e;}
+    // No hard links here: a chunked copy, fsynced, then renamed into place (never a partial copy).
+    const tmp=`${target}.tmp`,buf=Buffer.alloc(chunkBytes);let src,dst;
+    try {
+      src=fs.openSync(path,'r');dst=fs.openSync(tmp,'w',0o600);
+      for(let pos=0;;) {const n=fs.readSync(src,buf,0,chunkBytes,pos);if(!n)break;for(let o=0;o<n;)o+=fs.writeSync(dst,buf,o,n-o);pos+=n;}
+      fs.fsyncSync(dst);
+    } finally {if(src!==undefined)fs.closeSync(src);if(dst!==undefined)fs.closeSync(dst);}
+    fs.renameSync(tmp,target);syncDir();return target;
+  }
+  // Streams both files in chunks (never one buffer) and compares them byte for byte.
+  sameBytes(a,b,chunkBytes) {
+    const {fs}=this,x=Buffer.alloc(chunkBytes),y=Buffer.alloc(chunkBytes);let fa,fb;
+    const fill=(fd,buf,pos)=>{let n=0;for(;n<buf.length;){const r=fs.readSync(fd,buf,n,buf.length-n,pos+n);if(!r)break;n+=r;}return n;};
+    try {
+      fa=fs.openSync(a,'r');fb=fs.openSync(b,'r');
+      for(let pos=0;;pos+=chunkBytes) {
+        const n=fill(fa,x,pos),m=fill(fb,y,pos);
+        if(n!==m||!x.subarray(0,n).equals(y.subarray(0,m)))return false;
+        if(n<chunkBytes)return true;
+      }
+    } finally {if(fa!==undefined)fs.closeSync(fa);if(fb!==undefined)fs.closeSync(fb);}
   }
   save() {
     const {fs}=this,tmp=`${this.path}.tmp`;let fd,renamed=false;
@@ -312,15 +368,43 @@ export function jobBudget(j) {
     return {reservedSats:0,paidSats:pay.amount_sats};
   return {reservedSats:j.args.max_sats,paidSats:0};
 }
+// R3-1: a seller's advertised price floor, read from its heartbeat tags exactly as its own claim
+// gate reads its config (maxplayer-core seller.rs rate_gate_allows; heartbeat.rs
+// takes_no_payment_from_tags): a FREE offer (amountSats 0, payment=none) is claimed only by a seat
+// advertising ["takes_payment","none"] (value trimmed); a priced offer only at amount >= rate.
+// rate=0 without takes_payment=none is NOT free: such a seat claims priced offers of >= 1 sat only.
+// A seller with neither tag (no heartbeat read yet) has unknown pricing and is not checked here.
+export function sellerPricing(s) {
+  const tags=Array.isArray(s?.capabilities)?s.capabilities:[],first=name=>tags.find(t=>Array.isArray(t)&&t[0]===name)?.[1];
+  const takes=first('takes_payment'),rate=first('rate');
+  if(takes===undefined&&rate===undefined)return {known:false,free:false,rateSats:null,minimumSats:null};
+  const free=typeof takes==='string'&&takes.trim()==='none';
+  const parsed=typeof rate==='string'&&/^\s*[0-9]+\s*$/.test(rate)?Number(rate.trim()):null;
+  const rateSats=Number.isSafeInteger(parsed)?parsed:null;
+  return {known:true,free,rateSats,minimumSats:free?0:rateSats===null?null:Math.max(1,rateSats)};
+}
+// Why an assignment at amountSats would never be claimed by this seller (null when it would be).
+export function belowSellerMinimum(pricing,amountSats) {
+  if(!pricing?.known||pricing.free)return null;
+  if(amountSats===0)return pricing.minimumSats===null
+    ?'seller is paid (no takes_payment=none in its heartbeat; rate unreadable): a 0-sat offer is never claimed'
+    :`below seller minimum ${pricing.minimumSats} (no takes_payment=none in its heartbeat: a 0-sat offer is never claimed${pricing.rateSats===0?'; rate 0 is not free':''})`;
+  if(pricing.rateSats!==null&&amountSats<pricing.rateSats)return `below seller minimum ${pricing.rateSats} (offered ${amountSats})`;
+  return null;
+}
+// Planner feedback: the reasons of the last assign batch's rejected assignments, shown on every
+// planner call until the next assign batch replaces them.
+export const MAX_REJECTED_FEEDBACK = 50;
 export function sellerProfile(s,jobs) {
   const tags=s.capabilities??[], values=name=>tags.filter(t=>t[0]===name).flatMap(t=>t.slice(1));
+  const price=sellerPricing(s);
   const own=jobs.filter(j=>j.seller===s.pubkey);
   const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:plannerTask(j.args.task),workstream:j.workstream??null,
     outcome:j.outcome,delivered:j.outcome==='collected',turnaroundSeconds:(j.ts??j.created)-j.created}));
   return {pubkey:s.pubkey,npub:s.npub??'',name:s.name??'',agents:values('agents'),
     harness:{family:values('harness_family'),model:values('harness_model'),variant:values('harness_variant')},
     capabilities:values('capabilities'),hardware:values('hardware'),minutesRemaining:s.minutesRemaining,note:s.note??'',
-    pricing:{rateSats:values('rate'),takesPayment:values('takes_payment')},
+    pricing:{rateSats:values('rate'),takesPayment:values('takes_payment'),free:price.free,minimumSats:price.minimumSats},
     challengeSpend:{paidSats:own.reduce((n,j)=>n+jobBudget(j).paidSats,0),reservedSats:own.reduce((n,j)=>n+jobBudget(j).reservedSats,0)},
     trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
 }
@@ -346,6 +430,30 @@ export const PERMANENT_COLLECT_REFUSAL = 'review: permanent input error';
 // the recorded reason starts at the marker so it is never cut out by the 500-character cap.
 export const permanentCollectRefusal = message => String(message).includes(PERMANENT_COLLECT_REFUSAL);
 export const collectFailureReason = message => {const m=String(message),at=m.indexOf(PERMANENT_COLLECT_REFUSAL);return (at<0?m:m.slice(at)).slice(0,500);};
+// R3-8: a paid collect the buyer's WALLET refuses to reconcile. maxplayer-core payment_wallet.rs
+// PaymentWalletError::Reconcile displays as "wallet reconciliation refused: <reason>" (e.g. "wallet
+// has an incomplete ProofsReserved operation that could not be retired safely" from
+// recover_unmapped_sagas, which every pay attempt runs first). Retrying the same collect cannot
+// clear it: the incomplete wallet operation must be retired by `maxplayer wallet reconcile`. The
+// whole error text is searched (stderr may precede the tool-error JSON), like the permanent refusal.
+export const PAYMENT_STUCK_MARKER = 'wallet reconciliation refused:';
+export const paymentStuck = message => String(message).includes(PAYMENT_STUCK_MARKER);
+export const paymentStuckReason = message => {const m=String(message),at=m.indexOf(PAYMENT_STUCK_MARKER);return (at<0?m:m.slice(at)).slice(0,500);};
+export const reconcileCommand = home => `maxplayer wallet reconcile --home ${home??'<buyer home>'}`;
+// A stuck payment is re-checked (ONE collect) only: on the first tick of a new runner process
+// (restart), after a later paid collect succeeded, or when the buyer wallet database changed
+// (`maxplayer wallet reconcile` writes it) - and never more often than this.
+export const PAYMENT_STUCK_RECHECK_MIN_SECONDS = 60;
+// R3-2 (runner workaround): a seller whose node no longer runs its harness (dropped after failures)
+// still heartbeats as a normal seller but skips every offer, so each assignment expires with no
+// claim. After SWARM_BENCH_AFTER_UNCLAIMED (default 2; 0 disables) consecutive assignments that
+// expired on a confirmed read with no claim by that seller, it is benched for SWARM_BENCH_SECONDS
+// (default 1800): left out of the assign roster, assignments to it rejected with the reason, and
+// listed to the planner as benchedSellers. Any claim by it (on any of its jobs) un-benches it and
+// resets the count; so does the cooldown ending, after which ONE more unclaimed expiry benches it
+// again (probation). The proper fix (heartbeat serving state) is in the seller daemon, not here.
+export const DEFAULT_BENCH_AFTER_UNCLAIMED = 2;
+export const DEFAULT_BENCH_SECONDS = 1800;
 // Not permanent in core, so they stay on the bounded retry loop (seller kept busy) even though an
 // unchanged delivery may never pass: policy_refused (review/state.rs:125-126) and
 // "review: encrypted message too large" (review/private.rs:84) lack the permanent prefix.
@@ -367,9 +475,58 @@ const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
 export const SIDECAR_CLOSED_EXIT = 3;
 export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.stderr??e.message).match(/challenge closed \((completed|cancelled)\)/)?.[1]??null:null;
 // Sidecar argv for the latest buyer-signed challenge (`status` requires --buyer; --json on stdout).
-export const latestChallengeArgs = (relays,challenge) => ['status',...relays.flatMap(url=>['--relay',url]),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
+// `quorum` is the challenge relay quorum (run 2 #13); a progress publish passes every relay (strict).
+export const quorumArgs = quorum => quorum===undefined?[]:['--quorum',String(quorum)];
+export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
+// Degraded-quorum warnings and re-sends the sidecar reported in its --json body (relay_quorum).
+export function sidecarQuorumLines(body) {
+  const q=body?.relay_quorum;if(!q||typeof q!=='object')return [];
+  return [...(Array.isArray(q.warnings)?q.warnings:[]).map(w=>`WARNING: challenge relays ${String(w)}`),
+    ...(Array.isArray(q.resent)?q.resent:[]).map(r=>`Re-sent missed challenge event ${String(r)}`)];
+}
 export class Swarm {
-  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
+  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;this.stuckRechecked=new Set();}
+  // R3-8: is a stuck payment due for its one re-check collect? (See PAYMENT_STUCK_RECHECK_MIN_SECONDS.)
+  stuckRecheckDue(j,now) {
+    const s=j.paymentStuck;
+    if(now-(s.checkedAt??0)<PAYMENT_STUCK_RECHECK_MIN_SECONDS)return null;
+    if(!this.stuckRechecked.has(j.id))return 'runner (re)started';
+    if(this.walletPaidAt!==undefined&&this.walletPaidAt>s.checkedAt)return 'a later paid collect succeeded';
+    let wallet;try{wallet=this.io.walletSignature?.();}catch{}
+    if(wallet!==undefined&&wallet!==s.wallet)return 'buyer wallet changed (reconcile?)';
+    return null;
+  }
+  // R3-2: per-seller unclaimed-expiry streak and bench (journaled, across challenges).
+  benchAfter(){return this.c.benchAfterUnclaimed??DEFAULT_BENCH_AFTER_UNCLAIMED;}
+  // Records the claim on the job AND clears the seller's bench record in ONE save: a failed save
+  // leaves neither change (the next start observes the claim again), never the flag without the
+  // un-bench (which would suppress the retry and keep the seller benched or its streak alive).
+  sellerClaimed(j,now) {
+    const b=this.state.bench?.[j.seller];
+    j.sawSellerClaim=now;if(b)delete this.state.bench[j.seller];this.save();
+    if(b?.until>now)this.io.report?.(`Un-benched seller ${j.seller}: it claimed job ${j.id}`);
+  }
+  unclaimedExpiry(j,now) {
+    const bench=this.state.bench??={},b=bench[j.seller]??={streak:0};
+    b.streak++;b.lastJob=j.id;
+    const n=this.benchAfter();
+    if(n>0&&b.streak>=n&&!(b.until>now)) {
+      const cooldown=this.c.benchSeconds??DEFAULT_BENCH_SECONDS;
+      Object.assign(b,{benchedAt:now,until:now+cooldown,reason:`${b.streak} consecutive assignments expired with no claim (last ${j.id}); its node may not be serving (e.g. harness dropped)`});
+      this.io.report?.(`Benched seller ${j.seller} for ${cooldown}s: ${b.reason}`);
+    } else this.io.report?.(`Job ${j.id}: expired with no claim by ${j.seller} (${b.streak} in a row)`);
+  }
+  // Ends cooldowns that have passed (probation: one more unclaimed expiry benches again) and
+  // returns the sellers still benched.
+  benched(now) {
+    const out=[];
+    for(const [seller,b] of Object.entries(this.state.bench??{})) {
+      if(b.until===undefined)continue;
+      if(b.until<=now){delete b.until;delete b.benchedAt;b.streak=Math.max(0,this.benchAfter()-1);this.save();this.io.report?.(`Un-benched seller ${seller}: cooldown ended (one more unclaimed expiry benches it again)`);continue;}
+      out.push({seller,until:b.until,reason:b.reason});
+    }
+    return out;
+  }
   save(){this.journal.save();}
   // Run 2 #10: every challenge publish re-reads the LATEST buyer-signed challenge from the
   // challenge relays first (never the tick-start snapshot, which can be minutes old after planner
@@ -387,14 +544,22 @@ export class Swarm {
     this.io.report?.(`Challenge ${c.id} is already ${closed} on the relays; not publishing ${status??'progress'} (a buyer close is never overwritten)`);
     return false;
   }
+  // Run 2 #13: our trade relay is required for every publish, whatever the challenge quorum says
+  // (checked on a fresh snapshot). A progress re-send (status null) needs EVERY challenge relay
+  // (strict): it re-sends the latest buyer-signed status, and a quorum read whose overlapping relay
+  // omitted a buyer close would otherwise resurrect the closed challenge as in_progress. Completion
+  // publishes use the quorum (they are terminal either way, and must not wait for a dead relay).
   async publishChallenge(day,c,status,update,result) {
+    const fresh=await this.io.snapshot();
+    if(fresh?.relay&&!tradeReady(fresh))throw Error(`Challenge ${c.id}: trade relay not ready; not publishing ${status??'progress'}`);
+    const strict=status==null;
     // main() always reads the relays directly (sidecar). An injected io without that read (embedders,
     // older tests) falls back to a FRESH snapshot taken now, never the tick-start one.
-    const latest=this.io.latestChallenge?await this.io.latestChallenge(c):await this.io.snapshot().then(x=>x?.challenge&&{...x.challenge,budgetSats:x.budget?.totalSats});
+    const latest=this.io.latestChallenge?await this.io.latestChallenge(c,{strict}):fresh&&fresh.challenge&&{...fresh.challenge,budgetSats:fresh.budget?.totalSats};
     if(!latest||latest.id!==c.id||latest.buyer!==c.buyer||typeof latest.status!=='string')throw Error(`Challenge ${c.id}: latest buyer-signed challenge unreadable; not publishing`);
     if(TERMINAL_STATUSES.includes(latest.status))return this.closeSeen(day,c,status,latest.status);
     const outgoing=status==null||(STATUS_RANK[status]??-1)<(STATUS_RANK[latest.status]??-1)?latest.status:status;
-    const sent=await this.io.publish(latest,latest.budgetSats,outgoing,update,result===undefined?latest.result:result);
+    const sent=await this.io.publish(latest,latest.budgetSats,outgoing,update,result===undefined?latest.result:result,{strict});
     if(TERMINAL_STATUSES.includes(sent?.closed))return this.closeSeen(day,c,status,sent.closed);
     return true;
   }
@@ -485,10 +650,17 @@ export class Swarm {
           const posted=await this.post(j.args);j.id=posted.job_id??posted.preparation_id;this.save();
         }
       }
+      // R3-8: a stuck payment is not polled or collected again until a re-check is due.
+      let recheck=null;
+      if(j.paymentStuck){recheck=this.stuckRecheckDue(j,now);if(!recheck)continue;this.stuckRechecked.add(j.id);}
       const state=await this.io.mcp('get_job',{job_id:j.id});
       now=this.io.now();
       if(state.status==='preparing')continue;
       if(state.status==='posted' && state.job_id && state.job_id!==j.id){j.id=state.job_id;this.save();continue;}
+      // R3-2: a claim un-benches once per job, on the transition. A paid job that was claimed stays
+      // open (and polled) until collected or proven released, even after its slot was freed; its old
+      // claim must not wipe a streak built by the seller's later unclaimed expiries on every poll.
+      if(!j.sawSellerClaim&&Array.isArray(state.claims)&&state.claims.some(cl=>cl?.seller_pubkey===j.seller))this.sellerClaimed(j,now);
       const expensive=(state.claim_prices??[]).find(p=>p.seller_pubkey===j.seller&&Number.isSafeInteger(p.amount_sats)&&p.amount_sats>j.args.max_sats);
       if(expensive && j.priceAsked!==expensive.amount_sats) {
         j.priceAsked=expensive.amount_sats;j.outcome=`price too high: asked ${expensive.amount_sats}`;j.ts=now;this.save();
@@ -501,6 +673,18 @@ export class Swarm {
         catch(e) {
           if(e.journalFailure)throw e;
           const message=String(e?.message??e),reason=collectFailureReason(message);
+          if(paymentStuck(message)) {
+            let wallet;try{wallet=this.io.walletSignature?.();}catch{}
+            const first=!j.paymentStuck;
+            j.paymentStuck={reason:paymentStuckReason(message),since:j.paymentStuck?.since??now,checkedAt:now,checks:(j.paymentStuck?.checks??0)+1,...(wallet!==undefined?{wallet}:{})};
+            // The delivery is in; the seller is not executing. Its sats stay reserved (not done).
+            j.outcome='payment stuck';j.ts=now;j.slotFreed??=now;delete j.collectRetryAt;delete j.collectError;this.save();
+            this.stuckRechecked.add(j.id);
+            this.io.report?.(first
+              ?`WARNING: Job ${j.id}: payment stuck (seller ${j.seller} delivered, not paid, ${jobBudget(j).reservedSats} sats stay reserved); collect is NOT retried. Run \`${reconcileCommand(this.c.home)}\`; the runner re-checks after the wallet changes, after a later paid collect succeeds, or on restart. ${j.paymentStuck.reason}`
+              :`Job ${j.id}: payment still stuck after re-check (${recheck??'re-check'}); run \`${reconcileCommand(this.c.home)}\``);
+            continue;
+          }
           if(permanentCollectRefusal(message)) {
             // Recorded once, never collected (or paid) again. done frees the seller in this runner;
             // the sats stay reserved (no receipt, no release proof: jobBudget fails closed).
@@ -514,6 +698,8 @@ export class Swarm {
           continue;
         }
         delete j.collectRetryAt;delete j.collectError;
+        if(j.paymentStuck){this.io.report?.(`Job ${j.id}: stuck payment cleared (${recheck??'re-check'}); collected`);j.paymentUnstuck={...j.paymentStuck,clearedAt:now};delete j.paymentStuck;}
+        if(typeof collected?.pay?.state==='string'&&/^Closed \{/.test(collected.pay.state)&&collected.pay.amount_sats>0)this.walletPaidAt=now;
         // collect succeeded (and settled): record it exactly once, whatever the answer read does.
         // An unreadable answer is an error the planner sees, never a reason to collect again.
         let answer,answerError;
@@ -535,6 +721,8 @@ export class Swarm {
           !state.results.length && state.accepted===null && !state.awarded_delivery_pending;
         j.done=j.args.payment==='none'||neverAwarded||reconciled;
         j.released=j.done;j.outcome=j.priceAsked?`price too high: asked ${j.priceAsked}`:'expired/undelivered';j.ts=now;
+        // R3-2: counted once per job, only on a confirmed read showing no claim by the seller.
+        if(!j.unclaimedAt&&state.read_confirmed===true&&Array.isArray(state.claims)&&!state.claims.some(cl=>cl?.seller_pubkey===j.seller)&&Array.isArray(state.results)&&!state.results.length&&!state.awarded){j.unclaimedAt=now;this.unclaimedExpiry(j,now);}
         // Not provably released: keep the sats reserved and keep polling, but free the seller slot
         // once it cannot still be executing and a confirmed read shows no delivery.
         const grace=this.c.expiredSlotGrace??EXPIRED_SLOT_GRACE_SECONDS;
@@ -555,11 +743,12 @@ export class Swarm {
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
-    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),ts:j.ts??now}));
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),...(j.paymentStuck?{paymentStuck:j.paymentStuck.reason}:{}),ts:j.ts??now}));
     const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && TERMINAL_STATUSES.includes(c.status)) {day.stop={external:true};day.closed={status:c.status,seenAt:now};this.save();}
     const min=this.c.minDuration??DEFAULT_MIN_DURATION, max=this.c.maxDuration??1800;
+    const bench=this.benched(now),benchedSet=new Map(bench.map(b=>[b.seller,b]));
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
       ...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>({seller:j.seller,workstream:j.workstream??null,task:plannerTask(j.args.task),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
@@ -568,6 +757,8 @@ export class Swarm {
       const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
         running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
         budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now(),
+        ...(day.rejected?.length?{rejectedAssignments:day.rejected}:{}),
+        ...(bench.length?{benchedSellers:bench}:{}),
         ...(this.releaseMissing?.length?{paidWorkRefused:`buyer get_job lacks ${this.releaseMissing.join(', ')}; assign only amountSats 0`}:{})};
       const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
       if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result answer omitted`);
@@ -595,20 +786,42 @@ export class Swarm {
       const decision=coordinate(snap,{now,durationSeconds:min,amountSats:0,budgetState:reservedBudget(snap,jobs,now),pendingSellers:pending()});
       if(now>=c.ends)stop('Unsolved: work window ended');
       else if(!decision.reasons.length) {
-        const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends);
+        const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends&&!benchedSet.has(s.seller_pubkey));
+        // R3-7: the plan this assign call is SENT with. A response may revise the plan (saved in
+        // ask()); its assignments are valid against either the plan the planner was shown in this
+        // call or the revision it returned with them, never only the post-call day.plan.
+        const sentPlan=day.plan;
         const p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)));
+        const planIds=new Set([...(sentPlan?.workstreams??[]),...(p.plan?.workstreams??[])].map(w=>w?.id).filter(id=>typeof id==='string'));
         if(p.solved)stop(p.summary??'Solved',p.result);
         let budgetRejected=0;
+        // Replaced by every assign batch (journaled with the next save), shown to the planner on its next calls.
+        const hadRejected=!!day.rejected?.length,rejected=day.rejected=[];
         for(const assignment of p.assignments??[]) {
-          const {seller,workstream,task,durationSeconds,amountSats=0}=assignment??{};
-          const reject=reason=>this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
+          const {seller,workstream,task,durationSeconds}=assignment??{};let {amountSats=0}=assignment??{};
+          let raised=null;
+          const reject=reason=>{
+            if(raised!==null)reason=`${raised.reason}; auto-raise to ${amountSats} sats refused: ${reason}`;
+            if(rejected.length<MAX_REJECTED_FEEDBACK)rejected.push({seller:String(seller).slice(0,100),workstream:String(workstream).slice(0,100),amountSats:assignment?.amountSats??0,reason:String(reason).slice(0,500),at:now});
+            this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
+          };
           if(!Number.isSafeInteger(amountSats)||amountSats<0){reject('amountSats must be a nonnegative safe integer');continue;}
+          // R3-1: a paid seller never claims below its advertised rate, so the job would only expire.
+          const below=belowSellerMinimum(sellerPricing(snap.sellers.find(x=>x.pubkey===seller)),amountSats);
+          if(below) {
+            const minimum=sellerPricing(snap.sellers.find(x=>x.pubkey===seller)).minimumSats;
+            if(!this.c.autoRaiseToRate||minimum===null){reject(below);continue;}
+            raised={from:amountSats,reason:below};amountSats=minimum;
+            this.io.report?.(`Raising assignment for ${String(seller)} from ${raised.from} to ${amountSats} sats (SWARM_AUTO_RAISE_TO_RATE): ${below}`);
+          }
           if(amountSats>0) {
             let ok;try{ok=await this.releaseSupport();}catch(e){reject(`priced work refused: cannot verify buyer get_job release fields (${e.message})`);continue;}
             if(!ok){reject(`priced work refused: buyer get_job lacks ${this.releaseMissing.join(', ')} (needs a buyer built from main at or after 7a14298d)`);continue;}
           }
+          if(benchedSet.has(seller)){const b=benchedSet.get(seller);reject(`seller benched until ${b.until}: ${b.reason}`);continue;}
           if(!candidates.some(s=>s.seller_pubkey===seller)){reject('seller busy or ineligible (not in free roster)');continue;}
-          if(typeof task!=='string'||!task.trim()||!day.plan.workstreams.some(w=>w.id===workstream)){reject('invalid task or workstream');continue;}
+          if(typeof task!=='string'||!task.trim()){reject('invalid task (empty or not text)');continue;}
+          if(!planIds.has(workstream)){reject(`unknown workstream ${JSON.stringify(String(workstream)).slice(0,120)}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})`);continue;}
           if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject('duration outside configured bounds');continue;}
           // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
           const fresh=await this.io.snapshot(),at=this.io.now();
@@ -628,18 +841,24 @@ export class Swarm {
           const posted=await this.post(args);j.id=posted.job_id??posted.preparation_id;
           if(!j.id)throw Error('Post returned no job or preparation id');this.save();
         }
+        if(rejected.length||hadRejected)this.save();
         if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
         // history) and those sellers' state. Metadata caps and the applicant list never block it.
-        // R3-2: a seller re-probing a dropped harness, that would otherwise fit, is not exhausted.
-        // Own clause: keep it beside any other suppressor (#1172 adds benched sellers) on merge.
+        // R3-2: neither a benched seller (cooldown ends) nor a seller re-probing a dropped harness
+        // that would otherwise fit is exhausted. Keep both named checks.
+        const benchedSellerWillReturn=bench.length>0;
         const reprobing=waitingOnHarnessProbe(decision,c.ends);
-        if(!day.stop&&!candidates.length&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null)&&!reprobing)stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
+        if(!day.stop&&!candidates.length&&!benchedSellerWillReturn&&!reprobing&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
       if(await this.publishChallenge(day,day.challenge,'completed',day.stop.update,day.stop.result)){day.published=true;this.save();}
+    } else if(!day.stop&&!day.closed&&ready&&snap.relay?.degraded&&now-day.lastUpdate>=this.c.updateEvery) {
+      // Progress needs every challenge relay (see publishChallenge); while degraded it waits.
+      if(!day.progressDegraded){day.progressDegraded=true;this.save();this.io.report?.(`Progress update for ${c.id} postponed: challenge relays degraded (${(snap.relay.missingRelays??[]).join(', ')} missing); progress needs every relay`);}
     } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&(!(now<day.progressRetryAt)||!(this.io.now()<day.progressRetryAt))) {
+      delete day.progressDegraded;
       // Progress never changes the status: it re-sends the latest buyer-signed one (null). The
       // interval restarts only after a publish; a failed re-read is retried after a short backoff
       // (PROGRESS_RETRY_SECONDS from the failure), not a full updateEvery and not every tick. The
@@ -651,7 +870,8 @@ export class Swarm {
       // otherwise lastUpdate records the tick-start now.
       const crossed=now<day.progressRetryAt;
       try {
-        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
+        const stuck=this.state.jobs.filter(j=>j.key===key&&j.paymentStuck).length;
+        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running${stuck?`; ${stuck} payment${stuck>1?'s':''} stuck awaiting the operator (wallet reconcile)`:''}`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
       } catch(e) {
         if(e.journalFailure)throw e;
         day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();
@@ -659,6 +879,19 @@ export class Swarm {
       }
     }
   }
+}
+// Run 2 #13: one log line per change of challenge relay coverage: all available, degraded (quorum
+// met, some relay missing: WARNING), or below quorum / trade relay not ready (nothing is posted).
+export function relayCoverageLine(r) {
+  if(!r)return 'Relay coverage unknown';
+  const q=r.quorum,missing=r.missingRelays??r.failedRelays??[];
+  const trade=r.relays?.find(x=>x.role==='trade');
+  // Same condition as tradeReady (coordinator.mjs): connected, authenticated, history complete, no error.
+  const tradeDown=trade&&!tradeReady({relay:r});
+  if(tradeDown)return `Relay coverage incomplete; trade relay not ready: ${trade.url} (required${trade.error?`: ${trade.error}`:!trade.connected?': disconnected':!trade.authenticated?': not authenticated':': history incomplete'}); nothing is posted or published`;
+  if(q&&q.complete<q.required)return `Relay coverage below quorum (${q.complete} of ${q.total} challenge relays complete, need ${q.required}); unavailable: ${missing.join(', ')}`;
+  if(r.degraded)return `WARNING: relay coverage degraded (${q.complete} of ${q.total} challenge relays complete, quorum ${q.required}); missing: ${missing.join(', ')}`;
+  return r.failedRelays?.length?`Relay coverage incomplete; unavailable: ${r.failedRelays.join(', ')}`:'All configured relays available';
 }
 // Run 2 #4: relay readiness log. Driven by its OWN timer (never by tick(), so a planner call of
 // several minutes cannot hide a stall). Every `checkMs` it compares each relay's readiness fields
@@ -674,10 +907,10 @@ export function relayHealthLines({status,sockets={}},now) {
   return rows.map(r=>{
     const s=r.role==='overall'?null:sockets[r.url];
     const fields={connected:!!r.connected,authenticated:!!r.authenticated,historyComplete:!!r.historyComplete,error:r.error??null,warnings:r.warnings??[],
-      ...(r.role==='overall'?{failedRelays:r.failedRelays??[]}:{socket:s?.readyState??null,sockets:s?.sockets??0})};
+      ...(r.role==='overall'?{failedRelays:r.failedRelays??[],quorum:r.quorum??null,degraded:!!r.degraded}:{socket:s?.readyState??null,sockets:s?.sockets??0})};
     const key=JSON.stringify([r.role,r.url,fields]);
     const text=`relay ${r.role}${r.url?` ${r.url}`:''}: connected=${fields.connected} authenticated=${fields.authenticated} historyComplete=${fields.historyComplete} error=${JSON.stringify(fields.error)} warnings=${JSON.stringify(fields.warnings)}`+
-      (r.role==='overall'?` failed=${JSON.stringify(fields.failedRelays)}`:` socket=${fields.socket} reconnects=${Math.max(0,fields.sockets-1)} lastMessage=${age(s?.lastMessageAt,now)} ago messages=${s?.messages??0}`);
+      (r.role==='overall'?` failed=${JSON.stringify(fields.failedRelays)}${fields.quorum?` quorum=${fields.quorum.complete}/${fields.quorum.total} (need ${fields.quorum.required}) degraded=${fields.degraded}`:''}`:` socket=${fields.socket} reconnects=${Math.max(0,fields.sockets-1)} lastMessage=${age(s?.lastMessageAt,now)} ago messages=${s?.messages??0}`);
     return {id:`${r.role} ${r.url}`,key,text};
   });
 }
@@ -692,6 +925,13 @@ export function startRelayHealthLog(diagnostics,report,{checkMs=RELAY_HEALTH_CHE
   check();const timer=setInterval(check,checkMs);timer.unref?.();
   return {check,stop:()=>clearInterval(timer)};
 }
+// R3-8: size + mtime of the buyer's CDK wallet database and its WAL (maxplayer-core
+// buyer_fund.rs: <home>/wallet/cdk-wallet.sqlite). Only a change signal for the stuck-payment
+// re-check; never read, never trusted as proof of anything.
+export function walletSignature(home,{stat=p=>{try{const s=statSync(p);return `${s.size}:${s.mtimeMs}`;}catch(e){if(e.code==='ENOENT')return '-';throw e;}}}={}) {
+  const db=join(home,'wallet','cdk-wallet.sqlite');
+  return [db,`${db}-wal`].map(stat).join('|');
+}
 // maxplayer rejects unknown MAXPLAYER_* variables, so only MAXPLAYER_HOME reaches it from here.
 export function childEnv(env,home) {
   const out={};for(const [k,v] of Object.entries(env)) if(!k.startsWith('MAXPLAYER_')) out[k]=v;
@@ -700,7 +940,9 @@ export function childEnv(env,home) {
 export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
-  const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  const flag=(name,value)=>{const v=String(value??'').trim().toLowerCase();if(['','0','false','no','off'].includes(v))return false;if(['1','true','yes','on'].includes(v))return true;throw Error(`Invalid ${name}: use 1/true/yes/on or 0/false/no/off`);};
+  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),benchAfterUnclaimed:+(env.SWARM_BENCH_AFTER_UNCLAIMED??DEFAULT_BENCH_AFTER_UNCLAIMED),benchSeconds:+(env.SWARM_BENCH_SECONDS??DEFAULT_BENCH_SECONDS),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  c.challengeQuorum=parseChallengeQuorum(env.SWARM_CHALLENGE_QUORUM,c.challengeRelays.length);
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
   for(const k of ['plannerDigestChars','plannerMaxInputChars'])if(!Number.isSafeInteger(c[k])||c[k]<100)throw Error(`Invalid ${k}`);
@@ -708,6 +950,8 @@ export function config(argv,env=process.env) {
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
   for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter','maxDefer'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
   if(c.minDuration>c.maxDuration)throw Error('Invalid duration bounds');
+  if(!Number.isSafeInteger(c.benchAfterUnclaimed)||c.benchAfterUnclaimed<0)throw Error('Invalid SWARM_BENCH_AFTER_UNCLAIMED: must be an integer >= 0 (0 disables benching)');
+  if(!Number.isSafeInteger(c.benchSeconds)||c.benchSeconds<1)throw Error('Invalid SWARM_BENCH_SECONDS: must be an integer >= 1');
   if(!Number.isSafeInteger(c.expiredSlotGrace)||c.expiredSlotGrace<MIN_EXPIRED_SLOT_GRACE_SECONDS)throw Error(`Invalid SWARM_EXPIRED_SLOT_GRACE_SECONDS: must be an integer >= ${MIN_EXPIRED_SLOT_GRACE_SECONDS} (seller execution tail ${SELLER_EXECUTION_TAIL_SECONDS} s + teardown margin ${SLOT_TEARDOWN_MARGIN_SECONDS} s)`);
   c.home=resolve(c.home);return c;
 }
@@ -772,34 +1016,39 @@ async function main() {
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
-  const challengeRelays=(process.env.SWARM_CHALLENGE_RELAYS??'wss://nos.lol,wss://relay.primal.net,wss://offchain.pub').split(',').map(s=>s.trim()).filter(Boolean);
-  if(!challengeRelays.length)throw Error('SWARM_CHALLENGE_RELAYS must not be empty');
+  const challengeRelays=c.challengeRelays;
   const env=childEnv(process.env,c.home);
   const identity=await command(c.binary,['whoami'],{env});
   const buyer=identity.match(/pubkey: ([0-9a-f]{64})/)?.[1];
   if(!buyer)throw Error('Cannot identify configured buyer');
   const journal=new Journal(join(c.home,'swarm/events.jsonl'));
+  if(journal.migrated)console.error(new Date().toISOString(),`Migrated legacy append journal (${journal.migrated.records} records${journal.migrated.torn?', torn final append discarded':''}) to one record; the legacy file is kept unchanged at ${journal.migrated.legacyPath}`);
   let relayCoverage;
-  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,buyer,onChange:s=>{
-    const failed=s.relay.failedRelays.join(', ');
-    if(failed!==relayCoverage){relayCoverage=failed;console.error(new Date().toISOString(),failed?`Relay coverage incomplete; unavailable: ${failed}`:'All configured relays available');}
+  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,quorum:c.challengeQuorum,buyer,onChange:s=>{
+    const line=relayCoverageLine(s.relay);
+    if(line!==relayCoverage){relayCoverage=line;console.error(new Date().toISOString(),line);}
   }});
   health=startRelayHealthLog(source.diagnostics,message=>console.error(new Date().toISOString(),message));
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>source.snapshot(),
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
     plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:c.plannerTimeouts.runnerMs(input.mode)})),
     answer:async collected=>readDeliveredAnswer(collected.path),
-    publish:async(challenge,budget,status,update,result)=>{
+    // R3-8: changes when the buyer wallet database is written (`maxplayer wallet reconcile`, a payment).
+    walletSignature:()=>walletSignature(c.home),
+    publish:async(challenge,budget,status,update,result,{strict=false}={})=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
-      const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),'--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
+      const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),...quorumArgs(strict?challengeRelays.length:c.challengeQuorum),'--json','--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
       if(result)args.push('--result',result);
-      try{await command(challengesBinary,args,{env});}
+      let out;try{out=await command(challengesBinary,args,{env});}
       catch(e){const closed=closedRefusal(e);if(closed)return {closed};throw e;}
+      try{for(const l of sidecarQuorumLines(JSON.parse(out)))io.report(l);}catch{}
     },
-    // The latest buyer-signed challenge with this id, read directly from every challenge relay by
-    // the sidecar (fails unless all relays answer); includes completed/cancelled ones.
-    latestChallenge:async challenge=>{
-      const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge),{env}));
+    // The latest buyer-signed challenge with this id, read directly from the challenge relays by the
+    // sidecar (fails below the quorum, or unless every relay answers when strict); includes
+    // completed/cancelled ones.
+    latestChallenge:async (challenge,{strict=false}={})=>{
+      const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge,strict?challengeRelays.length:c.challengeQuorum),{env}));
+      for(const l of sidecarQuorumLines(body))io.report(l);
       const x=body?.challenge;if(!x||typeof x!=='object')throw Error(`challenge ${challenge.id} not found on the challenge relays`);
       return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
     }};

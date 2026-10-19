@@ -16,6 +16,10 @@ task to fit the remaining time after startup and prefer fewer, well-scoped tasks
 You decide per seller whether to pay and how much: optional amountSats is an integer >=0 (default 0).
 Free (0) is fine. Pay more for sellers who delivered useful results; judge whether each is worth it.
 Use pricing, challengeSpend and outcomes (including price too high) to raise a price or skip a seller.
+HARD RULE: a seller is free only if pricing.free is true (takes_payment=none). For any other seller
+amountSats must be at least pricing.minimumSats (its advertised rate; rate 0 alone is NOT free), or
+the runner rejects the assignment. rejectedAssignments lists the last batch's rejected entries with
+the reason; correct them (price, workstream id, seller) instead of repeating them.
 Stay within budgetTotalSats and budgetHeadroomSats across the whole batch.
 Seller abilities (harness, capability tokens, hardware) and notes are SELF-REPORTED, not trusted
 proof. Match work to abilities and prefer sellers whose track record delivered useful results.

@@ -28,11 +28,12 @@ subcommand. The buyer auto-award and job protocol are unchanged.
 Kinds 30341–30343 use public relays, by default `wss://nos.lol`,
 `wss://relay.primal.net`, and `wss://offchain.pub`. Repeat `--relay URL` after the
 sidecar command to override. Only loopback permits `ws://`; `relay.maxplayer.ai`
-is refused. Publish attempts all relays, requiring acknowledgement from **every configured relay**,
-with per-relay outcomes on stderr. Reads union verified events and deduplicate ids,
-then select latest per coordinate. No EOSE is a per-relay error (discard that
-partial response); any missing EOSE is a command error. Partial relay
-failures are reported, not treated as complete global history.
+is refused. Publish attempts all relays and requires acknowledgement from a **quorum**
+of them (default 2; `--quorum N`, `SWARM_CHALLENGE_QUORUM`, `CHALLENGE_QUORUM`), with
+per-relay outcomes on stderr. Reads union verified events from every relay that completed and
+deduplicate ids, then select latest per coordinate. No EOSE is a per-relay error (discard that
+partial response); fewer than the quorum completing is a command error. See
+[Challenge relay quorum](#challenge-relay-quorum-run-2-13).
 
 Jobs remain on the configured trade relay. Buzz's allowlist is unchanged from main:
 no 30341–30343 support is added and production relay deployment is unnecessary.
@@ -177,7 +178,19 @@ parser; above-cap prices appear in results as `price too high: asked X`. Prices 
 not award authority; normal exact-price/mint/payment-mode checks remain unchanged.
 Free is fine; pay more for useful results, raise a future price or skip a seller, and keep
 all assignments in the batch within headroom.
-`assess` checks newly settled results even after posting stops. Later responses may revise the plan.
+The runner enforces each paid seller's advertised floor in code: a seller is free only when its
+heartbeat says `takes_payment=none`; otherwise an assignment below its `rate` (and any 0-sat
+assignment, `rate=0` included) would never be claimed, so it is rejected with `below seller
+minimum N`, or, with the default-off `SWARM_AUTO_RAISE_TO_RATE`, raised to the minimum within
+headroom. Rejected assignments of the last `assign` batch, with their reasons, are returned to
+the planner as `rejectedAssignments` on its next calls.
+A seller whose assignments keep expiring with no claim (default 2 in a row on confirmed reads; a
+dropped harness looks exactly like this from the buyer) is benched for a cooldown (default 30 min):
+excluded from the assign roster and listed to the planner as `benchedSellers` with the reason. Any
+claim by it, or the cooldown ending, un-benches it; a benched seller is not counted as exhausted.
+`assess` checks newly settled results even after posting stops. Later responses may revise the plan;
+an assignment's workstream is checked against the plan sent with that `assign` call or the revision
+returned with it, never only the plan saved after the call.
 Profiles include npub/name, self-reported harness/capabilities/hardware, remaining minutes, notes,
 and this-challenge delivery/expiry/turnaround/workstream history. The planner may leave sellers idle
 and prefer useful past deliveries. Every assignment is revalidated against fresh eligibility,
@@ -218,6 +231,10 @@ publications release too. Uncertainty retains reservations across restarts and k
 possibly payable work. At zero headroom, free work remains possible; budget stops only on
 an idle paid-only rejected batch. Wait/empty assignments alone never imply exhaustion.
 Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amounts fail closed.
+A paid collect refused by the buyer wallet's reconciliation (`wallet reconciliation refused: …`)
+is a distinct `payment stuck` state, not a retry loop: logged and journaled once, shown in progress,
+seller freed, sats kept reserved, and re-checked once after `maxplayer wallet reconcile --home <home>`
+changes the wallet, after a later paid collect succeeds, or on restart.
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
 
@@ -246,6 +263,13 @@ The community HTTP/SSE server and review page have been removed; use
   with the relay's reason. Polling runs every 15 seconds from each filter's newest timestamp minus
   900 seconds, also repairing late events while streaming. Disconnects reconnect with bounded
   backoff and reload history.
+- A poll round re-reads history the reader already holds, so once a trusted filter's history has
+  been read completely on a connection, its poll pages (and their pagination) keep
+  `historyComplete` true; the round is reported as `pollInProgress`, which is not a readiness field
+  (R3-4). Poll pages keep every fail-closed rule: a silent page closes the connection, a truncated
+  page sets an error, a refused page recovers and must be read again in full, and any filter not
+  yet read on the connection (initial read, a new roster chunk, a re-read after AUTH) blocks
+  readiness until it completes. The quorum and trade-relay rules are unchanged.
 - When a relay sent an AUTH challenge that was not refused, and while it is recovering from a
   CLOSED, `historyComplete` also requires AUTH OK and an EOSE for every trusted filter's live
   subscription sent after AUTH OK on this connection, whether or not that subscription is still
@@ -280,9 +304,10 @@ The community HTTP/SSE server and review page have been removed; use
   hosted relay origins must also be allowed in `web/app/vercel.json` CSP.
 - The buyer runner takes `--relay-url` / `RELAY_URL` and derives the buyer public key
   from its configured CLI home. Its admission gate still requires authenticated,
-  complete trade-relay history and complete history from healthy challenge relays.
+  complete trade-relay history and complete history from at least the quorum of challenge relays.
   `SWARM_CHALLENGE_RELAYS` selects the same default public relay list; public relays need no AUTH.
-  Partial coverage is exposed as `relay.failedRelays` and per-source `relay.relays` status.
+  Partial coverage is exposed as `relay.failedRelays`, `relay.missingRelays`, `relay.quorum`
+  (`required`, `complete`, `total`), `relay.degraded` and per-source `relay.relays` status.
 
 ## CLI (`maxplayer-challenges …`)
 
@@ -310,10 +335,9 @@ The same minutes with `--note` omitted or equal is a no-op (nothing published,
 `"unchanged": true`). On a real change, omitting `--note` keeps the current note and
 `--note ''` clears it. Pending or denied sellers, and memberships already replaced after the
 start, are not counted that day, so their changes publish. The challenge read is the
-trusted, paged, every-relay read; if it is incomplete (refused, timed out, truncated) the
-change fails closed (nothing published). It must stay an every-relay read even if other
-reads move to a quorum: the relay left out could be the only one holding the running
-challenge. First joins, rejoins after `left`, `leave` and `status` are unaffected.
+trusted, paged, every-relay read (`Relays::fetch_all`), not the quorum read; if it is
+incomplete (refused, timed out, truncated) on any relay the change fails closed (nothing
+published): the relay left out could be the only one holding the running challenge. First joins, rejoins after `left`, `leave` and `status` are unaffected.
 This is client policy only: the event format and the eligibility rule are unchanged, and
 another client can still republish (and forfeit the day).
 
@@ -361,15 +385,80 @@ offers are intentionally excluded; existing runner journal reservations remain
 conservative. Challenge IDs must not be reused for a different challenge.
 
 All sidecar publishes (not only leave, deny, cancel and budget updates) require
-ACK from every configured challenge relay. Partial delivery can already have
+ACK from the challenge relay quorum. Below quorum, partial delivery can already have
 written some relays: the command fails and identifies failed URLs; retry repairs
-coverage. Reads require EOSE from every configured relay. The page keeps healthy
-relay data visible with an incomplete/failed-URL indicator; the runner never posts
-from that partial history. AUTH-required CLOSED history requests are retried after
-AUTH OK. A dead relay blocks the runner on purpose. Removing it is safe only after
-successfully reading that relay, or after a person has checked it holds no newer
-replaceable event (challenge, membership, or decision). Otherwise removing it can
-resurrect an older joined membership, budget, or challenge state.
+coverage. Reads require EOSE from the quorum. The page keeps healthy relay data
+visible with an incomplete/failed-URL indicator; the runner never posts from history
+below quorum. AUTH-required CLOSED history requests are retried after AUTH OK.
+Removing a relay from the list is safe only after successfully reading that relay, or
+after a person has checked it holds no newer replaceable event (challenge, membership,
+or decision). Otherwise removing it can resurrect an older joined membership, budget,
+or challenge state. With the quorum a dead relay no longer needs removing.
+
+### Challenge relay quorum (run 2 #13)
+
+Run 2 showed one dead public relay (offchain.pub) blocking joins, leaves, decisions,
+publishes and the whole runner, because every read and every publish needed every relay.
+
+**Setting.** One number, the quorum `q`, for reads and publishes: `--quorum N` on the
+sidecar, `SWARM_CHALLENGE_QUORUM` for the runner, `CHALLENGE_QUORUM` at page build. Default
+2 for the three default relays; for other list sizes the default is a strict majority
+(`floor(n/2)+1`, at least 2, at most `n`). An explicit value must be a strict majority and at
+most `n`; anything else is refused at startup. `q = n` restores the old every-relay rule.
+
+**Why a majority.** A publish reached at least `q` relays and a read completed on at least
+`q`; with `q > n/2` the two sets always share at least one relay, so a quorum read sees every
+quorum-published leave, deny or close as long as that shared relay does not hide or lose it.
+
+**Our trade relay is required.** It is not part of the quorum and is never optional: reader
+readiness (`historyComplete`), the runner's `relay_not_ready` gate and every runner challenge
+publish (checked on a fresh snapshot) need it, quorum or not.
+
+**Degraded.** Quorum met with a relay missing is ready but degraded, and says so: the
+sidecar prints `Warning: degraded read|publish: …` on stderr and adds `relay_quorum` to
+`--json`; the reader adds `Degraded: <n> of <m> challenge relays complete (quorum q);
+missing: …` to `relay.warnings`, which the page's status line shows; the runner logs
+`WARNING: relay coverage degraded (…)` and copies the sidecar's warnings.
+
+**Re-send.** The sidecar keeps every quorum publish that missed a relay, exactly as signed,
+in `<home>/challenges/outbox.json` and re-sends it (never re-signed: same id and signature)
+to that relay once it answers a later command. Bounded (64 entries, 10 failed attempts per
+relay, 7 days), idempotent (a delivered relay is removed; re-sending to a relay that already
+has it is harmless), and superseded by a newer event for the same coordinate. Only events
+signed by the home's own key, with valid signatures, are loaded. A publish below quorum
+fails and is never queued: the caller was told it failed.
+
+**Fail-closed cases kept.** Below quorum, or without our trade relay: reads fail ("challenge
+relay read incomplete; quorum not met …"), publishes fail, the reader is not ready and the
+runner posts and publishes nothing. The minutes-change refusal keeps its every-relay
+challenge read. The closed-challenge refusal (exit 3) still runs on the pre-publish read; a
+`scheduled`/`in_progress` update over an existing challenge while degraded re-reads every
+relay first. Runner progress updates (which re-send the latest buyer-signed status) need
+every relay and wait while degraded; completion publishes at the quorum.
+
+**A completed read that omits an accepted event.** The quorum assumes the relay a read shares
+with a publish returns what it accepted. If that relay lost or hides the event, a read that
+completed on the quorum omits it, and nothing in the read shows that. With 2 of 3 an
+attacker (or a lossy relay) needs only that shared relay; with every relay required it needed
+all of them to agree. Consequences and mitigations:
+- A seller's `leave` or a buyer's deny/close could be missed by one quorum read until the
+  missing relay is back (re-send) or the shared relay serves it again; the runner could
+  assign one more task to a seller who left. The leave still takes effect on the next read
+  that includes an honest holder, and a left seller never claims (seller-side check).
+- Reads union every relay that answers: with all three up, one honest relay still suffices,
+  exactly as before. The weaker guarantee applies only while degraded, which is visible.
+- The home that published the event keeps it in its outbox until every relay has it and
+  counts it in its own trusted reads, so the sidecar never republishes over its own pending
+  leave/close (e.g. an `in_progress` update over its own pending completion is refused).
+- Reads whose mistake cannot be undone stay every-relay: the minutes-change challenge read
+  (and, while degraded, its decision read: a quorum read that omits the buyer's acceptance
+  must not skip the challenge check), a degraded non-terminal challenge update, and runner
+  progress re-sends.
+- Routine polls never count a relay as missing: a relay that finished its round keeps
+  counting toward the quorum while a poll is in flight (R3-4); it drops out only on a
+  disconnect, a recover, or a failed (refused, truncated, timed-out) round.
+- Not covered: another client reading at a bare quorum, or a relay that acknowledged and then
+  dropped the event before re-send. Operators who need the old guarantee set `q = n`.
 
 ### Trusted roster and applicant list (advisor r4)
 
