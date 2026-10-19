@@ -906,7 +906,9 @@ mod tests {
             .collect();
         assert!(!commands.is_empty(), "skill shows no sidecar commands");
         assert!(
-            !skill.lines().any(|line| line.trim().starts_with("maxplayer-challenges ")),
+            !skill
+                .lines()
+                .any(|line| line.trim().starts_with("maxplayer-challenges ")),
             "skill still shows the old command name"
         );
         for line in commands {
