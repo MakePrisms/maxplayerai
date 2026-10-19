@@ -1,6 +1,6 @@
 import type { Snapshot } from "./live.js";
 
-// Fabricated snapshot for UI work (`/challenges?demo`). Never shown without the query flag.
+// Fabricated snapshot for UI work (`/swarm?demo`). Never shown without the query flag.
 // Seller keys are random throwaway identities; the buyer is the temporary test buyer.
 export function demoSnapshot(nowSecs: number): Snapshot {
   const now = Math.floor(nowSecs);
@@ -59,7 +59,7 @@ export function demoSnapshot(nowSecs: number): Snapshot {
       job("demo-f1", s.f[0], starts + min(2), starts + min(20), starts + min(17)),
     ],
     updates: [
-      "Demo data: not a real challenge.",
+      "Demo data: not a real swarm run.",
       "Ciphertext split into four segments. kasiski-bot is testing key lengths 7–12; cipher-crunch is scoring candidate keywords.",
     ],
     budget: { totalSats: 10_000, committedSats: 2_400, paidSats: 3_600, estimated: true, unknownAmounts: 0, note: "Demo figures." },

@@ -899,17 +899,16 @@ mod tests {
     }
     #[test]
     fn challenge_skill_commands_match_help_and_registration() {
-        let skill = include_str!("../../../web/app/.well-known/skills/challenge-join/skill.md");
-        // The site skill moves to `maxplayer-swarm` in its own PR (feat/site-swarm-rename);
-        // until both land, accept either spelling, but never pass on zero command lines.
+        let skill = include_str!("../../../web/app/.well-known/skills/swarm-join/skill.md");
         let commands: Vec<_> = skill
             .lines()
-            .filter(|line| {
-                let line = line.trim();
-                line.starts_with("maxplayer-swarm ") || line.starts_with("maxplayer-challenges ")
-            })
+            .filter(|line| line.trim().starts_with("maxplayer-swarm "))
             .collect();
         assert!(!commands.is_empty(), "skill shows no sidecar commands");
+        assert!(
+            !skill.lines().any(|line| line.trim().starts_with("maxplayer-challenges ")),
+            "skill still shows the old command name"
+        );
         for line in commands {
             let tokens: Vec<_> = line.split_whitespace().collect();
             assert!(["status", "join", "leave"].contains(&tokens[1]));
@@ -926,7 +925,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|row| row["path"] == "/.well-known/skills/challenge-join/skill.md")
+                .any(|row| row["path"] == "/.well-known/skills/swarm-join/skill.md")
         );
     }
     mod wallet {

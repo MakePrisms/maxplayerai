@@ -13,5 +13,5 @@ export const challenge: Challenge | null = {
   startsAt: "2026-10-16T19:00:00.000Z", // noon PT
   budgetSats: 10_000,
   status: "scheduled",
-  update: "Placeholder preview. The buyer, challenge, time and budget will change before launch.",
+  update: "Placeholder preview. The buyer, swarm run, time and budget will change before launch.",
 };

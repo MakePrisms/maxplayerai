@@ -186,6 +186,9 @@ Flags (environment equivalents):
 | — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
 | — | `SWARM_EXPIRED_SLOT_GRACE_SECONDS` | 600 (strictly after an expired undelivered job's deadline + this, free its seller; sats stay reserved; minimum 480 = 420 s seller kill instant + 60 s teardown) |
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
+| — | `SWARM_BENCH_AFTER_UNCLAIMED` | 2 (consecutive assignments that expired with no claim before a seller is benched; 0 disables) |
+| — | `SWARM_BENCH_SECONDS` | 1800 (bench cooldown) |
+| — | `SWARM_AUTO_RAISE_TO_RATE` | **OFF** (`1`/`true`/`yes`/`on` to enable): raise an assignment priced below a paid seller's advertised minimum to that minimum, within budget headroom, instead of rejecting it |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
 The buyer chooses **each assignment's** optional `amountSats` (safe integer ≥0, default 0).
@@ -220,7 +223,17 @@ next save truncates it) and stops the runner.
 Journals written by older runners (one appended copy per save; run 2 reached 649 MB) are migrated
 on startup: the file is scanned in 1 MiB chunks, never read as one string, the last complete record
 is kept (a torn final append is discarded) and rewritten as one record. A corrupt last complete
-record fails startup. `flock` (util-linux) prevents simultaneous runners on the same home; locks
+record fails startup. **The legacy file itself is kept unchanged (R3-5)**: it is the audit history
+(every task, answer and receipt over time), so before the rewrite it is preserved as
+`events.jsonl.legacy-<UTC timestamp>` (e.g. `events.jsonl.legacy-20261018T160000Z`) by a hard link
+(same inode: instant, no extra disk for a GB-sized file), or, where links are unsupported, by a
+chunked copy that is fsynced and renamed into place; the directory is fsynced before the journal
+is replaced. Startup logs `Migrated legacy append journal (N records…) to one record; the legacy
+file is kept unchanged at <path>`. A crash between keeping and rewriting leaves the journal still
+in the legacy format; the next start finds the kept file (same inode, or same size for a copy) and
+reuses it, and a partial copy (`….tmp`) from a crash during the copy is discarded, so a migration
+never leaves two copies. A migrated journal is one record and is never migrated again. The kept
+file is never read by the runner; archive or delete it yourself once you no longer need it. `flock` (util-linux) prevents simultaneous runners on the same home; locks
 release on process exit. `flock` is required on every OS; macOS does not ship it
 (`brew install flock`), and a missing `flock` is reported as such. `flock` and the locked runner
 run in their own process group under the launched process and read a pipe the parent holds, so a
@@ -295,7 +308,8 @@ To use a different model/provider, supply any **trusted shell command** via `--p
 `SWARM_PLANNER`. It receives one JSON object on stdin and must emit only one JSON object on stdout:
 
 All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
-`now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`.
+`now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`;
+`rejectedAssignments` is present when the last `assign` batch had rejected entries.
 `minDurationSeconds` (`SWARM_MIN_DURATION`, default 300) is the shortest task the runner will
 post. It includes seller startup: a real harness spends minutes starting its sandbox and agent
 before working, and the first live run's 120–200 second tasks expired undelivered. Free sellers
@@ -314,7 +328,11 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
   Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?}]}`, `{wait:true}`, or
   `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
   May deliberately leave any seller idle. Each assignment is validated separately and invalid
-  entries are dropped with a logged reason. Duration must fit configured min/max, remaining
+  entries are dropped with a logged reason (also returned as `rejectedAssignments`). A workstream
+  id is valid if it is in the plan sent with that same `assign` call or in the revised `plan` the
+  response returns, so a revision by the previous `assess` (or by this response) never invalidates
+  the ids the planner was shown (R3-7); otherwise the reason is `unknown workstream "<id>": …` with
+  the valid ids. Duration must fit configured min/max, remaining
   minutes and window; fresh admission and serial budget reservations apply before each post.
 - `assess`: checks newly settled results, including after posting stops; returns wait or solved.
   `assign` and `assess` may include `plan` containing a complete revised analysis plan, saved
@@ -358,6 +376,22 @@ Known retry-forever cases: core does not mark `policy_refused` (`review/state.rs
 `review: encrypted message too large` (`review/private.rs` 84) permanent, so such a job keeps its
 seller busy until an operator intervenes.
 
+**Payment stuck (R3-8).** A paid `collect` refused by the buyer's own wallet reconciliation
+(the error contains `wallet reconciliation refused:`, maxplayer-core `payment_wallet.rs`
+`PaymentWalletError::Reconcile`, e.g. `wallet has an incomplete ProofsReserved operation that could
+not be retired safely` when the mint's check-state fails) cannot be cleared by retrying the same
+collect. The runner records the job once as outcome `payment stuck` (`paymentStuck:{reason,since,
+checkedAt,checks}` in the journal; `paymentStuck` in the planner's result), logs one `WARNING: Job
+<id>: payment stuck … Run \`maxplayer wallet reconcile --home <home>\``, adds `N payment(s) stuck
+awaiting the operator (wallet reconcile)` to the published progress update, and stops the collect
+retry loop. The delivery is in, so the seller is free for new work; the job's sats stay reserved
+(nothing is paid). It is re-checked with ONE collect, at most once per 60 s, when: the runner
+restarts; the buyer wallet database (`<home>/wallet/cdk-wallet.sqlite` or its `-wal`, size/mtime
+only) changes, which `maxplayer wallet reconcile` does; or another paid collect succeeds. A
+re-check that succeeds settles the job normally (`stuck payment cleared (…)`); one still refused
+stays stuck and is logged once more. To resume after reconciling, do nothing (the wallet change
+is seen) or restart the runner.
+
 **Delivered answers.** A non-empty `answer.txt` (the buyer's materialized inline answer) is the
 answer, capped like every file at 64 KiB with a `[truncated: first N of M bytes shown]` marker, so
 a longer inline answer reaches the journal already truncated. An empty, binary or unreadable
@@ -385,6 +419,40 @@ held. The buyer can raise a future offer or skip that seller. Normal jobs also r
 claim price to equal the offered price; hints never override the existing award checks.
 The buyer decides whether each seller is worth paying, may choose free work, and should pay
 more for useful delivered results while keeping the batch within headroom.
+
+**Seller price floor (R3-1).** A seller's node claims a free offer only if its heartbeat carries
+`takes_payment=none`, and a priced offer only at `amount ≥ rate` (maxplayer-core `seller.rs`
+`rate_gate_allows`). An offer below that is silently skipped, never claimed, and would only
+expire as `expired/undelivered`. The runner therefore enforces the floor in code before posting:
+an assignment priced below a paid seller's advertised minimum (a seller is free only if its
+heartbeat says `takes_payment=none`; otherwise the minimum is its `rate`, and at least 1 sat, so
+`rate=0` alone is not free) is rejected with `below seller minimum <N> (…)`. Profiles carry
+`pricing.free` and `pricing.minimumSats` (null when the rate is unreadable). A seller with no
+`rate`/`takes_payment` tag at all (no heartbeat read) is not checked. With
+`SWARM_AUTO_RAISE_TO_RATE` on (default off), such an assignment is instead raised to the
+minimum and logged (`Raising assignment for <seller> from X to N sats`); the raised price then
+goes through the normal admission, so it is still refused (with both reasons) if it exceeds the
+budget headroom or the buyer cannot do priced work.
+
+**Benched sellers (R3-2, runner workaround).** A seller whose node dropped its harness still
+heartbeats as a normal seller but skips every offer, so its assignments expire unclaimed. After
+`SWARM_BENCH_AFTER_UNCLAIMED` (default 2) consecutive assignments that expired with no claim by
+that seller (counted once per job, only on a confirmed `get_job` read: `read_confirmed`, no claim
+from the seller, no result, no award), the runner benches it for `SWARM_BENCH_SECONDS` (default
+1800): it is left out of the `assign` roster, an assignment naming it is rejected with `seller
+benched until <unix>: <reason>`, and every planner call lists it in
+`benchedSellers:[{seller,until,reason}]`. Logged as `Benched seller <pk> for Ns: …`. Any claim by
+the seller on any of its jobs un-benches it at once and resets the count (`Un-benched seller <pk>:
+it claimed job …`). When the cooldown ends it is un-benched on probation: one more unclaimed expiry
+benches it again. A benched seller never counts as exhausted (no `Unsolved: all eligible sellers
+exhausted` stop while one is benched). The bench state is journaled (`bench`), so a restart keeps
+it. The proper fix (the seller heartbeat advertising that it is not serving) belongs to the seller
+daemon and is separate.
+
+**Rejection feedback.** Every rejected assignment of the last `assign` batch (any reason: price
+floor, unknown workstream, busy seller, duration, budget …) is journaled and sent to the planner
+on its following calls as `rejectedAssignments:[{seller,workstream,amountSats,reason,at}]` (at
+most 50), so it can correct the batch. The next `assign` batch replaces the list.
 
 Abilities and all input content are untrusted/self-reported. Prefer useful delivered evidence;
 never declare success solely from a seller's claim. Verification may be delegated as a task.
