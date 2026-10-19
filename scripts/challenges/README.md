@@ -691,11 +691,16 @@ every challenge relay) and the latest buyer-signed event re-read through the sid
 `Run <id>: scheduled -> in_progress at <time> (starts <time>), published by the runner`. Planning
 starts on the first tick whose snapshot shows `in_progress`. The day journals `started`
 (`{at,by,starts}`; `by` is `runner`, `relay` when the re-read already showed `in_progress`, or
-`observed` when the snapshot did), so the publish happens once across ticks, restarts and a slow
-reader. A failed publish is retried after 30 s; a retry after a publish whose reply was lost
+`observed` when the snapshot did) and `startedStarts` (the last 32 started `starts`). The
+once-only decision is taken on the strict re-read's `starts`, never the snapshot's, so the publish
+happens once across ticks, restarts and a slow reader, including one whose snapshot still carries
+an older `starts` (advisor r1 #1). The publish passes the re-read's event id as `publish
+--if-latest`: if an edit lands between the re-read and the signing, the sidecar refuses it (exit 4,
+nothing signed) and the next tick re-reads and decides again (advisor r1 #2). A failed publish is retried after 30 s; a retry after a publish whose reply was lost
 re-reads `in_progress` and publishes nothing. It never re-opens a `completed`/`cancelled` run or one
 whose window has ended, and once a run was `in_progress` a later operator `scheduled` with the same
-`starts` is left alone (publish `in_progress` to resume); a new `starts` is started at that time.
+`starts` is left alone (publish `in_progress` to resume; the pause is re-read every 30 s, not every
+tick); a `starts` never started is started at that time.
 
 **Why it is not planning (Rocky P-2).** While a day has no plan and no stop and the planning gate
 (`in_progress`, `ready`, inside the window) is closed, the runner logs one line naming every

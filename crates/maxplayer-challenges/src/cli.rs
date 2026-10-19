@@ -7,13 +7,15 @@ const HELP: &str = "Usage: maxplayer-swarm <command> [--home <path>] [--json] [-
   join --buyer <npub|hex> --minutes <1..480> [--note <text>]
   status --buyer <npub|hex> [--run <d>]
   leave --buyer <npub|hex>
-  publish --id <d> --title <text> --goal-file <path> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>] [--result <text>]
+  publish --id <d> --title <text> --goal-file <path> --starts <rfc3339> --ends <rfc3339> --budget-sats <n> [--status <scheduled|in_progress|completed|cancelled>] [--update <text>] [--result <text>] [--if-latest <event-id>]
   members [--run <d>]
   decide --seller <npub|hex> --accept|--deny
 Join or leave at any time. Joining after work starts means eligibility from the next day.
 publish --status defaults to scheduled: the run is visible and sellers can join, but no work is
 posted until it is in_progress. A running swarm runner (scripts/challenges/swarm.mjs) publishes
 in_progress itself at --starts; without a runner, publish --status in_progress at starts yourself.
+publish --if-latest <event-id> (status --json reports it as run_event_id) signs nothing and exits 4
+when the latest buyer-signed event for --id is no longer that event (an edit landed after your read).
 While a swarm run that counts your accepted membership is in progress, join refuses to change
 minutes or note (republishing would forfeit that day); change them 15 minutes after it ends (clock drift).
 Never leave and rejoin to change minutes: that forfeits the day too. Same minutes with --note
@@ -34,6 +36,10 @@ const SCHEDULED_NOTE: &str = "Note: status scheduled: no work is posted until th
 /// `CLOSED_EXIT` and an error starting with `CHALLENGE_CLOSED` (nothing is signed or sent).
 const CHALLENGE_CLOSED: &str = "swarm run closed";
 const CLOSED_EXIT: i32 = 3;
+/// `publish --if-latest <id>` refused because the latest buyer-signed event for the run is no longer
+/// `<id>` (an edit landed after the caller's read): exits `SUPERSEDED_EXIT`, nothing signed or sent.
+const CHALLENGE_SUPERSEDED: &str = "swarm run changed";
+const SUPERSEDED_EXIT: i32 = 4;
 /// Authors per roster membership REQ, and the newest-first applicant sample size (matches the page).
 const ROSTER_AUTHOR_CHUNK: usize = 100;
 const APPLICANT_LIMIT: usize = 256;
@@ -87,6 +93,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--status",
             "--update",
             "--result",
+            "--if-latest",
         ],
         "members" => &["--run"],
         "decide" => &["--seller", "--accept", "--deny"],
@@ -164,6 +171,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             ] {
                 o.required(k)?;
             }
+            if let Some(id) = o.get("--if-latest")
+                && !(id.len() == 64 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+            {
+                return Err("--if-latest must be a 64-character lowercase hex event id".into());
+            }
         }
         _ => (),
     }
@@ -216,6 +228,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 let _ = writeln!(err, "swarm: {e}");
                 if e.starts_with(CHALLENGE_CLOSED) {
                     CLOSED_EXIT
+                } else if e.starts_with(CHALLENGE_SUPERSEDED) {
+                    SUPERSEDED_EXIT
                 } else {
                     2
                 }
@@ -307,6 +321,14 @@ fn select_challenge(
     buyer: &str,
     id: Option<&str>,
 ) -> Result<maxplayer_core::challenge::Challenge, String> {
+    select_challenge_event(events, buyer, id).map(|(_, c)| c)
+}
+/// `select_challenge` plus the id of the event it was parsed from (`run_event_id`).
+fn select_challenge_event(
+    events: &[nostr_sdk::Event],
+    buyer: &str,
+    id: Option<&str>,
+) -> Result<(String, maxplayer_core::challenge::Challenge), String> {
     use maxplayer_core::challenge::*;
     let mut candidates: Vec<_> =
         latest_per_coordinate(events.iter().filter(|e| parse_challenge(e, buyer).is_ok()))
@@ -318,7 +340,7 @@ fn select_challenge(
     candidates
         .into_iter()
         .next()
-        .map(|(_, c)| c)
+        .map(|(e, c)| (e.id.to_hex(), c))
         .ok_or_else(|| "swarm run not found or not verified for this buyer".into())
 }
 /// Runs the command, then re-sends queued events to relays that answered in this run (also after a
@@ -428,6 +450,20 @@ async fn command_async(
                 c.id
             ));
         }
+        // The caller built this publish from the event it read: if another edit has become the
+        // latest since, signing would replace it with the caller's stale fields. Refuse (exit 4).
+        if let Some(expected) = o.get("--if-latest") {
+            let latest = select_challenge_event(&previous, &c.buyer, Some(&c.id))
+                .ok()
+                .map(|(id, _)| id);
+            if latest.as_deref() != Some(expected) {
+                return Err(format!(
+                    "{CHALLENGE_SUPERSEDED}: the latest buyer-signed swarm run {} is {}, not the event {expected} this publish was built from; nothing published",
+                    c.id,
+                    latest.as_deref().unwrap_or("absent")
+                ));
+            }
+        }
         let created = replacement_timestamp(now, &previous, &own, CHALLENGE_KIND, &c.id)?;
         reject_secret_in_draft(home, &draft)?;
         let id = relay
@@ -437,6 +473,7 @@ async fn command_async(
         return Ok((json!({"ok":true,"event_id":id,"run":c}), None));
     }
     // Membership operations do not depend on any daily challenge existing.
+    let mut run_event_id = None;
     let c = if matches!(o.command.as_str(), "status" | "members") {
         let challenges = relay
             .fetch(
@@ -450,7 +487,9 @@ async fn command_async(
         if challenges.is_empty() && o.get("--run").is_none() {
             None
         } else {
-            Some(select_challenge(&challenges, &buyer, o.get("--run"))?)
+            let (event_id, c) = select_challenge_event(&challenges, &buyer, o.get("--run"))?;
+            run_event_id = Some(event_id);
+            Some(c)
         }
     } else {
         None
@@ -706,6 +745,10 @@ async fn command_async(
                 })
                 .collect();
             let mut body = json!({"run": c, "members": rows});
+            // The event the run was read from: pass it to `publish --if-latest`.
+            if let Some(id) = &run_event_id {
+                body["run_event_id"] = json!(id);
+            }
             if o.command == "members" {
                 body["applicants_incomplete"] = json!(applicants_incomplete);
             }
@@ -1138,6 +1181,143 @@ mod tests {
                 assert!(after.writes.lock().unwrap().is_empty(), "close replaced");
                 std::fs::remove_dir_all(root).unwrap();
             }
+        }
+        /// Advisor r1 #2 (PR #1180): `status --json` names the event the run was read from
+        /// (`run_event_id`), and `publish --if-latest <id>` signs nothing (exit 4) once another
+        /// edit has become the latest, so the caller's stale fields never replace it.
+        #[test]
+        fn publish_if_latest_refuses_an_edit_newer_than_the_read() {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "challenge-if-latest-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let keys = crate::relay::keys(&home).unwrap();
+            let buyer = keys.public_key().to_hex();
+            let now = Timestamp::now().as_secs();
+            let mut c = Challenge {
+                buyer: buyer.clone(),
+                id: "today".into(),
+                title: "Build".into(),
+                goal: "goal".into(),
+                starts: now - 60,
+                ends: now + 3600,
+                budget_sats: 0,
+                status: "scheduled".into(),
+                update: None,
+                result: None,
+            };
+            let sign = |c: &Challenge, t: u64| {
+                let d = c.to_event_draft().unwrap();
+                EventBuilder::new(Kind::from(d.kind), d.content)
+                    .tags(d.tags.into_iter().map(|t| Tag::parse(t.0).unwrap()))
+                    .custom_created_at(Timestamp::from(t))
+                    .sign_with_keys(&keys)
+                    .unwrap()
+            };
+            let read = sign(&c, now - 30);
+            c.title = "Operator edit".into();
+            let edit = sign(&c, now - 10);
+            let goal = root.join("goal.md");
+            std::fs::write(&goal, "goal").unwrap();
+            let iso = |t| Timestamp::from(t).to_human_datetime();
+            let publish = |url: &str, if_latest: &str| {
+                args(&format!(
+                    "publish --home {} --relay {url} --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0 --status in_progress --update started --if-latest {if_latest} --json",
+                    root.display(),
+                    goal.display(),
+                    iso(now - 60),
+                    iso(now + 3600)
+                ))
+            };
+            // status --json reports the latest event's id.
+            let relay = rt.block_on(crate::relay::transport_tests::fixture(
+                vec![read.clone()],
+                true,
+                true,
+            ));
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let status = args(&format!(
+                "status --home {} --relay {} --buyer {buyer} --run today --json",
+                root.display(),
+                relay.url
+            ));
+            assert_eq!(run(&status, &mut out, &mut err), 0);
+            let body: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(body["run_event_id"], read.id.to_hex());
+            assert_eq!(body["run"]["title"], "Build");
+            // Still the latest: the publish goes through.
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run(&publish(&relay.url, &read.id.to_hex()), &mut out, &mut err),
+                0,
+                "{}",
+                String::from_utf8_lossy(&err)
+            );
+            assert_eq!(relay.writes.lock().unwrap().len(), 1);
+            // The operator edit landed after the read: refused with exit 4, nothing written.
+            let after = rt.block_on(crate::relay::transport_tests::fixture(
+                vec![read.clone(), edit.clone()],
+                true,
+                true,
+            ));
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run(&publish(&after.url, &read.id.to_hex()), &mut out, &mut err),
+                SUPERSEDED_EXIT
+            );
+            let err = String::from_utf8(err).unwrap();
+            assert!(
+                err.contains(&format!("swarm: {CHALLENGE_SUPERSEDED}")),
+                "{err}"
+            );
+            assert!(err.contains(&edit.id.to_hex()), "{err}");
+            assert!(out.is_empty());
+            assert!(after.writes.lock().unwrap().is_empty(), "edit replaced");
+            // A run absent from the relays is not "the event you read" either.
+            let empty = rt.block_on(crate::relay::transport_tests::fixture(
+                Vec::new(),
+                true,
+                true,
+            ));
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run(&publish(&empty.url, &read.id.to_hex()), &mut out, &mut err),
+                SUPERSEDED_EXIT
+            );
+            assert!(empty.writes.lock().unwrap().is_empty());
+            // Without --if-latest the publish is unchanged (still signs over the edit).
+            let plain = rt.block_on(crate::relay::transport_tests::fixture(
+                vec![read.clone(), edit],
+                true,
+                true,
+            ));
+            let line = publish(&plain.url, &read.id.to_hex());
+            let cut = line.iter().position(|a| a == "--if-latest").unwrap();
+            let line: Vec<String> = line[..cut]
+                .iter()
+                .chain(&line[cut + 2..])
+                .cloned()
+                .collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(run(&line, &mut out, &mut err), 0);
+            assert_eq!(plain.writes.lock().unwrap().len(), 1);
+            // A malformed id is a usage error, before any read.
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(run(&publish(&plain.url, "abc"), &mut out, &mut err), 1);
+            assert!(
+                String::from_utf8(err)
+                    .unwrap()
+                    .contains("--if-latest must be")
+            );
+            assert!(HELP.contains("[--if-latest <event-id>]"));
+            assert!(HELP.contains("exits 4"));
+            std::fs::remove_dir_all(root).unwrap();
         }
         /// Rocky P-1: `scheduled` is valid, but help and a stderr note say what moves it to
         /// in_progress (the runner at --starts), so a buyer is never left waiting on it silently.

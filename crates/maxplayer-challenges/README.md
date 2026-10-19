@@ -169,7 +169,10 @@ maxplayer-swarm decide --seller <npub-or-hex> --deny --json
 `cancelled`. `scheduled` (the default) makes the run visible so sellers can join; no work
 is posted until it is `in_progress`. A running buyer runner (`scripts/challenges/swarm.mjs`)
 publishes `in_progress` itself at `--starts`, and a successful `scheduled` publish says so on
-stderr; without a runner, publish `--status in_progress` at `starts` yourself. A `completed` or `cancelled` challenge is final: if `publish`'s own fetch finds the
+stderr; without a runner, publish `--status in_progress` at `starts` yourself.
+`status --json` reports the event the run was read from as `run_event_id`; `publish --if-latest
+<event-id>` signs nothing and exits 4 (`swarm run changed`) when another event has become the
+latest since (an edit after your read), so a read-modify-publish never replaces a newer edit. A `completed` or `cancelled` challenge is final: if `publish`'s own fetch finds the
 latest buyer-signed event for that id closed, it signs nothing and exits 3 with `swarm:
 swarm run closed (<status>): …`. `status`/`members` default to the latest non-cancelled swarm run
 (`--run <d>` selects one). Publishing

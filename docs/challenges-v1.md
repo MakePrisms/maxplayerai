@@ -143,8 +143,10 @@ buyer-signed ACCEPT stops accrual. All durations are capped at deadline.
   buyer's runner at `starts`: when `starts ≤ now < ends` and the latest buyer-signed event is still
   `scheduled`, it publishes `in_progress` once (same latest read and every-relay rule as a progress
   update). It never re-opens a `completed`/`cancelled` run or one past `ends`, and once the run was
-  `in_progress` it leaves a later operator `scheduled` with the same `starts` alone (a new `starts`
-  is started again at that time). Without a runner, the buyer publishes `in_progress` at `starts`.
+  `in_progress` it leaves a later operator `scheduled` with the same `starts` alone (a `starts` it
+  never started is started at that time). Both decisions use that latest read, never a cached view,
+  and the publish carries the read's event id (`publish --if-latest`): an edit that became latest
+  after the read is never signed over. Without a runner, the buyer publishes `in_progress` at `starts`.
 - Target only eligible sellers with no running job, and only a task with
   `deadline − now ≤ remaining minutes`.
 - Skip a seller whose newest heartbeat says `status=not_serving` or `serving=0/N` (reason
@@ -355,7 +357,8 @@ Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
 The buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 --ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
 `members [--run <d>]`, `decide --seller <npub|hex> --accept|--deny`.
-`--status` defaults to `scheduled`; a successful `scheduled` publish prints a stderr note that no
+`publish --if-latest <event-id>` (`status --json` reports `run_event_id`) signs nothing and exits 4
+when the latest buyer-signed event for `--id` is no longer that event. `--status` defaults to `scheduled`; a successful `scheduled` publish prints a stderr note that no
 work is posted until the run is `in_progress`, which a running buyer runner publishes at `starts`.
 `--run` (a CHALLENGE `d`) defaults to the buyer's latest non-cancelled one. All sign with the home's
 key; none prints a secret. In `--json` output the selected CHALLENGE is the top-level `run` object

@@ -1443,7 +1443,7 @@ test('quorum: sidecar degraded warnings and re-sends from --json reach the runne
 test('json key: the runner reads the sidecar run from `run`, never from `challenge`',async()=>{
   const {sidecarRun}=await import('./swarm.mjs');
   const x={buyer:'f'.repeat(64),id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:null,budget_sats:7};
-  assert.deepEqual(sidecarRun({run:x,members:[]},'d'),{buyer:x.buyer,id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:'',budgetSats:7});
+  assert.deepEqual(sidecarRun({run:x,members:[]},'d'),{buyer:x.buyer,id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:'',budgetSats:7,eventId:null});
   // Pre-rename body shape: refused as not found (no alias), even with the run object present.
   assert.throws(()=>sidecarRun({challenge:x,members:[]},'d'),/swarm run d not found/);
   assert.throws(()=>sidecarRun({run:null},'d'),/not found/);
@@ -2358,12 +2358,18 @@ const {RUN_STARTED_UPDATE,NOT_PLANNING_LOG_SECONDS,notPlanningLine,readinessBloc
 function scheduledFixture({starts=200,ends=1000}={}) {
   const f=fixture(),reports=[],reads=[];f.io.report=m=>reports.push(m);f.setPlan(()=>({wait:true}));
   Object.assign(f.snap.challenge,{status:'scheduled',starts,ends});
-  let relay={...structuredClone(f.snap.challenge),budgetSats:10,result:''};
+  // Every buyer-signed event on the relays has its own id; the sidecar refuses a publish whose
+  // --if-latest is not the latest id (exit 4 -> {superseded:true}).
+  let n=0,refused=0;const nextId=()=>(++n).toString(16).padStart(64,'0');
+  let relay={...structuredClone(f.snap.challenge),budgetSats:10,result:'',eventId:nextId()};
   f.io.latestChallenge=async(c,o)=>{reads.push(o);return structuredClone(relay);};
-  f.io.publish=async(ch,budget,status,update,result,o)=>{f.publishes.push([ch,budget,status,update,result,o]);relay={...relay,status,update,result};};
+  f.io.publish=async(ch,budget,status,update,result,o)=>{
+    if(o?.ifLatest!==undefined&&o.ifLatest!==relay.eventId){refused++;return {superseded:true};}
+    f.publishes.push([ch,budget,status,update,result,o]);relay={...relay,status,update,result,eventId:nextId()};};
   const flips=()=>f.publishes.filter(p=>p[2]==='in_progress'&&p[3]===RUN_STARTED_UPDATE);
   const lines=()=>reports.filter(m=>m.startsWith('not planning'));
-  return {...f,reports,reads,flips,lines,relay:()=>relay,edit:x=>{relay={...relay,...x};Object.assign(f.snap.challenge,x);},setRelay:x=>{relay={...relay,...x};},show:()=>{f.snap.challenge.status=relay.status;}};
+  const setRelay=x=>{relay={...relay,...x,eventId:nextId()};};
+  return {...f,reports,reads,flips,lines,refused:()=>refused,relay:()=>relay,edit:x=>{setRelay(x);Object.assign(f.snap.challenge,x);},setRelay,show:()=>{f.snap.challenge.status=relay.status;}};
 }
 const tickAt=async(f,...times)=>{for(const t of times){f.time(t);await f.runner.tick();}};
 test('P-1: a scheduled run is published in_progress once at starts, then planned; slow relay and restart never publish it again',async()=>{
@@ -2374,7 +2380,8 @@ test('P-1: a scheduled run is published in_progress once at starts, then planned
   await tickAt(f,200);
   assert.equal(f.flips().length,1,'published at starts');
   const [ch,budget,,,result,opts]=f.flips()[0];
-  assert.deepEqual(opts,{strict:true},'every challenge relay, like a progress re-send');assert.deepEqual(f.reads.at(-1),{strict:true});
+  assert.deepEqual(opts,{strict:true,ifLatest:ch.eventId},'every challenge relay, like a progress re-send, and only over the event it read');
+  assert.match(ch.eventId,/^[0-9a-f]{64}$/);assert.deepEqual(f.reads.at(-1),{strict:true});
   assert.equal(ch.title,'test');assert.equal(budget,10);assert.equal(result,'');
   assert.equal(f.reports.filter(m=>/^Run day: scheduled -> in_progress at 1970-01-01T00:03:20Z \(starts 1970-01-01T00:03:20Z\), published by the runner/.test(m)).length,1,f.reports.join('\n'));
   assert.equal(f.publishes.length,before+1,'the flip is this tick\'s progress update too');
@@ -2492,4 +2499,79 @@ test('P-1: a close seen by the flip\'s own read is journaled at once; a journale
   // A failed flip publish is not followed by a progress re-send in the same tick.
   const c=scheduledFixture();let attempts=0;c.io.publish=async()=>{attempts++;throw Error('relay refused');};
   await tickAt(c,200);assert.equal(attempts,1);
+});
+// Advisor r1 #1: the snapshot's `starts` lags (old schedule) while the strict read is scheduled
+// with a NEW starts. The once-guard must use the read: one flip for the new starts, and a pause
+// of that new starts is never undone, however long the snapshot keeps the old starts.
+test('advisor r1 #1: a snapshot whose starts lags never re-flips the read\'s schedule, nor undoes its pause',async()=>{
+  const f=scheduledFixture({starts:200,ends:1000});f.c.updateEvery=100000;
+  f.setRelay({starts:250}); // rescheduled; the reader still shows starts=200 (status scheduled)
+  await tickAt(f,300,305,310,315);
+  assert.equal(f.flips().length,1,'one flip for starts=250 while the snapshot lags at 200');
+  assert.deepEqual(Object.values(f.journal.state.days)[0].started,{at:300,by:'runner',starts:250});
+  // Operator pause of the NEW schedule; the snapshot still has starts=200.
+  f.setRelay({status:'scheduled'});
+  await tickAt(f,320,345,400,460,520);
+  for(const t of [580,640]){f.time(t);await new Swarm(f.c,f.io,f.journal).tick();}
+  assert.equal(f.flips().length,1,'the pause of starts=250 stands across ticks and restarts');
+  assert.ok(f.reports.some(m=>m.includes('scheduled for starts 1970-01-01T00:04:10Z, which was already started')),f.reports.join('\n'));
+  // The pause is re-read at the 30 s backoff, not every tick.
+  const reads=f.reads.length;await tickAt(f,641,650);assert.equal(f.reads.length,reads);
+  // The snapshot catches up (starts=250, scheduled): it is filtered before any read.
+  f.snap.challenge.starts=250;await tickAt(f,700,760);assert.equal(f.reads.length,reads);assert.equal(f.flips().length,1);
+  // A schedule never started (starts=800) is started once.
+  f.setRelay({starts:800});f.snap.challenge.starts=800;await tickAt(f,800,805,840,900);assert.equal(f.flips().length,2);
+  // Starting 800 keeps 250 known: a later read back at starts=250 (scheduled) is still a pause.
+  f.setRelay({status:'scheduled',starts:250});f.snap.challenge.starts=250;await tickAt(f,950,990);
+  assert.equal(f.flips().length,2);
+});
+test('advisor r1 #2: an edit that lands after the strict read is never signed over; the next tick re-reads',async()=>{
+  const f=scheduledFixture({starts:200,ends:1000});f.c.updateEvery=100000;
+  // The edit lands between the strict read and the publish.
+  const read=f.io.latestChallenge;let once=true;
+  f.io.latestChallenge=async(...a)=>{const r=await read(...a);if(once){once=false;f.setRelay({title:'operator edit',ends:900});}return r;};
+  await tickAt(f,200);
+  assert.equal(f.refused(),1,'the publish named the read event; the sidecar refused it');
+  assert.equal(f.publishes.length,0,'nothing signed over the edit, no progress re-send in that tick');
+  assert.equal(Object.values(f.journal.state.days)[0].started,undefined);
+  assert.ok(f.reports.some(m=>m.includes('the run changed after the read')),f.reports.join('\n'));
+  // The next tick re-reads (no 30 s backoff) and publishes from the edited event.
+  await tickAt(f,201);
+  assert.equal(f.flips().length,1);
+  const [ch]=f.flips()[0];assert.equal(ch.title,'operator edit');assert.equal(ch.ends,900);
+  assert.equal(f.flips()[0][5].ifLatest,ch.eventId);
+  // A read without an event id (older sidecar) publishes nothing and retries.
+  const g=scheduledFixture({starts:200,ends:1000});const r=g.io.latestChallenge;
+  g.io.latestChallenge=async(...a)=>({...await r(...a),eventId:null});
+  await tickAt(g,200);assert.equal(g.publishes.length,0);
+  assert.match(Object.values(g.journal.state.days)[0].startError,/names no event id/);
+});
+test('advisor r1 #2: runner plumbing for --if-latest and run_event_id',async()=>{
+  const {sidecarRun,supersededRefusal,SIDECAR_SUPERSEDED_EXIT,closedRefusal,markStarted,wasStarted,STARTED_STARTS_KEPT}=await import('./swarm.mjs');
+  const x={buyer:'f'.repeat(64),id:'d',title:'T',goal:'g',starts:1,ends:2,status:'scheduled',result:null,budget_sats:7};
+  assert.equal(sidecarRun({run:x,run_event_id:'a'.repeat(64)},'d').eventId,'a'.repeat(64));
+  assert.equal(sidecarRun({run:x},'d').eventId,null);
+  const refusal={exitCode:SIDECAR_SUPERSEDED_EXIT,stderr:'swarm: swarm run changed: the latest buyer-signed swarm run d is b…; nothing published\n'};
+  assert.equal(SIDECAR_SUPERSEDED_EXIT,4);assert.equal(supersededRefusal(refusal),true);
+  assert.equal(supersededRefusal({...refusal,exitCode:2}),false);assert.equal(closedRefusal(refusal),null);
+  const day={};for(let i=0;i<STARTED_STARTS_KEPT+5;i++)markStarted(day,{at:i,by:'runner',starts:i});
+  assert.equal(day.startedStarts.length,STARTED_STARTS_KEPT);assert.ok(wasStarted(day,STARTED_STARTS_KEPT+4)&&!wasStarted(day,0));
+  assert.equal(wasStarted({started:{starts:9}},9),true,'a journal from before startedStarts still counts');
+  const src=readFileSync(new URL('./swarm.mjs',import.meta.url),'utf8');
+  assert.match(src,/if\(ifLatest\)args\.push\('--if-latest',ifLatest\);/);
+  assert.match(src,/if\(supersededRefusal\(e\)\)return \{superseded:true\};/);
+});
+test('advisor r1: a lagging snapshot re-reads an already-started schedule at the backoff only; a refused flip is the tick\'s only publish attempt',async()=>{
+  // The reader still shows scheduled/starts=200; the relays already hold in_progress for starts=250.
+  const f=scheduledFixture({starts:200,ends:1000});f.c.updateEvery=100000;f.setRelay({starts:250,status:'in_progress'});
+  await tickAt(f,300);const reads=f.reads.length;assert.equal(reads,1);
+  await tickAt(f,301,310,329);assert.equal(f.reads.length,reads,'no strict read every tick while the snapshot lags');
+  await tickAt(f,330);assert.equal(f.reads.length,reads+1,'re-read once the backoff has passed');
+  assert.equal(f.publishes.length,0);
+  // A superseded flip with progress due: no progress re-send over the edit in that tick.
+  const g=scheduledFixture({starts:200,ends:1000});await tickAt(g,150);
+  Object.values(g.journal.state.days)[0].lastUpdate=-1000;
+  const read=g.io.latestChallenge;let once=true;
+  g.io.latestChallenge=async(...a)=>{const r=await read(...a);if(once){once=false;g.setRelay({title:'operator edit'});}return r;};
+  await tickAt(g,200);assert.equal(g.refused(),1);assert.equal(g.publishes.length,0,'nothing published in the refused tick');
 });
