@@ -208,7 +208,11 @@ a late delivery is still collected exactly once. Minutes are not recounted. Dura
 `SWARM_MIN_DURATION` (300 seconds, a floor that covers seller sandbox/agent startup; a seller
 whose remaining minutes cannot fit it gets no assignment) and `SWARM_MAX_DURATION` (1800 seconds).
 Exhaustion means no free seller can fit the minimum duration and no work is running; choosing
-wait alone never exhausts a challenge. Bundled planners are a deterministic capability-routing
+wait alone never exhausts a challenge. Minutes can end a run before the work window does: the
+stop `Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)` is
+published as soon as every accepted seller's remaining donated minutes (or the time left before
+`ends`) is below `SWARM_MIN_DURATION`, nothing is running or unsettled and no seller is benched, even
+hours before `ends`. The runner does not post a shorter final task to use leftover minutes. Bundled planners are a deterministic capability-routing
 stub and non-interactive Claude; verified-solution rules remain, including both Hutton keywords
 and checked English decryption. Verification can itself be a delegated task.
 
@@ -249,6 +253,21 @@ an empty cache), so history is not re-verified. The checksum guards against acci
 rewrite with a matching checksum makes its keys count as verified, so the file is inside the
 home's trust boundary, like the buyer key; a history page's 20 s deadline is credited with the
 process's own frame-handling time (capped at 120 s), never idle time.
+
+Every job runs in a fresh, empty container and cannot see another job's files or answer, so the
+planner is told to put what a task needs in the task text: the exact URL(s) of every source (a seller
+may have no web search but can fetch pages), and inline only small essential data (a key, a
+ciphertext, a short candidate list, a transcript under ~2 KB), never whole pages or large tables. The
+whole assembled task is capped at 8192 UTF-8 bytes; a larger assignment is rejected unposted with its
+size breakdown as the reason. An assignment may quote earlier answers with `includeAnswers:[jobId,…]`:
+the runner appends a deliberately small excerpt of each (1500 chars each, 3000 in total)
+(collected answers of this challenge from its own journal only; anything else rejects the assignment
+with the reason), framed as untrusted data and neutralised so it cannot forge the challenge prefix,
+delivery note, REPORT BACK section, context block or answer markers; the quoted ids are journaled and
+shown to the planner. Every posted task ends with a `REPORT BACK:` section (planner-tailored, or a
+generic one the runner appends). A rejected planner plan or response names its first failing check
+(e.g. `ws9.dependsOn names unknown workstream ws7`) and is shown to the planner on the retry as
+`previousPlannerError`.
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
 
