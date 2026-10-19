@@ -762,7 +762,7 @@ mod tests {
         let skill = include_str!("../../../web/app/.well-known/skills/swarm-join/skill.md");
         for line in skill
             .lines()
-            .filter(|line| line.trim().starts_with("maxplayer-challenges "))
+            .filter(|line| line.trim().starts_with("maxplayer-swarm "))
         {
             let tokens: Vec<_> = line.split_whitespace().collect();
             assert!(["status", "join", "leave"].contains(&tokens[1]));

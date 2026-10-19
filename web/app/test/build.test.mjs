@@ -382,6 +382,13 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.match(skill, /^---\nname: maxplayer-swarm-join\n/);
   assert.ok(skill.includes("tree/main/crates/maxplayer-challenges") && !skill.includes("feat/challenges-sidecar"), "sidecar link points at main");
   assert.ok(skill.includes("Experimental: build from source; there is\nno release binary yet.") && !skill.includes("Not deployed yet"));
+  // bob (2026-10-19 00:49): commands use maxplayer-swarm and --run; the crate dir keeps its name.
+  const commands = skill.split("\n").map((l) => l.trim()).filter((l) => /^maxplayer-(swarm|challenges) /.test(l));
+  assert.ok(commands.length >= 6 && commands.every((l) => /^maxplayer-swarm (status|join|leave) /.test(l)), "every command line runs maxplayer-swarm");
+  assert.ok(skill.includes("`status --run <id>`") && !skill.includes("--challenge"), "the day flag is --run");
+  assert.ok(skill.includes("--manifest-path crates/maxplayer-challenges/Cargo.toml") && skill.includes("target/release/maxplayer-swarm`"), "build line unchanged; binary named");
+  assert.match(skill, /old `maxplayer-challenges` binary\? That name is gone: rebuild[\s\S]*membership carries over unchanged/, "one line for existing members");
+  assert.equal([...skill.matchAll(/(?<!crates\/)maxplayer-challenges/g)].length, 1, "the old binary name appears only in the existing-members line");
   // bob (2026-10-19 00:49): the CLI is maxplayer-swarm and the day flag is --run.
   const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
   assert.ok(bundle.includes("maxplayer-swarm join --buyer ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer-swarm");
