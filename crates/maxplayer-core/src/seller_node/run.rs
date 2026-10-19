@@ -4374,6 +4374,12 @@ pub struct SellerNodeRunner {
     /// Behind an `Arc` because execution runs off the loop: the task that discovers a harness is
     /// broken is not the task that publishes the next advertisement. See [`LiveRoster`].
     agents: Arc<LiveRoster>,
+    /// The [`LiveRoster::generation`] the last kind-30340 beat was built from (R3-2). The drain tick
+    /// compares it with the roster's and, on a difference, fires the heartbeat supervision now rather
+    /// than an interval later, so a seat that drops (or restores) a harness re-announces within
+    /// seconds. Recorded on every publish ATTEMPT: a relay that refuses the beat is the watchdog's
+    /// business, and retrying it every drain tick would turn the interval into five seconds.
+    announced_serving_generation: std::sync::atomic::AtomicU64,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     /// The seat's held tools (the Holder route, `[[sandbox.held_tools]]`): one holder container per
@@ -4862,6 +4868,7 @@ impl SellerNodeRunner {
             boot_auth,
             private_authenticated,
             agents,
+            announced_serving_generation: std::sync::atomic::AtomicU64::new(0),
             held_tools,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
@@ -5747,6 +5754,24 @@ impl SellerNodeRunner {
                 // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
                     queue.request_tick();
+                    // R3-2: a harness dropped or came back since the last beat. Fire the heartbeat
+                    // supervision NOW (its single-flight arm below) rather than an interval later, so
+                    // buyers stop targeting a seat that cannot work within seconds, and resume as
+                    // soon as it can. While a supervision is in flight it publishes a fresh beat
+                    // itself; the next drain tick re-checks after it lands.
+                    if heartbeat_enabled
+                        && supervision.is_none()
+                        && self.serving_changed_since_last_beat()
+                    {
+                        let ad = self.agents.advertisement();
+                        opline!(
+                            "seller node serving changed: now serving {}/{} harness(es) — \
+                             republishing kind-30340 now",
+                            ad.harnesses.available,
+                            ad.harnesses.configured
+                        );
+                        heartbeat_tick.reset_immediately();
+                    }
                     if let Some((label, busy)) = lane_busy.due_warning(tokio::time::Instant::now()) {
                         opline!(
                             "seller node WORK-LANE busy for {}s on {label} ({} event(s) queued, {} \
@@ -6617,8 +6642,12 @@ impl SellerNodeRunner {
             return true;
         };
         let in_flight = self.live_in_flight("heartbeat");
-        // ONE roster read for both wire signals: a seat that has dropped every harness advertises
-        // `accepting=n`, so it stops attracting work instead of looking open and declining later.
+        // R3-2: the generation is read BEFORE the snapshot, so a transition landing between the two
+        // leaves the recorded value behind the roster — one extra beat, never a missed one.
+        let generation = self.agents.generation();
+        // ONE roster read for every wire signal: a seat that has dropped every harness advertises
+        // `accepting=n` and `serving=0/<n>` with `status=not_serving`, so it stops attracting work
+        // instead of looking open and declining later.
         let roster = self.agents.advertisement();
         // The mints ride the announcement every beat (§4.2). They come from the SAME config field
         // the pay path validates against, so what a buyer reads here is what this seat can settle
@@ -6643,8 +6672,21 @@ impl SellerNodeRunner {
             // from the gate that enforces it.
             crate::home::AdmissionPolicy::from_seller_config(&seller),
         )
+        // R3-2 — the count from the SAME snapshot as `accepting`, so `serving=0/n` and
+        // `accepting=n` cannot describe two different moments.
+        .with_serving(roster.harnesses)
         .to_event_draft();
+        self.announced_serving_generation
+            .store(generation, std::sync::atomic::Ordering::SeqCst);
         self.publish_seat_announcement(draft, "heartbeat").await
+    }
+
+    /// R3-2: has the roster's serving state changed since the last beat was built?
+    fn serving_changed_since_last_beat(&self) -> bool {
+        self.agents.generation()
+            != self
+                .announced_serving_generation
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// #747 — publish the seat's TERMINAL announcement: the same kind-30340, `accepting=n`, once,
@@ -6693,6 +6735,10 @@ impl SellerNodeRunner {
             roster.capability(&self.node.home().config.seat),
             crate::home::AdmissionPolicy::from_seller_config(&seller),
         )
+        // The serving count rides the terminal beat unchanged, like the roster: a seat leaving with
+        // working harnesses says `serving=1/1` beside `accepting=n`, which is how a reader tells a
+        // retraction from a seat that cannot work.
+        .with_serving(roster.harnesses)
         .to_event_draft();
 
         opline!("seller node: publishing terminal kind-30340 (accepting=n) — retracting this seat");
@@ -18095,6 +18141,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // BEGIN R3-2 run-loop tests
+    /// R3-2 — a seat whose harness drops republishes its beat promptly with `serving=0/1` and
+    /// `status=not_serving`, and promptly again with `serving=1/1` once it is restored. The heartbeat
+    /// interval is an hour, so the only beats after the boot one are the change-driven ones.
+    ///
+    /// RED ON REVERT: remove the `serving_changed_since_last_beat` arm on the drain tick and no second
+    /// beat arrives within the wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_serving_change_republishes_the_beat_promptly_in_both_directions() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("r3-2-serving-change");
+        let mut home = lane_home(&root, &fixture);
+        home.config.seller_heartbeat.interval_secs = 3600;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let roster = Arc::clone(&runner.agents);
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let beat_with = |serving: &'static str, status: Option<&'static str>| {
+            move |events: &[PublishedEvent]| {
+                seat_announcements(events).iter().any(|e| {
+                    e.tag_value(crate::heartbeat::SERVING_TAG) == Some(serving)
+                        && e.tag_value(crate::heartbeat::STATUS_TAG) == status
+                })
+            }
+        };
+        local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, beat_with("1/1", None))
+                        .await,
+                    "the boot beat states serving=1/1"
+                );
+                roster.fault(0, Fault::Unproven, Instant::now());
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, beat_with("0/1", Some("not_serving")))
+                        .await,
+                    "a dropped harness must be re-announced now (serving=0/1, status=not_serving), \
+                     not an interval later"
+                );
+                let dark = fixture.events().await;
+                let last = *seat_announcements(&dark).last().expect("a beat");
+                assert_eq!(last.tag_value("accepting"), Some("n"));
+                let before = seat_announcements(&dark).len();
+
+                roster.restore(0);
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| {
+                            let beats = seat_announcements(events);
+                            beats.len() > before
+                                && beats
+                                    .last()
+                                    .unwrap()
+                                    .tag_value(crate::heartbeat::SERVING_TAG)
+                                    == Some("1/1")
+                        })
+                        .await,
+                    "a restored harness must be re-announced now (serving=1/1)"
+                );
+                assert!(shutdown.request("R3-2 stop"));
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END R3-2 run-loop tests
+
     /// Every kind-30340 seat announcement that reached the relay, in arrival order.
     fn seat_announcements(events: &[PublishedEvent]) -> Vec<&PublishedEvent> {
         events
@@ -20537,6 +20653,50 @@ mod supervised_probe_tests {
              value it ever gave outlives the truth, and absent is the only honest spelling"
         );
     }
+
+    // BEGIN R3-2 restore tests
+    /// R3-2 — the restore path: a dropped harness becomes due after the FIRST short backoff step (one
+    /// minute, not fifteen), a passing probe restores it, the advertisement's serving count returns to
+    /// 1/1, and the roster's generation moves so the loop republishes.
+    #[tokio::test]
+    async fn a_passing_probe_one_minute_after_a_drop_restores_serving_and_flags_a_republish() {
+        let roster = Arc::new(LiveRoster::new(AgentRegistry::new(vec![RegisteredAgent {
+            name: Some("claude".to_owned()),
+            argv: vec!["claude-acp".to_owned()],
+        }])));
+        let now = Instant::now();
+        roster.fault(0, Fault::Unproven, now);
+        roster.fault(0, Fault::Unproven, now); // strike 2, as seen live
+        let dark = roster.advertisement().harnesses;
+        assert_eq!((dark.available, dark.configured), (0, 1));
+        assert!(
+            roster
+                .claim_due_probes(now + Duration::from_secs(119))
+                .is_empty(),
+            "strike 2 waits two minutes"
+        );
+        assert_eq!(
+            roster.claim_due_probes(now + Duration::from_secs(120)),
+            vec![0],
+            "strike 2 is re-probed after two minutes (the old schedule waited an hour)"
+        );
+        let generation = roster.generation();
+        let outcome =
+            supervise_harness_probe(Arc::clone(&roster), 0, std::future::ready(Ok(None))).await;
+        assert!(matches!(outcome, ProbeOutcome::Restored), "{outcome:?}");
+        let back = roster.advertisement().harnesses;
+        assert_eq!(
+            (back.available, back.configured),
+            (1, 1),
+            "serving is restored"
+        );
+        assert_ne!(
+            roster.generation(),
+            generation,
+            "the restore must flag a prompt republish"
+        );
+    }
+    // END R3-2 restore tests
 
     #[tokio::test(start_paused = true)]
     async fn a_hung_probe_hits_the_wall_clock_ceiling_and_the_harness_is_re_probed() {

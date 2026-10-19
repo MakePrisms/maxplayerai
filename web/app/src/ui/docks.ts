@@ -175,7 +175,7 @@ const statBlock = (pairs: [string, string, string?][]): string =>
 
 const fieldLabel = (name: string): string => ({
   d: "Seat", t: "Namespace", v: "Protocol version", rate: "Rate (sats)",
-  accepting: "Serving", queue_depth: "Jobs in flight",
+  accepting: "Serving", queue_depth: "Jobs in flight", serving: "Harnesses serving",
   accepted_mints: "Accepted mints", agents: "Agents",
   model: "Model", models: "Models", hardware: "Hardware",
 } as Record<string, string>)[name] || String(name).replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -363,10 +363,15 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
     : acceptingFlag === true ? (loadText ? `Serving · ${loadText}` : "Serving")
     : acceptingFlag === false ? (depth ? `Not serving · ${loadText}` : "Not serving")
     : String(accepting);
+  // R3-2: how many of the seat's harnesses can run a job. Absent ⇒ no row (unknown, not zero).
+  const servingText = s?.serving == null ? null
+    : `${nf.format(s.serving.available)} of ${nf.format(s.serving.configured)}`
+      + (s.servingState === "not_serving" ? " · not serving" : "");
   const profileRowsHtml = ([
     ["About", about ? String(about) : null],
     ["Min rate", s?.askSats == null ? null : `${usd(s.askSats)} · ${nf.format(s.askSats)} sat`],
     ["Status", statusText],
+    ["Harnesses serving", servingText],
     ["Accepted mints", s?.acceptedMints?.length ? s.acceptedMints.join(" · ") : null],
     ...capabilityRows(s),
   ] as ProfileRow[])

@@ -330,6 +330,9 @@ export interface SellerRow extends NamedRow {
   askSats: number | null;
   accepting: string | null;
   queueDepth: number | null;
+  /** R3-2 serving count from the same newest beat; null ⇒ the seat states none (unknown). */
+  serving: { available: number; configured: number } | null;
+  servingState: "serving" | "not_serving" | "unknown";
   acceptedMints: string[];
   /**
    * What the seat says it can run, all from the SAME newest heartbeat as the
@@ -385,6 +388,7 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
             // not measurements. Unknown tags stay intact for the detail view.
             name: null, about: null, profile: null, profileAt: 0,
             askSats: null, accepting: null, queueDepth: null,
+            serving: null, servingState: "unknown",
             acceptedMints: [],
             harnessFamilies: [], harnessModels: [], capabilities: [],
             harnessVariant: null, hardware: null,
@@ -434,6 +438,8 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
         r.askSats = p.rateSats ?? null;
         r.accepting = p.accepting ?? null;
         r.queueDepth = p.queueDepth ?? null;
+        r.serving = p.serving ?? null;
+        r.servingState = p.servingState ?? "unknown";
         r.acceptedMints = p.acceptedMints ?? [];
         // Assigned in this block with the rest of the advertisement, so every
         // capability field on a row comes from ONE beat. Merged across beats
