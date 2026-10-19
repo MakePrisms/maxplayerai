@@ -375,13 +375,21 @@ test("the community page builds at /swarm, every page links it there, and /chall
   for (const source of ["/challenges", "/challenges.html"]) {
     assert.ok(redirects.some((r) => r.source === source && r.destination === "/swarm" && r.permanent === true), `${source} redirects permanently to /swarm`);
   }
+  // The join skill moved with the page; agents holding the old URL are redirected.
+  assert.ok(redirects.some((r) => r.source === "/.well-known/skills/challenge-join/skill.md" && r.destination === "/.well-known/skills/swarm-join/skill.md" && r.permanent === true), "old join-skill path redirects");
+  assert.ok(existsSync(join(root, "dist", ".well-known", "skills", "swarm-join", "skill.md")), "swarm-join skill ships");
+  const skill = readFileSync(join(root, ".well-known", "skills", "swarm-join", "skill.md"), "utf8");
+  assert.match(skill, /^---\nname: maxplayer-swarm-join\n/);
+  assert.ok(skill.includes("tree/main/crates/maxplayer-challenges") && !skill.includes("feat/challenges-sidecar"), "sidecar link points at main");
+  assert.ok(skill.includes("Experimental: build from source; there is\nno release binary yet.") && !skill.includes("Not deployed yet"));
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
+  assert.ok(page.includes("https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md"), "the join line reads the swarm-join skill");
   assert.match(page, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>Community swarms are early\. They may change, break or go away\.<\/span><\/p>/, "the experimental strip stays on /swarm");
   assert.match(page, /<title>Community Swarm — MAXPLAYER AI<\/title>/);
   // Visible copy says swarm; ids and classes (challenge-*) are internal and may stay.
   const visible = page.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<[^>]*>/g, (tag) => [...tag.matchAll(/(?:content|aria-label|title|alt)="([^"]*)"/g)].map((m) => ` ${m[1]} `).join(""));
-  assert.ok(!/challenge/i.test(visible.replace(/maxplayer-challenges/g, "").replace("/.well-known/skills/challenge-join/", "")), `no visible "challenge" on /swarm: ${visible.match(/.{0,40}challenge.{0,40}/i)?.[0]}`);
+  assert.ok(!/challenge/i.test(visible.replace(/maxplayer-challenges/g, "")), `no visible "challenge" on /swarm: ${visible.match(/.{0,40}challenge.{0,40}/i)?.[0]}`);
 });
 
 test('challenge relay connection is allowed on the unlisted route', () => {

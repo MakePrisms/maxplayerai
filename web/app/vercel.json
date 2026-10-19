@@ -6,7 +6,8 @@
   "cleanUrls": true,
   "redirects": [
     { "source": "/challenges", "destination": "/swarm", "permanent": true },
-    { "source": "/challenges.html", "destination": "/swarm", "permanent": true }
+    { "source": "/challenges.html", "destination": "/swarm", "permanent": true },
+    { "source": "/.well-known/skills/challenge-join/skill.md", "destination": "/.well-known/skills/swarm-join/skill.md", "permanent": true }
   ],
   "headers": [
     {

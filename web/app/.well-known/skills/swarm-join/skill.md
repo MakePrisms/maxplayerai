@@ -1,16 +1,19 @@
 ---
-name: maxplayer-challenge-join
+name: maxplayer-swarm-join
 description: Join the community swarm once with daily minutes, check persistent acceptance, change minutes, or leave at any time.
 ---
 
 # Join the community swarm
 
-Requires the separate [maxplayer-challenges sidecar](https://github.com/MakePrisms/maxplayerai/tree/feat/challenges-sidecar/crates/maxplayer-challenges), built from source (`cargo build --release --locked --manifest-path crates/maxplayer-challenges/Cargo.toml`), with `maxplayer-challenges --help` and an initialized, running seller
-(see [seller-operate](../seller-operate/skill.md)). Not deployed yet. Use the seller's
-existing `MAXPLAYER_HOME`; never create or print a secret key. Obtain the dedicated
-buyer's public key from the operator, not a member's note.
+Requires the swarm sidecar ([`maxplayer-challenges`](https://github.com/MakePrisms/maxplayerai/tree/main/crates/maxplayer-challenges)), built from source (`cargo build --release --locked --manifest-path crates/maxplayer-challenges/Cargo.toml`), with `maxplayer-challenges --help` and an initialized, running seller
+(see [seller-operate](../seller-operate/skill.md)). Experimental: build from source; there is
+no release binary yet. Use the seller's existing `MAXPLAYER_HOME`; never create or print a
+secret key. Obtain the dedicated buyer's public key from the operator, not a member's note.
 
-1. Read the current challenge and your membership:
+The sidecar's flags and messages still say "challenge": one swarm run (one day) is a
+challenge to the CLI. Quoted messages below are exact CLI output.
+
+1. Read the current swarm run and your membership:
 
    ```bash
    maxplayer-challenges status --buyer <npub-or-hex> --json
@@ -43,10 +46,10 @@ buyer's public key from the operator, not a member's note.
    ```
 
    Same minutes with `--note` omitted or equal is a no-op (`"unchanged": true`). On a
-   change, omitting `--note` keeps the note; `--note ''` clears it. While a challenge that
+   change, omitting `--note` keeps the note; `--note ''` clears it. While a swarm run that
    counts you is running, `join` exits 2 with "You're in today's challenge … Nothing was
    published": republishing would make you ineligible for that day. Change minutes after
-   the time the message names (15 minutes after the challenge ends). Never leave and rejoin
+   the time the message names (15 minutes after the run ends). Never leave and rejoin
    to change minutes: leaving drops today's eligibility and the rejoin starts a new period,
    so it forfeits the day too. If the message says you're in today's challenge, nothing
    was published: wait until after the time it names. For any other `join` exit 2, re-run

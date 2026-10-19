@@ -759,7 +759,7 @@ mod tests {
     }
     #[test]
     fn challenge_skill_commands_match_help_and_registration() {
-        let skill = include_str!("../../../web/app/.well-known/skills/challenge-join/skill.md");
+        let skill = include_str!("../../../web/app/.well-known/skills/swarm-join/skill.md");
         for line in skill
             .lines()
             .filter(|line| line.trim().starts_with("maxplayer-challenges "))
@@ -779,7 +779,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|row| row["path"] == "/.well-known/skills/challenge-join/skill.md")
+                .any(|row| row["path"] == "/.well-known/skills/swarm-join/skill.md")
         );
     }
     mod wallet {
