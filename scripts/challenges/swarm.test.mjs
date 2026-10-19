@@ -2477,3 +2477,19 @@ test('P-2: notPlanningLine/readinessBlocker use the reader status (trade relay, 
   assert.match(notPlanningLine({c:{...c,status:'completed'},snap:snap(ok),now:50}).line,/status=completed \(needs in_progress\)/);
   assert.match(notPlanningLine({c,snap:snap(ok),now:150,day:{started:{starts:100,by:'observed'}}}).line,/it was already in_progress, so the runner leaves this later scheduled edit alone/);
 });
+test('P-1: a close seen by the flip\'s own read is journaled at once; a journaled stop/close is never re-opened; a failed flip is the tick\'s only publish',async()=>{
+  // The read (not the lagging snapshot) says cancelled: closeSeen in THAT tick, no progress needed.
+  const a=scheduledFixture();a.c.updateEvery=100000;a.setRelay({status:'cancelled'});await tickAt(a,200);
+  const ad=Object.values(a.journal.state.days)[0];
+  assert.deepEqual(ad.stop,{external:true});assert.equal(ad.closed.status,'cancelled');assert.equal(ad.started,undefined);
+  assert.ok(a.reports.includes('Challenge day is already cancelled on the relays; not publishing in_progress (a buyer close is never overwritten)'),a.reports.join('\n'));
+  // A journaled stop (or close) stays final even when a read still says scheduled.
+  for(const seed of [{stop:{update:'Unsolved: work window ended',result:''},published:true},{stop:{external:true},closed:{status:'cancelled',seenAt:150}}]) {
+    const b=scheduledFixture();await tickAt(b,150);Object.assign(Object.values(b.journal.state.days)[0],structuredClone(seed));
+    await tickAt(b,200,260,400);
+    assert.equal(b.publishes.length,0,JSON.stringify(seed));
+  }
+  // A failed flip publish is not followed by a progress re-send in the same tick.
+  const c=scheduledFixture();let attempts=0;c.io.publish=async()=>{attempts++;throw Error('relay refused');};
+  await tickAt(c,200);assert.equal(attempts,1);
+});
