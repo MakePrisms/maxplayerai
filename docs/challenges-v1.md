@@ -139,6 +139,12 @@ buyer-signed ACCEPT stops accrual. All durations are capped at deadline.
 ## The buyer’s rules
 
 - Post only while `now ∈ [C.starts, C.ends]` and `C.status = in_progress`.
+- A run published `scheduled` (visible early so sellers can join) is moved to `in_progress` by the
+  buyer's runner at `starts`: when `starts ≤ now < ends` and the latest buyer-signed event is still
+  `scheduled`, it publishes `in_progress` once (same latest read and every-relay rule as a progress
+  update). It never re-opens a `completed`/`cancelled` run or one past `ends`, and once the run was
+  `in_progress` it leaves a later operator `scheduled` with the same `starts` alone (a new `starts`
+  is started again at that time). Without a runner, the buyer publishes `in_progress` at `starts`.
 - Target only eligible sellers with no running job, and only a task with
   `deadline − now ≤ remaining minutes`.
 - Skip a seller whose newest heartbeat says `status=not_serving` or `serving=0/N` (reason
@@ -349,6 +355,8 @@ Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
 The buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 --ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
 `members [--run <d>]`, `decide --seller <npub|hex> --accept|--deny`.
+`--status` defaults to `scheduled`; a successful `scheduled` publish prints a stderr note that no
+work is posted until the run is `in_progress`, which a running buyer runner publishes at `starts`.
 `--run` (a CHALLENGE `d`) defaults to the buyer's latest non-cancelled one. All sign with the home's
 key; none prints a secret. In `--json` output the selected CHALLENGE is the top-level `run` object
 (`null` if none; `join` always reports `null`), renamed from `challenge` with no alias. The event

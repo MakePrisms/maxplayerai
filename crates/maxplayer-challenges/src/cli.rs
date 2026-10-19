@@ -11,6 +11,9 @@ const HELP: &str = "Usage: maxplayer-swarm <command> [--home <path>] [--json] [-
   members [--run <d>]
   decide --seller <npub|hex> --accept|--deny
 Join or leave at any time. Joining after work starts means eligibility from the next day.
+publish --status defaults to scheduled: the run is visible and sellers can join, but no work is
+posted until it is in_progress. A running swarm runner (scripts/challenges/swarm.mjs) publishes
+in_progress itself at --starts; without a runner, publish --status in_progress at starts yourself.
 While a swarm run that counts your accepted membership is in progress, join refuses to change
 minutes or note (republishing would forfeit that day); change them 15 minutes after it ends (clock drift).
 Never leave and rejoin to change minutes: that forfeits the day too. Same minutes with --note
@@ -25,6 +28,8 @@ and at most all of them). Quorum met with a relay missing is degraded: a warning
 A minutes/note change while a swarm run is in progress still needs every relay.
 Per-relay read/publish outcomes are printed to stderr; --json uses stdout.
 ";
+/// Printed on stderr after a successful `scheduled` publish (the default status): what starts it.
+const SCHEDULED_NOTE: &str = "Note: status scheduled: no work is posted until the run is in_progress. A running swarm runner publishes in_progress itself at --starts; without one, publish --status in_progress at starts.";
 /// A publish refused because the swarm run is already closed on the relays exits with
 /// `CLOSED_EXIT` and an error starting with `CHALLENGE_CLOSED` (nothing is signed or sent).
 const CHALLENGE_CLOSED: &str = "swarm run closed";
@@ -181,6 +186,11 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             Ok((body, warning)) => {
                 if let Some(warning) = warning {
                     let _ = writeln!(err, "Warning: {warning}");
+                }
+                if opts.command == "publish"
+                    && opts.get("--status").unwrap_or("scheduled") == "scheduled"
+                {
+                    let _ = writeln!(err, "{SCHEDULED_NOTE}");
                 }
                 // Degraded quorum (met, with a relay missing) and re-sends: always on stderr, and
                 // in --json as `relay_quorum`.
@@ -1128,6 +1138,81 @@ mod tests {
                 assert!(after.writes.lock().unwrap().is_empty(), "close replaced");
                 std::fs::remove_dir_all(root).unwrap();
             }
+        }
+        /// Rocky P-1: `scheduled` is valid, but help and a stderr note say what moves it to
+        /// in_progress (the runner at --starts), so a buyer is never left waiting on it silently.
+        #[test]
+        fn scheduled_publish_explains_who_starts_the_run() {
+            assert!(
+                HELP.contains("publish --status defaults to scheduled"),
+                "{HELP}"
+            );
+            assert!(
+                HELP.contains("publishes\nin_progress itself at --starts"),
+                "{HELP}"
+            );
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            let root = std::env::temp_dir().join(format!(
+                "challenge-scheduled-note-{}",
+                Keys::generate().public_key()
+            ));
+            home::bootstrap(&root).unwrap();
+            let goal = root.join("goal.md");
+            std::fs::write(&goal, "goal").unwrap();
+            let now = Timestamp::now().as_secs();
+            let iso = |t| Timestamp::from(t).to_human_datetime();
+            for (status, noted) in [
+                (Some("scheduled"), true),
+                (None, true),
+                (Some("in_progress"), false),
+                (Some("completed"), false),
+            ] {
+                let relay = rt.block_on(crate::relay::transport_tests::fixture(
+                    Vec::new(),
+                    true,
+                    true,
+                ));
+                let mut line = format!(
+                    "publish --home {} --relay {} --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0 --json",
+                    root.display(),
+                    relay.url,
+                    goal.display(),
+                    iso(now + 3600),
+                    iso(now + 7200)
+                );
+                if let Some(status) = status {
+                    line.push_str(&format!(" --status {status}"));
+                }
+                let (mut out, mut err) = (Vec::new(), Vec::new());
+                assert_eq!(run(&args(&line), &mut out, &mut err), 0, "{status:?}");
+                assert_eq!(relay.writes.lock().unwrap().len(), 1, "{status:?}");
+                let err = String::from_utf8(err).unwrap();
+                assert_eq!(err.contains(SCHEDULED_NOTE), noted, "{status:?}: {err}");
+                assert!(
+                    !String::from_utf8(out).unwrap().contains("Note:"),
+                    "stdout stays JSON"
+                );
+            }
+            // A refused publish prints no note (nothing was published).
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run(
+                    &args(&format!(
+                        "publish --home {} --id today --title Build --goal-file {} --starts nope --ends nope --budget-sats 0",
+                        root.display(),
+                        goal.display()
+                    )),
+                    &mut out,
+                    &mut err
+                ),
+                2
+            );
+            assert!(!String::from_utf8(err).unwrap().contains(SCHEDULED_NOTE));
+            std::fs::remove_dir_all(root).unwrap();
         }
         #[tokio::test]
         async fn leave_with_oversized_prior_note_publishes_bounded_note() {

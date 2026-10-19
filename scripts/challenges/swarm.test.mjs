@@ -2351,3 +2351,129 @@ test('R4 size cap: startup refuses an operator context that leaves the planner t
     assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT_FILE:file}),/Invalid task context: it leaves -?\d+ of the 8192-byte task cap for the planner's task text, need at least 2048/);
   } finally {rmSync(dir,{recursive:true});}
 });
+// Rocky P-1 (run-start feedback, 2026-10-19): a run published `scheduled` never started; the runner
+// planned only on in_progress and nothing moved it. P-2: it said nothing about why it was idle.
+const {RUN_STARTED_UPDATE,NOT_PLANNING_LOG_SECONDS,notPlanningLine,readinessBlocker}=await import('./swarm.mjs');
+// The relays hold `relay` (the sidecar's latest read); the reader's snapshot lags until show().
+function scheduledFixture({starts=200,ends=1000}={}) {
+  const f=fixture(),reports=[],reads=[];f.io.report=m=>reports.push(m);f.setPlan(()=>({wait:true}));
+  Object.assign(f.snap.challenge,{status:'scheduled',starts,ends});
+  let relay={...structuredClone(f.snap.challenge),budgetSats:10,result:''};
+  f.io.latestChallenge=async(c,o)=>{reads.push(o);return structuredClone(relay);};
+  f.io.publish=async(ch,budget,status,update,result,o)=>{f.publishes.push([ch,budget,status,update,result,o]);relay={...relay,status,update,result};};
+  const flips=()=>f.publishes.filter(p=>p[2]==='in_progress'&&p[3]===RUN_STARTED_UPDATE);
+  const lines=()=>reports.filter(m=>m.startsWith('not planning'));
+  return {...f,reports,reads,flips,lines,relay:()=>relay,edit:x=>{relay={...relay,...x};Object.assign(f.snap.challenge,x);},setRelay:x=>{relay={...relay,...x};},show:()=>{f.snap.challenge.status=relay.status;}};
+}
+const tickAt=async(f,...times)=>{for(const t of times){f.time(t);await f.runner.tick();}};
+test('P-1: a scheduled run is published in_progress once at starts, then planned; slow relay and restart never publish it again',async()=>{
+  const f=scheduledFixture();
+  await tickAt(f,100,150,199);
+  assert.equal(f.flips().length,0,'nothing before starts');assert.equal(f.inputs.length,0,'no planner call before starts');
+  const before=f.publishes.length;
+  await tickAt(f,200);
+  assert.equal(f.flips().length,1,'published at starts');
+  const [ch,budget,,,result,opts]=f.flips()[0];
+  assert.deepEqual(opts,{strict:true},'every challenge relay, like a progress re-send');assert.deepEqual(f.reads.at(-1),{strict:true});
+  assert.equal(ch.title,'test');assert.equal(budget,10);assert.equal(result,'');
+  assert.equal(f.reports.filter(m=>/^Run day: scheduled -> in_progress at 1970-01-01T00:03:20Z \(starts 1970-01-01T00:03:20Z\), published by the runner/.test(m)).length,1,f.reports.join('\n'));
+  assert.equal(f.publishes.length,before+1,'the flip is this tick\'s progress update too');
+  assert.equal(Object.values(f.journal.state.days)[0].lastUpdate,200);
+  // The reader still shows scheduled (slow relay): no second flip, no planning; nor after a restart.
+  await tickAt(f,201,230,260,330);
+  for(const t of [340,350]){f.time(t);await new Swarm(f.c,f.io,f.journal).tick();}
+  assert.equal(f.flips().length,1,'published once across ticks and restarts');assert.equal(f.inputs.length,0);
+  assert.equal(Object.values(f.journal.state.days)[0].started.by,'runner');
+  // Once the reader shows in_progress, planning starts in that tick.
+  f.show();await tickAt(f,360);
+  assert.equal(f.inputs[0]?.mode,'analyze');assert.equal(posts(f).length,0);
+  await tickAt(f,361,700);assert.equal(f.flips().length,1);
+});
+test('P-1: no flip before starts, at or after ends, or on a completed/cancelled/already started run; the latest read decides',async()=>{
+  // Window already over (runner down through it): never re-opened.
+  const a=scheduledFixture({starts:100,ends:300});await tickAt(a,300,500,900);
+  assert.equal(a.publishes.filter(p=>p[2]==='in_progress').length,0);assert.equal(a.inputs.length,0);
+  // Completed / cancelled in the snapshot: an external stop, nothing published.
+  for(const closed of ['completed','cancelled']) {
+    const b=scheduledFixture();b.edit({status:closed});await tickAt(b,200,300,600);
+    assert.equal(b.publishes.length,0,closed);assert.deepEqual(Object.values(b.journal.state.days)[0].stop,{external:true});
+  }
+  // Cancelled on the relays while the snapshot still says scheduled: the latest read wins.
+  const c=scheduledFixture();c.setRelay({status:'cancelled'});await tickAt(c,200,260,600);
+  assert.equal(c.publishes.length,0);assert.deepEqual(Object.values(c.journal.state.days)[0].stop,{external:true});
+  assert.ok(c.reports.some(m=>m.includes('already cancelled on the relays; not publishing in_progress')),c.reports.join('\n'));
+  // Moved later by the operator (the read's window does not contain now): nothing published.
+  const d=scheduledFixture();d.setRelay({starts:500});await tickAt(d,200);
+  assert.equal(d.publishes.filter(p=>p[2]==='in_progress').length,0);assert.ok(d.reports.some(m=>m.includes('does not contain now')));
+  // Already in_progress on the relays (an operator flip the reader has not seen): nothing published.
+  const e=scheduledFixture();e.setRelay({status:'in_progress'});await tickAt(e,200,260,300);
+  assert.equal(e.flips().length,0);assert.equal(Object.values(e.journal.state.days)[0].started.by,'relay');
+});
+test('P-1: never fights an operator who sets a started run back to scheduled; a new starts is started again',async()=>{
+  const f=scheduledFixture({starts:100,ends:2000});f.edit({status:'in_progress'});
+  await tickAt(f,150);assert.equal(f.inputs[0].mode,'analyze');
+  assert.equal(Object.values(f.journal.state.days)[0].started.by,'observed');
+  f.edit({status:'scheduled'});
+  await tickAt(f,160,200,400,700);
+  for(const t of [710]){f.time(t);await new Swarm(f.c,f.io,f.journal).tick();}
+  assert.equal(f.publishes.filter(p=>p[2]==='in_progress').length,0,'an operator pause stands');
+  // A reschedule (new starts) is started at that time.
+  f.edit({starts:800});await tickAt(f,790);assert.equal(f.flips().length,0);
+  await tickAt(f,800);assert.equal(f.flips().length,1);
+});
+test('P-1: unready or degraded relays wait; a failed publish retries after a backoff, a lost reply is not repeated',async()=>{
+  const f=scheduledFixture();f.c.updateEvery=100000; // isolate the flip from progress re-sends
+  f.snap.relay.historyComplete=false;await tickAt(f,200,201);assert.equal(f.publishes.length,0,'not ready');
+  f.snap.relay={...f.snap.relay,historyComplete:true,degraded:true,missingRelays:['ws://c']};await tickAt(f,202);
+  assert.equal(f.publishes.length,0,'degraded: in_progress needs every challenge relay');
+  assert.match(f.lines().at(-1),/status=scheduled \(needs in_progress; publishing it waits for every challenge relay, missing: ws:\/\/c\)/);
+  delete f.snap.relay.degraded;delete f.snap.relay.missingRelays;
+  // A failed publish: retried after PROGRESS_RETRY_SECONDS, not every tick.
+  const publish=f.io.publish;let attempts=0;f.io.publish=async(...a)=>{attempts++;throw Error('relay refused');};
+  await tickAt(f,203,210,232);assert.equal(attempts,1);
+  assert.match(f.lines().at(-1),/publishing it failed, retrying: relay refused/);
+  // The retry's publish lands but its reply is lost; the next retry reads in_progress and stops.
+  f.io.publish=async(...a)=>{attempts++;await publish(...a);throw Error('lost reply');};
+  await tickAt(f,233);assert.equal(attempts,2);assert.equal(f.flips().length,1);
+  f.io.publish=publish;await tickAt(f,240,263,300);
+  assert.equal(f.flips().length,1,'never published twice');assert.equal(Object.values(f.journal.state.days)[0].started.by,'relay');
+});
+test('P-2: one not-planning line per minute naming every blocker, at once on a change, quiet once planning starts',async()=>{
+  const f=scheduledFixture({starts:1000,ends:5000});
+  await tickAt(f,100);
+  assert.deepEqual(f.lines(),['not planning (run day): status=scheduled (the runner publishes in_progress at starts, 1970-01-01T00:16:40Z) · ready=true · window opens in 15m (1970-01-01T00:16:40Z) · 2 eligible sellers (2 min left) · budget 10 sats']);
+  await tickAt(f,130,159);assert.equal(f.lines().length,1,'a countdown is not a change');
+  await tickAt(f,100+NOT_PLANNING_LOG_SECONDS);assert.equal(f.lines().length,2,'repeated once a minute');
+  f.snap.relay.historyComplete=false;await tickAt(f,161);
+  assert.equal(f.lines().length,3,'at once on a change');assert.match(f.lines()[2],/ · ready=false \(history incomplete\) · /);
+  await tickAt(f,162);assert.equal(f.lines().length,3);
+  f.snap.relay.historyComplete=true;await tickAt(f,163);assert.equal(f.lines().length,4);
+  f.snap.sellers.forEach(s=>{s.eligible=false;});await tickAt(f,164);
+  assert.match(f.lines()[4],/ · 0 eligible sellers \(2 accepted but joined after starts\) · /);
+  f.snap.sellers.forEach(s=>{s.eligible=true;});await tickAt(f,165);assert.equal(f.lines().length,6);
+  // The flip itself is a change; once the reader shows in_progress, planning starts and the line stops.
+  await tickAt(f,1000);assert.equal(f.flips().length,1);assert.match(f.lines().at(-1),/the runner published in_progress at 1970-01-01T00:16:40Z; waiting for the relays to show it/);
+  const n=f.lines().length;f.show();
+  await tickAt(f,1001,1100,1200,1300);assert.equal(f.lines().length,n,'quiet once planning has started');assert.equal(f.inputs[0].mode,'analyze');
+  // In progress but unready: the line names the readiness blocker. After ends: only on a change.
+  const g=scheduledFixture({starts:100,ends:400});g.edit({status:'in_progress'});g.snap.relay.error='Relay history timed out';
+  await tickAt(g,150);assert.match(g.lines()[0],/^not planning \(run day\): status=in_progress · ready=false \(Relay history timed out\) · window open \(ends in 4m\) · /);
+  const h=scheduledFixture({starts:100,ends:300});await tickAt(h,300,400,500,600);
+  assert.equal(h.lines().length,1);assert.match(h.lines()[0],/the work window has ended, so the runner does not start it\) · ready=true · window ended 0s ago/);
+});
+test('P-2: notPlanningLine/readinessBlocker use the reader status (trade relay, quorum, staleness, budget)',()=>{
+  const c={id:'d',status:'scheduled',starts:100,ends:200};
+  const snap=(relay,extra={})=>({asOf:50,relay,sellers:[],applicants:[{pubkey:'x'}],budget:{totalSats:5,committedSats:0,paidSats:0,unknownAmounts:0},...extra});
+  const ok={connected:true,authenticated:true,historyComplete:true};
+  assert.equal(readinessBlocker(snap(ok),50),null);
+  assert.equal(readinessBlocker(snap(ok),60),'snapshot stale (as of 50, now 60)');
+  assert.equal(readinessBlocker(snap({...ok,historyComplete:false,relays:[{role:'trade',url:'ws://t',connected:true,authenticated:false}]}),50),'trade relay not ready: ws://t (not authenticated)');
+  assert.equal(readinessBlocker(snap({...ok,historyComplete:false,relays:[{role:'trade',url:'ws://t',...ok}],quorum:{required:2,complete:1,total:3},missingRelays:['ws://a','ws://b']}),50),'history incomplete (1 of 3 challenge relays complete, need 2): ws://a, ws://b');
+  const {key,line}=notPlanningLine({c,snap:snap(ok),now:50});
+  assert.equal(line,'not planning (run d): status=scheduled (the runner publishes in_progress at starts, 1970-01-01T00:01:40Z) · ready=true · window opens in 50s (1970-01-01T00:01:40Z) · 0 eligible sellers (1 awaiting decide --accept) · budget 5 sats');
+  assert.equal(notPlanningLine({c,snap:snap(ok),now:51}).key,key,'the key never carries a countdown');
+  assert.notEqual(notPlanningLine({c,snap:snap(ok,{budget:null}),now:50}).key,key);
+  assert.match(notPlanningLine({c,snap:snap(ok,{budget:null}),now:50}).line,/ · budget unknown$/);
+  assert.match(notPlanningLine({c:{...c,status:'completed'},snap:snap(ok),now:50}).line,/status=completed \(needs in_progress\)/);
+  assert.match(notPlanningLine({c,snap:snap(ok),now:150,day:{started:{starts:100,by:'observed'}}}).line,/it was already in_progress, so the runner leaves this later scheduled edit alone/);
+});
