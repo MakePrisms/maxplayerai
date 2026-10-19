@@ -26,6 +26,42 @@ const RUNTIME_ERROR: i32 = 2;
 /// with margin (Scribe ★1). Cap-hit → graceful tool-error; server stays up.
 const TOOL_DEADLINE_SECS: u64 = 15;
 
+/// `post_job`'s own cap (every other tool keeps [`TOOL_DEADLINE_SECS`]). The daemon already answers
+/// a slow post within a bounded window — input fingerprinting stops at 8s, then it waits at most 1s
+/// before replying `status=preparing` with a preparation_id (`buyer/preparations.rs`) — but that
+/// window starts when the daemon DISPATCHES the request. Before that, this call runs the
+/// connect-or-spawn `status` probe (a full status read: wallet balances through the wallet actor,
+/// ledger queries) and waits for a free daemon worker; on a loaded buyer those can consume most of
+/// 15s, so the post timed out even though the daemon would have acknowledged it in time. 45s keeps
+/// the whole ack window plus room for that queueing, and stays under the client's ~60s read
+/// timeout so this graceful error, not a client-side abort, is what a caller sees.
+const POST_JOB_DEADLINE_SECS: u64 = 45;
+
+/// The deadline for one `tools/call`, by tool name.
+fn tool_deadline_secs(tool: Option<&str>) -> u64 {
+    match tool {
+        Some("post_job") => POST_JOB_DEADLINE_SECS,
+        _ => TOOL_DEADLINE_SECS,
+    }
+}
+
+/// The deadline error names the tool that hit it. It used to say "for post_job, retry…" on every
+/// tool, so a get_job or collect timeout read as a post_job one in runner logs.
+fn deadline_message(tool: Option<&str>, secs: u64) -> String {
+    match tool {
+        Some("post_job") => format!(
+            "tool deadline exceeded ({secs}s) for post_job; server still alive — retry only the \
+             identical arguments and request_id to recover its preparation"
+        ),
+        Some(name) => format!(
+            "tool deadline exceeded ({secs}s) for {name}; server still alive — retry or narrow the call"
+        ),
+        None => format!(
+            "tool deadline exceeded ({secs}s); server still alive — retry or narrow the call"
+        ),
+    }
+}
+
 const INSTRUCTION_MARKETPLACE: &str = "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.";
 const INSTRUCTION_REAL_MONEY: &str = "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.";
 const INSTRUCTION_WALLET: &str = "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.";
@@ -60,12 +96,13 @@ pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     let _ = writeln!(
         err,
-        "maxplayer mcp ready (home={}, key_created={}, mint={}, relay={}, tool_deadline_secs={})",
+        "maxplayer mcp ready (home={}, key_created={}, mint={}, relay={}, tool_deadline_secs={}, post_job_deadline_secs={})",
         state.home.root.display(),
         state.home.key_created,
         state.home.config.default_mint(),
         state.home.config.relay_url,
-        TOOL_DEADLINE_SECS
+        TOOL_DEADLINE_SECS,
+        POST_JOB_DEADLINE_SECS
     );
 
     // Multi-thread so sync verify/pay inside authorize_pay_async does not starve
@@ -196,20 +233,17 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
         "ping" => ok(id, json!({})),
         "tools/list" => ok(id, json!({ "tools": tools() })),
         "tools/call" => {
+            let tool = request.params.get("name").and_then(Value::as_str);
+            let deadline = tool_deadline_secs(tool);
             match tokio::time::timeout(
-                Duration::from_secs(TOOL_DEADLINE_SECS),
+                Duration::from_secs(deadline),
                 call_tool_async(state, &request.params),
             )
             .await
             {
                 Ok(Ok(result)) => ok(id, result),
                 Ok(Err(message)) => tool_error(id, message),
-                Err(_) => tool_error(
-                    id,
-                    format!(
-                        "tool deadline exceeded ({TOOL_DEADLINE_SECS}s); server still alive — for post_job, retry only the identical arguments and request_id to recover its preparation; otherwise retry or narrow the call"
-                    ),
-                ),
+                Err(_) => tool_error(id, deadline_message(tool, deadline)),
             }
         }
         other => error_response(id, -32601, format!("method not found: {other}")),
@@ -581,6 +615,25 @@ mod tests {
     use super::*;
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn post_job_alone_gets_the_longer_deadline_and_errors_name_their_tool() {
+        assert_eq!(tool_deadline_secs(Some("post_job")), POST_JOB_DEADLINE_SECS);
+        assert!(POST_JOB_DEADLINE_SECS > TOOL_DEADLINE_SECS && POST_JOB_DEADLINE_SECS < 60);
+        for other in [Some("get_job"), Some("collect"), Some("award_claim"), None] {
+            assert_eq!(tool_deadline_secs(other), TOOL_DEADLINE_SECS);
+        }
+        let post = deadline_message(Some("post_job"), 45);
+        assert!(
+            post.contains("(45s) for post_job") && post.contains("request_id"),
+            "{post}"
+        );
+        let get = deadline_message(Some("get_job"), 15);
+        assert!(
+            get.contains("(15s) for get_job") && !get.contains("post_job"),
+            "{get}"
+        );
+    }
 
     #[test]
     fn local_base_mcp_schema_exposes_local_only_contribution_hint() {

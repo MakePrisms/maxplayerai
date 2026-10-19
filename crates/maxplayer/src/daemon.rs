@@ -8,6 +8,7 @@
 //! binds the socket, and both callers connect to the winner. No manual `maxplayer buyer` command is
 //! ever needed.
 
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -31,7 +32,14 @@ pub fn socket_path(home: &MaxplayerHome) -> PathBuf {
 /// thin client can call. Never runs a money op itself — it only guarantees a daemon owns the home.
 pub fn ensure(home: &MaxplayerHome) -> Result<PathBuf, String> {
     let sock = socket_path(home);
-    if client::status(&sock).is_ok() {
+    // A daemon is serving iff something accepts on its socket, so the hot path only connects. It
+    // used to send a full `status` RPC first — wallet balances through the wallet actor (a fresh
+    // wallet-DB open), ledger and award queries — on EVERY tool call before the real request. On a
+    // loaded buyer that probe alone could eat most of MCP's tool deadline (R4-2). A status reply
+    // proved no more than the connect does: an error reply also counted as "serving", and a wedged
+    // daemon hangs the real call exactly as it hung the probe. A stale socket file refuses the
+    // connect, so a dead daemon still takes the spawn path below.
+    if UnixStream::connect(&sock).is_ok() {
         return Ok(sock); // a daemon is already serving this home.
     }
     spawn_detached(&home.root)?;

@@ -17,9 +17,10 @@ fn canonical(value: &Value) -> Value {
         _ => value.clone(),
     }
 }
-/// Pre-claim fingerprinting must answer well inside MCP's 15-second tool deadline
-/// (the daemon then waits at most 1s more): a call that times out at MCP while the
-/// daemon goes on to claim and publish invites a second hire under a new key.
+/// Pre-claim fingerprinting must answer well inside MCP's post_job deadline
+/// (`POST_JOB_DEADLINE_SECS`, 45s; the daemon then waits at most 1s more): a call that
+/// times out at MCP while the daemon goes on to claim and publish invites a second hire
+/// under a new key.
 const FINGERPRINT_BUDGET: Duration = Duration::from_secs(8);
 
 /// The input files could not be hashed before the deadline. Nothing was claimed.
@@ -290,7 +291,7 @@ where
                 }
             });
             // Fast jobs retain the ordinary single-call result. A slow one gets a
-            // durable handle well before MCP's 15-second deadline. Timeout drops
+            // durable handle well before MCP's post_job deadline. Timeout drops
             // only this waiter, NOT either daemon task.
             let _ = tokio::time::timeout(Duration::from_secs(1), completion).await;
             poll_store(&store, id, &handle, false)
