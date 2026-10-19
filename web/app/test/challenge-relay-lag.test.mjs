@@ -92,9 +92,16 @@ test('P-3 lagTimeout: late only because this thread was blocked, it lets queued 
   await blockThen(400);assert.equal(at,0);
   await until(()=>at);assert.ok(at-t0<400+300,`fired after ${at-t0} ms`);
 });
-test('P-3 lagTimeout: repeated blocks cannot postpone it past ms + maxCreditMs; clear() cancels it',async()=>{
-  const t0=performance.now();let fired=0;lagTimeout(()=>fired=performance.now(),100,{thresholdMs:30,maxCreditMs:400});
-  while(!fired&&performance.now()-t0<5000)await blockThen(150);
-  assert.ok(fired,'fired');assert.ok(fired-t0<=100+400+150+400,`fired after ${fired-t0} ms`);
-  let cleared=false;const h=lagTimeout(()=>cleared=true,20);h.clear();await pause(60);assert.equal(cleared,false);
+test('P-3 lagTimeout: repeated blocks cannot postpone it past ms + maxCreditMs + one late check; clear() cancels it',async t=>{
+  // Deterministic: setTimeout callbacks are run by hand, each one 300 ms after it fell due (the
+  // thread was blocked before every check), on a mocked performance.now.
+  let clock=0;const queue=[];t.mock.method(performance,'now',()=>clock);
+  t.mock.method(globalThis,'setTimeout',(fn,d)=>{queue.push({fn,d,live:true});return queue.length;});
+  t.mock.method(globalThis,'clearTimeout',h=>{if(queue[h-1])queue[h-1].live=false;});
+  let fired=null,checks=0;lagTimeout(()=>fired=clock,100,{thresholdMs:30,maxCreditMs:400});
+  for(let i=0;i<50&&fired===null;i++){const next=queue.find(q=>q.live);next.live=false;clock+=next.d+300;checks++;next.fn();}
+  assert.notEqual(fired,null,'fired despite every check being late');
+  assert.ok(checks>1,'the first late check re-armed instead of firing');
+  assert.ok(fired<=100+400+300,`fired at ${fired} ms`);
+  let cleared=false;const h=lagTimeout(()=>cleared=true,20);h.clear();for(const q of queue)if(q.live)q.fn();assert.equal(cleared,false);
 });

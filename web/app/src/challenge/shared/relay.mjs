@@ -56,14 +56,15 @@ const now=()=>globalThis.performance?.now?.()??Date.now();
 // P-3: a setTimeout whose deadline does not expire because of our own lag (see above). When it runs
 // more than thresholdMs past its due time, the deadline moves back by the time it lost (so it is
 // due now) and it re-checks on a later turn, after the frames that arrived meanwhile were handled,
-// instead of calling fn. Moves spend from maxCreditMs, so fn runs no later than ms + maxCreditMs
-// plus the lateness of its last check. clear() cancels it like clearTimeout.
+// instead of calling fn. Moves spend from maxCreditMs; a check whose lost time no longer fits in it
+// calls fn, so fn runs no later than ms + maxCreditMs plus the lateness of its last check.
+// clear() cancels it like clearTimeout.
 export function lagTimeout(fn,ms,{thresholdMs=LAG_THRESHOLD_MS,maxCreditMs=PAGE_CPU_CREDIT_MAX_MS}={}) {
   let credit=0,handle=null,done=false,due=now()+ms;
   const arm=()=>{handle=setTimeout(()=>{
     if(done)return;
     const lost=now()-due;
-    if(lost>thresholdMs&&credit<maxCreditMs){const extra=Math.min(lost,maxCreditMs-credit);credit+=extra;due+=extra;arm();return;}
+    if(lost>thresholdMs&&credit+lost<=maxCreditMs){credit+=lost;due+=lost;arm();return;}
     done=true;fn();},Math.max(0,due-now()));};
   arm();
   return {clear(){done=true;clearTimeout(handle);}};
