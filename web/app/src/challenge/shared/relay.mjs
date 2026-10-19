@@ -393,7 +393,7 @@ export class ChallengeReader {
       warnings:[...new Set(relays.flatMap(r=>r.warnings))],
       // Display only; never part of readiness or the runner's exhaustion stop.
       applicantsIncomplete:this.challenges.some(r=>r.status.applicantsIncomplete)||!!this.store.applicantsTruncated,
-      error:this.trade.status.error??(failedRelays.length?`Challenge history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
+      error:this.trade.status.error??(failedRelays.length?`Swarm history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}
   stop(){this.trade.stop();for(const r of this.challenges)r.stop();}

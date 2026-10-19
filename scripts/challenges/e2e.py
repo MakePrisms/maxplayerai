@@ -195,8 +195,8 @@ try:
         command(['npm', 'run', 'build', '--prefix', ROOT / 'web/app'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_BUYER_PUBKEY': BUYER, 'CHALLENGE_RELAYS': challenge_relays})
         siteport = port()
         start('site', ['python3', '-m', 'http.server', siteport, '--bind', '127.0.0.1', '--directory', ROOT / 'web/app/dist'])
-        print(f'Browser fixture: http://127.0.0.1:{siteport}/challenges.html', flush=True)
-        (RUN / 'browser.json').write_text(json.dumps({'url': f'http://127.0.0.1:{siteport}/challenges.html', 'relay': relay, 'buyer': BUYER}))
+        print(f'Browser fixture: http://127.0.0.1:{siteport}/swarm.html', flush=True)
+        (RUN / 'browser.json').write_text(json.dumps({'url': f'http://127.0.0.1:{siteport}/swarm.html', 'relay': relay, 'buyer': BUYER}))
     start('buyer', [BIN, 'buyer', 'serve'], buyer_env)
     for name, env in [('seller', seller_env), ('denied', denied_env)]:
         start(name, [BIN, 'seller', '--non-interactive', '--skip-doctor'], env)

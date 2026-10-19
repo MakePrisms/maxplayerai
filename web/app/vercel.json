@@ -4,6 +4,10 @@
   "outputDirectory": "dist",
   "framework": null,
   "cleanUrls": true,
+  "redirects": [
+    { "source": "/challenges", "destination": "/swarm", "permanent": true },
+    { "source": "/challenges.html", "destination": "/swarm", "permanent": true }
+  ],
   "headers": [
     {
       "source": "/(.*)",
@@ -27,7 +31,7 @@
       ]
     },
     {
-      "source": "/((?!(?:tokens|challenges)$).*)",
+      "source": "/((?!(?:tokens|swarm)$).*)",
       "headers": [
         {
           "key": "Content-Security-Policy",
@@ -49,7 +53,7 @@
       ]
     },
     {
-      "source": "/challenges",
+      "source": "/swarm",
       "headers": [
         {
           "key": "X-Robots-Tag",

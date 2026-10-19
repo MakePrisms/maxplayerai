@@ -1,4 +1,4 @@
-// One paint of the live parts of /challenges: hero fact, agents eyebrow, rows, summary and status
+// One paint of the live parts of /swarm: hero fact, agents eyebrow, rows, summary and status
 // line. Called on every snapshot and every 1s tick with the reader's current relay status, so the
 // readiness tracker is refreshed between the reader's 15s polls.
 import { renderStart, startFact } from "./hero.js";
