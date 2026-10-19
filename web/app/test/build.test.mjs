@@ -388,6 +388,11 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(skill.includes("`status --run <id>`") && !skill.includes("--challenge"), "the day flag is --run");
   assert.ok(skill.includes("--manifest-path crates/maxplayer-challenges/Cargo.toml") && skill.includes("target/release/maxplayer-swarm`"), "build line unchanged; binary named");
   assert.match(skill, /old `maxplayer-challenges` binary\? That name is gone: rebuild[\s\S]*membership carries over unchanged/, "one line for existing members");
+  // Skill walkthrough fixes (2026-10-19): free-job prerequisite, tested version, strict minutes-change read.
+  assert.match(skill, /\*\*Prerequisite: free swarm jobs\.\*\* Set `takes_no_payment = true` under `\[seller\]`/, "free-job prerequisite is its own line");
+  assert.ok(skill.includes("Tested with seller 0.6.1.") && !/⟨TBD⟩|or later/.test(skill), "tested version, no invented minimum");
+  assert.ok(skill.includes("needs every relay, whether or not a swarm run is\n   in progress"), "minutes change needs every relay");
+  assert.ok(!/\b300\b/.test(skill), "no unexercised 300-second floor");
   assert.equal([...skill.matchAll(/(?<!crates\/)maxplayer-challenges/g)].length, 1, "the old binary name appears only in the existing-members line");
   // bob (2026-10-19 00:49): the CLI is maxplayer-swarm and the day flag is --run.
   const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
