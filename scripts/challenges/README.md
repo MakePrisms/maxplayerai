@@ -188,6 +188,7 @@ Flags (environment equivalents):
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
 | — | `SWARM_BENCH_AFTER_UNCLAIMED` | 2 (consecutive assignments that expired with no claim before a seller is benched; 0 disables) |
 | — | `SWARM_BENCH_SECONDS` | 1800 (bench cooldown) |
+| — | `SWARM_TASK_CONTEXT` / `SWARM_TASK_CONTEXT_FILE` | unset (operator context appended to every posted task; at most 4000 chars; not both, see *Task context* below) |
 | — | `SWARM_AUTO_RAISE_TO_RATE` | **OFF** (`1`/`true`/`yes`/`on` to enable): raise an assignment priced below a paid seller's advertised minimum to that minimum, within budget headroom, instead of rejecting it |
 | `--award-fallback` | none | **OFF**; E2E compatibility only |
 
@@ -309,7 +310,9 @@ To use a different model/provider, supply any **trusted shell command** via `--p
 
 All calls include `mode`, `goal`, `challenge`, `plan`, `sellers`, `running`, `results`,
 `now`, `minDurationSeconds`, `maxDurationSeconds`, `budgetTotalSats`, and `budgetHeadroomSats`;
-`rejectedAssignments` is present when the last `assign` batch had rejected entries.
+`rejectedAssignments` is present when the last `assign` batch had rejected entries;
+`taskContext` when an operator context is configured; `refusals` when a seller refused a task
+(see *Refusals* below).
 `minDurationSeconds` (`SWARM_MIN_DURATION`, default 300) is the shortest task the runner will
 post. It includes seller startup: a real harness spends minutes starting its sandbox and agent
 before working, and the first live run's 120–200 second tasks expired undelivered. Free sellers
@@ -448,6 +451,63 @@ benches it again. A benched seller never counts as exhausted (no `Unsolved: all 
 exhausted` stop while one is benched). The bench state is journaled (`bench`), so a restart keeps
 it. The proper fix (the seller heartbeat advertising that it is not serving) belongs to the seller
 daemon and is separate.
+
+**Task context (R3-3).** `SWARM_TASK_CONTEXT` (text) or `SWARM_TASK_CONTEXT_FILE` (path to a text
+file; setting both is a startup error) is operator context for the sellers, e.g. `This is a public
+historical cipher (Hutton, 1870s); the task is educational cryptanalysis.` In round 3 a Claude seller
+stopped its first crib task on a safety classifier; that one factual line in the goal fixed it. The
+runner appends it, trimmed (at most 4000 characters), to **every** task it posts, as
+`---` / `CONTEXT (from the challenge operator, added to every task): …` between the planner's task text
+and the delivery note. Startup logs the context (or that none is set). The planner gets it once as
+`taskContext` and is told not to repeat it; the task text it sees in `running`, `results` and track
+records is its own text, without the context block or delivery note. Each job journals the context it
+was posted with (`taskContext`), so changing it later does not change how old tasks are shown.
+
+**Refusals (R3-3).** A seller that declines a task, or is stopped by its harness's safety system,
+still delivers (a `MAXPLAYER-ANSWER-V1` answer saying so) and the job is collected (and, if priced,
+paid: core cannot judge content). The runner then records it as outcome **`refused`** instead of
+`collected` (`refusal:{by,kind?,reason}` in the journal) and logs `Job <id>: seller <pk> REFUSED (…)`.
+Detection:
+Runner framing is removed first (a `MAXPLAYER-ANSWER-V1` line, the `Delivered files (no inline
+answer):` header and `=====` frames, `[truncated…]`/`[skipped…]` notes). Then:
+- *Explicit marker:* the first non-blank line of that body is `MAXPLAYER-REFUSED-V1` (Markdown
+  decoration and a trailing colon allowed). Any length. The reason is the rest. This also works when
+  the seller writes it as the first line of its only (or alphabetically first) delivered file.
+- *Heuristic, conservative on purpose.* A missed refusal costs one reassignment; a false one throws a
+  solution away, so doubt means a normal collect. The text must be **at most 600 characters** and
+  carry **no answer evidence**: no code block, no list of 3+ items, no `here is/are`, no answer
+  statement (`answer`, `result`, `solution`, `plaintext`, `decryption`, `keyword`, `key`, `crib`,
+  optionally numbered, followed by `:` or `=`; the same noun + *is/are/was/were* only when a **value**
+  follows: one optional straight or curly quote, then a number, an ALL-CAPS word or a Title-case word
+  of 3+ letters, never a non-answer (`not, never, still, found, tried, recovered, blocked, redacted,
+  unknown, empty`, any case): `the key is CROWN`, `the keyword is "Hutton"`, `the answer was 42`,
+  but not `no keyword was recovered`, `the key was sensitive` or `the key is REDACTED`; any
+  *is/are/was/were* + such a value of **5+** letters or a number (`the first one is Hutton`, but not
+  `the category is API` or `the topic was NSFW`); or *found/recovered/cracked … the
+  key/keyword/plaintext* followed by an upper-case word). A lower-case plaintext (`the plaintext is
+  attack at dawn`) is not evidence: no clean rule tells it from `the plaintext is likely sensitive`,
+  so next to stop language it is refused. Then it is refused if it has
+  - a **safety stop**, case-insensitive: a safety/content/usage/policy/moderation
+    classifier/filter/system/check/policy/… *directly* followed by *stopped, blocked, flagged,
+    refused, …* (`A safety classifier stopped me`), or *stopped/refused/… by the <that noun>*
+    (`Refused by the content filter.`). Generic work words do not veto a safety stop (`… stopped me
+    before I found a key.` is still a stop); or
+  - a **first-person refusal at a sentence start**, case-sensitive (`I can't help with`, `I'm sorry,
+    but I cannot assist`, `I must decline`, `I'm not comfortable`), with more words after the verb,
+    and no work words (*found, candidate(s), tested, partial(ly)*). The bare nouns *keyword, plaintext,
+    key* are not work words: `I can't help you find the keyword.` is a refusal.
+  So `KLJBO`, `42`, `Answer: KLJBO`, `Result: 42`, `I cannot help.` (may be the plaintext), `I CANNOT
+  HELP`, `I can't help it: both keywords are HUTTON and CIPHER.`, `Policy check ended. The plaintext
+  is ATTACK AT DAWN.` and `No valid keyword found among the 200 candidates tested` stay normal collects.
+A refusal is not work: it does not count as `delivered` in the seller's track record (profiles carry
+`trackRecord.refused`), the planner sees its answer prefixed `[refused: … NOT completed work; assign
+this workstream to a different seller]` with `refused:true`, every planner call lists the challenge's
+refusals as `refusals:[{seller,workstream,task,by,reason,at,sameContext}]` (newest 50), and progress
+updates say `N results recorded; M refused by sellers (not counted as work)`. An assignment giving
+the same workstream back to the seller that refused it is rejected (`seller refused workstream "<id>"
+(job …); assign it to a different seller`) unless the operator context has changed since that refusal
+(`sameContext:false`): a new context may be exactly what lets it proceed. The seller itself is not
+benched and stays eligible for other workstreams.
 
 **Rejection feedback.** Every rejected assignment of the last `assign` batch (any reason: price
 floor, unknown workstream, busy seller, duration, budget …) is journaled and sent to the planner
@@ -590,6 +650,36 @@ relay every 60 s with reconnect count, message count and the age of its last rec
 (`Relay change + heartbeat: …` when one check is both). A
 relay that stays "ready" while its last frame grows old is a silent stall. Live-subscription,
 pending-page and EOSE counts are not part of the reader's exposed status and are not logged.
+
+**Cold start (R3-6).** After a restart, round 3's runner sat at 95–120% CPU for about 4.5 minutes
+while both public relays failed their first read (`Relay history timed out` after 34 s) and the trade
+reader went through a CLOSED recovery. Two costs, both fixed:
+- *Signature verification.* The #1167 verified-signature cache is now persisted to
+  `$MAXPLAYER_HOME/swarm/verified-sigs` (mode 0600). It stores only cache keys, each `id + pubkey +
+  sig` (public relay data), at most 100,000 (the in-memory bound; ~25.7 MB), behind a header with the
+  count and a SHA-256 of the body. It is loaded before the first relay frame
+  (`Verified-signature cache: loaded N keys from … in M ms`), flushed every 30 s while new keys were
+  verified and once on a clean stop, and written crash-safely (temp, fsync, rename, fsync the
+  directory). A missing file starts empty; a torn, truncated, edited, oversized or malformed file
+  loads **nothing** (`WARNING: verified-signature cache … unusable (…); starting empty, every signature
+  is verified again`) and is rewritten; a failed write is logged and retried, never fatal. A loaded key
+  only ever accepts that exact triple: `verify()` still recomputes each event's id from its own fields
+  before the lookup, and a different signature is a different key, Schnorr-checked as before.
+  **Trust boundary:** the SHA-256 is a checksum against *accidental* corruption, not a MAC. Anyone who
+  can rewrite `$MAXPLAYER_HOME/swarm/verified-sigs` with a matching checksum can plant a key, and that
+  exact `id + pubkey + sig` is then accepted **without** a Schnorr check (an unverified signature counts
+  as verified). That writer is already inside the home's trust boundary: the same access reads the
+  buyer key and rewrites the journal. Keep the home private to the runner user (the runner creates
+  `swarm/` 0700 and the file 0600); never run it against a home another user can write.
+- *Per-frame projection.* The runner's relay callback used to build the full challenge projection on
+  every stored frame, which is quadratic in history size (measured: most of the CPU even with every
+  signature cached). It now receives only the relay status per frame; the runner projects once per
+  tick. The E2E artifact writer (`relay-snapshot.mjs` CLI) still projects on change.
+- *Page deadline.* A history page (and, in a strict round, a live REQ) still fails at 20 s without an
+  EOSE, but the deadline is credited with the time this process spent **handling relay frames**
+  since the request left (process-wide, since one busy reader delays every other reader's frames),
+  capped at 120 s. Idle time is never credited, so a silent relay still times out at 20 s, and while
+  a page is pending history is not complete. No fail-closed rule of #1165/#1170 changes.
 
 **Poll rounds do not flap readiness (R3-4).** Each relay is re-polled every 15 s, and every round
 re-pages its history. That used to drop `historyComplete` until the round finished, so each round

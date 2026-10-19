@@ -235,6 +235,20 @@ A paid collect refused by the buyer wallet's reconciliation (`wallet reconciliat
 is a distinct `payment stuck` state, not a retry loop: logged and journaled once, shown in progress,
 seller freed, sats kept reserved, and re-checked once after `maxplayer wallet reconcile --home <home>`
 changes the wallet, after a later paid collect succeeds, or on restart.
+Optional operator task context (`SWARM_TASK_CONTEXT` / `SWARM_TASK_CONTEXT_FILE`, e.g. "public
+historical cipher; educational") is appended by the runner to every posted task; the planner sees it
+once as `taskContext`, never inside its own task text. A delivery that is a seller refusal or safety
+stop (explicit `MAXPLAYER-REFUSED-V1` first line of the answer or of the delivered report, or a short
+refusal/safety-stop text with no answer statement, by a deliberately conservative heuristic that
+prefers a missed refusal to a discarded solution) is still collected once but recorded as outcome
+`refused`: not counted as delivered work or in progress, listed to the planner as `refusals`, and
+the same seller is not given that workstream again unless the context has changed.
+After a restart the runner reloads its verified-signature cache from `<home>/swarm/verified-sigs`
+(public id+pubkey+sig keys, bounded, checksummed, written atomically; a corrupt or missing file is
+an empty cache), so history is not re-verified. The checksum guards against accidents only: a
+rewrite with a matching checksum makes its keys count as verified, so the file is inside the
+home's trust boundary, like the buyer key; a history page's 20 s deadline is credited with the
+process's own frame-handling time (capped at 120 s), never idle time.
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
 

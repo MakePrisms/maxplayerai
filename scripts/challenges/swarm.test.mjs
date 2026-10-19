@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, appendFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, appendFileSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Journal, Swarm, childEnv, validatePlan, requestId, preparationId, config, reservedBudget, jobBudget } from './swarm.mjs';
@@ -1832,5 +1832,244 @@ test('R3-5 (advisor r1 M2): a same-size decoy legacy file is not reused; the aud
       assert.match(kept,/audit-first/,'audit-first survives in a kept file');
       assert.equal(j.state.jobs[0].id,'audit-last');
     } finally {rmSync(dir,{recursive:true});}
+  }
+});
+// R3-3: operator task context, refusal outcome, planner feedback.
+test('R3-3 context: SWARM_TASK_CONTEXT is appended to every posted task, journaled, and kept out of the planner task text',async()=>{
+  const {challengeTaskPrefix}=await import('../../web/app/src/challenge/shared/events.mjs');
+  const {DELIVERY_NOTE,contextBlock,plannerTask}=await import('./swarm.mjs');
+  const f=fixture(),ctx='This is a public historical cipher from 1872, used for education.';f.c.taskContext=ctx;
+  await f.runner.tick();
+  const posts=f.calls.filter(([t])=>t==='post_job').map(([,a])=>a.task);
+  assert.equal(posts.length,2);
+  for(const task of posts)assert.equal(task,challengeTaskPrefix('b','day')+'piece'+contextBlock(ctx)+DELIVERY_NOTE,'every task carries the context once, before the delivery note');
+  assert.ok(f.journal.state.jobs.every(j=>j.taskContext===ctx));
+  f.setPlan(()=>({wait:true}));f.time(101);await f.runner.tick();
+  const input=f.inputs.at(-1);
+  assert.equal(input.taskContext,ctx,'planner is told the context once');
+  for(const r of input.running)assert.equal(r.task,challengeTaskPrefix('b','day')+'piece','running task is the planner text only');
+  for(const j of f.journal.state.jobs)j.done=true,j.outcome='expired/undelivered';
+  f.time(102);await f.runner.tick();
+  for(const r of f.inputs.at(-1).results)assert.ok(!r.task.includes('CONTEXT'),'result task is the planner text only');
+  // A context changed after posting still strips the one the job was posted with.
+  assert.equal(plannerTask(challengeTaskPrefix('b','day')+'x'+contextBlock('old')+DELIVERY_NOTE,'old'),challengeTaskPrefix('b','day')+'x');
+  // No context: unchanged task (back-compatible) and no taskContext field.
+  const g=fixture();await g.runner.tick();
+  assert.equal(g.calls.find(([t])=>t==='post_job')[1].task,challengeTaskPrefix('b','day')+'piece'+DELIVERY_NOTE);
+  g.setPlan(()=>({wait:true}));g.time(101);await g.runner.tick();assert.equal('taskContext' in g.inputs.at(-1),false);
+});
+test('R3-3 context: config reads SWARM_TASK_CONTEXT or SWARM_TASK_CONTEXT_FILE, trims, bounds, refuses both',()=>{
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://localhost'};
+  assert.equal(config([],base).taskContext,null);
+  assert.equal(config([],{...base,SWARM_TASK_CONTEXT:'  Public historical cipher.\n'}).taskContext,'Public historical cipher.');
+  assert.equal(config([],{...base,SWARM_TASK_CONTEXT:'   '}).taskContext,null);
+  const dir=mkdtempSync(join(tmpdir(),'swarm-ctx-'));
+  try {
+    const file=join(dir,'context.txt');process.getBuiltinModule('node:fs').writeFileSync(file,'Line one.\nLine two.\n');
+    assert.equal(config([],{...base,SWARM_TASK_CONTEXT_FILE:file}).taskContext,'Line one.\nLine two.');
+    assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT_FILE:file,SWARM_TASK_CONTEXT:'x'}),/not both/);
+    assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT_FILE:join(dir,'missing')}),/ENOENT/);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+  assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT:'x'.repeat(4001)}),/at most 4000/);
+});
+const REFUSALS=[
+  'A safety classifier stopped my work right after I checked the environment.',
+  'MAXPLAYER-ANSWER-V1\nI can\'t help with breaking this cipher.',
+  'I\u2019m sorry, but I cannot assist with this request.',
+  'Unfortunately, I am unable to complete this task because it may violate the usage policy.',
+  'My work was blocked by the content filter before I could start.',
+  'I must decline this task.',
+  'I\'m not comfortable continuing with this.',
+  'Delivered files (no inline answer):\n===== REPORT.md =====\nI won\'t help with decrypting this message.\n',
+  // Advisor r1 M2: real stops that were counted as work.
+  'Stopped by the safety system.',
+  'This request was refused by the safety system.',
+  'A safety classifier stopped me before I found a key.',
+  'The safety system refused this task.',
+  'Refused by the content filter.',
+];
+const LEGITIMATE=[
+  'KLJBO','42','The answer is 42.','Plaintext: I CANNOT HELP YOU','Decrypted: "i cannot help" is the crib position 7',
+  'I cannot complete this in the time given, but here is partial progress: key length 5.',
+  'No valid keyword found among the 200 candidates tested.',
+  'I could not find the second keyword; tested HUTTON, CIPHER and SECRET.',
+  'Keyword 1: SECRET\nKeyword 2: unknown (search space exhausted for 5-letter words)',
+  'Result: the bombe found no stop with crib WETTER at offsets 0-40.',
+  '```\nI cannot help\n```',
+  'Steps:\n1. I can\'t help noticing the period is 26.\n2. Shifted.\n3. Checked.',
+  'I can\'t help noticing the key repeats every 7 letters, so the keyword is CLOCKWORK.',
+  'The safety classifier note in the README is unrelated; the key is CROWN.',
+  'x'.repeat(700)+' A safety classifier stopped my work.',
+  'Policy: none. Decryption: ATTACK AT DAWN.',
+  // Advisor r1 H1: short solutions that were recorded as refusals.
+  'I can\'t help it: both keywords are HUTTON and CIPHER.',
+  'Policy check ended. The plaintext is ATTACK AT DAWN.',
+  'The usage policy guidelines stopped the old procedure. Keyword: SECRET.',
+  'I cannot help.',
+  'Plaintext:\nI cannot help',
+  'I must refuse to continue.\nKeyword 1: SECRET\nKeyword 2: CIPHER',
+  'I can\'t complete this.\nResult: 42',
+  'Answer: KLJBO',
+  'results: none',
+  'I CANNOT HELP',
+  'I can\'t help it.',
+  'Solution = ROSEBUD',
+  'Recovered the keyword: WETTER.',
+  'The safety filter stopped me after I found the key CROWN.',
+  'I can\'t continue past the second keyword; the first one is HUTTON.',
+  'Policy check ended without issue; decoded text ATTACK AT DAWN.',
+];
+test('R3-3 refusal: detectRefusal flags refusals and safety stops, never legitimate short answers',async()=>{
+  const {detectRefusal,REFUSAL_MARKER}=await import('./swarm.mjs');
+  for(const s of REFUSALS)assert.ok(detectRefusal(s),`refusal not detected: ${JSON.stringify(s)}`);
+  for(const s of LEGITIMATE)assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
+  for(const s of ['',null,undefined,42,'\n\n'])assert.equal(detectRefusal(s),null);
+  // The explicit marker is honoured at any length and with Markdown decoration.
+  for(const m of [REFUSAL_MARKER,`**${REFUSAL_MARKER}**`,`# ${REFUSAL_MARKER}:`,`\`${REFUSAL_MARKER}\``])
+    assert.deepEqual(detectRefusal(`\n${m}\nPolicy forbids this. ${'x'.repeat(2000)}`).by,'marker');
+  assert.equal(detectRefusal(`${REFUSAL_MARKER}`).reason,'(no reason given)');
+  // Not the marker unless it is the first non-blank line of the (unframed) body.
+  assert.equal(detectRefusal(`Result: 42\n${REFUSAL_MARKER}`),null);
+  // Advisor r1 M2: the marker in a delivered file (readDeliveredAnswer framing) is honoured at any length.
+  const framed=`Delivered files (no inline answer):\n===== REPORT.md =====\n${REFUSAL_MARKER}\nThe harness stopped this task. ${'reason '.repeat(200)}\n`;
+  assert.equal(detectRefusal(framed).by,'marker');assert.match(detectRefusal(framed).reason,/^The harness stopped this task\./);
+  assert.equal(detectRefusal(`MAXPLAYER-ANSWER-V1\n${REFUSAL_MARKER}\nno`).by,'marker');
+  // Only the first file's first line: a marker inside a later file (or after text) is not one.
+  assert.equal(detectRefusal(`Delivered files (no inline answer):\n===== a.md =====\nKey: CROWN\n===== b.md =====\n${REFUSAL_MARKER}\n`),null);
+});
+test('R3-3 refusal (advisor r2): a copula is answer evidence only with a value; bare key nouns are not work words',async()=>{
+  const {detectRefusal}=await import('./swarm.mjs');
+  const stops=[
+    'stopped by the safety system before any keyword was tried.',
+    'The safety classifier stopped me. No keyword was recovered.',
+    'The safety system refused this because the key was sensitive.',
+    'The safety filter stopped the run. The plaintext was not recovered.',
+    'The safety filter stopped the run. The plaintext is NOT recovered.',
+    'I must decline to recover the keyword.',
+    'I can\'t help you find the keyword.',
+    'I can\'t help with breaking this cipher or recovering the keyword.',
+  ];
+  for(const s of stops)assert.ok(detectRefusal(s),`stop not detected: ${JSON.stringify(s)}`);
+  // A value after the copula (upper-case word of 3+ letters, or a number) is still an answer.
+  for(const s of ['The key was CROWN.','Keyword is "HUTTON".','The answer was 42.','KEYWORD IS HUTTON','the crib was WETTER',
+    'Key #2 is SECRET.','I can\'t continue past the second keyword; the first one is HUTTON.',
+    'The safety classifier stopped me, but the keyword is HUTTON.',
+    // Numeric value after a capitalised noun/copula: only the noun+copula rule sees these.
+    'I can\'t complete this. Result was 42.','I can\'t complete this. RESULT WAS 42.'])
+    assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
+});
+test('R3-3 refusal (advisor r3): copula values are numbers, ALL-CAPS or Title-case words, quoted or not; short tokens and non-answers do not veto a stop',async()=>{
+  const {detectRefusal}=await import('./swarm.mjs');
+  // Advisor r3 table 1: answers next to stop language, collected (all refused at 1defc389).
+  for(const s of ['The safety classifier stopped me, but the keyword is Hutton.',
+    'The safety classifier stopped me, but the keyword is "Hutton".',
+    'The safety classifier stopped me, but the keyword is \u201CHUTTON\u201D.',
+    'I can\'t continue past the second keyword; the first one is Hutton.',
+    'I can\'t continue past the second keyword; the first one is 7.',
+    // Quoted value after a stop: only the optional quote in the value class lets this collect.
+    'The safety classifier stopped me, but the keyword is "HUTTON".',
+    'The safety classifier stopped me, but the keyword is \u201CHutton\u201D.',
+    // A 3-letter value after an answer noun: only the noun rule (3+, not the generic 5+) collects it.
+    'The safety classifier stopped me, but the keyword is OWL.',
+    'The safety classifier stopped me, but the keyword is Owl.',
+    // No stop language: collected either way.
+    'The keyword is Hutton.','The plaintext is attack at dawn.','Stopped by the safety system. Keyword: Hutton'])
+    assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
+  // Advisor r3 table 2: explicit stops with a short token after a copula, refused (collected at 1defc389).
+  for(const s of ['The safety system refused this because the category is API.',
+    'Stopped by the safety system. The classifier is LLM-based.',
+    'I can\'t assist with cracking this. My model is GPT.',
+    'Refused by the content filter. Reason code is HTTP 403.',
+    'Refused by the content filter because the topic was NSFW.',
+    'This request was BLOCKED by the safety system.',
+    // Non-answer words are never a value, in any case.
+    'The safety filter stopped the run. The key is REDACTED.',
+    'The safety filter stopped the run. The answer is Unknown.',
+    'The safety filter stopped the run. The plaintext is Not recovered.',
+    'The safety filter stopped the run. The keyword was Never found.',
+    'The safety filter stopped me. This is OK.','The safety filter stopped me. This is AI.'])
+    assert.ok(detectRefusal(s),`stop not detected: ${JSON.stringify(s)}`);
+  // Known limit (documented): a lower-case plaintext next to stop language is refused. No clean rule
+  // separates it from "the plaintext is likely sensitive" / "is about weapons".
+  assert.ok(detectRefusal('The safety filter stopped the run. The plaintext is attack at dawn.'));
+});
+test('R3-3 refusal (advisor r1 M2): a marker written to a delivered file is read through readDeliveredAnswer as a refusal',async()=>{
+  const {detectRefusal,readDeliveredAnswer,REFUSAL_MARKER}=await import('./swarm.mjs');
+  const dir=mkdtempSync(join(tmpdir(),'refused-file-'));
+  try {
+    writeFileSync(join(dir,'REPORT.md'),`${REFUSAL_MARKER}\nMy harness's safety layer ended the session. ${'detail '.repeat(150)}\n`);
+    const answer=readDeliveredAnswer(dir);
+    assert.ok(answer.startsWith('Delivered files (no inline answer):'));
+    assert.deepEqual(detectRefusal(answer)?.by,'marker');
+  } finally {rmSync(dir,{recursive:true,force:true});}
+});
+test('R3-3 refusal: recorded once as refused (not collected work), planner told to reassign, same seller rejected, another accepted',async()=>{
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);
+  await f.runner.tick();
+  const [ja,jb]=f.journal.state.jobs;
+  [...f.remote.values()].find(r=>r.id===ja.id).results=[{}];
+  f.io.answer=async()=>'A safety classifier stopped my work right after I checked the environment.';
+  f.setPlan(()=>({wait:true}));
+  for(let t=101;t<=105;t++){f.time(t);await f.runner.tick();}
+  assert.equal(f.calls.filter(([t])=>t==='collect').length,1,'collected (and settled) exactly once');
+  assert.equal(ja.outcome,'refused');assert.equal(ja.done,true);assert.equal(ja.refusal.by,'heuristic');assert.equal(ja.refusal.kind,'safety stop');
+  assert.equal(reports.filter(m=>m.includes('REFUSED')).length,1);
+  const input=f.inputs.at(-1),r=input.results.find(x=>x.seller==='a');
+  assert.equal(r.outcome,'refused');assert.equal(r.refused,true);assert.match(r.answer,/^\[refused: .*NOT completed work; assign this workstream to a different seller\]/);
+  assert.deepEqual(input.refusals.map(x=>[x.seller,x.workstream,x.by,x.sameContext]),[['a','piece','heuristic',true]]);
+  const profile=input.sellers.find(s=>s.pubkey==='a');
+  if(profile){assert.equal(profile.trackRecord.delivered,0);assert.equal(profile.trackRecord.refused,1);}
+  // Free seller a (ACCEPT projected) and b (expired); the planner tries the same seller again, then another.
+  f.snap.jobs=[{id:ja.id,seller:'a',result:{},accepted:true,running:false}];
+  jb.done=true;jb.outcome='expired/undelivered';jb.released=true;
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:({assignments:[{seller:'a',workstream:'piece',task:'retry',durationSeconds:30},{seller:'b',workstream:'piece',task:'retry',durationSeconds:30}]}));
+  f.time(106);await f.runner.tick();
+  const posts=f.calls.filter(([t])=>t==='post_job').map(([,a])=>a.seller_pubkey);
+  assert.deepEqual(posts,['a','b','b'],'refused workstream goes to the other seller only');
+  const rej=Object.values(f.journal.state.days)[0].rejected;
+  assert.equal(rej.length,1);assert.equal(rej[0].seller,'a');assert.match(rej[0].reason,/seller refused workstream "piece".*assign it to a different seller/);
+  // A changed operator context lifts the same-seller guard (the context may be what was missing).
+  f.c.taskContext='Public historical cipher; educational.';
+  f.snap.jobs.push({id:f.journal.state.jobs[2].id,seller:'b',result:{},accepted:true,running:false});f.journal.state.jobs[2].done=true;f.journal.state.jobs[2].outcome='collected';
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:({assignments:[{seller:'a',workstream:'piece',task:'retry with context',durationSeconds:30}]}));
+  f.time(107);await f.runner.tick();
+  assert.equal(f.calls.filter(([t])=>t==='post_job').at(-1)[1].seller_pubkey,'a');
+});
+test('R3-3 refusal: progress does not count a refusal as a recorded result; stub planner never counts it as delivered',async()=>{
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.c.updateEvery=1;
+  await f.runner.tick();[...f.remote.values()][0].results=[{}];
+  f.io.answer=async()=>'I\'m sorry, but I can\'t help with that.';f.setPlan(()=>({wait:true}));
+  f.time(300);await f.runner.tick();
+  const update=f.publishes.at(-1)[3];
+  assert.match(update,/^0 results recorded; 1 refused by sellers \(not counted as work\); /);
+  // planner-stub counts delivered results by non-bracketed answers.
+  assert.ok(f.inputs.at(-1).results[0].answer.startsWith('['));
+});
+// Advisor r1: this test must exercise the detector. Each refusal-shaped solution is collected as work
+// while a real refusal through the same path is refused (so a runner without the detector, or with a
+// detector that flags these solutions, fails it).
+test('R3-3 refusal: a refusal-shaped short solution is a normal collect; a real refusal on the same path is refused',async()=>{
+  const cases=[
+    ['I can\'t help it: both keywords are HUTTON and CIPHER.','collected'],
+    ['Policy check ended. The plaintext is ATTACK AT DAWN.','collected'],
+    ['I can\'t complete this.\nResult: 42','collected'],
+    ['I cannot help.','collected'],
+    ['Stopped by the safety system.','refused'],
+    // Advisor r2: an explicit stop that mentions the key without a value is not work.
+    ['The safety classifier stopped me. No keyword was recovered.','refused'],
+    ['I can\'t help you find the keyword.','refused'],
+    // Advisor r3: a Title-case value is an answer; a 3-letter token after a copula does not veto a stop.
+    ['The safety classifier stopped me, but the keyword is Hutton.','collected'],
+    ['The safety system refused this because the category is API.','refused'],
+  ];
+  for(const [answer,outcome] of cases) {
+    const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();[...f.remote.values()][0].results=[{}];
+    f.io.answer=async()=>answer;f.setPlan(()=>({wait:true}));f.time(101);await f.runner.tick();
+    const j=f.journal.state.jobs[0];assert.equal(j.outcome,outcome,JSON.stringify(answer));
+    if(outcome==='collected') {
+      assert.equal(j.refusal,undefined);assert.equal(f.inputs.at(-1).refusals,undefined);assert.equal(f.inputs.at(-1).results[0].answer,answer);
+    } else {
+      assert.ok(['safety stop','refusal'].includes(j.refusal.kind));assert.equal(f.inputs.at(-1).refusals.length,1);
+    }
   }
 });

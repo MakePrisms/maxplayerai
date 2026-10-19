@@ -2,9 +2,10 @@
 import {challengeTaskPrefix} from '../../web/app/src/challenge/shared/events.mjs';
 import { parseChallengeRelays, parseChallengeQuorum } from '../../web/app/src/challenge/shared/relay.mjs';
 import { openSnapshot } from './relay-snapshot.mjs';
+import { persistVerifyCache, VERIFY_CACHE_FILE } from './verify-cache-file.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, linkSync, readdirSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, linkSync, readdirSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS, waitingOnHarnessProbe } from './coordinator.mjs';
@@ -115,7 +116,115 @@ export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=2000
 // Appended after the challenge prefix (which stays exactly as the shared projection matches it).
 export const DELIVERY_NOTE = '\n\n---\nDELIVERY: give your final answer inline. Start your final message with the line MAXPLAYER-ANSWER-V1 alone on its line, then the answer (or, if it is long, a short summary of it) as plain text. If you also leave files, write the same answer or summary to answer.txt at the top level.';
 // The planner sees the task it wrote: the delivery note is runner boilerplate (older journals lack it).
-export const plannerTask = task => typeof task==='string'&&task.endsWith(DELIVERY_NOTE)?task.slice(0,-DELIVERY_NOTE.length):task;
+// R3-3 (a): optional operator context (SWARM_TASK_CONTEXT or SWARM_TASK_CONTEXT_FILE), appended by
+// the runner to EVERY task it posts, between the planner's task text and the delivery note. A
+// Claude seller refused a historical-cipher task until one factual line (public historical cipher,
+// educational) was added; the planner should not have to remember to repeat it in every task. The
+// block each job was posted with is journaled (j.taskContext) and stripped again for the planner,
+// which sees its own task text plus the context once, as input.taskContext.
+export const TASK_CONTEXT_MAX_CHARS = 4000;
+export const contextBlock = context => typeof context==='string'&&context?`\n\n---\nCONTEXT (from the challenge operator, added to every task): ${context}`:'';
+export function parseTaskContext(text) {
+  if(text===undefined||text===null)return null;
+  const t=String(text).trim();
+  if(!t)return null;
+  if(t.length>TASK_CONTEXT_MAX_CHARS)throw Error(`Invalid task context: ${t.length} chars, at most ${TASK_CONTEXT_MAX_CHARS}`);
+  return t;
+}
+export const plannerTask = (task,context=null) => {
+  if(typeof task!=='string')return task;
+  let t=task.endsWith(DELIVERY_NOTE)?task.slice(0,-DELIVERY_NOTE.length):task;
+  const block=contextBlock(context);
+  if(block&&t.endsWith(block))t=t.slice(0,-block.length);
+  return t;
+};
+const jobTask = j => plannerTask(j.args.task,j.taskContext);
+// R3-3 (b): a collected delivery that is a refusal or safety stop, not work. The answer is first
+// unframed: runner framing (the "Delivered files (no inline answer):" header, ===== file frames,
+// [truncated…]/[skipped…] notes and a MAXPLAYER-ANSWER-V1 line) is removed. Then two signals:
+// - Explicit: the first non-blank line of that body is REFUSAL_MARKER (Markdown decoration and a
+//   trailing colon allowed, as for the core inline-answer marker). Any length; also when the
+//   seller wrote it to a delivered file rather than inline.
+// - Heuristic, deliberately conservative. A missed refusal costs one reassignment; a false one
+//   throws a solution away, so when in doubt it is a normal collect. The body must be SHORT (at
+//   most REFUSAL_MAX_CHARS) and must carry no ANSWER_EVIDENCE: a code block, a list of 3+ items,
+//   "here is/are", or an answer statement: answer/result/solution/plaintext/decryption/keyword/key,
+//   optionally numbered, followed by a colon or "="; the same noun + is/are/was/were only when a
+//   VALUE follows: one optional straight or curly quote, then a number, an all-caps word or a
+//   title-case word of 3+ letters, other than a non-answer (NOT, NEVER, STILL, FOUND, TRIED,
+//   RECOVERED, BLOCKED, REDACTED, UNKNOWN, EMPTY in any case): "the key is CROWN", "the keyword
+//   is Hutton", "the answer was 42", not "no keyword was recovered" or "the plaintext is NOT
+//   recovered"; any is/are/was/were + such a value of 5+ letters (or a number): "the first one is
+//   Hutton", but not "the category is API" / "the topic was NSFW"; or found/recovered/cracked… a
+//   key/keyword/plaintext followed by an upper-case word. A lower-case plaintext ("the plaintext
+//   is attack at dawn") is NOT evidence: no clean rule tells it from "the plaintext is withheld",
+//   so next to stop language it is refused. Then:
+//   * a safety stop (a safety|content|usage|moderation classifier/filter/system/policy/… directly
+//     followed by stopped/blocked/flagged/refused/…, or "stopped/refused/… by the <that noun>"),
+//     case-insensitive, counts even next to generic work words ("…before I found a key");
+//   * a first-person refusal counts only at a sentence start, case-sensitive (a decrypted
+//     "I CANNOT HELP" is not one), only with words after the verb (a bare "I cannot help." may be
+//     the plaintext), never the idioms "I can't help it/noticing/but…", and only without generic
+//     work words (found / candidate / tested / partial). The bare nouns keyword/plaintext/key are
+//     NOT work words: "I can't help you find the keyword." is the usual refusal on a cipher task.
+// A refused job is still collected exactly once (a priced one is paid: core cannot gate content).
+export const REFUSAL_MARKER = 'MAXPLAYER-REFUSED-V1';
+export const REFUSAL_MAX_CHARS = 600;
+const SAFETY_NOUN = String.raw`(?:safety|content|usage|policy|moderation) (?:classifiers?|filters?|systems?|layers?|checks?|polic(?:y|ies)|guardrails?|models?)(?: (?:classifier|filter|system|layer|check))?`;
+const SAFETY_VERB = String.raw`(?:stopped|blocked|halted|flagged|prevented|interrupted|terminated|refused|rejected)`;
+const REFUSAL_VERB = String.raw`(?:help|assist|comply|continue|proceed|complete|do|provide|perform|work on|carry out|engage|participate|fulfil|fulfill)`;
+const SENTENCE_START = String.raw`(?:^|[.!?]\s+|\n\s*)`;
+export const SAFETY_PATTERNS = [
+  new RegExp(String.raw`\b${SAFETY_NOUN}(?: (?:has|had|have|just|was|is))? ${SAFETY_VERB}\b`,'i'),
+  new RegExp(String.raw`\b${SAFETY_VERB}\b[^.\n]{0,40}?\bby (?:a|an|the|my|its) ${SAFETY_NOUN}\b`,'i'),
+];
+export const REFUSAL_PATTERNS = [
+  new RegExp(String.raw`${SENTENCE_START}(?:(?:I'm sorry|I am sorry|Sorry|Unfortunately|However),?\s+(?:but\s+)?)?I (?:can't|cannot|can not|won't|will not|am unable to|'m unable to|am not able to|'m not able to) ${REFUSAL_VERB}(?= +[A-Za-z])(?! +(?:it|but|noticing|thinking|wondering|feeling|seeing|myself)\b)`),
+  new RegExp(String.raw`${SENTENCE_START}I (?:must|have to|need to|will|'ll|'m going to) (?:decline|refuse)\b`),
+  new RegExp(String.raw`${SENTENCE_START}I(?:'m| am) not (?:comfortable|willing)\b`),
+];
+const ANSWER_NOUN = String.raw`(?:answers?|results?|solutions?|plaintexts?|decryptions?|decrypted(?: text| message)?|keywords?|keys?|cribs?)`;
+// Case-insensitive letters for a pattern made only of words, groups and quantifiers (no escapes),
+// so a copula rule can stay case-sensitive about the VALUE while accepting "Keyword"/"KEYWORD".
+const anyCase = p => p.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
+const COPULA = String.raw`(?:is|are|was|were)`;
+// Advisor r3: one optional straight or curly quote (curly singles are already folded to '), then a
+// number, an ALL-CAPS word or a Title-case word of at least `min` letters, never a non-answer word.
+const VALUE_QUOTE = String.raw`["'\x60\u201C\u201D]?`;
+const NON_ANSWER = anyCase('(?:not|never|still|found|tried|recovered|blocked|redacted|unknown|empty)');
+const answerValue = min => String.raw`${VALUE_QUOTE}(?!${NON_ANSWER}\b)(?:\d+|[A-Z]{${min},}|[A-Z][a-z]{${min-1},})\b`;
+const ANSWER_EVIDENCE = [
+  new RegExp(String.raw`\x60\x60\x60|\bhere (?:is|are)\b|\b${ANSWER_NOUN}(?: ?#?\d+)?\s*(?::|=)`,'i'),
+  // Advisor r2: a copula is an answer statement only when a value follows. Case-sensitive value.
+  new RegExp(String.raw`\b${anyCase(ANSWER_NOUN)}(?: ?#?\d+)?\s+${anyCase(COPULA)}\s+${answerValue(3)}`),
+  // Any copula: 5+ letters, so API/LLM/GPT/HTTP/NSFW after a stop do not veto it.
+  new RegExp(String.raw`\b${anyCase(COPULA)}\s+${answerValue(5)}`),
+  // Case-sensitive on purpose: the recovered value must be an upper-case word ("found the key CROWN").
+  /\b(?:[Ff]ound|[Rr]ecovered|[Cc]racked|[Ss]olved|[Dd]ecrypted|[Gg]ot)\b[^.\n]{0,30}?\b(?:[Kk]eywords?|[Kk]eys?|[Pp]laintext|[Ss]olution|[Aa]nswer)\b[: ]+["'\x60]?[A-Z]{3,}\b/,
+];
+const WORK_WORDS = /\b(?:found|candidates?|tested|partial(?:ly)?)\b/i;
+const markerLine = line => {let b=line.trim().replace(/^#+/,'').trim().replace(/^[`*_]+|[`*_]+$/g,'').trim();if(b.endsWith(':'))b=b.slice(0,-1).trim();return b;};
+const framing = l => /^===== .* =====$/.test(l)||/^\[(?:truncated|skipped):/.test(l)||l.trim()==='Delivered files (no inline answer):'||markerLine(l)==='MAXPLAYER-ANSWER-V1';
+export function detectRefusal(answer) {
+  if(typeof answer!=='string')return null;
+  const body=answer.replace(/[\u2018\u2019]/g,"'").split('\n').filter(l=>!framing(l));
+  const first=body.findIndex(l=>l.trim());
+  if(first<0)return null;
+  if(markerLine(body[first])===REFUSAL_MARKER) {
+    const reason=body.slice(first+1).join('\n').trim().slice(0,300)||'(no reason given)';
+    return {by:'marker',reason};
+  }
+  const text=body.join('\n').trim();
+  if(text.length>REFUSAL_MAX_CHARS||ANSWER_EVIDENCE.some(re=>re.test(text)))return null;
+  if(body.filter(l=>/^\s*(?:[-*•]|\d+[.)])\s+\S/.test(l)).length>=3)return null;
+  const reason=()=>text.replace(/\s+/g,' ').slice(0,300);
+  if(SAFETY_PATTERNS.some(re=>re.test(text)))return {by:'heuristic',kind:'safety stop',reason:reason()};
+  if(!WORK_WORDS.test(text)&&REFUSAL_PATTERNS.some(re=>re.test(text)))return {by:'heuristic',kind:'refusal',reason:reason()};
+  return null;
+}
+// R3-3 (c): planner feedback (newest refusals of this challenge) and the reassignment guard.
+export const MAX_REFUSAL_FEEDBACK = 50;
+const collectedOutcome = o => o==='collected'||o==='refused';
 // Planner call timeouts (seconds; SWARM_ANALYZE_TIMEOUT_SECONDS / SWARM_PLANNER_TIMEOUT_SECONDS).
 // The runner kills the planner command at `runner`; the bundled planner-llm.mjs kills its own LLM
 // call PLANNER_LLM_MARGIN_SECONDS earlier, so it can still report the failure before being killed.
@@ -399,14 +508,14 @@ export function sellerProfile(s,jobs) {
   const tags=s.capabilities??[], values=name=>tags.filter(t=>t[0]===name).flatMap(t=>t.slice(1));
   const price=sellerPricing(s);
   const own=jobs.filter(j=>j.seller===s.pubkey);
-  const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:plannerTask(j.args.task),workstream:j.workstream??null,
+  const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:jobTask(j),workstream:j.workstream??null,
     outcome:j.outcome,delivered:j.outcome==='collected',turnaroundSeconds:(j.ts??j.created)-j.created}));
   return {pubkey:s.pubkey,npub:s.npub??'',name:s.name??'',agents:values('agents'),
     harness:{family:values('harness_family'),model:values('harness_model'),variant:values('harness_variant')},
     capabilities:values('capabilities'),hardware:values('hardware'),minutesRemaining:s.minutesRemaining,note:s.note??'',
     pricing:{rateSats:values('rate'),takesPayment:values('takes_payment'),free:price.free,minimumSats:price.minimumSats},
     challengeSpend:{paidSats:own.reduce((n,j)=>n+jobBudget(j).paidSats,0),reservedSats:own.reduce((n,j)=>n+jobBudget(j).reservedSats,0)},
-    trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
+    trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,refused:tasks.filter(t=>t.outcome==='refused').length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
 }
 export function requestId(c,s,n) {return 'swarm-'+createHash('sha256').update(JSON.stringify([c.buyer,c.id,s,n])).digest('hex');}
 // This is the buyer's explicit-request preparation identity (buyer/preparations.rs).
@@ -589,7 +698,7 @@ export class Swarm {
   // collected work whose ACCEPT/deadline is not yet projected keep the seller busy. An expired
   // job whose slot was freed (see EXPIRED_SLOT_GRACE_SECONDS) cannot be executing any more.
   pendingSellers(snap,key,now,except=null) {
-    return this.state.jobs.filter(j=>j!==except&&((!j.done&&!j.slotFreed)||(j.key===key&&j.outcome==='collected'&&!(snap.jobs??[]).some(p=>p.id===j.id&&(p.accepted||now>=p.deadline))))).map(j=>j.seller);
+    return this.state.jobs.filter(j=>j!==except&&((!j.done&&!j.slotFreed)||(j.key===key&&collectedOutcome(j.outcome)&&!(snap.jobs??[]).some(p=>p.id===j.id&&(p.accepted||now>=p.deadline))))).map(j=>j.seller);
   }
   // Full fresh admission for one assignment: challenge identity and window, eligibility,
   // leave/deny, minutes, budget headroom and one-job-per-seller. Returns failing reasons.
@@ -714,8 +823,12 @@ export class Swarm {
         try {answer=await this.io.answer(collected);if(typeof answer!=='string')throw Error('answer is not text');}
         catch(e) {answerError=String(e?.message??e).slice(0,500);answer=`[collected, answer unreadable: ${answerError}]`;
           this.io.report?.(`Job ${j.id}: collected (pay ${collected?.pay?.state}) but answer unreadable: ${answerError}`);}
+        // R3-3: a refusal or safety stop is collected (and settled) like any delivery, but recorded as
+        // its own outcome: never counted as work, shown to the planner for reassignment.
+        const refusal=answerError?null:detectRefusal(answer);
         // done records collection, not release of the seller slot; pending() waits for meter closure.
-        Object.assign(j,{answer,ts:now,done:true,outcome:'collected',pay:collected?.pay,...(answerError?{answerError}:{})});this.save();
+        Object.assign(j,{answer,ts:now,done:true,outcome:refusal?'refused':'collected',pay:collected?.pay,...(answerError?{answerError}:{}),...(refusal?{refusal}:{})});this.save();
+        if(refusal)this.io.report?.(`Job ${j.id}: seller ${j.seller} REFUSED (${refusal.by}${refusal.kind?`: ${refusal.kind}`:''}); recorded as refused, not as work; the planner is told to reassign workstream ${j.workstream??'?'} to a different seller: ${refusal.reason.slice(0,200)}`);
       } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.released=true;j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
       else if(now>j.args.deadline_unix) {
         // Deadline alone is not proof of nonpayment. A confirmed empty/expired claim history,
@@ -751,7 +864,12 @@ export class Swarm {
     const day=this.state.days[key]??= {challenge:c,budget:snap.budget.totalSats,lastUpdate:0};
     if(!day.stop){day.challenge=c;day.budget=snap.budget.totalSats;}
     const jobs=this.state.jobs.filter(j=>j.key===key);
-    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:plannerTask(j.args.task),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.answer??`[${j.outcome}]`,...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),...(j.paymentStuck?{paymentStuck:j.paymentStuck.reason}:{}),ts:j.ts??now}));
+    const refusedAnswer=j=>`[refused: the seller declined or was stopped (${j.refusal.by}${j.refusal.kind?`: ${j.refusal.kind}`:''}); NOT completed work; assign this workstream to a different seller]\n${j.answer}`;
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:jobTask(j),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.outcome==='refused'&&j.refusal?refusedAnswer(j):j.answer??`[${j.outcome}]`,...(j.outcome==='refused'?{refused:true}:{}),...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),...(j.paymentStuck?{paymentStuck:j.paymentStuck.reason}:{}),ts:j.ts??now}));
+    // R3-3 (c): this challenge's refusals, newest last. sameContext: the task was posted with the
+    // current operator context (only then is a reassignment to the same seller refused).
+    const sameContext=j=>(j.taskContext??null)===(this.c.taskContext??null);
+    const refusals=jobs.filter(j=>j.outcome==='refused').slice(-MAX_REFUSAL_FEEDBACK).map(j=>({seller:j.seller,workstream:j.workstream??null,task:jobTask(j),by:j.refusal?.by??null,reason:j.refusal?.reason??'',at:j.ts??null,sameContext:sameContext(j)}));
     const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && TERMINAL_STATUSES.includes(c.status)) {day.stop={external:true};day.closed={status:c.status,seenAt:now};this.save();}
@@ -759,7 +877,7 @@ export class Swarm {
     const bench=this.benched(now),benchedSet=new Map(bench.map(b=>[b.seller,b]));
     const eligible=s=>(s.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state));
     const running=()=>[
-      ...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>({seller:j.seller,workstream:j.workstream??null,task:plannerTask(j.args.task),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
+      ...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>({seller:j.seller,workstream:j.workstream??null,task:jobTask(j),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
     const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
       const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
@@ -767,6 +885,8 @@ export class Swarm {
         budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now(),
         ...(day.rejected?.length?{rejectedAssignments:day.rejected}:{}),
         ...(bench.length?{benchedSellers:bench}:{}),
+        ...(this.c.taskContext?{taskContext:this.c.taskContext}:{}),
+        ...(refusals.length?{refusals}:{}),
         ...(this.releaseMissing?.length?{paidWorkRefused:`buyer get_job lacks ${this.releaseMissing.join(', ')}; assign only amountSats 0`}:{})};
       const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
       if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result answer omitted`);
@@ -830,6 +950,10 @@ export class Swarm {
           if(!candidates.some(s=>s.seller_pubkey===seller)){reject('seller busy or ineligible (not in free roster)');continue;}
           if(typeof task!=='string'||!task.trim()){reject('invalid task (empty or not text)');continue;}
           if(!planIds.has(workstream)){reject(`unknown workstream ${JSON.stringify(String(workstream)).slice(0,120)}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})`);continue;}
+          // R3-3 (c): a seller that refused this workstream is not given it again under the same
+          // operator context (a changed SWARM_TASK_CONTEXT may be what lets it proceed).
+          const refusedBy=jobs.find(j=>j.outcome==='refused'&&j.seller===seller&&j.workstream===workstream&&sameContext(j));
+          if(refusedBy){reject(`seller refused workstream ${JSON.stringify(String(workstream)).slice(0,120)} (job ${refusedBy.id}: ${String(refusedBy.refusal?.reason??'').slice(0,200)}); assign it to a different seller`);continue;}
           if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject('duration outside configured bounds');continue;}
           // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
           const fresh=await this.io.snapshot(),at=this.io.now();
@@ -839,8 +963,8 @@ export class Swarm {
           const deferred=reasons.length>0&&reasons.every(r=>TRANSIENT_REASONS.includes(r));
           if(reasons.length&&!deferred){if(reasons.includes('budget_exceeded'))budgetRejected++;reject(reasons.join(', '));continue;}
           const sequence=jobs.filter(j=>j.seller===seller).length+1;
-          const args={task:challengeTaskPrefix(c.buyer,c.id)+task+DELIVERY_NOTE,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
-          const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args};
+          const args={task:challengeTaskPrefix(c.buyer,c.id)+task+contextBlock(this.c.taskContext)+DELIVERY_NOTE,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
+          const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args,...(this.c.taskContext?{taskContext:this.c.taskContext}:{})};
           if(deferred) {
             Object.assign(j,{deferred:true,deferredAt:at});this.state.jobs.push(j);jobs.push(j);this.save();
             this.io.report?.(`Deferred assignment for ${seller}: ${reasons.join(', ')}; retrying once the relay snapshot is ready and fresh`);continue;
@@ -879,7 +1003,8 @@ export class Swarm {
       const crossed=now<day.progressRetryAt;
       try {
         const stuck=this.state.jobs.filter(j=>j.key===key&&j.paymentStuck).length;
-        if(await this.publishChallenge(day,c,null,`${results.length} results recorded; ${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running${stuck?`; ${stuck} payment${stuck>1?'s':''} stuck awaiting the operator (wallet reconcile)`:''}`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
+        const refusedCount=results.filter(r=>r.outcome==='refused').length;
+        if(await this.publishChallenge(day,c,null,`${results.length-refusedCount} results recorded; ${refusedCount?`${refusedCount} refused by sellers (not counted as work); `:''}${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running${stuck?`; ${stuck} payment${stuck>1?'s':''} stuck awaiting the operator (wallet reconcile)`:''}`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
       } catch(e) {
         if(e.journalFailure)throw e;
         day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();
@@ -951,6 +1076,9 @@ export function config(argv,env=process.env) {
   const flag=(name,value)=>{const v=String(value??'').trim().toLowerCase();if(['','0','false','no','off'].includes(v))return false;if(['1','true','yes','on'].includes(v))return true;throw Error(`Invalid ${name}: use 1/true/yes/on or 0/false/no/off`);};
   const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),benchAfterUnclaimed:+(env.SWARM_BENCH_AFTER_UNCLAIMED??DEFAULT_BENCH_AFTER_UNCLAIMED),benchSeconds:+(env.SWARM_BENCH_SECONDS??DEFAULT_BENCH_SECONDS),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
   c.challengeQuorum=parseChallengeQuorum(env.SWARM_CHALLENGE_QUORUM,c.challengeRelays.length);
+  // R3-3 (a): operator task context, inline or from a file (not both).
+  if(env.SWARM_TASK_CONTEXT!==undefined&&env.SWARM_TASK_CONTEXT_FILE!==undefined)throw Error('Set SWARM_TASK_CONTEXT or SWARM_TASK_CONTEXT_FILE, not both');
+  c.taskContext=parseTaskContext(env.SWARM_TASK_CONTEXT_FILE!==undefined?readFileSync(env.SWARM_TASK_CONTEXT_FILE,'utf8'):env.SWARM_TASK_CONTEXT);
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
   for(const k of ['plannerDigestChars','plannerMaxInputChars'])if(!Number.isSafeInteger(c[k])||c[k]<100)throw Error(`Invalid ${k}`);
@@ -1020,7 +1148,7 @@ async function main() {
     child.on('exit',(code,signal)=>{process.exitCode=code??1;if(signal)console.error(`Locked runner ended by ${signal}`);child.stdin.destroy();});return;
   }
   // A stop can arrive during startup (whoami, buyer probe): it is recorded here and the loop never starts.
-  let quitting=false,source,wake,health;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();wake?.();};
+  let quitting=false,source,wake,health,sigCache;const stopRunner=()=>{quitting=true;health?.stop();source?.stop();sigCache?.stop();wake?.();};
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-swarm';
@@ -1030,10 +1158,13 @@ async function main() {
   const buyer=identity.match(/pubkey: ([0-9a-f]{64})/)?.[1];
   if(!buyer)throw Error('Cannot identify configured buyer');
   const journal=new Journal(join(c.home,'swarm/events.jsonl'));
+  console.error(new Date().toISOString(),c.taskContext?`Task context (appended to every posted task): ${JSON.stringify(c.taskContext)}`:'No task context configured (SWARM_TASK_CONTEXT / SWARM_TASK_CONTEXT_FILE)');
   if(journal.migrated)console.error(new Date().toISOString(),`Migrated legacy append journal (${journal.migrated.records} records${journal.migrated.torn?', torn final append discarded':''}) to one record; the legacy file is kept unchanged at ${journal.migrated.legacyPath}`);
+  // R3-6: load the persisted verified-signature cache BEFORE the first relay frame arrives.
+  sigCache=persistVerifyCache(join(c.home,'swarm',VERIFY_CACHE_FILE),{report:message=>console.error(new Date().toISOString(),message)});
   let relayCoverage;
-  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,quorum:c.challengeQuorum,buyer,onChange:s=>{
-    const line=relayCoverageLine(s.relay);
+  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,quorum:c.challengeQuorum,buyer,onRelay:relay=>{
+    const line=relayCoverageLine(relay);
     if(line!==relayCoverage){relayCoverage=line;console.error(new Date().toISOString(),line);}
   }});
   health=startRelayHealthLog(source.diagnostics,message=>console.error(new Date().toISOString(),message));
@@ -1071,7 +1202,7 @@ async function main() {
       if(!quitting)await new Promise(r=>{const t=setTimeout(r,c.poll*1000);wake=()=>{clearTimeout(t);r();};});wake=undefined;
     }
   } finally {
-    health.stop();source.stop();
+    health.stop();source.stop();sigCache.stop();
     // Locked runner: the loop has ended. On a stop request nothing is in flight and the last save
     // is durable, so cancel the grace timer and exit 0 on the next turn, releasing the lock; never
     // wait on relay socket teardown. On a fatal journal error the throw continues past this block

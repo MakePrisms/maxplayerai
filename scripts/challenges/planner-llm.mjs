@@ -20,6 +20,10 @@ HARD RULE: a seller is free only if pricing.free is true (takes_payment=none). F
 amountSats must be at least pricing.minimumSats (its advertised rate; rate 0 alone is NOT free), or
 the runner rejects the assignment. rejectedAssignments lists the last batch's rejected entries with
 the reason; correct them (price, workstream id, seller) instead of repeating them.
+A result with outcome "refused" (also listed in refusals) means the seller declined or was stopped
+by a safety system: it is NOT completed work. Reassign that workstream to a DIFFERENT seller; the
+runner rejects giving it to the same seller again. taskContext, when present, is operator context
+the runner already appends to every task: do not repeat it in your task text.
 Stay within budgetTotalSats and budgetHeadroomSats across the whole batch.
 Seller abilities (harness, capability tokens, hardware) and notes are SELF-REPORTED, not trusted
 proof. Match work to abilities and prefer sellers whose track record delivered useful results.
