@@ -21,7 +21,8 @@ minutes or note (republishing would forfeit that day); change them 15 minutes af
 Never leave and rejoin to change minutes: that forfeits the day too. Same minutes with --note
 omitted or equal is a no-op; on a change, omitting --note keeps the note, --note '' clears it.
 Membership and acceptance persist across days. Minutes are offered per day.
-Status/members default to the buyer's latest non-cancelled swarm run. Uses the initialized home's key.
+Status/members default to the buyer's latest non-cancelled swarm run (newest publish; of runs published
+in the same second, the one that starts later). Uses the initialized home's key.
 Home: $MAXPLAYER_HOME or ~/.maxplayer. Relays default to wss://nos.lol, wss://relay.primal.net, wss://offchain.pub.
 Repeat --relay URL after the command to override. ws:// is loopback-only; relay.maxplayer.ai is forbidden.
 Reads and publishes need a quorum of relays: --quorum N (default 2, at least a majority of the relays
@@ -324,6 +325,10 @@ fn select_challenge(
     select_challenge_event(events, buyer, id).map(|(_, c)| c)
 }
 /// `select_challenge` plus the id of the event it was parsed from (`run_event_id`).
+/// Without `id`, the default is the most recently published non-cancelled run (highest
+/// `created_at`). Runs published in the same second (today's and tomorrow's from one script)
+/// tie on `created_at`; then the run that starts later wins, and only then the lowest event id,
+/// so the default never depends on event hashes or relay order.
 fn select_challenge_event(
     events: &[nostr_sdk::Event],
     buyer: &str,
@@ -336,7 +341,12 @@ fn select_challenge_event(
             .filter_map(|e| parse_challenge(e, buyer).ok().map(|c| (e, c)))
             .filter(|(_, c)| id.map_or(c.status != "cancelled", |id| c.id == id))
             .collect();
-    candidates.sort_by(|(a, _), (b, _)| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+    candidates.sort_by(|(a, ca), (b, cb)| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then(cb.starts.cmp(&ca.starts))
+            .then(a.id.cmp(&b.id))
+    });
     candidates
         .into_iter()
         .next()
@@ -1955,6 +1965,82 @@ mod tests {
             let d = row(&denied);
             assert_eq!(d["decision"], "denied");
             assert_eq!(d["eligible"], false);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        /// Two runs published in the same second (today's and tomorrow's from one script) tie on
+        /// `created_at`. The default run is the one that starts later, never the lower event id (a
+        /// hash): the old tie-break picked `today` whenever its id sorted first, which is how
+        /// `challenge_cli_local_relay_publish_join_decide_status_leave` flaked.
+        #[tokio::test]
+        async fn same_second_runs_default_to_the_later_start_not_the_lower_event_id() {
+            let root = std::env::temp_dir().join(format!(
+                "challenge-same-second-{}",
+                Keys::generate().public_key()
+            ));
+            let home = home::bootstrap(&root).unwrap();
+            let buyer_keys = crate::relay::keys(&home).unwrap();
+            let buyer = buyer_keys.public_key().to_hex();
+            let run = |id: &str, starts: u64, goal: String| {
+                let c = Challenge {
+                    buyer: buyer.clone(),
+                    id: id.into(),
+                    title: "Build".into(),
+                    goal,
+                    starts,
+                    ends: starts + 3600,
+                    budget_sats: 0,
+                    status: "scheduled".into(),
+                    update: None,
+                    result: None,
+                };
+                signed(c.to_event_draft().unwrap(), &buyer_keys, 1000)
+            };
+            let tomorrow = run("tomorrow", 90_000, "Goal".into());
+            // `today` gets the lower event id: the run the old tie-break picked.
+            let today = (0..)
+                .map(|i| run("today", 5_000, format!("Goal {i}")))
+                .find(|e| e.id < tomorrow.id)
+                .unwrap();
+            for events in [
+                [today.clone(), tomorrow.clone()],
+                [tomorrow.clone(), today.clone()],
+            ] {
+                let (event_id, c) = select_challenge_event(&events, &buyer, None).unwrap();
+                assert_eq!(
+                    (c.id.as_str(), event_id),
+                    ("tomorrow", tomorrow.id.to_hex())
+                );
+            }
+            // Same second and same start: the lowest event id, whatever the input order.
+            let twin = (0..)
+                .map(|i| run("twin", 90_000, format!("Goal {i}")))
+                .find(|e| e.id < tomorrow.id)
+                .unwrap();
+            for events in [
+                [twin.clone(), tomorrow.clone()],
+                [tomorrow.clone(), twin.clone()],
+            ] {
+                assert_eq!(select_challenge(&events, &buyer, None).unwrap().id, "twin");
+            }
+            // `--run` still selects either one.
+            let both = [today.clone(), tomorrow.clone()];
+            assert_eq!(
+                select_challenge(&both, &buyer, Some("today")).unwrap().id,
+                "today"
+            );
+            // Through the CLI, with the relay returning `today` first: members reads tomorrow.
+            let seller = Keys::generate();
+            let events = vec![
+                today,
+                tomorrow,
+                decision(&buyer_keys, &seller, "accepted", 900),
+                membership(&seller, &buyer, "joined", 100, 800),
+            ];
+            let relay = crate::relay::transport_tests::relay_like(events, vec![]).await;
+            let mut o = super::parse(&args("members --json")).unwrap();
+            o.relays = vec![relay.url.clone()];
+            let (body, _) = execute_async(&o, &home).await.unwrap();
+            assert_eq!(body["run"]["id"], "tomorrow", "{body}");
             std::fs::remove_dir_all(root).unwrap();
         }
         #[tokio::test]
