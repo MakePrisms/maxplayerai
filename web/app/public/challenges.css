@@ -2,6 +2,11 @@
 .c-facts { display: flex; justify-content: center; flex-wrap: wrap; gap: 14px 44px; margin: 34px 0 0; }
 .c-facts dt { font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
 .c-facts dd { margin: 6px 0 0; font-family: var(--sans); font-size: 16px; color: var(--ink); }
+/* Hero fact skeletons (styles.css .skel): shorter than one line of each font, so the line box,
+   and the block's height, is the same before and after the reveal. */
+.c-facts .skel { display: inline-block; vertical-align: middle; height: 0.8em; }
+.c-facts .c-skel-dt { width: 72px; }
+.c-facts .c-skel-dd { width: 96px; }
 .c-sellers { list-style: none; margin: 36px 0 0; padding: 0; text-align: left; }
 .c-sellers li {
   display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 18px; align-items: baseline;
@@ -32,3 +37,34 @@
 .c-job-body li { margin: 4px 0; }
 .c-job-body li::marker { color: var(--neon); }
 .c-job-body a { color: var(--neon); overflow-wrap: anywhere; }
+/* hero: once the run is on, "Running now" links down to the live list (bob) */
+.c-facts dd a { color: var(--neon); text-decoration: underline; text-underline-offset: 4px; text-decoration-thickness: 1px; }
+.c-facts dd a:hover { color: var(--ink); }
+/* while the live list loads only "Updating…" shows; the empty summary keeps no gap */
+.c-summary:empty { display: none; }
+.c-summary:empty ~ .c-sellers { margin-top: 28px; }
+/* the job is capped at about one screen (the viewport minus the nav, the section padding,
+   heading and button) with a fade, and "See more" opens it (bob). src/challenge/more.ts adds
+   .is-clamped only when JS runs, so without JS the whole job is readable. */
+.c-job-body.is-clamped {
+  max-height: max(240px, calc(100vh - var(--nav-h) - 380px));
+  max-height: max(240px, calc(100svh - var(--nav-h) - 380px));
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 110px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 110px), transparent);
+}
+.c-more {
+  display: block; margin: 22px auto 0; min-height: 44px; padding: 0 24px; box-sizing: border-box;
+  background: none; border: 1px solid var(--line); border-radius: 2px; color: var(--ink); cursor: pointer;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+}
+.c-more:hover { color: var(--neon); border-color: var(--neon); }
+.c-more:focus-visible { outline: 2px solid var(--neon); outline-offset: 3px; }
+.c-more[hidden] { display: none; }
+@media (max-width: 760px) {
+  .c-job-body.is-clamped {
+    max-height: max(220px, calc(100vh - var(--nav-h) - 330px));
+    max-height: max(220px, calc(100svh - var(--nav-h) - 330px));
+  }
+}
+.eyebrow.is-off { visibility: hidden; }

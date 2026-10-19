@@ -1,9 +1,13 @@
-import { connectionText, parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
+import { parseSnapshot, renderLiveState, UPDATING, type Snapshot, type Tracker } from "./challenge/live.js";
+import { paint } from "./challenge/page.js";
+import { wireMore } from "./challenge/more.js";
+import { coalesce } from "./challenge/coalesce.js";
 import { demoSnapshot } from "./challenge/demo.js";
 import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
 import { writeClipboard } from "./ui/clipboard.js";
-import { usd, onSpotChange, startSpot } from "./ui/spot.js";
+import { usd, onSpotChange, spotUsd, startSpot } from "./ui/spot.js";
+import { budgetValue } from "./challenge/hero.js";
 import { EventStore } from "./challenge/shared/model.mjs";
 import { ChallengeReader } from "./challenge/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
@@ -49,15 +53,27 @@ jobFloat.addEventListener("click", (e) => {
   jobSection.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
 });
 
+// The job is capped at about one screen with a "See more" toggle (bob). Collapsing scrolls the
+// section back into view so the reader isn't left below it.
+const jobMore = wireMore(el("job-body"), el("job-more") as HTMLButtonElement, () => {
+  if (jobSection.getBoundingClientRect().top < 0) jobSection.scrollIntoView({ block: "start" });
+});
+addEventListener("resize", () => jobMore.update());
+void document.fonts?.ready.then(() => jobMore.update());
+
 let snapshot: Snapshot | null = null;
 let receivedAt = 0;
+// wasLive: the data has been live on this page load, so a routine poll or catch-up stays live.
+// readyAt: last time the relay was fully ready (drives "Running now"). See live.ts observe.
+let tracker: Tracker = { wasLive: false, readyAt: null };
+let reader: ChallengeReader | null = null;
+let demoStatus: string | null = null;
 
 function render(s: Snapshot): void {
   const c = s.challenge;
   if (!c) return;
   renderJob(document, c.goal);
-  text("challenge-start", when(c.starts));
-  text("challenge-budget", usd(s.budget!.totalSats));
+  jobMore.update();
   text("buyer-npub", c.buyerNpub);
   text("buyer-hex", buyerHex(c.buyerNpub));
   text("apply-command", `maxplayer-challenges join --buyer ${c.buyerNpub} --minutes 60`);
@@ -65,29 +81,39 @@ function render(s: Snapshot): void {
 }
 function tick(): void {
   if (!snapshot) return;
-  renderSellers(document, snapshot, snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000));
+  // The reader's current status, read every tick (not only the one copied into the last snapshot).
+  const relay = (reader ? reader.status : snapshot.relay) as Snapshot["relay"];
+  const status = demoStatus ?? (relay?.authenticated ? "Live" : "Polling");
+  const now = snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000);
+  const budget = (sats: number) => budgetValue(sats, spotUsd() === null ? null : usd(sats), performance.now());
+  tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status, budget });
 }
-function receive(value: unknown, status: string): void {
+function receive(value: unknown): void {
   snapshot = parseSnapshot(value);
   receivedAt = performance.now();
   render(snapshot);
-  text("connection-status", connectionText(snapshot.relay, status));
 }
 function unavailable(): void {
-  text("connection-status", snapshot ? "Reconnecting · showing last known" : "Live view unavailable · check back soon");
+  tracker = { ...tracker, readyAt: null };
+  renderLiveState(document, "updating");
+  text("connection-status", snapshot ? UPDATING : "Live view unavailable · check back soon");
 }
 
+// At most one snapshot rebuild per RENDER_MS (see challenge/coalesce.ts).
+const RENDER_MS = 250;
 function connect(): void {
   const store = new EventStore();
-  const reader = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, quorum: CHALLENGE_QUORUM, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: () => {
-    try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: reader.status}, reader.status.authenticated ? "Live" : "Polling"); }
+  const changed = coalesce(() => {
+    try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: live.status}); }
     catch { unavailable(); }
-  }});
-  reader.start();
-  addEventListener("pagehide", (event) => { if (!event.persisted) reader.stop(); });
+  }, RENDER_MS);
+  const live = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, quorum: CHALLENGE_QUORUM, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: changed});
+  reader = live;
+  live.start();
+  addEventListener("pagehide", (event) => { if (!event.persisted) live.stop(); });
 }
 
-if (new URLSearchParams(location.search).has("demo")) receive(demoSnapshot(Date.now() / 1000), "Demo data · not a real challenge");
+if (new URLSearchParams(location.search).has("demo")) { demoStatus = "Demo data · not a real challenge"; receive(demoSnapshot(Date.now() / 1000)); }
 else void connect();
 setInterval(tick, 1000);
 // Budget shows in dollars at the live BTC-USD rate, like the rest of the site.
