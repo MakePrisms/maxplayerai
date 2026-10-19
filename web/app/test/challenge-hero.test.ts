@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AGENTS_ANCHOR, FRESH_S, isRunning, renderStart, startFact } from "../src/challenge/hero.js";
+import { AGENTS_ANCHOR, FRESH_S, isRunning, LOADING, renderStart, startFact } from "../src/challenge/hero.js";
 
 const when = (secs: number) => `t=${secs}`;
 const run = { starts: 1000, ends: 2000, status: "in_progress" };
@@ -21,14 +21,24 @@ test("in_progress inside the window with fresh, ready data says 'Running now' an
   assert.equal(AGENTS_ANCHOR, "#agents");
 });
 
+test("with ready data and no challenge published, the start is to be announced; not ready, still the placeholder", () => {
+  assert.deepEqual(startFact(null, 1500, when, ready), { label: "Work starts", value: "To be announced", href: null });
+  assert.deepEqual(startFact(null, 1500, when, null), LOADING);
+});
+
 test("a scheduled day inside its window is not running (the coordinator does not assign work)", () => {
   assert.deepEqual(startFact({ ...run, status: "scheduled" }, 1500, when, ready), starts);
   assert.equal(isRunning({ ...run, status: "scheduled" }, 1500, ready), false);
 });
 
-test("not-ready or stale relay data never says 'Running now', including on reconnect", () => {
-  assert.deepEqual(startFact(run, 1500, when, null), starts, "never ready / disconnected / error");
-  assert.deepEqual(startFact(run, 1500, when, FRESH_S + 0.5), starts, "last ready read is stale");
+test("until the challenge data is ready (or once it is stale) the fact is a neutral placeholder, never 'Work starts' or 'Running now'", () => {
+  for (const c of [run, { ...run, status: "scheduled" }, { ...run, status: "completed" }])
+    for (const now of [999, 1500, 2500]) {
+      assert.deepEqual(startFact(c, now, when, null), LOADING, `${c.status} at ${now}, not ready`);
+      assert.deepEqual(startFact(c, now, when, FRESH_S + 0.5), LOADING, `${c.status} at ${now}, stale`);
+    }
+  assert.equal(LOADING.label, "Loading…");
+  assert.equal(LOADING.href, null);
 });
 
 test("a finished or cancelled run never says 'Running now'; it shows what it showed before", () => {

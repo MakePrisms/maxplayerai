@@ -8,7 +8,7 @@ export interface PaintClock { nowMs: number; now: number; when: (secs: number) =
 
 export function paint(doc: Document, s: Snapshot, relay: Snapshot["relay"], t: Tracker, clock: PaintClock): Tracker {
   const o = observe(t, relay, clock.nowMs);
-  if (s.challenge) renderStart(doc, startFact(s.challenge, clock.now, clock.when, o.readyAgeS));
+  renderStart(doc, startFact(s.challenge, clock.now, clock.when, o.readyAgeS));
   renderLiveState(doc, o.state);
   renderSellers(doc, s, clock.now, o.state !== "live");
   doc.getElementById("connection-status")!.textContent = connectionLine(relay, clock.status, o.wasLive);

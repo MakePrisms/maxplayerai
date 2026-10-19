@@ -28,7 +28,7 @@ test("page: loading -> live -> 15s poll stays live -> disconnect shows Updating 
   const { doc, ids } = page();
   let t = paint(doc, s, { ...live, historyComplete: false }, { wasLive: false, readyAt: null }, clock(0));
   assert.equal(ids["connection-status"]!.textContent, "Updating…");
-  assert.equal(ids["challenge-start-label"]!.textContent, "Work starts");
+  assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
   assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"));
   assert.equal(ids["challenge-sellers"]!.children.length, 0);
 
@@ -49,7 +49,7 @@ test("page: loading -> live -> 15s poll stays live -> disconnect shows Updating 
 
   t = paint(doc, s, { ...live, connected: false, authenticated: false, historyComplete: false }, t, clock(6000));
   assert.equal(ids["connection-status"]!.textContent, "Updating…");
-  assert.equal(ids["challenge-start-label"]!.textContent, "Work starts");
+  assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
   assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"));
   assert.equal(ids["challenge-sellers"]!.children.length, 0);
   assert.equal(ids["seller-summary"]!.textContent, "");
@@ -61,7 +61,7 @@ test("page: stuck incomplete after being live keeps Live but drops Running now o
   t = paint(doc, s, { ...live, historyComplete: false }, t, clock(5000));
   assert.equal(ids["challenge-start-label"]!.textContent, "Running now");
   paint(doc, s, { ...live, historyComplete: false }, t, clock(6000));
-  assert.equal(ids["challenge-start-label"]!.textContent, "Work starts");
+  assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
   assert.equal(ids["connection-status"]!.textContent, "Live");
 });
 
@@ -78,7 +78,7 @@ test("page: after a disconnect, the reconnect waits for a fresh complete history
     assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"));
     assert.equal(ids["challenge-sellers"]!.children.length, 0);
     assert.equal(ids["seller-summary"]!.textContent, "");
-    assert.equal(ids["challenge-start-label"]!.textContent, "Work starts");
+    assert.equal(ids["challenge-start-label"]!.textContent, "Loading…");
   }
   t = paint(doc, s, live, t, clock(4000));
   assert.equal(ids["connection-status"]!.textContent, "Live");
@@ -87,4 +87,27 @@ test("page: after a disconnect, the reconnect waits for a fresh complete history
   // And the latch is back: a routine poll afterwards stays Live.
   paint(doc, s, { ...live, historyComplete: false }, t, clock(5000));
   assert.equal(ids["connection-status"]!.textContent, "Live");
+});
+
+test("page: while a run is on, loading never shows 'Work starts', and 'Running now' doesn't wait for trade auth or trade history", () => {
+  const { doc, ids } = page();
+  const ch = (o = {}) => ["wss://a", "wss://b", "wss://c"].map((url) => ({ role: "challenge", url, connected: true, historyComplete: false, error: null, ...o }));
+  const trade = { role: "trade", url: "wss://t", connected: true, historyComplete: false, error: null };
+  const seen: string[] = [];
+  // Every tick of the load: challenge relays catching up, then complete; trade unauthenticated throughout.
+  let t = { wasLive: false, readyAt: null as number | null };
+  const steps = [
+    { relays: [{ ...trade, connected: false }, ...ch({ connected: false })], connected: false },
+    { relays: [trade, ...ch()], connected: true },
+    { relays: [trade, ...ch().map((r, i) => (i ? r : { ...r, historyComplete: true }))], connected: true },
+    { relays: [trade, ...ch({ historyComplete: true })], connected: true },
+  ];
+  steps.forEach((st, i) => {
+    t = paint(doc, s, { connected: st.connected, authenticated: false, historyComplete: false, error: null, relays: st.relays }, t, clock(i * 1000));
+    seen.push(ids["challenge-start-label"]!.textContent);
+  });
+  assert.deepEqual(seen, ["Loading…", "Loading…", "Loading…", "Running now"]);
+  assert.equal(ids["challenge-start"]!.querySelector("a")?.getAttribute("href"), "#agents");
+  // The agents section still waits for the full history; only the hero is earlier.
+  assert.equal(ids["connection-status"]!.textContent, "Updating…");
 });

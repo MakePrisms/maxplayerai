@@ -8,7 +8,8 @@ export interface Snapshot {
   challenge: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: Challenge['status']; result: string }|null;
   sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
-  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; warnings?: string[]; applicantsIncomplete?: boolean };
+  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; warnings?: string[]; applicantsIncomplete?: boolean;
+    relays?: { role: string; url: string; connected: boolean; historyComplete: boolean; error: string|null }[] };
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);
 // Fail closed on malformed snapshots; never put remote text into HTML.
@@ -54,18 +55,30 @@ type Relay=Snapshot['relay'];
 export type LiveState='live'|'updating';
 export function isLive(r: Relay): boolean { return !!r&&r.connected&&r.historyComplete; }
 export function liveState(r: Relay,wasLive: boolean): LiveState { return !!r&&r.connected&&(wasLive||r.historyComplete)?'live':'updating'; }
-// Fully ready: the bar the swarm coordinator uses before it assigns work (connected,
-// authenticated, history complete, no error, no failed relay).
-export function relayReady(r: Relay): boolean { return isLive(r)&&r!.authenticated&&!r!.error&&!r!.failedRelays?.length; }
+// The challenge event (status, window) comes only from the challenge relays, so the hero needs
+// only them: every challenge relay connected, history complete, no error. Trade auth and trade
+// history (which finish ~8-12s later on the real relays) don't gate it. Without per-relay status
+// (demo), the aggregate stands in.
+const challengeRelays=(r: NonNullable<Relay>)=>r.relays?.filter(x=>x.role==='challenge');
+export function challengeReady(r: Relay): boolean {
+  if(!r)return false;
+  const ch=challengeRelays(r);
+  return ch?ch.length>0&&ch.every(x=>x.connected&&x.historyComplete&&!x.error):r.connected&&r.historyComplete&&!r.error;
+}
+function challengeDown(r: Relay): boolean {
+  if(!r)return true;
+  const ch=challengeRelays(r);
+  return ch?ch.some(x=>!x.connected||!!x.error):!r.connected||!!r.error;
+}
 // Called on every read of the relay status (each receive and each 1s tick). readyAt is the
-// last time the relay was fully ready; a disconnect or an error clears it at once. readyAgeS
-// lets the hero drop "Running now" when the data stops being ready, without the 15s poll
-// (which clears historyComplete for about a second) making it flicker.
+// last time the challenge data was ready; a challenge relay dropping or erroring clears it at
+// once. readyAgeS lets the hero drop "Running now" when the data stops being ready, without
+// the 15s poll (which clears historyComplete for about a second) making it flicker.
 export interface Tracker { wasLive: boolean; readyAt: number|null }
 export interface Observed extends Tracker { state: LiveState; readyAgeS: number|null }
 export function observe(t: Tracker,r: Relay,nowMs: number): Observed {
   const wasLive=!!r&&r.connected&&(t.wasLive||isLive(r));
-  const readyAt=!r||!r.connected||r.error?null:relayReady(r)?nowMs:t.readyAt;
+  const readyAt=challengeDown(r)?null:challengeReady(r)?nowMs:t.readyAt;
   return {wasLive,readyAt,state:liveState(r,wasLive),readyAgeS:readyAt===null?null:Math.max(0,nowMs-readyAt)/1000};
 }
 // The section eyebrow says "Live" only while the section is live; it keeps its space otherwise.

@@ -2,20 +2,27 @@
 // on it reads "Running now" and links to the live agents list on the same page (bob). After the
 // run it goes back to the start time.
 //
-// "On" matches the swarm coordinator: status in_progress (a scheduled day is not on), the
-// half-open window starts <= now < ends, and relay data that was fully ready within FRESH_S
-// (see observe in live.ts). Anything else, including a reconnect or a stale snapshot, shows
-// the start time. Residual: the window follows the browser clock.
+// "On" matches the swarm coordinator: status in_progress (a scheduled day is not on) and the
+// half-open window starts <= now < ends, read from challenge data that was ready within
+// FRESH_S (see observe in live.ts). Until then, and whenever that data is stale or a challenge
+// relay is down, the fact is a neutral placeholder (bob: no "Work starts" flash before
+// "Running now"), never a guess. Residual: the window follows the browser clock.
 export const AGENTS_ANCHOR = "#agents";
 export const FRESH_S = 5;
+// Same text as the static HTML, so the first paint doesn't change it.
+export const LOADING: StartFact = { label: "Loading…", value: "\u00a0", href: null };
 export interface StartFact { label: string; value: string; href: string | null }
 type Run = { starts: number; ends: number; status: string };
 
+const fresh = (readyAgeS: number | null) => readyAgeS !== null && readyAgeS <= FRESH_S;
 export function isRunning(c: Run, now: number, readyAgeS: number | null): boolean {
-  return c.status === "in_progress" && now >= c.starts && now < c.ends && readyAgeS !== null && readyAgeS <= FRESH_S;
+  return c.status === "in_progress" && now >= c.starts && now < c.ends && fresh(readyAgeS);
 }
 
-export function startFact(c: Run, now: number, when: (secs: number) => string, readyAgeS: number | null): StartFact {
+// No challenge published yet (data ready, nothing found): the start is to be announced.
+export function startFact(c: Run | null, now: number, when: (secs: number) => string, readyAgeS: number | null): StartFact {
+  if (!fresh(readyAgeS)) return LOADING;
+  if (!c) return { label: "Work starts", value: "To be announced", href: null };
   if (isRunning(c, now, readyAgeS)) return { label: "Running now", value: "See the agents", href: AGENTS_ANCHOR };
   return { label: "Work starts", value: when(c.starts), href: null };
 }

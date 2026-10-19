@@ -213,6 +213,12 @@ test("all site pages share navigation and footer links, with a current page and 
   }
 });
 
+test("/challenges hero fact starts on a neutral placeholder, not 'Work starts' (bob)", () => {
+  const html = readFileSync(join(root, "dist", "challenges.html"), "utf8");
+  assert.match(html, /<dt id="challenge-start-label">Loading…<\/dt><dd id="challenge-start">&nbsp;<\/dd>/);
+  assert.ok(!html.includes(">Work starts<"), "no static 'Work starts' to flash before 'Running now'");
+});
+
 test("/challenges carries the /tokens experimental notice under the nav (bob)", () => {
   const html = readFileSync(join(root, "dist", "challenges.html"), "utf8");
   assert.match(html, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>[^<]+<\/span><\/p>/, "experimental strip under the nav, like /tokens");
