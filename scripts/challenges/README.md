@@ -144,8 +144,9 @@ projection already charged the expired job from award to deadline.
   rule counts jobs the runner tracks, not the seller's containers).
 
 Hand-whitelist sellers once with `maxplayer-swarm decide --seller HEX --accept`, then
-publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
-the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:
+publish the daily challenge, `scheduled` (the default: visible early so sellers can join) or
+`in_progress`. Membership (30342) and acceptance (30343) persist; the runner updates the same daily
+CHALLENGE (30341). Run **one runner per buyer home**:
 
 ```sh
 MAXPLAYER_HOME=/absolute/buyer-home \
@@ -680,6 +681,36 @@ The repo's reusable CDK mint is an in-process Rust fixture in
 this E2E needs a loopback-only test-mint launcher/funding API, funded disposable buyer wallet,
 a priced seller accepting that mint, disabled external fee remittance, and receipt/spend
 assertions after both paid and free deliveries. No production relay or real funds are needed.
+
+### Run start and idle diagnosis
+
+**`scheduled` runs start themselves (Rocky P-1).** The runner plans only an `in_progress` run. When
+`starts ≤ now < ends`, the relays are ready (not degraded: like a progress update, this publish needs
+every challenge relay) and the latest buyer-signed event re-read through the sidecar is still
+`scheduled`, it publishes `in_progress` itself (update `Run started: …`) and logs
+`Run <id>: scheduled -> in_progress at <time> (starts <time>), published by the runner`. Planning
+starts on the first tick whose snapshot shows `in_progress`. The day journals `started`
+(`{at,by,starts}`; `by` is `runner`, `relay` when the re-read already showed `in_progress`, or
+`observed` when the snapshot did) and `startedStarts` (the last 32 started `starts`). The
+once-only decision is taken on the strict re-read's `starts`, never the snapshot's, so the publish
+happens once across ticks, restarts and a slow reader, including one whose snapshot still carries
+an older `starts` (advisor r1 #1). The publish passes the re-read's event id as `publish
+--if-latest`: if an edit lands between the re-read and the signing, the sidecar refuses it (exit 4,
+nothing signed) and the next tick re-reads and decides again (advisor r1 #2). A failed publish is retried after 30 s; a retry after a publish whose reply was lost
+re-reads `in_progress` and publishes nothing. It never re-opens a `completed`/`cancelled` run or one
+whose window has ended, and once a run was `in_progress` a later operator `scheduled` with the same
+`starts` is left alone (publish `in_progress` to resume; the pause is re-read every 30 s, not every
+tick); a `starts` never started is started at that time.
+
+**Why it is not planning (Rocky P-2).** While a day has no plan and no stop and the planning gate
+(`in_progress`, `ready`, inside the window) is closed, the runner logs one line naming every
+condition, e.g.
+`not planning (run 2026-10-19): status=scheduled (the runner publishes in_progress at starts, 2026-10-19T15:00:00Z) · ready=false (history incomplete (1 of 3 challenge relays complete, need 2): wss://nos.lol, wss://offchain.pub) · window opens in 12m (2026-10-19T15:00:00Z) · 4 eligible sellers (480 min left) · budget 2000 sats`.
+`ready` is the runner's own `relayReady && snapshotFresh` (the reason comes from the reader's
+status); sellers are the eligible roster (with `0 eligible sellers` it says why: awaiting `decide
+--accept`, joined after `starts`, left, denied). The line repeats at most once a minute
+(`NOT_PLANNING_LOG_SECONDS`), immediately when a condition changes (a countdown is not a change),
+only on a change after the window has ended, and stops once planning has started.
 
 ### Separate challenge relays
 

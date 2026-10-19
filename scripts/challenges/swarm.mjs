@@ -727,7 +727,7 @@ export const quorumArgs = quorum => quorum===undefined?[]:['--quorum',String(quo
 // with no alias); a body without it is "not found", never read from the old key.
 export function sidecarRun(body,id) {
   const x=body?.run;if(!x||typeof x!=='object')throw Error(`swarm run ${id} not found on the challenge relays`);
-  return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
+  return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats,eventId:typeof body.run_event_id==='string'?body.run_event_id:null};
 }
 export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--run',challenge.id,'--json'];
 // Degraded-quorum warnings and re-sends the sidecar reported in its --json body (relay_quorum).
@@ -738,6 +738,89 @@ export function sidecarQuorumLines(body) {
 }
 // Accepted, eligible and still a member (the assign roster's own filter).
 export const eligibleSeller = s => s?.eligible===true&&s.decision==='accepted'&&!['left','denied'].includes(s.state);
+// Rocky P-1: a run published `scheduled` (so sellers can see and join it early) is moved to
+// `in_progress` by the runner itself at `starts`, through the same latest-read + sidecar publish as
+// progress (every challenge relay must answer: a non-terminal update over an existing run needs
+// that, see publishChallenge). Only when the LATEST buyer-signed event is still `scheduled`, now is
+// in its [starts, ends) window, and the day was never started for THAT read's `starts`
+// (wasStarted: journaled by the runner's own publish, by a read already in_progress, or by an
+// in_progress snapshot at/after starts). The decision is taken on the strict read, never on the
+// tick snapshot, whose `starts` may lag (advisor r1 #1). So it publishes once across ticks,
+// restarts and a lagging reader, never re-opens a completed/cancelled or ended run, and leaves
+// alone an operator who sets a started run back to `scheduled` (a `starts` it never started is a
+// reschedule, started at that time). The publish names the event it read (--if-latest): an edit
+// that lands after the read makes the sidecar refuse it (advisor r1 #2). Its update text:
+export const RUN_STARTED_UPDATE = 'Run started: the runner moved it from scheduled to in_progress at its start time';
+// Rocky P-2: while a day has no plan and no stop, one `not planning` line naming every condition
+// (status, readiness, window, eligible sellers, budget); repeated at most once per this many
+// seconds, and at once when a condition changes. After the window has ended it is logged only on
+// a change (the runner stays up for later days).
+export const NOT_PLANNING_LOG_SECONDS = 60;
+// Every `starts` a day was started for (bounded), plus the last record in day.started.
+export const STARTED_STARTS_KEPT = 32;
+export const wasStarted = (day,starts) => day?.started?.starts===starts||(Array.isArray(day?.startedStarts)&&day.startedStarts.includes(starts));
+export function markStarted(day,record) {
+  day.started=record;
+  const all=(Array.isArray(day.startedStarts)?day.startedStarts:[]).filter(x=>x!==record.starts);
+  day.startedStarts=[...all,record.starts].slice(-STARTED_STARTS_KEPT);
+}
+// The sidecar refused a publish because the latest buyer-signed run is no longer the event the
+// caller read (`publish --if-latest`): nothing was signed; re-read and decide again.
+export const SIDECAR_SUPERSEDED_EXIT = 4;
+export const supersededRefusal = e => e?.exitCode===SIDECAR_SUPERSEDED_EXIT&&/swarm run changed/.test(String(e.stderr??e.message));
+const isoTime = t => Number.isFinite(t)?new Date(t*1000).toISOString().replace('.000Z','Z'):String(t);
+const span = s => {s=Math.max(0,Math.round(s));return s>=3600?`${Math.floor(s/3600)}h${String(Math.floor(s%3600/60)).padStart(2,'0')}m`:s>=60?`${Math.floor(s/60)}m`:`${s}s`;};
+// Why the runner's `ready` (relayReady && snapshotFresh) is false, from the reader's own status; null when ready.
+export function readinessBlocker(snap,now) {
+  if(!relayReady(snap)) {
+    const r=snap?.relay;
+    if(!r)return 'no relay status';
+    const trade=r.relays?.find(x=>x.role==='trade');
+    if(trade&&!tradeReady(snap))return `trade relay not ready: ${trade.url} (${trade.error??(!trade.connected?'disconnected':!trade.authenticated?'not authenticated':'history incomplete')})`;
+    if(r.error)return r.error;
+    if(!r.connected)return 'disconnected';
+    if(!r.authenticated)return 'not authenticated';
+    const q=r.quorum,missing=r.missingRelays??r.failedRelays??[];
+    return `history incomplete${q?` (${q.complete} of ${q.total} challenge relays complete, need ${q.required})`:''}${missing.length?`: ${missing.join(', ')}`:''}`;
+  }
+  if(!snapshotFresh(snap,now))return `snapshot stale (as of ${snap?.asOf}, now ${now})`;
+  return null;
+}
+// The P-2 line for a day without a plan: {key, line}. `key` changes exactly when a condition does
+// (never with a countdown), so the caller logs at once on a change and otherwise once a minute.
+export function notPlanningLine({c,snap,now,day={}}) {
+  const parts=[];
+  const relay=snap?.relay;
+  if(c.status==='in_progress')parts.push(['in_progress','status=in_progress']);
+  else if(c.status!=='scheduled')parts.push([`status:${c.status}`,`status=${c.status} (needs in_progress)`]);
+  else if(now>=c.ends)parts.push(['scheduled:ended','status=scheduled (needs in_progress; the work window has ended, so the runner does not start it)']);
+  else if(day.started?.by==='runner'&&day.started.starts===c.starts)parts.push(['scheduled:published',`status=scheduled (the runner published in_progress at ${isoTime(day.started.at)}; waiting for the relays to show it)`]);
+  else if(wasStarted(day,c.starts))parts.push(['scheduled:operator','status=scheduled (needs in_progress; it was already in_progress, so the runner leaves this later scheduled edit alone: publish in_progress to resume)']);
+  else if(now<c.starts)parts.push(['scheduled:waiting',`status=scheduled (the runner publishes in_progress at starts, ${isoTime(c.starts)})`]);
+  else if(day.startError)parts.push(['scheduled:failed',`status=scheduled (needs in_progress; publishing it failed, retrying: ${day.startError})`]);
+  else if(relay?.degraded)parts.push(['scheduled:degraded',`status=scheduled (needs in_progress; publishing it waits for every challenge relay, missing: ${(relay.missingRelays??[]).join(', ')})`]);
+  else parts.push(['scheduled:due','status=scheduled (needs in_progress; the runner publishes it once the relays are ready)']);
+  const blocker=readinessBlocker(snap,now);
+  parts.push(blocker===null?['ready','ready=true']:[blocker.startsWith('snapshot stale')?'stale':`unready:${blocker}`,`ready=false (${blocker})`]);
+  if(now<c.starts)parts.push(['before',`window opens in ${span(c.starts-now)} (${isoTime(c.starts)})`]);
+  else if(now>=c.ends)parts.push(['ended',`window ended ${span(now-c.ends)} ago (${isoTime(c.ends)})`]);
+  else parts.push(['open',`window open (ends in ${span(c.ends-now)})`]);
+  const all=snap?.sellers??[],eligible=all.filter(eligibleSeller);
+  if(!eligible.length) {
+    const n=(k,what)=>k?[`${k} ${what}`]:[];
+    const left=all.filter(s=>s.state==='left').length,denied=all.filter(s=>s.state!=='left'&&s.decision==='denied').length;
+    const late=all.filter(s=>s.state!=='left'&&s.decision==='accepted'&&s.eligible!==true).length;
+    const why=[...n((snap?.applicants??[]).length,'awaiting decide --accept'),...n(late,'accepted but joined after starts'),...n(left,'left'),...n(denied,'denied'),...n(all.length-left-denied-late,'other ineligible')];
+    parts.push(['sellers:0',`0 eligible sellers (${why.join(', ')||'no members'})`]);
+  } else {
+    const minutes=eligible.reduce((m,s)=>m+Math.max(0,Number.isFinite(s.minutesRemaining)?s.minutesRemaining:0),0);
+    const idle=eligible.filter(s=>s.servingState==='not_serving'||s.serving?.available===0).length;
+    parts.push([`sellers:${eligible.length}:${minutes>0?'minutes':'none'}`,`${eligible.length} eligible seller${eligible.length>1?'s':''} (${minutes>0?`${Math.floor(minutes)} min left`:'no minutes left'}${idle?`, ${idle} not serving`:''})`]);
+  }
+  let unknownBudget=true;try{unknownBudget=coordinate(snap,{now,durationSeconds:1}).reasons.includes('unknown_budget');}catch{}
+  parts.push(unknownBudget?['budget:unknown','budget unknown']:['budget',`budget ${snap.budget.totalSats} sats`]);
+  return {key:parts.map(p=>p[0]).join('|'),line:`not planning (run ${c.id}): ${parts.map(p=>p[1]).join(' · ')}`};
+}
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;this.stuckRechecked=new Set();}
   // R3-8: is a stuck payment due for its one re-check collect? (See PAYMENT_STUCK_RECHECK_MIN_SECONDS.)
@@ -803,19 +886,78 @@ export class Swarm {
   // (strict): it re-sends the latest buyer-signed status, and a quorum read whose overlapping relay
   // omitted a buyer close would otherwise resurrect the closed challenge as in_progress. Completion
   // publishes use the quorum (they are terminal either way, and must not wait for a dead relay).
-  async publishChallenge(day,c,status,update,result) {
+  async readLatest(c,strict,what) {
     const fresh=await this.io.snapshot();
-    if(fresh?.relay&&!tradeReady(fresh))throw Error(`Challenge ${c.id}: trade relay not ready; not publishing ${status??'progress'}`);
-    const strict=status==null;
+    if(fresh?.relay&&!tradeReady(fresh))throw Error(`Challenge ${c.id}: trade relay not ready; not publishing ${what}`);
     // main() always reads the relays directly (sidecar). An injected io without that read (embedders,
     // older tests) falls back to a FRESH snapshot taken now, never the tick-start one.
     const latest=this.io.latestChallenge?await this.io.latestChallenge(c,{strict}):fresh&&fresh.challenge&&{...fresh.challenge,budgetSats:fresh.budget?.totalSats};
     if(!latest||latest.id!==c.id||latest.buyer!==c.buyer||typeof latest.status!=='string')throw Error(`Challenge ${c.id}: latest buyer-signed challenge unreadable; not publishing`);
+    return latest;
+  }
+  async publishChallenge(day,c,status,update,result) {
+    const strict=status==null;
+    const latest=await this.readLatest(c,strict,status??'progress');
     if(TERMINAL_STATUSES.includes(latest.status))return this.closeSeen(day,c,status,latest.status);
     const outgoing=status==null||(STATUS_RANK[status]??-1)<(STATUS_RANK[latest.status]??-1)?latest.status:status;
     const sent=await this.io.publish(latest,latest.budgetSats,outgoing,update,result===undefined?latest.result:result,{strict});
     if(TERMINAL_STATUSES.includes(sent?.closed))return this.closeSeen(day,c,status,sent.closed);
     return true;
+  }
+  // P-1: publish in_progress for a scheduled run at `starts` (see RUN_STARTED_UPDATE). Strict like a
+  // progress re-send: the latest read and the publish need every challenge relay. Decided on that
+  // read, never on the tick-start snapshot (its `starts` may lag): a `scheduled` read for a `starts`
+  // this day was already started for is an operator pause or a flip already sent, never published.
+  // A failure (or a read whose window does not contain now, or such a pause) is re-read after
+  // PROGRESS_RETRY_SECONDS; a retry after a publish that landed but reported an error reads
+  // in_progress and publishes nothing. The publish carries the read's event id: a newer edit makes
+  // the sidecar refuse it, and the next tick re-reads. Returns true when this tick published,
+  // failed or was refused (the caller then skips its progress re-send), false when the read alone
+  // settled it.
+  async startRun(day,c) {
+    try {
+      const latest=await this.readLatest(c,true,'in_progress');
+      if(TERMINAL_STATUSES.includes(latest.status)){delete day.startError;return this.closeSeen(day,c,'in_progress',latest.status);}
+      const at=this.io.now();
+      if(latest.status!=='scheduled') {
+        // Keep the record of a flip this runner sent; re-read at the backoff, not every tick, while a
+        // lagging snapshot (older starts) still passes the cheap filter.
+        if(!wasStarted(day,latest.starts))markStarted(day,{at,by:'relay',starts:latest.starts});
+        delete day.startError;day.startRetryAt=at+PROGRESS_RETRY_SECONDS;this.save();
+        this.io.report?.(`Run ${c.id} is already ${latest.status} on the relays; not publishing in_progress`);return false;
+      }
+      if(!(at>=latest.starts&&at<latest.ends)) {
+        day.startRetryAt=at+PROGRESS_RETRY_SECONDS;this.save();
+        this.io.report?.(`Run ${c.id}: not publishing in_progress: the latest buyer-signed work window (${isoTime(latest.starts)} to ${isoTime(latest.ends)}) does not contain now`);return false;
+      }
+      if(wasStarted(day,latest.starts)) {
+        day.startRetryAt=at+PROGRESS_RETRY_SECONDS;delete day.startError;this.save();
+        this.io.report?.(`Run ${c.id}: not publishing in_progress: the latest buyer-signed run is scheduled for starts ${isoTime(latest.starts)}, which was already started (an operator pause or a flip already sent); publish in_progress to resume`);return false;
+      }
+      if(typeof latest.eventId!=='string'||!/^[0-9a-f]{64}$/.test(latest.eventId))throw Error(`Challenge ${c.id}: the latest read names no event id (a maxplayer-swarm sidecar without run_event_id); not publishing in_progress`);
+      const sent=await this.io.publish(latest,latest.budgetSats,'in_progress',RUN_STARTED_UPDATE,latest.result,{strict:true,ifLatest:latest.eventId});
+      if(TERMINAL_STATUSES.includes(sent?.closed)){delete day.startError;return this.closeSeen(day,c,'in_progress',sent.closed);}
+      if(sent?.superseded) {
+        // An edit landed after the read: nothing was signed. The next tick re-reads (no backoff).
+        delete day.startError;delete day.startRetryAt;this.save();
+        this.io.report?.(`Run ${c.id}: not publishing in_progress: the run changed after the read (event ${latest.eventId.slice(0,12)}… is no longer the latest); re-reading next tick`);return true;
+      }
+      // This publish is also the progress update: no second publish in the same tick.
+      markStarted(day,{at,by:'runner',starts:latest.starts});day.lastUpdate=at;delete day.startError;delete day.startRetryAt;this.save();
+      this.io.report?.(`Run ${c.id}: scheduled -> in_progress at ${isoTime(at)} (starts ${isoTime(latest.starts)}), published by the runner; planning begins once the relays show it`);
+      return true;
+    } catch(e) {
+      if(e.journalFailure)throw e;
+      day.startError=String(e.message).slice(0,300);day.startRetryAt=this.io.now()+PROGRESS_RETRY_SECONDS;this.save();
+      this.io.report?.(`Run ${c.id}: publishing in_progress failed (retry in ${PROGRESS_RETRY_SECONDS}s): ${e.message}`);
+      return true;
+    }
+  }
+  // P-2: rate-limited `not planning` line (see NOT_PLANNING_LOG_SECONDS). In memory: a restart logs at once.
+  logNotPlanning(key,day,c,snap,now) {
+    const {key:reason,line}=notPlanningLine({c,snap,now,day}),k=JSON.stringify([key,reason]),last=this.idleLog;
+    if(last?.key===k&&(now-last.at<NOT_PLANNING_LOG_SECONDS||now>=c.ends))return;
+    this.idleLog={key:k,at:now};this.io.report?.(line);
   }
   // Every post_job goes through here, so the log has one line per post call per request id.
   async post(args){this.io.report?.(`post_job request ${args.request_id} seller ${args.seller_pubkey}`);return this.io.mcp('post_job',args);}
@@ -1021,6 +1163,15 @@ export class Swarm {
     const ready=relayReady(snap)&&snapshotFresh(snap,now);
     const stop=(update,result='')=>{day.stop={update,result};this.save();};
     if(!day.stop && TERMINAL_STATUSES.includes(c.status)) {day.stop={external:true};day.closed={status:c.status,seenAt:now};this.save();}
+    // P-1: in_progress seen at/after starts marks the day started for that starts (a later
+    // `scheduled` with the same starts is an operator pause, never flipped back).
+    // A tick whose flip published (or failed) sends no progress re-send as well; a flip that only
+    // read the run already in_progress/closed leaves this tick's progress as before.
+    let startPublished=false;
+    // Both checks here use the snapshot only as a cheap filter; startRun decides on the strict read.
+    if(c.status==='in_progress'&&now>=c.starts&&!wasStarted(day,c.starts)){markStarted(day,{at:now,by:'observed',starts:c.starts});this.save();}
+    if(!day.stop&&!day.closed&&c.status==='scheduled'&&!wasStarted(day,c.starts)&&now>=c.starts&&now<c.ends&&ready&&!snap.relay?.degraded&&!(now<day.startRetryAt))
+      startPublished=await this.startRun(day,c);
     const min=this.c.minDuration??DEFAULT_MIN_DURATION, max=this.c.maxDuration??1800;
     const bench=this.benched(now),benchedSet=new Map(bench.map(b=>[b.seller,b]));
     const eligible=eligibleSeller;
@@ -1068,7 +1219,9 @@ export class Swarm {
         this.io.report?.(`Planner ${mode} ${ok?'ok':'failed'} in ${((Date.now()-started)/1000).toFixed(1)}s; input ${chars} chars, results ${h.results} (${h.fullText} full, ${h.digested} digested, ${h.answersOmitted} answers omitted, ${h.resultsDropped} dropped)`);
       }
     };
-    if(!day.plan&&!day.stop&&ready&&c.status==='in_progress'&&now>=c.starts&&now<c.ends)
+    const planGate=ready&&c.status==='in_progress'&&now>=c.starts&&now<c.ends;
+    if(!day.plan&&!day.stop&&!planGate)this.logNotPlanning(key,day,c,snap,now);else this.idleLog=undefined;
+    if(!day.plan&&!day.stop&&planGate)
       await ask('analyze',snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)));
     // Final results can solve even after posting has stopped.
     const resultVersion=createHash('sha256').update(JSON.stringify(results.map(r=>[r.seller,r.task,r.outcome,r.answer]))).digest('hex');
@@ -1166,7 +1319,7 @@ export class Swarm {
     } else if(!day.stop&&!day.closed&&ready&&snap.relay?.degraded&&now-day.lastUpdate>=this.c.updateEvery) {
       // Progress needs every challenge relay (see publishChallenge); while degraded it waits.
       if(!day.progressDegraded){day.progressDegraded=true;this.save();this.io.report?.(`Progress update for ${c.id} postponed: challenge relays degraded (${(snap.relay.missingRelays??[]).join(', ')} missing); progress needs every relay`);}
-    } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&(!(now<day.progressRetryAt)||!(this.io.now()<day.progressRetryAt))) {
+    } else if(!startPublished&&!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&(!(now<day.progressRetryAt)||!(this.io.now()<day.progressRetryAt))) {
       delete day.progressDegraded;
       // Progress never changes the status: it re-sends the latest buyer-signed one (null). The
       // interval restarts only after a publish; a failed re-read is retried after a short backoff
@@ -1355,12 +1508,13 @@ async function main() {
     answer:async collected=>readDeliveredAnswer(collected.path),
     // R3-8: changes when the buyer wallet database is written (`maxplayer wallet reconcile`, a payment).
     walletSignature:()=>walletSignature(c.home),
-    publish:async(challenge,budget,status,update,result,{strict=false}={})=>{
+    publish:async(challenge,budget,status,update,result,{strict=false,ifLatest}={})=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
       const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),...quorumArgs(strict?challengeRelays.length:c.challengeQuorum),'--json','--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
       if(result)args.push('--result',result);
+      if(ifLatest)args.push('--if-latest',ifLatest);
       let out;try{out=await command(challengesBinary,args,{env});}
-      catch(e){const closed=closedRefusal(e);if(closed)return {closed};throw e;}
+      catch(e){const closed=closedRefusal(e);if(closed)return {closed};if(supersededRefusal(e))return {superseded:true};throw e;}
       try{for(const l of sidecarQuorumLines(JSON.parse(out)))io.report(l);}catch{}
     },
     // The latest buyer-signed challenge with this id, read directly from the challenge relays by the
