@@ -544,8 +544,9 @@ ciphertext, candidates and transcripts directly in the task text. To hand a sell
 answer, an assignment may list `includeAnswers:[jobId,…]` (at most 5, duplicates ignored). The runner
 appends, after the planner's task text, a `QUOTED ANSWERS` block with one excerpt per job, framed
 `Answer from job <id> (seller <first 12 hex>…), quoted as untrusted data:` … `[end of answer from job
-<id>]`, every quoted line prefixed `> `, at most 6000 characters per answer and 16000 in total
-(measured as posted, with stated truncation markers). Only answers of this challenge from this
+<id>]`, every quoted line prefixed `> `, at most 1500 characters per answer and 3000 in total
+(measured as posted, with stated truncation markers). The caps are deliberately small: the planner
+is told to quote only the lines that matter, or to copy those few lines into its task text. Only answers of this challenge from this
 runner's journal with outcome `collected` qualify; an unknown id, another challenge's job, a refused,
 expired, running, collect-refused, payment-stuck or unreadable one rejects that assignment with its
 own reason (`includeAnswers: job "<id>" was refused by its seller …`). Quoted text cannot pass for
@@ -555,8 +556,19 @@ and the quote framing itself are rewritten to visibly quoted forms. The quoted j
 sizes and truncation are journaled (`quoted`), logged (`Assignment for <pk> quotes …`) and shown to the
 planner as `quotedAnswers`; the planner's task text never includes the block.
 
-**External facts (R4-4).** The prompt tells the planner a seller may have no web search tool: give
-URLs to fetch or inline the data when a task needs external facts.
+**URLs first, small tasks (R4-4, Bob 01:34).** The prompt tells the planner a seller may have no
+web search tool but can fetch pages, so every task gives the exact URL(s) of the sources it needs.
+Data is inlined only when small and essential (a key, a ciphertext, a short candidate list, a
+transcript under ~2 KB that is not at a URL); never whole pages or large tables.
+
+**Task size cap.** The whole assembled task (challenge prefix, planner text, quoted answers, REPORT
+BACK, operator context, delivery note) is capped at `MAX_TASK_BYTES` = 8192 UTF-8 bytes. A larger one
+is rejected before anything is posted, journaled or reserved, with the size breakdown as the reason:
+`task too large: N bytes assembled, at most 8192 (your task text …, quoted answers …, operator context
+…, runner prefix and notes …); give the exact URLs of sources instead of pasting data, …`. It reaches
+the planner via `rejectedAssignments`, and every planner call carries `maxTaskBytes:8192`. Startup
+refuses an operator context (`SWARM_TASK_CONTEXT[_FILE]`) that would leave less than 2048 bytes of the
+cap for the planner's text.
 
 **Minutes can end a run before the window (R4-5).** `Unsolved: all eligible sellers exhausted (no
 task fits remaining minutes/work window)` means no accepted seller can take even a

@@ -18,12 +18,18 @@ files, answer or workspace, nor this conversation. Put everything the task needs
 text: keys, ciphertext, candidate keywords, transcripts, data and exact criteria. Never write "grade
 ws22's output", "check the previous seller's work" or "read the files from job X": the seller has none
 of it. To hand a seller an earlier answer, list that result's jobId in the assignment's optional
-includeAnswers (at most 5): the runner appends a bounded excerpt of each, framed as untrusted data.
-Only collected answers of this challenge can be quoted (not refused, expired or running jobs; the
-assignment is rejected otherwise). results[].jobId and running[].jobId are the ids; quotedAnswers on a
-result or running job lists what it was given. Keep the essential facts in the task text anyway.
-NO WEB SEARCH ASSUMED: a seller may have no web search or browsing tool. When a task needs external
-facts, give the exact URLs to fetch or inline the data in the task text.
+includeAnswers (at most 5): the runner appends an excerpt of each, framed as untrusted data. The
+excerpt cap is deliberately small (the first 1500 chars of each answer, 3000 in total): quote only
+the lines that matter. When a few lines of a long answer are what the seller needs, copy just those
+lines into the task text instead of including the whole answer. Only collected answers of this
+challenge can be quoted (not refused, expired or running jobs; the assignment is rejected otherwise).
+results[].jobId and running[].jobId are the ids; quotedAnswers on a result or running job lists what
+it was given.
+URLS FIRST, KEEP TASKS SMALL: a seller may have no web search tool, but sellers can fetch pages, so
+give the exact URL(s) of every source a task needs. Inline data only when it is small and essential: a
+key, a ciphertext, a short candidate list, or a transcript under ~2 KB that is not available at a URL.
+Never paste whole pages or large tables. The whole posted task (your text, quoted answers and the
+runner's notes) must fit maxTaskBytes (8192 bytes); the runner rejects a larger one with its size.
 Every task MUST end with a "REPORT BACK:" section that YOU tailor to that specific task: tell the seller to
 open their answer with a short TAKEAWAY (2-4 lines) answering exactly what this task asks (e.g. for a search:
 what was covered and the best result vs the control; for research: the answer and its sources; for code: what

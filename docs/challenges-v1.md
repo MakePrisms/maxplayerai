@@ -247,9 +247,12 @@ home's trust boundary, like the buyer key; a history page's 20 s deadline is cre
 process's own frame-handling time (capped at 120 s), never idle time.
 
 Every job runs in a fresh, empty container and cannot see another job's files or answer, so the
-planner is told to inline keys, ciphertext, candidates and transcripts in the task text, and to give
-URLs or inline data when a task needs external facts (a seller may have no web search). An assignment
-may quote earlier answers with `includeAnswers:[jobId,…]`: the runner appends a bounded excerpt of each
+planner is told to put what a task needs in the task text: the exact URL(s) of every source (a seller
+may have no web search but can fetch pages), and inline only small essential data (a key, a
+ciphertext, a short candidate list, a transcript under ~2 KB), never whole pages or large tables. The
+whole assembled task is capped at 8192 UTF-8 bytes; a larger assignment is rejected unposted with its
+size breakdown as the reason. An assignment may quote earlier answers with `includeAnswers:[jobId,…]`:
+the runner appends a deliberately small excerpt of each (1500 chars each, 3000 in total)
 (collected answers of this challenge from its own journal only; anything else rejects the assignment
 with the reason), framed as untrusted data and neutralised so it cannot forge the challenge prefix,
 delivery note, REPORT BACK section, context block or answer markers; the quoted ids are journaled and

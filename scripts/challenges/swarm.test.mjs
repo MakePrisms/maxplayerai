@@ -723,10 +723,13 @@ test('planner input: a huge seller task, note or running task is bounded and can
   assert.deepEqual([tr.tasksDone,tr.tasks.length,tr.tasksOmitted,tr.tasks[0].task],[30,10,20,'task 20'],'newest 10 kept; counts exact');
   assert.ok(tr.tasks.at(-1).task.length<700&&out.running[0].task.length<2200&&out.sellers[0].note.length<2200&&out.sellers[0].capabilities.length===32);
   assert.ok(out.history.fieldsCut>=5);
-  // End to end: a 300k-char past task no longer fails every later planner call.
-  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(input=>({assignments:[{seller:'a',workstream:'piece',task:huge,durationSeconds:30}]}));
-  await f.runner.tick();for(const j of f.remote.values())j.results=[{}];f.time(101);f.setPlan(()=>({wait:true}));await f.runner.tick();
-  f.snap.jobs=f.journal.state.jobs.map(j=>({id:j.id,seller:'a',result:{},accepted:true,running:false}));f.time(102);
+  // End to end: a 300k-char past task no longer fails every later planner call. The runner now
+  // refuses to post such a task (round 4 MAX_TASK_BYTES), so it is seeded as a journal entry, as
+  // an older journal can still hold one.
+  const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);f.setPlan(()=>({wait:true}));
+  f.journal.state.jobs.push({key:JSON.stringify(['b','day']),id:'old-huge',seller:'a',workstream:'piece',challenge:{buyer:'b',id:'day'},created:90,durationSeconds:30,
+    args:{task:'[challenge:b:day]\n'+huge,amount_sats:0,max_sats:0,payment:'none',deadline_unix:95},done:true,outcome:'collected',answer:'a',pay:{state:'none',amount_sats:0},ts:95});
+  f.snap.jobs=[{id:'old-huge',seller:'a',result:{},accepted:true,running:false}];f.time(102);
   const before=f.inputs.length;await f.runner.tick();
   assert.ok(f.inputs.length>before&&f.inputs.slice(before).every(i=>JSON.stringify(i).length<=200000));
   assert.ok(f.inputs.at(-1).sellers[0].trackRecord.tasks[0].task.length<700);
@@ -2060,9 +2063,13 @@ test('R4 items 1/2a/4/6: planner-llm prompt carries REPORT BACK, the exact paid-
     assert.match(p,/"includeAnswers":\[\]/);assert.match(p,/list that result's jobId in the assignment's optional includeAnswers \(at most 5\)/);
     // Item 4: the retry sees the exact validation failure.
     assert.match(p,/previousPlannerError, when present, is why the runner rejected your last response or plan/);
-    // Item 6: no web search assumed.
-    assert.match(p,/a seller may have no web search or browsing tool/);
-    assert.match(p,/give the exact URLs to fetch or inline the data in the task text/);
+    // Item 6 (Bob 01:34): URLs first, inline only small essential data, never whole pages; the task cap is stated.
+    assert.match(p,/a seller may have no web search tool, but sellers can fetch pages, so give the exact URL\(s\) of every source a task needs/);
+    assert.match(p,/Inline data only when it is small and essential: a key, a ciphertext, a short candidate list, or a transcript under ~2 KB that is not available at a URL/);
+    assert.match(p,/Never paste whole pages or large tables/);
+    assert.match(p,/must fit maxTaskBytes \(8192 bytes\); the runner rejects a larger one/);
+    // Item 2 size discipline: the excerpt cap is deliberately small; quote only the lines that matter.
+    assert.match(p,/The excerpt cap is deliberately small \(the first 1500 chars of each answer, 3000 in total\): quote only the lines that matter/);
   } finally {rmSync(dir,{recursive:true});}
 });
 test('R4-1 (b): includeAnswers quotes collected answers of this challenge, bounded and framed; ids reach the planner and the journal',async()=>{
@@ -2225,4 +2232,45 @@ test('R4-3: assignment rejections name the seller, value and limit instead of a 
   assert.ok(rej.some(r=>/^a: budget_exceeded.* \(amountSats 11, durationSeconds 30, deadline 130, work window ends 1000\)$/.test(r)),rej.join('\n'));
   assert.ok(rej.some(r=>r.startsWith('a: seller busy or ineligible: seller "a" already has a running or unsettled job (amountSats 0, durationSeconds 30,')),rej.join('\n'));
   assert.deepEqual(posts(f).map(([,a])=>a.seller_pubkey),['a']);
+});
+
+test('R4 size cap: an assembled task over MAX_TASK_BYTES is rejected with its size breakdown and never posted; the planner sees the reason and the cap',async()=>{
+  const {MAX_TASK_BYTES,composeTask,taskTooLarge,QUOTED_ANSWER_MAX_CHARS,QUOTED_ANSWERS_MAX_TOTAL_CHARS}=await import('./swarm.mjs');
+  assert.equal(MAX_TASK_BYTES,8192);assert.deepEqual([QUOTED_ANSWER_MAX_CHARS,QUOTED_ANSWERS_MAX_TOTAL_CHARS],[1500,3000]);
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.taskContext='ctx';
+  const big='x'.repeat(8000),multi='é'.repeat(4000); // 8000 bytes ASCII; 8000 bytes UTF-8 from 4000 chars
+  f.setPlan(r4once(()=>({assignments:[{seller:'a',workstream:'piece',task:big,durationSeconds:30},{seller:'b',workstream:'piece',task:multi,durationSeconds:30}]})));
+  await f.runner.tick();
+  assert.equal(posts(f).length,0,'neither over-cap task is posted');
+  assert.equal(f.journal.state.jobs.length,0,'nothing journaled or reserved');
+  const rej=reports.filter(r=>r.startsWith('Rejected assignment for '));
+  assert.equal(rej.length,2,rej.join('\n'));
+  assert.match(rej[0],/^Rejected assignment for a: task too large: \d+ bytes assembled, at most 8192 \(your task text 8000, quoted answers 0, operator context \d+, runner prefix and notes \d+\); give the exact URLs of sources instead of pasting data/);
+  assert.match(rej[1],/^Rejected assignment for b: task too large: .*your task text 8000,/,'counted in UTF-8 bytes, not characters');
+  f.time(101);await f.runner.tick();
+  const input=f.inputs.at(-1);
+  assert.equal(input.maxTaskBytes,8192,'the planner is told the cap');
+  assert.deepEqual(input.rejectedAssignments.map(r=>[r.seller,/^task too large/.test(r.reason)]),[['a',true],['b',true]]);
+  // Exactly at the cap posts; one byte over does not.
+  const prefix='[challenge:b:day]\n',fixed=Buffer.byteLength(composeTask(prefix,'',{reportBack:true,context:'ctx'}));
+  const fit='y'.repeat(MAX_TASK_BYTES-fixed);
+  assert.equal(taskTooLarge(composeTask(prefix,fit,{context:'ctx'}),{task:fit,context:'ctx'}),null);
+  assert.match(taskTooLarge(composeTask(prefix,fit+'y',{context:'ctx'}),{task:fit+'y',context:'ctx'}),/^task too large: 8193 bytes assembled/);
+  const g=fixture();g.c.taskContext='ctx';g.snap.sellers=g.snap.sellers.slice(0,1);
+  g.setPlan(r4once(()=>({assignments:[{seller:'a',workstream:'piece',task:fit,durationSeconds:30}]})));await g.runner.tick();
+  assert.equal(posts(g).length,1);assert.equal(Buffer.byteLength(posts(g)[0][1].task),MAX_TASK_BYTES);
+  // Quoted answers count toward the cap.
+  const h=fixture(),hr=[];h.io.report=m=>hr.push(m);h.snap.sellers=h.snap.sellers.slice(0,1);
+  h.journal.state.jobs.push(r4prior('q1',{answer:'z'.repeat(5000)}));
+  h.setPlan(r4once(()=>({assignments:[{seller:'a',workstream:'piece',task:'w'.repeat(6000),durationSeconds:30,includeAnswers:['q1']}]})));await h.runner.tick();
+  assert.equal(posts(h).length,0);assert.ok(hr.some(r=>/task too large: .*your task text 6000, quoted answers [1-9]\d+,/.test(r)),hr.join('\n'));
+});
+test('R4 size cap: startup refuses an operator context that leaves the planner too little of the task cap',()=>{
+  const base={MAXPLAYER_HOME:'/tmp/b',RELAY_URL:'ws://localhost'};
+  assert.ok(config([],{...base,SWARM_TASK_CONTEXT:'c'.repeat(4000)}).taskContext,'the 4000-char maximum context still fits');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-ctx-cap-'));
+  try {
+    const file=join(dir,'c.txt');writeFileSync(file,'€'.repeat(2000)); // 2000 chars (within 4000), 6000 bytes
+    assert.throws(()=>config([],{...base,SWARM_TASK_CONTEXT_FILE:file}),/Invalid task context: it leaves -?\d+ of the 8192-byte task cap for the planner's task text, need at least 2048/);
+  } finally {rmSync(dir,{recursive:true});}
 });
