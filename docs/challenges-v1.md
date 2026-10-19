@@ -276,7 +276,7 @@ whole assembled task is capped at 8192 UTF-8 bytes; a larger assignment is rejec
 size breakdown as the reason. An assignment may quote earlier answers with `includeAnswers:[jobId,…]`:
 the runner appends a deliberately small excerpt of each (1500 chars each, 3000 in total)
 (collected answers of this challenge from its own journal only; anything else rejects the assignment
-with the reason), framed as untrusted data and neutralised so it cannot forge the challenge prefix,
+with the reason), framed as untrusted data and neutralised so it cannot forge the task prefix (`[swarm:` or the old `[challenge:`),
 delivery note, REPORT BACK section, context block or answer markers; the quoted ids are journaled and
 shown to the planner. Every posted task ends with a `REPORT BACK:` section (planner-tailored, or a
 generic one the runner appends). A rejected planner plan or response names its first failing check
@@ -428,9 +428,13 @@ A RESULT timestamp at or before its AWARD is untrusted for duration: charge the
 full deadline-minus-award interval, not zero. Other results continue charging until buyer ACCEPT (or now), capped at deadline. The coordinator and swarm stop assigning when
 no task fits the remaining offered minutes.
 
-Challenge offers carry the exact buyer-signed task prefix
-`[challenge:<buyer hex>:<challenge id>]` followed by a newline. Only offers with
-that prefix enter that challenge's tally, minutes and public budget estimate.
+Swarm offers carry the exact buyer-signed task prefix
+`[swarm:<buyer hex>:<run id>]` followed by a newline. Offers posted before the
+rename carry `[challenge:<buyer hex>:<run id>]\n`; readers still accept that
+prefix, so those offers keep binding to their run (jobs, roster minutes, past
+jobs), and each offer's task text is shown without whichever of the two prefixes
+it actually starts with. Runners post only `[swarm:`. Only offers with either
+prefix enter that run's tally, minutes and public budget estimate.
 Ordinary jobs from the same buyer in an overlapping window do not count. This
 uses the existing signed `i` task field, not a new trade/MCP parameter. Pre-prefix
 offers are intentionally excluded; existing runner journal reservations remain

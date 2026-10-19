@@ -499,7 +499,7 @@ file; setting both is a startup error) is operator context for the sellers, e.g.
 historical cipher (Hutton, 1870s); the task is educational cryptanalysis.` In round 3 a Claude seller
 stopped its first crib task on a safety classifier; that one factual line in the goal fixed it. The
 runner appends it, trimmed (at most 4000 characters), to **every** task it posts, as
-`---` / `CONTEXT (from the challenge operator, added to every task): …` between the planner's task text
+`---` / `CONTEXT (from the swarm operator, added to every task): …` between the planner's task text
 and the delivery note. Startup logs the context (or that none is set). The planner gets it once as
 `taskContext` and is told not to repeat it; the task text it sees in `running`, `results` and track
 records is its own text, without the context block or delivery note. Each job journals the context it
@@ -575,7 +575,7 @@ recognised from its stderr; a timeout or crash is not reported as a plan error.
 `REPORT BACK:` section tailored to that task (lead with a 2–4 line TAKEAWAY answering exactly what
 the task asks, then evidence, a confidence/status mark and a next step; plain text). When a task's
 text has no `REPORT BACK:` section, the runner appends a generic one (`REPORT_BACK_NOTE`). The posted
-task is, in order: challenge prefix, planner task, quoted answers (below), generic REPORT BACK (only
+task is, in order: task prefix (`[swarm:<buyer>:<run>]`), planner task, quoted answers (below), generic REPORT BACK (only
 when needed), operator context block, delivery note. Whether the generic note was appended is
 journaled (`reportBack`), and the planner sees only its own text in `running`, `results` and track
 records (jobs from older journals, including runs with Rocky's local patch, have the trailing
@@ -594,8 +594,8 @@ is told to quote only the lines that matter, or to copy those few lines into its
 runner's journal with outcome `collected` qualify; an unknown id, another challenge's job, a refused,
 expired, running, collect-refused, payment-stuck or unreadable one rejects that assignment with its
 own reason (`includeAnswers: job "<id>" was refused by its seller …`). Quoted text cannot pass for
-runner framing: it is NFKC-folded, zero-width and control characters are removed, and the challenge
-prefix, `DELIVERY:`, `REPORT BACK:`, the context block, `MAXPLAYER-ANSWER-V1` / `MAXPLAYER-REFUSED-V1`
+runner framing: it is NFKC-folded, zero-width and control characters are removed, and the task
+prefix (`[swarm:`, and the pre-rename `[challenge:`), `DELIVERY:`, `REPORT BACK:`, the context block, `MAXPLAYER-ANSWER-V1` / `MAXPLAYER-REFUSED-V1`
 and the quote framing itself are rewritten to visibly quoted forms. The quoted job ids, sellers,
 sizes and truncation are journaled (`quoted`), logged (`Assignment for <pk> quotes …`) and shown to the
 planner as `quotedAnswers`; the planner's task text never includes the block.
@@ -605,7 +605,7 @@ web search tool but can fetch pages, so every task gives the exact URL(s) of the
 Data is inlined only when small and essential (a key, a ciphertext, a short candidate list, a
 transcript under ~2 KB that is not at a URL); never whole pages or large tables.
 
-**Task size cap.** The whole assembled task (challenge prefix, planner text, quoted answers, REPORT
+**Task size cap.** The whole assembled task (task prefix, planner text, quoted answers, REPORT
 BACK, operator context, delivery note) is capped at `MAX_TASK_BYTES` = 8192 UTF-8 bytes. A larger one
 is rejected before anything is posted, journaled or reserved, with the size breakdown as the reason:
 `task too large: N bytes assembled, at most 8192 (your task text …, quoted answers …, operator context
