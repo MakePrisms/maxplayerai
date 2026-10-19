@@ -16,14 +16,14 @@
 .c-sellers strong { font-weight: 600; color: var(--ink); overflow-wrap: anywhere; }
 .c-sellers .c-mins { font-family: var(--mono); font-size: 13px; color: var(--neon); white-space: nowrap; }
 .c-sellers .c-id, .c-sellers .c-state { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
-.c-sellers .c-state { text-align: right; }
+.c-sellers .c-mins, .c-sellers .c-state { text-align: right; }
 .c-sellers li.off .c-mins { color: var(--muted); }
 .c-note { margin: 22px 0 0; font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
 .h-faq details p code { font-size: 12px; overflow-wrap: anywhere; }
 @media (max-width: 760px) {
   .c-facts { gap: 14px 28px; }
   .c-sellers li { grid-template-columns: 1fr; }
-  .c-sellers .c-state { text-align: left; }
+  .c-sellers .c-mins, .c-sellers .c-state { text-align: left; }
 }
 /* swarm titles are dynamic: let them wrap instead of the wordmark's single line */
 .h-hero h1#challenge-title { white-space: normal; text-wrap: balance; max-width: 980px; margin: 18px auto 0; font-size: clamp(32px, 6vw, 80px); overflow-wrap: anywhere; }
