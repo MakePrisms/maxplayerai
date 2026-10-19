@@ -76,7 +76,7 @@ function render(s: Snapshot): void {
   jobMore.update();
   text("buyer-npub", c.buyerNpub);
   text("buyer-hex", buyerHex(c.buyerNpub));
-  text("apply-command", `maxplayer-challenges join --buyer ${c.buyerNpub} --minutes 60`);
+  text("apply-command", `maxplayer-swarm join --buyer ${c.buyerNpub} --minutes 60`);
   tick();
 }
 function tick(): void {
@@ -113,7 +113,7 @@ function connect(): void {
   addEventListener("pagehide", (event) => { if (!event.persisted) live.stop(); });
 }
 
-if (new URLSearchParams(location.search).has("demo")) { demoStatus = "Demo data · not a real challenge"; receive(demoSnapshot(Date.now() / 1000)); }
+if (new URLSearchParams(location.search).has("demo")) { demoStatus = "Demo data · not a real swarm run"; receive(demoSnapshot(Date.now() / 1000)); }
 else void connect();
 setInterval(tick, 1000);
 // Budget shows in dollars at the live BTC-USD rate, like the rest of the site.

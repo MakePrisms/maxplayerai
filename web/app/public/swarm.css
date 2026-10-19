@@ -1,4 +1,4 @@
-/* /challenges reuses the /sell layout (styles.css h-*). Only the bits /sell doesn't have live here. */
+/* /swarm reuses the /sell layout (styles.css h-*). Only the bits /sell doesn't have live here. */
 .c-facts { display: flex; justify-content: center; flex-wrap: wrap; gap: 14px 44px; margin: 34px 0 0; }
 .c-facts dt { font-size: 10.5px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
 .c-facts dd { margin: 6px 0 0; font-family: var(--sans); font-size: 16px; color: var(--ink); }
@@ -25,9 +25,9 @@
   .c-sellers li { grid-template-columns: 1fr; }
   .c-sellers .c-state { text-align: left; }
 }
-/* challenge titles are dynamic: let them wrap instead of the wordmark's single line */
+/* swarm titles are dynamic: let them wrap instead of the wordmark's single line */
 .h-hero h1#challenge-title { white-space: normal; text-wrap: balance; max-width: 980px; margin: 18px auto 0; font-size: clamp(32px, 6vw, 80px); overflow-wrap: anywhere; }
-/* the job: the challenge event's content, read like an article */
+/* the job: the swarm event's content, read like an article */
 .c-job .h-in { text-align: left; }
 .c-job .eyebrow, .c-job h2 { display: block; text-align: center; }
 .c-job h2 { margin-bottom: 34px; text-wrap: balance; }

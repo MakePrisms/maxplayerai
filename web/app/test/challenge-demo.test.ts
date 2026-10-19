@@ -6,7 +6,7 @@ import { parseSnapshot, sellerLine } from "../src/challenge/live.js";
 test("demo snapshot passes the same validation as live data and counts running jobs up", () => {
   const now = 1_792_100_000;
   const s = parseSnapshot(demoSnapshot(now));
-  assert.equal(s.updates[0], "Demo data: not a real challenge.");
+  assert.equal(s.updates[0], "Demo data: not a real swarm run.");
   const crunch = s.sellers.find((a) => a.name === "cipher-crunch")!;
   assert.equal(sellerLine(s, crunch, now), "32 / 60 min");
   assert.match(sellerLine(s, crunch, now + 60), /^33 \/ 60 min$/);

@@ -1,11 +1,11 @@
 # Community challenges v1
 
-Status: opt-in `maxplayer-challenges` sidecar, built from source. Not live.
+Status: opt-in `maxplayer-swarm` sidecar (crate `crates/maxplayer-challenges`), built from source. Not live.
 
 See [the crate README](../crates/maxplayer-challenges/README.md) for installation.
 It has its own Cargo workspace and lockfile; build with `--manifest-path
 crates/maxplayer-challenges/Cargo.toml`. The main `maxplayer` CLI has no challenge
-subcommand. The buyer auto-award and job protocol are unchanged.
+or swarm subcommand. The buyer auto-award and job protocol are unchanged.
 
 ## Model
 
@@ -243,7 +243,7 @@ See [runner configuration, planner contract, restart behavior and service exampl
 `web/app/src/challenge/shared/{events,model,relay}.mjs` is used by the browser,
 the buyer runner and local E2E. Install its dependencies with `npm ci --prefix web/app`.
 The community HTTP/SSE server and review page have been removed; use
-`maxplayer-challenges members` and `maxplayer-challenges decide` for membership review.
+`maxplayer-swarm members` and `maxplayer-swarm decide` for membership review.
 
 - Challenge kinds 30341/30342/30343 are read from every configured public challenge relay.
   Jobs 3401–3406 and member profiles/heartbeats stay on the trade relay. Signed events are
@@ -309,15 +309,17 @@ The community HTTP/SSE server and review page have been removed; use
   Partial coverage is exposed as `relay.failedRelays`, `relay.missingRelays`, `relay.quorum`
   (`required`, `complete`, `total`), `relay.degraded` and per-source `relay.relays` status.
 
-## CLI (`maxplayer-challenges …`)
+## CLI (`maxplayer-swarm …`)
 
 Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
-`status --buyer … [--challenge <d>]`, `leave --buyer …`.
+`status --buyer … [--run <d>]`, `leave --buyer …`.
 The buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 --ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
-`members [--challenge <d>]`, `decide --seller <npub|hex> --accept|--deny`.
-`--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's
-key; none prints a secret.
+`members [--run <d>]`, `decide --seller <npub|hex> --accept|--deny`.
+`--run` (a CHALLENGE `d`) defaults to the buyer's latest non-cancelled one. All sign with the home's
+key; none prints a secret. In `--json` output the selected CHALLENGE is the top-level `run` object
+(`null` if none; `join` always reports `null`), renamed from `challenge` with no alias. The event
+kinds, tags and d-tags keep their CHALLENGE names.
 
 **Minutes changes during a running challenge.** `join` on an existing `joined` membership
 with different `--minutes` (or a different `--note`) republishes the membership. The sidecar
@@ -328,7 +330,7 @@ or before `starts`, the replacement would be dated after `starts` (its `created_
 `max(now, previous + 1)`), and `now <= ends + 900`. The buyer posts through `ends` inclusive,
 and the 900-second `created_at` tolerance lets a fast seller clock publish before the
 buyer's `ends`, so the refusal lasts until 15 minutes after `ends`:
-"You're in today's challenge (<id>, ends <time>). Change your minutes (or note) after
+"You're in today's swarm run (<id>, ends <time>). Change your minutes (or note) after
 <ends + 15 min> …; they apply from the next day. Re-publishing now would make you ineligible
 for today. Do not leave and rejoin to change minutes: that also forfeits today."
 The same minutes with `--note` omitted or equal is a no-op (nothing published,
@@ -428,7 +430,7 @@ has it is harmless), and superseded by a newer event for the same coordinate. On
 signed by the home's own key, with valid signatures, are loaded. A publish below quorum
 fails and is never queued: the caller was told it failed.
 
-**Fail-closed cases kept.** Below quorum, or without our trade relay: reads fail ("challenge
+**Fail-closed cases kept.** Below quorum, or without our trade relay: reads fail ("swarm
 relay read incomplete; quorum not met …"), publishes fail, the reader is not ready and the
 runner posts and publishes nothing. The minutes-change refusal keeps its every-relay
 challenge read. The closed-challenge refusal (exit 3) still runs on the pre-publish read; a

@@ -455,7 +455,7 @@ export class ChallengeReader {
       applicantsIncomplete:this.challenges.some(r=>r.status.applicantsIncomplete)||!!this.store.applicantsTruncated,
       // An error only once the quorum cannot be met by the relays still up (a relay still catching
       // up is not a failure; historyComplete stays false meanwhile).
-      error:this.trade.status.error??(available.length<this.quorum?`Challenge history incomplete; quorum not met (${available.length} of ${quorum.total} challenge relays available, need ${this.quorum}); relay failed: ${failedRelays.filter(u=>u!==this.trade.url).join(', ')}`:null),
+      error:this.trade.status.error??(available.length<this.quorum?`Swarm history incomplete; quorum not met (${available.length} of ${quorum.total} challenge relays available, need ${this.quorum}); relay failed: ${failedRelays.filter(u=>u!==this.trade.url).join(', ')}`:null),
       failedRelays,missingRelays,quorum,degraded,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}

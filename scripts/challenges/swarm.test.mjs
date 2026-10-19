@@ -1228,18 +1228,20 @@ test('close: without a direct relay read the publish guard re-reads a fresh snap
 test('close: the latest-challenge read passes the sidecar status its required --buyer and the exact id',async()=>{
   const {latestChallengeArgs}=await import('./swarm.mjs');
   assert.deepEqual(latestChallengeArgs(['ws://a','ws://b'],{buyer:'f'.repeat(64),id:'day-1'}),
-    ['status','--relay','ws://a','--relay','ws://b','--buyer','f'.repeat(64),'--challenge','day-1','--json']);
+    ['status','--relay','ws://a','--relay','ws://b','--buyer','f'.repeat(64),'--run','day-1','--json']);
 });
 
 // Advisor r1 #1: the runner's status read was in_progress, the close landed before the sidecar's own
 // pre-publish fetch, and the sidecar refused (exit 3). The refusal is a close: journaled, nothing more.
-test('close: a sidecar "challenge closed" publish refusal is journaled as the buyer close; nothing more is published',async()=>{
+test('close: a sidecar "swarm run closed" publish refusal is journaled as the buyer close; nothing more is published',async()=>{
   const {closedRefusal,SIDECAR_CLOSED_EXIT}=await import('./swarm.mjs');
-  const refusal=Object.assign(Error('maxplayer-challenges exited 3: challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published'),
-    {exitCode:SIDECAR_CLOSED_EXIT,stderr:'challenge: challenge closed (cancelled): the latest buyer-signed challenge day is cancelled; nothing published\n'});
+  const refusal=Object.assign(Error('maxplayer-swarm exited 3: swarm: swarm run closed (cancelled): the latest buyer-signed swarm run day is cancelled; nothing published'),
+    {exitCode:SIDECAR_CLOSED_EXIT,stderr:'swarm: swarm run closed (cancelled): the latest buyer-signed swarm run day is cancelled; nothing published\n'});
   assert.equal(closedRefusal(refusal),'cancelled');
+  // A sidecar built before the rename still refuses with the old text: still a close.
+  assert.equal(closedRefusal({exitCode:SIDECAR_CLOSED_EXIT,stderr:'challenge: challenge closed (completed): the latest buyer-signed challenge day is completed; nothing published\n'}),'completed');
   assert.equal(closedRefusal({...refusal,exitCode:2}),null,'only the dedicated exit code counts');
-  assert.equal(closedRefusal(Object.assign(Error('x'),{exitCode:3,stderr:'challenge: relay read incomplete'})),null);
+  assert.equal(closedRefusal(Object.assign(Error('x'),{exitCode:3,stderr:'swarm: swarm relay read incomplete'})),null);
   for(const kind of ['progress','completion']) {
     const f=fixture(),reports=[];f.io.report=m=>reports.push(m);let attempts=0;
     // The runner's read still says in_progress; the sidecar's own fetch sees the cancel and refuses.
@@ -1428,12 +1430,26 @@ test('quorum: coverage log line says degraded (WARNING), below quorum, or trade 
 });
 test('quorum: sidecar degraded warnings and re-sends from --json reach the runner log',async()=>{
   const {sidecarQuorumLines,latestChallengeArgs,quorumArgs}=await import('./swarm.mjs');
-  assert.deepEqual(sidecarQuorumLines({relay_quorum:{warnings:['degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/'],resent:['ab -> ws://c/']}}),
-    ['WARNING: challenge relays degraded publish: 2 of 3 challenge relays (quorum 2); missing: ws://c/','Re-sent missed challenge event ab -> ws://c/']);
+  assert.deepEqual(sidecarQuorumLines({relay_quorum:{warnings:['degraded publish: 2 of 3 swarm relays (quorum 2); missing: ws://c/'],resent:['ab -> ws://c/']}}),
+    ['WARNING: challenge relays degraded publish: 2 of 3 swarm relays (quorum 2); missing: ws://c/','Re-sent missed challenge event ab -> ws://c/']);
   assert.deepEqual(sidecarQuorumLines({}),[]);assert.deepEqual(sidecarQuorumLines(null),[]);
   assert.deepEqual(quorumArgs(undefined),[]);
   assert.deepEqual(latestChallengeArgs(['ws://a','ws://b','ws://c'],{buyer:'f'.repeat(64),id:'d'},2),
-    ['status','--relay','ws://a','--relay','ws://b','--relay','ws://c','--quorum','2','--buyer','f'.repeat(64),'--challenge','d','--json']);
+    ['status','--relay','ws://a','--relay','ws://b','--relay','ws://c','--quorum','2','--buyer','f'.repeat(64),'--run','d','--json']);
+});
+test('json key: the runner reads the sidecar run from `run`, never from `challenge`',async()=>{
+  const {sidecarRun}=await import('./swarm.mjs');
+  const x={buyer:'f'.repeat(64),id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:null,budget_sats:7};
+  assert.deepEqual(sidecarRun({run:x,members:[]},'d'),{buyer:x.buyer,id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:'',budgetSats:7});
+  // Pre-rename body shape: refused as not found (no alias), even with the run object present.
+  assert.throws(()=>sidecarRun({challenge:x,members:[]},'d'),/swarm run d not found/);
+  assert.throws(()=>sidecarRun({run:null},'d'),/not found/);
+  // No reader of sidecar JSON in the runner source touches a `challenge` key.
+  const {readFileSync}=await import('node:fs');
+  const src=readFileSync(new URL('./swarm.mjs',import.meta.url),'utf8');
+  assert.doesNotMatch(src,/body\??\.challenge\b|body\[['"]challenge['"]\]/);
+  const reader=src.slice(src.indexOf('latestChallenge:async'));
+  assert.ok(reader.slice(0,reader.indexOf('}};')).includes('return sidecarRun(body,challenge.id);'),'latestChallenge parses through sidecarRun');
 });
 test('quorum: SWARM_CHALLENGE_QUORUM defaults to 2 and must be a majority of the challenge relays',()=>{
   const argv=['--home','/tmp/q-home','--relay-url','ws://trade'];

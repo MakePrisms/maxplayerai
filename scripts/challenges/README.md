@@ -9,7 +9,7 @@ bash scripts/challenges/run-e2e.sh
 
 The harness builds **this integration checkout** with wallet+ACP and Buzz in dedicated
 `target/challenges-e2e` and `target/challenges-buzz` directories, installs the web app's locked
-Node dependencies, and builds the separate `crates/maxplayer-challenges` workspace (binary and
+Node dependencies, and builds the separate `crates/maxplayer-challenges` workspace (`maxplayer-swarm` binary and
 generic local relay fixture) into its own target. Challenge metadata goes only to that generic
 relay; jobs stay on Buzz. On this Nix host it discovers
 installed Postgres/Redis in `/nix/store` if absent from PATH. Else supply them on PATH;
@@ -141,7 +141,7 @@ projection already charged the expired job from award to deadline.
   still be within its 420 s tail when the next free job is offered (the runner's one-job-per-seller
   rule counts jobs the runner tracks, not the seller's containers).
 
-Hand-whitelist sellers once with `maxplayer-challenges decide --seller HEX --accept`, then
+Hand-whitelist sellers once with `maxplayer-swarm decide --seller HEX --accept`, then
 publish an `in_progress` daily challenge. Membership (30342) and acceptance (30343) persist;
 the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer home**:
 
@@ -149,7 +149,7 @@ the runner updates the same daily CHALLENGE (30341). Run **one runner per buyer 
 MAXPLAYER_HOME=/absolute/buyer-home \
 SWARM_MAXPLAYER_BINARY=/absolute/bin/maxplayer \
 RELAY_URL=ws://127.0.0.1:8080 \
-SWARM_CHALLENGES_BINARY=/absolute/bin/maxplayer-challenges \
+SWARM_CHALLENGES_BINARY=/absolute/bin/maxplayer-swarm \
 SWARM_CHALLENGE_RELAYS=wss://nos.lol,wss://relay.primal.net,wss://offchain.pub \
 node scripts/challenges/swarm.mjs
 ```
@@ -169,7 +169,7 @@ Flags (environment equivalents):
 | `--home` | `MAXPLAYER_HOME` | required, explicit |
 | `--binary` | `SWARM_MAXPLAYER_BINARY` | `maxplayer` |
 | `--relay-url` | `RELAY_URL` | required trade relay |
-| — | `SWARM_CHALLENGES_BINARY` | `maxplayer-challenges` |
+| — | `SWARM_CHALLENGES_BINARY` | `maxplayer-swarm` |
 | — | `SWARM_CHALLENGE_RELAYS` | comma list: `wss://nos.lol,wss://relay.primal.net,wss://offchain.pub` |
 | — | `SWARM_CHALLENGE_QUORUM` | 2 (challenge relays that must complete a read / accept a publish; a strict majority of `SWARM_CHALLENGE_RELAYS`, at most all) |
 | `--planner` | `SWARM_PLANNER` | bundled `planner-llm.mjs` |
@@ -254,7 +254,7 @@ Planner/MCP errors are logged and retried on the next polling cycle without chan
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
 
 Before every challenge publish (progress or completion) the runner re-reads the latest
-buyer-signed challenge from the challenge relays (`maxplayer-challenges status --buyer <hex> --challenge <d> --json`),
+buyer-signed challenge from the challenge relays (`maxplayer-swarm status --buyer <hex> --run <d> --json`, read from its top-level `run` object),
 not the tick-start snapshot. If it is `completed` or `cancelled` — closed by the operator, or by
 anything else holding the buyer key — nothing is published, the close is journaled as an external
 stop (no new work, outstanding jobs still collected) and restarts publish nothing either. A status
@@ -262,9 +262,9 @@ never moves backwards; progress re-sends the relay's own status, title, budget a
 read fails nothing is published. A completion publish is retried on every tick. A progress
 publish waits `min(updateEvery, 30 s)` counted from the failure, so a hung challenge relay cannot
 hold back-to-back ticks; the progress interval restarts only after a successful publish. That read can still be stale by the time the sidecar
-signs, so `maxplayer-challenges publish` checks again: if its own pre-publish fetch shows the
-challenge `completed` or `cancelled` it signs nothing and exits 3 (`challenge: challenge closed
-(<status>): …`). The runner treats that refusal exactly like a close seen in its read.
+signs, so `maxplayer-swarm publish` checks again: if its own pre-publish fetch shows the
+challenge `completed` or `cancelled` it signs nothing and exits 3 (`swarm: swarm run closed
+(<status>): …`; a sidecar built before the rename says `challenge: challenge closed`, also recognised). The runner treats that refusal exactly like a close seen in its read.
 
 Once the planner verifies success, completion includes `--result`. If no eligible seller can fit
 another task and none is running, the work window ends, or zero headroom rejects an idle paid-only batch, the
@@ -551,7 +551,7 @@ assertions after both paid and free deliveries. No production relay or real fund
 
 ### Separate challenge relays
 
-Challenge announcements/memberships/decisions are published with `maxplayer-challenges` and
+Challenge announcements/memberships/decisions are published with `maxplayer-swarm` and
 unioned across `SWARM_CHALLENGE_RELAYS`; job events and member heartbeats are read only from
 `RELAY_URL`, and job MCP stays on `maxplayer`. The page uses build-time `CHALLENGE_RELAYS`
 with the same three public defaults. Only the challenges page CSP adds these hosts; custom
@@ -576,7 +576,7 @@ whose shared relay lost a buyer close would otherwise republish it as `in_progre
 degraded they wait, logged once as `Progress update for <id> postponed: challenge relays
 degraded (…)`.
 
-Build the [challenge sidecar](../../crates/maxplayer-challenges/README.md) from source before
+Build the [`maxplayer-swarm` sidecar](../../crates/maxplayer-challenges/README.md) from source before
 running the swarm. Local E2E runs a separate generic local relay for challenge events and
 Buzz for jobs; `E2E_CHALLENGE_RELAYS` overrides the challenge read list (disposable local
 relays only). The sidecar never uses the configured job relay for challenges.
@@ -617,7 +617,7 @@ read first; memberships are then read with `authors` = the accepted sellers. Eli
 minutes, leave, readiness and the "all eligible sellers exhausted" stop use only that set, so a
 stranger's join flood cannot hide or delay an accepted seller's join/leave or block the stop.
 New joiners appear in a separate, capped applicant list (newest 256, display only) for the
-buyer to approve with `maxplayer-challenges decide`; a flood there can only truncate that list,
+buyer to approve with `maxplayer-swarm decide`; a flood there can only truncate that list,
 which the page marks as possibly incomplete. It never affects runner readiness.
 
 Valid oversized replacements retain status/minutes/since/time; the stored copy drops the note

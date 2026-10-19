@@ -56,8 +56,8 @@ test('the status line is latched: once live, a routine poll or catch-up keeps "L
   assert.equal(connectionLine({...live,historyComplete:false},'Live',true),'Live');
   assert.equal(connectionLine({...live,authenticated:false,historyComplete:false},'Polling',true),'Polling');
   // Reasons are still shown while the latch holds.
-  assert.equal(connectionLine({...live,historyComplete:false,error:'Challenge history incomplete; relay failed: wss://x',failedRelays:['wss://x'],warnings:['w']},'Live',true),
-    'Live · Challenge history incomplete; relay failed: wss://x · Unavailable: wss://x · w');
+  assert.equal(connectionLine({...live,historyComplete:false,error:'Swarm history incomplete; relay failed: wss://x',failedRelays:['wss://x'],warnings:['w']},'Live',true),
+    'Live · Swarm history incomplete; relay failed: wss://x · Unavailable: wss://x · w');
   // Actually disconnected: "Updating…" even after having been live.
   assert.equal(connectionLine({...live,connected:false,historyComplete:false},'Live',true),'Updating…');
   assert.equal(connectionLine({...live,connected:false,historyComplete:false},'Live',false),'Updating…');

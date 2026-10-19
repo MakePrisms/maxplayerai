@@ -265,7 +265,7 @@ jobs:
           fi
 
   maxplayer-challenges:
-    name: maxplayer-challenges sidecar
+    name: maxplayer-challenges sidecar (maxplayer-swarm)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -280,6 +280,12 @@ jobs:
       - run: cargo fmt --manifest-path crates/maxplayer-challenges/Cargo.toml --check
       - run: cargo clippy --manifest-path crates/maxplayer-challenges/Cargo.toml --locked --all-targets --no-deps -- -D warnings
       - run: cargo test --manifest-path crates/maxplayer-challenges/Cargo.toml --locked
+      # The crate keeps its package name; the installed command is `maxplayer-swarm` ([[bin]]).
+      - name: Binary is named maxplayer-swarm
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path crates/maxplayer-challenges/Cargo.toml --locked --bins
+          crates/maxplayer-challenges/target/debug/maxplayer-swarm --help | grep -q '^Usage: maxplayer-swarm <command>'
 
   # The standalone Cashu trade CLI. It is its OWN cargo workspace (`[workspace]` in its manifest)
   # with its own Cargo.lock, so no root-workspace job above builds or tests it: before this job a
