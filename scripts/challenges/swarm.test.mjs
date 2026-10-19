@@ -1919,6 +1919,41 @@ test('R3-3 refusal (advisor r2): a copula is answer evidence only with a value; 
     'I can\'t complete this. Result was 42.','I can\'t complete this. RESULT WAS 42.'])
     assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
 });
+test('R3-3 refusal (advisor r3): copula values are numbers, ALL-CAPS or Title-case words, quoted or not; short tokens and non-answers do not veto a stop',async()=>{
+  const {detectRefusal}=await import('./swarm.mjs');
+  // Advisor r3 table 1: answers next to stop language, collected (all refused at 1defc389).
+  for(const s of ['The safety classifier stopped me, but the keyword is Hutton.',
+    'The safety classifier stopped me, but the keyword is "Hutton".',
+    'The safety classifier stopped me, but the keyword is \u201CHUTTON\u201D.',
+    'I can\'t continue past the second keyword; the first one is Hutton.',
+    'I can\'t continue past the second keyword; the first one is 7.',
+    // Quoted value after a stop: only the optional quote in the value class lets this collect.
+    'The safety classifier stopped me, but the keyword is "HUTTON".',
+    'The safety classifier stopped me, but the keyword is \u201CHutton\u201D.',
+    // A 3-letter value after an answer noun: only the noun rule (3+, not the generic 5+) collects it.
+    'The safety classifier stopped me, but the keyword is OWL.',
+    'The safety classifier stopped me, but the keyword is Owl.',
+    // No stop language: collected either way.
+    'The keyword is Hutton.','The plaintext is attack at dawn.','Stopped by the safety system. Keyword: Hutton'])
+    assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
+  // Advisor r3 table 2: explicit stops with a short token after a copula, refused (collected at 1defc389).
+  for(const s of ['The safety system refused this because the category is API.',
+    'Stopped by the safety system. The classifier is LLM-based.',
+    'I can\'t assist with cracking this. My model is GPT.',
+    'Refused by the content filter. Reason code is HTTP 403.',
+    'Refused by the content filter because the topic was NSFW.',
+    'This request was BLOCKED by the safety system.',
+    // Non-answer words are never a value, in any case.
+    'The safety filter stopped the run. The key is REDACTED.',
+    'The safety filter stopped the run. The answer is Unknown.',
+    'The safety filter stopped the run. The plaintext is Not recovered.',
+    'The safety filter stopped the run. The keyword was Never found.',
+    'The safety filter stopped me. This is OK.','The safety filter stopped me. This is AI.'])
+    assert.ok(detectRefusal(s),`stop not detected: ${JSON.stringify(s)}`);
+  // Known limit (documented): a lower-case plaintext next to stop language is refused. No clean rule
+  // separates it from "the plaintext is likely sensitive" / "is about weapons".
+  assert.ok(detectRefusal('The safety filter stopped the run. The plaintext is attack at dawn.'));
+});
 test('R3-3 refusal (advisor r1 M2): a marker written to a delivered file is read through readDeliveredAnswer as a refusal',async()=>{
   const {detectRefusal,readDeliveredAnswer,REFUSAL_MARKER}=await import('./swarm.mjs');
   const dir=mkdtempSync(join(tmpdir(),'refused-file-'));
@@ -1984,6 +2019,9 @@ test('R3-3 refusal: a refusal-shaped short solution is a normal collect; a real 
     // Advisor r2: an explicit stop that mentions the key without a value is not work.
     ['The safety classifier stopped me. No keyword was recovered.','refused'],
     ['I can\'t help you find the keyword.','refused'],
+    // Advisor r3: a Title-case value is an answer; a 3-letter token after a copula does not veto a stop.
+    ['The safety classifier stopped me, but the keyword is Hutton.','collected'],
+    ['The safety system refused this because the category is API.','refused'],
   ];
   for(const [answer,outcome] of cases) {
     const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();[...f.remote.values()][0].results=[{}];

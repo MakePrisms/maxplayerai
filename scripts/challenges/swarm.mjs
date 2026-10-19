@@ -150,10 +150,15 @@ const jobTask = j => plannerTask(j.args.task,j.taskContext);
 //   most REFUSAL_MAX_CHARS) and must carry no ANSWER_EVIDENCE: a code block, a list of 3+ items,
 //   "here is/are", or an answer statement: answer/result/solution/plaintext/decryption/keyword/key,
 //   optionally numbered, followed by a colon or "="; the same noun + is/are/was/were only when a
-//   VALUE follows (an upper-case word of 3+ letters other than NOT, or a number: "the key is
-//   CROWN", "the answer was 42", not "no keyword was recovered"); any is/are/was/were + such an
-//   upper-case word ("the first one is HUTTON"); or found/recovered/cracked… a
-//   key/keyword/plaintext followed by an upper-case word. Then:
+//   VALUE follows: one optional straight or curly quote, then a number, an all-caps word or a
+//   title-case word of 3+ letters, other than a non-answer (NOT, NEVER, STILL, FOUND, TRIED,
+//   RECOVERED, BLOCKED, REDACTED, UNKNOWN, EMPTY in any case): "the key is CROWN", "the keyword
+//   is Hutton", "the answer was 42", not "no keyword was recovered" or "the plaintext is NOT
+//   recovered"; any is/are/was/were + such a value of 5+ letters (or a number): "the first one is
+//   Hutton", but not "the category is API" / "the topic was NSFW"; or found/recovered/cracked… a
+//   key/keyword/plaintext followed by an upper-case word. A lower-case plaintext ("the plaintext
+//   is attack at dawn") is NOT evidence: no clean rule tells it from "the plaintext is withheld",
+//   so next to stop language it is refused. Then:
 //   * a safety stop (a safety|content|usage|moderation classifier/filter/system/policy/… directly
 //     followed by stopped/blocked/flagged/refused/…, or "stopped/refused/… by the <that noun>"),
 //     case-insensitive, counts even next to generic work words ("…before I found a key");
@@ -183,12 +188,17 @@ const ANSWER_NOUN = String.raw`(?:answers?|results?|solutions?|plaintexts?|decry
 // so a copula rule can stay case-sensitive about the VALUE while accepting "Keyword"/"KEYWORD".
 const anyCase = p => p.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
 const COPULA = String.raw`(?:is|are|was|were)`;
-const ANSWER_VALUE = String.raw`["'\x60]?(?:(?!NOT\b)[A-Z]{3,}|\d+)\b`;
+// Advisor r3: one optional straight or curly quote (curly singles are already folded to '), then a
+// number, an ALL-CAPS word or a Title-case word of at least `min` letters, never a non-answer word.
+const VALUE_QUOTE = String.raw`["'\x60\u201C\u201D]?`;
+const NON_ANSWER = anyCase('(?:not|never|still|found|tried|recovered|blocked|redacted|unknown|empty)');
+const answerValue = min => String.raw`${VALUE_QUOTE}(?!${NON_ANSWER}\b)(?:\d+|[A-Z]{${min},}|[A-Z][a-z]{${min-1},})\b`;
 const ANSWER_EVIDENCE = [
   new RegExp(String.raw`\x60\x60\x60|\bhere (?:is|are)\b|\b${ANSWER_NOUN}(?: ?#?\d+)?\s*(?::|=)`,'i'),
   // Advisor r2: a copula is an answer statement only when a value follows. Case-sensitive value.
-  new RegExp(String.raw`\b${anyCase(ANSWER_NOUN)}(?: ?#?\d+)?\s+${anyCase(COPULA)}\s+${ANSWER_VALUE}`),
-  new RegExp(String.raw`\b${anyCase(COPULA)}\s+["'\x60]?(?!NOT\b)[A-Z]{3,}\b`),
+  new RegExp(String.raw`\b${anyCase(ANSWER_NOUN)}(?: ?#?\d+)?\s+${anyCase(COPULA)}\s+${answerValue(3)}`),
+  // Any copula: 5+ letters, so API/LLM/GPT/HTTP/NSFW after a stop do not veto it.
+  new RegExp(String.raw`\b${anyCase(COPULA)}\s+${answerValue(5)}`),
   // Case-sensitive on purpose: the recovered value must be an upper-case word ("found the key CROWN").
   /\b(?:[Ff]ound|[Rr]ecovered|[Cc]racked|[Ss]olved|[Dd]ecrypted|[Gg]ot)\b[^.\n]{0,30}?\b(?:[Kk]eywords?|[Kk]eys?|[Pp]laintext|[Ss]olution|[Aa]nswer)\b[: ]+["'\x60]?[A-Z]{3,}\b/,
 ];

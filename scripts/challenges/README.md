@@ -478,10 +478,15 @@ answer):` header and `=====` frames, `[truncated…]`/`[skipped…]` notes). The
   carry **no answer evidence**: no code block, no list of 3+ items, no `here is/are`, no answer
   statement (`answer`, `result`, `solution`, `plaintext`, `decryption`, `keyword`, `key`, `crib`,
   optionally numbered, followed by `:` or `=`; the same noun + *is/are/was/were* only when a **value**
-  follows, i.e. an upper-case word of 3+ letters other than `NOT`, or a number (`the key is CROWN`,
-  `the answer was 42`, but not `no keyword was recovered` or `the key was sensitive`); any
-  *is/are/was/were* + such an upper-case word (`the first one is HUTTON`); or *found/recovered/cracked
-  … the key/keyword/plaintext* followed by an upper-case word). Then it is refused if it has
+  follows: one optional straight or curly quote, then a number, an ALL-CAPS word or a Title-case word
+  of 3+ letters, never a non-answer (`not, never, still, found, tried, recovered, blocked, redacted,
+  unknown, empty`, any case): `the key is CROWN`, `the keyword is "Hutton"`, `the answer was 42`,
+  but not `no keyword was recovered`, `the key was sensitive` or `the key is REDACTED`; any
+  *is/are/was/were* + such a value of **5+** letters or a number (`the first one is Hutton`, but not
+  `the category is API` or `the topic was NSFW`); or *found/recovered/cracked … the
+  key/keyword/plaintext* followed by an upper-case word). A lower-case plaintext (`the plaintext is
+  attack at dawn`) is not evidence: no clean rule tells it from `the plaintext is likely sensitive`,
+  so next to stop language it is refused. Then it is refused if it has
   - a **safety stop**, case-insensitive: a safety/content/usage/policy/moderation
     classifier/filter/system/check/policy/… *directly* followed by *stopped, blocked, flagged,
     refused, …* (`A safety classifier stopped me`), or *stopped/refused/… by the <that noun>*
