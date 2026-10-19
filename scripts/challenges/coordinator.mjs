@@ -27,6 +27,16 @@ export const relayReady = snapshot => {
 export const snapshotFresh = (snapshot, now) => Number.isSafeInteger(snapshot?.asOf) && now >= snapshot.asOf && now - snapshot.asOf <= 5;
 // Reasons that only say "this read cannot be trusted yet", never anything about the assignment.
 export const TRANSIENT_REASONS = ['relay_not_ready','stale_snapshot'];
+// R3-2: is the day waiting on a seller that a harness restore ALONE would make a candidate? True
+// only when the roster-wide reasons are empty, and some seller's sole reason is seller_not_serving
+// and a minimum task (its deadlineUnix) still ends inside the work window. A not-serving seller
+// that is also short of minutes, or whose task cannot finish before `ends`, does not hold the day
+// open. A separate clause on purpose: it must compose with other exhaustion suppressors (#1172's
+// benched sellers), not replace them.
+export function waitingOnHarnessProbe(decision, ends) {
+  return (decision?.reasons ?? []).length === 0 && (decision?.sellers ?? []).some(s =>
+    s.reasons?.length === 1 && s.reasons[0] === 'seller_not_serving' && s.deadlineUnix <= ends);
+}
 export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 300, amountSats = 0, budgetState = null, pendingSellers = [] } = {}) {
   if (!Number.isSafeInteger(now) || !Number.isSafeInteger(durationSeconds) || durationSeconds <= 0 || !Number.isSafeInteger(amountSats) || amountSats < 0) throw Error('now, durationSeconds and amountSats must be valid integers');
   const c = snapshot.challenge, b = budgetState ?? snapshot.budget, reasons = [];
@@ -46,7 +56,11 @@ export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 30
   const sellers = (snapshot.sellers ?? []).filter(s => s.eligible === true && s.decision === 'accepted' && !['left','denied'].includes(s.state) && nonnegative(s.minutesRemaining) && s.minutesRemaining > 0 && !pending.has(s.pubkey) && !(snapshot.jobs ?? []).some(j => j.seller === s.pubkey && j.running) && s.currentJobStart == null).map(s => {
     const deadlineUnix = now + durationSeconds;
     const fits = durationSeconds <= s.minutesRemaining * 60;
-    return { seller_pubkey:s.pubkey, remainingMinutes:s.minutesRemaining, deadlineUnix, postingAllowed:reasons.length === 0 && fits, reasons:fits ? [...reasons] : [...reasons,'insufficient_minutes'] };
+    // R3-2: a seller whose newest heartbeat says it can run nothing (status=not_serving or
+    // serving=0/N) is not assigned work. Absent/unknown stays eligible, exactly as before.
+    const notServing = s.servingState === 'not_serving' || s.serving?.available === 0;
+    const own = [...(fits ? [] : ['insufficient_minutes']), ...(notServing ? ['seller_not_serving'] : [])];
+    return { seller_pubkey:s.pubkey, remainingMinutes:s.minutesRemaining, deadlineUnix, postingAllowed:reasons.length === 0 && own.length === 0, reasons:[...reasons, ...own] };
   }).sort((a,b) => a.seller_pubkey.localeCompare(b.seller_pubkey));
   return { asOf:now, challengeId:c?.id ?? null, budgetHeadroomSats:headroom, budgetSource:budgetState ? 'buyer' : 'public_estimate', amountSats, durationSeconds, postingAllowed:reasons.length === 0 && sellers.some(s => s.postingAllowed), reasons, sellers };
 }

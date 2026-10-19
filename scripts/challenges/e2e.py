@@ -21,7 +21,7 @@ from preparation import posted_job_id
 ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser()
 parser.add_argument('--skip-build', action='store_true', help='use binaries already built by run-e2e.sh')
-parser.add_argument('--baseline', action='store_true', help='exercise existing free-job flow before challenge CLI lands')
+parser.add_argument('--baseline', action='store_true', help='exercise existing free-job flow before the swarm CLI lands')
 parser.add_argument('--duplicate-history', action='store_true', help='replay historical claim frames to reproduce live/history overlap')
 ARGS = parser.parse_args()
 # Turn termination into normal exception unwinding so recorded processes are cleaned up.
@@ -32,7 +32,7 @@ RUN = Path(tempfile.mkdtemp(prefix='ce-', dir=ROOT / '.scratch'))
 os.chmod(RUN, 0o700)
 # Keep buyer Unix socket below sockaddr_un's 108-byte path limit.
 BIN = Path(os.environ.get('CARGO_TARGET_DIR', ROOT / 'target/challenges-e2e')) / 'debug/maxplayer'
-CHALLENGES = ROOT / 'crates/maxplayer-challenges/target/debug/maxplayer-challenges'
+CHALLENGES = ROOT / 'crates/maxplayer-challenges/target/debug/maxplayer-swarm'
 LOCAL_RELAY = ROOT / 'crates/maxplayer-challenges/target/debug/examples/local_relay'
 BUZZ = ROOT / 'target/challenges-buzz/debug/buzz-relay'
 PROCESSES = []
@@ -197,8 +197,8 @@ try:
         command(['npm', 'run', 'build', '--prefix', ROOT / 'web/app'], {**ENV, 'RELAY_URL': relay, 'CHALLENGE_BUYER_PUBKEY': BUYER, 'CHALLENGE_RELAYS': challenge_relays})
         siteport = port()
         start('site', ['python3', '-m', 'http.server', siteport, '--bind', '127.0.0.1', '--directory', ROOT / 'web/app/dist'])
-        print(f'Browser fixture: http://127.0.0.1:{siteport}/challenges.html', flush=True)
-        (RUN / 'browser.json').write_text(json.dumps({'url': f'http://127.0.0.1:{siteport}/challenges.html', 'relay': relay, 'buyer': BUYER}))
+        print(f'Browser fixture: http://127.0.0.1:{siteport}/swarm.html', flush=True)
+        (RUN / 'browser.json').write_text(json.dumps({'url': f'http://127.0.0.1:{siteport}/swarm.html', 'relay': relay, 'buyer': BUYER}))
     start('buyer', [BIN, 'buyer', 'serve'], buyer_env)
     for name, env in [('seller', seller_env), ('denied', denied_env)]:
         start(name, [BIN, 'seller', '--non-interactive', '--skip-doctor'], env)
@@ -225,7 +225,9 @@ try:
         cli(buyer_env, 'decide', '--seller', SELLER, '--accept')
         cli(buyer_env, 'decide', '--seller', DENIED, '--deny')
         s = wait('accepted roster read and authenticated history', lambda: (s if [(x['pubkey'], x['state']) for x in s['sellers']] == [(SELLER, 'accepted')] and not s['applicants'] and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
-        rows = json.loads(cli(buyer_env, 'members', '--challenge', 'local-e2e', '--json'))['members']
+        members_body = json.loads(cli(buyer_env, 'members', '--run', 'local-e2e', '--json'))
+        check('sidecar --json names the run `run` (no `challenge` key)', members_body['run']['id'] == 'local-e2e' and 'challenge' not in members_body)
+        rows = members_body['members']
         check('Rust CLI and shared model agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
             check('the buyer blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])
@@ -280,7 +282,7 @@ try:
         day2own = next(x for x in day2['sellers'] if x['pubkey'] == SELLER)
         check('join once eligible on day 1 and day 2 without rejoining or reaccepting', own['eligible'] and day2own['eligible'] and day2own['since'] == own['since'])
         check('minutes reset per day while prior jobs remain in history', day2own['minutesUsed'] == 0 and day2own['minutesRemaining'] == 60 and any(j['id'] == job for j in day2own['pastJobs']))
-        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'day-2', '--json'))['members']
+        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--run', 'day-2', '--json'))['members']
         check('Rust confirms persistent day 2 eligibility', rows[0]['eligible'])
         publish_day('local-e2e', starts, now + 900)
         cli(seller_env, 'leave', '--buyer', BUYER)
@@ -289,7 +291,7 @@ try:
         check('leave stops further assignment', not p['postingAllowed'] and p['sellers'] == [])
         wait('relay streaming leave received', lambda: any(any(x['pubkey'] == SELLER and x['state'] == 'left' for x in f['sellers']) for f in frames()))
         check('leave preserves settled job/minutes', len(s['jobs']) == 1 and next(x for x in s['sellers'] if x['pubkey'] == SELLER)['minutesUsed'] == own['minutesUsed'])
-        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--challenge', 'local-e2e', '--json'))['members']
+        rows = json.loads(cli(seller_env, 'status', '--buyer', BUYER, '--run', 'local-e2e', '--json'))['members']
         check('Rust CLI confirms left ineligible seller', len(rows) == 1 and not rows[0]['eligible'] and rows[0]['membership']['status'] == 'left')
         # Join just after work starts: even within 900 seconds there is no grace period.
         late_start = int(time.time()) - 1
@@ -300,15 +302,15 @@ try:
         late = wait('late join visible and accepted', lambda: (s if any(x['pubkey'] == DENIED and x['membershipStatus'] == 'joined' and x['decision'] == 'accepted' and x['since'] > late_start for x in s['sellers']) else None) if (s := snapshot()) else None)
         lateown = next(x for x in late['sellers'] if x['pubkey'] == DENIED)
         check('join after starts cannot receive same-day assignments', not lateown['eligible'] and not plan(late)['postingAllowed'])
-        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-day', '--json'))['members']
+        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--run', 'late-day', '--json'))['members']
         check('Rust confirms late join ineligible that day', not rows[0]['eligible'])
         nextday = publish_day('late-next-day', late_start + 86400, late_start + 90000)
         nextown = next(x for x in nextday['sellers'] if x['pubkey'] == DENIED)
         check('late join eligible next day without rejoining', nextown['eligible'] and nextown['since'] == lateown['since'])
-        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-next-day', '--json'))['members']
+        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--run', 'late-next-day', '--json'))['members']
         check('Rust confirms late join eligible next day', rows[0]['eligible'])
         cli(denied_env, 'join', '--buyer', BUYER, '--minutes', '45')
-        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--challenge', 'late-next-day', '--json'))['members']
+        rows = json.loads(cli(denied_env, 'status', '--buyer', BUYER, '--run', 'late-next-day', '--json'))['members']
         check('changing daily minutes preserves membership since', rows[0]['membership']['since'] == lateown['since'] and rows[0]['membership']['minutes'] == 45)
         # One runner invocation per day: no harness post/award/collect calls in these scenarios.
         cli(seller_env, 'join', '--buyer', BUYER, '--minutes', '1')

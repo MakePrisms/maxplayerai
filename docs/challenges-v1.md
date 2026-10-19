@@ -1,11 +1,11 @@
 # Community challenges v1
 
-Status: opt-in `maxplayer-challenges` sidecar, built from source. Not live.
+Status: opt-in `maxplayer-swarm` sidecar (crate `crates/maxplayer-challenges`), built from source. Not live.
 
 See [the crate README](../crates/maxplayer-challenges/README.md) for installation.
 It has its own Cargo workspace and lockfile; build with `--manifest-path
 crates/maxplayer-challenges/Cargo.toml`. The main `maxplayer` CLI has no challenge
-subcommand. The buyer auto-award and job protocol are unchanged.
+or swarm subcommand. The buyer auto-award and job protocol are unchanged.
 
 ## Model
 
@@ -141,6 +141,14 @@ buyer-signed ACCEPT stops accrual. All durations are capped at deadline.
 - Post only while `now ∈ [C.starts, C.ends]` and `C.status = in_progress`.
 - Target only eligible sellers with no running job, and only a task with
   `deadline − now ≤ remaining minutes`.
+- Skip a seller whose newest heartbeat says `status=not_serving` or `serving=0/N` (reason
+  `seller_not_serving`). A missing heartbeat or tag is unknown and stays assignable. Such a seller
+  holds the day open (not "exhausted") only while `seller_not_serving` is its sole reason and a
+  minimum task still fits the work window; short of minutes or out of window, it does not.
+  The wire cannot yet tell a re-probed dropped harness from a never-probed incapable one, so a
+  permanently incapable seat that would otherwise be a candidate (its sole reason is
+  `seller_not_serving` and its minimum task fits before the window ends) holds the day open
+  until the window ends.
 - Budget: committed (awarded, unsettled) + paid ≤ `C.budget`. Stop posting when the next task
   would exceed it.
 - Public jobs, `seller_pubkey` targeted, existing review/collect/pay.
@@ -227,6 +235,20 @@ A paid collect refused by the buyer wallet's reconciliation (`wallet reconciliat
 is a distinct `payment stuck` state, not a retry loop: logged and journaled once, shown in progress,
 seller freed, sats kept reserved, and re-checked once after `maxplayer wallet reconcile --home <home>`
 changes the wallet, after a later paid collect succeeds, or on restart.
+Optional operator task context (`SWARM_TASK_CONTEXT` / `SWARM_TASK_CONTEXT_FILE`, e.g. "public
+historical cipher; educational") is appended by the runner to every posted task; the planner sees it
+once as `taskContext`, never inside its own task text. A delivery that is a seller refusal or safety
+stop (explicit `MAXPLAYER-REFUSED-V1` first line of the answer or of the delivered report, or a short
+refusal/safety-stop text with no answer statement, by a deliberately conservative heuristic that
+prefers a missed refusal to a discarded solution) is still collected once but recorded as outcome
+`refused`: not counted as delivered work or in progress, listed to the planner as `refusals`, and
+the same seller is not given that workstream again unless the context has changed.
+After a restart the runner reloads its verified-signature cache from `<home>/swarm/verified-sigs`
+(public id+pubkey+sig keys, bounded, checksummed, written atomically; a corrupt or missing file is
+an empty cache), so history is not re-verified. The checksum guards against accidents only: a
+rewrite with a matching checksum makes its keys count as verified, so the file is inside the
+home's trust boundary, like the buyer key; a history page's 20 s deadline is credited with the
+process's own frame-handling time (capped at 120 s), never idle time.
 
 See [runner configuration, planner contract, restart behavior and service example](../scripts/challenges/README.md#automatic-swarm-runner).
 
@@ -235,7 +257,7 @@ See [runner configuration, planner contract, restart behavior and service exampl
 `web/app/src/challenge/shared/{events,model,relay}.mjs` is used by the browser,
 the buyer runner and local E2E. Install its dependencies with `npm ci --prefix web/app`.
 The community HTTP/SSE server and review page have been removed; use
-`maxplayer-challenges members` and `maxplayer-challenges decide` for membership review.
+`maxplayer-swarm members` and `maxplayer-swarm decide` for membership review.
 
 - Challenge kinds 30341/30342/30343 are read from every configured public challenge relay.
   Jobs 3401–3406 and member profiles/heartbeats stay on the trade relay. Signed events are
@@ -301,15 +323,17 @@ The community HTTP/SSE server and review page have been removed; use
   Partial coverage is exposed as `relay.failedRelays`, `relay.missingRelays`, `relay.quorum`
   (`required`, `complete`, `total`), `relay.degraded` and per-source `relay.relays` status.
 
-## CLI (`maxplayer-challenges …`)
+## CLI (`maxplayer-swarm …`)
 
 Seller: `join --buyer <npub|hex> --minutes <n> [--note <text>]`,
-`status --buyer … [--challenge <d>]`, `leave --buyer …`.
+`status --buyer … [--run <d>]`, `leave --buyer …`.
 The buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 --ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
-`members [--challenge <d>]`, `decide --seller <npub|hex> --accept|--deny`.
-`--challenge` defaults to the buyer's latest non-cancelled challenge. All sign with the home's
-key; none prints a secret.
+`members [--run <d>]`, `decide --seller <npub|hex> --accept|--deny`.
+`--run` (a CHALLENGE `d`) defaults to the buyer's latest non-cancelled one. All sign with the home's
+key; none prints a secret. In `--json` output the selected CHALLENGE is the top-level `run` object
+(`null` if none; `join` always reports `null`), renamed from `challenge` with no alias. The event
+kinds, tags and d-tags keep their CHALLENGE names.
 
 **Minutes changes during a running challenge.** `join` on an existing `joined` membership
 with different `--minutes` (or a different `--note`) republishes the membership. The sidecar
@@ -320,7 +344,7 @@ or before `starts`, the replacement would be dated after `starts` (its `created_
 `max(now, previous + 1)`), and `now <= ends + 900`. The buyer posts through `ends` inclusive,
 and the 900-second `created_at` tolerance lets a fast seller clock publish before the
 buyer's `ends`, so the refusal lasts until 15 minutes after `ends`:
-"You're in today's challenge (<id>, ends <time>). Change your minutes (or note) after
+"You're in today's swarm run (<id>, ends <time>). Change your minutes (or note) after
 <ends + 15 min> …; they apply from the next day. Re-publishing now would make you ineligible
 for today. Do not leave and rejoin to change minutes: that also forfeits today."
 The same minutes with `--note` omitted or equal is a no-op (nothing published,
@@ -420,7 +444,7 @@ has it is harmless), and superseded by a newer event for the same coordinate. On
 signed by the home's own key, with valid signatures, are loaded. A publish below quorum
 fails and is never queued: the caller was told it failed.
 
-**Fail-closed cases kept.** Below quorum, or without our trade relay: reads fail ("challenge
+**Fail-closed cases kept.** Below quorum, or without our trade relay: reads fail ("swarm
 relay read incomplete; quorum not met …"), publishes fail, the reader is not ready and the
 runner posts and publishes nothing. The minutes-change refusal keeps its every-relay
 challenge read. The closed-challenge refusal (exit 3) still runs on the pre-publish read; a
@@ -506,7 +530,7 @@ oversized prior note.
 
 Profiles/heartbeats are requested for accepted sellers only, at most 256 in pubkey order. They
 are display/planner metadata: a missing profile or heartbeat never makes an accepted seller
-ineligible, and the cap warning never blocks readiness or exhaustion. The former
+ineligible (only a heartbeat that states `status=not_serving` or `serving=0/N` pauses assignments to it), and the cap warning never blocks readiness or exhaustion. The former
 `excludedMembers` field is removed.
 
 The production-relay fence is a normalized **hostname string** denylist, shared by

@@ -81,11 +81,13 @@ gift-wrap, so a trade can settle with no public receipt ever published. Every
 settlement figure is a FLOOR, and anything user-facing must say so
 (`src/market/trades.ts`).
 
-## Unlisted challenge announcement
+## Community swarm page
 
-`/challenges` shows one organizer-maintained challenge: goal, scheduled work start,
-planned total budget in sats, joining window, buyer npub and latest update. It has
-no inbound navigation/footer/discovery links and is noindexed. Unlisted is not
+`/swarm` (formerly `/challenges`, which now redirects permanently) shows one organizer-maintained
+swarm run (internally a "challenge"; the code keeps that name under `src/challenge/`): goal,
+scheduled work start, planned total budget in sats, joining window, buyer npub and latest
+update. Its only inbound link is the footer's Swarm Lab link; it has no top-nav or discovery
+(`llms.txt`, `skill.md`) links and is noindexed. Unlisted is not
 access-controlled: anyone with the URL can read it.
 
 Edit `src/challenge/content.ts` to publish a complete `Challenge` (see the type in

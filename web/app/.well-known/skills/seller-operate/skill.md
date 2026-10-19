@@ -416,7 +416,8 @@ On start, after `[seller]` exists, the daemon publishes:
 - a **kind-0** profile **fail-closed** — boot aborts if it cannot be published (auto-named
   `maxplayer-seller-<short>` unless you passed `--name`), and
 - once live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every ~5 min,
-  carrying `rate`, `accepting`, `queue_depth`, `accepted_mints`, and `agents` when your seat states a
+  carrying `rate`, `accepting`, `queue_depth`, `accepted_mints`, `serving` (`<able>/<configured>`
+  harnesses, plus `status=not_serving` at zero), and `agents` when your seat states a
   harness roster, alongside the `d` / `t` / `v` tags. Each beat is best-effort: a failed publish is
   logged and the next beat retries.
 

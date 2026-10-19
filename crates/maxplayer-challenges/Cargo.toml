@@ -6,6 +6,11 @@ publish = false
 license = "MIT OR Apache-2.0"
 description = "Opt-in public-relay community challenges sidecar"
 
+# The package (and crate directory) keep their names; only the installed command is renamed.
+[[bin]]
+name = "maxplayer-swarm"
+path = "src/main.rs"
+
 [workspace]
 
 [dependencies]

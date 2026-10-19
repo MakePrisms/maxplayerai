@@ -26,6 +26,19 @@ export const matches = (e,f) => f.kinds.includes(e.kind) && (!f.authors || f.aut
 const metadataId=id=>id.startsWith(`${PROFILE}-`)||id.startsWith(`${HEARTBEAT}-`);
 const soft=id=>id===APPLICANTS||metadataId(id);
 const RECOVERING='Recovering after relay CLOSED';
+// R3-6: a history page (or, in a strict round, a live REQ) with no EOSE within PAGE_TIMEOUT_MS fails
+// the read ("Relay history timed out"). After a restart the runner spent minutes CPU-bound verifying
+// and projecting history, so frames that had ARRIVED waited in the socket buffer behind that work and
+// both public relays timed out after 34 s. The deadline is therefore credited with the time THIS
+// process spent handling relay frames since the request was sent (busyMs: every reader's message
+// handler, process-wide, since one busy reader delays every other reader's frames), capped at
+// PAGE_CPU_CREDIT_MAX_MS. Wall time the process was idle is never credited, so a relay that sends
+// nothing still times out at PAGE_TIMEOUT_MS, and while any page is pending history is not complete
+// (fail closed); the cap bounds how long a flood of frames can hold a read open.
+export const PAGE_TIMEOUT_MS=20000, PAGE_CPU_CREDIT_MAX_MS=120000;
+let busy=0;
+export const relayBusyMs=()=>busy;
+const now=()=>globalThis.performance?.now?.()??Date.now();
 // Read-only transport. The only signed frame is NIP-42 AUTH, using an in-memory
 // throwaway key (one key per relay connection). Never loads a wallet or publishes EVENT.
 //
@@ -64,9 +77,9 @@ const RECOVERING='Recovering after relay CLOSED';
 // a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,
-    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,filters=challengeFilters(buyer),
+    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,pageTimeoutMs=PAGE_TIMEOUT_MS,pageCreditMaxMs=PAGE_CPU_CREDIT_MAX_MS,filters=challengeFilters(buyer),
     roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey()}) {
-    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,readsRoster:roster,readsMetadata:metadata,applicants});
+    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,pageTimeoutMs,pageCreditMaxMs,readsRoster:roster,readsMetadata:metadata,applicants});
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
     this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
@@ -103,9 +116,11 @@ export class RelayReader {
   // In a strict round a trusted live REQ left unanswered for 20s fails the round, like a silent history read.
   liveLate(){
     if(!this.strict())return false;
-    for(const [id,sub] of this.liveSub){const e=this.live.get(sub);if(!soft(id)&&e?.sentAt&&!e.eose&&Date.now()-e.sentAt>20000)return true;}
+    for(const [id,sub] of this.liveSub){const e=this.live.get(sub);if(!soft(id)&&e?.sentAt&&!e.eose&&this.late(e))return true;}
     return false;
   }
+  // R3-6: past its deadline (PAGE_TIMEOUT_MS plus the capped busy credit, see above).
+  late(r){return Date.now()-r.sentAt>this.pageTimeoutMs+Math.min(this.pageCreditMaxMs,Math.max(0,busy-(r.busyAt??busy)));}
   // One warning per prefix, replaced by the latest relay reason.
   warn(prefix,why){this.status.warnings=[...this.status.warnings.filter(w=>!w.startsWith(prefix)),`${prefix} (${why}); polling`];}
   updateComplete(){
@@ -182,11 +197,11 @@ export class RelayReader {
     const held=f=>f[0]==='REQ'&&this.live.has(f[1])&&!this.status.authenticated&&(this.authExpected()||this.expectAuth&&!this.challenged&&!this.holdExpired);
     this.queueTimer=setInterval(()=>{const i=this.queue.findIndex(f=>!held(f));if(i>=0&&ws.readyState===1){const [frame]=this.queue.splice(i,1);send(frame);const p=this.pages.get(frame[1]),e=this.live.get(frame[1]);
         // Whether each REQ left before or after AUTH decides what a later auth-required CLOSED means.
-        if(p){p.sentAt=Date.now();p.authed=this.status.authenticated;}
+        if(p){p.sentAt=Date.now();p.busyAt=busy;p.authed=this.status.authenticated;}
         // A live REQ is unconfirmed from the moment subscribe() creates it (every caller then runs
         // updateComplete), so readiness already dropped when it was queued, before this send.
-        if(e)Object.assign(e,{sentAt:Date.now(),authed:this.status.authenticated});}
-      const late=[...this.pages].filter(([,p])=>p.sentAt&&Date.now()-p.sentAt>20000);
+        if(e)Object.assign(e,{sentAt:Date.now(),busyAt:busy,authed:this.status.authenticated});}
+      const late=[...this.pages].filter(([,p])=>p.sentAt&&this.late(p));
       // A silent display-only read truncates that display; never the trusted history.
       for(const [id] of late)if(soft(id)){this.softFailure(id);this.updateComplete();this.onChange();}
       if(late.some(([id])=>!soft(id))){this.status.error='Relay history timed out';close();}
@@ -219,7 +234,9 @@ export class RelayReader {
         this.holdExpired=true;this.expectAuth=false;this.authAccepted=false;},this.authWaitMs);
       this.updateComplete();this.onChange();
     });
-    ws.addEventListener('message',({data})=>{
+    // Every frame's handling time (verify, store, projection callbacks) counts toward busy (R3-6).
+    ws.addEventListener('message',ev=>{const t0=now();try{handle(ev);}finally{busy+=now()-t0;}});
+    const handle=({data})=>{
       if(this.dead||ws!==this.ws)return;
       let m; try {m=JSON.parse(String(data));}catch{return;}
       if(!Array.isArray(m))return;
@@ -334,7 +351,7 @@ export class RelayReader {
         }
         this.onChange();
       }
-    });
+    };
     ws.addEventListener('error',close);
     ws.addEventListener('close',end);
   }
@@ -455,7 +472,7 @@ export class ChallengeReader {
       applicantsIncomplete:this.challenges.some(r=>r.status.applicantsIncomplete)||!!this.store.applicantsTruncated,
       // An error only once the quorum cannot be met by the relays still up (a relay still catching
       // up is not a failure; historyComplete stays false meanwhile).
-      error:this.trade.status.error??(available.length<this.quorum?`Challenge history incomplete; quorum not met (${available.length} of ${quorum.total} challenge relays available, need ${this.quorum}); relay failed: ${failedRelays.filter(u=>u!==this.trade.url).join(', ')}`:null),
+      error:this.trade.status.error??(available.length<this.quorum?`Swarm history incomplete; quorum not met (${available.length} of ${quorum.total} challenge relays available, need ${this.quorum}); relay failed: ${failedRelays.filter(u=>u!==this.trade.url).join(', ')}`:null),
       failedRelays,missingRelays,quorum,degraded,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}
