@@ -2752,3 +2752,12 @@ test('S-2 runner: an input over the cap shrinks and the planner is still called,
   assert.match(h.summary,/^600 of 600 results are not shown in full: /);
   assert.ok(f.reports.some(r=>/^Planner assign ok in .*results 600 \(0 full, .* dropped\)/.test(r)));
 });
+test('S-2 the same rejection again with only its numbers changed (deadline, time) is no change',async()=>{
+  // Headroom 5 (a foreign 5-sat reservation): a 6-sat assignment is rejected at admission with a
+  // reason naming its deadline (at+300), which moves every tick.
+  const f=s2Fixture();f.snap.jobs=[{id:'foreign',seller:'x',running:true,amountSats:5,start:50}];
+  f.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:300,amountSats:6}]}:{wait:true});
+  await f.ticks(100,2);assert.equal(f.assigns().length,2,'first call, then one call that shows the rejection');
+  assert.match(f.assigns()[1].rejectedAssignments[0].reason,/budget_exceeded .*deadline 400/);
+  await f.ticks(110,10);assert.equal(f.assigns().length,2,'the same rejection with a new deadline is not new feedback');
+});
