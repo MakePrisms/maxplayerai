@@ -477,8 +477,11 @@ answer):` header and `=====` frames, `[truncated…]`/`[skipped…]` notes). The
   solution away, so doubt means a normal collect. The text must be **at most 600 characters** and
   carry **no answer evidence**: no code block, no list of 3+ items, no `here is/are`, no answer
   statement (`answer`, `result`, `solution`, `plaintext`, `decryption`, `keyword`, `key`, `crib`,
-  optionally numbered, followed by `:`, `=`, or *is/are/was/were*; or *found/recovered/cracked … the
-  key/keyword/plaintext* followed by an upper-case word). Then it is refused if it has
+  optionally numbered, followed by `:` or `=`; the same noun + *is/are/was/were* only when a **value**
+  follows, i.e. an upper-case word of 3+ letters other than `NOT`, or a number (`the key is CROWN`,
+  `the answer was 42`, but not `no keyword was recovered` or `the key was sensitive`); any
+  *is/are/was/were* + such an upper-case word (`the first one is HUTTON`); or *found/recovered/cracked
+  … the key/keyword/plaintext* followed by an upper-case word). Then it is refused if it has
   - a **safety stop**, case-insensitive: a safety/content/usage/policy/moderation
     classifier/filter/system/check/policy/… *directly* followed by *stopped, blocked, flagged,
     refused, …* (`A safety classifier stopped me`), or *stopped/refused/… by the <that noun>*
@@ -486,7 +489,8 @@ answer):` header and `=====` frames, `[truncated…]`/`[skipped…]` notes). The
     before I found a key.` is still a stop); or
   - a **first-person refusal at a sentence start**, case-sensitive (`I can't help with`, `I'm sorry,
     but I cannot assist`, `I must decline`, `I'm not comfortable`), with more words after the verb,
-    and no work words (*found, candidate(s), tested, partial(ly), keyword(s), plaintext(s), key(s)*).
+    and no work words (*found, candidate(s), tested, partial(ly)*). The bare nouns *keyword, plaintext,
+    key* are not work words: `I can't help you find the keyword.` is a refusal.
   So `KLJBO`, `42`, `Answer: KLJBO`, `Result: 42`, `I cannot help.` (may be the plaintext), `I CANNOT
   HELP`, `I can't help it: both keywords are HUTTON and CIPHER.`, `Policy check ended. The plaintext
   is ATTACK AT DAWN.` and `No valid keyword found among the 200 candidates tested` stay normal collects.

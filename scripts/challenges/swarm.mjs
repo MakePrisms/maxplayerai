@@ -148,16 +148,20 @@ const jobTask = j => plannerTask(j.args.task,j.taskContext);
 // - Heuristic, deliberately conservative. A missed refusal costs one reassignment; a false one
 //   throws a solution away, so when in doubt it is a normal collect. The body must be SHORT (at
 //   most REFUSAL_MAX_CHARS) and must carry no ANSWER_EVIDENCE: a code block, a list of 3+ items,
-//   "here is/are", or an answer statement (answer/result/solution/plaintext/decryption/keyword/key,
-//   optionally numbered, followed by a colon, "=" or is/are/was/were; or found/recovered/cracked…
-//   a key/keyword/plaintext followed by an upper-case word). Then:
+//   "here is/are", or an answer statement: answer/result/solution/plaintext/decryption/keyword/key,
+//   optionally numbered, followed by a colon or "="; the same noun + is/are/was/were only when a
+//   VALUE follows (an upper-case word of 3+ letters other than NOT, or a number: "the key is
+//   CROWN", "the answer was 42", not "no keyword was recovered"); any is/are/was/were + such an
+//   upper-case word ("the first one is HUTTON"); or found/recovered/cracked… a
+//   key/keyword/plaintext followed by an upper-case word. Then:
 //   * a safety stop (a safety|content|usage|moderation classifier/filter/system/policy/… directly
 //     followed by stopped/blocked/flagged/refused/…, or "stopped/refused/… by the <that noun>"),
 //     case-insensitive, counts even next to generic work words ("…before I found a key");
 //   * a first-person refusal counts only at a sentence start, case-sensitive (a decrypted
 //     "I CANNOT HELP" is not one), only with words after the verb (a bare "I cannot help." may be
 //     the plaintext), never the idioms "I can't help it/noticing/but…", and only without generic
-//     work words (found / candidate / tested / partial / keyword / plaintext / key).
+//     work words (found / candidate / tested / partial). The bare nouns keyword/plaintext/key are
+//     NOT work words: "I can't help you find the keyword." is the usual refusal on a cipher task.
 // A refused job is still collected exactly once (a priced one is paid: core cannot gate content).
 export const REFUSAL_MARKER = 'MAXPLAYER-REFUSED-V1';
 export const REFUSAL_MAX_CHARS = 600;
@@ -175,12 +179,20 @@ export const REFUSAL_PATTERNS = [
   new RegExp(String.raw`${SENTENCE_START}I(?:'m| am) not (?:comfortable|willing)\b`),
 ];
 const ANSWER_NOUN = String.raw`(?:answers?|results?|solutions?|plaintexts?|decryptions?|decrypted(?: text| message)?|keywords?|keys?|cribs?)`;
+// Case-insensitive letters for a pattern made only of words, groups and quantifiers (no escapes),
+// so a copula rule can stay case-sensitive about the VALUE while accepting "Keyword"/"KEYWORD".
+const anyCase = p => p.replace(/[a-z]/g,c=>`[${c}${c.toUpperCase()}]`);
+const COPULA = String.raw`(?:is|are|was|were)`;
+const ANSWER_VALUE = String.raw`["'\x60]?(?:(?!NOT\b)[A-Z]{3,}|\d+)\b`;
 const ANSWER_EVIDENCE = [
-  new RegExp(String.raw`\x60\x60\x60|\bhere (?:is|are)\b|\b${ANSWER_NOUN}(?: ?#?\d+)?\s*(?::|=|\b(?:is|are|was|were)\b)`,'i'),
+  new RegExp(String.raw`\x60\x60\x60|\bhere (?:is|are)\b|\b${ANSWER_NOUN}(?: ?#?\d+)?\s*(?::|=)`,'i'),
+  // Advisor r2: a copula is an answer statement only when a value follows. Case-sensitive value.
+  new RegExp(String.raw`\b${anyCase(ANSWER_NOUN)}(?: ?#?\d+)?\s+${anyCase(COPULA)}\s+${ANSWER_VALUE}`),
+  new RegExp(String.raw`\b${anyCase(COPULA)}\s+["'\x60]?(?!NOT\b)[A-Z]{3,}\b`),
   // Case-sensitive on purpose: the recovered value must be an upper-case word ("found the key CROWN").
   /\b(?:[Ff]ound|[Rr]ecovered|[Cc]racked|[Ss]olved|[Dd]ecrypted|[Gg]ot)\b[^.\n]{0,30}?\b(?:[Kk]eywords?|[Kk]eys?|[Pp]laintext|[Ss]olution|[Aa]nswer)\b[: ]+["'\x60]?[A-Z]{3,}\b/,
 ];
-const WORK_WORDS = /\b(?:found|candidates?|tested|partial(?:ly)?|keywords?|plaintexts?|keys?)\b/i;
+const WORK_WORDS = /\b(?:found|candidates?|tested|partial(?:ly)?)\b/i;
 const markerLine = line => {let b=line.trim().replace(/^#+/,'').trim().replace(/^[`*_]+|[`*_]+$/g,'').trim();if(b.endsWith(':'))b=b.slice(0,-1).trim();return b;};
 const framing = l => /^===== .* =====$/.test(l)||/^\[(?:truncated|skipped):/.test(l)||l.trim()==='Delivered files (no inline answer):'||markerLine(l)==='MAXPLAYER-ANSWER-V1';
 export function detectRefusal(answer) {

@@ -1898,6 +1898,27 @@ test('R3-3 refusal: detectRefusal flags refusals and safety stops, never legitim
   // Only the first file's first line: a marker inside a later file (or after text) is not one.
   assert.equal(detectRefusal(`Delivered files (no inline answer):\n===== a.md =====\nKey: CROWN\n===== b.md =====\n${REFUSAL_MARKER}\n`),null);
 });
+test('R3-3 refusal (advisor r2): a copula is answer evidence only with a value; bare key nouns are not work words',async()=>{
+  const {detectRefusal}=await import('./swarm.mjs');
+  const stops=[
+    'stopped by the safety system before any keyword was tried.',
+    'The safety classifier stopped me. No keyword was recovered.',
+    'The safety system refused this because the key was sensitive.',
+    'The safety filter stopped the run. The plaintext was not recovered.',
+    'The safety filter stopped the run. The plaintext is NOT recovered.',
+    'I must decline to recover the keyword.',
+    'I can\'t help you find the keyword.',
+    'I can\'t help with breaking this cipher or recovering the keyword.',
+  ];
+  for(const s of stops)assert.ok(detectRefusal(s),`stop not detected: ${JSON.stringify(s)}`);
+  // A value after the copula (upper-case word of 3+ letters, or a number) is still an answer.
+  for(const s of ['The key was CROWN.','Keyword is "HUTTON".','The answer was 42.','KEYWORD IS HUTTON','the crib was WETTER',
+    'Key #2 is SECRET.','I can\'t continue past the second keyword; the first one is HUTTON.',
+    'The safety classifier stopped me, but the keyword is HUTTON.',
+    // Numeric value after a capitalised noun/copula: only the noun+copula rule sees these.
+    'I can\'t complete this. Result was 42.','I can\'t complete this. RESULT WAS 42.'])
+    assert.equal(detectRefusal(s),null,`false positive: ${JSON.stringify(s)}`);
+});
 test('R3-3 refusal (advisor r1 M2): a marker written to a delivered file is read through readDeliveredAnswer as a refusal',async()=>{
   const {detectRefusal,readDeliveredAnswer,REFUSAL_MARKER}=await import('./swarm.mjs');
   const dir=mkdtempSync(join(tmpdir(),'refused-file-'));
@@ -1960,6 +1981,9 @@ test('R3-3 refusal: a refusal-shaped short solution is a normal collect; a real 
     ['I can\'t complete this.\nResult: 42','collected'],
     ['I cannot help.','collected'],
     ['Stopped by the safety system.','refused'],
+    // Advisor r2: an explicit stop that mentions the key without a value is not work.
+    ['The safety classifier stopped me. No keyword was recovered.','refused'],
+    ['I can\'t help you find the keyword.','refused'],
   ];
   for(const [answer,outcome] of cases) {
     const f=fixture();f.snap.sellers=f.snap.sellers.slice(0,1);await f.runner.tick();[...f.remote.values()][0].results=[{}];
@@ -1968,7 +1992,7 @@ test('R3-3 refusal: a refusal-shaped short solution is a normal collect; a real 
     if(outcome==='collected') {
       assert.equal(j.refusal,undefined);assert.equal(f.inputs.at(-1).refusals,undefined);assert.equal(f.inputs.at(-1).results[0].answer,answer);
     } else {
-      assert.equal(j.refusal.kind,'safety stop');assert.equal(f.inputs.at(-1).refusals.length,1);
+      assert.ok(['safety stop','refusal'].includes(j.refusal.kind));assert.equal(f.inputs.at(-1).refusals.length,1);
     }
   }
 });
