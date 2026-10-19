@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import {challengeTaskPrefix} from '../../web/app/src/challenge/shared/events.mjs';
-import { parseChallengeRelays } from '../../web/app/src/challenge/shared/relay.mjs';
+import { parseChallengeRelays, parseChallengeQuorum } from '../../web/app/src/challenge/shared/relay.mjs';
 import { openSnapshot } from './relay-snapshot.mjs';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate, relayReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
+import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 // Process groups of in-flight commands, so a runner told to stop can kill them (planner, MCP).
@@ -367,7 +367,15 @@ const STATUS_RANK = {scheduled:0,in_progress:1,completed:2,cancelled:2};
 export const SIDECAR_CLOSED_EXIT = 3;
 export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.stderr??e.message).match(/challenge closed \((completed|cancelled)\)/)?.[1]??null:null;
 // Sidecar argv for the latest buyer-signed challenge (`status` requires --buyer; --json on stdout).
-export const latestChallengeArgs = (relays,challenge) => ['status',...relays.flatMap(url=>['--relay',url]),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
+// `quorum` is the challenge relay quorum (run 2 #13); a progress publish passes every relay (strict).
+export const quorumArgs = quorum => quorum===undefined?[]:['--quorum',String(quorum)];
+export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--challenge',challenge.id,'--json'];
+// Degraded-quorum warnings and re-sends the sidecar reported in its --json body (relay_quorum).
+export function sidecarQuorumLines(body) {
+  const q=body?.relay_quorum;if(!q||typeof q!=='object')return [];
+  return [...(Array.isArray(q.warnings)?q.warnings:[]).map(w=>`WARNING: challenge relays ${String(w)}`),
+    ...(Array.isArray(q.resent)?q.resent:[]).map(r=>`Re-sent missed challenge event ${String(r)}`)];
+}
 export class Swarm {
   constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;}
   save(){this.journal.save();}
@@ -387,14 +395,22 @@ export class Swarm {
     this.io.report?.(`Challenge ${c.id} is already ${closed} on the relays; not publishing ${status??'progress'} (a buyer close is never overwritten)`);
     return false;
   }
+  // Run 2 #13: our trade relay is required for every publish, whatever the challenge quorum says
+  // (checked on a fresh snapshot). A progress re-send (status null) needs EVERY challenge relay
+  // (strict): it re-sends the latest buyer-signed status, and a quorum read whose overlapping relay
+  // omitted a buyer close would otherwise resurrect the closed challenge as in_progress. Completion
+  // publishes use the quorum (they are terminal either way, and must not wait for a dead relay).
   async publishChallenge(day,c,status,update,result) {
+    const fresh=await this.io.snapshot();
+    if(fresh?.relay&&!tradeReady(fresh))throw Error(`Challenge ${c.id}: trade relay not ready; not publishing ${status??'progress'}`);
+    const strict=status==null;
     // main() always reads the relays directly (sidecar). An injected io without that read (embedders,
     // older tests) falls back to a FRESH snapshot taken now, never the tick-start one.
-    const latest=this.io.latestChallenge?await this.io.latestChallenge(c):await this.io.snapshot().then(x=>x?.challenge&&{...x.challenge,budgetSats:x.budget?.totalSats});
+    const latest=this.io.latestChallenge?await this.io.latestChallenge(c,{strict}):fresh&&fresh.challenge&&{...fresh.challenge,budgetSats:fresh.budget?.totalSats};
     if(!latest||latest.id!==c.id||latest.buyer!==c.buyer||typeof latest.status!=='string')throw Error(`Challenge ${c.id}: latest buyer-signed challenge unreadable; not publishing`);
     if(TERMINAL_STATUSES.includes(latest.status))return this.closeSeen(day,c,status,latest.status);
     const outgoing=status==null||(STATUS_RANK[status]??-1)<(STATUS_RANK[latest.status]??-1)?latest.status:status;
-    const sent=await this.io.publish(latest,latest.budgetSats,outgoing,update,result===undefined?latest.result:result);
+    const sent=await this.io.publish(latest,latest.budgetSats,outgoing,update,result===undefined?latest.result:result,{strict});
     if(TERMINAL_STATUSES.includes(sent?.closed))return this.closeSeen(day,c,status,sent.closed);
     return true;
   }
@@ -636,7 +652,11 @@ export class Swarm {
     }
     if(day.stop&&!day.stop.external&&!day.published) {
       if(await this.publishChallenge(day,day.challenge,'completed',day.stop.update,day.stop.result)){day.published=true;this.save();}
+    } else if(!day.stop&&!day.closed&&ready&&snap.relay?.degraded&&now-day.lastUpdate>=this.c.updateEvery) {
+      // Progress needs every challenge relay (see publishChallenge); while degraded it waits.
+      if(!day.progressDegraded){day.progressDegraded=true;this.save();this.io.report?.(`Progress update for ${c.id} postponed: challenge relays degraded (${(snap.relay.missingRelays??[]).join(', ')} missing); progress needs every relay`);}
     } else if(!day.stop&&!day.closed&&ready&&now-day.lastUpdate>=this.c.updateEvery&&(!(now<day.progressRetryAt)||!(this.io.now()<day.progressRetryAt))) {
+      delete day.progressDegraded;
       // Progress never changes the status: it re-sends the latest buyer-signed one (null). The
       // interval restarts only after a publish; a failed re-read is retried after a short backoff
       // (PROGRESS_RETRY_SECONDS from the failure), not a full updateEvery and not every tick. The
@@ -657,6 +677,19 @@ export class Swarm {
     }
   }
 }
+// Run 2 #13: one log line per change of challenge relay coverage: all available, degraded (quorum
+// met, some relay missing: WARNING), or below quorum / trade relay not ready (nothing is posted).
+export function relayCoverageLine(r) {
+  if(!r)return 'Relay coverage unknown';
+  const q=r.quorum,missing=r.missingRelays??r.failedRelays??[];
+  const trade=r.relays?.find(x=>x.role==='trade');
+  // Same condition as tradeReady (coordinator.mjs): connected, authenticated, history complete, no error.
+  const tradeDown=trade&&!tradeReady({relay:r});
+  if(tradeDown)return `Relay coverage incomplete; trade relay not ready: ${trade.url} (required${trade.error?`: ${trade.error}`:!trade.connected?': disconnected':!trade.authenticated?': not authenticated':': history incomplete'}); nothing is posted or published`;
+  if(q&&q.complete<q.required)return `Relay coverage below quorum (${q.complete} of ${q.total} challenge relays complete, need ${q.required}); unavailable: ${missing.join(', ')}`;
+  if(r.degraded)return `WARNING: relay coverage degraded (${q.complete} of ${q.total} challenge relays complete, quorum ${q.required}); missing: ${missing.join(', ')}`;
+  return r.failedRelays?.length?`Relay coverage incomplete; unavailable: ${r.failedRelays.join(', ')}`:'All configured relays available';
+}
 // Run 2 #4: relay readiness log. Driven by its OWN timer (never by tick(), so a planner call of
 // several minutes cannot hide a stall). Every `checkMs` it compares each relay's readiness fields
 // (connected, authenticated, historyComplete, error, warnings, socket readyState) with the last
@@ -671,10 +704,10 @@ export function relayHealthLines({status,sockets={}},now) {
   return rows.map(r=>{
     const s=r.role==='overall'?null:sockets[r.url];
     const fields={connected:!!r.connected,authenticated:!!r.authenticated,historyComplete:!!r.historyComplete,error:r.error??null,warnings:r.warnings??[],
-      ...(r.role==='overall'?{failedRelays:r.failedRelays??[]}:{socket:s?.readyState??null,sockets:s?.sockets??0})};
+      ...(r.role==='overall'?{failedRelays:r.failedRelays??[],quorum:r.quorum??null,degraded:!!r.degraded}:{socket:s?.readyState??null,sockets:s?.sockets??0})};
     const key=JSON.stringify([r.role,r.url,fields]);
     const text=`relay ${r.role}${r.url?` ${r.url}`:''}: connected=${fields.connected} authenticated=${fields.authenticated} historyComplete=${fields.historyComplete} error=${JSON.stringify(fields.error)} warnings=${JSON.stringify(fields.warnings)}`+
-      (r.role==='overall'?` failed=${JSON.stringify(fields.failedRelays)}`:` socket=${fields.socket} reconnects=${Math.max(0,fields.sockets-1)} lastMessage=${age(s?.lastMessageAt,now)} ago messages=${s?.messages??0}`);
+      (r.role==='overall'?` failed=${JSON.stringify(fields.failedRelays)}${fields.quorum?` quorum=${fields.quorum.complete}/${fields.quorum.total} (need ${fields.quorum.required}) degraded=${fields.degraded}`:''}`:` socket=${fields.socket} reconnects=${Math.max(0,fields.sockets-1)} lastMessage=${age(s?.lastMessageAt,now)} ago messages=${s?.messages??0}`);
     return {id:`${r.role} ${r.url}`,key,text};
   });
 }
@@ -698,6 +731,7 @@ export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
   const c={challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  c.challengeQuorum=parseChallengeQuorum(env.SWARM_CHALLENGE_QUORUM,c.challengeRelays.length);
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
   for(const k of ['plannerDigestChars','plannerMaxInputChars'])if(!Number.isSafeInteger(c[k])||c[k]<100)throw Error(`Invalid ${k}`);
@@ -769,34 +803,36 @@ async function main() {
   let parentWatch;
   if(process.env.SWARM_PARENT_PIPE==='stdin'){delete process.env.SWARM_PARENT_PIPE;parentWatch=watchParent(process.stdin,stopRunner);}
   const challengesBinary=process.env.SWARM_CHALLENGES_BINARY??'maxplayer-challenges';
-  const challengeRelays=(process.env.SWARM_CHALLENGE_RELAYS??'wss://nos.lol,wss://relay.primal.net,wss://offchain.pub').split(',').map(s=>s.trim()).filter(Boolean);
-  if(!challengeRelays.length)throw Error('SWARM_CHALLENGE_RELAYS must not be empty');
+  const challengeRelays=c.challengeRelays;
   const env=childEnv(process.env,c.home);
   const identity=await command(c.binary,['whoami'],{env});
   const buyer=identity.match(/pubkey: ([0-9a-f]{64})/)?.[1];
   if(!buyer)throw Error('Cannot identify configured buyer');
   const journal=new Journal(join(c.home,'swarm/events.jsonl'));
   let relayCoverage;
-  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,buyer,onChange:s=>{
-    const failed=s.relay.failedRelays.join(', ');
-    if(failed!==relayCoverage){relayCoverage=failed;console.error(new Date().toISOString(),failed?`Relay coverage incomplete; unavailable: ${failed}`:'All configured relays available');}
+  source=openSnapshot({url:c.url,challengeRelays:c.challengeRelays,quorum:c.challengeQuorum,buyer,onChange:s=>{
+    const line=relayCoverageLine(s.relay);
+    if(line!==relayCoverage){relayCoverage=line;console.error(new Date().toISOString(),line);}
   }});
   health=startRelayHealthLog(source.diagnostics,message=>console.error(new Date().toISOString(),message));
   const io={now:seconds,report:message=>console.error(new Date().toISOString(),message),snapshot:async()=>source.snapshot(),
     mcp:async(tool,args)=>JSON.parse(await command(process.execPath,[join(here,'mcp-call.mjs'),c.binary,tool,JSON.stringify(args)],{env})),
     plan:async input=>JSON.parse(await command('/bin/sh',['-c',c.planner],{input:JSON.stringify(input),env,timeout:c.plannerTimeouts.runnerMs(input.mode)})),
     answer:async collected=>readDeliveredAnswer(collected.path),
-    publish:async(challenge,budget,status,update,result)=>{
+    publish:async(challenge,budget,status,update,result,{strict=false}={})=>{
       const goal=join(c.home,'swarm/goal.txt');writeFileSync(goal,challenge.goal,{mode:0o600});
-      const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),'--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
+      const args=['publish',...challengeRelays.flatMap(url=>['--relay',url]),...quorumArgs(strict?challengeRelays.length:c.challengeQuorum),'--json','--id',challenge.id,'--title',challenge.title,'--goal-file',goal,'--starts',new Date(challenge.starts*1000).toISOString(),'--ends',new Date(challenge.ends*1000).toISOString(),'--budget-sats',String(budget),'--status',status,'--update',String(update).slice(0,1000)];
       if(result)args.push('--result',result);
-      try{await command(challengesBinary,args,{env});}
+      let out;try{out=await command(challengesBinary,args,{env});}
       catch(e){const closed=closedRefusal(e);if(closed)return {closed};throw e;}
+      try{for(const l of sidecarQuorumLines(JSON.parse(out)))io.report(l);}catch{}
     },
-    // The latest buyer-signed challenge with this id, read directly from every challenge relay by
-    // the sidecar (fails unless all relays answer); includes completed/cancelled ones.
-    latestChallenge:async challenge=>{
-      const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge),{env}));
+    // The latest buyer-signed challenge with this id, read directly from the challenge relays by the
+    // sidecar (fails below the quorum, or unless every relay answers when strict); includes
+    // completed/cancelled ones.
+    latestChallenge:async (challenge,{strict=false}={})=>{
+      const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge,strict?challengeRelays.length:c.challengeQuorum),{env}));
+      for(const l of sidecarQuorumLines(body))io.report(l);
       const x=body?.challenge;if(!x||typeof x!=='object')throw Error(`challenge ${challenge.id} not found on the challenge relays`);
       return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
     }};

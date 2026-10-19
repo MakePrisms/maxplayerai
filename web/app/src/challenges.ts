@@ -1,4 +1,4 @@
-import { parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
+import { connectionText, parseSnapshot, renderSellers, type Snapshot } from "./challenge/live.js";
 import { demoSnapshot } from "./challenge/demo.js";
 import { renderJob } from "./challenge/job.js";
 import { buyerHex } from "./challenge/model.js";
@@ -9,6 +9,7 @@ import { ChallengeReader } from "./challenge/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
 declare const CHALLENGE_BUYER_PUBKEY: string;
 declare const CHALLENGE_RELAYS: string[];
+declare const CHALLENGE_QUORUM: number;
 
 const el = (id: string) => document.getElementById(id)!;
 const text = (id: string, value: string) => { el(id).textContent = value; };
@@ -70,10 +71,7 @@ function receive(value: unknown, status: string): void {
   snapshot = parseSnapshot(value);
   receivedAt = performance.now();
   render(snapshot);
-  const r = snapshot.relay;
-  const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : status;
-  // The relay's own reason (e.g. a CLOSED) is shown at once, not only after the reconnect copies it into a warning.
-  text("connection-status", connection + (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : ""));
+  text("connection-status", connectionText(snapshot.relay, status));
 }
 function unavailable(): void {
   text("connection-status", snapshot ? "Reconnecting · showing last known" : "Live view unavailable · check back soon");
@@ -81,7 +79,7 @@ function unavailable(): void {
 
 function connect(): void {
   const store = new EventStore();
-  const reader = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: () => {
+  const reader = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, quorum: CHALLENGE_QUORUM, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: () => {
     try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: reader.status}, reader.status.authenticated ? "Live" : "Polling"); }
     catch { unavailable(); }
   }});
