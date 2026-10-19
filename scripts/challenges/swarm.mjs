@@ -238,9 +238,9 @@ export const MIN_EXPIRED_SLOT_GRACE_SECONDS = SELLER_EXECUTION_TAIL_SECONDS + SL
 // file; a chunked copy + fsync + rename where links are unsupported) to
 // <journal>.legacy-<UTC timestamp>, and the directory is fsynced; only then is the journal
 // replaced. A crash between the two leaves the journal still legacy and the kept file in place: the
-// next open finds that file (same inode, or same size for a copy) and reuses it, so a migration
-// never produces a second kept copy. After the rewrite the journal is one record, so it is never
-// migrated again. `migrated.legacyPath` names the kept file; the runner logs it.
+// next open finds that file (same inode and device for a link, or the same size and equal bytes for
+// a copy) and reuses it, so a migration never produces a second kept copy. After the rewrite the
+// journal is one record, so it is never migrated again. `migrated.legacyPath` names the kept file; the runner logs it.
 export const JOURNAL_CHUNK_BYTES = 1<<20;
 export const legacyJournalName = (path,ms) => `${path}.legacy-${new Date(ms).toISOString().replace(/[-:]/g,'').replace(/\.\d+Z$/,'Z')}`;
 export class Journal {
@@ -498,10 +498,13 @@ export class Swarm {
   }
   // R3-2: per-seller unclaimed-expiry streak and bench (journaled, across challenges).
   benchAfter(){return this.c.benchAfterUnclaimed??DEFAULT_BENCH_AFTER_UNCLAIMED;}
-  sellerClaimed(seller,jobId,now) {
-    const b=this.state.bench?.[seller];if(!b)return;
-    delete this.state.bench[seller];this.save();
-    if(b.until>now)this.io.report?.(`Un-benched seller ${seller}: it claimed job ${jobId}`);
+  // Records the claim on the job AND clears the seller's bench record in ONE save: a failed save
+  // leaves neither change (the next start observes the claim again), never the flag without the
+  // un-bench (which would suppress the retry and keep the seller benched or its streak alive).
+  sellerClaimed(j,now) {
+    const b=this.state.bench?.[j.seller];
+    j.sawSellerClaim=now;if(b)delete this.state.bench[j.seller];this.save();
+    if(b?.until>now)this.io.report?.(`Un-benched seller ${j.seller}: it claimed job ${j.id}`);
   }
   unclaimedExpiry(j,now) {
     const bench=this.state.bench??={},b=bench[j.seller]??={streak:0};
@@ -657,7 +660,7 @@ export class Swarm {
       // R3-2: a claim un-benches once per job, on the transition. A paid job that was claimed stays
       // open (and polled) until collected or proven released, even after its slot was freed; its old
       // claim must not wipe a streak built by the seller's later unclaimed expiries on every poll.
-      if(!j.sawSellerClaim&&Array.isArray(state.claims)&&state.claims.some(cl=>cl?.seller_pubkey===j.seller)){j.sawSellerClaim=now;this.save();this.sellerClaimed(j.seller,j.id,now);}
+      if(!j.sawSellerClaim&&Array.isArray(state.claims)&&state.claims.some(cl=>cl?.seller_pubkey===j.seller))this.sellerClaimed(j,now);
       const expensive=(state.claim_prices??[]).find(p=>p.seller_pubkey===j.seller&&Number.isSafeInteger(p.amount_sats)&&p.amount_sats>j.args.max_sats);
       if(expensive && j.priceAsked!==expensive.amount_sats) {
         j.priceAsked=expensive.amount_sats;j.outcome=`price too high: asked ${expensive.amount_sats}`;j.ts=now;this.save();

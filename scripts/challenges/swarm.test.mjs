@@ -1693,6 +1693,39 @@ test('R3-2 (advisor r1 H1): a lingering claim on a slot-freed paid job does not 
   assert.ok(!reports.some(r=>r.startsWith('Un-benched seller a: it claimed')),'the old claim does not un-bench');
 });
 
+// Advisor r2 H1: observing a claim was two saves (the job flag, then the bench delete). A crash on
+// the second left the flag without the un-bench, so the claim was never observed again and the
+// seller stayed benched. The flag and the un-bench are one save.
+test('R3-2 (advisor r2 H1): a failed save while observing a claim leaves neither change; after restart the claim un-benches the seller',async()=>{
+  const fs=process.getBuiltinModule('node:fs');
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.snap.challenge.ends=100000;
+  f.setPlan(input=>input.mode==='assess'?{wait:true}:everyone(input));
+  await f.runner.tick();
+  const ja=f.journal.state.jobs.find(x=>x.seller==='a');assert.ok(ja&&!ja.done);
+  const dir=mkdtempSync(join(tmpdir(),'swarm-r2h1-')),path=join(dir,'events.jsonl');
+  try {
+    // A durable journal: seller a is benched (from earlier expiries) while its open job is polled.
+    const seed=new Journal(path);seed.state=structuredClone(f.journal.state);
+    seed.state.bench={a:{streak:2,benchedAt:90,until:5000,reason:'2 consecutive assignments expired with no claim'}};seed.save();
+    const remote=[...f.remote.values()].find(r=>r.id===ja.id);Object.assign(remote,{claims:[{seller_pubkey:'a',live:true,claim_id:'c'}],results:[]});
+    // The save that would record the un-bench fails (crash): the durable record keeps the previous state.
+    let armed=true;
+    const failing={renameSync:(from,to)=>{if(armed&&to===path&&!JSON.parse(fs.readFileSync(from,'utf8')).bench?.a){armed=false;throw Object.assign(Error('crash'),{code:'EIO'});}return fs.renameSync(from,to);}};
+    f.time(110);
+    await assert.rejects(new Swarm(f.c,f.io,new Journal(path,{fs:failing})).tick(),e=>e.journalFailure===true);
+    assert.equal(armed,false,'the un-bench save was attempted and failed');
+    const afterCrash=new Journal(path);
+    assert.ok(afterCrash.state.bench.a.until,'still benched on disk');
+    assert.equal(afterCrash.state.jobs.find(x=>x.id===ja.id).sawSellerClaim,undefined,'flag not committed without the un-bench');
+    // Restart: the claim is observed again and un-benches the seller, flag and delete together.
+    f.time(111);await new Swarm(f.c,f.io,afterCrash).tick();
+    const reopened=new Journal(path);
+    assert.equal(reopened.state.bench.a,undefined,`un-benched after restart: ${JSON.stringify(reopened.state.bench)}`);
+    assert.equal(reopened.state.jobs.find(x=>x.id===ja.id).sawSellerClaim,111);
+    assert.ok(reports.some(r=>r===`Un-benched seller a: it claimed job ${ja.id}`),reports.join('\n'));
+  } finally {rmSync(dir,{recursive:true});}
+});
+
 // R3-5 (round 3): the migration rewrote a 1.27 GB legacy append journal in place, discarding the audit history.
 test('R3-5: migration keeps the legacy journal as events.jsonl.legacy-<timestamp> (link, or copy), reuses it after a crash, never migrates twice',async()=>{
   const {legacyJournalName}=await import('./swarm.mjs');
