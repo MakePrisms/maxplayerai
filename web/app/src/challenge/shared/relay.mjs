@@ -35,10 +35,39 @@ const RECOVERING='Recovering after relay CLOSED';
 // PAGE_CPU_CREDIT_MAX_MS. Wall time the process was idle is never credited, so a relay that sends
 // nothing still times out at PAGE_TIMEOUT_MS, and while any page is pending history is not complete
 // (fail closed); the cap bounds how long a flood of frames can hold a read open.
-export const PAGE_TIMEOUT_MS=20000, PAGE_CPU_CREDIT_MAX_MS=120000;
+//
+// P-3: frame-handling time is not the only way this thread falls behind. Any other main-thread work
+// (the runner's projection tick, a cold signature cache, a large backfill, a throttled browser tab)
+// leaves arrived frames unread, and after the block the deadline timer runs BEFORE the socket's
+// queued frames (timers precede I/O in each event-loop turn), so a relay whose EOSE was already
+// waiting was declared dead: recover() -> reconnect -> full history re-read -> more CPU. So each
+// reader also measures its own event-loop lag by timer drift (performance.now, browser and Node; no
+// perf_hooks): a queue tick more than lagThresholdMs (LAG_THRESHOLD_MS) later than its interval
+// means the thread was blocked, and that lost time (minus frame handling already counted in busyMs)
+// is credited to every pending page and live REQ deadline, inside the same PAGE_CPU_CREDIT_MAX_MS cap
+// as busyMs. The one-shot deadlines (connect, AUTH answer, AUTH challenge hold) use lagTimeout, which
+// re-arms for the time it lost when it fires late instead of failing, within the same cap. An idle
+// loop gains no credit, so a silent relay still fails at its plain deadline, and a relay that is
+// silent while this thread is blocked over and over still fails within deadline + cap.
+export const PAGE_TIMEOUT_MS=20000, PAGE_CPU_CREDIT_MAX_MS=120000, LAG_THRESHOLD_MS=250;
 let busy=0;
 export const relayBusyMs=()=>busy;
 const now=()=>globalThis.performance?.now?.()??Date.now();
+// P-3: a setTimeout whose deadline does not expire because of our own lag (see above). When it runs
+// more than thresholdMs past its due time, the deadline moves back by the time it lost (so it is
+// due now) and it re-checks on a later turn, after the frames that arrived meanwhile were handled,
+// instead of calling fn. Moves spend from maxCreditMs, so fn runs no later than ms + maxCreditMs
+// plus the lateness of its last check. clear() cancels it like clearTimeout.
+export function lagTimeout(fn,ms,{thresholdMs=LAG_THRESHOLD_MS,maxCreditMs=PAGE_CPU_CREDIT_MAX_MS}={}) {
+  let credit=0,handle=null,done=false,due=now()+ms;
+  const arm=()=>{handle=setTimeout(()=>{
+    if(done)return;
+    const lost=now()-due;
+    if(lost>thresholdMs&&credit<maxCreditMs){const extra=Math.min(lost,maxCreditMs-credit);credit+=extra;due+=extra;arm();return;}
+    done=true;fn();},Math.max(0,due-now()));};
+  arm();
+  return {clear(){done=true;clearTimeout(handle);}};
+}
 // Read-only transport. The only signed frame is NIP-42 AUTH, using an in-memory
 // throwaway key (one key per relay connection). Never loads a wallet or publishes EVENT.
 //
@@ -77,15 +106,15 @@ const now=()=>globalThis.performance?.now?.()??Date.now();
 // a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,
-    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,pageTimeoutMs=PAGE_TIMEOUT_MS,pageCreditMaxMs=PAGE_CPU_CREDIT_MAX_MS,filters=challengeFilters(buyer),
+    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,pageTimeoutMs=PAGE_TIMEOUT_MS,pageCreditMaxMs=PAGE_CPU_CREDIT_MAX_MS,lagThresholdMs=LAG_THRESHOLD_MS,filters=challengeFilters(buyer),
     roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey()}) {
-    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,pageTimeoutMs,pageCreditMaxMs,readsRoster:roster,readsMetadata:metadata,applicants});
+    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,pageTimeoutMs,pageCreditMaxMs,lagThresholdMs,readsRoster:roster,readsMetadata:metadata,applicants});
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
     this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
     this.authAccepted=false; // the relay accepted our AUTH and has not since refused it or stopped challenging outside recovery
     this.status=this.freshStatus();
-    this.stopped=false; this.retry=retryMs;
+    this.stopped=false; this.retry=retryMs; this.lag=0; // this reader's observed event-loop lag (P-3), ms
   }
   freshStatus(){return {connected:false,authenticated:false,historyComplete:false,pollInProgress:false,error:null,
     warnings:[...this.metaWarnings,...(this.closedStreak?[`${RECOVERING} (${this.lastClosed}); reconnect ${this.closedStreak}`]:[])],applicantsIncomplete:false};}
@@ -119,8 +148,10 @@ export class RelayReader {
     for(const [id,sub] of this.liveSub){const e=this.live.get(sub);if(!soft(id)&&e?.sentAt&&!e.eose&&this.late(e))return true;}
     return false;
   }
-  // R3-6: past its deadline (PAGE_TIMEOUT_MS plus the capped busy credit, see above).
-  late(r){return Date.now()-r.sentAt>this.pageTimeoutMs+Math.min(this.pageCreditMaxMs,Math.max(0,busy-(r.busyAt??busy)));}
+  // R3-6/P-3: past its deadline (PAGE_TIMEOUT_MS plus the capped busy + lag credit, see above).
+  late(r){return Date.now()-r.sentAt>this.pageTimeoutMs+Math.min(this.pageCreditMaxMs,Math.max(0,busy-(r.busyAt??busy))+Math.max(0,this.lag-(r.lagAt??this.lag)));}
+  // A one-shot deadline that tolerates our own lag (P-3), within the same credit cap.
+  after(fn,ms){return lagTimeout(fn,ms,{thresholdMs:this.lagThresholdMs,maxCreditMs:this.pageCreditMaxMs});}
   // One warning per prefix, replaced by the latest relay reason.
   warn(prefix,why){this.status.warnings=[...this.status.warnings.filter(w=>!w.startsWith(prefix)),`${prefix} (${why}); polling`];}
   updateComplete(){
@@ -149,7 +180,7 @@ export class RelayReader {
   // but never answers) treat it as refused and fall back to anonymous reads, as for an AUTH refusal.
   awaitAuth(reason){
     if(!this.authReason||reason.startsWith('auth-required:'))this.authReason=reason;
-    this.authTimer??=setTimeout(()=>{this.authTimer=null;
+    this.authTimer??=this.after(()=>{this.authTimer=null;
       if(this.dead||this.status.authenticated||this.authRefused!==null)return;
       const why=`${this.authReason} (AUTH did not complete within ${this.authWaitMs/1000}s)`;
       if(this.closedStreak||this.authClosed.size)return this.recover(why);
@@ -184,7 +215,7 @@ export class RelayReader {
     let closing=false,ended=false,timeout;
     const end=()=>{
       if(ended)return;ended=true;
-      clearTimeout(timeout);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.dead=true;
+      timeout?.clear();clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.dead=true;
       this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.onChange();
       if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,this.closedStreak?this.closedMaxRetryMs:this.maxRetryMs);}
     };
@@ -195,18 +226,22 @@ export class RelayReader {
     // replaced (or refused) after AUTH OK. History pages go out at once either way.
     // A relay that challenged an earlier connection is given authWaitMs to challenge this one first.
     const held=f=>f[0]==='REQ'&&this.live.has(f[1])&&!this.status.authenticated&&(this.authExpected()||this.expectAuth&&!this.challenged&&!this.holdExpired);
-    this.queueTimer=setInterval(()=>{const i=this.queue.findIndex(f=>!held(f));if(i>=0&&ws.readyState===1){const [frame]=this.queue.splice(i,1);send(frame);const p=this.pages.get(frame[1]),e=this.live.get(frame[1]);
+    // P-3: a tick that runs more than lagThresholdMs past its interval measures time this thread was
+    // blocked; it is credited to every deadline still pending (late()).
+    this.lastTick=now();this.tickBusy=busy;
+    this.queueTimer=setInterval(()=>{const t=now(),lost=t-this.lastTick-this.queueMs-(busy-this.tickBusy);this.lastTick=t;this.tickBusy=busy;if(lost>this.lagThresholdMs)this.lag+=lost;
+      const i=this.queue.findIndex(f=>!held(f));if(i>=0&&ws.readyState===1){const [frame]=this.queue.splice(i,1);send(frame);const p=this.pages.get(frame[1]),e=this.live.get(frame[1]);
         // Whether each REQ left before or after AUTH decides what a later auth-required CLOSED means.
-        if(p){p.sentAt=Date.now();p.busyAt=busy;p.authed=this.status.authenticated;}
+        if(p){p.sentAt=Date.now();p.busyAt=busy;p.lagAt=this.lag;p.authed=this.status.authenticated;}
         // A live REQ is unconfirmed from the moment subscribe() creates it (every caller then runs
         // updateComplete), so readiness already dropped when it was queued, before this send.
-        if(e)Object.assign(e,{sentAt:Date.now(),busyAt:busy,authed:this.status.authenticated});}
+        if(e)Object.assign(e,{sentAt:Date.now(),busyAt:busy,lagAt:this.lag,authed:this.status.authenticated});}
       const late=[...this.pages].filter(([,p])=>p.sentAt&&this.late(p));
       // A silent display-only read truncates that display; never the trusted history.
       for(const [id] of late)if(soft(id)){this.softFailure(id);this.updateComplete();this.onChange();}
       if(late.some(([id])=>!soft(id))){this.status.error='Relay history timed out';close();}
       else if(this.liveLate())this.recover('Relay live subscription timed out (no EOSE within 20s)');},this.queueMs);
-    timeout=setTimeout(close,this.connectMs);
+    timeout=this.after(close,this.connectMs);
     this.pollTimer=setInterval(()=>{
       // Finish the entire trusted round before polling again, including member profiles.
       // Otherwise a large history can keep refilling faster than it drains.
@@ -221,7 +256,7 @@ export class RelayReader {
     ws.addEventListener('open',()=>{
       if(ended)return; // closed while connecting (stop, connect timeout): never a live round
       // A CLOSED-driven reconnect keeps its backoff until the recovered connection settles.
-      clearTimeout(timeout);this.status.connected=true;if(!this.closedStreak)this.retry=this.retryMs;this.opened=true;
+      timeout?.clear();this.status.connected=true;if(!this.closedStreak)this.retry=this.retryMs;this.opened=true;
       // History must work even if AUTH is absent or explicitly refused.
       for(const [id,f] of this.filters)this.page(id,f);
       if(this.applicants)this.pageApplicants();
@@ -229,7 +264,7 @@ export class RelayReader {
       // No challenge within authWaitMs: live REQs fall back to anonymous and the relay's posture
       // becomes anonymous, unless recovery needs AUTH OK; then this recovers like an unanswered
       // challenge (expectAuth stays set for the retry).
-      if(this.expectAuth)this.holdTimer=setTimeout(()=>{this.holdTimer=null;if(this.challenged||this.dead)return;
+      if(this.expectAuth)this.holdTimer=this.after(()=>{this.holdTimer=null;if(this.challenged||this.dead)return;
         if(this.needsAuth())return this.recover(`Relay sent no AUTH challenge within ${this.authWaitMs/1000}s while recovering`);
         this.holdExpired=true;this.expectAuth=false;this.authAccepted=false;},this.authWaitMs);
       this.updateComplete();this.onChange();
@@ -247,7 +282,7 @@ export class RelayReader {
         this.updateComplete();this.onChange();
       } else if(m[0]==='OK'&&m[1]===this.authId) {
         this.status.authenticated=m[2]===true;
-        clearTimeout(this.authTimer);this.authTimer=null;
+        this.authTimer?.clear();this.authTimer=null;
         if(this.status.authenticated) {
           this.authAccepted=true;
           // A late OK after the no-answer fallback still counts: AUTH is expected again.
@@ -396,7 +431,7 @@ export class RelayReader {
   }
   page(id,filter,{poll=false}={}) {const p={filter,received:0,oldest:Infinity,poll};this.pages.set(id,p);if(this.blockingPending())this.status.historyComplete=false;this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
   pageApplicants() {const filter=applicantFilter(this.buyer);this.pages.set(APPLICANTS,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',APPLICANTS,{...filter,limit:APPLICANT_LIMIT}]);}
-  clearRecoveryTimers(){clearTimeout(this.authTimer);this.authTimer=null;clearTimeout(this.holdTimer);this.holdTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
+  clearRecoveryTimers(){this.authTimer?.clear();this.authTimer=null;this.holdTimer?.clear();this.holdTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.closeSocket?.();}
 }
 
