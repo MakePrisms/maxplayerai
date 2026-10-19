@@ -8,8 +8,14 @@
 // the event's own fields before the lookup, so changed content/tags/kind/time/pubkey miss, and a
 // different sig is a different key (a forged or foreign sig is Schnorr-checked and rejected as before).
 //
-// File: <home>/swarm/verified-sigs, mode 0600 in the runner's 0700 directory (the same trust as the
-// journal: anyone who can write it can also read the buyer key in that home).
+// File: <home>/swarm/verified-sigs, mode 0600 in the runner's 0700 directory.
+// TRUST BOUNDARY (advisor r1 L3): the SHA-256 in the header is a checksum, NOT a MAC. It only makes
+// ACCIDENTAL damage (a torn or truncated write, a stray edit that leaves the header stale) fail safe.
+// Anyone who rewrites the file with a matching checksum can plant any id+pubkey+sig key, and verify()
+// then accepts that exact triple WITHOUT a Schnorr check, i.e. an unverified signature counts as
+// verified. That is accepted on purpose: whoever can write $MAXPLAYER_HOME/swarm is already inside
+// the home's trust boundary (the same user can read the buyer key and rewrite the journal), so a key
+// over this file would add nothing. Never point the runner at a home another user can write.
 //   line 1: "maxplayer-verified-sigs v1 <count> <sha256 hex of the body>"
 //   body:   <count> lines, one key each
 // Bounded: at most VERIFY_CACHE_LIMIT keys (the in-memory bound), so at most ~25.7 MB; a larger file
@@ -42,6 +48,7 @@ export function decodeVerifyCache(text,{limit=VERIFY_CACHE_LIMIT}={}) {
   const count=+m[1],body=text.slice(nl+1);
   if(!Number.isSafeInteger(count)||count>limit)return {error:`count ${m[1]} above the limit ${limit}`};
   // A torn, truncated or edited body fails the checksum; the count and per-key checks follow.
+  // Integrity against accidents only: a rewrite that updates the checksum passes (see the header).
   if(sha256(body)!==m[2])return {error:'checksum mismatch (torn, truncated or edited file)'};
   const keys=count?body.slice(0,-1).split('\n'):[];
   if(keys.length!==count||keys.some(k=>!VERIFY_KEY.test(k)))return {error:'malformed key'};

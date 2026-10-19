@@ -36,6 +36,10 @@ export function eventId(e) { return bytesToHex(sha256(new TextEncoder().encode(J
 //   verify-cache-file.mjs) so a restart does not re-verify the whole history. primeVerifyCache is
 //   the only way in without a Schnorr check; it takes exact keys (the same id+pubkey+sig
 //   concatenation, format-checked here), so a primed key can only ever accept that exact triple.
+//   A primed key is TRUSTED, not re-checked: the caller vouches that it came from an earlier
+//   successful Schnorr check. The runner's file is checksummed against accidents only, so whoever
+//   can rewrite it can make an unverified signature count as verified; that writer is already inside
+//   the runner home's trust boundary (it can read the buyer key). See verify-cache-file.mjs.
 //   The browser never primes or listens.
 export const VERIFY_CACHE_LIMIT = 100000;
 export const VERIFY_KEY = /^[0-9a-f]{256}$/;

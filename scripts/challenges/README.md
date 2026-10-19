@@ -468,18 +468,28 @@ still delivers (a `MAXPLAYER-ANSWER-V1` answer saying so) and the job is collect
 paid: core cannot judge content). The runner then records it as outcome **`refused`** instead of
 `collected` (`refusal:{by,kind?,reason}` in the journal) and logs `Job <id>: seller <pk> REFUSED (…)`.
 Detection:
-- *Explicit marker:* the answer's first non-blank line is `MAXPLAYER-REFUSED-V1` (Markdown
-  decoration and a trailing colon allowed). Any length. The reason is the rest.
-- *Heuristic, conservative on purpose* (a false positive discards a real answer, so doubt means a
-  normal collect): after removing runner framing (a leading `MAXPLAYER-ANSWER-V1`, the delivered-files
-  header and `=====` frames, `[truncated…]`/`[skipped…]` notes) the text must be **at most 600
-  characters**, contain a safety-stop phrase (`safety classifier … stopped`, `blocked by the content
-  filter`, …) or a first-person refusal **at a sentence start** (`I can't help with`, `I'm sorry, but I
-  cannot assist`, `I must decline`, `I'm not comfortable`; case-sensitive, so a decrypted `I CANNOT
-  HELP` is not one, and never the idiom `I can't help noticing/but`), and show **no sign of work**: no
-  code block, no list of 3+ items, none of *found, candidate(s), tested, partial(ly), result(s):, here
-  is/are, the answer is*. So `KLJBO`, `42`, `No valid keyword found among the 200 candidates tested`
-  and `I cannot complete this in time, but here is partial progress: …` stay normal collects.
+Runner framing is removed first (a `MAXPLAYER-ANSWER-V1` line, the `Delivered files (no inline
+answer):` header and `=====` frames, `[truncated…]`/`[skipped…]` notes). Then:
+- *Explicit marker:* the first non-blank line of that body is `MAXPLAYER-REFUSED-V1` (Markdown
+  decoration and a trailing colon allowed). Any length. The reason is the rest. This also works when
+  the seller writes it as the first line of its only (or alphabetically first) delivered file.
+- *Heuristic, conservative on purpose.* A missed refusal costs one reassignment; a false one throws a
+  solution away, so doubt means a normal collect. The text must be **at most 600 characters** and
+  carry **no answer evidence**: no code block, no list of 3+ items, no `here is/are`, no answer
+  statement (`answer`, `result`, `solution`, `plaintext`, `decryption`, `keyword`, `key`, `crib`,
+  optionally numbered, followed by `:`, `=`, or *is/are/was/were*; or *found/recovered/cracked … the
+  key/keyword/plaintext* followed by an upper-case word). Then it is refused if it has
+  - a **safety stop**, case-insensitive: a safety/content/usage/policy/moderation
+    classifier/filter/system/check/policy/… *directly* followed by *stopped, blocked, flagged,
+    refused, …* (`A safety classifier stopped me`), or *stopped/refused/… by the <that noun>*
+    (`Refused by the content filter.`). Generic work words do not veto a safety stop (`… stopped me
+    before I found a key.` is still a stop); or
+  - a **first-person refusal at a sentence start**, case-sensitive (`I can't help with`, `I'm sorry,
+    but I cannot assist`, `I must decline`, `I'm not comfortable`), with more words after the verb,
+    and no work words (*found, candidate(s), tested, partial(ly), keyword(s), plaintext(s), key(s)*).
+  So `KLJBO`, `42`, `Answer: KLJBO`, `Result: 42`, `I cannot help.` (may be the plaintext), `I CANNOT
+  HELP`, `I can't help it: both keywords are HUTTON and CIPHER.`, `Policy check ended. The plaintext
+  is ATTACK AT DAWN.` and `No valid keyword found among the 200 candidates tested` stay normal collects.
 A refusal is not work: it does not count as `delivered` in the seller's track record (profiles carry
 `trackRecord.refused`), the planner sees its answer prefixed `[refused: … NOT completed work; assign
 this workstream to a different seller]` with `refused:true`, every planner call lists the challenge's
@@ -646,6 +656,12 @@ reader went through a CLOSED recovery. Two costs, both fixed:
   is verified again`) and is rewritten; a failed write is logged and retried, never fatal. A loaded key
   only ever accepts that exact triple: `verify()` still recomputes each event's id from its own fields
   before the lookup, and a different signature is a different key, Schnorr-checked as before.
+  **Trust boundary:** the SHA-256 is a checksum against *accidental* corruption, not a MAC. Anyone who
+  can rewrite `$MAXPLAYER_HOME/swarm/verified-sigs` with a matching checksum can plant a key, and that
+  exact `id + pubkey + sig` is then accepted **without** a Schnorr check (an unverified signature counts
+  as verified). That writer is already inside the home's trust boundary: the same access reads the
+  buyer key and rewrites the journal. Keep the home private to the runner user (the runner creates
+  `swarm/` 0700 and the file 0600); never run it against a home another user can write.
 - *Per-frame projection.* The runner's relay callback used to build the full challenge projection on
   every stored frame, which is quadratic in history size (measured: most of the CPU even with every
   signature cached). It now receives only the relay status per frame; the runner projects once per
