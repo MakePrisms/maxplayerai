@@ -176,7 +176,9 @@ a revised plan, budget, minutes, bench or context; at least every `SWARM_PLANNER
 result history (bounded: the newest results in full, older ones as marked head-and-tail digests,
 under a hard per-call character budget described in the runner README that degrades rather than
 fails unless the goal, plan and seller profiles alone exceed it; a result dropped to fit
-still leaves a seller/outcome/time index line, and seller-supplied profile text is capped), and returns a batch of assignments
+leaves a seller/outcome/time index line, and under extreme pressure the oldest index lines are
+dropped too, counted in `history.droppedIndexOmitted` and stated in `history.summary`;
+seller-supplied profile text is capped), and returns a batch of assignments
 `{seller,workstream,task,durationSeconds,amountSats?}`, wait, or verified solved answer.
 The buyer decides whether each seller is worth paying. `amountSats` is a safe integer ≥0,
 default 0: zero posts `payment=none, amount_sats=0, max_sats=0`; N>0 posts a normal
@@ -244,7 +246,8 @@ buyer reservation and parked auto-award intent, or the buyer's existing ledger m
 no pending delivery/accept. Free terminal jobs, abandoned never-posted intents and refused
 publications release too. Uncertainty retains reservations across restarts and keeps polling
 possibly payable work. At zero headroom, free work remains possible; budget stops only on
-an idle paid-only rejected batch. Wait/empty assignments alone never imply exhaustion.
+an idle paid-only rejected batch, so that stop waits for an `assign` call (on a change or after
+`SWARM_PLANNER_IDLE_SECONDS`); window-end and exhaustion stops run on every tick. Wait/empty assignments alone never imply exhaustion.
 Public ACCEPT is not payment proof. Use a dedicated buyer; unknown public amounts fail closed.
 A paid collect refused by the buyer wallet's reconciliation (`wallet reconciliation refused: …`)
 is a distinct `payment stuck` state, not a retry loop: logged and journaled once, shown in progress,
