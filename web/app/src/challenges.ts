@@ -13,6 +13,7 @@ import { ChallengeReader } from "./challenge/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
 declare const CHALLENGE_BUYER_PUBKEY: string;
 declare const CHALLENGE_RELAYS: string[];
+declare const CHALLENGE_QUORUM: number;
 
 const el = (id: string) => document.getElementById(id)!;
 const text = (id: string, value: string) => { el(id).textContent = value; };
@@ -106,7 +107,7 @@ function connect(): void {
     try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: live.status}); }
     catch { unavailable(); }
   }, RENDER_MS);
-  const live = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: changed});
+  const live = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, quorum: CHALLENGE_QUORUM, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: changed});
   reader = live;
   live.start();
   addEventListener("pagehide", (event) => { if (!event.persisted) live.stop(); });

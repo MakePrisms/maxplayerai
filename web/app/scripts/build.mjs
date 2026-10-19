@@ -14,7 +14,7 @@
  * to cache. The files themselves keep their names; the query string is the
  * only difference.
  */
-import { parseChallengeRelays } from "../src/challenge/shared/relay.mjs";
+import { parseChallengeRelays, parseChallengeQuorum } from "../src/challenge/shared/relay.mjs";
 import { build, context } from "esbuild";
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -30,6 +30,8 @@ if (!/^[0-9a-f]{64}$/.test(buyer)) throw Error("CHALLENGE_BUYER_PUBKEY must be l
 const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
 if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
 const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
+// Challenge relay quorum (run 2 #13): default 2; must be a majority of CHALLENGE_RELAYS.
+const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, challengeRelays.length);
 const watch = process.argv.includes("--watch");
 const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "challenges.html"];
 
@@ -44,6 +46,7 @@ const options = {
   define: {
     CHALLENGE_BUYER_PUBKEY: JSON.stringify(buyer),
     CHALLENGE_RELAYS: JSON.stringify(challengeRelays),
+    CHALLENGE_QUORUM: JSON.stringify(challengeQuorum),
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
     WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
     TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),

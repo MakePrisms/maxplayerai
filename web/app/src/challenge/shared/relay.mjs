@@ -52,13 +52,21 @@ const RECOVERING='Recovering after relay CLOSED';
 // connection opened expecting one, recovers again like an unanswered challenge. A relay that never
 // challenges, or refuses AUTH, outside recovery keeps the anonymous path, in recovery too.
 //
+// Poll rounds (R3-4): once a trusted filter's history has been read completely on this connection
+// (`read`), a later poll page for it (and that page's pagination) is a re-read of history already
+// held, so it no longer drops historyComplete; status.pollInProgress says a trusted poll round is in
+// flight instead. Every fail-closed rule still applies to poll pages: a silent page times out and
+// closes the socket, a truncated page sets an error, a refused page recovers (and its filter must be
+// read again in full), and a filter never read on this connection (initial read, a new roster chunk,
+// a re-read after AUTH) keeps historyComplete false until it completes.
+//
 // Live REQ ids: `live-<id>` for a filter's first live REQ on a connection, `live-<id>~<n>` for
 // a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,
-    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,filters=challengeFilters(buyer),
+    retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,filters=challengeFilters(buyer),
     roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey()}) {
-    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,readsRoster:roster,readsMetadata:metadata,applicants});
+    Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,readsRoster:roster,readsMetadata:metadata,applicants});
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
     this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
@@ -66,10 +74,13 @@ export class RelayReader {
     this.status=this.freshStatus();
     this.stopped=false; this.retry=retryMs;
   }
-  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,error:null,
+  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,pollInProgress:false,error:null,
     warnings:[...this.metaWarnings,...(this.closedStreak?[`${RECOVERING} (${this.lastClosed}); reconnect ${this.closedStreak}`]:[])],applicantsIncomplete:false};}
   // Applicant and profile/heartbeat reads are display-only: they never gate readiness.
   trustedPending(){for(const id of this.pages.keys())if(!soft(id))return true;return false;}
+  // A pending trusted page that must complete before history counts as complete (R3-4): any page of
+  // a filter not yet read completely on this connection. A poll of a read filter does not block.
+  blockingPending(){for(const [id,p] of this.pages)if(!soft(id)&&!(p.poll&&this.read.has(id)))return true;return false;}
   softFailure(id){this.pages.delete(id);if(id===APPLICANTS)this.status.applicantsIncomplete=true;else this.metaIncomplete();}
   metaIncomplete(){const w='Profile/heartbeat read incomplete';if(!this.status.warnings.includes(w))this.status.warnings.push(w);}
   authExpected(){return !!this.challenged&&this.authRefused===null;}
@@ -98,8 +109,9 @@ export class RelayReader {
   // One warning per prefix, replaced by the latest relay reason.
   warn(prefix,why){this.status.warnings=[...this.status.warnings.filter(w=>!w.startsWith(prefix)),`${prefix} (${why}); polling`];}
   updateComplete(){
-    const done=!!this.opened&&this.status.connected&&!this.trustedPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.strict()||this.liveConfirmed());
+    const done=!!this.opened&&this.status.connected&&!this.blockingPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.strict()||this.liveConfirmed());
     this.status.historyComplete=done;
+    this.status.pollInProgress=this.trustedPending()&&!this.blockingPending();
     // The stable period restarts when the connection stops being healthy (an error, or a trusted
     // live REQ no longer confirmed), with or without a socket close. A routine poll page in
     // flight is not a failure and does not restart it.
@@ -114,7 +126,7 @@ export class RelayReader {
     if(this.dead)return;
     this.dead=true;this.closedStreak++;this.lastClosed=error;
     Object.assign(this.status,{error,historyComplete:false,authenticated:false});
-    this.onChange();this.ws.close();
+    this.onChange();this.closeSocket();
   }
   // Something needs AUTH (a challenge, or an auth-required refusal). If it neither completes nor is
   // refused within authWaitMs: while recovering, or when trusted history was refused for lack of
@@ -142,12 +154,27 @@ export class RelayReader {
     if(this.stopped)return;
     this.status=this.freshStatus(); this.opened=false;
     this.filters=new Map([...this.initialFilters.map(f=>[String(f.kinds[0]),f]),...this.extra]);
-    this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map();
+    this.authClosed=new Map(); this.pages=new Map(); this.queue=[]; this.newest=new Map(); this.read=new Set();
     // live: per live REQ id {id, filter, sentAt, authed (sent after AUTH OK), eose}; liveSub: filter id -> current REQ id.
     // closing: our own CLOSEs, whose empty-reason CLOSED acknowledgement is not a refusal.
     this.live=new Map(); this.liveSub=new Map(); this.liveGen=new Map(); this.closing=new Set();
     this.dead=false; this.authRefused=null; this.challenged=false; this.authReason=null; this.holdExpired=false;
     const ws=this.ws=new this.WebSocketImpl(this.url);
+    // Every teardown goes through close() and ends the connection exactly once (end()), without
+    // waiting for the socket's own close event. Node 22's WebSocket, closed while still CONNECTING,
+    // dispatches 'error' synchronously from close() and never dispatches 'close': the old
+    // error -> ws.close() handler recursed until the stack overflowed, and a connect timeout could
+    // never reach the reconnect. `closing` stops the re-entry; end() is idempotent, so a late close
+    // event (Node 24) is ignored.
+    let closing=false,ended=false,timeout;
+    const end=()=>{
+      if(ended)return;ended=true;
+      clearTimeout(timeout);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.dead=true;
+      this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.onChange();
+      if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,this.closedStreak?this.closedMaxRetryMs:this.maxRetryMs);}
+    };
+    const close=()=>{if(!closing){closing=true;try{ws.close();}catch{}}end();};
+    this.closeSocket=close;
     const send=frame=>{if(ws.readyState===1){ws.send(JSON.stringify(frame));if(frame[0]==='CLOSE')this.closing.add(frame[1]);}};
     // Once AUTH is expected, live REQs wait for its outcome: an anonymous live REQ would only be
     // replaced (or refused) after AUTH OK. History pages go out at once either way.
@@ -162,9 +189,9 @@ export class RelayReader {
       const late=[...this.pages].filter(([,p])=>p.sentAt&&Date.now()-p.sentAt>20000);
       // A silent display-only read truncates that display; never the trusted history.
       for(const [id] of late)if(soft(id)){this.softFailure(id);this.updateComplete();this.onChange();}
-      if(late.some(([id])=>!soft(id))){this.status.error='Relay history timed out';ws.close();}
+      if(late.some(([id])=>!soft(id))){this.status.error='Relay history timed out';close();}
       else if(this.liveLate())this.recover('Relay live subscription timed out (no EOSE within 20s)');},this.queueMs);
-    const timeout=setTimeout(()=>ws.close(),20000);
+    timeout=setTimeout(close,this.connectMs);
     this.pollTimer=setInterval(()=>{
       // Finish the entire trusted round before polling again, including member profiles.
       // Otherwise a large history can keep refilling faster than it drains.
@@ -172,10 +199,12 @@ export class RelayReader {
       // it in full; polling it again would only resend the same requests every interval.
       if(this.status.error||this.trustedPending())return;
       // Poll also repairs late/backdated writes even when streaming succeeds.
-      for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)});
+      for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)},{poll:true});
+      this.updateComplete();
       if(this.applicants&&!this.pages.has(APPLICANTS))this.pageApplicants();
     },this.pollMs);
     ws.addEventListener('open',()=>{
+      if(ended)return; // closed while connecting (stop, connect timeout): never a live round
       // A CLOSED-driven reconnect keeps its backoff until the recovered connection settles.
       clearTimeout(timeout);this.status.connected=true;if(!this.closedStreak)this.retry=this.retryMs;this.opened=true;
       // History must work even if AUTH is absent or explicitly refused.
@@ -255,8 +284,10 @@ export class RelayReader {
           // events is never skipped. The cursor must move strictly older or history fails closed.
           if(p.oldest===Infinity)this.status.error='History truncated: full page without an in-range event';
           else if(p.filter.until!==undefined&&p.oldest>=p.filter.until)this.status.error='History truncated: 500+ events in one second';
-          else this.page(m[1],{...p.filter,until:p.oldest});
+          else this.page(m[1],{...p.filter,until:p.oldest},{poll:p.poll});
         }
+        // A trusted filter's history is read once its last page ends without an error (R3-4).
+        if(!soft(m[1])&&m[1]!==APPLICANTS&&!this.pages.has(m[1])&&!this.status.error)this.read.add(m[1]);
         if(!this.pages.has(m[1]))send(['CLOSE',m[1]]);
         if(m[1]===String(DECISION)&&!this.pages.has(m[1]))this.onRoster();
         this.updateComplete();this.onChange();
@@ -287,6 +318,7 @@ export class RelayReader {
         } else if(soft(sub)&&this.pages.has(sub)) {this.softFailure(sub);this.updateComplete();}
         else if(this.pages.has(sub)) {
           const p=this.pages.get(sub);
+          this.read.delete(sub); // a refused read must be re-read in full before history counts again
           // Refused trusted history: fail closed now and re-read it in full on a fresh connection.
           if(!auth||(p.authed??this.status.authenticated))return this.recover(`Relay history subscription refused (${sub}): ${why}`);
           this.pages.delete(sub);this.status.historyComplete=false;
@@ -303,12 +335,8 @@ export class RelayReader {
         this.onChange();
       }
     });
-    ws.addEventListener('error',()=>ws.close());
-    ws.addEventListener('close',()=>{
-      clearTimeout(timeout);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.dead=true;
-      this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.onChange();
-      if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,this.closedStreak?this.closedMaxRetryMs:this.maxRetryMs);}
-    });
+    ws.addEventListener('error',close);
+    ws.addEventListener('close',end);
   }
   // Accepted sellers (buyer-signed decisions only) drive roster membership reads and
   // profile/heartbeat reads. Re-subscribes whenever the accepted set changes.
@@ -345,19 +373,36 @@ export class RelayReader {
   dropFilter(id) {
     if(!this.filters)return;
     const sub=this.liveSub.get(id)??`live-${id}`;
-    this.filters.delete(id);this.pages.delete(id);this.live.delete(sub);this.liveSub.delete(id);this.newest.delete(id);this.authClosed.delete(id);
+    this.filters.delete(id);this.pages.delete(id);this.read?.delete(id);this.live.delete(sub);this.liveSub.delete(id);this.newest.delete(id);this.authClosed.delete(id);
     this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==sub);
     for(const s of [id,sub])this.sendNow(['CLOSE',s]);
   }
-  page(id,filter) {this.status.historyComplete=false;this.pages.set(id,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
+  page(id,filter,{poll=false}={}) {const p={filter,received:0,oldest:Infinity,poll};this.pages.set(id,p);if(this.blockingPending())this.status.historyComplete=false;this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
   pageApplicants() {const filter=applicantFilter(this.buyer);this.pages.set(APPLICANTS,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',APPLICANTS,{...filter,limit:APPLICANT_LIMIT}]);}
   clearRecoveryTimers(){clearTimeout(this.authTimer);this.authTimer=null;clearTimeout(this.holdTimer);this.holdTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
-  stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.ws?.close();}
+  stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.closeSocket?.();}
 }
 
 // Canonical hostname denylist; the Rust sidecar reads this JSON literal at compile time.
 export const CHALLENGE_RELAY_DENYLIST = ["relay.maxplayer.ai"];
 export const DEFAULT_CHALLENGE_RELAYS = ['wss://nos.lol','wss://relay.primal.net','wss://offchain.pub'];
+// Challenge relay quorum (run 2 #13): how many challenge relays must complete a read, and must
+// acknowledge a publish (sidecar), for it to count. The same number is used for both, and it must
+// be a strict majority of the configured relays: every quorum read then shares at least one relay
+// with every quorum publish, so a read still sees every published leave, deny or close as long as
+// that shared relay does not hide it. Default 2 (for the three default relays), raised to a
+// majority for longer lists and lowered to the list size for one relay. Our trade relay is never
+// part of the quorum and is always required on top of it.
+export const DEFAULT_CHALLENGE_QUORUM = 2;
+export const majority = n => Math.floor(n/2)+1;
+export function parseChallengeQuorum(value,relayCount) {
+  if(!Number.isSafeInteger(relayCount)||relayCount<1)throw Error('At least one challenge relay is required');
+  if(value===undefined||value===null||value==='')return Math.min(relayCount,Math.max(DEFAULT_CHALLENGE_QUORUM,majority(relayCount)));
+  const q=typeof value==='number'?value:/^[0-9]+$/.test(String(value).trim())?Number(String(value).trim()):NaN;
+  if(!Number.isSafeInteger(q)||q<majority(relayCount)||q>relayCount)
+    throw Error(`Invalid challenge relay quorum ${JSON.stringify(String(value))}: must be an integer from ${majority(relayCount)} (a majority) to ${relayCount} (every relay)`);
+  return q;
+}
 export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
   const urls=[...new Set((Array.isArray(value)?value:value.split(',')).map(url=>url.trim()).filter(Boolean))];
   if(!urls.length)throw Error('At least one challenge relay is required');
@@ -373,27 +418,45 @@ export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
 // The accepted roster is recomputed from the shared store whenever a buyer decision arrives
 // on any relay and pushed to every reader (roster memberships + trade metadata).
 export class ChallengeReader {
-  constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...options}) {
+  constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...rest}) {
+    // quorum: challenge relays that must complete (default: parseChallengeQuorum). The rest are RelayReader options.
+    const {quorum,...options}=rest;
     const filters=challengeFilters(buyer);
     const onRoster=()=>{const accepted=acceptedSellers(store.events.values(),buyer);for(const r of [this.trade,...this.challenges])r.setRoster(accepted);};
     const common={...options,buyer,store,onChange,onRoster};
     this.store=store;
     this.trade=new RelayReader({...common,url,roster:false,metadata:true,applicants:false,filters:filters.filter(f=>!CHALLENGE_KINDS.includes(f.kinds[0]))});
-    this.challenges=parseChallengeRelays(challengeRelays).map(url=>new RelayReader({...common,url,roster:true,metadata:false,applicants:true,
+    const urls=parseChallengeRelays(challengeRelays);
+    this.quorum=parseChallengeQuorum(quorum,urls.length);
+    this.challenges=urls.map(url=>new RelayReader({...common,url,roster:true,metadata:false,applicants:true,
       filters:filters.filter(f=>CHALLENGE_KINDS.includes(f.kinds[0]))}));
   }
+  // Ready (historyComplete) needs our trade relay complete AND at least `quorum` challenge relays
+  // complete. The store unions every relay's events, so a relay that is still connected keeps
+  // contributing. Below quorum, or with the trade relay incomplete, the view is never ready: the
+  // runner posts and publishes nothing. Quorum met with a relay missing is "degraded": ready, with a
+  // visible warning (page, runner log) naming the missing relays.
   get status() {
     const relays=[{role:'trade',url:this.trade.url,...this.trade.status},...this.challenges.map(r=>({role:'challenge',url:r.url,...r.status}))];
     const available=this.challenges.filter(r=>r.status.connected&&!r.status.error);
-    const ready=available.length===this.challenges.length&&available.every(r=>r.status.historyComplete);
+    const complete=available.filter(r=>r.status.historyComplete);
+    const missingRelays=this.challenges.filter(r=>!complete.includes(r)).map(r=>r.url);
+    const quorum={required:this.quorum,complete:complete.length,total:this.challenges.length};
+    const quorumMet=complete.length>=this.quorum,degraded=quorumMet&&missingRelays.length>0;
     const failedRelays=relays.filter(r=>!r.connected||r.error).map(r=>r.url);
+    const degradedWarning=`Degraded: ${complete.length} of ${quorum.total} challenge relays complete (quorum ${this.quorum}); missing: ${missingRelays.join(', ')}`;
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
-      historyComplete:this.trade.status.historyComplete&&ready,
-      warnings:[...new Set(relays.flatMap(r=>r.warnings))],
+      historyComplete:this.trade.status.historyComplete&&quorumMet,
+      // A poll round re-reading history already held (R3-4); never part of readiness.
+      pollInProgress:[this.trade,...this.challenges].some(r=>r.status.pollInProgress),
+      warnings:[...new Set([...relays.flatMap(r=>r.warnings),...(degraded?[degradedWarning]:[])])],
       // Display only; never part of readiness or the runner's exhaustion stop.
       applicantsIncomplete:this.challenges.some(r=>r.status.applicantsIncomplete)||!!this.store.applicantsTruncated,
-      error:this.trade.status.error??(failedRelays.length?`Challenge history incomplete; relay failed: ${failedRelays.join(', ')}`:null),failedRelays,relays};
+      // An error only once the quorum cannot be met by the relays still up (a relay still catching
+      // up is not a failure; historyComplete stays false meanwhile).
+      error:this.trade.status.error??(available.length<this.quorum?`Challenge history incomplete; quorum not met (${available.length} of ${quorum.total} challenge relays available, need ${this.quorum}); relay failed: ${failedRelays.filter(u=>u!==this.trade.url).join(', ')}`:null),
+      failedRelays,missingRelays,quorum,degraded,relays};
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}
   stop(){this.trade.stop();for(const r of this.challenges)r.stop();}

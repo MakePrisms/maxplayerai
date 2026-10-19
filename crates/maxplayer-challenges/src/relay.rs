@@ -10,7 +10,8 @@ use nostr_sdk::pool::transport::{
 use nostr_sdk::prelude::*;
 use nostr_sdk::util::BoxedFuture;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -21,6 +22,22 @@ pub const DEFAULT_RELAYS: [&str; 3] = [
     "wss://offchain.pub",
 ];
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// Default challenge relay quorum (run 2 #13): relays that must complete a read, and acknowledge
+/// a publish, for it to count. Same rule as the page/runner (`parseChallengeQuorum` in
+/// `web/app/src/challenge/shared/relay.mjs`): 2, raised to a strict majority for longer lists and
+/// lowered to the list size for one relay. A configured quorum must be a strict majority, so every
+/// quorum read shares at least one relay with every quorum publish.
+pub const DEFAULT_QUORUM: usize = 2;
+pub fn majority(n: usize) -> usize {
+    n / 2 + 1
+}
+pub fn default_quorum(n: usize) -> usize {
+    n.min(DEFAULT_QUORUM.max(majority(n)))
+}
+/// Re-send outbox bounds: entries kept, delivery attempts per missing relay, and age.
+pub const OUTBOX_MAX_ENTRIES: usize = 64;
+pub const OUTBOX_MAX_ATTEMPTS: u32 = 10;
+pub const OUTBOX_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 /// Events per history REQ (the common public-relay cap; same as the page's `PAGE_LIMIT`).
 pub const PAGE_LIMIT: usize = 500;
 /// Most pages one trusted `fetch` may request from one relay. Reaching it with a still-full page
@@ -131,11 +148,72 @@ struct Page {
     received: usize,
     oldest: Option<Timestamp>,
 }
+/// What this invocation saw: relays that completed a read or accepted a publish (the only ones
+/// the outbox re-sends to), degraded-quorum warnings, and events re-sent.
+#[derive(Debug, Default)]
+pub struct Report {
+    pub answered: BTreeSet<String>,
+    pub warnings: Vec<String>,
+    pub missing: BTreeSet<String>,
+    pub resent: Vec<String>,
+}
 pub struct Relays {
     urls: Vec<String>,
+    quorum: usize,
+    report: Mutex<Report>,
 }
 impl Relays {
+    /// Default quorum. Production always goes through [`Self::with_quorum`] with the `--quorum`
+    /// flag; this is the tests' shorthand.
+    #[cfg(test)]
     pub fn new(urls: &[String]) -> Result<Self, String> {
+        Self::with_quorum(urls, None)
+    }
+    /// `quorum` None uses [`default_quorum`]; an explicit value must be a strict majority of the
+    /// (deduplicated) relays and at most their number.
+    pub fn with_quorum(urls: &[String], quorum: Option<usize>) -> Result<Self, String> {
+        let urls = Self::validate(urls)?;
+        let n = urls.len();
+        let quorum = match quorum {
+            None => default_quorum(n),
+            Some(q) if (majority(n)..=n).contains(&q) => q,
+            Some(_) => {
+                return Err(format!(
+                    "invalid --quorum: must be from {} (a majority) to {n} (every relay)",
+                    majority(n)
+                ));
+            }
+        };
+        Ok(Self {
+            urls,
+            quorum,
+            report: Mutex::new(Report::default()),
+        })
+    }
+    pub fn quorum(&self) -> (usize, usize) {
+        (self.quorum, self.urls.len())
+    }
+    /// Relays missing from any read or publish so far in this invocation.
+    pub fn missing(&self) -> BTreeSet<String> {
+        self.report.lock().unwrap().missing.clone()
+    }
+    pub fn take_report(&self) -> Report {
+        std::mem::take(&mut *self.report.lock().unwrap())
+    }
+    fn degraded(&self, what: &str, ok: usize, failed: &[String], missing: &[String]) {
+        let warning = format!(
+            "degraded {what}: {ok} of {} challenge relays (quorum {}); missing: {}",
+            self.urls.len(),
+            self.quorum,
+            failed.join(", ")
+        );
+        let mut report = self.report.lock().unwrap();
+        report.missing.extend(missing.iter().cloned());
+        if !report.warnings.contains(&warning) {
+            report.warnings.push(warning);
+        }
+    }
+    fn validate(urls: &[String]) -> Result<Vec<String>, String> {
         let urls = if urls.is_empty() {
             DEFAULT_RELAYS.iter().map(|s| s.to_string()).collect()
         } else {
@@ -178,7 +256,7 @@ impl Relays {
                 normalized.push(value);
             }
         }
-        Ok(Self { urls: normalized })
+        Ok(normalized)
     }
     async fn client(
         home: &MaxplayerHome,
@@ -220,8 +298,22 @@ impl Relays {
     /// full page (counted in raw relay frames) is never treated as complete. It re-reads from
     /// the oldest in-range second (inclusive `until`), fails the read unless that cursor moves
     /// strictly older, and fails once `MAX_TRUSTED_PAGES` pages were all full.
+    ///
+    /// Quorum read: every relay is asked and every complete answer is unioned (so with all relays
+    /// up, one honest relay is still enough); it succeeds once at least `quorum` relays completed.
     pub async fn fetch(&self, home: &MaxplayerHome, filter: Filter) -> Result<Vec<Event>, String> {
-        self.read(home, filter.limit(PAGE_LIMIT), true)
+        self.read(home, filter.limit(PAGE_LIMIT), true, self.quorum)
+            .await
+            .map(|(events, _)| events)
+    }
+    /// [`Self::fetch`], but every configured relay must complete (no quorum). For a check that
+    /// must not miss an event published below quorum (the minutes-change challenge read).
+    pub async fn fetch_all(
+        &self,
+        home: &MaxplayerHome,
+        filter: Filter,
+    ) -> Result<Vec<Event>, String> {
+        self.read(home, filter.limit(PAGE_LIMIT), true, self.urls.len())
             .await
             .map(|(events, _)| events)
     }
@@ -233,21 +325,31 @@ impl Relays {
         filter: Filter,
     ) -> Result<(Vec<Event>, bool), String> {
         let limit = filter.limit.unwrap_or(PAGE_LIMIT);
-        self.read(home, filter.limit(limit), false).await
+        self.read(home, filter.limit(limit), false, self.quorum)
+            .await
     }
     async fn read(
         &self,
         home: &MaxplayerHome,
         filter: Filter,
         paged: bool,
+        need: usize,
     ) -> Result<(Vec<Event>, bool), String> {
         let mut union = BTreeMap::new();
         let mut failed = Vec::new();
+        let mut missing = Vec::new();
+        let mut ok = 0;
         let mut saturated = false;
         for url in &self.urls {
-            let (client, counter) = Self::client(home, url).await?;
-            let result = Self::read_relay(&client, &counter, &filter, paged).await;
-            client.disconnect().await;
+            // A relay that cannot even be configured is one more missing relay, not a global error.
+            let result = match Self::client(home, url).await {
+                Ok((client, counter)) => {
+                    let result = Self::read_relay(&client, &counter, &filter, paged).await;
+                    client.disconnect().await;
+                    result
+                }
+                Err(_) => Err("could not configure relay"),
+            };
             match result {
                 Ok((events, pages, full)) => {
                     eprintln!(
@@ -255,6 +357,8 @@ impl Relays {
                         events.len()
                     );
                     saturated |= full;
+                    ok += 1;
+                    self.report.lock().unwrap().answered.insert(url.clone());
                     for e in events {
                         union.insert(e.id, e);
                     }
@@ -262,14 +366,40 @@ impl Relays {
                 Err(reason) => {
                     eprintln!("relay {url}: read failed ({reason})");
                     failed.push(format!("{url} ({reason})"));
+                    missing.push(url.clone());
                 }
             }
         }
+        if ok < need {
+            // Below quorum (or, for a strict read, any relay missing): fail closed.
+            return Err(if need == self.urls.len() {
+                format!(
+                    "challenge relay read incomplete; failed: {}",
+                    failed.join(", ")
+                )
+            } else {
+                format!(
+                    "challenge relay read incomplete; quorum not met ({ok} of {} relays complete, need {need}); failed: {}",
+                    self.urls.len(),
+                    failed.join(", ")
+                )
+            });
+        }
         if !failed.is_empty() {
-            return Err(format!(
-                "challenge relay read incomplete; failed: {}",
-                failed.join(", ")
-            ));
+            self.degraded("read", ok, &failed, &missing);
+        }
+        // An event this home published at a bare quorum, whose missing relay has not had it re-sent
+        // yet, is still in the outbox: a quorum read that omits it (the overlapping relay lost it)
+        // still sees it. Trusted reads only; outbox events are own-key and signature-checked.
+        // Pruned first: an entry past its age or attempt bound no longer counts (advisor r1 nit).
+        if paged {
+            let mut outbox = Outbox::load(home);
+            outbox.prune(now());
+            for e in outbox.entries {
+                if filter.match_event(&e.event, Default::default()) {
+                    union.entry(e.event.id).or_insert(e.event);
+                }
+            }
         }
         // Keep all verified versions for eligibility and replacement-timestamp checks; callers
         // select latest per (kind, author, d), never collapse distinct authors sharing a d-tag.
@@ -404,11 +534,10 @@ impl Relays {
             .map_err(|_| "challenge signing failed")?;
         let mut failed = Vec::new();
         for url in &self.urls {
-            let (client, _) = Self::client(home, url).await?;
-            let result = tokio::time::timeout(TIMEOUT, client.send_event(&event)).await;
-            client.disconnect().await;
-            let ok = matches!(result, Ok(Ok(ref output)) if !output.success.is_empty());
-            if !ok {
+            let ok = Self::send(home, url, &event).await;
+            if ok {
+                self.report.lock().unwrap().answered.insert(url.clone());
+            } else {
                 failed.push(url.clone());
             }
             eprintln!(
@@ -420,13 +549,208 @@ impl Relays {
                 }
             );
         }
-        if !failed.is_empty() {
+        let accepted = self.urls.len() - failed.len();
+        if accepted < self.quorum {
+            // Below quorum: the command fails and nothing is queued for re-send (the caller was
+            // told it failed; a later re-send must never publish what they believe was not).
             return Err(format!(
-                "challenge publish incomplete; failed: {}",
+                "challenge publish incomplete; quorum not met ({accepted} of {} relays accepted, need {}); failed: {}",
+                self.urls.len(),
+                self.quorum,
                 failed.join(", ")
             ));
         }
+        if !failed.is_empty() {
+            self.degraded("publish", accepted, &failed, &failed);
+        }
+        // Quorum met: queue this exact signed event for the relays that missed it, to re-send once
+        // they answer again (`resend`). Queueing also drops any older queued version of the same
+        // coordinate (it is superseded). Persisting is best effort: a failure only loses the repair.
+        let path = Outbox::path(home);
+        if !failed.is_empty() || path.exists() {
+            let mut outbox = Outbox::load(home);
+            outbox.queue(&event, &failed, now());
+            if let Err(e) = outbox.save(home) {
+                eprintln!("Warning: could not save the challenge re-send outbox ({e})");
+            }
+        }
         Ok(event.id.to_hex())
+    }
+    /// Send one already-signed event to one relay; true when the relay acknowledged it.
+    async fn send(home: &MaxplayerHome, url: &str, event: &Event) -> bool {
+        let Ok((client, _)) = Self::client(home, url).await else {
+            return false;
+        };
+        let result = tokio::time::timeout(TIMEOUT, client.send_event(event)).await;
+        client.disconnect().await;
+        matches!(result, Ok(Ok(ref output)) if !output.success.is_empty())
+    }
+    /// Re-send queued events (exactly as signed, never re-signed) to the relays that missed them,
+    /// but only to relays that answered a read or accepted a publish in this invocation, so a still
+    /// dead relay costs nothing. Bounded: at most `OUTBOX_MAX_ATTEMPTS` failed sends per relay and
+    /// `OUTBOX_MAX_AGE_SECS` per entry; idempotent: a relay already holding the event just
+    /// acknowledges it again, and an acknowledged relay is removed from the entry.
+    pub async fn resend(&self, home: &MaxplayerHome) {
+        let at = now();
+        let mut outbox = Outbox::load(home);
+        if outbox.entries.is_empty() {
+            return;
+        }
+        // Prune first, with the same `at` as after the sends: an entry past its age or attempt
+        // bound is never sent again, including on the command that expires it (advisor r2).
+        outbox.prune(at);
+        let answered = self.report.lock().unwrap().answered.clone();
+        let mut resent = Vec::new();
+        for entry in &mut outbox.entries {
+            let targets: Vec<String> = entry
+                .missing
+                .keys()
+                .filter(|url| answered.contains(*url))
+                .cloned()
+                .collect();
+            for url in targets {
+                let ok = Self::send(home, &url, &entry.event).await;
+                eprintln!(
+                    "relay {url}: re-send {} {}",
+                    entry.event.id.to_hex(),
+                    if ok { "accepted" } else { "failed" }
+                );
+                if ok {
+                    entry.missing.remove(&url);
+                    resent.push(format!("{} -> {url}", entry.event.id.to_hex()));
+                } else if let Some(n) = entry.missing.get_mut(&url) {
+                    *n += 1;
+                }
+            }
+        }
+        outbox.prune(at);
+        if let Err(e) = outbox.save(home) {
+            eprintln!("Warning: could not save the challenge re-send outbox ({e})");
+        }
+        self.report.lock().unwrap().resent.extend(resent);
+    }
+}
+fn now() -> u64 {
+    Timestamp::now().as_secs()
+}
+/// One event a quorum publish could not deliver everywhere: the exact signed event and, per
+/// relay that missed it, the failed re-send attempts so far.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OutboxEntry {
+    pub event: Event,
+    pub missing: BTreeMap<String, u32>,
+    pub queued_at: u64,
+}
+/// `<home>/challenges/outbox.json` (directory 0700, file 0600, atomic replace).
+///
+/// Not locked: each command loads, changes and atomically replaces the whole file, so a crash never
+/// tears it, but two sidecar processes running at the same time can drop each other's changes
+/// (a queued entry, or a delivery). Both are best-effort repairs; the publish itself already met
+/// the quorum. Run one sidecar command per home at a time to keep every entry.
+#[derive(Debug, Default)]
+pub struct Outbox {
+    pub entries: Vec<OutboxEntry>,
+}
+impl Outbox {
+    pub fn path(home: &MaxplayerHome) -> PathBuf {
+        home.root.join("challenges").join("outbox.json")
+    }
+    /// A missing or unreadable file is an empty outbox; entries whose event fails verification or
+    /// is not signed by this home's key are dropped (a tampered file can never make the sidecar
+    /// send, or read as published, something it did not sign).
+    pub fn load(home: &MaxplayerHome) -> Self {
+        let Ok(own) = keys(home).map(|k| k.public_key()) else {
+            return Self::default();
+        };
+        let Ok(raw) = std::fs::read_to_string(Self::path(home)) else {
+            return Self::default();
+        };
+        let Ok(serde_json::Value::Array(rows)) = serde_json::from_str(&raw) else {
+            return Self::default();
+        };
+        let entries = rows
+            .into_iter()
+            .filter_map(|row| {
+                let event: Event = serde_json::from_value(row.get("event")?.clone()).ok()?;
+                event.verify().ok()?;
+                (event.pubkey == own).then_some(())?;
+                let missing = serde_json::from_value(row.get("missing")?.clone()).ok()?;
+                let queued_at = row.get("queued_at")?.as_u64()?;
+                Some(OutboxEntry {
+                    event,
+                    missing,
+                    queued_at,
+                })
+            })
+            .collect();
+        Self { entries }
+    }
+    pub fn save(&self, home: &MaxplayerHome) -> std::io::Result<()> {
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let path = Self::path(home);
+        let dir = path.parent().expect("outbox has a parent");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        let rows: Vec<_> = self
+            .entries
+            .iter()
+            .map(|e| serde_json::json!({"event": e.event, "missing": e.missing, "queued_at": e.queued_at}))
+            .collect();
+        let tmp = dir.join(format!("outbox.json.{}.tmp", std::process::id()));
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            f.write_all(serde_json::Value::Array(rows).to_string().as_bytes())?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)
+    }
+    fn coordinate(e: &Event) -> (PublicKey, Kind, String) {
+        (
+            e.pubkey,
+            e.kind,
+            e.tags.identifier().unwrap_or_default().to_owned(),
+        )
+    }
+    /// Queue `event` for `missing` relays. An older queued event for the same addressable
+    /// coordinate is superseded (relays keep only the newest), and the oldest entries beyond
+    /// `OUTBOX_MAX_ENTRIES` are dropped.
+    pub fn queue(&mut self, event: &Event, missing: &[String], at: u64) {
+        let key = Self::coordinate(event);
+        self.entries
+            .retain(|e| Self::coordinate(&e.event) != key || e.event.created_at > event.created_at);
+        if self
+            .entries
+            .iter()
+            .any(|e| Self::coordinate(&e.event) == key)
+        {
+            return; // a newer version is already queued
+        }
+        self.entries.push(OutboxEntry {
+            event: event.clone(),
+            missing: missing.iter().map(|u| (u.clone(), 0)).collect(),
+            queued_at: at,
+        });
+        self.prune(at);
+    }
+    /// Drop relays out of attempts, delivered or expired entries, and the oldest over the cap.
+    pub fn prune(&mut self, at: u64) {
+        for e in &mut self.entries {
+            e.missing.retain(|_, n| *n < OUTBOX_MAX_ATTEMPTS);
+        }
+        self.entries.retain(|e| {
+            !e.missing.is_empty() && at.saturating_sub(e.queued_at) <= OUTBOX_MAX_AGE_SECS
+        });
+        self.entries.sort_by_key(|e| e.queued_at);
+        let over = self.entries.len().saturating_sub(OUTBOX_MAX_ENTRIES);
+        self.entries.drain(..over);
     }
 }
 pub(crate) fn keys(home: &MaxplayerHome) -> Result<Keys, String> {
@@ -466,6 +790,10 @@ pub(crate) mod transport_tests {
         pub(crate) url: String,
         pub(crate) writes: Arc<Mutex<Vec<Event>>>,
         pub(crate) reqs: Arc<Mutex<Vec<serde_json::Value>>>,
+        /// false: every new connection is dropped before the WebSocket handshake (relay down).
+        pub(crate) online: Arc<std::sync::atomic::AtomicBool>,
+        /// The `OK` verdict for every EVENT (false: the relay refuses writes).
+        pub(crate) accept: Arc<std::sync::atomic::AtomicBool>,
         task: tokio::task::JoinHandle<()>,
     }
     impl Drop for Fixture {
@@ -555,12 +883,22 @@ pub(crate) mod transport_tests {
         let recorded = writes.clone();
         let reqs = Arc::new(Mutex::new(Vec::new()));
         let filters = reqs.clone();
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let online = Arc::new(AtomicBool::new(true));
+        let accept = Arc::new(AtomicBool::new(accept));
+        let (up, verdict) = (online.clone(), accept.clone());
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
+                if !up.load(Ordering::SeqCst) {
+                    drop(tcp);
+                    continue;
+                }
                 let answer = answer.clone();
                 let recorded = recorded.clone();
                 let filters = filters.clone();
+                let verdict = verdict.clone();
                 tokio::spawn(async move {
+                    let accept = verdict.load(Ordering::SeqCst);
                     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
                     while let Some(Ok(message)) = ws.next().await {
                         let Message::Text(text) = message else {
@@ -622,6 +960,8 @@ pub(crate) mod transport_tests {
             url,
             writes,
             reqs,
+            online,
+            accept,
             task,
         }
     }

@@ -150,3 +150,21 @@ test("page: once revealed, a poll keeps the facts on screen; stale data puts the
   paint(doc, s, live, t, clock(6000));
   assert.ok(revealed(ids));
 });
+
+test("page: quorum (run 2 #13): one challenge relay down with 2 of 3 complete reveals; below quorum stays skeleton", () => {
+  const ch = (down: number) => ["wss://a", "wss://b", "wss://c"].map((url, i) => ({ role: "challenge", url, connected: i >= down, historyComplete: i >= down, error: null }));
+  const trade = { role: "trade", url: "wss://t", connected: true, historyComplete: false, error: null };
+  const relay = (down: number) => ({ connected: true, authenticated: false, historyComplete: false, error: null, quorum: { required: 2, complete: 3 - down, total: 3 }, degraded: down > 0, relays: [trade, ...ch(down)] });
+  let { doc, ids } = page();
+  let t = paint(doc, s, relay(1), { wasLive: false, readyAt: null }, clock(0));
+  assert.ok(revealed(ids), "degraded, quorum met: revealed");
+  assert.equal(ids["challenge-start-label"]!.textContent, "Running now");
+  // A second relay drops: below quorum, back to skeletons at once.
+  t = paint(doc, s, relay(2), t, clock(1000));
+  assert.ok(skeletons(ids), "below quorum: skeletons");
+  // Below quorum from the start never reveals.
+  ({ doc, ids } = page());
+  t = paint(doc, s, relay(2), { wasLive: false, readyAt: null }, clock(0));
+  t = paint(doc, s, relay(2), t, clock(1000));
+  assert.ok(skeletons(ids), "never ready below quorum");
+});

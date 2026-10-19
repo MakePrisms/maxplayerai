@@ -8,8 +8,18 @@ export interface Snapshot {
   challenge: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: Challenge['status']; result: string }|null;
   sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
-  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; warnings?: string[]; applicantsIncomplete?: boolean;
+  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; failedRelays?: string[]; missingRelays?: string[]; degraded?: boolean; quorum?: {required: number; complete: number; total: number}; warnings?: string[]; applicantsIncomplete?: boolean;
     relays?: { role: string; url: string; connected: boolean; historyComplete: boolean; error: string|null }[] };
+}
+// What follows the status word on the relay status line: the relay's own reason (e.g. a CLOSED)
+// at once, unavailable relays, and the reader's warnings. Degraded (run 2 #13: quorum met, a
+// challenge relay missing) stays live; the reader's "Degraded: … missing: …" warning says so.
+function relayDetail(r: Snapshot['relay']): string {
+  return (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : "");
+}
+export function connectionText(r: Snapshot['relay'], status: string): string {
+  const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : status;
+  return connection + relayDetail(r);
 }
 const finite = (v: unknown): v is number => typeof v==='number' && Number.isFinite(v);
 // Fail closed on malformed snapshots; never put remote text into HTML.
@@ -56,19 +66,25 @@ export type LiveState='live'|'updating';
 export function isLive(r: Relay): boolean { return !!r&&r.connected&&r.historyComplete; }
 export function liveState(r: Relay,wasLive: boolean): LiveState { return !!r&&r.connected&&(wasLive||r.historyComplete)?'live':'updating'; }
 // The challenge event (status, window) comes only from the challenge relays, so the hero needs
-// only them: every challenge relay connected, history complete, no error. Trade auth and trade
-// history (which finish ~8-12s later on the real relays) don't gate it. Without per-relay status
-// (demo), the aggregate stands in.
+// only them: at least the reader's quorum (run 2 #13, default 2 of 3) of challenge relays
+// connected, history complete, no error. Degraded (quorum met, one missing) is ready, as it is for
+// the reader; below quorum is not. Without a quorum in the status, every challenge relay is
+// required. Trade auth and trade history (which finish ~8-12s later on the real relays) don't
+// gate it. Without per-relay status (demo), the aggregate stands in.
 const challengeRelays=(r: NonNullable<Relay>)=>r.relays?.filter(x=>x.role==='challenge');
+const required=(r: NonNullable<Relay>,n: number)=>Math.max(1,Math.min(n,r.quorum?.required??n));
 export function challengeReady(r: Relay): boolean {
   if(!r)return false;
   const ch=challengeRelays(r);
-  return ch?ch.length>0&&ch.every(x=>x.connected&&x.historyComplete&&!x.error):r.connected&&r.historyComplete&&!r.error;
+  if(!ch)return r.connected&&r.historyComplete&&!r.error;
+  return ch.length>0&&ch.filter(x=>x.connected&&x.historyComplete&&!x.error).length>=required(r,ch.length);
 }
+// Down: fewer challenge relays up (connected, no error) than the quorum needs.
 function challengeDown(r: Relay): boolean {
   if(!r)return true;
   const ch=challengeRelays(r);
-  return ch?ch.some(x=>!x.connected||!!x.error):!r.connected||!!r.error;
+  if(!ch)return !r.connected||!!r.error;
+  return ch.filter(x=>x.connected&&!x.error).length<required(r,ch.length);
 }
 // Called on every read of the relay status (each receive and each 1s tick). readyAt is the
 // last time the challenge data was ready; a challenge relay dropping or erroring clears it at
@@ -87,8 +103,9 @@ export function renderLiveState(doc: Document,state: LiveState): void {
 }
 export function connectionLine(r: Relay,status: string,wasLive=false): string {
   if(liveState(r,wasLive)!=='live')return UPDATING;
-  // The relay's own reason (e.g. a CLOSED) is shown at once, not only after the reconnect copies it into a warning.
-  return status+(r?.error?` · ${r.error}`:'')+(r?.failedRelays?.length?` · Unavailable: ${r.failedRelays.join(', ')}`:'')+(r?.warnings?.length?` · ${r.warnings.join('; ')}`:'');
+  // Same detail as connectionText (error, unavailable relays, degraded warning); the word stays
+  // "Live" through a routine poll (latched), where connectionText would say catching up.
+  return status+relayDetail(r);
 }
 const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
 // Public page: denied members are not listed. Remote text only ever reaches textContent.
