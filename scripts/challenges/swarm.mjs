@@ -638,7 +638,10 @@ export class Swarm {
       now=this.io.now();
       if(state.status==='preparing')continue;
       if(state.status==='posted' && state.job_id && state.job_id!==j.id){j.id=state.job_id;this.save();continue;}
-      if(Array.isArray(state.claims)&&state.claims.some(cl=>cl?.seller_pubkey===j.seller))this.sellerClaimed(j.seller,j.id,now);
+      // R3-2: a claim un-benches once per job, on the transition. A paid job that was claimed stays
+      // open (and polled) until collected or proven released, even after its slot was freed; its old
+      // claim must not wipe a streak built by the seller's later unclaimed expiries on every poll.
+      if(!j.sawSellerClaim&&Array.isArray(state.claims)&&state.claims.some(cl=>cl?.seller_pubkey===j.seller)){j.sawSellerClaim=now;this.save();this.sellerClaimed(j.seller,j.id,now);}
       const expensive=(state.claim_prices??[]).find(p=>p.seller_pubkey===j.seller&&Number.isSafeInteger(p.amount_sats)&&p.amount_sats>j.args.max_sats);
       if(expensive && j.priceAsked!==expensive.amount_sats) {
         j.priceAsked=expensive.amount_sats;j.outcome=`price too high: asked ${expensive.amount_sats}`;j.ts=now;this.save();

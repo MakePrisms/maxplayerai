@@ -1664,6 +1664,35 @@ test('R3-2: N consecutive unclaimed expiries bench a seller for a cooldown; the 
   assert.equal(Object.values(k.journal.state.days)[0].stop,undefined,kr.join('\n'));
 });
 
+// Advisor r1 H1: a claimed PAID job stays open (polled) until collected or proven released, even
+// after its slot was freed. Its old claim un-benched the seller on every poll, so a streak of later
+// unclaimed expiries never reached the bench. A claim counts once per job, on the transition.
+test('R3-2 (advisor r1 H1): a lingering claim on a slot-freed paid job does not reset the streak of later unclaimed expiries',async()=>{
+  const {EXPIRED_SLOT_GRACE_SECONDS}=await import('./swarm.mjs');
+  const f=fixture(),reports=[];f.io.report=m=>reports.push(m);f.c.benchSeconds=1000;
+  f.snap.sellers=f.snap.sellers.slice(0,1);f.snap.sellers[0].minutesRemaining=100;f.snap.challenge.ends=100000;
+  let n=0;f.setPlan(input=>input.mode==='assess'?{wait:true}:n++?everyone(input):priced(input,5));
+  await f.runner.tick();assert.deepEqual(posts(f).map(([,a])=>[a.amount_sats,a.deadline_unix]),[[5,130]]);
+  // The paid job was claimed (the claim expired) and is never delivered or released: it stays open.
+  const paid=[...f.remote.values()][0];
+  Object.assign(paid,{read_confirmed:true,award_read_confirmed:true,reservation_state:'held',offer:{deadline_unix:130},claims:[{seller_pubkey:'a',live:false,status:'expired'}],results:[],accepted:null});
+  let t=131;f.time(t);await f.runner.tick();
+  const j0=f.journal.state.jobs[0];assert.equal(j0.done,false);assert.equal(j0.sawSellerClaim,131);
+  t=130+EXPIRED_SLOT_GRACE_SECONDS+1;f.time(t);await f.runner.tick();
+  assert.equal(j0.slotFreed,t);assert.equal(j0.done,false,'still open and polled');assert.equal(posts(f).length,2,'seller freed for new work');
+  // Two later assignments expire with no claim while the old paid job is still polled every tick.
+  const expireNew=()=>{for(const r of f.remote.values())if(r!==paid&&!f.journal.state.jobs.find(x=>x.id===r.id)?.done)Object.assign(r,{read_confirmed:true,claims:[],results:[]});};
+  expireNew();t+=31;f.time(t);await f.runner.tick();t+=1;f.time(t);await f.runner.tick();
+  assert.equal(f.journal.state.bench?.a?.streak,1,'first unclaimed expiry counted (not wiped by the old claim)');
+  assert.equal(posts(f).length,3);
+  expireNew();t+=31;f.time(t);await f.runner.tick();t+=1;f.time(t);await f.runner.tick();
+  assert.ok(f.journal.state.bench?.a?.until>t,`benched: ${JSON.stringify(f.journal.state.bench)}`);
+  assert.ok(reports.some(r=>/^Benched seller a for 1000s: 2 consecutive/.test(r)),reports.join('\n'));
+  assert.equal(posts(f).length,3,'benched: no new assignment');
+  assert.equal(j0.done,false,'the old paid job is still polled');
+  assert.ok(!reports.some(r=>r.startsWith('Un-benched seller a: it claimed')),'the old claim does not un-bench');
+});
+
 // R3-5 (round 3): the migration rewrote a 1.27 GB legacy append journal in place, discarding the audit history.
 test('R3-5: migration keeps the legacy journal as events.jsonl.legacy-<timestamp> (link, or copy), reuses it after a crash, never migrates twice',async()=>{
   const {legacyJournalName}=await import('./swarm.mjs');
