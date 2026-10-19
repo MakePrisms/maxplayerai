@@ -402,6 +402,11 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(skill.includes("Tested with seller 0.6.1.") && !/⟨TBD⟩|or later/.test(skill), "tested version, no invented minimum");
   assert.ok(skill.includes("needs every relay, whether or not a swarm run is\n   in progress"), "minutes change needs every relay");
   assert.ok(!/\b300\b/.test(skill), "no unexercised 300-second floor");
+  // bob (2026-10-19 02:08): the --json top-level `challenge` object is `run` (#1176).
+  for (const key of ["`run.buyer`", "`run.goal`", "`run.starts`/`run.ends`", "`run.budget_sats`", '`"run": null`']) {
+    assert.ok(skill.includes(key), `skill reads ${key}`);
+  }
+  assert.ok(!/`challenge\.|"challenge"|the `challenge` object/.test(skill), "no `challenge` JSON field left in the skill");
   assert.equal([...skill.matchAll(/(?<!crates\/)maxplayer-challenges/g)].length, 1, "the old binary name appears only in the existing-members line");
   // bob (2026-10-19 00:49): the CLI is maxplayer-swarm and the day flag is --run.
   const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
