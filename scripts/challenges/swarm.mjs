@@ -337,21 +337,30 @@ export function plannerTimeouts(env=process.env) {
 // Bounded planner history. Results stay oldest-to-newest; the newest `fullResults` keep their full
 // answer, older ones get a `digestChars` digest: the head AND the tail of the text (long reports
 // often put the conclusion last), joined by a marked cut. If the serialized input still exceeds
-// `maxInputChars`, it degrades in this fixed order until it fits: newest answers to digests (oldest
-// first), older answers omitted, then older result entries dropped (oldest first). A dropped entry
-// leaves one compact line in history.droppedIndex (seller | outcome | ts | answer chars), which no
-// later step removes. Every cut is marked in the text and counted in input.history.
+// `maxInputChars`, it degrades in this fixed order until it fits (S-2: it no longer gives up while
+// anything but the fixed parts can still shrink):
+//   1. fewer full results: the newest answers become digests too (oldest of them first);
+//   2. shorter digests: every digest is halved, down to `minDigestChars`;
+//   3. older answers omitted (a marker with the original length), oldest first;
+//   4. the oldest `refusals` feed entries dropped (each refused result is still in `results`);
+//   5. the oldest result entries dropped; each leaves one compact line in history.droppedIndex
+//      (seller | outcome | ts | answer chars);
+//   6. the oldest droppedIndex lines dropped (their count stays in history.droppedIndexOmitted);
+//   7. the oldest rejectedAssignments feedback entries dropped.
+// Every cut is marked in the text and counted in input.history, and history.summary tells the
+// planner in one sentence how many results it is not seeing in full.
 // Non-result inputs are bounded first, whatever the budget, so one huge string cannot push every
 // later call over it: each seller's trackRecord keeps its newest `trackRecordTasks` tasks (counts
-// stay exact; `tasksOmitted`), each with a digested task; running tasks are digested to
+// stay exact; `tasksOmitted`), each with a digested task; running and refused tasks are digested to
 // `fieldChars`; seller name/note to `fieldChars`; advertised tag arrays to 32 values of 200 chars.
-// goal, challenge and plan are buyer/planner-authored and are not cut. Returns null when even that
-// cannot fit.
+// The fixed parts (goal, challenge, plan, seller profiles, running jobs and scalars) are never cut
+// further: returns null only when they alone (plus empty feeds) cannot fit.
 export const TRUNCATION_MARKER = '[truncated:';
 // One droppedIndex field: cut to n chars, then control characters escaped (\n, \r, \t, \uXXXX), so
 // a relay error string cannot span lines and a non-hex seller string cannot grow the line.
 const indexField=(v,n)=>{const s=String(v),c=s.length>n?s.slice(0,n)+'…':s;return c.replace(/[\u0000-\u001f\u007f]/g,ch=>({'\n':'\\n','\r':'\\r','\t':'\\t'})[ch]??`\\u${ch.charCodeAt(0).toString(16).padStart(4,'0')}`);};
-export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000,fieldChars=2000,trackRecordTasks=10}={}) {
+export const MIN_DIGEST_CHARS = 100;
+export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000,fieldChars=2000,trackRecordTasks=10,minDigestChars=MIN_DIGEST_CHARS}={}) {
   const all=input.results??[],total=all.length;
   let fieldsCut=0;
   const cut=(text,n,why)=>{
@@ -373,29 +382,41 @@ export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputC
   };
   const base={...input,
     ...(Array.isArray(input.sellers)?{sellers:input.sellers.map(seller)}:{}),
-    ...(Array.isArray(input.running)?{running:input.running.map(r=>r&&typeof r==='object'?{...r,task:field(r.task,fieldChars,'running task')}:r)}:{})};
-  const digest=r=>({...r,task:cut(r.task,digestChars,'older task'),answer:cut(r.answer,digestChars,'older result digest'),...(typeof r.answer==='string'&&r.answer.length>digestChars?{answerChars:r.answer.length}:{})});
+    ...(Array.isArray(input.running)?{running:input.running.map(r=>r&&typeof r==='object'?{...r,task:field(r.task,fieldChars,'running task')}:r)}:{}),
+    ...(Array.isArray(input.refusals)?{refusals:input.refusals.map(r=>r&&typeof r==='object'?{...r,task:field(r.task,fieldChars,'refused task')}:r)}:{})};
+  let digestNow=digestChars;
+  const digest=r=>({...r,task:cut(r.task,digestNow,'older task'),answer:cut(r.answer,digestNow,'older result digest'),...(typeof r.answer==='string'&&r.answer.length>digestNow?{answerChars:r.answer.length}:{})});
   let results=all.map((r,i)=>i<total-fullResults?digest(r):r);
-  let dropped=0;const droppedIndex=[];
+  let refusals=base.refusals,rejected=base.rejectedAssignments;
+  let dropped=0,indexOmitted=0,refusalsDropped=0,rejectedDropped=0;const droppedIndex=[];
   const build=()=>{
     const full=results.filter(r=>!r.answerChars&&!r.answerOmitted).length;
-    const history={results:total,fullText:Math.min(full,total-dropped),digested:results.filter(r=>r.answerChars).length,answersOmitted:results.filter(r=>r.answerOmitted).length,resultsDropped:dropped,droppedIndex,fieldsCut,fullResultsKept:fullResults,digestChars,maxInputChars,marker:TRUNCATION_MARKER};
-    return {...base,results,history};
+    const digested=results.filter(r=>r.answerChars).length,answersOmitted=results.filter(r=>r.answerOmitted).length,fullText=Math.min(full,total-dropped);
+    const summary=`${total-fullText} of ${total} results are not shown in full: ${digested} digested (head and tail, ${digestNow} chars), ${answersOmitted} with the answer omitted, ${dropped} dropped (${dropped-indexOmitted} listed in droppedIndex${indexOmitted?`, ${indexOmitted} not listed at all`:''})${refusalsDropped?`; ${refusalsDropped} older refusals feed entries dropped`:''}${rejectedDropped?`; ${rejectedDropped} older rejected assignments dropped`:''}`;
+    const history={results:total,fullText,digested,answersOmitted,resultsDropped:dropped,droppedIndex:droppedIndex.slice(indexOmitted),droppedIndexOmitted:indexOmitted,refusalsDropped,rejectedDropped,fieldsCut,fullResultsKept:fullResults,digestChars,digestCharsUsed:digestNow,maxInputChars,marker:TRUNCATION_MARKER,summary};
+    return {...base,results,...(refusals!==undefined?{refusals}:{}),...(rejected!==undefined?{rejectedAssignments:rejected}:{}),history};
   };
   const size=x=>JSON.stringify(x).length;
   let out=build();
-  // Newest answers to digests, oldest of them first.
-  for(let i=Math.max(0,total-fullResults);size(out)>maxInputChars&&i<results.length;i++){results[i]=digest(results[i]);out=build();}
-  // Older answers omitted, oldest first (the newest digests stay).
+  // 1. Fewer full results: newest answers to digests, oldest of them first.
+  for(let i=Math.max(0,total-fullResults);size(out)>maxInputChars&&i<results.length;i++){results[i]=digest(all[i]);out=build();}
+  // 2. Shorter digests (every entry is a digest by now): halve, down to minDigestChars.
+  while(size(out)>maxInputChars&&digestNow>minDigestChars){digestNow=Math.max(minDigestChars,Math.floor(digestNow/2));results=all.map(digest);out=build();}
+  // 3. Older answers omitted, oldest first (the newest digests stay).
   for(let i=0;size(out)>maxInputChars&&i<Math.max(0,results.length-fullResults);i++){
     const r=results[i];results[i]={...r,task:cut(r.task,200,'older task'),answer:`${TRUNCATION_MARKER} answer omitted to fit the planner input budget; ${typeof all[i].answer==='string'?all[i].answer.length:0} chars]`,answerOmitted:true};delete results[i].answerChars;out=build();
   }
-  // Older entries dropped, oldest first; each leaves its index line.
+  // 4. Oldest refusals feed entries (the refused results themselves stay in results).
+  while(size(out)>maxInputChars&&refusals?.length){refusals=refusals.slice(1);refusalsDropped++;out=build();}
+  // 5. Older entries dropped, oldest first; each leaves its index line.
   while(size(out)>maxInputChars&&results.length){
     const o=all[dropped];
     droppedIndex.push(`${indexField(o?.seller,100)} | ${indexField(o?.outcome,200)} | ts ${indexField(o?.ts,20)} | ${typeof o?.answer==='string'?o.answer.length:0} answer chars`);
     results=results.slice(1);dropped++;out=build();
   }
+  // 6. Oldest index lines (counted), 7. oldest rejected-assignment feedback.
+  while(size(out)>maxInputChars&&indexOmitted<droppedIndex.length){indexOmitted++;out=build();}
+  while(size(out)>maxInputChars&&rejected?.length){rejected=rejected.slice(1);rejectedDropped++;out=build();}
   return size(out)>maxInputChars?null:out;
 }
 // get_job fields the budget release proofs (expired paid jobs) depend on. They first reached main
@@ -756,6 +777,36 @@ export const RUN_STARTED_UPDATE = 'Run started: the runner moved it from schedul
 // seconds, and at once when a condition changes. After the window has ended it is logged only on
 // a change (the runner stays up for later days).
 export const NOT_PLANNING_LOG_SECONDS = 60;
+// S-2 (run feedback: 171 planner calls in 2.5 h): `assign` was called on EVERY tick that passed the
+// posting gate, including ticks with an empty free roster (every seller busy) and ticks where
+// nothing had changed since the last call. It is now called only when its input would meaningfully
+// differ from the last call (plannerFactChanges), on the first call of a day (and after a runner
+// restart), after a failed call (retried next tick, as before), or once SWARM_PLANNER_IDLE_SECONDS
+// (default 600; 0 = every tick) passed without a change, so the planner can still declare solved
+// or close with every seller busy. An empty roster with nothing else changed is "no change". Stops
+// that do not depend on the planner (work window ended, exhaustion) run every tick as before.
+export const DEFAULT_PLANNER_IDLE_SECONDS = 600;
+export const PLANNER_SKIP_LOG_SECONDS = 60;
+const factHash = v => createHash('sha256').update(JSON.stringify(v??null)).digest('hex').slice(0,16);
+// What changed between two ticks' assign facts (see Swarm.assignTrigger), as reasons. Only changes
+// that can change the planner's decision count: a seller leaving the free roster (it was just
+// given work), a newly posted job or reservations this runner just made are not reasons.
+export function plannerFactChanges(prev,cur) {
+  const out=[];
+  if(prev.results!==cur.results)out.push('new result or refusal');
+  if(cur.free.some(s=>!prev.free.includes(s)))out.push('seller became free');
+  if(prev.eligible!==cur.eligible)out.push('seller became eligible or left');
+  if(prev.running.some(id=>!cur.running.includes(id)))out.push('job finished or expired');
+  if(prev.plan!==cur.plan)out.push('plan changed');
+  if(prev.budgetTotalSats!==cur.budgetTotalSats||cur.headroomSats>prev.headroomSats)out.push('budget changed');
+  if(Object.entries(cur.minutes).some(([s,m])=>s in prev.minutes&&prev.minutes[s]!==m))out.push('donated minutes changed');
+  if(prev.benched!==cur.benched)out.push('bench changed');
+  // Feedback the planner has not seen yet (its last batch's rejections), once: the same rejections
+  // again (times and numbers aside) are no change, so a planner that repeats them is not re-asked.
+  if(prev.rejected!==cur.rejected&&cur.rejected!=='none')out.push('assignments rejected (new feedback)');
+  if(prev.context!==cur.context)out.push('challenge or runner context changed');
+  return out;
+}
 // Every `starts` a day was started for (bounded), plus the last record in day.started.
 export const STARTED_STARTS_KEPT = 32;
 export const wasStarted = (day,starts) => day?.started?.starts===starts||(Array.isArray(day?.startedStarts)&&day.startedStarts.includes(starts));
@@ -822,7 +873,43 @@ export function notPlanningLine({c,snap,now,day={}}) {
   return {key:parts.map(p=>p[0]).join('|'),line:`not planning (run ${c.id}): ${parts.map(p=>p[1]).join(' · ')}`};
 }
 export class Swarm {
-  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;this.stuckRechecked=new Set();}
+  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;this.stuckRechecked=new Set();this.cadence=new Map();}
+  // S-2: why this tick must call `assign` (a short reason), or null to skip it. In memory per day:
+  // a restarted runner makes its first call at once. See DEFAULT_PLANNER_IDLE_SECONDS.
+  assignTrigger(key,{c,day,snap,jobs,candidates,decision,bench,resultVersion},now) {
+    const facts={results:resultVersion,free:candidates.map(s=>s.seller_pubkey).sort(),
+      eligible:factHash((snap.sellers??[]).filter(eligibleSeller).map(s=>s.pubkey).sort()),
+      // Local jobs by request id (stable from intent through deferral to post), relay-only by offer id.
+      running:[...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>j.args?.request_id??j.id),...(snap.jobs??[]).filter(j=>j.running).map(j=>j.id)],
+      plan:factHash(day.plan),budgetTotalSats:snap.budget?.totalSats??null,headroomSats:decision.budgetHeadroomSats,
+      minutes:Object.fromEntries(candidates.map(s=>[s.seller_pubkey,Math.floor(s.remainingMinutes)])),
+      benched:factHash(bench.map(b=>b.seller).sort()),
+      rejected:day.rejected?.length?factHash(day.rejected.map(r=>[r.seller,r.workstream,r.amountSats,String(r.reason).replace(/\d+/g,'#')])):'none',
+      context:factHash([c.goal,c.ends,c.status,this.c.taskContext??null,this.releaseMissing??null])};
+    const cad=this.cadence.get(key);
+    if(!cad){this.cadence.set(key,{facts,pending:new Set(),calledAt:null,failed:false,skipped:0});return 'first call of the day';}
+    for(const x of plannerFactChanges(cad.facts,facts))cad.pending.add(x);
+    cad.facts=facts;
+    if(cad.failed||cad.calledAt===null)return 'retry after a failed call';
+    if(cad.pending.size)return [...cad.pending].join(', ');
+    const idle=this.c.plannerIdleSeconds??DEFAULT_PLANNER_IDLE_SECONDS,quiet=now-cad.calledAt;
+    if(quiet>=idle)return `no change for ${span(quiet)} (SWARM_PLANNER_IDLE_SECONDS ceiling)`;
+    cad.skipped++;
+    if(!(now-(cad.skipLoggedAt??-Infinity)<PLANNER_SKIP_LOG_SECONDS)) {
+      cad.skipLoggedAt=now;
+      this.io.report?.(`Planner assign skipped: no change since the last call ${span(quiet)} ago (${facts.free.length} free seller${facts.free.length===1?'':'s'}, ${facts.running.length} running job${facts.running.length===1?'':'s'}); next call on a change, at the latest in ${span(idle-quiet)}; ${cad.skipped} skipped this day since the runner started`);
+    }
+    return null;
+  }
+  // Records an assign call: pending changes are consumed; the plan the response left is the new base.
+  assignCalled(key,day,now,ok) {
+    const cad=this.cadence.get(key);if(!cad)return;
+    cad.pending.clear();cad.calledAt=now;cad.failed=!ok;cad.facts={...cad.facts,plan:factHash(day.plan)};
+  }
+  plannerCallsText(key,day) {
+    const n=day.plannerCalls??{},total=Object.values(n).reduce((a,b)=>a+(Number.isSafeInteger(b)?b:0),0);
+    return `planner calls today: ${total} (analyze ${n.analyze??0}, assign ${n.assign??0}, assess ${n.assess??0}); assign skipped (no change) ${this.cadence.get(key)?.skipped??0} since the runner started`;
+  }
   // R3-8: is a stuck payment due for its one re-check collect? (See PAYMENT_STUCK_RECHECK_MIN_SECONDS.)
   stuckRecheckDue(j,now) {
     const s=j.paymentStuck;
@@ -1178,7 +1265,7 @@ export class Swarm {
     const running=()=>[
       ...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>({jobId:j.id??null,...quotedIds(j),seller:j.seller,workstream:j.workstream??null,task:jobTask(j),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
       ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
-    const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)))=>{
+    const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)),trigger=null)=>{
       const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
         running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
         maxTaskBytes:MAX_TASK_BYTES,budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now(),
@@ -1189,8 +1276,10 @@ export class Swarm {
         ...(refusals.length?{refusals}:{}),
         ...(this.releaseMissing?.length?{paidWorkRefused:`buyer get_job lacks ${this.releaseMissing.join(', ')}; assign only amountSats 0`}:{})};
       const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
-      if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result answer omitted`);
+      if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result, refusal and rejected assignment dropped: its fixed parts (goal, challenge, plan, seller profiles, running jobs) alone do not fit`);
       const chars=JSON.stringify(input).length,h=input.history,started=Date.now();let ok=false;
+      // S-2: calls per day and mode (journaled), counted when the planner command is run.
+      const calls=day.plannerCalls??={analyze:0,assign:0,assess:0};calls[mode]=(calls[mode]??0)+1;this.save();
       try {
         let p;
         try {p=validatePlan(await this.io.plan(input),mode);}
@@ -1216,7 +1305,7 @@ export class Swarm {
         if(cleared||next)this.save();
         return p;
       } finally {
-        this.io.report?.(`Planner ${mode} ${ok?'ok':'failed'} in ${((Date.now()-started)/1000).toFixed(1)}s; input ${chars} chars, results ${h.results} (${h.fullText} full, ${h.digested} digested, ${h.answersOmitted} answers omitted, ${h.resultsDropped} dropped)`);
+        this.io.report?.(`Planner ${mode} ${ok?'ok':'failed'} in ${((Date.now()-started)/1000).toFixed(1)}s; input ${chars} chars, results ${h.results} (${h.fullText} full, ${h.digested} digested, ${h.answersOmitted} answers omitted, ${h.resultsDropped} dropped)${h.digestCharsUsed<h.digestChars?`, digests cut to ${h.digestCharsUsed} chars`:''}; ${mode} call ${calls[mode]} today${trigger?` (trigger: ${trigger})`:''}; ${this.plannerCallsText(key,day)}`);
       }
     };
     const planGate=ready&&c.status==='in_progress'&&now>=c.starts&&now<c.ends;
@@ -1236,75 +1325,83 @@ export class Swarm {
       if(now>=c.ends)stop('Unsolved: work window ended');
       else if(!decision.reasons.length) {
         const candidates=decision.sellers.filter(s=>s.postingAllowed&&s.deadlineUnix<=c.ends&&!benchedSet.has(s.seller_pubkey));
-        // R3-7: the plan this assign call is SENT with. A response may revise the plan (saved in
-        // ask()); its assignments are valid against either the plan the planner was shown in this
-        // call or the revision it returned with them, never only the post-call day.plan.
-        const sentPlan=day.plan;
-        const p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)));
-        const planIds=new Set([...(sentPlan?.workstreams??[]),...(p.plan?.workstreams??[])].map(w=>w?.id).filter(id=>typeof id==='string'));
-        if(p.solved)stop(p.summary??'Solved',p.result);
-        let budgetRejected=0;
-        // Replaced by every assign batch (journaled with the next save), shown to the planner on its next calls.
-        const hadRejected=!!day.rejected?.length,rejected=day.rejected=[];
-        for(const assignment of p.assignments??[]) {
-          const {seller,workstream,task,durationSeconds}=assignment??{};let {amountSats=0}=assignment??{};
-          let raised=null;
-          const reject=reason=>{
-            if(raised!==null)reason=`${raised.reason}; auto-raise to ${amountSats} sats refused: ${reason}`;
-            if(rejected.length<MAX_REJECTED_FEEDBACK)rejected.push({seller:String(seller).slice(0,100),workstream:String(workstream).slice(0,100),amountSats:assignment?.amountSats??0,reason:String(reason).slice(0,500),at:now});
-            this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
-          };
-          if(!Number.isSafeInteger(amountSats)||amountSats<0){reject(`amountSats must be a nonnegative safe integer (got ${JSON.stringify(assignment?.amountSats??null).slice(0,40)})`);continue;}
-          // R3-1: a paid seller never claims below its advertised rate, so the job would only expire.
-          const below=belowSellerMinimum(sellerPricing(snap.sellers.find(x=>x.pubkey===seller)),amountSats);
-          if(below) {
-            const minimum=sellerPricing(snap.sellers.find(x=>x.pubkey===seller)).minimumSats;
-            if(!this.c.autoRaiseToRate||minimum===null){reject(below);continue;}
-            raised={from:amountSats,reason:below};amountSats=minimum;
-            this.io.report?.(`Raising assignment for ${String(seller)} from ${raised.from} to ${amountSats} sats (SWARM_AUTO_RAISE_TO_RATE): ${below}`);
+        // S-2: assign only when its input would meaningfully differ from the last call (or the
+        // ceiling passed); see assignTrigger. Skipping it leaves rejectedAssignments untouched.
+        const trigger=this.assignTrigger(key,{c,day,snap,jobs,candidates,decision,bench,resultVersion},now);
+        if(trigger) {
+          // R3-7: the plan this assign call is SENT with. A response may revise the plan (saved in
+          // ask()); its assignments are valid against either the plan the planner was shown in this
+          // call or the revision it returned with them, never only the post-call day.plan.
+          const sentPlan=day.plan;
+          let p;
+          try{p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)),trigger);}
+          catch(e){this.assignCalled(key,day,now,false);throw e;}
+          this.assignCalled(key,day,now,true);
+          const planIds=new Set([...(sentPlan?.workstreams??[]),...(p.plan?.workstreams??[])].map(w=>w?.id).filter(id=>typeof id==='string'));
+          if(p.solved)stop(p.summary??'Solved',p.result);
+          let budgetRejected=0;
+          // Replaced by every assign batch (journaled with the next save), shown to the planner on its next calls.
+          const hadRejected=!!day.rejected?.length,rejected=day.rejected=[];
+          for(const assignment of p.assignments??[]) {
+            const {seller,workstream,task,durationSeconds}=assignment??{};let {amountSats=0}=assignment??{};
+            let raised=null;
+            const reject=reason=>{
+              if(raised!==null)reason=`${raised.reason}; auto-raise to ${amountSats} sats refused: ${reason}`;
+              if(rejected.length<MAX_REJECTED_FEEDBACK)rejected.push({seller:String(seller).slice(0,100),workstream:String(workstream).slice(0,100),amountSats:assignment?.amountSats??0,reason:String(reason).slice(0,500),at:now});
+              this.io.report?.(`Rejected assignment for ${String(seller)}: ${reason}`);
+            };
+            if(!Number.isSafeInteger(amountSats)||amountSats<0){reject(`amountSats must be a nonnegative safe integer (got ${JSON.stringify(assignment?.amountSats??null).slice(0,40)})`);continue;}
+            // R3-1: a paid seller never claims below its advertised rate, so the job would only expire.
+            const below=belowSellerMinimum(sellerPricing(snap.sellers.find(x=>x.pubkey===seller)),amountSats);
+            if(below) {
+              const minimum=sellerPricing(snap.sellers.find(x=>x.pubkey===seller)).minimumSats;
+              if(!this.c.autoRaiseToRate||minimum===null){reject(below);continue;}
+              raised={from:amountSats,reason:below};amountSats=minimum;
+              this.io.report?.(`Raising assignment for ${String(seller)} from ${raised.from} to ${amountSats} sats (SWARM_AUTO_RAISE_TO_RATE): ${below}`);
+            }
+            if(amountSats>0) {
+              let ok;try{ok=await this.releaseSupport();}catch(e){reject(`priced work refused: cannot verify buyer get_job release fields (${e.message})`);continue;}
+              if(!ok){reject(`priced work refused: buyer get_job lacks ${this.releaseMissing.join(', ')} (needs a buyer built from main at or after 7a14298d)`);continue;}
+            }
+            if(benchedSet.has(seller)){const b=benchedSet.get(seller);reject(`seller benched until ${b.until}: ${b.reason}`);continue;}
+            if(!candidates.some(s=>s.seller_pubkey===seller)){reject(`seller busy or ineligible (not in free roster): ${this.notFreeReason(snap,key,now,seller,min,c)}`);continue;}
+            if(typeof task!=='string'||!task.trim()){reject('invalid task (empty or not text)');continue;}
+            if(!planIds.has(workstream)){const stale=(day.retiredWorkstreams??[]).includes(workstream);reject(`${stale?'stale':'unknown'} workstream ${JSON.stringify(String(workstream)).slice(0,120)}${stale?' (it was in an earlier plan; a later revision dropped it)':''}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})`);continue;}
+            // R3-3 (c): a seller that refused this workstream is not given it again under the same
+            // operator context (a changed SWARM_TASK_CONTEXT may be what lets it proceed).
+            const refusedBy=jobs.find(j=>j.outcome==='refused'&&j.seller===seller&&j.workstream===workstream&&sameContext(j));
+            if(refusedBy){reject(`seller refused workstream ${JSON.stringify(String(workstream)).slice(0,120)} (job ${refusedBy.id}: ${String(refusedBy.refusal?.reason??'').slice(0,200)}); assign it to a different seller`);continue;}
+            if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject(`duration outside configured bounds: durationSeconds ${JSON.stringify(durationSeconds??null).slice(0,40)} not in ${min}..${max}`);continue;}
+            // R4-1 (b): quoted earlier answers (this challenge, collected, this journal only).
+            const quote=quoteAnswers(assignment.includeAnswers,this.state.jobs,key);
+            if(quote.error){reject(quote.error);continue;}
+            // Round 4: hard cap on the assembled task, checked before any post or reservation.
+            const reportBack=!hasReportBack(task);
+            const postedTask=composeTask(challengeTaskPrefix(c.buyer,c.id),task,{quoted:quote.block,reportBack,context:this.c.taskContext});
+            const tooLarge=taskTooLarge(postedTask,{task,quoted:quote.block,context:this.c.taskContext});
+            if(tooLarge){reject(tooLarge);continue;}
+            // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
+            const fresh=await this.io.snapshot(),at=this.io.now();
+            const reasons=this.admission(fresh,c,seller,durationSeconds,amountSats,at);
+            // Transient readiness alone (relay gap and/or a stale read after a slow plan) defers
+            // (journaled, no offer, no budget held); any other reason drops.
+            const deferred=reasons.length>0&&reasons.every(r=>TRANSIENT_REASONS.includes(r));
+            if(reasons.length&&!deferred){if(reasons.includes('budget_exceeded'))budgetRejected++;reject(`${reasons.join(', ')} (amountSats ${amountSats}, durationSeconds ${durationSeconds}, deadline ${at+durationSeconds}, work window ends ${fresh.challenge?.ends??'?'})`);continue;}
+            const sequence=jobs.filter(j=>j.seller===seller).length+1;
+            const args={task:postedTask,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
+            const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args,reportBack,...(quote.jobs.length?{quoted:{jobs:quote.jobs,chars:quote.block.length}}:{}),...(this.c.taskContext?{taskContext:this.c.taskContext}:{})};
+            if(quote.jobs.length)this.io.report?.(`Assignment for ${seller} quotes ${quote.jobs.map(q=>`${q.id} (${q.chars} chars${q.truncated?', truncated':''})`).join(', ')}`);
+            if(deferred) {
+              Object.assign(j,{deferred:true,deferredAt:at});this.state.jobs.push(j);jobs.push(j);this.save();
+              this.io.report?.(`Deferred assignment for ${seller}: ${reasons.join(', ')}; retrying once the relay snapshot is ready and fresh`);continue;
+            }
+            this.state.jobs.push(j);jobs.push(j);this.save();
+            const posted=await this.post(args);j.id=posted.job_id??posted.preparation_id;
+            if(!j.id)throw Error('Post returned no job or preparation id');this.save();
           }
-          if(amountSats>0) {
-            let ok;try{ok=await this.releaseSupport();}catch(e){reject(`priced work refused: cannot verify buyer get_job release fields (${e.message})`);continue;}
-            if(!ok){reject(`priced work refused: buyer get_job lacks ${this.releaseMissing.join(', ')} (needs a buyer built from main at or after 7a14298d)`);continue;}
-          }
-          if(benchedSet.has(seller)){const b=benchedSet.get(seller);reject(`seller benched until ${b.until}: ${b.reason}`);continue;}
-          if(!candidates.some(s=>s.seller_pubkey===seller)){reject(`seller busy or ineligible (not in free roster): ${this.notFreeReason(snap,key,now,seller,min,c)}`);continue;}
-          if(typeof task!=='string'||!task.trim()){reject('invalid task (empty or not text)');continue;}
-          if(!planIds.has(workstream)){const stale=(day.retiredWorkstreams??[]).includes(workstream);reject(`${stale?'stale':'unknown'} workstream ${JSON.stringify(String(workstream)).slice(0,120)}${stale?' (it was in an earlier plan; a later revision dropped it)':''}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})`);continue;}
-          // R3-3 (c): a seller that refused this workstream is not given it again under the same
-          // operator context (a changed SWARM_TASK_CONTEXT may be what lets it proceed).
-          const refusedBy=jobs.find(j=>j.outcome==='refused'&&j.seller===seller&&j.workstream===workstream&&sameContext(j));
-          if(refusedBy){reject(`seller refused workstream ${JSON.stringify(String(workstream)).slice(0,120)} (job ${refusedBy.id}: ${String(refusedBy.refusal?.reason??'').slice(0,200)}); assign it to a different seller`);continue;}
-          if(!Number.isSafeInteger(durationSeconds)||durationSeconds<min||durationSeconds>max){reject(`duration outside configured bounds: durationSeconds ${JSON.stringify(durationSeconds??null).slice(0,40)} not in ${min}..${max}`);continue;}
-          // R4-1 (b): quoted earlier answers (this challenge, collected, this journal only).
-          const quote=quoteAnswers(assignment.includeAnswers,this.state.jobs,key);
-          if(quote.error){reject(quote.error);continue;}
-          // Round 4: hard cap on the assembled task, checked before any post or reservation.
-          const reportBack=!hasReportBack(task);
-          const postedTask=composeTask(challengeTaskPrefix(c.buyer,c.id),task,{quoted:quote.block,reportBack,context:this.c.taskContext});
-          const tooLarge=taskTooLarge(postedTask,{task,quoted:quote.block,context:this.c.taskContext});
-          if(tooLarge){reject(tooLarge);continue;}
-          // Planning and earlier posts may be slow: recheck EVERY assignment and reservation.
-          const fresh=await this.io.snapshot(),at=this.io.now();
-          const reasons=this.admission(fresh,c,seller,durationSeconds,amountSats,at);
-          // Transient readiness alone (relay gap and/or a stale read after a slow plan) defers
-          // (journaled, no offer, no budget held); any other reason drops.
-          const deferred=reasons.length>0&&reasons.every(r=>TRANSIENT_REASONS.includes(r));
-          if(reasons.length&&!deferred){if(reasons.includes('budget_exceeded'))budgetRejected++;reject(`${reasons.join(', ')} (amountSats ${amountSats}, durationSeconds ${durationSeconds}, deadline ${at+durationSeconds}, work window ends ${fresh.challenge?.ends??'?'})`);continue;}
-          const sequence=jobs.filter(j=>j.seller===seller).length+1;
-          const args={task:postedTask,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
-          const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args,reportBack,...(quote.jobs.length?{quoted:{jobs:quote.jobs,chars:quote.block.length}}:{}),...(this.c.taskContext?{taskContext:this.c.taskContext}:{})};
-          if(quote.jobs.length)this.io.report?.(`Assignment for ${seller} quotes ${quote.jobs.map(q=>`${q.id} (${q.chars} chars${q.truncated?', truncated':''})`).join(', ')}`);
-          if(deferred) {
-            Object.assign(j,{deferred:true,deferredAt:at});this.state.jobs.push(j);jobs.push(j);this.save();
-            this.io.report?.(`Deferred assignment for ${seller}: ${reasons.join(', ')}; retrying once the relay snapshot is ready and fresh`);continue;
-          }
-          this.state.jobs.push(j);jobs.push(j);this.save();
-          const posted=await this.post(args);j.id=posted.job_id??posted.preparation_id;
-          if(!j.id)throw Error('Post returned no job or preparation id');this.save();
+          if(rejected.length||hadRejected)this.save();
+          if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         }
-        if(rejected.length||hadRejected)this.save();
-        if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
         // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
         // history) and those sellers' state. Metadata caps and the applicant list never block it.
         // R3-2: neither a benched seller (cooldown ends) nor a seller re-probing a dropped harness
@@ -1334,7 +1431,10 @@ export class Swarm {
       try {
         const stuck=this.state.jobs.filter(j=>j.key===key&&j.paymentStuck).length;
         const refusedCount=results.filter(r=>r.outcome==='refused').length;
-        if(await this.publishChallenge(day,c,null,`${results.length-refusedCount} results recorded; ${refusedCount?`${refusedCount} refused by sellers (not counted as work); `:''}${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running${stuck?`; ${stuck} payment${stuck>1?'s':''} stuck awaiting the operator (wallet reconcile)`:''}`)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();}
+        const update=`${results.length-refusedCount} results recorded; ${refusedCount?`${refusedCount} refused by sellers (not counted as work); `:''}${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running${stuck?`; ${stuck} payment${stuck>1?'s':''} stuck awaiting the operator (wallet reconcile)`:''}`;
+        if(await this.publishChallenge(day,c,null,update)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();
+          // S-2: the planner call count goes to the runner log only, not into the public update.
+          this.io.report?.(`Progress ${c.id}: ${this.plannerCallsText(key,day)}`);}
       } catch(e) {
         if(e.journalFailure)throw e;
         day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();
@@ -1404,7 +1504,7 @@ export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
   const flag=(name,value)=>{const v=String(value??'').trim().toLowerCase();if(['','0','false','no','off'].includes(v))return false;if(['1','true','yes','on'].includes(v))return true;throw Error(`Invalid ${name}: use 1/true/yes/on or 0/false/no/off`);};
-  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),benchAfterUnclaimed:+(env.SWARM_BENCH_AFTER_UNCLAIMED??DEFAULT_BENCH_AFTER_UNCLAIMED),benchSeconds:+(env.SWARM_BENCH_SECONDS??DEFAULT_BENCH_SECONDS),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000)};
+  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),benchAfterUnclaimed:+(env.SWARM_BENCH_AFTER_UNCLAIMED??DEFAULT_BENCH_AFTER_UNCLAIMED),benchSeconds:+(env.SWARM_BENCH_SECONDS??DEFAULT_BENCH_SECONDS),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000),plannerIdleSeconds:+(env.SWARM_PLANNER_IDLE_SECONDS??DEFAULT_PLANNER_IDLE_SECONDS)};
   c.challengeQuorum=parseChallengeQuorum(env.SWARM_CHALLENGE_QUORUM,c.challengeRelays.length);
   // R3-3 (a): operator task context, inline or from a file (not both).
   if(env.SWARM_TASK_CONTEXT!==undefined&&env.SWARM_TASK_CONTEXT_FILE!==undefined)throw Error('Set SWARM_TASK_CONTEXT or SWARM_TASK_CONTEXT_FILE, not both');
@@ -1416,6 +1516,7 @@ export function config(argv,env=process.env) {
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
   for(const k of ['plannerDigestChars','plannerMaxInputChars'])if(!Number.isSafeInteger(c[k])||c[k]<100)throw Error(`Invalid ${k}`);
+  if(!Number.isSafeInteger(c.plannerIdleSeconds)||c.plannerIdleSeconds<0)throw Error('Invalid SWARM_PLANNER_IDLE_SECONDS: must be an integer >= 0 (0 calls assign on every tick)');
   if(!c.home||!c.url)throw Error('Explicit buyer home and relay URL required');
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
   for(const k of ['duration','minDuration','maxDuration','poll','updateEvery','awardAfter','maxDefer'])if(!Number.isSafeInteger(c[k])||c[k]<1)throw Error(`Invalid ${k}`);
