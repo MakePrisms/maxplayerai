@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual full run. The maxplayer-trade jobs always run on push and dispatch; only pull requests
+  # are filtered (see trade-changes).
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -288,15 +291,110 @@ jobs:
   # though production trading is wallet-only. No test here reaches a real mint, wallet or relay:
   # every mint is a loopback fixture, and `lab` timing controls refuse non-loopback mints.
   #
+  # It used to be one job, ~63 minutes (default suite ~13 min + lab suite ~49 min, both
+  # --test-threads=1). It is now four jobs:
+  #   trade-changes          decides whether trading code changed (PRs only; push/dispatch always run)
+  #   maxplayer-trade-lint   fmt, the matrix guard, clippy (default + lab), and the shared cache build
+  #   maxplayer-trade-test   the default and lab suites, one matrix entry per test group
+  #   maxplayer-trade        aggregate that keeps the old check name, so anything keyed on it holds
+  #
+  # The trade jobs are skipped with a job-level `if:` rather than a workflow `paths:` filter: a job
+  # skipped by `if:` reports success, so a required check on it can never leave a PR waiting.
+  trade-changes:
+    name: maxplayer-trade change filter
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.filter.outputs.run }}
+    env:
+      # maxplayer-trade's local dependencies, followed recursively from the `path =` entries:
+      #   crates/maxplayer-trade  -> maxplayer-core (dependency), maxplayer-mint (dev-dependency)
+      #   crates/maxplayer-core   -> crates/buzz/crates/maxplayer-private-protocol; it also inherits
+      #                              version/edition/dependencies from the root Cargo.toml
+      #   crates/maxplayer-mint   -> maxplayer-core (already listed)
+      #   maxplayer-private-protocol -> nothing; a member of the crates/buzz workspace
+      # tests/auth_gated.rs includes crates/maxplayer-core/tests/support via #[path]; covered above.
+      # The trade Cargo.lock is crates/maxplayer-trade/Cargo.lock. There is no rust-toolchain file or
+      # .cargo/ config today; they are listed so adding one re-runs trading.
+      # `dir/` matches a prefix, anything else one exact path. scripts/verify-trade-test-matrix.py
+      # (run by the lint job) fails if a local package or its workspace manifest is not covered here.
+      TRADE_PATHS: >-
+        crates/maxplayer-trade/
+        crates/maxplayer-core/
+        crates/maxplayer-mint/
+        crates/buzz/crates/maxplayer-private-protocol/
+        Cargo.toml
+        crates/buzz/Cargo.toml
+        rust-toolchain
+        rust-toolchain.toml
+        .cargo/
+        .github/workflows/ci.yml
+        scripts/verify-trade-test-matrix.py
+    steps:
+      # A pull_request run checks out the merge commit refs/pull/N/merge: its first parent is the
+      # base branch tip and its diff against that parent is exactly what merging the PR changes.
+      - uses: actions/checkout@v4
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+      - name: Did trading code change?
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          decide() {
+            echo "run=$1" >>"$GITHUB_OUTPUT"
+            echo "maxplayer-trade run=$1: $2" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          if [ "$EVENT" != pull_request ]; then
+            decide true "$EVENT event, the trade jobs always run"
+            exit 0
+          fi
+          if ! git rev-parse -q --verify 'HEAD^2' >/dev/null; then
+            echo "::warning::HEAD is not a PR merge commit; running the trade jobs"
+            decide true "no merge commit to diff"
+            exit 0
+          fi
+          covered() {
+            local p
+            for p in $TRADE_PATHS; do
+              if [[ "$p" == */ ]]; then
+                if [[ "$1" == "$p"* ]]; then return 0; fi
+              elif [[ "$1" == "$p" ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+          changed="$(git diff --no-renames --name-only 'HEAD^1' HEAD)"
+          hits=()
+          while IFS= read -r f; do
+            if [ -n "$f" ] && covered "$f"; then hits+=("$f"); fi
+          done <<<"$changed"
+          echo "Changed files: $(grep -c . <<<"$changed" || true); trading paths among them: ${#hits[@]}"
+          if [ "${#hits[@]}" -gt 0 ]; then
+            printf '  %s\n' "${hits[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
+            decide true "${#hits[@]} trading path(s) changed"
+          else
+            decide false "no trading path changed; the trade jobs are skipped"
+          fi
+
   # Clippy runs with -D warnings. The -A list names the lint classes that were already present
   # when this job was added (collapsible `if`, wide money-path signatures, one no-op struct update,
   # fixture slice clones, one constant assertion); allowing them by name keeps every OTHER lint a
   # hard failure without restyling reviewed money code in the same change.
   #
-  # The lab suite (`--features lab`, TRADE_LAB_SECONDS=1 short deadlines) is where refund/claim
-  # recovery, slow/dead-mint and deadline regressions live; the default suite compiles them out.
-  maxplayer-trade:
-    name: maxplayer-trade (fmt, clippy, default + lab tests)
+  # Cache: every trade job uses shared-key `maxplayer-trade` (the key the single job used to save
+  # under), so they all restore one dependency build. Only this job saves it, after it has built
+  # both the clippy and the test artifacts; the test jobs only restore. Otherwise whichever job
+  # finished first would save, and a clippy-only cache would make every test job rebuild its deps.
+  # Each test job still compiles the trade crate and its own test binaries once.
+  maxplayer-trade-lint:
+    name: maxplayer-trade fmt, clippy, matrix guard
+    needs: trade-changes
+    if: needs.trade-changes.outputs.run == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -312,21 +410,215 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
+          shared-key: maxplayer-trade
           workspaces: crates/maxplayer-trade -> target
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: cargo fmt --check
         run: cargo fmt --manifest-path "$TRADE_MANIFEST" --check
+      # Every test target, plus the lib/bin/doc tests, runs exactly once per suite in the matrix
+      # below, and every local dependency is covered by trade-changes. A new tests/*.rs file that
+      # is not added to the matrix turns this red instead of silently never running.
+      - name: Guard the test matrix and the change filter
+        run: python3 scripts/verify-trade-test-matrix.py
       - name: Clippy (default features)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
       - name: Clippy (lab)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --features lab --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
-      - name: Test (default features)
-        run: cargo test --manifest-path "$TRADE_MANIFEST" --locked -- --test-threads=1
-      - name: Test (lab, short deadlines)
+      # Builds the test dependencies into the cache this job saves. `lab` adds no dependency, so
+      # one default build covers both suites.
+      - name: Build the tests (cache warm-up)
+        run: cargo test --manifest-path "$TRADE_MANIFEST" --locked --no-run
+
+  # The lab suite (`--features lab`, TRADE_LAB_SECONDS=1 short deadlines) is where refund/claim
+  # recovery, slow/dead-mint and deadline regressions live; the default suite compiles them out.
+  #
+  # Groups are balanced on per-test times from a green main run (job 117865014532), aiming at
+  # ~7 minutes of tests per job. Tests stay --test-threads=1 inside each job. A binary too slow for
+  # one job is sharded: `only:` entries run named tests (--exact), and exactly one `skip:` entry
+  # per binary runs everything else, so a test added to that binary later runs by default. The
+  # guard in the lint job checks that coverage; the step below fails if a named test is missing.
+  # Measured test seconds per group are noted on each entry.
+  maxplayer-trade-test:
+    name: maxplayer-trade test (${{ matrix.suite }}, ${{ matrix.group }})
+    needs: trade-changes
+    if: needs.trade-changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # default suite (~799s total)
+          - suite: default
+            group: nostr # ~360s
+            targets: --test nostr
+          - suite: default
+            group: lib + other binaries # ~360s
+            targets: >-
+              --lib --bins --test auth_gated --test backoff --test cli --test e2e --test lifecycle
+              --test money --test pinned_quote_recovery --test receive --test relays
+              --test review_regressions --test round5 --test round7 --test send
+              --test serve_receive --test serve_review_r2 --test serve_send_fund
+              --test serve_socket_uid --test ux
+            doc: true
+          # lab suite (~2870s total)
+          - suite: lab
+            group: nostr 1 # ~400s
+            targets: --test nostr
+            only: >-
+              nostr_abandoned_maker_lock_expires_on_slow_relay_and_frees_the_taker
+              nostr_taker_timed_refund
+              nostr_claim_past_window_stays_ambiguous_then_restores
+          - suite: lab
+            group: nostr 2 # ~383s
+            targets: --test nostr
+            only: >-
+              nostr_slow_relay_near_deadline_claim_stays_safe
+              nostr_nostr_trade_completes_through_lost_swap_replies
+              nostr_counterparty_unreachable_refund_still_lands
+              redelivered_request_is_refused_after_cancel_or_expiry
+          - suite: lab
+            group: nostr rest # ~310s
+            targets: --test nostr
+            skip: >-
+              nostr_abandoned_maker_lock_expires_on_slow_relay_and_frees_the_taker
+              nostr_taker_timed_refund
+              nostr_claim_past_window_stays_ambiguous_then_restores
+              nostr_slow_relay_near_deadline_claim_stays_safe
+              nostr_nostr_trade_completes_through_lost_swap_replies
+              nostr_counterparty_unreachable_refund_still_lands
+              redelivered_request_is_refused_after_cancel_or_expiry
+          - suite: lab
+            group: review_regressions 1 # ~357s
+            targets: --test review_regressions
+            only: >-
+              h2_failed_claim_abandoned_then_taker_refunds
+              probe_owned_change_spent_does_not_block_refund
+              n3_taker_invalid_dleq_refunds
+              n2_late_lock_after_abandonment_is_restored_and_refunded
+              probe_taker_persistent_invalid_dleq
+              probe_taker_invalid_lock_valid_refund
+          - suite: lab
+            group: review_regressions 2 # ~360s
+            targets: --test review_regressions
+            only: >-
+              n3_taker_missing_dleq_refunds
+              n1_maker_refund_before_taker_observes_abandonment
+              h2_landed_claim_lost_reply_never_refunds
+              r4_all_relays_down_after_both_locks_still_refunds
+              n2_late_claim_after_abandonment_restore_outage_never_refunds
+              m3_claimed_terminal_without_refund
+              h1_maker_offline_past_long_still_claims
+          - suite: lab
+            group: review_regressions rest # ~247s
+            targets: --test review_regressions
+            skip: >-
+              h2_failed_claim_abandoned_then_taker_refunds
+              probe_owned_change_spent_does_not_block_refund
+              n3_taker_invalid_dleq_refunds
+              n2_late_lock_after_abandonment_is_restored_and_refunded
+              probe_taker_persistent_invalid_dleq
+              probe_taker_invalid_lock_valid_refund
+              n3_taker_missing_dleq_refunds
+              n1_maker_refund_before_taker_observes_abandonment
+              h2_landed_claim_lost_reply_never_refunds
+              r4_all_relays_down_after_both_locks_still_refunds
+              n2_late_claim_after_abandonment_restore_outage_never_refunds
+              m3_claimed_terminal_without_refund
+              h1_maker_offline_past_long_still_claims
+          - suite: lab
+            group: lib + round5, e2e # ~400s
+            targets: >-
+              --lib --bins --test round5 --test e2e --test money --test auth_gated
+              --test lifecycle --test cli --test pinned_quote_recovery
+            doc: true
+          - suite: lab
+            group: serve, backoff, other binaries # ~412s
+            targets: >-
+              --test serve_receive --test backoff --test ux --test send --test receive
+              --test serve_send_fund --test round7 --test relays --test serve_review_r2
+              --test serve_socket_uid
+    env:
+      TRADE_MANIFEST: crates/maxplayer-trade/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: maxplayer-trade
+          workspaces: crates/maxplayer-trade -> target
+          save-if: false
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Test (${{ matrix.suite }}, ${{ matrix.group }})
         env:
-          TRADE_LAB_SECONDS: "1"
-        run: cargo test --manifest-path "$TRADE_MANIFEST" --locked --features lab -- --test-threads=1
+          SUITE: ${{ matrix.suite }}
+          TARGETS: ${{ matrix.targets }}
+          ONLY: ${{ matrix.only }}
+          SKIP: ${{ matrix.skip }}
+          DOC: ${{ matrix.doc && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          args=(--manifest-path "$TRADE_MANIFEST" --locked)
+          if [ "$SUITE" = lab ]; then
+            args+=(--features lab)
+            # Set only for lab: the code checks presence, so even an empty value would count.
+            export TRADE_LAB_SECONDS=1
+          fi
+          read -ra target_args <<<"$TARGETS"
+          read -ra only_names <<<"$ONLY"
+          read -ra skip_names <<<"$SKIP"
+          filter=()
+          if [ $((${#only_names[@]} + ${#skip_names[@]})) -gt 0 ]; then
+            # A shard names tests; a renamed or deleted one must fail here, not shrink the shard.
+            listed="$(cargo test "${args[@]}" "${target_args[@]}" -- --list --format terse)"
+            for name in "${only_names[@]}" "${skip_names[@]}"; do
+              if ! grep -qxF "$name: test" <<<"$listed"; then
+                echo "::error::$name is not a test in ${target_args[*]} ($SUITE); update the ci.yml shard"
+                exit 1
+              fi
+            done
+            filter=(--exact "${only_names[@]}")
+            for name in "${skip_names[@]}"; do filter+=(--skip "$name"); done
+          fi
+          cargo test "${args[@]}" "${target_args[@]}" -- --test-threads=1 "${filter[@]}"
+          if [ "$DOC" = true ]; then
+            cargo test "${args[@]}" --doc -- --test-threads=1
+          fi
+
+  # Keeps the exact name of the old single job, so a required-check rule or anything else keyed on
+  # it keeps working without an admin change. Fails if any trade job failed or was cancelled.
+  # Skipped is accepted only when trade-changes found no trading change; if it said run, every
+  # trade job must have succeeded.
+  maxplayer-trade:
+    name: maxplayer-trade (fmt, clippy, default + lab tests)
+    needs: [trade-changes, maxplayer-trade-lint, maxplayer-trade-test]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: All maxplayer-trade jobs passed or were skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          RUN: ${{ needs.trade-changes.outputs.run }}
+        run: |
+          set -euo pipefail
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<<"$NEEDS"
+          bad="$(jq -r --arg run "$RUN" '[to_entries[]
+            | select(.value.result != "success"
+                and (.value.result != "skipped" or $run == "true" or .key == "trade-changes"))
+            | "\(.key)=\(.value.result)"] | join(", ")' <<<"$NEEDS")"
+          if [ -n "$bad" ]; then
+            echo "::error::maxplayer-trade jobs did not pass: $bad"
+            exit 1
+          fi
+          if [ "$RUN" != true ]; then
+            echo "::notice::maxplayer-trade jobs skipped: no trading path changed"
+          fi
 
   # The release workflow triggers only on a tag, so no pull request ever exercises it. What CI can
   # check is that the gates keeping it from publishing are still in place — otherwise the property
