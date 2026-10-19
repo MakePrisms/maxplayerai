@@ -84,7 +84,9 @@ bad signature), so `applicants_incomplete` can be true with fewer than 256 rows 
 affects the roster or what is published. A sample event
 only fills a seller row the trusted read did not return (for example a denied or undecided
 seller); it never replaces an accepted seller's roster membership.
-`--json` retains the existing command JSON on stdout.
+`--json` prints the command JSON on stdout. The run (the CHALLENGE event) is the top-level `run`
+object (`null` when there is none, and always `null` for `join`); it was `challenge` before the
+rename, with no alias.
 
 ## Sellers: join once
 

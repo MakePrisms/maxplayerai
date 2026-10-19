@@ -223,7 +223,9 @@ try:
         cli(buyer_env, 'decide', '--seller', SELLER, '--accept')
         cli(buyer_env, 'decide', '--seller', DENIED, '--deny')
         s = wait('accepted roster read and authenticated history', lambda: (s if [(x['pubkey'], x['state']) for x in s['sellers']] == [(SELLER, 'accepted')] and not s['applicants'] and s['relay']['historyComplete'] else None) if (s := snapshot()) else None)
-        rows = json.loads(cli(buyer_env, 'members', '--run', 'local-e2e', '--json'))['members']
+        members_body = json.loads(cli(buyer_env, 'members', '--run', 'local-e2e', '--json'))
+        check('sidecar --json names the run `run` (no `challenge` key)', members_body['run']['id'] == 'local-e2e' and 'challenge' not in members_body)
+        rows = members_body['members']
         check('Rust CLI and shared model agree on eligibility', len(rows) == 2 and [r['membership']['seller'] for r in rows if r['eligible']] == [SELLER])
         if int(time.time()) < starts:
             check('the buyer blocks before work window', 'outside_work_window' in plan(snapshot())['reasons'])

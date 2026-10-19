@@ -1413,6 +1413,20 @@ test('quorum: sidecar degraded warnings and re-sends from --json reach the runne
   assert.deepEqual(latestChallengeArgs(['ws://a','ws://b','ws://c'],{buyer:'f'.repeat(64),id:'d'},2),
     ['status','--relay','ws://a','--relay','ws://b','--relay','ws://c','--quorum','2','--buyer','f'.repeat(64),'--run','d','--json']);
 });
+test('json key: the runner reads the sidecar run from `run`, never from `challenge`',async()=>{
+  const {sidecarRun}=await import('./swarm.mjs');
+  const x={buyer:'f'.repeat(64),id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:null,budget_sats:7};
+  assert.deepEqual(sidecarRun({run:x,members:[]},'d'),{buyer:x.buyer,id:'d',title:'T',goal:'g',starts:1,ends:2,status:'in_progress',result:'',budgetSats:7});
+  // Pre-rename body shape: refused as not found (no alias), even with the run object present.
+  assert.throws(()=>sidecarRun({challenge:x,members:[]},'d'),/swarm run d not found/);
+  assert.throws(()=>sidecarRun({run:null},'d'),/not found/);
+  // No reader of sidecar JSON in the runner source touches a `challenge` key.
+  const {readFileSync}=await import('node:fs');
+  const src=readFileSync(new URL('./swarm.mjs',import.meta.url),'utf8');
+  assert.doesNotMatch(src,/body\??\.challenge\b|body\[['"]challenge['"]\]/);
+  const reader=src.slice(src.indexOf('latestChallenge:async'));
+  assert.ok(reader.slice(0,reader.indexOf('}};')).includes('return sidecarRun(body,challenge.id);'),'latestChallenge parses through sidecarRun');
+});
 test('quorum: SWARM_CHALLENGE_QUORUM defaults to 2 and must be a majority of the challenge relays',()=>{
   const argv=['--home','/tmp/q-home','--relay-url','ws://trade'];
   assert.equal(config(argv,{}).challengeQuorum,2);

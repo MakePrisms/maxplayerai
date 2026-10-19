@@ -371,6 +371,12 @@ export const closedRefusal = e => e?.exitCode===SIDECAR_CLOSED_EXIT?String(e.std
 // Sidecar argv for the latest buyer-signed challenge (`status` requires --buyer; --json on stdout).
 // `quorum` is the challenge relay quorum (run 2 #13); a progress publish passes every relay (strict).
 export const quorumArgs = quorum => quorum===undefined?[]:['--quorum',String(quorum)];
+// The run object in a sidecar `status --json` body. The key is `run` (renamed from `challenge`
+// with no alias); a body without it is "not found", never read from the old key.
+export function sidecarRun(body,id) {
+  const x=body?.run;if(!x||typeof x!=='object')throw Error(`swarm run ${id} not found on the challenge relays`);
+  return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
+}
 export const latestChallengeArgs = (relays,challenge,quorum) => ['status',...relays.flatMap(url=>['--relay',url]),...quorumArgs(quorum),'--buyer',challenge.buyer,'--run',challenge.id,'--json'];
 // Degraded-quorum warnings and re-sends the sidecar reported in its --json body (relay_quorum).
 export function sidecarQuorumLines(body) {
@@ -835,8 +841,7 @@ async function main() {
     latestChallenge:async (challenge,{strict=false}={})=>{
       const body=JSON.parse(await command(challengesBinary,latestChallengeArgs(challengeRelays,challenge,strict?challengeRelays.length:c.challengeQuorum),{env}));
       for(const l of sidecarQuorumLines(body))io.report(l);
-      const x=body?.challenge;if(!x||typeof x!=='object')throw Error(`challenge ${challenge.id} not found on the challenge relays`);
-      return {buyer:x.buyer,id:x.id,title:x.title,goal:x.goal,starts:x.starts,ends:x.ends,status:x.status,result:x.result??'',budgetSats:x.budget_sats};
+      return sidecarRun(body,challenge.id);
     }};
   io.probeBuyer=()=>io.mcp('get_job',{job_id:PROBE_JOB_ID});
   const runner=new Swarm(c,io,journal);

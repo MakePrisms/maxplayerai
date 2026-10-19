@@ -241,7 +241,7 @@ Planner/MCP errors are logged and retried on the next polling cycle without chan
 intent. A pending or unprojected completed job blocks that seller from receiving another job.
 
 Before every challenge publish (progress or completion) the runner re-reads the latest
-buyer-signed challenge from the challenge relays (`maxplayer-swarm status --buyer <hex> --run <d> --json`),
+buyer-signed challenge from the challenge relays (`maxplayer-swarm status --buyer <hex> --run <d> --json`, read from its top-level `run` object),
 not the tick-start snapshot. If it is `completed` or `cancelled` — closed by the operator, or by
 anything else holding the buyer key — nothing is published, the close is journaled as an external
 stop (no new work, outstanding jobs still collected) and restarts publish nothing either. A status

@@ -293,7 +293,9 @@ The buyer: `publish --id <d> --title … --goal-file <path> --starts <rfc3339>
 --ends <rfc3339> --budget-sats <n> [--status …] [--update <text>] [--result <text>]`,
 `members [--run <d>]`, `decide --seller <npub|hex> --accept|--deny`.
 `--run` (a CHALLENGE `d`) defaults to the buyer's latest non-cancelled one. All sign with the home's
-key; none prints a secret.
+key; none prints a secret. In `--json` output the selected CHALLENGE is the top-level `run` object
+(`null` if none; `join` always reports `null`), renamed from `challenge` with no alias. The event
+kinds, tags and d-tags keep their CHALLENGE names.
 
 **Minutes changes during a running challenge.** `join` on an existing `joined` membership
 with different `--minutes` (or a different `--note`) republishes the membership. The sidecar

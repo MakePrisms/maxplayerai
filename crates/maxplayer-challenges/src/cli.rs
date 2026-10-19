@@ -224,7 +224,7 @@ fn human(body: &serde_json::Value) -> String {
         );
     }
     let mut lines = Vec::new();
-    if let Some(c) = body.get("challenge").filter(|c| !c.is_null()) {
+    if let Some(c) = body.get("run").filter(|c| !c.is_null()) {
         lines.push(format!(
             "Swarm run {}: {} ({})\nThe buyer: {}\nGoal: {}\nWork: {} – {}\nBudget: {} sat",
             c["id"].as_str().unwrap_or(""),
@@ -424,7 +424,7 @@ async fn command_async(
             .publish(home, draft, created)
             .await
             .map_err(|e| e.to_string())?;
-        return Ok((json!({"ok":true,"event_id":id,"challenge":c}), None));
+        return Ok((json!({"ok":true,"event_id":id,"run":c}), None));
     }
     // Membership operations do not depend on any daily challenge existing.
     let c = if matches!(o.command.as_str(), "status" | "members") {
@@ -567,7 +567,7 @@ async fn command_async(
                 .map_err(|_| "invalid minutes")?;
             if current.minutes == minutes && o.get("--note").is_none_or(|n| n == current.note) {
                 return Ok((
-                    json!({"ok": true, "unchanged": true, "membership": current, "challenge": null}),
+                    json!({"ok": true, "unchanged": true, "membership": current, "run": null}),
                     warning,
                 ));
             }
@@ -695,7 +695,7 @@ async fn command_async(
                         "eligible": eligible.iter().any(|s| s.seller == a.seller)})
                 })
                 .collect();
-            let mut body = json!({"challenge": c, "members": rows});
+            let mut body = json!({"run": c, "members": rows});
             if o.command == "members" {
                 body["applicants_incomplete"] = json!(applicants_incomplete);
             }
@@ -708,7 +708,7 @@ async fn command_async(
         .publish(home, draft, created)
         .await
         .map_err(|e| e.to_string())?;
-    Ok((json!({"ok":true,"event_id":id,"challenge":c}), warning))
+    Ok((json!({"ok":true,"event_id":id,"run":c}), warning))
 }
 
 /// The running challenge (latest-ending, if several) that the caller's current membership still
@@ -844,6 +844,39 @@ mod tests {
         ] {
             assert!(parse(&args(s)).is_err(), "{s}");
         }
+    }
+    /// `--json` bodies name the run `run`; the pre-rename `challenge` key must never come back
+    /// (Bob, 2026-10-19: no alias). Checks every object key, nested ones included.
+    fn assert_no_challenge_key(body: &serde_json::Value) {
+        fn walk(v: &serde_json::Value, path: &str) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    for (k, v) in m {
+                        assert!(
+                            !k.to_ascii_lowercase().contains("challenge"),
+                            "--json key {path}.{k} names a challenge"
+                        );
+                        walk(v, &format!("{path}.{k}"));
+                    }
+                }
+                serde_json::Value::Array(a) => a.iter().for_each(|v| walk(v, path)),
+                _ => (),
+            }
+        }
+        assert!(
+            body.get("run").is_some(),
+            "--json body has no run key: {body}"
+        );
+        walk(body, "");
+    }
+    #[test]
+    fn json_human_output_reads_the_run_key() {
+        let run = serde_json::json!({"id":"d1","title":"T","status":"scheduled","buyer":"b","goal":"g","starts":1,"ends":2,"budget_sats":0});
+        assert!(
+            human(&serde_json::json!({"run": run, "members": []})).starts_with("Swarm run d1: T")
+        );
+        // A body keyed `challenge` is not a run: nothing about it is printed.
+        assert!(!human(&serde_json::json!({"challenge": run, "members": []})).contains("d1"));
     }
     #[test]
     fn challenge_help_is_side_effect_free() {
@@ -1745,14 +1778,18 @@ mod tests {
             execute_async(&before, &seller).await.unwrap();
             let status = parse(&args(&format!("status --buyer {buyer_key} --json"))).unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
-            assert!(body["challenge"].is_null());
+            assert!(body["run"].is_null());
+            assert_no_challenge_key(&body);
             let since = body["members"][0]["membership"]["since"].clone();
             let publish=parse(&args(&format!("publish --id today --title Build --goal-file {} --starts {} --ends {} --budget-sats 0",goal.display(),iso(now+3590),iso(now+7200)))).unwrap();
             let (published, _) = execute_async(&publish, &buyer).await.unwrap();
-            assert_eq!(published["challenge"]["starts"], now + 3590);
+            assert_eq!(published["run"]["starts"], now + 3590);
+            assert_no_challenge_key(&published);
             let join = parse(&args(&format!("join --buyer {buyer_key} --minutes 60"))).unwrap();
-            let (_, warning) = execute_async(&join, &seller).await.unwrap();
+            let (joined, warning) = execute_async(&join, &seller).await.unwrap();
             assert!(warning.is_some());
+            assert!(joined["run"].is_null());
+            assert_no_challenge_key(&joined);
             let decide = parse(&args(&format!("decide --seller {seller_key} --accept"))).unwrap();
             execute_async(&decide, &buyer).await.unwrap();
             let status = parse(&args(&format!("status --buyer {buyer_key} --json"))).unwrap();
@@ -1771,11 +1808,14 @@ mod tests {
             )))
             .unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
-            assert_eq!(body["challenge"]["id"], "tomorrow");
+            assert_eq!(body["run"]["id"], "tomorrow");
+            assert_no_challenge_key(&body);
             assert_eq!(body["members"][0]["eligible"], true);
             let list = parse(&args("members --json")).unwrap();
             let (body, _) = execute_async(&list, &buyer).await.unwrap();
             assert_eq!(body["members"].as_array().unwrap().len(), 1);
+            assert_eq!(body["run"]["id"], "tomorrow");
+            assert_no_challenge_key(&body);
             let leave = parse(&args(&format!("leave --buyer {buyer_key}"))).unwrap();
             execute_async(&leave, &seller).await.unwrap();
             let (body, _) = execute_async(&status, &seller).await.unwrap();
@@ -2007,6 +2047,8 @@ mod tests {
                         .await
                         .unwrap_or_else(|e| panic!("{line}: {e}"));
                     assert_eq!(body["unchanged"], true, "{line}: {body}");
+                    assert!(body["run"].is_null(), "{line}: {body}");
+                    assert_no_challenge_key(&body);
                     assert_eq!(body["membership"]["minutes"], 60);
                     assert!(body.get("event_id").is_none(), "{line}: {body}");
                     assert!(
