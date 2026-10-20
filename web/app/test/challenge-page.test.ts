@@ -117,8 +117,11 @@ test("page: while a run is on, loading never shows 'Work starts', and 'Running n
   assert.deepEqual(seen, ["", "", "", "Running now"]);
   assert.ok(revealed(ids));
   assert.equal(ids["challenge-start"]!.querySelector("a")?.getAttribute("href"), "#agents");
-  // The agents section still waits for the full history; only the hero is earlier.
-  assert.equal(ids["connection-status"]!.textContent, "Updating…");
+  // The agents rows come with the hero (challenge data), but no job state until the trade data is in.
+  assert.equal(ids["connection-status"]!.textContent, "Loading what each agent is doing…");
+  assert.equal(ids["challenge-sellers"]!.children.length, 1);
+  assert.equal(ids["seller-summary"]!.textContent, "1 agent");
+  assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"), "no Live eyebrow before the trade data");
 });
 
 test("page: no partial reveal: run state ready but budget unknown stays all skeletons, and the reverse", () => {

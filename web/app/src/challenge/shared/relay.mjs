@@ -2,12 +2,12 @@ import { CHALLENGE, MEMBERSHIP, DECISION, OFFER, CLAIM, RESULT, AWARD, ACCEPT, H
 import { schnorr } from '@noble/curves/secp256k1';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
-import { signAuth, verify, mentions, validMembership } from './events.mjs';
-import { acceptedSellers } from './model.mjs';
+import { signAuth, verify, mentions, validMembership, tag, number } from './events.mjs';
+import { acceptedSellers, buyerChallenges, currentChallenge } from './model.mjs';
 
 // Per-REQ page size, applicant sample size, metadata budget and authors chunk size.
 export const PAGE_LIMIT=500, APPLICANT_LIMIT=256, METADATA_CAP=256, AUTHOR_CHUNK=100;
-const APPLICANTS='applicants';
+const APPLICANTS='applicants',BOUND='bound-';
 const CHALLENGE_KINDS=[CHALLENGE,MEMBERSHIP,DECISION];
 // Fixed filters. Memberships are deliberately absent: the runner reads them only through
 // rosterFilters (authors = buyer-accepted sellers); the untrusted applicantFilter is display-only.
@@ -22,6 +22,7 @@ export function rosterFilters(buyer,accepted) {
 }
 export const applicantFilter=buyer=>({kinds:[MEMBERSHIP],'#p':[buyer]});
 export const matches = (e,f) => f.kinds.includes(e.kind) && (!f.authors || f.authors.includes(e.pubkey)) && (!f['#p'] || f['#p'].some(pk=>mentions(e,pk))) &&
+  (!f['#e'] || f['#e'].some(id=>e.tags.some(t=>t[0]==='e'&&t[1]===id))) &&
   (f.since===undefined || e.created_at>=f.since) && (f.until===undefined || e.created_at<=f.until);
 const metadataId=id=>id.startsWith(`${PROFILE}-`)||id.startsWith(`${HEARTBEAT}-`);
 const soft=id=>id===APPLICANTS||metadataId(id);
@@ -105,11 +106,35 @@ export function lagTimeout(fn,ms,{thresholdMs=LAG_THRESHOLD_MS,maxCreditMs=PAGE_
 //
 // Live REQ ids: `live-<id>` for a filter's first live REQ on a connection, `live-<id>~<n>` for
 // a replacement, so an EOSE, EVENT or CLOSED of a replaced REQ never counts for the current one.
+//
+// Window mode (`window:true`; only the /swarm page turns it on, through ChallengeReader's
+// tradeWindowMarginS. The runner and CLI never set it and read exactly as before). Trusted history
+// is read in two phases, so the current run is complete before the whole history is:
+// - Until setWindow(since) is called, no trusted history page or live REQ is sent and nothing is
+//   complete. setWindow is called once per reader; reconnects reuse the same window.
+// - Window phase: each trusted filter is read from `since` (inclusive), with the usual pagination
+//   and every fail-closed rule (a silent page times out and reconnects, a truncated page is an
+//   error, a refused page recovers and is read again in full). Live REQs never reach below `since`.
+// - Backfill phase: once a filter's window is read, its older history is read with `until: since`.
+//   Backfill pages are sent after every other frame (window and live REQs, then profiles, then other
+//   display reads) and fail closed in the same way.
+// - Bound reads: a claim or result carries its seller's clock, and an award or accept could carry a
+//   skewed buyer clock, so one dated before `since` can still belong to an offer in the window. Once
+//   the offer window is read, every claim, result, award and accept that references an offer the
+//   window holds (`#e`, chunks of AUTHOR_CHUNK offer ids, ids `bound-…`) is read in full, whatever
+//   its date, and the window is complete only with those reads. A run's jobs are therefore the same
+//   from the window as from the whole history; only older runs wait for the backfill.
+// status.windowComplete is historyComplete for the window alone: every trusted filter's window read,
+// with all other conditions (connection, no error, AUTH and live EOSE in a strict round) unchanged.
+// status.historyComplete still means the WHOLE history, so it waits for the backfill too.
+// setWindow(null) reads the whole history in one phase; both flags are then the same.
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,
     retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,pageTimeoutMs=PAGE_TIMEOUT_MS,pageCreditMaxMs=PAGE_CPU_CREDIT_MAX_MS,lagThresholdMs=LAG_THRESHOLD_MS,filters=challengeFilters(buyer),
-    roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey()}) {
+    roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey(),window=false}) {
     Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,pageTimeoutMs,pageCreditMaxMs,lagThresholdMs,readsRoster:roster,readsMetadata:metadata,applicants});
+    // Window mode (see above). windowSince: undefined = not chosen yet, null = whole history, else unix seconds.
+    this.windowMode=!!window; this.windowSince=undefined;
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
     this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
@@ -117,13 +142,61 @@ export class RelayReader {
     this.status=this.freshStatus();
     this.stopped=false; this.retry=retryMs; this.lag=0; // this reader's observed event-loop lag (P-3), ms
   }
-  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,pollInProgress:false,error:null,
+  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,windowComplete:false,pollInProgress:false,error:null,
     warnings:[...this.metaWarnings,...(this.closedStreak?[`${RECOVERING} (${this.lastClosed}); reconnect ${this.closedStreak}`]:[])],applicantsIncomplete:false};}
   // Applicant and profile/heartbeat reads are display-only: they never gate readiness.
   trustedPending(){for(const id of this.pages.keys())if(!soft(id))return true;return false;}
   // A pending trusted page that must complete before history counts as complete (R3-4): any page of
   // a filter not yet read completely on this connection. A poll of a read filter does not block.
   blockingPending(){for(const [id,p] of this.pages)if(!soft(id)&&!(p.poll&&this.read.has(id)))return true;return false;}
+  // Window mode: the same, except a backfill page (history older than the window) does not block the window.
+  windowBlockingPending(){for(const [id,p] of this.pages)if(!soft(id)&&p.phase!=='backfill'&&!(p.poll&&this.read.has(id)))return true;return false;}
+  // Window mode, before setWindow: trusted filters send nothing yet.
+  deferred(id){return this.windowMode&&this.windowSince===undefined&&!soft(id);}
+  // A trusted filter's first history page on a connection: from the window when there is one.
+  firstPage(id,filter){
+    if(soft(id)||id.startsWith(BOUND)||!this.windowMode||this.windowSince===null)return this.page(id,filter);
+    this.page(id,{...filter,since:this.windowSince},{phase:'window'});
+  }
+  // Window mode only: called once, with the window's lower bound (unix seconds) or null for the
+  // whole history. Pages and subscribes the trusted filters that were waiting for it.
+  setWindow(since){
+    if(!this.windowMode||this.windowSince!==undefined)return;
+    if(since!==null&&!(Number.isSafeInteger(since)&&since>=0))throw Error('Invalid history window');
+    this.windowSince=since;
+    if(this.filters&&this.opened&&!this.dead)for(const [id,f] of this.filters)if(!soft(id)){this.firstPage(id,f);this.subscribe(id);}
+    if(this.pages)this.updateComplete();
+    this.onChange();
+  }
+  // Window mode send order (lower first, first in first out within a rank): profile pages (one
+  // small page per agent: the names the early rows show); trusted window, bound and live REQs and
+  // anything else; other display reads; backfill pages. Without window mode the queue stays first
+  // in, first out.
+  rank(frame){
+    if(frame[0]!=='REQ')return 1;
+    const p=this.pages.get(frame[1]);
+    if(p?.phase==='backfill')return 3;
+    if(p&&frame[1].startsWith(`${PROFILE}-`))return 0;
+    const id=p?frame[1]:this.live.get(frame[1])?.id;
+    return id!==undefined&&soft(id)?2:1;
+  }
+  // Window mode: the offer window is read; read everything that references its offers (see above).
+  bindWindow(){
+    const offers=[...this.store.events.values()].filter(e=>e.kind===OFFER&&e.pubkey===this.buyer&&e.created_at>=this.windowSince)
+      .sort((a,b)=>a.created_at-b.created_at||a.id.localeCompare(b.id)).map(e=>e.id),entries=new Map();
+    for(let i=0;i<offers.length;i+=AUTHOR_CHUNK){
+      const ids=offers.slice(i,i+AUTHOR_CHUNK),key=bytesToHex(sha256(ids.join(','))).slice(0,16);
+      entries.set(`${BOUND}s-${key}`,{kinds:[CLAIM,RESULT],'#p':[this.buyer],'#e':ids});
+      entries.set(`${BOUND}b-${key}`,{kinds:[AWARD,ACCEPT],authors:[this.buyer],'#e':ids});
+    }
+    this.replaceExtra(id=>id.startsWith(BOUND),entries);
+  }
+  next(held){
+    if(!this.windowMode)return this.queue.findIndex(f=>!held(f));
+    let best=-1,rank=Infinity;
+    for(let i=0;i<this.queue.length&&rank>0;i++){const f=this.queue[i];if(held(f))continue;const r=this.rank(f);if(r<rank){best=i;rank=r;}}
+    return best;
+  }
   softFailure(id){this.pages.delete(id);if(id===APPLICANTS)this.status.applicantsIncomplete=true;else this.metaIncomplete();}
   metaIncomplete(){const w='Profile/heartbeat read incomplete';if(!this.status.warnings.includes(w))this.status.warnings.push(w);}
   authExpected(){return !!this.challenged&&this.authRefused===null;}
@@ -156,8 +229,10 @@ export class RelayReader {
   // One warning per prefix, replaced by the latest relay reason.
   warn(prefix,why){this.status.warnings=[...this.status.warnings.filter(w=>!w.startsWith(prefix)),`${prefix} (${why}); polling`];}
   updateComplete(){
-    const done=!!this.opened&&this.status.connected&&!this.blockingPending()&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.strict()||this.liveConfirmed());
+    const ok=!!this.opened&&this.status.connected&&!this.status.error&&(!this.readsRoster||this.rosterKey!==null)&&(!this.strict()||this.liveConfirmed())&&!(this.windowMode&&this.windowSince===undefined);
+    const done=ok&&!this.blockingPending();
     this.status.historyComplete=done;
+    this.status.windowComplete=ok&&!this.windowBlockingPending();
     this.status.pollInProgress=this.trustedPending()&&!this.blockingPending();
     // The stable period restarts when the connection stops being healthy (an error, or a trusted
     // live REQ no longer confirmed), with or without a socket close. A routine poll page in
@@ -172,7 +247,7 @@ export class RelayReader {
   recover(error){
     if(this.dead)return;
     this.dead=true;this.closedStreak++;this.lastClosed=error;
-    Object.assign(this.status,{error,historyComplete:false,authenticated:false});
+    Object.assign(this.status,{error,historyComplete:false,windowComplete:false,authenticated:false});
     this.onChange();this.closeSocket();
   }
   // Something needs AUTH (a challenge, or an auth-required refusal). If it neither completes nor is
@@ -194,9 +269,11 @@ export class RelayReader {
     if(old){const e=this.live.get(old);this.live.delete(old);if(e?.sentAt)this.sendNow(['CLOSE',old]);else this.queue=this.queue.filter(m=>m[1]!==old);}
     const sub=n?`live-${id}~${n}`:`live-${id}`,applicants=id===APPLICANTS,filter=applicants?applicantFilter(this.buyer):this.filters.get(id);
     this.liveGen.set(id,n+1);this.liveSub.set(id,sub);this.live.set(sub,{id,filter,sentAt:0,authed:false,eose:false});
-    this.queue.push(['REQ',sub,{...filter,since:Math.max(0,(applicants?Math.floor(Date.now()/1000):this.newest.get(id)??0)-this.overlap)}]);
+    // Window mode: a trusted live REQ starts at the window at the earliest (the backfill reads below it).
+    const floor=this.windowMode&&typeof this.windowSince==='number'&&!applicants&&!soft(id)&&!id.startsWith(BOUND)?this.windowSince:0;
+    this.queue.push(['REQ',sub,{...filter,since:Math.max(floor,(applicants?Math.floor(Date.now()/1000):this.newest.get(id)??0)-this.overlap)}]);
   }
-  liveIds(){return [...this.filters.keys(),...(this.applicants?[APPLICANTS]:[])];}
+  liveIds(){return [...[...this.filters.keys()].filter(id=>!this.deferred(id)),...(this.applicants?[APPLICANTS]:[])];}
   start() {
     if(this.stopped)return;
     this.status=this.freshStatus(); this.opened=false;
@@ -217,7 +294,7 @@ export class RelayReader {
     const end=()=>{
       if(ended)return;ended=true;
       timeout?.clear();clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.dead=true;
-      this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.onChange();
+      this.status.connected=false;this.status.authenticated=false;this.status.historyComplete=false;this.status.windowComplete=false;this.onChange();
       if(!this.stopped){this.timer=setTimeout(()=>this.start(),this.retry);this.retry=Math.min(this.retry*2,this.closedStreak?this.closedMaxRetryMs:this.maxRetryMs);}
     };
     const close=()=>{if(!closing){closing=true;try{ws.close();}catch{}}end();};
@@ -231,7 +308,7 @@ export class RelayReader {
     // blocked; it is credited to every deadline still pending (late()).
     this.lastTick=now();this.tickBusy=busy;
     this.queueTimer=setInterval(()=>{const t=now(),lost=t-this.lastTick-this.queueMs-(busy-this.tickBusy);this.lastTick=t;this.tickBusy=busy;if(lost>this.lagThresholdMs)this.lag+=lost;
-      const i=this.queue.findIndex(f=>!held(f));if(i>=0&&ws.readyState===1){const [frame]=this.queue.splice(i,1);send(frame);const p=this.pages.get(frame[1]),e=this.live.get(frame[1]);
+      const i=this.next(held);if(i>=0&&ws.readyState===1){const [frame]=this.queue.splice(i,1);send(frame);const p=this.pages.get(frame[1]),e=this.live.get(frame[1]);
         // Whether each REQ left before or after AUTH decides what a later auth-required CLOSED means.
         if(p){p.sentAt=Date.now();p.busyAt=busy;p.lagAt=this.lag;p.authed=this.status.authenticated;}
         // A live REQ is unconfirmed from the moment subscribe() creates it (every caller then runs
@@ -250,7 +327,7 @@ export class RelayReader {
       // it in full; polling it again would only resend the same requests every interval.
       if(this.status.error||this.trustedPending())return;
       // Poll also repairs late/backdated writes even when streaming succeeds.
-      for(const [id,f] of this.filters)if(!this.pages.has(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)},{poll:true});
+      for(const [id,f] of this.filters)if(!this.pages.has(id)&&!this.deferred(id))this.page(id,{...f,since:Math.max(0,(this.newest.get(id)??0)-this.overlap)},{poll:true});
       this.updateComplete();
       if(this.applicants&&!this.pages.has(APPLICANTS))this.pageApplicants();
     },this.pollMs);
@@ -259,7 +336,7 @@ export class RelayReader {
       // A CLOSED-driven reconnect keeps its backoff until the recovered connection settles.
       timeout?.clear();this.status.connected=true;if(!this.closedStreak)this.retry=this.retryMs;this.opened=true;
       // History must work even if AUTH is absent or explicitly refused.
-      for(const [id,f] of this.filters)this.page(id,f);
+      for(const [id,f] of this.filters)if(!this.deferred(id))this.firstPage(id,f);
       if(this.applicants)this.pageApplicants();
       for(const id of this.liveIds())this.subscribe(id);
       // No challenge within authWaitMs: live REQs fall back to anonymous and the relay's posture
@@ -290,7 +367,7 @@ export class RelayReader {
           if(this.authRefused==='not answered'){this.authRefused=null;this.status.warnings=this.status.warnings.filter(w=>!w.startsWith('AUTH not answered'));}
           if(this.authClosed.size) {
             if(this.status.error?.startsWith('auth-required:'))this.status.error=null;
-            for(const [id,filter] of this.authClosed)this.page(id,filter);
+            for(const [id,p] of this.authClosed)this.page(id,p.filter,{phase:p.phase});
             this.authClosed.clear();
           }
           // A live REQ that already left anonymously is replaced (an open-read relay gave it
@@ -337,10 +414,14 @@ export class RelayReader {
           // events is never skipped. The cursor must move strictly older or history fails closed.
           if(p.oldest===Infinity)this.status.error='History truncated: full page without an in-range event';
           else if(p.filter.until!==undefined&&p.oldest>=p.filter.until)this.status.error='History truncated: 500+ events in one second';
-          else this.page(m[1],{...p.filter,until:p.oldest},{poll:p.poll});
+          else this.page(m[1],{...p.filter,until:p.oldest},{poll:p.poll,phase:p.phase});
         }
         // A trusted filter's history is read once its last page ends without an error (R3-4).
-        if(!soft(m[1])&&m[1]!==APPLICANTS&&!this.pages.has(m[1])&&!this.status.error)this.read.add(m[1]);
+        // Window mode: a window read in full goes on to the history below it (backfill).
+        if(!soft(m[1])&&m[1]!==APPLICANTS&&!this.pages.has(m[1])&&!this.status.error) {
+          if(p.phase==='window'){this.page(m[1],{...this.filters.get(m[1]),until:this.windowSince},{phase:'backfill'});if(m[1]===String(OFFER))this.bindWindow();}
+          else this.read.add(m[1]);
+        }
         if(!this.pages.has(m[1]))send(['CLOSE',m[1]]);
         if(m[1]===String(DECISION)&&!this.pages.has(m[1]))this.onRoster();
         this.updateComplete();this.onChange();
@@ -374,12 +455,12 @@ export class RelayReader {
           this.read.delete(sub); // a refused read must be re-read in full before history counts again
           // Refused trusted history: fail closed now and re-read it in full on a fresh connection.
           if(!auth||(p.authed??this.status.authenticated))return this.recover(`Relay history subscription refused (${sub}): ${why}`);
-          this.pages.delete(sub);this.status.historyComplete=false;
-          if(this.status.authenticated)this.page(sub,p.filter); // refused before AUTH; AUTH already succeeded
+          this.pages.delete(sub);this.status.historyComplete=false;this.status.windowComplete=false;
+          if(this.status.authenticated)this.page(sub,p.filter,{phase:p.phase}); // refused before AUTH; AUTH already succeeded
           // AUTH was already refused on this connection: retry it on a fresh one.
           else if(this.authRefused!==null)return this.recover(`${reason}; AUTH refused: ${this.authRefused}`);
           else {
-            this.authClosed.set(sub,p.filter);
+            this.authClosed.set(sub,{filter:p.filter,phase:p.phase});
             if(!this.status.error||this.status.error.startsWith('auth-required:'))this.status.error=reason;
             this.awaitAuth(reason); // AUTH OK re-reads it; otherwise a fresh connection retries
             this.updateComplete(); // the error also restarts the stable period now
@@ -420,8 +501,8 @@ export class RelayReader {
   addFilter(id,filter) {
     if(!this.filters)return;
     this.filters.set(id,filter);
-    if(!this.opened)return; // the open handler pages and subscribes every filter
-    this.page(id,filter);this.subscribe(id);
+    if(!this.opened||this.deferred(id))return; // the open handler (or setWindow) pages and subscribes it
+    this.firstPage(id,filter);this.subscribe(id);
   }
   dropFilter(id) {
     if(!this.filters)return;
@@ -430,7 +511,7 @@ export class RelayReader {
     this.queue=this.queue.filter(m=>m[1]!==id&&m[1]!==sub);
     for(const s of [id,sub])this.sendNow(['CLOSE',s]);
   }
-  page(id,filter,{poll=false}={}) {const p={filter,received:0,oldest:Infinity,poll};this.pages.set(id,p);if(this.blockingPending())this.status.historyComplete=false;this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
+  page(id,filter,{poll=false,phase}={}) {const p={filter,received:0,oldest:Infinity,poll,phase};this.pages.set(id,p);if(this.blockingPending())this.status.historyComplete=false;if(this.windowBlockingPending())this.status.windowComplete=false;this.queue.push(['REQ',id,{...filter,limit:PAGE_LIMIT}]);}
   pageApplicants() {const filter=applicantFilter(this.buyer);this.pages.set(APPLICANTS,{filter,received:0,oldest:Infinity});this.queue.push(['REQ',APPLICANTS,{...filter,limit:APPLICANT_LIMIT}]);}
   clearRecoveryTimers(){this.authTimer?.clear();this.authTimer=null;this.holdTimer?.clear();this.holdTimer=null;clearTimeout(this.stableTimer);this.stableTimer=null;}
   stop(){this.stopped=true;clearTimeout(this.timer);clearInterval(this.queueTimer);clearInterval(this.pollTimer);this.clearRecoveryTimers();this.closeSocket?.();}
@@ -473,12 +554,18 @@ export function parseChallengeRelays(value=DEFAULT_CHALLENGE_RELAYS) {
 export class ChallengeReader {
   constructor({url,challengeRelays=DEFAULT_CHALLENGE_RELAYS,buyer,store,onChange=()=>{},...rest}) {
     // quorum: challenge relays that must complete (default: parseChallengeQuorum). The rest are RelayReader options.
-    const {quorum,...options}=rest;
+    // tradeWindowMarginS (the /swarm page only; default off = today's single full read): the trade
+    // relay reads the current run first. Once a quorum of challenge relays has read the challenge
+    // events, the window starts tradeWindowMarginS before the current run's start (no run: the whole
+    // history), and older trade history backfills afterwards (RelayReader window mode).
+    const {quorum,tradeWindowMarginS,...options}=rest;
+    if(tradeWindowMarginS!==undefined&&!(Number.isSafeInteger(tradeWindowMarginS)&&tradeWindowMarginS>=0))throw Error('Invalid trade window margin');
     const filters=challengeFilters(buyer);
     const onRoster=()=>{const accepted=acceptedSellers(store.events.values(),buyer);for(const r of [this.trade,...this.challenges])r.setRoster(accepted);};
-    const common={...options,buyer,store,onChange,onRoster};
-    this.store=store;
-    this.trade=new RelayReader({...common,url,roster:false,metadata:true,applicants:false,filters:filters.filter(f=>!CHALLENGE_KINDS.includes(f.kinds[0]))});
+    const changed=tradeWindowMarginS===undefined?onChange:()=>{this.chooseWindow();onChange();};
+    const common={...options,buyer,store,onChange:changed,onRoster};
+    this.store=store;this.buyer=buyer;this.windowMargin=tradeWindowMarginS;
+    this.trade=new RelayReader({...common,url,roster:false,metadata:true,applicants:false,window:tradeWindowMarginS!==undefined,filters:filters.filter(f=>!CHALLENGE_KINDS.includes(f.kinds[0]))});
     const urls=parseChallengeRelays(challengeRelays);
     this.quorum=parseChallengeQuorum(quorum,urls.length);
     this.challenges=urls.map(url=>new RelayReader({...common,url,roster:true,metadata:false,applicants:true,
@@ -509,7 +596,23 @@ export class ChallengeReader {
       // An error only once the quorum cannot be met by the relays still up (a relay still catching
       // up is not a failure; historyComplete stays false meanwhile).
       error:this.trade.status.error??(available.length<this.quorum?`Swarm history incomplete; quorum not met (${available.length} of ${quorum.total} challenge relays available, need ${this.quorum}); relay failed: ${failedRelays.filter(u=>u!==this.trade.url).join(', ')}`:null),
-      failedRelays,missingRelays,quorum,degraded,relays};
+      failedRelays,missingRelays,quorum,degraded,relays,
+      // Window mode: the trade relay's window (and the quorum) complete. windowSince: the window's
+      // lower bound, null when the whole history is (or is being) read in one pass. Without window
+      // mode windowComplete is historyComplete. A run's trade data is complete only when
+      // historyComplete, or windowComplete with windowSince at or before the run's start.
+      windowComplete:this.trade.status.windowComplete&&quorumMet,
+      windowSince:typeof this.trade.windowSince==='number'?this.trade.windowSince:null};
+  }
+  // Window mode: choose the trade window once a quorum of challenge relays has read the challenge
+  // events. The page checks that the window covers the run it shows, so a run chosen later (a newer
+  // event from a slow relay) is never shown from the window alone.
+  chooseWindow(){
+    if(this.windowMargin===undefined||this.trade.windowSince!==undefined)return;
+    const read=this.challenges.filter(r=>r.status.connected&&!r.status.error&&r.read?.has(String(CHALLENGE))).length;
+    if(read<this.quorum)return;
+    const c=currentChallenge(buyerChallenges([...this.store.events.values()],this.buyer));
+    this.trade.setWindow(c?Math.max(0,number(tag(c,'starts'))-this.windowMargin):null);
   }
   start(){this.trade.start();for(const r of this.challenges)r.start();}
   stop(){this.trade.stop();for(const r of this.challenges)r.stop();}
