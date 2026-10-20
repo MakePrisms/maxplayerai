@@ -1,15 +1,16 @@
 import { OFFER, CLAIM, RESULT, AWARD, ACCEPT, HEARTBEAT, PROFILE, MEMBERSHIP, DECISION } from '../../model/kinds.ts';
 import { servingFromTags } from '../../model/serving.mjs';
-import {boundMembership,membershipNote,verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode,challengeTaskPrefix} from './events.mjs';
+import {boundMembership,membershipNote,verify,tag,one,number,hex,root,claimRef,mentions,newer,namespace,tradeNamespace,validChallenge,validMembership,validDecision,npubEncode,matchedTaskPrefix} from './events.mjs';
 const latest = (events,key) => { const map=new Map(); for(const e of events) if(newer(e,map.get(key(e)))) map.set(key(e),e); return [...map.values()]; };
 const ascending = (a,b) => a.created_at-b.created_at || a.id.localeCompare(b.id);
 // P-4: sellers' pastJobs cover at most this many past challenges (the newest by challenge event
 // time). Nothing reads pastJobs to plan or render (the page and the planner use the current
 // challenge's jobs and the runner journal); this only bounds the snapshot's growth with history.
 export const PAST_CHALLENGE_LIMIT=50;
-// Matches exactly the offers challengeTaskPrefix(buyer,d) can bind to a valid challenge (hex
+// Matches exactly the offers matchedTaskPrefix(task,buyer,d) can bind to a valid challenge (hex
 // buyer, d per validChallenge), so the store can tell which challenge an offer may belong to.
-const TASK_PREFIX=/^\[challenge:([0-9a-f]{64}):([a-z0-9-]{1,64})\]\n/;
+// `swarm` is the current prefix; `challenge` is the pre-rename one, still on the relays.
+const TASK_PREFIX=/^\[(?:swarm|challenge):([0-9a-f]{64}):([a-z0-9-]{1,64})\]\n/;
 let projections=0;
 // How many times a challenge's jobs were projected from the trade events (P-4 tests, benchmarks).
 export const challengeProjections=()=>projections;
@@ -79,8 +80,8 @@ export class EventStore {
 // Time-independent facts of every awarded job of challenge c; jobAt() applies `now`.
 function jobFacts(trade,buyer,c) {
   projections++;
-  const facts=[];
-  for(const offer of trade.filter(e=>e.kind===OFFER && e.pubkey===buyer && one(e,'i') && typeof tag(e,'i')==='string' && tag(e,'i').startsWith(challengeTaskPrefix(buyer,tag(c,'d'))) && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
+  const facts=[],d=tag(c,'d');
+  for(const offer of trade.filter(e=>e.kind===OFFER && e.pubkey===buyer && one(e,'i') && matchedTaskPrefix(tag(e,'i'),buyer,d)!==null && e.created_at>=+tag(c,'starts') && e.created_at<=+tag(c,'ends') && one(e,'p') && hex(tag(e,'p')))) {
     const seller=tag(offer,'p');
     const deadlines=offer.tags.filter(t=>t[0]==='param'&&t[1]==='deadline');
     const deadline=deadlines.length===1?number(deadlines[0][2]):null;
@@ -94,7 +95,7 @@ function jobFacts(trade,buyer,c) {
     const amountTag=offer.tags.find(t=>t[0]==='amount');
     const noPayment=offer.tags.some(t=>t[0]==='param'&&t[1]==='payment'&&t[2]==='none');
     const amount=noPayment?0:(one(offer,'amount')&&amountTag?.[2]==='sat'?number(amountTag[1]):null);
-    facts.push({id:offer.id,seller,npub:npubEncode(seller),task:tag(offer,'i').slice(challengeTaskPrefix(buyer,tag(c,'d')).length),start:award.created_at,deadline,
+    facts.push({id:offer.id,seller,npub:npubEncode(seller),task:tag(offer,'i').slice(matchedTaskPrefix(tag(offer,'i'),buyer,d).length),start:award.created_at,deadline,
       award:award.id,claim:claimRef(award),result:result?{id:result.id,content:result.content}:null,acceptedAt:acceptance?acceptance.created_at:null,
       // An impossible result timestamp conservatively consumes the whole award window.
       backdated:!!result&&result.created_at<=award.created_at,amountSats:amount});

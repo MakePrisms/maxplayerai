@@ -95,8 +95,15 @@ export function validDecision(e,c) {
   return e.kind===DECISION && e.pubkey===c.pubkey && namespace(e) && ['d','p','decision'].every(k=>scalar(e,k)) && !e.tags.some(t=>t[0]==='a') && hex(seller) && tag(e,'d')===seller && ['accepted','denied'].includes(tag(e,'decision')) && (!e.tags.some(t=>t[0]==='e') || (scalar(e,'e') && hex(tag(e,'e'))));
 }
 
-// Buyer-signed task prefix binds an offer without changing the trade protocol.
-export const challengeTaskPrefix = (buyer,id) => `[challenge:${buyer}:${id}]\n`;
+// Buyer-signed task prefix binds an offer without changing the trade protocol. New offers start
+// with `[swarm:<buyer>:<run id>]`; offers posted before the rename start with
+// `[challenge:<buyer>:<run id>]` and are still read (they stay on the relays).
+export const challengeTaskPrefix = (buyer,id) => `[swarm:${buyer}:${id}]\n`;
+export const legacyChallengeTaskPrefix = (buyer,id) => `[challenge:${buyer}:${id}]\n`;
+// The prefix (new or legacy) this task actually starts with for run `id` of `buyer`, or null.
+// Callers slice by ITS length: the two prefixes differ in length.
+export const matchedTaskPrefix = (task,buyer,id) => typeof task!=='string' ? null :
+  [challengeTaskPrefix(buyer,id),legacyChallengeTaskPrefix(buyer,id)].find(p=>task.startsWith(p)) ?? null;
 
 // Keep authenticated membership state; bound only its display note.
 export const membershipNote = e => e.content.length>4096 || JSON.stringify(e.tags).length>16384 ? '' : e.content;
