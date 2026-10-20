@@ -136,6 +136,16 @@ export function connectionLine(r: Relay,status: string,wasLive=false,run?: Run):
   return status+relayDetail(r);
 }
 const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.slice(-6)}`:npub;
+// The agents listed for the run shown (bob, 2026-10-20). Denied members are never listed. A member
+// who left is listed only if they had at least one job in this run: s.jobs is exactly the shown
+// run's awarded jobs (running, done, expired or never accepted all count), so a past run lists the
+// members who left after working in it, and a leaver who only worked in other runs is not listed.
+// In 'roster' the jobs aren't known yet, so every leaver is held back until 'live': a row that
+// appears once the trade data is in beats one that shows and then vanishes. Display only: the
+// shared snapshot (runner, CLI) still carries every left seller.
+export function listedSellers(s: Snapshot,roster=false): Seller[] {
+  return s.sellers.filter(a=>a.decision!=='denied'&&(a.state!=='left'||!roster&&s.jobs.some(j=>j.seller===a.pubkey)));
+}
 // Public page: denied members are not listed. Remote text only ever reaches textContent.
 // mode 'loading' (or true: not live and no fresh challenge data, e.g. before the first data or
 // disconnected): no rows and no counts, so nothing reads as current; only "Updating…" shows.
@@ -150,16 +160,15 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
   list.setAttribute?.('aria-busy',String(mode!=='live'));
   if(mode==='loading'){rosterShown.delete(list);list.replaceChildren();doc.getElementById('seller-summary')!.textContent='';return;}
   const roster=mode==='roster';
-  const shown=s.sellers.filter(a=>a.decision!=='denied');
+  const shown=listedSellers(s,roster);
   const key=roster?JSON.stringify([shown.map(a=>[a.name,a.npub,a.minutesOffered,a.state]),s.applicants??[],!!s.relay?.applicantsIncomplete]):null;
   if(key!==null&&rosterShown.get(list)===key)return;
   if(key===null)rosterShown.delete(list);else rosterShown.set(list,key);
   const fragment=doc.createDocumentFragment();
   for(const a of shown) {
-    // Roster only: 'Left' comes from the member's own membership (challenge data); every other
-    // state, and the minutes used, need the trade data and stay placeholders.
-    const left=a.state==='left';
-    const row=doc.createElement('li');const state=roster?(left?'Left':null):sellerState(s,a,now);
+    // Roster only: every state, and the minutes used, need the trade data and stay placeholders
+    // (no leaver is listed yet, see listedSellers).
+    const row=doc.createElement('li');const state=roster?null:sellerState(s,a,now);
     if(state==='Done'||state==='Left')row.className='off';
     const name=doc.createElement('strong');name.textContent=a.name||shortNpub(a.npub);
     const mins=doc.createElement('span');mins.className='c-mins';
