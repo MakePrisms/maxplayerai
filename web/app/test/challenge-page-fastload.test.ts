@@ -44,13 +44,13 @@ test("fastload: rows show with the hero, before the trade data; job states are p
   const { doc, ids } = page();
   paint(doc, s, roster(), { wasLive: false, readyAt: null }, clock(0));
   assert.equal(ids["challenge-start-label"]!.textContent, "Running now", "hero");
-  assert.equal(rows(ids).length, 2, "rows with the hero");
+  assert.equal(rows(ids).length, 1, "rows with the hero; the member who left is held back until the trade data says whether they worked");
   assert.equal(rows(ids)[0]!.children[0]!.textContent, "alice");
   assert.ok(placeholder(rows(ids)[0]!), "the working seller's state is a placeholder");
   assert.equal(all(rows(ids)[0]!.children[1]!), " / 60 min", "minutes used is a placeholder; offered shows");
   assert.equal(rows(ids)[0]!.children[1]!.children[0]!.className, "skel c-skel-used");
-  assert.equal(stateCell(rows(ids)[1]!).textContent, "Left", "a member who left (their own membership) shows");
-  assert.equal(ids["seller-summary"]!.textContent, "2 agents", "count without 'working now'");
+  assert.ok(!all(ids["challenge-sellers"]!).includes("Left"), "no member who left is listed before the trade data");
+  assert.equal(ids["seller-summary"]!.textContent, "1 agent", "count without 'working now', and without the leaver");
   assert.ok(!all(ids["challenge-sellers"]!).includes("Working now"));
   assert.ok(ids["agents-eyebrow"]!.cls.has("is-off"), "no Live eyebrow");
   assert.equal(ids["connection-status"]!.textContent, ROSTER_ONLY);
@@ -68,7 +68,7 @@ test("fastload: never 'Working now' before the run's trade data is complete, wha
     const { doc, ids } = page();
     let t = { wasLive: false, readyAt: null as number | null };
     for (const ms of [0, 1000, 2000]) t = paint(doc, s, r, t, clock(ms));
-    assert.equal(rows(ids).length, 2, `case ${i}`);
+    assert.equal(rows(ids).length, 1, `case ${i}`);
     assert.ok(!all(ids["challenge-sellers"]!).includes("Working now"), `case ${i}`);
     assert.ok(placeholder(rows(ids)[0]!), `case ${i}`);
     assert.ok(!ids["seller-summary"]!.textContent.includes("working now"), `case ${i}`);
@@ -81,7 +81,7 @@ test("fastload: the trade window completes -> states and count; the 15s poll aft
   let t = paint(doc, s, roster(), { wasLive: false, readyAt: null }, clock(0));
   t = paint(doc, s, windowDone(), t, clock(1000));
   assert.equal(stateCell(rows(ids)[0]!).textContent, "Working now");
-  assert.equal(ids["seller-summary"]!.textContent, "2 agents · 1 working now");
+  assert.equal(ids["seller-summary"]!.textContent, "1 agent · 1 working now", "the leaver had no job in this run");
   assert.equal(ids["connection-status"]!.textContent, "Live");
   assert.ok(!ids["agents-eyebrow"]!.cls.has("is-off"));
   // Backfill and poll rounds: windowComplete/historyComplete drop briefly while still connected.
@@ -91,7 +91,7 @@ test("fastload: the trade window completes -> states and count; the 15s poll aft
     t = paint(doc, s, poll ? roster({ windowSince: 900 }) : windowDone({ historyComplete: ms > 20000 }), t, clock(ms));
     seen.add(`${stateCell(rows(ids)[0]!).textContent}|${ids["seller-summary"]!.textContent}|${ids["connection-status"]!.textContent}|${ids["agents-eyebrow"]!.cls.has("is-off")}`);
   }
-  assert.deepEqual([...seen], ["Working now|2 agents · 1 working now|Live|false"], "one steady state across every tick");
+  assert.deepEqual([...seen], ["Working now|1 agent · 1 working now|Live|false"], "one steady state across every tick");
 });
 
 test("fastload: placeholder rows are not rebuilt every tick (no restarted sheen), and are once the roster changes", () => {
@@ -136,7 +136,7 @@ test("fastload: stale challenge data (no fresh ready read for over 5s) drops the
   const catching = roster({ relays: [tradeRelay(), ...ch().map((r) => ({ ...r, historyComplete: false }))] });
   let t = paint(doc, s, roster(), { wasLive: false, readyAt: null }, clock(0));
   t = paint(doc, s, catching, t, clock(5000));
-  assert.equal(rows(ids).length, 2, "held through a poll");
+  assert.equal(rows(ids).length, 1, "held through a poll");
   paint(doc, s, catching, t, clock(6000));
   assert.equal(rows(ids).length, 0, "stale: blank");
 });
