@@ -1,4 +1,4 @@
-import { parseSnapshot, renderLiveState, UPDATING, type Snapshot, type Tracker } from "./challenge/live.js";
+import { parseSnapshot, renderLiveState, TRADE_WINDOW_MARGIN_S, UPDATING, type Snapshot, type Tracker } from "./challenge/live.js";
 import { paint } from "./challenge/page.js";
 import { wireMore } from "./challenge/more.js";
 import { coalesce } from "./challenge/coalesce.js";
@@ -107,7 +107,8 @@ function connect(): void {
     try { receive({...store.snapshot(CHALLENGE_BUYER_PUBKEY), relay: live.status}); }
     catch { unavailable(); }
   }, RENDER_MS);
-  const live = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, quorum: CHALLENGE_QUORUM, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: changed});
+  // tradeWindowMarginS: read the current run's trade events first, older ones afterwards (relay.mjs window mode).
+  const live = new ChallengeReader({url: RELAY_URL, challengeRelays: CHALLENGE_RELAYS, quorum: CHALLENGE_QUORUM, buyer: CHALLENGE_BUYER_PUBKEY, store, onChange: changed, tradeWindowMarginS: TRADE_WINDOW_MARGIN_S});
   reader = live;
   live.start();
   addEventListener("pagehide", (event) => { if (!event.persisted) live.stop(); });

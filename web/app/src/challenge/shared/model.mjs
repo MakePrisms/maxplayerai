@@ -115,14 +115,18 @@ function applicantRows(events,buyer,decided) {
     .sort((a,b)=>b.created_at-a.created_at||a.pubkey.localeCompare(b.pubkey))
     .map(e=>({pubkey:e.pubkey,npub:npubEncode(e.pubkey),minutesOffered:+tag(e,'minutes'),since:+tag(e,'since'),joinedAt:e.created_at,note:membershipNote(e)}));
 }
+// The buyer's challenges, latest version per d, newest first; and the one a snapshot shows (the
+// newest not cancelled, else the newest). The /swarm reader uses the same choice for its trade window.
+export const buyerChallenges=(events,buyer)=>latest(events.filter(e=>validChallenge(e,buyer)),e=>tag(e,'d')).sort((a,b)=>b.created_at-a.created_at||a.id.localeCompare(b.id));
+export const currentChallenge=challenges=>challenges.find(e=>tag(e,'status')!=='cancelled')??challenges[0];
 // Inputs to this pure projection must already have passed EventStore.add (signature + id).
 // `cache` (an EventStore) reuses unchanged challenges' job facts; without it every challenge is
 // projected afresh. Both give identical output.
 export function snapshot(events,buyer,now,selectedChallenge=null,includeHistory=true,applicantEvents=[],cache=null) {
   const decisions=latest(events.filter(e=>validDecision(e,{pubkey:buyer})),e=>tag(e,'p'));
   const applicants=applicantRows(applicantEvents,buyer,new Set(decisions.map(e=>tag(e,'p'))));
-  const challenges=latest(events.filter(e=>validChallenge(e,buyer)),e=>tag(e,'d')).sort((a,b)=>b.created_at-a.created_at||a.id.localeCompare(b.id));
-  const c=selectedChallenge??challenges.find(e=>tag(e,'status')!=='cancelled')??challenges[0];
+  const challenges=buyerChallenges(events,buyer);
+  const c=selectedChallenge??currentChallenge(challenges);
   const empty={asOf:now,challenge:null,sellers:[],budget:null,jobs:[],updates:[],applicants};
   if(!c) return empty;
   // Sellers are exactly the trusted roster: buyer-accepted pubkeys (latest decision), whose
