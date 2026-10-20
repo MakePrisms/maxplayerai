@@ -406,13 +406,14 @@ test('collected journal job waits for ACCEPT projection rather than RESULT proje
   await f.runner.tick();assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
 });
 
-test('planner running roster includes collected work while projected meter runs',async()=>{
+test('F-5 (b): collected work whose relay meter still runs is awaitingAccept (recorded status), not running; its sellers stay busy',async()=>{
   const f=fixture();await f.runner.tick();
   for(const job of f.remote.values())job.results=[{}];
   f.snap.jobs=f.journal.state.jobs.map(j=>({id:j.id,seller:j.seller,result:{},running:true,accepted:false,start:100,deadline:1000}));
   await f.runner.tick();
-  assert.equal(f.inputs.at(-1).running.length,2);
-  assert.equal(f.calls.filter(([t])=>t==='post_job').length,2);
+  assert.deepEqual(f.inputs.at(-1).running,[],'the record says collected: never presented as running (8c0a4d12 listed both)');
+  assert.deepEqual(f.inputs.at(-1).awaitingAccept.map(x=>[x.seller,x.status,x.busyUntil]),[['a','collected',1000],['b','collected',1000]]);
+  assert.equal(f.calls.filter(([t])=>t==='post_job').length,2,'still busy until ACCEPT is projected');
 });
 
 // Roster uncertainty blocks exhaustion through readiness only; display warnings never do.
@@ -2317,7 +2318,7 @@ test('R4-3: a rejected planner response is journaled and shown on the retry as p
   f.io.plan=async x=>{f.inputs.push(structuredClone(x));
     if(x.mode==='analyze'){if(badAnalysis){badAnalysis=false;return {...analysis,workstreams:[{...analysis.workstreams[0],id:'ws9',dependsOn:['ws7']}]};}return structuredClone(analysis);}
     if(x.mode==='assign'&&badAssign){badAssign=false;return {};}
-    return {wait:true};};
+    return {wait:true,idleReason:'r4 test waits'};};
   await assert.rejects(f.runner.tick(),e=>e.message===why);
   assert.deepEqual(Object.values(f.journal.saved.days)[0].plannerError,{mode:'analyze',reason:why,at:100},'journaled');
   assert.ok(reports.includes(`Planner analyze response rejected: ${why}`));
@@ -2627,7 +2628,8 @@ test('advisor r1: a lagging snapshot re-reads an already-started schedule at the
 // meaningfully differ from the last call, on a day's first call, after a failed call, or after
 // SWARM_PLANNER_IDLE_SECONDS without a change. These tests use the real default (600 s).
 const s2Seller=(pubkey,extra={})=>({pubkey,eligible:true,decision:'accepted',state:'accepted',minutesRemaining:60,currentJobStart:null,...extra});
-function s2Fixture({sellers=['a'],plan=()=>({wait:true}),ends=5000}={}) {
+const s2Wait=()=>({wait:true,idleReason:'s2 test waits on purpose'});
+function s2Fixture({sellers=['a'],plan=s2Wait,ends=5000}={}) {
   const f=fixture();delete f.c.plannerIdleSeconds;f.c.maxDuration=900;
   f.snap.challenge.ends=ends;f.snap.sellers=sellers.map(p=>s2Seller(p));f.setPlan(plan);
   f.reports=[];f.io.report=m=>f.reports.push(m);
@@ -2635,7 +2637,7 @@ function s2Fixture({sellers=['a'],plan=()=>({wait:true}),ends=5000}={}) {
   f.ticks=async(from,n,step=5)=>{for(let i=0;i<n;i++){f.time(from+i*step);await f.runner.tick();}};
   return f;
 }
-const s2TenMinutes=x=>x.mode==='assign'&&x.sellers.length?{assignments:x.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'a ten-minute task',durationSeconds:600}))}:{wait:true};
+const s2TenMinutes=x=>x.mode==='assign'&&x.sellers.length?{assignments:x.sellers.map(s=>({seller:s.pubkey,workstream:'piece',task:'a ten-minute task',durationSeconds:600}))}:s2Wait();
 test('S-2 simulated ticks: 60 unchanged ticks call assign once (73e0a3d2: 60), for one free seller and for every seller busy',async()=>{
   // One free seller, the planner keeps waiting.
   const f=s2Fixture();await f.ticks(100,60);
@@ -2729,16 +2731,18 @@ for(const [name,reason,seed,change] of s2Changes)test(`S-2 re-call after a chang
 });
 test('S-2 re-call after a failed call (retried next tick, as before) and once after new rejected-assignment feedback, not for the same feedback again',async()=>{
   const f=s2Fixture();let fail=true;
-  f.setPlan(x=>{if(x.mode==='assign'&&fail){fail=false;throw Error('planner timed out');}return {wait:true};});
+  f.setPlan(x=>{if(x.mode==='assign'&&fail){fail=false;throw Error('planner timed out');}return s2Wait();});
   await assert.rejects(f.ticks(100,1),/planner timed out/);
   await f.ticks(105,1);assert.equal(f.assigns().length,2,'retried on the next tick');
   assert.ok(f.reports.some(r=>/assign call 2 today \(trigger: retry after a failed call\)/.test(r)));
   await f.ticks(110,5);assert.equal(f.assigns().length,2);
-  // Rejections are new input for the planner: one call shows them; the same rejections again are no change.
-  const g=s2Fixture();g.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'nope',task:'t',durationSeconds:300}]}:{wait:true});
+  // Rejections are new input for the planner: F-5 (c) re-asks at once, at most twice for the same
+  // error; then the normal cadence applies (logged).
+  const g=s2Fixture();g.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'nope',task:'t',durationSeconds:300}]}:s2Wait());
   await g.ticks(100,1);assert.equal(g.assigns().length,1);
   await g.ticks(105,1);assert.equal(g.assigns().length,2);assert.match(g.assigns()[1].rejectedAssignments[0].reason,/unknown workstream "nope"/);
-  await g.ticks(110,10);assert.equal(g.assigns().length,2,'the same rejection again is no change');
+  await g.ticks(110,10);assert.equal(g.assigns().length,3,'the same rejection again: one more immediate retry, then the cap');
+  assert.equal(g.reports.filter(r=>/not retried at once: its error already had 2 immediate retries today; falling back to the normal cadence/.test(r)).length,1);
 });
 // S-2 Fix 2: over the cap the input degrades further instead of failing the call.
 test('S-2 planner input: shorter digests come before omitting answers',async()=>{
@@ -2804,5 +2808,168 @@ test('S-2 the same rejection again with only its numbers changed (deadline, time
   f.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:300,amountSats:6}]}:{wait:true});
   await f.ticks(100,2);assert.equal(f.assigns().length,2,'first call, then one call that shows the rejection');
   assert.match(f.assigns()[1].rejectedAssignments[0].reason,/budget_exceeded .*deadline 400/);
-  await f.ticks(110,10);assert.equal(f.assigns().length,2,'the same rejection with a new deadline is not new feedback');
+  await f.ticks(110,10);assert.equal(f.assigns().length,3,'the same rejection with a new deadline is the same error: capped at 2 immediate retries');
+});
+
+// F-5 (run feedback, MEDIUM): mid-round the planner stopped assigning while 3 sellers sat idle with
+// 90% of the budget unspent; its own plan still said a refused job's workstream was running, and its
+// one attempt to use an idle seller named a workstream that did not exist.
+const F5PLAN={approach:'split',workstreams:[
+  {id:'ws1',description:'decrypt',needs:{skills:[]},estMinutes:5,dependsOn:[],status:'running'},
+  {id:'ws2',description:'verify ws1',needs:{skills:[]},estMinutes:5,dependsOn:['ws1'],status:'pending'}],verification:'check'};
+// A planner that trusts what it is shown: a workstream's status is its record when the runner sends
+// one, else its own plan text. Its first batch invents an id (as in the run); it gives an idleReason
+// only once the runner asks for one.
+const f5Model=x=>{
+  if(x.mode!=='assign')return {wait:true};
+  const st=w=>w.record?.status??w.status;
+  const done=new Set(x.plan.workstreams.filter(w=>['collected','done'].includes(st(w))).map(w=>w.id));
+  const open=x.plan.workstreams.filter(w=>!['running','deferred','collected','done'].includes(st(w))&&w.dependsOn.every(d=>done.has(d)));
+  const refusedBy=new Set((x.refusals??[]).map(r=>r.seller+'|'+r.workstream)),free=x.sellers.map(s=>s.pubkey),out=[];
+  if(!x.rejectedAssignments&&free.length)out.push({seller:free.shift(),workstream:'ws3-new',task:'start a new line of work',durationSeconds:600});
+  for(const w of open){const i=free.findIndex(s=>!refusedBy.has(s+'|'+w.id));if(i>=0)out.push({seller:free.splice(i,1)[0],workstream:w.id,task:`do ${w.id}`,durationSeconds:600});}
+  if(out.length)return {assignments:out};
+  return /idleReason/.test(x.previousPlannerError?.reason??'')?{wait:true,idleReason:'ws2 waits for ws1, which is running'}:{wait:true};
+};
+function f5Fixture(model=f5Model) {
+  const f=s2Fixture({sellers:['a','b','c']});f.snap.budget.totalSats=1000;
+  // Seller a refused ws1 (100 sats paid, its ACCEPT projected): 900 of 1000 sats left, a/b/c free.
+  f.journal.state.jobs.push({key:s2Key,id:'job-ws1',seller:'a',workstream:'ws1',challenge:{buyer:'b',id:'day'},created:50,durationSeconds:600,
+    args:{task:'[challenge:b:day]\ndo ws1',output:'text/plain',amount_sats:100,max_sats:100,payment:'sat',deadline_unix:650,request_id:'rq-ws1'},
+    done:true,outcome:'refused',refusal:{by:'heuristic',kind:'refusal',reason:'I cannot help with this.'},answer:'I cannot help with this.',pay:{state:'Closed { paid }',amount_sats:100},ts:90});
+  f.snap.jobs=[{id:'job-ws1',seller:'a',running:false,accepted:true,result:{},start:50,deadline:650,amountSats:100}];
+  f.io.plan=async x=>{f.inputs.push(structuredClone(x));return x.mode==='analyze'?structuredClone(F5PLAN):model(x);};
+  f.posts=()=>f.calls.filter(([t])=>t==='post_job').map(([,a])=>a);
+  return f;
+}
+test('F-5 scenario: 3 idle sellers, a refused job the plan calls running, an invented workstream, 90% budget left: work at the first tick, 3 assign calls in 60 ticks (8d03b49c: no work in 240 ticks)',async()=>{
+  const f=f5Fixture();await f.ticks(100,1);
+  const first=f.assigns()[0],ws1=first.plan.workstreams.find(w=>w.id==='ws1');
+  // (b) the record, not the plan text: ws1 is refused and the correction is spelled out.
+  assert.equal(ws1.status,'refused');assert.equal(ws1.record.status,'refused');assert.equal(ws1.record.running,0);
+  assert.deepEqual(ws1.record.jobs,[{jobId:'job-ws1',seller:'a',status:'refused'}]);
+  assert.deepEqual(first.statusCorrections,[{workstream:'ws1',field:'status',planSaid:'running',record:'refused',jobId:'job-ws1'}]);
+  assert.deepEqual(first.running,[]);assert.deepEqual(first.validWorkstreams,['ws1','ws2']);
+  assert.ok(f.reports.some(r=>/^Planner plan status corrected from the runner record \(sent as statusCorrections\): ws1\.status said "running", record: refused \(job job-ws1\)$/.test(r)));
+  assert.equal(Object.values(f.journal.state.days)[0].plan.workstreams[0].status,'running','the journaled plan is left as written');
+  // An idle seller other than the refuser gets ws1 in the first planning tick; the invented id is rejected.
+  assert.deepEqual(f.posts().map(a=>a.seller_pubkey),['b']);
+  await f.ticks(105,59);
+  assert.deepEqual(f.posts().map(a=>a.seller_pubkey),['b'],'one post: ws2 depends on ws1');
+  // (c) the next tick re-asks with the rejection and the valid ids; (a) its silent wait is asked once more.
+  assert.deepEqual(f.assigns().map(i=>i.now),[100,105,105]);
+  const [,retry,again]=f.assigns();
+  assert.match(retry.rejectedAssignments[0].reason,/unknown workstream "ws3-new"/);assert.deepEqual(retry.validWorkstreams,['ws1','ws2']);
+  assert.ok(f.reports.some(r=>/assign call 2 today \(trigger: assignments rejected \(immediate retry 1 of 2\)\)/.test(r)));
+  assert.match(again.previousPlannerError.reason,/^Invalid planner response \(assign\): 2 free sellers the budget can pay \(a, c; headroom 900 sats\) but no assignment and no idleReason/);
+  const day=Object.values(f.journal.state.days)[0];
+  assert.deepEqual({...day.idle,at:undefined},{reason:'ws2 waits for ws1, which is running',at:undefined,freeSellers:2,payable:2,assignments:0,headroomSats:900});
+  assert.ok(f.reports.some(r=>r==='Planner assign: 0 assignments for 2 free sellers (2 payable, headroom 900 sats); idle reason: ws2 waits for ws1, which is running'));
+});
+test('F-5 (b): a finished job is never presented as running: plan fields, plan running lists and the running roster follow the record',async()=>{
+  const {planWithRecord,recordedStatus}=await import('./swarm.mjs');
+  const plan={...F5PLAN,workstreams:[
+    {...F5PLAN.workstreams[0],state:'IN PROGRESS (seller a)',progress:'50%',description:'running the attack'},
+    {...F5PLAN.workstreams[1],status:'assigned',active:true},
+    {id:'ws4',description:'d',needs:{},estMinutes:1,dependsOn:[],status:'running'}],
+    running:[{workstream:'ws1',seller:'a'},'job-ws4','someone else'],notes:'ws1 running'};
+  const jobs=[{id:'j0',seller:'b',workstream:'ws1',slotFreed:5},{id:'j1',seller:'a',workstream:'ws1',done:true,outcome:'collect refused'},{id:'job-ws4',seller:'c',workstream:'ws4',deferred:true}];
+  assert.equal(recordedStatus(jobs[0]),'expired/undelivered');assert.equal(recordedStatus(jobs[2]),'deferred');
+  const {plan:out,corrections}=planWithRecord(plan,jobs);
+  assert.equal(out.workstreams[0].state,'collect refused');assert.equal(out.workstreams[0].progress,'50%');assert.equal(out.workstreams[0].description,'running the attack');
+  assert.deepEqual(out.workstreams[0].record,{status:'collect refused',running:0,jobs:[{jobId:'j0',seller:'b',status:'expired/undelivered'},{jobId:'j1',seller:'a',status:'collect refused'}]});
+  assert.equal(out.workstreams[1].status,'not assigned');assert.equal(out.workstreams[1].active,'not assigned');
+  assert.equal(out.workstreams[2].status,'running','a deferred job holds its workstream');
+  assert.deepEqual(out.running,['job-ws4','someone else']);assert.equal(out.notes,'ws1 running','free text is not rewritten; the record field is authoritative');
+  assert.deepEqual(corrections.map(c=>[c.workstream,c.field,c.record]),[['ws1','status','collect refused'],['ws1','state','collect refused'],['ws2','status','not assigned'],['ws2','active','not assigned'],['ws1','running','collect refused']]);
+  assert.deepEqual(planWithRecord(null,jobs),{plan:null,corrections:[]});
+  // Runner: a collect-refused job (no ACCEPT ever) whose relay meter still runs is not running work.
+  const f=f5Fixture(()=>({wait:true,idleReason:'test'}));
+  Object.assign(f.journal.state.jobs[0],{outcome:'collect refused',collectRefused:'review: permanent input error: binary',refusal:undefined});
+  f.snap.jobs=[{id:'job-ws1',seller:'a',running:true,accepted:false,result:{},start:50,deadline:650,amountSats:100}];
+  await f.ticks(100,1);
+  const input=f.assigns()[0];
+  assert.deepEqual(input.running,[],'8d03b49c listed it as a running relay job');
+  assert.deepEqual(input.awaitingAccept,[{jobId:'job-ws1',seller:'a',workstream:'ws1',status:'collect refused',busyUntil:650}]);
+  assert.deepEqual(input.sellers.map(s=>s.pubkey),['b','c'],'its seller stays busy until the meter closes');
+  // A plan echoed back with the overlay is journaled without it; a correction set is logged once.
+  f.io.plan=async x=>{f.inputs.push(structuredClone(x));return x.mode==='assign'?{wait:true,idleReason:'test',plan:x.plan}:{wait:true};};
+  f.snap.budget.totalSats=2000;await f.ticks(105,3);
+  const saved=Object.values(f.journal.state.days)[0].plan;
+  assert.equal(saved.workstreams[0].status,'collect refused','the echoed plan was saved');
+  assert.ok(saved.workstreams.every(w=>!('record' in w)),'without the runner overlay');
+  assert.equal(f.reports.filter(r=>r.startsWith('Planner plan status corrected')).length,1);
+});
+test('F-5 (c): a rejected assignment re-asks at once with validWorkstreams, at most 2 immediate retries per distinct error per day, then the normal cadence (logged)',async()=>{
+  const f=s2Fixture({sellers:['a','b']});let target='nope';
+  f.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:target,task:'t',durationSeconds:300}],idleReason:'b: nothing else to do'}:{wait:true});
+  await f.ticks(100,60);
+  assert.deepEqual(f.assigns().map(i=>i.now),[100,105,110],'first call plus 2 immediate retries in 60 ticks (8d03b49c: 2 calls)');
+  assert.deepEqual(f.assigns()[1].validWorkstreams,['piece']);
+  assert.match(f.assigns()[1].rejectedAssignments[0].reason,/unknown workstream "nope": not in the plan sent with this assign call \(ids: piece\)/);
+  const capped=f.reports.filter(r=>r.startsWith('Planner assign: 1 rejected assignment not retried at once'));
+  assert.deepEqual(capped,['Planner assign: 1 rejected assignment not retried at once: its error already had 2 immediate retries today; falling back to the normal cadence (the rejections stay in the next call\'s input)']);
+  const day=Object.values(f.journal.state.days)[0];assert.deepEqual(Object.values(day.rejectionRetries),[2]);assert.equal('rejectedUnseen' in day,false);
+  // The cadence still applies: the 600 s ceiling (from the last call, 110) calls once more; the input still shows the rejection.
+  await f.ticks(400,64);assert.deepEqual(f.assigns().map(i=>i.now),[100,105,110,710]);assert.equal(f.assigns()[3].rejectedAssignments.length,1);
+  // The cap is journaled: a restarted runner makes its first call, then does not retry the capped error again.
+  f.runner=new Swarm(f.c,f.io,f.journal);await f.ticks(720,6);
+  assert.deepEqual(f.assigns().map(i=>i.now).slice(4),[720],'restart: first call only, the capped error is not retried');
+  // A different error is a new error with its own two retries.
+  target='nope2';f.snap.budget.totalSats=20;await f.ticks(750,6);
+  assert.deepEqual(f.assigns().map(i=>i.now).slice(5),[750,755,760],'budget change, then 2 immediate retries for the new error');
+});
+test('F-5 (a): free payable sellers and no assignment need an idleReason: one retry, then journaled and logged; no capacity stays quiet',async()=>{
+  assert.throws(()=>validatePlan({wait:true,idleReason:''}),/idleReason must be a non-empty string/);
+  assert.throws(()=>validatePlan({wait:true,idleReason:3}),/idleReason must be a non-empty string/);
+  assert.equal(validatePlan({assignments:[],idleReason:'x'}).idleReason,'x');
+  const {affordableSellers}=await import('./swarm.mjs');
+  const free={pubkey:'f',capabilities:[['takes_payment','none'],['rate','5']]},paid={pubkey:'p',capabilities:[['rate','5']]},unread={pubkey:'u',capabilities:[]};
+  assert.deepEqual(affordableSellers([free,paid,unread],4).map(s=>s.pubkey),['f','u']);
+  assert.deepEqual(affordableSellers([free,paid,unread],5).map(s=>s.pubkey),['f','p','u']);
+  assert.deepEqual(affordableSellers([free,paid,unread],100,{paidRefused:true}).map(s=>s.pubkey),['f','u'],'a free seat needs no release proof');
+  // Neither, twice: one retry in the same tick, then accepted as idle with the fallback reason.
+  const f=s2Fixture({sellers:['a','b']});f.c.updateEvery=1;f.setPlan(()=>({wait:true}));
+  await f.ticks(100,20);
+  assert.deepEqual(f.assigns().map(i=>i.now),[100,100],'one retry, never a call per tick');
+  assert.match(f.assigns()[1].previousPlannerError.reason,/2 free sellers the budget can pay \(a, b; headroom 10 sats\) but no assignment and no idleReason: return at least one assignment, or \{"wait":true,"idleReason":/);
+  assert.ok(f.reports.some(r=>/^Planner assign response rejected: Invalid planner response \(assign\): 2 free sellers .*; asking once more$/.test(r)));
+  assert.ok(f.reports.includes('Planner assign gave no assignment and no idleReason again after one retry; accepted as idle (next call on a change)'));
+  const day=Object.values(f.journal.state.days)[0];
+  assert.equal(day.idle.reason,'(no idleReason given, even after one retry)');assert.equal('plannerError' in day,false);
+  assert.ok(f.reports.some(r=>r==='Idle day: the last assign call (1970-01-01T00:01:40Z) left 2 payable free sellers without work: (no idleReason given, even after one retry)'),'the progress log line');
+  // A reason the first time: no retry; a later batch with work clears it.
+  const g=s2Fixture();let reason=true;g.setPlan(x=>x.mode!=='assign'?{wait:true}:reason?{wait:true,idleReason:' waiting for the analysis seller '}:{assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:300}]});
+  await g.ticks(100,1);assert.equal(g.assigns().length,1);assert.equal(Object.values(g.journal.state.days)[0].idle.reason,'waiting for the analysis seller');
+  reason=false;g.snap.budget.totalSats=20;await g.ticks(105,1);assert.equal('idle' in Object.values(g.journal.state.days)[0],false);
+  // No capacity, nothing to assign: paid sellers the headroom cannot pay, or an empty roster.
+  const h=s2Fixture({sellers:['a','b']});h.snap.budget.totalSats=0;h.snap.sellers.forEach(s=>s.capabilities=[['rate','5']]);h.setPlan(()=>({wait:true}));
+  await h.ticks(100,3);assert.equal(h.assigns().length,1);
+  const k=s2Fixture({sellers:['a'],plan:s2TenMinutes});k.setPlan(x=>x.mode==='assign'&&x.sellers.length?s2TenMinutes(x):{wait:true});
+  await k.ticks(100,1);k.snap.budget.totalSats=20;await k.ticks(105,1);
+  assert.deepEqual(k.assigns().map(i=>i.sellers.length),[1,0]);
+  for(const x of [h,k])assert.ok(!x.reports.some(r=>/idleReason|idle reason|^Idle /.test(r)),x.reports.join('\n'));
+  // A free seller the headroom covers (a free seat among paid ones) still needs a reason.
+  const m=s2Fixture({sellers:['a','b']});m.snap.budget.totalSats=0;m.snap.sellers[0].capabilities=[['rate','5']];m.snap.sellers[1].capabilities=[['takes_payment','none']];m.setPlan(()=>({wait:true}));
+  await m.ticks(100,1);assert.equal(m.assigns().length,2);assert.match(m.assigns()[1].previousPlannerError.reason,/1 free seller the budget can pay \(b; headroom 0 sats\)/);
+});
+test('F-5: planner-llm prompt states idleReason, record status and validWorkstreams; the stub names only valid workstreams',async()=>{
+  const {command}=await import('./swarm.mjs');
+  const dir=mkdtempSync(join(tmpdir(),'swarm-f5-prompt-')),bin=join(dir,'fake-claude'),out=join(dir,'prompt.txt');
+  try {
+    writeFileSync(bin,`#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(out)},require('fs').readFileSync(0,'utf8'));console.log(JSON.stringify({wait:true,idleReason:'x'}));\n`,{mode:0o700});
+    const res=JSON.parse(await command(process.execPath,['scripts/challenges/planner-llm.mjs'],{input:JSON.stringify({mode:'assign',results:[]}),env:{...process.env,SWARM_LLM_BINARY:bin}}));
+    assert.equal(res.idleReason,'x');
+    const p=readFileSync(out,'utf8').replace(/\s+/g,' ');
+    assert.match(p,/\{"wait":true,"idleReason":"\.\.\."\}/);
+    assert.match(p,/IDLE CAPACITY: when sellers \(the free roster\) is not empty and budgetHeadroomSats covers at least one of them/);
+    assert.match(p,/A response with neither is rejected and asked once more\. With no free seller, or none the budget can pay, plain \{"wait":true\} is fine/);
+    assert.match(p,/JOB STATUS COMES FROM THE RUNNER'S RECORD, never from your own plan text/);
+    assert.match(p,/awaitingAccept lists finished jobs .* NOT running work/);assert.match(p,/statusCorrections, when present/);
+    assert.match(p,/validWorkstreams lists the plan ids an assignment may name/);
+  } finally {rmSync(dir,{recursive:true});}
+  const stub=async data=>JSON.parse(await command(process.execPath,['scripts/challenges/planner-stub.mjs'],{input:JSON.stringify(data)}));
+  const input={mode:'assign',results:[],now:100,challenge:{ends:5000},maxDurationSeconds:900,minDurationSeconds:300,sellers:[{pubkey:'a',capabilities:['rust'],minutesRemaining:60},{pubkey:'b',capabilities:[],minutesRemaining:60}]};
+  assert.deepEqual((await stub(input)).assignments.map(a=>a.workstream),['rust','research']);
+  assert.deepEqual((await stub({...input,validWorkstreams:['verify']})).assignments.map(a=>a.workstream),['verify','verify']);
 });

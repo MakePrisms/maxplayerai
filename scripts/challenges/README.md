@@ -264,8 +264,25 @@ every seller was busy (an empty free roster) and ticks where nothing had changed
 made 171 planner calls. It is now called only when its input would meaningfully differ from the
 last call: a new result or refusal, a seller became free, became eligible or left, a job finished
 or expired, the plan changed, the budget or a free seller's donated minutes moved, the bench
-changed, the challenge (goal, window, status) or task context changed, or new rejected-assignment
-feedback is waiting. An empty roster with nothing else changed is no change. It is also called on
+changed, or the challenge (goal, window, status) or task context changed. An empty roster with
+nothing else changed is no change. **Rejected assignments (F-5 c)** re-ask at once: an `assign`
+batch with any rejected entry makes the next eligible tick call `assign` again (trigger
+`assignments rejected (immediate retry N of 2)`), with the rejections in `rejectedAssignments` and
+the plan ids in `validWorkstreams`. Each distinct error (seller, workstream, price and reason, with
+numbers ignored) gets at most `REJECTION_RETRIES_PER_ERROR` (2) immediate retries per day
+(journaled in `days[…].rejectionRetries`, so a restart does not reset them); past the cap the
+runner logs `Planner assign: N rejected assignment(s) not retried at once: … falling back to the
+normal cadence` and the rejections wait for the next change or the idle ceiling.
+**Idle capacity (F-5 a):** when the free roster has at least one seller the budget headroom can
+pay (a free seat, a seat whose pricing is not read yet, or a paid seat whose minimum fits the
+headroom with a buyer that can prove releases), an `assign` response must contain an assignment
+or `idleReason` (a non-empty string). A response with neither is asked once more in the same tick,
+with `previousPlannerError` naming the free sellers and the headroom; a second such response is
+accepted as idle with the reason `(no idleReason given, even after one retry)`. The reason is
+journaled (`days[…].idle`: reason, free/payable sellers, assignments, headroom), logged as
+`Planner assign: N assignments for M free sellers (P payable, headroom H sats); idle reason: …`,
+and repeated with each progress log as `Idle <run>: … without work: <reason>`. With no free seller,
+or none the budget can pay, a plain `{"wait":true}` needs no reason and logs nothing. It is also called on
 the first planning tick of a day (and right after a runner restart), on the tick after a failed
 call, and once `SWARM_PLANNER_IDLE_SECONDS` (600) passed with no change, so the planner can still
 declare solved with every seller busy. The work-window-ended and seller-exhaustion stops do not
@@ -357,8 +374,24 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
   (`seller,workstream,task,since,deadline` where available; `deferred:true` marks an
   assignment waiting for the relay snapshot, not yet offered), and all settled results.
   Returns `{assignments:[{seller,workstream,task,durationSeconds,amountSats?,includeAnswers?}]}`, `{wait:true}`, or
-  `{solved:true,result,summary}`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
-  May deliberately leave any seller idle. Each assignment is validated separately and invalid
+  `{solved:true,result,summary}`; `assignments` or `wait` may carry `idleReason`. Seller is the profile's hex `pubkey`; workstream is a plan ID.
+  May deliberately leave any seller idle, but while a free seller the headroom can pay is left
+  without work it must say why in `idleReason` (see *Planner cadence*).
+  **Job status comes from the runner's record (F-5 b).** `running` lists only jobs the journal says
+  are running (posted, posting or deferred), plus relay jobs the journal has no record of. A
+  journaled job that is finished (collected, refused, expired/undelivered, collect refused, payment
+  stuck, price too high…) is never listed there, even while the relay meter is still open; such a
+  job is in `awaitingAccept` (`jobId,seller,workstream,status,busyUntil`): its seller stays busy
+  until then, but it is not running work. Every plan workstream sent with `assign`/`assess` carries
+  `record:{status,running,jobs:[{jobId,seller,status}],jobsOmitted?}` (status `running`, the newest
+  job's recorded outcome, or `not assigned`). A status-like field the planner wrote into its plan
+  (`status`, `state`, `progress`, `running`, `assigned`, `active`…) that claims running work for a
+  workstream with no running job, and a top-level `running`/`inProgress`/`active`/`assigned` list
+  entry naming a finished job or workstream, are replaced by the record before the planner sees
+  them. Each replacement is listed in `statusCorrections`
+  (`workstream,field,planSaid,record,jobId?`) and logged once per new set as `Planner plan status
+  corrected from the runner record …`. The journaled plan is kept as written; a plan the planner
+  echoes back is saved without `record`. `validWorkstreams` lists the current plan's ids. Each assignment is validated separately and invalid
   entries are dropped with a logged reason (also returned as `rejectedAssignments`). A workstream
   id is valid if it is in the plan sent with that same `assign` call or in the revised `plan` the
   response returns, so a revision by the previous `assess` (or by this response) never invalidates

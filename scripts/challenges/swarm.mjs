@@ -621,6 +621,7 @@ export function validatePlan(p, mode='assign') {
   if(kinds.length!==1)bad(kinds.length?`return exactly one of assignments, solved or wait (got ${kinds.join(' + ')})`:'return exactly one of {"assignments":[...]}, {"wait":true} or {"solved":true,...}');
   if(mode==='assess'&&p.assignments)bad('assess returns solved or wait, never assignments');
   if(p.solved && (typeof p.result!=='string'||!p.result.trim()))throw planError('Solved requires result','result must be a non-empty string');
+  if('idleReason' in p && (typeof p.idleReason!=='string'||!p.idleReason.trim()))bad('idleReason must be a non-empty string saying why free sellers stay idle');
   if(p.plan)validateAnalysis(p.plan,'Invalid revised plan');
   return p;
 }
@@ -807,11 +808,97 @@ export function plannerFactChanges(prev,cur) {
   if(prev.budgetTotalSats!==cur.budgetTotalSats||cur.headroomSats>prev.headroomSats)out.push('budget changed');
   if(Object.entries(cur.minutes).some(([s,m])=>s in prev.minutes&&prev.minutes[s]!==m))out.push('donated minutes changed');
   if(prev.benched!==cur.benched)out.push('bench changed');
-  // Feedback the planner has not seen yet (its last batch's rejections), once: the same rejections
-  // again (times and numbers aside) are no change, so a planner that repeats them is not re-asked.
-  if(prev.rejected!==cur.rejected&&cur.rejected!=='none')out.push('assignments rejected (new feedback)');
+  // Rejected assignments are not a fact here: F-5 (c) re-asks for them through
+  // Swarm.rejectionRetry, capped per distinct error (REJECTION_RETRIES_PER_ERROR).
   if(prev.context!==cur.context)out.push('challenge or runner context changed');
   return out;
+}
+// F-5 (c): an assign batch with rejected assignments makes the next eligible tick call `assign`
+// again at once, with the rejections and validWorkstreams in its input. At most this many immediate
+// retries per day per distinct error (seller, workstream, price and reason, numbers ignored), so a
+// planner that keeps repeating a mistake cannot burn calls; past the cap the rejections stay in the
+// input but wait for the normal cadence (logged). Journaled per day (days[…].rejectionRetries).
+export const REJECTION_RETRIES_PER_ERROR = 2;
+export const REJECTION_RETRY_KEYS_KEPT = 200;
+export const rejectionKey = r => factHash([r?.seller,r?.workstream,r?.amountSats,String(r?.reason).replace(/\d+/g,'#')]);
+// F-5 (a): free sellers the budget headroom can pay. A free seat (takes_payment=none) or one whose
+// pricing is not read yet costs 0; a paid seat needs its advertised minimum within headroom and a
+// buyer that can prove releases (paidRefused otherwise). While at least one is left, an `assign`
+// response must carry an assignment or `idleReason`; with none, waiting needs no reason (quiet).
+export function affordableSellers(sellers,headroomSats,{paidRefused=false}={}) {
+  return sellers.filter(s=>{
+    const p=sellerPricing(s);
+    if(!p.known||p.free)return true;
+    return !paidRefused&&p.minimumSats!==null&&Number.isSafeInteger(headroomSats)&&p.minimumSats<=headroomSats;
+  });
+}
+export const IDLE_REASON_MAX_CHARS = 500;
+export const idleReasonOf = p => typeof p?.idleReason==='string'&&p.idleReason.trim()?p.idleReason.trim().slice(0,IDLE_REASON_MAX_CHARS):null;
+export const IDLE_REASON_FALLBACK = '(no idleReason given, even after one retry)';
+export function missingIdleReason(sellers,headroomSats) {
+  const n=sellers.length,ids=sellers.map(s=>String(s.pubkey).slice(0,16)).join(', ').slice(0,300);
+  return `Invalid planner response (assign): ${n} free seller${n===1?'':'s'} the budget can pay (${ids}; headroom ${headroomSats} sats) but no assignment and no idleReason: return at least one assignment, or {"wait":true,"idleReason":"<why each free seller stays idle>"}`;
+}
+// F-5 (b): a journaled job's status as the planner sees it, from the runner's own record (never
+// from the planner's plan text): running (posted or posting), deferred (not yet offered; the seller
+// is held), or its recorded outcome (collected, refused, expired/undelivered, collect refused,
+// payment stuck, price too high…) once done or once its slot was freed.
+export function recordedStatus(j) {
+  if(j.done||j.slotFreed)return String(j.outcome??(j.done?'finished':'expired/undelivered')).slice(0,200);
+  return j.deferred?'deferred':'running';
+}
+const recordedActive = status => status==='running'||status==='deferred';
+// F-5 (b): the plan as sent to the planner. Each workstream carries `record` (its jobs' statuses
+// from the journal: status, running count, newest RECORD_JOBS_PER_WORKSTREAM jobs). A status-like
+// field the planner wrote (status/state/progress/running/assigned/active…) that claims running
+// work for a workstream with no running job in the record is replaced by the record's status, and
+// so is a top-level running/inProgress/active/assigned list entry naming a finished job or
+// workstream. Every replacement is returned as a correction (sent as statusCorrections and logged).
+// The journaled plan itself is left as the planner wrote it.
+export const RECORD_JOBS_PER_WORKSTREAM = 5;
+export const MAX_STATUS_CORRECTIONS = 20;
+const RUNNING_CLAIM = /\b(running|in[ _-]?progress|assigned|active|working|underway|ongoing|started|busy)\b/i;
+const STATUS_KEY = /status|state|progress|running|assigned|active/i;
+const RUNNING_LIST_KEY = /^(running|in[ _-]?progress|active|assigned)/i;
+const PLAN_FIELDS = ['id','description','needs','estMinutes','dependsOn','record'];
+export function planWithRecord(plan,jobs) {
+  if(!plan||typeof plan!=='object'||!Array.isArray(plan.workstreams))return {plan:plan??null,corrections:[]};
+  const corrections=[],note=x=>{if(corrections.length<MAX_STATUS_CORRECTIONS)corrections.push(x);};
+  const records=new Map();
+  const recordOf=id=>{
+    if(records.has(id))return records.get(id);
+    const list=jobs.filter(j=>j.workstream===id).map(j=>({jobId:j.id??null,seller:j.seller,status:recordedStatus(j)}));
+    const running=list.filter(x=>recordedActive(x.status)).length,kept=list.slice(-RECORD_JOBS_PER_WORKSTREAM);
+    const r={status:running?'running':list.length?list.at(-1).status:'not assigned',running,jobs:kept,...(list.length>kept.length?{jobsOmitted:list.length-kept.length}:{})};
+    records.set(id,r);return r;
+  };
+  const claims=v=>v===true||(typeof v==='string'&&RUNNING_CLAIM.test(v));
+  const lastJob=r=>r.jobs.length?{jobId:r.jobs.at(-1).jobId}:{};
+  const workstreams=plan.workstreams.map(w=>{
+    if(!w||typeof w!=='object'||Array.isArray(w))return w;
+    const record=recordOf(w.id),out={...w,record};
+    if(!record.running)for(const [k,v] of Object.entries(w)) {
+      if(PLAN_FIELDS.includes(k)||!STATUS_KEY.test(k)||!claims(v))continue;
+      out[k]=record.status;
+      note({workstream:String(w.id).slice(0,100),field:k,planSaid:String(v).slice(0,200),record:record.status,...lastJob(record)});
+    }
+    return out;
+  });
+  const out={...plan,workstreams};
+  for(const [k,v] of Object.entries(plan)) {
+    if(k==='workstreams'||!Array.isArray(v)||!RUNNING_LIST_KEY.test(k))continue;
+    out[k]=v.filter(e=>{
+      const o=e&&typeof e==='object'&&!Array.isArray(e)?e:null,refs=o?[o.jobId,o.job,o.id,o.workstream]:[e];
+      const job=jobs.find(j=>j.id!=null&&refs.includes(j.id));
+      const ws=job?null:[o?.workstream,...refs].find(r=>typeof r==='string'&&plan.workstreams.some(w=>w?.id===r));
+      if(!job&&ws===undefined)return true;
+      const status=job?recordedStatus(job):recordOf(ws).status;
+      if(job?recordedActive(status):recordOf(ws).running)return true;
+      note({...(ws!==undefined&&ws!==null?{workstream:ws}:{workstream:job?.workstream??null}),field:k,planSaid:JSON.stringify(e).slice(0,200),record:status,...(job?{jobId:job.id}:lastJob(recordOf(ws)))});
+      return false;
+    });
+  }
+  return {plan:out,corrections};
 }
 // Every `starts` a day was started for (bounded), plus the last record in day.started.
 export const STARTED_STARTS_KEPT = 32;
@@ -890,13 +977,14 @@ export class Swarm {
       plan:factHash(day.plan),budgetTotalSats:snap.budget?.totalSats??null,headroomSats:decision.budgetHeadroomSats,
       minutes:Object.fromEntries(candidates.map(s=>[s.seller_pubkey,Math.floor(s.remainingMinutes)])),
       benched:factHash(bench.map(b=>b.seller).sort()),
-      rejected:day.rejected?.length?factHash(day.rejected.map(r=>[r.seller,r.workstream,r.amountSats,String(r.reason).replace(/\d+/g,'#')])):'none',
       context:factHash([c.goal,c.ends,c.status,this.c.taskContext??null,this.releaseMissing??null])};
     const cad=this.cadence.get(key);
     if(!cad){this.cadence.set(key,{facts,pending:new Set(),calledAt:null,failed:false,skipped:0});return 'first call of the day';}
     for(const x of plannerFactChanges(cad.facts,facts))cad.pending.add(x);
     cad.facts=facts;
     if(cad.failed||cad.calledAt===null)return 'retry after a failed call';
+    const retry=this.rejectionRetry(day);
+    if(retry)cad.pending.add(retry);
     if(cad.pending.size)return [...cad.pending].join(', ');
     const idle=this.c.plannerIdleSeconds??DEFAULT_PLANNER_IDLE_SECONDS,quiet=now-cad.calledAt;
     if(quiet>=idle)return `no change for ${span(quiet)} (SWARM_PLANNER_IDLE_SECONDS ceiling)`;
@@ -907,7 +995,26 @@ export class Swarm {
     }
     return null;
   }
+  // F-5 (c): the immediate re-call for the last batch's rejections (a trigger reason), or null once
+  // every distinct error in it already had REJECTION_RETRIES_PER_ERROR immediate retries today (then
+  // the normal cadence applies, logged once per batch).
+  rejectionRetry(day) {
+    if(!day.rejectedUnseen||!day.rejected?.length)return null;
+    const counts=day.rejectionRetries??={},keys=[...new Set(day.rejected.map(rejectionKey))];
+    const open=keys.filter(k=>(counts[k]??0)<REJECTION_RETRIES_PER_ERROR);
+    if(!open.length) {
+      delete day.rejectedUnseen;this.save();
+      const n=day.rejected.length;
+      this.io.report?.(`Planner assign: ${n} rejected assignment${n===1?'':'s'} not retried at once: ${keys.length===1?'its error':`each of its ${keys.length} errors`} already had ${REJECTION_RETRIES_PER_ERROR} immediate retries today; falling back to the normal cadence (the rejections stay in the next call's input)`);
+      return null;
+    }
+    for(const k of open)counts[k]=(counts[k]??0)+1;
+    const all=Object.keys(counts);for(const k of all.slice(0,Math.max(0,all.length-REJECTION_RETRY_KEYS_KEPT)))delete counts[k];
+    this.save();
+    return `assignments rejected (immediate retry ${Math.max(...open.map(k=>counts[k]))} of ${REJECTION_RETRIES_PER_ERROR})`;
+  }
   // Records an assign call: pending changes are consumed; the plan the response left is the new base.
+  // (day.rejectedUnseen needs no reset here: every completed batch replaces day.rejected.)
   assignCalled(key,day,now,ok) {
     const cad=this.cadence.get(key);if(!cad)return;
     cad.pending.clear();cad.calledAt=now;cad.failed=!ok;cad.facts={...cad.facts,plan:factHash(day.plan)};
@@ -1045,6 +1152,13 @@ export class Swarm {
       this.io.report?.(`Run ${c.id}: publishing in_progress failed (retry in ${PROGRESS_RETRY_SECONDS}s): ${e.message}`);
       return true;
     }
+  }
+  // F-5 (b): one log line per new set of plan-status corrections (in memory: a restart logs again).
+  logCorrections(key,corrections) {
+    const h=factHash(corrections.map(x=>[x.workstream,x.field,x.planSaid,x.record]));
+    if((this.correctionsLogged??=new Map()).get(key)===h)return;
+    this.correctionsLogged.set(key,h);
+    this.io.report?.(`Planner plan status corrected from the runner record (sent as statusCorrections): ${corrections.map(x=>`${x.workstream}.${x.field} said ${JSON.stringify(x.planSaid).slice(0,80)}, record: ${x.record}${x.jobId?` (job ${x.jobId})`:''}`).join('; ')}`);
   }
   // P-2: rate-limited `not planning` line (see NOT_PLANNING_LOG_SECONDS). In memory: a restart logs at once.
   logNotPlanning(key,day,c,snap,now) {
@@ -1268,12 +1382,25 @@ export class Swarm {
     const min=this.c.minDuration??DEFAULT_MIN_DURATION, max=this.c.maxDuration??1800;
     const bench=this.benched(now),benchedSet=new Map(bench.map(b=>[b.seller,b]));
     const eligible=eligibleSeller;
+    // F-5 (b): `running` is what the runner's record says is running. A relay job is listed only when
+    // the journal has no record of it (the relay is then the only record); a journaled job that is
+    // finished is never listed, even while the relay still shows its meter open.
     const running=()=>[
       ...jobs.filter(j=>!j.done&&!j.slotFreed).map(j=>({jobId:j.id??null,...quotedIds(j),seller:j.seller,workstream:j.workstream??null,task:jobTask(j),since:j.created,deadline:j.args.deadline_unix,...(j.deferred?{deferred:true}:{})})),
-      ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id&&!local.done)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
+      ...(snap.jobs??[]).filter(j=>j.running&&!jobs.some(local=>local.id===j.id)).map(j=>({seller:j.seller,task:j.task,since:j.start,workstream:null}))];
+    // Finished in the record while the relay meter is still open (ACCEPT not yet visible; a collect
+    // refusal never gets one): the seller stays busy until busyUntil, but this is not running work.
+    const awaitingAccept=()=>(snap.jobs??[]).filter(p=>p.running).flatMap(p=>{
+      const j=jobs.find(l=>l.id===p.id&&(l.done||l.slotFreed));
+      return j?[{jobId:j.id,seller:j.seller,workstream:j.workstream??null,status:recordedStatus(j),busyUntil:p.deadline}]:[];});
     const ask=async(mode,sellers=snap.sellers.filter(eligible).map(s=>sellerProfile(s,jobs)),trigger=null)=>{
-      const raw={mode,goal:c.goal,challenge:c,plan:day.plan??null,sellers,
-        running:running(),results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
+      const record=planWithRecord(day.plan??null,jobs),settling=awaitingAccept();
+      if(record.corrections.length)this.logCorrections(key,record.corrections);
+      const raw={mode,goal:c.goal,challenge:c,plan:record.plan,sellers,
+        running:running(),...(settling.length?{awaitingAccept:settling}:{}),
+        ...(record.corrections.length?{statusCorrections:record.corrections}:{}),
+        ...(mode!=='analyze'&&Array.isArray(day.plan?.workstreams)?{validWorkstreams:day.plan.workstreams.map(w=>w?.id).filter(id=>typeof id==='string')}:{}),
+        results,minDurationSeconds:min,maxDurationSeconds:max,budgetTotalSats:snap.budget.totalSats,
         maxTaskBytes:MAX_TASK_BYTES,budgetHeadroomSats:Math.max(0,snap.budget.totalSats-reservedBudget(snap,jobs,this.io.now()).committedSats-reservedBudget(snap,jobs,this.io.now()).paidSats),now:this.io.now(),
         ...(day.rejected?.length?{rejectedAssignments:day.rejected}:{}),
         ...(bench.length?{benchedSellers:bench}:{}),
@@ -1298,7 +1425,10 @@ export class Swarm {
         ok=true;
         // Cleared only by a valid response of the SAME mode (an assess cannot fix an assign batch).
         const cleared=day.plannerError?.mode===mode;if(cleared)delete day.plannerError;
-        const next=mode==='analyze'?p:p.plan;
+        // F-5 (b): `record` is the runner's overlay (planWithRecord); a plan echoed back with it is
+        // journaled without it, so the record is always rebuilt from the journal, never from the plan.
+        const strip=x=>x&&Array.isArray(x.workstreams)?{...x,workstreams:x.workstreams.map(w=>{if(!w||typeof w!=='object'||!('record' in w))return w;const {record,...rest}=w;return rest;})}:x;
+        const next=strip(mode==='analyze'?p:p.plan);
         if(next) {
           // R4-3: remember ids a revision dropped, so a later assignment naming one is rejected as
           // a STALE workstream (named), not just an unknown one (bounded; a re-added id is live again).
@@ -1338,12 +1468,31 @@ export class Swarm {
           // R3-7: the plan this assign call is SENT with. A response may revise the plan (saved in
           // ask()); its assignments are valid against either the plan the planner was shown in this
           // call or the revision it returned with them, never only the post-call day.plan.
-          const sentPlan=day.plan;
-          let p;
-          try{p=await ask('assign',candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs)),trigger);}
-          catch(e){this.assignCalled(key,day,now,false);throw e;}
+          const sentPlans=[day.plan];
+          const roster=candidates.map(s=>sellerProfile(snap.sellers.find(x=>x.pubkey===s.seller_pubkey),jobs));
+          const call=async why=>{try{return await ask('assign',roster,why);}catch(e){this.assignCalled(key,day,now,false);throw e;}};
+          let p=await call(trigger);
+          // F-5 (a): free sellers the budget can pay, and neither an assignment nor idleReason: one
+          // retry in this tick, with the reason as previousPlannerError. A second such answer is
+          // accepted (journaled and logged as having no reason); no capacity stays quiet.
+          const affordable=affordableSellers(candidates.map(s=>snap.sellers.find(x=>x.pubkey===s.seller_pubkey)),decision.budgetHeadroomSats,{paidRefused:!!this.releaseMissing?.length});
+          const needsReason=r=>affordable.length>0&&!r.solved&&!r.assignments?.length&&idleReasonOf(r)===null;
+          if(needsReason(p)) {
+            const reason=missingIdleReason(affordable,decision.budgetHeadroomSats);
+            day.plannerError={mode:'assign',reason,at:this.io.now()};this.save();
+            this.io.report?.(`Planner assign response rejected: ${reason}; asking once more`);
+            this.assignCalled(key,day,now,true);sentPlans.push(day.plan);
+            p=await call('retry: no assignment and no idleReason while sellers are free');
+            if(needsReason(p)){p={...p,idleReason:IDLE_REASON_FALLBACK};this.io.report?.(`Planner assign gave no assignment and no idleReason again after one retry; accepted as idle (next call on a change)`);}
+          }
           this.assignCalled(key,day,now,true);
-          const planIds=new Set([...(sentPlan?.workstreams??[]),...(p.plan?.workstreams??[])].map(w=>w?.id).filter(id=>typeof id==='string'));
+          const idleWhy=affordable.length&&!p.solved?idleReasonOf(p):null;
+          if(idleWhy!==null) {
+            const n=p.assignments?.length??0;
+            day.idle={reason:idleWhy,at:now,freeSellers:candidates.length,payable:affordable.length,assignments:n,headroomSats:decision.budgetHeadroomSats};this.save();
+            this.io.report?.(`Planner assign: ${n} assignment${n===1?'':'s'} for ${candidates.length} free seller${candidates.length===1?'':'s'} (${affordable.length} payable, headroom ${decision.budgetHeadroomSats} sats); idle reason: ${idleWhy}`);
+          } else if(day.idle){delete day.idle;this.save();}
+          const planIds=new Set([...sentPlans.flatMap(x=>x?.workstreams??[]),...(p.plan?.workstreams??[])].map(w=>w?.id).filter(id=>typeof id==='string'));
           if(p.solved)stop(p.summary??'Solved',p.result);
           let budgetRejected=0;
           // Replaced by every assign batch (journaled with the next save), shown to the planner on its next calls.
@@ -1405,8 +1554,9 @@ export class Swarm {
             const posted=await this.post(args);j.id=posted.job_id??posted.preparation_id;
             if(!j.id)throw Error('Post returned no job or preparation id');this.save();
           }
+          if(rejected.length)day.rejectedUnseen=true;else delete day.rejectedUnseen;
           if(rejected.length||hadRejected)this.save();
-          if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length)stop('Unsolved: budget exhausted');
+          if(!day.stop && decision.budgetHeadroomSats<=0 && budgetRejected===p.assignments?.length && p.assignments?.length && p.assignments.every(a=>Number.isSafeInteger(a?.amountSats)&&a.amountSats>0) && !running().length && !awaitingAccept().length)stop('Unsolved: budget exhausted');
         }
         // Exhaustion depends only on the trusted roster (ready = complete decision + accepted-member
         // history) and those sellers' state. Metadata caps and the applicant list never block it.
@@ -1440,7 +1590,8 @@ export class Swarm {
         const update=`${results.length-refusedCount} results recorded; ${refusedCount?`${refusedCount} refused by sellers (not counted as work); `:''}${this.state.jobs.filter(j=>j.key===key&&!j.done&&!j.slotFreed).length} jobs running${stuck?`; ${stuck} payment${stuck>1?'s':''} stuck awaiting the operator (wallet reconcile)`:''}`;
         if(await this.publishChallenge(day,c,null,update)){day.lastUpdate=crossed?this.io.now():now;delete day.progressRetryAt;this.save();
           // S-2: the planner call count goes to the runner log only, not into the public update.
-          this.io.report?.(`Progress ${c.id}: ${this.plannerCallsText(key,day)}`);}
+          this.io.report?.(`Progress ${c.id}: ${this.plannerCallsText(key,day)}`);
+          if(day.idle)this.io.report?.(`Idle ${c.id}: the last assign call (${isoTime(day.idle.at)}) left ${day.idle.payable-Math.min(day.idle.payable,day.idle.assignments)} payable free seller${day.idle.payable===1?'':'s'} without work: ${day.idle.reason}`);}
       } catch(e) {
         if(e.journalFailure)throw e;
         day.progressRetryAt=this.io.now()+Math.min(this.c.updateEvery,PROGRESS_RETRY_SECONDS);this.save();

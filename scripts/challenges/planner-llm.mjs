@@ -8,7 +8,20 @@ In mode analyze, study the goal and full eligible roster before allocating any w
 {"approach":"...","workstreams":[{"id":"...","description":"...","needs":{"skills":[],"harness":[],"hardware":[]},"estMinutes":5,"dependsOn":[]}],"verification":"..."}.
 In mode assign, use the current plan, all results and running jobs (seller/task/since) to return
 {"assignments":[{"seller":"pubkey from free roster","workstream":"plan id","task":"concrete task with context","durationSeconds":600,"amountSats":0,"includeAnswers":[]}]},
-{"wait":true}, or {"solved":true,"result":"verified complete answer","summary":"verification"}.
+{"wait":true,"idleReason":"..."}, or {"solved":true,"result":"verified complete answer","summary":"verification"}.
+IDLE CAPACITY: when sellers (the free roster) is not empty and budgetHeadroomSats covers at least one of them
+(a free seller, or a paid seller's minimum), return at least one assignment, or add "idleReason": one or two
+sentences saying why each free seller stays idle (e.g. "ws3 depends on ws2, still running"). A response with
+neither is rejected and asked once more. With no free seller, or none the budget can pay, plain {"wait":true}
+is fine. idleReason may also accompany a partial batch (why the other free sellers get nothing).
+JOB STATUS COMES FROM THE RUNNER'S RECORD, never from your own plan text: running lists only jobs the
+record says are running; each plan workstream carries "record" (status, running count, its newest jobs
+with jobId/seller/status: running, deferred, collected, refused, expired/undelivered, collect refused,
+price too high...). awaitingAccept lists finished jobs whose seller is still held until the buyer's
+accept is seen: that is NOT running work. statusCorrections, when present, lists plan fields that
+claimed running work the record shows finished; trust the record and do not write "running" for them.
+validWorkstreams lists the plan ids an assignment may name (the plan you were sent; ids in a revised plan
+you return are valid too). Never invent an id: add a workstream with a revised "plan" first.
 Choose durations per task within minDurationSeconds/maxDurationSeconds, donated minutes and
 challenge.ends. A real seller agent spends several minutes of every task just starting its
 sandbox and agent before any work happens; minDurationSeconds is the floor for that, so size each

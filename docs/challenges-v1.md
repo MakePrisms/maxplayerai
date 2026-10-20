@@ -172,7 +172,8 @@ its goal and full eligible roster and returns an approach, workstreams (needs, e
 dependencies), and verification plan. The durable journal preserves this analysis across restarts.
 When its input changes (a new result or refusal, a seller freed, eligible or gone, a finished job,
 a revised plan, budget, minutes, bench or context; at least every `SWARM_PLANNER_IDLE_SECONDS`,
-600, and never delayed on a day's first call) `assign` receives the plan, all free eligible seller profiles, running jobs and the
+600, and never delayed on a day's first call; at once after a batch with rejected assignments, at
+most twice per day per distinct error) `assign` receives the plan, all free eligible seller profiles, running jobs and the
 result history (bounded: the newest results in full, older ones as marked head-and-tail digests,
 under a hard per-call character budget described in the runner README that degrades rather than
 fails unless the goal, plan and seller profiles alone exceed it; a result dropped to fit
@@ -196,7 +197,17 @@ heartbeat says `takes_payment=none`; otherwise an assignment below its `rate` (a
 assignment, `rate=0` included) would never be claimed, so it is rejected with `below seller
 minimum N`, or, with the default-off `SWARM_AUTO_RAISE_TO_RATE`, raised to the minimum within
 headroom. Rejected assignments of the last `assign` batch, with their reasons, are returned to
-the planner as `rejectedAssignments` on its next calls.
+the planner as `rejectedAssignments` on its next calls, with the plan's ids as `validWorkstreams`;
+the next eligible tick calls `assign` again at once, at most twice per day for the same error, then
+the normal cadence applies (logged).
+Job status shown to the planner comes from the runner's journal, never from the planner's own plan
+text: `running` holds only jobs the journal says are running, a finished job whose relay meter is
+still open is in `awaitingAccept`, each plan workstream carries its `record` (status and newest
+jobs), and any plan field claiming running work the record shows finished is replaced and listed in
+`statusCorrections`.
+While a free seller the budget headroom can pay is left without work, an `assign` response must
+carry an assignment or an `idleReason`; one with neither is asked once more, and the reason is
+journaled and logged for operators. With no such seller, waiting needs no reason.
 A seller whose assignments keep expiring with no claim (default 2 in a row on confirmed reads; a
 dropped harness looks exactly like this from the buyer) is benched for a cooldown (default 30 min):
 excluded from the assign roster and listed to the planner as `benchedSellers` with the reason. Any
