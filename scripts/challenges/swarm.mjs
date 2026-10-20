@@ -460,6 +460,62 @@ export const EXPIRED_SLOT_GRACE_SECONDS = 600;
 export const SELLER_EXECUTION_TAIL_SECONDS = 420;
 export const SLOT_TEARDOWN_MARGIN_SECONDS = 60;
 export const MIN_EXPIRED_SLOT_GRACE_SECONDS = SELLER_EXECUTION_TAIL_SECONDS + SLOT_TEARDOWN_MARGIN_SECONDS;
+// I-1: a post whose offer never reached the relay. A slow post_job answers `status=preparing` with
+// a `preparation:<hex>` handle; once that preparation has FAILED, every get_job of the handle
+// returns the same error (failures are sticky: buyer/preparations.rs poll_store). The texts are the
+// buyer's own (maxplayer-core, read-only):
+// - poll_store appends " Offer <id> was queued for publication before this failure and may be live;
+//   auto-award was NOT armed." to a failure after the offer was recorded;
+// - a daemon restart (buyer/store/preparations.rs interrupt_preparations) writes "... after offer
+//   <id> was queued for publication: it may be live ..." (lower case; poll_store appends nothing
+//   because the id is already in it) or "... before any offer was queued; nothing was published.";
+// - job_lifecycle.rs publish_signed_event_async: "no relay accepted event (<url>: <error>; ...)",
+//   shown as "job lifecycle relay: no relay accepted event (...)";
+// - "unknown preparation handle": the buyer holds no such preparation.
+// The offer read for a never-published offer is `offer: null` (read_confirmed only when the relay
+// answered the probe), no claims/results/accept/award, reservation_state "none" and
+// auto_award_state null: the buyer records the auto-award intent only after a SUCCESSFUL post
+// (buyer/mod.rs post_job put_pending_award), so null proves auto-award was never armed.
+export const QUEUED_OFFER = /\b[Oo]ffer ([0-9a-f]{64}) was queued for publication/;
+export const NOTHING_PUBLISHED = 'before any offer was queued; nothing was published';
+export const NO_RELAY_ACCEPTED = /no relay accepted event \(([^)]*)\)/;
+export const NEVER_PUBLISHED = 'never published';
+// A FREE job with no offer seen by its deadline but no confirmed proof that nothing exists.
+export const EXPIRED_UNPUBLISHED = 'expired/unpublished';
+// One warning per job once no offer has been seen for this long (not one line per tick).
+export const UNPUBLISHED_WARN_SECONDS = 300;
+// Re-check cadence of an unpublished job that cannot be closed yet (past its deadline without
+// proof, or its day stopped): 60 s, then every 300 s, instead of every tick.
+export const UNPUBLISHED_BACKOFF_SECONDS = [60,300];
+export const isPreparationId = id => typeof id==='string'&&id.startsWith('preparation:');
+export const relayUrl = detail => String(detail??'').match(/wss?:\/\/[^\s;:/]+(?::\d+)?(?:\/[^\s;:]*)?/)?.[0]??null;
+// The buyer's message inside an mcp-call.mjs failure ("<node> exited 1: {"content":[...],"isError":true}").
+export function toolErrorText(message) {
+  const m=String(message??''),at=m.indexOf('{"content":');
+  if(at>=0)try{const t=JSON.parse(m.slice(at,m.lastIndexOf('}')+1))?.content?.find?.(c=>c?.type==='text')?.text;if(typeof t==='string')return t;}catch{}
+  return m;
+}
+// Classifies a get_job(preparation handle) failure: queued (an offer id the buyer may have
+// published), nothing (the buyer states nothing was published), unknown (no such preparation) or
+// error (anything else: a transport failure or an unclassified terminal failure; proves nothing).
+export function preparationFailure(message) {
+  const text=toolErrorText(message),relay=text.match(NO_RELAY_ACCEPTED)?.[1]??null,offer=text.match(QUEUED_OFFER)?.[1];
+  const reason=relay!==null?`no relay accepted the offer (${relay})`:(text.split(/(?<=\.)\s+(?=[A-Z])/)[0]||text).trim().slice(0,300);
+  if(offer)return {kind:'queued',offer,relay,reason};
+  if(text.includes(NOTHING_PUBLISHED))return {kind:'nothing',relay,reason:text.trim().slice(0,300)};
+  if(text.includes('unknown preparation handle'))return {kind:'unknown',relay,reason:'unknown preparation handle'};
+  return {kind:'error',relay,reason};
+}
+// I-1 (b): a confirmed read past the deadline proving the offer never existed for anyone: the relay
+// answered and holds no offer, claim, result or accept; the buyer holds no award (confirmed lookup),
+// no reservation and no auto-award intent. Nothing can be awarded or owed, so it is released.
+export const neverPublishedProof = s => !!s&&s.read_confirmed===true&&s.award_read_confirmed===true&&s.offer===null&&
+  s.reservation_state==='none'&&s.auto_award_state===null&&Array.isArray(s.claims)&&!s.claims.length&&
+  Array.isArray(s.results)&&!s.results.length&&s.accepted===null&&!s.awarded&&!s.awarded_delivery_pending;
+// Nothing in this view can lead to a payment soon (no award, delivery or accept): safe to back off.
+// A claim alone cannot (auto-award was never armed for a queued offer); an award keeps every tick so
+// that a delivery is collected promptly.
+const quietView = s => !s.awarded&&!s.awarded_delivery_pending&&!(Array.isArray(s.results)&&s.results.length)&&s.accepted==null;
 // Durable runner state: ONE fsynced JSON record, replaced atomically on every save (temp file,
 // fsync, rename over the journal, fsync the directory). A crash at any point leaves either the
 // previous complete record or the new one, never a mix, and the file never grows past one state.
@@ -966,7 +1022,7 @@ export function notPlanningLine({c,snap,now,day={}}) {
   return {key:parts.map(p=>p[0]).join('|'),line:`not planning (run ${c.id}): ${parts.map(p=>p[1]).join(' · ')}`};
 }
 export class Swarm {
-  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;this.stuckRechecked=new Set();this.cadence=new Map();}
+  constructor(config, io, journal) {this.c=config;this.io=io;this.journal=journal;this.state=journal.state;this.stuckRechecked=new Set();this.cadence=new Map();this.unpublishedChecked=new Set();this.unpublishedLogged=new Set();}
   // S-2: why this tick must call `assign` (a short reason), or null to skip it. In memory per day:
   // a restarted runner makes its first call at once. See DEFAULT_PLANNER_IDLE_SECONDS.
   assignTrigger(key,{c,day,snap,jobs,candidates,decision,bench,resultVersion},now) {
@@ -1022,6 +1078,84 @@ export class Swarm {
   plannerCallsText(key,day) {
     const n=day.plannerCalls??{},total=Object.values(n).reduce((a,b)=>a+(Number.isSafeInteger(b)?b:0),0);
     return `planner calls today: ${total} (analyze ${n.analyze??0}, assign ${n.assign??0}, assess ${n.assess??0}); assign skipped (no change) ${this.cadence.get(key)?.skipped??0} since the runner started`;
+  }
+  // I-1: an unpublished job (no offer known on the relay) is journaled as j.unpublished
+  // {kind: preparing|error|queued, reason, relay?, offer?, since, warnedAt?, checks?, retryAt?, seenAt?}.
+  // Records the latest reason (first observation kept as `since`); a lookup error is logged once
+  // per distinct text, never once per tick.
+  noteUnpublished(j,info,now) {
+    const prev=j.unpublished;
+    if(!prev||prev.kind!==info.kind||prev.reason!==info.reason){j.unpublished={...prev,...info,since:prev?.since??now};this.save();}
+    const k=JSON.stringify([j.args.request_id,info.kind,info.reason]);
+    if(info.kind==='error'&&!this.unpublishedLogged.has(k)) {
+      this.unpublishedLogged.add(k);
+      this.io.report?.(`Job ${j.id??j.args.request_id}: post preparation lookup failed, no offer is known to be published: ${info.reason} (logged once per distinct error)`);
+    }
+    this.warnUnpublished(j,now);
+  }
+  // One WARNING per job (journaled) once no offer has been seen for UNPUBLISHED_WARN_SECONDS.
+  warnUnpublished(j,now) {
+    const u=j.unpublished;if(!u||u.seenAt||u.warnedAt||now-u.since<UNPUBLISHED_WARN_SECONDS)return;
+    u.warnedAt=now;this.save();
+    const relay=relayUrl(u.relay),paid=j.args.payment!=='none';
+    this.io.report?.(`WARNING: Job ${j.id??j.args.request_id}: ${u.relay!=null?`offer never reached the relay: ${relay??u.relay} accepted no event (${u.relay})`:`no offer published (${u.reason})`} ${Math.floor((now-u.since)/60)} min ago and no read has seen it since; auto-award was NOT armed. At its deadline ${isoTime(j.args.deadline_unix)} it closes as "${NEVER_PUBLISHED}" once a confirmed read shows nothing exists${paid?`; otherwise its ${jobBudget(j).reservedSats} sats stay reserved and it is re-checked after ${UNPUBLISHED_BACKOFF_SECONDS[0]} s, then every ${UNPUBLISHED_BACKOFF_SECONDS.at(-1)} s`:''}. This warning is not repeated`);
+  }
+  // Slower re-checks for an unpublished job that cannot be closed yet. A restarted runner checks
+  // once at once (unpublishedChecked is in memory), then follows the journaled retryAt.
+  backoffUnpublished(j,now,why) {
+    const u=j.unpublished;if(!u)return;
+    u.checks=(u.checks??0)+1;const wait=UNPUBLISHED_BACKOFF_SECONDS[Math.min(u.checks,UNPUBLISHED_BACKOFF_SECONDS.length)-1];
+    // Before the deadline the next check is never later than just past it, so it closes promptly.
+    u.retryAt=now<=j.args.deadline_unix?Math.min(now+wait,j.args.deadline_unix+1):now+wait;
+    // The one warning is due UNPUBLISHED_WARN_SECONDS after the first observation, not a backoff later.
+    if(!u.warnedAt&&!u.seenAt)u.retryAt=Math.min(u.retryAt,Math.max(now+1,u.since+UNPUBLISHED_WARN_SECONDS));
+    this.unpublishedChecked.add(j.args.request_id);this.save();
+    if(u.checks<=UNPUBLISHED_BACKOFF_SECONDS.length)this.io.report?.(`Job ${j.id??j.args.request_id}: still unpublished and ${why}; next check in ${wait}s${u.checks<UNPUBLISHED_BACKOFF_SECONDS.length?`, then every ${UNPUBLISHED_BACKOFF_SECONDS.at(-1)}s`:''} (not every tick)`);
+  }
+  unpublishedWaiting(j,now) {
+    const u=j.unpublished;
+    return !!u?.retryAt&&!u.seenAt&&this.unpublishedChecked.has(j.args.request_id)&&now<u.retryAt;
+  }
+  // The failed preparation named the offer it queued: from now on the offer itself is read.
+  offerQueued(j,failure,now) {
+    const from=j.id??preparationId(j.args.request_id),relay=failure.relay!=null?relayUrl(failure.relay)??failure.relay:null;
+    j.id=failure.offer;
+    j.unpublished={...(j.unpublished??{}),kind:'queued',offer:failure.offer,preparation:from,reason:failure.reason,since:j.unpublished?.since??now};
+    if(failure.relay!=null)j.unpublished.relay=failure.relay;
+    delete j.unpublished.retryAt;delete j.unpublished.checks;this.save();
+    this.io.report?.(relay!==null
+      ?`Job ${from}: offer ${failure.offer} was queued but NO RELAY ACCEPTED IT (${failure.relay}); not published unless a later read sees it, auto-award NOT armed. Reading the offer from now on, never the failed preparation; it closes as "${NEVER_PUBLISHED}" at its deadline ${isoTime(j.args.deadline_unix)} once a confirmed read shows nothing exists`
+      :`Job ${from}: preparation failed after queueing offer ${failure.offer}: QUEUED, MAY BE LIVE, auto-award NOT armed (${failure.reason}). Reading the offer from now on, never the failed preparation; if no read ever sees it, it closes as "${NEVER_PUBLISHED}" at its deadline ${isoTime(j.args.deadline_unix)}`);
+  }
+  // I-1 (b): released and done; the seller never saw the offer, so it is not an unclaimed expiry.
+  closeNeverPublished(j,reason,how,now) {
+    const sats=jobBudget(j).reservedSats;
+    Object.assign(j,{done:true,released:true,outcome:NEVER_PUBLISHED,neverPublished:{reason,how,at:now},answer:`[${NEVER_PUBLISHED}: ${reason}; the seller never saw this task; reassign it]`,ts:now});
+    if(j.unpublished)delete j.unpublished.retryAt;
+    this.save();
+    this.io.report?.(`Job ${j.id??j.args.request_id}: NEVER PUBLISHED (${reason}): ${how}. Closed; ${sats} sats released; seller ${j.seller} freed and not counted as an unclaimed expiry (it never saw the offer)`);
+  }
+  // A job known only by its preparation (still preparing, or a failure that proves nothing).
+  // Before its deadline it is checked every tick unless its day has stopped; past it a free job
+  // closes, a paid one stays reserved (its seller freed after the grace) and is re-checked slowly.
+  stillUnpublished(j,info,now) {
+    // The same lookup error twice in a row is not transient: back off instead of every tick.
+    const repeat=info.kind==='error'&&j.unpublished?.kind==='error'&&j.unpublished?.reason===info.reason;
+    this.noteUnpublished(j,info,now);
+    const deadline=j.args.deadline_unix;
+    if(now>deadline) {
+      if(j.args.payment==='none') {
+        Object.assign(j,{done:true,released:true,outcome:EXPIRED_UNPUBLISHED,answer:`[${EXPIRED_UNPUBLISHED}: no offer was seen published by the deadline (${j.unpublished.reason}); reassign the task]`,ts:now});this.save();
+        this.io.report?.(`Job ${j.id??j.args.request_id}: free job still unpublished at its deadline (${j.unpublished.reason}); closed as ${EXPIRED_UNPUBLISHED}, nothing reserved, seller ${j.seller} not counted as an unclaimed expiry`);
+        return;
+      }
+      j.outcome=`unpublished: ${j.unpublished.reason}`.slice(0,200);j.ts=now;
+      const grace=this.c.expiredSlotGrace??EXPIRED_SLOT_GRACE_SECONDS;
+      if(!j.slotFreed&&now>deadline+grace){j.slotFreed=now;this.io.report?.(`Job ${j.id??j.args.request_id}: unpublished ${grace}s past its deadline; seller ${j.seller} freed for new work, ${jobBudget(j).reservedSats} sats stay reserved until the buyer reports the preparation's end`);}
+      this.backoffUnpublished(j,now,'past its deadline with no confirmed proof that nothing exists (sats stay reserved)');
+    } else if(this.state.days[j.key]?.stop)this.backoffUnpublished(j,now,'its day has stopped (no retry each tick; it closes at its deadline)');
+    else if(repeat)this.backoffUnpublished(j,now,'its preparation lookup keeps failing the same way');
+    else if(j.unpublished.warnedAt)this.backoffUnpublished(j,now,`no offer published for ${Math.floor(UNPUBLISHED_WARN_SECONDS/60)} min`);
   }
   // R3-8: is a stuck payment due for its one re-check collect? (See PAYMENT_STUCK_RECHECK_MIN_SECONDS.)
   stuckRecheckDue(j,now) {
@@ -1237,39 +1371,85 @@ export class Swarm {
     // Settle even after a stop or a change of challenge day.
     for(const j of this.state.jobs.filter(j=>!j.done)) {
       try {
+      // I-1: an unpublished job being re-checked slowly spawns no MCP call until it is due.
+      if(this.unpublishedWaiting(j,now))continue;
       if(!j.id&&j.deferred) {if(await this.retryDeferred(j))continue;}
       else if(!j.id) {
         let recovered;
         try { recovered=await this.io.mcp('get_job',{job_id:preparationId(j.args.request_id)}); }
         catch(e) {
-          // Failed preparations are sticky once an offer was queued. The buyer explicitly
-          // supplies its ID: inspect that offer, never retry the failed preparation forever.
-          const offer=e.message.match(/Offer ([0-9a-f]{64}) was queued for publication/);
-          if(offer)recovered={job_id:offer[1]};
-          else if(!e.message.includes('unknown preparation handle'))throw e;
+          if(e.journalFailure)throw e;
+          // Failed preparations are sticky: never retry the failed preparation forever (I-1).
+          // Once an offer was queued the buyer names it: inspect that offer instead.
+          const failure=preparationFailure(e.message);now=this.io.now();
+          if(failure.kind==='queued'){this.offerQueued(j,failure,now);recovered={job_id:failure.offer};}
+          else if(failure.kind==='nothing'){this.closeNeverPublished(j,failure.reason,'the buyer reports its preparation failed before any offer was queued',now);continue;}
+          else if(failure.kind!=='unknown'){this.stillUnpublished(j,{kind:'error',reason:failure.reason,...(failure.relay!=null?{relay:failure.relay}:{})},now);continue;}
         }
         if(recovered) {
+          // A lookup that found the posted job clears an earlier unpublished note (a lookup error).
+          if(recovered.job_id&&j.id!==recovered.job_id)delete j.unpublished;
           j.id=recovered.job_id??recovered.preparation_id??preparationId(j.args.request_id);this.save();
+          // Still preparing: this lookup already answered for this tick (no second get_job).
+          if(!recovered.job_id&&recovered.status==='preparing'){this.stillUnpublished(j,{kind:'preparing',reason:'the buyer is still preparing the post'},this.io.now());continue;}
         } else {
           // No preparation exists: a post would be NEW work. Recheck admission before retrying.
           const fresh=await this.io.snapshot(),at=this.io.now();
           const reservation=fresh.challenge?reservedBudget(fresh,this.state.jobs.filter(x=>x.key===j.key),at):null;
           const valid=coordinate(fresh,{now:at,durationSeconds:j.durationSeconds??(j.args.deadline_unix-j.created),amountSats:0,budgetState:reservation});
           if(this.state.days[j.key]?.stop || fresh.challenge?.id!==j.challenge.id || fresh.challenge?.buyer!==j.challenge.buyer || at>=j.args.deadline_unix || j.args.deadline_unix>fresh.challenge.ends || !valid.sellers.some(s=>s.seller_pubkey===j.seller&&s.postingAllowed)) {
-            // Unready history is transient, not proof that an intent should be discarded.
-            if(valid.reasons.some(r=>['stale_snapshot','relay_not_ready','unknown_budget'].includes(r)))continue;
+            // Unready history is transient, not proof that an intent should be discarded. A stopped
+            // day is: no preparation exists, so nothing was posted and nothing is ever posted now.
+            if(!this.state.days[j.key]?.stop&&valid.reasons.some(r=>['stale_snapshot','relay_not_ready','unknown_budget'].includes(r)))continue;
             j.released=true;j.done=true;j.outcome='abandoned intent';j.ts=at;this.save();continue;
           }
           const posted=await this.post(j.args);j.id=posted.job_id??posted.preparation_id;this.save();
         }
       }
+      // I-1 (a): a post that answered `preparing` holds the preparation handle as its id. Its
+      // lookup either resolves (posted), names the offer it queued (read that offer from now on,
+      // this tick included), proves nothing was published, or proves nothing (kept, see
+      // stillUnpublished). A failed preparation is never read again once it named its offer.
+      if(isPreparationId(j.id)) {
+        let prep;
+        try{prep=await this.io.mcp('get_job',{job_id:j.id});}
+        catch(e) {
+          if(e.journalFailure)throw e;
+          const failure=preparationFailure(e.message);now=this.io.now();
+          if(failure.kind==='queued')this.offerQueued(j,failure,now);
+          else if(failure.kind==='nothing'){this.closeNeverPublished(j,failure.reason,'the buyer reports its preparation failed before any offer was queued',now);continue;}
+          else{this.stillUnpublished(j,{kind:'error',reason:failure.reason,...(failure.relay!=null?{relay:failure.relay}:{})},now);continue;}
+        }
+        if(prep) {
+          now=this.io.now();
+          if(prep.status==='posted'&&prep.job_id){j.id=prep.job_id;delete j.unpublished;this.save();continue;}
+          this.stillUnpublished(j,{kind:'preparing',reason:'the buyer is still preparing the post'},now);continue;
+        }
+      }
       // R3-8: a stuck payment is not polled or collected again until a re-check is due.
       let recheck=null;
       if(j.paymentStuck){recheck=this.stuckRecheckDue(j,now);if(!recheck)continue;this.stuckRechecked.add(j.id);}
-      const state=await this.io.mcp('get_job',{job_id:j.id});
+      let state;
+      try{state=await this.io.mcp('get_job',{job_id:j.id});}
+      catch(e) {
+        // A failing read of an offer never seen on the relay backs off too (no MCP child per tick).
+        if(!e.journalFailure&&j.unpublished&&!j.unpublished.seenAt)this.backoffUnpublished(j,this.io.now(),`its offer read failed (${toolErrorText(e.message).slice(0,200)})`);
+        throw e;
+      }
       now=this.io.now();
       if(state.status==='preparing')continue;
       if(state.status==='posted' && state.job_id && state.job_id!==j.id){j.id=state.job_id;this.save();continue;}
+      // I-1: an offer queued by a failed preparation is watched until a read sees it on the relay.
+      if(j.unpublished&&!j.unpublished.seenAt) {
+        if(state.offer) {
+          j.unpublished.seenAt=now;delete j.unpublished.retryAt;this.save();
+          this.io.report?.(`Job ${j.id}: the offer queued by a failed preparation IS on the relay after all; the buyer did NOT arm auto-award for it, so only an explicit award (--award-fallback) can award it; otherwise it expires unawarded under the ordinary rules`);
+        } else if(state.offer===null) {
+          this.warnUnpublished(j,now);
+          // Not on the relay and nothing that could lead to a payment: read slowly, not every tick.
+          if(now<=j.args.deadline_unix&&quietView(state))this.backoffUnpublished(j,now,this.state.days[j.key]?.stop?'its day has stopped (it closes at its deadline)':'its offer is not on the relay (auto-award was not armed)');
+        }
+      }
       // R3-2: a claim un-benches once per job, on the transition. A paid job that was claimed stays
       // open (and polled) until collected or proven released, even after its slot was freed; its old
       // claim must not wipe a streak built by the seller's later unclaimed expiries on every poll.
@@ -1327,6 +1507,8 @@ export class Swarm {
         if(refusal)this.io.report?.(`Job ${j.id}: seller ${j.seller} REFUSED (${refusal.by}${refusal.kind?`: ${refusal.kind}`:''}); recorded as refused, not as work; the planner is told to reassign workstream ${j.workstream??'?'} to a different seller: ${refusal.reason.slice(0,200)}`);
       } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.released=true;j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
       else if(now>j.args.deadline_unix) {
+        // I-1 (b): the offer never existed for anyone (see neverPublishedProof): released, done.
+        if(neverPublishedProof(state)){this.closeNeverPublished(j,j.unpublished?.reason??'no offer on the relay',`a confirmed read ${now-j.args.deadline_unix}s past its deadline shows no offer, claim, award, reservation, auto-award intent, delivery or accept`,now);continue;}
         // Deadline alone is not proof of nonpayment. A confirmed empty/expired claim history,
         // matching expired offer and successful local award lookup prove never awarded.
         // Unresolved claims/awards/accepts or incomplete reads stay reserved and are polled again.
@@ -1337,9 +1519,12 @@ export class Swarm {
           state.offer?.deadline_unix===j.args.deadline_unix && Array.isArray(state.results) &&
           !state.results.length && state.accepted===null && !state.awarded_delivery_pending;
         j.done=j.args.payment==='none'||neverAwarded||reconciled;
-        j.released=j.done;j.outcome=j.priceAsked?`price too high: asked ${j.priceAsked}`:'expired/undelivered';j.ts=now;
+        const unseen=j.unpublished&&!j.unpublished.seenAt&&state.offer===null;
+        j.released=j.done;j.outcome=j.priceAsked?`price too high: asked ${j.priceAsked}`:unseen?(j.done?EXPIRED_UNPUBLISHED:`unpublished: ${j.unpublished.reason}`.slice(0,200)):'expired/undelivered';j.ts=now;
         // R3-2: counted once per job, only on a confirmed read showing no claim by the seller.
-        if(!j.unclaimedAt&&state.read_confirmed===true&&Array.isArray(state.claims)&&!state.claims.some(cl=>cl?.seller_pubkey===j.seller)&&Array.isArray(state.results)&&!state.results.length&&!state.awarded){j.unclaimedAt=now;this.unclaimedExpiry(j,now);}
+        // An offer queued by a failed preparation and never seen on the relay (offer: null) was never
+        // seen by the seller either: not counted.
+        if(!j.unclaimedAt&&state.read_confirmed===true&&!(unseen&&state.offer===null)&&Array.isArray(state.claims)&&!state.claims.some(cl=>cl?.seller_pubkey===j.seller)&&Array.isArray(state.results)&&!state.results.length&&!state.awarded){j.unclaimedAt=now;this.unclaimedExpiry(j,now);}
         // Not provably released: keep the sats reserved and keep polling, but free the seller slot
         // once it cannot still be executing and a confirmed read shows no delivery.
         const grace=this.c.expiredSlotGrace??EXPIRED_SLOT_GRACE_SECONDS;
@@ -1347,6 +1532,9 @@ export class Swarm {
           j.slotFreed=now;
           this.io.report?.(`Job ${j.id}: expired undelivered ${grace}s past its deadline; seller ${j.seller} freed for new work, ${jobBudget(j).reservedSats} sats stay reserved until collected or proven released`);
         }
+        // I-1: an offer never seen on the relay, not provably absent, and nothing in the view can
+        // lead to a payment: re-checked slowly (an award, delivery or accept keeps every tick).
+        if(!j.done&&j.unpublished&&!j.unpublished.seenAt&&state.offer!==undefined&&!state.offer&&quietView(state))this.backoffUnpublished(j,now,'past its deadline without a confirmed read proving nothing exists (sats stay reserved)');
         this.save();
       }
       else if(this.c.awardFallback && now-j.created>=this.c.awardAfter && !state.awarded) {
