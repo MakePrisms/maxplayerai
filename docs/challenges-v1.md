@@ -249,13 +249,26 @@ a default-off E2E-only fallback permits bounded manual award while its separate 
 Progress republishes the same CHALLENGE fields with a short update (default every 180 seconds).
 Solved completes with result; exhausted minutes, work window or budget completes with an
 unsolved reason. A stopped day never receives new posts, but outstanding work is still
-collected. The process remains alive for subsequent days. All local offers reserve their full
+collected: awarded or running jobs are polled, collected and paid exactly once as before. Unposted
+intents are dropped, and preparations that never published are not retried every tick. They close at
+their deadline (below). The process remains alive for subsequent days. All local offers reserve their full
 price serially before posting, including unawarded offers. Closed collect receipts move
 actual sats from reserved to paid. Timeout alone does not release: an expired matching offer
 needs confirmed empty/expired claims and empty results, no accepted bind, a successful no-award lookup and no
 buyer reservation and parked auto-award intent, or the buyer's existing ledger must have reconciled it to released with
 no pending delivery/accept. Free terminal jobs, abandoned never-posted intents and refused
-publications release too. Uncertainty retains reservations across restarts and keeps polling
+publications release too. So does a **never published** offer (I-1): the buyer said its preparation
+failed before any offer was queued, or the preparation failed with no relay accepting the queued offer
+and a confirmed read past the deadline shows `offer: null` with no claim, result, accept or award, no
+buyer reservation and no auto-award intent (`auto_award_state: null`; the buyer arms auto-award only
+after a successful post). That job is journaled as outcome `never published` with its own log line,
+distinct from "queued, may be live". It is not counted as an unclaimed expiry against the seller, who
+never saw the offer. A failed preparation that names its queued offer is never polled again: the runner
+reads the offer itself. While a job has no published offer and nothing could lead to a payment, it is
+read on a 60 s, then 300 s backoff instead of every tick. Without the full proof a paid job stays
+reserved on that backoff (a free one closes as `expired/unpublished`). One warning naming the relay
+is logged after 5 minutes without a published offer. A restarted runner closes such a journaled job
+rather than resuming its loop. Uncertainty retains reservations across restarts and keeps polling
 possibly payable work. At zero headroom, free work remains possible; budget stops only on
 an idle paid-only rejected batch, so that stop waits for an `assign` call (on a change or after
 `SWARM_PLANNER_IDLE_SECONDS`); window-end and exhaustion stops run on every tick. Wait/empty assignments alone never imply exhaustion.

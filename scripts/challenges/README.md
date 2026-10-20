@@ -211,7 +211,8 @@ Expired jobs release only on confirmed evidence: an expired matching offer, comp
 claim history and empty results, no accepted bind, a successful local award lookup with no award, and
 no buyer reservation and parked auto-award intent; or the existing buyer ledger has reconciled the reservation to released
 with no delivery/accept pending. Free terminal jobs, abandoned never-posted intents (including
-dropped relay-deferred assignments) and permanently refused publications also release; a
+dropped relay-deferred assignments), permanently refused publications and `never published` offers
+(see *Never-published offers* below) also release; a
 deferred assignment reserves nothing until it is actually posted. Any uncertain/possibly payable paid job stays
 reserved and continues polling, including after stop. An old journal lacking proof stays reserved.
 Known external public awards are additionally reserved; unknown amounts fail closed. Dedicate
@@ -312,7 +313,13 @@ Once the planner verifies success, completion includes `--result`. If no eligibl
 another task and none is running, the work window ends, or zero headroom rejects an idle paid-only batch, the
 runner completes with an **Unsolved** update. Stop decisions are durable before publication;
 publication retries after restart. It never posts further jobs for that stopped day, but continues
-collecting outstanding deliveries until completion/expiry. Completion publication is immediate;
+collecting outstanding deliveries until completion/expiry. After the stop it posts nothing new,
+not even a journaled intent that has no preparation (released as `abandoned intent`, even while the
+relay snapshot is not ready). It never re-posts an unpublished preparation either: those are read
+only on the backoff above and close at their deadline under the never-published rules. Awarded or
+running jobs are untouched by the stop: they are still polled every tick and collected and paid
+exactly once, through the deadline and the delivery pay window, as before. Only the loops that
+cannot lead to a payment are cut. Completion publication is immediate;
 ordinary progress updates default to at most one per three minutes. Leave/deny/status changes
 and deadlines are rechecked after planning, immediately before posting.
 
@@ -469,6 +476,38 @@ only) changes, which `maxplayer wallet reconcile` does; or another paid collect 
 re-check that succeeds settles the job normally (`stuck payment cleared (…)`); one still refused
 stays stuck and is logged once more. To resume after reconciling, do nothing (the wallet change
 is seen) or restart the runner.
+
+**Never-published offers (I-1).** A slow `post_job` answers `status: preparing` with a
+`preparation:<hex>` handle, and the journal records that handle as the job id. If the buyer's
+preparation then fails, every `get_job` of the handle returns the same error for good (failed
+preparations are sticky). In run `2026-10-19-iso` the failure was `job lifecycle relay: no relay
+accepted event (wss://relay.maxplayer.ai: timeout) Offer <id> was queued for publication before this
+failure and may be live; auto-award was NOT armed`. The runner kept re-reading the failed
+preparation on every tick, starting one `maxplayer mcp` child each time: 379 failures, past the
+deadline, the window end and the day stop, and again after a restart. The runner now ends it like this:
+
+| What the buyer reports | Runner state | Journal outcome | Log |
+|---|---|---|---|
+| preparation still `preparing` | open, reserved (`unpublished.kind: preparing`) | `running` | warning after 5 min |
+| preparation failed, queued offer, `no relay accepted event (...)` | reads the **offer** from then on, never the preparation (`id` = offer id, `unpublished.kind: queued`, `unpublished.relay`) | open until the deadline | `offer … was queued but NO RELAY ACCEPTED IT (<relay>)`, once |
+| preparation failed, queued offer, any other reason (e.g. daemon restart) | same, reads the offer | open | `… QUEUED, MAY BE LIVE, auto-award NOT armed`, once |
+| preparation failed before any offer was queued (`nothing was published`) | **closed, released** at once | `never published` | `NEVER PUBLISHED`, once |
+| past the deadline, **confirmed** read: `offer: null`, `read_confirmed` and `award_read_confirmed` true, `reservation_state: "none"`, `auto_award_state: null`, no claim, result, accept or award | **closed, released** | `never published` | `NEVER PUBLISHED`, once |
+| past the deadline, anything less (unconfirmed read, any claim, award, accept, held reservation, auto-award intent, preparation still running) | paid: **stays reserved**, checked 60 s later, then every 300 s; seller freed after the expired-slot grace on a confirmed read; free: closed | paid: `unpublished: <reason>`; free: `expired/unpublished` | one line per backoff step |
+| the queued offer later shows up on the relay | ordinary job rules from then on (auto-award was never armed; it expires unawarded unless awarded explicitly) | ordinary | `IS on the relay after all`, once |
+
+`auto_award_state: null` is part of the proof because the buyer records the auto-award intent
+only after a *successful* post. A `never published` job is not counted as an unclaimed expiry against its
+seller (the seller never saw the offer, so it is never benched for it); the planner sees the outcome
+and is told to reassign the task. Money safety beats tidiness: a read that cannot prove that nothing
+exists never releases sats. While an unpublished job is quiet (no award, delivery or accept), it is
+read on a backoff (60 s, then 300 s; before the deadline, never later than just past it) instead of
+every tick, and a failing read backs off too. An award, delivery or accept makes it a normal job again,
+read every tick. After 5 minutes with no published offer (`UNPUBLISHED_WARN_SECONDS`) the runner logs one
+`WARNING: Job <id>: offer never reached the relay: <relay> accepted no event (…)`; the warning is
+journaled, so it is not repeated after a restart. A restarted runner whose journal holds such a job
+(its id still the preparation handle) reads the failed preparation once, switches to the offer and
+closes it on the same tick if the proof holds. It never resumes the loop.
 
 **Delivered answers.** A non-empty `answer.txt` (the buyer's materialized inline answer) is the
 answer, capped like every file at 64 KiB with a `[truncated: first N of M bytes shown]` marker, so
