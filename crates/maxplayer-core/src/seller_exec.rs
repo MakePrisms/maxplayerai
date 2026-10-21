@@ -2317,6 +2317,14 @@ where
 /// Every unmarked outcome, a refusal among them, keeps the exact path it has today. The marker can
 /// only turn a reply that would have been discarded into a delivery; it can never turn a refusal
 /// into a payment, which is the direction #685 is guarding.
+///
+/// `nix_available` is the boot-time measurement of whether `nix` works in the JOB environment
+/// ([`crate::capability::probe_seat_nix`]). It decides which install route TOOLING names. Field
+/// case (seat `io-seller-5d1636c9`, v0.6.1, docker): the old text offered nix only for a project
+/// that ships a flake and otherwise sent the agent to rustup and `pip install --user`, neither of
+/// which runs in the sandbox image (no curl, no python). Every swarm job starts in an empty
+/// directory, so the agents never tried nix, found no compiler, and stopped within two minutes of
+/// a 40–60 minute window — while `nix shell nixpkgs#gcc` worked in that same image in 46 s.
 pub fn compose_agent_prompt(
     task: &str,
     git_remote: &str,
@@ -2324,6 +2332,7 @@ pub fn compose_agent_prompt(
     declared_output: Option<&str>,
     memory_section: Option<&str>,
     accepts_inline: bool,
+    nix_available: bool,
 ) -> String {
     // #686: the buyer's `["output", …]` tag is MANDATORY on ingest and is a MIME / output type
     // (`text/plain`, `application/json`). Stating it here is the only way the hired agent learns what
@@ -2365,6 +2374,23 @@ pub fn compose_agent_prompt(
     } else {
         String::new()
     };
+    // The install route is chosen by MEASUREMENT, never assumed: naming `nix shell` on a seat with
+    // no working nix sends the agent down a dead path, which is exactly the failure this replaces
+    // in the other direction. The command carries `--extra-experimental-features` itself because a
+    // host seat's nix may not enable flakes in its config, and the probe does not read that config.
+    let install_route = if nix_available {
+        "nix is installed here and fetches prebuilt packages from cache.nixos.org, so use it to \
+         get any missing tool; no flake is needed. Run your command through it, naming the \
+         packages you need, for example `nix --extra-experimental-features 'nix-command flakes' \
+         shell nixpkgs#gcc nixpkgs#python3 --command <your command>` (other packages: \
+         nixpkgs#cargo, nixpkgs#procps, nixpkgs#curl and so on). The first download can take a \
+         minute or more, so fetch everything you need in one call at the start; later calls reuse \
+         the download, so wrap each later command the same way. When the project ships a flake, \
+         prefer `nix develop` instead."
+    } else {
+        "Use a user-local installer this machine can actually run, such as rustup, `pip install \
+         --user`, or `npm install -g` with a prefix under `$HOME`."
+    };
     let base = format!(
         "{task}\n\n\
          ---\n\
@@ -2389,12 +2415,13 @@ pub fn compose_agent_prompt(
          needs may be absent — installing it is expected, and the container is yours alone and \
          is discarded when the job ends. You run as an unprivileged user with no sudo and no \
          capabilities, so a system package manager will fail; install under `$HOME` instead, and \
-         never into the job directory, where it would become part of your deliverable. Prefer \
-         `nix develop` when the project ships a flake and nix is present, otherwise a user-local \
-         installer such as rustup, `pip install --user`, or `npm install -g` with a prefix under \
-         `$HOME`. When `$HOME` is not writable, say so in your output and carry on with the \
-         rest of the task — a named obstacle is worth more to the buyer than a deadline spent \
-         hiding one.\n\
+         never into the job directory, where it would become part of your deliverable. \
+         {install_route} Downloading a tool is permitted even when the task says it is offline: \
+         offline means the task needs no data from the web, not that installing tools is \
+         off-limits. Never conclude a tool is unavailable before you have tried to install it. \
+         When an install still fails, or `$HOME` is not writable, name the command you ran and \
+         its exact error in your output and carry on with the rest of the task — a named \
+         obstacle is worth more to the buyer than a deadline spent hiding one.\n\
          ---\n\
          DELIVERY (required). Your deliverable is the FINAL STATE OF YOUR CURRENT WORKING \
          DIRECTORY:\n\
@@ -8168,7 +8195,7 @@ mod tests {
     #[test]
     fn composed_prompt_carries_task_and_owned_delivery_instructions() {
         let remote = "https://relay.example/git/abc.git";
-        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None, None, true);
+        let prompt = compose_agent_prompt("build a widget", remote, 1_800_000_123, None, None, true, false);
         // The original task stays up front.
         assert!(prompt.starts_with("build a widget"), "task preserved: {prompt}");
         // Explicit, seller-owned delivery instructions are appended.
@@ -8214,7 +8241,7 @@ mod tests {
         let remote_b = "https://relay.example/git/bbb.git";
         // Composed WITH a declared output type (#686) so every check below — the wrap-seam
         // instruments and the refusal ban especially — covers that line too, not only the #685 text.
-        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, Some("text/plain"), None, true);
+        let a = compose_agent_prompt("task A", remote_a, 1_800_000_123, Some("text/plain"), None, true, false);
         let b = compose_agent_prompt(
             "task B",
             remote_b,
@@ -8222,6 +8249,7 @@ mod tests {
             Some("application/json"),
             None,
             true,
+            false,
         );
 
         // Identity, deadline and boundaries are present at all — the three things #685 adds.
@@ -8261,10 +8289,12 @@ mod tests {
                 "the container is yours alone and is discarded when the job ends",
                 "an unprivileged user with no sudo and no capabilities",
                 "install under `$HOME` instead, and never into the job directory",
-                "your deliverable. Prefer `nix develop` when the project ships a flake",
-                "otherwise a user-local installer such as rustup",
-                "with a prefix under `$HOME`.",
-                "say so in your output and carry on with the rest of the task",
+                "where it would become part of your deliverable. Use a user-local installer",
+                "such as rustup, `pip install --user`, or `npm install -g`",
+                "with a prefix under `$HOME`. Downloading a tool is permitted",
+                "even when the task says it is offline: offline means",
+                "not that installing tools is off-limits. Never conclude",
+                "name the command you ran and its exact error in your output and carry on",
                 "worth more to the buyer than a deadline spent hiding one.",
             ] {
                 assert!(
@@ -8283,8 +8313,8 @@ mod tests {
         assert!(!a.contains("bbb.git"), "not the other job's remote: {a}");
 
         // The deadline VALUE reaches the text: hold every other input fixed and only it varies.
-        let early = compose_agent_prompt("t", "r", 1_000_000_001, None, None, true);
-        let late = compose_agent_prompt("t", "r", 1_000_000_002, None, None, true);
+        let early = compose_agent_prompt("t", "r", 1_000_000_001, None, None, true, false);
+        let late = compose_agent_prompt("t", "r", 1_000_000_002, None, None, true, false);
         assert_ne!(
             early, late,
             "the deadline argument must reach the prompt, not be dropped"
@@ -8314,7 +8344,7 @@ mod tests {
     // Bite (measured): drop the ANSWER JOBS block from `compose_agent_prompt` and this goes red.
     #[test]
     fn the_inline_answer_marker_reaches_the_prompt() {
-        let prompt = compose_agent_prompt("t", "r", 1_000, None, None, true);
+        let prompt = compose_agent_prompt("t", "r", 1_000, None, None, true, false);
         assert!(
             prompt.contains(crate::engine::INLINE_ANSWER_MARKER),
             "the agent must be told the exact marker the seller matches on: {prompt}"
@@ -8333,8 +8363,8 @@ mod tests {
     // `{output_section}` from the format string, and this test goes red on the first assertion.
     #[test]
     fn the_declared_output_type_reaches_the_prompt_and_absence_states_nothing() {
-        let json = compose_agent_prompt("t", "r", 1_000, Some("application/json"), None, true);
-        let plain = compose_agent_prompt("t", "r", 1_000, Some("text/plain"), None, true);
+        let json = compose_agent_prompt("t", "r", 1_000, Some("application/json"), None, true, false);
+        let plain = compose_agent_prompt("t", "r", 1_000, Some("text/plain"), None, true, false);
 
         assert!(
             json.contains("application/json"),
@@ -8363,7 +8393,7 @@ mod tests {
 
         // ABSENT ⇒ SILENT, byte-for-byte. An offer recorded before the column existed declares no
         // output type, and stating a default would put a fact in the prompt no buyer ever gave.
-        let absent = compose_agent_prompt("t", "r", 1_000, None, None, true);
+        let absent = compose_agent_prompt("t", "r", 1_000, None, None, true, false);
         assert!(
             !absent.contains("DECLARED OUTPUT TYPE"),
             "no declared type ⇒ nothing stated: {absent}"
@@ -8371,7 +8401,7 @@ mod tests {
         // Blank is absence too (a whitespace-only tag value states nothing), so it lands on the
         // very same bytes rather than on an empty "DECLARED OUTPUT TYPE: ." line.
         assert_eq!(
-            compose_agent_prompt("t", "r", 1_000, Some("   "), None, true),
+            compose_agent_prompt("t", "r", 1_000, Some("   "), None, true, false),
             absent,
             "a blank output type states nothing, exactly as an absent one does"
         );
@@ -8396,9 +8426,69 @@ mod tests {
     // Daemon-side reaping is #733, not this change.
     //
     // Bite: drop the BOUNDARIES bullet, and the first assertion goes red.
+    // TOOTH (field report, seat io-seller-5d1636c9, v0.6.1 docker) — where nix WORKS in the job
+    // environment, TOOLING names `nix shell` as the way to get ANY missing tool, flake or not.
+    //
+    // The old text offered nix only "when the project ships a flake", and every swarm job starts
+    // in an empty directory, so agents fell through to rustup / `pip install --user` (no curl, no
+    // python in the image), found no compiler, and stopped in two minutes of a 40–60 minute window.
+    // Composed twice with every other input fixed and only `nix_available` varying, so a hardcoded
+    // string (or a dropped argument) cannot satisfy both halves.
+    //
+    // Bite: make `install_route` ignore `nix_available` (either arm) in `compose_agent_prompt`, and
+    // this goes red. The boot-to-prompt wiring has its own teeth in `seller_node::run`.
+    #[test]
+    fn tooling_names_nix_shell_for_any_missing_tool_only_where_nix_works() {
+        let with_nix = compose_agent_prompt("t", "r", 1_000, None, None, true, true);
+        let without = compose_agent_prompt("t", "r", 1_000, None, None, true, false);
+        let tooling = |prompt: &str| -> String {
+            prompt
+                .split("TOOLING: ")
+                .nth(1)
+                .and_then(|rest| rest.split("\n---\n").next())
+                .expect("TOOLING paragraph")
+                .to_owned()
+        };
+        let (with_nix_t, without_t) = (tooling(&with_nix), tooling(&without));
+
+        // nix seat: the generic `nix shell` route, needing no flake, with real package names.
+        assert!(with_nix_t.contains(" shell nixpkgs#gcc nixpkgs#python3 --command "), "{with_nix_t}");
+        assert!(with_nix_t.contains("no flake is needed"), "{with_nix_t}");
+        assert!(
+            with_nix_t.contains("--extra-experimental-features 'nix-command flakes'"),
+            "the command must work on a host nix whose config does not enable flakes: {with_nix_t}"
+        );
+        // …and none of the installers the sandbox image cannot run.
+        for dead in ["rustup", "pip install --user"] {
+            assert!(!with_nix_t.contains(dead), "nix seat must not suggest {dead:?}: {with_nix_t}");
+        }
+
+        // No-nix seat: never told to use a nix it does not have.
+        assert!(!without_t.contains("nix"), "no-nix seat must not name nix: {without_t}");
+        assert!(without_t.contains("user-local installer"), "{without_t}");
+
+        // Both: offline is not a reason to skip installing, and an obstacle is named WITH its error.
+        for t in [&with_nix_t, &without_t] {
+            assert!(t.contains("permitted even when the task says it is offline"), "{t}");
+            assert!(t.contains("Never conclude a tool is unavailable before you have tried"), "{t}");
+            assert!(t.contains("its exact error"), "{t}");
+        }
+        // The nix text joins cleanly across its source-wrap seams (see the preamble test).
+        assert!(!with_nix.contains("  "), "no doubled space at any wrap seam: {with_nix}");
+        for joined in [
+            "fetches prebuilt packages from cache.nixos.org, so use it",
+            "naming the packages you need",
+            "(other packages: nixpkgs#cargo, nixpkgs#procps",
+            "so fetch everything you need in one call at the start",
+            "prefer `nix develop` instead. Downloading a tool",
+        ] {
+            assert!(with_nix.contains(joined), "joins cleanly ({joined:?}): {with_nix}");
+        }
+    }
+
     #[test]
     fn preamble_warns_off_self_matching_process_waiters() {
-        let prompt = compose_agent_prompt("t", "r", 1_000, None, None, true);
+        let prompt = compose_agent_prompt("t", "r", 1_000, None, None, true, false);
         let boundaries = prompt
             .split("BOUNDARIES:\n")
             .nth(1)

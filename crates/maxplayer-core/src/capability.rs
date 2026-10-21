@@ -186,6 +186,57 @@ pub fn probe_seat_capabilities(
     })
 }
 
+/// The command that proves `nix` WORKS in the job environment, not merely that it resolves.
+///
+/// Not a [`CAPABILITIES`] token and never advertised: it decides only which install route the job
+/// prompt's TOOLING paragraph names ([`crate::seller_exec::compose_agent_prompt`]). A `--version`
+/// check is not enough here, because version reporting never opens the store, so it succeeds against
+/// a store nix cannot use (see the per-user note in `docker/maxplayer-sandbox/Dockerfile`). `eval`
+/// opens the store and needs no network. The feature flag is passed explicitly because a host seat's
+/// nix may not enable `nix-command` in its own config, and the prompt names the same flag.
+pub const NIX_PROBE_COMMAND: [&str; 6] = [
+    "nix",
+    "--extra-experimental-features",
+    "nix-command flakes",
+    "eval",
+    "--expr",
+    "1",
+];
+
+/// Whether `nix` works in the JOB execution environment, measured through the same launcher a job
+/// runs under (the [`probe_capabilities`] rule: never bypass the launcher). `resolves` has the
+/// [`probe_capabilities`] contract.
+#[cfg(feature = "wallet")]
+pub fn probe_nix(
+    policy: &crate::seller_exec::SandboxPolicy,
+    workdir: &std::path::Path,
+    resolves: impl Fn(&[String]) -> Result<bool, crate::seller_exec::ProbeRunError>,
+) -> Result<bool, CapabilityProbeError> {
+    let argv: Vec<String> = NIX_PROBE_COMMAND.iter().map(|part| (*part).to_owned()).collect();
+    let rendered = crate::seller_exec::probe_launch_argv(policy, &argv, workdir)
+        .map_err(CapabilityProbeError::Render)?;
+    resolves(&rendered).map_err(CapabilityProbeError::Run)
+}
+
+/// [`probe_nix`] for real, under the standard probe bound. The production entry point seller boot
+/// calls. A measurement ERROR is the caller's to read; boot reads it as "no nix" and keeps the
+/// generic install advice, because this steers prompt text and nothing a buyer pays against.
+#[cfg(feature = "wallet")]
+pub fn probe_seat_nix(
+    policy: &crate::seller_exec::SandboxPolicy,
+    workdir: &std::path::Path,
+) -> Result<bool, CapabilityProbeError> {
+    let executor = crate::seller_exec::ProbeExecutor::for_policy(policy, workdir);
+    probe_nix(policy, workdir, |argv| {
+        crate::seller_exec::probe_command_outcome(
+            argv,
+            workdir,
+            crate::seller_exec::CAPABILITY_PROBE_TIMEOUT,
+            &executor,
+        )
+    })
+}
+
 /// Why a job's capability REQUEST is itself malformed (#897).
 ///
 /// Distinct from [`crate::buyer::lifecycle::CapabilityRefusal`], which judges a well-formed request
@@ -260,6 +311,34 @@ pub fn validate_capability_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The nix probe opens the STORE (`eval`), not just `--version`, and it renders through the job
+    // launcher like every capability probe. Driven with an injected runner so the verdict is the
+    // runner's, not this host's.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn the_nix_probe_evaluates_through_the_job_launcher_and_reports_its_verdict() {
+        let dir = std::env::temp_dir().join(format!("nix-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("probe dir");
+        let policy = crate::seller_exec::SandboxPolicy::passthrough();
+        let seen = std::cell::RefCell::new(Vec::new());
+        for verdict in [true, false] {
+            let got = probe_nix(&policy, &dir, |argv| {
+                seen.borrow_mut().push(argv.to_vec());
+                Ok(verdict)
+            })
+            .expect("measurable");
+            assert_eq!(got, verdict, "the runner's verdict is the answer");
+        }
+        let argv = &seen.borrow()[0];
+        assert_eq!(argv, &NIX_PROBE_COMMAND.map(str::to_owned).to_vec(), "pass-through renders as-is");
+        assert!(argv.iter().any(|a| a == "eval"), "must open the store, not stop at --version");
+
+        // An unmeasurable probe is an error the caller sees, never a silent `true`.
+        let err = probe_nix(&policy, &dir, |_| Err(crate::seller_exec::ProbeRunError::EmptyArgv));
+        assert!(err.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn every_token_in_the_vocabulary_has_a_probe_command() {

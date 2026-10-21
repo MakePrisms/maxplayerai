@@ -90,7 +90,7 @@ fn the_operator_authored_memory_index_reaches_the_agents_prompt() {
 
     let section = job_memory_section(&root, &SellerMemoryConfig::default());
     let section = section.expect("a non-empty index renders a read-on-start section");
-    let prompt = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()));
+    let prompt = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()), false);
 
     assert!(
         prompt.contains("Söhne, never centre body copy"),
@@ -113,7 +113,7 @@ fn the_operator_authored_memory_index_reaches_the_agents_prompt() {
 /// render nothing, and nothing is what shipped before.
 #[test]
 fn the_golden_invariant_holds_no_memory_is_byte_identical() {
-    let baseline = job_prompt(&offer(), GIT_REMOTE, DEADLINE, None);
+    let baseline = job_prompt(&offer(), GIT_REMOTE, DEADLINE, None, false);
     assert!(
         !baseline.contains("SELLER MEMORY"),
         "control: the memory-off prompt must not already carry the section this test looks for"
@@ -125,7 +125,7 @@ fn the_golden_invariant_holds_no_memory_is_byte_identical() {
     let none_section = job_memory_section(&bare, &SellerMemoryConfig::default());
     assert_eq!(none_section, None);
     assert_eq!(
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, none_section.as_deref()),
+        job_prompt(&offer(), GIT_REMOTE, DEADLINE, none_section.as_deref(), false),
         baseline,
         "absent index ⇒ byte-identical to the memory-disabled prompt"
     );
@@ -135,7 +135,7 @@ fn the_golden_invariant_holds_no_memory_is_byte_identical() {
     let blank_section = job_memory_section(&blank, &SellerMemoryConfig::default());
     assert_eq!(blank_section, None);
     assert_eq!(
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, blank_section.as_deref()),
+        job_prompt(&offer(), GIT_REMOTE, DEADLINE, blank_section.as_deref(), false),
         baseline,
         "blank index ⇒ byte-identical to the memory-disabled prompt"
     );
@@ -146,7 +146,7 @@ fn the_golden_invariant_holds_no_memory_is_byte_identical() {
     let real = home_with_index("golden-real", "# Memory\n\nhouse style: sentence case headings\n");
     let section = job_memory_section(&real, &SellerMemoryConfig::default())
         .expect("control: a non-empty index must render a section, or the test above proves nothing");
-    let with_memory = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()));
+    let with_memory = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()), false);
     assert_ne!(with_memory, baseline, "memory must actually change the prompt");
     assert!(
         with_memory.starts_with(&baseline),
@@ -216,8 +216,8 @@ fn an_over_budget_index_degrades_instead_of_blocking_the_job() {
     );
     // And the job it would have run is exactly the job that runs today.
     assert_eq!(
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, section.as_deref()),
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, None),
+        job_prompt(&offer(), GIT_REMOTE, DEADLINE, section.as_deref(), false),
+        job_prompt(&offer(), GIT_REMOTE, DEADLINE, None, false),
         "the degraded job is byte-identical to a normal memory-free job"
     );
 
@@ -260,8 +260,8 @@ fn the_read_wire_never_creates_the_memory_directory() {
 
     // And the prompt an existing seller gets is the one it got before this feature was wired.
     assert_eq!(
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, section.as_deref()),
-        job_prompt(&offer(), GIT_REMOTE, DEADLINE, None),
+        job_prompt(&offer(), GIT_REMOTE, DEADLINE, section.as_deref(), false),
+        job_prompt(&offer(), GIT_REMOTE, DEADLINE, None, false),
         "an untouched seller's prompt is byte-identical to the memory-off output"
     );
 
@@ -302,7 +302,7 @@ fn an_index_of_exactly_65536_bytes_is_accepted_and_reaches_the_agent() {
         "an index of exactly 65,536 bytes must be accepted; if the injection bound is lowered this \
          is refused and returns None",
     );
-    let prompt = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()));
+    let prompt = job_prompt(&offer(), GIT_REMOTE, DEADLINE, Some(section.as_str()), false);
 
     assert!(
         prompt.contains(marker),

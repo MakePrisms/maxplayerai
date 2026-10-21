@@ -2445,6 +2445,7 @@ pub fn job_prompt(
     git_remote: &str,
     deadline_unix: u64,
     memory_section: Option<&str>,
+    nix_available: bool,
 ) -> String {
     compose_agent_prompt(
         &offer.task,
@@ -2459,6 +2460,8 @@ pub fn job_prompt(
             .accepts_delivery
             .iter()
             .any(|mode| mode == gateway::DELIVERY_MODE_INLINE),
+        // Measured at boot in the job environment, never assumed from the sandbox mode.
+        nix_available,
     )
 }
 
@@ -4320,8 +4323,22 @@ pub async fn boot_advertising_only_proven(
                 "capability probe could not be measured; refusing to advertise: {error}"
             ))
         })?;
+    // Whether nix WORKS in the job environment decides which install route the job prompt names
+    // (`compose_agent_prompt`'s TOOLING). Not advertised and not a gate, so a probe that cannot be
+    // measured degrades to "no nix" — the generic installer advice — rather than failing boot.
+    let job_nix = match crate::capability::probe_seat_nix(&sandbox, probe_dir.path()) {
+        Ok(present) => present,
+        Err(error) => {
+            opline!("seller node nix probe could not be measured; job prompts omit nix: {error}");
+            false
+        }
+    };
     drop(probe_dir);
     opline!("seller node capability probe proved: [{}]", capabilities.join(", "));
+    opline!(
+        "seller node job environment nix: {}",
+        if job_nix { "works (job prompts name `nix shell`)" } else { "absent" }
+    );
 
     let disco = crate::profile::publish_seller_discoverability_async(&mut home)
         .await
@@ -4339,6 +4356,9 @@ pub async fn boot_advertising_only_proven(
     // serve. The first heartbeat and the first claim both read the roster, so recording here — not on
     // first use — is what makes the very first advertisement honest.
     runner.agents.record_capabilities(capabilities);
+    runner
+        .job_nix
+        .store(job_nix, std::sync::atomic::Ordering::SeqCst);
     Ok(runner)
 }
 
@@ -4380,6 +4400,10 @@ pub struct SellerNodeRunner {
     /// seconds. Recorded on every publish ATTEMPT: a relay that refuses the beat is the watchdog's
     /// business, and retrying it every drain tick would turn the interval into five seconds.
     announced_serving_generation: std::sync::atomic::AtomicU64,
+    /// Whether `nix` works in the JOB environment, measured once at boot alongside the capability
+    /// probe ([`crate::capability::probe_seat_nix`]). Read into every job prompt. `false` until
+    /// measured, so a node booted without the probe keeps the generic install advice.
+    job_nix: std::sync::atomic::AtomicBool,
     /// Homogeneous execution-slot admission (reserve-at-claim). Behind an `Arc` so it is shared with
     /// the off-loop execution tasks; see [`SlotGate`].
     /// The seat's held tools (the Holder route, `[[sandbox.held_tools]]`): one holder container per
@@ -4869,6 +4893,7 @@ impl SellerNodeRunner {
             private_authenticated,
             agents,
             announced_serving_generation: std::sync::atomic::AtomicU64::new(0),
+            job_nix: std::sync::atomic::AtomicBool::new(false),
             held_tools,
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
@@ -8502,7 +8527,13 @@ impl SellerNodeRunner {
                 &self.node.home().root,
                 &self.node.home().config.seller_memory,
             );
-            let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
+            let prompt = job_prompt(
+                &offer,
+                &seller.git_remote,
+                deadline,
+                memory_section.as_deref(),
+                self.job_nix.load(std::sync::atomic::Ordering::SeqCst),
+            );
             match self
                 .deliver_via_container(
                     job_id,
@@ -8654,7 +8685,13 @@ impl SellerNodeRunner {
                 &self.node.home().root,
                 &self.node.home().config.seller_memory,
             );
-            let prompt = job_prompt(&offer, &seller.git_remote, deadline, memory_section.as_deref());
+            let prompt = job_prompt(
+                &offer,
+                &seller.git_remote,
+                deadline,
+                memory_section.as_deref(),
+                self.job_nix.load(std::sync::atomic::Ordering::SeqCst),
+            );
             // Resolve the sandbox executor before the run; a misconfigured `[sandbox]` fails the job
             // rather than silently running the agent unsandboxed.
             let sandbox = match SandboxPolicy::from_config(self.node.home().config.sandbox.as_ref()) {
@@ -13178,7 +13215,7 @@ mod tests {
         let resumed = store.offer_row(&job).expect("offer row").expect("offer survives");
 
         // The exact call the execute path makes, over the exact row a resumed job reads.
-        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000, None);
+        let prompt = job_prompt(&resumed, "https://relay.example/git/abc.git", 2_000_000_000, None, false);
         assert!(
             prompt.contains("application/json"),
             "the buyer's declared output type must reach the hired agent: {prompt}"
@@ -13191,10 +13228,27 @@ mod tests {
         // the other job's type.
         let mut other = resumed.clone();
         other.output = Some("text/plain".to_owned());
-        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000, None);
+        let other_prompt = job_prompt(&other, "https://relay.example/git/abc.git", 2_000_000_000, None, false);
         assert!(other_prompt.contains("text/plain"), "{other_prompt}");
         assert!(!other_prompt.contains("application/json"), "{other_prompt}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH (field report, v0.6.1 docker seat) — the boot nix verdict reaches the hired agent through
+    // `job_prompt`, the one seam a stored row becomes a prompt. Bite: pass a constant for
+    // `nix_available` at `job_prompt`'s `compose_agent_prompt` call and one half goes red.
+    #[test]
+    fn the_job_nix_verdict_reaches_the_prompt_through_job_prompt() {
+        let asked =
+            gateway::OfferDraft::new("do a task", "text/plain", 5, NOW + 600, "a".repeat(64))
+                .to_event_draft();
+        let row = offer_row(&"d".repeat(64), "buyer-1", &parse_offer(&asked).expect("parse"));
+        let remote = "https://relay.example/git/abc.git";
+        let with_nix = job_prompt(&row, remote, 2_000_000_000, None, true);
+        let without = job_prompt(&row, remote, 2_000_000_000, None, false);
+        assert!(with_nix.contains("shell nixpkgs#gcc"), "{with_nix}");
+        // Not a bare "nix": the DEADLINE line says "Unix epoch seconds".
+        assert!(!without.contains("nixpkgs") && !without.contains("`nix "), "{without}");
     }
 
     // TOOTH (charter invariant 2, RESTART form — the strong one) — a job requesting harness X is
@@ -19882,6 +19936,21 @@ mod tests {
                 .capabilities,
             expected,
             "the claim capability must carry the same probed set as the heartbeat"
+        );
+        // The nix measurement that steers the job prompt's TOOLING is wired at boot too, and it is
+        // the SAME environment's answer, not a default.
+        let probe_dir = crate::seller_exec::ProbeWorkdir::create(runner.node.home())
+            .expect("probe workdir");
+        let expected_nix = crate::capability::probe_seat_nix(
+            &crate::seller_exec::SandboxPolicy::passthrough(),
+            probe_dir.path(),
+        )
+        .unwrap_or(false);
+        drop(probe_dir);
+        assert_eq!(
+            runner.job_nix.load(std::sync::atomic::Ordering::SeqCst),
+            expected_nix,
+            "boot must record the measured job-environment nix verdict the job prompt reads"
         );
 
         runner.client.disconnect().await;
