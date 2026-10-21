@@ -184,6 +184,13 @@ is a new kind or a new optional tag. Protocol §2.1 lists the maxplayer-owned ki
      16 KiB creq bound at `:440` applies).
    - `3406` (`:344`): add `"reply"`.
    - Feedback reasons (`ppp/wire.rs:170 @e0262420`): add `"session_expired"`.
+   - `3404` allowed (`:345`): add `"reply"` — §2.3's `session_expired` FEEDBACK carries
+     `["e", followup_id, "", "reply"]`, which the private allowlist would otherwise refuse.
+     (Found while implementing; the list above omitted it.)
+   - Client side, same rows: the core private carrier projection
+     (`core/private_content/carriers.rs`, `project`) has its own per-kind tag allowlist and drops
+     unlisted tags before signing; it gains `session` on 3402 and `turn_status`/`context`/`creq`
+     on 3403, or a private session claim/result would be published without them.
    - **Why this is load-bearing on the relay, not only in clients:** private-repo provisioning validates
      the claim with this same function (`relay/api/git/private_jobs.rs:202 @e0262420`). A private claim
      carrying `session` is refused by an un-upgraded relay, and provisioning fails.
