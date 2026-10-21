@@ -1717,7 +1717,12 @@ pub struct OwnedSelection {
 /// An empty `seat` selects nothing: a caller that cannot name itself owns nothing to remove.
 #[must_use]
 pub fn partition_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64) -> OwnedSelection {
-    partition_owned_keeping(containers, seat, now_unix, &std::collections::BTreeSet::new())
+    partition_owned_keeping(
+        containers,
+        seat,
+        now_unix,
+        &std::collections::BTreeSet::new(),
+    )
 }
 
 /// [`partition_owned`], keeping every container whose job is in `keep` (job ids with a live
@@ -2114,7 +2119,14 @@ pub async fn sweep_expired_keeping(
     now_unix: u64,
     keep: &std::collections::BTreeSet<String>,
 ) -> Result<ReapReport, String> {
-    sweep_expired_within_keeping(&DockerCli::system(), seat, now_unix, SWEEP_PASS_BUDGET, keep).await
+    sweep_expired_within_keeping(
+        &DockerCli::system(),
+        seat,
+        now_unix,
+        SWEEP_PASS_BUDGET,
+        keep,
+    )
+    .await
 }
 
 /// [`sweep_expired`], with the docker client supplied by the caller.
@@ -2139,8 +2151,14 @@ async fn sweep_expired_within(
     now_unix: u64,
     budget: std::time::Duration,
 ) -> Result<ReapReport, String> {
-    sweep_expired_within_keeping(client, seat, now_unix, budget, &std::collections::BTreeSet::new())
-        .await
+    sweep_expired_within_keeping(
+        client,
+        seat,
+        now_unix,
+        budget,
+        &std::collections::BTreeSet::new(),
+    )
+    .await
 }
 
 #[cfg(feature = "acp")]
@@ -4608,7 +4626,10 @@ exit 0
         assert_eq!(after.removable.len(), 3);
         assert_eq!(after, partition_owned(&owned, &seat, 10_000));
         // Before its stamp a kept container is neither removable nor reported.
-        assert_eq!(partition_owned_keeping(&owned, &seat, 50, &keep), OwnedSelection::default());
+        assert_eq!(
+            partition_owned_keeping(&owned, &seat, 50, &keep),
+            OwnedSelection::default()
+        );
     }
 
     /// A PERSISTENTLY FAILING HEAD CANNOT STARVE THE TAIL OF THE QUEUE.
