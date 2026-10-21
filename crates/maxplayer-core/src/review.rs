@@ -5,7 +5,9 @@ pub mod state;
 #[cfg(feature = "wallet")]
 pub mod private;
 use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
-use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_KIND};
+use crate::kinds::{
+    JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_KIND, SESSION_FOLLOWUP_KIND,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -72,7 +74,9 @@ impl ReviewConfig {
     pub fn enabled(&self, kind: u16, counterparty: &str) -> Result<bool, String> {
         self.validate()?;
         match kind {
-            JOB_OFFER_KIND => {
+            // A session follow-up is buyer-authored work input, reviewed like the offer it
+            // continues: same switch, same buyer opt-outs (docs/specs/session-jobs.md §9).
+            JOB_OFFER_KIND | SESSION_FOLLOWUP_KIND => {
                 Ok(self.seller_offer && !self.skip_buyer_pubkeys.iter().any(|p| p == counterparty))
             }
             JOB_RESULT_KIND => {
@@ -104,6 +108,8 @@ impl Subject {
         }
         match self.kind {
             JOB_OFFER_KIND if self.offer == self.event && self.commit.is_none() => Ok(()),
+            // Session follow-up: `offer` is the job root, `event` the follow-up, no commit.
+            SESSION_FOLLOWUP_KIND if self.offer != self.event && self.commit.is_none() => Ok(()),
             JOB_RESULT_KIND
                 if self.commit.as_ref().is_none_or(|c| {
                     (c.len() == 40 || c.len() == 64)
@@ -792,6 +798,33 @@ mod tests {
         assert!(error.contains("relay refused the review request"), "{error}");
         assert!(error.contains("timestamp too far"), "{error}");
         assert!(!error.contains("timeout"), "{error}");
+    }
+    #[test]
+    fn session_followup_subject_and_opt_outs() {
+        let followup = Subject {
+            offer: "a".repeat(64),
+            event: "b".repeat(64),
+            kind: SESSION_FOLLOWUP_KIND,
+            commit: None,
+        };
+        followup.validate().unwrap();
+        request_draft(&followup, &"c".repeat(64)).unwrap();
+        // Bound to a distinct follow-up event and never to a commit.
+        for bad in [
+            Subject { event: "a".repeat(64), ..followup.clone() },
+            Subject { commit: Some("d".repeat(40)), ..followup.clone() },
+        ] {
+            assert!(bad.validate().is_err());
+        }
+        let mut cfg = ReviewConfig::default();
+        assert!(cfg.enabled(SESSION_FOLLOWUP_KIND, &"e".repeat(64)).unwrap());
+        cfg.skip_buyer_pubkeys.push("e".repeat(64));
+        assert!(!cfg.enabled(SESSION_FOLLOWUP_KIND, &"e".repeat(64)).unwrap());
+        cfg.skip_buyer_pubkeys.clear();
+        cfg.seller_offer = false;
+        assert!(!cfg.enabled(SESSION_FOLLOWUP_KIND, &"e".repeat(64)).unwrap());
+        // Neighbouring kinds stay unsupported subjects.
+        assert!(cfg.enabled(3410, &"e".repeat(64)).is_err());
     }
     #[test]
     fn request_refused_reads_the_relay_reason_from_the_send_output() {
