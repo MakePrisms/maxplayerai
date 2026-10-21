@@ -49,6 +49,8 @@ Final stakeholder summary: 21 Oct 2026 12:38 UTC.
    offers. (Josip, 20 Oct.)
 10. **No maximum session size in v1** (harnesses compact long conversations). `session/load` end-to-end
     test in the sandbox skipped (Josip: safe to assume). (21 Oct.)
+11. **Credential proxy is stopped at park and re-minted per turn** (new proxy, new model-key
+    placeholder each turn), not kept alive while parked. §6.4. (Josip, 21 Oct 22:24 UTC.)
 
 ---
 
@@ -573,8 +575,7 @@ follow-up is sent or accepted, and every code path is today's.
 4. **A relay that has not been upgraded refuses private session claims at provisioning**
    (`relay/api/git/private_jobs.rs:202 @e0262420`). Fixed: deploy order, §3.
 5. **Keeping the credential proxy alive while parked** would starve `proxy_port_range` and extend the
-   `0.0.0.0` exposure to 6 h. Fixed: re-mint per turn, §6.4. This changes the stakeholder summary's
-   "placeholder stays registered" wording — flagged for confirmation.
+   `0.0.0.0` exposure to 6 h. Fixed: re-mint per turn, §6.4. Confirmed by Josip, §0 item 11.
 6. **A restarted holder is running but has no rules.** "Holder isn't running" is not enough. Fixed:
    `StartedAt` check, §5.5.
 7. **Old orchestrator binary inside parked containers** after an upgrade. Fixed: `session_protocol`
@@ -641,9 +642,7 @@ follow-up is sent or accepted, and every code path is today's.
    measurement.
 3. **Closure of abandoned private session repos.** *Proposed:* none in v1 (seller-only, create-only,
    5 GiB quota); add a relay idle-close later if it shows up.
-4. **Credential re-mint instead of keeping the placeholder registered (§6.4, flaw 5).** *Proposed:*
-   re-mint per turn.
-5. **`reply` with an uncollected previous turn.** *Proposed:* refuse with "collect first" (one explicit
+4. **`reply` with an uncollected previous turn.** *Proposed:* refuse with "collect first" (one explicit
    spend per turn), rather than auto-collecting inside `reply`.
 
 ---
