@@ -15,6 +15,7 @@
 //! | `3405` | AWARD (claim selection) | buyer |
 //! | `3406` | ACCEPT (pay-bind for one verified result) | buyer |
 //! | `3407` | REJECT (verified delivery refusal) | buyer |
+//! | `3412` | FOLLOW-UP (session turn / close) | buyer |
 //! | `30340` | SELLER HEARTBEAT (addressable, `d="maxplayer-seller"`) | seller |
 
 //! | `30341` | CHALLENGE | buyer |
@@ -55,6 +56,10 @@ pub const JOB_REJECT_KIND: u16 = 3407;
 pub const REVIEW_KIND: u16 = 3408;
 /// Buyer/seller request for a review.
 pub const REVIEW_REQUEST_KIND: u16 = 3409;
+/// Buyer-authored session FOLLOW-UP: start turn n >= 2 of an awarded job, or close the session
+/// (`docs/specs/session-jobs.md` §2.1). Deliberately outside the contiguous `3400`–`3407` block
+/// (`3410`/`3411` belong to `maxplayer-trade`).
+pub const SESSION_FOLLOWUP_KIND: u16 = 3412;
 /// Addressable seller liveness heartbeat, `d="maxplayer-seller"`. Must stay in the NIP-01
 /// parameterized-replaceable range `30000`–`39999`, hence `30340` (not a `34xx` value).
 pub const SELLER_HEARTBEAT_KIND: u16 = 30340;
@@ -114,6 +119,16 @@ mod tests {
         ] {
             assert!((30000..=39999).contains(&kind));
             assert_ne!(kind, SELLER_HEARTBEAT_KIND);
+        }
+    }
+
+    #[test]
+    fn session_followup_kind_is_outside_the_block_and_trade_kinds() {
+        assert_eq!(SESSION_FOLLOWUP_KIND, 3412);
+        assert!(!(3400..=3407).contains(&SESSION_FOLLOWUP_KIND));
+        // 3410/3411 are maxplayer-trade kinds; 3408/3409 are reviews.
+        for taken in [REVIEW_KIND, REVIEW_REQUEST_KIND, 3410, 3411] {
+            assert_ne!(SESSION_FOLLOWUP_KIND, taken);
         }
     }
 

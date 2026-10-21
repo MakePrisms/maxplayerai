@@ -1753,6 +1753,56 @@ impl PrivacyConfig {
     }
 }
 
+/// Default parked-session lifetime (`docs/specs/session-jobs.md` §0 item 5): 6 h.
+pub const DEFAULT_SESSION_LIFETIME_SECS: u64 = 21_600;
+/// Default parked-session disk budget per seat (§0 item 12): 20 GiB.
+pub const DEFAULT_SESSION_DISK_BUDGET_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+/// Default wrap-up margin before a turn's deadline (§4): 300 s, unmeasured.
+pub const DEFAULT_SESSION_WRAP_UP_SECS: u64 = 300;
+/// Default per-session cap multiplier when no `max_session_sats` is given (§0 item 12).
+pub const DEFAULT_SESSION_CAP_MULTIPLIER: u64 = 10;
+
+/// `[sessions]` — session (multi-turn) jobs, both roles. OFF by default: with `enabled = false`
+/// no claim carries `["session","1"]`, no follow-up is sent or accepted, and every code path and
+/// every wire byte is today's. Absent from a written config while it equals the default, so an
+/// existing `config.toml` round-trips unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SessionsConfig {
+    pub enabled: bool,
+    /// Seller: a parked session idle this long is expired by the GC pass.
+    pub lifetime_secs: u64,
+    /// Seller: sum of parked sessions' measured size; oldest evicted first when exceeded.
+    pub disk_budget_bytes: u64,
+    /// Seller: `session/cancel` is sent at `deadline - wrap_up_secs`.
+    pub wrap_up_secs: u64,
+    /// Buyer: default session cap; `None` => `10 x` the job price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_cap_sats: Option<u64>,
+}
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lifetime_secs: DEFAULT_SESSION_LIFETIME_SECS,
+            disk_budget_bytes: DEFAULT_SESSION_DISK_BUDGET_BYTES,
+            wrap_up_secs: DEFAULT_SESSION_WRAP_UP_SECS,
+            session_cap_sats: None,
+        }
+    }
+}
+impl SessionsConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    /// The session cap for a job priced `price_sats`: explicit > config > `10 x price`.
+    pub fn cap_for(&self, explicit: Option<u64>, price_sats: u64) -> u64 {
+        explicit
+            .or(self.session_cap_sats)
+            .unwrap_or_else(|| price_sats.saturating_mul(DEFAULT_SESSION_CAP_MULTIPLIER))
+    }
+}
+
 /// Buyer-facing packaged config (`~/.maxplayer/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1847,6 +1897,9 @@ pub struct MaxplayerConfig {
     /// `[seat]` operator-declared seat colour. Defaults (both fields unstated) when absent.
     #[serde(default, skip_serializing_if = "SeatConfig::is_default")]
     pub seat: SeatConfig,
+    /// `[sessions]` multi-turn jobs. Defaults (OFF) when absent; never written while default.
+    #[serde(default, skip_serializing_if = "SessionsConfig::is_default")]
+    pub sessions: SessionsConfig,
 }
 
 /// `[seat]` — the operator-declared half of the seat's advertisement (#784).
@@ -1993,6 +2046,7 @@ impl Default for MaxplayerConfig {
             contribution: None,
             sandbox: None,
             seat: SeatConfig::default(),
+            sessions: SessionsConfig::default(),
         }
     }
 }
