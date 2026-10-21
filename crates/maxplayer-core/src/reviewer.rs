@@ -592,17 +592,23 @@ async fn snapshot(
         {
             return Err("invalid_subject".into());
         }
-        let parsed_followup = crate::session::parse_followup(&crate::job_lifecycle::event_to_draft(&followup))
-            .map_err(|_| "invalid_subject")?;
-        if request.pubkey != offer.pubkey && request.pubkey.to_hex() != parsed_followup.seller_pubkey {
+        let parsed_followup =
+            crate::session::parse_followup(&crate::job_lifecycle::event_to_draft(&followup))
+                .map_err(|_| "invalid_subject")?;
+        if request.pubkey != offer.pubkey
+            && request.pubkey.to_hex() != parsed_followup.seller_pubkey
+        {
             return Err("unauthorized_request".into());
         }
         let context = followup_context(client, &offer, &parsed.task, &parsed_followup).await?;
         let manifest = file_manifest(files)?;
         let metadata = json!({"schema":1,"subject":subject,"offer":offer,"followup":followup,"session_context":context});
         let model = config.model.clone();
-        return tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &manifest, &model, deadline))
-            .await.map_err(|_| "input_unavailable")?;
+        return tokio::task::spawn_blocking(move || {
+            Plan::from_parts(&metadata, &manifest, &model, deadline)
+        })
+        .await
+        .map_err(|_| "input_unavailable")?;
     }
     if subject.kind == JOB_RESULT_KIND {
         let event = fetch(client, &subject.event).await?;
@@ -674,7 +680,10 @@ async fn followup_context(
     let events = client
         .fetch_events(
             Filter::new()
-                .kinds([Kind::Custom(SESSION_FOLLOWUP_KIND), Kind::Custom(JOB_RESULT_KIND)])
+                .kinds([
+                    Kind::Custom(SESSION_FOLLOWUP_KIND),
+                    Kind::Custom(JOB_RESULT_KIND),
+                ])
                 .event(offer.id),
             Duration::from_secs(3),
         )
@@ -682,7 +691,10 @@ async fn followup_context(
         .map_err(|_| "input_unavailable")?;
     let mut followups: BTreeMap<u32, String> = BTreeMap::new();
     let mut deliveries = Vec::new();
-    for event in events.iter().filter(|e| e.verify().is_ok() && root_is(e, &offer.id.to_hex())) {
+    for event in events
+        .iter()
+        .filter(|e| e.verify().is_ok() && root_is(e, &offer.id.to_hex()))
+    {
         let draft = crate::job_lifecycle::event_to_draft(event);
         if event.kind == Kind::Custom(SESSION_FOLLOWUP_KIND) && event.pubkey == offer.pubkey {
             if let Ok(f) = crate::session::parse_followup(&draft) {
@@ -694,8 +706,14 @@ async fn followup_context(
             }
         } else if event.kind == Kind::Custom(JOB_RESULT_KIND) {
             let turn = 1 + followups.len() as u32;
-            let status = crate::session::result_turn_status(&draft.tags).unwrap_or(crate::session::TurnStatus::Done);
-            let commit = draft.tags.iter().find(|t| t.first() == Some("commit")).and_then(|t| t.value()).map(str::to_owned);
+            let status = crate::session::result_turn_status(&draft.tags)
+                .unwrap_or(crate::session::TurnStatus::Done);
+            let commit = draft
+                .tags
+                .iter()
+                .find(|t| t.first() == Some("commit"))
+                .and_then(|t| t.value())
+                .map(str::to_owned);
             deliveries.push((event.created_at, status, commit, turn));
         }
     }
@@ -707,9 +725,17 @@ async fn followup_context(
     let lines: Vec<_> = deliveries
         .into_iter()
         .enumerate()
-        .map(|(i, (_, status, commit, _))| crate::session::DeliveryLine { turn: i as u32 + 1, status, commit })
+        .map(|(i, (_, status, commit, _))| crate::session::DeliveryLine {
+            turn: i as u32 + 1,
+            status,
+            commit,
+        })
         .collect();
-    Ok(crate::session::followup_review_context(task, &followups.into_values().collect::<Vec<_>>(), &lines))
+    Ok(crate::session::followup_review_context(
+        task,
+        &followups.into_values().collect::<Vec<_>>(),
+        &lines,
+    ))
 }
 
 /// Persist before publishing. Successful records are immutable, including unsafe decisions.

@@ -811,8 +811,14 @@ mod tests {
         request_draft(&followup, &"c".repeat(64)).unwrap();
         // Bound to a distinct follow-up event and never to a commit.
         for bad in [
-            Subject { event: "a".repeat(64), ..followup.clone() },
-            Subject { commit: Some("d".repeat(40)), ..followup.clone() },
+            Subject {
+                event: "a".repeat(64),
+                ..followup.clone()
+            },
+            Subject {
+                commit: Some("d".repeat(40)),
+                ..followup.clone()
+            },
         ] {
             assert!(bad.validate().is_err());
         }
