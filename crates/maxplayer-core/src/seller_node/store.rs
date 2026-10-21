@@ -681,7 +681,8 @@ pub struct SessionTurnRecord {
     pub state: crate::session::TurnState,
 }
 
-const SESSION_COLUMNS: &str = "job_id, buyer_pubkey, container, holder, holder_started_at, image_id,
+const SESSION_COLUMNS: &str =
+    "job_id, buyer_pubkey, container, holder, holder_started_at, image_id,
     orchestrator_version, acp_session_id, harness, model, turn, last_turn_at, disk_bytes, state";
 
 fn bad_state(i: usize) -> rusqlite::Error {
@@ -2136,7 +2137,9 @@ impl SellerStore {
 
     pub fn sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let conn = self.lock()?;
-        let mut stmt = conn.prepare(&format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY job_id"))?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY job_id"
+        ))?;
         let rows = stmt.query_map([], session_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -2193,7 +2196,14 @@ impl SellerStore {
             "INSERT INTO session_turns (followup_id, job_id, turn, deadline_unix, state,
                  created_at_unix, updated_at_unix)
              VALUES (?1,?2,?3,?4,?5,?6,?6) ON CONFLICT DO NOTHING",
-            params![followup_id, job_id, turn, deadline_unix as i64, state.as_str(), now_unix as i64],
+            params![
+                followup_id,
+                job_id,
+                turn,
+                deadline_unix as i64,
+                state.as_str(),
+                now_unix as i64
+            ],
         )?;
         Ok(n == 1)
     }
@@ -2211,7 +2221,13 @@ impl SellerStore {
             "UPDATE session_turns SET state = ?2, result_id = COALESCE(?3, result_id),
                  delivery_oid = COALESCE(?4, delivery_oid), updated_at_unix = ?5
              WHERE followup_id = ?1",
-            params![followup_id, state.as_str(), result_id, delivery_oid, now_unix as i64],
+            params![
+                followup_id,
+                state.as_str(),
+                result_id,
+                delivery_oid,
+                now_unix as i64
+            ],
         )?;
         Ok(())
     }
@@ -2250,17 +2266,17 @@ impl SellerStore {
             if free {
                 let conn = self.lock()?;
                 return Ok(conn
-                    .query_row("SELECT 1 FROM deliveries WHERE job_id = ?1", [job_id], |_| Ok(()))
+                    .query_row(
+                        "SELECT 1 FROM deliveries WHERE job_id = ?1",
+                        [job_id],
+                        |_| Ok(()),
+                    )
                     .optional()?
                     .is_some());
             }
             return self.has_receipt(job_id);
         }
-        let Some(row) = self
-            .turns(job_id)?
-            .into_iter()
-            .find(|t| t.turn == turn)
-        else {
+        let Some(row) = self.turns(job_id)?.into_iter().find(|t| t.turn == turn) else {
             return Ok(false);
         };
         Ok(row.state == crate::session::TurnState::Paid || self.has_receipt(&row.followup_id)?)
@@ -3433,26 +3449,63 @@ mod tests {
         assert!(store.sessions().unwrap().is_empty());
         store.put_session(&parked("job-a", 10, 100)).unwrap();
         store.put_session(&parked("job-b", 20, 200)).unwrap();
-        assert_eq!(store.session("job-a").unwrap().unwrap(), parked("job-a", 10, 100));
+        assert_eq!(
+            store.session("job-a").unwrap().unwrap(),
+            parked("job-a", 10, 100)
+        );
         assert_eq!(
             store.live_session_jobs().unwrap(),
             ["job-a".to_owned(), "job-b".to_owned()].into()
         );
-        assert!(store.set_session_state("job-a", SessionState::Running, 30).unwrap());
-        assert!(store.set_session_state("job-a", SessionState::Parked, 40).unwrap());
+        assert!(
+            store
+                .set_session_state("job-a", SessionState::Running, 30)
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_session_state("job-a", SessionState::Parked, 40)
+                .unwrap()
+        );
         assert_eq!(store.session("job-a").unwrap().unwrap().last_turn_at, 40);
-        assert!(store.set_session_state("job-b", SessionState::Expired, 50).unwrap());
-        assert!(!store.set_session_state("job-b", SessionState::Parked, 60).unwrap(), "expired is terminal");
-        assert_eq!(store.live_session_jobs().unwrap(), ["job-a".to_owned()].into());
+        assert!(
+            store
+                .set_session_state("job-b", SessionState::Expired, 50)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_session_state("job-b", SessionState::Parked, 60)
+                .unwrap(),
+            "expired is terminal"
+        );
+        assert_eq!(
+            store.live_session_jobs().unwrap(),
+            ["job-a".to_owned()].into()
+        );
 
         let f2 = "f".repeat(64);
-        assert!(store.record_turn(&f2, "job-a", 2, 1_000, TurnState::Received, 41).unwrap());
-        assert!(!store.record_turn(&f2, "job-a", 2, 1_000, TurnState::Received, 42).unwrap(), "idempotent");
         assert!(
-            !store.record_turn(&"e".repeat(64), "job-a", 2, 1_000, TurnState::Received, 42).unwrap(),
+            store
+                .record_turn(&f2, "job-a", 2, 1_000, TurnState::Received, 41)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .record_turn(&f2, "job-a", 2, 1_000, TurnState::Received, 42)
+                .unwrap(),
+            "idempotent"
+        );
+        assert!(
+            !store
+                .record_turn(&"e".repeat(64), "job-a", 2, 1_000, TurnState::Received, 42)
+                .unwrap(),
             "a second follow-up for the same turn is refused"
         );
-        assert_eq!(store.turn_for_payment(&f2).unwrap(), Some(("job-a".into(), 2)));
+        assert_eq!(
+            store.turn_for_payment(&f2).unwrap(),
+            Some(("job-a".into(), 2))
+        );
         assert_eq!(store.turn_for_payment("job-a").unwrap(), None);
 
         // Turn 1 receipted; turn 2 still unsettled until its own receipt lands.
@@ -3461,14 +3514,22 @@ mod tests {
             .expect("turn-1 receipt");
         assert!(store.turn_settled("job-a", 1, false).unwrap());
         assert!(!store.turn_settled("job-a", 2, false).unwrap());
-        assert!(!store.has_receipt(&f2).unwrap(), "turn-1 receipt does not cover turn 2");
+        assert!(
+            !store.has_receipt(&f2).unwrap(),
+            "turn-1 receipt does not cover turn 2"
+        );
         store
             .collect_receipt("r2", &f2, 100, fees(0, 0, 0), 60)
             .expect("turn-2 receipt keyed by follow-up id");
         assert!(store.turn_settled("job-a", 2, false).unwrap());
-        store.set_turn_state(&f2, TurnState::Paid, Some("res"), Some("oid"), 61).unwrap();
+        store
+            .set_turn_state(&f2, TurnState::Paid, Some("res"), Some("oid"), 61)
+            .unwrap();
         let t = store.turn(&f2).unwrap().unwrap();
-        assert_eq!((t.state, t.result_id.as_deref(), t.delivery_oid.as_deref()), (TurnState::Paid, Some("res"), Some("oid")));
+        assert_eq!(
+            (t.state, t.result_id.as_deref(), t.delivery_oid.as_deref()),
+            (TurnState::Paid, Some("res"), Some("oid"))
+        );
     }
 
     fn temp_db(label: &str) -> std::path::PathBuf {
