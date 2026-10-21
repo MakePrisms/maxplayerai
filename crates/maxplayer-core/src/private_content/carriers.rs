@@ -110,9 +110,13 @@ pub fn project(
             "agents",
             "harness_family",
             "capabilities",
+            // Session jobs (§2.2): only ever present when `[sessions] enabled` added it.
+            "session",
         ],
         3403 => &[
             "e", "p", "amount", "job-hash", "sig", "delivery", "repo", "branch", "commit",
+            // Session jobs (§2.3): per-turn result tags, absent on a one-shot result.
+            "turn_status", "context", "creq",
         ],
         3404 => &["e", "p", "status", "reason_code"],
         3405 | 3406 => &["e", "p", "status"],
