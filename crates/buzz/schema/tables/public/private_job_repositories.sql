@@ -11,6 +11,8 @@ CREATE TABLE private_job_repositories (
     service TEXT NOT NULL CHECK (service ~ '^[0-9a-f]{64}$'),
     closed BOOLEAN NOT NULL DEFAULT FALSE,
     input_frozen BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Session job (migration 100027): closure ignores turn ACCEPTs.
+    session BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (community_id,buyer,job_id),
     UNIQUE (community_id,offer_id),
     CHECK ((seller IS NULL) = (award_id IS NULL)),
