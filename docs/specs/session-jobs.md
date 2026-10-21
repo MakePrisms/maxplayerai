@@ -51,6 +51,11 @@ Final stakeholder summary: 21 Oct 2026 12:38 UTC.
     test in the sandbox skipped (Josip: safe to assume). (21 Oct.)
 11. **Credential proxy is stopped at park and re-minted per turn** (new proxy, new model-key
     placeholder each turn), not kept alive while parked. §6.4. (Josip, 21 Oct 22:24 UTC.)
+12. **Defaults** (Josip, 21 Oct 22:27 UTC): session cap when neither `post_job` nor `reply` sets
+    `max_session_sats` = `10 × job price`; parked disk budget = 20 GiB per seat (revisited after the
+    test-env size measurement); no automatic close of abandoned private session repos in v1
+    (seller-only, create-only, 5 GiB quota); `reply` with an uncollected previous turn is refused with
+    "collect first".
 
 ---
 
@@ -294,7 +299,7 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   (`run_expiry_sweep`, `core/seller_node/run.rs:5051 @e0262420`): a parked session past
   `last_turn_at + lifetime_secs` is expired — `docker rm --force` the container and the holder, remove
   the workdir and the resolver file, `state = expired`.
-- `[sessions] disk_budget_bytes` (default §14 Q2). After each park, measure the session
+- `[sessions] disk_budget_bytes` (default §0 item 12). After each park, measure the session
   (`docker container inspect --size` → `SizeRw`, plus `du` of the workdir) into `disk_bytes`; while the
   sum over parked sessions exceeds the budget, expire the oldest `last_turn_at` first. A running session
   is never evicted.
@@ -424,7 +429,7 @@ pattern, `docs/protocol-v1.md:870 @e0262420`); the composed prompt (`compose_age
   sole spend gate, `:51`);
 - **session cap:** `sum(spent + reserved over the session's turns) + price > session_cap_sats`.
   `session_cap_sats` is stored per job in a new buyer `sessions` table (buyer `SCHEMA_VERSION` 8 → 9,
-  `core/buyer/store.rs:48`), set from `post_job`/`reply` `max_session_sats` or the default (§14 Q1).
+  `core/buyer/store.rs:48`), set from `post_job`/`reply` `max_session_sats` or the default (§0 item 12).
 
 Then: sign the follow-up once and persist it (write-once, retries re-send the same bytes — protocol §11
 rule 2's discipline, `docs/protocol-v1.md:989 @e0262420`), reserve the price keyed by the **follow-up id**
@@ -618,7 +623,7 @@ follow-up is sent or accepted, and every code path is today's.
   relay.maxplayer.ai. If it is down, no turn can start; parked sessions expire on the seller's clock while
   the buyer cannot reach them. Nothing is lost that was collected.
 - **Abandoned private session repos stay writable** by the awarded seller (create-only, quota-bound)
-  until a close or reject. §14 Q3.
+  until a close or reject. §0 item 12.
 - **Unmeasured:** review time per turn, parked size, wrap-up margin (§11 test env).
 
 ---
@@ -634,16 +639,9 @@ follow-up is sent or accepted, and every code path is today's.
 
 ---
 
-## 14. Open questions (only those that change the design)
+## 14. Open questions
 
-1. **Default session cap.** *Proposed:* `10 × job price` when neither `post_job` nor `reply` sets
-   `max_session_sats`.
-2. **Default parked disk budget.** *Proposed:* 20 GiB per seat, revisited after the test-env size
-   measurement.
-3. **Closure of abandoned private session repos.** *Proposed:* none in v1 (seller-only, create-only,
-   5 GiB quota); add a relay idle-close later if it shows up.
-4. **`reply` with an uncollected previous turn.** *Proposed:* refuse with "collect first" (one explicit
-   spend per turn), rather than auto-collecting inside `reply`.
+None. The four proposed defaults were confirmed by Josip (§0 item 12).
 
 ---
 
