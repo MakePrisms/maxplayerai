@@ -521,7 +521,7 @@ follow-up is sent or accepted, and every code path is today's.
 | 8 | `core/delivery_orchestrator.rs` | resume inputs (`session_protocol`, `acp_session_id`, `base_oid`, env/argv overrides), `prompt.json`/`abort` wait, wrap-up cancel, outcome `acp_session_id` + `turn_status` |
 | 9 | `core/seller_exec.rs` | `CaptureThenPark`; per-turn `prepare_launch` without holder creation (`:2932`) |
 | 10 | `core/sandbox_netns.rs` | `NetnsHolder::park`; `sweep_expired` keep-set; holder `StartedAt` check |
-| 11 | `core/seller_node/{run,store}.rs` | session store v15; follow-up subscription (add 3412 with `#p` = seat to the award filter, `:1325`); resume flow §6.1; GC/eviction §5.5; per-turn payment §8.2–8.3 |
+| 11 | `core/seller_node/{run,store}.rs` | session store v15; follow-up subscription (add 3412 with `#p` = seat to `award_filter`, `core/seller_node/run.rs:1325 @e0262420`); resume flow §6.1; GC/eviction §5.5; per-turn payment §8.2–8.3 |
 | 12 | `core/buyer/*`, `core/job_lifecycle.rs`, `core/collect.rs` | buyer store v9; `reply`; per-turn bind/verify/collect; session cap |
 | 13 | `mcp.rs` | `reply`, `get_job.session`, `collect` params |
 | 14 | `docs/protocol-v1.md`, `AGENTS.md`, quickstarts, skill | §2 tables, §5 lifecycle, §6.2/6.4/6.5 notes, §7.1 reason, §6.4 inline relaxation |
