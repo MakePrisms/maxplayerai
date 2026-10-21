@@ -1653,6 +1653,11 @@ pub enum SkipReason {
     },
     /// The cleanup stamp is absent, empty, or not a unix second.
     UnreadableStamp,
+    /// Past its stamp, but its job has a live (running or parked) session record. Labels cannot
+    /// change on a running container, so a parked session's holder keeps its turn-1 stamp; the
+    /// session record, not the stamp, decides (docs/specs/session-jobs.md §5.3). Session GC
+    /// removes it when the session ends.
+    ParkedSession,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -1675,6 +1680,7 @@ impl std::fmt::Display for SkipReason {
                 "job {job:?} sits in the wrong-role column for a {role:?} — no launch writes that"
             ),
             Self::UnreadableStamp => write!(f, "cleanup stamp absent or unparseable"),
+            Self::ParkedSession => write!(f, "parked_session"),
         }
     }
 }
@@ -1711,6 +1717,20 @@ pub struct OwnedSelection {
 /// An empty `seat` selects nothing: a caller that cannot name itself owns nothing to remove.
 #[must_use]
 pub fn partition_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64) -> OwnedSelection {
+    partition_owned_keeping(containers, seat, now_unix, &std::collections::BTreeSet::new())
+}
+
+/// [`partition_owned`], keeping every container whose job is in `keep` (job ids with a live
+/// session record). A kept container past its stamp is reported in `skipped` as
+/// [`SkipReason::ParkedSession`] instead of becoming removable. An empty `keep` is exactly
+/// [`partition_owned`], which is what `[sessions] enabled = false` passes.
+#[must_use]
+pub fn partition_owned_keeping(
+    containers: &[OwnedContainer],
+    seat: &str,
+    now_unix: u64,
+    keep: &std::collections::BTreeSet<String>,
+) -> OwnedSelection {
     let mut selection = OwnedSelection::default();
     if seat.trim().is_empty() {
         return selection;
@@ -1737,10 +1757,13 @@ pub fn partition_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64)
         }
         // Per role, and reported rather than dropped: a row naming two different jobs, or naming
         // one in the other role's column, is refused here with the reason the operator needs.
-        if let Err(reason) = container.resolve_job() {
-            selection.skipped.push((container.id.clone(), reason));
-            continue;
-        }
+        let job = match container.resolve_job() {
+            Ok(job) => job,
+            Err(reason) => {
+                selection.skipped.push((container.id.clone(), reason));
+                continue;
+            }
+        };
         let Some(after) = container.cleanup_after else {
             selection
                 .skipped
@@ -1748,7 +1771,13 @@ pub fn partition_owned(containers: &[OwnedContainer], seat: &str, now_unix: u64)
             continue;
         };
         if now_unix >= after {
-            selection.removable.push(container.id.clone());
+            if keep.contains(job) {
+                selection
+                    .skipped
+                    .push((container.id.clone(), SkipReason::ParkedSession));
+            } else {
+                selection.removable.push(container.id.clone());
+            }
         }
     }
     selection
@@ -2078,6 +2107,16 @@ pub async fn sweep_expired(seat: &str, now_unix: u64) -> Result<ReapReport, Stri
     sweep_expired_with(&DockerCli::system(), seat, now_unix).await
 }
 
+/// [`sweep_expired`], keeping the holders/helpers of jobs with a live session record (§5.3).
+#[cfg(feature = "acp")]
+pub async fn sweep_expired_keeping(
+    seat: &str,
+    now_unix: u64,
+    keep: &std::collections::BTreeSet<String>,
+) -> Result<ReapReport, String> {
+    sweep_expired_within_keeping(&DockerCli::system(), seat, now_unix, SWEEP_PASS_BUDGET, keep).await
+}
+
 /// [`sweep_expired`], with the docker client supplied by the caller.
 ///
 /// Private for the same reason [`establish_with`] is: a test hands in a stand-in as an ARGUMENT, so
@@ -2100,6 +2139,18 @@ async fn sweep_expired_within(
     now_unix: u64,
     budget: std::time::Duration,
 ) -> Result<ReapReport, String> {
+    sweep_expired_within_keeping(client, seat, now_unix, budget, &std::collections::BTreeSet::new())
+        .await
+}
+
+#[cfg(feature = "acp")]
+async fn sweep_expired_within_keeping(
+    client: &DockerCli,
+    seat: &str,
+    now_unix: u64,
+    budget: std::time::Duration,
+    keep: &std::collections::BTreeSet<String>,
+) -> Result<ReapReport, String> {
     // Refused rather than run on an identity we do not have: an empty seat would match every
     // container whose seat label failed to parse. Same refusal, same reason, as
     // `reapable_holders_live`.
@@ -2114,7 +2165,7 @@ async fn sweep_expired_within(
     let (listing, _) = run_bounded(client, list_owned_argv(seat), None, SWEEP_DOCKER_DEADLINE)
         .await
         .map_err(|error| format!("could not list this seat's containers — {error}"))?;
-    let selection = partition_owned(&parse_owned_listing(&listing), seat, now_unix);
+    let selection = partition_owned_keeping(&parse_owned_listing(&listing), seat, now_unix, keep);
     // Carried out of the pass whatever else happens: these are the containers the sweep cannot
     // authorise itself to remove, and they are invisible to the operator anywhere else.
     report.skipped = selection.skipped;
@@ -4522,6 +4573,42 @@ exit 0
             selection.skipped.is_empty(),
             "and nothing is refused: {selection:?}"
         );
+    }
+
+    /// Session jobs, failure test 7 (pure half): a parked session's holder and helper are past
+    /// their turn-1 stamp yet kept while the session record is live; once it ends they go.
+    #[test]
+    fn parked_session_holder_and_helpers_survive_the_sweep_until_expiry() {
+        let seat = "seat-sessions".to_owned();
+        let row = |id: &str, role: &str, job: &str| OwnedContainer {
+            id: id.into(),
+            seat: Some(seat.clone()),
+            cleanup_after: Some(100),
+            role: Some(role.into()),
+            holder_job: (role == ROLE_HOLDER).then(|| job.to_owned()),
+            helper_job: (role == ROLE_HELPER).then(|| job.to_owned()),
+        };
+        let owned = vec![
+            row("h-parked", ROLE_HOLDER, "job-parked"),
+            row("p-parked", ROLE_HELPER, "job-parked"),
+            row("h-done", ROLE_HOLDER, "job-done"),
+        ];
+        let keep = std::collections::BTreeSet::from(["job-parked".to_owned()]);
+        let kept = partition_owned_keeping(&owned, &seat, 10_000, &keep);
+        assert_eq!(kept.removable, vec!["h-done".to_owned()]);
+        assert_eq!(
+            kept.skipped,
+            vec![
+                ("h-parked".to_owned(), SkipReason::ParkedSession),
+                ("p-parked".to_owned(), SkipReason::ParkedSession)
+            ]
+        );
+        // Session expired => record no longer live => removable like any other.
+        let after = partition_owned_keeping(&owned, &seat, 10_000, &Default::default());
+        assert_eq!(after.removable.len(), 3);
+        assert_eq!(after, partition_owned(&owned, &seat, 10_000));
+        // Before its stamp a kept container is neither removable nor reported.
+        assert_eq!(partition_owned_keeping(&owned, &seat, 50, &keep), OwnedSelection::default());
     }
 
     /// A PERSISTENTLY FAILING HEAD CANNOT STARVE THE TAIL OF THE QUEUE.
