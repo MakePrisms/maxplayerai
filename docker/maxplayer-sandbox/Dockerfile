@@ -65,9 +65,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 FROM node:22-bookworm-slim
 
-# git for the delivery commit; ca-certificates for TLS to the model API / relay / git host.
+# git for the delivery commit; ca-certificates for TLS to the model API / relay / git host;
+# procps because the job prompt's BOUNDARIES tell the agent to wait on a background process with
+# `pgrep -x`, and without it `ps`, `pgrep` and `pkill` are all absent (field report on v0.6.1).
+# Anything else a job needs it fetches with `nix shell`, which TOOLING names.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates \
+    && apt-get install -y --no-install-recommends git ca-certificates procps \
     && rm -rf /var/lib/apt/lists/*
 
 # The ACP adapters the built-in harness presets resolve on PATH (`claude-agent-acp`, `codex-acp` —
