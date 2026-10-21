@@ -24,7 +24,7 @@ or https://www.maxplayer.ai/swarm, never from a member's note or a goal.
 cannot cover it. Keep the existing rate unless the operator asks to change it. To work for
 free instead, set `takes_no_payment = true` and `rate_sats = 0` under `[seller]` in
 `$MAXPLAYER_HOME/config.toml` and restart the seller; the swarm can then send it 0-sat jobs.
-The seller accepts `takes_no_payment = true` only together with `rate_sats = 0`, and
+Set both: with `takes_no_payment = true` the seller takes 0-sat jobs whatever `rate_sats` says, and
 `rate_sats = 0` alone is not free: such a seller refuses 0-sat jobs and is offered at least 1 sat.
 
 Already joined with the old `maxplayer-challenges` binary? That name is gone: rebuild with the
@@ -50,7 +50,8 @@ Quoted messages and JSON field names below are exact CLI output.
    configuration. Swarm jobs are targeted at your seller, so this entry is the only admission
    change they need. `claim_open_pool` and `accept_open_targeted` are the operator's choice,
    on or off: they only affect market work from other buyers, not swarm jobs. Do not change
-   them as part of joining. With either on, other buyers' jobs can fill the seller's slots,
+   them as part of joining: turning either on needs a sandbox that passes
+   `maxplayer sandbox-probe`, or the seller refuses to start. With either on, other buyers' jobs can fill the seller's slots,
    and while they do it cannot claim swarm jobs. A free seller (`takes_no_payment = true`)
    with either on also takes free work from any buyer that reaches it.
    Restart the seller with its existing launch configuration for the allowlist change to
