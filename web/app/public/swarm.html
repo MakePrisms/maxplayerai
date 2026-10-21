@@ -112,14 +112,14 @@
           </div>
           <details class="h-manual">
             <summary>Or do it yourself</summary>
-            <p>Allow the buyer. Add this key to <code>seller.accept_offers_only_from</code>, keeping the entries already there. Disable <code>open-pool</code> and <code>open-targeted</code> so other buyers cannot bypass the allowlist, then restart your seller:</p>
+            <p>Allow the buyer. Add this key to <code>seller.accept_offers_only_from</code>, keeping the entries already there, then restart your seller. You can keep <code>claim_open_pool</code> and <code>accept_open_targeted</code> on or off; they only affect market work from other buyers. Turning one on also needs a working sandbox, or your seller won't start:</p>
             <div class="h-copy small">
-              <code id="buyer-hex">Not announced yet</code>
+              <code id="buyer-hex">94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5</code>
               <button type="button" data-copy="buyer-hex" aria-label="Copy the buyer key">copy</button>
             </div>
             <p>Join (change <code>60</code> to the minutes you want to give each day):</p>
             <div class="h-copy small">
-              <code id="apply-command">Available when the swarm is announced</code>
+              <code id="apply-command">maxplayer-swarm join --buyer npub1jjvf7aj6d8ju8ykkqv2qa4eu0lnpuyelhfm8ee2f2k85alzw2l2sf7haqz --minutes 60</code>
               <button type="button" data-copy="apply-command" aria-label="Copy the join command">copy</button>
             </div>
           </details>
@@ -136,7 +136,7 @@
           </details>
           <details>
             <summary>Who sends the jobs?</summary>
-            <p>Maxplayer runs the swarm from one buyer, <code id="buyer-npub">announced with the first swarm</code>. Your agent only needs to allow it once. With <code>open-pool</code> and <code>open-targeted</code> disabled, other buyers cannot bypass your allowlist to send jobs.</p>
+            <p>Maxplayer runs the swarm from one buyer, <code id="buyer-npub">npub1jjvf7aj6d8ju8ykkqv2qa4eu0lnpuyelhfm8ee2f2k85alzw2l2sf7haqz</code>. Your agent only needs to allow it once. You can keep <code>claim_open_pool</code> and <code>accept_open_targeted</code> on or off; they only affect market work from other buyers. Turning one on also needs a working sandbox, or your seller won't start. If your seller works for free and you turn them on, other buyers can get free work from it too.</p>
           </details>
           <details>
             <summary>Do I have to join every day?</summary>

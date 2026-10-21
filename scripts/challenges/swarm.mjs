@@ -114,7 +114,16 @@ export function readDeliveredAnswer(dir, {maxFileBytes=65536, maxTotalChars=2000
   return `Delivered files (no inline answer):\n${out}${notes.join('\n')}`;
 }
 // Appended after the challenge prefix (which stays exactly as the shared projection matches it).
-export const DELIVERY_NOTE = '\n\n---\nDELIVERY: give your final answer inline. Start your final message with the line MAXPLAYER-ANSWER-V1 alone on its line, then the answer (or, if it is long, a short summary of it) as plain text. If you also leave files, write the same answer or summary to answer.txt at the top level.';
+// The seller daemon, not this runner, reads the marker (maxplayer-core engine.rs
+// marked_inline_answer): it must be the whole FIRST non-blank line of the agent's final message,
+// so a note written before it on that line makes the seller refuse the job (no_sentinel). Any file
+// left on disk switches the job to a git delivery of those files and drops the inline message, so
+// answer.txt is asked for only when the agent leaves files or the answer is over the seller's
+// inline limit (INLINE_ANSWER_MAX_BYTES, 4076 bytes), never for every job: that would make every
+// answer a git push.
+export const DELIVERY_NOTE = '\n\n---\nDELIVERY: give your final answer inline. The first line of your final message must be exactly MAXPLAYER-ANSWER-V1 with nothing before it or after it on that line: no greeting, note or heading first, not even on the same line. Put the answer on the lines after it, as plain text. If that line is not first, nothing is delivered. Leaving any file on disk delivers your files instead of your message, so if you leave files, or the answer is over about 4000 bytes, also write the full answer to answer.txt at the top level.';
+// The note as posted before 2026-10-21; plannerTask() still strips it from journaled tasks.
+const LEGACY_DELIVERY_NOTES = ['\n\n---\nDELIVERY: give your final answer inline. Start your final message with the line MAXPLAYER-ANSWER-V1 alone on its line, then the answer (or, if it is long, a short summary of it) as plain text. If you also leave files, write the same answer or summary to answer.txt at the top level.'];
 // The planner sees the task it wrote: the delivery note is runner boilerplate (older journals lack it).
 // R3-3 (a): optional operator context (SWARM_TASK_CONTEXT or SWARM_TASK_CONTEXT_FILE), appended by
 // the runner to EVERY task it posts, between the planner's task text and the delivery note. A
@@ -152,7 +161,8 @@ export function composeTask(prefix,task,{quoted='',reportBack=!hasReportBack(tas
 export const plannerTask = (task,opts=null) => {
   if(typeof task!=='string')return task;
   const {context=null,reportBack,quotedChars=0}=opts===null||typeof opts==='string'?{context:opts}:opts;
-  let t=task.endsWith(DELIVERY_NOTE)?task.slice(0,-DELIVERY_NOTE.length):task;
+  const note=[DELIVERY_NOTE,...LEGACY_DELIVERY_NOTES].find(n=>task.endsWith(n));
+  let t=note?task.slice(0,-note.length):task;
   for(const block of [contextBlock(context),legacyContextBlock(context)])if(block&&t.endsWith(block)){t=t.slice(0,-block.length);break;}
   if(reportBack!==false&&t.endsWith(REPORT_BACK_NOTE))t=t.slice(0,-REPORT_BACK_NOTE.length);
   if(quotedChars>0&&quotedChars<=t.length&&[QUOTED_ANSWERS_HEADER,LEGACY_QUOTED_ANSWERS_HEADER].some(h=>t.slice(-quotedChars).startsWith(h)))t=t.slice(0,-quotedChars);

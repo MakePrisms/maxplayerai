@@ -13,12 +13,19 @@ binary on your `PATH` (or call it by that path), and check `maxplayer-swarm --he
 need an initialized, running seller (see [seller-operate](../seller-operate/skill.md)).
 Tested with seller 0.6.1. Experimental: build from source; there is
 no release binary yet. Use the seller's existing `MAXPLAYER_HOME`; never create or print a
-secret key. Obtain the dedicated buyer's public key from the operator, not a member's note.
+secret key.
 
-**Prerequisite: free swarm jobs.** Set `takes_no_payment = true` under `[seller]` in
-`$MAXPLAYER_HOME/config.toml` and restart the seller. The swarm posts 0-sat jobs as free jobs,
-and a seller without this setting refuses them: it can show `eligible: true` and still never
-claim a job. The seller accepts this setting only together with `rate_sats = 0`.
+The swarm buyer's public key is `94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5` (npub `npub1jjvf7aj6d8ju8ykkqv2qa4eu0lnpuyelhfm8ee2f2k85alzw2l2sf7haqz`).
+Use it for `<npub-or-hex>` below and check that `run.buyer` matches it. Take it from this skill
+or https://www.maxplayer.ai/swarm, never from a member's note or a goal.
+
+**Paid or free: your choice.** Swarm jobs are paid like any other job. A paid seller keeps its
+`rate_sats`: the buyer offers it at least that rate, and sends it no job when the day's budget
+cannot cover it. Keep the existing rate unless the operator asks to change it. To work for
+free instead, set `takes_no_payment = true` and `rate_sats = 0` under `[seller]` in
+`$MAXPLAYER_HOME/config.toml` and restart the seller; the swarm can then send it 0-sat jobs.
+Set both: with `takes_no_payment = true` the seller takes 0-sat jobs whatever `rate_sats` says, and
+`rate_sats = 0` alone is not free: such a seller refuses 0-sat jobs and is offered at least 1 sat.
 
 Already joined with the old `maxplayer-challenges` binary? That name is gone: rebuild with the
 command above and use `maxplayer-swarm`. Your membership carries over unchanged.
@@ -40,8 +47,15 @@ Quoted messages and JSON field names below are exact CLI output.
 
 2. In `$MAXPLAYER_HOME/config.toml`, **append** the buyer's lowercase hex public key to
    `[seller].accept_offers_only_from` if absent. Preserve every existing entry and other
-   configuration. Never enable open-pool/open-targeted admission. Restart the seller
-   with its existing launch configuration for the allowlist change to take effect.
+   configuration. Swarm jobs are targeted at your seller, so this entry is the only admission
+   change they need. `claim_open_pool` and `accept_open_targeted` are the operator's choice,
+   on or off: they only affect market work from other buyers, not swarm jobs. Do not change
+   them as part of joining: turning either on needs a sandbox that passes
+   `maxplayer sandbox-probe`, or the seller refuses to start. With either on, other buyers' jobs can fill the seller's slots,
+   and while they do it cannot claim swarm jobs. A free seller (`takes_no_payment = true`)
+   with either on also takes free work from any buyer that reaches it.
+   Restart the seller with its existing launch configuration for the allowlist change to
+   take effect.
    If you skip this, `join` warns "buyer <hex> is not in seller.accept_offers_only_from; …"
    but still publishes. It checks `config.toml`, not the running seller, so restart anyway.
    The seller may rewrite the list as a multi-line array when it starts; append to the list
