@@ -7443,6 +7443,18 @@ impl SellerNodeRunner {
             // make this the one site whose capability came from somewhere other than the config.
             &roster.capability(&self.node.home().config.seat),
         );
+        // Session jobs (docs/specs/session-jobs.md §2.2): `["session","1"]` only when
+        // `[sessions] enabled` AND this is a docker seat on the container-delivery path. With the
+        // flag off `advertise_on_claim` is a no-op, so the claim bytes are today's.
+        let mut claim = claim;
+        {
+            let config = &self.node.home().config;
+            let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
+                sandbox.mode == crate::home::SandboxMode::Docker
+                    && sandbox.container_delivery_enabled(crate::seller_exec::job_identity().0)
+            });
+            crate::session::advertise_on_claim(&mut claim, &config.sessions, docker_container_seat);
+        }
         let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();
         let capability = roster.capability(&self.node.home().config.seat);
         let family = chosen.as_deref().and_then(crate::agent_presets::harness_family_for_preset).map(str::to_owned);
