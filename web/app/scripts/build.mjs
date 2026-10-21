@@ -15,6 +15,7 @@
  * only difference.
  */
 import { parseChallengeRelays, parseChallengeQuorum } from "../src/challenge/shared/relay.mjs";
+import { withSwarmBuyer } from "./swarm-buyer.mjs";
 import { build, context } from "esbuild";
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -64,6 +65,7 @@ if (watch) {
   // Dev loop: unstamped copies, rebuild on save. Stamping is a deploy concern.
   mkdirSync(dist, { recursive: true });
   cpSync(join(root, "public"), dist, { recursive: true });
+  writeFileSync(join(dist, "swarm.html"), withSwarmBuyer(readFileSync(join(root, "public/swarm.html"), "utf8"), "html", buyer));
   const ctx = await context(options);
   await ctx.watch();
   console.log("watching src/ …");
@@ -97,13 +99,17 @@ if (watch) {
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
-      readFileSync(join(root, "public", page), "utf8")
+      withSwarmBuyer(readFileSync(join(root, "public", page), "utf8"), page === "swarm.html" ? "html" : null, buyer)
         .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|swarm\.js|swarm\.css|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
     );
   }
 
   // The agent-facing surface: skills, discovery index, /skill.md alias.
   cpSync(join(root, ".well-known"), join(dist, ".well-known"), { recursive: true });
+  // The join skill names the swarm buyer's key in its text, written at build time like the page's,
+  // so an agent following the one-line join finds it without running the page's script.
+  const joinSkill = join(".well-known", "skills", "swarm-join", "skill.md");
+  writeFileSync(join(dist, joinSkill), withSwarmBuyer(readFileSync(join(root, joinSkill), "utf8"), "skill", buyer));
 
   // The legacy index remains the inventory for the skill URLs we already
   // publish. Discovery v0.2.0 adds integrity metadata, so derive every digest
@@ -115,7 +121,8 @@ if (watch) {
   const discoveryIndex = {
     $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
     skills: legacySkillIndex.skills.map(({ name, description, path }) => {
-      const artifact = readFileSync(join(root, path.slice(1)));
+      // The SHIPPED bytes: the join skill is rewritten above, so its source file is not what is served.
+      const artifact = readFileSync(join(dist, path.slice(1)));
       return {
         name,
         type: "skill-md",
