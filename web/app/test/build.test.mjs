@@ -403,10 +403,10 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(!/Prerequisite: free swarm jobs/.test(skill), "free jobs are not a prerequisite");
   assert.match(skill, /\*\*Paid or free: your choice\.\*\* Swarm jobs are paid like any other job\. A paid seller keeps its\n`rate_sats`/, "paid sellers keep their rate");
   assert.ok(skill.includes("To work for\nfree instead, set `takes_no_payment = true` and `rate_sats = 0`"), "free is opt-in, with its rate pairing");
-  // Item 3: closing the open surfaces is required for free sellers only.
-  assert.ok(!/Never enable open-pool\/open-targeted admission/.test(skill));
-  assert.ok(skill.includes("A free seller (`takes_no_payment = true`) must also keep both `false` (the default)"), "free sellers keep both open surfaces off");
-  assert.ok(skill.includes("A paid seller may keep them as they are"), "paid sellers may keep theirs");
+  // Item 3 (bob 2026-10-21): allowlisting is the only step; the open surfaces are the operator's choice.
+  assert.ok(!/Never enable open-pool\/open-targeted admission/.test(skill) && !/must also keep both `false`/.test(skill), "no requirement to close them");
+  assert.ok(skill.includes("`claim_open_pool` and `accept_open_targeted` are the operator's choice,\n   on or off"), "on or off is the member's choice");
+  assert.ok(skill.includes("with either on also takes free work from any buyer that reaches it"), "free-seller consequence stated");
   assert.ok(skill.includes("Tested with seller 0.6.1.") && !/⟨TBD⟩|or later/.test(skill), "tested version, no invented minimum");
   assert.ok(skill.includes("needs every relay, whether or not a swarm run is\n   in progress"), "minutes change needs every relay");
   assert.ok(!/\b300\b/.test(skill), "no unexercised 300-second floor");
@@ -449,9 +449,11 @@ test("the built /swarm page and join skill carry the swarm buyer key without Jav
   // The page script keeps filling the same elements from the relay.
   const src = readFileSync(join(root, "src", "swarm.ts"), "utf8");
   for (const id of ["buyer-hex", "buyer-npub", "apply-command"]) assert.ok(src.includes(`text("${id}",`), `swarm.ts still fills #${id}`);
-  // Item 3 on the page: closing the open surfaces is asked of free sellers only.
+  // Item 3 (bob 2026-10-21): allowlisting the buyer is the only step; the open surfaces are the member's choice.
   assert.ok(!/Disable <code>open-pool<\/code>/.test(page) && !/With <code>open-pool<\/code> and <code>open-targeted<\/code> disabled/.test(page));
-  assert.equal([...page.matchAll(/If your seller works for free/g)].length, 2, "manual steps and FAQ both scope it to free sellers");
+  assert.ok(!/keep <code>claim_open_pool<\/code> and <code>accept_open_targeted<\/code> off/.test(page), "no requirement to close them");
+  assert.equal([...page.matchAll(/<code>accept_open_targeted<\/code> on or off; they only affect market work from other buyers/g)].length, 2, "manual steps and FAQ both say on or off");
+  assert.ok(!/never enable `claim_open_pool`/.test(skill) && skill.includes("are the operator's choice"), "skill makes them optional");
 });
 test("CHALLENGE_BUYER_PUBKEY overrides the key in the shipped page, skill and discovery digest", async () => {
   const { mkdtempSync, cpSync, rmSync } = await import("node:fs");

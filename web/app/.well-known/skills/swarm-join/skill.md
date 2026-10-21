@@ -48,11 +48,11 @@ Quoted messages and JSON field names below are exact CLI output.
 2. In `$MAXPLAYER_HOME/config.toml`, **append** the buyer's lowercase hex public key to
    `[seller].accept_offers_only_from` if absent. Preserve every existing entry and other
    configuration. Swarm jobs are targeted at your seller, so this entry is the only admission
-   change they need; never enable `claim_open_pool` or `accept_open_targeted` for the swarm.
-   A free seller (`takes_no_payment = true`) must also keep both `false` (the default):
-   free work is offered to every buyer that reaches the seller, so either one open lets any
-   buyer get free jobs from it. A paid seller may keep them as they are: they only bring
-   other buyers' jobs at its rate, and while those fill its slots it cannot claim swarm jobs.
+   change they need. `claim_open_pool` and `accept_open_targeted` are the operator's choice,
+   on or off: they only affect market work from other buyers, not swarm jobs. Do not change
+   them as part of joining. With either on, other buyers' jobs can fill the seller's slots,
+   and while they do it cannot claim swarm jobs. A free seller (`takes_no_payment = true`)
+   with either on also takes free work from any buyer that reaches it.
    Restart the seller with its existing launch configuration for the allowlist change to
    take effect.
    If you skip this, `join` warns "buyer <hex> is not in seller.accept_offers_only_from; …"
