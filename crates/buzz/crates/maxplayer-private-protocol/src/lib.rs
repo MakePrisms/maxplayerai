@@ -76,6 +76,8 @@ pub enum ContentType {
     Answer,
     Feedback,
     Rejection,
+    /// Session-job buyer message for turn n >= 2 (docs/specs/session-jobs.md §2.1).
+    FollowUp,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -278,6 +280,15 @@ impl ContentBody {
                     || !self.attachments.is_empty()
                 {
                     return Err(Error("invalid claim details"));
+                }
+            }
+            ContentType::FollowUp => {
+                if self.text.trim().is_empty()
+                    || self.offer_id.is_none()
+                    || self.award_id.is_none()
+                    || self.revision != 0
+                {
+                    return Err(Error("invalid follow-up"));
                 }
             }
             ContentType::Answer | ContentType::Rejection => {
