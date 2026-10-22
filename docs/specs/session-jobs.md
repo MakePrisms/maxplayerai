@@ -489,6 +489,15 @@ receipt (`core/seller_node/run.rs:10080 @e0262420`). Turn 2 would be dropped as 
   `core/job_lifecycle.rs:2736 @e0262420`); `PaymentKey` already includes `result_id`
   (`core/payment.rs:173`), so attempt ids differ per turn; receipts name the result by their `reply` tag.
 
+  *Found while implementing:* the seller co-signs the receipt preimage over the TURN's creq hash, so
+  the buyer's v2 evidence validators (`private_content::evidence`, `public_v2::validate_evidence`)
+  must bind the result's own `creq` when it carries one (claim creq otherwise), and refuse a priced
+  `reply` result without `creq` or a free one with it. The payload id rides on the payment key as an
+  optional `payment_id` that is NOT folded into the attempt id (the result id already separates
+  turns), so every existing journal and attempt id is unchanged. Reconcile keys a turn's journal by
+  that payload id, and a reservation keyed by a follow-up id is judged by its turn row, not by a relay
+  read of a job that does not exist under that id.
+
 ### 8.3 Seller: one unpaid turn at most
 
 A follow-up for turn n+1 is held in `session_turns(waiting_payment)` until turn n is `paid` (free job:
@@ -502,6 +511,13 @@ pays leaves the session parked until it expires; the seller's exposure is one tu
 to `results/<job_id>` as today (`core/collect.rs:458 @e0262420`); turn n to `results/<job_id>-t<n>`.
 Verification additionally checks the commit's single parent is the previous git turn's accepted commit.
 
+*Found while implementing:* "previous git turn" skips inline turns (an inline turn keeps the base,
+§7.2), down to turn 1. When every earlier turn was inline, the seller's base is its own provisioning
+commit, which the buyer never saw, so the parent check is skipped and only the tip-match and
+sentinel run. The check runs on the fetched delivery before any spend. Turn 1's own selectors (auto
+accept, "awarded seller delivered", pay window) must ignore results that carry `reply`, or a turn-2
+result could be bound as turn 1.
+
 ---
 
 ## 9. Reviews
@@ -514,11 +530,16 @@ Verification additionally checks the commit's single parent is the previous git 
   Only when that context exceeds `MAX_INPUT_BYTES` = 128 KiB (`core/review.rs:13`; checked at
   `core/reviewer.rs:550 @e0262420`) does the reviewer summarize the oldest follow-ups itself; the current
   follow-up is always in full.
-  *Found while implementing:* the encrypted (private) review lane's `Request` carries only an offer or
-  a delivery, so a private follow-up has no subject there yet. Until it does, a seller with
-  `seller_offer` review enabled **withholds** a private follow-up (`abort`, turn refused, nothing
-  charged) rather than send its text over the public lane; `skip_buyer_pubkeys` or
-  `seller_offer = false` lets it run. Public follow-ups use the public lane as specified.
+  *Found while implementing:* the encrypted (private) review lane's `Request` carried only an offer or
+  a delivery. It now has an optional `followup` evidence block: the selected claim and award plus the
+  buyer's signed 3412 carriers with their encrypted `FollowUp` bodies, oldest first (the last is the
+  subject), trimmed oldest-first to the 60 KiB message bound. The reviewer re-authenticates every
+  carrier and body against the signed offer/claim/award chain (buyer-authored, `bind_content`),
+  admits the buyer and the selected seller as requesters, and builds the context from those bodies
+  only. Earlier deliveries are not yet listed as one-liners on the private lane. A seller that cannot
+  build the request still withholds the follow-up; it never falls back to the public lane. An old
+  reviewer refuses the new field (`deny_unknown_fields`), so **the reviewer deploys before any seller
+  enables `[sessions]`**.
 - **Buyer, delivery review.** Per turn, from that turn's diff: the reviewer's diff plan already takes a
   base (`core/reviewer.rs:618`, `:625 @e0262420`); for turn n the base is the previous git turn's commit,
   read from the follow-up the result replies to. A `needs_input` question is reviewed like an inline answer.
@@ -541,6 +562,11 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
   content. `no_response`: the follow-up's deadline passed with no result; the reservation is released
   (as feedback-driven releases do today, `core/buyer/mod.rs:2934 @e0262420`) and `reply` may retry.
 - **`collect`** gains `turn?` and `close_session?` (collect, then send close).
+
+*Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed) only
+when the buyer runs with `[sessions] enabled = true`; with the flag off the tool list is
+byte-identical. `max_session_sats` is accepted on `reply` only (not `post_job`): the session row is
+created at the first `reply`, from the explicit value, the config, or 10× the price.
 
 The buyer's agent needs no skill or keyword. `AGENTS.md` and `multi-turn-buying/skill.md` are updated to
 point at `reply`.
