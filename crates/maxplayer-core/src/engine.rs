@@ -153,7 +153,7 @@ pub type PromptRelease<'a> = dyn FnOnce(bool) -> Result<Option<PromptTurn>, Engi
 /// Why [`run_session_job`] ended without prompting.
 #[derive(Debug)]
 pub enum SessionTurnEnd {
-    Ran(SessionTurnOutcome),
+    Ran(Box<SessionTurnOutcome>),
     /// The host withheld the prompt; the agent was never prompted.
     Withheld,
 }
@@ -306,7 +306,7 @@ async fn run_session_turn<D: Driver>(
     let cancelled_for_wrap_up = fired.load(std::sync::atomic::Ordering::SeqCst);
     let artifacts = driver.artifacts(&session_id).await?;
     let usage = driver.usage();
-    Ok(SessionTurnEnd::Ran(SessionTurnOutcome {
+    Ok(SessionTurnEnd::Ran(Box::new(SessionTurnOutcome {
         run: RunOutcome {
             terminal,
             artifacts,
@@ -315,7 +315,7 @@ async fn run_session_turn<D: Driver>(
         session_id,
         context_reset,
         cancelled_for_wrap_up,
-    }))
+    })))
 }
 
 /// The fallible body of [`run_job`]: readiness through usage capture, shutdown excluded.
@@ -1144,7 +1144,7 @@ mod tests {
 
     fn ran(end: super::SessionTurnEnd) -> super::SessionTurnOutcome {
         match end {
-            super::SessionTurnEnd::Ran(outcome) => outcome,
+            super::SessionTurnEnd::Ran(outcome) => *outcome,
             super::SessionTurnEnd::Withheld => panic!("the turn was withheld"),
         }
     }
