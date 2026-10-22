@@ -697,12 +697,11 @@ async fn followup_context(
     {
         let draft = crate::job_lifecycle::event_to_draft(event);
         if event.kind == Kind::Custom(SESSION_FOLLOWUP_KIND) && event.pubkey == offer.pubkey {
-            if let Ok(f) = crate::session::parse_followup(&draft) {
-                if let (Some(turn), Some(text)) = (f.turn, f.text) {
-                    if turn <= current_turn {
-                        followups.entry(turn).or_insert(text);
-                    }
-                }
+            if let Ok(f) = crate::session::parse_followup(&draft)
+                && let (Some(turn), Some(text)) = (f.turn, f.text)
+                && turn <= current_turn
+            {
+                followups.entry(turn).or_insert(text);
             }
         } else if event.kind == Kind::Custom(JOB_RESULT_KIND) {
             let turn = 1 + followups.len() as u32;
