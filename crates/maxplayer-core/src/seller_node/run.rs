@@ -1328,7 +1328,11 @@ fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter 
 
 /// [`award_filter`], plus kind-3412 FOLLOW-UPs when `[sessions] enabled` (docs/specs/session-jobs.md
 /// §11 row 11). Disabled ⇒ byte-identical to today's filter.
-fn award_filter_with(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool, sessions: bool) -> Filter {
+fn award_filter_with(
+    seller_pubkey: nostr_sdk::PublicKey,
+    open_pool: bool,
+    sessions: bool,
+) -> Filter {
     let mut kinds = vec![
         Kind::Custom(JOB_AWARD_KIND),
         Kind::Custom(JOB_ACCEPT_KIND),
@@ -9459,7 +9463,11 @@ impl SellerNodeRunner {
         // seat's claim carried `["session","1"]`. Otherwise `None`, and the inputs file is today's.
         let sessions_config = &self.node.home().config.sessions;
         let session_job = sessions_config.enabled
-            && self.node.store().claim_advertised_session(job_id).unwrap_or(false);
+            && self
+                .node
+                .store()
+                .claim_advertised_session(job_id)
+                .unwrap_or(false);
         let prompt = if session_job {
             format!("{prompt}\n\n{}", crate::session::prompt_session_section())
         } else {
@@ -9670,7 +9678,10 @@ impl SellerNodeRunner {
                 proxy_host,
                 &harness,
                 outcome,
-                result.as_ref().ok().map(|delivered| delivered.commit.as_str()),
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|delivered| delivered.commit.as_str()),
             )
             .await;
             return result;
