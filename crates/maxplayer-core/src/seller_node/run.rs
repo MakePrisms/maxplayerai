@@ -5026,6 +5026,17 @@ impl SellerNodeRunner {
     }
 
     /// The seller public key (hex).
+    /// The session GC for this node, or `None` with `[sessions] enabled = false`.
+    fn session_gc(&self) -> Option<super::session_gc::SessionGc> {
+        let config = &self.node.home().config.sessions;
+        config.enabled.then(|| super::session_gc::SessionGc {
+            store: self.node.store().clone(),
+            home_root: self.node.home().root.clone(),
+            lifetime_secs: config.lifetime_secs,
+            disk_budget_bytes: config.disk_budget_bytes,
+        })
+    }
+
     pub fn seller_pubkey(&self) -> String {
         self.seller_pubkey.to_hex()
     }
@@ -5048,7 +5059,7 @@ impl SellerNodeRunner {
     /// [`spawn_expiry_sweep`], so it borrows nothing from the runner and the loop's `select!` is
     /// free to serve offers, awards and the shutdown signal while docker is still answering.
     #[cfg(feature = "acp")]
-    async fn run_expiry_sweep(seat: &str) {
+    async fn run_expiry_sweep(seat: &str, sessions: Option<super::session_gc::SessionGc>) {
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             opline!(
                 "seller node: skipping the container expiry sweep — the system clock is before the \
@@ -5057,7 +5068,37 @@ impl SellerNodeRunner {
             );
             return;
         };
-        match crate::sandbox_netns::sweep_expired(seat, now.as_secs()).await {
+        // Session jobs (§5.3, §5.5): GC first, so a session it just expired is swept like any
+        // other; then the sweep keeps the holders of every still-live session. With `[sessions]
+        // enabled = false` there is no GC and the keep-set is empty: exactly today's sweep.
+        let keep = match sessions {
+            None => std::collections::BTreeSet::new(),
+            Some(gc) => {
+                let now_secs = now.as_secs();
+                let gc_for_pass = gc.clone();
+                match tokio::task::spawn_blocking(move || {
+                    gc_for_pass.pass(&mut crate::seller_exec::RealDockerCli, now_secs)
+                })
+                .await
+                {
+                    Ok(Ok(report)) => {
+                        for job in &report.expired_lifetime {
+                            opline!("seller node: session job_id={job} expired (parked past its lifetime)");
+                        }
+                        for job in &report.evicted_disk {
+                            opline!("seller node: session job_id={job} evicted (parked sessions over the disk budget)");
+                        }
+                        for (job, error) in &report.removal_errors {
+                            opline!("seller node: session job_id={job} removal incomplete ({error})");
+                        }
+                    }
+                    Ok(Err(error)) => opline!("seller node: session GC could not read the store ({error})"),
+                    Err(error) => opline!("seller node: session GC task failed ({error})"),
+                }
+                gc.keep()
+            }
+        };
+        match crate::sandbox_netns::sweep_expired_keeping(seat, now.as_secs(), &keep).await {
             Ok(report) => {
                 if !report.removed.is_empty() {
                     opline!(
@@ -5108,7 +5149,7 @@ impl SellerNodeRunner {
     /// its tick unconditionally and only the work behind it is feature-gated.
     #[cfg(not(feature = "acp"))]
     #[allow(clippy::unused_async)]
-    async fn run_expiry_sweep(_seat: &str) {}
+    async fn run_expiry_sweep(_seat: &str, _sessions: Option<super::session_gc::SessionGc>) {}
 
     /// Start one expiry sweep pass **as its own task** and return immediately.
     ///
@@ -5122,7 +5163,11 @@ impl SellerNodeRunner {
     /// pass is still running is DROPPED, not queued, so an unreachable daemon can never accumulate
     /// one outstanding pass per five minutes. The flag is cleared by a guard, so a pass that panics
     /// releases it too.
-    fn spawn_expiry_sweep(seat: String, in_flight: &std::rc::Rc<std::cell::Cell<bool>>) {
+    fn spawn_expiry_sweep(
+        seat: String,
+        sessions: Option<super::session_gc::SessionGc>,
+        in_flight: &std::rc::Rc<std::cell::Cell<bool>>,
+    ) {
         if in_flight.get() {
             opline!(
                 "seller node: skipping this container expiry sweep — the previous pass is still \
@@ -5133,7 +5178,7 @@ impl SellerNodeRunner {
         in_flight.set(true);
         let done = SweepGuard(std::rc::Rc::clone(in_flight));
         tokio::task::spawn_local(async move {
-            Self::run_expiry_sweep(&seat).await;
+            Self::run_expiry_sweep(&seat, sessions).await;
             drop(done);
         });
     }
@@ -5619,6 +5664,8 @@ impl SellerNodeRunner {
         let sweep_seat = self.seller_pubkey();
         // One pass at a time, for the life of the loop. See `spawn_expiry_sweep`.
         let sweep_in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Session GC rides the same pass (§5.5), only when `[sessions] enabled`.
+        let sweep_sessions = self.session_gc();
         // Only when this node actually runs contained jobs. A seat with no sandbox network creates
         // no holders and no helpers, and a sweep there would spend a `docker ps` every five minutes
         // to look for containers this build never creates — on a host that may not even run docker.
@@ -5772,7 +5819,7 @@ impl SellerNodeRunner {
                 // must keep serving offers, awards and shutdown throughout. A tick that lands while
                 // the previous pass still runs is dropped rather than queued.
                 _ = sweep_tick.tick(), if sweep_enabled => {
-                    Self::spawn_expiry_sweep(sweep_seat.clone(), &sweep_in_flight);
+                    Self::spawn_expiry_sweep(sweep_seat.clone(), sweep_sessions.clone(), &sweep_in_flight);
                     continue;
                 }
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
