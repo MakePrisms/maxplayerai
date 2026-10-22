@@ -86,6 +86,8 @@ pub struct AcpDriver {
     /// first would send no opt-in and resolve no model; it would fail closed to absent, not wrong.
     is_claude_adapter: bool,
     is_codex_adapter: bool,
+    /// `initialize` advertised `agentCapabilities.loadSession` (session jobs, §6.3).
+    load_session_supported: bool,
     codex_session: Option<crate::home::CodexSessionSettings>,
 }
 
@@ -110,6 +112,7 @@ impl AcpDriver {
             claude_turn_model: Arc::new(Mutex::new(None)),
             is_claude_adapter: false,
             is_codex_adapter: false,
+            load_session_supported: false,
             codex_session: None,
         }
     }
@@ -375,6 +378,7 @@ impl Driver for AcpDriver {
         self.is_claude_adapter = is_claude_agent_acp(&result);
         self.is_codex_adapter = result.pointer("/agentInfo/name").and_then(Value::as_str)
             == Some("@agentclientprotocol/codex-acp");
+        self.load_session_supported = advertises_load_session(&result);
         let protocol_version = result
             .get("protocol_version")
             .or_else(|| result.get("protocolVersion"))
@@ -409,6 +413,40 @@ impl Driver for AcpDriver {
         Ok(session_id)
     }
 
+    fn supports_load_session(&self) -> bool {
+        self.load_session_supported
+    }
+
+    async fn load_session(
+        &mut self,
+        cfg: SessionConfig,
+        session_id: &SessionId,
+    ) -> Result<SessionId, DriverError> {
+        if !self.load_session_supported {
+            return Err(DriverError::Other(
+                "the agent did not advertise agentCapabilities.loadSession".into(),
+            ));
+        }
+        let id = self.send_request(
+            "session/load",
+            session_load_params(cfg, session_id, self.is_claude_adapter)?,
+        )?;
+        let result = self.wait_response(id).await?;
+        self.session_model = session_model_from_result(&result);
+        self.reset_turn_model();
+        // `session/load` answers with no id of its own (ACP); the loaded session keeps the id asked
+        // for. An answer that names a DIFFERENT id is a new conversation, not a reload.
+        match session_id_from_result(&result) {
+            Ok(answered) if &answered != session_id => Err(DriverError::Other(format!(
+                "session/load answered with another session id ({answered})"
+            ))),
+            _ => {
+                self.configure_codex_session(session_id, &result).await?;
+                Ok(session_id.clone())
+            }
+        }
+    }
+
     async fn prompt(
         &mut self,
         session_id: &SessionId,
@@ -431,6 +469,20 @@ impl Driver for AcpDriver {
 
     async fn on_permission(&mut self, _req: PermissionRequest) -> PermissionOutcome {
         self.permission_policy.clone()
+    }
+
+    /// ACP `session/cancel` is a NOTIFICATION; the agent answers it by ending the in-flight
+    /// `session/prompt` with `stopReason: cancelled`, which the waiting `prompt` then returns.
+    fn cancel_trigger(&self, session_id: &SessionId) -> Option<super::CancelTrigger> {
+        let stdin = self.stdin.clone()?;
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": { "sessionId": session_id },
+        });
+        Some(Arc::new(move || {
+            let _ = write_wire_to_stdin(&stdin, &notification);
+        }))
     }
 
     async fn artifacts(&self, _session_id: &SessionId) -> Result<Vec<Artifact>, DriverError> {
@@ -903,6 +955,29 @@ fn is_claude_agent_acp(initialize_result: &Value) -> bool {
 /// The filter matches type and optional subtype/origin, so only system/init is requested here.
 /// The original 0.70.0 live measurement was 15 frames unfiltered versus one filtered frame;
 /// it is historical evidence, not a live 0.85.0 count. Other harnesses get unchanged params.
+/// `agentCapabilities.loadSession == true` in an `initialize` result (either key casing).
+fn advertises_load_session(initialize: &Value) -> bool {
+    initialize
+        .get("agentCapabilities")
+        .or_else(|| initialize.get("agent_capabilities"))
+        .and_then(|caps| caps.get("loadSession").or_else(|| caps.get("load_session")))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `session/load` params: the `session/new` shape plus the session id to reload.
+fn session_load_params(
+    cfg: SessionConfig,
+    session_id: &SessionId,
+    is_claude_adapter: bool,
+) -> Result<Value, DriverError> {
+    let mut params = session_new_params(cfg, is_claude_adapter)?;
+    if let Some(object) = params.as_object_mut() {
+        object.insert("sessionId".into(), json!(session_id));
+    }
+    Ok(params)
+}
+
 fn session_new_params(cfg: SessionConfig, is_claude_adapter: bool) -> Result<Value, DriverError> {
     let mut params = serde_json::to_value(cfg)
         .map_err(|error| DriverError::Other(format!("failed to encode session params: {error}")))?;
@@ -2960,6 +3035,36 @@ mod tests {
         );
     }
 
+
+    /// Session jobs §6.3: `loadSession` is read from `initialize` in either casing and defaults to
+    /// absent; `session/load` params are `session/new`'s plus the id to reload.
+    #[test]
+    fn load_session_capability_and_params() {
+        assert!(advertises_load_session(&json!({"agentCapabilities": {"loadSession": true}})));
+        assert!(advertises_load_session(&json!({"agent_capabilities": {"load_session": true}})));
+        assert!(!advertises_load_session(&json!({"agentCapabilities": {"loadSession": false}})));
+        assert!(!advertises_load_session(&json!({"agentCapabilities": {}})));
+        assert!(!advertises_load_session(&json!({})));
+        let cfg = SessionConfig { cwd: "/work".into(), mcp_servers: Vec::new(), env: Vec::new() };
+        let params = session_load_params(cfg, &"acp-7".to_owned(), false).expect("params");
+        assert_eq!(params["sessionId"], json!("acp-7"));
+        assert_eq!(params["cwd"], json!("/work"));
+        let mut driver = AcpDriver::new(
+            AgentCommand::new("/bin/true".into(), Vec::new()),
+            PermissionOutcome::Allow,
+            Duration::from_secs(1),
+        );
+        assert!(!driver.supports_load_session());
+        let refused = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("rt")
+            .block_on(driver.load_session(
+                SessionConfig { cwd: "/work".into(), mcp_servers: Vec::new(), env: Vec::new() },
+                &"acp-7".to_owned(),
+            ));
+        assert!(refused.is_err(), "no capability, no load request is sent");
+    }
 
     /// A `/bin/sh` agent that speaks just enough ACP to drive `ready` -> `start_session` -> `prompt`,
     /// announcing itself as claude-agent-acp and emitting the init frame DURING the prompt turn,
