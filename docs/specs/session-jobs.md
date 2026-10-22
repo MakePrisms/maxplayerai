@@ -225,6 +225,11 @@ Public events are not run through `validate_private`, so a public-only deploymen
   sends `session/cancel` (`core/driver/acp_driver.rs:443 @e0262420`), waits for the turn to end, then
   snapshots and delivers with `["turn_status","out_of_time"]`. A cancelled turn with no file change and an
   empty last message is refused `no_sentinel` exactly as today — nothing was observed, nothing is charged.
+  *Found while implementing:* the existing `Driver::cancel` sends `session/cancel` as a request and
+  needs `&mut self`, but `session/prompt` holds the driver until the turn answers. ACP defines
+  `session/cancel` as a notification, so the wrap-up sends it as one from a timer through a handle
+  cloned before the prompt (`Driver::cancel_trigger`). A session turn is ONE agent attempt (a retry
+  would open a second conversation); the one-shot retry loop is unchanged.
 
 ---
 
@@ -324,6 +329,11 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   `session_protocol: 1`; the orchestrator refuses an inputs file it does not understand, and the host
   expires a session whose recorded `orchestrator_version` is below the protocol it would send. Within
   one session protocol version an old container keeps working.
+  *Found while implementing:* an orchestrator built before sessions does not refuse the new block —
+  `Phase1Inputs` is not `deny_unknown_fields`, so it ignores `session` and runs a one-shot job. The
+  host therefore treats the outcome's `session` block (written only by a session-aware orchestrator,
+  carrying its `session_protocol`) as the proof: no block ⇒ remove, never park. A newer protocol than
+  the orchestrator speaks is refused before the agent runs.
 
 ---
 
@@ -396,6 +406,11 @@ for the job's lifetime (`core/credential_proxy.rs:210`, `:1228 @e0262420`), whic
   (`snapshot_delivery_at`, `core/seller_git.rs:315`; refused if the tree equals the base, `:271`). The
   layout gate and config replacement run on every push as today. If the agent deleted the base object
   from `.git`, the snapshot fails `delivery_failed` — the agent can only hurt its own turn.
+  *Found while implementing:* "refused if the tree equals the base" cannot be the existing check on
+  a session base. The previous turn's commit carries that turn's sentinel, so an untouched workdir
+  always differs from it and an empty turn would mint a new sentinel. The follow-up gate compares
+  the raw workdir tree (runtime artifacts excluded) with the base tree **with its sentinel removed**
+  (`seller_git::session_tree_unchanged`); equal ⇒ `NoExecutionObserved` ⇒ inline turn or `no_sentinel`.
 - **Turn hash.** For n ≥ 2 the `job-hash` the result carries and the sentinel is seeded from is the hash
   of the **follow-up**: public `job_hash_for_offer(followup_id, followup_text, amount)`
   (`core/job_lifecycle.rs:2763 @e0262420`), private `pc::job_hash(followup_id)` (`ppp/lib.rs:62`). This
