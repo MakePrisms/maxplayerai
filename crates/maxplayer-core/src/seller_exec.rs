@@ -3058,6 +3058,23 @@ pub(crate) struct PreparedLaunch {
     _containment: Option<crate::sandbox_netns::Containment>,
 }
 
+#[cfg(feature = "acp")]
+impl PreparedLaunch {
+    /// Park a session job's launch (docs/specs/session-jobs.md §5.2 step 3, §6.4): the credential
+    /// proxy is STOPPED (its placeholders are revoked; the next turn mints new ones) and the netns
+    /// holder is detached from this guard and left running. Returns the holder's name.
+    pub fn park(mut self) -> Option<String> {
+        drop(self._proxy.take());
+        self._containment.take().map(crate::sandbox_netns::Containment::park)
+    }
+
+    /// The per-turn values the orchestrator lays over the container env (§6.4): every env pair this
+    /// launch minted. Placeholders and base URLs only, never a real contained credential.
+    pub fn turn_env(&self) -> Vec<(String, String)> {
+        self.env.clone()
+    }
+}
+
 /// Prepare a launch (see [`PreparedLaunch`]). `job_lifetime` bounds the contained credentials'
 /// placeholders and the host ChatGPT session read; the agent launch passes its unified job timeout,
 /// the container-delivery launch adds its push margin.
