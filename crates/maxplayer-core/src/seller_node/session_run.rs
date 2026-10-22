@@ -599,10 +599,6 @@ impl SellerNodeRunner {
             seller.git_remote = private.remote.clone();
         }
         let private = private_execution.is_some();
-        let v2 = private
-            || crate::private_content::public_v2::known(home, job_id)
-                .map(|known| known.is_some())
-                .unwrap_or(false);
         let contribution = private_execution
             .as_ref()
             .map(|p| p.contribution)
@@ -640,15 +636,19 @@ impl SellerNodeRunner {
         let workdir = job_workdir(home, job_id);
         let branch = session::delivery_branch(private, job_id, n, Some(fid));
         let push_ref = crate::git_transport::delivery_ref(&branch);
-        let sentinel_hash = session::turn_job_hash(
-            v2,
-            job_id,
-            &offer.task,
-            n,
-            Some((fid, &text)),
-            offer.amount_sats,
-        )
-        .map_err(setup)?;
+        // Every turn binds the OFFER's job hash (spec §7.1 as amended): the v2 result validators
+        // require `job-hash == job_hash(offer)`, and the receipt preimage already names the offer.
+        // Turns stay distinct through the per-turn creq hash and the delivered commit/answer digest.
+        let sentinel_hash = match private_execution.as_ref() {
+            Some(p) => p.job_hash.clone(),
+            None => crate::private_content::public_v2::execution_hash(
+                home,
+                job_id,
+                &offer.task,
+                offer.amount_sats,
+            )
+            .map_err(setup)?,
+        };
         let io_dir = container_exchange_dir(&home.root, job_id);
         orch::create_exchange_dir(&io_dir).map_err(setup)?;
         let tool_endpoints = self.attach_held_tools(job_id).await.map_err(setup)?;
