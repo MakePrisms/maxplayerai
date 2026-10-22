@@ -3735,21 +3735,55 @@ mod tests {
         // A refused turn releases its number: the buyer's retry for the same turn is recorded.
         let f3 = "3".repeat(64);
         let f3b = "4".repeat(64);
-        assert!(store.record_turn(&f3, "job-a", 3, 2_000, TurnState::Received, 70).unwrap());
+        assert!(
+            store
+                .record_turn(&f3, "job-a", 3, 2_000, TurnState::Received, 70)
+                .unwrap()
+        );
         store.set_turn_text(&f3, "third").unwrap();
-        assert!(!store.record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 71).unwrap());
-        store.set_turn_state(&f3, TurnState::Refused, None, None, 72).unwrap();
-        assert!(store.turn_texts("job-a", 3).unwrap().is_empty(), "refused text is not history");
-        assert!(store.record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 73).unwrap());
+        assert!(
+            !store
+                .record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 71)
+                .unwrap()
+        );
+        store
+            .set_turn_state(&f3, TurnState::Refused, None, None, 72)
+            .unwrap();
+        assert!(
+            store.turn_texts("job-a", 3).unwrap().is_empty(),
+            "refused text is not history"
+        );
+        assert!(
+            store
+                .record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 73)
+                .unwrap()
+        );
         assert!(store.turn(&f3).unwrap().is_none());
         store.set_turn_text(&f3b, "third, retried").unwrap();
-        assert_eq!(store.turn_texts("job-a", 3).unwrap(), vec!["third, retried".to_owned()]);
+        assert_eq!(
+            store.turn_texts("job-a", 3).unwrap(),
+            vec!["third, retried".to_owned()]
+        );
         let draft = EventDraft::new(crate::kinds::JOB_RESULT_KIND, vec![], "");
-        assert!(store.deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 80).unwrap());
-        assert!(!store.deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 81).unwrap(), "idempotent");
+        assert!(
+            store
+                .deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 80)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 81)
+                .unwrap(),
+            "idempotent"
+        );
         let s = store.session("job-a").unwrap().unwrap();
         assert_eq!((s.turn, s.base_oid.as_deref()), (3, Some("b3")));
-        assert!(store.outbox_row(&format!("result:{f3b}")).unwrap().is_some());
+        assert!(
+            store
+                .outbox_row(&format!("result:{f3b}"))
+                .unwrap()
+                .is_some()
+        );
         assert!(!store.session_close_requested("job-a").unwrap());
         store.request_session_close("job-a").unwrap();
         assert!(store.session_close_requested("job-a").unwrap());

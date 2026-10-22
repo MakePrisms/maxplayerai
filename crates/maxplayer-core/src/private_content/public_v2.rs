@@ -247,7 +247,9 @@ impl Context {
         turn_key: Option<&str>,
     ) -> Result<PreparedContent> {
         validate_selection(offer, claim, award)?;
-        let key = turn_key.map(str::to_owned).unwrap_or_else(|| offer.id.to_hex());
+        let key = turn_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| offer.id.to_hex());
         self.store.prepare_once(
             &format!("answer:{key}"),
             ContentBody {

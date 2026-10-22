@@ -3394,10 +3394,17 @@ pub fn docker_start_argv(container: &str) -> Vec<String> {
 /// `docker container inspect --format {{.Image}}`: the image a parked container runs, recorded on
 /// the session (§5.4).
 pub fn container_image_argv(container: &str) -> Vec<String> {
-    ["docker", "container", "inspect", "--format", "{{.Image}}", container]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    [
+        "docker",
+        "container",
+        "inspect",
+        "--format",
+        "{{.Image}}",
+        container,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// Run the **production** preparation and launch construction for one job, hand the resulting argv
@@ -3489,7 +3496,9 @@ pub(crate) async fn cleanup_job_container(
     // blocking docker calls here would stall every sibling job for the duration.
     if cleanup == CleanupPolicy::CaptureThenPark {
         let parked = tokio::task::spawn_blocking(move || {
-            destination.map(|dir| capture_into(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets))
+            destination.map(|dir| {
+                capture_into(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets)
+            })
         })
         .await;
         container.settle();
