@@ -1035,17 +1035,43 @@ mod tests {
         assert!(collect["inputSchema"]["properties"]["turn"].is_object());
         assert!(collect["inputSchema"]["properties"]["close_session"].is_object());
         let off = tools();
-        let collect = off.as_array().unwrap().iter().find(|t| t["name"] == "collect").unwrap();
+        let collect = off
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "collect")
+            .unwrap();
         assert!(collect["inputSchema"]["properties"].get("turn").is_none());
         // post_job gains max_session_sats only with the flag on; off, its schema bytes are today's.
-        let post = |list: &Value| list.as_array().unwrap().iter().find(|t| t["name"] == "post_job").unwrap().clone();
+        let post = |list: &Value| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "post_job")
+                .unwrap()
+                .clone()
+        };
         assert!(post(&on)["inputSchema"]["properties"]["max_session_sats"].is_object());
-        assert!(post(&off)["inputSchema"]["properties"].get("max_session_sats").is_none());
-        assert_eq!(serde_json::to_string(&tools_for(false)).unwrap(), serde_json::to_string(&off).unwrap());
-        assert!(!serde_json::to_string(&tools_for(false)).unwrap().contains("max_session_sats"));
+        assert!(
+            post(&off)["inputSchema"]["properties"]
+                .get("max_session_sats")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_string(&tools_for(false)).unwrap(),
+            serde_json::to_string(&off).unwrap()
+        );
+        assert!(
+            !serde_json::to_string(&tools_for(false))
+                .unwrap()
+                .contains("max_session_sats")
+        );
         // Only that one property differs between the flag-on and flag-off post_job.
         let mut on_post = post(&on);
-        on_post["inputSchema"]["properties"].as_object_mut().unwrap().remove("max_session_sats");
+        on_post["inputSchema"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_session_sats");
         assert_eq!(on_post, post(&off));
     }
 

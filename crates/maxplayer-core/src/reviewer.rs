@@ -2099,7 +2099,8 @@ fn private_classifier_evidence(bundle: &crate::review::private::Request) -> Valu
         let mut evidence = json!({"offer":bundle.offer.id, "claim":f.claim.id, "award":f.award.id,
             "followups":f.followups.iter().map(|i| i.carrier.id).collect::<Vec<_>>()});
         if !f.deliveries.is_empty() {
-            evidence["deliveries"] = json!(f.deliveries.iter().map(|d| d.result.id).collect::<Vec<_>>());
+            evidence["deliveries"] =
+                json!(f.deliveries.iter().map(|d| d.result.id).collect::<Vec<_>>());
         }
         return evidence;
     }
