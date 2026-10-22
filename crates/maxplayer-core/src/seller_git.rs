@@ -447,7 +447,9 @@ pub fn session_tree_unchanged(workdir: &Path, base_oid: &str) -> Result<bool, Se
     let base = Oid::from_str(base_oid)
         .ok()
         .and_then(|oid| repo.find_commit(oid).ok())
-        .ok_or_else(|| SellerGitError::Io("delivery refused: base_oid absent from workdir".into()))?;
+        .ok_or_else(|| {
+            SellerGitError::Io("delivery refused: base_oid absent from workdir".into())
+        })?;
     let mut index = repo
         .index()
         .map_err(|_| SellerGitError::CommandFailed("session-gate-index"))?;

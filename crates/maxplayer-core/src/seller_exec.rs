@@ -2966,7 +2966,10 @@ pub async fn run_session_agent_in_env(
     let ended = run_session_job(
         &mut driver,
         &mut log,
-        &JobId(format!("seller-session-{}", short_hash(&job_id_of(workdir)))),
+        &JobId(format!(
+            "seller-session-{}",
+            short_hash(&job_id_of(workdir))
+        )),
         params,
         Box::new(move |reset| {
             Ok(release(reset).map(|text| PromptTurn {
@@ -2980,7 +2983,10 @@ pub async fn run_session_agent_in_env(
     drop(prepared);
     match ended {
         SessionTurnEnd::Withheld => Ok(SessionAgentReport {
-            report: AgentRunReport { usage: None, last_agent_message: None },
+            report: AgentRunReport {
+                usage: None,
+                last_agent_message: None,
+            },
             acp_session_id: None,
             context_reset: false,
             cancelled_for_wrap_up: false,
