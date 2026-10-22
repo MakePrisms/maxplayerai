@@ -5834,6 +5834,26 @@ mod tests {
         }
     }
 
+    /// Session jobs: a turn ≥ 2 result (it replies to a follow-up) never stands in for turn 1 —
+    /// not in auto-selection, not as "the awarded seller delivered", not for the pay window.
+    #[test]
+    fn turn_results_never_stand_in_for_turn_one() {
+        let seller = "aa".repeat(32);
+        let mut turn2 = result_view("result-t2", &seller);
+        turn2.created_at = 200;
+        turn2.session.reply = Some("ff".repeat(32));
+        assert!(turn2.has_delivery() && !turn2.is_turn_one_delivery());
+        let only_turn2 = vec![turn2.clone()];
+        assert!(select_result(&only_turn2, &seller, None).is_err());
+        assert_eq!(delivery_pay_deadline(&only_turn2, &seller), None);
+        let both = vec![turn2, result_view("result-t1", &seller)];
+        assert_eq!(select_result(&both, &seller, None).unwrap().result_id, "result-t1");
+        assert_eq!(
+            delivery_pay_deadline(&both, &seller),
+            Some(100 + DELIVERY_PAY_WINDOW_SECS)
+        );
+    }
+
     // CROSS-BIND TOOTH (accept path): an explicit `result_id` authored by a DIFFERENT seller
     // than the accepted claim's seller is REFUSED (the tool must not trust operator input) —
     // the live 21-sat cross-bind fixture shape (claim A + result B). An own-authored result,

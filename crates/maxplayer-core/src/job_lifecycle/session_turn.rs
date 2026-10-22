@@ -337,6 +337,70 @@ pub fn turn_parent_commit(
 mod tests {
     use super::*;
 
+    fn bind(job: &str, followup: Option<&str>, commit: &str, inline: bool) -> AcceptedBind {
+        AcceptedBind {
+            private_evidence: None,
+            job_id: job.into(),
+            claim_id: "c".into(),
+            result_id: format!("r-{commit}"),
+            seller_pubkey: "aa".repeat(32),
+            commit_oid: commit.into(),
+            repo: String::new(),
+            branch: String::new(),
+            delivery_kind: inline.then(|| crate::receipt::DeliveryKind::Inline.as_str().into()),
+            inline_answer: inline.then(|| "answer".into()),
+            job_hash: "ff".repeat(32),
+            amount_sats: 0,
+            accept_event_id: "e".into(),
+            accepted_at: 1,
+            seller_signature: "ab".repeat(32),
+            creq_hash: None,
+            accepted_mints: Vec::new(),
+            funding_mint: None,
+            delivery_mint: None,
+            agent_used: None,
+            model_used: None,
+            contribution: None,
+            payment_mode: PaymentMode::None,
+            followup_id: followup.map(str::to_owned),
+        }
+    }
+
+    /// Failure test 10 (buyer half, bind chain): the parent a git turn must have is the newest
+    /// earlier GIT turn's commit — inline turns are skipped, turn 1 is the floor — and a turn
+    /// bind lives at its follow-up's path, never over turn 1's.
+    #[test]
+    fn turn_parent_is_the_newest_earlier_git_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::home::bootstrap(dir.path()).unwrap();
+        let (c1, c2) = ("11".repeat(20), "22".repeat(20));
+        write_accepted_bind(&home, &bind("job", None, &c1, false)).unwrap();
+        assert_eq!(
+            turn_parent_commit(&home, "job", &[]).unwrap(),
+            Some(c1.clone())
+        );
+        write_accepted_bind(&home, &bind("job", Some("f2"), &c2, false)).unwrap();
+        write_accepted_bind(&home, &bind("job", Some("f3"), &"33".repeat(32), true)).unwrap();
+        assert_eq!(
+            load_accepted_bind(&home, "job")
+                .unwrap()
+                .unwrap()
+                .commit_oid,
+            c1
+        );
+        assert_eq!(
+            turn_parent_commit(&home, "job", &["f2".into(), "f3".into()]).unwrap(),
+            Some(c2)
+        );
+        // An unaccepted earlier turn refuses rather than skipping to an older parent.
+        assert!(turn_parent_commit(&home, "job", &["f9".into()]).is_err());
+        // Every earlier turn inline: nothing the buyer saw to compare against.
+        let dir2 = tempfile::tempdir().unwrap();
+        let home2 = crate::home::bootstrap(dir2.path()).unwrap();
+        write_accepted_bind(&home2, &bind("job", None, &"44".repeat(32), true)).unwrap();
+        assert_eq!(turn_parent_commit(&home2, "job", &[]).unwrap(), None);
+    }
+
     #[test]
     fn turn_creq_names_the_followup_and_quotes_only_claim_mints() {
         let mint = "https://testnut.cashu.space";

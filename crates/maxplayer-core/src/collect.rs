@@ -679,6 +679,34 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    /// Failure test 10 (buyer half, git): a turn commit whose single parent is the previous
+    /// turn's commit passes; a replayed turn-1 commit (parent ≠ previous) or a merge is refused.
+    #[test]
+    fn turn_commit_must_have_the_previous_turn_as_its_single_parent() {
+        let root = temp_root("turn-parent");
+        let store = root.join("store");
+        let repo = git2::Repository::init_bare(&store).unwrap();
+        let sig = git2::Signature::now("t", "t@example.invalid").unwrap();
+        let tree = repo.find_tree(repo.treebuilder(None).unwrap().write().unwrap()).unwrap();
+        // Distinct messages: identical commits would share one oid and hide the replay case.
+        let commit = |msg: &str, parents: &[&git2::Commit]| {
+            let oid = repo.commit(None, &sig, &sig, msg, &tree, parents).unwrap();
+            repo.find_commit(oid).unwrap()
+        };
+        let t1 = commit("turn 1", &[]);
+        let t2 = commit("turn 2", &[&t1]);
+        let other = commit("unrelated root", &[]);
+        let merge = commit("merge", &[&t1, &other]);
+        let parents = |c: &git2::Commit| commit_parents(&store, &c.id().to_string()).unwrap();
+        let t1_hex = t1.id().to_string();
+        assert!(crate::session::verify_turn_parent(&parents(&t2), &t1_hex).is_ok());
+        assert!(crate::session::verify_turn_parent(&parents(&t1), &t1_hex).is_err());
+        assert!(crate::session::verify_turn_parent(&parents(&merge), &t1_hex).is_err());
+        let replay = commit("replayed turn", &[&other]);
+        assert!(crate::session::verify_turn_parent(&parents(&replay), &t1_hex).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn temp_root(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
         std::env::temp_dir().join(format!("maxplayer-collect-{label}-{}-{id}", std::process::id()))
