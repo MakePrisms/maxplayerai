@@ -9354,6 +9354,7 @@ impl SellerNodeRunner {
             relay_url: seller.git_remote.clone(),
             push_token,
             handoff_nonce: nonce.clone(),
+            session: None,
         };
         orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
             .map_err(|error| Fail::Setup(error.to_string()))?;
@@ -9653,6 +9654,8 @@ impl SellerNodeRunner {
             orch::Phase1Status::TokenUnavailable
             | orch::Phase1Status::PushFailed
             | orch::Phase1Status::Tampered => Err(Fail::Delivery(detail)),
+            // Session jobs: only a session turn can be withheld, and a one-shot launch never asks.
+            orch::Phase1Status::Withheld => Err(Fail::Setup(detail)),
         }
     }
 

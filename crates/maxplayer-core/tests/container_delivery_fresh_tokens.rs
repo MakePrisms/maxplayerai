@@ -49,6 +49,7 @@ fn container_entry_refreshes_each_wire_leg_and_delivers_the_gated_commit() {
         relay_url: relay.repo_url(),
         push_token: orch::PushTokenSource::FreshAfterAgent { wait_secs: 5 },
         handoff_nonce: nonce.clone(),
+        session: None,
     };
     let path = out.join(orch::PHASE1_INPUTS_FILE);
     orch::write_phase1_inputs(&path, &inputs).unwrap();

@@ -142,6 +142,9 @@ pub enum OrchestratorError {
     /// Evidence that something other than the orchestrator touched the delivery between the gate and
     /// the push — a process that survived the agent, a moved branch, a forged marker. Fail closed.
     Tampered(String),
+    /// Session jobs §6.1 step 3: the host withheld this turn's prompt (its review refused). The
+    /// agent was never prompted; nothing is delivered.
+    Withheld,
 }
 
 impl std::fmt::Display for OrchestratorError {
@@ -162,6 +165,7 @@ impl std::fmt::Display for OrchestratorError {
             }
             Self::TokenUnavailable(message) => write!(f, "delivery push token: {message}"),
             Self::Tampered(message) => write!(f, "delivery refused (tamper evidence): {message}"),
+            Self::Withheld => write!(f, "session turn withheld by the host (review refused)"),
         }
     }
 }
@@ -265,6 +269,70 @@ pub fn run_phase1(
         delivery_oid,
         delivery_repo_dir: agent_workdir.to_path_buf(),
     })
+}
+
+/// Phase 1 for a session follow-up (turn n >= 2, docs/specs/session-jobs.md §7.1): the workdir is
+/// the session's, already a repository, so nothing is provisioned. The agent runs, then the gate
+/// snapshots against `base_oid` (the last git-delivered commit): a tree equal to it is refused
+/// `NoExecutionObserved`, which the host turns into an inline turn when the agent marked one.
+#[allow(clippy::too_many_arguments)]
+pub fn run_session_followup(
+    agent_workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    base_oid: Option<&str>,
+    delivery_branch: &str,
+    message: &str,
+    author_date_unix: i64,
+    job_hash: &str,
+    spawn_agent: impl FnOnce(&Path) -> Result<(), OrchestratorError>,
+) -> Result<Phase1Output, OrchestratorError> {
+    if git2::Repository::open(agent_workdir).is_err() {
+        return Err(OrchestratorError::Provision(SellerGitError::Io(
+            "session follow-up: the session workdir is not a repository".into(),
+        )));
+    }
+    spawn_agent(agent_workdir)?;
+    if let Some(base) = base_oid
+        && seller_git::session_tree_unchanged(agent_workdir, base).map_err(OrchestratorError::Gate)?
+    {
+        return Err(OrchestratorError::Gate(SellerGitError::NoExecutionObserved(
+            "session workdir unchanged since the previous turn — no execution observed".into(),
+        )));
+    }
+    let delivery_oid = seller_git::snapshot_delivery_at(
+        agent_workdir,
+        identity,
+        base_oid,
+        delivery_branch,
+        message,
+        author_date_unix,
+        job_hash,
+    )
+    .map_err(OrchestratorError::Gate)?;
+    Ok(Phase1Output {
+        delivery_oid,
+        delivery_repo_dir: agent_workdir.to_path_buf(),
+    })
+}
+
+/// The prompt this turn sends (§6.1 step 3, §6.3). A one-shot job, or a session's first turn,
+/// takes `inputs.prompt`. A follow-up waits for the host's release: `Ok(None)` on abort, the reset
+/// prompt when the conversation could not be reloaded. Waits at most until the deadline.
+pub fn session_prompt_for(
+    inputs: &Phase1Inputs,
+    context_reset: bool,
+    poll: Duration,
+) -> Result<Option<String>, OrchestratorError> {
+    let Some(session) = inputs.session.as_ref().filter(|s| s.prompt_from_exchange) else {
+        return Ok(Some(inputs.prompt.clone()));
+    };
+    let _ = session;
+    let wait = Duration::from_secs(inputs.deadline_unix.saturating_sub(unix_now()));
+    match await_session_release(&inputs.out_dir, &inputs.handoff_nonce, wait, poll)? {
+        SessionRelease::Abort => Ok(None),
+        SessionRelease::Prompt(released) if context_reset => Ok(Some(released.reset_prompt)),
+        SessionRelease::Prompt(released) => Ok(Some(released.prompt)),
+    }
 }
 
 /// The file phase 1 writes the delivery oid to, in the host-mounted output directory, so the host
@@ -379,6 +447,112 @@ pub struct Phase1Inputs {
     /// the host can tell the orchestrator's marker from one a job process forged: the agent never
     /// sees this file, so it never learns the nonce.
     pub handoff_nonce: String,
+    /// Session jobs (docs/specs/session-jobs.md §5, §6). Absent on every one-shot job, and never
+    /// serialized then, so a flag-off inputs file is byte-identical to one written before sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionInputs>,
+}
+
+/// The per-turn session inputs (§5.5 `session_protocol`, §6.1, §6.3, §6.4, §7.1, §4).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionInputs {
+    /// The inputs protocol the host speaks. An orchestrator refuses a higher one it cannot read.
+    pub session_protocol: u32,
+    /// 1 for the first turn of a session job, n >= 2 for a follow-up.
+    pub turn: u32,
+    /// The ACP session recorded at the previous park; `session/load` target (§6.3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_acp_session_id: Option<String>,
+    /// Turn n >= 2: the last git-delivered commit. Provisioning is skipped (the workdir is the
+    /// session's) and the snapshot is parented on this (§7.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_oid: Option<String>,
+    /// The instant the orchestrator sends `session/cancel` (§4). 0 = never.
+    #[serde(default)]
+    pub wrap_up_unix: u64,
+    /// Turn n >= 2: the prompt is NOT in this file. The orchestrator opens the conversation, then
+    /// waits for [`SESSION_PROMPT_FILE`] or [`SESSION_ABORT_FILE`] (§6.1 step 3), so the buyer's
+    /// text enters the container only after its review passed.
+    #[serde(default)]
+    pub prompt_from_exchange: bool,
+    /// Per-turn agent env values laid over the container environment (§6.4: the credential proxy
+    /// is re-minted per turn, so the placeholders and base URLs baked in at create are stale).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_env_overrides: Vec<(String, String)>,
+}
+
+/// Host → container: the released follow-up prompt (§6.1 step 3), written only after review.
+pub const SESSION_PROMPT_FILE: &str = "prompt.json";
+/// Host → container: the review refused; exit without prompting.
+pub const SESSION_ABORT_FILE: &str = "abort";
+/// Bound on [`SESSION_PROMPT_FILE`] (two prompts, the reset one carrying up to 64 KiB history).
+pub const EXCHANGE_PROMPT_MAX_BYTES: usize = 512 * 1024;
+
+/// [`SESSION_PROMPT_FILE`]'s body. `reset_prompt` is used when `session/load` failed (§6.3): it
+/// restates the original task and the buyer's follow-ups.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionPrompt {
+    pub nonce: String,
+    pub prompt: String,
+    pub reset_prompt: String,
+}
+
+/// What the host released for this turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionRelease {
+    Prompt(SessionPrompt),
+    Abort,
+}
+
+/// Container side: wait for the host's verdict on this turn's follow-up. The file is read through
+/// [`read_exchange_file`] and DELETED before this returns, so no job process the prompt later
+/// starts can find it (or the nonce in it). A wrong nonce is tamper evidence. Times out at `wait`.
+pub fn await_session_release(
+    out_dir: &Path,
+    nonce: &str,
+    wait: Duration,
+    poll: Duration,
+) -> Result<SessionRelease, OrchestratorError> {
+    let started = std::time::Instant::now();
+    loop {
+        if let Some(raw) = read_exchange_file(out_dir, SESSION_ABORT_FILE, EXCHANGE_MARKER_MAX_BYTES)? {
+            let _ = std::fs::remove_file(out_dir.join(SESSION_ABORT_FILE));
+            if raw.trim_ascii() != nonce.as_bytes() {
+                return Err(OrchestratorError::Tampered("abort file nonce mismatch".into()));
+            }
+            return Ok(SessionRelease::Abort);
+        }
+        if let Some(raw) = read_exchange_file(out_dir, SESSION_PROMPT_FILE, EXCHANGE_PROMPT_MAX_BYTES)? {
+            std::fs::remove_file(out_dir.join(SESSION_PROMPT_FILE)).map_err(|error| {
+                OrchestratorError::Io(format!("delete {SESSION_PROMPT_FILE}: {error}; refusing to prompt"))
+            })?;
+            let prompt: SessionPrompt = serde_json::from_slice(&raw).map_err(|error| {
+                OrchestratorError::Tampered(format!("{SESSION_PROMPT_FILE} does not parse ({error})"))
+            })?;
+            if prompt.nonce != nonce {
+                return Err(OrchestratorError::Tampered(format!(
+                    "{SESSION_PROMPT_FILE} nonce mismatch"
+                )));
+            }
+            return Ok(SessionRelease::Prompt(prompt));
+        }
+        if started.elapsed() >= wait {
+            return Err(OrchestratorError::DeadlineExceeded);
+        }
+        std::thread::sleep(poll);
+    }
+}
+
+/// Host side: release the prompt (after the review passed). Owner-only, never over a file.
+pub fn write_session_prompt(out_dir: &Path, prompt: &SessionPrompt) -> Result<(), OrchestratorError> {
+    let json = serde_json::to_string(prompt)
+        .map_err(|error| OrchestratorError::Io(format!("encode prompt: {error}")))?;
+    write_secret_file(&out_dir.join(SESSION_PROMPT_FILE), &json)
+}
+
+/// Host side: the review refused; the orchestrator exits without prompting.
+pub fn write_session_abort(out_dir: &Path, nonce: &str) -> Result<(), OrchestratorError> {
+    write_secret_file(&out_dir.join(SESSION_ABORT_FILE), nonce)
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, OrchestratorError> {
@@ -515,19 +689,47 @@ fn deliver_in_container(
         branch: &b.branch,
         oid: &b.oid,
     });
-    let output = run_phase1(
-        &inputs.workdir,
-        &identity,
-        base,
-        &inputs.delivery_branch,
-        &inputs.message,
-        inputs.author_date_unix,
-        &inputs.job_hash,
-        |workdir| {
-            *agent = Some(run_agent(inputs, workdir)?);
-            Ok(())
-        },
-    )?;
+    if let Some(session) = &inputs.session
+        && session.session_protocol > crate::session::SESSION_PROTOCOL
+    {
+        // §5.5: an inputs file from a newer host than this (parked) container's orchestrator.
+        return Err(OrchestratorError::AgentUnavailable(format!(
+            "session_protocol {} is newer than this orchestrator's {}",
+            session.session_protocol,
+            crate::session::SESSION_PROTOCOL
+        )));
+    }
+    let followup = inputs.session.as_ref().filter(|session| session.turn >= 2);
+    let output = match followup {
+        // §7.1: turn n >= 2 runs in the session's own workdir. No provisioning; the snapshot is
+        // parented on the last git-delivered commit (none yet: from scratch).
+        Some(session) => run_session_followup(
+            &inputs.workdir,
+            &identity,
+            session.base_oid.as_deref(),
+            &inputs.delivery_branch,
+            &inputs.message,
+            inputs.author_date_unix,
+            &inputs.job_hash,
+            |workdir| {
+                *agent = Some(run_agent(inputs, workdir)?);
+                Ok(())
+            },
+        )?,
+        None => run_phase1(
+            &inputs.workdir,
+            &identity,
+            base,
+            &inputs.delivery_branch,
+            &inputs.message,
+            inputs.author_date_unix,
+            &inputs.job_hash,
+            |workdir| {
+                *agent = Some(run_agent(inputs, workdir)?);
+                Ok(())
+            },
+        )?,
+    };
 
     // The gate has run and the delivery commit exists. From here on nothing but this process may
     // touch the workdir: reap whatever the agent left behind BEFORE the marker invites a token in
@@ -608,6 +810,9 @@ fn drive_acp_agent(
         .enable_all()
         .build()
         .map_err(|error| OrchestratorError::Io(format!("tokio runtime: {error}")))?;
+    if let Some(session) = &inputs.session {
+        return drive_session_turn(inputs, session, workdir, &identity, env, &policy, &runtime);
+    }
     let result = runtime.block_on(run_agent_with_retry(
         inputs.deadline_unix,
         inputs.max_agent_attempts.max(1),
@@ -636,9 +841,98 @@ fn drive_acp_agent(
         Ok(report) => Ok(AgentOutcome {
             // `bound_text` sets this when it cuts; nothing is cut yet at this point.
             last_agent_message_truncated: false,
+                session: None,
             usage: report.usage,
             last_agent_message: report.last_agent_message,
         }),
+        Err(ExecError::DeadlineExceeded) => Err(OrchestratorError::DeadlineExceeded),
+        Err(error @ (ExecError::AcpRequired | ExecError::Config(_))) => {
+            Err(OrchestratorError::AgentUnavailable(error.to_string()))
+        }
+        Err(error) => Err(OrchestratorError::Agent(error.to_string())),
+    }
+}
+
+/// §6.4: the per-turn credential values (re-minted proxy placeholders, base URLs) replace the
+/// stale ones the container was created with; a name the allowlist did not carry is added.
+pub fn apply_env_overrides(env: &mut Vec<(String, String)>, overrides: &[(String, String)]) {
+    for (key, value) in overrides {
+        match env.iter_mut().find(|(existing, _)| existing == key) {
+            Some(entry) => entry.1 = value.clone(),
+            None => env.push((key.clone(), value.clone())),
+        }
+    }
+}
+
+/// One session turn inside the container: ONE attempt (a retry would start a second conversation),
+/// `session/load` or a reset, the host's prompt release, the wrap-up cancel (§4, §6).
+#[cfg(feature = "wallet")]
+fn drive_session_turn(
+    inputs: &Phase1Inputs,
+    session: &SessionInputs,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    mut env: Vec<(String, String)>,
+    policy: &crate::seller_exec::SandboxPolicy,
+    runtime: &tokio::runtime::Runtime,
+) -> Result<AgentOutcome, OrchestratorError> {
+    use crate::seller_exec::{
+        AgentRunTimeout, ExecError, JobAttachments, run_session_agent_in_env, unified_job_timeout,
+    };
+    apply_env_overrides(&mut env, &session.agent_env_overrides);
+    let release_error: std::cell::RefCell<Option<OrchestratorError>> = Default::default();
+    let release = |reset: bool| match session_prompt_for(inputs, reset, TOKEN_POLL) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            *release_error.borrow_mut() = Some(error);
+            None
+        }
+    };
+    let wrap_up_at = (session.wrap_up_unix > 0)
+        .then(|| std::time::UNIX_EPOCH + Duration::from_secs(session.wrap_up_unix));
+    let result = runtime.block_on(run_session_agent_in_env(
+        &inputs.agent_argv,
+        policy,
+        workdir,
+        identity,
+        AgentRunTimeout::JobDeadline {
+            remaining: unified_job_timeout(inputs.deadline_unix, unix_now()),
+            deadline_unix: inputs.deadline_unix,
+        },
+        Some(env),
+        JobAttachments {
+            mcp_servers: inputs.mcp_servers.clone(),
+            extra_mounts: Vec::new(),
+        },
+        session.resume_acp_session_id.clone(),
+        wrap_up_at,
+        Box::new(release),
+    ));
+    if let Some(error) = release_error.into_inner() {
+        return Err(error);
+    }
+    match result {
+        Ok(turn) if turn.withheld => Err(OrchestratorError::Withheld),
+        Ok(turn) => {
+            let message = turn.report.last_agent_message.clone().unwrap_or_default();
+            Ok(AgentOutcome {
+                usage: turn.report.usage,
+                last_agent_message: turn.report.last_agent_message,
+                last_agent_message_truncated: false,
+                session: Some(SessionOutcome {
+                    session_protocol: crate::session::SESSION_PROTOCOL,
+                    acp_session_id: turn.acp_session_id,
+                    turn_status: crate::session::TurnStatus::from_turn(
+                        turn.cancelled_for_wrap_up,
+                        &message,
+                    )
+                    .as_str()
+                    .to_owned(),
+                    context_reset: turn.context_reset,
+                    withheld: false,
+                }),
+            })
+        }
         Err(ExecError::DeadlineExceeded) => Err(OrchestratorError::DeadlineExceeded),
         Err(error @ (ExecError::AcpRequired | ExecError::Config(_))) => {
             Err(OrchestratorError::AgentUnavailable(error.to_string()))
@@ -1023,6 +1317,24 @@ pub struct AgentOutcome {
     /// which is what every such outcome meant when nothing could be paid off this field.
     #[serde(default)]
     pub last_agent_message_truncated: bool,
+    /// Session jobs: what the turn left for the next one. Absent on one-shot jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionOutcome>,
+}
+
+/// The session half of an outcome (§5.2 step 1, §6.3, §7.3). Its presence is also the host's proof
+/// that THIS orchestrator speaks sessions: an older container ignores [`Phase1Inputs::session`] and
+/// writes no such block, and the host then removes rather than parks (§5.5 image upgrade).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SessionOutcome {
+    pub session_protocol: u32,
+    pub acp_session_id: Option<String>,
+    /// `done` | `needs_input` | `out_of_time` (`crate::session::TurnStatus`).
+    pub turn_status: String,
+    pub context_reset: bool,
+    /// The host's abort was honoured: the agent was never prompted.
+    #[serde(default)]
+    pub withheld: bool,
 }
 
 /// How the run ended, for the host's feedback and harness attribution. Every arm maps onto a host
@@ -1052,6 +1364,8 @@ pub enum Phase1Status {
     Tampered,
     /// An I/O failure outside the arms above.
     Aborted,
+    /// Session jobs: the host withheld the prompt (review refused); nothing ran, nothing delivered.
+    Withheld,
 }
 
 /// The orchestrator's account of one run, written to [`OUTCOME_FILE`] on every exit. Carries the
@@ -1114,6 +1428,7 @@ impl Phase1Outcome {
                         Phase1Status::PushFailed
                     }
                     OrchestratorError::Tampered(_) => Phase1Status::Tampered,
+                    OrchestratorError::Withheld => Phase1Status::Withheld,
                     OrchestratorError::Io(_) => Phase1Status::Aborted,
                 };
                 Self {
@@ -1898,6 +2213,175 @@ mod tests {
 
     const NONCE: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    // ---- Session jobs (docs/specs/session-jobs.md §6.1, §7.1) ---------------------------------
+
+    /// A flag-off inputs file carries no `session` key at all (golden, failure test 13), and an
+    /// inputs file without one still parses.
+    #[test]
+    fn session_inputs_are_absent_from_one_shot_inputs() {
+        let inputs = inputs_for(Path::new("/tmp/test"), PushTokenSource::None);
+        let json = serde_json::to_value(&inputs).expect("encode");
+        assert!(json.get("session").is_none());
+        let back: Phase1Inputs = serde_json::from_value(json).expect("decode");
+        assert!(back.session.is_none());
+        let outcome = serde_json::to_value(AgentOutcome::default()).expect("encode");
+        assert!(outcome.get("session").is_none());
+    }
+
+    /// Failure test 5 (container half): until the host releases, no prompt exists in the container;
+    /// an abort yields none at all; a prompt with the wrong nonce is tamper evidence; the released
+    /// file is deleted before the prompt is returned; the reset prompt is used after a reset.
+    #[test]
+    fn session_prompt_waits_for_release_and_honours_abort() {
+        let root = fresh_root("session-release");
+        let mut inputs = inputs_for(&root, PushTokenSource::None);
+        inputs.prompt = "BUYER TEXT MUST NOT BE HERE".into();
+        inputs.session = Some(SessionInputs {
+            session_protocol: crate::session::SESSION_PROTOCOL,
+            turn: 2,
+            prompt_from_exchange: true,
+            ..SessionInputs::default()
+        });
+        let io = root.join("io");
+        let poll = Duration::from_millis(5);
+
+        // Nothing released: times out rather than prompting (deadline already passed).
+        let mut expired = inputs.clone();
+        expired.deadline_unix = 0;
+        assert!(matches!(
+            session_prompt_for(&expired, false, poll),
+            Err(OrchestratorError::DeadlineExceeded)
+        ));
+
+        // Abort: no prompt, and the inputs' own prompt is never used.
+        write_session_abort(&io, NONCE).expect("abort");
+        assert_eq!(session_prompt_for(&inputs, false, poll).expect("abort read"), None);
+        assert!(!io.join(SESSION_ABORT_FILE).exists());
+
+        // Released: the composed follow-up, file consumed; the reset variant after a reset.
+        let released = SessionPrompt {
+            nonce: NONCE.into(),
+            prompt: "follow-up".into(),
+            reset_prompt: "task + follow-ups".into(),
+        };
+        write_session_prompt(&io, &released).expect("release");
+        assert_eq!(
+            session_prompt_for(&inputs, false, poll).expect("read").as_deref(),
+            Some("follow-up")
+        );
+        assert!(!io.join(SESSION_PROMPT_FILE).exists(), "consumed before prompting");
+        write_session_prompt(&io, &released).expect("release");
+        assert_eq!(
+            session_prompt_for(&inputs, true, poll).expect("read").as_deref(),
+            Some("task + follow-ups")
+        );
+
+        // Forged (wrong nonce): refused.
+        let forged = SessionPrompt { nonce: "f".repeat(64), ..released };
+        write_session_prompt(&io, &forged).expect("plant");
+        assert!(matches!(
+            session_prompt_for(&inputs, false, poll),
+            Err(OrchestratorError::Tampered(_))
+        ));
+
+        // A one-shot job (or turn 1) never waits: it takes the inputs prompt.
+        let one_shot = inputs_for(&root, PushTokenSource::None);
+        assert_eq!(
+            session_prompt_for(&one_shot, false, poll).expect("one-shot").as_deref(),
+            Some("do the task")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// §7.1 / failure test 10 (seller half): a follow-up runs in the session's workdir, its commit
+    /// has exactly one parent (the previous turn's), and an unchanged tree is refused.
+    #[test]
+    fn session_followup_parents_on_the_previous_turn_and_refuses_an_unchanged_tree() {
+        let root = fresh_root("session-followup");
+        let workdir = root.join("work");
+        fs::create_dir_all(&workdir).expect("mkdir");
+        let id = DeliveryAgentIdentity::for_seller("e".repeat(64).as_str());
+        let first = run_phase1(&workdir, &id, None, "maxplayer/abc12345", "t1", DATE, JOB_HASH, |dir| {
+            fs::write(dir.join("a.txt"), "one\n").map_err(|e| OrchestratorError::Io(e.to_string()))
+        })
+        .expect("turn 1");
+        let hash2 = "b".repeat(64);
+        let second = run_session_followup(
+            &workdir, &id, Some(&first.delivery_oid), "maxplayer/abc12345-t2", "t2", DATE + 1, &hash2,
+            |dir| fs::write(dir.join("a.txt"), "two\n").map_err(|e| OrchestratorError::Io(e.to_string())),
+        )
+        .expect("turn 2");
+        let repo = git2::Repository::open(&workdir).expect("open");
+        let commit = repo
+            .find_commit(git2::Oid::from_str(&second.delivery_oid).expect("oid"))
+            .expect("commit");
+        let parents: Vec<String> = commit.parent_ids().map(|p| p.to_string()).collect();
+        assert_eq!(parents, vec![first.delivery_oid.clone()]);
+        assert!(crate::session::verify_turn_parent(&parents, &first.delivery_oid).is_ok());
+
+        // Turn 3 changes nothing: the gate refuses (inline turn or no_sentinel, host decides).
+        let err = run_session_followup(
+            &workdir, &id, Some(&second.delivery_oid), "maxplayer/abc12345-t3", "t3", DATE + 2,
+            &"c".repeat(64), |_| Ok(()),
+        )
+        .expect_err("unchanged tree");
+        assert!(matches!(err, OrchestratorError::Gate(SellerGitError::NoExecutionObserved(_))), "{err}");
+
+        // Not a repository: refused before the agent runs.
+        let bare = root.join("empty");
+        fs::create_dir_all(&bare).expect("mkdir");
+        let mut ran = false;
+        let err = run_session_followup(&bare, &id, None, "b", "m", DATE, JOB_HASH, |_| {
+            ran = true;
+            Ok(())
+        })
+        .expect_err("no repo");
+        assert!(matches!(err, OrchestratorError::Provision(_)));
+        assert!(!ran);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// §5.5: a newer host's inputs are refused by an older orchestrator before any agent runs.
+    #[test]
+    fn newer_session_protocol_is_refused_before_the_agent() {
+        let root = fresh_root("session-proto");
+        let mut inputs = inputs_for(&root, PushTokenSource::None);
+        inputs.session = Some(SessionInputs {
+            session_protocol: crate::session::SESSION_PROTOCOL + 1,
+            turn: 2,
+            ..SessionInputs::default()
+        });
+        let path = root.join("io").join(PHASE1_INPUTS_FILE);
+        write_phase1_inputs(&path, &inputs).expect("write");
+        let mut ran = false;
+        let err = entry(&path, |_, _| {
+            ran = true;
+            Ok(AgentOutcome::default())
+        })
+        .expect_err("refused");
+        assert!(matches!(err, OrchestratorError::AgentUnavailable(_)), "{err}");
+        assert!(!ran);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// §6.4: re-minted per-turn values replace the stale container values.
+    #[test]
+    fn per_turn_env_overrides_replace_stale_values() {
+        let mut env = vec![("ANTHROPIC_API_KEY".to_owned(), "old".to_owned()), ("PATH".to_owned(), "/bin".to_owned())];
+        apply_env_overrides(
+            &mut env,
+            &[("ANTHROPIC_API_KEY".into(), "new".into()), ("ANTHROPIC_BASE_URL".into(), "http://p:9".into())],
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("ANTHROPIC_API_KEY".to_owned(), "new".to_owned()),
+                ("PATH".to_owned(), "/bin".to_owned()),
+                ("ANTHROPIC_BASE_URL".to_owned(), "http://p:9".to_owned()),
+            ]
+        );
+    }
+
     #[test]
     fn codex_session_settings_survive_container_handoff_and_old_inputs_default_to_none() {
         let mut inputs = inputs_for(Path::new("/tmp/test"), PushTokenSource::None);
@@ -1944,6 +2428,7 @@ mod tests {
             relay_url: "ext::sh -c evil".to_owned(),
             push_token,
             handoff_nonce: NONCE.to_owned(),
+            session: None,
         }
     }
 
@@ -2257,6 +2742,7 @@ mod tests {
                 .map_err(|e| OrchestratorError::Io(e.to_string()))?;
             Ok(AgentOutcome {
                 last_agent_message_truncated: false,
+                session: None,
                 usage: None,
                 last_agent_message: Some("done".to_owned()),
             })
@@ -2873,6 +3359,7 @@ mod tests {
             }),
             Some(AgentOutcome {
                 last_agent_message_truncated: false,
+                session: None,
                 usage: Some(usage.clone()),
                 last_agent_message: None,
             }),
@@ -3199,6 +3686,7 @@ mod tests {
         let io = root.join("io");
         let agent = Some(AgentOutcome {
             last_agent_message_truncated: false,
+                session: None,
             usage: None,
             last_agent_message: Some("é".repeat(EXCHANGE_OUTCOME_MAX_BYTES)),
         });

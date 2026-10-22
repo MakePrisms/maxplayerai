@@ -128,8 +128,9 @@ pub struct SessionTurnParams {
     pub session_config: SessionConfig,
     /// The ACP session id recorded at the end of the previous turn; `None` on turn 1.
     pub resume: Option<crate::driver::SessionId>,
-    /// Time from the start of the prompt to the wrap-up `session/cancel`; `None` = never.
-    pub wrap_up_after: Option<std::time::Duration>,
+    /// The wall-clock instant of the wrap-up `session/cancel` (§4); `None` = never. Slot wait,
+    /// review and `session/load` all count against it.
+    pub wrap_up_at: Option<std::time::SystemTime>,
 }
 
 /// What a session turn adds to a [`RunOutcome`].
@@ -218,9 +219,11 @@ async fn run_session_turn<D: Driver>(
     // for drivers whose prompt returns at once. Fired at most once.
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trigger = driver.cancel_trigger(&session_id);
-    let wrap_at = params
-        .wrap_up_after
-        .map(|after| std::time::Instant::now() + after);
+    let wrap_up_after = params.wrap_up_at.map(|at| {
+        at.duration_since(std::time::SystemTime::now())
+            .unwrap_or_default()
+    });
+    let wrap_at = wrap_up_after.map(|after| std::time::Instant::now() + after);
     let fire = {
         let fired = std::sync::Arc::clone(&fired);
         let trigger = trigger.clone();
@@ -233,7 +236,7 @@ async fn run_session_turn<D: Driver>(
         }
     };
     let (stop_timer, timer_rx) = std::sync::mpsc::channel::<()>();
-    let timer = match (params.wrap_up_after, trigger.is_some()) {
+    let timer = match (wrap_up_after, trigger.is_some()) {
         (Some(after), true) => {
             let fire = fire.clone();
             Some(std::thread::spawn(move || {
@@ -1120,12 +1123,12 @@ mod tests {
 
     fn session_params(
         resume: Option<&str>,
-        wrap: Option<std::time::Duration>,
+        wrap: Option<std::time::SystemTime>,
     ) -> super::SessionTurnParams {
         super::SessionTurnParams {
             session_config: RunParams::mock_defaults().session_config,
             resume: resume.map(str::to_owned),
-            wrap_up_after: wrap,
+            wrap_up_at: wrap,
         }
     }
 
@@ -1293,7 +1296,7 @@ mod tests {
             &mut driver,
             &mut log,
             &JobId("j".into()),
-            session_params(None, Some(std::time::Duration::ZERO)),
+            session_params(None, Some(std::time::UNIX_EPOCH)),
             released("task"),
             &mut |_| {},
         ))
@@ -1309,7 +1312,10 @@ mod tests {
             &mut driver,
             &mut log,
             &JobId("j".into()),
-            session_params(None, Some(std::time::Duration::from_secs(3600))),
+            session_params(
+                None,
+                Some(std::time::SystemTime::now() + std::time::Duration::from_secs(3600)),
+            ),
             released("task"),
             &mut |_| {},
         ))
