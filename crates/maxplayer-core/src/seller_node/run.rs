@@ -12818,6 +12818,23 @@ mod tests {
     // The FOIL: a targeted-only seller KEEPS the pubkey scope (it only claims offers addressed to it;
     // an award for such an offer p-tags it as the sole winner). Without this leg the test above would
     // still pass if the scope were dropped for everyone.
+    /// Session jobs, failure test 13 (subscription half): with `[sessions] enabled = false` the
+    /// award REQ is byte-identical to today's; enabled adds exactly kind 3412.
+    #[test]
+    fn award_filter_adds_followups_only_when_sessions_are_enabled() {
+        let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        for open_pool in [false, true] {
+            let off = serde_json::to_string(&award_filter_with(pk, open_pool, false)).unwrap();
+            assert_eq!(off, serde_json::to_string(&award_filter(pk, open_pool)).unwrap());
+            assert!(!off.contains("3412"), "{off}");
+            let on = serde_json::to_value(award_filter_with(pk, open_pool, true)).unwrap();
+            let kinds: Vec<u64> = on["kinds"].as_array().unwrap().iter().filter_map(|k| k.as_u64()).collect();
+            assert!(kinds.contains(&u64::from(crate::kinds::SESSION_FOLLOWUP_KIND)), "{on}");
+            assert_eq!(kinds.len(), 4);
+        }
+        assert!(handled_event_kind(Kind::Custom(crate::kinds::SESSION_FOLLOWUP_KIND)));
+    }
+
     #[test]
     fn award_filter_is_pubkey_scoped_for_targeted() {
         let pk = nostr_sdk::prelude::Keys::generate().public_key();

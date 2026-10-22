@@ -3388,6 +3388,25 @@ mod tests {
         );
     }
 
+    /// Session jobs, failure test 7 (reaper half, mocked as the repo's reaper tests are): a parked
+    /// session's holder whose ONLY joiner is a STOPPED job container survives the boot reaper. The
+    /// listing is `docker ps --all`, so stopped containers' `container:<holder>` modes are read.
+    /// Believed, not measured: the live-docker check is the §11 test-env run.
+    #[test]
+    fn a_holder_joined_only_by_a_stopped_parked_container_is_kept() {
+        assert!(list_all_containers_argv().iter().any(|a| a == "--all"), "stopped containers must be listed");
+        let parked = "9".repeat(64);
+        let idle = "8".repeat(64);
+        let mine = vec![
+            HolderRecord { id: parked.clone(), seat: Some(seat_b()) },
+            HolderRecord { id: idle.clone(), seat: Some(seat_b()) },
+        ];
+        // The only line naming `parked` comes from the stopped job container.
+        let modes = format!("container:{parked}
+");
+        assert_eq!(reapable_holders(&mine, &seat_b(), &modes), vec![idle]);
+    }
+
     /// The positive control: this seat's own holders, nothing attached, all reapable. Without this a
     /// predicate that never matches would look like a careful one.
     #[test]
