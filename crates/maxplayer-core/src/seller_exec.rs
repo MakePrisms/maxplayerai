@@ -2885,6 +2885,133 @@ pub async fn run_agent_job_in_env(
     }
 }
 
+/// What one session turn reported (docs/specs/session-jobs.md §6.3, §4, §6.1).
+#[derive(Debug)]
+pub struct SessionAgentReport {
+    pub report: AgentRunReport,
+    pub acp_session_id: Option<String>,
+    pub context_reset: bool,
+    pub cancelled_for_wrap_up: bool,
+    /// The host withheld the prompt (review refused); the agent was never prompted.
+    pub withheld: bool,
+}
+
+/// One turn of a session job, inside the delivery container (pass-through policy): open the
+/// conversation (`session/load`, else `session/new` + `context_reset`), only then call `release`
+/// for the prompt, cancel at `wrap_up_at`. `release(context_reset)` returns `None` to withhold.
+/// A cancelled turn is a normal turn (`out_of_time`), not an error.
+#[cfg(feature = "acp")]
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_agent_in_env(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    workdir: &Path,
+    identity: &DeliveryAgentIdentity,
+    timeout: AgentRunTimeout,
+    agent_env: Option<Vec<(String, String)>>,
+    attachments: JobAttachments,
+    resume: Option<String>,
+    wrap_up_at: Option<std::time::SystemTime>,
+    release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
+) -> Result<SessionAgentReport, ExecError> {
+    use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
+    use crate::engine::{SessionTurnEnd, SessionTurnParams, run_session_job};
+    use crate::event::JobId;
+    use crate::log::EventLog;
+
+    let prepared = prepare_launch(
+        agent_command,
+        policy,
+        workdir,
+        identity,
+        timeout.duration(),
+        timeout.deadline_unix(),
+    )
+    .await?;
+    let mut session_mcp_servers = prepared.mcp_servers.clone();
+    session_mcp_servers.extend(attachments.mcp_servers);
+    let job = JobLaunch {
+        workdir,
+        env: &prepared.env,
+        uid: prepared.uid,
+        gid: prepared.gid,
+        netns: prepared.holder_name.as_deref(),
+        mcp_servers: &session_mcp_servers,
+        resolv_conf: prepared.resolv_conf.as_deref(),
+    };
+    let launch =
+        policy.launch_with_mounts(&prepared.effective_command, &job, &attachments.extra_mounts)?;
+    let mut agent = AgentCommand::new(launch.program, launch.args);
+    if let Some(env) = agent_env {
+        agent = agent.with_env(env);
+    }
+    let mut driver = AcpDriver::new(
+        agent,
+        crate::driver::PermissionOutcome::Allow,
+        timeout.duration(),
+    )
+    .with_codex_session(prepared.codex_session.clone());
+    let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
+    let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
+    let params = SessionTurnParams {
+        session_config: SessionConfig {
+            cwd: launch.cwd,
+            mcp_servers: session_mcp_servers,
+            env: identity.git_env(),
+        },
+        resume,
+        wrap_up_at,
+    };
+    let mut capture = crate::engine::AgentMessageCapture::default();
+    let ended = run_session_job(
+        &mut driver,
+        &mut log,
+        &JobId(format!("seller-session-{}", short_hash(&job_id_of(workdir)))),
+        params,
+        Box::new(move |reset| {
+            Ok(release(reset).map(|text| PromptTurn {
+                input: vec![ContentBlock::Text { text }],
+            }))
+        }),
+        &mut |event| capture.observe(event),
+    )
+    .await
+    .map_err(|error| classify_run_error(error, timeout))?;
+    drop(prepared);
+    match ended {
+        SessionTurnEnd::Withheld => Ok(SessionAgentReport {
+            report: AgentRunReport { usage: None, last_agent_message: None },
+            acp_session_id: None,
+            context_reset: false,
+            cancelled_for_wrap_up: false,
+            withheld: true,
+        }),
+        SessionTurnEnd::Ran(outcome) => {
+            let ok = matches!(
+                (&outcome.run.terminal, outcome.cancelled_for_wrap_up),
+                (crate::event::JobExecutionStatus::Completed, _)
+                    | (crate::event::JobExecutionStatus::Cancelled, true)
+            );
+            if !ok {
+                return Err(ExecError::Agent(format!(
+                    "agent terminal {:?}",
+                    outcome.run.terminal
+                )));
+            }
+            Ok(SessionAgentReport {
+                report: AgentRunReport {
+                    usage: outcome.run.usage,
+                    last_agent_message: capture.into_last_message(),
+                },
+                acp_session_id: Some(outcome.session_id),
+                context_reset: outcome.context_reset,
+                cancelled_for_wrap_up: outcome.cancelled_for_wrap_up,
+                withheld: false,
+            })
+        }
+    }
+}
+
 /// The host-side preparation of one job launch under `policy`: the delivery-identity env, the
 /// forwarded agent-auth allowlist, egress containment (#797) and credential containment (#647) when
 /// the policy is docker — everything [`run_agent_job`] did before it built the argv, as ONE value

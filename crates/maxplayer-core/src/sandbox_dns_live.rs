@@ -459,6 +459,7 @@ async fn contained_delivery(
         // A non-relay https remote takes no header — the same arm the host selects.
         push_token: orch::PushTokenSource::None,
         handoff_nonce: "ef".repeat(16),
+        session: None,
     };
     orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
         .expect("the inputs file must be written");
