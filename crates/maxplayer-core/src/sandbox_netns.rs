@@ -684,9 +684,21 @@ pub struct NetnsHolder {
     /// fixture has no seat and no deadline to attribute a helper to, and an empty seat label would
     /// be worse than none.
     helper_labels: Vec<String>,
+    /// Set by [`Self::park`]: the holder outlives this guard (a parked session, §5.2 step 3), so
+    /// `Drop` removes nothing. Session GC owns its removal from then on.
+    parked: bool,
 }
 
 impl NetnsHolder {
+    /// Detach the holder from this guard for a parked session (docs/specs/session-jobs.md §5.2
+    /// step 3): `Drop` is disarmed and the name returned. Sidecars registered for in-flight commands
+    /// are none by now (every helper finished before the job ran). From here the session record and
+    /// session GC own the holder; the expiry sweep keeps it while the record is live (§5.3).
+    pub fn park(mut self) -> String {
+        self.parked = true;
+        self.name.clone()
+    }
+
     /// Adopt a container name as the holder, whether or not the container exists yet.
     ///
     /// Private on purpose. Adoption happens **before** the create command is issued: the create is
@@ -710,6 +722,7 @@ impl NetnsHolder {
             client,
             bounds,
             helper_labels: Vec::new(),
+            parked: false,
         }
     }
 
@@ -934,6 +947,9 @@ impl Drop for NetnsHolder {
     /// failure is printed as a failure — "could not remove", not "destroyed" — and
     /// [`reap_orphans`] is the backstop. A cleanup that failed is a leak that is now on the record.
     fn drop(&mut self) {
+        if self.parked {
+            return;
+        }
         // FIRST, before a single remove is issued: let any in-flight create finish.
         //
         // Removing ahead of the create is worse than not removing at all, because "No such
@@ -1188,6 +1204,13 @@ pub struct Containment {
     /// guess like `eth0`. Carried so a caller, a log line or a test can name the interface that is
     /// actually filtered rather than the one everybody assumes.
     pub egress_dev: String,
+}
+
+impl Containment {
+    /// [`NetnsHolder::park`] for the whole containment.
+    pub fn park(self) -> String {
+        self.holder.park()
+    }
 }
 
 /// The holder's container name for `job_id`.

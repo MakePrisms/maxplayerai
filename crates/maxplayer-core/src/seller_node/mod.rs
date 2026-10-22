@@ -30,6 +30,7 @@ pub(crate) mod preflight;
 pub(crate) mod privacy;
 pub mod run;
 pub(crate) mod schedule;
+pub mod session_gc;
 pub mod shutdown;
 pub mod signer;
 pub mod store;
