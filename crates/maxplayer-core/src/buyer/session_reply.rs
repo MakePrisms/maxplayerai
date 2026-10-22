@@ -91,6 +91,7 @@ pub(super) struct Money {
 /// published) → sign once → persist the exact bytes (write-once) → reserve keyed by the follow-up
 /// id → publish → `sent`. A refused reservation frees the turn number; a failed publish leaves the
 /// turn `pending` so a retry re-sends the same bytes.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn advance<S, R, RF, P, PF>(
     store: &BuyerStore,
     job_id: &str,
@@ -143,11 +144,11 @@ where
                 .map_err(|e| e.to_string())?
         }
     };
-    if row.amount_sats > 0 {
-        if let Err(error) = reserve(row.followup_id.clone()).await {
-            let _ = store.set_turn_state(&row.followup_id, "refused", None, now);
-            return Err(error);
-        }
+    if row.amount_sats > 0
+        && let Err(error) = reserve(row.followup_id.clone()).await
+    {
+        let _ = store.set_turn_state(&row.followup_id, "refused", None, now);
+        return Err(error);
     }
     publish(row.clone()).await?;
     store
@@ -221,12 +222,12 @@ pub(super) fn facts(
     let now = now_unix();
     let mut turns = store.session_turns(job_id).map_err(|e| e.to_string())?;
     for turn in &mut turns {
-        if turn.state == "sent" {
-            if let Some(result) = delivered.get(&turn.followup_id) {
-                let _ = store.set_turn_state(&turn.followup_id, "delivered", Some(result), now);
-                turn.state = "delivered".into();
-                turn.result_id = Some(result.clone());
-            }
+        if turn.state == "sent"
+            && let Some(result) = delivered.get(&turn.followup_id)
+        {
+            let _ = store.set_turn_state(&turn.followup_id, "delivered", Some(result), now);
+            turn.state = "delivered".into();
+            turn.result_id = Some(result.clone());
         }
     }
     Ok(Facts {
@@ -374,7 +375,7 @@ async fn reply_inner(context: &Arc<BuyerContext>, params: ReplyParams) -> Result
         };
         let draft = crate::session::followup_draft(&followup).map_err(|e| e.to_string())?;
         let Some(chain) = &private else {
-            let event = sign_draft(&keys, &draft)?;
+            let event = sign_draft(keys, &draft)?;
             return Ok((event.id.to_hex(), event.as_json()));
         };
         use crate::private_content as pc;
@@ -399,7 +400,7 @@ async fn reply_inner(context: &Arc<BuyerContext>, params: ReplyParams) -> Result
             &ctx.policy.host,
         )
         .map_err(|e| e.to_string())?;
-        let event = sign_draft(&keys, &draft)?;
+        let event = sign_draft(keys, &draft)?;
         ctx.enqueue(
             &event,
             &chain.offer,
@@ -425,7 +426,7 @@ async fn reply_inner(context: &Arc<BuyerContext>, params: ReplyParams) -> Result
         if is_private {
             // The carrier and its encrypted copies sit in the durable content outbox; a failed
             // flush here is retried by the content worker, never re-signed.
-            flush_private(home, &keys).await;
+            flush_private(home, keys).await;
             return Ok(());
         }
         match context.relay.publish(event).await {
@@ -770,7 +771,7 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, BuyerStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = BuyerStore::open(&dir.path().join("buyer.sqlite")).unwrap();
+        let store = BuyerStore::open(dir.path().join("buyer.sqlite")).unwrap();
         (dir, store)
     }
     fn ready() -> Facts {

@@ -277,12 +277,11 @@ pub async fn collect_turn_async(
         .map_err(CollectError::Lifecycle)?;
     let dest = results_dest(home, &crate::session::collect_dir_name(job_id, turn), None)
         .map_err(CollectError::Input)?;
-    if !bind_is_inline(&bind) {
-        if let Some(parent) = job_lifecycle::turn_parent_commit(home, job_id, earlier)
+    if !bind_is_inline(&bind)
+        && let Some(parent) = job_lifecycle::turn_parent_commit(home, job_id, earlier)
             .map_err(CollectError::Lifecycle)?
-        {
-            verify_turn_parent_in_store(home, &bind, &parent)?;
-        }
+    {
+        verify_turn_parent_in_store(home, &bind, &parent)?;
     }
     if bind.payment_mode.is_free() {
         job_lifecycle::validate_private_bind(home, &bind).map_err(CollectError::Lifecycle)?;
