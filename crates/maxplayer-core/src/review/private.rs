@@ -19,6 +19,71 @@ pub struct Request {
     pub offer: Event,
     pub task_envelope: Option<String>,
     pub delivery: Option<pc::evidence::PrivateEvidence>,
+    /// Session follow-up subject (session-jobs §9): present iff `subject.kind` is 3412.
+    pub followup: Option<FollowUpEvidence>,
+}
+
+/// A private follow-up review's evidence: the selected claim/award and the buyer's signed
+/// follow-up carriers with their encrypted bodies, oldest first; the LAST is the subject. The
+/// reviewer re-authenticates every carrier against the signed offer/claim/award chain, so neither
+/// party can put words in the other's mouth.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowUpEvidence {
+    pub claim: Event,
+    pub award: Event,
+    pub followups: Vec<FollowUpItem>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowUpItem {
+    pub carrier: Event,
+    pub envelope: String,
+}
+impl FollowUpEvidence {
+    /// `(turn, text)` per follow-up, oldest first, after authenticating each one.
+    pub fn verify(
+        &self,
+        offer: &Event,
+        policy: &pc::runtime::Policy,
+    ) -> Result<Vec<(u32, String)>, String> {
+        pc::lifecycle::validate_selection(offer, &self.claim, &self.award, &policy.host)
+            .map_err(|_| "invalid_subject")?;
+        if self.followups.is_empty() || self.followups.len() > 64 {
+            return Err("invalid_subject".into());
+        }
+        let mut out: Vec<(u32, String)> = Vec::new();
+        for item in &self.followups {
+            let tags = pc::wire::validate_private(&item.carrier, &policy.host)
+                .map_err(|_| "invalid_subject")?;
+            let turn: u32 = tags
+                .get("turn")
+                .and_then(|t| t.parse().ok())
+                .ok_or("invalid_subject")?;
+            if item.carrier.kind.as_u16() != SESSION_FOLLOWUP_KIND
+                || item.carrier.pubkey != offer.pubkey
+                || tags.get("status") != Some("turn")
+                || out.last().is_some_and(|(n, _)| *n >= turn)
+            {
+                return Err("invalid_subject".into());
+            }
+            let content =
+                pc::PreparedContent::decode(&item.envelope).map_err(|_| "invalid_subject")?;
+            pc::wire::bind_content(
+                &content,
+                &item.carrier,
+                offer,
+                Some(&self.award),
+                Some(&self.claim),
+                None,
+                &policy.service,
+                &policy.host,
+            )
+            .map_err(|_| "invalid_subject")?;
+            out.push((turn, content.body().text.clone()));
+        }
+        Ok(out)
+    }
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -134,7 +199,22 @@ impl Request {
             policy.service.clone(),
             requester.to_hex(),
         ]);
-        if self.subject.kind == JOB_OFFER_KIND {
+        if self.subject.kind == SESSION_FOLLOWUP_KIND {
+            let f = self.followup.as_ref().ok_or("invalid_subject")?;
+            if self.delivery.is_some()
+                || f.followups.last().map(|i| i.carrier.id.to_hex()).as_deref()
+                    != Some(self.subject.event.as_str())
+            {
+                return Err("invalid_subject".into());
+            }
+            f.verify(&self.offer, policy)?;
+            if *requester != buyer && *requester != f.claim.pubkey {
+                return Err("unauthorized_request".into());
+            }
+            recipients.insert(f.claim.pubkey.to_hex());
+        } else if self.followup.is_some() {
+            return Err("invalid_subject".into());
+        } else if self.subject.kind == JOB_OFFER_KIND {
             if self.delivery.is_some()
                 || (!tags.participants.is_empty()
                     && *requester != buyer
@@ -206,7 +286,92 @@ pub fn offer_request(
         offer,
         task_envelope,
         delivery: None,
+        followup: None,
     }))
+}
+
+/// The seller's private follow-up review request (session-jobs §9): the selected claim/award, the
+/// current follow-up, then as many `earlier` follow-ups (oldest first) as fit the message bound,
+/// newest kept first. Everything comes from the seller's authenticated content store.
+pub fn followup_request(
+    home: &MaxplayerHome,
+    seller: &str,
+    job: &str,
+    earlier: &[String],
+    followup: &str,
+) -> Result<Request, String> {
+    let (mut ctx, offer) = crate::seller_node::privacy::known(home, seller, job)
+        .map_err(|e| e.to_string())?
+        .ok_or("review: private offer context unavailable")?;
+    let (claim, award) = ctx
+        .store
+        .selection(job)
+        .map_err(|e| e.to_string())?
+        .ok_or("review: private selection unavailable")?;
+    let tags = pc::wire::validate_private(&offer, &ctx.policy.host).map_err(|e| e.to_string())?;
+    let task_envelope = if tags.get("discovery") == Some("targeted") {
+        Some(
+            ctx.accept_content(&offer, &offer, None, None, None, Timestamp::now().as_secs())
+                .map_err(|e| e.to_string())?
+                .envelope()
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let item = |id: &str| -> Result<FollowUpItem, String> {
+        let carrier = ctx
+            .store
+            .event(id)
+            .map_err(|e| e.to_string())?
+            .ok_or("review: follow-up carrier unavailable")?;
+        let t =
+            pc::wire::validate_private(&carrier, &ctx.policy.host).map_err(|e| e.to_string())?;
+        let content = ctx
+            .store
+            .get(
+                t.required("job").map_err(|e| e.to_string())?,
+                t.required("content-id").map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?
+            .ok_or("review: follow-up content unavailable")?;
+        Ok(FollowUpItem {
+            carrier,
+            envelope: content.envelope().to_owned(),
+        })
+    };
+    let mut request = Request {
+        subject: Subject {
+            offer: job.into(),
+            event: followup.into(),
+            kind: SESSION_FOLLOWUP_KIND,
+            commit: None,
+        },
+        offer,
+        task_envelope,
+        delivery: None,
+        followup: Some(FollowUpEvidence {
+            claim,
+            award,
+            followups: vec![item(followup)?],
+        }),
+    };
+    for id in earlier.iter().rev() {
+        let Ok(earlier) = item(id) else { continue };
+        let list = &mut request.followup.as_mut().expect("set above").followups;
+        list.insert(0, earlier);
+        let size = serde_json::to_string(&request).map_or(usize::MAX, |s| s.len());
+        if size > MAX_MESSAGE - 2048 {
+            request
+                .followup
+                .as_mut()
+                .expect("set above")
+                .followups
+                .remove(0);
+            break;
+        }
+    }
+    Ok(request)
 }
 
 /// Keys remain in their existing custody site. Seller calls cross only the signer actor.
@@ -420,6 +585,7 @@ mod tests {
                 offer: evidence.offer.clone(),
                 task_envelope: evidence.task_envelope.clone(),
                 delivery: delivery.then_some(evidence),
+                followup: None,
             },
             policy,
         )
@@ -590,6 +756,119 @@ mod tests {
             .unwrap_err()
             .contains("content-service")
         );
+    }
+
+    /// A private follow-up as the buyer sends it: FollowUp content + projected 3412 carrier.
+    fn followup_item(
+        evidence: &pc::evidence::PrivateEvidence,
+        policy: &pc::runtime::Policy,
+        signer: &Keys,
+        text: &str,
+    ) -> FollowUpItem {
+        let buyer = key(1);
+        let content = pc::carriers::prepare_content(
+            &evidence.offer,
+            Some(&evidence.claim),
+            Some(&evidence.award),
+            &signer.public_key().to_hex(),
+            &policy.service,
+            pc::ContentType::FollowUp,
+            text.into(),
+            None,
+            &policy.host,
+        )
+        .unwrap();
+        let draft = crate::session::followup_draft(&crate::session::FollowUp {
+            offer_id: evidence.offer.id.to_hex(),
+            seller_pubkey: evidence.claim.pubkey.to_hex(),
+            status: crate::session::FollowUpStatus::Turn,
+            prev_result_id: Some(evidence.result.id.to_hex()),
+            turn: Some(2),
+            deadline_unix: Some(2_000_000_000),
+            text: None,
+        })
+        .unwrap();
+        let draft = pc::carriers::project(
+            &evidence.offer,
+            &draft,
+            Some(&evidence.award),
+            Some(&content),
+            &policy.host,
+        )
+        .unwrap();
+        let _ = buyer;
+        FollowUpItem {
+            carrier: pc::builders::sign(signer, draft).unwrap(),
+            envelope: content.envelope().to_owned(),
+        }
+    }
+
+    /// Session-jobs §9 private lane: a follow-up subject carries the buyer's signed carrier and
+    /// its encrypted body; the reviewer authenticates both against the signed chain, the buyer
+    /// and the selected seller may ask, nobody else, and a forged or swapped body is refused.
+    #[test]
+    fn private_followup_review_authenticates_the_buyers_carrier_and_body() {
+        let (evidence, _, _, policy) = pc::evidence::inline_fixture_for(true);
+        let item = followup_item(&evidence, &policy, &key(1), "now add tests");
+        let request = |items: Vec<FollowUpItem>| Request {
+            subject: Subject {
+                offer: evidence.offer.id.to_hex(),
+                event: items.last().unwrap().carrier.id.to_hex(),
+                kind: SESSION_FOLLOWUP_KIND,
+                commit: None,
+            },
+            offer: evidence.offer.clone(),
+            task_envelope: evidence.task_envelope.clone(),
+            delivery: None,
+            followup: Some(FollowUpEvidence {
+                claim: evidence.claim.clone(),
+                award: evidence.award.clone(),
+                followups: items,
+            }),
+        };
+        let good = request(vec![item.clone()]);
+        assert_eq!(
+            good.followup
+                .as_ref()
+                .unwrap()
+                .verify(&good.offer, &policy)
+                .unwrap(),
+            vec![(2, "now add tests".to_owned())]
+        );
+        // Wire round trip keeps the evidence, and both parties may request the review.
+        let wire: Request = serde_json::from_str(&serde_json::to_string(&good).unwrap()).unwrap();
+        for requester in [key(1), key(2)] {
+            let recipients = wire.validate(&requester.public_key(), &policy).unwrap();
+            assert!(recipients.contains(&key(2).public_key().to_hex()));
+        }
+        assert_eq!(
+            wire.validate(&key(4).public_key(), &policy).unwrap_err(),
+            "unauthorized_request"
+        );
+        // A carrier signed by the seller (words put in the buyer's mouth) is refused.
+        let forged = followup_item(&evidence, &policy, &key(2), "now add tests");
+        assert!(
+            request(vec![forged])
+                .validate(&key(2).public_key(), &policy)
+                .is_err()
+        );
+        // Another follow-up's body under this carrier is refused.
+        let other = followup_item(&evidence, &policy, &key(1), "something else");
+        let mut swapped = item.clone();
+        swapped.envelope = other.envelope;
+        assert!(
+            request(vec![swapped])
+                .validate(&key(1).public_key(), &policy)
+                .is_err()
+        );
+        // Follow-up evidence on a non-follow-up subject, or a subject that is not the last item.
+        let mut stray = good.clone();
+        stray.subject.event = evidence.offer.id.to_hex();
+        stray.subject.kind = JOB_OFFER_KIND;
+        assert!(stray.validate(&key(1).public_key(), &policy).is_err());
+        let mut wrong = good;
+        wrong.subject.event = evidence.result.id.to_hex();
+        assert!(wrong.validate(&key(1).public_key(), &policy).is_err());
     }
 }
 

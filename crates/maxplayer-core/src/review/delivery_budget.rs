@@ -49,6 +49,7 @@ pub(crate) async fn seller_delivery_budget(
         offer,
         task_envelope,
         delivery: None,
+        followup: None,
     };
     let reviewer =
         PublicKey::from_hex(&ctx.policy.service).map_err(|_| reviewer_error("invalid_subject"))?;
@@ -181,6 +182,7 @@ fn budget_request(
             result,
             answer_envelope,
         }),
+        followup: None,
     })
 }
 
@@ -198,6 +200,7 @@ mod tests {
             offer: e.offer.clone(),
             task_envelope: e.task_envelope.clone(),
             delivery: Some(e.clone()),
+            followup: None,
         }
     }
     async fn wraps(r: &Request, buyer: &Keys, service: PublicKey) -> bool {

@@ -2048,6 +2048,18 @@ async fn private_snapshot(
     use crate::private_content as pc;
     let task = bundle.task_envelope.as_deref().map(pc::PreparedContent::decode).transpose().map_err(|_| "invalid_subject")?;
     let resolved = pc::lifecycle::resolve_offer(&bundle.offer, task.as_ref(), &policy.service, &policy.service, &policy.host).map_err(|_| "invalid_subject")?;
+    // Session follow-up (§9): context from the authenticated carriers only, current one in full.
+    if let Some(f) = &bundle.followup {
+        let turns = f.verify(&bundle.offer, policy)?;
+        let texts: Vec<String> = turns.into_iter().map(|(_, text)| text).collect();
+        let context = crate::session::followup_review_context(&resolved.offer.task, &texts, &[]);
+        let metadata = json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,
+            "session_context":context,"evidence":private_classifier_evidence(bundle)});
+        let files = file_manifest(Vec::new())?;
+        let model = config.model.clone();
+        return tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &files, &model, deadline))
+            .await.map_err(|_| "input_unavailable")?;
+    }
     let files = Vec::new();
     let mut answer = None;
     if let Some(evidence) = &bundle.delivery {
@@ -2084,6 +2096,10 @@ async fn private_snapshot(
 // lifecycle and commitments have already been validated; wire encodings are not
 // additional task content and must not be mistaken for hidden instructions.
 fn private_classifier_evidence(bundle: &crate::review::private::Request) -> Value {
+    if let Some(f) = &bundle.followup {
+        return json!({"offer":bundle.offer.id, "claim":f.claim.id, "award":f.award.id,
+            "followups":f.followups.iter().map(|i| i.carrier.id).collect::<Vec<_>>()});
+    }
     json!({"offer":bundle.offer.id, "claim":bundle.delivery.as_ref().map(|e| e.claim.id),
         "award":bundle.delivery.as_ref().map(|e| e.award.id),
         "result":bundle.delivery.as_ref().map(|e| e.result.id)})

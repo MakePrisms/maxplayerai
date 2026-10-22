@@ -99,6 +99,8 @@ async fn scenario(targeted: bool, delivery: bool, provider_failure: bool) {
         offer: evidence.offer.clone(),
         task_envelope: evidence.task_envelope.clone(),
         delivery: delivery.then_some(evidence.clone()),
+
+        followup: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -324,6 +326,8 @@ async fn refusal_reply_scenario() {
         offer: evidence.offer.clone(),
         task_envelope: None,
         delivery: None,
+
+        followup: None,
     };
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -572,6 +576,8 @@ async fn private_git_review_reads_exact_commit_and_refuses_changed_binding() {
         offer: evidence.offer.clone(),
         task_envelope: evidence.task_envelope.clone(),
         delivery: Some(evidence),
+
+        followup: None,
     };
     let inner = crate::gateway::nostr::event_builder(
         &request.draft(&key(3).public_key().to_hex()).unwrap(),

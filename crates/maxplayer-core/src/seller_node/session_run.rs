@@ -748,15 +748,53 @@ impl SellerNodeRunner {
                 commit: None,
             };
             let buyer = offer.buyer_pubkey.clone();
+            // A private follow-up is reviewed ONLY over the encrypted lane (§9): its request
+            // carries the signed carriers + encrypted bodies of this and earlier follow-ups.
+            let private_request =
+                if private && matches!(review.enabled(subject.kind, &buyer), Ok(true)) {
+                    let earlier: Vec<String> = store
+                        .turns(job_id)
+                        .map(|turns| {
+                            turns
+                                .into_iter()
+                                .filter(|t| t.turn < n && t.state != TurnState::Refused)
+                                .map(|t| t.followup_id)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(crate::review::private::followup_request(
+                        home,
+                        &seller_pubkey,
+                        job_id,
+                        &earlier,
+                        fid,
+                    ))
+                } else {
+                    None
+                };
+            let review_home = home.clone();
+            let review_signer = self.node.signer().clone();
             tokio::task::spawn_local(async move {
                 let verdict = match review.enabled(subject.kind, &buyer) {
                     Ok(false) => Ok(None),
-                    // The encrypted review lane has no follow-up subject yet: fail closed rather
-                    // than send a private message over the public lane (spec §9 note).
-                    Ok(true) if private => Err(
-                        "private follow-up review is not available yet; the follow-up is withheld"
-                            .into(),
-                    ),
+                    // Never the public lane for a private follow-up; a request that cannot be
+                    // built withholds the follow-up (nothing runs, nothing is charged).
+                    Ok(true) if private => match private_request {
+                        Some(Ok(request)) => {
+                            crate::review::private::check(
+                                &review_home,
+                                &client,
+                                crate::review::private::Identity::Seller(&review_signer),
+                                &request,
+                                &buyer,
+                            )
+                            .await
+                        }
+                        Some(Err(error)) => Err(format!(
+                            "private follow-up review request unavailable ({error}); withheld"
+                        )),
+                        None => Err("private follow-up review unavailable; withheld".into()),
+                    },
                     Ok(true) => {
                         let transport = crate::review::wire::RelayTransport {
                             client: &client,
