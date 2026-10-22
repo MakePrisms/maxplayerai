@@ -557,9 +557,13 @@ fn public_job_hash(id: &str, text: &str, amount_sats: u64) -> String {
     hex::encode(h.finalize())
 }
 
-/// The turn's `job-hash` (§7.1): turn 1 is the offer's; turn n ≥ 2 is the FOLLOW-UP's, which makes
-/// every turn's receipt preimage distinct and refuses a turn-1 tree replayed as turn 2 (its
-/// sentinel was seeded from a different hash). Failure tests 3 and 10.
+/// The turn's `job-hash` (§7.1 as amended): the OFFER's, on every turn. The v2 result validators on
+/// both buyer paths require `job-hash == job_hash(offer)` (`private_content::wire::bind_content`,
+/// `public_v2::validate_evidence`), so a follow-up-derived hash would get every turn n ≥ 2 refused.
+/// Turns stay distinct without it: the receipt preimage binds each turn's own creq hash and
+/// delivered commit/answer, payment ids are the follow-up id, and a turn-1 tree cannot pass as
+/// turn 2 because a turn-n commit must have the previous turn's commit as its single parent
+/// ([`verify_turn_parent`]). `followup` is still required for n ≥ 2 (a turn needs its follow-up).
 pub fn turn_job_hash(
     private: bool,
     offer_id: &str,
@@ -569,8 +573,7 @@ pub fn turn_job_hash(
     amount_sats: u64,
 ) -> Result<String, SessionError> {
     let (id, text) = match (turn, followup) {
-        (1, _) => (offer_id, offer_task),
-        (_, Some((fid, ftext))) => (fid, ftext),
+        (1, _) | (_, Some(_)) => (offer_id, offer_task),
         _ => return Err(SessionError::Malformed("turn >= 2 without follow-up")),
     };
     if private {

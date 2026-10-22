@@ -341,15 +341,16 @@ fn eviction_is_oldest_first_and_never_running() {
     assert!(!expired_by_lifetime(&sessions, 1_000_000, 1).contains(&"running-oldest".to_owned()));
 }
 
-/// Failure tests 3 and 10 (turn hash) — every turn gets a distinct preimage hash.
+/// §7.1 as amended: every turn binds the OFFER hash (the v2 validators require it); a turn without
+/// its follow-up is refused. Turn distinctness is the parent check + per-turn creq (tests 3, 10).
 #[test]
-fn turn_hashes_are_distinct_per_turn_and_bound_to_the_followup() {
+fn turn_hashes_are_the_offer_hash_on_every_turn() {
     for private in [false, true] {
         let t1 = turn_job_hash(private, OFFER, "task", 1, None, 10).unwrap();
         let t2 = turn_job_hash(private, OFFER, "task", 2, Some((FOLLOWUP, "more")), 10).unwrap();
         let t3 = turn_job_hash(private, OFFER, "task", 3, Some((RESULT1, "more")), 10).unwrap();
-        assert_ne!(t1, t2);
-        assert_ne!(t2, t3);
+        assert_eq!(t1, t2);
+        assert_eq!(t2, t3);
         assert!(turn_job_hash(private, OFFER, "task", 2, None, 10).is_err());
     }
     assert_eq!(
@@ -367,7 +368,7 @@ fn public_turn_hash_matches_the_offer_hash_algorithm() {
     );
     assert_eq!(
         turn_job_hash(false, OFFER, "task", 2, Some((FOLLOWUP, "more")), 10).unwrap(),
-        crate::job_lifecycle::job_hash_for_offer(FOLLOWUP, "more", 10)
+        crate::job_lifecycle::job_hash_for_offer(OFFER, "task", 10)
     );
 }
 
