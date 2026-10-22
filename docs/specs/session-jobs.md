@@ -43,8 +43,10 @@ Final stakeholder summary: 21 Oct 2026 12:38 UTC.
    12:36 UTC.)
 8. **Both reviews on every turn**, the seller-side follow-up review overlapped with resume; measure
    review time on the test env before optimizing. Follow-up review context: every buyer message in full,
-   earlier deliveries summarized or left out, neither party writes it, the reviewer summarizes only past
-   the 128 KB limit. Existing trust opt-outs apply unchanged. (Josip, 20 Oct 15:52 + 21 Oct 12:38 UTC.)
+   earlier deliveries as one line each (turn, status, commit — never their content), neither party writes
+   it, the reviewer summarizes only past the 128 KB limit; the public and private (encrypted) lanes give the
+   same context (§9). Existing trust opt-outs apply unchanged. (Josip, 20 Oct 15:52 + 21 Oct 12:38 UTC;
+   private-lane parity 22 Oct 12:43 UTC.)
 9. **A follow-up to a busy seller waits for a slot**; parked sessions take a free slot before new
    offers. (Josip, 20 Oct.)
 10. **No maximum session size in v1** (harnesses compact long conversations). `session/load` end-to-end
@@ -52,7 +54,8 @@ Final stakeholder summary: 21 Oct 2026 12:38 UTC.
 11. **Credential proxy is stopped at park and re-minted per turn** (new proxy, new model-key
     placeholder each turn), not kept alive while parked. §6.4. (Josip, 21 Oct 22:24 UTC.)
 12. **Defaults** (Josip, 21 Oct 22:27 UTC): session cap when neither `post_job` nor `reply` sets
-    `max_session_sats` = `10 × job price`; parked disk budget = 20 GiB per seat (revisited after the
+    `max_session_sats` = `10 × job price` (both accept it; `reply` overrides the value stored at post —
+    Josip, 22 Oct 12:43 UTC); parked disk budget = 20 GiB per seat (revisited after the
     test-env size measurement); no automatic close of abandoned private session repos in v1
     (seller-only, create-only, 5 GiB quota); `reply` with an uncollected previous turn is refused with
     "collect first".
@@ -536,7 +539,20 @@ result could be bound as turn 1.
   subject), trimmed oldest-first to the 60 KiB message bound. The reviewer re-authenticates every
   carrier and body against the signed offer/claim/award chain (buyer-authored, `bind_content`),
   admits the buyer and the selected seller as requesters, and builds the context from those bodies
-  only. Earlier deliveries are not yet listed as one-liners on the private lane. A seller that cannot
+  only.
+  *Private-lane parity (22 Oct, Josip):* the `followup` block also carries optional `deliveries`, oldest
+  first: each earlier turn's signed RESULT carrier (turn 1: the job's result; turn n ≥ 2: the result plus
+  the buyer's signed 3412 carrier it replies to, which is where the turn number is authenticated). The
+  reviewer authenticates each against the selected chain (`validate_result`: seller-signed, this award;
+  the follow-up buyer-signed, `reply`-linked, `status=turn`), requires strictly increasing turns all
+  earlier than the follow-up under review, and reduces each to one line from the signed public tags only
+  (`turn n: <turn_status>, commit <oid|inline>`); it never decrypts a delivery body. The context is
+  rendered by the same function as the public lane (follow-ups labelled by their own turn number), so
+  both lanes give the same text for the same facts. Under the 60 KiB message bound buyer follow-ups are
+  kept first (newest first), deliveries take what is left (newest first); the current follow-up is never
+  cut. Neither party authors any line: the seller only forwards signed events, and a forged, misattributed
+  or misordered one fails the whole request. `deliveries` is omitted when empty, and every non-follow-up
+  request is byte-identical. A seller that cannot
   build the request still withholds the follow-up; it never falls back to the public lane. An old
   reviewer refuses the new field (`deny_unknown_fields`), so **the reviewer deploys before any seller
   enables `[sessions]`**.
@@ -565,8 +581,12 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
 
 *Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed) only
 when the buyer runs with `[sessions] enabled = true`; with the flag off the tool list is
-byte-identical. `max_session_sats` is accepted on `reply` only (not `post_job`): the session row is
-created at the first `reply`, from the explicit value, the config, or 10× the price.
+byte-identical. `max_session_sats` is accepted on `post_job` too (22 Oct, Josip): it is local session
+state, stored in the buyer `sessions` row right after the offer is published and never put on the offer,
+so the offer bytes are unchanged. It is listed on the `post_job` schema and accepted by the daemon only
+with `[sessions] enabled` (off: the schema is byte-identical and the daemon refuses the parameter). The
+first `reply` uses the stored cap; `reply max_session_sats` still overrides it. Cap precedence: `reply`
+value > value stored at post (or by an earlier `reply`) > `[sessions] session_cap_sats` > 10× the price.
 
 The buyer's agent needs no skill or keyword. `AGENTS.md` and `multi-turn-buying/skill.md` are updated to
 point at `reply`.
@@ -697,8 +717,8 @@ follow-up is sent or accepted, and every code path is today's.
 - **Holder rebuild** after host/Docker restart — v1 expires.
 - **Maximum session size / turn count** — harness compaction; the session cap bounds spend.
 - **Per-turn pricing** and **quote per follow-up** — turn price = job price.
-- Sessions on host-path and launcher seats; proactive expiry notices; delivery summaries in the
-  follow-up review context; migrating a session to a new image; advertising sessions on the heartbeat.
+- Sessions on host-path and launcher seats; proactive expiry notices; content summaries of earlier
+  deliveries in the follow-up review context (both lanes give one status/commit line per delivery); migrating a session to a new image; advertising sessions on the heartbeat.
 
 ---
 
