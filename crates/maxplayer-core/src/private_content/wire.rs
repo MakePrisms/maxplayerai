@@ -41,7 +41,8 @@ pub fn bind_content(
     } else if c.get("root") != Some(offer_id.as_str()) {
         return Err(Error("wrong content root"));
     }
-    if kind != 3401 && kind != 3407 && !c.participants.contains(&buyer) {
+    // A session FOLLOW-UP (3412) is addressed to the awarded seller only; the buyer authors it.
+    if kind != 3401 && kind != 3407 && kind != 3412 && !c.participants.contains(&buyer) {
         return Err(Error("wrong buyer recipient"));
     }
     if award.is_none()
@@ -172,6 +173,13 @@ pub fn bind_content(
                 && (award.is_some() || c.get("status") != Some("progress"))
         }
         3407 => content.body().kind == ContentType::Rejection && award.is_some() && author == buyer,
+        // Session follow-up (session-jobs §2.1): buyer-authored, after the award, to its seller.
+        3412 => {
+            content.body().kind == ContentType::FollowUp
+                && award.is_some()
+                && author == buyer
+                && c.participants == BTreeSet::from([seller.clone()])
+        }
         _ => false,
     };
     if !allowed {

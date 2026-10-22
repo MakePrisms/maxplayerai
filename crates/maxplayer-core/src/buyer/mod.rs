@@ -30,6 +30,8 @@ pub mod signer;
 pub mod store;
 mod preparations;
 mod auto_award_retry;
+/// Session jobs (docs/specs/session-jobs.md §8, §10): `reply`, `get_job.session`, turn collect.
+mod session_reply;
 
 /// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
 #[cfg(test)]
@@ -420,6 +422,7 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
         "get_job" => get_job(context, id, request.params).await,
         "award" => award(context, id, request.params).await,
         "collect" => collect(context, id, request.params).await,
+        "reply" => session_reply::reply(context, id, request.params).await,
         "accept_claim" | "authorize_pay" => Response::err(
             id,
             CODE_NOT_IMPLEMENTED,
@@ -799,6 +802,8 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
                 let amount = claim_price_sats(claim.creq.as_deref());
                 json!({"claim_id": claim.claim_id, "seller_pubkey": claim.seller_pubkey, "amount_sats": amount})
             }).collect();
+            // Session jobs (§10): absent unless `[sessions] enabled` (one-shot bytes unchanged).
+            let session = session_reply::view(context, &view).await;
             let mut response = json!(GetJobResponse { view, awarded, awarded_delivery_pending, review_status });
             response["award_read_confirmed"] = json!(award_read_confirmed);
             // Only the existing buyer reconciliation decides that held funds are released.
@@ -808,6 +813,10 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             response["auto_award_state"] = json!(context.store.pending_award_state(response["job_id"].as_str().unwrap_or_default())
                 .ok().flatten().map(|(state, _)| state));
             response["claim_prices"] = json!(claim_prices);
+            // Session jobs (§10): absent unless `[sessions] enabled` (one-shot bytes unchanged).
+            if let Some(session) = session {
+                response["session"] = session;
+            }
             Response::ok(id, response)
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
@@ -1196,6 +1205,13 @@ struct CollectParams {
     job_id: String,
     #[serde(default)]
     out: Option<String>,
+    /// Session jobs (§8.4): the turn to settle (≥ 2). Omitted ⇒ the newest delivered, uncollected
+    /// turn once turn 1 is collected, else turn 1.
+    #[serde(default)]
+    turn: Option<u32>,
+    /// Session jobs (§10): collect, then send the `close` follow-up.
+    #[serde(default)]
+    close_session: bool,
 }
 
 /// Collect a delivered job: run the sealed pay path ([`collect::collect_async`] — accept-if-needed,
@@ -1409,7 +1425,63 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
     };
 
+    let sessions = context.home.config.sessions.enabled;
+    if !sessions && (params.turn.is_some_and(|t| t > 1) || params.close_session) {
+        return Response::err(id, CODE_REFUSED, session_reply::disabled());
+    }
+    match session_reply::collect_target(context, &params.job_id, params.turn).await {
+        Ok(Some(row)) => {
+            if params.out.is_some() {
+                return Response::err(id, CODE_REFUSED, "a session turn collects into results/<job>-t<n>; omit out".to_owned());
+            }
+            let settled = session_reply::settle_turn(context, &row).await;
+            return match settled {
+                Ok(outcome) => {
+                    let closed = if params.close_session {
+                        Some(collect_close(context, &params.job_id).await)
+                    } else {
+                        None
+                    };
+                    Response::ok(
+                        id,
+                        json!({
+                            "pay": collect_pay_response(&outcome.pay),
+                            "commit_oid": outcome.commit_oid,
+                            "path": outcome.path,
+                            "files": outcome.files,
+                            "agent_used": outcome.agent_used,
+                            "model_used": outcome.model_used,
+                            "turn": row.turn,
+                            "session_closed": closed,
+                        }),
+                    )
+                }
+                Err(error) => {
+                    crate::opline!("{}", could_not_settle_line(&params.job_id, &error));
+                    Response::err(id, CODE_REFUSED, error)
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return Response::err(id, CODE_REFUSED, error),
+    }
+    let close_session = params.close_session;
     match settle_job(context, &params.job_id, params.out).await {
+        Ok(outcome) if close_session => {
+            let closed = collect_close(context, &params.job_id).await;
+            Response::ok(
+                id,
+                json!({
+                    "pay": collect_pay_response(&outcome.pay),
+                    "commit_oid": outcome.commit_oid,
+                    "path": outcome.path,
+                    "files": outcome.files,
+                    "agent_used": outcome.agent_used,
+                    "model_used": outcome.model_used,
+                    "session_closed": closed,
+                }),
+            )
+        }
         Ok(outcome) => Response::ok(
             id,
             json!({
@@ -1430,6 +1502,17 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
             Response::err(id, CODE_REFUSED, error.to_string())
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// `collect close_session=true`: the collect already settled; a close failure is reported, not raised.
+async fn collect_close(context: &BuyerContext, job_id: &str) -> Value {
+    let Some(award) = context.store.award_record(job_id).ok().flatten() else {
+        return json!(false);
+    };
+    match session_reply::send_close(context, job_id, &award.seller_pubkey).await {
+        Ok(()) => json!(true),
+        Err(error) => json!(error),
     }
 }
 
@@ -2932,6 +3015,10 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
 /// award/collect. Only a genuine failure report takes the lock, under which the authorization +
 /// release mirrors [`terminalize_absent_attempt`]'s money-serialized verdict.
 async fn release_on_failure_feedback(context: &BuyerContext, event: &nostr_sdk::Event) {
+    // A feedback naming one of our session turns frees THAT turn's reservation, never the job's.
+    if session_reply::on_turn_feedback(context, event).await {
+        return;
+    }
     if !is_releasable_failure_feedback(event) {
         return; // progress / other feedback — not actionable, and not worth taking the money lock.
     }
@@ -3116,6 +3203,21 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         let has_bind = job_lifecycle::load_accepted_bind(&context.home, job_id)
             .map(|bind| bind.is_some())
             .unwrap_or(false);
+        // Session turn (§8.1): the reservation is keyed by the FOLLOW-UP id, which names no job on
+        // the relay. It stays payable while the turn is live or accepted; `no_response`, refusal
+        // feedback and collect own its other transitions. An unreadable row keeps the funds.
+        match context.store.turn(job_id) {
+            Ok(Some(turn)) => {
+                let live = !matches!(turn.state.as_str(), "refused" | "no_response");
+                payable.insert(job_id.clone(), live || has_bind);
+                continue;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                payable.insert(job_id.clone(), true);
+                continue;
+            }
+        }
         let claim_live = match job_lifecycle::fetch_job_view_async(
             &context.home,
             &keys,
@@ -3356,7 +3458,8 @@ fn scan_payment_progress(home: &MaxplayerHome) -> BTreeMap<String, PaymentProgre
             .collect();
         let Ok(records) = records else { continue };
         let Some(first) = records.first() else { continue };
-        let job_id = first.key.job_id.as_str().to_owned();
+        // The reservation key: the job id, or the follow-up id of a session turn (§8.2).
+        let job_id = first.key.payload_id().to_owned();
         let folded = match PaymentMachine::fold(&first.key, &records) {
             Ok(state) => progress_from_state(state.as_ref()),
             // A journal that will not fold is ambiguous — keep the reservation, never release it.
@@ -6421,6 +6524,7 @@ mod tests {
 
         fn claim_with(status: &str, seller_pubkey: String) -> job_lifecycle::ClaimView {
             job_lifecycle::ClaimView {
+                session: false,
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
                 // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
@@ -6439,6 +6543,7 @@ mod tests {
 
         fn result(commit_oid: Option<String>) -> job_lifecycle::ResultView {
             job_lifecycle::ResultView {
+                session: Default::default(),
                 private_evidence: None,
                 inline_answer: None,
                 result_id: "r".repeat(64),
@@ -6481,6 +6586,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    followup_id: None,
                     private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,
@@ -6524,6 +6630,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    followup_id: None,
                     private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,

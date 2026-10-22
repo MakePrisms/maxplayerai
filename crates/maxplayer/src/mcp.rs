@@ -730,6 +730,7 @@ mod tests {
             job_id,
             offer: None,
             claims: vec![ClaimView {
+                session: false,
                 claim_id: "c".repeat(64),
                 created_at: 1,
                 seller_pubkey: seller_pubkey.to_owned(),

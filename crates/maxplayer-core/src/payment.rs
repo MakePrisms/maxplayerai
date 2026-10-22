@@ -186,9 +186,25 @@ pub struct PaymentKey {
     /// fields denote the realized terms, with `mint` re-pointed to the payload's mint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq_hash: Option<String>,
+    /// Session turn ≥ 2 (session-jobs §8.2): the NUT-18 payload id, the follow-up id the turn's
+    /// creq names. NOT folded into the [`AttemptId`] (the result id already makes each turn's
+    /// attempt distinct) and absent on every one-shot key, so existing journals read unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_id: Option<String>,
 }
 
 impl PaymentKey {
+    /// Set the session-turn payload id (§8.2). `None` leaves the key as it was.
+    pub fn with_payment_id(mut self, payment_id: Option<String>) -> Self {
+        self.payment_id = payment_id;
+        self
+    }
+
+    /// The id the NUT-18 payment payload carries: the follow-up id on a session turn, else the job.
+    pub fn payload_id(&self) -> &str {
+        self.payment_id.as_deref().unwrap_or(self.job_id.as_str())
+    }
+
     /// Builds a key from trade identity and typed payment terms.
     ///
     /// `creq_hash` is the seller-authored request hash bound into the attempt; pass
@@ -211,6 +227,7 @@ impl PaymentKey {
             unit: terms.unit.clone(),
             mint: terms.mint.clone(),
             creq_hash,
+            payment_id: None,
         }
     }
 

@@ -259,6 +259,117 @@ pub async fn collect_async(
     })
 }
 
+/// Session jobs (§8.4): settle ONE turn ≥ 2 — accept its result if needed (per-turn bind at
+/// `jobs/<followup_id>.json`, ACCEPT with `reply`), refuse a git turn whose commit does not have the
+/// previous git turn's commit as its single parent (before any spend), then pay (NUT-18 payload id
+/// = the follow-up id) or settle free, and materialize into `results/<job_id>-t<n>`.
+/// `earlier` lists the follow-up ids of turns 2..n-1, oldest first.
+pub async fn collect_turn_async(
+    home: &MaxplayerHome,
+    gate: Option<&mut BudgetGate>,
+    job_id: &str,
+    followup_id: &str,
+    turn: u32,
+    earlier: &[String],
+) -> Result<CollectOutcome, CollectError> {
+    let bind = job_lifecycle::accept_turn_async(home, job_id, followup_id)
+        .await
+        .map_err(CollectError::Lifecycle)?;
+    let dest = results_dest(home, &crate::session::collect_dir_name(job_id, turn), None)
+        .map_err(CollectError::Input)?;
+    if !bind_is_inline(&bind) {
+        if let Some(parent) = job_lifecycle::turn_parent_commit(home, job_id, earlier)
+            .map_err(CollectError::Lifecycle)?
+        {
+            verify_turn_parent_in_store(home, &bind, &parent)?;
+        }
+    }
+    if bind.payment_mode.is_free() {
+        job_lifecycle::validate_private_bind(home, &bind).map_err(CollectError::Lifecycle)?;
+        let files = match bind.inline_answer.as_deref() {
+            Some(answer) if bind_is_inline(&bind) => {
+                let files = materialize_inline_delivery(answer, &dest)
+                    .map_err(CollectError::Materialize)?;
+                write_free_collect_record(home, &bind, &dest, &files)?;
+                files
+            }
+            _ => collect_free(home, &bind, &dest)?,
+        };
+        return Ok(CollectOutcome {
+            pay: CollectPayment::Free,
+            commit_oid: bind.commit_oid,
+            path: dest.display().to_string(),
+            files,
+            agent_used: bind.agent_used,
+            model_used: bind.model_used,
+        });
+    }
+    let pay_request =
+        job_lifecycle::authorize_request_from_bind(&bind, bind.amount_sats, bind.commit_oid.clone())
+            .map_err(CollectError::Lifecycle)?;
+    let gate = gate.ok_or_else(|| {
+        CollectError::Input("a priced turn collect requires the durable budget gate".to_owned())
+    })?;
+    let pay = authorize_pay::authorize_pay_async(home, gate, pay_request)
+        .await
+        .map_err(CollectError::Pay)?;
+    let files = match bind.inline_answer.as_deref() {
+        Some(answer) if bind_is_inline(&bind) => {
+            materialize_inline_delivery(answer, &dest).map_err(CollectError::Materialize)?
+        }
+        _ => materialize_delivery(
+            &delivery_store_path(home),
+            &PayPathDeliveryVerifier::store_ref_for(&bind.commit_oid),
+            &bind.commit_oid,
+            &dest,
+        )
+        .map_err(CollectError::Materialize)?,
+    };
+    Ok(CollectOutcome {
+        pay: CollectPayment::Sat(pay),
+        commit_oid: bind.commit_oid,
+        path: dest.display().to_string(),
+        files,
+        agent_used: bind.agent_used,
+        model_used: bind.model_used,
+    })
+}
+
+/// Fetch + tip-match the turn's delivery into the buyer store, then require its single parent to
+/// be `parent` (failure test 10). Runs before any payment; a refusal pays and writes nothing.
+fn verify_turn_parent_in_store(
+    home: &MaxplayerHome,
+    bind: &AcceptedBind,
+    parent: &str,
+) -> Result<(), CollectError> {
+    let commit_oid = CommitOid::parse(bind.commit_oid.clone())
+        .map_err(|error| CollectError::Integrity(format!("accepted commit_oid: {error}")))?;
+    let delivery = GitDelivery::new(bind.repo.clone(), bind.branch.clone(), commit_oid)
+        .map_err(|error| CollectError::Integrity(format!("accepted delivery: {error}")))?;
+    let secret_hex = home::read_secret_key_hex(home)
+        .map_err(|error| CollectError::Integrity(format!("buyer key: {error}")))?;
+    let store = delivery_store_path(home);
+    let mut verifier = PayPathDeliveryVerifier::new(store.clone(), Some(secret_hex));
+    let verified = verifier
+        .verify(&delivery)
+        .map_err(|error| CollectError::Integrity(format!("delivery verify refused: {error}")))?;
+    if verified.commit_oid().as_str() != bind.commit_oid {
+        return Err(CollectError::Integrity("turn delivery tip does not match its bind".into()));
+    }
+    let parents = commit_parents(&store, &bind.commit_oid).map_err(CollectError::Integrity)?;
+    crate::session::verify_turn_parent(&parents, parent)
+        .map_err(|why| CollectError::Integrity(format!("turn {}: {why}", bind.commit_oid)))
+}
+
+/// The parent oids of `commit_oid` in the buyer store.
+pub fn commit_parents(store: &Path, commit_oid: &str) -> Result<Vec<String>, String> {
+    let repo = git2::Repository::open_bare(store)
+        .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
+    let oid = git2::Oid::from_str(commit_oid).map_err(|error| error.to_string())?;
+    let commit = repo.find_commit(oid).map_err(|error| error.to_string())?;
+    Ok(commit.parent_ids().map(|id| id.to_string()).collect())
+}
+
 /// Blocking wrapper over [`collect_async`] for the CLI (builds a current-thread runtime).
 pub fn collect_blocking(
     home: &MaxplayerHome,
@@ -412,7 +523,8 @@ fn write_free_collect_record(
     dest: &Path,
     files: &[String],
 ) -> Result<(), CollectError> {
-    let path = free_collect_record_path(home, &bind.job_id);
+    // A session turn's record is keyed by its follow-up, so it never collides with turn 1's.
+    let path = free_collect_record_path(home, bind.followup_id.as_deref().unwrap_or(&bind.job_id));
     if path.exists() {
         return Ok(());
     }
@@ -724,6 +836,7 @@ mod tests {
     // Helper: a from-scratch accept-bind pinning `commit_oid` (used by refuse-path tests).
     fn bind_for(job_id: &str, seller_hex: &str, commit_oid: &str) -> AcceptedBind {
         AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,

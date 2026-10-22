@@ -262,7 +262,7 @@ impl BuyerStore {
              CREATE TABLE IF NOT EXISTS sessions (
                  job_id           TEXT PRIMARY KEY,
                  session_cap_sats INTEGER NOT NULL CHECK (session_cap_sats >= 0),
-                 state            TEXT NOT NULL CHECK (state IN ('open','closed')),
+                 state            TEXT NOT NULL CHECK (state IN ('open','closed','expired')),
                  updated_at_unix  INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS session_turns (
@@ -453,6 +453,33 @@ impl BuyerStore {
             "UPDATE session_turns SET state = ?2, result_id = COALESCE(?3, result_id),
                  updated_at_unix = ?4 WHERE followup_id = ?1",
             params![followup_id, state, result_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// One turn by its follow-up id (also how a reservation key is recognised as a turn's).
+    pub fn turn(&self, followup_id: &str) -> Result<Option<BuyerTurn>, StoreError> {
+        let conn = self.lock()?;
+        read_turn(&conn, followup_id)
+    }
+
+    /// `(cap, state)` of a session row; `None` before the first `reply`.
+    pub fn session_row(&self, job_id: &str) -> Result<Option<(u64, String)>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT session_cap_sats, state FROM sessions WHERE job_id = ?1",
+                [job_id],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The seller ended the session (`session_expired`): no further turn can start.
+    pub fn expire_session(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "UPDATE sessions SET state = 'expired', updated_at_unix = ?2 WHERE job_id = ?1",
+            params![job_id, now_unix],
         )?;
         Ok(())
     }

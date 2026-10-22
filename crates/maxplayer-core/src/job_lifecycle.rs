@@ -364,6 +364,43 @@ pub struct ClaimView {
     /// unpayable, not free, and the award filter refuses it for a different reason.
     #[serde(default)]
     pub payment_mode: PaymentMode,
+    /// Session jobs (§2.2): the claim advertised `["session","1"]`. Never serialized when false, so
+    /// a one-shot view is byte-identical to today's.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub session: bool,
+}
+
+/// Session-job tags on a RESULT (§2.3). All default on a one-shot (turn-1) result.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct ResultSession {
+    /// The FOLLOW-UP this result answers (`["e", followup, "", "reply"]`); `None` on turn 1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply: Option<String>,
+    /// `turn_status`; `None` ⇒ `done`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_status: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub context_reset: bool,
+    /// The turn's own payment request (priced jobs, turn ≥ 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creq: Option<String>,
+}
+impl ResultSession {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+    pub fn from_tags(tags: &[TagSpec]) -> Self {
+        let reply = tags
+            .iter()
+            .find(|t| t.first() == Some("e") && t.0.get(3).map(String::as_str) == Some("reply"))
+            .and_then(|t| t.0.get(1).cloned());
+        Self {
+            reply,
+            turn_status: first_tag_value(tags, "turn_status").map(str::to_owned),
+            context_reset: crate::session::result_context_reset(tags),
+            creq: first_tag_value(tags, "creq").map(str::to_owned),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -403,7 +440,15 @@ pub struct ResultView {
     /// well-formed `job-class=contribution` echo AND a `sig/seller-contribution` tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contribution: Option<ContributionResultView>,
+    /// Session-job result tags (§2.3); default (and never serialized) on a one-shot result.
+    #[serde(default, skip_serializing_if = "ResultSession::is_default")]
+    pub session: ResultSession,
 }
+
+/// Session jobs (§8.2–8.4): per-turn accept-bind, creq check and parent commit.
+#[path = "job_lifecycle/session_turn.rs"]
+mod session_turn;
+pub use session_turn::{accept_turn_async, turn_parent_commit};
 
 /// Local accept-bind recorded by [`accept_claim`] for authorize_pay.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +540,11 @@ pub struct AcceptedBind {
     /// [`PaymentMode::Sat`] and behaves byte-identically to before.
     #[serde(default)]
     pub payment_mode: PaymentMode,
+    /// Session jobs (§8.2): the FOLLOW-UP this bind settles (turn ≥ 2). The bind lives at
+    /// `jobs/<followup_id>.json`, its result answers that follow-up, and its NUT-18 payload id is
+    /// the follow-up id. `None` on every one-shot / turn-1 bind (never serialized).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub followup_id: Option<String>,
 }
 
 /// Contribution binds captured in the accept-bind. `target_*` / `base_*` come from the
@@ -1912,6 +1962,7 @@ pub async fn accept_claim_async(
         // The bind records what a free trade actually is: no amount, no creq, no mints, no funding
         // or delivery mint, and the mode that makes `authorize_pay` refuse it (§2.5).
         let mut bind = AcceptedBind {
+            followup_id: None,
             private_evidence: result.private_evidence.clone(),
             job_id: request.job_id.clone(),
             claim_id: request.claim_id.clone(),
@@ -2046,6 +2097,7 @@ pub async fn accept_claim_async(
     // bind carries an empty `accept_event_id` (the pay path never reads that field — it is a
     // record only), then we publish and finalize the bind with the real id + timestamp.
     let mut bind = AcceptedBind {
+        followup_id: None,
         private_evidence: result.private_evidence.clone(),
         job_id: request.job_id.clone(),
         claim_id: request.claim_id.clone(),
@@ -2213,7 +2265,7 @@ fn select_deliverable_claim(
     let delivered = view
         .results
         .iter()
-        .any(|result| result.seller_pubkey == awarded.seller_pubkey && result.has_delivery());
+        .any(|result| result.seller_pubkey == awarded.seller_pubkey && result.is_turn_one_delivery());
     if !delivered {
         return Err(JobLifecycleError::NotFound(format!(
             "collect: the awarded seller for job {} has not delivered a result yet — wait for \
@@ -2247,7 +2299,7 @@ pub(crate) fn awarded_delivery_pending(
     }
     view.results
         .iter()
-        .any(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
+        .any(|result| result.seller_pubkey == seller_pubkey && result.is_turn_one_delivery())
 }
 
 /// Accept-time contribution resolution. Authority is the buyer's SIGNED OFFER:
@@ -2616,6 +2668,8 @@ pub fn authorize_request_from_bind(
         // Thread the sealed mode so the §2.5 entry guard can refuse a free bind. A legacy bind
         // deserializes to `Sat` and reaches the pay path exactly as it always did.
         payment_mode: bind.payment_mode,
+        // Session turn ≥ 2: the NUT-18 payload id is the follow-up id (§8.2).
+        payment_id: bind.followup_id.clone(),
     })
 }
 
@@ -2721,7 +2775,7 @@ pub(crate) fn validate_private_bind(home: &MaxplayerHome, bind: &AcceptedBind) -
 fn write_accepted_bind(home: &MaxplayerHome, bind: &AcceptedBind) -> Result<(), JobLifecycleError> {
     let dir = home.root.join(JOBS_DIR);
     fs::create_dir_all(&dir).map_err(|error| JobLifecycleError::Io(error.to_string()))?;
-    let path = bind_path(home, &bind.job_id);
+    let path = bind_path(home, bind.followup_id.as_deref().unwrap_or(&bind.job_id));
     let raw = serde_json::to_string_pretty(bind)
         .map_err(|error| JobLifecycleError::Io(format!("accept bind encode: {error}")))?;
     // Crash-atomic rewrite (temp → sync → rename → dir-fsync): a crash between the relay publish and
@@ -2852,7 +2906,7 @@ fn now_unix() -> u64 {
 fn delivery_pay_deadline(results: &[ResultView], seller_pubkey: &str) -> Option<u64> {
     results
         .iter()
-        .filter(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
+        .filter(|result| result.seller_pubkey == seller_pubkey && result.is_turn_one_delivery())
         .map(|result| result.created_at)
         .max()
         .map(|created_at| created_at.saturating_add(DELIVERY_PAY_WINDOW_SECS))
@@ -3323,6 +3377,7 @@ fn claim_view_from_tags(
     tags: &[crate::gateway::TagSpec],
 ) -> ClaimView {
     ClaimView {
+        session: crate::session::claim_supports_sessions(tags),
         claim_id,
         created_at,
         seller_pubkey,
@@ -3361,6 +3416,12 @@ impl ResultView {
     pub fn has_delivery(&self) -> bool {
         self.commit_oid.is_some() || self.inline_answer.is_some()
     }
+
+    /// A delivery of the JOB itself (turn 1): a session turn ≥ 2 result (it carries a `reply` to
+    /// its follow-up) is settled through the session path and never stands in for turn 1.
+    pub fn is_turn_one_delivery(&self) -> bool {
+        self.has_delivery() && self.session.reply.is_none()
+    }
 }
 
 /// Build one [`ResultView`] from a published RESULT event.
@@ -3383,6 +3444,7 @@ fn result_view_from_event(
         .and_then(|value| value.parse().ok());
     let (harness, model) = result_attribution(&draft.tags);
     ResultView {
+        session: ResultSession::from_tags(&draft.tags),
         private_evidence: None,
         // Threaded, not dropped: `accept_claim_async` reads the answer off this view to build the
         // bind. Pinned to `None`, every inline result takes the git arm of the accept split and
@@ -4117,7 +4179,7 @@ fn select_result<'a>(
     }
     results
         .iter()
-        .find(|result| result.seller_pubkey == seller_pubkey && result.has_delivery())
+        .find(|result| result.seller_pubkey == seller_pubkey && result.is_turn_one_delivery())
         .ok_or_else(|| {
             JobLifecycleError::NotFound(format!(
                 "no delivered result from seller {seller_pubkey} for this job"
@@ -4618,6 +4680,7 @@ mod tests {
     #[test]
     fn authorize_from_bind_refuses_amount_drift() {
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -4661,6 +4724,7 @@ mod tests {
     #[test]
     fn single_settlement_refuses_different_result_and_is_idempotent_on_same() {
         let existing = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -4753,6 +4817,7 @@ mod tests {
             require_seller_signature(&Some("ab".repeat(64))).expect("valid non-empty sig accepted");
         assert_eq!(valid_sig, "ab".repeat(64));
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -4809,6 +4874,7 @@ mod tests {
     #[test]
     fn explicit_and_bind_forms_build_identical_request() {
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -4841,6 +4907,7 @@ mod tests {
         // The explicit request as mcp.rs builds it, with a job_hash that DIVERGES from the bind
         // (the real-trade failure) and creq_hash/accepted_mints/seller_signature left for the fill.
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4874,6 +4941,7 @@ mod tests {
     #[test]
     fn explicit_form_seals_repo_and_branch_from_bind() {
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -4899,6 +4967,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -4932,6 +5001,7 @@ mod tests {
     #[test]
     fn byte_equal_explicit_matches_bind_request() {
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -4961,6 +5031,7 @@ mod tests {
 
         // Explicit form with EVERY field byte-equal to the bind (the incident's inputs).
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -5000,6 +5071,7 @@ mod tests {
         let bound_mint = "https://mint.minibits.cash/Bitcoin".to_string();
         let attacker_mint = "https://evil.example/attacker".to_string();
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5027,6 +5099,7 @@ mod tests {
             contribution: None,
         };
         let mut explicit = crate::authorize_pay::AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -5113,6 +5186,7 @@ mod tests {
             CashuPublicKey::from_str(&format!("02{}", seller_nostr.to_hex())).expect("p2pk");
 
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5231,6 +5305,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5441,6 +5516,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5515,6 +5591,7 @@ mod tests {
         let job_id = "aa".repeat(32);
 
         let bind_for = |result_id: &str| AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5608,6 +5685,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = home::bootstrap(&root).expect("home");
         let mut bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5658,6 +5736,7 @@ mod tests {
     #[test]
     fn authorize_from_bind_requires_buyer_tip_match_hash() {
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5703,6 +5782,7 @@ mod tests {
     #[test]
     fn assert_authorize_matches_bind_refuses_seller_mismatch() {
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -5735,6 +5815,7 @@ mod tests {
 
     fn result_view(result_id: &str, seller_pubkey: &str) -> ResultView {
         ResultView {
+            session: Default::default(),
             private_evidence: None,
             inline_answer: None,
             result_id: result_id.to_owned(),
@@ -5886,6 +5967,7 @@ mod tests {
     // the winning claim + its seller. These drive the resolver purely, no relay.
     fn claim_with(claim_id: &str, seller: &str, status: &str, live: bool) -> ClaimView {
         ClaimView {
+            session: false,
             payment_mode: crate::gateway::PaymentMode::Sat,
             claim_id: claim_id.to_owned(),
             created_at: 100,
@@ -6024,6 +6106,7 @@ mod tests {
 
     fn claim_view(claim_id: &str, created_at: u64, status: &str) -> ClaimView {
         ClaimView {
+            session: false,
             payment_mode: crate::gateway::PaymentMode::Sat,
             claim_id: claim_id.to_owned(),
             created_at,
@@ -6041,6 +6124,7 @@ mod tests {
     /// `commit_oid` so [`delivery_pay_deadline`] counts it as a delivery.
     fn delivery_result(seller_pubkey: &str, created_at: u64) -> ResultView {
         ResultView {
+            session: Default::default(),
             private_evidence: None,
             inline_answer: None,
             result_id: format!("res-{created_at}"),
@@ -7058,6 +7142,7 @@ mod tests {
         let answer = "Europe/Zagreb";
         let digest = crate::receipt::result_content_hash_hex(answer);
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: Some(crate::receipt::DeliveryKind::Inline.as_str().to_owned()),
             inline_answer: Some(answer.to_owned()),
@@ -7097,6 +7182,7 @@ mod tests {
     #[test]
     fn authorize_request_from_bind_threads_contribution() {
         let mut bind = AcceptedBind {
+            followup_id: None,
             private_evidence: None,
             delivery_kind: None,
             inline_answer: None,
@@ -8129,6 +8215,7 @@ mod free_lane_tests {
 
     fn claim_view(mode: PaymentMode, creq: Option<&str>) -> ClaimView {
         ClaimView {
+            session: false,
             payment_mode: mode,
             capability: crate::heartbeat::SeatCapability::default(),
             claim_id: "c".repeat(64),
@@ -8385,6 +8472,7 @@ mod review_exposure_tests {
         let root = std::env::temp_dir().join(format!("review-exposure-{}", uuid::Uuid::new_v4()));
         let mut home = crate::home::bootstrap(&root).unwrap();
         let result = ResultView {
+            session: Default::default(),
             private_evidence: None,
             result_id: "a".repeat(64),
             created_at: 1,
@@ -8672,6 +8760,7 @@ mod private_flow_tests {
         let public_view = serde_json::to_string(&view.results[0]).unwrap();
         assert!(!public_view.contains("body_b64"), "internal signed evidence is not a presentation field");
         let bind = AcceptedBind {
+            followup_id: None,
             private_evidence: Some(evidence.clone()), job_id: request.job_id.clone(), claim_id: evidence.claim.id.to_hex(),
             result_id: request.result_id.clone(), seller_pubkey: request.seller_pubkey.clone(), commit_oid: request.commit_oid.clone(),
             repo: String::new(), branch: String::new(), delivery_kind: Some("inline".into()), inline_answer: request.inline_answer.clone(),

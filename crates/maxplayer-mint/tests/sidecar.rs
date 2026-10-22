@@ -1050,6 +1050,7 @@ async fn credits_first_preupgrade_bind_replans_without_spend_or_journal() {
         creq_hash: None,
     };
     let request = AuthorizePayRequest {
+        payment_id: None,
         private_evidence: None,
         job_id: preimage.offer_id.clone(),
         result_id: "cc".repeat(32),
@@ -1269,6 +1270,7 @@ async fn credits_first_https_hop_child() {
         creq_hash: None,
     };
     let request = AuthorizePayRequest {
+        payment_id: None,
         private_evidence: None,
         job_id: preimage.offer_id.clone(),
         result_id: "cc".repeat(32),
