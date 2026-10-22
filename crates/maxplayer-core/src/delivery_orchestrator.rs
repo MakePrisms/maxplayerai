@@ -293,11 +293,14 @@ pub fn run_session_followup(
     }
     spawn_agent(agent_workdir)?;
     if let Some(base) = base_oid
-        && seller_git::session_tree_unchanged(agent_workdir, base).map_err(OrchestratorError::Gate)?
+        && seller_git::session_tree_unchanged(agent_workdir, base)
+            .map_err(OrchestratorError::Gate)?
     {
-        return Err(OrchestratorError::Gate(SellerGitError::NoExecutionObserved(
-            "session workdir unchanged since the previous turn — no execution observed".into(),
-        )));
+        return Err(OrchestratorError::Gate(
+            SellerGitError::NoExecutionObserved(
+                "session workdir unchanged since the previous turn — no execution observed".into(),
+            ),
+        ));
     }
     let delivery_oid = seller_git::snapshot_delivery_at(
         agent_workdir,
@@ -515,19 +518,29 @@ pub fn await_session_release(
 ) -> Result<SessionRelease, OrchestratorError> {
     let started = std::time::Instant::now();
     loop {
-        if let Some(raw) = read_exchange_file(out_dir, SESSION_ABORT_FILE, EXCHANGE_MARKER_MAX_BYTES)? {
+        if let Some(raw) =
+            read_exchange_file(out_dir, SESSION_ABORT_FILE, EXCHANGE_MARKER_MAX_BYTES)?
+        {
             let _ = std::fs::remove_file(out_dir.join(SESSION_ABORT_FILE));
             if raw.trim_ascii() != nonce.as_bytes() {
-                return Err(OrchestratorError::Tampered("abort file nonce mismatch".into()));
+                return Err(OrchestratorError::Tampered(
+                    "abort file nonce mismatch".into(),
+                ));
             }
             return Ok(SessionRelease::Abort);
         }
-        if let Some(raw) = read_exchange_file(out_dir, SESSION_PROMPT_FILE, EXCHANGE_PROMPT_MAX_BYTES)? {
+        if let Some(raw) =
+            read_exchange_file(out_dir, SESSION_PROMPT_FILE, EXCHANGE_PROMPT_MAX_BYTES)?
+        {
             std::fs::remove_file(out_dir.join(SESSION_PROMPT_FILE)).map_err(|error| {
-                OrchestratorError::Io(format!("delete {SESSION_PROMPT_FILE}: {error}; refusing to prompt"))
+                OrchestratorError::Io(format!(
+                    "delete {SESSION_PROMPT_FILE}: {error}; refusing to prompt"
+                ))
             })?;
             let prompt: SessionPrompt = serde_json::from_slice(&raw).map_err(|error| {
-                OrchestratorError::Tampered(format!("{SESSION_PROMPT_FILE} does not parse ({error})"))
+                OrchestratorError::Tampered(format!(
+                    "{SESSION_PROMPT_FILE} does not parse ({error})"
+                ))
             })?;
             if prompt.nonce != nonce {
                 return Err(OrchestratorError::Tampered(format!(
@@ -544,7 +557,10 @@ pub fn await_session_release(
 }
 
 /// Host side: release the prompt (after the review passed). Owner-only, never over a file.
-pub fn write_session_prompt(out_dir: &Path, prompt: &SessionPrompt) -> Result<(), OrchestratorError> {
+pub fn write_session_prompt(
+    out_dir: &Path,
+    prompt: &SessionPrompt,
+) -> Result<(), OrchestratorError> {
     let json = serde_json::to_string(prompt)
         .map_err(|error| OrchestratorError::Io(format!("encode prompt: {error}")))?;
     write_secret_file(&out_dir.join(SESSION_PROMPT_FILE), &json)
@@ -841,7 +857,7 @@ fn drive_acp_agent(
         Ok(report) => Ok(AgentOutcome {
             // `bound_text` sets this when it cuts; nothing is cut yet at this point.
             last_agent_message_truncated: false,
-                session: None,
+            session: None,
             usage: report.usage,
             last_agent_message: report.last_agent_message,
         }),
@@ -2255,7 +2271,10 @@ mod tests {
 
         // Abort: no prompt, and the inputs' own prompt is never used.
         write_session_abort(&io, NONCE).expect("abort");
-        assert_eq!(session_prompt_for(&inputs, false, poll).expect("abort read"), None);
+        assert_eq!(
+            session_prompt_for(&inputs, false, poll).expect("abort read"),
+            None
+        );
         assert!(!io.join(SESSION_ABORT_FILE).exists());
 
         // Released: the composed follow-up, file consumed; the reset variant after a reset.
@@ -2266,18 +2285,28 @@ mod tests {
         };
         write_session_prompt(&io, &released).expect("release");
         assert_eq!(
-            session_prompt_for(&inputs, false, poll).expect("read").as_deref(),
+            session_prompt_for(&inputs, false, poll)
+                .expect("read")
+                .as_deref(),
             Some("follow-up")
         );
-        assert!(!io.join(SESSION_PROMPT_FILE).exists(), "consumed before prompting");
+        assert!(
+            !io.join(SESSION_PROMPT_FILE).exists(),
+            "consumed before prompting"
+        );
         write_session_prompt(&io, &released).expect("release");
         assert_eq!(
-            session_prompt_for(&inputs, true, poll).expect("read").as_deref(),
+            session_prompt_for(&inputs, true, poll)
+                .expect("read")
+                .as_deref(),
             Some("task + follow-ups")
         );
 
         // Forged (wrong nonce): refused.
-        let forged = SessionPrompt { nonce: "f".repeat(64), ..released };
+        let forged = SessionPrompt {
+            nonce: "f".repeat(64),
+            ..released
+        };
         write_session_prompt(&io, &forged).expect("plant");
         assert!(matches!(
             session_prompt_for(&inputs, false, poll),
@@ -2287,7 +2316,9 @@ mod tests {
         // A one-shot job (or turn 1) never waits: it takes the inputs prompt.
         let one_shot = inputs_for(&root, PushTokenSource::None);
         assert_eq!(
-            session_prompt_for(&one_shot, false, poll).expect("one-shot").as_deref(),
+            session_prompt_for(&one_shot, false, poll)
+                .expect("one-shot")
+                .as_deref(),
             Some("do the task")
         );
         let _ = fs::remove_dir_all(&root);
@@ -2301,14 +2332,33 @@ mod tests {
         let workdir = root.join("work");
         fs::create_dir_all(&workdir).expect("mkdir");
         let id = DeliveryAgentIdentity::for_seller("e".repeat(64).as_str());
-        let first = run_phase1(&workdir, &id, None, "maxplayer/abc12345", "t1", DATE, JOB_HASH, |dir| {
-            fs::write(dir.join("a.txt"), "one\n").map_err(|e| OrchestratorError::Io(e.to_string()))
-        })
+        let first = run_phase1(
+            &workdir,
+            &id,
+            None,
+            "maxplayer/abc12345",
+            "t1",
+            DATE,
+            JOB_HASH,
+            |dir| {
+                fs::write(dir.join("a.txt"), "one\n")
+                    .map_err(|e| OrchestratorError::Io(e.to_string()))
+            },
+        )
         .expect("turn 1");
         let hash2 = "b".repeat(64);
         let second = run_session_followup(
-            &workdir, &id, Some(&first.delivery_oid), "maxplayer/abc12345-t2", "t2", DATE + 1, &hash2,
-            |dir| fs::write(dir.join("a.txt"), "two\n").map_err(|e| OrchestratorError::Io(e.to_string())),
+            &workdir,
+            &id,
+            Some(&first.delivery_oid),
+            "maxplayer/abc12345-t2",
+            "t2",
+            DATE + 1,
+            &hash2,
+            |dir| {
+                fs::write(dir.join("a.txt"), "two\n")
+                    .map_err(|e| OrchestratorError::Io(e.to_string()))
+            },
         )
         .expect("turn 2");
         let repo = git2::Repository::open(&workdir).expect("open");
@@ -2321,11 +2371,23 @@ mod tests {
 
         // Turn 3 changes nothing: the gate refuses (inline turn or no_sentinel, host decides).
         let err = run_session_followup(
-            &workdir, &id, Some(&second.delivery_oid), "maxplayer/abc12345-t3", "t3", DATE + 2,
-            &"c".repeat(64), |_| Ok(()),
+            &workdir,
+            &id,
+            Some(&second.delivery_oid),
+            "maxplayer/abc12345-t3",
+            "t3",
+            DATE + 2,
+            &"c".repeat(64),
+            |_| Ok(()),
         )
         .expect_err("unchanged tree");
-        assert!(matches!(err, OrchestratorError::Gate(SellerGitError::NoExecutionObserved(_))), "{err}");
+        assert!(
+            matches!(
+                err,
+                OrchestratorError::Gate(SellerGitError::NoExecutionObserved(_))
+            ),
+            "{err}"
+        );
 
         // Not a repository: refused before the agent runs.
         let bare = root.join("empty");
@@ -2359,7 +2421,10 @@ mod tests {
             Ok(AgentOutcome::default())
         })
         .expect_err("refused");
-        assert!(matches!(err, OrchestratorError::AgentUnavailable(_)), "{err}");
+        assert!(
+            matches!(err, OrchestratorError::AgentUnavailable(_)),
+            "{err}"
+        );
         assert!(!ran);
         let _ = fs::remove_dir_all(&root);
     }
@@ -2367,10 +2432,16 @@ mod tests {
     /// §6.4: re-minted per-turn values replace the stale container values.
     #[test]
     fn per_turn_env_overrides_replace_stale_values() {
-        let mut env = vec![("ANTHROPIC_API_KEY".to_owned(), "old".to_owned()), ("PATH".to_owned(), "/bin".to_owned())];
+        let mut env = vec![
+            ("ANTHROPIC_API_KEY".to_owned(), "old".to_owned()),
+            ("PATH".to_owned(), "/bin".to_owned()),
+        ];
         apply_env_overrides(
             &mut env,
-            &[("ANTHROPIC_API_KEY".into(), "new".into()), ("ANTHROPIC_BASE_URL".into(), "http://p:9".into())],
+            &[
+                ("ANTHROPIC_API_KEY".into(), "new".into()),
+                ("ANTHROPIC_BASE_URL".into(), "http://p:9".into()),
+            ],
         );
         assert_eq!(
             env,
@@ -3686,7 +3757,7 @@ mod tests {
         let io = root.join("io");
         let agent = Some(AgentOutcome {
             last_agent_message_truncated: false,
-                session: None,
+            session: None,
             usage: None,
             last_agent_message: Some("é".repeat(EXCHANGE_OUTCOME_MAX_BYTES)),
         });
