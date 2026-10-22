@@ -4240,6 +4240,24 @@ pub async fn run_agent_job_with_env(
 /// Without the `acp` feature there is no agent runtime — fail closed with the rebuild hint.
 #[cfg(not(feature = "acp"))]
 #[allow(clippy::too_many_arguments)]
+pub async fn run_session_agent_in_env(
+    _agent_command: &[String],
+    _policy: &SandboxPolicy,
+    _workdir: &Path,
+    _identity: &DeliveryAgentIdentity,
+    _timeout: AgentRunTimeout,
+    _agent_env: Option<Vec<(String, String)>>,
+    _attachments: JobAttachments,
+    _resume: Option<String>,
+    _wrap_up_at: Option<std::time::SystemTime>,
+    _release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
+) -> Result<SessionAgentReport, ExecError> {
+    Err(ExecError::AcpRequired)
+}
+
+/// Without the `acp` feature there is no agent runtime — fail closed with the rebuild hint.
+#[cfg(not(feature = "acp"))]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_agent_job_in_env(
     _agent_command: &[String],
     _policy: &SandboxPolicy,
