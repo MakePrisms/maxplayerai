@@ -2717,6 +2717,21 @@ mod tests {
         )
     }
 
+    /// Session jobs §8.2: a turn's NUT-18 payload id is its follow-up id; the attempt id is
+    /// unchanged by it (the result id already separates turns), and a one-shot key serializes
+    /// exactly as before.
+    #[test]
+    fn payload_id_is_the_followup_on_a_turn_and_the_job_otherwise() {
+        let plain = key();
+        assert_eq!(plain.payload_id(), "job");
+        assert!(!serde_json::to_string(&plain).unwrap().contains("payment_id"));
+        let turn = key().with_payment_id(Some("followup".into()));
+        assert_eq!(turn.payload_id(), "followup");
+        assert_eq!(turn.attempt_id(), plain.attempt_id());
+        let back: PaymentKey = serde_json::from_str(&serde_json::to_string(&turn).unwrap()).unwrap();
+        assert_eq!(back.payload_id(), "followup");
+    }
+
     fn git_delivery() -> GitDelivery {
         GitDelivery::new(
             "https://example.invalid/repo.git",
