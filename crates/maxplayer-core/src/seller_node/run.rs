@@ -5083,16 +5083,24 @@ impl SellerNodeRunner {
                 {
                     Ok(Ok(report)) => {
                         for job in &report.expired_lifetime {
-                            opline!("seller node: session job_id={job} expired (parked past its lifetime)");
+                            opline!(
+                                "seller node: session job_id={job} expired (parked past its lifetime)"
+                            );
                         }
                         for job in &report.evicted_disk {
-                            opline!("seller node: session job_id={job} evicted (parked sessions over the disk budget)");
+                            opline!(
+                                "seller node: session job_id={job} evicted (parked sessions over the disk budget)"
+                            );
                         }
                         for (job, error) in &report.removal_errors {
-                            opline!("seller node: session job_id={job} removal incomplete ({error})");
+                            opline!(
+                                "seller node: session job_id={job} removal incomplete ({error})"
+                            );
                         }
                     }
-                    Ok(Err(error)) => opline!("seller node: session GC could not read the store ({error})"),
+                    Ok(Err(error)) => {
+                        opline!("seller node: session GC could not read the store ({error})")
+                    }
                     Err(error) => opline!("seller node: session GC task failed ({error})"),
                 }
                 gc.keep()
@@ -10143,7 +10151,9 @@ impl SellerNodeRunner {
         let target = match self.node.store().turn_for_payment(&payload_id) {
             Ok(turn) => crate::session::resolve_payment(&payload_id, |_| turn.clone()),
             Err(error) => {
-                opline!("seller node wrap event={event_id}: session turn read failed for {payload_id} (fail-closed, skipping): {error}");
+                opline!(
+                    "seller node wrap event={event_id}: session turn read failed for {payload_id} (fail-closed, skipping): {error}"
+                );
                 return;
             }
         };
@@ -10368,7 +10378,9 @@ impl SellerNodeRunner {
                 None,
                 now_unix().max(0) as u64,
             ) {
-                opline!("seller node wrap event={event_id}: session turn {receipt_key} paid but its state write failed ({error})");
+                opline!(
+                    "seller node wrap event={event_id}: session turn {receipt_key} paid but its state write failed ({error})"
+                );
             }
         }
         match &collected {
