@@ -235,9 +235,21 @@ impl Context {
         award: &Event,
         text: &str,
     ) -> Result<PreparedContent> {
+        self.answer_keyed(offer, claim, award, text, None)
+    }
+    /// [`Self::answer`] keyed per session turn (the follow-up id).
+    pub fn answer_keyed(
+        &mut self,
+        offer: &Event,
+        claim: &Event,
+        award: &Event,
+        text: &str,
+        turn_key: Option<&str>,
+    ) -> Result<PreparedContent> {
         validate_selection(offer, claim, award)?;
+        let key = turn_key.map(str::to_owned).unwrap_or_else(|| offer.id.to_hex());
         self.store.prepare_once(
-            &format!("answer:{}", offer.id),
+            &format!("answer:{key}"),
             ContentBody {
                 schema: super::BODY_SCHEMA.into(),
                 job_id: required(offer, "job")?.into(),
@@ -480,6 +492,14 @@ pub fn validate_request(
 }
 
 pub fn project_local(home: &MaxplayerHome, id: &str, draft: EventDraft) -> Result<EventDraft> {
+    project_local_keyed(home, id, draft, None)
+}
+pub fn project_local_keyed(
+    home: &MaxplayerHome,
+    id: &str,
+    draft: EventDraft,
+    turn_key: Option<&str>,
+) -> Result<EventDraft> {
     let Some((mut ctx, offer)) = known(home, id)? else {
         return Ok(draft);
     };
@@ -493,7 +513,7 @@ pub fn project_local(home: &MaxplayerHome, id: &str, draft: EventDraft) -> Resul
         let (claim, award) = selected
             .as_ref()
             .ok_or(Error("public inline selection unavailable"))?;
-        Some(ctx.answer(&offer, claim, award, &draft.content)?)
+        Some(ctx.answer_keyed(&offer, claim, award, &draft.content, turn_key)?)
     } else {
         None
     };
@@ -511,6 +531,16 @@ pub fn bind_receipt(
     p: &mut crate::receipt::ReceiptPreimage,
     answer: Option<&str>,
 ) -> Result<()> {
+    bind_receipt_keyed(home, seller, id, p, answer, None)
+}
+pub fn bind_receipt_keyed(
+    home: &MaxplayerHome,
+    seller: &str,
+    id: &str,
+    p: &mut crate::receipt::ReceiptPreimage,
+    answer: Option<&str>,
+    turn_key: Option<&str>,
+) -> Result<()> {
     let Some((mut ctx, offer)) = known(home, id)? else {
         return Ok(());
     };
@@ -523,7 +553,7 @@ pub fn bind_receipt(
     p.job_hash = super::job_hash(id)?;
     if let Some(text) = answer {
         p.delivery_integrity_hash = ctx
-            .answer(&offer, &claim, &award, text)?
+            .answer_keyed(&offer, &claim, &award, text, turn_key)?
             .commitment()
             .into();
     }

@@ -3064,7 +3064,6 @@ pub(crate) struct PreparedLaunch {
     _containment: Option<crate::sandbox_netns::Containment>,
 }
 
-#[cfg(feature = "acp")]
 impl PreparedLaunch {
     /// Park a session job's launch (docs/specs/session-jobs.md §5.2 step 3, §6.4): the credential
     /// proxy is STOPPED (its placeholders are revoked; the next turn mints new ones) and the netns

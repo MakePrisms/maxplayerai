@@ -1184,6 +1184,9 @@ pub enum ReasonCode {
     DeliveryFailed,
     /// The delivery carried no execution sentinel — a refusal that DOES count against the seller (§19).
     NoSentinel,
+    /// Session jobs (docs/specs/session-jobs.md §2.3): the parked session behind a follow-up is
+    /// gone. Nothing was delivered or charged, and it does not count against the seller.
+    SessionExpired,
 }
 
 impl ReasonCode {
@@ -1198,6 +1201,7 @@ impl ReasonCode {
             Self::ExecutionFailed => "execution_failed",
             Self::DeliveryFailed => "delivery_failed",
             Self::NoSentinel => "no_sentinel",
+            Self::SessionExpired => "session_expired",
         }
     }
 }
