@@ -9627,11 +9627,19 @@ impl SellerNodeRunner {
         let park = session_outcome.is_some()
             && match &result {
                 Ok(_) => true,
+                // Only what the inline arm can actually deliver: an authentic, uncut, MARKED answer
+                // on a from-scratch job whose buyer reads inline. Anything else fails the job, so
+                // parking it would only hold disk until GC.
                 Err(Fail::NoSentinel {
                     outcome_authentic: true,
-                    last_agent_message: Some(_),
+                    message_truncated: false,
+                    from_scratch: true,
+                    last_agent_message: Some(message),
                     ..
-                }) => true,
+                }) => {
+                    offer.accepts_delivery.iter().any(|m| m == gateway::DELIVERY_MODE_INLINE)
+                        && crate::engine::marked_inline_answer(message).is_some()
+                }
                 Err(_) => false,
             };
         // Evidence first, then remove (or, for a session turn, keep) — the agent launch's tail.
