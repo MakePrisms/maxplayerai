@@ -37,6 +37,13 @@ pub struct MockDriver {
     usage: Option<UsageMetadata>,
     shutdown_calls: u32,
     shutdown_error: Option<DriverError>,
+    /// Session jobs §6.3: what `loadSession` the mock advertises, and whether a load succeeds.
+    load_session: Option<Result<(), DriverError>>,
+    load_calls: Vec<SessionId>,
+    new_calls: u32,
+    /// Set only by a cancel fired through [`Driver::cancel_trigger`] (the wrap-up path); a
+    /// `shutdown` or a plain `cancel` leaves it alone.
+    cancel_flag: Arc<AtomicBool>,
 }
 
 impl MockDriver {
@@ -52,7 +59,33 @@ impl MockDriver {
             usage: None,
             shutdown_calls: 0,
             shutdown_error: None,
+            load_session: None,
+            load_calls: Vec::new(),
+            new_calls: 0,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Advertise `loadSession`; `Ok(())` reloads the asked-for id (reusing the next script's
+    /// updates), `Err` makes the load fail.
+    pub fn with_load_session(mut self, result: Result<(), DriverError>) -> Self {
+        self.load_session = Some(result);
+        self
+    }
+
+    /// Session ids `session/load` was asked for.
+    pub fn load_calls(&self) -> &[SessionId] {
+        &self.load_calls
+    }
+
+    /// How many `session/new` calls were made.
+    pub fn new_calls(&self) -> u32 {
+        self.new_calls
+    }
+
+    /// Whether a cancel arrived through the out-of-band trigger.
+    pub fn cancel_fired(&self) -> bool {
+        self.cancel_flag.load(Ordering::SeqCst)
     }
 
     pub fn with_permission_outcomes(mut self, outcomes: Vec<PermissionOutcome>) -> Self {
@@ -109,10 +142,49 @@ impl Driver for MockDriver {
         })
     }
 
+    fn supports_load_session(&self) -> bool {
+        self.load_session.is_some()
+    }
+
+    async fn load_session(
+        &mut self,
+        _cfg: SessionConfig,
+        session_id: &SessionId,
+    ) -> Result<SessionId, DriverError> {
+        self.load_calls.push(session_id.clone());
+        match self.load_session.clone() {
+            Some(Ok(())) => {
+                let script = self
+                    .scripts
+                    .pop_front()
+                    .ok_or(DriverError::ScriptExhausted)?;
+                self.sessions.push(SessionState {
+                    session_id: session_id.clone(),
+                    updates: script.updates,
+                    artifacts: script.artifacts,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                });
+                Ok(session_id.clone())
+            }
+            Some(Err(error)) => Err(error),
+            None => Err(DriverError::Other("loadSession not advertised".into())),
+        }
+    }
+
+    fn cancel_trigger(&self, session_id: &SessionId) -> Option<crate::driver::CancelTrigger> {
+        let session = Arc::clone(&self.session(session_id).ok()?.cancelled);
+        let fired = Arc::clone(&self.cancel_flag);
+        Some(Arc::new(move || {
+            fired.store(true, Ordering::SeqCst);
+            session.store(true, Ordering::SeqCst);
+        }))
+    }
+
     async fn start_session(&mut self, _cfg: SessionConfig) -> Result<SessionId, DriverError> {
         if !self.ready {
             return Err(DriverError::NotReady);
         }
+        self.new_calls += 1;
 
         let script = self
             .scripts

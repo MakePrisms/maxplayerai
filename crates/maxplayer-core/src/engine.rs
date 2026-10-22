@@ -122,6 +122,199 @@ pub async fn run_job<D: Driver>(
     }
 }
 
+/// How a session turn opens its conversation and when it must wrap up (docs/specs/session-jobs.md
+/// §4, §6.1, §6.3).
+pub struct SessionTurnParams {
+    pub session_config: SessionConfig,
+    /// The ACP session id recorded at the end of the previous turn; `None` on turn 1.
+    pub resume: Option<crate::driver::SessionId>,
+    /// Time from the start of the prompt to the wrap-up `session/cancel`; `None` = never.
+    pub wrap_up_after: Option<std::time::Duration>,
+}
+
+/// What a session turn adds to a [`RunOutcome`].
+#[derive(Debug)]
+pub struct SessionTurnOutcome {
+    pub run: RunOutcome,
+    /// The session the turn ran in: recorded for the next turn's `session/load`.
+    pub session_id: crate::driver::SessionId,
+    /// The previous conversation could not be reloaded and a new one was started (§6.3).
+    pub context_reset: bool,
+    /// The wrap-up cancel fired before the turn ended on its own (§4, `out_of_time`).
+    pub cancelled_for_wrap_up: bool,
+}
+
+/// The released prompt, or `None` when the host withheld it (review refused, §6.1 step 3). Called
+/// AFTER the conversation is open, with whether it was reset, so the host-supplied history can be
+/// chosen — the buyer's text exists in this process only once this returns.
+pub type PromptRelease<'a> = dyn FnOnce(bool) -> Result<Option<PromptTurn>, EngineError> + 'a;
+
+/// Why [`run_session_job`] ended without prompting.
+#[derive(Debug)]
+pub enum SessionTurnEnd {
+    Ran(SessionTurnOutcome),
+    /// The host withheld the prompt; the agent was never prompted.
+    Withheld,
+}
+
+/// [`run_job`] for one turn of a session job: open the conversation by `session/load` when the
+/// agent supports it and a previous session id is known, else `session/new` with `context_reset`;
+/// only then ask `release` for the prompt; cancel at the wrap-up instant; shut down on every exit.
+pub async fn run_session_job<D: Driver>(
+    driver: &mut D,
+    log: &mut EventLog,
+    job_id: &JobId,
+    params: SessionTurnParams,
+    release: Box<PromptRelease<'_>>,
+    sink: &mut dyn FnMut(RunEvent<'_>),
+) -> Result<SessionTurnEnd, EngineError> {
+    let outcome = run_session_turn(driver, log, job_id, params, release, sink).await;
+    let shutdown = driver.shutdown().await;
+    match outcome {
+        Ok(run) => {
+            shutdown?;
+            Ok(run)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn run_session_turn<D: Driver>(
+    driver: &mut D,
+    log: &mut EventLog,
+    job_id: &JobId,
+    params: SessionTurnParams,
+    release: Box<PromptRelease<'_>>,
+    sink: &mut dyn FnMut(RunEvent<'_>),
+) -> Result<SessionTurnEnd, EngineError> {
+    let readiness = driver.ready().await?;
+    log.append(Event::DriverReady {
+        runtime_id: readiness.runtime_id,
+    })?;
+    append_execution(log, job_id, JobExecutionStatus::Queued)?;
+
+    // §6.3: reload only when the agent advertised it and an id was recorded; any failure falls back
+    // to a new conversation in the same container (files and tools stay) and says so.
+    let (session_id, context_reset) = match params.resume.as_ref() {
+        Some(id) if driver.supports_load_session() => {
+            match driver.load_session(params.session_config.clone(), id).await {
+                Ok(loaded) => (loaded, false),
+                Err(_) => (driver.start_session(params.session_config).await?, true),
+            }
+        }
+        Some(_) => (driver.start_session(params.session_config).await?, true),
+        None => (driver.start_session(params.session_config).await?, false),
+    };
+
+    // §6.1 step 3: the buyer's text arrives only now, and only if the review passed.
+    let Some(prompt) = release(context_reset)? else {
+        append_execution(log, job_id, JobExecutionStatus::Cancelled)?;
+        return Ok(SessionTurnEnd::Withheld);
+    };
+    append_execution(log, job_id, JobExecutionStatus::Running)?;
+
+    // §4 wrap-up. `prompt` holds the driver until the turn answers, so the cancel fires from a
+    // timer thread through a trigger cloned beforehand; the update loop also checks the instant
+    // for drivers whose prompt returns at once. Fired at most once.
+    let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trigger = driver.cancel_trigger(&session_id);
+    let wrap_at = params
+        .wrap_up_after
+        .map(|after| std::time::Instant::now() + after);
+    let fire = {
+        let fired = std::sync::Arc::clone(&fired);
+        let trigger = trigger.clone();
+        move || {
+            if !fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+                && let Some(trigger) = &trigger
+            {
+                trigger();
+            }
+        }
+    };
+    let (stop_timer, timer_rx) = std::sync::mpsc::channel::<()>();
+    let timer = match (params.wrap_up_after, trigger.is_some()) {
+        (Some(after), true) => {
+            let fire = fire.clone();
+            Some(std::thread::spawn(move || {
+                if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                    timer_rx.recv_timeout(after)
+                {
+                    fire();
+                }
+            }))
+        }
+        _ => None,
+    };
+    let stop = |timer: Option<std::thread::JoinHandle<()>>| {
+        let _ = stop_timer.send(());
+        if let Some(timer) = timer {
+            let _ = timer.join();
+        }
+    };
+
+    let mut stream = match driver.prompt(&session_id, prompt).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            stop(timer);
+            append_execution(log, job_id, JobExecutionStatus::Failed)?;
+            return Err(error.into());
+        }
+    };
+    let mut terminal = None;
+    loop {
+        if wrap_at.is_some_and(|at| std::time::Instant::now() >= at)
+            && !fired.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            fire();
+            let _ = driver.cancel(&session_id).await;
+        }
+        let Some(update) = stream.next().await else {
+            break;
+        };
+        sink(RunEvent::Update(&update));
+        if let Some(text) = update_text(&update)
+            && !text.trim().is_empty()
+        {
+            log.append(Event::AgentMessage {
+                job_id: job_id.clone(),
+                text,
+            })?;
+        }
+        if let SessionUpdate::PermissionRequest(request) = update.clone() {
+            let outcome = driver.on_permission(request.clone()).await;
+            sink(RunEvent::PermissionDecided {
+                request: &request,
+                outcome: &outcome,
+            });
+        }
+        if let SessionUpdate::TurnEnded(reason) = update {
+            let status = terminal_status(reason);
+            append_execution(log, job_id, status.clone())?;
+            terminal = Some(status);
+            break;
+        }
+    }
+    stop(timer);
+    let Some(terminal) = terminal else {
+        append_execution(log, job_id, JobExecutionStatus::Failed)?;
+        return Err(EngineError::MissingTerminal);
+    };
+    let cancelled_for_wrap_up = fired.load(std::sync::atomic::Ordering::SeqCst);
+    let artifacts = driver.artifacts(&session_id).await?;
+    let usage = driver.usage();
+    Ok(SessionTurnEnd::Ran(SessionTurnOutcome {
+        run: RunOutcome {
+            terminal,
+            artifacts,
+            usage,
+        },
+        session_id,
+        context_reset,
+        cancelled_for_wrap_up,
+    }))
+}
+
 /// The fallible body of [`run_job`]: readiness through usage capture, shutdown excluded.
 async fn run_turn<D: Driver>(
     driver: &mut D,
@@ -913,6 +1106,217 @@ mod tests {
             .into_iter()
             .map(|envelope| envelope.payload)
             .collect()
+    }
+
+    // ---- Session jobs (docs/specs/session-jobs.md) -------------------------------------------
+
+    fn session_script(id: &str, updates: Vec<SessionUpdate>) -> ScriptedSession {
+        ScriptedSession {
+            session_id: id.into(),
+            updates,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn session_params(
+        resume: Option<&str>,
+        wrap: Option<std::time::Duration>,
+    ) -> super::SessionTurnParams {
+        super::SessionTurnParams {
+            session_config: RunParams::mock_defaults().session_config,
+            resume: resume.map(str::to_owned),
+            wrap_up_after: wrap,
+        }
+    }
+
+    fn released(text: &str) -> Box<super::PromptRelease<'static>> {
+        let text = text.to_owned();
+        Box::new(move |_reset| {
+            Ok(Some(RunParams::mock_defaults().prompt).map(|mut p| {
+                p.input = vec![ContentBlock::Text { text }];
+                p
+            }))
+        })
+    }
+
+    fn ran(end: super::SessionTurnEnd) -> super::SessionTurnOutcome {
+        match end {
+            super::SessionTurnEnd::Ran(outcome) => outcome,
+            super::SessionTurnEnd::Withheld => panic!("the turn was withheld"),
+        }
+    }
+
+    /// Failure test 8: `session/load` reloads the recorded id when the agent advertises it; a load
+    /// error, or no capability, falls back to `session/new` and reports `context_reset`.
+    #[test]
+    fn session_load_reloads_or_falls_back_to_new_with_context_reset() {
+        let done = vec![SessionUpdate::TurnEnded(StopReason::Completed)];
+        // Advertised and succeeds: no new session, no reset.
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script("unused", done.clone())],
+        )
+        .with_load_session(Ok(()));
+        let mut log = EventLog::open(test_path("session-load-ok")).expect("open log");
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(Some("acp-1"), None),
+            released("next"),
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert_eq!(driver.load_calls(), &["acp-1".to_owned()]);
+        assert_eq!(driver.new_calls(), 0);
+        assert!(!out.context_reset);
+        assert_eq!(out.session_id, "acp-1");
+
+        // Advertised but the load fails: a new session in the same container, reset reported.
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script("fresh", done.clone())],
+        )
+        .with_load_session(Err(DriverError::Other("transcript gone".into())));
+        let mut log = EventLog::open(test_path("session-load-err")).expect("open log");
+        let mut reset_seen = None;
+        let release: Box<super::PromptRelease<'_>> = Box::new(|reset| {
+            reset_seen = Some(reset);
+            Ok(Some(RunParams::mock_defaults().prompt))
+        });
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(Some("acp-1"), None),
+            release,
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert_eq!(driver.load_calls(), &["acp-1".to_owned()]);
+        assert_eq!(driver.new_calls(), 1);
+        assert!(out.context_reset);
+        assert_eq!(out.session_id, "fresh");
+        assert_eq!(
+            reset_seen,
+            Some(true),
+            "the release learns of the reset before the prompt exists"
+        );
+
+        // Not advertised: never asked to load, reset reported.
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script("fresh", done.clone())],
+        );
+        let mut log = EventLog::open(test_path("session-load-absent")).expect("open log");
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(Some("acp-1"), None),
+            released("next"),
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert!(driver.load_calls().is_empty());
+        assert!(out.context_reset);
+
+        // Turn 1 (no recorded id): a plain new session, no reset.
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script("first", done)],
+        )
+        .with_load_session(Ok(()));
+        let mut log = EventLog::open(test_path("session-first")).expect("open log");
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(None, None),
+            released("task"),
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert!(driver.load_calls().is_empty());
+        assert!(!out.context_reset);
+    }
+
+    /// Failure test 5 (orchestrator half): a withheld prompt never reaches the agent.
+    #[test]
+    fn withheld_prompt_never_reaches_the_agent() {
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script(
+                "s",
+                vec![SessionUpdate::TurnEnded(StopReason::Completed)],
+            )],
+        )
+        .with_load_session(Ok(()));
+        let mut log = EventLog::open(test_path("session-withheld")).expect("open log");
+        let end = block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(Some("acp-1"), None),
+            Box::new(|_| Ok(None)),
+            &mut |_| {},
+        ))
+        .expect("withheld is not an error");
+        assert!(matches!(end, super::SessionTurnEnd::Withheld));
+        assert!(driver.prompt_history().is_empty(), "no prompt was sent");
+        assert_eq!(
+            driver.shutdown_calls(),
+            1,
+            "the agent is shut down on the withheld exit too"
+        );
+    }
+
+    /// Failure test 9 (orchestrator half): an agent still running at the wrap-up instant is
+    /// cancelled and the turn is reported `cancelled_for_wrap_up`; a turn that ends first is not.
+    #[test]
+    fn wrap_up_cancels_a_running_turn_and_reports_it() {
+        // A turn that would keep streaming: the cancel ends it.
+        let busy: Vec<SessionUpdate> = (0..50)
+            .map(|i| {
+                SessionUpdate::AgentMessage(vec![ContentBlock::Text {
+                    text: format!("step {i}"),
+                }])
+            })
+            .chain([SessionUpdate::TurnEnded(StopReason::Completed)])
+            .collect();
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script("s", busy.clone())],
+        );
+        let mut log = EventLog::open(test_path("session-wrap")).expect("open log");
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(None, Some(std::time::Duration::ZERO)),
+            released("task"),
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert!(driver.cancel_fired(), "the wrap-up cancel was sent");
+        assert!(out.cancelled_for_wrap_up);
+        assert_eq!(out.run.terminal, JobExecutionStatus::Cancelled);
+
+        // Plenty of time: the turn ends on its own and is not marked.
+        let mut driver = MockDriver::new(RuntimeId("mock".into()), vec![session_script("s", busy)]);
+        let mut log = EventLog::open(test_path("session-nowrap")).expect("open log");
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(None, Some(std::time::Duration::from_secs(3600))),
+            released("task"),
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert!(!driver.cancel_fired());
+        assert!(!out.cancelled_for_wrap_up);
+        assert_eq!(out.run.terminal, JobExecutionStatus::Completed);
     }
 
     fn test_path(name: &str) -> std::path::PathBuf {
