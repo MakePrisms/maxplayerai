@@ -253,6 +253,20 @@ struct ReplyParams {
     close: bool,
 }
 
+/// The session cap a `reply` reserves against (§8.1): `reply max_session_sats` > the cap stored
+/// with the session (set by `post_job max_session_sats` or an earlier `reply`) > `[sessions]
+/// session_cap_sats` > `10 x` the price.
+pub(super) fn session_cap(
+    explicit: Option<u64>,
+    stored: Option<u64>,
+    sessions: &crate::home::SessionsConfig,
+    price: u64,
+) -> u64 {
+    explicit
+        .or(stored)
+        .unwrap_or_else(|| sessions.cap_for(None, price))
+}
+
 pub(super) fn disabled() -> String {
     "sessions are disabled on this buyer ([sessions] enabled = false); post a new job".into()
 }
@@ -332,10 +346,12 @@ async fn reply_inner(context: &Arc<BuyerContext>, params: ReplyParams) -> Result
         .store
         .session_row(job_id)
         .map_err(|e| e.to_string())?;
-    let cap = params
-        .max_session_sats
-        .or(row.as_ref().map(|(cap, _)| *cap))
-        .unwrap_or_else(|| home.config.sessions.cap_for(None, price));
+    let cap = session_cap(
+        params.max_session_sats,
+        row.as_ref().map(|(cap, _)| *cap),
+        &home.config.sessions,
+        price,
+    );
     let money = Money {
         price,
         per_job_cap: if price == 0 {
@@ -549,7 +565,10 @@ pub(super) async fn view(context: &BuyerContext, view: &job_lifecycle::JobView) 
     let award = context.store.award_record(job_id).ok().flatten()?;
     let row = context.store.session_row(job_id).ok().flatten();
     let mut facts = facts(context, job_id, &award, view).ok()?;
-    if !facts.claim_session && row.is_none() {
+    // A row opened only by `post_job max_session_sats` (open, no turn yet) is not evidence of a
+    // session: the claim decides, as before.
+    let post_only = row.as_ref().is_some_and(|(_, s)| s == "open") && facts.turns.is_empty();
+    if !facts.claim_session && (row.is_none() || post_only) {
         return Some(json!({"supported": false}));
     }
     let now = now_unix();

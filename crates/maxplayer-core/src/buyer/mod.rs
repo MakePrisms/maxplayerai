@@ -516,6 +516,13 @@ struct PostJobParams {
     /// instead is the one outcome nobody wants.
     #[serde(default)]
     payment: Option<String>,
+    /// Session jobs (docs/specs/session-jobs.md §8.1/§10): the session spend cap across all turns,
+    /// stored locally with the session so the first `reply` uses it (`reply max_session_sats` may
+    /// still override). LOCAL ONLY: never an offer field, so the offer bytes are unchanged. Accepted
+    /// only with `[sessions] enabled`; absent ⇒ no session row, and `reply` falls back to the
+    /// config or `10 x` the price.
+    #[serde(default)]
+    max_session_sats: Option<u64>,
 }
 
 /// Resolve the offer's payment mode from the RPC `payment` parameter (§1.1).
@@ -596,10 +603,70 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         Ok(mode) => mode,
         Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
+    let max_session_sats =
+        match post_job_session_cap(params.max_session_sats, context.home.config.sessions.enabled) {
+            Ok(cap) => cap,
+            Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
+        };
     let max_sats = params.max_sats.unwrap_or(params.amount_sats);
     let harness = params.harness.clone();
     let model = params.model.clone();
-    let request = PostJobRequest {
+    let request = post_job_request(params, job, payment_mode);
+    match job_lifecycle::post_job_async(&context.home, request).await {
+        Ok(outcome) => {
+            // Session cap set at post (§8.1): persisted with the session before anything can
+            // reply; the first `reply` reads it. Failing to store it is reported, never silent.
+            if let Some(cap) = max_session_sats
+                && let Err(error) = context.store.open_session(&outcome.job_id, cap, now_unix())
+            {
+                crate::opline!(
+                    "buyer: could not record max_session_sats for {}: {error}; pass it on reply",
+                    outcome.job_id
+                );
+            }
+            // Record the intent BEFORE spawning so a crash right after post still re-arms on restart.
+            if let Err(error) = context.store.put_pending_award(
+                &outcome.job_id,
+                max_sats,
+                harness.as_deref(),
+                model.as_deref(),
+                now_unix(),
+            ) {
+                crate::opline!(
+                    "buyer: could not record auto-award intent for {}: {error}",
+                    outcome.job_id
+                );
+            } else {
+                spawn_auto_award(context.clone(), outcome.job_id.clone(), max_sats);
+            }
+            Response::ok(id, json!(outcome))
+        }
+        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// `post_job max_session_sats` (§8.1/§10): accepted only with `[sessions] enabled` (the flag-off
+/// tool schema does not list it), refused before anything is posted otherwise.
+fn post_job_session_cap(cap: Option<u64>, sessions_enabled: bool) -> Result<Option<u64>, String> {
+    match cap {
+        Some(_) if !sessions_enabled => Err(format!(
+            "post_job max_session_sats: {}",
+            session_reply::disabled()
+        )),
+        cap => Ok(cap),
+    }
+}
+
+/// The offer request a `post_job` RPC builds. Pure: `max_session_sats` (local session state) is
+/// deliberately not read, so the offer bytes never depend on it.
+fn post_job_request(
+    params: PostJobParams,
+    job: JobKind,
+    payment_mode: crate::gateway::PaymentMode,
+) -> PostJobRequest {
+    let harness = params.harness.clone();
+    let model = params.model.clone();
+    PostJobRequest {
         visibility: params.visibility,
         output_category: params.output_category,
         inputs: params.inputs,
@@ -634,27 +701,6 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         // read alone would make free jobs postable and — because `authorize_pay_async` refuses a
         // free bind — uncollectable.
         payment_mode,
-    };
-    match job_lifecycle::post_job_async(&context.home, request).await {
-        Ok(outcome) => {
-            // Record the intent BEFORE spawning so a crash right after post still re-arms on restart.
-            if let Err(error) = context.store.put_pending_award(
-                &outcome.job_id,
-                max_sats,
-                harness.as_deref(),
-                model.as_deref(),
-                now_unix(),
-            ) {
-                crate::opline!(
-                    "buyer: could not record auto-award intent for {}: {error}",
-                    outcome.job_id
-                );
-            } else {
-                spawn_auto_award(context.clone(), outcome.job_id.clone(), max_sats);
-            }
-            Response::ok(id, json!(outcome))
-        }
-        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
 
@@ -7631,6 +7677,55 @@ mod tests {
     // FREE JOB LANE — the `post_job` RPC's `payment` parameter (§1.1). This is the surface that
     // makes the lane reachable by a user; until it existed the daemon hardcoded `Sat`.
     // ————————————————————————————————————————————————————————————————————————————————————————
+
+    /// Session jobs §8.1/§10: `post_job max_session_sats` is local session state. It never changes
+    /// the offer request (so never the offer bytes), and it is refused with `[sessions]` off.
+    #[test]
+    fn post_job_max_session_sats_is_local_only_and_flag_gated() {
+        let body = json!({"task":"t", "output":"text/plain", "amount_sats":7,
+            "seller_pubkey": "5".repeat(64)});
+        let mut with = body.clone();
+        with["max_session_sats"] = json!(500);
+        let build = |body: Value| {
+            let params: PostJobParams = serde_json::from_value(body).unwrap();
+            let cap = params.max_session_sats;
+            let job = post_job_kind(&params).unwrap();
+            let mode = post_job_payment_mode(params.payment.as_deref(), params.amount_sats).unwrap();
+            (cap, post_job_request(params, job, mode))
+        };
+        let (none, plain) = build(body);
+        let (cap, capped) = build(with);
+        assert_eq!((none, cap), (None, Some(500)));
+        assert_eq!(plain, capped, "the offer request (hence its bytes) ignores max_session_sats");
+        assert_eq!(post_job_session_cap(None, false), Ok(None));
+        assert_eq!(post_job_session_cap(Some(500), true), Ok(Some(500)));
+        assert!(post_job_session_cap(Some(500), false).unwrap_err().contains("sessions are disabled"));
+    }
+
+    /// §8.1 cap precedence across post and reply, through the real store: a cap stored at post is
+    /// what the first `reply` reserves against; `reply max_session_sats` overrides it; with neither,
+    /// the config cap, else 10 x the price.
+    #[test]
+    fn session_cap_set_at_post_reaches_the_first_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BuyerStore::open(dir.path().join("buyer.sqlite")).unwrap();
+        let mut cfg = crate::home::SessionsConfig::default();
+        // post_job max_session_sats=500 opens the row (what `post_job` does after publishing).
+        store.open_session("job", 500, 1).unwrap();
+        let stored = store.session_row("job").unwrap().map(|(cap, _)| cap);
+        assert_eq!(stored, Some(500));
+        assert_eq!(session_reply::session_cap(None, stored, &cfg, 7), 500);
+        // The first reply's own open keeps it; an explicit reply value overrides it.
+        assert_eq!(store.open_session("job", 70, 2).unwrap(), (500, true));
+        assert_eq!(session_reply::session_cap(Some(900), stored, &cfg, 7), 900);
+        store.set_session_cap("job", 900, 3).unwrap();
+        assert_eq!(store.session_row("job").unwrap().map(|(cap, _)| cap), Some(900));
+        // Nothing set anywhere: 10 x the price; a config cap beats the multiplier.
+        assert_eq!(session_reply::session_cap(None, None, &cfg, 7), 70);
+        cfg.session_cap_sats = Some(55);
+        assert_eq!(session_reply::session_cap(None, None, &cfg, 7), 55);
+        assert_eq!(session_reply::session_cap(None, Some(500), &cfg, 7), 500);
+    }
 
     #[test]
     fn local_base_rpc_requires_contribution_and_preserves_path() {

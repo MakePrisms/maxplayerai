@@ -2048,11 +2048,10 @@ async fn private_snapshot(
     use crate::private_content as pc;
     let task = bundle.task_envelope.as_deref().map(pc::PreparedContent::decode).transpose().map_err(|_| "invalid_subject")?;
     let resolved = pc::lifecycle::resolve_offer(&bundle.offer, task.as_ref(), &policy.service, &policy.service, &policy.host).map_err(|_| "invalid_subject")?;
-    // Session follow-up (§9): context from the authenticated carriers only, current one in full.
+    // Session follow-up (§9): context from the authenticated carriers only — buyer follow-ups in
+    // full (current one always), earlier deliveries as one line each — same renderer as public.
     if let Some(f) = &bundle.followup {
-        let turns = f.verify(&bundle.offer, policy)?;
-        let texts: Vec<String> = turns.into_iter().map(|(_, text)| text).collect();
-        let context = crate::session::followup_review_context(&resolved.offer.task, &texts, &[]);
+        let context = f.context(&bundle.offer, &resolved.offer.task, policy)?;
         let metadata = json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,
             "session_context":context,"evidence":private_classifier_evidence(bundle)});
         let files = file_manifest(Vec::new())?;
@@ -2097,8 +2096,12 @@ async fn private_snapshot(
 // additional task content and must not be mistaken for hidden instructions.
 fn private_classifier_evidence(bundle: &crate::review::private::Request) -> Value {
     if let Some(f) = &bundle.followup {
-        return json!({"offer":bundle.offer.id, "claim":f.claim.id, "award":f.award.id,
+        let mut evidence = json!({"offer":bundle.offer.id, "claim":f.claim.id, "award":f.award.id,
             "followups":f.followups.iter().map(|i| i.carrier.id).collect::<Vec<_>>()});
+        if !f.deliveries.is_empty() {
+            evidence["deliveries"] = json!(f.deliveries.iter().map(|d| d.result.id).collect::<Vec<_>>());
+        }
+        return evidence;
     }
     json!({"offer":bundle.offer.id, "claim":bundle.delivery.as_ref().map(|e| e.claim.id),
         "award":bundle.delivery.as_ref().map(|e| e.award.id),

@@ -842,6 +842,21 @@ pub fn followup_review_context(
     followups: &[String],
     deliveries: &[DeliveryLine],
 ) -> String {
+    let numbered: Vec<(u32, String)> = followups
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (i as u32 + 2, f.clone()))
+        .collect();
+    followup_review_context_numbered(task, &numbered, deliveries)
+}
+
+/// [`followup_review_context`] with each follow-up's own turn number: the private lane (§9) may
+/// carry only the newest follow-ups (transport bound), so numbering by position would mislabel them.
+pub fn followup_review_context_numbered(
+    task: &str,
+    followups: &[(u32, String)],
+    deliveries: &[DeliveryLine],
+) -> String {
     let render = |omit: usize| -> String {
         let mut s = format!("ORIGINAL TASK:\n{task}\n");
         for d in deliveries {
@@ -852,8 +867,7 @@ pub fn followup_review_context(
                 d.commit.as_deref().unwrap_or("inline")
             ));
         }
-        for (i, f) in followups.iter().enumerate() {
-            let n = i + 2;
+        for (i, (n, f)) in followups.iter().enumerate() {
             if i < omit && i + 1 < followups.len() {
                 s.push_str(&format!(
                     "FOLLOW-UP turn {n}: [omitted, {} bytes]\n",
