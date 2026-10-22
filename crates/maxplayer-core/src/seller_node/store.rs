@@ -1298,6 +1298,10 @@ impl SellerStore {
                 conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {column} TEXT;"))?;
             }
         }
+        // The buyer's message per turn: the `context_reset` prompt restates every follow-up (§6.3).
+        if !Self::column_exists(conn, "session_turns", "text")? {
+            conn.execute_batch("ALTER TABLE session_turns ADD COLUMN text TEXT;")?;
+        }
         if !Self::column_exists(conn, "offers", "capability_request")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN capability_request TEXT;")?;
         }
@@ -2211,10 +2215,17 @@ impl SellerStore {
         now_unix: u64,
     ) -> Result<bool, StoreError> {
         let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM session_turns WHERE job_id = ?1 AND turn = ?2 AND state = 'refused'
+                 AND followup_id != ?3",
+            params![job_id, turn, followup_id],
+        )?;
         let n = conn.execute(
             "INSERT INTO session_turns (followup_id, job_id, turn, deadline_unix, state,
                  created_at_unix, updated_at_unix)
              VALUES (?1,?2,?3,?4,?5,?6,?6) ON CONFLICT DO NOTHING",
+            // (a refused turn's row is cleared first, so the buyer can retry that turn with a new
+            // follow-up: `no_response`/`at_capacity` release the turn number, §10)
             params![
                 followup_id,
                 job_id,
@@ -2291,6 +2302,108 @@ impl SellerStore {
             params![job_id, turn, base_oid, acp_session_id, now_unix as i64],
         )?;
         Ok(())
+    }
+
+    /// Keep the buyer's message for a turn (§6.3 reset history). Write-once.
+    pub fn set_turn_text(&self, followup_id: &str, text: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE session_turns SET text = ?2 WHERE followup_id = ?1 AND text IS NULL",
+            params![followup_id, text],
+        )?;
+        Ok(())
+    }
+
+    /// Buyer messages of turns 2..=`up_to`, oldest first (§6.3).
+    pub fn turn_texts(&self, job_id: &str, up_to: u32) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT text FROM session_turns WHERE job_id = ?1 AND turn <= ?2 AND text IS NOT NULL
+             AND state != 'refused' ORDER BY turn",
+        )?;
+        let rows = stmt.query_map(params![job_id, up_to], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Journal a delivered session turn and enqueue its RESULT in one transaction (§7). Keyed by
+    /// the follow-up id, so turn n never collides with turn 1's `result:<job>` row. Idempotent:
+    /// a turn already `delivered`/`paid` enqueues nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver_turn_and_enqueue(
+        &self,
+        followup_id: &str,
+        job_id: &str,
+        turn: u32,
+        delivery_oid: Option<&str>,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM session_turns WHERE followup_id = ?1",
+                [followup_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if matches!(state.as_deref(), Some("delivered" | "paid") | None) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE session_turns SET state = 'delivered', delivery_oid = ?2, updated_at_unix = ?3
+             WHERE followup_id = ?1",
+            params![followup_id, delivery_oid, now_unix],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET turn = MAX(turn, ?2), base_oid = COALESCE(?3, base_oid),
+                 last_turn_at = ?4 WHERE job_id = ?1",
+            params![job_id, turn, delivery_oid, now_unix],
+        )?;
+        enqueue_event(
+            &tx,
+            &format!("result:{followup_id}"),
+            draft,
+            created_at_unix,
+            expires_at_unix,
+            now_unix,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Record the published RESULT id of a turn (read off the outbox after publication).
+    pub fn set_turn_result(&self, followup_id: &str, result_id: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE session_turns SET result_id = ?2 WHERE followup_id = ?1",
+            params![followup_id, result_id],
+        )?;
+        Ok(())
+    }
+
+    /// A `close` follow-up arrived while a turn was running: honoured at the next park (§5.5).
+    pub fn request_session_close(&self, job_id: &str) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "INSERT OR IGNORE INTO seller_meta(key,value) VALUES(?1,'1')",
+            [format!("session-close:{job_id}")],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_close_requested(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM seller_meta WHERE key = ?1",
+                [format!("session-close:{job_id}")],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
     }
 
     /// The turn a RESULT answered (free-job ACCEPT binding, §8.3).
@@ -3618,6 +3731,28 @@ mod tests {
             (t.state, t.result_id.as_deref(), t.delivery_oid.as_deref()),
             (TurnState::Paid, Some("res"), Some("oid"))
         );
+
+        // A refused turn releases its number: the buyer's retry for the same turn is recorded.
+        let f3 = "3".repeat(64);
+        let f3b = "4".repeat(64);
+        assert!(store.record_turn(&f3, "job-a", 3, 2_000, TurnState::Received, 70).unwrap());
+        store.set_turn_text(&f3, "third").unwrap();
+        assert!(!store.record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 71).unwrap());
+        store.set_turn_state(&f3, TurnState::Refused, None, None, 72).unwrap();
+        assert!(store.turn_texts("job-a", 3).unwrap().is_empty(), "refused text is not history");
+        assert!(store.record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 73).unwrap());
+        assert!(store.turn(&f3).unwrap().is_none());
+        store.set_turn_text(&f3b, "third, retried").unwrap();
+        assert_eq!(store.turn_texts("job-a", 3).unwrap(), vec!["third, retried".to_owned()]);
+        let draft = EventDraft::new(crate::kinds::JOB_RESULT_KIND, vec![], "");
+        assert!(store.deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 80).unwrap());
+        assert!(!store.deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 81).unwrap(), "idempotent");
+        let s = store.session("job-a").unwrap().unwrap();
+        assert_eq!((s.turn, s.base_oid.as_deref()), (3, Some("b3")));
+        assert!(store.outbox_row(&format!("result:{f3b}")).unwrap().is_some());
+        assert!(!store.session_close_requested("job-a").unwrap());
+        store.request_session_close("job-a").unwrap();
+        assert!(store.session_close_requested("job-a").unwrap());
     }
 
     fn temp_db(label: &str) -> std::path::PathBuf {
