@@ -256,16 +256,24 @@ async fn run_session_turn<D: Driver>(
         }
     };
 
-    let mut stream = match driver.prompt(&session_id, prompt).await {
-        Ok(stream) => stream,
+    let prompted = driver.prompt(&session_id, prompt).await;
+    let mut terminal = None;
+    let mut stream = match prompted {
+        Ok(stream) => Some(stream),
+        // The wrap-up cancel won the race against the prompt (a turn started with almost no time
+        // left): that is a cancelled turn, `out_of_time`, not a failed one.
+        Err(_) if fired.load(std::sync::atomic::Ordering::SeqCst) => {
+            append_execution(log, job_id, JobExecutionStatus::Cancelled)?;
+            terminal = Some(JobExecutionStatus::Cancelled);
+            None
+        }
         Err(error) => {
             stop(timer);
             append_execution(log, job_id, JobExecutionStatus::Failed)?;
             return Err(error.into());
         }
     };
-    let mut terminal = None;
-    loop {
+    while let Some(stream) = stream.as_mut() {
         if wrap_at.is_some_and(|at| std::time::Instant::now() >= at)
             && !fired.load(std::sync::atomic::Ordering::SeqCst)
         {
