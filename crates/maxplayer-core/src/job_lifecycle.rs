@@ -7212,6 +7212,19 @@ mod tests {
         }
     }
 
+    /// Session jobs, failure test 13 (offer half): an OFFER never carries session state — the
+    /// offer builder takes no `[sessions]` input, and its bytes contain no session tag or kind.
+    #[test]
+    fn offers_carry_no_session_tags() {
+        let request = post_request_requesting(None, None, None, &[]);
+        let draft = build_offer_draft(&request, 10, None).unwrap();
+        assert_eq!(draft.kind, JOB_OFFER_KIND);
+        for name in ["session", "turn", "turn_status", "context", "reply"] {
+            assert!(!draft.tags.iter().any(|t| t.first() == Some(name)), "{name} on an offer");
+        }
+        assert_eq!(draft, build_offer_draft(&request, 10, None).unwrap(), "deterministic bytes");
+    }
+
     #[test]
     fn local_base_path_is_absolute_and_never_in_offer() {
         let mut request = contribution_post_request(
