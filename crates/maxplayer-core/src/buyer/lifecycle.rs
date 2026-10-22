@@ -1628,6 +1628,7 @@ mod publish_refused_tests {
         // money path must keep running for it.
         let mut claimed = view(Some("invalid: refused"));
         claimed.claims.push(crate::job_lifecycle::ClaimView {
+            session: false,
             claim_id: "c".repeat(64),
             created_at: 1,
             seller_pubkey: "5".repeat(64),
@@ -1802,6 +1803,7 @@ mod tests {
     fn claim(job_id: &str, live: bool, creq_amount: u64, mints: &[String]) -> ClaimView {
         let creq = build_seller_creq(job_id, creq_amount, "sat", mints, SELLER_HEX).expect("creq");
         ClaimView {
+            session: false,
             payment_mode: crate::gateway::PaymentMode::Sat,
             // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
             // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
@@ -5056,6 +5058,7 @@ mod free_lane_tests {
 
     fn claim_view(mode: PaymentMode, creq: Option<String>) -> ClaimView {
         ClaimView {
+            session: false,
             payment_mode: mode,
             capability: crate::heartbeat::SeatCapability::default(),
             claim_id: "c".repeat(64),

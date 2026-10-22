@@ -80,7 +80,7 @@ pub fn project(
     let o = wire::validate_private(offer, host)?;
     let kind = local.kind;
     if offer.kind.as_u16() != 3401
-        || !matches!(kind, 3400 | 3402 | 3403 | 3404 | 3405 | 3406 | 3407)
+        || !matches!(kind, 3400 | 3402 | 3403 | 3404 | 3405 | 3406 | 3407 | 3412)
     {
         return Err(Error("unsupported lifecycle projection"));
     }
@@ -120,6 +120,8 @@ pub fn project(
         ],
         3404 => &["e", "p", "status", "reason_code"],
         3405 | 3406 => &["e", "p", "status"],
+        // Session FOLLOW-UP (§2.1): the message itself rides as encrypted content, never `i`.
+        3412 => &["e", "p", "status", "turn", "param"],
         3407 => &["e", "p", "status", "reason_code", "commit"],
         _ => unreachable!(),
     };

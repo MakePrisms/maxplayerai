@@ -48,6 +48,9 @@ pub enum JobClass {
 pub struct AuthorizePayRequest {
     pub private_evidence: Option<crate::private_content::evidence::PrivateEvidence>,
     pub job_id: String,
+    /// Session turn ≥ 2 (§8.2): the NUT-18 payload id (the follow-up id). `None` ⇒ the job id,
+    /// exactly as before. Never part of the attempt id or the receipt preimage (both keep the offer).
+    pub payment_id: Option<String>,
     pub result_id: String,
     /// Buyer-derived job class (from the signed offer). Sealing input: `Contribution` with
     /// `contribution: None` is refused (see [`JobClass`]).
@@ -372,6 +375,7 @@ pub async fn authorize_pay_async(
         request.realized_mint.as_deref(),
         request.creq_hash.clone(),
     )?;
+    let key = key.with_payment_id(request.payment_id.clone());
     let attempt_id = key.attempt_id();
 
     // §6.4 — the delivery mode splits here, BEFORE the wallet is opened and long before the budget
@@ -1654,6 +1658,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -1775,6 +1780,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -1826,6 +1832,7 @@ mod tests {
         let home = home::bootstrap(&root).expect("home");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -1873,6 +1880,7 @@ mod tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let oid = "aa".repeat(20);
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -1923,6 +1931,7 @@ mod tests {
             &prepay_preimage(&home, "job-ext", "result-ext", &"bb".repeat(32), &"aa".repeat(20), 2),
         );
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -2202,6 +2211,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -2262,6 +2272,7 @@ mod tests {
             .sign_schnorr(&Message::from_digest(preimage.digest_bytes()))
             .to_string();
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -2338,6 +2349,7 @@ mod tests {
         );
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let tampered_amount = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -2372,6 +2384,7 @@ mod tests {
         );
         let mut gate2 = BudgetGate::from_home(&home).expect("gate");
         let tampered_delivery = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: crate::gateway::PaymentMode::Sat,
@@ -2604,6 +2617,7 @@ mod free_lane_tests {
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let commit = "ab".repeat(20);
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: PaymentMode::None,
@@ -2645,6 +2659,7 @@ mod free_lane_tests {
         let (root, home) = temp_home("sat-passes");
         let mut gate = BudgetGate::from_home(&home).expect("gate");
         let request = AuthorizePayRequest {
+            payment_id: None,
             private_evidence: None,
             inline_answer: None,
             payment_mode: PaymentMode::Sat,
