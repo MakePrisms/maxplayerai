@@ -603,11 +603,13 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         Ok(mode) => mode,
         Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
-    let max_session_sats =
-        match post_job_session_cap(params.max_session_sats, context.home.config.sessions.enabled) {
-            Ok(cap) => cap,
-            Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
-        };
+    let max_session_sats = match post_job_session_cap(
+        params.max_session_sats,
+        context.home.config.sessions.enabled,
+    ) {
+        Ok(cap) => cap,
+        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
+    };
     let max_sats = params.max_sats.unwrap_or(params.amount_sats);
     let harness = params.harness.clone();
     let model = params.model.clone();
@@ -7690,16 +7692,24 @@ mod tests {
             let params: PostJobParams = serde_json::from_value(body).unwrap();
             let cap = params.max_session_sats;
             let job = post_job_kind(&params).unwrap();
-            let mode = post_job_payment_mode(params.payment.as_deref(), params.amount_sats).unwrap();
+            let mode =
+                post_job_payment_mode(params.payment.as_deref(), params.amount_sats).unwrap();
             (cap, post_job_request(params, job, mode))
         };
         let (none, plain) = build(body);
         let (cap, capped) = build(with);
         assert_eq!((none, cap), (None, Some(500)));
-        assert_eq!(plain, capped, "the offer request (hence its bytes) ignores max_session_sats");
+        assert_eq!(
+            plain, capped,
+            "the offer request (hence its bytes) ignores max_session_sats"
+        );
         assert_eq!(post_job_session_cap(None, false), Ok(None));
         assert_eq!(post_job_session_cap(Some(500), true), Ok(Some(500)));
-        assert!(post_job_session_cap(Some(500), false).unwrap_err().contains("sessions are disabled"));
+        assert!(
+            post_job_session_cap(Some(500), false)
+                .unwrap_err()
+                .contains("sessions are disabled")
+        );
     }
 
     /// §8.1 cap precedence across post and reply, through the real store: a cap stored at post is
@@ -7719,7 +7729,10 @@ mod tests {
         assert_eq!(store.open_session("job", 70, 2).unwrap(), (500, true));
         assert_eq!(session_reply::session_cap(Some(900), stored, &cfg, 7), 900);
         store.set_session_cap("job", 900, 3).unwrap();
-        assert_eq!(store.session_row("job").unwrap().map(|(cap, _)| cap), Some(900));
+        assert_eq!(
+            store.session_row("job").unwrap().map(|(cap, _)| cap),
+            Some(900)
+        );
         // Nothing set anywhere: 10 x the price; a config cap beats the multiplier.
         assert_eq!(session_reply::session_cap(None, None, &cfg, 7), 70);
         cfg.session_cap_sats = Some(55);

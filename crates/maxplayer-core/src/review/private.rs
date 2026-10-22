@@ -487,16 +487,36 @@ fn fill_followup_evidence(
     let fits =
         |request: &Request| serde_json::to_string(request).map_or(usize::MAX, |s| s.len()) <= bound;
     for item in earlier.into_iter().rev() {
-        request.followup.as_mut().expect("follow-up request").followups.insert(0, item);
+        request
+            .followup
+            .as_mut()
+            .expect("follow-up request")
+            .followups
+            .insert(0, item);
         if !fits(request) {
-            request.followup.as_mut().expect("follow-up request").followups.remove(0);
+            request
+                .followup
+                .as_mut()
+                .expect("follow-up request")
+                .followups
+                .remove(0);
             break;
         }
     }
     for item in deliveries.into_iter().rev() {
-        request.followup.as_mut().expect("follow-up request").deliveries.insert(0, item);
+        request
+            .followup
+            .as_mut()
+            .expect("follow-up request")
+            .deliveries
+            .insert(0, item);
         if !fits(request) {
-            request.followup.as_mut().expect("follow-up request").deliveries.remove(0);
+            request
+                .followup
+                .as_mut()
+                .expect("follow-up request")
+                .deliveries
+                .remove(0);
             break;
         }
     }
@@ -893,7 +913,14 @@ mod tests {
         signer: &Keys,
         text: &str,
     ) -> FollowUpItem {
-        followup_item_at(evidence, policy, signer, text, 2, &evidence.result.id.to_hex())
+        followup_item_at(
+            evidence,
+            policy,
+            signer,
+            text,
+            2,
+            &evidence.result.id.to_hex(),
+        )
     }
 
     /// A follow-up for turn `turn` replying to result `prev`.
@@ -1002,10 +1029,22 @@ mod tests {
         let (evidence, _, _, policy) = pc::evidence::inline_fixture_for(true);
         let r1 = evidence.result.id.to_hex();
         let f2 = followup_item_at(&evidence, &policy, &key(1), "second ask", 2, &r1);
-        let r2 = turn_result(&evidence, &policy, &key(2), &f2.carrier, TurnStatus::NeedsInput);
+        let r2 = turn_result(
+            &evidence,
+            &policy,
+            &key(2),
+            &f2.carrier,
+            TurnStatus::NeedsInput,
+        );
         let f3 = followup_item_at(&evidence, &policy, &key(1), "third ask", 3, &r2.id.to_hex());
-        let d1 = DeliveryItem { result: evidence.result.clone(), followup: None };
-        let d2 = DeliveryItem { result: r2.clone(), followup: Some(f2.carrier.clone()) };
+        let d1 = DeliveryItem {
+            result: evidence.result.clone(),
+            followup: None,
+        };
+        let d2 = DeliveryItem {
+            result: r2.clone(),
+            followup: Some(f2.carrier.clone()),
+        };
         let request = |deliveries: Vec<DeliveryItem>| Request {
             subject: Subject {
                 offer: evidence.offer.id.to_hex(),
@@ -1028,8 +1067,16 @@ mod tests {
         assert_eq!(
             f.delivery_lines(&good.offer, &policy).unwrap(),
             vec![
-                crate::session::DeliveryLine { turn: 1, status: TurnStatus::Done, commit: None },
-                crate::session::DeliveryLine { turn: 2, status: TurnStatus::NeedsInput, commit: None },
+                crate::session::DeliveryLine {
+                    turn: 1,
+                    status: TurnStatus::Done,
+                    commit: None
+                },
+                crate::session::DeliveryLine {
+                    turn: 2,
+                    status: TurnStatus::NeedsInput,
+                    commit: None
+                },
             ]
         );
         let context = f.context(&good.offer, "the task", &policy).unwrap();
@@ -1038,7 +1085,10 @@ mod tests {
             "ORIGINAL TASK:\nthe task\nturn 1: done, commit inline\nturn 2: needs_input, commit inline\n\
              FOLLOW-UP turn 2:\nsecond ask\nFOLLOW-UP turn 3:\nthird ask\n"
         );
-        assert!(!context.contains("delivery body"), "delivery content never reaches the context");
+        assert!(
+            !context.contains("delivery body"),
+            "delivery content never reaches the context"
+        );
         // Same bytes as the public lane renders for the same facts.
         let lines = f.delivery_lines(&good.offer, &policy).unwrap();
         assert_eq!(
@@ -1060,32 +1110,74 @@ mod tests {
         let none = request(vec![]);
         assert!(!serde_json::to_string(&none).unwrap().contains("deliveries"));
         assert_eq!(
-            none.followup.as_ref().unwrap().context(&none.offer, "t", &policy).unwrap(),
-            crate::session::followup_review_context("t", &["second ask".into(), "third ask".into()], &[])
+            none.followup
+                .as_ref()
+                .unwrap()
+                .context(&none.offer, "t", &policy)
+                .unwrap(),
+            crate::session::followup_review_context(
+                "t",
+                &["second ask".into(), "third ask".into()],
+                &[]
+            )
         );
         // Refused: a delivery signed by anyone but the selected seller (the buyer cannot put a
         // delivery in the seller's mouth either) ...
         let by_buyer = turn_result(&evidence, &policy, &key(1), &f2.carrier, TurnStatus::Done);
         let refused = |deliveries: Vec<DeliveryItem>| {
             let r = request(deliveries);
-            assert!(r.followup.as_ref().unwrap().delivery_lines(&r.offer, &policy).is_err());
+            assert!(
+                r.followup
+                    .as_ref()
+                    .unwrap()
+                    .delivery_lines(&r.offer, &policy)
+                    .is_err()
+            );
             assert!(r.validate(&key(2).public_key(), &policy).is_err());
         };
-        refused(vec![DeliveryItem { result: by_buyer, followup: Some(f2.carrier.clone()) }]);
+        refused(vec![DeliveryItem {
+            result: by_buyer,
+            followup: Some(f2.carrier.clone()),
+        }]);
         // ... a turn-n result paired with a follow-up it does not answer, or with none ...
-        refused(vec![DeliveryItem { result: r2.clone(), followup: Some(f3.carrier.clone()) }]);
-        refused(vec![DeliveryItem { result: r2.clone(), followup: None }]);
+        refused(vec![DeliveryItem {
+            result: r2.clone(),
+            followup: Some(f3.carrier.clone()),
+        }]);
+        refused(vec![DeliveryItem {
+            result: r2.clone(),
+            followup: None,
+        }]);
         // ... a turn-1 result dressed up with a follow-up ...
-        refused(vec![DeliveryItem { result: evidence.result.clone(), followup: Some(f2.carrier.clone()) }]);
+        refused(vec![DeliveryItem {
+            result: evidence.result.clone(),
+            followup: Some(f2.carrier.clone()),
+        }]);
         // ... a follow-up forged by the seller to number a delivery ...
         let forged = followup_item_at(&evidence, &policy, &key(2), "x", 2, &r1);
-        let r_forged = turn_result(&evidence, &policy, &key(2), &forged.carrier, TurnStatus::Done);
-        refused(vec![DeliveryItem { result: r_forged, followup: Some(forged.carrier) }]);
+        let r_forged = turn_result(
+            &evidence,
+            &policy,
+            &key(2),
+            &forged.carrier,
+            TurnStatus::Done,
+        );
+        refused(vec![DeliveryItem {
+            result: r_forged,
+            followup: Some(forged.carrier),
+        }]);
         // ... out of order, duplicated, or not earlier than the follow-up under review.
         refused(vec![d2.clone(), d1.clone()]);
         refused(vec![d1.clone(), d1.clone()]);
         let r3 = turn_result(&evidence, &policy, &key(2), &f3.carrier, TurnStatus::Done);
-        refused(vec![d1, d2, DeliveryItem { result: r3, followup: Some(f3.carrier.clone()) }]);
+        refused(vec![
+            d1,
+            d2,
+            DeliveryItem {
+                result: r3,
+                followup: Some(f3.carrier.clone()),
+            },
+        ]);
     }
 
     /// §9 size bound on the private lane: buyer follow-ups take the bound first (newest kept
@@ -1098,8 +1190,14 @@ mod tests {
         let f2 = followup_item_at(&evidence, &policy, &key(1), "second ask", 2, &r1);
         let r2 = turn_result(&evidence, &policy, &key(2), &f2.carrier, TurnStatus::Done);
         let f3 = followup_item_at(&evidence, &policy, &key(1), "third ask", 3, &r2.id.to_hex());
-        let d1 = DeliveryItem { result: evidence.result.clone(), followup: None };
-        let d2 = DeliveryItem { result: r2, followup: Some(f2.carrier.clone()) };
+        let d1 = DeliveryItem {
+            result: evidence.result.clone(),
+            followup: None,
+        };
+        let d2 = DeliveryItem {
+            result: r2,
+            followup: Some(f2.carrier.clone()),
+        };
         let base = || Request {
             subject: Subject {
                 offer: evidence.offer.id.to_hex(),
@@ -1127,16 +1225,39 @@ mod tests {
         };
         // Unbounded: everything, oldest first.
         let mut all = base();
-        fill_followup_evidence(&mut all, vec![f2.clone()], vec![d1.clone(), d2.clone()], usize::MAX);
-        assert_eq!(ids(&all), (vec![f2.carrier.id, f3.carrier.id], vec![d1.result.id, d2.result.id]));
+        fill_followup_evidence(
+            &mut all,
+            vec![f2.clone()],
+            vec![d1.clone(), d2.clone()],
+            usize::MAX,
+        );
+        assert_eq!(
+            ids(&all),
+            (
+                vec![f2.carrier.id, f3.carrier.id],
+                vec![d1.result.id, d2.result.id]
+            )
+        );
         all.validate(&key(2).public_key(), &policy).unwrap();
         // Room for the follow-up and only the newest delivery: the oldest delivery goes.
         let mut want = base();
-        want.followup.as_mut().unwrap().followups.insert(0, f2.clone());
+        want.followup
+            .as_mut()
+            .unwrap()
+            .followups
+            .insert(0, f2.clone());
         want.followup.as_mut().unwrap().deliveries.push(d2.clone());
         let mut cut = base();
-        fill_followup_evidence(&mut cut, vec![f2.clone()], vec![d1.clone(), d2.clone()], size(&want));
-        assert_eq!(ids(&cut), (vec![f2.carrier.id, f3.carrier.id], vec![d2.result.id]));
+        fill_followup_evidence(
+            &mut cut,
+            vec![f2.clone()],
+            vec![d1.clone(), d2.clone()],
+            size(&want),
+        );
+        assert_eq!(
+            ids(&cut),
+            (vec![f2.carrier.id, f3.carrier.id], vec![d2.result.id])
+        );
         // Room for nothing extra: the earlier follow-up wins over any delivery only when it fits;
         // here neither fits and the current follow-up stays.
         let mut bare = base();
