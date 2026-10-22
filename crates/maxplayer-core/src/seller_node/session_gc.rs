@@ -284,6 +284,8 @@ mod tests {
             last_turn_at: at,
             disk_bytes: bytes,
             state,
+            proxy_host: None,
+            base_oid: None,
         }
     }
 

@@ -657,6 +657,11 @@ pub struct SessionRecord {
     pub last_turn_at: u64,
     pub disk_bytes: u64,
     pub state: crate::session::SessionState,
+    /// The holder's measured proxy address (turn 1's containment). A resumed turn starts a fresh
+    /// credential proxy reachable at the same address inside the same namespace (§6.4).
+    pub proxy_host: Option<String>,
+    /// The last git-delivered commit of the session: turn n+1's single parent (§7.1).
+    pub base_oid: Option<String>,
 }
 impl SessionRecord {
     pub fn size(&self) -> crate::session::SessionSize {
@@ -683,7 +688,8 @@ pub struct SessionTurnRecord {
 
 const SESSION_COLUMNS: &str =
     "job_id, buyer_pubkey, container, holder, holder_started_at, image_id,
-    orchestrator_version, acp_session_id, harness, model, turn, last_turn_at, disk_bytes, state";
+    orchestrator_version, acp_session_id, harness, model, turn, last_turn_at, disk_bytes, state,
+    proxy_host, base_oid";
 
 fn bad_state(i: usize) -> rusqlite::Error {
     rusqlite::Error::InvalidColumnType(i, "state".into(), rusqlite::types::Type::Text)
@@ -706,6 +712,8 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
         disk_bytes: r.get::<_, i64>(12)? as u64,
         state: crate::session::SessionState::parse(&r.get::<_, String>(13)?)
             .ok_or_else(|| bad_state(13))?,
+        proxy_host: r.get(14)?,
+        base_oid: r.get(15)?,
     })
 }
 
@@ -1255,7 +1263,8 @@ impl SellerStore {
                  acp_session_id TEXT, harness TEXT NOT NULL, model TEXT,
                  turn INTEGER NOT NULL, last_turn_at INTEGER NOT NULL,
                  disk_bytes INTEGER NOT NULL DEFAULT 0,
-                 state TEXT NOT NULL CHECK (state IN ('running','parked','closed','expired')));
+                 state TEXT NOT NULL CHECK (state IN ('running','parked','closed','expired')),
+                 proxy_host TEXT, base_oid TEXT);
              CREATE TABLE IF NOT EXISTS session_turns (
                  followup_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, turn INTEGER NOT NULL,
                  deadline_unix INTEGER NOT NULL, result_id TEXT, delivery_oid TEXT,
@@ -1282,6 +1291,13 @@ impl SellerStore {
     /// reads the same as its default. Nothing here rewrites or drops a row: this store holds live
     /// trade state.
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        // v15 (session jobs): the resume facts, additive on a sessions table an earlier build of
+        // the same version may have created without them.
+        for column in ["proxy_host", "base_oid"] {
+            if !Self::column_exists(conn, "sessions", column)? {
+                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {column} TEXT;"))?;
+            }
+        }
         if !Self::column_exists(conn, "offers", "capability_request")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN capability_request TEXT;")?;
         }
@@ -2095,15 +2111,16 @@ impl SellerStore {
         conn.execute(
             "INSERT INTO sessions (job_id, buyer_pubkey, container, holder, holder_started_at,
                  image_id, orchestrator_version, acp_session_id, harness, model, turn,
-                 last_turn_at, disk_bytes, state)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                 last_turn_at, disk_bytes, state, proxy_host, base_oid)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(job_id) DO UPDATE SET buyer_pubkey=excluded.buyer_pubkey,
                  container=excluded.container, holder=excluded.holder,
                  holder_started_at=excluded.holder_started_at, image_id=excluded.image_id,
                  orchestrator_version=excluded.orchestrator_version,
                  acp_session_id=excluded.acp_session_id, harness=excluded.harness,
                  model=excluded.model, turn=excluded.turn, last_turn_at=excluded.last_turn_at,
-                 disk_bytes=excluded.disk_bytes, state=excluded.state",
+                 disk_bytes=excluded.disk_bytes, state=excluded.state,
+                 proxy_host=excluded.proxy_host, base_oid=excluded.base_oid",
             params![
                 s.job_id,
                 s.buyer_pubkey,
@@ -2118,7 +2135,9 @@ impl SellerStore {
                 s.turn,
                 s.last_turn_at as i64,
                 s.disk_bytes as i64,
-                s.state.as_str()
+                s.state.as_str(),
+                s.proxy_host,
+                s.base_oid
             ],
         )?;
         Ok(())
@@ -2252,6 +2271,73 @@ impl SellerStore {
         )?;
         let rows = stmt.query_map([job_id], turn_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A turn was delivered (§5.2 step 4): `turn` is now the last delivered turn, the git base moves
+    /// only when the turn delivered through git (an inline turn keeps it, §7.2).
+    pub fn advance_session(
+        &self,
+        job_id: &str,
+        turn: u32,
+        base_oid: Option<&str>,
+        acp_session_id: Option<&str>,
+        now_unix: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET turn = MAX(turn, ?2), base_oid = COALESCE(?3, base_oid),
+                 acp_session_id = COALESCE(?4, acp_session_id), last_turn_at = ?5
+             WHERE job_id = ?1",
+            params![job_id, turn, base_oid, acp_session_id, now_unix as i64],
+        )?;
+        Ok(())
+    }
+
+    /// The turn a RESULT answered (free-job ACCEPT binding, §8.3).
+    pub fn turn_by_result(&self, result_id: &str) -> Result<Option<SessionTurnRecord>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT followup_id, job_id, turn, deadline_unix, result_id, delivery_oid, state
+                 FROM session_turns WHERE result_id = ?1",
+                [result_id],
+                turn_row,
+            )
+            .optional()?)
+    }
+
+    /// Follow-ups a restart left unfinished (§5.5 seller restart): received, waiting for payment,
+    /// under review or running.
+    pub fn unfinished_turns(&self) -> Result<Vec<SessionTurnRecord>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT followup_id, job_id, turn, deadline_unix, result_id, delivery_oid, state
+             FROM session_turns
+             WHERE state IN ('received','waiting_payment','reviewing','running')
+             ORDER BY created_at_unix, followup_id",
+        )?;
+        let rows = stmt.query_map([], turn_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether THIS seat's claim for `job_id` carried `["session","1"]` (§2.2): read off the claim
+    /// draft journaled in the outbox, so the answer is the claim the buyer actually saw, not live
+    /// config. No claim row ⇒ `false`.
+    pub fn claim_advertised_session(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let draft: Option<String> = conn
+            .query_row(
+                "SELECT draft_json FROM nostr_event_outbox WHERE dedup_key = ?1",
+                [format!("claim:{job_id}")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(draft) = draft else {
+            return Ok(false);
+        };
+        let draft: EventDraft = serde_json::from_str(&draft)
+            .map_err(|error| StoreError(format!("claim draft decode: {error}")))?;
+        Ok(crate::session::claim_supports_sessions(&draft.tags))
     }
 
     /// The payment lookup for an incoming wrap (§8.2): a follow-up id resolves to `(job, turn)`.
@@ -3436,6 +3522,8 @@ mod tests {
             last_turn_at: at,
             disk_bytes: bytes,
             state: crate::session::SessionState::Parked,
+            proxy_host: Some("172.18.0.1".into()),
+            base_oid: Some("a".repeat(40)),
         }
     }
 
