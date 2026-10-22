@@ -2003,6 +2003,9 @@ pub enum CleanupPolicy {
     CaptureThenRemove,
     /// Remove without capturing: a self-probe.
     RemoveOnly,
+    /// Session jobs (docs/specs/session-jobs.md §5.2 step 2): capture the diagnostics, then KEEP the
+    /// stopped container for the next turn. Session GC owns its removal from here on.
+    CaptureThenPark,
 }
 
 /// The cleanup a run under `timeout` gets.
@@ -3054,6 +3057,9 @@ pub(crate) struct PreparedLaunch {
     /// than re-derived per call site so the agent launch and the container-delivery launch hand the
     /// job the same resolvers its own firewall was told about.
     pub resolv_conf: Option<std::path::PathBuf>,
+    /// The address the job reaches the credential proxy at inside its namespace (§6.4: a resumed
+    /// session turn starts its fresh proxy behind the same address). `None` uncontained.
+    pub proxy_host: Option<String>,
     _proxy: Option<crate::credential_proxy::RunningProxy>,
     _containment: Option<crate::sandbox_netns::Containment>,
 }
@@ -3281,12 +3287,118 @@ pub(crate) async fn prepare_launch(
         forwarded_secrets,
         uid,
         gid,
+        proxy_host: holder.as_ref().map(|(_, host)| host.clone()),
         holder_name: holder.map(|(name, _)| name),
         mcp_servers,
         resolv_conf: job_resolv_conf,
         _proxy,
         _containment,
     })
+}
+
+/// Prepare a RESUMED session turn (docs/specs/session-jobs.md §6.1, §6.4): the netns holder and the
+/// job container already exist, so no containment is established and no resolver is written. Only
+/// the credential side is re-done: the host Codex session is re-read against THIS turn's lifetime and
+/// a fresh credential proxy mints new placeholders behind `proxy_host` (the holder's measured
+/// address; the firewall pinhole from `proxy_port_range` still covers it). The env, argv and MCP
+/// servers returned are laid over the stale ones the container was created with
+/// ([`crate::delivery_orchestrator::SessionInputs::agent_env_overrides`]).
+#[cfg(feature = "acp")]
+pub(crate) async fn prepare_resume_launch(
+    agent_command: &[String],
+    policy: &SandboxPolicy,
+    identity: &DeliveryAgentIdentity,
+    job_lifetime: Duration,
+    proxy_host: Option<&str>,
+) -> Result<PreparedLaunch, ExecError> {
+    let mut env = identity.git_env();
+    let codex_chatgpt_session =
+        codex_chatgpt_session_for_command(policy, agent_command, job_lifetime)?;
+    let mut effective_command = agent_command.to_vec();
+    let forwarded = forwarded_agent_env(policy);
+    let mut forwarded_secrets: Vec<String> = forwarded.iter().map(|(_, v)| v.clone()).collect();
+    let (uid, gid) = job_identity();
+    let mut _proxy = None;
+    let mut mcp_servers = Vec::new();
+    if policy.docker_image().is_some() {
+        match start_credential_containment(
+            &forwarded,
+            policy.file_credentials(),
+            policy.mcp_tools(),
+            codex_chatgpt_session,
+            job_lifetime,
+            policy.proxy_ports(),
+            proxy_host.unwrap_or(crate::credential_proxy::PROXY_HOST_ALIAS),
+        )
+        .await?
+        {
+            Some(containment) => {
+                if proxy_host.is_some() && policy.proxy_ports().is_none() {
+                    return Err(ExecError::Config(
+                        "[sandbox] docker: a contained credential needs [sandbox] proxy_port_range \
+                         when egress containment is active"
+                            .into(),
+                    ));
+                }
+                env.extend(containment.env);
+                effective_command.extend(containment.argv_extra);
+                mcp_servers = containment.mcp_servers;
+                for secret in containment.secrets {
+                    if !forwarded_secrets.contains(&secret) {
+                        forwarded_secrets.push(secret);
+                    }
+                }
+                _proxy = Some(containment.proxy);
+            }
+            None => env.extend(forwarded),
+        }
+    } else {
+        env.extend(forwarded);
+    }
+    Ok(PreparedLaunch {
+        codex_session: policy.codex_session_for_command(agent_command),
+        env,
+        effective_command,
+        forwarded_secrets,
+        uid,
+        gid,
+        holder_name: None,
+        mcp_servers,
+        resolv_conf: None,
+        proxy_host: proxy_host.map(str::to_owned),
+        _proxy,
+        _containment: None,
+    })
+}
+
+/// Without the `acp` feature there is no containment path to prepare — fail closed.
+#[cfg(not(feature = "acp"))]
+pub(crate) async fn prepare_resume_launch(
+    _agent_command: &[String],
+    _policy: &SandboxPolicy,
+    _identity: &DeliveryAgentIdentity,
+    _job_lifetime: Duration,
+    _proxy_host: Option<&str>,
+) -> Result<PreparedLaunch, ExecError> {
+    Err(ExecError::AcpRequired)
+}
+
+/// `docker start -a -i <container>`: run a PARKED session container again (§6.1). Its command is the
+/// orchestrator, fixed at create; it reads the inputs file the host re-wrote into the exchange dir.
+pub fn docker_start_argv(container: &str) -> Vec<String> {
+    ["docker", "start", "-a", "-i", container]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// `docker container inspect --format {{.Image}}`: the image a parked container runs, recorded on
+/// the session (§5.4).
+pub fn container_image_argv(container: &str) -> Vec<String> {
+    ["docker", "container", "inspect", "--format", "{{.Image}}", container]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 /// Run the **production** preparation and launch construction for one job, hand the resulting argv
@@ -3376,7 +3488,31 @@ pub(crate) async fn cleanup_job_container(
     // Off the runtime, for the reason `AcpDriver::shutdown` gives for its own blocking work: the
     // seller node runs every awarded job as a `spawn_local` task on ONE LocalSet thread, so
     // blocking docker calls here would stall every sibling job for the duration.
+    if cleanup == CleanupPolicy::CaptureThenPark {
+        let parked = tokio::task::spawn_blocking(move || {
+            destination.map(|dir| capture_into(&mut RealDockerCli, &name, &dir, Some(&event_log), &secrets))
+        })
+        .await;
+        container.settle();
+        match parked {
+            Ok(Some(Err(error))) => eprintln!(
+                "sandbox: job_capture=failed container={} error={error}",
+                container.name()
+            ),
+            Ok(_) => eprintln!("sandbox: job_parked=ok container={}", container.name()),
+            Err(error) => eprintln!(
+                "sandbox: job_parked=unknown container={} error=capture task panicked: {error}",
+                container.name()
+            ),
+        }
+        return;
+    }
     let reported = tokio::task::spawn_blocking(move || match (cleanup, destination) {
+        // Handled above; never removes.
+        (CleanupPolicy::CaptureThenPark, _) => CleanupReport {
+            capture: CaptureOutcome::SkippedByPolicy(CAPTURE_SKIPPED_PROBE),
+            removal: Ok(()),
+        },
         (CleanupPolicy::RemoveOnly, _) => {
             remove_only(&mut RealDockerCli, &name, CAPTURE_SKIPPED_PROBE)
         }
@@ -6528,6 +6664,7 @@ mod tests {
             // capture tomorrow.
             let report = match cleanup_policy(AgentRunTimeout::HarnessProbe(Duration::from_secs(120))) {
                 CleanupPolicy::RemoveOnly => remove_only(&mut cli, &name, CAPTURE_SKIPPED_PROBE),
+                CleanupPolicy::CaptureThenPark => unreachable!("a probe never parks"),
                 CleanupPolicy::CaptureThenRemove => {
                     capture_then_remove(&mut cli, &name, &dir, None, &[])
                 }
