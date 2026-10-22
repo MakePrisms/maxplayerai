@@ -417,6 +417,13 @@ for the job's lifetime (`core/credential_proxy.rs:210`, `:1228 @e0262420`), whic
   makes every turn's receipt preimage (`receipt_preimage_for`, `core/authorize_pay.rs:1101 @e0262420`,
   which binds `job_hash`) distinct, and a turn-1 tree cannot be replayed as turn 2, without changing the
   preimage struct.
+  *Amended while implementing:* every turn carries the **offer's** `job-hash`. The v2 result validators
+  on both buyer paths require `job-hash == job_hash(offer)` (`private_content::wire::bind_content`,
+  `public_v2::validate_evidence`), so a follow-up-derived hash would get every turn n ≥ 2 refused, and
+  relaxing those validators is a money-path change this PR does not need. Turns stay distinct without
+  it: the preimage binds each turn's own `creq` hash (payment id = follow-up id) and its delivered
+  commit/answer digest, and a turn-1 tree cannot pass as turn n because the buyer requires the turn-n
+  commit's single parent to be the previous turn's accepted commit (§8.4).
 
 ### 7.2 Inline turns and questions
 
@@ -430,6 +437,9 @@ pattern, `docs/protocol-v1.md:870 @e0262420`); the composed prompt (`compose_age
 - **Protocol relaxation, session jobs only:** today inline is refused on contribution jobs
   (`docs/protocol-v1.md:669`, `:677 @e0262420`). On a session job an inline turn is allowed in either class
   and does not move the base. A one-shot job is unchanged.
+  *Not implemented in the first PR:* the buyer validators still refuse inline on a contribution
+  offer, so the seller only delivers an inline turn where today's rule allows it (from-scratch, buyer
+  reads inline); a question on a contribution session therefore travels as a git turn's content.
 
 ### 7.3 Turn status
 
@@ -504,6 +514,11 @@ Verification additionally checks the commit's single parent is the previous git 
   Only when that context exceeds `MAX_INPUT_BYTES` = 128 KiB (`core/review.rs:13`; checked at
   `core/reviewer.rs:550 @e0262420`) does the reviewer summarize the oldest follow-ups itself; the current
   follow-up is always in full.
+  *Found while implementing:* the encrypted (private) review lane's `Request` carries only an offer or
+  a delivery, so a private follow-up has no subject there yet. Until it does, a seller with
+  `seller_offer` review enabled **withholds** a private follow-up (`abort`, turn refused, nothing
+  charged) rather than send its text over the public lane; `skip_buyer_pubkeys` or
+  `seller_offer = false` lets it run. Public follow-ups use the public lane as specified.
 - **Buyer, delivery review.** Per turn, from that turn's diff: the reviewer's diff plan already takes a
   base (`core/reviewer.rs:618`, `:625 @e0262420`); for turn n the base is the previous git turn's commit,
   read from the follow-up the result replies to. A `needs_input` question is reviewed like an inline answer.
