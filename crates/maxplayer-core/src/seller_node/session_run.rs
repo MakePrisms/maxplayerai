@@ -752,22 +752,41 @@ impl SellerNodeRunner {
             // carries the signed carriers + encrypted bodies of this and earlier follow-ups.
             let private_request =
                 if private && matches!(review.enabled(subject.kind, &buyer), Ok(true)) {
-                    let earlier: Vec<String> = store
+                    let turns: Vec<SessionTurnRecord> = store
                         .turns(job_id)
                         .map(|turns| {
                             turns
                                 .into_iter()
                                 .filter(|t| t.turn < n && t.state != TurnState::Refused)
-                                .map(|t| t.followup_id)
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let earlier: Vec<String> =
+                        turns.iter().map(|t| t.followup_id.clone()).collect();
+                    // Earlier deliveries (§9): turn 1's published RESULT, then each earlier
+                    // turn's with the follow-up it answers. The reviewer re-authenticates each
+                    // and keeps one line (turn, status, commit); unpublished ones are skipped.
+                    let turn_one = store
+                        .outbox_row(&format!("result:{job_id}"))
+                        .ok()
+                        .flatten()
+                        .and_then(|(_, _, id)| id);
+                    let deliveries: Vec<(String, Option<String>)> = turn_one
+                        .map(|id| (id, None))
+                        .into_iter()
+                        .chain(turns.iter().filter_map(|t| {
+                            t.result_id
+                                .clone()
+                                .map(|id| (id, Some(t.followup_id.clone())))
+                        }))
+                        .collect();
                     Some(crate::review::private::followup_request(
                         home,
                         &seller_pubkey,
                         job_id,
                         &earlier,
                         fid,
+                        &deliveries,
                     ))
                 } else {
                     None

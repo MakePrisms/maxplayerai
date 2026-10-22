@@ -415,6 +415,9 @@ fn tools_for(sessions: bool) -> Value {
     let tools = list.as_array_mut().expect("tools array");
     for tool in tools.iter_mut() {
         match tool["name"].as_str() {
+            Some("post_job") => {
+                tool["inputSchema"]["properties"]["max_session_sats"] = json!({"type": "integer", "minimum": 0, "description": "Session job: spend cap across ALL turns of this job (turn 1 included), stored locally with the session so the first reply uses it; reply max_session_sats may still override it. Never sent to the seller. Default 10x amount_sats."});
+            }
             Some("collect") => {
                 let props = &mut tool["inputSchema"]["properties"];
                 props["turn"] = json!({"type": "integer", "minimum": 1, "description": "Session job: the turn to settle. Omit to settle the newest delivered, uncollected turn (turn 1 first). Turn n >= 2 materializes into <home>/results/<job_id>-t<n>; out is refused for it."});
@@ -1034,6 +1037,16 @@ mod tests {
         let off = tools();
         let collect = off.as_array().unwrap().iter().find(|t| t["name"] == "collect").unwrap();
         assert!(collect["inputSchema"]["properties"].get("turn").is_none());
+        // post_job gains max_session_sats only with the flag on; off, its schema bytes are today's.
+        let post = |list: &Value| list.as_array().unwrap().iter().find(|t| t["name"] == "post_job").unwrap().clone();
+        assert!(post(&on)["inputSchema"]["properties"]["max_session_sats"].is_object());
+        assert!(post(&off)["inputSchema"]["properties"].get("max_session_sats").is_none());
+        assert_eq!(serde_json::to_string(&tools_for(false)).unwrap(), serde_json::to_string(&off).unwrap());
+        assert!(!serde_json::to_string(&tools_for(false)).unwrap().contains("max_session_sats"));
+        // Only that one property differs between the flag-on and flag-off post_job.
+        let mut on_post = post(&on);
+        on_post["inputSchema"]["properties"].as_object_mut().unwrap().remove("max_session_sats");
+        assert_eq!(on_post, post(&off));
     }
 
     #[test]

@@ -565,6 +565,31 @@ fn review_context_keeps_current_followup_and_summarises_oldest() {
     assert!(ctx.ends_with(&format!("FOLLOW-UP turn 4:\n{current}\n")));
 }
 
+/// §9: the numbered renderer (private lane) labels follow-ups by their own turn, so a trimmed
+/// oldest follow-up never shifts the labels; positional numbering is its turn-2-onward special case.
+#[test]
+fn numbered_review_context_keeps_each_followups_own_turn() {
+    let lines = [DeliveryLine {
+        turn: 3,
+        status: TurnStatus::OutOfTime,
+        commit: Some("c3".into()),
+    }];
+    let numbered = followup_review_context_numbered(
+        "task",
+        &[(3, "third".into()), (4, "fourth".into())],
+        &lines,
+    );
+    assert_eq!(
+        numbered,
+        "ORIGINAL TASK:\ntask\nturn 3: out_of_time, commit c3\nFOLLOW-UP turn 3:\nthird\nFOLLOW-UP turn 4:\nfourth\n"
+    );
+    let positional = followup_review_context("task", &["a".into(), "b".into()], &lines);
+    assert_eq!(
+        positional,
+        followup_review_context_numbered("task", &[(2, "a".into()), (3, "b".into())], &lines)
+    );
+}
+
 #[test]
 fn reset_history_cuts_oldest_and_keeps_newest() {
     let big = "y".repeat(40 * 1024);
