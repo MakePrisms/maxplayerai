@@ -63,7 +63,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     install -m 0755 /src/target/release/tool-mcp-bridge /usr/local/bin/tool-mcp-bridge; \
     strip /usr/local/bin/tool-mcp-bridge
 
-FROM node:22-bookworm-slim
+# Pinned to an exact patch release + index digest, not the floating `22` tag: the Oct 21 2026 Node
+# security release (22.23.4: Brotli RCE, TLS hostname bypasses, NSS 3.131.1 roots without the
+# compromised eMudhra emSign roots) only reaches published images when this line moves. Bump deliberately.
+FROM node:22.23.4-bookworm-slim@sha256:de170b39439eb0e5a3444ad7d60b015614a381e10fecae2e30ec9e735122f38d
 
 # git for the delivery commit; ca-certificates for TLS to the model API / relay / git host;
 # procps because the job prompt's BOUNDARIES tell the agent to wait on a background process with

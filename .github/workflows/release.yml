@@ -431,7 +431,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.23.4 # exact patch: >= Oct 21 2026 security release; a bare 22 resolved to a cached 22.23.3
           # No NODE_AUTH_TOKEN goes with this — it only points npm at the public registry, which is
           # also where OIDC exchange happens.
           registry-url: https://registry.npmjs.org
@@ -535,7 +535,7 @@ jobs:
       # here. What gets published is only what the next step writes.
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.23.4 # exact patch: >= Oct 21 2026 security release; a bare 22 resolved to a cached 22.23.3
           registry-url: https://registry.npmjs.org
 
       # Same pin as the publish job: trusted publishing landed in npm 11.5. A probe on a different
