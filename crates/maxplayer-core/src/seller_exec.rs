@@ -3065,7 +3065,9 @@ impl PreparedLaunch {
     /// holder is detached from this guard and left running. Returns the holder's name.
     pub fn park(mut self) -> Option<String> {
         drop(self._proxy.take());
-        self._containment.take().map(crate::sandbox_netns::Containment::park)
+        self._containment
+            .take()
+            .map(crate::sandbox_netns::Containment::park)
     }
 
     /// The per-turn values the orchestrator lays over the container env (§6.4): every env pair this

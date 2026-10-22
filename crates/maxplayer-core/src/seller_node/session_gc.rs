@@ -181,7 +181,8 @@ impl SessionGc {
             .filter(|s| s.state.is_live())
             .map(SessionRecord::size)
             .collect();
-        report.expired_lifetime = session::expired_by_lifetime(&sizes, now_unix, self.lifetime_secs);
+        report.expired_lifetime =
+            session::expired_by_lifetime(&sizes, now_unix, self.lifetime_secs);
         let remaining: Vec<_> = sizes
             .into_iter()
             .filter(|s| !report.expired_lifetime.contains(&s.job_id))
@@ -196,7 +197,14 @@ impl SessionGc {
                 continue;
             };
             let paths = SessionPaths::for_job(&self.home_root, job);
-            for error in end_session(cli, &self.store, record, &paths, SessionState::Expired, now_unix)? {
+            for error in end_session(
+                cli,
+                &self.store,
+                record,
+                &paths,
+                SessionState::Expired,
+                now_unix,
+            )? {
                 report.removal_errors.push((job.clone(), error));
             }
         }
@@ -330,7 +338,10 @@ mod tests {
         for gone in ["old", "mid"] {
             let paths = SessionPaths::for_job(&root, gone);
             assert!(!paths.workdir.exists() && !paths.resolv_conf.exists());
-            assert_eq!(gc.store.session(gone).unwrap().unwrap().state, SessionState::Expired);
+            assert_eq!(
+                gc.store.session(gone).unwrap().unwrap().state,
+                SessionState::Expired
+            );
         }
         assert!(SessionPaths::for_job(&root, "run").workdir.exists());
         assert_eq!(
@@ -353,13 +364,26 @@ mod tests {
             end_session(&mut cli, &gc.store, &r, &paths, SessionState::Expired, 10).expect("end");
         assert_eq!(errors.len(), 1);
         assert!(cli.calls.is_empty(), "no docker call at all");
-        assert_eq!(gc.store.session("live").unwrap().unwrap().state, SessionState::Running);
+        assert_eq!(
+            gc.store.session("live").unwrap().unwrap().state,
+            SessionState::Running
+        );
         // A buyer close of a parked session ends it as `closed`.
         let parked = record("p", 0, 0, SessionState::Parked);
         gc.store.put_session(&parked).expect("put");
-        end_session(&mut cli, &gc.store, &parked, &SessionPaths::for_job(&root, "p"), SessionState::Closed, 10)
-            .expect("close");
-        assert_eq!(gc.store.session("p").unwrap().unwrap().state, SessionState::Closed);
+        end_session(
+            &mut cli,
+            &gc.store,
+            &parked,
+            &SessionPaths::for_job(&root, "p"),
+            SessionState::Closed,
+            10,
+        )
+        .expect("close");
+        assert_eq!(
+            gc.store.session("p").unwrap().unwrap().state,
+            SessionState::Closed
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -367,7 +391,9 @@ mod tests {
     #[test]
     fn measurement_is_size_rw_plus_workdir_and_ignores_symlinks() {
         let (gc, root) = gc("measure");
-        gc.store.put_session(&record("m", 0, 0, SessionState::Parked)).expect("put");
+        gc.store
+            .put_session(&record("m", 0, 0, SessionState::Parked))
+            .expect("put");
         let paths = SessionPaths::for_job(&root, "m");
         std::fs::create_dir_all(paths.workdir.join("sub")).expect("mkdir");
         std::fs::write(paths.workdir.join("a"), vec![0u8; 300]).expect("a");
@@ -375,13 +401,18 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/", paths.workdir.join("root-link")).expect("link");
         let mut cli = Recording::new();
-        let bytes = gc.measure_and_record(&mut cli, "m", "maxplayer-job-m").expect("measure");
+        let bytes = gc
+            .measure_and_record(&mut cli, "m", "maxplayer-job-m")
+            .expect("measure");
         assert_eq!(bytes, 1_000 + 500);
         assert_eq!(gc.store.session("m").unwrap().unwrap().disk_bytes, 1_500);
         assert_eq!(cli.calls[0], size_rw_argv("maxplayer-job-m"));
         // The daemon will not answer: the workdir still counts.
         cli.size_rw = "<no value>".into();
-        assert_eq!(gc.measure_and_record(&mut cli, "m", "c").expect("measure"), 500);
+        assert_eq!(
+            gc.measure_and_record(&mut cli, "m", "c").expect("measure"),
+            500
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -390,7 +421,9 @@ mod tests {
     fn holder_state_parses_running_stopped_and_missing() {
         assert_eq!(
             parse_holder_state(Ok("true 2026-10-21T10:00:00.1Z\n".into())),
-            HolderObservation::Running { started_at: "2026-10-21T10:00:00.1Z".into() }
+            HolderObservation::Running {
+                started_at: "2026-10-21T10:00:00.1Z".into()
+            }
         );
         assert_eq!(
             parse_holder_state(Ok("false 0001-01-01T00:00:00Z".into())),
@@ -400,7 +433,10 @@ mod tests {
             parse_holder_state(Err("Error: No such object: maxplayer-netns-x".into())),
             HolderObservation::Missing
         );
-        assert_eq!(parse_holder_state(Ok(String::new())), HolderObservation::Missing);
+        assert_eq!(
+            parse_holder_state(Ok(String::new())),
+            HolderObservation::Missing
+        );
         let mut cli = Recording::new();
         cli.holder = Ok("true 2026-10-22T00:00:00Z".into());
         // Restarted holder => the resume gate expires.
