@@ -10131,15 +10131,28 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        let job_id = received.payload.job_id().to_owned();
-        if job_id.is_empty() {
+        let payload_id = received.payload.job_id().to_owned();
+        if payload_id.is_empty() {
             opline!("seller node wrap event={event_id}: payment carries no job id (skipped)");
             return;
         }
+        // Session jobs (§8.2): a payload id that names a recorded follow-up pays THAT turn. The
+        // receipt row is keyed by the follow-up id, so turn 1's receipt cannot swallow it. With
+        // `[sessions] enabled = false` no turn row exists and this is the job id, as today. A read
+        // error fails closed (skipped, re-seen on the next wrap backfill).
+        let target = match self.node.store().turn_for_payment(&payload_id) {
+            Ok(turn) => crate::session::resolve_payment(&payload_id, |_| turn.clone()),
+            Err(error) => {
+                opline!("seller node wrap event={event_id}: session turn read failed for {payload_id} (fail-closed, skipping): {error}");
+                return;
+            }
+        };
+        let job_id = target.job_id.clone();
+        let receipt_key = target.receipt_key.clone();
 
         // Already-paid job: a re-see of consumed money — skip (do not re-redeem). Fail closed on a
         // read error (never read an unreadable journal as "not paid ⇒ safe to redeem again").
-        match self.node.store().has_receipt(&job_id) {
+        match self.node.store().has_receipt(&receipt_key) {
             Ok(true) => {
                 opline!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
                 return;
@@ -10280,7 +10293,7 @@ impl SellerNodeRunner {
         if let Err(error) =
             self.node
                 .store()
-                .append_pending_receive(&job_id, &token_hash, &buyer, &mint_str, expected, now_unix())
+                .append_pending_receive(&receipt_key, &token_hash, &buyer, &mint_str, expected, now_unix())
         {
             opline!("seller node wrap event={event_id}: breadcrumb write failed for job {job_id} ({error}) — refusing to receive");
             return;
@@ -10302,7 +10315,7 @@ impl SellerNodeRunner {
         let (amount_received, mint_fee_sats) = match classify_redeem_outcome(receive_result, || {
             self.node
                 .store()
-                .has_receipt(&job_id)
+                .has_receipt(&receipt_key)
                 .map_err(|error| error.to_string())
         }) {
             RedeemDecision::Finalize(received) => received,
@@ -10337,7 +10350,7 @@ impl SellerNodeRunner {
         // replayed wrap marks the job paid at most once. The fees ride in the same row.
         let collected = self.node.store().collect_receipt(
             &event_id,
-            &job_id,
+            &receipt_key,
             amount_received,
             super::store::ReceiptFees {
                 mint_fee_sats,
@@ -10346,6 +10359,18 @@ impl SellerNodeRunner {
             },
             now_unix(),
         );
+        if target.turn >= 2 && matches!(collected, Ok(super::store::Collected::New)) {
+            // §8.3: the paid turn releases the next follow-up.
+            if let Err(error) = self.node.store().set_turn_state(
+                &receipt_key,
+                crate::session::TurnState::Paid,
+                None,
+                None,
+                now_unix().max(0) as u64,
+            ) {
+                opline!("seller node wrap event={event_id}: session turn {receipt_key} paid but its state write failed ({error})");
+            }
+        }
         match &collected {
             Ok(super::store::Collected::New) => {
                 // `event_id` is the kind-1059 payment gift-wrap — the id this collection is
