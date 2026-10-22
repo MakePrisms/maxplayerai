@@ -32,7 +32,8 @@ Every maxplayer-owned event carries two tags:
 A reader MUST reject a maxplayer-owned event that lacks either tag. A reader MUST reject an event
 whose `v` is not `1`. A reader MUST ignore tags it does not recognize.
 
-The maxplayer-owned kinds are `3400` through `3409` and `30340`. Kinds `0`, `1059`, and `30617` are
+The maxplayer-owned kinds are `3400` through `3409`, `3412` and `30340` (`3410`/`3411` belong to
+`maxplayer-trade`). Kinds `0`, `1059`, and `30617` are
 borrowed from other specifications. They do not carry `["t","maxplayer"]`, and a reader MUST ignore
 `t` on them.
 
@@ -75,6 +76,7 @@ provide its checks. See [execution reviews](execution-reviews.md).
 | `3407` | Reject | buyer | Refusal of one delivered commit |
 | `3408` | Review | configured reviewer | Signed execution-safety assessment |
 | `3409` | Review request | buyer or seller | Request an assessment of an exact subject |
+| `3412` | Follow-up | buyer | Start the next turn of a session job, or close it (§6.9) |
 
 `AWARD` selects a claim before work starts. `ACCEPT` authorises payment after delivery. They are
 separate kinds.
@@ -603,8 +605,10 @@ on an unfalsifiable claim.
 | `["harness_family", family, ...]` | 0..1 | no | Harness families the seat serves |
 | `["harness_model", family, model]` | 0..N | no | One resolved model, paired to its family |
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
+| `["session","1"]` | 0..1 | no | The seat keeps the agent parked after the result and accepts follow-ups (§6.9). Absent means single-turn |
 
-A claim carries the three FILTERABLE capability tags and no others. `harness_variant` and `hardware`
+A claim carries the three FILTERABLE capability tags, `session`, and no others. `session` is not an
+award filter; it only decides whether a follow-up can continue the job. `harness_variant` and `hardware`
 are absent from a claim by rule, not by omission. Section 4.5 defines the split and the reason for
 it. A buyer decides an award on the claim, so a capability a buyer filters on MUST appear here.
 
@@ -654,6 +658,13 @@ its own signed offer stated (the both-ends rule, §6.1.1).
 | `["tokens", n, qualifier]` | 0..N | no | Token usage the seller reports |
 | `["cost", n, "usd", basis]` | 0..N | no | Cost the seller reports |
 | `["metadata_trust","seller-claimed"]` | 0..1 | no | Marks the block above as unverified |
+| `["e", followup_id, "", "reply"]` | 0..1 | no | Session turn ≥ 2: the follow-up this result answers (§6.9) |
+| `["turn_status", status]` | 0..1 | no | Session turn: `done`, `needs_input` or `out_of_time`. Absent means `done` |
+| `["context","reset"]` | 0..1 | no | Session turn: the agent's conversation could not be reloaded |
+| `["creq", creqA...]` | 0..1 | yes* | Session turn ≥ 2 on a priced job: this turn's payment request, `payment_id` = the follow-up id, the offer's amount, mints within the claim's |
+
+Every session turn carries the OFFER's `job-hash`. A turn result carries `reply` exactly when it is
+turn ≥ 2; on a priced job it then also carries `creq`, and the receipt preimage binds THAT creq.
 
 If the result carries `["delivery","git"]`, it MUST also carry `repo`, `branch`, and `commit`.
 
@@ -694,13 +705,16 @@ reader MUST NOT treat it as proof that a given harness or model ran.
 | `["p", seller_pubkey]` | 1 | yes | Bound seller |
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
+| `["e", result_id, "", "reply"]` | 0..1 | no | Session job: the result (turn) this accept settles (§6.9) |
 
-`ACCEPT` carries two `e` tags. A reader resolves them by marker, never by position:
+`ACCEPT` carries two `e` tags, three on a session turn. A reader resolves them by marker, never by
+position:
 
 | Marker | Names |
 |---|---|
 | `root` | the offer |
 | none | the claim |
+| `reply` | the accepted result (session jobs only) |
 
 `AWARD` selects a claim. `ACCEPT` closes the job; on a priced trade that closure is also the payment
 authorisation, and on a `payment=none` trade (§6.1.1) it authorises nothing and no payment follows.
@@ -716,7 +730,10 @@ Across re-deliveries it is ambiguous. A claim MAY produce more than one result, 
 binds to none of them specifically. A reader MUST NOT infer which result a payment authorises when
 the job carries more than one.
 
-Binding an `ACCEPT` to a specific result is a deliberate future protocol rev, to be taken if
+Session jobs (§6.9) bind every `ACCEPT` to its result with the `reply` tag; there an `ACCEPT` closes
+the TURN, and the job closes with a `close` follow-up, a `REJECT`, or seller-side expiry. Both ends
+of a session job are session-aware by construction (the claim advertised `session`). For every
+other job, binding an `ACCEPT` to a specific result remains a deliberate future protocol rev, to be taken if
 trustless joins are ever needed. It is not a change that can be backfilled quietly: a reader deployed
 against this major does not see a tag this major does not define, so the added precision would be
 claimed on the wire before any deployed reader could rely on it.
@@ -787,6 +804,38 @@ The receipt is the settlement artifact. A third party can check five facts from 
 
 A receipt does not prove that the seller's execution metadata is true.
 
+### 6.9 Follow-up, kind `3412` (session jobs)
+
+A session job is one job with many turns: the awarded seller keeps the agent's container and
+conversation parked after a result, and the buyer continues it. Turn 1 is the job itself. Only a
+claim carrying `["session","1"]` (§6.2) can be continued.
+
+| Tag | Card. | Req. | Meaning |
+|---|---|---:|---|
+| `["e", offer_id, "", "root"]` | 1 | yes | The job |
+| `["e", prev_result_id, "", "reply"]` | 0..1 | yes* | The result this turn continues. Required for `turn` |
+| `["status", "turn" \| "close"]` | 1 | yes | Start a turn, or close the session |
+| `["turn", n]` | 0..1 | yes* | Turn number, `n ≥ 2`. Required for `turn` |
+| `["param","deadline", unix]` | 0..1 | yes* | This turn's deadline. Required for `turn` |
+| `["i", text]` | 0..1 | yes* | Buyer message, public jobs only |
+| `["content-id", …]`, `["content-commitment", …]` | 0..1 | yes* | Buyer message as an encrypted `FollowUp` body, private jobs only |
+| `["p", seller_pubkey]` | 1 | yes | The awarded seller |
+| `["t","maxplayer"]` | 1 | yes | Namespace |
+| `["v","1"]` | 1 | yes | Protocol major |
+
+A `close` carries no turn fields and is never paid. A seller MUST ignore a follow-up whose author is
+not the buyer that authored the job's `AWARD`, whose `p` is not its seat, or whose `turn` is not
+exactly one more than the last turn it delivered.
+
+Each turn ≥ 2 costs the job's price and is settled like turn 1 with these differences: the result
+carries `reply`, `turn_status` and (priced) its own `creq` (§6.4); the buyer's `ACCEPT` carries
+`reply` (§6.5); the NUT-18 payment payload `id` is the follow-up id, so the seller's receipt for
+turn 1 never swallows turn 2. A seller runs turn n+1 only after turn n is paid (a free job: after its
+`ACCEPT`), and drops a waiting follow-up uncharged past its deadline. A git turn's commit MUST have
+the previous git turn's commit as its single parent; a buyer refuses any other before paying.
+
+A seller that cannot resume the session answers with `session_expired` feedback (§7.1).
+
 ## 7. Feedback
 
 ### 7.1 Reason codes
@@ -803,6 +852,10 @@ to determine the class.
 | `execution_failed` | `error` | yes |
 | `delivery_failed` | `error` | yes |
 | `no_sentinel` | `refusal` | yes |
+| `session_expired` | `refusal` | no |
+
+`session_expired` answers a follow-up (§6.9) whose parked session is gone; it carries
+`["e", followup_id, "", "reply"]`. Nothing was delivered or charged.
 
 The vocabulary is extensible. A reader that meets an unknown `reason_code` MUST fall back to the
 class named by `status`. That reader MUST NOT treat the event as malformed.

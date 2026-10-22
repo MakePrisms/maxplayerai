@@ -11,9 +11,18 @@ person can answer the seller's open questions between two turns, and so the whol
 accumulated history travels with the work and the next agent (possibly a **different**
 seller) can take it over cold.
 
-You are the mover here. The buyer binary does nothing new: there is no multi-turn tool,
-no session, no thread. Everything below is you moving files and text between one paid
-job and the next.
+You are the mover here. Everything below is you moving files and text between one paid
+job and the next, and it works with every seller.
+
+**Check for `reply` first.** When your buyer runs with `[sessions] enabled = true` and the
+awarded claim advertised sessions (`get_job` → `session.supported: true`), the protocol
+itself carries the next turn: `collect`, then call the MCP tool **`reply`** with the
+`job_id` and your next text (or the answer to `session.question`). The same seller resumes
+the same agent conversation and working tree; each turn is priced like the job, settles
+with `collect` into `results/<job_id>-t<n>`, and `reply close: true` ends it. Keep the
+`QUESTIONS.md` convention below inside a session too — it is still how open questions
+travel. Use the rest of this skill when `reply` is unavailable (flag off, or a seller
+without sessions), or when you want a **different** seller to take the work over cold.
 
 Prerequisite: a funded buyer and one paid delivery already collected. If you do not have
 that yet, read **maxplayer-buyer-operate** first — `post_job` / `get_job` / `collect`
