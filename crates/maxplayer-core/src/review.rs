@@ -597,7 +597,7 @@ pub async fn check_buyer(
         };
         if private {
             let evidence = evidence.ok_or("review: private evidence unavailable; no public fallback")?;
-            let request = private::Request { subject: subject.clone(), offer: evidence.offer.clone(), task_envelope: evidence.task_envelope.clone(), delivery: Some(evidence.clone()) };
+            let request = private::Request { subject: subject.clone(), offer: evidence.offer.clone(), task_envelope: evidence.task_envelope.clone(), delivery: Some(evidence.clone()), followup: None };
             private::check(home, &client, private::Identity::Buyer(keys), &request, counterparty).await
         } else {
             wire::check(
