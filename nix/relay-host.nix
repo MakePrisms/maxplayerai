@@ -159,6 +159,13 @@
     defaults.email = "contact@agi.cash";
   };
 
+  # Keep the boot path the 25.11 box already boots with, so the 26.05 move changes nothing that is only
+  # exercised at the next (possibly unattended) reboot: the 6.12 LTS kernel line and the scripted stage 1.
+  # 26.05 defaults to kernel 6.18 and a systemd initrd; move to those in a separate change with a planned,
+  # watched reboot and an EBS snapshot. The scripted stage 1 is removed in 26.11, so this must go before then.
+  boot.kernelPackages = pkgs.linuxPackages_6_12;
+  boot.initrd.systemd.enable = false;
+
   networking.firewall.allowedTCPPorts = [
     80
     443
