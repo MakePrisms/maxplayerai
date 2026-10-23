@@ -2264,8 +2264,9 @@ where
             ));
         }
         // The NUT-18 payload (id/mint/unit/proofs) is built on the wallet worker, where the mint
-        // keysets needed to decompose the token into proofs live. `id` == the job id.
-        let job_id = key.job_id.as_str().to_owned();
+        // keysets needed to decompose the token into proofs live. `id` == the job id, or the
+        // follow-up id on a session turn ≥ 2 (§8.2) so the seller's receipt keys that turn.
+        let job_id = key.payload_id().to_owned();
         let seller_pubkey = terms.seller_nostr_pubkey.to_hex();
         let token = locked.token().clone();
         self.request(|response| BuyerCommand::Send {

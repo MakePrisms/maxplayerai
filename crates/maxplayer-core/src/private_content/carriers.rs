@@ -80,7 +80,7 @@ pub fn project(
     let o = wire::validate_private(offer, host)?;
     let kind = local.kind;
     if offer.kind.as_u16() != 3401
-        || !matches!(kind, 3400 | 3402 | 3403 | 3404 | 3405 | 3406 | 3407)
+        || !matches!(kind, 3400 | 3402 | 3403 | 3404 | 3405 | 3406 | 3407 | 3412)
     {
         return Err(Error("unsupported lifecycle projection"));
     }
@@ -110,12 +110,18 @@ pub fn project(
             "agents",
             "harness_family",
             "capabilities",
+            // Session jobs (§2.2): only ever present when `[sessions] enabled` added it.
+            "session",
         ],
         3403 => &[
             "e", "p", "amount", "job-hash", "sig", "delivery", "repo", "branch", "commit",
+            // Session jobs (§2.3): per-turn result tags, absent on a one-shot result.
+            "turn_status", "context", "creq",
         ],
         3404 => &["e", "p", "status", "reason_code"],
         3405 | 3406 => &["e", "p", "status"],
+        // Session FOLLOW-UP (§2.1): the message itself rides as encrypted content, never `i`.
+        3412 => &["e", "p", "status", "turn", "param"],
         3407 => &["e", "p", "status", "reason_code", "commit"],
         _ => unreachable!(),
     };
@@ -182,6 +188,7 @@ pub fn project(
                         "execution_failed",
                         "delivery_failed",
                         "no_sentinel",
+                        "session_expired",
                         "other",
                     ][..]
                 };

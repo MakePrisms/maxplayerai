@@ -233,7 +233,7 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
             }),
         ),
         "ping" => ok(id, json!({})),
-        "tools/list" => ok(id, json!({ "tools": tools() })),
+        "tools/list" => ok(id, json!({ "tools": tools_for(state.home.config.sessions.enabled) })),
         "tools/call" => {
             let tool = request.params.get("name").and_then(Value::as_str);
             let deadline = tool_deadline_secs(tool);
@@ -404,6 +404,51 @@ fn tools() -> Value {
     ])
 }
 
+/// Session jobs (docs/specs/session-jobs.md §10): with `[sessions] enabled = true` the surface gains
+/// `reply`, `collect.turn`/`collect.close_session`, and `get_job` documents its `session` object.
+/// With the flag off the list is exactly [`tools`] — byte-identical to before sessions existed.
+fn tools_for(sessions: bool) -> Value {
+    let mut list = tools();
+    if !sessions {
+        return list;
+    }
+    let tools = list.as_array_mut().expect("tools array");
+    for tool in tools.iter_mut() {
+        match tool["name"].as_str() {
+            Some("post_job") => {
+                tool["inputSchema"]["properties"]["max_session_sats"] = json!({"type": "integer", "minimum": 0, "description": "Session job: spend cap across ALL turns of this job (turn 1 included), stored locally with the session so the first reply uses it; reply max_session_sats may still override it. Never sent to the seller. Default 10x amount_sats."});
+            }
+            Some("collect") => {
+                let props = &mut tool["inputSchema"]["properties"];
+                props["turn"] = json!({"type": "integer", "minimum": 1, "description": "Session job: the turn to settle. Omit to settle the newest delivered, uncollected turn (turn 1 first). Turn n >= 2 materializes into <home>/results/<job_id>-t<n>; out is refused for it."});
+                props["close_session"] = json!({"type": "boolean", "description": "Session job: after collecting, close the session (the seller frees the parked agent; no further reply)."});
+            }
+            Some("get_job") => {
+                let description = tool["description"].as_str().unwrap_or_default().to_owned();
+                tool["description"] = json!(format!("{description} On a session job the response carries session: {{supported, turn, status (running|parked|closed|expired|no_response), turn_status (done|needs_input|out_of_time), question (the seller's question when needs_input), context_reset, uncollected_turn, expires_hint}}. no_response means the turn's deadline passed with no result: its reservation was released and reply may retry."));
+            }
+            _ => {}
+        }
+    }
+    tools.push(json!({
+        "name": "reply",
+        "description": "Continue a SESSION job with the same seller and the same agent conversation: start the next turn with text (a follow-up instruction or the answer to the seller's needs_input question). Works only when the awarded claim advertised sessions (get_job.session.supported) and the previous turn is collected — otherwise it refuses before anything is signed or reserved ('collect turn n first', 'seller does not support sessions; post a new job'). Each turn costs the job's price, is reserved against the per-job cap AND the session cap (max_session_sats, default 10x the price), and is paid on collect. deadline_secs bounds the turn (default 3600). close: true (no text) ends the session and pays nothing. Retrying after an error re-sends the same signed follow-up; it never starts a second turn. Then wait with get_job wait_for=result and settle with collect.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "job_id": { "type": "string", "description": "Offer event id (hex) of the awarded session job" },
+                "text": { "type": "string", "description": "The next instruction or the answer to the seller's question" },
+                "deadline_secs": { "type": "integer", "minimum": 60, "description": "This turn's deadline from now (default 3600)" },
+                "max_session_sats": { "type": "integer", "minimum": 0, "description": "Session spend cap across all turns (default 10x the job price)" },
+                "close": { "type": "boolean", "description": "Close the session instead of starting a turn" }
+            },
+            "required": ["job_id"],
+            "additionalProperties": false
+        }
+    }));
+    list
+}
+
 async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, String> {
     let name = params
         .get("name")
@@ -420,6 +465,9 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         "get_job" => route_tool(state, "get_job", "get_job", arguments).await,
         "collect" => route_tool(state, "collect", "collect", arguments).await,
         "award_claim" => route_tool(state, "award_claim", "award", arguments).await,
+        "reply" if state.home.config.sessions.enabled => {
+            route_tool(state, "reply", "reply", arguments).await
+        }
         moved => Err(moved_tool_error(moved)),
     }
 }
@@ -730,6 +778,7 @@ mod tests {
             job_id,
             offer: None,
             claims: vec![ClaimView {
+                session: false,
                 claim_id: "c".repeat(64),
                 created_at: 1,
                 seller_pubkey: seller_pubkey.to_owned(),
@@ -967,6 +1016,63 @@ mod tests {
             .map(|tool| tool["name"].as_str().expect("name"))
             .collect();
         assert_eq!(names, vec!["post_job", "get_job", "collect", "award_claim"]);
+    }
+
+    /// Session jobs §10: `reply` and the collect params appear only with `[sessions] enabled`;
+    /// with the flag off the list is byte-identical to the trade loop above.
+    #[test]
+    fn session_tools_appear_only_when_sessions_are_enabled() {
+        assert_eq!(tools_for(false), tools());
+        let on = tools_for(true);
+        let names: Vec<&str> = on
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["post_job", "get_job", "collect", "award_claim", "reply"]);
+        let collect = on.as_array().unwrap().iter().find(|t| t["name"] == "collect").unwrap();
+        assert!(collect["inputSchema"]["properties"]["turn"].is_object());
+        assert!(collect["inputSchema"]["properties"]["close_session"].is_object());
+        let off = tools();
+        let collect = off
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "collect")
+            .unwrap();
+        assert!(collect["inputSchema"]["properties"].get("turn").is_none());
+        // post_job gains max_session_sats only with the flag on; off, its schema bytes are today's.
+        let post = |list: &Value| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == "post_job")
+                .unwrap()
+                .clone()
+        };
+        assert!(post(&on)["inputSchema"]["properties"]["max_session_sats"].is_object());
+        assert!(
+            post(&off)["inputSchema"]["properties"]
+                .get("max_session_sats")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_string(&tools_for(false)).unwrap(),
+            serde_json::to_string(&off).unwrap()
+        );
+        assert!(
+            !serde_json::to_string(&tools_for(false))
+                .unwrap()
+                .contains("max_session_sats")
+        );
+        // Only that one property differs between the flag-on and flag-off post_job.
+        let mut on_post = post(&on);
+        on_post["inputSchema"]["properties"]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_session_sats");
+        assert_eq!(on_post, post(&off));
     }
 
     #[test]

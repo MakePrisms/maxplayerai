@@ -60,11 +60,24 @@ pub fn project(
     draft: EventDraft,
     dispatch: Option<pc::Dispatch>,
 ) -> pc::Result<EventDraft> {
+    project_keyed(home, seller, id, draft, dispatch, None)
+}
+
+/// [`project`] for a session turn (docs/specs/session-jobs.md §7): `turn_key` (the follow-up id)
+/// keys the prepared RESULT content, so turn n never collides with turn 1's `answer:<job>` intent.
+pub fn project_keyed(
+    home: &MaxplayerHome,
+    seller: &str,
+    id: &str,
+    draft: EventDraft,
+    dispatch: Option<pc::Dispatch>,
+    turn_key: Option<&str>,
+) -> pc::Result<EventDraft> {
     let Some((mut ctx, offer)) = known(home, seller, id)? else {
         if is_private(&draft) {
             return Err(pc::Error("private offer context unavailable"));
         }
-        return pc::public_v2::project_local(home, id, draft);
+        return pc::public_v2::project_local_keyed(home, id, draft, turn_key);
     };
     let selected = ctx.store.selection(id)?;
     let (claim, award) = selected
@@ -94,7 +107,7 @@ pub fn project(
     };
     let content = if draft.kind == 3402 || !text.is_empty() {
         let intent = if draft.kind == 3403 {
-            format!("answer:{id}")
+            format!("answer:{}", turn_key.unwrap_or(id))
         } else if draft.kind == 3402 {
             format!("claim:{id}")
         } else {
@@ -117,8 +130,20 @@ pub fn bind_receipt(
     preimage: &mut crate::receipt::ReceiptPreimage,
     answer: Option<&str>,
 ) -> pc::Result<()> {
+    bind_receipt_keyed(home, seller, id, preimage, answer, None)
+}
+
+/// [`bind_receipt`] for a session turn: the inline answer's content intent is keyed by `turn_key`.
+pub fn bind_receipt_keyed(
+    home: &MaxplayerHome,
+    seller: &str,
+    id: &str,
+    preimage: &mut crate::receipt::ReceiptPreimage,
+    answer: Option<&str>,
+    turn_key: Option<&str>,
+) -> pc::Result<()> {
     let Some((mut ctx, offer)) = known(home, seller, id)? else {
-        return pc::public_v2::bind_receipt(home, seller, id, preimage, answer);
+        return pc::public_v2::bind_receipt_keyed(home, seller, id, preimage, answer, turn_key);
     };
     let (claim, award) = ctx
         .store
@@ -132,7 +157,7 @@ pub fn bind_receipt(
     preimage.job_hash = pc::job_hash(id)?;
     if let Some(answer) = answer {
         let content = ctx.prepare(
-            &format!("answer:{id}"),
+            &format!("answer:{}", turn_key.unwrap_or(id)),
             &offer,
             Some(&claim),
             Some(&award),

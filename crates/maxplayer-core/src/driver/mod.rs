@@ -113,11 +113,34 @@ impl Display for DriverError {
 
 impl Error for DriverError {}
 
+/// Fires a session's cancel from OUTSIDE the driver while a prompt is in flight (session jobs, §4
+/// wrap-up). `prompt` holds `&mut self` until the turn answers, so the cancel cannot be a method
+/// call on the driver; it is a handle cloned before the prompt starts.
+pub type CancelTrigger = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 #[allow(async_fn_in_trait)]
 pub trait Driver {
     fn id(&self) -> RuntimeId;
     async fn ready(&mut self) -> Result<Readiness, DriverError>;
     async fn start_session(&mut self, cfg: SessionConfig) -> Result<SessionId, DriverError>;
+    /// Whether `initialize` advertised `agentCapabilities.loadSession` (session jobs, §6.3). Read
+    /// only after [`Self::ready`]. Default: no.
+    fn supports_load_session(&self) -> bool {
+        false
+    }
+    /// Reload a session the agent saved earlier (ACP `session/load`, docs/specs/session-jobs.md
+    /// §6.3). Called only when [`Self::supports_load_session`] is true; any error makes the caller
+    /// fall back to [`Self::start_session`] and mark the turn `context_reset`. Default: unsupported.
+    async fn load_session(
+        &mut self,
+        cfg: SessionConfig,
+        session_id: &SessionId,
+    ) -> Result<SessionId, DriverError> {
+        let _ = (cfg, session_id);
+        Err(DriverError::Other(
+            "session/load is not supported by this driver".into(),
+        ))
+    }
     async fn prompt(
         &mut self,
         session_id: &SessionId,
@@ -126,6 +149,12 @@ pub trait Driver {
     async fn on_permission(&mut self, req: PermissionRequest) -> PermissionOutcome;
     async fn artifacts(&self, session_id: &SessionId) -> Result<Vec<Artifact>, DriverError>;
     async fn cancel(&mut self, session_id: &SessionId) -> Result<(), DriverError>;
+    /// A [`CancelTrigger`] for `session_id`, usable while a prompt is in flight. Default: none, and
+    /// a session turn on such a driver simply runs to its deadline.
+    fn cancel_trigger(&self, session_id: &SessionId) -> Option<CancelTrigger> {
+        let _ = session_id;
+        None
+    }
     async fn shutdown(&mut self) -> Result<(), DriverError>;
 
     /// Execution usage captured from the most recent prompt, if the harness surfaced any.

@@ -7,7 +7,7 @@ mod diff;
 use batches::Plan;
 use std::sync::Arc;
 use crate::gateway::{MAXPLAYER_TAG, TagSpec};
-use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_REQUEST_KIND};
+use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_REQUEST_KIND, SESSION_FOLLOWUP_KIND};
 use crate::review::*;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
@@ -582,6 +582,34 @@ async fn snapshot(
     }
     let mut result = None;
     let files = Vec::new();
+    if subject.kind == SESSION_FOLLOWUP_KIND {
+        // Session follow-up (docs/specs/session-jobs.md §9). The reviewer builds the context
+        // itself from signed relay events; neither party supplies it.
+        let followup = fetch(client, &subject.event).await?;
+        if followup.kind != Kind::Custom(SESSION_FOLLOWUP_KIND)
+            || !root_is(&followup, &subject.offer)
+            || followup.pubkey != offer.pubkey
+        {
+            return Err("invalid_subject".into());
+        }
+        let parsed_followup =
+            crate::session::parse_followup(&crate::job_lifecycle::event_to_draft(&followup))
+                .map_err(|_| "invalid_subject")?;
+        if request.pubkey != offer.pubkey
+            && request.pubkey.to_hex() != parsed_followup.seller_pubkey
+        {
+            return Err("unauthorized_request".into());
+        }
+        let context = followup_context(client, &offer, &parsed.task, &parsed_followup).await?;
+        let manifest = file_manifest(files)?;
+        let metadata = json!({"schema":1,"subject":subject,"offer":offer,"followup":followup,"session_context":context});
+        let model = config.model.clone();
+        return tokio::task::spawn_blocking(move || {
+            Plan::from_parts(&metadata, &manifest, &model, deadline)
+        })
+        .await
+        .map_err(|_| "input_unavailable")?;
+    }
     if subject.kind == JOB_RESULT_KIND {
         let event = fetch(client, &subject.event).await?;
         if event.kind != Kind::Custom(JOB_RESULT_KIND) || !root_is(&event, &subject.offer) {
@@ -637,6 +665,76 @@ async fn snapshot(
     let model = config.model.clone();
     tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &manifest, &model, deadline))
         .await.map_err(|_| "input_unavailable")?
+}
+
+/// Follow-up review context (session-jobs §9): the original task and every buyer follow-up up to
+/// and including the current one in full, each earlier delivery as one line; only past the input
+/// bound are the oldest follow-ups summarised (by size) — the current one is always in full.
+async fn followup_context(
+    client: &Client,
+    offer: &Event,
+    task: &str,
+    current: &crate::session::FollowUp,
+) -> Result<String, String> {
+    let current_turn = current.turn.ok_or("invalid_subject")?;
+    let events = client
+        .fetch_events(
+            Filter::new()
+                .kinds([
+                    Kind::Custom(SESSION_FOLLOWUP_KIND),
+                    Kind::Custom(JOB_RESULT_KIND),
+                ])
+                .event(offer.id),
+            Duration::from_secs(3),
+        )
+        .await
+        .map_err(|_| "input_unavailable")?;
+    let mut followups: BTreeMap<u32, String> = BTreeMap::new();
+    let mut deliveries = Vec::new();
+    for event in events
+        .iter()
+        .filter(|e| e.verify().is_ok() && root_is(e, &offer.id.to_hex()))
+    {
+        let draft = crate::job_lifecycle::event_to_draft(event);
+        if event.kind == Kind::Custom(SESSION_FOLLOWUP_KIND) && event.pubkey == offer.pubkey {
+            if let Ok(f) = crate::session::parse_followup(&draft)
+                && let (Some(turn), Some(text)) = (f.turn, f.text)
+                && turn <= current_turn
+            {
+                followups.entry(turn).or_insert(text);
+            }
+        } else if event.kind == Kind::Custom(JOB_RESULT_KIND) {
+            let turn = 1 + followups.len() as u32;
+            let status = crate::session::result_turn_status(&draft.tags)
+                .unwrap_or(crate::session::TurnStatus::Done);
+            let commit = draft
+                .tags
+                .iter()
+                .find(|t| t.first() == Some("commit"))
+                .and_then(|t| t.value())
+                .map(str::to_owned);
+            deliveries.push((event.created_at, status, commit, turn));
+        }
+    }
+    if followups.get(&current_turn) != current.text.as_ref() {
+        // The fetched set must contain exactly the follow-up under review.
+        followups.insert(current_turn, current.text.clone().ok_or("invalid_subject")?);
+    }
+    deliveries.sort_by_key(|d| d.0);
+    let lines: Vec<_> = deliveries
+        .into_iter()
+        .enumerate()
+        .map(|(i, (_, status, commit, _))| crate::session::DeliveryLine {
+            turn: i as u32 + 1,
+            status,
+            commit,
+        })
+        .collect();
+    Ok(crate::session::followup_review_context(
+        task,
+        &followups.into_values().collect::<Vec<_>>(),
+        &lines,
+    ))
 }
 
 /// Persist before publishing. Successful records are immutable, including unsafe decisions.
@@ -1238,6 +1336,9 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         // internal/test entry point and must never run unbounded or sub-second.
         let deadline = tokio::time::Instant::now()
             + Duration::from_secs(config.window_seconds.clamp(60, 3600));
+        // Session-jobs §9/§11: review wall time per follow-up and per delivery is measured on the
+        // test env before anything is optimised. One line per request, no content.
+        let review_started = std::time::Instant::now();
         let body = match tokio::time::timeout_at(
             deadline,
             async {
@@ -1343,6 +1444,12 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         };
         let recipients = private_request.as_ref().map(|(_, _, r)| r.as_slice());
         publish_or_log(&client, &config.relay, &keys, &event, recipients, &request).await;
+        crate::opline!(
+            "reviewer: review_wall_ms={} subject_kind={} subject={}",
+            review_started.elapsed().as_millis(),
+            subject.kind,
+            subject.event
+        );
     }
     client.disconnect().await;
     Ok(())
@@ -1941,6 +2048,17 @@ async fn private_snapshot(
     use crate::private_content as pc;
     let task = bundle.task_envelope.as_deref().map(pc::PreparedContent::decode).transpose().map_err(|_| "invalid_subject")?;
     let resolved = pc::lifecycle::resolve_offer(&bundle.offer, task.as_ref(), &policy.service, &policy.service, &policy.host).map_err(|_| "invalid_subject")?;
+    // Session follow-up (§9): context from the authenticated carriers only — buyer follow-ups in
+    // full (current one always), earlier deliveries as one line each — same renderer as public.
+    if let Some(f) = &bundle.followup {
+        let context = f.context(&bundle.offer, &resolved.offer.task, policy)?;
+        let metadata = json!({"schema":2,"subject":bundle.subject,"task":resolved.offer.task,
+            "session_context":context,"evidence":private_classifier_evidence(bundle)});
+        let files = file_manifest(Vec::new())?;
+        let model = config.model.clone();
+        return tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &files, &model, deadline))
+            .await.map_err(|_| "input_unavailable")?;
+    }
     let files = Vec::new();
     let mut answer = None;
     if let Some(evidence) = &bundle.delivery {
@@ -1977,6 +2095,15 @@ async fn private_snapshot(
 // lifecycle and commitments have already been validated; wire encodings are not
 // additional task content and must not be mistaken for hidden instructions.
 fn private_classifier_evidence(bundle: &crate::review::private::Request) -> Value {
+    if let Some(f) = &bundle.followup {
+        let mut evidence = json!({"offer":bundle.offer.id, "claim":f.claim.id, "award":f.award.id,
+            "followups":f.followups.iter().map(|i| i.carrier.id).collect::<Vec<_>>()});
+        if !f.deliveries.is_empty() {
+            evidence["deliveries"] =
+                json!(f.deliveries.iter().map(|d| d.result.id).collect::<Vec<_>>());
+        }
+        return evidence;
+    }
     json!({"offer":bundle.offer.id, "claim":bundle.delivery.as_ref().map(|e| e.claim.id),
         "award":bundle.delivery.as_ref().map(|e| e.award.id),
         "result":bundle.delivery.as_ref().map(|e| e.result.id)})

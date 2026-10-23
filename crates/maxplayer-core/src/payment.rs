@@ -186,9 +186,25 @@ pub struct PaymentKey {
     /// fields denote the realized terms, with `mint` re-pointed to the payload's mint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creq_hash: Option<String>,
+    /// Session turn ≥ 2 (session-jobs §8.2): the NUT-18 payload id, the follow-up id the turn's
+    /// creq names. NOT folded into the [`AttemptId`] (the result id already makes each turn's
+    /// attempt distinct) and absent on every one-shot key, so existing journals read unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payment_id: Option<String>,
 }
 
 impl PaymentKey {
+    /// Set the session-turn payload id (§8.2). `None` leaves the key as it was.
+    pub fn with_payment_id(mut self, payment_id: Option<String>) -> Self {
+        self.payment_id = payment_id;
+        self
+    }
+
+    /// The id the NUT-18 payment payload carries: the follow-up id on a session turn, else the job.
+    pub fn payload_id(&self) -> &str {
+        self.payment_id.as_deref().unwrap_or(self.job_id.as_str())
+    }
+
     /// Builds a key from trade identity and typed payment terms.
     ///
     /// `creq_hash` is the seller-authored request hash bound into the attempt; pass
@@ -211,6 +227,7 @@ impl PaymentKey {
             unit: terms.unit.clone(),
             mint: terms.mint.clone(),
             creq_hash,
+            payment_id: None,
         }
     }
 
@@ -2698,6 +2715,21 @@ mod tests {
             &terms(),
             None,
         )
+    }
+
+    /// Session jobs §8.2: a turn's NUT-18 payload id is its follow-up id; the attempt id is
+    /// unchanged by it (the result id already separates turns), and a one-shot key serializes
+    /// exactly as before.
+    #[test]
+    fn payload_id_is_the_followup_on_a_turn_and_the_job_otherwise() {
+        let plain = key();
+        assert_eq!(plain.payload_id(), "job");
+        assert!(!serde_json::to_string(&plain).unwrap().contains("payment_id"));
+        let turn = key().with_payment_id(Some("followup".into()));
+        assert_eq!(turn.payload_id(), "followup");
+        assert_eq!(turn.attempt_id(), plain.attempt_id());
+        let back: PaymentKey = serde_json::from_str(&serde_json::to_string(&turn).unwrap()).unwrap();
+        assert_eq!(back.payload_id(), "followup");
     }
 
     fn git_delivery() -> GitDelivery {

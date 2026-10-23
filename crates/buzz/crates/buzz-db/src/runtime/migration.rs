@@ -762,11 +762,17 @@ mod postgres_tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        // MAXPLAYER: upstream's 60 plus the two private-job migrations, which
+        // MAXPLAYER: upstream's 60 plus the three private-job migrations, which
         // sort after every upstream version.
-        assert_eq!(migrations.len(), 62);
+        assert_eq!(migrations.len(), 63);
         assert_eq!(migrations[60].version, PRIVATE_JOB_REPOSITORIES_VERSION);
         assert_eq!(migrations[61].version, PRIVATE_JOB_REPOSITORIES_VERSION + 1);
+        // Session jobs: closure ignores turn ACCEPTs (docs/specs/session-jobs.md §3.3).
+        assert_eq!(migrations[62].version, PRIVATE_JOB_REPOSITORIES_VERSION + 2);
+        assert!(migrations[62]
+            .sql
+            .as_str()
+            .contains("ALTER TABLE private_job_repositories ADD COLUMN session"));
         assert_eq!(migrations[58].version, 59);
         assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
         assert_eq!(migrations[59].version, 60);
