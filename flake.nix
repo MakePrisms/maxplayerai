@@ -1,7 +1,7 @@
 {
   description = "Maxplayer";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   # Scoped toolchain source for the vendored buzz relay only (rustc >= 1.94, see maxplayer-relay).
   inputs.rust-overlay = {
     url = "github:oxalica/rust-overlay";
@@ -26,7 +26,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
 
           # rustc 1.96 for the vendored buzz relay: its floor is >= 1.94 (sqlx 0.9),
-          # and stock nixpkgs-25.11 ships ~1.91 which will NOT compile it. Scoped to the relay package
+          # and stock nixpkgs ships an older rustc (25.11: ~1.91; 26.05: 1.95 at the time of the bump). Scoped to the relay package
           # via its own rust-overlay toolchain so the other packages keep stock nixpkgs rust untouched.
           buzzRust =
             (import nixpkgs {
@@ -128,7 +128,7 @@
           # cross-workspace dep reconciliation.
           #
           # Toolchain = buzzRustPlatform (rustc 1.96): the relay needs >= 1.94 (sqlx 0.9) and
-          # stock nixpkgs-25.11 (~1.91) will not compile it. nativeBuildInputs = pkg-config + cmake
+          # stock nixpkgs may lag that floor (25.11 shipped ~1.91). nativeBuildInputs = pkg-config + cmake
           # (cmake builds aws-lc-sys, pulled by buzz's [patch.crates-io] aws-creds fork that the vendor
           # preserves; the relay links aws-lc, so there is no openssl input).
           #

@@ -4,17 +4,20 @@
 #   nixos-rebuild switch --flake .#relay --target-host root@34.225.223.145 --build-host root@34.225.223.145
 #
 # Target: AWS EC2 t3.small-class (x86_64, 2 vCPU / 2 GB), first booted from a NixOS 26.05 x86_64 AMI. The AMI
-# is only the bootstrap — after the first switch the running system is whatever this flake's nixpkgs (25.11)
-# builds, so the box converges to 25.11 regardless of the AMI channel.
+# is only the bootstrap — after the first switch the running system is whatever this flake's nixpkgs (26.05)
+# builds.
 #
-# FIRST switch on a fresh AMI needs a reboot to finish, and `nixos-rebuild` will NOT tell you: the 26.05 AMI
-# runs dbus-broker while 25.11 uses dbus-daemon, so activation stops the very bus `switch-to-configuration` is
-# talking to and then spins at 100% CPU on "Transport endpoint is not connected". It exited 0 while
-# /run/current-system still pointed at the old 26.05 generation — a green deploy that changed nothing. The
-# profile and GRUB are already correct at that point, so `reboot` activates the new generation cleanly.
-# Verify the switch actually took by comparing, never by exit code:
+# D-Bus: the box has run the classic dbus-daemon since it converged to 25.11. NixOS 26.05 changed the default to
+# dbus-broker, and changing `services.dbus.implementation` is a switch inhibitor (switch-to-configuration
+# refuses it), on top of the history below. `services.dbus.implementation = "dbus"` further down keeps the
+# daemon the live box already runs, so the 25.11 -> 26.05 move activates in place with no bus swap.
+#
+# History, for a FRESH 26.05 AMI only: the AMI runs dbus-broker, so the first switch onto the classic daemon
+# stops the very bus `switch-to-configuration` is talking to and spins at 100% CPU on "Transport endpoint is not
+# connected". It exited 0 while /run/current-system still pointed at the old generation — a green deploy that
+# changed nothing. The profile and GRUB are already correct at that point, so `reboot` activates the new
+# generation cleanly. Verify a switch actually took by comparing, never by exit code:
 #   readlink -f /run/current-system   # must equal /nix/var/nix/profiles/system
-# Later switches within 25.11 do not cross the bus implementation and activate in place.
 #
 # Secrets are referenced by PATH only; gudnuf places the material on the box. Nothing here is a credential.
 {
@@ -176,7 +179,12 @@
   # spikes, not a place to keep the running relay, so only lean on it under real pressure.
   boot.kernel.sysctl."vm.swappiness" = 10;
 
-  # The release this box's stateful defaults are pinned to. It is the flake's nixpkgs (25.11), NOT the AMI's
-  # channel — the system converges to what this flake builds on first switch.
+  # Keep the classic dbus-daemon the live box has run since 25.11 (see the header). 26.05 defaults to
+  # dbus-broker and treats a change of implementation as a switch inhibitor.
+  services.dbus.implementation = "dbus";
+
+  # The release this box's stateful defaults (Postgres data dir, ACME state, ...) were first created under.
+  # Deliberately NOT bumped with the nixpkgs move to 26.05: stateVersion records when the state was created,
+  # and raising it can silently change data-format defaults. Leave it at 25.11.
   system.stateVersion = "25.11";
 }
