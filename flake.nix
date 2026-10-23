@@ -143,7 +143,7 @@
             src = ./crates/buzz;
             # cargoHash of buzz's vendored dep set (crates.io + the rust-s3 git source). Recompute it
             # whenever crates/buzz/Cargo.lock changes: set pkgs.lib.fakeHash, build, copy the reported hash.
-            cargoHash = "sha256-brugeyc7Y39ouHpFNV8jV00B3wj/6fE/U/dDNP2X3Hs=";
+            cargoHash = "sha256-g4wNDk1jBnfOGrg0pTstPAKUHQkK7QJWRgZrAX7G4hM=";
             cargoBuildFlags = [
               "-p"
               "buzz-relay"
