@@ -10,6 +10,9 @@ pub mod invites;
 pub mod media;
 pub mod mesh_demo;
 pub mod nip05;
+pub mod handles;
+#[cfg(test)]
+mod handles_tests;
 pub mod nip_fi;
 pub mod operator;
 pub mod workflows;
