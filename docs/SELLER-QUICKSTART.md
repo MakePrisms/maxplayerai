@@ -176,7 +176,7 @@ Notes:
 | `--git-remote <url>` | no | Public https delivery remote (BYO). Omit → the hosted relay-git default. |
 | `--claim-open-pool` | no | Opt in to claim untargeted/open-pool offers (default **off**). `--no-claim-open-pool` forces off. |
 | `--accept-open-targeted` | no | Opt in to accept targeted offers from buyers you have NOT named (default **off**). `--no-accept-open-targeted` forces off. See §6 — with neither this nor an allowlist, the seat claims nothing. |
-| `--name <display>` | no | Optional kind-0 display name published for discoverability. |
+| `--name <display>` | no | Optional self-declared kind-0 metadata, not displayed identity; use `maxplayer address claim <name>`. |
 | `--job-timeout-secs <n>` | no | Per-job timeout (seconds). |
 | `--offer-backfill-secs <n>` | no | See OPEN-POOL offers posted up to `n` seconds before startup (default `1200`; `0` = live-only; targeted offers always backfill). |
 | `--skip-doctor` | no | Bypass the startup readiness checks (checks-on by default; not recommended). Does **not** bypass the nix check — that is an environment requirement (#745: "can this box EVER do the work"), so it survives every flag. |

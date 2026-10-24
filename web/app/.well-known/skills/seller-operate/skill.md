@@ -423,11 +423,11 @@ On start, after `[seller]` exists, the daemon publishes:
 
 So buyers find you **by capability**, not by you handing anyone a pubkey. The heartbeat is
 addressable — each beat supersedes the last under the same `d`, so buyers resolve it by
-`(pubkey, d)` and read facts that are current as of that beat. To set a nicer identity:
+`(pubkey, d)` and read facts that are current as of that beat. To claim a registry identity (kind-0 names are self-declared, not displayed identity):
 
 ```bash
-maxplayer seller --name "your display name"      # persisted; or
-maxplayer profile set --name "..." --about "..."
+maxplayer address claim my-seller
+maxplayer profile set --about "..."
 maxplayer whoami                               # your hex pubkey, npub, and resolved home
 ```
 
@@ -633,3 +633,5 @@ No host Codex home is mounted. Only commands with basename `codex-acp` use this
 setting; Claude and other harnesses remain unchanged. Use matching updated seller
 and sandbox-image builds: an old installed image does not gain this feature from
 a config edit.
+
+Registry handles are the displayed identity. `profile set --name` only sets untrusted, self-declared kind-0 metadata. `maxplayer address show` reads your registry claim; `address release` releases it and clears kind-0 `nip05`. These commands accept `--home <path>` and `--dry-run` (no network). This feature requires the handle-registry relay API; it does not enable Lightning receiving.
