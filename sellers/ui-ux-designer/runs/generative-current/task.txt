@@ -1,0 +1,71 @@
+You are a UI/UX designer. Design and BUILD the page described in the brief below.
+
+There is no existing implementation and no candidate to edit. You are authoring this from
+nothing. Write the source yourself.
+
+=== BRIEF (verbatim from the buyer) ===
+# Design brief — Nova status page
+
+Natural language, as a buyer would write it. **No candidate implementation is supplied**, and none
+exists in this repository: the agent authors the source itself.
+
+---
+
+We run Nova, a small hosted service. We need a **public status page** — one screen, no login,
+the thing people open when they think we are down.
+
+It should show, at a glance:
+
+- whether everything is currently working, in plain words, at the top
+- the state of our four components: API, Dashboard, Webhooks, Scheduled Jobs
+- uptime over the last 90 days for each, as a small bar strip
+- the two most recent incidents, each with a title, when it started, how long it lasted, and a
+  one-line summary of what happened
+- when the page last refreshed
+
+People land here angry and in a hurry, often on a phone, sometimes on a train with one bar of
+signal. Make it fast to read and impossible to misread. It has to work for someone who cannot
+distinguish red from green, and for someone using a screen reader.
+
+Build it as a single self-contained HTML file called `status.html`. No build step, no framework, no
+external network requests — inline the styles.
+
+Use our design tokens; do not invent a second colour system.
+
+=== END BRIEF ===
+
+Your working directory already contains everything you need:
+
+  design-identity/tokens.css    the design tokens — link or inline these; do not invent
+                                a second colour system. Read them before you design.
+  design-identity/contrast.md   measured contrast ratios for the token palette
+  tools/shoot.mjs               screenshots, desktop AND mobile in one run
+  tools/a11y.mjs                axe-core accessibility audit
+  node_modules/                 pinned Chromium/Playwright/axe — already installed
+
+Do this, in order:
+
+1. Read design-identity/tokens.css so you know the real token names and values.
+2. Write status.html in the working directory: ONE self-contained file, styles inline,
+   no framework, no build step, no external network requests.
+3. Screenshot it and LOOK at what you produced:
+     node tools/shoot.mjs --url file://$PWD/status.html --name status --out shots --full
+   The tool prints the pixel dimensions, distinct colour count and ink ratio of each
+   capture, and it fails if the image is blank. Read that output.
+4. Audit accessibility at BOTH viewports, and read every violation:
+     node tools/a11y.mjs --url file://$PWD/status.html --name status --viewport desktop --out a11y
+     node tools/a11y.mjs --url file://$PWD/status.html --name status --viewport mobile  --out a11y
+5. FIX what the tools report and repeat steps 3-4 until BOTH audits report
+   violations=0. Do not stop while a violation remains. Do not silence a violation by
+   deleting the content it was about.
+6. Finish by writing DESIGN-NOTES.md in the working directory: what you designed and why,
+   which token you used for what, how you met the colour-blindness and screen-reader
+   constraints in the brief, and the final violation counts and screenshot dimensions you
+   observed from the tool output.
+
+Constraints that matter as much as the visual result: the status must be readable without
+relying on colour alone, the page must make sense to a screen reader in source order, and
+it must hold up at 390px wide. Contrast must meet WCAG AA.
+
+Run the tools yourself and act on what they say. Do not claim a result you have not seen
+in tool output.

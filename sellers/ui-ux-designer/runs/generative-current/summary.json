@@ -1,0 +1,76 @@
+{
+  "generatedAt": "2026-09-09T17:54:47.422Z",
+  "driver": {
+    "path": "(verify-only)",
+    "exit": 0,
+    "elapsedSeconds": 0
+  },
+  "harness": "(verify-only)",
+  "brief": {
+    "path": "briefs/nova-status-brief.md",
+    "sha256": "aab962e18c4a05ad6a7176f7bbae0f78929bdfeee5b808a75ad3db2daa54b66f",
+    "candidateSupplied": false
+  },
+  "events": {
+    "lines": 444,
+    "stdoutLines": 568,
+    "jobStatus": "completed",
+    "turnEnded": "completed",
+    "toolCallsObserved": 47
+  },
+  "agentInvokedTools": {
+    "shoot": true,
+    "a11y": true
+  },
+  "deliverable": {
+    "file": "workspace/status.html",
+    "bytes": 14942,
+    "sha256": "a443bb3901127282ac595930afd010cd8d0bb7a0c772793dcefc824b39b5d790"
+  },
+  "screenshots": [
+    {
+      "file": "workspace/shots/status-desktop.png",
+      "bytes": 122207,
+      "sha256": "4f64cae3c6983f08a1838e0e650d3c04bb583a3a8ccc9998e6751e41bfba0996"
+    },
+    {
+      "file": "workspace/shots/status-mobile.png",
+      "bytes": 291881,
+      "sha256": "9796062cc8c4e970123ffbd6126263f4e70f20dc21f40906783c476b90a35a55"
+    }
+  ],
+  "accessibility": {
+    "desktop": {
+      "engine": "axe-core 4.11.4",
+      "violations": 0,
+      "passes": 15,
+      "rulesConsidered": 63,
+      "loadProof": {
+        "title": "Nova service status",
+        "elements": 225,
+        "textLength": 1281,
+        "stylesheets": 2,
+        "url": "file:///Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/runs/generative-current/workspace/status.html",
+        "rulesConsidered": 63,
+        "httpStatus": 200
+      }
+    },
+    "mobile": {
+      "engine": "axe-core 4.11.4",
+      "violations": 0,
+      "passes": 15,
+      "rulesConsidered": 63,
+      "loadProof": {
+        "title": "Nova service status",
+        "elements": 225,
+        "textLength": 1281,
+        "stylesheets": 2,
+        "url": "file:///Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/runs/generative-current/workspace/status.html",
+        "rulesConsidered": 63,
+        "httpStatus": 200
+      }
+    }
+  },
+  "failures": [],
+  "verdict": "PASS"
+}
