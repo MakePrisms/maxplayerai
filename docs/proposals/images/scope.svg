@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="400" viewBox="0 0 800 400" role="img" aria-label="scope.svg">
+<defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8Z" fill="#64748b"/></marker></defs>
+<rect width="800" height="400" fill="#ffffff"/>
+<path d="M400 84 L400 110 L210 110 L210 140" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<path d="M400 110 L600 110 L600 140" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<path d="M210 216 L210 245 L400 245 L400 270" stroke="#64748b" stroke-width="2" fill="none" marker-end="url(#arrow)"/>
+<rect x="220" y="20" width="360" height="64" rx="12" fill="#f1f5f9" stroke="#94a3b8"/>
+<text x="400.0" y="58.0" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#172554">Offer or delivery</text>
+<rect x="40" y="140" width="340" height="76" rx="12" fill="#e8f1ff" stroke="#94a3b8"/>
+<text x="210.0" y="172.0" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#172554">Execution safety</text>
+<text x="210.0" y="196.0" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#172554">FIRST RELEASE</text>
+<rect x="440" y="140" width="320" height="76" rx="12" fill="#f1f5f9" stroke="#94a3b8"/>
+<text x="600.0" y="172.0" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#172554">Harmful intent</text>
+<text x="600.0" y="196.0" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#172554">SEPARATE FUTURE CLASSIFIER</text>
+<rect x="40" y="270" width="720" height="96" rx="12" fill="#fff1f2" stroke="#94a3b8"/>
+<text x="400.0" y="312.0" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#172554">Prompt injection · Secret or context theft</text>
+<text x="400.0" y="336.0" text-anchor="middle" font-family="sans-serif" font-size="18" fill="#172554">Unauthorized tool or capability use</text>
+</svg>
