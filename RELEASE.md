@@ -197,6 +197,17 @@ first-class release artifact while `npm i maxplayer` answered `no binary for dar
 mac (#446), because the build matrix and the npm platform list were independent lists and nothing
 compared them.
 
+`verify-release-version.sh` has two arms and says which ones ran. The tree arm reads the crate
+version, the npm manifests, the payload pins and the release notes; the artifact arm inspects a built
+binary's own `--version` line and build stamp. So it is invoked
+`./scripts/verify-release-version.sh <version> <path-to-binary>` — both call sites in CI and the
+release job pass a path, and the version without a leading `v`. A run with no binary path is a
+refusal, not a pass: to check the tree alone, ask for it by name with
+`./scripts/verify-release-version.sh <version> --no-artifacts` — the same opt-out flag
+`verify-release-surface.sh` takes, printing the same `ok: skipping the built-artifact check
+(--no-artifacts) — …` line and closing with `PASS (NO ARTIFACTS)`. Before that, a missing path
+silently skipped the artifact arm and still printed `PASS: everything states <version>` with exit 0.
+
 The trusted-publisher entry is the step no check can make: it lives on npmjs.com, needs an org admin,
 and must exist BEFORE the tag. Without it the publish job fails on that package — loudly, which is
 correct — but only after the packages ahead of it in the loop have published, and npm does not allow
