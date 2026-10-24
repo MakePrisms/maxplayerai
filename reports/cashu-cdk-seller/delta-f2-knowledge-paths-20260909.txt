@@ -1,0 +1,6 @@
+===F2-KNOWLEDGE===
+MEMORY.md
+cashu-corpus.md
+cdk-wallet-api.md
+known-drift.md
+test-mint.md

@@ -1,0 +1,94 @@
+===F5-GATE===
+mint-acceptance — sandbox-local fakewallet mint at http://127.0.0.1:8085
+WORTHLESS TEST ECASH. No real funds, no external payment.
+
+
+[1] mint info (NUT-06)
+  ok   mint version is exactly cdk-mintd/0.17.2: cdk-mintd/0.17.2
+  ok   mint advertises NUT-04 mint support: 3 method(s)
+
+[2] mint quote + issue
+  ok   proofs minted: 64 sats (wanted 64)
+  ok   wallet balance after issue: 64 sats
+
+[3] send + receive across wallets
+  ok   token is a cashu token: 954 chars
+  ok   sender debited exactly amount+fee: 43 sats (issued 64 - sent 21 - fee 0)
+  ok   receiver credited: 21 sats (wanted 21)
+
+[4] double spend rejected with the exact protocol error
+  ok   second receive fails with Error::TokenAlreadySpent: TokenAlreadySpent
+  ok   double-spender balance stays zero: 0 sats
+
+[5] melt
+  ok   melt amount: 5 sats
+  ok   melt finalised Paid: Paid
+  ok   balance fell by exactly amount+fee: 21 -> 15 (melt 5, fee 1)
+
+[6] failed payment: exact error, terminal quote state, nothing lost
+  ok   melt fails with Error::PaymentFailed: PaymentFailed
+  ok   mint reports the failed quote as Unpaid: Unpaid
+  ok   no test ecash lost to the failed payment: 15 -> 15 sats
+  ok   nothing left stranded pending or reserved: pending 0, reserved 0
+
+[7] recovery of an unresolved send across a wallet restart
+  ok   recovery wallet funded: 32 sats
+  ok   an unresolved send exists before restart: 1 pending send(s), 12 sats locked
+  ok   the unresolved send survives the wallet restart: 1 pending send(s) after reopen
+  ok   recovery reports a non-empty result: recovered 1, compensated 0, skipped 0, failed 0
+  ok   recovery failed nothing: failed 0
+  ok   revoke_send reclaims the stranded value: reclaimed 12 sats of 12 locked
+  ok   spendable balance grows by exactly the reclaimed amount: 20 -> 32 (+12)
+  ok   no unresolved sends remain: 0 left
+  ok   check_all_pending_proofs returns the residual pending total: returned 0, wallet pending 0
+
+[8] mint restart: full residual value still spendable, nothing duplicated
+  ok   there is real residual value to test with: sender 43 + receiver 15 + recovery 32 = 90
+  test-mint: stopped (pid 3443) | test-mint: up at http://127.0.0.1:8085/ (pid 3487, state /var/lib/cashu-test-state/mint)
+  ok   sender: mint honoured the swept token after restart: swept 43 of 43 sats
+  ok   receiver: mint honoured the swept token after restart: swept 15 of 15 sats
+  ok   recovery: mint honoured the swept token after restart: swept 32 of 32 sats
+  ok   swept value reconciles exactly with the pre-restart total: sink 90 = swept 90; swept + fees 0 = 90 pre-restart
+  ok   sender fully drained, nothing stranded: spendable 0, pending 0
+  ok   receiver fully drained, nothing stranded: spendable 0, pending 0
+  ok   recovery fully drained, nothing stranded: spendable 0, pending 0
+  ok   pre-restart spent token still fails with Error::TokenAlreadySpent: TokenAlreadySpent
+
+[9] loopback-only reachability
+  ok   a listener exists on 8085: ["0100007F"]
+  ok   every 8085 listener is bound to loopback: /proc/net/tcp local_address ["0100007F"]
+  ok   mint NOT reachable on the container's own routable address: 172.17.0.2:8085 refused
+
+[10] private test state is outside the delivered workdir
+  | state root:      /var/lib/cashu-test-state
+  | mint state dir:  /var/lib/cashu-test-state/mint
+  | delivered dir:   /work
+  | state inside delivered dir: no
+  | state contents (names and sizes only, no values):
+  |   mintd.pid 5 bytes
+  |   mintd.log 8118 bytes
+  |   cdk-mintd.sqlite-wal 1998232 bytes
+  |   cdk-mintd.sqlite 4096 bytes
+  |   seed 76 bytes
+  |   cdk-mintd.sqlite-shm 32768 bytes
+  |   config.toml 2571 bytes
+  | seed mode: 600
+  | delivered dir entries matching test-mint state:
+  |   none
+  ok   test-mint isolation reports state outside the delivery dir: see the lines above
+  ok   no mint state names appear in the delivered workdir: see the lines above
+
+=====================================================
+PASS — 39 assertions across 10 legs
+  1. mint info (NUT-06)
+  2. mint quote + issue
+  3. send + receive across wallets
+  4. double spend rejected with the exact protocol error
+  5. melt
+  6. failed payment: exact error, terminal quote state, nothing lost
+  7. recovery of an unresolved send across a wallet restart
+  8. mint restart: full residual value still spendable, nothing duplicated
+  9. loopback-only reachability
+  10. private test state is outside the delivered workdir
+mint: http://127.0.0.1:8085 (fakewallet, worthless test ecash)
+=====================================================
