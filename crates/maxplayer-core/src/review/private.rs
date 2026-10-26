@@ -561,6 +561,60 @@ impl Identity<'_> {
         }
     }
 }
+/// Gift-wraps per page of the encrypted-response read.
+const REVIEW_PAGE_LIMIT: usize = 128;
+/// Pages read before the window counts as saturated (2048 wraps in ~30 minutes).
+const REVIEW_PAGE_CAP: usize = 16;
+
+/// Read every event in `[since, now]` by paging BACKWARDS: each page asks for `until` = the
+/// oldest `created_at` seen so far (inclusive, so rows at that second are re-read and deduped by
+/// id). Stops when a page comes back short of `limit` or reaches `since`. A single full page used
+/// to fail the whole review with "window saturated" at 128 wraps (rc1 sweep); now only more than
+/// `max_pages` full pages, or a full page that adds nothing new (more than `limit` wraps share
+/// one second, so `until` cannot move without skipping some), is an error.
+async fn page_back<F, Fut>(
+    since: Timestamp,
+    limit: usize,
+    max_pages: usize,
+    mut fetch: F,
+) -> Result<Vec<Event>, String>
+where
+    F: FnMut(Option<Timestamp>) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Event>, String>>,
+{
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut until = None;
+    for _ in 0..max_pages {
+        let page = fetch(until).await?;
+        let full = page.len() >= limit;
+        let oldest = page.iter().map(|e| e.created_at).min();
+        let mut fresh = 0usize;
+        for event in page {
+            if seen.insert(event.id) {
+                out.push(event);
+                fresh += 1;
+            }
+        }
+        let Some(oldest) = oldest else {
+            return Ok(out);
+        };
+        if !full || oldest <= since {
+            return Ok(out);
+        }
+        if fresh == 0 {
+            return Err(
+                "review: encrypted response window saturated (one second holds a full page); retry required"
+                    .into(),
+            );
+        }
+        until = Some(oldest);
+    }
+    Err(format!(
+        "review: encrypted response window saturated past {max_pages} pages; retry required"
+    ))
+}
+
 struct Transport<'a> {
     client: &'a Client,
     relay: &'a str,
@@ -571,32 +625,35 @@ struct Transport<'a> {
 impl wire::Transport for Transport<'_> {
     async fn fetch(&self, subject: &Subject, reviewer: &PublicKey) -> Result<Vec<Event>, String> {
         let recipient = self.identity.public_key()?;
-        let rows = self
-            .client
-            .fetch_events_from(
-                [self.relay],
-                Filter::new()
-                    .kind(Kind::GiftWrap)
-                    .pubkey(recipient)
-                    .since(Timestamp::from(
-                        // A reply can land after this client's wait: the worker holds
-                        // its own processing window (default 600s, configurable) behind
-                        // a 300s request-freshness allowance, plus queueing. Cover that
-                        // lifetime generously, or a later attempt reads a published
-                        // reply as "no response" (#1115). A reply older than this is
-                        // still collected by any retry within 30 minutes of it.
-                        Timestamp::now()
-                            .as_secs()
-                            .saturating_sub(pc::transport::TIMESTAMP_TWEAK_SECS + 1800),
-                    ))
-                    .limit(128),
-                std::time::Duration::from_secs(2),
-            )
-            .await
-            .map_err(|_| "review: encrypted response read failed")?;
-        if rows.len() >= 128 {
-            return Err("review: encrypted response window saturated; retry required".into());
-        }
+        // A reply can land after this client's wait: the worker holds its own processing window
+        // (default 600s, configurable) behind a 300s request-freshness allowance, plus queueing.
+        // Cover that lifetime generously, or a later attempt reads a published reply as "no
+        // response" (#1115). A reply older than this is still collected by any retry within 30
+        // minutes of it.
+        let since = Timestamp::from(
+            Timestamp::now()
+                .as_secs()
+                .saturating_sub(pc::transport::TIMESTAMP_TWEAK_SECS + 1800),
+        );
+        let (client, relay) = (self.client, self.relay);
+        let rows = page_back(since, REVIEW_PAGE_LIMIT, REVIEW_PAGE_CAP, |until| {
+            let mut filter = Filter::new()
+                .kind(Kind::GiftWrap)
+                .pubkey(recipient)
+                .since(since)
+                .limit(REVIEW_PAGE_LIMIT);
+            if let Some(until) = until {
+                filter = filter.until(until);
+            }
+            async move {
+                client
+                    .fetch_events_from([relay], filter, std::time::Duration::from_secs(2))
+                    .await
+                    .map(|events| events.into_iter().collect())
+                    .map_err(|_| "review: encrypted response read failed".to_owned())
+            }
+        })
+        .await?;
         let mut found = Vec::new();
         for outer in rows {
             if let Ok(event) = self.identity.decode(&outer).await {
@@ -1333,6 +1390,114 @@ mod tests {
         let mut wrong = good;
         wrong.subject.event = evidence.result.id.to_hex();
         assert!(wrong.validate(&key(1).public_key(), &policy).is_err());
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    fn wrap_at(keys: &Keys, n: u64, at: u64) -> Event {
+        EventBuilder::text_note(format!("w{n}"))
+            .custom_created_at(Timestamp::from(at))
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// A relay as NIP-01 answers: `since <= created_at <= until`, newest first, `limit` rows.
+    fn relay(
+        events: &[Event],
+        since: Timestamp,
+        until: Option<Timestamp>,
+        limit: usize,
+    ) -> Vec<Event> {
+        let mut rows: Vec<_> = events
+            .iter()
+            .filter(|e| e.created_at >= since && until.is_none_or(|u| e.created_at <= u))
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.id.cmp(&b.id)));
+        rows.truncate(limit);
+        rows
+    }
+
+    async fn read(
+        events: &[Event],
+        since: u64,
+        limit: usize,
+        cap: usize,
+    ) -> (Result<Vec<Event>, String>, usize) {
+        let since = Timestamp::from(since);
+        let mut calls = 0;
+        let got = page_back(since, limit, cap, |until| {
+            calls += 1;
+            let rows = relay(events, since, until, limit);
+            async move { Ok(rows) }
+        })
+        .await;
+        (got, calls)
+    }
+
+    /// rc2: more wraps than one page in the window are all read, deduped across the inclusive
+    /// `until` boundary, including ones sharing a second with a page edge.
+    #[tokio::test]
+    async fn a_window_wider_than_one_page_is_read_completely() {
+        let keys = Keys::generate();
+        // 300 wraps over 150 seconds, two per second, so page edges split seconds.
+        let events: Vec<_> = (0..300).map(|n| wrap_at(&keys, n, 1_000 + n / 2)).collect();
+        let (got, calls) = read(&events, 1_000, 128, 16).await;
+        let got = got.expect("paged");
+        assert_eq!(got.len(), 300, "every wrap, once");
+        let ids: std::collections::HashSet<_> = got.iter().map(|e| e.id).collect();
+        assert_eq!(ids.len(), 300);
+        assert!(calls >= 3, "{calls} pages");
+        // Exactly one page's worth still stops at a short page.
+        let (got, _) = read(&events[..128], 1_000, 128, 16).await;
+        assert_eq!(got.unwrap().len(), 128);
+        // Fewer than a page: one call, as before.
+        let (got, calls) = read(&events[..5], 1_000, 128, 16).await;
+        assert_eq!((got.unwrap().len(), calls), (5, 1));
+        // Nothing at all.
+        let (got, calls) = read(&[], 1_000, 128, 16).await;
+        assert_eq!((got.unwrap().len(), calls), (0, 1));
+    }
+
+    #[tokio::test]
+    async fn paging_stops_at_since_and_errors_only_past_the_cap() {
+        let keys = Keys::generate();
+        let events: Vec<_> = (0..300).map(|n| wrap_at(&keys, n, 1_000 + n)).collect();
+        // `since` inside the data: only rows at or after it, and no read below it.
+        let (got, _) = read(&events, 1_200, 50, 16).await;
+        let got = got.unwrap();
+        assert_eq!(got.len(), 100);
+        assert!(got.iter().all(|e| e.created_at.as_secs() >= 1_200));
+        // The hard cap: 300 wraps at 10 per page need more than 16 pages.
+        let (got, calls) = read(&events, 1_000, 10, 16).await;
+        assert!(got.unwrap_err().contains("saturated"));
+        assert_eq!(calls, 16);
+        // More than a page in one second cannot be paged without skipping: an error, not a loop.
+        let same: Vec<_> = (0..20).map(|n| wrap_at(&keys, n, 5_000)).collect();
+        let (got, calls) = read(&same, 1_000, 10, 16).await;
+        assert!(got.unwrap_err().contains("saturated"));
+        assert_eq!(calls, 2);
+    }
+
+    #[tokio::test]
+    async fn a_read_error_on_any_page_fails_the_fetch() {
+        let mut calls = 0;
+        let got = page_back(Timestamp::from(0), 2, 16, |until| {
+            calls += 1;
+            let keys = Keys::generate();
+            async move {
+                match until {
+                    None => Ok(vec![wrap_at(&keys, 0, 10), wrap_at(&keys, 1, 9)]),
+                    Some(_) => Err("review: encrypted response read failed".to_owned()),
+                }
+            }
+        })
+        .await;
+        assert_eq!(got.unwrap_err(), "review: encrypted response read failed");
+        assert_eq!(calls, 2);
     }
 }
 
