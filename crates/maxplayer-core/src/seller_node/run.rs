@@ -7568,10 +7568,11 @@ impl SellerNodeRunner {
         let mut claim = claim;
         {
             let config = &self.node.home().config;
-            let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
-                sandbox.mode == crate::home::SandboxMode::Docker
-                    && sandbox.container_delivery_enabled(crate::seller_exec::job_identity().0)
-            });
+            // Not on runsc: the parked holder loses its network there (rc2; runc-only for now).
+            let docker_container_seat = crate::session::session_capable_seat(
+                config.sandbox.as_ref(),
+                crate::seller_exec::job_identity().0,
+            );
             crate::session::advertise_on_claim(&mut claim, &config.sessions, docker_container_seat);
         }
         let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();

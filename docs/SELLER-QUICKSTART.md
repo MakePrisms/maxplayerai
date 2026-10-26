@@ -592,6 +592,12 @@ docker info --format '{{.Runtimes}}'        # runsc must be listed before you se
 maxplayer doctor                            # checks the image, the network and the containment probe
 ```
 
+> **Session (multi-turn) jobs are runc-only for now.** With `[sessions] enabled = true`, a seat whose
+> `runtime = "runsc"` does not advertise `["session","1"]` on its claims: under gVisor the parked
+> network-namespace holder loses its network after turn 1, so every follow-up turn would expire. Such a
+> seat still takes ordinary single-turn jobs. A runc seat (no `runtime` line on Linux, or
+> `runtime = "runc"`) advertises sessions as before.
+
 ⚠ **Two things block a working docker seat, and neither is caught before a job runs.**
 
 **1. `proxy_port_range` is mandatory once `network` is set.** Your model credential is held by a per-job

@@ -280,6 +280,58 @@ fn turn_start_needs_wrap_up_push_and_start_margin() {
     assert!(!turn_can_start(1_000, 1_000 + need - 1, 300));
 }
 
+/// rc2: a runsc seat never advertises sessions (its parked holder loses its network after turn 1);
+/// runc, the daemon default (no runtime line) and a padded `runc` still do. The other conditions are
+/// unchanged: docker mode and container delivery are both required.
+#[test]
+fn runsc_seats_are_not_session_capable() {
+    use crate::home::{SandboxConfig, SandboxMode};
+    let seat = |runtime: Option<&str>| SandboxConfig {
+        mode: SandboxMode::Docker,
+        container_delivery: Some(true),
+        runtime: runtime.map(str::to_owned),
+        ..Default::default()
+    };
+    assert!(session_capable_seat(Some(&seat(None)), 1000));
+    assert!(session_capable_seat(Some(&seat(Some("runc"))), 1000));
+    assert!(!session_capable_seat(Some(&seat(Some("runsc"))), 1000));
+    assert!(!session_capable_seat(Some(&seat(Some(" runsc "))), 1000));
+    assert!(!session_capable_seat(None, 1000));
+    let launcher = SandboxConfig {
+        mode: SandboxMode::Launcher,
+        ..seat(None)
+    };
+    assert!(!session_capable_seat(Some(&launcher), 1000));
+    let host_delivery = SandboxConfig {
+        container_delivery: Some(false),
+        ..seat(None)
+    };
+    assert!(!session_capable_seat(Some(&host_delivery), 1000));
+    // What the claim path does with it: a runsc seat's claim carries no session tag.
+    let draft = gateway::claim_draft(
+        OFFER,
+        BUYER,
+        SELLER,
+        ClaimPayment::None,
+        &["claude".into()],
+        &Default::default(),
+    );
+    let mut runsc = draft.clone();
+    advertise_on_claim(
+        &mut runsc,
+        &on(),
+        session_capable_seat(Some(&seat(Some("runsc"))), 1000),
+    );
+    assert_eq!(runsc, draft);
+    let mut runc = draft.clone();
+    advertise_on_claim(
+        &mut runc,
+        &on(),
+        session_capable_seat(Some(&seat(Some("runc"))), 1000),
+    );
+    assert!(claim_supports_sessions(&runc.tags));
+}
+
 /// Failure tests 6 and 14.
 #[test]
 fn restarted_or_missing_holder_and_old_orchestrator_expire() {

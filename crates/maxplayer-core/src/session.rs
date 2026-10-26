@@ -282,6 +282,21 @@ pub fn advertise_on_claim(
         .insert(at, TagSpec::new([SESSION_TAG, SESSION_TAG_VALUE]));
 }
 
+/// Whether this seat may advertise sessions at all (§2.2, §5.1): a docker seat on the
+/// container-delivery path whose sandbox runtime is NOT gVisor (`runsc`). On runsc the parked
+/// holder's namespace loses its network after turn 1 (rc1 sweep), so every turn 2 would expire;
+/// such a seat does not offer sessions until that is fixed. `runc`/the daemon default qualify.
+pub fn session_capable_seat(
+    sandbox: Option<&crate::home::SandboxConfig>,
+    container_uid: u32,
+) -> bool {
+    sandbox.is_some_and(|sandbox| {
+        sandbox.mode == crate::home::SandboxMode::Docker
+            && sandbox.container_delivery_enabled(container_uid)
+            && sandbox.runtime.as_deref().map(str::trim) != Some("runsc")
+    })
+}
+
 /// Exactly one `["session","1"]` row. Anything else — absent, another value, a duplicate — reads
 /// as no session support.
 pub fn claim_supports_sessions(tags: &[TagSpec]) -> bool {
