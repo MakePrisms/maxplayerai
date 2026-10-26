@@ -446,6 +446,27 @@ pub enum HolderObservation {
     Running { started_at: String },
 }
 
+/// What the holder's network namespace looked like at resume, read by an unprivileged helper that
+/// joins it (`--network container:<holder>`), before any job container starts.
+///
+/// A holder can be running, unrestarted and still carry the firewall rules while its namespace has
+/// lost every address and route: measured on runsc seats, where turn 1's gVisor sandbox leaves the
+/// parked holder with only `lo`. A turn started into that namespace cannot reach the credential
+/// proxy, burns ~4 minutes, and strikes a healthy harness. Only [`HolderNetwork::Up`] starts a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderNetwork {
+    /// A non-loopback IPv4 address and a default route are present.
+    Up,
+    /// No non-loopback IPv4 address in the namespace.
+    NoAddress,
+    /// An address, but no default route.
+    NoDefaultRoute,
+    /// The probe could not answer (docker error, timeout, unreadable output). Fail-closed.
+    ProbeFailed(String),
+    /// Not probed: the holder already failed its own check, or no probe was run at all.
+    NotProbed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResumeGate {
     Start,
@@ -456,11 +477,14 @@ pub enum ResumeGate {
 
 /// §5.5: a holder that is gone, stopped, or restarted (a new `State.StartedAt` is a new network
 /// namespace with no firewall rules) expires the session; so does an orchestrator that predates
-/// the inputs protocol the host would send.
+/// the inputs protocol the host would send. A holder that passes all of that must ALSO still have a
+/// network ([`HolderNetwork::Up`]); anything else — including a probe that could not answer or was
+/// never run — expires with `holder_network_lost`.
 pub fn resume_gate(
     recorded_holder_started_at: Option<&str>,
     observed: &HolderObservation,
     recorded_orchestrator_protocol: u32,
+    network: &HolderNetwork,
 ) -> ResumeGate {
     if recorded_orchestrator_protocol < SESSION_PROTOCOL {
         return ResumeGate::Expire("orchestrator_too_old");
@@ -473,6 +497,9 @@ pub fn resume_gate(
         HolderObservation::NotRunning => ResumeGate::Expire("holder_not_running"),
         HolderObservation::Running { started_at } if started_at != recorded => {
             ResumeGate::Expire("holder_restarted")
+        }
+        HolderObservation::Running { .. } if *network != HolderNetwork::Up => {
+            ResumeGate::Expire("holder_network_lost")
         }
         HolderObservation::Running { .. } => ResumeGate::Start,
     }

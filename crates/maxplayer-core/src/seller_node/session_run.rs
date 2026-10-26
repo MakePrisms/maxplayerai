@@ -522,12 +522,48 @@ impl SellerNodeRunner {
         let protocol = record.orchestrator_version.parse::<u32>().unwrap_or(0);
         let gate = match record.holder.clone() {
             Some(holder) => {
+                // The holder's own state first, then (only for a running holder) its namespace's
+                // address and default route, read by an unprivileged helper joined to it. Both
+                // run before any job container starts; a probe that cannot answer expires the
+                // session (`holder_network_lost`) rather than starting a turn into a dead network.
+                let labels = crate::sandbox_netns::helper_label_args(
+                    &job_id,
+                    &self.seller_pubkey.to_hex(),
+                    crate::sandbox_netns::cleanup_after_unix(turn.deadline_unix),
+                );
                 let observed = tokio::task::spawn_blocking(move || {
-                    session_gc::observe_holder(&mut RealDockerCli, &holder)
+                    let observed = session_gc::observe_holder(&mut RealDockerCli, &holder);
+                    let network = if matches!(observed, session::HolderObservation::Running { .. })
+                    {
+                        session_gc::observe_holder_network(
+                            &mut RealDockerCli,
+                            &holder,
+                            crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
+                            &labels,
+                        )
+                    } else {
+                        session::HolderNetwork::NotProbed
+                    };
+                    (observed, network)
                 })
                 .await
-                .unwrap_or(session::HolderObservation::Missing);
-                session::resume_gate(record.holder_started_at.as_deref(), &observed, protocol)
+                .unwrap_or((
+                    session::HolderObservation::Missing,
+                    session::HolderNetwork::NotProbed,
+                ));
+                if let (session::HolderObservation::Running { .. }, network) = &observed
+                    && *network != session::HolderNetwork::Up
+                {
+                    opline!(
+                        "seller node session job_id={job_id}: holder network check failed ({network:?})"
+                    );
+                }
+                session::resume_gate(
+                    record.holder_started_at.as_deref(),
+                    &observed.0,
+                    protocol,
+                    &observed.1,
+                )
             }
             // An uncontained docker seat has no holder to verify.
             None if protocol >= session::SESSION_PROTOCOL => session::ResumeGate::Start,

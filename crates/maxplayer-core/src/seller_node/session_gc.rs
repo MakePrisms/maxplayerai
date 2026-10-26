@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::seller_exec::{DockerCli, force_remove_argv};
-use crate::session::{self, HolderObservation, SessionState};
+use crate::session::{self, HolderNetwork, HolderObservation, SessionState};
 
 use super::store::{SellerStore, SessionRecord, StoreError};
 
@@ -69,6 +69,139 @@ pub fn parse_holder_state(answer: Result<String, String>) -> HolderObservation {
 
 pub fn observe_holder<D: DockerCli>(cli: &mut D, holder: &str) -> HolderObservation {
     parse_holder_state(cli.run(&holder_state_argv(holder)))
+}
+
+/// `docker inspect` of the holder's docker-recorded IPv4 address(es), one per joined network.
+pub fn holder_ip_argv(holder: &str) -> Vec<String> {
+    [
+        "docker",
+        "inspect",
+        "--format",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}",
+        holder,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// `docker run` argv that runs `ip -4 -oneline <what>` INSIDE the holder's namespace.
+///
+/// The same shape as [`crate::sandbox_iface::link_probe_argv`]: the sidecar image (it carries
+/// iproute2), `--network container:<holder>`, no capability, `--entrypoint ip` so the image's
+/// privileged applier is unreachable. `labels` are this job's helper labels
+/// ([`crate::sandbox_netns::helper_label_args`]), so a probe that outlives its client is judged by
+/// the same sweep as every other helper.
+pub fn holder_ip_probe_argv(
+    holder: &str,
+    image: &str,
+    labels: &[String],
+    what: &[&str],
+) -> Vec<String> {
+    let mut argv: Vec<String> = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        &crate::sandbox_netns::NetnsHolder::network_mode_for(holder),
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    argv.extend(labels.iter().cloned());
+    argv.extend(["--entrypoint", "ip", image, "-4", "-oneline"].map(String::from));
+    argv.extend(what.iter().map(|s| (*s).to_owned()));
+    argv
+}
+
+/// The non-loopback IPv4 addresses in `ip -4 -oneline addr show` output.
+pub fn parse_ipv4_addrs(stdout: &str) -> Vec<std::net::Ipv4Addr> {
+    stdout
+        .lines()
+        .flat_map(|line| {
+            let mut words = line.split_whitespace();
+            let mut found = Vec::new();
+            while let Some(word) = words.next() {
+                if word == "inet"
+                    && let Some(cidr) = words.next()
+                    && let Ok(ip) = cidr.split('/').next().unwrap_or("").parse()
+                {
+                    found.push(ip);
+                }
+            }
+            found
+        })
+        .filter(|ip: &std::net::Ipv4Addr| !ip.is_loopback())
+        .collect()
+}
+
+/// Judge the holder namespace's network from the three answers [`observe_holder_network`] reads.
+/// Every error is `ProbeFailed`: the turn is never started on a namespace nobody could inspect.
+pub fn judge_holder_network(
+    recorded_ip: Result<String, String>,
+    addrs: Result<String, String>,
+    routes: Result<String, String>,
+) -> HolderNetwork {
+    let recorded_ip = match recorded_ip {
+        Ok(out) => out
+            .split_whitespace()
+            .filter_map(|w| w.parse::<std::net::Ipv4Addr>().ok())
+            .collect::<Vec<_>>(),
+        Err(error) => return HolderNetwork::ProbeFailed(format!("holder inspect: {error}")),
+    };
+    let present = match addrs {
+        Ok(out) => parse_ipv4_addrs(&out),
+        Err(error) => return HolderNetwork::ProbeFailed(format!("addr probe: {error}")),
+    };
+    // The address docker recorded for the holder must still be in the namespace; with none recorded,
+    // any non-loopback address will do.
+    let has_address = if recorded_ip.is_empty() {
+        !present.is_empty()
+    } else {
+        recorded_ip.iter().any(|ip| present.contains(ip))
+    };
+    if !has_address {
+        return HolderNetwork::NoAddress;
+    }
+    match routes {
+        Ok(out) if out.lines().any(|l| l.trim_start().starts_with("default")) => HolderNetwork::Up,
+        Ok(_) => HolderNetwork::NoDefaultRoute,
+        Err(error) => HolderNetwork::ProbeFailed(format!("route probe: {error}")),
+    }
+}
+
+/// §5.5 holder network check: does the parked holder's namespace still have its address and a
+/// default route? Runs before any job container starts; see [`HolderNetwork`].
+pub fn observe_holder_network<D: DockerCli>(
+    cli: &mut D,
+    holder: &str,
+    image: &str,
+    labels: &[String],
+) -> HolderNetwork {
+    let recorded = cli.run(&holder_ip_argv(holder));
+    if let Err(error) = recorded {
+        return HolderNetwork::ProbeFailed(format!("holder inspect: {error}"));
+    }
+    let addrs = cli.run(&holder_ip_probe_argv(
+        holder,
+        image,
+        labels,
+        &["addr", "show"],
+    ));
+    if let Err(error) = addrs {
+        return HolderNetwork::ProbeFailed(format!("addr probe: {error}"));
+    }
+    let routes = cli.run(&holder_ip_probe_argv(
+        holder,
+        image,
+        labels,
+        &["route", "show", "default"],
+    ));
+    judge_holder_network(recorded, addrs, routes)
 }
 
 /// Bytes under `dir`, never following a symlink (a job could plant one to `/`). Unreadable
@@ -446,9 +579,144 @@ mod tests {
             session::resume_gate(
                 Some("2026-10-21T10:00:00Z"),
                 &observe_holder(&mut cli, "h"),
-                session::SESSION_PROTOCOL
+                session::SESSION_PROTOCOL,
+                &HolderNetwork::Up
             ),
             session::ResumeGate::Expire("holder_restarted")
+        );
+    }
+
+    /// What `ip -4 -oneline addr show` printed in a healthy holder, and what the runsc sweep saw.
+    const ADDRS_UP: &str = "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n\
+         2: eth0    inet 172.18.0.5/16 brd 172.18.255.255 scope global eth0\\       valid_lft forever preferred_lft forever\n";
+    const ADDRS_LO_ONLY: &str =
+        "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever\n";
+
+    #[test]
+    fn holder_network_is_judged_from_recorded_ip_addresses_and_default_route() {
+        let ok = |s: &str| Ok::<String, String>(s.to_owned());
+        assert_eq!(
+            judge_holder_network(
+                ok("172.18.0.5 "),
+                ok(ADDRS_UP),
+                ok("default via 172.18.0.1 dev eth0")
+            ),
+            HolderNetwork::Up
+        );
+        // The runsc failure: only `lo` left, no routes.
+        assert_eq!(
+            judge_holder_network(ok("172.18.0.5 "), ok(ADDRS_LO_ONLY), ok("")),
+            HolderNetwork::NoAddress
+        );
+        // An address, but not the one docker recorded for the holder.
+        assert_eq!(
+            judge_holder_network(
+                ok("172.18.0.9 "),
+                ok(ADDRS_UP),
+                ok("default via 172.18.0.1 dev eth0")
+            ),
+            HolderNetwork::NoAddress
+        );
+        // Nothing recorded: any non-loopback address will do.
+        assert_eq!(
+            judge_holder_network(ok(" "), ok(ADDRS_UP), ok("default via 172.18.0.1 dev eth0")),
+            HolderNetwork::Up
+        );
+        assert_eq!(
+            judge_holder_network(ok("172.18.0.5"), ok(ADDRS_UP), ok("")),
+            HolderNetwork::NoDefaultRoute
+        );
+        // Every probe error fails closed.
+        for (a, b, c) in [
+            (Err("x".to_owned()), ok(ADDRS_UP), ok("default via x")),
+            (ok("172.18.0.5"), Err("x".to_owned()), ok("default via x")),
+            (ok("172.18.0.5"), ok(ADDRS_UP), Err("x".to_owned())),
+        ] {
+            assert!(matches!(
+                judge_holder_network(a, b, c),
+                HolderNetwork::ProbeFailed(_)
+            ));
+        }
+    }
+
+    /// Answers the holder-network probe as a fake daemon would, recording every call.
+    struct NetProbe {
+        calls: Vec<Vec<String>>,
+        ip: Result<String, String>,
+        addrs: Result<String, String>,
+        routes: Result<String, String>,
+    }
+    impl DockerCli for NetProbe {
+        fn run(&mut self, argv: &[String]) -> Result<String, String> {
+            self.calls.push(argv.to_vec());
+            match (
+                argv.get(1).map(String::as_str),
+                argv.iter().rev().nth(1).map(String::as_str),
+            ) {
+                (Some("inspect"), _) => self.ip.clone(),
+                (Some("run"), Some("addr")) => self.addrs.clone(),
+                (Some("run"), _) => self.routes.clone(),
+                _ => Err("unexpected".into()),
+            }
+        }
+    }
+
+    #[test]
+    fn holder_network_probe_joins_the_holder_unprivileged_and_fails_closed() {
+        let labels = crate::sandbox_netns::helper_label_args("j", "seat", 99);
+        let mut cli = NetProbe {
+            calls: Vec::new(),
+            ip: Ok("172.18.0.5 ".into()),
+            addrs: Ok(ADDRS_UP.into()),
+            routes: Ok("default via 172.18.0.1 dev eth0".into()),
+        };
+        assert_eq!(
+            observe_holder_network(&mut cli, "maxplayer-netns-j", "img", &labels),
+            HolderNetwork::Up
+        );
+        assert_eq!(cli.calls.len(), 3);
+        for probe in &cli.calls[1..] {
+            assert!(
+                probe.contains(&"container:maxplayer-netns-j".to_owned()),
+                "{probe:?}"
+            );
+            assert!(probe.contains(&"--rm".to_owned()));
+            assert!(
+                !probe.iter().any(|a| a == "NET_ADMIN"),
+                "a reader needs no capability"
+            );
+            assert!(!probe.iter().any(|a| a == "nsenter"));
+            assert!(probe.windows(2).any(|w| w == ["--entrypoint", "ip"]));
+            for label in &labels {
+                assert!(probe.contains(label), "helper labels: {probe:?}");
+            }
+        }
+        // The runsc failure, measured: lo only.
+        cli.addrs = Ok(ADDRS_LO_ONLY.into());
+        cli.routes = Ok(String::new());
+        assert_eq!(
+            observe_holder_network(&mut cli, "maxplayer-netns-j", "img", &labels),
+            HolderNetwork::NoAddress
+        );
+        // A daemon that cannot run the probe: fail closed, and stop at the first error.
+        cli.calls.clear();
+        cli.addrs = Err("exit 125: no such image".into());
+        assert!(matches!(
+            observe_holder_network(&mut cli, "maxplayer-netns-j", "img", &labels),
+            HolderNetwork::ProbeFailed(_)
+        ));
+        assert_eq!(cli.calls.len(), 2);
+        // Through the gate: that expires the session.
+        assert_eq!(
+            session::resume_gate(
+                Some("t"),
+                &HolderObservation::Running {
+                    started_at: "t".into()
+                },
+                session::SESSION_PROTOCOL,
+                &HolderNetwork::ProbeFailed("x".into())
+            ),
+            session::ResumeGate::Expire("holder_network_lost")
         );
     }
 }
