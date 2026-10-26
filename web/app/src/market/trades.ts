@@ -51,6 +51,27 @@ export interface Trade {
    */
   free: boolean;
   at: Partial<Record<Stage, number>>;
+  /**
+   * Session jobs: the highest turn a buyer FOLLOW-UP started (1 when there is
+   * none — every job is at least its first turn).
+   */
+  turns: number;
+  /**
+   * The turn each RESULT, ACCEPT and RECEIPT settles, by event id. A turn-n
+   * result e-tags its follow-up (`reply`); an accept or receipt e-tags its
+   * result. Turn 1's result names no follow-up, and its accept names no result
+   * (only session accepts carry the `reply` tag, session-jobs.md §2.4), so
+   * those read as turn 1. Empty unless `turns > 1`.
+   */
+  turnOf: Map<string, number>;
+  /** The newest FOLLOW-UP, turn or close — what decides whether a session job is working again. */
+  lastFollowUp: ParsedEvent | null;
+  /**
+   * The NEWEST result, accept, receipt or terminal feedback. `at` keeps the
+   * earliest stamp per stage; a session turn is answered only by something
+   * later than the follow-up that started it, so this is the clock it needs.
+   */
+  lastSettledAt: number | null;
 }
 
 /**
@@ -110,7 +131,8 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     if (!t) {
       t = { offerId, buyer: null, seller: null, sellerConflict: false, offerAmount: null,
             receiptAmount: null, declineReason: null,
-            claimants: [], releasedBy: [], deliveredBy: [], selfTrade: false, free: false, at: {} };
+            claimants: [], releasedBy: [], deliveredBy: [], selfTrade: false, free: false, at: {},
+            turns: 1, turnOf: new Map(), lastFollowUp: null, lastSettledAt: null };
       trades.set(offerId, t);
       signals.set(offerId, { authenticated: new Set(), delivered: null, deliveredAt: Infinity,
                              claimed: null, claimedAt: Infinity });
@@ -121,6 +143,15 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
   // that names the winner may arrive AFTER the feedback it has to be compared
   // against. So collect every terminal refusal, then resolve.
   const terminals = new Map<string, { seller: string; at: number; reason: string }[]>();
+  // Session jobs: per trade, follow-up id -> turn, and the settling events to
+  // number once every follow-up has been read (relay order is not event order).
+  const followUpTurns = new Map<string, Map<string, number>>();
+  const settling = new Map<string, ParsedEvent[]>();
+  // Receipts per settled result: each turn of a session job is paid on its own,
+  // so the figure is the sum over results — each still a floor, so a duplicate
+  // receipt for the SAME result never adds twice. Receipts naming no result
+  // share one bucket, which is exactly the old one-receipt-per-trade floor.
+  const receiptsByResult = new Map<string, Map<string, number>>();
   const earliest = (trade: Trade, stage: Stage, ts: number) => {
     const seen = trade.at[stage];
     trade.at[stage] = seen == null ? ts : Math.min(seen, ts);
@@ -156,7 +187,30 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     // one trade, they arrive in relay order, and a plain assignment would let
     // whichever paged last decide the figure.
     if (e.stage === "receipt" && e.amount != null) {
-      t.receiptAmount = Math.max(t.receiptAmount ?? 0, e.amount);
+      const buckets = receiptsByResult.get(e.offerId) ?? new Map<string, number>();
+      const key = e.replyTo ?? "";
+      buckets.set(key, Math.max(buckets.get(key) ?? 0, e.amount));
+      receiptsByResult.set(e.offerId, buckets);
+    }
+    if (e.stage === "reply") {
+      if (e.status !== "close" && e.turn != null) {
+        const turns = followUpTurns.get(e.offerId) ?? new Map<string, number>();
+        turns.set(e.id, e.turn);
+        followUpTurns.set(e.offerId, turns);
+        t.turns = Math.max(t.turns, e.turn);
+      }
+      const last = t.lastFollowUp;
+      if (!last || e.created_at > last.created_at ||
+          (e.created_at === last.created_at && e.id > last.id)) t.lastFollowUp = e;
+    }
+    if (e.stage === "result" || e.stage === "accept" || e.stage === "receipt" ||
+        (e.stage === "feedback" && e.terminal)) {
+      t.lastSettledAt = Math.max(t.lastSettledAt ?? 0, e.created_at);
+    }
+    if (e.stage === "result" || e.stage === "accept" || e.stage === "receipt") {
+      const list = settling.get(e.offerId) ?? [];
+      list.push(e);
+      settling.set(e.offerId, list);
     }
     // Only a TERMINAL feedback (claim_released / refusal / error, §7.2) is a
     // decline. `reason` alone can't gate this: feedbackReason() always returns
@@ -171,6 +225,23 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
   }
 
   for (const t of trades.values()) {
+    const buckets = receiptsByResult.get(t.offerId);
+    if (buckets) t.receiptAmount = [...buckets.values()].reduce((a, b) => a + b, 0);
+    if (t.turns > 1) {
+      const turns = followUpTurns.get(t.offerId)!;
+      const events = settling.get(t.offerId) ?? [];
+      const resultTurn = new Map<string, number>();
+      for (const e of events) {
+        if (e.stage !== "result") continue;
+        const n = e.replyTo ? turns.get(e.replyTo) : 1;
+        if (n != null) { resultTurn.set(e.id, n); t.turnOf.set(e.id, n); }
+      }
+      for (const e of events) {
+        if (e.stage === "result") continue;
+        const n = e.replyTo ? resultTurn.get(e.replyTo) : e.stage === "accept" ? 1 : undefined;
+        if (n != null) t.turnOf.set(e.id, n);
+      }
+    }
     const { seller, conflict } = resolveSeller(signals.get(t.offerId)!);
     t.seller = seller;
     t.sellerConflict = conflict;
@@ -188,6 +259,19 @@ function buildTradesUncached(events: (RawEvent | ParsedEvent)[]): Trade[] {
     t.declineReason = t.seller ? seen.find((f) => f.seller === t.seller)?.reason ?? null : null;
   }
   return [...trades.values()];
+}
+
+/**
+ * A session job the buyer has sent back to work: its newest FOLLOW-UP starts a
+ * turn and nothing has answered it yet — no result, accept, receipt or terminal
+ * feedback at or after it. A `close` follow-up never reopens anything. Returns
+ * that follow-up, or null when the job is not in a reopened turn.
+ */
+export function openFollowUp(trade: Trade): ParsedEvent | null {
+  const f = trade.lastFollowUp;
+  if (!f || f.status !== "turn") return null;
+  if (trade.lastSettledAt != null && trade.lastSettledAt >= f.created_at) return null;
+  return f;
 }
 
 export interface MarketFunnel {

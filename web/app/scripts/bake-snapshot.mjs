@@ -32,7 +32,7 @@ export const RELAY_URL = "wss://relay.maxplayer.ai";
  * two against kinds.ts, so a renumber that misses this file fails the suite
  * rather than silently baking the wrong market.
  */
-export const TAGGED_KINDS = [3401, 3402, 3403, 3404, 3405, 3406, 3400, 30340];
+export const TAGGED_KINDS = [3401, 3402, 3403, 3404, 3405, 3406, 3400, 30340, 3412];
 export const PROFILE_KIND = 0;
 
 export const PAGE = 500;

@@ -11,7 +11,7 @@
 import { createCache, type EventCache } from "../store/cache.js";
 import { parseEvent, type ParsedEvent, type RawEvent } from "../model/events.js";
 import { TRADE_STAGES } from "../model/kinds.js";
-import { buildTrades, marketMetrics, type MarketMetrics, type Trade } from "./trades.js";
+import { buildTrades, marketMetrics, openFollowUp, type MarketMetrics, type Trade } from "./trades.js";
 import {
   DEFAULT_WINDOW, buyerBoard, participantNames, participantProfiles, racerLastActivity,
   sellerBoard, withinWindow, type BuyerRow, type Profile, type SellerRow,
@@ -22,7 +22,7 @@ export interface ActiveJob { offerId: string; startedAt: number }
 
 /** Same-second tiebreak for the feed: reverse lifecycle order, newest first. */
 const FEED_STAGE_RANK: Record<string, number> = {
-  offer: 0, claim: 1, award: 2, result: 3, feedback: 4, accept: 5, receipt: 6,
+  offer: 0, claim: 1, award: 2, result: 3, feedback: 4, accept: 5, receipt: 6, reply: 7,
 };
 const feedStageRank = (e: ParsedEvent): number => (e.stage != null ? FEED_STAGE_RANK[e.stage] ?? 50 : 50);
 
@@ -88,6 +88,11 @@ export function activeTradeJobs(allEvents: RawEvent[], t: number): {
   const tradeByOffer = new Map(trades.map((tr) => [tr.offerId, tr]));
   const over = (trade: Trade | undefined, offerId: string): boolean => {
     if (!trade) return true;
+    // A session job the buyer sent back to work is working again until that
+    // turn is answered (result, accept, receipt or terminal feedback), its own
+    // deadline passes, or the buyer closes the session.
+    const reopened = openFollowUp(trade);
+    if (reopened) return reopened.deadline != null && reopened.deadline < t;
     // Delivered, accepted or paid: nobody is working on it any more. The
     // accept and the receipt are OPTIONAL announcements — plenty of buyers
     // deliver-and-pay without publishing either — so the result alone ends it.
