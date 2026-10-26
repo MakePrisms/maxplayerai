@@ -458,9 +458,13 @@ pub const INLINE_ANSWER_MARKER: &str = "MAXPLAYER-ANSWER-V1";
 
 /// The answer an agent marked for inline delivery, or `None` when it marked none.
 ///
-/// The marker must be on the FIRST non-blank line and be the only WORD on it. First, because a
-/// marker the agent could bury anywhere is one a quoted task description or a pasted log can forge
-/// by accident.
+/// The marker must be the FIRST whitespace-delimited token of the FIRST non-blank line. First,
+/// because a marker the agent could bury anywhere is one a quoted task description or a pasted log
+/// can forge by accident. The answer is the rest of that line plus every following line, trimmed:
+/// codex, opencode and muse agents routinely write `MAXPLAYER-ANSWER-V1 WORKER1 47` on one line,
+/// and refusing that refused a correct, prompted answer, left it unpaid, and struck a healthy
+/// harness. What keeps forgery out is the position and the exact token, not the line break: a
+/// longer token (`MAXPLAYER-ANSWER-V1-DRAFT`) or a marker anywhere but first is still refused.
 ///
 /// Markdown decoration around the token is accepted — `` `MARKER` ``, `**MARKER**`, `# MARKER`, a
 /// trailing colon. A model told to emit an exact line routinely formats it, and every such reply is
@@ -469,8 +473,10 @@ pub const INLINE_ANSWER_MARKER: &str = "MAXPLAYER-ANSWER-V1";
 /// obedience. Nothing is weakened: the decoration characters cannot make an unmarked message
 /// marked.
 ///
-/// The answer is everything after that line, trimmed. An empty remainder is `None`: a marker with
-/// nothing behind it is not an answer, and §6.4 refuses an empty inline delivery anyway.
+/// One repeated leading marker is stripped from the answer: an agent that wrote the marker line
+/// and then `MARKER <answer>` (measured on muse) means `<answer>`, not a reply naming the marker.
+/// An empty answer is `None`: a marker with nothing behind it is not an answer, and §6.4 refuses
+/// an empty inline delivery anyway.
 pub fn marked_inline_answer(message: &str) -> Option<&str> {
     let text = message.trim_start();
     // A fenced first line (```), which some models wrap the whole reply in, is stepped over.
@@ -478,20 +484,28 @@ pub fn marked_inline_answer(message: &str) -> Option<&str> {
         Some(rest) => rest.split_once('\n').map(|(_, body)| body)?.trim_start(),
         None => text,
     };
-    let (first, rest) = match text.split_once('\n') {
-        Some((first, rest)) => (first, rest),
-        // No newline at all: the whole message is one line, so there is nothing behind the marker.
-        None => return None,
-    };
-    // Strip the decoration a model reaches for, then require what is left to BE the marker.
-    let bare = first.trim().trim_start_matches('#').trim();
-    let bare = bare.trim_matches(|c| c == '`' || c == '*' || c == '_').trim();
-    let bare = bare.strip_suffix(':').unwrap_or(bare).trim();
-    if bare != INLINE_ANSWER_MARKER {
-        return None;
+    let mut answer = after_leading_marker(text)?.trim();
+    if let Some(again) = after_leading_marker(answer) {
+        answer = again.trim();
     }
-    let answer = rest.trim();
     (!answer.is_empty()).then_some(answer)
+}
+
+/// Everything after the marker when `text`'s first line starts with it (decoration allowed), else
+/// `None`. `text` must not start with whitespace.
+fn after_leading_marker(text: &str) -> Option<&str> {
+    let first = text.split('\n').next().unwrap_or("");
+    // Strip the heading decoration a model reaches for, then take the first word.
+    let line = first.trim_start_matches('#').trim_start();
+    let start = first.len() - line.len();
+    let end = line.find(char::is_whitespace).unwrap_or(line.len());
+    let decoration = |c: char| c == '`' || c == '*' || c == '_';
+    let bare = line[..end].trim_matches(decoration);
+    let bare = bare
+        .strip_suffix(':')
+        .unwrap_or(bare)
+        .trim_matches(decoration);
+    (bare == INLINE_ANSWER_MARKER).then(|| &text[start + end..])
 }
 
 /// The agent's own account of a turn, accumulated from the sink [`run_job`] already calls for every
@@ -994,9 +1008,19 @@ mod tests {
             "the marker must be alone on its line, not a prefix of a longer token"
         );
         assert_eq!(
-            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER} and then some\nx")),
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}-DRAFT 47")),
             None,
-            "prose on the marker line is not a marker"
+            "a longer token is not the marker, on one line either"
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("answer: {INLINE_ANSWER_MARKER} 47")),
+            None,
+            "the marker must be the first word of the first line"
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}   \n\n")),
+            None,
+            "a one-line marker with nothing behind it delivers nothing"
         );
 
         // A model told to emit an exact line formats it. Each of these is a CORRECT answer, and
@@ -1020,6 +1044,70 @@ mod tests {
             marked_inline_answer(&format!("here you go:\n{INLINE_ANSWER_MARKER}\nx")),
             None,
             "a marker buried below the first line is one a pasted log could forge"
+        );
+    }
+
+    /// rc2 sweep: codex, opencode and muse put the answer on the marker line. That is the marker
+    /// as the first word of the first line, and the answer is the rest of the reply.
+    #[test]
+    fn the_answer_may_share_the_marker_line() {
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER} WORKER1 47")),
+            Some("WORKER1 47")
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER} WORKER1 47\nand more\n")),
+            Some("WORKER1 47\nand more"),
+            "the rest of the marker line plus the following lines"
+        );
+        for decorated in [
+            format!("**{INLINE_ANSWER_MARKER}** WORKER1 47"),
+            format!("`{INLINE_ANSWER_MARKER}` WORKER1 47"),
+            format!("# {INLINE_ANSWER_MARKER} WORKER1 47"),
+            format!("{INLINE_ANSWER_MARKER}: WORKER1 47"),
+            format!("```\n{INLINE_ANSWER_MARKER} WORKER1 47"),
+            format!("\n  {INLINE_ANSWER_MARKER}\tWORKER1 47  "),
+        ] {
+            assert_eq!(
+                marked_inline_answer(&decorated),
+                Some("WORKER1 47"),
+                "{decorated:?}"
+            );
+        }
+    }
+
+    /// muse's "passing" run sent the marker twice; the second must not become part of the answer.
+    #[test]
+    fn one_repeated_leading_marker_is_stripped_from_the_answer() {
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER}\n{INLINE_ANSWER_MARKER} WORKERMU1 47"
+            )),
+            Some("WORKERMU1 47")
+        );
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER}\n**{INLINE_ANSWER_MARKER}**\nWORKERMU1 47"
+            )),
+            Some("WORKERMU1 47")
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}\n{INLINE_ANSWER_MARKER}")),
+            None,
+            "two markers and nothing else is still an empty answer"
+        );
+        // Only ONE repeat is stripped, and a longer token is answer text.
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER} {INLINE_ANSWER_MARKER} {INLINE_ANSWER_MARKER} x"
+            )),
+            Some(format!("{INLINE_ANSWER_MARKER} x").as_str())
+        );
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER}\n{INLINE_ANSWER_MARKER}-DRAFT x"
+            )),
+            Some(format!("{INLINE_ANSWER_MARKER}-DRAFT x").as_str())
         );
     }
 
