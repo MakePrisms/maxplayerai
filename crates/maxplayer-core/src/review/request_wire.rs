@@ -13,6 +13,9 @@ pub(super) struct RequestWire {
     public_task_b64: Option<String>,
     task_envelope: Option<String>,
     delivery: Option<DeliveryWire>,
+    // Session follow-up evidence (§9). Absent on every other request, so their bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    followup: Option<FollowUpEvidence>,
 }
 
 // Updated reviewers accept old clients first; only then deploy compact writers.
@@ -71,6 +74,7 @@ impl TryFrom<RequestWire> for Request {
             offer: w.offer,
             task_envelope: w.task_envelope,
             delivery,
+            followup: w.followup,
         })
     }
 }
@@ -110,6 +114,7 @@ impl Serialize for Request {
             public_task_b64,
             task_envelope: self.task_envelope.clone(),
             delivery,
+            followup: self.followup.clone(),
         }
         .serialize(serializer)
     }
@@ -237,6 +242,7 @@ mod tests {
                             offer: evidence.offer.clone(),
                             task_envelope: evidence.task_envelope.clone(),
                             delivery: delivery.then_some(evidence.clone()),
+                            followup: None,
                         };
                         let service = super::super::tests::key(3);
                         let draft = request.draft(&service.public_key().to_hex()).unwrap();

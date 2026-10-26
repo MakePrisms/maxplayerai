@@ -25,6 +25,10 @@ pub struct PrivateJobRepo {
     pub closed: bool,
     /// Input publication prevents additional buyer uploads.
     pub input_frozen: bool,
+    /// Session job (the awarded claim carried `["session","1"]`): a turn's ACCEPT
+    /// does not close the repository; only a REJECT or a `close` follow-up does
+    /// (docs/specs/session-jobs.md §3.3). Set once, with the award binding.
+    pub session: bool,
 }
 impl PrivateJobRepo {
     /// Knowing an opaque URL or being a relay member grants no extra read access.
@@ -73,9 +77,13 @@ impl Db {
         buyer: &str,
         job: &str,
     ) -> Result<Option<PrivateJobRepo>> {
-        let row=sqlx::query("SELECT buyer,job_id,offer_id,target,seller,award_id,service,
+        // Closure: a one-shot repo closes on the buyer's RECEIPT/ACCEPT/REJECT. A session
+        // repo closes only on REJECT or a `["status","close"]` FOLLOW-UP (3412).
+        let row=sqlx::query("SELECT buyer,job_id,offer_id,target,seller,award_id,service,session,
             closed OR EXISTS (SELECT 1 FROM events e WHERE e.community_id=j.community_id
-                AND e.pubkey=decode(j.buyer,'hex') AND e.kind IN (3400,3406,3407)
+                AND e.pubkey=decode(j.buyer,'hex')
+                AND ((NOT j.session AND e.kind IN (3400,3406,3407))
+                    OR (j.session AND (e.kind=3407 OR (e.kind=3412 AND EXISTS (SELECT 1 FROM jsonb_array_elements(e.tags) t WHERE t=jsonb_build_array('status','close'))))))
                 AND EXISTS (SELECT 1 FROM jsonb_array_elements(e.tags) t WHERE t=jsonb_build_array('e',j.offer_id,'','root'))
                 AND EXISTS (SELECT 1 FROM jsonb_array_elements(e.tags) t WHERE t=jsonb_build_array('job',j.job_id))
                 AND EXISTS (SELECT 1 FROM jsonb_array_elements(e.tags) t WHERE t=jsonb_build_array('v','2'))) AS closed,
@@ -92,6 +100,7 @@ impl Db {
             service: r.get("service"),
             closed: r.get("closed"),
             input_frozen: r.get("input_frozen"),
+            session: r.get("session"),
         }))
     }
     /// Atomically reserve the exact offer and bind at most one award. False means
@@ -164,8 +173,8 @@ impl Db {
                 if row.get::<bool, _>("closed") {
                     return Ok(false);
                 }
-                sqlx::query("UPDATE private_job_repositories SET award_id=$4,seller=$5,input_frozen=TRUE WHERE community_id=$1 AND buyer=$2 AND job_id=$3")
-                    .bind(community.as_uuid()).bind(&job.buyer).bind(&job.job_id).bind(&job.award_id).bind(&job.seller).execute(&mut *tx).await?;
+                sqlx::query("UPDATE private_job_repositories SET award_id=$4,seller=$5,input_frozen=TRUE,session=$6 WHERE community_id=$1 AND buyer=$2 AND job_id=$3")
+                    .bind(community.as_uuid()).bind(&job.buyer).bind(&job.job_id).bind(&job.award_id).bind(&job.seller).bind(job.session).execute(&mut *tx).await?;
             }
         }
         tx.commit().await?;
@@ -186,6 +195,7 @@ mod tests {
             service: "55".repeat(32),
             closed: false,
             input_frozen: false,
+            session: false,
         }
     }
     #[test]
@@ -270,6 +280,7 @@ mod postgres_tests {
             service: "44".repeat(32),
             closed: false,
             input_frozen: false,
+            session: false,
         };
         assert!(
             db.ensure_private_job_repo(communities[0], &job)
@@ -453,6 +464,92 @@ mod postgres_tests {
                 .unwrap()
                 .closed
         );
+        // Session jobs (session-jobs §3.3): the award binding records `session`; a
+        // turn ACCEPT (or RECEIPT) leaves the repo open, a close FOLLOW-UP closes it,
+        // and delivery refs stay create-only throughout.
+        let mut session = job.clone();
+        session.job_id = "a1".repeat(32);
+        session.offer_id = "a2".repeat(32);
+        assert!(db
+            .ensure_private_job_repo(communities[0], &session)
+            .await
+            .unwrap());
+        session.seller = Some("a3".repeat(32));
+        session.award_id = Some("a4".repeat(32));
+        session.session = true;
+        assert!(db
+            .ensure_private_job_repo(communities[0], &session)
+            .await
+            .unwrap());
+        let root = serde_json::json!(["e", session.offer_id, "", "root"]);
+        for (id, kind) in [("b1", 3406), ("b2", 3400)] {
+            event(
+                &pool,
+                communities[0],
+                &id.repeat(32),
+                &session.buyer,
+                kind,
+                serde_json::json!([root, ["job", session.job_id], ["v", "2"]]),
+            )
+            .await;
+        }
+        let open = db
+            .private_job_repo(communities[0], &session.buyer, &session.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            open.session && !open.closed,
+            "turn ACCEPT closed a session repo"
+        );
+        let delivery = format!("refs/heads/delivery/{}", "b9".repeat(32));
+        let (zero, oid) = ("00".repeat(20), "88".repeat(20));
+        let seller = session.seller.clone().unwrap();
+        assert!(open.can_create_ref(&seller, &delivery, &zero, &oid));
+        assert!(!open.can_create_ref(&seller, &delivery, &oid, &oid));
+        // A turn follow-up does not close; a close follow-up does.
+        event(
+            &pool,
+            communities[0],
+            &"b3".repeat(32),
+            &session.buyer,
+            3412,
+            serde_json::json!([
+                root,
+                ["job", session.job_id],
+                ["v", "2"],
+                ["status", "turn"]
+            ]),
+        )
+        .await;
+        assert!(
+            !db.private_job_repo(communities[0], &session.buyer, &session.job_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .closed
+        );
+        event(
+            &pool,
+            communities[0],
+            &"b4".repeat(32),
+            &session.buyer,
+            3412,
+            serde_json::json!([
+                root,
+                ["job", session.job_id],
+                ["v", "2"],
+                ["status", "close"]
+            ]),
+        )
+        .await;
+        let closed = db
+            .private_job_repo(communities[0], &session.buyer, &session.job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(closed.closed);
+        assert!(!closed.can_create_ref(&seller, &delivery, &zero, &oid));
         pool.close().await;
     }
 }

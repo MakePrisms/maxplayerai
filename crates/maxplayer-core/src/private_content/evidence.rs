@@ -108,10 +108,18 @@ impl PrivateEvidence {
             delivery_integrity_hash: integrity.clone(),
             delivery_kind: kind.into(),
             exec_metadata_commitment: "none".into(),
-            creq_hash: c
+            // Session turn ≥ 2 (session-jobs §8.2): the result carries its own payment request and
+            // the seller co-signs THAT; turn 1 binds the claim's.
+            creq_hash: r
                 .get("creq")
+                .or(c.get("creq"))
                 .map(|creq| hex::encode(Sha256::digest(creq.as_bytes()))),
         };
+        // A priced session turn carries its own creq; a free one none. A creq never rides alone.
+        let free = o.get("param:payment") == Some("none");
+        if (r.has("creq") && (free || !r.has("reply"))) || (!free && r.has("reply") && !r.has("creq")) {
+            return Err(Error("session turn result payment request mismatch"));
+        }
         // Pin the exact canonical v2 shape before any signing/payment caller uses it.
         super::settlement::canonical_json(&preimage)?;
         Ok(VerifiedEvidence {
@@ -174,7 +182,10 @@ impl PrivateEvidence {
         {
             return Err(Error("accepted bind differs from signed private result"));
         }
-        let mints = if let Some(raw) = c.get("creq") {
+        if request.payment_id.as_deref() != r.get("reply") {
+            return Err(Error("session turn payment id differs from signed result"));
+        }
+        let claim_mints = if let Some(raw) = c.get("creq") {
             super::invoice::validate(raw, &p.offer_id, p.amount, &p.seller_pubkey, &policy.host)?
                 .mints
                 .iter()
@@ -182,6 +193,22 @@ impl PrivateEvidence {
                 .collect::<Vec<_>>()
         } else {
             Vec::new()
+        };
+        // A turn's creq names its follow-up and may quote only mints the claim already did.
+        let mints = match (r.get("creq"), r.get("reply")) {
+            (Some(raw), Some(followup)) => {
+                let turn: Vec<String> =
+                    super::invoice::validate(raw, followup, p.amount, &p.seller_pubkey, &policy.host)?
+                        .mints
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                if turn.iter().any(|m| !claim_mints.contains(m)) {
+                    return Err(Error("session turn invoice quotes a mint the claim did not"));
+                }
+                turn
+            }
+            _ => claim_mints,
         };
         let mut expected = mints;
         let mut actual = request.accepted_mints.clone();
@@ -489,6 +516,7 @@ pub(crate) fn inline_fixture_with_metadata(
         answer_envelope: Some(answer.envelope().to_owned()),
     };
     let request = crate::authorize_pay::AuthorizePayRequest {
+        payment_id: None,
         private_evidence: Some(evidence.clone()),
         job_id: preimage.offer_id,
         result_id: evidence.result.id.to_hex(),

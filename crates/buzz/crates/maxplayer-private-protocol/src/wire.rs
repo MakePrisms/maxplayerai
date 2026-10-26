@@ -175,8 +175,11 @@ const FEEDBACK_REASONS: &[&str] = &[
     "execution_failed",
     "delivery_failed",
     "no_sentinel",
+    "session_expired",
     "other",
 ];
+/// Session-job per-turn status on a RESULT (docs/specs/session-jobs.md §2.3).
+const TURN_STATUSES: &[&str] = &["done", "needs_input", "out_of_time"];
 const REJECT_REASONS: &[&str] = &[
     "verify_not_descendant",
     "verify_tip_mismatch",
@@ -240,7 +243,7 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
         .verify()
         .map_err(|_| Error("invalid event signature"))?;
     let kind = event.kind.as_u16();
-    if !(3400..=3407).contains(&kind) || !event.content.is_empty() {
+    if !((3400..=3407).contains(&kind) || kind == 3412) || !event.content.is_empty() {
         return Err(Error("invalid private coordination content"));
     }
     let mut out = Tags {
@@ -338,15 +341,29 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
             "agents",
             "harness_family",
             "capabilities",
+            "session",
             "content-id",
             "content-commitment",
         ],
-        3405 | 3406 => &["root", "claim", "status"],
+        3405 => &["root", "claim", "status"],
+        // Session jobs: a turn's ACCEPT names the RESULT it binds (§2.4).
+        3406 => &["root", "claim", "status", "reply"],
         3404 => &[
             "root",
             "status",
             "reason_code",
             "award",
+            "reply",
+            "content-id",
+            "content-commitment",
+        ],
+        // Session FOLLOW-UP: start turn n >= 2, or close the session (§2.1).
+        3412 => &[
+            "root",
+            "reply",
+            "status",
+            "turn",
+            "param:deadline",
             "content-id",
             "content-commitment",
         ],
@@ -369,6 +386,10 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
             "tokens:output",
             "tokens:total",
             "metadata_trust",
+            "reply",
+            "turn_status",
+            "context",
+            "creq",
         ],
         3407 => &[
             "root",
@@ -435,6 +456,14 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
                     .ok_or(Error("invalid delivery ref"))?,
                 32,
             )?,
+            "session" => member(v, &["1"])?,
+            "turn_status" => member(v, TURN_STATUSES)?,
+            "context" => member(v, &["reset"])?,
+            "turn" => {
+                if decimal(v)? < 2 {
+                    return Err(Error("invalid session turn"));
+                }
+            }
             "creq" => {
                 if v.len() > 16 * 1024 {
                     return Err(Error("invoice too large"));
@@ -457,6 +486,7 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
         3402 => &["root", "status"],
         3405 | 3406 => &["root", "claim", "status"],
         3404 => &["root", "status", "reason_code"],
+        3412 => &["root", "status"],
         3403 => &[
             "root",
             "award",
@@ -495,6 +525,7 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
                 3405 | 3406 => &["accepted"],
                 3407 => &["rejected"],
                 3404 => &["progress", "claim_released", "refusal", "error"],
+                3412 => &["turn", "close"],
                 _ => &[],
             },
         )?;
@@ -540,6 +571,21 @@ pub fn validate_private(event: &Event, host: &HostPolicy) -> Result<Tags> {
             {
                 return Err(Error("bound repo is not this buyer's job"));
             }
+        }
+    } else if kind == 3412 {
+        // A follow-up is addressed to exactly one party: the awarded seller.
+        if out.participants.len() != 1 {
+            return Err(Error("invalid participant count"));
+        }
+        if out.get("status") == Some("turn") {
+            for k in ["reply", "turn", "param:deadline", "content-id"] {
+                out.required(k)?;
+            }
+        } else if ["turn", "param:deadline", "content-id"]
+            .iter()
+            .any(|k| out.has(k))
+        {
+            return Err(Error("close follow-up carries turn fields"));
         }
     } else if out.participants.is_empty() || out.participants.len() > 2 {
         return Err(Error("invalid participant count"));
@@ -689,5 +735,153 @@ mod mint_tests {
         ] {
             assert!(policy(mint).mint(mint).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use nostr::prelude::{EventBuilder, Keys, Kind, Tag};
+
+    fn host() -> HostPolicy {
+        HostPolicy {
+            git_prefix: "https://git.example/git/".into(),
+            accepted_mints: vec!["https://mint.example".into()],
+        }
+    }
+    fn sign(kind: u16, rows: Vec<Vec<String>>) -> Event {
+        let keys = Keys::parse(&format!("{:064x}", 7)).unwrap();
+        EventBuilder::new(Kind::from(kind), "")
+            .tags(rows.into_iter().map(|row| Tag::parse(row).unwrap()))
+            .sign_with_keys(&keys)
+            .unwrap()
+    }
+    fn r(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+    fn base() -> Vec<Vec<String>> {
+        let h = "ab".repeat(32);
+        vec![
+            r(&["t", "maxplayer"]),
+            r(&["v", "2"]),
+            r(&["job", &h]),
+            r(&["e", &h, "", "root"]),
+            r(&["p", &"cd".repeat(32)]),
+        ]
+    }
+    fn turn(extra: &[&[&str]]) -> Vec<Vec<String>> {
+        let mut rows = base();
+        let h = "ef".repeat(32);
+        rows.push(r(&["e", &h, "", "reply"]));
+        rows.push(r(&["status", "turn"]));
+        rows.push(r(&["turn", "2"]));
+        rows.push(r(&["param", "deadline", "1800000000"]));
+        rows.push(r(&["content-id", &"01".repeat(32)]));
+        rows.push(r(&["content-commitment", &"02".repeat(32)]));
+        for e in extra {
+            rows.push(r(e));
+        }
+        rows
+    }
+
+    #[test]
+    fn private_followup_turn_and_close_are_admitted() {
+        validate_private(&sign(3412, turn(&[])), &host()).unwrap();
+        let mut close = base();
+        close.push(r(&["status", "close"]));
+        validate_private(&sign(3412, close), &host()).unwrap();
+    }
+
+    #[test]
+    fn private_followup_shape_is_closed() {
+        // Unknown status, turn 1, missing turn fields, extra participant, inline text.
+        let mut bad = turn(&[]);
+        bad.retain(|row| row[0] != "status");
+        bad.push(r(&["status", "accepted"]));
+        assert!(validate_private(&sign(3412, bad), &host()).is_err());
+        let mut one = turn(&[]);
+        one.retain(|row| row[0] != "turn");
+        one.push(r(&["turn", "1"]));
+        assert!(validate_private(&sign(3412, one), &host()).is_err());
+        for missing in ["turn", "param", "content-id", "e"] {
+            let mut rows = turn(&[]);
+            if missing == "e" {
+                rows.retain(|row| !(row[0] == "e" && row[3] == "reply"));
+            } else if missing == "content-id" {
+                rows.retain(|row| row[0] != "content-id" && row[0] != "content-commitment");
+            } else {
+                rows.retain(|row| row[0] != missing);
+            }
+            assert!(
+                validate_private(&sign(3412, rows), &host()).is_err(),
+                "{missing}"
+            );
+        }
+        assert!(validate_private(&sign(3412, turn(&[&["p", &"ee".repeat(32)]])), &host()).is_err());
+        assert!(validate_private(&sign(3412, turn(&[&["i", "hello"]])), &host()).is_err());
+        let mut close = base();
+        close.push(r(&["status", "close"]));
+        close.push(r(&["turn", "3"]));
+        assert!(validate_private(&sign(3412, close), &host()).is_err());
+        // Neighbouring trade kinds remain outside the private schema.
+        assert!(validate_private(&sign(3410, turn(&[])), &host()).is_err());
+        assert!(validate_private(&sign(3411, turn(&[])), &host()).is_err());
+    }
+
+    #[test]
+    fn claim_session_tag_and_result_turn_tags() {
+        let mut claim = base();
+        claim.push(r(&["status", "processing"]));
+        claim.push(r(&["payment", "none"]));
+        claim.push(r(&["session", "1"]));
+        validate_private(&sign(3402, claim.clone()), &host()).unwrap();
+        claim.retain(|row| row[0] != "session");
+        claim.push(r(&["session", "2"]));
+        assert!(validate_private(&sign(3402, claim), &host()).is_err());
+
+        let h = "ab".repeat(32);
+        let mut result = base();
+        for row in [
+            r(&["award", &h]),
+            r(&["output", "text"]),
+            r(&["amount", "10", "sat"]),
+            r(&["job-hash", &h]),
+            r(&["sig", "seller", &"cd".repeat(64)]),
+            r(&["delivery", "inline"]),
+            r(&["content-id", &"01".repeat(32)]),
+            r(&["content-commitment", &"02".repeat(32)]),
+            r(&["e", &"ef".repeat(32), "", "reply"]),
+            r(&["turn_status", "needs_input"]),
+            r(&["context", "reset"]),
+            r(&["creq", "creqAabc"]),
+        ] {
+            result.push(row);
+        }
+        validate_private(&sign(3403, result.clone()), &host()).unwrap();
+        let mut bad = result.clone();
+        bad.retain(|row| row[0] != "turn_status");
+        bad.push(r(&["turn_status", "partial"]));
+        assert!(validate_private(&sign(3403, bad), &host()).is_err());
+        let mut bad = result;
+        bad.retain(|row| row[0] != "context");
+        bad.push(r(&["context", "kept"]));
+        assert!(validate_private(&sign(3403, bad), &host()).is_err());
+    }
+
+    #[test]
+    fn accept_reply_and_session_expired_feedback() {
+        let h = "ab".repeat(32);
+        let mut accept = base();
+        accept.push(r(&["e", &"99".repeat(32)]));
+        accept.push(r(&["status", "accepted"]));
+        accept.push(r(&["e", &h, "", "reply"]));
+        validate_private(&sign(3406, accept.clone()), &host()).unwrap();
+        // AWARD does not gain a reply binding.
+        assert!(validate_private(&sign(3405, accept), &host()).is_err());
+        let mut fb = base();
+        fb.push(r(&["status", "refusal"]));
+        fb.push(r(&["reason_code", "session_expired"]));
+        fb.push(r(&["e", &h, "", "reply"]));
+        validate_private(&sign(3404, fb), &host()).unwrap();
     }
 }

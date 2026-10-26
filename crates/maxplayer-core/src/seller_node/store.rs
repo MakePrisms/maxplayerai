@@ -45,7 +45,10 @@ use crate::gateway::EventDraft;
 /// raises another for the row; reconciliation of a spending row asks the mint about that quote by id
 /// and releases the row only on a transition naming it ([`SellerStore::release_remittance`]).
 /// v14 retains signed capability requirements for queued-offer admission after restart.
-pub const SCHEMA_VERSION: i64 = 14;
+/// v15 (session jobs, docs/specs/session-jobs.md §5.4) adds the `sessions` and `session_turns`
+/// tables. Additive only: no existing table or CHECK changes, and both stay empty while
+/// `[sessions] enabled = false`.
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// The platform fee as journaled so far: what is owed on paper, what has been remitted, and the
 /// figures around them. Returned by [`SellerStore::accrued_fees`]. A query and nothing more — the
@@ -637,6 +640,96 @@ pub struct SellerStore {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreError(pub String);
 
+/// One `sessions` row (docs/specs/session-jobs.md §5.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRecord {
+    pub job_id: String,
+    pub buyer_pubkey: String,
+    pub container: String,
+    pub holder: Option<String>,
+    pub holder_started_at: Option<String>,
+    pub image_id: String,
+    pub orchestrator_version: String,
+    pub acp_session_id: Option<String>,
+    pub harness: String,
+    pub model: Option<String>,
+    pub turn: u32,
+    pub last_turn_at: u64,
+    pub disk_bytes: u64,
+    pub state: crate::session::SessionState,
+    /// The holder's measured proxy address (turn 1's containment). A resumed turn starts a fresh
+    /// credential proxy reachable at the same address inside the same namespace (§6.4).
+    pub proxy_host: Option<String>,
+    /// The last git-delivered commit of the session: turn n+1's single parent (§7.1).
+    pub base_oid: Option<String>,
+}
+impl SessionRecord {
+    pub fn size(&self) -> crate::session::SessionSize {
+        crate::session::SessionSize {
+            job_id: self.job_id.clone(),
+            state: self.state,
+            last_turn_at: self.last_turn_at,
+            disk_bytes: self.disk_bytes,
+        }
+    }
+}
+
+/// One `session_turns` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionTurnRecord {
+    pub followup_id: String,
+    pub job_id: String,
+    pub turn: u32,
+    pub deadline_unix: u64,
+    pub result_id: Option<String>,
+    pub delivery_oid: Option<String>,
+    pub state: crate::session::TurnState,
+}
+
+const SESSION_COLUMNS: &str =
+    "job_id, buyer_pubkey, container, holder, holder_started_at, image_id,
+    orchestrator_version, acp_session_id, harness, model, turn, last_turn_at, disk_bytes, state,
+    proxy_host, base_oid";
+
+fn bad_state(i: usize) -> rusqlite::Error {
+    rusqlite::Error::InvalidColumnType(i, "state".into(), rusqlite::types::Type::Text)
+}
+
+fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    Ok(SessionRecord {
+        job_id: r.get(0)?,
+        buyer_pubkey: r.get(1)?,
+        container: r.get(2)?,
+        holder: r.get(3)?,
+        holder_started_at: r.get(4)?,
+        image_id: r.get(5)?,
+        orchestrator_version: r.get(6)?,
+        acp_session_id: r.get(7)?,
+        harness: r.get(8)?,
+        model: r.get(9)?,
+        turn: r.get(10)?,
+        last_turn_at: r.get::<_, i64>(11)? as u64,
+        disk_bytes: r.get::<_, i64>(12)? as u64,
+        state: crate::session::SessionState::parse(&r.get::<_, String>(13)?)
+            .ok_or_else(|| bad_state(13))?,
+        proxy_host: r.get(14)?,
+        base_oid: r.get(15)?,
+    })
+}
+
+fn turn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTurnRecord> {
+    Ok(SessionTurnRecord {
+        followup_id: r.get(0)?,
+        job_id: r.get(1)?,
+        turn: r.get(2)?,
+        deadline_unix: r.get::<_, i64>(3)? as u64,
+        result_id: r.get(4)?,
+        delivery_oid: r.get(5)?,
+        state: crate::session::TurnState::parse(&r.get::<_, String>(6)?)
+            .ok_or_else(|| bad_state(6))?,
+    })
+}
+
 impl std::fmt::Display for StoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "seller store error: {}", self.0)
@@ -1161,6 +1254,25 @@ impl SellerStore {
                  remittance_id    TEXT
              );",
         )?;
+        // v15 — session jobs (§5.4). Turn 1 has no session_turns row; it is the jobs row.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                 job_id TEXT PRIMARY KEY, buyer_pubkey TEXT NOT NULL,
+                 container TEXT NOT NULL, holder TEXT, holder_started_at TEXT,
+                 image_id TEXT NOT NULL, orchestrator_version TEXT NOT NULL,
+                 acp_session_id TEXT, harness TEXT NOT NULL, model TEXT,
+                 turn INTEGER NOT NULL, last_turn_at INTEGER NOT NULL,
+                 disk_bytes INTEGER NOT NULL DEFAULT 0,
+                 state TEXT NOT NULL CHECK (state IN ('running','parked','closed','expired')),
+                 proxy_host TEXT, base_oid TEXT);
+             CREATE TABLE IF NOT EXISTS session_turns (
+                 followup_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, turn INTEGER NOT NULL,
+                 deadline_unix INTEGER NOT NULL, result_id TEXT, delivery_oid TEXT,
+                 state TEXT NOT NULL CHECK (state IN
+                   ('received','waiting_payment','reviewing','running','delivered','paid','refused')),
+                 created_at_unix INTEGER NOT NULL, updated_at_unix INTEGER NOT NULL,
+                 UNIQUE (job_id, turn));",
+        )?;
         Self::migrate(conn)?;
         conn.execute(
             "INSERT INTO seller_meta (key, value) VALUES ('schema_version', ?1)
@@ -1179,6 +1291,17 @@ impl SellerStore {
     /// reads the same as its default. Nothing here rewrites or drops a row: this store holds live
     /// trade state.
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
+        // v15 (session jobs): the resume facts, additive on a sessions table an earlier build of
+        // the same version may have created without them.
+        for column in ["proxy_host", "base_oid"] {
+            if !Self::column_exists(conn, "sessions", column)? {
+                conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {column} TEXT;"))?;
+            }
+        }
+        // The buyer's message per turn: the `context_reset` prompt restates every follow-up (§6.3).
+        if !Self::column_exists(conn, "session_turns", "text")? {
+            conn.execute_batch("ALTER TABLE session_turns ADD COLUMN text TEXT;")?;
+        }
         if !Self::column_exists(conn, "offers", "capability_request")? {
             conn.execute_batch("ALTER TABLE offers ADD COLUMN capability_request TEXT;")?;
         }
@@ -1982,6 +2105,380 @@ impl SellerStore {
             |row| row.get::<_, Option<i64>>(0),
         )?;
         Ok(oldest)
+    }
+
+    // ---- Session jobs (docs/specs/session-jobs.md §5.4) ------------------------------------------
+
+    /// Insert or replace the session record (written at park, §5.2 step 4).
+    pub fn put_session(&self, s: &SessionRecord) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO sessions (job_id, buyer_pubkey, container, holder, holder_started_at,
+                 image_id, orchestrator_version, acp_session_id, harness, model, turn,
+                 last_turn_at, disk_bytes, state, proxy_host, base_oid)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+             ON CONFLICT(job_id) DO UPDATE SET buyer_pubkey=excluded.buyer_pubkey,
+                 container=excluded.container, holder=excluded.holder,
+                 holder_started_at=excluded.holder_started_at, image_id=excluded.image_id,
+                 orchestrator_version=excluded.orchestrator_version,
+                 acp_session_id=excluded.acp_session_id, harness=excluded.harness,
+                 model=excluded.model, turn=excluded.turn, last_turn_at=excluded.last_turn_at,
+                 disk_bytes=excluded.disk_bytes, state=excluded.state,
+                 proxy_host=excluded.proxy_host, base_oid=excluded.base_oid",
+            params![
+                s.job_id,
+                s.buyer_pubkey,
+                s.container,
+                s.holder,
+                s.holder_started_at,
+                s.image_id,
+                s.orchestrator_version,
+                s.acp_session_id,
+                s.harness,
+                s.model,
+                s.turn,
+                s.last_turn_at as i64,
+                s.disk_bytes as i64,
+                s.state.as_str(),
+                s.proxy_host,
+                s.base_oid
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn session(&self, job_id: &str) -> Result<Option<SessionRecord>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE job_id = ?1"),
+                [job_id],
+                session_row,
+            )
+            .optional()?)
+    }
+
+    pub fn sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions ORDER BY job_id"
+        ))?;
+        let rows = stmt.query_map([], session_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Job ids whose session is running or parked: the keep-set for the expiry sweep (§5.3).
+    pub fn live_session_jobs(&self) -> Result<std::collections::BTreeSet<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt =
+            conn.prepare("SELECT job_id FROM sessions WHERE state IN ('running','parked')")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Move a session to `state`. A closed or expired session never comes back: returns `false`
+    /// (and changes nothing) for such a row.
+    pub fn set_session_state(
+        &self,
+        job_id: &str,
+        state: crate::session::SessionState,
+        now_unix: u64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let n = conn.execute(
+            "UPDATE sessions SET state = ?2,
+                 last_turn_at = CASE WHEN ?2 = 'parked' THEN ?3 ELSE last_turn_at END
+             WHERE job_id = ?1 AND state IN ('running','parked')",
+            params![job_id, state.as_str(), now_unix as i64],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn set_session_disk_bytes(&self, job_id: &str, bytes: u64) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET disk_bytes = ?2 WHERE job_id = ?1",
+            params![job_id, bytes as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Record a received follow-up. Idempotent on `followup_id`; a second follow-up for the same
+    /// `(job, turn)` is refused by the UNIQUE constraint and reported as `false`.
+    pub fn record_turn(
+        &self,
+        followup_id: &str,
+        job_id: &str,
+        turn: u32,
+        deadline_unix: u64,
+        state: crate::session::TurnState,
+        now_unix: u64,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "DELETE FROM session_turns WHERE job_id = ?1 AND turn = ?2 AND state = 'refused'
+                 AND followup_id != ?3",
+            params![job_id, turn, followup_id],
+        )?;
+        let n = conn.execute(
+            "INSERT INTO session_turns (followup_id, job_id, turn, deadline_unix, state,
+                 created_at_unix, updated_at_unix)
+             VALUES (?1,?2,?3,?4,?5,?6,?6) ON CONFLICT DO NOTHING",
+            // (a refused turn's row is cleared first, so the buyer can retry that turn with a new
+            // follow-up: `no_response`/`at_capacity` release the turn number, §10)
+            params![
+                followup_id,
+                job_id,
+                turn,
+                deadline_unix as i64,
+                state.as_str(),
+                now_unix as i64
+            ],
+        )?;
+        Ok(n == 1)
+    }
+
+    pub fn set_turn_state(
+        &self,
+        followup_id: &str,
+        state: crate::session::TurnState,
+        result_id: Option<&str>,
+        delivery_oid: Option<&str>,
+        now_unix: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE session_turns SET state = ?2, result_id = COALESCE(?3, result_id),
+                 delivery_oid = COALESCE(?4, delivery_oid), updated_at_unix = ?5
+             WHERE followup_id = ?1",
+            params![
+                followup_id,
+                state.as_str(),
+                result_id,
+                delivery_oid,
+                now_unix as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn turn(&self, followup_id: &str) -> Result<Option<SessionTurnRecord>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT followup_id, job_id, turn, deadline_unix, result_id, delivery_oid, state
+                 FROM session_turns WHERE followup_id = ?1",
+                [followup_id],
+                turn_row,
+            )
+            .optional()?)
+    }
+
+    pub fn turns(&self, job_id: &str) -> Result<Vec<SessionTurnRecord>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT followup_id, job_id, turn, deadline_unix, result_id, delivery_oid, state
+             FROM session_turns WHERE job_id = ?1 ORDER BY turn",
+        )?;
+        let rows = stmt.query_map([job_id], turn_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A turn was delivered (§5.2 step 4): `turn` is now the last delivered turn, the git base moves
+    /// only when the turn delivered through git (an inline turn keeps it, §7.2).
+    pub fn advance_session(
+        &self,
+        job_id: &str,
+        turn: u32,
+        base_oid: Option<&str>,
+        acp_session_id: Option<&str>,
+        now_unix: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE sessions SET turn = MAX(turn, ?2), base_oid = COALESCE(?3, base_oid),
+                 acp_session_id = COALESCE(?4, acp_session_id), last_turn_at = ?5
+             WHERE job_id = ?1",
+            params![job_id, turn, base_oid, acp_session_id, now_unix as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Keep the buyer's message for a turn (§6.3 reset history). Write-once.
+    pub fn set_turn_text(&self, followup_id: &str, text: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE session_turns SET text = ?2 WHERE followup_id = ?1 AND text IS NULL",
+            params![followup_id, text],
+        )?;
+        Ok(())
+    }
+
+    /// Buyer messages of turns 2..=`up_to`, oldest first (§6.3).
+    pub fn turn_texts(&self, job_id: &str, up_to: u32) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT text FROM session_turns WHERE job_id = ?1 AND turn <= ?2 AND text IS NOT NULL
+             AND state != 'refused' ORDER BY turn",
+        )?;
+        let rows = stmt.query_map(params![job_id, up_to], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Journal a delivered session turn and enqueue its RESULT in one transaction (§7). Keyed by
+    /// the follow-up id, so turn n never collides with turn 1's `result:<job>` row. Idempotent:
+    /// a turn already `delivered`/`paid` enqueues nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deliver_turn_and_enqueue(
+        &self,
+        followup_id: &str,
+        job_id: &str,
+        turn: u32,
+        delivery_oid: Option<&str>,
+        draft: &EventDraft,
+        created_at_unix: i64,
+        expires_at_unix: i64,
+        now_unix: i64,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let state: Option<String> = tx
+            .query_row(
+                "SELECT state FROM session_turns WHERE followup_id = ?1",
+                [followup_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if matches!(state.as_deref(), Some("delivered" | "paid") | None) {
+            tx.commit()?;
+            return Ok(false);
+        }
+        tx.execute(
+            "UPDATE session_turns SET state = 'delivered', delivery_oid = ?2, updated_at_unix = ?3
+             WHERE followup_id = ?1",
+            params![followup_id, delivery_oid, now_unix],
+        )?;
+        tx.execute(
+            "UPDATE sessions SET turn = MAX(turn, ?2), base_oid = COALESCE(?3, base_oid),
+                 last_turn_at = ?4 WHERE job_id = ?1",
+            params![job_id, turn, delivery_oid, now_unix],
+        )?;
+        enqueue_event(
+            &tx,
+            &format!("result:{followup_id}"),
+            draft,
+            created_at_unix,
+            expires_at_unix,
+            now_unix,
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Record the published RESULT id of a turn (read off the outbox after publication).
+    pub fn set_turn_result(&self, followup_id: &str, result_id: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "UPDATE session_turns SET result_id = ?2 WHERE followup_id = ?1",
+            params![followup_id, result_id],
+        )?;
+        Ok(())
+    }
+
+    /// A `close` follow-up arrived while a turn was running: honoured at the next park (§5.5).
+    pub fn request_session_close(&self, job_id: &str) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "INSERT OR IGNORE INTO seller_meta(key,value) VALUES(?1,'1')",
+            [format!("session-close:{job_id}")],
+        )?;
+        Ok(())
+    }
+
+    pub fn session_close_requested(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT 1 FROM seller_meta WHERE key = ?1",
+                [format!("session-close:{job_id}")],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// The turn a RESULT answered (free-job ACCEPT binding, §8.3).
+    pub fn turn_by_result(&self, result_id: &str) -> Result<Option<SessionTurnRecord>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT followup_id, job_id, turn, deadline_unix, result_id, delivery_oid, state
+                 FROM session_turns WHERE result_id = ?1",
+                [result_id],
+                turn_row,
+            )
+            .optional()?)
+    }
+
+    /// Follow-ups a restart left unfinished (§5.5 seller restart): received, waiting for payment,
+    /// under review or running.
+    pub fn unfinished_turns(&self) -> Result<Vec<SessionTurnRecord>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT followup_id, job_id, turn, deadline_unix, result_id, delivery_oid, state
+             FROM session_turns
+             WHERE state IN ('received','waiting_payment','reviewing','running')
+             ORDER BY created_at_unix, followup_id",
+        )?;
+        let rows = stmt.query_map([], turn_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Whether THIS seat's claim for `job_id` carried `["session","1"]` (§2.2): read off the claim
+    /// draft journaled in the outbox, so the answer is the claim the buyer actually saw, not live
+    /// config. No claim row ⇒ `false`.
+    pub fn claim_advertised_session(&self, job_id: &str) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let draft: Option<String> = conn
+            .query_row(
+                "SELECT draft_json FROM nostr_event_outbox WHERE dedup_key = ?1",
+                [format!("claim:{job_id}")],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(draft) = draft else {
+            return Ok(false);
+        };
+        let draft: EventDraft = serde_json::from_str(&draft)
+            .map_err(|error| StoreError(format!("claim draft decode: {error}")))?;
+        Ok(crate::session::claim_supports_sessions(&draft.tags))
+    }
+
+    /// The payment lookup for an incoming wrap (§8.2): a follow-up id resolves to `(job, turn)`.
+    pub fn turn_for_payment(&self, payload_id: &str) -> Result<Option<(String, u32)>, StoreError> {
+        Ok(self.turn(payload_id)?.map(|t| (t.job_id, t.turn)))
+    }
+
+    /// Whether turn `turn` of `job_id` is settled (§8.3): turn 1 by the job's own receipt (priced)
+    /// or its free delivery; turn n >= 2 by its follow-up-keyed receipt or a `paid` turn row.
+    pub fn turn_settled(&self, job_id: &str, turn: u32, free: bool) -> Result<bool, StoreError> {
+        if turn <= 1 {
+            if free {
+                let conn = self.lock()?;
+                return Ok(conn
+                    .query_row(
+                        "SELECT 1 FROM deliveries WHERE job_id = ?1",
+                        [job_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some());
+            }
+            return self.has_receipt(job_id);
+        }
+        let Some(row) = self.turns(job_id)?.into_iter().find(|t| t.turn == turn) else {
+            return Ok(false);
+        };
+        Ok(row.state == crate::session::TurnState::Paid || self.has_receipt(&row.followup_id)?)
     }
 
     pub fn has_receipt(&self, job_id: &str) -> Result<bool, StoreError> {
@@ -3121,6 +3618,176 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    fn parked(job: &str, at: u64, bytes: u64) -> SessionRecord {
+        SessionRecord {
+            job_id: job.into(),
+            buyer_pubkey: "b".repeat(64),
+            container: format!("c-{job}"),
+            holder: Some(format!("h-{job}")),
+            holder_started_at: Some("2026-10-21T10:00:00Z".into()),
+            image_id: "sha256:img".into(),
+            orchestrator_version: crate::session::SESSION_PROTOCOL.to_string(),
+            acp_session_id: Some("acp-1".into()),
+            harness: "claude".into(),
+            model: None,
+            turn: 1,
+            last_turn_at: at,
+            disk_bytes: bytes,
+            state: crate::session::SessionState::Parked,
+            proxy_host: Some("172.18.0.1".into()),
+            base_oid: Some("a".repeat(40)),
+        }
+    }
+
+    /// Session jobs §5.4/§8: the v15 tables, the sweep keep-set, terminal states, the per-turn
+    /// payment lookup, and failure test 3 at the store layer (turn 2 is not settled by turn 1's
+    /// receipt; it needs its own follow-up-keyed receipt).
+    #[test]
+    fn session_records_turns_and_per_turn_settlement() {
+        use crate::session::{SessionState, TurnState};
+        let store = SellerStore::open(temp_db("sessions")).expect("open");
+        assert!(store.sessions().unwrap().is_empty());
+        store.put_session(&parked("job-a", 10, 100)).unwrap();
+        store.put_session(&parked("job-b", 20, 200)).unwrap();
+        assert_eq!(
+            store.session("job-a").unwrap().unwrap(),
+            parked("job-a", 10, 100)
+        );
+        assert_eq!(
+            store.live_session_jobs().unwrap(),
+            ["job-a".to_owned(), "job-b".to_owned()].into()
+        );
+        assert!(
+            store
+                .set_session_state("job-a", SessionState::Running, 30)
+                .unwrap()
+        );
+        assert!(
+            store
+                .set_session_state("job-a", SessionState::Parked, 40)
+                .unwrap()
+        );
+        assert_eq!(store.session("job-a").unwrap().unwrap().last_turn_at, 40);
+        assert!(
+            store
+                .set_session_state("job-b", SessionState::Expired, 50)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .set_session_state("job-b", SessionState::Parked, 60)
+                .unwrap(),
+            "expired is terminal"
+        );
+        assert_eq!(
+            store.live_session_jobs().unwrap(),
+            ["job-a".to_owned()].into()
+        );
+
+        let f2 = "f".repeat(64);
+        assert!(
+            store
+                .record_turn(&f2, "job-a", 2, 1_000, TurnState::Received, 41)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .record_turn(&f2, "job-a", 2, 1_000, TurnState::Received, 42)
+                .unwrap(),
+            "idempotent"
+        );
+        assert!(
+            !store
+                .record_turn(&"e".repeat(64), "job-a", 2, 1_000, TurnState::Received, 42)
+                .unwrap(),
+            "a second follow-up for the same turn is refused"
+        );
+        assert_eq!(
+            store.turn_for_payment(&f2).unwrap(),
+            Some(("job-a".into(), 2))
+        );
+        assert_eq!(store.turn_for_payment("job-a").unwrap(), None);
+
+        // Turn 1 receipted; turn 2 still unsettled until its own receipt lands.
+        store
+            .collect_receipt("r1", "job-a", 100, fees(0, 0, 0), 50)
+            .expect("turn-1 receipt");
+        assert!(store.turn_settled("job-a", 1, false).unwrap());
+        assert!(!store.turn_settled("job-a", 2, false).unwrap());
+        assert!(
+            !store.has_receipt(&f2).unwrap(),
+            "turn-1 receipt does not cover turn 2"
+        );
+        store
+            .collect_receipt("r2", &f2, 100, fees(0, 0, 0), 60)
+            .expect("turn-2 receipt keyed by follow-up id");
+        assert!(store.turn_settled("job-a", 2, false).unwrap());
+        store
+            .set_turn_state(&f2, TurnState::Paid, Some("res"), Some("oid"), 61)
+            .unwrap();
+        let t = store.turn(&f2).unwrap().unwrap();
+        assert_eq!(
+            (t.state, t.result_id.as_deref(), t.delivery_oid.as_deref()),
+            (TurnState::Paid, Some("res"), Some("oid"))
+        );
+
+        // A refused turn releases its number: the buyer's retry for the same turn is recorded.
+        let f3 = "3".repeat(64);
+        let f3b = "4".repeat(64);
+        assert!(
+            store
+                .record_turn(&f3, "job-a", 3, 2_000, TurnState::Received, 70)
+                .unwrap()
+        );
+        store.set_turn_text(&f3, "third").unwrap();
+        assert!(
+            !store
+                .record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 71)
+                .unwrap()
+        );
+        store
+            .set_turn_state(&f3, TurnState::Refused, None, None, 72)
+            .unwrap();
+        assert!(
+            store.turn_texts("job-a", 3).unwrap().is_empty(),
+            "refused text is not history"
+        );
+        assert!(
+            store
+                .record_turn(&f3b, "job-a", 3, 2_000, TurnState::Received, 73)
+                .unwrap()
+        );
+        assert!(store.turn(&f3).unwrap().is_none());
+        store.set_turn_text(&f3b, "third, retried").unwrap();
+        assert_eq!(
+            store.turn_texts("job-a", 3).unwrap(),
+            vec!["third, retried".to_owned()]
+        );
+        let draft = EventDraft::new(crate::kinds::JOB_RESULT_KIND, vec![], "");
+        assert!(
+            store
+                .deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 80)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .deliver_turn_and_enqueue(&f3b, "job-a", 3, Some("b3"), &draft, 80, 90, 81)
+                .unwrap(),
+            "idempotent"
+        );
+        let s = store.session("job-a").unwrap().unwrap();
+        assert_eq!((s.turn, s.base_oid.as_deref()), (3, Some("b3")));
+        assert!(
+            store
+                .outbox_row(&format!("result:{f3b}"))
+                .unwrap()
+                .is_some()
+        );
+        assert!(!store.session_close_requested("job-a").unwrap());
+        store.request_session_close("job-a").unwrap();
+        assert!(store.session_close_requested("job-a").unwrap());
+    }
 
     fn temp_db(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
@@ -5371,7 +6038,7 @@ mod tests {
             store.health().expect("health").schema_version,
             SCHEMA_VERSION
         );
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 15);
         let spending = store
             .in_flight_remittance()
             .expect("row")
@@ -5643,8 +6310,8 @@ mod free_lane_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 14,
-            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission; v14 queued-offer capability requirements"
+            SCHEMA_VERSION, 15,
+            "v7 was the free lane; v8 added the receipt fee columns; v9 the mint fee; v10 the fee remittance ledger; v11 its ownership and settlement provenance; v12 the spending mark; v13 the quote bound at admission; v14 queued-offer capability requirements; v15 session jobs"
         );
 
         // The legacy rows SURVIVE and read as PAID — correct by construction, because every job

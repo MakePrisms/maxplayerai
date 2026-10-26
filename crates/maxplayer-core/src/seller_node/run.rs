@@ -1323,12 +1323,26 @@ fn offer_subscription_filters(
 /// our claim, and a handler resting on those alone binds other seats' wins (#626). The filter is
 /// static for the node's lifetime — no per-claim re-subscription to drift or leak.
 fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter {
+    award_filter_with(seller_pubkey, open_pool, false)
+}
+
+/// [`award_filter`], plus kind-3412 FOLLOW-UPs when `[sessions] enabled` (docs/specs/session-jobs.md
+/// §11 row 11). Disabled ⇒ byte-identical to today's filter.
+fn award_filter_with(
+    seller_pubkey: nostr_sdk::PublicKey,
+    open_pool: bool,
+    sessions: bool,
+) -> Filter {
+    let mut kinds = vec![
+        Kind::Custom(JOB_AWARD_KIND),
+        Kind::Custom(JOB_ACCEPT_KIND),
+        Kind::Custom(JOB_REJECT_KIND),
+    ];
+    if sessions {
+        kinds.push(Kind::Custom(crate::kinds::SESSION_FOLLOWUP_KIND));
+    }
     let base = Filter::new()
-        .kinds([
-            Kind::Custom(JOB_AWARD_KIND),
-            Kind::Custom(JOB_ACCEPT_KIND),
-            Kind::Custom(JOB_REJECT_KIND),
-        ])
+        .kinds(kinds)
         .hashtag(crate::gateway::MAXPLAYER_TAG);
     if open_pool {
         base
@@ -3026,6 +3040,8 @@ struct ContainerDelivery {
     usage: Option<crate::driver::UsageMetadata>,
     last_agent_message: Option<String>,
     wall_time_ms: u64,
+    /// Session jobs: the orchestrator's session block (turn status, reset, ACP session id).
+    session: Option<crate::delivery_orchestrator::SessionOutcome>,
 }
 
 /// Why a container delivery failed, shaped for the feedback and harness attribution the host path
@@ -4433,6 +4449,8 @@ pub struct SellerNodeRunner {
     /// guard is owned and travels with the spawned push, so it is released when the upload is
     /// actually finished rather than when the arm stops waiting. See [`serialized_bounded_push`].
     delivery_push_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Session jobs: follow-up tasks in flight and private follow-ups awaiting their message.
+    session_rt: session_run::SessionRuntime,
     /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
     /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
@@ -4900,6 +4918,7 @@ impl SellerNodeRunner {
             review_checks: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             private_preflight: super::preflight::PreflightGate::new(),
             delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            session_rt: session_run::SessionRuntime::default(),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
@@ -5026,6 +5045,17 @@ impl SellerNodeRunner {
     }
 
     /// The seller public key (hex).
+    /// The session GC for this node, or `None` with `[sessions] enabled = false`.
+    fn session_gc(&self) -> Option<super::session_gc::SessionGc> {
+        let config = &self.node.home().config.sessions;
+        config.enabled.then(|| super::session_gc::SessionGc {
+            store: self.node.store().clone(),
+            home_root: self.node.home().root.clone(),
+            lifetime_secs: config.lifetime_secs,
+            disk_budget_bytes: config.disk_budget_bytes,
+        })
+    }
+
     pub fn seller_pubkey(&self) -> String {
         self.seller_pubkey.to_hex()
     }
@@ -5048,7 +5078,7 @@ impl SellerNodeRunner {
     /// [`spawn_expiry_sweep`], so it borrows nothing from the runner and the loop's `select!` is
     /// free to serve offers, awards and the shutdown signal while docker is still answering.
     #[cfg(feature = "acp")]
-    async fn run_expiry_sweep(seat: &str) {
+    async fn run_expiry_sweep(seat: &str, sessions: Option<super::session_gc::SessionGc>) {
         let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
             opline!(
                 "seller node: skipping the container expiry sweep — the system clock is before the \
@@ -5057,7 +5087,45 @@ impl SellerNodeRunner {
             );
             return;
         };
-        match crate::sandbox_netns::sweep_expired(seat, now.as_secs()).await {
+        // Session jobs (§5.3, §5.5): GC first, so a session it just expired is swept like any
+        // other; then the sweep keeps the holders of every still-live session. With `[sessions]
+        // enabled = false` there is no GC and the keep-set is empty: exactly today's sweep.
+        let keep = match sessions {
+            None => std::collections::BTreeSet::new(),
+            Some(gc) => {
+                let now_secs = now.as_secs();
+                let gc_for_pass = gc.clone();
+                match tokio::task::spawn_blocking(move || {
+                    gc_for_pass.pass(&mut crate::seller_exec::RealDockerCli, now_secs)
+                })
+                .await
+                {
+                    Ok(Ok(report)) => {
+                        for job in &report.expired_lifetime {
+                            opline!(
+                                "seller node: session job_id={job} expired (parked past its lifetime)"
+                            );
+                        }
+                        for job in &report.evicted_disk {
+                            opline!(
+                                "seller node: session job_id={job} evicted (parked sessions over the disk budget)"
+                            );
+                        }
+                        for (job, error) in &report.removal_errors {
+                            opline!(
+                                "seller node: session job_id={job} removal incomplete ({error})"
+                            );
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        opline!("seller node: session GC could not read the store ({error})")
+                    }
+                    Err(error) => opline!("seller node: session GC task failed ({error})"),
+                }
+                gc.keep()
+            }
+        };
+        match crate::sandbox_netns::sweep_expired_keeping(seat, now.as_secs(), &keep).await {
             Ok(report) => {
                 if !report.removed.is_empty() {
                     opline!(
@@ -5108,7 +5176,7 @@ impl SellerNodeRunner {
     /// its tick unconditionally and only the work behind it is feature-gated.
     #[cfg(not(feature = "acp"))]
     #[allow(clippy::unused_async)]
-    async fn run_expiry_sweep(_seat: &str) {}
+    async fn run_expiry_sweep(_seat: &str, _sessions: Option<super::session_gc::SessionGc>) {}
 
     /// Start one expiry sweep pass **as its own task** and return immediately.
     ///
@@ -5122,7 +5190,11 @@ impl SellerNodeRunner {
     /// pass is still running is DROPPED, not queued, so an unreachable daemon can never accumulate
     /// one outstanding pass per five minutes. The flag is cleared by a guard, so a pass that panics
     /// releases it too.
-    fn spawn_expiry_sweep(seat: String, in_flight: &std::rc::Rc<std::cell::Cell<bool>>) {
+    fn spawn_expiry_sweep(
+        seat: String,
+        sessions: Option<super::session_gc::SessionGc>,
+        in_flight: &std::rc::Rc<std::cell::Cell<bool>>,
+    ) {
         if in_flight.get() {
             opline!(
                 "seller node: skipping this container expiry sweep — the previous pass is still \
@@ -5133,7 +5205,7 @@ impl SellerNodeRunner {
         in_flight.set(true);
         let done = SweepGuard(std::rc::Rc::clone(in_flight));
         tokio::task::spawn_local(async move {
-            Self::run_expiry_sweep(&seat).await;
+            Self::run_expiry_sweep(&seat, sessions).await;
             drop(done);
         });
     }
@@ -5369,7 +5441,11 @@ impl SellerNodeRunner {
             // Award/accept visibility (#456): an open-pool seller subscribes UNSCOPED so a losing
             // claimant still receives the award that releases its slot (an award p-tags only the
             // winner). See `award_filter` — on_award/on_accept still bind only offers we claimed.
-            AWARD_SUB_ID => award_filter(self.seller_pubkey, self.claim_open_pool()),
+            AWARD_SUB_ID => award_filter_with(
+                self.seller_pubkey,
+                self.claim_open_pool(),
+                self.node.home().config.sessions.enabled,
+            ),
             WRAP_SUB_ID => Filter::new()
                 .kind(Kind::GiftWrap)
                 .pubkey(self.seller_pubkey),
@@ -5603,6 +5679,8 @@ impl SellerNodeRunner {
                 opline!("seller node resume: resumable_jobs read failed (continuing): {error}")
             }
         }
+        // Session jobs (§5.5 seller restart): parked sessions survive; unfinished follow-ups resume.
+        self.recover_sessions().await;
 
         let mut drain_tick = tokio::time::interval(DRAIN_INTERVAL);
         // The container expiry sweep rides THIS loop, for the same reason the heartbeat does: a
@@ -5619,6 +5697,8 @@ impl SellerNodeRunner {
         let sweep_seat = self.seller_pubkey();
         // One pass at a time, for the life of the loop. See `spawn_expiry_sweep`.
         let sweep_in_flight = std::rc::Rc::new(std::cell::Cell::new(false));
+        // Session GC rides the same pass (§5.5), only when `[sessions] enabled`.
+        let sweep_sessions = self.session_gc();
         // Only when this node actually runs contained jobs. A seat with no sandbox network creates
         // no holders and no helpers, and a sweep there would spend a `docker ps` every five minutes
         // to look for containers this build never creates — on a host that may not even run docker.
@@ -5772,7 +5852,7 @@ impl SellerNodeRunner {
                 // must keep serving offers, awards and shutdown throughout. A tick that lands while
                 // the previous pass still runs is dropped rather than queued.
                 _ = sweep_tick.tick(), if sweep_enabled => {
-                    Self::spawn_expiry_sweep(sweep_seat.clone(), &sweep_in_flight);
+                    Self::spawn_expiry_sweep(sweep_seat.clone(), sweep_sessions.clone(), &sweep_in_flight);
                     continue;
                 }
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
@@ -6349,6 +6429,32 @@ impl SellerNodeRunner {
         reason: &str,
         reason_detail: Option<&str>,
     ) -> bool {
+        self.publish_buyer_feedback_tagged(
+            offer_id,
+            buyer_pubkey,
+            reason_code,
+            reason,
+            reason_detail,
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// [`Self::publish_buyer_feedback`] with an optional `status` override and extra tags: a
+    /// session turn's feedback names its follow-up (`["e", followup_id, "", "reply"]`) and a
+    /// `session_expired` refusal carries `status=refusal` (docs/specs/session-jobs.md §2.3).
+    #[allow(clippy::too_many_arguments)]
+    async fn publish_buyer_feedback_tagged(
+        &self,
+        offer_id: &str,
+        buyer_pubkey: &str,
+        reason_code: ReasonCode,
+        reason: &str,
+        reason_detail: Option<&str>,
+        status: Option<&str>,
+        extra_tags: Vec<gateway::TagSpec>,
+    ) -> bool {
         let mut draft = error_draft(
             offer_id,
             buyer_pubkey,
@@ -6356,6 +6462,19 @@ impl SellerNodeRunner {
             reason_code,
             reason,
         );
+        if let Some(status) = status {
+            for tag in draft.tags.iter_mut() {
+                if tag.first() == Some("status") {
+                    *tag = gateway::TagSpec::new(["status", status]);
+                }
+            }
+        }
+        let at = draft
+            .tags
+            .iter()
+            .position(|tag| tag.first() == Some("t"))
+            .unwrap_or(draft.tags.len());
+        draft.tags.splice(at..at, extra_tags);
         if let Some(reason_detail) = reason_detail {
             draft
                 .tags
@@ -7443,6 +7562,18 @@ impl SellerNodeRunner {
             // make this the one site whose capability came from somewhere other than the config.
             &roster.capability(&self.node.home().config.seat),
         );
+        // Session jobs (docs/specs/session-jobs.md §2.2): `["session","1"]` only when
+        // `[sessions] enabled` AND this is a docker seat on the container-delivery path. With the
+        // flag off `advertise_on_claim` is a no-op, so the claim bytes are today's.
+        let mut claim = claim;
+        {
+            let config = &self.node.home().config;
+            let docker_container_seat = config.sandbox.as_ref().is_some_and(|sandbox| {
+                sandbox.mode == crate::home::SandboxMode::Docker
+                    && sandbox.container_delivery_enabled(crate::seller_exec::job_identity().0)
+            });
+            crate::session::advertise_on_claim(&mut claim, &config.sessions, docker_container_seat);
+        }
         let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();
         let capability = roster.capability(&self.node.home().config.seat);
         let family = chosen.as_deref().and_then(crate::agent_presets::harness_family_for_preset).map(str::to_owned);
@@ -7566,6 +7697,8 @@ impl SellerNodeRunner {
             );
             return;
         }
+        // Session jobs (§2.4, §8.3): a turn ACCEPT settles a free job's turn. No-op when disabled.
+        self.on_turn_accept(event, &job_id);
         match self.node.store().job_creq(&job_id) {
             Ok(Some(_)) => {}
             Ok(None) => {
@@ -8521,7 +8654,7 @@ impl SellerNodeRunner {
             .sandbox
             .as_ref()
             .is_some_and(|sandbox| sandbox.container_delivery_enabled(job_identity().0));
-        let (commit, branch, usage, wall_time_ms) = if container_delivery {
+        let (commit, branch, usage, wall_time_ms, turn_session) = if container_delivery {
             let deadline = offer.deadline_unix.max(0) as u64;
             let memory_section = job_memory_section(
                 &self.node.home().root,
@@ -8562,6 +8695,7 @@ impl SellerNodeRunner {
                         delivered.branch,
                         delivered.usage,
                         delivered.wall_time_ms,
+                        delivered.session,
                     )
                 }
                 Err(failure) => {
@@ -9035,7 +9169,7 @@ impl SellerNodeRunner {
                     return;
                 }
             };
-            (commit, branch, usage, wall_time_ms)
+            (commit, branch, usage, wall_time_ms, None)
         };
 
         // #552: arm the durable pushed-delivery marker IMMEDIATELY after the push (arm-state-after-
@@ -9128,6 +9262,13 @@ impl SellerNodeRunner {
                 self.fail_job_with_feedback(job_id, &offer.buyer_pubkey, ReasonCode::DeliveryFailed, DELIVERY_FAILURE_FEEDBACK, None).await;
                 return;
             }
+        }
+        // Session jobs (§2.3): turn 1 carries `turn_status` only when it is not `done`; a session
+        // turn 1 that is `done` (and every one-shot result) is byte-identical to today's.
+        if let Some(session) = &turn_session {
+            let status = crate::session::TurnStatus::parse(&session.turn_status)
+                .unwrap_or(crate::session::TurnStatus::Done);
+            crate::session::append_result_tags(&mut draft, None, status, false, None);
         }
         // Journal the delivery + enqueue the result in one transaction. Idempotent: a resumed job
         // that already delivered re-enqueues nothing (invariant 2 — no divergent double-publish).
@@ -9318,6 +9459,26 @@ impl SellerNodeRunner {
         let mut session_servers = prepared.mcp_servers.clone();
         session_servers.extend(attachments.mcp_servers.iter().cloned());
         let base_is_none = private_execution.as_ref().map(|p| !p.contribution).unwrap_or(base.is_none());
+        // Session jobs (docs/specs/session-jobs.md §5.2): only when `[sessions] enabled` AND this
+        // seat's claim carried `["session","1"]`. Otherwise `None`, and the inputs file is today's.
+        let sessions_config = &self.node.home().config.sessions;
+        let session_job = sessions_config.enabled
+            && self
+                .node
+                .store()
+                .claim_advertised_session(job_id)
+                .unwrap_or(false);
+        let prompt = if session_job {
+            format!("{prompt}\n\n{}", crate::session::prompt_session_section())
+        } else {
+            prompt.to_owned()
+        };
+        let session_inputs = session_job.then(|| orch::SessionInputs {
+            session_protocol: crate::session::SESSION_PROTOCOL,
+            turn: 1,
+            wrap_up_unix: crate::session::wrap_up_at(deadline, sessions_config.wrap_up_secs),
+            ..Default::default()
+        });
         let inputs = orch::Phase1Inputs {
             job_hash,
             seller_pubkey_hex: identity.seller_pubkey_hex().to_owned(),
@@ -9329,9 +9490,10 @@ impl SellerNodeRunner {
             codex_session: prepared.codex_session.clone(),
             workdir: std::path::PathBuf::from(CONTAINER_WORKDIR),
             out_dir: std::path::PathBuf::from(orch::CONTAINER_EXCHANGE_DIR),
-            prompt: prompt.to_owned(),
+            prompt,
             deadline_unix: deadline,
-            max_agent_attempts: MAX_AGENT_ATTEMPTS,
+            // A session turn gets ONE agent attempt (a retry would open a second conversation).
+            max_agent_attempts: if session_job { 1 } else { MAX_AGENT_ATTEMPTS },
             // C4: names only. The orchestrator hands the agent these (values from the container
             // environment), the runtime baseline, and the git identity — nothing else.
             agent_env_names: prepared.env.iter().map(|(key, _)| key.clone()).collect(),
@@ -9342,6 +9504,7 @@ impl SellerNodeRunner {
             relay_url: seller.git_remote.clone(),
             push_token,
             handoff_nonce: nonce.clone(),
+            session: session_inputs,
         };
         orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
             .map_err(|error| Fail::Setup(error.to_string()))?;
@@ -9402,8 +9565,163 @@ impl SellerNodeRunner {
             delivery_policy.token
         );
 
-        // Liveness + hand-off loop. "Alive" is the `docker run` client still running; the marker is
-        // the orchestrator's word that the agent is dead and the commit is gated.
+        let (exit, mut marker) = self
+            .supervise_container(
+                job_id,
+                &mut child,
+                &io_dir,
+                &nonce,
+                fresh_mode,
+                &seller.git_remote,
+                &push_ref,
+                deadline,
+                started,
+                None,
+            )
+            .await;
+        if exit.is_err() {
+            // Kill the `docker run` CLIENT and reap it; the container itself is removed below by name.
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // The container exited between two polls: the marker may not have been read yet.
+        if marker.is_none()
+            && let Ok(Some(seen)) = orch::read_agent_done_marker(&io_dir, &nonce)
+        {
+            marker = Some(seen);
+        }
+        // §5.5: the outcome's session block is the proof this orchestrator speaks sessions. Only
+        // the orchestrator's own (nonce-echoing) outcome counts. No block ⇒ remove, never park.
+        let session_outcome = if session_job && exit.is_ok() {
+            orch::read_outcome(&io_dir)
+                .ok()
+                .flatten()
+                .filter(|outcome| outcome.handoff_nonce.as_deref() == Some(nonce.as_str()))
+                .and_then(|outcome| outcome.agent)
+                .and_then(|agent| agent.session)
+        } else {
+            None
+        };
+        let container_name = container.name().to_owned();
+
+        let result = match exit {
+            Ok(status) => {
+                self.classify_container_outcome(
+                    job_id,
+                    &io_dir,
+                    status,
+                    marker.as_ref(),
+                    &branch,
+                    started,
+                    // The base the orchestrator was handed: `None` is from-scratch, `Some` is a
+                    // contribution clone. Read here, where it is a fact of THIS delivery, rather
+                    // than re-derived from the pin in the classifier.
+                    base_is_none,
+                    &nonce,
+                )
+            }
+            Err(failure) => Err(failure),
+        };
+        // Park only a turn that delivers: a git commit, or an authentic marked message the inline
+        // arm may deliver. Anything else is removed exactly as a one-shot job is.
+        let park = session_outcome.is_some()
+            && match &result {
+                Ok(_) => true,
+                // Only what the inline arm can actually deliver: an authentic, uncut, MARKED answer
+                // on a from-scratch job whose buyer reads inline. Anything else fails the job, so
+                // parking it would only hold disk until GC.
+                Err(Fail::NoSentinel {
+                    outcome_authentic: true,
+                    message_truncated: false,
+                    from_scratch: true,
+                    last_agent_message: Some(message),
+                    ..
+                }) => {
+                    offer.accepts_delivery.iter().any(|m| m == gateway::DELIVERY_MODE_INLINE)
+                        && crate::engine::marked_inline_answer(message).is_some()
+                }
+                Err(_) => false,
+            };
+        // Evidence first, then remove (or, for a session turn, keep) — the agent launch's tail.
+        cleanup_job_container(
+            container,
+            workdir,
+            workdir.join(seller_git::SELLER_RUN_LOG),
+            prepared.forwarded_secrets.clone(),
+            if park {
+                CleanupPolicy::CaptureThenPark
+            } else {
+                CleanupPolicy::CaptureThenRemove
+            },
+        )
+        .await;
+        // The container is gone (or stopped); the job's sockets go with it. Tools stay enrolled.
+        for endpoint in tool_endpoints {
+            if let Err(error) = endpoint.detach().await {
+                opline!("seller node execute job_id={job_id}: {error}");
+            }
+        }
+        // The exchange directory may still hold an unconsumed token file (a container that died
+        // between the hand-off and the read). Remove the whole directory; the token was 60 s anyway.
+        if let Err(error) = std::fs::remove_dir_all(&io_dir) {
+            opline!(
+                "seller node execute job_id={job_id}: could not remove the exchange dir {} ({error})",
+                io_dir.display()
+            );
+        }
+        if let (true, Some(outcome)) = (park, session_outcome.as_ref()) {
+            // §5.2 step 3: the proxy stops, the holder is detached and left running.
+            let proxy_host = prepared.proxy_host.clone();
+            let holder = prepared.park();
+            let harness = offer
+                .requested_agent
+                .clone()
+                .or_else(|| agent_command.first().cloned())
+                .unwrap_or_default();
+            self.park_first_turn(
+                job_id,
+                &offer.buyer_pubkey,
+                &container_name,
+                holder,
+                proxy_host,
+                &harness,
+                outcome,
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|delivered| delivered.commit.as_str()),
+            )
+            .await;
+            return result;
+        }
+        // `prepared` — the proxy and the namespace — lives to here on purpose.
+        drop(prepared);
+        result
+    }
+
+    /// The container liveness + hand-off loop shared by a job's first launch and every resumed
+    /// session turn (`docker run -i` / `docker start -a -i`). "Alive" is the client process still
+    /// running; the marker is the orchestrator's word that the agent is dead and the commit is
+    /// gated. `release` is the session follow-up review gate (§6.1 step 3); `None` on turn 1.
+    #[allow(clippy::too_many_arguments)]
+    async fn supervise_container(
+        &self,
+        job_id: &str,
+        child: &mut std::process::Child,
+        io_dir: &std::path::Path,
+        nonce: &str,
+        fresh_mode: bool,
+        git_remote: &str,
+        push_ref: &str,
+        deadline: u64,
+        started: Instant,
+        mut release: Option<&mut session_run::ReleaseGate>,
+    ) -> (
+        Result<std::process::ExitStatus, ContainerDeliveryFailure>,
+        Option<crate::delivery_orchestrator::AgentDoneMarker>,
+    ) {
+        use crate::delivery_orchestrator as orch;
+        use ContainerDeliveryFailure as Fail;
         let hard_deadline = deadline
             .saturating_add(orch::PUSH_MARGIN_SECS)
             .saturating_add(orch::CONTAINER_EXIT_GRACE_SECS);
@@ -9411,6 +9729,9 @@ impl SellerNodeRunner {
         let mut token_sequence = 0;
         let mut last_alive_line = Instant::now();
         let exit: Result<std::process::ExitStatus, Fail> = loop {
+            if let Some(gate) = release.as_deref_mut() {
+                gate.poll(io_dir, nonce, job_id).await;
+            }
             match child.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {}
@@ -9428,7 +9749,7 @@ impl SellerNodeRunner {
                 )));
             }
             if marker.is_none() {
-                match orch::read_agent_done_marker(&io_dir, &nonce) {
+                match orch::read_agent_done_marker(io_dir, nonce) {
                     Ok(None) => {}
                     Ok(Some(seen)) => {
                         opline!(
@@ -9439,7 +9760,7 @@ impl SellerNodeRunner {
                             // The agent is dead. Mint the 60 s scoped token NOW and hand it over,
                             // owner-only, atomically.
                             let header = match self
-                                .mint_push_header(&seller.git_remote, &push_ref, None)
+                                .mint_push_header(git_remote, push_ref, None)
                                 .await
                             {
                                 Ok(header) => header,
@@ -9460,7 +9781,7 @@ impl SellerNodeRunner {
                 }
             }
             if fresh_mode && marker.is_some() {
-                match orch::read_push_token_request(&io_dir, &nonce, token_sequence) {
+                match orch::read_push_token_request(io_dir, nonce, token_sequence) {
                     Ok(Some(sequence)) => {
                         // Consume the request BEFORE publishing its response. Otherwise a fast
                         // container can replace it for the next leg before the host removes it.
@@ -9470,7 +9791,7 @@ impl SellerNodeRunner {
                             break Err(Fail::Delivery(format!("token request consume: {error}")));
                         }
                         let header = match self
-                            .mint_push_header(&seller.git_remote, &push_ref, None)
+                            .mint_push_header(git_remote, push_ref, None)
                             .await
                         {
                             Ok(header) => header,
@@ -9501,62 +9822,7 @@ impl SellerNodeRunner {
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         };
-        if exit.is_err() {
-            // Kill the `docker run` CLIENT and reap it; the container itself is removed below by name.
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        // Evidence first, then remove — the same tail as the agent launch.
-        cleanup_job_container(
-            container,
-            workdir,
-            workdir.join(seller_git::SELLER_RUN_LOG),
-            prepared.forwarded_secrets.clone(),
-            CleanupPolicy::CaptureThenRemove,
-        )
-        .await;
-        // The container is gone; the job's sockets go with it. The tools stay enrolled.
-        for endpoint in tool_endpoints {
-            if let Err(error) = endpoint.detach().await {
-                opline!("seller node execute job_id={job_id}: {error}");
-            }
-        }
-        // The container exited between two polls: the marker may not have been read yet.
-        if marker.is_none()
-            && let Ok(Some(seen)) = orch::read_agent_done_marker(&io_dir, &nonce)
-        {
-            marker = Some(seen);
-        }
-
-        let result = match exit {
-            Ok(status) => {
-                self.classify_container_outcome(
-                    job_id,
-                    &io_dir,
-                    status,
-                    marker.as_ref(),
-                    &branch,
-                    started,
-                    // The base the orchestrator was handed: `None` is from-scratch, `Some` is a
-                    // contribution clone. Read here, where it is a fact of THIS delivery, rather
-                    // than re-derived from the pin in the classifier.
-                    base_is_none,
-                    &nonce,
-                )
-            }
-            Err(failure) => Err(failure),
-        };
-        // The exchange directory may still hold an unconsumed token file (a container that died
-        // between the hand-off and the read). Remove the whole directory; the token was 60 s anyway.
-        if let Err(error) = std::fs::remove_dir_all(&io_dir) {
-            opline!(
-                "seller node execute job_id={job_id}: could not remove the exchange dir {} ({error})",
-                io_dir.display()
-            );
-        }
-        // `prepared` — the proxy and the namespace — lives to here on purpose.
-        drop(prepared);
-        result
+        (exit, marker)
     }
 
     /// Read the orchestrator's outcome and oid after the container exited, and map them onto the
@@ -9615,6 +9881,7 @@ impl SellerNodeRunner {
                     usage: agent.usage,
                     last_agent_message: agent.last_agent_message,
                     wall_time_ms: started.elapsed().as_millis() as u64,
+                    session: agent.session,
                 })
             }
             orch::Phase1Status::ProvisionFailed | orch::Phase1Status::Aborted => {
@@ -9641,6 +9908,8 @@ impl SellerNodeRunner {
             orch::Phase1Status::TokenUnavailable
             | orch::Phase1Status::PushFailed
             | orch::Phase1Status::Tampered => Err(Fail::Delivery(detail)),
+            // Session jobs: only a session turn can be withheld, and a one-shot launch never asks.
+            orch::Phase1Status::Withheld => Err(Fail::Setup(detail)),
         }
     }
 
@@ -10069,15 +10338,30 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        let job_id = received.payload.job_id().to_owned();
-        if job_id.is_empty() {
+        let payload_id = received.payload.job_id().to_owned();
+        if payload_id.is_empty() {
             opline!("seller node wrap event={event_id}: payment carries no job id (skipped)");
             return;
         }
+        // Session jobs (§8.2): a payload id that names a recorded follow-up pays THAT turn. The
+        // receipt row is keyed by the follow-up id, so turn 1's receipt cannot swallow it. With
+        // `[sessions] enabled = false` no turn row exists and this is the job id, as today. A read
+        // error fails closed (skipped, re-seen on the next wrap backfill).
+        let target = match self.node.store().turn_for_payment(&payload_id) {
+            Ok(turn) => crate::session::resolve_payment(&payload_id, |_| turn.clone()),
+            Err(error) => {
+                opline!(
+                    "seller node wrap event={event_id}: session turn read failed for {payload_id} (fail-closed, skipping): {error}"
+                );
+                return;
+            }
+        };
+        let job_id = target.job_id.clone();
+        let receipt_key = target.receipt_key.clone();
 
         // Already-paid job: a re-see of consumed money — skip (do not re-redeem). Fail closed on a
         // read error (never read an unreadable journal as "not paid ⇒ safe to redeem again").
-        match self.node.store().has_receipt(&job_id) {
+        match self.node.store().has_receipt(&receipt_key) {
             Ok(true) => {
                 opline!("seller node wrap event={event_id}: job {job_id} already receipted, skipping");
                 return;
@@ -10218,7 +10502,7 @@ impl SellerNodeRunner {
         if let Err(error) =
             self.node
                 .store()
-                .append_pending_receive(&job_id, &token_hash, &buyer, &mint_str, expected, now_unix())
+                .append_pending_receive(&receipt_key, &token_hash, &buyer, &mint_str, expected, now_unix())
         {
             opline!("seller node wrap event={event_id}: breadcrumb write failed for job {job_id} ({error}) — refusing to receive");
             return;
@@ -10240,7 +10524,7 @@ impl SellerNodeRunner {
         let (amount_received, mint_fee_sats) = match classify_redeem_outcome(receive_result, || {
             self.node
                 .store()
-                .has_receipt(&job_id)
+                .has_receipt(&receipt_key)
                 .map_err(|error| error.to_string())
         }) {
             RedeemDecision::Finalize(received) => received,
@@ -10275,7 +10559,7 @@ impl SellerNodeRunner {
         // replayed wrap marks the job paid at most once. The fees ride in the same row.
         let collected = self.node.store().collect_receipt(
             &event_id,
-            &job_id,
+            &receipt_key,
             amount_received,
             super::store::ReceiptFees {
                 mint_fee_sats,
@@ -10284,6 +10568,20 @@ impl SellerNodeRunner {
             },
             now_unix(),
         );
+        if target.turn >= 2 && matches!(collected, Ok(super::store::Collected::New)) {
+            // §8.3: the paid turn releases the next follow-up.
+            if let Err(error) = self.node.store().set_turn_state(
+                &receipt_key,
+                crate::session::TurnState::Paid,
+                None,
+                None,
+                now_unix().max(0) as u64,
+            ) {
+                opline!(
+                    "seller node wrap event={event_id}: session turn {receipt_key} paid but its state write failed ({error})"
+                );
+            }
+        }
         match &collected {
             Ok(super::store::Collected::New) => {
                 // `event_id` is the kind-1059 payment gift-wrap — the id this collection is
@@ -10641,6 +10939,7 @@ impl SellerNodeRunner {
                     self.on_offer(&staged).await;
                 }
                 self.sweep_lapsed_claims();
+                self.redrive_followups().await;
                 self.reconsider_capacity_skips().await;
                 self.start_due_harness_probes();
             }
@@ -10662,6 +10961,7 @@ impl SellerNodeRunner {
             k if k.as_u16() == JOB_ACCEPT_KIND => self.on_accept(event).await,
             k if k.as_u16() == JOB_REJECT_KIND => self.on_reject(event).await,
             k if k.as_u16() == JOB_RECEIPT_KIND => self.on_receipt(event).await,
+            k if k.as_u16() == crate::kinds::SESSION_FOLLOWUP_KIND => self.on_followup(event).await,
             Kind::GiftWrap => self.on_gift_wrap(event).await,
             _ => {}
         }
@@ -10768,6 +11068,9 @@ impl SellerNodeRunner {
     }
 }
 
+#[path = "session_run.rs"]
+mod session_run;
+
 /// The relay event kinds the lane has a handler for; anything else is never queued.
 fn handled_event_kind(kind: Kind) -> bool {
     let k = kind.as_u16();
@@ -10776,6 +11079,7 @@ fn handled_event_kind(kind: Kind) -> bool {
         || k == JOB_ACCEPT_KIND
         || k == JOB_REJECT_KIND
         || k == JOB_RECEIPT_KIND
+        || k == crate::kinds::SESSION_FOLLOWUP_KIND
         || kind == Kind::GiftWrap
 }
 
@@ -12522,6 +12826,23 @@ mod tests {
     // The FOIL: a targeted-only seller KEEPS the pubkey scope (it only claims offers addressed to it;
     // an award for such an offer p-tags it as the sole winner). Without this leg the test above would
     // still pass if the scope were dropped for everyone.
+    /// Session jobs, failure test 13 (subscription half): with `[sessions] enabled = false` the
+    /// award REQ is byte-identical to today's; enabled adds exactly kind 3412.
+    #[test]
+    fn award_filter_adds_followups_only_when_sessions_are_enabled() {
+        let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        for open_pool in [false, true] {
+            let off = serde_json::to_string(&award_filter_with(pk, open_pool, false)).unwrap();
+            assert_eq!(off, serde_json::to_string(&award_filter(pk, open_pool)).unwrap());
+            assert!(!off.contains("3412"), "{off}");
+            let on = serde_json::to_value(award_filter_with(pk, open_pool, true)).unwrap();
+            let kinds: Vec<u64> = on["kinds"].as_array().unwrap().iter().filter_map(|k| k.as_u64()).collect();
+            assert!(kinds.contains(&u64::from(crate::kinds::SESSION_FOLLOWUP_KIND)), "{on}");
+            assert_eq!(kinds.len(), 4);
+        }
+        assert!(handled_event_kind(Kind::Custom(crate::kinds::SESSION_FOLLOWUP_KIND)));
+    }
+
     #[test]
     fn award_filter_is_pubkey_scoped_for_targeted() {
         let pk = nostr_sdk::prelude::Keys::generate().public_key();

@@ -205,6 +205,18 @@ In practice: `post_job`, then `collect` once the delivery lands — the daemon a
 claim in between (use `get_job` to watch, and `award_claim` only to pick the claim by hand). Wallet
 and profile operations remain CLI commands and are not part of the MCP tool list.
 
+**Session jobs (opt-in, `[sessions] enabled = true`).** When the awarded claim advertised
+`["session","1"]` (`get_job` → `session.supported`), you can continue the same job with the same
+seller instead of posting a new one: `collect` the delivered turn, then call **`reply`** with
+`job_id` and `text` (your next instruction, or the answer to the seller's `needs_input` question in
+`get_job` → `session.question`). Each turn costs the job's price and must fit both the per-job cap and
+the session cap (`max_session_sats` on `post_job` or `reply`; `reply`'s value wins; default 10× the
+price; it is never sent to the seller); `reply` refuses before signing anything
+when the previous turn is not collected yet. Collect turn n into `results/<job_id>-t<n>` with
+`collect` (the newest delivered turn is chosen automatically, or pass `turn`), and end the session
+with `reply` `close: true` or `collect` `close_session: true`. With the flag off (the default) none
+of this appears.
+
 ## 5. The buyer daemon
 
 The first money tool you call starts a **buyer daemon** for that home if one is not already running.

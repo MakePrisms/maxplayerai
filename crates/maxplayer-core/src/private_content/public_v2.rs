@@ -235,9 +235,23 @@ impl Context {
         award: &Event,
         text: &str,
     ) -> Result<PreparedContent> {
+        self.answer_keyed(offer, claim, award, text, None)
+    }
+    /// [`Self::answer`] keyed per session turn (the follow-up id).
+    pub fn answer_keyed(
+        &mut self,
+        offer: &Event,
+        claim: &Event,
+        award: &Event,
+        text: &str,
+        turn_key: Option<&str>,
+    ) -> Result<PreparedContent> {
         validate_selection(offer, claim, award)?;
+        let key = turn_key
+            .map(str::to_owned)
+            .unwrap_or_else(|| offer.id.to_hex());
         self.store.prepare_once(
-            &format!("answer:{}", offer.id),
+            &format!("answer:{key}"),
             ContentBody {
                 schema: super::BODY_SCHEMA.into(),
                 job_id: required(offer, "job")?.into(),
@@ -406,8 +420,18 @@ pub fn validate_evidence(
         delivery_integrity_hash: integrity.clone(),
         delivery_kind: kind.into(),
         exec_metadata_commitment: "none".into(),
-        creq_hash: value(&e.claim, "creq")?.map(gateway::creq_hash_hex),
+        // Session turn ≥ 2 (§8.2): the seller co-signs the result's own creq.
+        creq_hash: value(result, "creq")?
+            .or(value(&e.claim, "creq")?)
+            .map(gateway::creq_hash_hex),
     };
+    let (turn_creq, turn_reply) = (value(result, "creq")?, value(result, "reply")?);
+    let free = offer.payment_mode.is_free();
+    if (turn_creq.is_some() && (free || turn_reply.is_none()))
+        || (!free && turn_reply.is_some() && turn_creq.is_none())
+    {
+        return Err(Error("session turn result payment request mismatch"));
+    }
     super::settlement::canonical_json(&preimage)?;
     Ok(super::evidence::VerifiedEvidence {
         routing_job_id: required(&e.offer, "job")?.into(),
@@ -445,15 +469,35 @@ pub fn validate_request(
             "accepted bind differs from signed public v2 evidence",
         ));
     }
+    let turn = value(result, "reply")?;
+    if request.payment_id.as_deref() != turn {
+        return Err(Error("session turn payment id differs from signed public result"));
+    }
     let mut expected = if offer.payment_mode.is_free() {
         vec![]
     } else {
-        crate::job_lifecycle::verify_accepted_claim_creq(
+        let claim = crate::job_lifecycle::verify_accepted_claim_creq(
             Some(required(&e.claim, "creq")?),
             &p.offer_id,
             p.amount,
         )
-        .map_err(|_| Error("public invoice mismatch"))?
+        .map_err(|_| Error("public invoice mismatch"))?;
+        match turn {
+            // A turn's creq names its follow-up and quotes only mints the claim did (§8.2).
+            Some(followup) => {
+                let mints = crate::job_lifecycle::verify_accepted_claim_creq(
+                    Some(required(result, "creq")?),
+                    followup,
+                    p.amount,
+                )
+                .map_err(|_| Error("public turn invoice mismatch"))?;
+                if mints.iter().any(|m| !claim.contains(m)) {
+                    return Err(Error("public turn invoice quotes a mint the claim did not"));
+                }
+                mints
+            }
+            None => claim,
+        }
     };
     let mut actual = request.accepted_mints.clone();
     expected.sort();
@@ -480,6 +524,14 @@ pub fn validate_request(
 }
 
 pub fn project_local(home: &MaxplayerHome, id: &str, draft: EventDraft) -> Result<EventDraft> {
+    project_local_keyed(home, id, draft, None)
+}
+pub fn project_local_keyed(
+    home: &MaxplayerHome,
+    id: &str,
+    draft: EventDraft,
+    turn_key: Option<&str>,
+) -> Result<EventDraft> {
     let Some((mut ctx, offer)) = known(home, id)? else {
         return Ok(draft);
     };
@@ -493,7 +545,7 @@ pub fn project_local(home: &MaxplayerHome, id: &str, draft: EventDraft) -> Resul
         let (claim, award) = selected
             .as_ref()
             .ok_or(Error("public inline selection unavailable"))?;
-        Some(ctx.answer(&offer, claim, award, &draft.content)?)
+        Some(ctx.answer_keyed(&offer, claim, award, &draft.content, turn_key)?)
     } else {
         None
     };
@@ -511,6 +563,16 @@ pub fn bind_receipt(
     p: &mut crate::receipt::ReceiptPreimage,
     answer: Option<&str>,
 ) -> Result<()> {
+    bind_receipt_keyed(home, seller, id, p, answer, None)
+}
+pub fn bind_receipt_keyed(
+    home: &MaxplayerHome,
+    seller: &str,
+    id: &str,
+    p: &mut crate::receipt::ReceiptPreimage,
+    answer: Option<&str>,
+    turn_key: Option<&str>,
+) -> Result<()> {
     let Some((mut ctx, offer)) = known(home, id)? else {
         return Ok(());
     };
@@ -523,7 +585,7 @@ pub fn bind_receipt(
     p.job_hash = super::job_hash(id)?;
     if let Some(text) = answer {
         p.delivery_integrity_hash = ctx
-            .answer(&offer, &claim, &award, text)?
+            .answer_keyed(&offer, &claim, &award, text, turn_key)?
             .commitment()
             .into();
     }
@@ -923,6 +985,7 @@ pub(crate) mod tests {
         let verified = validate_evidence(&e, &buyer.public_key().to_hex()).unwrap();
         let p = verified.preimage;
         let request = crate::authorize_pay::AuthorizePayRequest {
+            payment_id: None,
             private_evidence: Some(e.clone()),
             job_id: e.offer.id.to_hex(),
             result_id: e.result.id.to_hex(),

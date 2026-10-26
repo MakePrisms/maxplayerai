@@ -434,6 +434,63 @@ pub fn snapshot_delivery_at(
     Ok(commit.to_string())
 }
 
+/// Session follow-up gate (docs/specs/session-jobs.md §7.1–§7.2): whether the workdir's raw tree
+/// (runtime artifacts and the sentinel excluded) equals `base_oid`'s tree with ITS sentinel removed.
+///
+/// [`snapshot_delivery_at`] compares against the base tree as it is, which is right for a buyer's
+/// base but wrong for a session base: the previous turn's commit carries the previous turn's
+/// sentinel, so an untouched workdir always differs from it and an empty turn would mint a fresh
+/// sentinel. Nothing is written to the index file.
+pub fn session_tree_unchanged(workdir: &Path, base_oid: &str) -> Result<bool, SellerGitError> {
+    let repo = Repository::open(workdir)
+        .map_err(|error| SellerGitError::Io(format!("session gate: open workdir: {error}")))?;
+    let base = Oid::from_str(base_oid)
+        .ok()
+        .and_then(|oid| repo.find_commit(oid).ok())
+        .ok_or_else(|| {
+            SellerGitError::Io("delivery refused: base_oid absent from workdir".into())
+        })?;
+    let mut index = repo
+        .index()
+        .map_err(|_| SellerGitError::CommandFailed("session-gate-index"))?;
+    index
+        .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
+        .map_err(|_| SellerGitError::CommandFailed("session-gate-add"))?;
+    index
+        .update_all(["*"].iter(), None)
+        .map_err(|_| SellerGitError::CommandFailed("session-gate-update"))?;
+    for name in RUNTIME_ARTIFACT_EXCLUSIONS
+        .iter()
+        .copied()
+        .chain([delivery_sentinel::SENTINEL_FILE])
+    {
+        let _ = index.remove_path(Path::new(name));
+    }
+    let raw = index
+        .write_tree()
+        .map_err(|_| SellerGitError::CommandFailed("session-gate-write-tree"))?;
+    let base_tree = base
+        .tree()
+        .map_err(|_| SellerGitError::CommandFailed("session-gate-base-tree"))?;
+    let mut builder = repo
+        .treebuilder(Some(&base_tree))
+        .map_err(|_| SellerGitError::CommandFailed("session-gate-builder"))?;
+    if builder
+        .get(delivery_sentinel::SENTINEL_FILE)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        builder
+            .remove(delivery_sentinel::SENTINEL_FILE)
+            .map_err(|_| SellerGitError::CommandFailed("session-gate-strip"))?;
+    }
+    let stripped = builder
+        .write()
+        .map_err(|_| SellerGitError::CommandFailed("session-gate-write-base"))?;
+    Ok(raw == stripped)
+}
+
 /// Count the blobs in `tree` and sum their byte sizes — the node-observed execution facts recorded
 /// in the manifest. Walks the tree (not the workdir), so it measures exactly what will be delivered.
 /// Fail-closed: an unreadable object aborts rather than under-counting the delivered work.

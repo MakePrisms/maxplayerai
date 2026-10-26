@@ -149,6 +149,8 @@ pub mod sandbox_net;
 /// contains the job are decided here, so they are compiled and tested on every build.
 pub mod sandbox_netns;
 pub mod seller;
+// Session (multi-turn) jobs: wire shapes and pure rules. Inert unless `[sessions] enabled`.
+pub mod session;
 /// The seller's harness registry: the agent harnesses one node enables, what it advertises for
 /// them, and which one a given job dispatches to.
 pub mod seller_agents;

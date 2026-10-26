@@ -193,6 +193,7 @@ pub async fn provision(
         service: service.into(),
         closed: false,
         input_frozen: false,
+        session: false,
     };
     if let Some(value) = request.signed_award {
         let award = wire::parse_signed(&value.to_string()).map_err(|_| deny())?;
@@ -221,6 +222,9 @@ pub async fn provision(
         job.seller = Some(seller);
         job.award_id = Some(award.id.to_hex());
         job.input_frozen = true;
+        // Session jobs keep the repository open across turns (session-jobs §3.3). Taken
+        // only from the validated, buyer-awarded claim; `validate_private` admits "1" only.
+        job.session = c.get("session") == Some("1");
     } else if actor != buyer || request.signed_claim.is_some() {
         return Err(deny());
     }

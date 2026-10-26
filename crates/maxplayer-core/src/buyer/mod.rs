@@ -30,6 +30,8 @@ pub mod signer;
 pub mod store;
 mod preparations;
 mod auto_award_retry;
+/// Session jobs (docs/specs/session-jobs.md §8, §10): `reply`, `get_job.session`, turn collect.
+mod session_reply;
 
 /// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
 #[cfg(test)]
@@ -420,6 +422,7 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
         "get_job" => get_job(context, id, request.params).await,
         "award" => award(context, id, request.params).await,
         "collect" => collect(context, id, request.params).await,
+        "reply" => session_reply::reply(context, id, request.params).await,
         "accept_claim" | "authorize_pay" => Response::err(
             id,
             CODE_NOT_IMPLEMENTED,
@@ -513,6 +516,13 @@ struct PostJobParams {
     /// instead is the one outcome nobody wants.
     #[serde(default)]
     payment: Option<String>,
+    /// Session jobs (docs/specs/session-jobs.md §8.1/§10): the session spend cap across all turns,
+    /// stored locally with the session so the first `reply` uses it (`reply max_session_sats` may
+    /// still override). LOCAL ONLY: never an offer field, so the offer bytes are unchanged. Accepted
+    /// only with `[sessions] enabled`; absent ⇒ no session row, and `reply` falls back to the
+    /// config or `10 x` the price.
+    #[serde(default)]
+    max_session_sats: Option<u64>,
 }
 
 /// Resolve the offer's payment mode from the RPC `payment` parameter (§1.1).
@@ -593,10 +603,72 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         Ok(mode) => mode,
         Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
     };
+    let max_session_sats = match post_job_session_cap(
+        params.max_session_sats,
+        context.home.config.sessions.enabled,
+    ) {
+        Ok(cap) => cap,
+        Err(message) => return Response::err(id, CODE_METHOD_NOT_FOUND, message),
+    };
     let max_sats = params.max_sats.unwrap_or(params.amount_sats);
     let harness = params.harness.clone();
     let model = params.model.clone();
-    let request = PostJobRequest {
+    let request = post_job_request(params, job, payment_mode);
+    match job_lifecycle::post_job_async(&context.home, request).await {
+        Ok(outcome) => {
+            // Session cap set at post (§8.1): persisted with the session before anything can
+            // reply; the first `reply` reads it. Failing to store it is reported, never silent.
+            if let Some(cap) = max_session_sats
+                && let Err(error) = context.store.open_session(&outcome.job_id, cap, now_unix())
+            {
+                crate::opline!(
+                    "buyer: could not record max_session_sats for {}: {error}; pass it on reply",
+                    outcome.job_id
+                );
+            }
+            // Record the intent BEFORE spawning so a crash right after post still re-arms on restart.
+            if let Err(error) = context.store.put_pending_award(
+                &outcome.job_id,
+                max_sats,
+                harness.as_deref(),
+                model.as_deref(),
+                now_unix(),
+            ) {
+                crate::opline!(
+                    "buyer: could not record auto-award intent for {}: {error}",
+                    outcome.job_id
+                );
+            } else {
+                spawn_auto_award(context.clone(), outcome.job_id.clone(), max_sats);
+            }
+            Response::ok(id, json!(outcome))
+        }
+        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// `post_job max_session_sats` (§8.1/§10): accepted only with `[sessions] enabled` (the flag-off
+/// tool schema does not list it), refused before anything is posted otherwise.
+fn post_job_session_cap(cap: Option<u64>, sessions_enabled: bool) -> Result<Option<u64>, String> {
+    match cap {
+        Some(_) if !sessions_enabled => Err(format!(
+            "post_job max_session_sats: {}",
+            session_reply::disabled()
+        )),
+        cap => Ok(cap),
+    }
+}
+
+/// The offer request a `post_job` RPC builds. Pure: `max_session_sats` (local session state) is
+/// deliberately not read, so the offer bytes never depend on it.
+fn post_job_request(
+    params: PostJobParams,
+    job: JobKind,
+    payment_mode: crate::gateway::PaymentMode,
+) -> PostJobRequest {
+    let harness = params.harness.clone();
+    let model = params.model.clone();
+    PostJobRequest {
         visibility: params.visibility,
         output_category: params.output_category,
         inputs: params.inputs,
@@ -631,27 +703,6 @@ async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Resp
         // read alone would make free jobs postable and — because `authorize_pay_async` refuses a
         // free bind — uncollectable.
         payment_mode,
-    };
-    match job_lifecycle::post_job_async(&context.home, request).await {
-        Ok(outcome) => {
-            // Record the intent BEFORE spawning so a crash right after post still re-arms on restart.
-            if let Err(error) = context.store.put_pending_award(
-                &outcome.job_id,
-                max_sats,
-                harness.as_deref(),
-                model.as_deref(),
-                now_unix(),
-            ) {
-                crate::opline!(
-                    "buyer: could not record auto-award intent for {}: {error}",
-                    outcome.job_id
-                );
-            } else {
-                spawn_auto_award(context.clone(), outcome.job_id.clone(), max_sats);
-            }
-            Response::ok(id, json!(outcome))
-        }
-        Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
     }
 }
 
@@ -799,6 +850,8 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
                 let amount = claim_price_sats(claim.creq.as_deref());
                 json!({"claim_id": claim.claim_id, "seller_pubkey": claim.seller_pubkey, "amount_sats": amount})
             }).collect();
+            // Session jobs (§10): absent unless `[sessions] enabled` (one-shot bytes unchanged).
+            let session = session_reply::view(context, &view).await;
             let mut response = json!(GetJobResponse { view, awarded, awarded_delivery_pending, review_status });
             response["award_read_confirmed"] = json!(award_read_confirmed);
             // Only the existing buyer reconciliation decides that held funds are released.
@@ -808,6 +861,10 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             response["auto_award_state"] = json!(context.store.pending_award_state(response["job_id"].as_str().unwrap_or_default())
                 .ok().flatten().map(|(state, _)| state));
             response["claim_prices"] = json!(claim_prices);
+            // Session jobs (§10): absent unless `[sessions] enabled` (one-shot bytes unchanged).
+            if let Some(session) = session {
+                response["session"] = session;
+            }
             Response::ok(id, response)
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
@@ -1196,6 +1253,13 @@ struct CollectParams {
     job_id: String,
     #[serde(default)]
     out: Option<String>,
+    /// Session jobs (§8.4): the turn to settle (≥ 2). Omitted ⇒ the newest delivered, uncollected
+    /// turn once turn 1 is collected, else turn 1.
+    #[serde(default)]
+    turn: Option<u32>,
+    /// Session jobs (§10): collect, then send the `close` follow-up.
+    #[serde(default)]
+    close_session: bool,
 }
 
 /// Collect a delivered job: run the sealed pay path ([`collect::collect_async`] — accept-if-needed,
@@ -1409,7 +1473,63 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
     };
 
+    let sessions = context.home.config.sessions.enabled;
+    if !sessions && (params.turn.is_some_and(|t| t > 1) || params.close_session) {
+        return Response::err(id, CODE_REFUSED, session_reply::disabled());
+    }
+    match session_reply::collect_target(context, &params.job_id, params.turn).await {
+        Ok(Some(row)) => {
+            if params.out.is_some() {
+                return Response::err(id, CODE_REFUSED, "a session turn collects into results/<job>-t<n>; omit out".to_owned());
+            }
+            let settled = session_reply::settle_turn(context, &row).await;
+            return match settled {
+                Ok(outcome) => {
+                    let closed = if params.close_session {
+                        Some(collect_close(context, &params.job_id).await)
+                    } else {
+                        None
+                    };
+                    Response::ok(
+                        id,
+                        json!({
+                            "pay": collect_pay_response(&outcome.pay),
+                            "commit_oid": outcome.commit_oid,
+                            "path": outcome.path,
+                            "files": outcome.files,
+                            "agent_used": outcome.agent_used,
+                            "model_used": outcome.model_used,
+                            "turn": row.turn,
+                            "session_closed": closed,
+                        }),
+                    )
+                }
+                Err(error) => {
+                    crate::opline!("{}", could_not_settle_line(&params.job_id, &error));
+                    Response::err(id, CODE_REFUSED, error)
+                }
+            };
+        }
+        Ok(None) => {}
+        Err(error) => return Response::err(id, CODE_REFUSED, error),
+    }
+    let close_session = params.close_session;
     match settle_job(context, &params.job_id, params.out).await {
+        Ok(outcome) if close_session => {
+            let closed = collect_close(context, &params.job_id).await;
+            Response::ok(
+                id,
+                json!({
+                    "pay": collect_pay_response(&outcome.pay),
+                    "commit_oid": outcome.commit_oid,
+                    "path": outcome.path,
+                    "files": outcome.files,
+                    "agent_used": outcome.agent_used,
+                    "model_used": outcome.model_used,
+                    "session_closed": closed,
+                }),
+            )
+        }
         Ok(outcome) => Response::ok(
             id,
             json!({
@@ -1430,6 +1550,17 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
             Response::err(id, CODE_REFUSED, error.to_string())
         }
         Err(error) => Response::err(id, CODE_INTERNAL, error.to_string()),
+    }
+}
+
+/// `collect close_session=true`: the collect already settled; a close failure is reported, not raised.
+async fn collect_close(context: &BuyerContext, job_id: &str) -> Value {
+    let Some(award) = context.store.award_record(job_id).ok().flatten() else {
+        return json!(false);
+    };
+    match session_reply::send_close(context, job_id, &award.seller_pubkey).await {
+        Ok(()) => json!(true),
+        Err(error) => json!(error),
     }
 }
 
@@ -2932,6 +3063,10 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
 /// award/collect. Only a genuine failure report takes the lock, under which the authorization +
 /// release mirrors [`terminalize_absent_attempt`]'s money-serialized verdict.
 async fn release_on_failure_feedback(context: &BuyerContext, event: &nostr_sdk::Event) {
+    // A feedback naming one of our session turns frees THAT turn's reservation, never the job's.
+    if session_reply::on_turn_feedback(context, event).await {
+        return;
+    }
     if !is_releasable_failure_feedback(event) {
         return; // progress / other feedback — not actionable, and not worth taking the money lock.
     }
@@ -3116,6 +3251,21 @@ async fn reconcile_reservations(context: &BuyerContext) -> Result<ReconcileRepor
         let has_bind = job_lifecycle::load_accepted_bind(&context.home, job_id)
             .map(|bind| bind.is_some())
             .unwrap_or(false);
+        // Session turn (§8.1): the reservation is keyed by the FOLLOW-UP id, which names no job on
+        // the relay. It stays payable while the turn is live or accepted; `no_response`, refusal
+        // feedback and collect own its other transitions. An unreadable row keeps the funds.
+        match context.store.turn(job_id) {
+            Ok(Some(turn)) => {
+                let live = !matches!(turn.state.as_str(), "refused" | "no_response");
+                payable.insert(job_id.clone(), live || has_bind);
+                continue;
+            }
+            Ok(None) => {}
+            Err(_) => {
+                payable.insert(job_id.clone(), true);
+                continue;
+            }
+        }
         let claim_live = match job_lifecycle::fetch_job_view_async(
             &context.home,
             &keys,
@@ -3356,7 +3506,8 @@ fn scan_payment_progress(home: &MaxplayerHome) -> BTreeMap<String, PaymentProgre
             .collect();
         let Ok(records) = records else { continue };
         let Some(first) = records.first() else { continue };
-        let job_id = first.key.job_id.as_str().to_owned();
+        // The reservation key: the job id, or the follow-up id of a session turn (§8.2).
+        let job_id = first.key.payload_id().to_owned();
         let folded = match PaymentMachine::fold(&first.key, &records) {
             Ok(state) => progress_from_state(state.as_ref()),
             // A journal that will not fold is ambiguous — keep the reservation, never release it.
@@ -6421,6 +6572,7 @@ mod tests {
 
         fn claim_with(status: &str, seller_pubkey: String) -> job_lifecycle::ClaimView {
             job_lifecycle::ClaimView {
+                session: false,
                 payment_mode: crate::gateway::PaymentMode::Sat,
                 // The UNSTATED capability — a seat advertising nothing. Set explicitly because `ClaimView`
                 // has no `Default` derive and must not gain one: a default `SandboxConfig` is a meaningful
@@ -6439,6 +6591,7 @@ mod tests {
 
         fn result(commit_oid: Option<String>) -> job_lifecycle::ResultView {
             job_lifecycle::ResultView {
+                session: Default::default(),
                 private_evidence: None,
                 inline_answer: None,
                 result_id: "r".repeat(64),
@@ -6481,6 +6634,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    followup_id: None,
                     private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,
@@ -6524,6 +6678,7 @@ mod tests {
                 results: vec![result(Some("d".repeat(40)))],
                 live_claim_id: None,
                 accepted: Some(job_lifecycle::AcceptedBind {
+                    followup_id: None,
                     private_evidence: None,
                     delivery_kind: None,
                     inline_answer: None,
@@ -7524,6 +7679,66 @@ mod tests {
     // FREE JOB LANE — the `post_job` RPC's `payment` parameter (§1.1). This is the surface that
     // makes the lane reachable by a user; until it existed the daemon hardcoded `Sat`.
     // ————————————————————————————————————————————————————————————————————————————————————————
+
+    /// Session jobs §8.1/§10: `post_job max_session_sats` is local session state. It never changes
+    /// the offer request (so never the offer bytes), and it is refused with `[sessions]` off.
+    #[test]
+    fn post_job_max_session_sats_is_local_only_and_flag_gated() {
+        let body = json!({"task":"t", "output":"text/plain", "amount_sats":7,
+            "seller_pubkey": "5".repeat(64)});
+        let mut with = body.clone();
+        with["max_session_sats"] = json!(500);
+        let build = |body: Value| {
+            let params: PostJobParams = serde_json::from_value(body).unwrap();
+            let cap = params.max_session_sats;
+            let job = post_job_kind(&params).unwrap();
+            let mode =
+                post_job_payment_mode(params.payment.as_deref(), params.amount_sats).unwrap();
+            (cap, post_job_request(params, job, mode))
+        };
+        let (none, plain) = build(body);
+        let (cap, capped) = build(with);
+        assert_eq!((none, cap), (None, Some(500)));
+        assert_eq!(
+            plain, capped,
+            "the offer request (hence its bytes) ignores max_session_sats"
+        );
+        assert_eq!(post_job_session_cap(None, false), Ok(None));
+        assert_eq!(post_job_session_cap(Some(500), true), Ok(Some(500)));
+        assert!(
+            post_job_session_cap(Some(500), false)
+                .unwrap_err()
+                .contains("sessions are disabled")
+        );
+    }
+
+    /// §8.1 cap precedence across post and reply, through the real store: a cap stored at post is
+    /// what the first `reply` reserves against; `reply max_session_sats` overrides it; with neither,
+    /// the config cap, else 10 x the price.
+    #[test]
+    fn session_cap_set_at_post_reaches_the_first_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BuyerStore::open(dir.path().join("buyer.sqlite")).unwrap();
+        let mut cfg = crate::home::SessionsConfig::default();
+        // post_job max_session_sats=500 opens the row (what `post_job` does after publishing).
+        store.open_session("job", 500, 1).unwrap();
+        let stored = store.session_row("job").unwrap().map(|(cap, _)| cap);
+        assert_eq!(stored, Some(500));
+        assert_eq!(session_reply::session_cap(None, stored, &cfg, 7), 500);
+        // The first reply's own open keeps it; an explicit reply value overrides it.
+        assert_eq!(store.open_session("job", 70, 2).unwrap(), (500, true));
+        assert_eq!(session_reply::session_cap(Some(900), stored, &cfg, 7), 900);
+        store.set_session_cap("job", 900, 3).unwrap();
+        assert_eq!(
+            store.session_row("job").unwrap().map(|(cap, _)| cap),
+            Some(900)
+        );
+        // Nothing set anywhere: 10 x the price; a config cap beats the multiplier.
+        assert_eq!(session_reply::session_cap(None, None, &cfg, 7), 70);
+        cfg.session_cap_sats = Some(55);
+        assert_eq!(session_reply::session_cap(None, None, &cfg, 7), 55);
+        assert_eq!(session_reply::session_cap(None, Some(500), &cfg, 7), 500);
+    }
 
     #[test]
     fn local_base_rpc_requires_contribution_and_preserves_path() {

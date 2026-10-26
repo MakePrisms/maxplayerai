@@ -45,7 +45,10 @@ use super::reservations::{
 ///   against the default mint, which is what those rows were checked against. Additive column via
 ///   [`BuyerStore::migrate`].
 /// - v8 — durable MCP post preparation handles and request deduplication (#1095).
-pub const SCHEMA_VERSION: i64 = 8;
+/// - v9 — session jobs (docs/specs/session-jobs.md §8.1): `sessions` (per-job cap and state) and
+///   `session_turns` (the write-once signed follow-up per turn, its reservation key and result).
+///   Additive tables; both stay empty while `[sessions] enabled = false`.
+pub const SCHEMA_VERSION: i64 = 9;
 
 pub(crate) mod preparations;
 
@@ -53,6 +56,45 @@ pub(crate) mod preparations;
 #[derive(Clone)]
 pub struct BuyerStore {
     conn: Arc<Mutex<Connection>>,
+}
+
+/// One buyer-side session turn (§8.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuyerTurn {
+    pub followup_id: String,
+    pub job_id: String,
+    pub turn: u32,
+    pub event_json: String,
+    pub amount_sats: u64,
+    pub deadline_unix: u64,
+    pub result_id: Option<String>,
+    pub state: String,
+}
+
+const TURN_COLUMNS: &str =
+    "followup_id, job_id, turn, event_json, amount_sats, deadline_unix, result_id, state";
+
+fn turn_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<BuyerTurn> {
+    Ok(BuyerTurn {
+        followup_id: r.get(0)?,
+        job_id: r.get(1)?,
+        turn: r.get(2)?,
+        event_json: r.get(3)?,
+        amount_sats: r.get::<_, i64>(4)? as u64,
+        deadline_unix: r.get::<_, i64>(5)? as u64,
+        result_id: r.get(6)?,
+        state: r.get(7)?,
+    })
+}
+
+fn read_turn(conn: &Connection, followup_id: &str) -> Result<Option<BuyerTurn>, StoreError> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {TURN_COLUMNS} FROM session_turns WHERE followup_id = ?1"),
+            [followup_id],
+            turn_from_row,
+        )
+        .optional()?)
 }
 
 /// Store open / query failure.
@@ -215,6 +257,26 @@ impl BuyerStore {
                  detail              TEXT,
                  created_at_unix     INTEGER NOT NULL,
                  updated_at_unix     INTEGER NOT NULL
+             );
+             -- v9 session jobs. Turn 1 is the job itself (no session_turns row).
+             CREATE TABLE IF NOT EXISTS sessions (
+                 job_id           TEXT PRIMARY KEY,
+                 session_cap_sats INTEGER NOT NULL CHECK (session_cap_sats >= 0),
+                 state            TEXT NOT NULL CHECK (state IN ('open','closed','expired')),
+                 updated_at_unix  INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_turns (
+                 followup_id     TEXT PRIMARY KEY,
+                 job_id          TEXT NOT NULL,
+                 turn            INTEGER NOT NULL CHECK (turn >= 2),
+                 event_json      TEXT NOT NULL,
+                 amount_sats     INTEGER NOT NULL CHECK (amount_sats >= 0),
+                 deadline_unix   INTEGER NOT NULL,
+                 result_id       TEXT,
+                 state           TEXT NOT NULL CHECK (state IN
+                     ('pending','sent','delivered','collected','refused','no_response')),
+                 created_at_unix INTEGER NOT NULL,
+                 updated_at_unix INTEGER NOT NULL
              );",
         )?;
         Self::migrate(conn)?;
@@ -303,6 +365,146 @@ impl BuyerStore {
             }
         }
         Ok(false)
+    }
+
+    // ---- Session jobs (docs/specs/session-jobs.md §8.1) ----------------------------------------
+
+    /// Open (or read) the session row, fixing its cap the first time. Returns the stored cap.
+    pub fn open_session(&self, job_id: &str, cap_sats: u64, now_unix: i64) -> Result<(u64, bool), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (job_id, session_cap_sats, state, updated_at_unix)
+             VALUES (?1, ?2, 'open', ?3)",
+            params![job_id, cap_sats as i64, now_unix],
+        )?;
+        let (cap, state): (i64, String) = conn.query_row(
+            "SELECT session_cap_sats, state FROM sessions WHERE job_id = ?1",
+            [job_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok((cap as u64, state == "open"))
+    }
+
+    /// Raise (never lower below what is committed) the session cap: `reply max_session_sats`.
+    pub fn set_session_cap(&self, job_id: &str, cap_sats: u64, now_unix: i64) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "UPDATE sessions SET session_cap_sats = ?2, updated_at_unix = ?3 WHERE job_id = ?1",
+            params![job_id, cap_sats as i64, now_unix],
+        )?;
+        Ok(())
+    }
+
+    pub fn close_session(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "INSERT INTO sessions (job_id, session_cap_sats, state, updated_at_unix)
+             VALUES (?1, 0, 'closed', ?2)
+             ON CONFLICT(job_id) DO UPDATE SET state = 'closed', updated_at_unix = ?2",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Persist a signed follow-up BEFORE it is reserved or published (write-once: a retry
+    /// re-sends these exact bytes, §8.1). Returns the stored row for `(job, turn)` — the existing
+    /// one when a live turn already holds that number.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_turn(
+        &self,
+        followup_id: &str,
+        job_id: &str,
+        turn: u32,
+        event_json: &str,
+        amount_sats: u64,
+        deadline_unix: u64,
+        now_unix: i64,
+    ) -> Result<BuyerTurn, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let live: Option<String> = tx
+            .query_row(
+                "SELECT followup_id FROM session_turns WHERE job_id = ?1 AND turn = ?2
+                 AND state NOT IN ('refused','no_response')",
+                params![job_id, turn],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if live.is_none() {
+            tx.execute(
+                "INSERT INTO session_turns (followup_id, job_id, turn, event_json, amount_sats,
+                     deadline_unix, state, created_at_unix, updated_at_unix)
+                 VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?7)",
+                params![followup_id, job_id, turn, event_json, amount_sats as i64, deadline_unix as i64, now_unix],
+            )?;
+        }
+        let id = live.unwrap_or_else(|| followup_id.to_owned());
+        let row = read_turn(&tx, &id)?.ok_or_else(|| StoreError("turn row vanished".into()))?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    pub fn set_turn_state(
+        &self,
+        followup_id: &str,
+        state: &str,
+        result_id: Option<&str>,
+        now_unix: i64,
+    ) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "UPDATE session_turns SET state = ?2, result_id = COALESCE(?3, result_id),
+                 updated_at_unix = ?4 WHERE followup_id = ?1",
+            params![followup_id, state, result_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// One turn by its follow-up id (also how a reservation key is recognised as a turn's).
+    pub fn turn(&self, followup_id: &str) -> Result<Option<BuyerTurn>, StoreError> {
+        let conn = self.lock()?;
+        read_turn(&conn, followup_id)
+    }
+
+    /// `(cap, state)` of a session row; `None` before the first `reply`.
+    pub fn session_row(&self, job_id: &str) -> Result<Option<(u64, String)>, StoreError> {
+        let conn = self.lock()?;
+        Ok(conn
+            .query_row(
+                "SELECT session_cap_sats, state FROM sessions WHERE job_id = ?1",
+                [job_id],
+                |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// The seller ended the session (`session_expired`): no further turn can start.
+    pub fn expire_session(&self, job_id: &str, now_unix: i64) -> Result<(), StoreError> {
+        self.lock()?.execute(
+            "UPDATE sessions SET state = 'expired', updated_at_unix = ?2 WHERE job_id = ?1",
+            params![job_id, now_unix],
+        )?;
+        Ok(())
+    }
+
+    /// Every turn of a session, oldest first.
+    pub fn session_turns(&self, job_id: &str) -> Result<Vec<BuyerTurn>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {TURN_COLUMNS} FROM session_turns WHERE job_id = ?1 ORDER BY turn, created_at_unix"
+        ))?;
+        let rows = stmt.query_map([job_id], turn_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Spent + reserved over every turn of the session, turn 1 included (§8.1 session cap).
+    pub fn session_committed_sats(&self, job_id: &str) -> Result<u64, StoreError> {
+        let conn = self.lock()?;
+        let total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(amount_sats), 0) FROM reservations
+             WHERE state IN ('reserved','spent')
+               AND (job_id = ?1 OR job_id IN (SELECT followup_id FROM session_turns WHERE job_id = ?1))",
+            [job_id],
+            |r| r.get(0),
+        )?;
+        Ok(total.max(0) as u64)
     }
 
     /// Record (idempotently overwrite) the daemon's most recent start time.
@@ -1506,6 +1708,33 @@ fn read_meta_i64(conn: &Connection, key: &str) -> Result<Option<i64>, StoreError
 
 #[cfg(test)]
 mod tests {
+
+    /// Session jobs §8.1 (buyer store v9): the session cap is fixed once, a live turn number is
+    /// write-once (a retry gets the stored signed bytes), a refused turn frees its number, and the
+    /// committed sum covers turn 1 plus every follow-up's own reservation key.
+    #[test]
+    fn session_turns_are_write_once_and_committed_sum_spans_turns() {
+        let dir = std::env::temp_dir().join(format!("mx-buyer-sessions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = BuyerStore::open(dir.join("buyer.sqlite")).unwrap();
+        assert_eq!(store.open_session("job", 500, 1).unwrap(), (500, true));
+        assert_eq!(store.open_session("job", 9, 2).unwrap(), (500, true), "cap fixed at first open");
+        let a = store.put_turn("f2a", "job", 2, "{a}", 100, 50, 3).unwrap();
+        let b = store.put_turn("f2b", "job", 2, "{b}", 100, 50, 4).unwrap();
+        assert_eq!((b.followup_id.as_str(), b.event_json.as_str()), ("f2a", "{a}"), "write-once");
+        assert_eq!(a, b);
+        store.set_turn_state("f2a", "refused", None, 5).unwrap();
+        let c = store.put_turn("f2c", "job", 2, "{c}", 100, 60, 6).unwrap();
+        assert_eq!(c.followup_id, "f2c", "a refused turn frees its number");
+        store.reserve("job", 100, 1_000, 7).unwrap();
+        store.reserve("f2c", 100, 1_000, 8).unwrap();
+        store.reserve("other", 100, 1_000, 8).unwrap();
+        assert_eq!(store.session_committed_sats("job").unwrap(), 200);
+        store.close_session("job", 9).unwrap();
+        assert_eq!(store.open_session("job", 500, 10).unwrap(), (500, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 

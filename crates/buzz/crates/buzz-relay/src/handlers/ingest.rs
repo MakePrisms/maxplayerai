@@ -71,6 +71,10 @@ const KIND_MOBEE_TRADE_ACCEPT: u32 = 3406;
 // Maxplayer execution reviews: signed assessments and requests (PR #1022).
 const KIND_MAXPLAYER_REVIEW: u32 = 3408;
 const KIND_MAXPLAYER_REVIEW_REQUEST: u32 = 3409;
+// Maxplayer session jobs: buyer-authored FOLLOW-UP (start a turn / close the
+// session) on an awarded job (docs/specs/session-jobs.md §2.1). 3410/3411 are
+// maxplayer-trade kinds and stay refused here.
+const KIND_MAXPLAYER_SESSION_FOLLOWUP: u32 = 3412;
 const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
 const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
 // NIP-17 DM-relay list (standard kind 10050). Pre-allowed by mobee for future
@@ -667,6 +671,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MOBEE_TRADE_ACCEPT
         | KIND_MAXPLAYER_REVIEW
         | KIND_MAXPLAYER_REVIEW_REQUEST
+        | KIND_MAXPLAYER_SESSION_FOLLOWUP
         | KIND_MOBEE_SELLER_HEARTBEAT => Ok(Scope::MessagesWrite),
         // Mobee self-describing discovery/config kinds — the NIP-89 handler
         // advertisement and the NIP-17 DM-relay list. Grouped with kind-0's
@@ -4508,6 +4513,24 @@ mod postgres_tests {
             assert!(!requires_h_channel_scope(kind));
         }
         assert!(required_scope_for_kind(3410, &dummy).is_err());
+    }
+
+    #[test]
+    fn session_followup_kind_is_admitted_and_trade_kinds_stay_refused() {
+        let dummy = make_dummy_event();
+        assert!(
+            !open_ingest_enabled(),
+            "run admission tests with BUZZ_OPEN_INGEST unset"
+        );
+        // Literal wire number: maxplayer-core SESSION_FOLLOWUP_KIND.
+        assert_eq!(
+            required_scope_for_kind(3412, &dummy).unwrap(),
+            Scope::MessagesWrite
+        );
+        assert!(!requires_h_channel_scope(3412));
+        // 3410/3411 belong to maxplayer-trade and remain unknown here.
+        assert!(required_scope_for_kind(3410, &dummy).is_err());
+        assert!(required_scope_for_kind(3411, &dummy).is_err());
     }
 
     #[test]

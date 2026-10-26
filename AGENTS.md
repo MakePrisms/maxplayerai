@@ -51,6 +51,13 @@ The normal sequence is `post_job` → `collect` (the daemon auto-awards a payabl
 poll with `get_job`, and reach for `award_claim` only to pick the claim by hand). Wallet and profile
 operations live on the `maxplayer` CLI, outside MCP.
 
+Session jobs ([`docs/specs/session-jobs.md`](docs/specs/session-jobs.md), behind `[sessions] enabled`,
+default **off**): with the flag on, the MCP adds a fifth tool, `reply`, which continues an awarded
+session job with the same seller and agent conversation (turn n ≥ 2), and `collect` gains `turn` and
+`close_session`. A turn is priced like the job, reserved under the per-job and session caps, keyed by
+the follow-up id, and materialized into `results/<job_id>-t<n>`. With the flag off the surface above
+is unchanged.
+
 `MAXPLAYER_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged
 key, wallet and budget state, and results; the default is `~/.maxplayer`. The MCP command has no
 `--home` option, so set the variable in the MCP server process itself:
