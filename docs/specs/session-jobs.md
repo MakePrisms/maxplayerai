@@ -575,7 +575,9 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
   (§8.1). `close: true` with no text sends the close follow-up and closes locally; it never pays.
 - **`get_job`** gains `session: { supported, turn, status: running|parked|closed|expired|no_response,
   turn_status, question, context_reset, expires_hint }`. `question` is the latest `needs_input`
-  content. `no_response`: the follow-up's deadline passed with no result; the reservation is released
+  content. `turn_status` is read off the CURRENT turn's own result (absent tag ⇒ `done`); a turn with
+  no result reports `pending`, `refused` (seller feedback refused or failed it) or `no_response`,
+  never `done` (rc2). `no_response`: the follow-up's deadline passed with no result; the reservation is released
   (as feedback-driven releases do today, `core/buyer/mod.rs:2934 @e0262420`) and `reply` may retry.
 - **`collect`** gains `turn?` and `close_session?` (collect, then send close).
 
