@@ -204,6 +204,320 @@ pub fn observe_holder_network<D: DockerCli>(
     judge_holder_network(recorded, addrs, routes)
 }
 
+/// `docker inspect` of what docker recorded for the holder's network: `<ip>/<prefix> <gateway>`, one
+/// line per joined network. The restore puts back exactly these values and nothing it computed.
+pub fn holder_recorded_network_argv(holder: &str) -> Vec<String> {
+    [
+        "docker",
+        "inspect",
+        "--format",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}/{{.IPPrefixLen}} {{.Gateway}}\n{{end}}",
+        holder,
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// Docker's record of the holder's one network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordedNetwork {
+    pub address: std::net::Ipv4Addr,
+    pub prefix_len: u8,
+    pub gateway: std::net::Ipv4Addr,
+}
+
+/// Parse [`holder_recorded_network_argv`] output. Anything but exactly one network with a usable
+/// address, prefix and an on-link gateway is "the recorded address is unavailable": no restore.
+pub fn parse_recorded_network(stdout: &str) -> Result<RecordedNetwork, String> {
+    let lines: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let [line] = lines.as_slice() else {
+        return Err(format!(
+            "expected exactly one recorded network on the holder, found {}: {stdout:?}",
+            lines.len()
+        ));
+    };
+    let unavailable = || format!("the holder's recorded network is unusable: {line:?}");
+    let (cidr, gateway) = line.split_once(' ').ok_or_else(unavailable)?;
+    let (address, prefix_len) = cidr.split_once('/').ok_or_else(unavailable)?;
+    let address: std::net::Ipv4Addr = address.parse().map_err(|_| unavailable())?;
+    let prefix_len: u8 = prefix_len.parse().map_err(|_| unavailable())?;
+    let gateway: std::net::Ipv4Addr = gateway.trim().parse().map_err(|_| unavailable())?;
+    let on_link = crate::sandbox_iface::prefix_contains(
+        &format!("{address}/{prefix_len}"),
+        &gateway.to_string(),
+    ) == Some(true);
+    if address.is_unspecified()
+        || address.is_loopback()
+        || gateway.is_unspecified()
+        || !(1..=30).contains(&prefix_len)
+        || gateway == address
+        || !on_link
+    {
+        return Err(unavailable());
+    }
+    Ok(RecordedNetwork {
+        address,
+        prefix_len,
+        gateway,
+    })
+}
+
+/// The containment policy turn 1 installed into this session's holder, rebuilt from what the seat
+/// recorded: the measured proxy address (`proxy_host`), this seat's `proxy_port_range`, and the
+/// resolvers in the session's own `resolv-<job>.conf` (the file `establish` was handed the same
+/// addresses as). `log_connections` is `true`, as every contained launch installs it. A missing piece
+/// is an error: a policy that cannot be rebuilt cannot be verified, and nothing is restored.
+pub fn session_containment_policy(
+    proxy_host: Option<&str>,
+    proxy_ports: Option<crate::sandbox_net::PortRange>,
+    resolv_conf: Option<&str>,
+) -> Result<crate::sandbox_net::NetPolicy, String> {
+    let gateway = proxy_host
+        .filter(|h| !h.trim().is_empty())
+        .ok_or("the session recorded no proxy address")?;
+    let resolv_conf = resolv_conf.ok_or("the session's resolver file is missing")?;
+    Ok(crate::sandbox_net::NetPolicy {
+        gateway: gateway.trim().to_owned(),
+        proxy_ports,
+        log_connections: true,
+        dns_resolvers: crate::sandbox_dns::parse_resolv_conf(resolv_conf).0,
+    })
+}
+
+/// The namespace's IPv4 addresses and default gateway, read by the unprivileged probes.
+struct NetState {
+    addrs: Vec<std::net::Ipv4Addr>,
+    default_via: Option<String>,
+}
+
+fn read_net_state<D: DockerCli>(
+    cli: &mut D,
+    holder: &str,
+    image: &str,
+    labels: &[String],
+) -> Result<NetState, String> {
+    let addrs = cli
+        .run(&holder_ip_probe_argv(
+            holder,
+            image,
+            labels,
+            &["addr", "show"],
+        ))
+        .map_err(|e| format!("addr probe: {e}"))?;
+    let routes = cli
+        .run(&holder_ip_probe_argv(
+            holder,
+            image,
+            labels,
+            &["route", "show", "default"],
+        ))
+        .map_err(|e| format!("route probe: {e}"))?;
+    let default_via = routes.lines().map(str::split_whitespace).find_map(|mut w| {
+        (w.next() == Some("default")).then(|| {
+            let words: Vec<&str> = w.collect();
+            words
+                .windows(2)
+                .find(|p| p[0] == "via")
+                .map_or_else(String::new, |p| p[1].to_owned())
+        })
+    });
+    Ok(NetState {
+        addrs: parse_ipv4_addrs(&addrs),
+        default_via,
+    })
+}
+
+/// The namespace's own veth, present and UP ([`crate::sandbox_iface::select_egress_link`], the
+/// same identity check setup applies before filtering it).
+fn holder_egress_dev<D: DockerCli>(
+    cli: &mut D,
+    holder: &str,
+    image: &str,
+    labels: &[String],
+) -> Result<String, String> {
+    let argv = crate::sandbox_netns::with_helper_labels(
+        crate::sandbox_iface::link_probe_argv(holder, image),
+        labels,
+    )?;
+    let links = cli.run(&argv).map_err(|e| format!("link probe: {e}"))?;
+    let parsed = crate::sandbox_iface::parse_links(&links)?;
+    Ok(crate::sandbox_iface::select_egress_link(&parsed)?.name)
+}
+
+/// The containment checks `sandbox_netns::establish` applies when the holder is set up, applied to
+/// the parked namespace: both iptables families read back and judged against `policy`, then the
+/// veth's `tc` egress filters read back and judged against the plan derived for `dev` (flower, or
+/// the u32 compatibility plan setup falls back to where flower is missing).
+pub fn verify_holder_containment<D: DockerCli>(
+    cli: &mut D,
+    holder: &str,
+    image: &str,
+    labels: &[String],
+    policy: &crate::sandbox_net::NetPolicy,
+    dev: &str,
+) -> Result<(), String> {
+    use crate::sandbox_net::Family;
+    for family in [Family::V4, Family::V6] {
+        let argv = crate::sandbox_netns::with_helper_labels(
+            crate::sandbox_netns::readback_argv(holder, image, family),
+            labels,
+        )?;
+        let readback = cli
+            .run(&argv)
+            .map_err(|e| format!("{} readback: {e}", family.binary()))?;
+        policy.verify_readback(family, &readback)?;
+    }
+    let iface = crate::sandbox_iface::IfacePlan::derive(dev, policy)?;
+    let argv = crate::sandbox_netns::with_helper_labels(
+        crate::sandbox_iface::filter_readback_argv(holder, image, dev),
+        labels,
+    )?;
+    let readback = cli
+        .run(&argv)
+        .map_err(|e| format!("tc readback on {dev}: {e}"))?;
+    match iface.verify_readback(&readback) {
+        Ok(()) => Ok(()),
+        Err(flower) => crate::sandbox_iface::U32Plan::derive(&iface)?
+            .verify_readback(&readback)
+            .map_err(|u32| {
+                format!("egress filters on {dev} match neither the flower plan ({flower}) nor the u32 plan ({u32})")
+            }),
+    }
+}
+
+/// runsc only: put back the address and/or default route a gVisor sandbox took from the parked
+/// holder's namespace, then re-verify the whole containment. `Ok(())` only when every check passes.
+///
+/// Order is the point:
+/// 1. the namespace's own veth must be present and UP — otherwise nothing is written;
+/// 2. docker's record of the holder must be usable — otherwise nothing is written;
+/// 3. the firewall and the veth filters must already be exactly as setup installed them — so a
+///    route is never added to a namespace that lacks its filters, even for an instant;
+/// 4. only the missing piece is written, from docker's record, by the setup sidecar's shape;
+/// 5. the same veth, the same filters, and the address-and-route probe are checked again.
+fn restore_and_verify<D: DockerCli>(
+    cli: &mut D,
+    holder: &str,
+    image: &str,
+    labels: &[String],
+    policy: &crate::sandbox_net::NetPolicy,
+) -> Result<(), String> {
+    let dev = holder_egress_dev(cli, holder, image, labels)
+        .map_err(|e| format!("no restore, the holder's interface is not usable: {e}"))?;
+    let recorded = cli
+        .run(&holder_recorded_network_argv(holder))
+        .map_err(|e| format!("no restore, holder inspect failed: {e}"))
+        .and_then(|out| parse_recorded_network(&out).map_err(|e| format!("no restore, {e}")))?;
+    verify_holder_containment(cli, holder, image, labels, policy, &dev)
+        .map_err(|e| format!("no restore, containment is not as installed: {e}"))?;
+    let state =
+        read_net_state(cli, holder, image, labels).map_err(|e| format!("no restore, {e}"))?;
+    let gateway = recorded.gateway.to_string();
+    if state.addrs.iter().any(|a| *a != recorded.address) {
+        return Err(format!(
+            "no restore, the namespace holds an address docker did not record: {:?}",
+            state.addrs
+        ));
+    }
+    if let Some(via) = &state.default_via
+        && *via != gateway
+    {
+        return Err(format!(
+            "no restore, the namespace's default route is via {via:?}, docker recorded {gateway}"
+        ));
+    }
+    if state.addrs.is_empty() {
+        cli.run(&crate::sandbox_netns::restore_address_argv(
+            holder,
+            image,
+            labels,
+            &dev,
+            recorded.address,
+            recorded.prefix_len,
+        ))
+        .map_err(|e| format!("address restore failed: {e}"))?;
+    }
+    if state.default_via.is_none() {
+        cli.run(&crate::sandbox_netns::restore_default_route_argv(
+            holder,
+            image,
+            labels,
+            &dev,
+            recorded.gateway,
+        ))
+        .map_err(|e| format!("route restore failed: {e}"))?;
+    }
+    // Re-verify everything, from fresh reads.
+    let dev_after = holder_egress_dev(cli, holder, image, labels)
+        .map_err(|e| format!("re-verify: interface: {e}"))?;
+    if dev_after != dev {
+        return Err(format!(
+            "re-verify: the egress interface changed from {dev} to {dev_after}"
+        ));
+    }
+    verify_holder_containment(cli, holder, image, labels, policy, &dev)
+        .map_err(|e| format!("re-verify: containment: {e}"))?;
+    match observe_holder_network(cli, holder, image, labels) {
+        HolderNetwork::Up => {}
+        other => return Err(format!("re-verify: holder network is {other:?}")),
+    }
+    let after =
+        read_net_state(cli, holder, image, labels).map_err(|e| format!("re-verify: {e}"))?;
+    if after.addrs != [recorded.address] || after.default_via.as_deref() != Some(gateway.as_str()) {
+        return Err(format!(
+            "re-verify: namespace holds {:?} via {:?}, docker recorded {}/{} via {gateway}",
+            after.addrs, after.default_via, recorded.address, recorded.prefix_len
+        ));
+    }
+    Ok(())
+}
+
+/// The §5.5 holder network check at resume, with the runsc restore.
+///
+/// `runsc_policy` is `None` on a runc (or default-runtime) seat: the probe alone decides, exactly as
+/// before. On a runsc seat it carries the containment policy turn 1 installed (or why it could not be
+/// rebuilt); a namespace that lost its address or default route is then restored and re-verified
+/// ([`restore_and_verify`]). Every other probe answer — `Up`, or a probe that could not answer — is
+/// returned untouched. Returns the verdict and whether a restore was written and re-verified.
+pub fn resume_holder_network<D: DockerCli>(
+    cli: &mut D,
+    holder: &str,
+    image: &str,
+    labels: &[String],
+    runsc_policy: Option<Result<&crate::sandbox_net::NetPolicy, String>>,
+) -> (HolderNetwork, bool) {
+    let observed = observe_holder_network(cli, holder, image, labels);
+    let Some(policy) = runsc_policy else {
+        return (observed, false);
+    };
+    if !matches!(
+        observed,
+        HolderNetwork::NoAddress | HolderNetwork::NoDefaultRoute
+    ) {
+        return (observed, false);
+    }
+    let policy = match policy {
+        Ok(policy) => policy,
+        Err(error) => {
+            return (
+                HolderNetwork::RestoreFailed(format!(
+                    "no restore, containment policy unavailable: {error}"
+                )),
+                false,
+            );
+        }
+    };
+    match restore_and_verify(cli, holder, image, labels, policy) {
+        Ok(()) => (HolderNetwork::Up, true),
+        Err(error) => (HolderNetwork::RestoreFailed(error), false),
+    }
+}
+
 /// Bytes under `dir`, never following a symlink (a job could plant one to `/`). Unreadable
 /// entries count zero; this is a measurement for the budget, not an audit.
 pub fn du_bytes(dir: &Path) -> u64 {
@@ -718,5 +1032,492 @@ mod tests {
             ),
             session::ResumeGate::Expire("holder_network_lost")
         );
+    }
+
+    // ── runsc restore at resume ─────────────────────────────────────────────────────────────
+
+    const LINKS_UP: &str = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0 minmtu 0 maxmtu 0 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 \n\
+19: eth0@if20: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default \\    link/ether 02:42:ac:13:00:05 brd ff:ff:ff:ff:ff:ff link-netnsid 0 promiscuity 0 minmtu 68 maxmtu 65535 veth numtxqueues 4 numrxqueues 4 gso_max_size 65536 gso_max_segs 65535 \n";
+    const LINKS_LO_ONLY: &str = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0 minmtu 0 maxmtu 0 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 \n";
+    const HOLDER: &str = "maxplayer-netns-j";
+
+    fn runsc_policy() -> crate::sandbox_net::NetPolicy {
+        crate::sandbox_net::NetPolicy {
+            gateway: "172.17.0.1".into(),
+            proxy_ports: Some(crate::sandbox_net::PortRange::new(9320, 9325).unwrap()),
+            log_connections: true,
+            dns_resolvers: vec!["1.1.1.1".into()],
+        }
+    }
+
+    /// A fake daemon holding one parked runsc holder's namespace: answers the probes from its state,
+    /// applies `ip … add` writes to it, and records every call.
+    struct Ns {
+        calls: Vec<Vec<String>>,
+        links: String,
+        recorded: Result<String, String>,
+        addr: bool,
+        route: bool,
+        v4: String,
+        v6: String,
+        tc: String,
+        /// `Some(e)`: every `ip … add` write fails with `e` and changes nothing.
+        write_error: Option<String>,
+        /// Writes report success but do not take (re-verify must catch it).
+        write_noop: bool,
+        /// A write wipes the veth filters (re-verify must catch it).
+        write_wipes_tc: bool,
+    }
+    impl Ns {
+        fn parked(addr: bool, route: bool) -> Self {
+            let policy = runsc_policy();
+            let plan = crate::sandbox_iface::IfacePlan::derive("eth0", &policy).unwrap();
+            Self {
+                calls: Vec::new(),
+                links: LINKS_UP.into(),
+                recorded: Ok("172.19.0.5/16 172.19.0.1\n".into()),
+                addr,
+                route,
+                v4: crate::sandbox_net::readback_fixture(&policy, crate::sandbox_net::Family::V4),
+                v6: crate::sandbox_net::readback_fixture(&policy, crate::sandbox_net::Family::V6),
+                tc: crate::sandbox_iface::readback_fixture(&plan),
+                write_error: None,
+                write_noop: false,
+                write_wipes_tc: false,
+            }
+        }
+        fn writes(&self) -> Vec<Vec<String>> {
+            self.calls
+                .iter()
+                .filter(|c| {
+                    c.windows(2)
+                        .any(|w| w[1] == "add" && (w[0] == "addr" || w[0] == "route"))
+                })
+                .cloned()
+                .collect()
+        }
+        fn first_index(&self, pred: impl Fn(&[String]) -> bool) -> Option<usize> {
+            self.calls.iter().position(|c| pred(c))
+        }
+    }
+    impl DockerCli for Ns {
+        fn run(&mut self, argv: &[String]) -> Result<String, String> {
+            self.calls.push(argv.to_vec());
+            let has = |w: &[&str]| argv.windows(w.len()).any(|x| x == w);
+            if argv.get(1).map(String::as_str) == Some("inspect") {
+                return if argv.iter().any(|a| a.contains("IPPrefixLen")) {
+                    self.recorded.clone()
+                } else {
+                    Ok("172.19.0.5 ".into())
+                };
+            }
+            let entry = argv
+                .windows(2)
+                .find(|w| w[0] == "--entrypoint")
+                .map(|w| w[1].clone())
+                .unwrap_or_default();
+            match entry.as_str() {
+                "iptables" => Ok(self.v4.clone()),
+                "ip6tables" => Ok(self.v6.clone()),
+                "tc" => Ok(self.tc.clone()),
+                "ip" if has(&["link", "show"]) => Ok(self.links.clone()),
+                "ip" if has(&["addr", "show"]) => Ok(if self.addr {
+                    "1: lo    inet 127.0.0.1/8 scope host lo\n19: eth0    inet 172.19.0.5/16 brd 172.19.255.255 scope global eth0\n".into()
+                } else {
+                    "1: lo    inet 127.0.0.1/8 scope host lo\n".into()
+                }),
+                "ip" if has(&["route", "show", "default"]) => Ok(if self.route {
+                    "default via 172.19.0.1 dev eth0 \n".into()
+                } else {
+                    String::new()
+                }),
+                "ip" if has(&["addr", "add"]) || has(&["route", "add"]) => {
+                    if let Some(error) = &self.write_error {
+                        return Err(error.clone());
+                    }
+                    if self.write_wipes_tc {
+                        self.tc.clear();
+                    }
+                    if !self.write_noop {
+                        if has(&["addr", "add"]) {
+                            self.addr = true;
+                        } else {
+                            self.route = true;
+                        }
+                    }
+                    Ok(String::new())
+                }
+                _ => Err(format!("unexpected argv {argv:?}")),
+            }
+        }
+    }
+
+    fn labels() -> Vec<String> {
+        crate::sandbox_netns::helper_label_args("j", "seat", 99)
+    }
+
+    fn resume(
+        ns: &mut Ns,
+        policy: Option<Result<&crate::sandbox_net::NetPolicy, String>>,
+    ) -> (HolderNetwork, bool) {
+        resume_holder_network(ns, HOLDER, "img", &labels(), policy)
+    }
+
+    /// The measured runsc state (address AND route gone): both are put back from docker's record
+    /// with the setup sidecar's shape, only after the filters were verified, and re-verified after.
+    #[test]
+    fn runsc_restore_puts_back_docker_recorded_address_and_route_then_reverifies() {
+        let policy = runsc_policy();
+        let mut ns = Ns::parked(false, false);
+        assert_eq!(
+            resume(&mut ns, Some(Ok(&policy))),
+            (HolderNetwork::Up, true)
+        );
+        let writes = ns.writes();
+        assert_eq!(writes.len(), 2, "{writes:?}");
+        assert!(
+            writes[0].ends_with(
+                &[
+                    "--entrypoint",
+                    "ip",
+                    "img",
+                    "-4",
+                    "addr",
+                    "add",
+                    "172.19.0.5/16",
+                    "brd",
+                    "+",
+                    "dev",
+                    "eth0"
+                ]
+                .map(String::from)
+            ),
+            "{:?}",
+            writes[0]
+        );
+        assert!(
+            writes[1].ends_with(
+                &[
+                    "--entrypoint",
+                    "ip",
+                    "img",
+                    "-4",
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    "172.19.0.1",
+                    "dev",
+                    "eth0"
+                ]
+                .map(String::from)
+            ),
+            "{:?}",
+            writes[1]
+        );
+        for w in &writes {
+            assert!(
+                w.windows(2)
+                    .any(|p| p == ["--network", "container:maxplayer-netns-j"])
+            );
+            let caps: Vec<_> = w
+                .windows(2)
+                .filter(|p| p[0] == "--cap-add")
+                .map(|p| p[1].clone())
+                .collect();
+            assert_eq!(caps, ["NET_ADMIN"]);
+            for l in &labels() {
+                assert!(w.contains(l));
+            }
+        }
+        // Filters verified (both iptables families and tc) BEFORE the first write…
+        let first_write = ns
+            .first_index(|c| c.windows(2).any(|w| w == ["addr", "add"]))
+            .unwrap();
+        for entry in ["iptables", "ip6tables", "tc"] {
+            let read = ns
+                .first_index(|c| c.windows(2).any(|w| w == ["--entrypoint", entry]))
+                .unwrap();
+            assert!(
+                read < first_write,
+                "{entry} read at {read}, first write at {first_write}"
+            );
+        }
+        // …and again after the last one.
+        let last_write = ns
+            .calls
+            .iter()
+            .rposition(|c| c.windows(2).any(|w| w == ["route", "add"]))
+            .unwrap();
+        for entry in ["iptables", "ip6tables", "tc"] {
+            assert!(
+                ns.calls[last_write..]
+                    .iter()
+                    .any(|c| c.windows(2).any(|w| w == ["--entrypoint", entry])),
+                "{entry} not re-verified after the restore"
+            );
+        }
+        // Every read helper also carries the job's helper labels.
+        for c in ns
+            .calls
+            .iter()
+            .filter(|c| c.get(1).map(String::as_str) == Some("run"))
+        {
+            for l in &labels() {
+                assert!(c.contains(l), "{c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn runsc_restore_writes_only_the_missing_address() {
+        let policy = runsc_policy();
+        let mut ns = Ns::parked(false, true);
+        assert_eq!(
+            resume(&mut ns, Some(Ok(&policy))),
+            (HolderNetwork::Up, true)
+        );
+        let writes = ns.writes();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(writes[0].windows(2).any(|w| w == ["addr", "add"]));
+    }
+
+    #[test]
+    fn runsc_restore_writes_only_the_missing_route() {
+        let policy = runsc_policy();
+        let mut ns = Ns::parked(true, false);
+        assert_eq!(
+            resume(&mut ns, Some(Ok(&policy))),
+            (HolderNetwork::Up, true)
+        );
+        let writes = ns.writes();
+        assert_eq!(writes.len(), 1, "{writes:?}");
+        assert!(writes[0].windows(2).any(|w| w == ["route", "add"]));
+    }
+
+    /// No veth (or one that is down): expire with no restore attempt.
+    #[test]
+    fn runsc_missing_interface_expires_without_a_restore() {
+        let policy = runsc_policy();
+        for links in [
+            LINKS_LO_ONLY.to_owned(),
+            LINKS_UP.replace("<BROADCAST,MULTICAST,UP,LOWER_UP>", "<BROADCAST,MULTICAST>"),
+        ] {
+            let mut ns = Ns::parked(false, false);
+            ns.links = links;
+            let (network, restored) = resume(&mut ns, Some(Ok(&policy)));
+            assert!(
+                matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("interface")),
+                "{network:?}"
+            );
+            assert!(!restored);
+            assert!(ns.writes().is_empty());
+            assert_eq!(
+                session::resume_gate(
+                    Some("t"),
+                    &HolderObservation::Running {
+                        started_at: "t".into()
+                    },
+                    session::SESSION_PROTOCOL,
+                    &network
+                ),
+                session::ResumeGate::Expire("holder_network_lost")
+            );
+        }
+    }
+
+    /// Docker's record unusable (none, two networks, garbage, inspect error): no restore.
+    #[test]
+    fn runsc_unavailable_recorded_address_expires_without_a_restore() {
+        let policy = runsc_policy();
+        for recorded in [
+            Ok("/0 \n".to_owned()),
+            Ok(String::new()),
+            Ok("172.19.0.5/16 172.19.0.1\n10.0.0.5/24 10.0.0.1\n".to_owned()),
+            Ok("172.19.0.5/16 10.9.9.9\n".to_owned()),
+            Err("exit 1: No such object".to_owned()),
+        ] {
+            let mut ns = Ns::parked(false, false);
+            ns.recorded = recorded.clone();
+            let (network, restored) = resume(&mut ns, Some(Ok(&policy)));
+            assert!(
+                matches!(network, HolderNetwork::RestoreFailed(_)),
+                "{recorded:?}: {network:?}"
+            );
+            assert!(!restored);
+            assert!(ns.writes().is_empty(), "{recorded:?}");
+        }
+    }
+
+    /// Filters not as installed before the restore: nothing is written, so a route is never added to
+    /// a namespace without its filters.
+    #[test]
+    fn runsc_namespace_without_its_filters_is_never_given_a_route() {
+        let policy = runsc_policy();
+        let cases: [fn(&mut Ns); 4] = [
+            |ns| ns.tc.clear(),
+            |ns| ns.v4 = ns.v4.replace("-j DROP", "-j ACCEPT"),
+            |ns| ns.v6.clear(),
+            |ns| ns.v4 = ns.v4.replace("9320:9325", "1:65535"),
+        ];
+        for (i, break_it) in cases.into_iter().enumerate() {
+            let mut ns = Ns::parked(false, false);
+            break_it(&mut ns);
+            let (network, restored) = resume(&mut ns, Some(Ok(&policy)));
+            assert!(
+                matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("containment")),
+                "case {i}: {network:?}"
+            );
+            assert!(!restored);
+            assert!(ns.writes().is_empty(), "case {i}");
+        }
+        // A policy that could not be rebuilt (e.g. no resolver file) also writes nothing.
+        let mut ns = Ns::parked(false, false);
+        let (network, _) = resume(
+            &mut ns,
+            Some(Err("the session's resolver file is missing".into())),
+        );
+        assert!(matches!(network, HolderNetwork::RestoreFailed(_)));
+        assert!(ns.writes().is_empty());
+    }
+
+    /// A restore that did not take, or that cost the veth its filters, fails re-verification.
+    #[test]
+    fn runsc_reverify_mismatch_expires() {
+        let policy = runsc_policy();
+        let mut ns = Ns::parked(false, false);
+        ns.write_wipes_tc = true;
+        let (network, restored) = resume(&mut ns, Some(Ok(&policy)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.starts_with("re-verify")),
+            "{network:?}"
+        );
+        assert!(!restored);
+        let mut ns = Ns::parked(false, true);
+        ns.write_noop = true;
+        let (network, _) = resume(&mut ns, Some(Ok(&policy)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.starts_with("re-verify")),
+            "{network:?}"
+        );
+        assert_eq!(
+            session::resume_gate(
+                Some("t"),
+                &HolderObservation::Running {
+                    started_at: "t".into()
+                },
+                session::SESSION_PROTOCOL,
+                &network
+            ),
+            session::ResumeGate::Expire("holder_network_lost")
+        );
+    }
+
+    #[test]
+    fn runsc_helper_error_expires() {
+        let policy = runsc_policy();
+        let mut ns = Ns::parked(false, false);
+        ns.write_error = Some("exit 2: RTNETLINK answers: Operation not permitted".into());
+        let (network, restored) = resume(&mut ns, Some(Ok(&policy)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("address restore failed")),
+            "{network:?}"
+        );
+        assert!(!restored);
+        // Stops at the failed write: nothing after it.
+        assert_eq!(ns.writes().len(), 1);
+    }
+
+    /// A foreign address or a default route to somewhere docker did not record is not "missing": no
+    /// restore over it.
+    #[test]
+    fn runsc_unexpected_namespace_state_is_not_overwritten() {
+        let policy = runsc_policy();
+        let mut ns = Ns::parked(false, false);
+        ns.route = true;
+        ns.recorded = Ok("172.19.0.5/16 172.19.0.254\n".into());
+        let (network, _) = resume(&mut ns, Some(Ok(&policy)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("default route")),
+            "{network:?}"
+        );
+        assert!(ns.writes().is_empty());
+    }
+
+    /// runc (no runsc policy): the probe alone decides; no link probe, readback or write is issued.
+    #[test]
+    fn runc_resume_is_probe_only_and_untouched() {
+        for (addr, route, want) in [
+            (true, true, HolderNetwork::Up),
+            (false, false, HolderNetwork::NoAddress),
+            (true, false, HolderNetwork::NoDefaultRoute),
+        ] {
+            let mut ns = Ns::parked(addr, route);
+            assert_eq!(resume(&mut ns, None), (want, false));
+            assert_eq!(ns.calls.len(), 3, "{:?}", ns.calls);
+            assert!(ns.writes().is_empty());
+            assert!(!ns.calls.iter().any(|c| c.iter().any(|a| a == "NET_ADMIN")));
+        }
+        // A healthy runsc holder is not touched either: probe only.
+        let policy = runsc_policy();
+        let mut ns = Ns::parked(true, true);
+        assert_eq!(
+            resume(&mut ns, Some(Ok(&policy))),
+            (HolderNetwork::Up, false)
+        );
+        assert_eq!(ns.calls.len(), 3);
+        // Nor is one whose probe could not answer.
+        let mut failing = NetProbe {
+            calls: Vec::new(),
+            ip: Err("daemon down".into()),
+            addrs: Ok(String::new()),
+            routes: Ok(String::new()),
+        };
+        let (network, restored) =
+            resume_holder_network(&mut failing, HOLDER, "img", &labels(), Some(Ok(&policy)));
+        assert!(matches!(network, HolderNetwork::ProbeFailed(_)));
+        assert!(!restored);
+        assert_eq!(failing.calls.len(), 1);
+    }
+
+    #[test]
+    fn recorded_network_parses_only_one_usable_on_link_record() {
+        assert_eq!(
+            parse_recorded_network("172.19.0.5/16 172.19.0.1\n"),
+            Ok(RecordedNetwork {
+                address: "172.19.0.5".parse().unwrap(),
+                prefix_len: 16,
+                gateway: "172.19.0.1".parse().unwrap(),
+            })
+        );
+        for bad in [
+            "",
+            "/0 ",
+            "172.19.0.5/16 ",
+            "172.19.0.5/0 172.19.0.1",
+            "172.19.0.5/32 172.19.0.1",
+            "172.19.0.5/16 10.0.0.1",
+            "172.19.0.5/16 172.19.0.5",
+            "fe80::1/64 fe80::2",
+        ] {
+            assert!(parse_recorded_network(bad).is_err(), "{bad:?}");
+        }
+        assert!(
+            holder_recorded_network_argv("h")
+                .iter()
+                .any(|a| a.contains("IPPrefixLen") && a.contains("Gateway"))
+        );
+    }
+
+    #[test]
+    fn the_containment_policy_is_rebuilt_from_the_session_record_and_resolver_file() {
+        let ports = Some(crate::sandbox_net::PortRange::new(9320, 9325).unwrap());
+        let resolv = "# Written by maxplayer\nnameserver 1.1.1.1\noptions ndots:0\n";
+        assert_eq!(
+            session_containment_policy(Some("172.17.0.1"), ports, Some(resolv)),
+            Ok(runsc_policy())
+        );
+        assert!(session_containment_policy(None, ports, Some(resolv)).is_err());
+        assert!(session_containment_policy(Some("172.17.0.1"), ports, None).is_err());
     }
 }

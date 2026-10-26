@@ -478,6 +478,10 @@ pub enum HolderNetwork {
     NoDefaultRoute,
     /// The probe could not answer (docker error, timeout, unreadable output). Fail-closed.
     ProbeFailed(String),
+    /// runsc only: the namespace lost its address or default route, and putting docker's recorded
+    /// values back was refused (no veth, no usable record, filters not as installed) or did not
+    /// re-verify afterwards. Fail-closed; the session expires and its holder is removed.
+    RestoreFailed(String),
     /// Not probed: the holder already failed its own check, or no probe was run at all.
     NotProbed,
 }

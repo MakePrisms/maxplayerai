@@ -531,26 +531,41 @@ impl SellerNodeRunner {
                     &self.seller_pubkey.to_hex(),
                     crate::sandbox_netns::cleanup_after_unix(turn.deadline_unix),
                 );
+                // runsc only: gVisor's netstack takes the holder's IPv4 address and routes when the
+                // job container joins and does not hand them back, so a parked runsc holder is
+                // restored from docker's record and its whole containment re-verified before the
+                // turn starts (`session_gc::resume_holder_network`). runc seats: probe only.
+                let runsc_policy = self.runsc_session_policy(&record);
                 let observed = tokio::task::spawn_blocking(move || {
                     let observed = session_gc::observe_holder(&mut RealDockerCli, &holder);
                     let network = if matches!(observed, session::HolderObservation::Running { .. })
                     {
-                        session_gc::observe_holder_network(
+                        session_gc::resume_holder_network(
                             &mut RealDockerCli,
                             &holder,
                             crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
                             &labels,
+                            runsc_policy
+                                .as_ref()
+                                .map(|p| p.as_ref().map_err(Clone::clone)),
                         )
                     } else {
-                        session::HolderNetwork::NotProbed
+                        (session::HolderNetwork::NotProbed, false)
                     };
-                    (observed, network)
+                    (observed, network.0, network.1)
                 })
                 .await
                 .unwrap_or((
                     session::HolderObservation::Missing,
                     session::HolderNetwork::NotProbed,
+                    false,
                 ));
+                if observed.2 {
+                    opline!(
+                        "seller node session job_id={job_id}: runsc holder network restored from docker's record; containment re-verified"
+                    );
+                }
+                let observed = (observed.0, observed.1);
                 if let (session::HolderObservation::Running { .. }, network) = &observed
                     && *network != session::HolderNetwork::Up
                 {
@@ -606,6 +621,32 @@ impl SellerNodeRunner {
         {
             self.end_session_now(record, SessionState::Closed).await;
         }
+    }
+
+    /// `None` unless this seat's sandbox runtime is `runsc`. On a runsc seat: the containment policy
+    /// turn 1 installed into the session's holder, rebuilt from the recorded proxy address, this
+    /// seat's `proxy_port_range` and the session's resolver file — or why it could not be.
+    fn runsc_session_policy(
+        &self,
+        record: &SessionRecord,
+    ) -> Option<Result<crate::sandbox_net::NetPolicy, String>> {
+        let home = self.node.home();
+        let config = home.config.sandbox.as_ref()?;
+        if config.runtime.as_deref().map(str::trim) != Some("runsc") {
+            return None;
+        }
+        let policy = SandboxPolicy::from_config(Some(config))
+            .map_err(|e| format!("sandbox policy: {e}"))
+            .and_then(|sandbox| {
+                let paths = session_gc::SessionPaths::for_job(&home.root, &record.job_id);
+                let resolv = std::fs::read_to_string(&paths.resolv_conf).ok();
+                session_gc::session_containment_policy(
+                    record.proxy_host.as_deref(),
+                    sandbox.proxy_ports(),
+                    resolv.as_deref(),
+                )
+            });
+        Some(policy)
     }
 
     /// The resumed container run and the turn's RESULT (§6.1 steps 2–4, §7, §8.2).

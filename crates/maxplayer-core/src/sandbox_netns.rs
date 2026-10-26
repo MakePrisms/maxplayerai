@@ -1350,6 +1350,82 @@ pub fn readback_argv(holder_name: &str, image: &str, family: Family) -> Vec<Stri
     .collect()
 }
 
+/// `docker run` argv for the one write a resumed session's holder may receive: putting back the IPv4
+/// address or default route docker recorded for it, after a gVisor (`runsc`) sandbox's netstack took
+/// them from the namespace and did not hand them back when the job container exited.
+///
+/// The same shape and the same single capability as [`sidecar_argv`]: the sidecar image,
+/// `--network container:<holder>`, `--cap-drop ALL --cap-add NET_ADMIN`, `no-new-privileges`, and the
+/// job's helper labels so a write that outlives its client is swept with the job's other helpers.
+/// `--entrypoint ip` replaces the iptables applier, so this container is handed no plan and cannot
+/// touch the firewall. Nothing here is computed: the address, prefix and gateway are docker's own
+/// record of the holder, and the device is the one [`crate::sandbox_iface::select_egress_link`]
+/// proved is the namespace's own veth.
+fn holder_ip_write_argv(
+    holder_name: &str,
+    image: &str,
+    labels: &[String],
+    ip_args: &[String],
+) -> Vec<String> {
+    let mut argv: Vec<String> = [
+        "docker",
+        "run",
+        "--rm",
+        "--network",
+        &NetnsHolder::network_mode_for(holder_name),
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "NET_ADMIN",
+        "--security-opt",
+        "no-new-privileges",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    argv.extend(labels.iter().cloned());
+    argv.extend(["--entrypoint", "ip", image, "-4"].map(String::from));
+    argv.extend(ip_args.iter().cloned());
+    argv
+}
+
+/// `ip -4 addr add <address>/<prefix_len> brd + dev <dev>` inside the holder; see
+/// [`holder_ip_write_argv`].
+pub fn restore_address_argv(
+    holder_name: &str,
+    image: &str,
+    labels: &[String],
+    dev: &str,
+    address: std::net::Ipv4Addr,
+    prefix_len: u8,
+) -> Vec<String> {
+    let cidr = format!("{address}/{prefix_len}");
+    holder_ip_write_argv(
+        holder_name,
+        image,
+        labels,
+        &["addr", "add", cidr.as_str(), "brd", "+", "dev", dev].map(String::from),
+    )
+}
+
+/// `ip -4 route add default via <gateway> dev <dev>` inside the holder; see
+/// [`holder_ip_write_argv`].
+pub fn restore_default_route_argv(
+    holder_name: &str,
+    image: &str,
+    labels: &[String],
+    dev: &str,
+    gateway: std::net::Ipv4Addr,
+) -> Vec<String> {
+    let via = gateway.to_string();
+    holder_ip_write_argv(
+        holder_name,
+        image,
+        labels,
+        &["route", "add", "default", "via", via.as_str(), "dev", dev].map(String::from),
+    )
+}
+
 /// The plan as the sidecar reads it: one `<binary> <args…>` line per rule, plus the count, so the
 /// caller can cross-check the sidecar's echoed total against what was actually rendered.
 ///
@@ -3313,6 +3389,103 @@ mod tests {
         // The holder must never carry it: it shares its namespace with the job.
         let holder_argv = holder_argv("h", "net", "img", 1000, 1000, "abc", &seat_b(), 2_000_000_000);
         assert!(!holder_argv.iter().any(|a| a == "NET_ADMIN"), "{holder_argv:?}");
+    }
+
+    /// The resume-time restore (runsc sessions) is the setup sidecar's shape and capability, with
+    /// `ip` as its entrypoint and docker's recorded values as its only arguments.
+    #[test]
+    fn the_holder_network_restore_is_the_sidecars_shape_with_ip_and_nothing_more() {
+        let labels = helper_label_args("j", "seat", 99);
+        let addr = restore_address_argv(
+            "maxplayer-netns-j",
+            "img",
+            &labels,
+            "eth0",
+            "172.19.0.5".parse().unwrap(),
+            16,
+        );
+        let route = restore_default_route_argv(
+            "maxplayer-netns-j",
+            "img",
+            &labels,
+            "eth0",
+            "172.19.0.1".parse().unwrap(),
+        );
+        assert!(
+            addr.ends_with(
+                &[
+                    "--entrypoint",
+                    "ip",
+                    "img",
+                    "-4",
+                    "addr",
+                    "add",
+                    "172.19.0.5/16",
+                    "brd",
+                    "+",
+                    "dev",
+                    "eth0"
+                ]
+                .map(String::from)
+            ),
+            "{addr:?}"
+        );
+        assert!(
+            route.ends_with(
+                &[
+                    "--entrypoint",
+                    "ip",
+                    "img",
+                    "-4",
+                    "route",
+                    "add",
+                    "default",
+                    "via",
+                    "172.19.0.1",
+                    "dev",
+                    "eth0"
+                ]
+                .map(String::from)
+            ),
+            "{route:?}"
+        );
+        for argv in [&addr, &route] {
+            assert_eq!(&argv[..3], &["docker", "run", "--rm"].map(String::from));
+            assert!(
+                argv.windows(2)
+                    .any(|w| w == ["--network", "container:maxplayer-netns-j"]),
+                "{argv:?}"
+            );
+            assert!(argv.windows(2).any(|w| w == ["--cap-drop", "ALL"]));
+            assert!(
+                argv.windows(2)
+                    .any(|w| w == ["--security-opt", "no-new-privileges"])
+            );
+            // Exactly the one capability the setup sidecar already carries, nothing broader.
+            let added: Vec<_> = argv
+                .windows(2)
+                .filter(|w| w[0] == "--cap-add")
+                .map(|w| w[1].clone())
+                .collect();
+            assert_eq!(added, ["NET_ADMIN"], "{argv:?}");
+            assert!(
+                !argv
+                    .iter()
+                    .any(|a| a == "--privileged" || a == "nsenter" || a.starts_with("--pid"))
+            );
+            for label in &labels {
+                assert!(argv.contains(label), "helper labels: {argv:?}");
+            }
+        }
+        // The setup sidecar it mirrors carries exactly the same capability set.
+        let holder = NetnsHolder::adopt("h".into(), DockerCli::system());
+        let sidecar = sidecar_argv(&holder, "img");
+        let sidecar_caps: Vec<_> = sidecar
+            .windows(2)
+            .filter(|w| w[0] == "--cap-add")
+            .map(|w| w[1].clone())
+            .collect();
+        assert_eq!(sidecar_caps, ["NET_ADMIN"], "{sidecar:?}");
     }
 
     #[test]

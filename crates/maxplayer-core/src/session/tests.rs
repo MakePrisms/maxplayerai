@@ -389,6 +389,7 @@ fn holder_without_network_expires_fail_closed() {
         HolderNetwork::NoAddress,
         HolderNetwork::NoDefaultRoute,
         HolderNetwork::ProbeFailed("exit 125: daemon".into()),
+        HolderNetwork::RestoreFailed("re-verify: tc filters missing".into()),
         HolderNetwork::NotProbed,
     ] {
         assert_eq!(
