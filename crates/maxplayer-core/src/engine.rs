@@ -518,6 +518,29 @@ fn after_leading_marker(text: &str) -> Option<&str> {
 /// Named rather than written inline at the call site so the retention rule can be tested on its own.
 /// An inline closure is reachable only through the driver it is installed beside, which is why the
 /// rule went untested when it was one.
+/// Whether `update` ends the agent message being streamed: only tool-call-type updates (and the
+/// turn's end) do. See [`AgentMessageCapture::observe`].
+fn closes_message(update: &SessionUpdate) -> bool {
+    match update {
+        SessionUpdate::ToolCall { .. }
+        | SessionUpdate::ToolResult { .. }
+        | SessionUpdate::PermissionRequest(_)
+        | SessionUpdate::TurnEnded(_) => true,
+        SessionUpdate::Ext(ext) => {
+            let kind = ext
+                .params
+                .get("update")
+                .unwrap_or(&ext.params)
+                .get("sessionUpdate")
+                .and_then(serde_json::Value::as_str);
+            matches!(kind, Some("tool_call" | "tool_call_update"))
+        }
+        SessionUpdate::Plan { .. }
+        | SessionUpdate::AgentMessage(_)
+        | SessionUpdate::AgentMessageChunk(_) => false,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentMessageCapture {
     last: Option<String>,
@@ -534,8 +557,12 @@ impl AgentMessageCapture {
     /// So a chunk is accumulated, never retained on its own: retaining it would make the captured
     /// "message" the last fragment, which is a different string from what the agent said.
     ///
-    /// Any other update closes the run of chunks. An agent streams its text, then calls a tool; the
-    /// text after that call is a new message, not a continuation. `TurnEnded` closes the last one.
+    /// A TOOL-CALL-type update closes the run of chunks (`tool_call`, `tool_call_update`, a tool
+    /// result, a permission request): an agent streams its text, then calls a tool, and the text
+    /// after that call is a new message, not a continuation. `TurnEnded` closes the last one.
+    /// Non-content updates — usage, thoughts, plans, mode/command/session-info notices — do NOT:
+    /// harnesses emit them mid-stream (the ACP driver passes them through as `Ext`), and closing on
+    /// one made the captured message only the tail after it, which then failed the marker gate.
     ///
     /// Whitespace-only text is not an account of anything and must not displace a real message;
     /// agents routinely close a turn with a bare newline chunk. That test is applied to the
@@ -559,7 +586,8 @@ impl AgentMessageCapture {
                     self.last = Some(text);
                 }
             }
-            _ => self.close_pending(),
+            update if closes_message(update) => self.close_pending(),
+            _ => {}
         }
     }
 
@@ -1135,6 +1163,82 @@ mod tests {
             "the last non-empty message must win: neither the trailing blank chunk nor the terminal \
              update carries an account of the turn, so neither may displace one"
         );
+    }
+
+    fn wire(kind: &str) -> SessionUpdate {
+        SessionUpdate::Ext(crate::driver::ExtMethod {
+            method: "session/update".into(),
+            params: serde_json::json!({"sessionId": "s", "update": {"sessionUpdate": kind}}),
+        })
+    }
+
+    fn chunk(text: &str) -> SessionUpdate {
+        SessionUpdate::AgentMessageChunk(ContentBlock::Text { text: text.into() })
+    }
+
+    /// rc2: usage, thought, plan and notice updates arriving between the chunks of ONE message do
+    /// not split it; the captured message is the whole of it, so the marker on its first line is
+    /// still first.
+    #[test]
+    fn non_content_updates_mid_message_do_not_split_it() {
+        for between in [
+            wire("usage_update"),
+            wire("agent_thought_chunk"),
+            wire("plan"),
+            wire("available_commands_update"),
+            wire("session_info_update"),
+            wire("current_mode_update"),
+            SessionUpdate::Plan {
+                entries: vec!["step".into()],
+            },
+        ] {
+            let mut capture = AgentMessageCapture::default();
+            for update in [
+                chunk(INLINE_ANSWER_MARKER),
+                between.clone(),
+                chunk(" WORKER1"),
+                wire("usage_update"),
+                chunk(" 47"),
+                SessionUpdate::TurnEnded(StopReason::Completed),
+            ] {
+                capture.observe(RunEvent::Update(&update));
+            }
+            let message = capture.into_last_message().expect("a message");
+            assert_eq!(
+                message,
+                format!("{INLINE_ANSWER_MARKER} WORKER1 47"),
+                "{between:?}"
+            );
+            assert_eq!(marked_inline_answer(&message), Some("WORKER1 47"));
+        }
+    }
+
+    /// A tool call still closes the message: the text after it is a new message, and the last wins.
+    #[test]
+    fn tool_call_updates_still_close_the_message() {
+        for tool in [
+            wire("tool_call"),
+            wire("tool_call_update"),
+            SessionUpdate::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+            SessionUpdate::ToolResult {
+                id: "1".into(),
+                output: serde_json::json!({}),
+            },
+        ] {
+            let mut capture = AgentMessageCapture::default();
+            for update in [chunk("let me look"), tool.clone(), chunk("the answer")] {
+                capture.observe(RunEvent::Update(&update));
+            }
+            assert_eq!(
+                capture.into_last_message().as_deref(),
+                Some("the answer"),
+                "{tool:?}"
+            );
+        }
     }
 
     #[test]
