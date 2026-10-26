@@ -9,7 +9,7 @@ import { dirname, join, relative } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, MAXPLAYER_TAGGED_KINDS, OFFER, PROFILE, RECEIPT, RESULT,
+  ACCEPT, AWARD, CLAIM, FEEDBACK, FOLLOW_UP, HEARTBEAT, MAXPLAYER_TAGGED_KINDS, OFFER, PROFILE, RECEIPT, RESULT,
   TRADE_KINDS, TRADE_LOT, TRADE_STATUS,
 } from "../src/model/kinds.js";
 import { PROFILE_KIND, TAGGED_KINDS } from "../scripts/bake-snapshot.mjs";
@@ -33,7 +33,7 @@ function sourceFiles(dir: string): string[] {
 test("kind numbers appear in exactly one file", () => {
   // The distinctive ones only. PROFILE is 0, and scanning for a bare 0 would
   // match arithmetic everywhere — it gets the shape-based check below instead.
-  const distinctive = [OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT, TRADE_LOT, TRADE_STATUS, 23412];
+  const distinctive = [OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT, FOLLOW_UP, TRADE_LOT, TRADE_STATUS, 23412];
   const pattern = new RegExp(`\\b(${distinctive.join("|")})\\b`);
 
   const offenders: string[] = [];

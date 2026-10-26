@@ -40,6 +40,15 @@ export const RECEIPT = 3400;
  * false "offline".
  */
 export const HEARTBEAT = 30340;
+/**
+ * Buyer FOLLOW-UP on a session job (docs/specs/session-jobs.md §2.1). Buyer-
+ * authored, p-tags the awarded seller. `["status","turn"]` starts turn `n`
+ * (`["turn",n]`, n ≥ 2) and e-tags the result it continues with a `reply`
+ * marker; `["status","close"]` ends the session. A public job carries the
+ * buyer's message as `["i",text]`; a private one carries only
+ * `content-id`/`content-commitment` — the message itself is encrypted.
+ */
+export const FOLLOW_UP = 3412;
 /** Signed execution-safety review of an offer or result, published by Maxplayer's review service. */
 export const REVIEW = 3408;
 
@@ -55,7 +64,7 @@ export const SELF_TRADE_TAG = "self-trade";
 
 /** Kinds that carry `["t","maxplayer"]` — requested with a `#t` filter. */
 export const MAXPLAYER_TAGGED_KINDS: readonly number[] = Object.freeze([
-  OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT,
+  OFFER, CLAIM, RESULT, FEEDBACK, AWARD, ACCEPT, RECEIPT, HEARTBEAT, FOLLOW_UP,
 ]);
 
 /**
@@ -72,7 +81,7 @@ export const ADDRESSABLE_KINDS: readonly number[] = Object.freeze([HEARTBEAT]);
 export const REPLACEABLE_KINDS: readonly number[] = Object.freeze([PROFILE]);
 
 export type Stage =
-  | "offer" | "claim" | "award" | "result" | "accept" | "receipt" | "feedback";
+  | "offer" | "claim" | "award" | "result" | "accept" | "receipt" | "feedback" | "reply";
 
 /**
  * The stage each kind represents in a trade's life. Kinds absent from this map
@@ -86,6 +95,7 @@ export const TRADE_STAGES: Readonly<Record<number, Stage>> = Object.freeze({
   [ACCEPT]: "accept",
   [RECEIPT]: "receipt",
   [FEEDBACK]: "feedback",
+  [FOLLOW_UP]: "reply",
 });
 
 /** Plain-English label for a kind, wherever one must surface to a human. */
@@ -99,6 +109,7 @@ export const KIND_LABELS: Readonly<Record<number, string>> = Object.freeze({
   [ACCEPT]: "accept",
   [RECEIPT]: "receipt",
   [HEARTBEAT]: "heartbeat",
+  [FOLLOW_UP]: "reply",
 });
 
 /**

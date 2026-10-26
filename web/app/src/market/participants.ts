@@ -8,7 +8,7 @@
  */
 import { buildTrades } from "./trades.js";
 import { parseEvent, type ParsedEvent, type RawEvent, type AdvertisementTag, type HarnessModel } from "../model/events.js";
-import { ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "../model/kinds.js";
+import { ACCEPT, AWARD, CLAIM, FEEDBACK, FOLLOW_UP, HEARTBEAT, OFFER, PROFILE, RECEIPT, RESULT } from "../model/kinds.js";
 
 /**
  * The two states an awarded, undelivered job can be in. Derived presentation
@@ -107,7 +107,7 @@ export function participantProfiles(events: RawEvent[]): Map<string, Profile> {
  * its profile exists or a runner acts on its job.
  */
 export function racerLastActivity(events: RawEvent[]): Map<string, number> {
-  const buyerStages = new Set(["offer", "award", "accept", "receipt"]);
+  const buyerStages = new Set(["offer", "award", "accept", "receipt", "reply"]);
   const latest = new Map<string, number>();
   for (const e of events.map(parseEvent)) {
     if (!e || !e.stage || !buyerStages.has(e.stage)) continue;
@@ -181,12 +181,14 @@ export function inProgressJobs(events: RawEvent[], now: number, graceSeconds = S
     award: ParsedEvent | null;
     deadline: number | null;
     terminals: ParsedEvent[];
+    /** Newest session FOLLOW-UP (turn or close), if any. */
+    followUp: ParsedEvent | null;
   }
   const jobs = new Map<string, PendingJob>();
   const get = (offerId: string): PendingJob => {
     let job = jobs.get(offerId);
     if (!job) {
-      job = { offerId, buyer: null, award: null, deadline: null, terminals: [] };
+      job = { offerId, buyer: null, award: null, deadline: null, terminals: [], followUp: null };
       jobs.set(offerId, job);
     }
     return job;
@@ -205,6 +207,9 @@ export function inProgressJobs(events: RawEvent[], now: number, graceSeconds = S
           (e.created_at === job.award.created_at && e.id < job.award.id)) job.award = e;
     } else if ([RESULT, ACCEPT, RECEIPT, FEEDBACK].includes(e.kind)) {
       job.terminals.push(e);
+    } else if (e.kind === FOLLOW_UP) {
+      const f = job.followUp;
+      if (!f || e.created_at > f.created_at || (e.created_at === f.created_at && e.id > f.id)) job.followUp = e;
     }
   }
 
@@ -218,22 +223,28 @@ export function inProgressJobs(events: RawEvent[], now: number, graceSeconds = S
     // Feedback ends the attempt only when its protocol class says so: a
     // `status=progress` note — explicitly non-terminal per §7.2, and REQUIRED
     // from a working seller — must not clear the lamp before any result.
-    const finished = job.terminals.some((e) =>
+    const ends = (e: ParsedEvent, since: number): boolean => e.created_at >= since && (
       e.kind === ACCEPT || e.kind === RECEIPT ||
       (e.kind === RESULT && e.seller === seller) ||
-      (e.kind === FEEDBACK && e.seller === seller && e.created_at >= award.created_at && e.terminal));
-    if (finished) continue;
+      (e.kind === FEEDBACK && e.seller === seller && e.terminal === true));
+    // A session job the buyer sent back to work: the newest follow-up starts a
+    // turn and nothing at or after it answers that turn. It is in progress
+    // again, from the follow-up, against the follow-up's own deadline.
+    const turn = job.followUp?.status === "turn" ? job.followUp : null;
+    const reopened = turn != null && !job.terminals.some((e) => ends(e, turn.created_at));
+    if (!reopened && job.terminals.some((e) => ends(e, award.created_at))) continue;
+    const deadline = reopened ? turn!.deadline ?? null : job.deadline;
     // No deadline means we never saw the offer, not that the job is on time.
     // An absence is not evidence of lateness — it stays working and visible.
-    const overdue = job.deadline != null && now > job.deadline + graceSeconds;
+    const overdue = deadline != null && now > deadline + graceSeconds;
     active.push({
       offerId: job.offerId,
       awardId: award.id,
       claimId: award.claimId ?? null,
       buyer,
       seller,
-      startedAt: award.created_at,
-      deadline: job.deadline,
+      startedAt: reopened ? turn!.created_at : award.created_at,
+      deadline,
       state: overdue ? JOB_OVERDUE : JOB_WORKING,
     });
   }
@@ -546,7 +557,7 @@ export function participantActivity(events: RawEvent[], pubkey: string): ParsedE
  * is the truth the timestamps are too coarse to carry.
  */
 const STAGE_RANK: Record<string, number> = {
-  offer: 0, claim: 1, award: 2, result: 3, feedback: 4, accept: 5, receipt: 6,
+  offer: 0, claim: 1, award: 2, result: 3, feedback: 4, accept: 5, receipt: 6, reply: 7,
 };
 const stageRank = (e: ParsedEvent): number => (e.stage != null ? STAGE_RANK[e.stage] ?? 50 : 50);
 

@@ -57,6 +57,18 @@ function counterparty(view: MarketView, e: ParsedEvent, want: "buyer" | "seller"
   return t?.sellerConflict ? CONFLICTED_SELLER : null;
 }
 
+/**
+ * ` · turn N` on a result, accept or receipt of a job that ran more than one
+ * turn, so its rounds can be told apart. Nothing on a one-turn job, and
+ * nothing when the event names no turn the trade can place.
+ */
+function turnSuffix(view: MarketView, e: ParsedEvent): string {
+  const t = e.offerId ? view.trades.get(e.offerId) : null;
+  if (!t || t.turns < 2) return "";
+  const n = t.turnOf.get(e.id);
+  return n != null ? ` · turn ${n}` : "";
+}
+
 /** One line of plain English per event kind — the feed reads, not decodes. */
 export function feedLine(view: MarketView, e: ParsedEvent): string {
   const who = identity(view.names, e.pubkey);
@@ -70,11 +82,22 @@ export function feedLine(view: MarketView, e: ParsedEvent): string {
     // "awarded the job", not "awarded a claim" — the claim is the mechanism,
     // the job is what the reader understands changed hands.
     case "award": { const to = counterparty(view, e, "seller"); return `${who} awarded the job${to ? ` to ${to}` : ""}`; }
-    case "result": { const to = counterparty(view, e, "buyer"); return `${who} delivered${to ? ` to ${to}` : ""}`; }
+    case "result": { const to = counterparty(view, e, "buyer"); return `${who} delivered${to ? ` to ${to}` : ""}${turnSuffix(view, e)}`; }
     // "accepted the delivery", not "authorised payment": it sits directly
     // above "paid" in the feed.
-    case "accept": { const from = counterparty(view, e, "seller"); return `${who} accepted the delivery${from ? ` from ${from}` : ""}`; }
-    case "receipt": { const to = counterparty(view, e, "seller"); return `${who} paid${to ? ` ${to}` : ""}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`; }
+    case "accept": { const from = counterparty(view, e, "seller"); return `${who} accepted the delivery${from ? ` from ${from}` : ""}${turnSuffix(view, e)}`; }
+    case "receipt": { const to = counterparty(view, e, "seller"); return `${who} paid${to ? ` ${to}` : ""}${turnSuffix(view, e)}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`; }
+    // A session FOLLOW-UP: the buyer sends the same seller back to work, or
+    // ends the session. A private job's message is encrypted, and says so the
+    // way a private offer says "Private task".
+    case "reply": {
+      const to = counterparty(view, e, "seller");
+      if (e.status === "close") return `${who} ended the session${to ? ` with ${to}` : ""}`;
+      const message = e.privateMessage
+        ? ' · <span title="The message is encrypted to the seller">private reply</span>'
+        : e.message ? ` · ${esc(e.message)}` : "";
+      return `${who} replied${to ? ` to ${to}` : ""}${e.turn != null ? ` · turn ${e.turn}` : ""}${message}`;
+    }
     case "feedback": return `${who} · ${esc(e.reason || "feedback")}`;
     default: return who;
   }

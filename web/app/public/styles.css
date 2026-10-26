@@ -463,7 +463,7 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
   border: 1px solid var(--line); border-radius: 2px; padding: 2px 0;
   color: var(--muted);
 }
-.tag[data-s="offer"] { color: var(--ink); border-color: var(--muted); }
+.tag[data-s="offer"], .tag[data-s="reply"] { color: var(--ink); border-color: var(--muted); }
 .tag[data-s="claim"] { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
 .tag[data-s="award"] { color: #ff6a4d; border-color: rgba(255, 40, 0, 0.4); }
 .tag[data-s="result"] { color: var(--ink-2); }

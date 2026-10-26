@@ -7,7 +7,7 @@
  * open relay must never take the page down.
  */
 import {
-  ACCEPT, AWARD, CLAIM, FEEDBACK, HEARTBEAT, OFFER, PROFILE, RECEIPT,
+  ACCEPT, AWARD, CLAIM, FEEDBACK, FOLLOW_UP, HEARTBEAT, OFFER, PROFILE, RECEIPT,
   RESULT, SELF_TRADE_TAG, TRADE_STAGES, type Stage,
 } from "./kinds.js";
 import { servingFromTags } from "./serving.mjs";
@@ -70,6 +70,18 @@ export interface ParsedEvent {
   deliveryVia?: string | null;
   commit?: string | null;
   wallTimeSeconds?: number | null;
+  /**
+   * Session jobs: the event this one answers, from `["e", id, "", "reply"]` —
+   * a follow-up names the result it continues, a result the follow-up it
+   * answers, an accept or receipt the result it settles.
+   */
+  replyTo?: string | null;
+  /** FOLLOW_UP: the turn it starts (n ≥ 2). Null on a close. */
+  turn?: number | null;
+  /** FOLLOW_UP on a public job: the buyer's message (`["i", text]`). Untrusted — escape it. */
+  message?: string | null;
+  /** FOLLOW_UP on a private job: the message is encrypted to the seller (`content-id`). */
+  privateMessage?: boolean;
   reason?: string;
   reasonCode?: string | null;
   feedbackClass?: string | null;
@@ -213,6 +225,20 @@ export function rootOfferId(event: RawEvent): string | null {
   // is not an event id is not one, whatever it claims.
   const named = firstTag(event, "E", "offer", "root");
   return isHex32(named) ? named : null;
+}
+
+/** The event a session-job event answers: the `e` tag marked `reply`. */
+function replyTarget(event: RawEvent): string | null {
+  for (const t of tagsNamed(event, "e")) if (t[3] === "reply" && isHex32(t[1])) return t[1] as string;
+  return null;
+}
+
+/** A follow-up's `["turn", n]`: whole digits only, n ≥ 2 (turn 1 is the offer itself). */
+function followUpTurn(event: RawEvent): number | null {
+  const raw = firstTag(event, "turn");
+  if (!raw || !/^[0-9]{1,6}$/.test(raw)) return null;
+  const n = Number(raw);
+  return n >= 2 ? n : null;
 }
 
 /** The non-root event selected by an award (the winning claim). */
@@ -424,9 +450,11 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
     case ACCEPT:
       return { ...base, offerId: rootOfferId(event), buyer: event.pubkey,
                acceptedSeller: boundSeller(event),
+               replyTo: replyTarget(event),
                status: firstTag(event, "status") };
     case RESULT:
       return { ...base, offerId: rootOfferId(event), seller: event.pubkey,
+               replyTo: replyTarget(event),
                amount: firstNumber(event, "amount", "amt", "sats"),
                // What actually did the work, and how it was handed over.
                harness: firstTag(event, "harness"),
@@ -441,6 +469,7 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                reason: feedbackReason(event),
                status: firstTag(event, "status"),
                reasonCode: firstTag(event, "reason_code"),
+               replyTo: replyTarget(event),
                feedbackClass: feedbackClass(event),
                terminal: feedbackIsTerminal(event) };
     // The co-signed settlement (§6.8). Buyer-authored, and its `p` tags name
@@ -450,7 +479,24 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
     case RECEIPT:
       return { ...base, offerId: rootOfferId(event),
                receiptSeller: boundSeller(event),
+               replyTo: replyTarget(event),
                amount: firstNumber(event, "amount", "amt", "sats") };
+    // A session FOLLOW-UP (docs/specs/session-jobs.md §2.1): the buyer starts
+    // turn n, or closes the session. Buyer-authored; its one `p` is the seller.
+    // A private job's message is encrypted — only `content-id` says one exists,
+    // and an `i` beside it is ignored rather than shown.
+    case FOLLOW_UP: {
+      const seller = firstTag(event, "p");
+      const encrypted = Boolean(firstTag(event, "content-id"));
+      return { ...base, offerId: rootOfferId(event), buyer: event.pubkey,
+               targetSeller: isHex32(seller) ? seller : null,
+               status: firstTag(event, "status"),
+               turn: followUpTurn(event),
+               replyTo: replyTarget(event),
+               deadline: Number.parseInt(param(event, "deadline") ?? "", 10) || null,
+               privateMessage: encrypted,
+               message: encrypted ? null : firstTag(event, "i") };
+    }
     case HEARTBEAT:
       return { ...base,
                d: firstTag(event, "d") || "",

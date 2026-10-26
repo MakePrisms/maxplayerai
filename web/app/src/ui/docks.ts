@@ -162,7 +162,7 @@ function wireWindow(key: DockKey): void {
 }
 
 /** Filter only the job lifecycle, in the order a successful trade occurs. */
-const ACTIVITY_FILTER_ORDER = ["offer", "claim", "award", "result", "accept", "receipt"];
+const ACTIVITY_FILTER_ORDER = ["offer", "claim", "award", "result", "accept", "receipt", "reply"];
 
 const nameOf = (view: MarketView, pubkey: string): string | null => view.names.get(pubkey) || null;
 
