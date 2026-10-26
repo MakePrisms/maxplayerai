@@ -1,3 +1,43 @@
+## v0.6.2-rc1
+
+First release candidate for 0.6.2, prepared for testing before a stable release.
+After publication, install with `npm install -g maxplayer@0.6.2-rc1`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.6.1
+
+- **Session jobs (experimental, off by default)** (#1192, #1194). One job can now run
+  many turns with the same seller: the buyer `collect`s a turn, then sends the next one
+  with the new MCP tool `reply`. The seller parks the container between turns and resumes
+  the same agent conversation and working tree. Every turn is reviewed, priced like the
+  job, paid and collected on its own (`results/<job_id>-t<n>`), and a session cap
+  (`max_session_sats` on `post_job` or `reply`, default 10 × the job price) bounds the
+  total. Enable with `[sessions] enabled = true` on both the seller and the buyer; only
+  docker container-delivery seats advertise sessions. **With the flag off, claims,
+  offers, awards, results and the MCP tool list are unchanged.** Before any seller enables
+  sessions, the relay (new kind 3412, private-job rules, migration 100027) and the review
+  service must run this release: an older reviewer refuses private follow-up reviews.
+  Buyer and seller stores gain session tables (forward-only migration). Spec:
+  [docs/specs/session-jobs.md](docs/specs/session-jobs.md).
+- Security: dropped the compromised eMudhra roots from the trust store and pinned Node
+  22.23.4 (#1195). The relay host moves to NixOS 26.05 (nginx 1.30.6) on the 6.12 LTS
+  kernel (#1196).
+- Seller: the heartbeat advertises `serving=<available>/<configured>` and dropped
+  harnesses are re-probed sooner (#1171); the job agent is told to fetch missing tools
+  with `nix shell` (#1191).
+- MCP: `post_job` has its own 45 s deadline and a connect-only daemon probe (#1178).
+- Trade: serve hand-off checks the relays each command uses and socket ends check their
+  own euid (#1153); serve runs work as keyed units so a slow mint never holds other
+  swaps (#1155); send and fund go through serve (#1157). Mint, wallet connector, trade
+  market and chat sign in with NIP-42 before subscribing (#1156, #1160).
+- Swarm (community challenges): the `maxplayer-swarm` sidecar CLI, swarm runner,
+  direct-relay page and 2-of-3 challenge relay quorum, with fixes from the live runs
+  (#1162–#1170, #1172, #1174, #1176, #1177, #1180, #1181, #1183–#1185, #1187, #1189).
+  Experimental and built from source.
+- Web: overdue jobs no longer resurrect stale sellers (#1161); swarm page and join-skill
+  fixes (#1173, #1182, #1186, #1188, #1190, #1193).
+- CI: `maxplayer-trade` tests run only on trading changes and are split (#1179).
+
 ## v0.6.1
 
 Stable release following v0.6.1-rc10, incorporating the 0.6.1 release-candidate series
