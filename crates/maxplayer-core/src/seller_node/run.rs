@@ -7492,6 +7492,17 @@ impl SellerNodeRunner {
             );
             return;
         }
+        // rc2: an offer replay of a job this seat already claimed and that has an award recorded
+        // (seller store `awarded`, or a private selection) is done — skip it quietly before the
+        // claim is rebuilt and projected. No claim row ⇒ a first claim, never skipped here.
+        let claim_state = self.node.store().claim_row_state(job_id).ok().flatten();
+        if super::privacy::replayed_claim_already_awarded(
+            claim_state.as_deref(),
+            claim_state.is_some() && super::privacy::selection_recorded(self.node.home(), job_id),
+        ) {
+            opline_verbose!("seller node offer skip id={job_id}: already claimed and awarded");
+            return;
+        }
         // Capacity back-pressure: never hold unbounded parked claims.
         match self.node.store().health() {
             Ok(health) if health.open_claims >= AWAITING_AWARD_CAP => {
