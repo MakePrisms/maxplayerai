@@ -3032,6 +3032,45 @@ fn harness_fault_for(error: &ExecError) -> Option<ExecutionFailure> {
     }
 }
 
+/// Whether a `no_sentinel` refusal strikes the harness that produced `last_agent_message`.
+///
+/// `no_sentinel` strikes because an empty tree plus some text is what a dead harness produces. A
+/// reply that CONTAINS [`crate::engine::INLINE_ANSWER_MARKER`] did not come from one: only a model
+/// that read this job's prompt writes that token. If the marker gate still refused it (a format
+/// the gate does not accept, an empty answer, a cut or unauthenticated outcome), delivery and
+/// payment are refused as before, but the harness proved it is alive and stays in the pool (rc2
+/// sweep: codex/opencode/muse answers on the marker line were refused AND dropped the harness).
+fn no_sentinel_strikes_harness(last_agent_message: Option<&str>) -> bool {
+    !last_agent_message.is_some_and(|m| m.contains(crate::engine::INLINE_ANSWER_MARKER))
+}
+
+#[cfg(test)]
+mod no_sentinel_strike_tests {
+    use super::no_sentinel_strikes_harness;
+    use crate::engine::INLINE_ANSWER_MARKER as M;
+
+    #[test]
+    fn a_reply_containing_the_marker_never_strikes_the_harness() {
+        assert!(
+            no_sentinel_strikes_harness(None),
+            "a turn that said nothing strikes"
+        );
+        assert!(no_sentinel_strikes_harness(Some(
+            "Upgrade your plan to continue"
+        )));
+        assert!(no_sentinel_strikes_harness(Some("")));
+        // Refused by the marker gate, but the model read the prompt: no strike.
+        for refused in [
+            M.to_string(),
+            format!("{M}-DRAFT 47"),
+            format!("here it is:\n{M}\n47"),
+            format!("{M}   \n"),
+        ] {
+            assert!(!no_sentinel_strikes_harness(Some(&refused)), "{refused:?}");
+        }
+    }
+}
+
 /// What a container-delivered job hands back to `execute_job`: the pushed commit, the branch it is
 /// on, and the agent's report for the seller-claimed exec-metadata block.
 struct ContainerDelivery {
@@ -9005,11 +9044,20 @@ impl SellerNodeRunner {
                     // Harness-attributable: the agent returned success having left nothing to deliver.
                     // This is the site that fires on a quota-dead harness — its turn "completes", so the
                     // agent-run arm above sees no error at all — which is why the trigger cannot live at
-                    // one site.
-                    self.drop_harness(
-                        harness,
-                        Some(ExecutionFailure::Harness(Fault::Unproven)),
-                    );
+                    // one site. A reply that carries the marker is exempt (refused, not struck).
+                    let strike =
+                        !matches!(&error, seller_git::SellerGitError::NoExecutionObserved(_))
+                            || no_sentinel_strikes_harness(report.last_agent_message.as_deref());
+                    if strike {
+                        self.drop_harness(
+                            harness,
+                            Some(ExecutionFailure::Harness(Fault::Unproven)),
+                        );
+                    } else {
+                        opline!(
+                            "seller node execute job_id={job_id}: reply carried the answer marker but was refused; harness not struck"
+                        );
+                    }
                     let (reason_code, feedback) = match error {
                         seller_git::SellerGitError::NoExecutionObserved(_) => {
                             opline!(
@@ -10118,10 +10166,13 @@ impl SellerNodeRunner {
                 // too, and treating that as an answer leaves a dead seat in the pool taking jobs.
                 // Truncation cannot hide the marker — it is the first line, and the cut is at the
                 // end — so the marker survives every message this arm can see.
+                // rc2: a reply that merely CONTAINS the marker is exempt too — the gate refused
+                // its shape, not a dead harness (see `no_sentinel_strikes_harness`).
                 let answered = last_agent_message
                     .as_deref()
                     .and_then(crate::engine::marked_inline_answer)
-                    .is_some();
+                    .is_some()
+                    || !no_sentinel_strikes_harness(last_agent_message.as_deref());
                 if answered {
                     opline!(
                         "seller node execute fail job_id={job_id}: delivery refused no_sentinel — \
