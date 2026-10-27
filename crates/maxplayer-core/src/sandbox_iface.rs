@@ -606,6 +606,13 @@ fn to_tc_port_range(dport: &str) -> String {
     }
 }
 
+/// The `tc filter show` shape of `plan`, for tests outside this module (a shape, not a capture; see
+/// the test helper it wraps).
+#[cfg(test)]
+pub(crate) fn readback_fixture(plan: &IfacePlan) -> String {
+    tests::as_tc_output(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,7 +715,7 @@ mod tests {
     /// have something to mutate. The anchors against reality are
     /// [`the_parser_reads_the_shape_tc_actually_prints`], which parses a literal capture, and the
     /// live gate in `tests/sandbox_iface_live.rs`, which asks a real kernel.
-    fn as_tc_output(plan: &IfacePlan) -> String {
+    pub(super) fn as_tc_output(plan: &IfacePlan) -> String {
         let mut out = String::new();
         for filter in &plan.filters {
             let protocol = tc_protocol(filter.family);

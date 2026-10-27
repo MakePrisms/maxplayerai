@@ -443,7 +443,38 @@ impl SessionState {
 pub enum HolderObservation {
     Missing,
     NotRunning,
-    Running { started_at: String },
+    Running {
+        started_at: String,
+    },
+    /// The holder-state `docker inspect` did not answer within its bound (a hung daemon), so
+    /// whether the holder still exists is unknown. Not `Missing`: nothing said it is gone. Fails
+    /// closed with `holder_network_lost`, like every other resume check that could not answer.
+    Unanswered(String),
+}
+
+/// What the holder's network namespace looked like at resume, read by an unprivileged helper that
+/// joins it (`--network container:<holder>`), before any job container starts.
+///
+/// A holder can be running, unrestarted and still carry the firewall rules while its namespace has
+/// lost every address and route: measured on runsc seats, where turn 1's gVisor sandbox leaves the
+/// parked holder with only `lo`. A turn started into that namespace cannot reach the credential
+/// proxy, burns ~4 minutes, and strikes a healthy harness. Only [`HolderNetwork::Up`] starts a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HolderNetwork {
+    /// A non-loopback IPv4 address and a default route are present.
+    Up,
+    /// No non-loopback IPv4 address in the namespace.
+    NoAddress,
+    /// An address, but no default route.
+    NoDefaultRoute,
+    /// The probe could not answer (docker error, timeout, unreadable output). Fail-closed.
+    ProbeFailed(String),
+    /// runsc only: the namespace lost its address or default route, and putting docker's recorded
+    /// values back was refused (no veth, no usable record, filters not as installed) or did not
+    /// re-verify afterwards. Fail-closed; the session expires and its holder is removed.
+    RestoreFailed(String),
+    /// Not probed: the holder already failed its own check, or no probe was run at all.
+    NotProbed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,11 +487,15 @@ pub enum ResumeGate {
 
 /// §5.5: a holder that is gone, stopped, or restarted (a new `State.StartedAt` is a new network
 /// namespace with no firewall rules) expires the session; so does an orchestrator that predates
-/// the inputs protocol the host would send.
+/// the inputs protocol the host would send. A holder that passes all of that must ALSO still have a
+/// network ([`HolderNetwork::Up`]); anything else — including a probe that could not answer or was
+/// never run — expires with `holder_network_lost`. A holder-state inspect that timed out
+/// ([`HolderObservation::Unanswered`]) expires with `holder_network_lost` too.
 pub fn resume_gate(
     recorded_holder_started_at: Option<&str>,
     observed: &HolderObservation,
     recorded_orchestrator_protocol: u32,
+    network: &HolderNetwork,
 ) -> ResumeGate {
     if recorded_orchestrator_protocol < SESSION_PROTOCOL {
         return ResumeGate::Expire("orchestrator_too_old");
@@ -471,8 +506,12 @@ pub fn resume_gate(
     match observed {
         HolderObservation::Missing => ResumeGate::Expire("holder_missing"),
         HolderObservation::NotRunning => ResumeGate::Expire("holder_not_running"),
+        HolderObservation::Unanswered(_) => ResumeGate::Expire("holder_network_lost"),
         HolderObservation::Running { started_at } if started_at != recorded => {
             ResumeGate::Expire("holder_restarted")
+        }
+        HolderObservation::Running { .. } if *network != HolderNetwork::Up => {
+            ResumeGate::Expire("holder_network_lost")
         }
         HolderObservation::Running { .. } => ResumeGate::Start,
     }

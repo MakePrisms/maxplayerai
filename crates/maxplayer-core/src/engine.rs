@@ -458,9 +458,13 @@ pub const INLINE_ANSWER_MARKER: &str = "MAXPLAYER-ANSWER-V1";
 
 /// The answer an agent marked for inline delivery, or `None` when it marked none.
 ///
-/// The marker must be on the FIRST non-blank line and be the only WORD on it. First, because a
-/// marker the agent could bury anywhere is one a quoted task description or a pasted log can forge
-/// by accident.
+/// The marker must be the FIRST whitespace-delimited token of the FIRST non-blank line. First,
+/// because a marker the agent could bury anywhere is one a quoted task description or a pasted log
+/// can forge by accident. The answer is the rest of that line plus every following line, trimmed:
+/// codex, opencode and muse agents routinely write `MAXPLAYER-ANSWER-V1 WORKER1 47` on one line,
+/// and refusing that refused a correct, prompted answer, left it unpaid, and struck a healthy
+/// harness. What keeps forgery out is the position and the exact token, not the line break: a
+/// longer token (`MAXPLAYER-ANSWER-V1-DRAFT`) or a marker anywhere but first is still refused.
 ///
 /// Markdown decoration around the token is accepted — `` `MARKER` ``, `**MARKER**`, `# MARKER`, a
 /// trailing colon. A model told to emit an exact line routinely formats it, and every such reply is
@@ -469,8 +473,10 @@ pub const INLINE_ANSWER_MARKER: &str = "MAXPLAYER-ANSWER-V1";
 /// obedience. Nothing is weakened: the decoration characters cannot make an unmarked message
 /// marked.
 ///
-/// The answer is everything after that line, trimmed. An empty remainder is `None`: a marker with
-/// nothing behind it is not an answer, and §6.4 refuses an empty inline delivery anyway.
+/// One repeated leading marker is stripped from the answer: an agent that wrote the marker line
+/// and then `MARKER <answer>` (measured on muse) means `<answer>`, not a reply naming the marker.
+/// An empty answer is `None`: a marker with nothing behind it is not an answer, and §6.4 refuses
+/// an empty inline delivery anyway.
 pub fn marked_inline_answer(message: &str) -> Option<&str> {
     let text = message.trim_start();
     // A fenced first line (```), which some models wrap the whole reply in, is stepped over.
@@ -478,20 +484,28 @@ pub fn marked_inline_answer(message: &str) -> Option<&str> {
         Some(rest) => rest.split_once('\n').map(|(_, body)| body)?.trim_start(),
         None => text,
     };
-    let (first, rest) = match text.split_once('\n') {
-        Some((first, rest)) => (first, rest),
-        // No newline at all: the whole message is one line, so there is nothing behind the marker.
-        None => return None,
-    };
-    // Strip the decoration a model reaches for, then require what is left to BE the marker.
-    let bare = first.trim().trim_start_matches('#').trim();
-    let bare = bare.trim_matches(|c| c == '`' || c == '*' || c == '_').trim();
-    let bare = bare.strip_suffix(':').unwrap_or(bare).trim();
-    if bare != INLINE_ANSWER_MARKER {
-        return None;
+    let mut answer = after_leading_marker(text)?.trim();
+    if let Some(again) = after_leading_marker(answer) {
+        answer = again.trim();
     }
-    let answer = rest.trim();
     (!answer.is_empty()).then_some(answer)
+}
+
+/// Everything after the marker when `text`'s first line starts with it (decoration allowed), else
+/// `None`. `text` must not start with whitespace.
+fn after_leading_marker(text: &str) -> Option<&str> {
+    let first = text.split('\n').next().unwrap_or("");
+    // Strip the heading decoration a model reaches for, then take the first word.
+    let line = first.trim_start_matches('#').trim_start();
+    let start = first.len() - line.len();
+    let end = line.find(char::is_whitespace).unwrap_or(line.len());
+    let decoration = |c: char| c == '`' || c == '*' || c == '_';
+    let bare = line[..end].trim_matches(decoration);
+    let bare = bare
+        .strip_suffix(':')
+        .unwrap_or(bare)
+        .trim_matches(decoration);
+    (bare == INLINE_ANSWER_MARKER).then(|| &text[start + end..])
 }
 
 /// The agent's own account of a turn, accumulated from the sink [`run_job`] already calls for every
@@ -504,6 +518,29 @@ pub fn marked_inline_answer(message: &str) -> Option<&str> {
 /// Named rather than written inline at the call site so the retention rule can be tested on its own.
 /// An inline closure is reachable only through the driver it is installed beside, which is why the
 /// rule went untested when it was one.
+/// Whether `update` ends the agent message being streamed: only tool-call-type updates (and the
+/// turn's end) do. See [`AgentMessageCapture::observe`].
+fn closes_message(update: &SessionUpdate) -> bool {
+    match update {
+        SessionUpdate::ToolCall { .. }
+        | SessionUpdate::ToolResult { .. }
+        | SessionUpdate::PermissionRequest(_)
+        | SessionUpdate::TurnEnded(_) => true,
+        SessionUpdate::Ext(ext) => {
+            let kind = ext
+                .params
+                .get("update")
+                .unwrap_or(&ext.params)
+                .get("sessionUpdate")
+                .and_then(serde_json::Value::as_str);
+            matches!(kind, Some("tool_call" | "tool_call_update"))
+        }
+        SessionUpdate::Plan { .. }
+        | SessionUpdate::AgentMessage(_)
+        | SessionUpdate::AgentMessageChunk(_) => false,
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentMessageCapture {
     last: Option<String>,
@@ -520,8 +557,12 @@ impl AgentMessageCapture {
     /// So a chunk is accumulated, never retained on its own: retaining it would make the captured
     /// "message" the last fragment, which is a different string from what the agent said.
     ///
-    /// Any other update closes the run of chunks. An agent streams its text, then calls a tool; the
-    /// text after that call is a new message, not a continuation. `TurnEnded` closes the last one.
+    /// A TOOL-CALL-type update closes the run of chunks (`tool_call`, `tool_call_update`, a tool
+    /// result, a permission request): an agent streams its text, then calls a tool, and the text
+    /// after that call is a new message, not a continuation. `TurnEnded` closes the last one.
+    /// Non-content updates — usage, thoughts, plans, mode/command/session-info notices — do NOT:
+    /// harnesses emit them mid-stream (the ACP driver passes them through as `Ext`), and closing on
+    /// one made the captured message only the tail after it, which then failed the marker gate.
     ///
     /// Whitespace-only text is not an account of anything and must not displace a real message;
     /// agents routinely close a turn with a bare newline chunk. That test is applied to the
@@ -545,7 +586,8 @@ impl AgentMessageCapture {
                     self.last = Some(text);
                 }
             }
-            _ => self.close_pending(),
+            update if closes_message(update) => self.close_pending(),
+            _ => {}
         }
     }
 
@@ -994,9 +1036,19 @@ mod tests {
             "the marker must be alone on its line, not a prefix of a longer token"
         );
         assert_eq!(
-            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER} and then some\nx")),
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}-DRAFT 47")),
             None,
-            "prose on the marker line is not a marker"
+            "a longer token is not the marker, on one line either"
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("answer: {INLINE_ANSWER_MARKER} 47")),
+            None,
+            "the marker must be the first word of the first line"
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}   \n\n")),
+            None,
+            "a one-line marker with nothing behind it delivers nothing"
         );
 
         // A model told to emit an exact line formats it. Each of these is a CORRECT answer, and
@@ -1020,6 +1072,70 @@ mod tests {
             marked_inline_answer(&format!("here you go:\n{INLINE_ANSWER_MARKER}\nx")),
             None,
             "a marker buried below the first line is one a pasted log could forge"
+        );
+    }
+
+    /// rc2 sweep: codex, opencode and muse put the answer on the marker line. That is the marker
+    /// as the first word of the first line, and the answer is the rest of the reply.
+    #[test]
+    fn the_answer_may_share_the_marker_line() {
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER} WORKER1 47")),
+            Some("WORKER1 47")
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER} WORKER1 47\nand more\n")),
+            Some("WORKER1 47\nand more"),
+            "the rest of the marker line plus the following lines"
+        );
+        for decorated in [
+            format!("**{INLINE_ANSWER_MARKER}** WORKER1 47"),
+            format!("`{INLINE_ANSWER_MARKER}` WORKER1 47"),
+            format!("# {INLINE_ANSWER_MARKER} WORKER1 47"),
+            format!("{INLINE_ANSWER_MARKER}: WORKER1 47"),
+            format!("```\n{INLINE_ANSWER_MARKER} WORKER1 47"),
+            format!("\n  {INLINE_ANSWER_MARKER}\tWORKER1 47  "),
+        ] {
+            assert_eq!(
+                marked_inline_answer(&decorated),
+                Some("WORKER1 47"),
+                "{decorated:?}"
+            );
+        }
+    }
+
+    /// muse's "passing" run sent the marker twice; the second must not become part of the answer.
+    #[test]
+    fn one_repeated_leading_marker_is_stripped_from_the_answer() {
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER}\n{INLINE_ANSWER_MARKER} WORKERMU1 47"
+            )),
+            Some("WORKERMU1 47")
+        );
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER}\n**{INLINE_ANSWER_MARKER}**\nWORKERMU1 47"
+            )),
+            Some("WORKERMU1 47")
+        );
+        assert_eq!(
+            marked_inline_answer(&format!("{INLINE_ANSWER_MARKER}\n{INLINE_ANSWER_MARKER}")),
+            None,
+            "two markers and nothing else is still an empty answer"
+        );
+        // Only ONE repeat is stripped, and a longer token is answer text.
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER} {INLINE_ANSWER_MARKER} {INLINE_ANSWER_MARKER} x"
+            )),
+            Some(format!("{INLINE_ANSWER_MARKER} x").as_str())
+        );
+        assert_eq!(
+            marked_inline_answer(&format!(
+                "{INLINE_ANSWER_MARKER}\n{INLINE_ANSWER_MARKER}-DRAFT x"
+            )),
+            Some(format!("{INLINE_ANSWER_MARKER}-DRAFT x").as_str())
         );
     }
 
@@ -1047,6 +1163,82 @@ mod tests {
             "the last non-empty message must win: neither the trailing blank chunk nor the terminal \
              update carries an account of the turn, so neither may displace one"
         );
+    }
+
+    fn wire(kind: &str) -> SessionUpdate {
+        SessionUpdate::Ext(crate::driver::ExtMethod {
+            method: "session/update".into(),
+            params: serde_json::json!({"sessionId": "s", "update": {"sessionUpdate": kind}}),
+        })
+    }
+
+    fn chunk(text: &str) -> SessionUpdate {
+        SessionUpdate::AgentMessageChunk(ContentBlock::Text { text: text.into() })
+    }
+
+    /// rc2: usage, thought, plan and notice updates arriving between the chunks of ONE message do
+    /// not split it; the captured message is the whole of it, so the marker on its first line is
+    /// still first.
+    #[test]
+    fn non_content_updates_mid_message_do_not_split_it() {
+        for between in [
+            wire("usage_update"),
+            wire("agent_thought_chunk"),
+            wire("plan"),
+            wire("available_commands_update"),
+            wire("session_info_update"),
+            wire("current_mode_update"),
+            SessionUpdate::Plan {
+                entries: vec!["step".into()],
+            },
+        ] {
+            let mut capture = AgentMessageCapture::default();
+            for update in [
+                chunk(INLINE_ANSWER_MARKER),
+                between.clone(),
+                chunk(" WORKER1"),
+                wire("usage_update"),
+                chunk(" 47"),
+                SessionUpdate::TurnEnded(StopReason::Completed),
+            ] {
+                capture.observe(RunEvent::Update(&update));
+            }
+            let message = capture.into_last_message().expect("a message");
+            assert_eq!(
+                message,
+                format!("{INLINE_ANSWER_MARKER} WORKER1 47"),
+                "{between:?}"
+            );
+            assert_eq!(marked_inline_answer(&message), Some("WORKER1 47"));
+        }
+    }
+
+    /// A tool call still closes the message: the text after it is a new message, and the last wins.
+    #[test]
+    fn tool_call_updates_still_close_the_message() {
+        for tool in [
+            wire("tool_call"),
+            wire("tool_call_update"),
+            SessionUpdate::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                input: serde_json::json!({}),
+            },
+            SessionUpdate::ToolResult {
+                id: "1".into(),
+                output: serde_json::json!({}),
+            },
+        ] {
+            let mut capture = AgentMessageCapture::default();
+            for update in [chunk("let me look"), tool.clone(), chunk("the answer")] {
+                capture.observe(RunEvent::Update(&update));
+            }
+            assert_eq!(
+                capture.into_last_message().as_deref(),
+                Some("the answer"),
+                "{tool:?}"
+            );
+        }
     }
 
     #[test]

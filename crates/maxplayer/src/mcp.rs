@@ -425,7 +425,7 @@ fn tools_for(sessions: bool) -> Value {
             }
             Some("get_job") => {
                 let description = tool["description"].as_str().unwrap_or_default().to_owned();
-                tool["description"] = json!(format!("{description} On a session job the response carries session: {{supported, turn, status (running|parked|closed|expired|no_response), turn_status (done|needs_input|out_of_time), question (the seller's question when needs_input), context_reset, uncollected_turn, expires_hint}}. no_response means the turn's deadline passed with no result: its reservation was released and reply may retry."));
+                tool["description"] = json!(format!("{description} On a session job the response carries session: {{supported, turn, status (running|parked|closed|expired|no_response), turn_status (done|needs_input|out_of_time from the current turn's result; pending|refused|no_response when that turn has no result), question (the seller's question when needs_input), context_reset, uncollected_turn, expires_hint}}. no_response means the turn's deadline passed with no result: its reservation was released and reply may retry."));
             }
             _ => {}
         }

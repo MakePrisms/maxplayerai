@@ -556,6 +556,56 @@ pub(super) async fn send_close(
     }
 }
 
+/// The turn `get_job.session` describes: the newest follow-up the buyer sent (any state), or turn 1
+/// when none was sent. `result_id` is THAT turn's result only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CurrentTurn {
+    pub turn: u32,
+    /// The follow-up row's state; `None` for turn 1.
+    pub followup_state: Option<String>,
+    pub result_id: Option<String>,
+}
+
+pub(super) fn current_turn(facts: &Facts) -> CurrentTurn {
+    match facts.turns.iter().max_by_key(|t| (t.turn, t.deadline_unix)) {
+        Some(t) => CurrentTurn {
+            turn: t.turn,
+            followup_state: Some(t.state.clone()),
+            result_id: facts
+                .delivered
+                .get(&t.followup_id)
+                .cloned()
+                .or_else(|| t.result_id.clone()),
+        },
+        None => CurrentTurn {
+            turn: 1,
+            followup_state: None,
+            result_id: facts.turn1_result.clone(),
+        },
+    }
+}
+
+/// `turn_status` for the current turn. "Absent ⇒ `done`" (§2.3) is a rule about a RESULT's tag, so
+/// it applies only when the turn has one. Without a result: `refused` (the seller's feedback refused
+/// or failed it, e.g. `no_sentinel`), `no_response` (deadline passed), else `pending`. Never `done`.
+pub(super) fn turn_status_for(
+    followup_state: Option<&str>,
+    result: Option<&job_lifecycle::ResultSession>,
+) -> String {
+    if let Some(session) = result {
+        return session
+            .turn_status
+            .clone()
+            .unwrap_or_else(|| crate::session::TurnStatus::Done.as_str().into());
+    }
+    match followup_state {
+        Some("refused") => "refused",
+        Some("no_response") => "no_response",
+        _ => "pending",
+    }
+    .into()
+}
+
 /// `get_job.session` (§10). `None` unless sessions are enabled and the job is a session job.
 pub(super) async fn view(context: &BuyerContext, view: &job_lifecycle::JobView) -> Option<Value> {
     if !context.home.config.sessions.enabled {
@@ -582,6 +632,7 @@ pub(super) async fn view(context: &BuyerContext, view: &job_lifecycle::JobView) 
         facts = self::facts(context, job_id, &award, view).ok()?;
     }
     let latest = facts.turns.iter().max_by_key(|t| (t.turn, t.deadline_unix));
+    let current = current_turn(&facts);
     let progress = progress(&facts);
     let status = match row.as_ref().map(|(_, s)| s.as_str()) {
         Some("closed") => "closed",
@@ -590,22 +641,27 @@ pub(super) async fn view(context: &BuyerContext, view: &job_lifecycle::JobView) 
         _ if latest.is_some_and(|t| t.state == "no_response") => "no_response",
         _ => "parked",
     };
-    let turn = latest
-        .filter(|t| live(t) || t.state == "no_response")
-        .map_or(1, |t| t.turn);
-    let result_id = latest
-        .filter(|t| live(t))
-        .and_then(|t| facts.delivered.get(&t.followup_id).cloned())
-        .or(facts.turn1_result.clone());
-    let result = view.results.iter().find(|r| {
-        Some(&r.result_id) == result_id.as_ref()
-            || (result_id.is_none()
+    // The CURRENT turn's own result, and nothing else: turn n's status must never be read off
+    // turn n-1's delivery (rc2: a refused turn 3 reported `done` from turn 1's result).
+    let result = view.results.iter().find(|r| match &current.result_id {
+        Some(id) => &r.result_id == id,
+        None => {
+            current.followup_state.is_none()
                 && r.seller_pubkey == award.seller_pubkey
-                && r.is_turn_one_delivery())
+                && r.is_turn_one_delivery()
+        }
     });
-    let turn_status = result
-        .and_then(|r| r.session.turn_status.clone())
-        .unwrap_or_else(|| "done".into());
+    let turn = current.turn;
+    let turn_status = turn_status_for(
+        current.followup_state.as_deref(),
+        result.map(|r| &r.session),
+    );
+    // The lifetime hint counts from the newest delivery of the session, whichever turn it was.
+    let last_delivery = view
+        .results
+        .iter()
+        .filter(|r| r.seller_pubkey == award.seller_pubkey && r.has_delivery())
+        .max_by_key(|r| r.created_at);
     let question = result
         .filter(|_| turn_status == crate::session::TurnStatus::NeedsInput.as_str())
         .and_then(|r| r.inline_answer.clone());
@@ -618,7 +674,7 @@ pub(super) async fn view(context: &BuyerContext, view: &job_lifecycle::JobView) 
         "context_reset": result.is_some_and(|r| r.session.context_reset),
         "uncollected_turn": progress.uncollected,
         // The SELLER's lifetime decides; this is the default counted from the last delivery.
-        "expires_hint": result.map(|r| r.created_at + crate::home::DEFAULT_SESSION_LIFETIME_SECS),
+        "expires_hint": last_delivery.map(|r| r.created_at + crate::home::DEFAULT_SESSION_LIFETIME_SECS),
     }))
 }
 
@@ -982,6 +1038,78 @@ mod tests {
         assert!(progress(&f).in_flight);
         f.delivered.insert("c".into(), "r3".into());
         assert_eq!(progress(&f).uncollected, Some(3));
+    }
+
+    /// rc2 sweep: the seller refused turn 3 (`no_sentinel`) and published no result. The view must
+    /// not borrow turn 1's (or turn 2's) result and call turn 3 `done`.
+    #[test]
+    fn a_turn_without_a_result_is_never_done() {
+        let turn = |id: &str, n: u32, state: &str, result: Option<&str>| BuyerTurn {
+            followup_id: id.into(),
+            job_id: "job".into(),
+            turn: n,
+            event_json: String::new(),
+            amount_sats: 1,
+            deadline_unix: 9,
+            result_id: result.map(str::to_owned),
+            state: state.into(),
+        };
+        let mut f = ready();
+        f.turn1_result = Some("r1".into());
+        f.turns = vec![
+            turn("a", 2, "collected", Some("r2")),
+            turn("b", 3, "refused", None),
+        ];
+        f.delivered.insert("a".into(), "r2".into());
+        let current = current_turn(&f);
+        assert_eq!(
+            current,
+            CurrentTurn {
+                turn: 3,
+                followup_state: Some("refused".into()),
+                result_id: None
+            }
+        );
+        assert_eq!(
+            turn_status_for(current.followup_state.as_deref(), None),
+            "refused"
+        );
+        // In flight, deadline passed, and the plain pending cases.
+        for (state, want) in [
+            ("sent", "pending"),
+            ("pending", "pending"),
+            ("no_response", "no_response"),
+        ] {
+            f.turns[1].state = state.into();
+            let current = current_turn(&f);
+            assert_eq!(current.result_id, None);
+            assert_eq!(
+                turn_status_for(current.followup_state.as_deref(), None),
+                want
+            );
+        }
+        // Delivered: the result's own tag, and absent ⇒ done applies to that result.
+        f.turns[1].state = "delivered".into();
+        f.delivered.insert("b".into(), "r3".into());
+        assert_eq!(current_turn(&f).result_id.as_deref(), Some("r3"));
+        let mut tags = job_lifecycle::ResultSession::default();
+        assert_eq!(turn_status_for(Some("delivered"), Some(&tags)), "done");
+        tags.turn_status = Some("needs_input".into());
+        assert_eq!(
+            turn_status_for(Some("delivered"), Some(&tags)),
+            "needs_input"
+        );
+        // A collected turn whose result aged out of the relay view keeps its stored result id.
+        f.delivered.remove("b");
+        f.turns[1].state = "collected".into();
+        f.turns[1].result_id = Some("r3".into());
+        assert_eq!(current_turn(&f).result_id.as_deref(), Some("r3"));
+        // Turn 1 with no follow-up yet: its own result, or pending before it lands.
+        let mut f = ready();
+        f.turn1_result = None;
+        let current = current_turn(&f);
+        assert_eq!((current.turn, current.result_id), (1, None));
+        assert_eq!(turn_status_for(None, None), "pending");
     }
 
     /// `no_response` (§10): a turn past its deadline with no result is released; a delivered one

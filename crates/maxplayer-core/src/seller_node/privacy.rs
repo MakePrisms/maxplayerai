@@ -51,6 +51,29 @@ pub fn known(
     let context = pc::channel::ContentContext::open(home, seller)?;
     Ok(Some((context, offer)))
 }
+/// Whether the private content store holds an authenticated selection (claim + award) for `id`.
+/// Unreadable or absent store ⇒ `false`: callers use this only to SKIP work quietly, never to
+/// decide money, so the fail-safe direction is "not recorded".
+pub fn selection_recorded(home: &MaxplayerHome, id: &str) -> bool {
+    let path = home.root.join("private-content.sqlite");
+    path.exists()
+        && pc::store::ContentStore::open(&path)
+            .and_then(|store| store.selection(id))
+            .is_ok_and(|selected| selected.is_some())
+}
+
+/// rc2: on the 5-minute offer replay, a job this seller ALREADY claimed and that has an award
+/// recorded must not be projected as a claim again (ClaimDetails refuses an award id and the
+/// refusal was logged as `seller private claim refused … invalid claim details` every pass).
+/// `claim_state` is this seat's own claim row; with none, this is a first claim and is never skipped.
+pub fn replayed_claim_already_awarded(claim_state: Option<&str>, selection_recorded: bool) -> bool {
+    match claim_state {
+        None => false,
+        Some("awarded") => true,
+        Some(_) => selection_recorded,
+    }
+}
+
 /// Prepare text before a seller co-signature or outbox write. The exact nonce is
 /// retained across retry; the outbox itself then contains only closed public tags.
 pub fn project(
@@ -491,6 +514,23 @@ pub fn execution(home: &MaxplayerHome, seller: &str, id: &str) -> pc::Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_an_existing_claim_with_a_recorded_award_skips_the_replay() {
+        // A first claim (no claim row) is never skipped, whatever the content store says.
+        assert!(!replayed_claim_already_awarded(None, false));
+        assert!(!replayed_claim_already_awarded(None, true));
+        // Our claim was awarded (seller store), or an award selection is recorded for it.
+        assert!(replayed_claim_already_awarded(Some("awarded"), false));
+        assert!(replayed_claim_already_awarded(Some("claimed"), true));
+        assert!(replayed_claim_already_awarded(Some("released"), true));
+        // Claimed, nothing awarded yet: the replay re-projects exactly as before.
+        assert!(!replayed_claim_already_awarded(Some("claimed"), false));
+        // No content store at all reads as no selection.
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::home::bootstrap(dir.path()).unwrap();
+        assert!(!selection_recorded(&home, &"22".repeat(32)));
+    }
+
     #[test]
     fn missing_private_context_never_reclassifies_a_resumed_job_as_public() {
         let dir = tempfile::tempdir().unwrap();

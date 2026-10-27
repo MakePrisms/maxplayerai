@@ -522,12 +522,74 @@ impl SellerNodeRunner {
         let protocol = record.orchestrator_version.parse::<u32>().unwrap_or(0);
         let gate = match record.holder.clone() {
             Some(holder) => {
+                // The holder's own state first, then (only for a running holder) its namespace's
+                // address and default route, read by an unprivileged helper joined to it. Both
+                // run before any job container starts; a probe that cannot answer expires the
+                // session (`holder_network_lost`) rather than starting a turn into a dead network.
+                let labels = crate::sandbox_netns::helper_label_args(
+                    &job_id,
+                    &self.seller_pubkey.to_hex(),
+                    crate::sandbox_netns::cleanup_after_unix(turn.deadline_unix),
+                );
+                // runsc only: gVisor's netstack takes the holder's IPv4 address and routes when the
+                // job container joins and does not hand them back, so a parked runsc holder is
+                // restored from docker's record and its whole containment re-verified before the
+                // turn starts (`session_gc::resume_holder_network`). runc seats: probe only.
+                let runsc_policy = self.runsc_session_policy(&record);
+                // Every docker call here — the holder-state inspect, the network probe, the runsc
+                // restore and its re-verify — is bounded (per call and in total, ONE clock started
+                // here, before the queue). A probe/restore timeout is a docker error like any other:
+                // fail closed, `holder_network_lost`. A holder-state inspect that times out is
+                // `HolderObservation::Unanswered`, which also expires as `holder_network_lost`.
+                let mut bounded = session_gc::BoundedDockerCli::for_holder_network();
                 let observed = tokio::task::spawn_blocking(move || {
-                    session_gc::observe_holder(&mut RealDockerCli, &holder)
+                    let observed = session_gc::observe_holder(&mut bounded, &holder);
+                    let network = if matches!(observed, session::HolderObservation::Running { .. })
+                    {
+                        session_gc::resume_holder_network(
+                            &mut bounded,
+                            &holder,
+                            crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
+                            &labels,
+                            runsc_policy
+                                .as_ref()
+                                .map(|p| p.as_ref().map_err(Clone::clone)),
+                        )
+                    } else {
+                        (session::HolderNetwork::NotProbed, false)
+                    };
+                    (observed, network.0, network.1)
                 })
                 .await
-                .unwrap_or(session::HolderObservation::Missing);
-                session::resume_gate(record.holder_started_at.as_deref(), &observed, protocol)
+                .unwrap_or((
+                    session::HolderObservation::Missing,
+                    session::HolderNetwork::NotProbed,
+                    false,
+                ));
+                if observed.2 {
+                    opline!(
+                        "seller node session job_id={job_id}: runsc holder network restored from docker's record; containment re-verified"
+                    );
+                }
+                let observed = (observed.0, observed.1);
+                if let session::HolderObservation::Unanswered(error) = &observed.0 {
+                    opline!(
+                        "seller node session job_id={job_id}: holder state check failed ({error})"
+                    );
+                }
+                if let (session::HolderObservation::Running { .. }, network) = &observed
+                    && *network != session::HolderNetwork::Up
+                {
+                    opline!(
+                        "seller node session job_id={job_id}: holder network check failed ({network:?})"
+                    );
+                }
+                session::resume_gate(
+                    record.holder_started_at.as_deref(),
+                    &observed.0,
+                    protocol,
+                    &observed.1,
+                )
             }
             // An uncontained docker seat has no holder to verify.
             None if protocol >= session::SESSION_PROTOCOL => session::ResumeGate::Start,
@@ -570,6 +632,32 @@ impl SellerNodeRunner {
         {
             self.end_session_now(record, SessionState::Closed).await;
         }
+    }
+
+    /// `None` unless this seat's sandbox runtime is `runsc`. On a runsc seat: the containment policy
+    /// turn 1 installed into the session's holder, rebuilt from the recorded proxy address, this
+    /// seat's `proxy_port_range` and the session's resolver file — or why it could not be.
+    fn runsc_session_policy(
+        &self,
+        record: &SessionRecord,
+    ) -> Option<Result<crate::sandbox_net::NetPolicy, String>> {
+        let home = self.node.home();
+        let config = home.config.sandbox.as_ref()?;
+        if config.runtime.as_deref().map(str::trim) != Some("runsc") {
+            return None;
+        }
+        let policy = SandboxPolicy::from_config(Some(config))
+            .map_err(|e| format!("sandbox policy: {e}"))
+            .and_then(|sandbox| {
+                let paths = session_gc::SessionPaths::for_job(&home.root, &record.job_id);
+                let resolv = std::fs::read_to_string(&paths.resolv_conf).ok();
+                session_gc::session_containment_policy(
+                    record.proxy_host.as_deref(),
+                    sandbox.proxy_ports(),
+                    resolv.as_deref(),
+                )
+            });
+        Some(policy)
     }
 
     /// The resumed container run and the turn's RESULT (§6.1 steps 2–4, §7, §8.2).

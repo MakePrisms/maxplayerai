@@ -287,29 +287,92 @@ fn restarted_or_missing_holder_and_old_orchestrator_expire() {
     let running = |s: &str| HolderObservation::Running {
         started_at: s.into(),
     };
+    let up = HolderNetwork::Up;
     assert_eq!(
-        resume_gate(Some(at), &running(at), SESSION_PROTOCOL),
+        resume_gate(Some(at), &running(at), SESSION_PROTOCOL, &up),
         ResumeGate::Start
     );
     assert_eq!(
-        resume_gate(Some(at), &running("2026-10-21T11:00:00Z"), SESSION_PROTOCOL),
+        resume_gate(
+            Some(at),
+            &running("2026-10-21T11:00:00Z"),
+            SESSION_PROTOCOL,
+            &up
+        ),
         ResumeGate::Expire("holder_restarted")
     );
     assert_eq!(
-        resume_gate(Some(at), &HolderObservation::NotRunning, SESSION_PROTOCOL),
+        resume_gate(
+            Some(at),
+            &HolderObservation::NotRunning,
+            SESSION_PROTOCOL,
+            &up
+        ),
         ResumeGate::Expire("holder_not_running")
     );
     assert_eq!(
-        resume_gate(Some(at), &HolderObservation::Missing, SESSION_PROTOCOL),
+        resume_gate(Some(at), &HolderObservation::Missing, SESSION_PROTOCOL, &up),
         ResumeGate::Expire("holder_missing")
     );
     assert_eq!(
-        resume_gate(None, &running(at), SESSION_PROTOCOL),
+        resume_gate(None, &running(at), SESSION_PROTOCOL, &up),
         ResumeGate::Expire("holder_unrecorded")
     );
     assert_eq!(
-        resume_gate(Some(at), &running(at), 0),
+        resume_gate(Some(at), &running(at), 0, &up),
         ResumeGate::Expire("orchestrator_too_old")
+    );
+}
+
+/// rc2 (runsc sweep): a running, unrestarted holder whose namespace lost its address or default
+/// route, or whose probe could not answer or never ran, expires with `holder_network_lost` and the
+/// turn's container never starts.
+#[test]
+fn holder_without_network_expires_fail_closed() {
+    let at = "2026-10-21T10:00:00.123Z";
+    let running = HolderObservation::Running {
+        started_at: at.into(),
+    };
+    for network in [
+        HolderNetwork::NoAddress,
+        HolderNetwork::NoDefaultRoute,
+        HolderNetwork::ProbeFailed("exit 125: daemon".into()),
+        HolderNetwork::RestoreFailed("re-verify: tc filters missing".into()),
+        HolderNetwork::NotProbed,
+    ] {
+        assert_eq!(
+            resume_gate(Some(at), &running, SESSION_PROTOCOL, &network),
+            ResumeGate::Expire("holder_network_lost"),
+            "{network:?}"
+        );
+    }
+    // A holder-state inspect that never answered is a lost network, not a missing holder, whatever
+    // the network says.
+    for network in [HolderNetwork::NotProbed, HolderNetwork::Up] {
+        assert_eq!(
+            resume_gate(
+                Some(at),
+                &HolderObservation::Unanswered("timed out: `docker` did not finish".into()),
+                SESSION_PROTOCOL,
+                &network
+            ),
+            ResumeGate::Expire("holder_network_lost"),
+            "{network:?}"
+        );
+    }
+    // The holder's own failures still name themselves, whatever the network says.
+    assert_eq!(
+        resume_gate(
+            Some(at),
+            &HolderObservation::Missing,
+            SESSION_PROTOCOL,
+            &HolderNetwork::NotProbed
+        ),
+        ResumeGate::Expire("holder_missing")
+    );
+    assert_eq!(
+        resume_gate(Some(at), &running, SESSION_PROTOCOL, &HolderNetwork::Up),
+        ResumeGate::Start
     );
 }
 
