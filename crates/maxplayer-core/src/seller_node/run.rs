@@ -13087,13 +13087,26 @@ mod tests {
     #[test]
     fn award_filter_adds_followups_only_when_sessions_are_enabled() {
         let pk = nostr_sdk::prelude::Keys::generate().public_key();
+        // Check the parsed `kinds` array, never the raw JSON: the filter also carries the random
+        // `#p` pubkey hex, which contains "3412" in about 1 run in 1,100.
+        let kinds_of = |filter: &serde_json::Value| -> Vec<u64> {
+            filter["kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|k| k.as_u64())
+                .collect()
+        };
+        let followup = u64::from(crate::kinds::SESSION_FOLLOWUP_KIND);
         for open_pool in [false, true] {
             let off = serde_json::to_string(&award_filter_with(pk, open_pool, false)).unwrap();
             assert_eq!(off, serde_json::to_string(&award_filter(pk, open_pool)).unwrap());
-            assert!(!off.contains("3412"), "{off}");
+            let off_kinds = kinds_of(&serde_json::from_str(&off).unwrap());
+            assert!(!off_kinds.contains(&followup), "{off}");
+            assert_eq!(off_kinds.len(), 3, "{off}");
             let on = serde_json::to_value(award_filter_with(pk, open_pool, true)).unwrap();
-            let kinds: Vec<u64> = on["kinds"].as_array().unwrap().iter().filter_map(|k| k.as_u64()).collect();
-            assert!(kinds.contains(&u64::from(crate::kinds::SESSION_FOLLOWUP_KIND)), "{on}");
+            let kinds = kinds_of(&on);
+            assert!(kinds.contains(&followup), "{on}");
             assert_eq!(kinds.len(), 4);
         }
         assert!(handled_event_kind(Kind::Custom(crate::kinds::SESSION_FOLLOWUP_KIND)));
