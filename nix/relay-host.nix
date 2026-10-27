@@ -1,7 +1,8 @@
 # Deployment host config for the launch relay — the concrete box that `nixosModules.relay` is designed to be
-# imported into. Deploy, building ON the target so nothing cross-compiles from an x86 workstation:
+# imported into. Deploy a CI-built `relay-v*` tag (runbook: docs/DEPLOYMENT.md "Deploying the relay"); do NOT
+# use `--build-host` on this box by default — it compiles the Rust packages here (~2 h on the t3.small):
 #
-#   nixos-rebuild switch --flake .#relay --target-host root@34.225.223.145 --build-host root@34.225.223.145
+#   nixos-rebuild switch --flake github:MakePrisms/maxplayerai/relay-vN#relay
 #
 # Target: AWS EC2 t3.small-class (x86_64, 2 vCPU / 2 GB), first booted from a NixOS 26.05 x86_64 AMI. The AMI
 # is only the bootstrap — after the first switch the running system is whatever this flake's nixpkgs (26.05)
@@ -171,7 +172,13 @@
     443
   ];
 
-  # A t3.small has 2 GB and no swap, but `nixos-rebuild --build-host` builds this box's own closure ON the box:
+  # Prebuilt relay systems from CI (.github/workflows/relay-build.yml pushes each `relay-v*` tag's closure).
+  # Merged with the NixOS default cache.nixos.org entry, not replacing it. Public key only; the push token
+  # lives in the repo's Actions secrets. A path missing from the cache still builds locally.
+  nix.settings.substituters = [ "https://maxplayer.cachix.org" ];
+  nix.settings.trusted-public-keys = [ "maxplayer.cachix.org-1:kagbHiSvJhLPUX6cKTnXM3IiM5rMcYpaJaj9phmOBEQ=" ];
+
+  # A t3.small has 2 GB and no swap, but a deploy of an unbuilt commit (or `--build-host`) builds this box's own closure ON the box:
   # the coordinating `nix` process alone peaked at 1.57 GB RSS and was OOM-killed, taking the deploy with it
   # (ssh exit 255). Swap is what makes the box able to build itself. 4 GB on a 59 GB root volume is free real
   # estate; without it every future switch is a coin flip against the OOM killer.

@@ -199,10 +199,12 @@ identity matches `privacy.service_pubkey` and can authenticate and read authoriz
 private as well as public Git repositories on the relay. Do not
 rotate the signing key on every deploy; clients trust that specific identity.
 
-Deploy the reviewed revision through the existing NixOS host flow:
+Deploy the reviewed revision through the relay deploy flow in
+[`DEPLOYMENT.md`](DEPLOYMENT.md#deploying-the-relay): tag it `relay-vN`, wait for the
+"Relay build" workflow to go green on the tag, then on the relay:
 
 ```sh
-nixos-rebuild switch --flake .#relay --target-host root@<host> --build-host root@<host>
+nixos-rebuild switch --flake github:MakePrisms/maxplayerai/relay-vN#relay
 ```
 
 On the target, verify:
