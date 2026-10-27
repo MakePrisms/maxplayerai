@@ -128,7 +128,13 @@ only downloads and activates.
 2. Wait for the **Relay build** run on that tag to go green (Actions tab, or
    `gh run list -R MakePrisms/maxplayerai --workflow relay-build.yml --limit 1`). It can also be
    started from "Run workflow" on a tag.
-3. On the relay, as root, back up and switch to the tag:
+3. Check that the tag names a commit on `main` (anyone with write access can create a
+   `relay-v*` tag, and CI builds and caches whatever it points at):
+   ```sh
+   git fetch origin --tags && git merge-base --is-ancestor relay-vN origin/main && echo on-main
+   ```
+   No `on-main`, no deploy.
+4. On the relay, as root, back up and switch to the tag:
    ```sh
    systemctl start buzz-relay-backup.service
    export NIX_CONFIG="experimental-features = nix-command flakes"
@@ -137,7 +143,7 @@ only downloads and activates.
    The output should show `copying path … from 'https://maxplayer.cachix.org'` for the
    maxplayer packages and no `building` lines for them. If it starts compiling Rust, stop
    (Ctrl-C): the build for that commit is missing or failed.
-4. Verify the switch took, by comparison rather than exit code (see the header of
+5. Verify the switch took, by comparison rather than exit code (see the header of
    `nix/relay-host.nix`):
    ```sh
    readlink -f /run/current-system; readlink -f /nix/var/nix/profiles/system   # must match
@@ -154,11 +160,13 @@ The first deploy of the commit that added the cache to `relay-host.nix` runs whi
 not trust it yet; pass it for that one switch (root is a trusted Nix user):
 `--option extra-substituters https://maxplayer.cachix.org --option extra-trusted-public-keys maxplayer.cachix.org-1:kagbHiSvJhLPUX6cKTnXM3IiM5rMcYpaJaj9phmOBEQ=`
 
-`relay-v*` tags must not move once built: a repository tag ruleset ("relay-v* tags immutable",
-Settings → Rules, admin-only) blocks updates and deletion of `refs/tags/relay-v*`, so a tag always
-names the commit that was built. Use a new `relay-vN` for every deploy. The push token is the `CACHIX_AUTH_TOKEN` Actions secret;
-pull requests that change the workflow build it too but do not push (their merge-commit builds
-are never deployed).
+`relay-v*` tags must not move once built: use a new `relay-vN` for every deploy, never re-point or
+delete one. Nothing enforces this yet; a tag ruleset blocking updates and deletion of
+`refs/tags/relay-v*` (admin-only to add) is planned. The push token is the `CACHIX_AUTH_TOKEN`
+repository Actions secret, so anyone with write access can reach it (e.g. via "Run workflow" on a
+branch); scoping it to a tag-only `cachix` environment is planned with the ruleset. Pull requests
+that change the workflow build it too but do not push (their merge-commit builds are never
+deployed).
 
 ### Roadmap — not yet built (do not assume these exist)
 

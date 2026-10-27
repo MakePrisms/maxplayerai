@@ -28,6 +28,12 @@ on:
 permissions:
   contents: read
 
+# Plain `run:` steps default to `bash -e {0}`, without pipefail: `nix build … | tee` would then pass
+# even when the build fails. An explicit `shell: bash` runs `bash --noprofile --norc -eo pipefail {0}`.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     name: Build .#relay (x86_64-linux)
@@ -40,7 +46,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: cachix/install-nix-action@v31
+      # Third-party actions that see the Cachix push token are pinned to a commit, not a movable tag.
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -48,7 +55,7 @@ jobs:
       # Pull from the cache (unchanged packages, e.g. the buzz relay when only crates/ moved, are
       # downloaded instead of rebuilt). skipPush: the daemon would push every path built here,
       # toolchains and vendor dirs included; we push only the relay's runtime closure below.
-      - uses: cachix/cachix-action@v17
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: maxplayer
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
@@ -72,6 +79,10 @@ jobs:
         run: |
           if [ -z "$CACHIX_AUTH_TOKEN" ]; then
             echo "::error::CACHIX_AUTH_TOKEN is not set; the relay system was built but not cached."
+            exit 1
+          fi
+          if [ ! -s out-path.txt ]; then
+            echo "::error::out-path.txt is empty; the build produced no system path to push."
             exit 1
           fi
           cachix push maxplayer "$(cat out-path.txt)"
