@@ -174,6 +174,165 @@ pub fn judge_holder_network(
     }
 }
 
+/// Per-call bound for the docker calls in the resume-time holder-network check (probe, runsc
+/// restore, re-verify). Each is a `docker inspect` or a `docker run --rm` of the already-pulled
+/// netfilter image, which finishes in about a second; thirty is far outside that and still ends a
+/// resume whose daemon has stopped answering.
+pub const HOLDER_NETWORK_CALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Total budget for every docker call in one resume's holder-network check. A full runsc restore is
+/// about twenty calls, so a per-call bound alone would allow ten minutes against a hung daemon.
+pub const HOLDER_NETWORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// A [`DockerCli`] whose every call is bounded, for the resume-time holder-network check.
+///
+/// The same rules as the sidecar runner in [`crate::sandbox_netns`] (which is `acp`-only and async,
+/// so it cannot be called from here directly): ONE clock, started when this value is built (before
+/// the work is queued for a blocking thread), that every call spends. A call whose budget is
+/// already spent is refused before it is spawned. A call that outlives its bound is killed AND
+/// reaped. Either way the caller gets an `Err` naming the timeout. The check treats that like any
+/// other docker error, which fails closed (`holder_network_lost`).
+///
+/// Output is shaped exactly like [`crate::seller_exec::RealDockerCli`]: trimmed stdout on exit 0,
+/// `exit <code>: <stderr, else stdout>` otherwise. A call that finishes in time therefore reads the
+/// same as it did before.
+pub struct BoundedDockerCli {
+    started: std::time::Instant,
+    per_call: std::time::Duration,
+    budget: std::time::Duration,
+    /// Test-only: what a leading `docker` is replaced with at the spawn site. Empty in production.
+    stand_in: Vec<String>,
+}
+
+impl BoundedDockerCli {
+    pub fn new(per_call: std::time::Duration, budget: std::time::Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            per_call,
+            budget,
+            stand_in: Vec::new(),
+        }
+    }
+
+    /// Test-only: run `program` (with its own leading args) wherever an argv says `docker`.
+    #[cfg(test)]
+    fn stand_in(
+        program: &[&str],
+        per_call: std::time::Duration,
+        budget: std::time::Duration,
+    ) -> Self {
+        Self {
+            stand_in: program.iter().map(|a| (*a).to_owned()).collect(),
+            ..Self::new(per_call, budget)
+        }
+    }
+
+    /// The production bounds: [`HOLDER_NETWORK_CALL_DEADLINE`] per call within
+    /// [`HOLDER_NETWORK_BUDGET`].
+    pub fn for_holder_network() -> Self {
+        Self::new(HOLDER_NETWORK_CALL_DEADLINE, HOLDER_NETWORK_BUDGET)
+    }
+}
+
+impl DockerCli for BoundedDockerCli {
+    fn run(&mut self, argv: &[String]) -> Result<String, String> {
+        use std::io::Read as _;
+        use std::sync::mpsc::RecvTimeoutError;
+
+        let substituted: Vec<String>;
+        let argv =
+            if argv.first().map(String::as_str) == Some("docker") && !self.stand_in.is_empty() {
+                substituted = self.stand_in.iter().chain(&argv[1..]).cloned().collect();
+                &substituted[..]
+            } else {
+                argv
+            };
+        let (program, args) = argv.split_first().ok_or("an empty docker argv")?;
+        let left = self.budget.saturating_sub(self.started.elapsed());
+        if left.is_zero() {
+            return Err(format!(
+                "timed out: `{program}` was not started, the {}s budget for this check is spent",
+                self.budget.as_secs()
+            ));
+        }
+        let bound = self.per_call.min(left);
+        let expires = std::time::Instant::now() + bound;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("could not run `{program}`: {error}"))?;
+        // Drained on their own threads so a chatty child cannot fill a pipe and stall its own exit,
+        // and received with what is left of the bound, so a pipe held open cannot outlast it.
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            if let Some(mut pipe) = pipe {
+                std::thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    let _ = pipe.read_to_end(&mut bytes);
+                    let _ = tx.send(bytes);
+                });
+            }
+            rx
+        };
+        let stdout_rx = drain(
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        );
+        let stderr_rx = drain(
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn std::io::Read + Send>),
+        );
+        let timed_out = |what: &str| {
+            format!(
+                "timed out: `{program}` {what} within {}ms",
+                bound.as_millis()
+            )
+        };
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() >= expires => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(timed_out("did not finish and was killed"));
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("could not wait for `{program}`: {error}"));
+                }
+            }
+        };
+        let read = |rx: std::sync::mpsc::Receiver<Vec<u8>>| match rx
+            .recv_timeout(expires.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+            Err(RecvTimeoutError::Timeout) => {
+                Err(timed_out("exited but its output was not drained"))
+            }
+        };
+        let stdout = String::from_utf8_lossy(&read(stdout_rx)?).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&read(stderr_rx)?).trim().to_owned();
+        match status.code() {
+            Some(0) => Ok(stdout),
+            Some(code) => Err(format!(
+                "exit {code}: {}",
+                if stderr.is_empty() { &stdout } else { &stderr }
+            )),
+            None => Err("killed by a signal".to_string()),
+        }
+    }
+}
+
 /// §5.5 holder network check: does the parked holder's namespace still have its address and a
 /// default route? Runs before any job container starts; see [`HolderNetwork`].
 pub fn observe_holder_network<D: DockerCli>(
@@ -1519,5 +1678,144 @@ mod tests {
         );
         assert!(session_containment_policy(None, ports, Some(resolv)).is_err());
         assert!(session_containment_policy(Some("172.17.0.1"), ports, None).is_err());
+    }
+
+    // ── bounded docker calls at resume ──────────────────────────────────────────────────────
+
+    fn ms(n: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(n)
+    }
+
+    /// Finished in time: the same output shape `RealDockerCli` gives, so nothing downstream changes.
+    #[test]
+    fn bounded_docker_call_in_time_reads_like_the_unbounded_one() {
+        let mut ok = BoundedDockerCli::stand_in(
+            &["sh", "-c", "echo ' 172.19.0.5 '; echo noise >&2"],
+            ms(5_000),
+            ms(10_000),
+        );
+        assert_eq!(
+            ok.run(&["docker".into(), "inspect".into()]),
+            Ok("172.19.0.5".into())
+        );
+        let mut refused = BoundedDockerCli::stand_in(
+            &["sh", "-c", "echo out; echo 'No such object' >&2; exit 3"],
+            ms(5_000),
+            ms(10_000),
+        );
+        assert_eq!(
+            refused.run(&["docker".into()]),
+            Err("exit 3: No such object".into())
+        );
+    }
+
+    /// A docker call that never returns is killed at its bound and reported as a timeout, and a call
+    /// issued after the check's total budget is spent is refused before it starts.
+    #[test]
+    fn bounded_docker_call_times_out_and_the_spent_budget_refuses_the_next() {
+        let mut hung = BoundedDockerCli::stand_in(&["sh", "-c", "sleep 30"], ms(200), ms(400));
+        let started = std::time::Instant::now();
+        let first = hung.run(&["docker".into(), "inspect".into(), "h".into()]);
+        assert!(
+            matches!(&first, Err(e) if e.starts_with("timed out") && e.contains("killed")),
+            "{first:?}"
+        );
+        assert!(
+            started.elapsed() < ms(5_000),
+            "the bound was not enforced: {:?}",
+            started.elapsed()
+        );
+        // The second call gets only what is left of the 400ms budget, the third gets nothing.
+        let second = hung.run(&["docker".into()]);
+        assert!(
+            matches!(&second, Err(e) if e.starts_with("timed out")),
+            "{second:?}"
+        );
+        let third = hung.run(&["docker".into()]);
+        assert!(
+            matches!(&third, Err(e) if e.contains("was not started")),
+            "{third:?}"
+        );
+        assert!(started.elapsed() < ms(5_000));
+    }
+
+    /// A probe that times out expires the session with `holder_network_lost`, on runc and runsc
+    /// alike, and nothing is written.
+    #[test]
+    fn a_timed_out_holder_network_probe_expires_the_session() {
+        let policy = runsc_policy();
+        for runsc in [false, true] {
+            let mut hung =
+                BoundedDockerCli::stand_in(&["sh", "-c", "sleep 30"], ms(150), ms(10_000));
+            let (network, restored) = resume_holder_network(
+                &mut hung,
+                HOLDER,
+                "img",
+                &labels(),
+                runsc.then_some(Ok(&policy)),
+            );
+            assert!(
+                matches!(&network, HolderNetwork::ProbeFailed(e) if e.contains("timed out")),
+                "{network:?}"
+            );
+            assert!(!restored);
+            assert_eq!(
+                session::resume_gate(
+                    Some("t"),
+                    &HolderObservation::Running {
+                        started_at: "t".into()
+                    },
+                    session::SESSION_PROTOCOL,
+                    &network
+                ),
+                session::ResumeGate::Expire("holder_network_lost")
+            );
+        }
+    }
+
+    /// A runsc restore whose write hangs is killed at its bound and the session expires with
+    /// `holder_network_lost`; nothing after the timed-out write runs.
+    #[test]
+    fn a_timed_out_runsc_restore_write_expires_the_session() {
+        struct HangOnWrite {
+            ns: Ns,
+            hung: BoundedDockerCli,
+        }
+        impl DockerCli for HangOnWrite {
+            fn run(&mut self, argv: &[String]) -> Result<String, String> {
+                if argv
+                    .windows(2)
+                    .any(|w| w[1] == "add" && (w[0] == "addr" || w[0] == "route"))
+                {
+                    self.ns.calls.push(argv.to_vec());
+                    return self.hung.run(argv);
+                }
+                self.ns.run(argv)
+            }
+        }
+        let policy = runsc_policy();
+        let mut cli = HangOnWrite {
+            ns: Ns::parked(false, false),
+            hung: BoundedDockerCli::stand_in(&["sh", "-c", "sleep 30"], ms(150), ms(10_000)),
+        };
+        let (network, restored) =
+            resume_holder_network(&mut cli, HOLDER, "img", &labels(), Some(Ok(&policy)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("address restore failed") && e.contains("timed out")),
+            "{network:?}"
+        );
+        assert!(!restored);
+        assert_eq!(cli.ns.writes().len(), 1, "stopped at the timed-out write");
+        assert_eq!(
+            session::resume_gate(
+                Some("t"),
+                &HolderObservation::Running {
+                    started_at: "t".into()
+                },
+                session::SESSION_PROTOCOL,
+                &network
+            ),
+            session::ResumeGate::Expire("holder_network_lost")
+        );
     }
 }

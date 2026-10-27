@@ -536,12 +536,16 @@ impl SellerNodeRunner {
                 // restored from docker's record and its whole containment re-verified before the
                 // turn starts (`session_gc::resume_holder_network`). runc seats: probe only.
                 let runsc_policy = self.runsc_session_policy(&record);
+                // Every docker call in the network probe, the runsc restore and its re-verify is
+                // bounded (per call and in total, clock started here, before the queue). A timeout
+                // is a docker error like any other: fail closed, `holder_network_lost`.
+                let mut bounded = session_gc::BoundedDockerCli::for_holder_network();
                 let observed = tokio::task::spawn_blocking(move || {
                     let observed = session_gc::observe_holder(&mut RealDockerCli, &holder);
                     let network = if matches!(observed, session::HolderObservation::Running { .. })
                     {
                         session_gc::resume_holder_network(
-                            &mut RealDockerCli,
+                            &mut bounded,
                             &holder,
                             crate::sandbox_netns::DEFAULT_NETFILTER_IMAGE,
                             &labels,
