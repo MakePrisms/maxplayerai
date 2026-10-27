@@ -979,6 +979,11 @@ impl SellerNodeRunner {
                 started,
                 inline_allowed,
                 &nonce,
+                if inline_allowed {
+                    InlineAnswerRule::SessionTurn
+                } else {
+                    InlineAnswerRule::Off
+                },
             ),
             Err(failure) => Err(failure),
         };

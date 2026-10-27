@@ -3138,6 +3138,76 @@ fn container_exchange_dir(home_root: &std::path::Path, job_id: &str) -> std::pat
     home_root.join("seller-delivery").join(job_id)
 }
 
+/// Which rule the caller of [`SellerNodeRunner::classify_container_outcome`] settles an empty-tree
+/// outcome by, so the outcome LINE can tell a real refusal from the first half of an ordinary
+/// inline delivery (§6.4). Logging only: the callers still make the delivery decision themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineAnswerRule {
+    /// The buyer reads no inline answer, or the job is a contribution: an empty tree is a refusal.
+    Off,
+    /// A job's first launch: the message must carry [`crate::engine::INLINE_ANSWER_MARKER`].
+    Marked,
+    /// A session follow-up turn: [`crate::session::session_delivery_content`] decides.
+    SessionTurn,
+}
+
+/// True when the caller will deliver this container outcome as an inline answer. Mirrors the
+/// callers' own conditions (the inline arm in `execute_job`, `TurnDelivery::Inline` in the session
+/// turn); it decides only which outcome line is printed.
+fn inline_answer_expected(
+    outcome: &crate::delivery_orchestrator::Phase1Outcome,
+    outcome_authentic: bool,
+    from_scratch: bool,
+    rule: InlineAnswerRule,
+) -> bool {
+    if outcome.status != crate::delivery_orchestrator::Phase1Status::NoSentinel
+        || !outcome_authentic
+        || !from_scratch
+    {
+        return false;
+    }
+    let Some(agent) = outcome.agent.as_ref() else {
+        return false;
+    };
+    let Some(message) = agent.last_agent_message.as_deref() else {
+        return false;
+    };
+    if agent.last_agent_message_truncated {
+        return false;
+    }
+    match rule {
+        InlineAnswerRule::Off => false,
+        InlineAnswerRule::Marked => crate::engine::marked_inline_answer(message).is_some(),
+        InlineAnswerRule::SessionTurn => {
+            let status = agent
+                .session
+                .as_ref()
+                .and_then(|session| crate::session::TurnStatus::parse(&session.turn_status))
+                .unwrap_or(crate::session::TurnStatus::Done);
+            crate::session::session_delivery_content(false, status, message).is_some()
+        }
+    }
+}
+
+/// The operator line for a container outcome. An empty git tree that the caller then delivers as
+/// an inline answer is the normal shape of an answer job, not a refusal, so it gets one calm line
+/// instead of the gate's `no execution observed` detail. Every other outcome prints as before.
+fn container_outcome_line(
+    job_id: &str,
+    outcome: &crate::delivery_orchestrator::Phase1Outcome,
+    status: std::process::ExitStatus,
+    inline_expected: bool,
+) -> String {
+    if inline_expected {
+        format!("seller node execute job_id={job_id}: git delivery empty, inline answer used")
+    } else {
+        format!(
+            "seller node execute job_id={job_id}: container outcome status={:?} exit={status} detail={}",
+            outcome.status, outcome.detail
+        )
+    }
+}
+
 /// A fresh 32-byte random nonce as hex, for the agent-done marker hand-off.
 fn random_nonce_hex() -> Result<String, String> {
     let mut bytes = [0u8; 32];
@@ -3148,6 +3218,7 @@ fn random_nonce_hex() -> Result<String, String> {
 #[cfg(test)]
 mod container_delivery_tests {
     use super::*;
+    use crate::delivery_orchestrator as orch_outcome;
 
     // The exchange directory is a sibling tree of the job workdirs (`seller-jobs/<job_id>`, per
     // `seller_exec::job_workdir`), never inside one.
@@ -3401,6 +3472,118 @@ mod container_delivery_tests {
         assert!(!verdict.is_supported());
         assert!(verdict.refusal().is_some());
     }
+
+    // BEGIN container outcome line tests
+    const GATE_REFUSAL: &str = "delivery gate refused: seller git no execution observed: empty tree — no execution observed";
+
+    fn empty_tree_outcome(message: &str, turn_status: Option<&str>) -> orch_outcome::Phase1Outcome {
+        orch_outcome::Phase1Outcome {
+            status: orch_outcome::Phase1Status::NoSentinel,
+            detail: GATE_REFUSAL.to_owned(),
+            delivery_oid: None,
+            agent: Some(orch_outcome::AgentOutcome {
+                usage: None,
+                last_agent_message: Some(message.to_owned()),
+                last_agent_message_truncated: false,
+                session: turn_status.map(|status| orch_outcome::SessionOutcome {
+                    turn_status: status.to_owned(),
+                    ..Default::default()
+                }),
+            }),
+            wall_time_ms: 10,
+            handoff_nonce: Some("n".to_owned()),
+        }
+    }
+
+    fn exit_2() -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(2 << 8)
+    }
+
+    fn line_for(
+        outcome: &orch_outcome::Phase1Outcome,
+        from_scratch: bool,
+        rule: InlineAnswerRule,
+    ) -> String {
+        let expected = inline_answer_expected(outcome, true, from_scratch, rule);
+        container_outcome_line("job1", outcome, exit_2(), expected)
+    }
+
+    fn marked(answer: &str) -> String {
+        format!("{}\n{answer}", crate::engine::INLINE_ANSWER_MARKER)
+    }
+
+    /// The live shape of every inline turn: empty tree + a marked answer the caller then delivers.
+    /// The outcome line must not print the gate's refusal for it.
+    #[test]
+    fn outcome_line_is_calm_for_an_inline_answer_turn() {
+        let outcome = empty_tree_outcome(&marked("forty-two"), None);
+        let line = line_for(&outcome, true, InlineAnswerRule::Marked);
+        assert_eq!(
+            line,
+            "seller node execute job_id=job1: git delivery empty, inline answer used"
+        );
+        assert!(!line.contains("refused"), "{line}");
+        assert!(!line.contains("no execution observed"), "{line}");
+
+        // A session follow-up turn reaches the same classifier with its own delivery rule.
+        let turn = empty_tree_outcome(&marked("turn two"), Some("done"));
+        assert_eq!(
+            line_for(&turn, true, InlineAnswerRule::SessionTurn),
+            "seller node execute job_id=job1: git delivery empty, inline answer used"
+        );
+        // An out-of-time session turn delivers any non-empty message inline.
+        let late = empty_tree_outcome("partial notes", Some("out_of_time"));
+        assert!(
+            line_for(&late, true, InlineAnswerRule::SessionTurn).contains("inline answer used")
+        );
+    }
+
+    /// No inline answer will be delivered: the refusal is a real failure and keeps today's line.
+    #[test]
+    fn outcome_line_still_logs_the_refusal_without_an_inline_answer() {
+        let refusal = format!(
+            "seller node execute job_id=job1: container outcome status=NoSentinel exit=exit status: 2 detail={GATE_REFUSAL}"
+        );
+        // Unmarked message (quota-dead harness, declining agent).
+        let unmarked = empty_tree_outcome("rate limit exceeded", None);
+        assert_eq!(line_for(&unmarked, true, InlineAnswerRule::Marked), refusal);
+        // Marked, but the buyer reads no inline answer.
+        let answered = empty_tree_outcome(&marked("forty-two"), None);
+        assert_eq!(line_for(&answered, true, InlineAnswerRule::Off), refusal);
+        // Marked, but a contribution can never settle inline.
+        assert_eq!(
+            line_for(&answered, false, InlineAnswerRule::Marked),
+            refusal
+        );
+        // Marked, but the outcome was not written by the orchestrator.
+        assert_eq!(
+            container_outcome_line(
+                "job1",
+                &answered,
+                exit_2(),
+                inline_answer_expected(&answered, false, true, InlineAnswerRule::Marked),
+            ),
+            refusal
+        );
+        // Marked, but cut to fit the outcome file.
+        let mut cut = empty_tree_outcome(&marked("forty-two"), None);
+        cut.agent.as_mut().unwrap().last_agent_message_truncated = true;
+        assert_eq!(line_for(&cut, true, InlineAnswerRule::Marked), refusal);
+        // A session turn whose message is neither marked nor out of time.
+        let idle = empty_tree_outcome("ok", Some("done"));
+        assert_eq!(
+            line_for(&idle, true, InlineAnswerRule::SessionTurn),
+            refusal
+        );
+        // Any other status keeps its line, even with a marked message.
+        let mut failed = empty_tree_outcome(&marked("forty-two"), None);
+        failed.status = orch_outcome::Phase1Status::AgentFailed;
+        assert!(
+            line_for(&failed, true, InlineAnswerRule::Marked)
+                .contains("container outcome status=AgentFailed")
+        );
+    }
+    // END container outcome line tests
 }
 
 /// How long a harness self-probe turn may take. Deliberately short: the probe asks for one tiny file,
@@ -9677,6 +9860,15 @@ impl SellerNodeRunner {
                     // than re-derived from the pin in the classifier.
                     base_is_none,
                     &nonce,
+                    if offer
+                        .accepts_delivery
+                        .iter()
+                        .any(|mode| mode == gateway::DELIVERY_MODE_INLINE)
+                    {
+                        InlineAnswerRule::Marked
+                    } else {
+                        InlineAnswerRule::Off
+                    },
                 )
             }
             Err(failure) => Err(failure),
@@ -9897,6 +10089,7 @@ impl SellerNodeRunner {
         started: Instant,
         from_scratch: bool,
         expected_nonce: &str,
+        inline_rule: InlineAnswerRule,
     ) -> Result<ContainerDelivery, ContainerDeliveryFailure> {
         use crate::delivery_orchestrator as orch;
         use ContainerDeliveryFailure as Fail;
@@ -9906,14 +10099,15 @@ impl SellerNodeRunner {
                 "container exited with {status} and wrote no outcome file"
             )));
         };
-        opline!(
-            "seller node execute job_id={job_id}: container outcome status={:?} exit={status} detail={}",
-            outcome.status,
-            outcome.detail
-        );
         // Only the orchestrator holds the nonce; the inputs file carrying it is deleted before
         // the agent exists. An outcome that does not echo it was not written by the orchestrator.
         let outcome_authentic = outcome.handoff_nonce.as_deref() == Some(expected_nonce);
+        let inline_expected =
+            inline_answer_expected(&outcome, outcome_authentic, from_scratch, inline_rule);
+        opline!(
+            "{}",
+            container_outcome_line(job_id, &outcome, status, inline_expected)
+        );
         let detail = outcome.detail;
         match outcome.status {
             orch::Phase1Status::Delivered => {
