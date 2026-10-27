@@ -52,10 +52,14 @@ pub fn stop_argv(container: &str) -> Vec<String> {
 
 /// Read [`holder_state_argv`]'s answer. A daemon error that names a missing container is
 /// `Missing`; any other error is treated as missing too — the job container is never started
-/// without proof its firewall is the one it was created into (§5.5).
+/// without proof its firewall is the one it was created into (§5.5). The one exception is a
+/// [`BoundedDockerCli`] timeout ([`is_bounded_timeout`]): the daemon never answered, so it is
+/// `Unanswered` (which expires as `holder_network_lost`), not a claim that the holder is gone.
 pub fn parse_holder_state(answer: Result<String, String>) -> HolderObservation {
-    let Ok(out) = answer else {
-        return HolderObservation::Missing;
+    let out = match answer {
+        Ok(out) => out,
+        Err(error) if is_bounded_timeout(&error) => return HolderObservation::Unanswered(error),
+        Err(_) => return HolderObservation::Missing,
     };
     let mut parts = out.trim().splitn(2, ' ');
     match (parts.next(), parts.next()) {
@@ -184,6 +188,15 @@ pub const HOLDER_NETWORK_CALL_DEADLINE: std::time::Duration = std::time::Duratio
 /// about twenty calls, so a per-call bound alone would allow ten minutes against a hung daemon.
 pub const HOLDER_NETWORK_BUDGET: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// How every [`BoundedDockerCli`] timeout error begins (a call killed at its bound, or refused
+/// because the budget is spent). No other error of it, nor any of `RealDockerCli`'s, begins so.
+pub const BOUNDED_TIMEOUT_PREFIX: &str = "timed out: ";
+
+/// Is `error` a [`BoundedDockerCli`] timeout rather than an answer from docker?
+pub fn is_bounded_timeout(error: &str) -> bool {
+    error.starts_with(BOUNDED_TIMEOUT_PREFIX)
+}
+
 /// A [`DockerCli`] whose every call is bounded, for the resume-time holder-network check.
 ///
 /// The same rules as the sidecar runner in [`crate::sandbox_netns`] (which is `acp`-only and async,
@@ -251,7 +264,7 @@ impl DockerCli for BoundedDockerCli {
         let left = self.budget.saturating_sub(self.started.elapsed());
         if left.is_zero() {
             return Err(format!(
-                "timed out: `{program}` was not started, the {}s budget for this check is spent",
+                "{BOUNDED_TIMEOUT_PREFIX}`{program}` was not started, the {}s budget for this check is spent",
                 self.budget.as_secs()
             ));
         }
@@ -291,7 +304,7 @@ impl DockerCli for BoundedDockerCli {
         );
         let timed_out = |what: &str| {
             format!(
-                "timed out: `{program}` {what} within {}ms",
+                "{BOUNDED_TIMEOUT_PREFIX}`{program}` {what} within {}ms",
                 bound.as_millis()
             )
         };
@@ -1771,6 +1784,108 @@ mod tests {
                 session::ResumeGate::Expire("holder_network_lost")
             );
         }
+    }
+
+    /// The holder-state inspect at resume (`observe_holder`) goes through the same bounded CLI: a
+    /// hung daemon is killed at the bound and the session expires with `holder_network_lost`, not
+    /// `holder_missing` (nothing said the holder is gone). The budget-spent refusal maps the same.
+    #[test]
+    fn a_hung_holder_state_inspect_expires_holder_network_lost_within_the_bound() {
+        let mut hung = BoundedDockerCli::stand_in(&["sh", "-c", "sleep 30"], ms(150), ms(10_000));
+        let started = std::time::Instant::now();
+        let observed = observe_holder(&mut hung, HOLDER);
+        assert!(
+            started.elapsed() < ms(5_000),
+            "the bound was not enforced: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&observed, HolderObservation::Unanswered(e) if is_bounded_timeout(e) && e.contains("killed")),
+            "{observed:?}"
+        );
+        // As session_run does: a holder that is not `Running` is never network-probed.
+        assert_eq!(
+            session::resume_gate(
+                Some("t"),
+                &observed,
+                session::SESSION_PROTOCOL,
+                &HolderNetwork::NotProbed
+            ),
+            session::ResumeGate::Expire("holder_network_lost")
+        );
+        let mut spent = BoundedDockerCli::stand_in(&["sh", "-c", "sleep 30"], ms(150), ms(0));
+        let observed = observe_holder(&mut spent, HOLDER);
+        assert!(
+            matches!(&observed, HolderObservation::Unanswered(e) if e.contains("was not started")),
+            "{observed:?}"
+        );
+        assert_eq!(
+            session::resume_gate(
+                Some("t"),
+                &observed,
+                session::SESSION_PROTOCOL,
+                &HolderNetwork::NotProbed
+            ),
+            session::ResumeGate::Expire("holder_network_lost")
+        );
+    }
+
+    /// When docker answers, the bounded holder-state inspect reads exactly as before: a missing
+    /// holder is still `holder_missing`, any other docker error is still treated as missing, a
+    /// stopped one `holder_not_running`, a running one is `Running`.
+    #[test]
+    fn a_bounded_holder_state_inspect_keeps_every_answered_reason() {
+        let gate = |observed: &HolderObservation| {
+            session::resume_gate(
+                Some("2026-10-21T10:00:00Z"),
+                observed,
+                session::SESSION_PROTOCOL,
+                &HolderNetwork::Up,
+            )
+        };
+        let answer = |script: &str| {
+            let mut cli = BoundedDockerCli::stand_in(&["sh", "-c", script], ms(5_000), ms(10_000));
+            observe_holder(&mut cli, HOLDER)
+        };
+        let missing = answer("echo 'Error: No such object: maxplayer-netns-j' >&2; exit 1");
+        assert_eq!(missing, HolderObservation::Missing);
+        assert_eq!(
+            gate(&missing),
+            session::ResumeGate::Expire("holder_missing")
+        );
+        let refused = answer("echo 'Cannot connect to the Docker daemon' >&2; exit 1");
+        assert_eq!(refused, HolderObservation::Missing);
+        assert_eq!(
+            gate(&refused),
+            session::ResumeGate::Expire("holder_missing")
+        );
+        let stopped = answer("echo false 0001-01-01T00:00:00Z");
+        assert_eq!(stopped, HolderObservation::NotRunning);
+        assert_eq!(
+            gate(&stopped),
+            session::ResumeGate::Expire("holder_not_running")
+        );
+        let running = answer("echo true 2026-10-21T10:00:00Z");
+        assert_eq!(
+            running,
+            HolderObservation::Running {
+                started_at: "2026-10-21T10:00:00Z".into()
+            }
+        );
+        assert_eq!(gate(&running), session::ResumeGate::Start);
+        // Only a bounded-CLI timeout is `Unanswered`; every other error keeps its old meaning.
+        assert_eq!(
+            parse_holder_state(Err("could not run `docker`: No such file".into())),
+            HolderObservation::Missing
+        );
+        assert_eq!(
+            parse_holder_state(Err("exit 1: timed out: something docker said".into())),
+            HolderObservation::Missing
+        );
+        assert_eq!(
+            parse_holder_state(Err("killed by a signal".into())),
+            HolderObservation::Missing
+        );
     }
 
     /// A runsc restore whose write hangs is killed at its bound and the session expires with

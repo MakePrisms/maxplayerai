@@ -346,6 +346,20 @@ fn holder_without_network_expires_fail_closed() {
             "{network:?}"
         );
     }
+    // A holder-state inspect that never answered is a lost network, not a missing holder, whatever
+    // the network says.
+    for network in [HolderNetwork::NotProbed, HolderNetwork::Up] {
+        assert_eq!(
+            resume_gate(
+                Some(at),
+                &HolderObservation::Unanswered("timed out: `docker` did not finish".into()),
+                SESSION_PROTOCOL,
+                &network
+            ),
+            ResumeGate::Expire("holder_network_lost"),
+            "{network:?}"
+        );
+    }
     // The holder's own failures still name themselves, whatever the network says.
     assert_eq!(
         resume_gate(
