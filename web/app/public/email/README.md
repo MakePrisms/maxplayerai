@@ -7,7 +7,6 @@ headlines are rendered to PNG from the site's own fonts (`../fonts/`).
 The templates load them from `https://www.maxplayer.ai/email/<name>.png`. Don't
 rename or remove a file while a template still points at it; add a new name instead.
 
-- `hero-code.png` — code email ("Link your agent")
-- `hero-welcome.png` — welcome email ("Welcome to Maxplayer")
-- `hero-agents.png` — agent list email ("Your agents")
-- `footer.png` — outline wordmark and red/yellow finish stripe, shared by all three
+- `hero-code-v2.png` — code email ("Link your agent")
+- `hero-welcome-v2.png` — welcome email ("Welcome to Maxplayer")
+- `footer-wordmark.png` — outline wordmark, shared by both
