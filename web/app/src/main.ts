@@ -1,4 +1,3 @@
-declare const TRY_IT_ENABLED: boolean;
 declare const WEB_ANALYTICS_ENABLED: boolean;
 /**
  * Boot — ordered for perceived speed:
@@ -117,7 +116,6 @@ async function boot(): Promise<void> {
   wireNav();
   wirePicker();
   pinFaqs();
-  if (TRY_IT_ENABLED && document.getElementById("try")) void import("./try/ui.js").then(m => m.bootTry());
   // The homepage (/) is static copy: nav, role picker and copy buttons only.
   // The market terminal — relay, IndexedDB, spot quote — boots on /market,
   // the one page that carries the board.

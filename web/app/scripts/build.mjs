@@ -34,24 +34,20 @@ const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
 // Challenge relay quorum (run 2 #13): default 2; must be a majority of CHALLENGE_RELAYS.
 const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, challengeRelays.length);
 const watch = process.argv.includes("--watch");
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html"];
+// terms-v1/privacy-v1 are served at /terms/v1 and /privacy/v1 (vercel.json rewrites); /terms and /privacy redirect to the current version.
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-v1.html", "privacy-v1.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
   // so the token-trade reader never ships in (or changes) the jobs bundle.
   entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts") },
   bundle: true,
-  // Vercel preview deployments show the Try it UI so it can be reviewed.
-  // Production stays off unless TRY_IT_ENABLED=true; /api/try has its own
-  // server flags and stays 404 in previews, so nothing is written to the relay.
   define: {
     CHALLENGE_BUYER_PUBKEY: JSON.stringify(buyer),
     CHALLENGE_RELAYS: JSON.stringify(challengeRelays),
     CHALLENGE_QUORUM: JSON.stringify(challengeQuorum),
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
     WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
-    TRY_IT_ENABLED: String(process.env.TRY_IT_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
-    TRY_IT_MARKET_LINK_ENABLED: String(process.env.TRY_IT_MARKET_LINK_ENABLED === "true" || process.env.VERCEL_ENV === "preview"),
   },
   minify: true,
   format: "esm",

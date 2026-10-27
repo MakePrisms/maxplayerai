@@ -92,7 +92,7 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-v1.html", "privacy-v1.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
@@ -163,7 +163,7 @@ test("the live market ships at /market and the homepage links it", () => {
 });
 
 test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
-  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"];
+  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html", "terms-v1.html", "privacy-v1.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -194,13 +194,13 @@ test("all site pages share navigation and footer links, with a current page and 
     assert.deepEqual(links(nav).map(([href]) => href), ["/", "/sell", "/market"], `${page}: top nav is Buy, Sell, Market`);
     // bob (2026-10-18): three rows on the right: Buy · Sell · Market, the Labs, then Skill · GitHub.
     const rows = [...footer.matchAll(/<div class="foot-row[^"]*">([\s\S]*?)<\/div>/g)].map((m) => links(m[1]).map(([, text]) => text));
-    assert.deepEqual(rows, [["Buy", "Sell", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub"]], `${page}: footer rows`);
+    assert.deepEqual(rows, [["Buy", "Sell", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub", "Terms", "Privacy"]], `${page}: footer rows`);
     // ...and the @maxplayerai handle moves to the left, under "The Multiplayer Marketplace".
     const brand = html.match(/<div class="foot-brand">([\s\S]*?)<\/div>/)?.[1] ?? "";
     assert.match(brand, /<p>The Multiplayer Marketplace<\/p>\s*<a class="foot-x" href="https:\/\/x\.com\/maxplayerai"[^>]*>@maxplayerai<\/a>/, `${page}: X handle under the tagline`);
     assert.ok(!footer.includes("x.com/maxplayerai"), `${page}: X handle is not in the link rows`);
     const current = [...nav.matchAll(/aria-current="page"/g)].length;
-    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "swarm.html") {
+    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "swarm.html" || page === "terms-v1.html" || page === "privacy-v1.html") {
       assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
     } else {
       const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
@@ -499,4 +499,35 @@ test('challenge relay connection is allowed on the unlisted route', () => {
 
  test("build refuses the production challenge relay hostname", () => {
   assert.throws(() => execFileSync(process.execPath, ["scripts/build.mjs"], {cwd:root,env:{...process.env,CHALLENGE_RELAYS:"wss://RELAY.MAXPLAYER.AI./"},stdio:"pipe"}), /production relay forbidden/);
+});
+
+// Email signup spec v2.10 §7.1 (Bob, Petar, Josip, 2026-10-27): the terms and privacy policy are
+// static pages on this site, one fixed URL per version; /terms and /privacy point at the current one.
+test("terms and privacy are versioned static pages, linked from every footer", () => {
+  const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  for (const doc of ["terms", "privacy"]) {
+    assert.ok(existsSync(join(root, "dist", `${doc}-v1.html`)), `${doc} v1 builds`);
+    assert.ok(cfg.rewrites.some((r) => r.source === `/${doc}/v1` && r.destination === `/${doc}-v1`), `/${doc}/v1 serves v1`);
+    const current = cfg.redirects.find((r) => r.source === `/${doc}`);
+    assert.equal(current?.destination, `/${doc}/v1`, `/${doc} points at the current version`);
+    assert.equal(current?.permanent, false, `/${doc} is a temporary redirect, so a new version can replace it`);
+    const html = readFileSync(join(root, "dist", `${doc}-v1.html`), "utf8");
+    assert.match(html, /<body class="home legal-page">/);
+    assert.match(html, /<h1 id="legal-h">/);
+  }
+  for (const page of ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
+    const html = readFileSync(join(root, "dist", page), "utf8");
+    assert.ok(html.includes('<a href="/terms">Terms</a>') && html.includes('<a href="/privacy">Privacy</a>'), `${page} links both`);
+  }
+});
+
+// Bob (2026-10-22, #email-signup): the Try it section is removed, with its /api/try function.
+test("the Try it flow and its Vercel function are gone", () => {
+  assert.ok(!existsSync(join(root, "api")), "no Vercel functions remain");
+  assert.ok(!existsSync(join(root, "src", "try")), "no buyer UI source remains");
+  const home = readFileSync(join(root, "dist", "index.html"), "utf8");
+  assert.ok(!home.includes('id="try"') && !home.includes("try-section"), "no Try it section on the homepage");
+  const js = readFileSync(join(root, "dist", "terminal.js"), "utf8");
+  assert.ok(!js.includes("/api/try") && !js.includes("bootTry"), "the bundle never loads the buyer UI");
+  assert.ok(!readFileSync(join(root, "dist", "styles.css"), "utf8").includes(".try-section"), "its styles are gone");
 });
