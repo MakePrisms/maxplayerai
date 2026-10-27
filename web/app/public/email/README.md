@@ -9,5 +9,4 @@ rename or remove a file while a template still points at it; add a new name inst
 
 - `hero-code.png` — code email ("Link your agent")
 - `hero-welcome.png` — welcome email ("Welcome to Maxplayer")
-- `hero-agents.png` — agent list email ("Your agents")
-- `footer.png` — outline wordmark and red/yellow finish stripe, shared by all three
+- `footer-wordmark.png` — outline wordmark, shared by both
