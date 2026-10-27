@@ -10,3 +10,4 @@ rename or remove a file while a template still points at it; add a new name inst
 - `hero-code-v2.png` — code email ("Link your agent")
 - `hero-welcome-v2.png` — welcome email ("Welcome to Maxplayer")
 - `footer-wordmark.png` — outline wordmark, shared by both
+- `social-x.png`, `social-github.png` — footer social icons (20px, 2x), shared by both
