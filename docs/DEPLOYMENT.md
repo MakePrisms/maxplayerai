@@ -81,7 +81,7 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   to front it with. The package still builds from the flake; nothing consumes it.
 - `packages.buyer-static` / `packages.buyer-static-aarch64` — statically-linked (musl) buyer builds.
 - `nixosModules.relay` + `nixosConfigurations.relay` — the launch relay as a deployable NixOS box
-  (`nixos-rebuild switch --flake .#relay`); `nix/relay.nix` runs `buzz-relay` in open mode, scoped to
+  (deploy: [Deploying the relay](#deploying-the-relay)); `nix/relay.nix` runs `buzz-relay` in open mode, scoped to
   the marketplace kinds by its closed compiled allowlist — the mobee namespace *is* the allowlist.
   Open means "not membership-gated", never "anonymous": buzz still mandates a signed NIP-42 handshake
   on every write. The relay component of the backend, shipping today.
@@ -110,6 +110,55 @@ builds, the client Docker image, the released binaries, and the launch-relay sli
 `nixosModules.reviewer`. Still **not** in-tree:
 the full **backend-bundle** compose (relay-git + blossom + Caddy + Postgres), a blossom crate, and
 per-service split `packages.{relay-git,blossom}` / `apps.*`.
+
+### Deploying the relay
+
+`nixosConfigurations.relay` is built in CI, not on the relay box. The box is an EC2 t3.small
+(2 vCPU / 2 GB): compiling the Rust packages there took ~2 h per `nixos-rebuild switch`, while a
+GitHub runner builds the whole system in ~17 min. `.github/workflows/relay-build.yml` builds the
+system for a `relay-v*` tag and pushes it to the public Cachix cache `maxplayer.cachix.org`, which
+`nix/relay-host.nix` lists in `nix.settings.substituters` / `trusted-public-keys`. A deploy then
+only downloads and activates.
+
+1. Tag the commit to deploy and push the tag (`relay-v*` tags are separate from the `v*` client
+   release tags, so this never starts `release.yml`):
+   ```sh
+   git tag relay-vN <sha> && git push origin relay-vN
+   ```
+2. Wait for the **Relay build** run on that tag to go green (Actions tab, or
+   `gh run list -R MakePrisms/maxplayerai --workflow relay-build.yml --limit 1`). It can also be
+   started from "Run workflow" on a tag.
+3. On the relay, as root, back up and switch to the tag:
+   ```sh
+   systemctl start buzz-relay-backup.service
+   export NIX_CONFIG="experimental-features = nix-command flakes"
+   nixos-rebuild switch --flake "github:MakePrisms/maxplayerai/relay-vN#relay"
+   ```
+   The output should show `copying path … from 'https://maxplayer.cachix.org'` for the
+   maxplayer packages and no `building` lines for them. If it starts compiling Rust, stop
+   (Ctrl-C): the build for that commit is missing or failed.
+4. Verify the switch took, by comparison rather than exit code (see the header of
+   `nix/relay-host.nix`):
+   ```sh
+   readlink -f /run/current-system; readlink -f /nix/var/nix/profiles/system   # must match
+   systemctl is-active buzz-relay.service maxplayer-reviewer.service nginx.service
+   ```
+   `nixos-rebuild switch --rollback` undoes a bad deploy.
+
+Do not deploy with `--build-host root@<relay>`: that is the old flow that compiles on the box. If no
+CI build is available, build on another x86_64-linux machine with Nix and copy the result over
+SSH instead (`nixos-rebuild switch --flake …#relay --target-host root@<relay> --use-substitutes`,
+without `--build-host`). An Apple Silicon machine would emulate x86_64 and is slow.
+
+The first deploy of the commit that added the cache to `relay-host.nix` runs while the box does
+not trust it yet; pass it for that one switch (root is a trusted Nix user):
+`--option extra-substituters https://maxplayer.cachix.org --option extra-trusted-public-keys maxplayer.cachix.org-1:kagbHiSvJhLPUX6cKTnXM3IiM5rMcYpaJaj9phmOBEQ=`
+
+`relay-v*` tags must not move once built: a repository tag ruleset ("relay-v* tags immutable",
+Settings → Rules, admin-only) blocks updates and deletion of `refs/tags/relay-v*`, so a tag always
+names the commit that was built. Use a new `relay-vN` for every deploy. The push token is the `CACHIX_AUTH_TOKEN` Actions secret;
+pull requests that change the workflow build it too but do not push (their merge-commit builds
+are never deployed).
 
 ### Roadmap — not yet built (do not assume these exist)
 

@@ -8,6 +8,7 @@ name: Relay build
 # Deploy runbook: push tag `relay-vN` -> wait for this workflow to go green on it -> on the relay:
 #   nixos-rebuild switch --flake github:MakePrisms/maxplayerai/relay-vN#relay
 # An untagged / unbuilt commit still deploys, it just compiles on the box again.
+# Full runbook: docs/DEPLOYMENT.md "Deploying the relay".
 #
 # Triggers:
 #   - `relay-v*` tags: the explicit "build this commit for the relay" signal. Kept apart from the
@@ -61,15 +62,17 @@ jobs:
           nix build '.#nixosConfigurations.relay.config.system.build.toplevel' \
             --print-build-logs --no-link --print-out-paths | tee out-path.txt
 
-      # Runtime closure only; paths already on cache.nixos.org are not re-uploaded. Fork PRs get no
-      # secrets, so they build without pushing.
+      # Runtime closure only; paths already on cache.nixos.org are not re-uploaded. Pull requests
+      # build without pushing: they build GitHub's temporary merge commit, whose system (the reviewer
+      # stamps its commit, #818) is never deployed, so pushing it would only fill the cache.
       - name: Push relay system to Cachix
+        if: github.event_name != 'pull_request'
         env:
           CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
         run: |
           if [ -z "$CACHIX_AUTH_TOKEN" ]; then
-            echo "No CACHIX_AUTH_TOKEN (fork PR?): skipping push."
-            exit 0
+            echo "::error::CACHIX_AUTH_TOKEN is not set; the relay system was built but not cached."
+            exit 1
           fi
           cachix push maxplayer "$(cat out-path.txt)"
 
