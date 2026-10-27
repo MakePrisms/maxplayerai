@@ -890,6 +890,8 @@ pub async fn open_wallet_async(
         seed,
         None,
         &home.config.relay_url,
+        nostr_sdk::Keys::parse(&secret)
+            .map_err(|error| WalletOpsError::Wallet(format!("wallet key: {error}")))?,
     )
     .map_err(|error| WalletOpsError::Wallet(error.to_string()))
 }

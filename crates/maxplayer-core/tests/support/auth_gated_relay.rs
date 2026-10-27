@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
-use nostr_sdk::prelude::{Event, Kind};
+use nostr_sdk::prelude::{Event, Kind, PublicKey};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
@@ -39,6 +39,9 @@ pub struct AuthRelayOptions {
     /// Require sign-in: refuse EVENT and withhold live events from pre-sign-in REQs. `false` is a
     /// relay that challenges but serves everyone anyway (sign-in is optional there).
     pub gate: bool,
+    /// Membership: accept a sign-in only from these keys (buzz with
+    /// `BUZZ_REQUIRE_RELAY_MEMBERSHIP`; repeat a key for one member). `None` accepts any sign-in.
+    pub members: Option<[PublicKey; 2]>,
 }
 
 impl Default for AuthRelayOptions {
@@ -48,6 +51,7 @@ impl Default for AuthRelayOptions {
             refuse_auth: false,
             challenge_delay: Duration::from_millis(150),
             gate: true,
+            members: None,
         }
     }
 }
@@ -217,6 +221,7 @@ async fn connection(
                         let ok = !options.refuse_auth
                             && serde_json::from_value::<Event>(v[1].clone()).is_ok_and(|e| {
                                 e.verify().is_ok()
+                                    && options.members.is_none_or(|m| m.contains(&e.pubkey))
                                     && e.kind == Kind::Authentication
                                     && e.tags
                                         .iter()

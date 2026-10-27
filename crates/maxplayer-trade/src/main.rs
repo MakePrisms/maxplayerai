@@ -194,6 +194,8 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         }
         _ => {}
     }
+    // Mint requests sign as this home's key: the default mint relay only admits registered keys.
+    maxplayer_trade::transport::configure_mint_identity(home);
     // A zero amount can never succeed: refuse it before any cap check, home, lock or mint.
     let zero = match &cli.command {
         Command::Fund { amount, .. }
