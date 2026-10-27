@@ -1,0 +1,62 @@
+name: Relay build
+
+# Builds the deployable relay system (`nixosConfigurations.relay`) on a GitHub runner, so the
+# relay box (EC2 t3.small, 2 vCPU / 2 GB) no longer has to compile our Rust packages itself during
+# `nixos-rebuild switch` (~2 h there).
+#
+# Step 1 of the plan: build only, to measure the real CI build time. The follow-up adds the
+# binary-cache push (Cachix) and the relay's substituter + trusted key in nix/relay-host.nix,
+# after which a deploy of a `relay-v*` tag downloads this build instead of compiling it.
+#
+# Triggers:
+#   - `relay-v*` tags: the explicit "build this commit for the relay" signal. Kept apart from the
+#     `v*` release tags (release.yml), so a relay build never starts a client release.
+#   - manual "Run workflow".
+#   - pull requests that change this file, so edits to it are proven before they merge.
+
+on:
+  push:
+    tags:
+      - 'relay-v*'
+  pull_request:
+    paths:
+      - '.github/workflows/relay-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build .#relay (x86_64-linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      # Full history, not the default shallow clone: Nix refuses a shallow repository as a flake
+      # source unless asked, and the reviewer stamps `self.rev` (#818) into its binary.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Disk before build
+        run: df -h /
+
+      - name: Build relay system
+        run: |
+          nix build '.#nixosConfigurations.relay.config.system.build.toplevel' \
+            --print-build-logs --no-link --print-out-paths | tee out-path.txt
+
+      - name: Summary
+        if: always()
+        run: |
+          df -h /
+          if [ -s out-path.txt ]; then
+            out=$(cat out-path.txt)
+            echo "Relay system: \`$out\`" >> "$GITHUB_STEP_SUMMARY"
+            nix path-info -Sh "$out" >> "$GITHUB_STEP_SUMMARY"
+          fi
