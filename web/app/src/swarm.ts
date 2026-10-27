@@ -35,7 +35,7 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
   });
 }
 
-// Floating "See the job" pill, same as Buy's "Try it first": gone once the job section reaches it.
+// Floating "See the job" pill: gone once the job section reaches it.
 const jobSection = el("job");
 const jobFloat = el("job-float");
 let floatQueued = false;

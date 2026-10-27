@@ -1,6 +1,6 @@
 # Buy tab: Try it
 
-**Status:** implementation of §8 stages 1–3 on `feat/try-it`, default-off; stage 4 remains out of scope. Bob approved building without a separate spec-review round. See [implementation and verification](../../web/app/src/try/README.md). Original design **anchor commit: 8c00b358497c703206c6b661cef0eed18db16958** (= origin/main at writing, 2026-09-28).
+**Status: removed (2026-10-27).** Bob asked to remove the Try it section from the website (#email-signup, 2026-10-22): browser-generated visitor keys cannot write once the relay requires registered keys. The UI, `/api/try` and the fixtures were deleted; this spec is kept as a record. Previous status: implementation of §8 stages 1–3 on `feat/try-it`, default-off.
 
 **Dependency:** stacked on [#1053](https://github.com/MakePrisms/maxplayerai/pull/1053), review after it. Homepage anchor: **c484db12b6d166fe1d1fc3d79efe006ca457bdbb**, `maxie-agent:feat/friendly-homepage`. The documentation branch starts there, not on main. Upstream has no branch named `feat/friendly-homepage`, so the PR targets main and includes the prerequisite diff. Review this spec's commit independently; rebase onto main after #1053 lands. Main-source citations and homepage-layer citations are deliberately separate in §11.
 

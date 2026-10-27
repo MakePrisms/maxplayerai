@@ -1125,60 +1125,17 @@ button.chip { cursor: pointer; }
   .market-page .rows { flex: 1; height: auto; min-height: 0; }
 }
 
-/* Scoped buyer UI; hidden must beat the homepage flex-section rule. */
-.try-section[hidden], .try-section [hidden] { display: none !important; }
-.try-section .h-in { width:100%; max-width:760px; box-sizing:border-box; }
-.try-section .h-lede { margin:18px auto 0; }
-.try-section textarea { display:block; width:100%; box-sizing:border-box; resize:vertical; margin:28px 0 0; padding:18px; background:var(--bg); color:var(--ink); border:1px solid var(--line); font:16px/1.6 var(--sans); }
-.try-section textarea:focus { outline:1px solid var(--neon); outline-offset:3px; }
-.try-section button, .try-section a { min-height:44px; box-sizing:border-box; }
-.try-section button { cursor:pointer; }
-.try-section button:disabled { opacity:.55; cursor:default; }
-.try-section .h-button { border:0; margin-top:24px; }
-.try-note, #try-count { color:var(--muted); font:12px/1.6 var(--mono); }
-.try-note { margin:18px 0 0; }
-/* Nothing in Try it shifts between states: content hangs from the top instead
-   of being centred (centring moved the heading whenever the content below
-   grew or shrank), and the buyer line keeps its row before its name arrives. */
-.h-section.try-section { justify-content:flex-start; }
-#try-buyer { min-height:1.6em; }
-/* ...but hung low enough that the heading-to-Ask block (--try-upper tall, as
-   measured) sits centred on screen, as the old centring had it. Anything that
-   arrives later (status, answer, buttons) only extends the section downward. */
-.try-section { --try-upper:356px; --try-pad:96px; }
-.try-section .h-in {
-  padding-top: max(var(--try-pad), calc((100vh - var(--nav-h) - var(--try-upper)) / 2));
-  padding-top: max(var(--try-pad), calc((100svh - var(--nav-h) - var(--try-upper)) / 2));
-}
-@media (max-width: 760px) { .try-section { --try-upper:340px; --try-pad:64px; } }
-.try-note a { color:var(--neon); text-underline-offset:3px; }
-.try-note a:hover { color:var(--ink); }
-#try-count { text-align:right; margin-top:8px; }
-#try-status { margin:24px 0 0; color:var(--ink-2); font:15px/1.6 var(--sans); }
-.try-actions { display:flex; align-items:center; justify-content:center; flex-wrap:wrap; gap:12px; }
-#try-question { text-align:left; margin:28px 0 24px; padding:4px 0 4px 18px; border-left:2px solid var(--neon); color:var(--ink-2); font:18px/1.6 var(--sans); overflow-wrap:anywhere; }
-#try-question::before { content:'“'; }
-#try-question::after { content:'”'; }
-#try-answer-panel { margin:24px 0 0; padding:20px 24px 24px; text-align:left; border:1px solid var(--line); background:var(--bg); }
-.try-answer-head { display:flex; justify-content:space-between; align-items:center; gap:16px; }
-.try-answer-head h3 { margin:0; font:700 13px var(--mono); text-transform:uppercase; letter-spacing:.08em; }
-#try-answer { white-space:pre-wrap; overflow-wrap:anywhere; font:18px/1.65 var(--sans); margin:12px 0 0; color:var(--ink); }
-#try-start { margin-top:32px; }
-.try-pitch { margin:0 auto 20px; max-width:560px; color:var(--ink-2); font:16px/1.6 var(--sans); }
-.try-section .h-copy { min-width:0; margin:0; padding:14px 18px; border:1px solid var(--line); text-align:left; gap:12px; }
-.try-section .h-copy code { white-space:normal; word-break:normal; overflow-wrap:normal; overflow:visible; font:15px/1.6 var(--sans); }
-.try-section .try-link { display:inline-flex; align-items:center; justify-content:center; padding:10px 4px; border:0; background:none; color:var(--neon); font:12px/1.4 var(--mono); text-decoration:underline; text-underline-offset:4px; }
-.try-section .try-link:hover { color:var(--ink); }
-#try-start > .h-button { margin-top:0; }
-@media(max-width:480px) {
-  .try-section .h-button { max-width:calc(100% - 16px); padding:14px 18px; font-size:13px; }
-  #try-answer-panel { padding:16px; }
-  .try-section .h-copy { align-items:flex-start; }
-}
+/* /terms and /privacy: one plain text column; versions live at /terms/vN, /privacy/vN. */
+.legal-page .h-section { justify-content:flex-start; }
+.legal-page .h-in { text-align:left; }
+.legal-page h1 { margin:12px 0 0; font:700 clamp(32px, 5vw, 48px)/1.1 var(--sans); }
+.legal-page .h-in p { margin:20px 0 0; color:var(--ink-2); font:16px/1.7 var(--sans); }
+.legal-page .h-in a { color:var(--neon); text-underline-offset:3px; }
+.legal-note { padding:14px 18px; border:1px solid var(--line); background:var(--bg-2); }
 @media(prefers-reduced-motion:reduce) { html { scroll-behavior:auto!important; } }
 
-/* Floating "Try it first" pill: pinned to the bottom of the screen and gone
-   as soon as the Try it section reaches it. It never moves on hover. */
+/* Floating pill (/swarm's "See the job"): pinned to the bottom of the screen
+   and gone as soon as its target section reaches it. It never moves on hover. */
 .try-float {
   position: fixed; left: 50%; bottom: 24px; z-index: 40; transform: translateX(-50%);
   display: inline-flex; align-items: center; gap: 7px; min-height: 38px; box-sizing: border-box;
