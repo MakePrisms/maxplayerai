@@ -461,6 +461,100 @@ pub fn session_containment_policy(
     })
 }
 
+/// The containment a parked runsc holder is re-verified against at resume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedContainment {
+    pub policy: crate::sandbox_net::NetPolicy,
+    /// What setup recorded it installed (egress interface, tc classifier, proxy pinhole). `None`
+    /// for a session parked before these were recorded: verified exactly as before, against the
+    /// seat's current `proxy_port_range` and either tc plan.
+    pub installed: Option<crate::sandbox_netns::InstalledEgress>,
+}
+
+/// The `sessions` column values for what a holder's containment installed (`holder_egress_dev`,
+/// `holder_classifier`, `holder_proxy_ports`). All `None` when there was no containment.
+pub fn installed_egress_columns(
+    installed: Option<&crate::sandbox_netns::InstalledEgress>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    match installed {
+        Some(i) => (
+            Some(i.egress_dev.clone()),
+            Some(i.classifier.name().to_owned()),
+            Some(
+                i.proxy_ports
+                    .map_or_else(|| "none".to_owned(), |p| p.to_string()),
+            ),
+        ),
+        None => (None, None, None),
+    }
+}
+
+/// Read back what the session recorded its holder's containment installed. `Ok(None)`: a row from
+/// before these were recorded (all three columns NULL). A partial or unreadable record is an error,
+/// so the session fails closed rather than falling back to the seat's config.
+pub fn recorded_installed_egress(
+    record: &SessionRecord,
+) -> Result<Option<crate::sandbox_netns::InstalledEgress>, String> {
+    use crate::sandbox_iface::IfaceClassifier;
+    let (Some(dev), Some(classifier), Some(ports)) = (
+        record.holder_egress_dev.as_deref(),
+        record.holder_classifier.as_deref(),
+        record.holder_proxy_ports.as_deref(),
+    ) else {
+        if record.holder_egress_dev.is_none()
+            && record.holder_classifier.is_none()
+            && record.holder_proxy_ports.is_none()
+        {
+            return Ok(None);
+        }
+        return Err("the session's recorded containment is incomplete".into());
+    };
+    let dev = dev.trim();
+    if dev.is_empty() {
+        return Err("the session recorded no egress interface".into());
+    }
+    let classifier = match classifier {
+        "flower" => IfaceClassifier::Flower,
+        "u32" => IfaceClassifier::U32,
+        other => {
+            return Err(format!(
+                "the session recorded an unknown tc classifier {other:?}"
+            ));
+        }
+    };
+    let proxy_ports = match ports {
+        "none" => None,
+        range => Some(
+            crate::sandbox_net::PortRange::parse(range)
+                .map_err(|e| format!("the session's recorded proxy port range {range:?}: {e}"))?,
+        ),
+    };
+    Ok(Some(crate::sandbox_netns::InstalledEgress {
+        egress_dev: dev.to_owned(),
+        classifier,
+        proxy_ports,
+    }))
+}
+
+/// The containment a resumed runsc turn re-verifies against. A session that recorded what its holder
+/// installed is verified against that record and the seat's config is never read; a session from
+/// before that was recorded is rebuilt from `config_proxy_ports` (the seat's current
+/// `proxy_port_range`), as it always was.
+pub fn expected_containment(
+    record: &SessionRecord,
+    resolv_conf: Option<&str>,
+    config_proxy_ports: impl FnOnce() -> Result<Option<crate::sandbox_net::PortRange>, String>,
+) -> Result<ExpectedContainment, String> {
+    let installed = recorded_installed_egress(record)?;
+    let proxy_ports = match &installed {
+        Some(installed) => installed.proxy_ports,
+        None => config_proxy_ports()?,
+    };
+    let policy =
+        session_containment_policy(record.proxy_host.as_deref(), proxy_ports, resolv_conf)?;
+    Ok(ExpectedContainment { policy, installed })
+}
+
 /// The namespace's IPv4 addresses and default gateway, read by the unprivileged probes.
 struct NetState {
     addrs: Vec<std::net::Ipv4Addr>,
@@ -522,18 +616,29 @@ fn holder_egress_dev<D: DockerCli>(
 }
 
 /// The containment checks `sandbox_netns::establish` applies when the holder is set up, applied to
-/// the parked namespace: both iptables families read back and judged against `policy`, then the
-/// veth's `tc` egress filters read back and judged against the plan derived for `dev` (flower, or
-/// the u32 compatibility plan setup falls back to where flower is missing).
+/// the parked namespace: both iptables families read back and judged against the policy, then the
+/// veth's `tc` egress filters read back and judged against the plan derived for `dev`. A session
+/// that recorded what was installed must still be on the recorded interface and match the recorded
+/// classifier's plan only; an older session accepts flower or the u32 compatibility plan, as before.
 pub fn verify_holder_containment<D: DockerCli>(
     cli: &mut D,
     holder: &str,
     image: &str,
     labels: &[String],
-    policy: &crate::sandbox_net::NetPolicy,
+    expected: &ExpectedContainment,
     dev: &str,
 ) -> Result<(), String> {
+    use crate::sandbox_iface::IfaceClassifier;
     use crate::sandbox_net::Family;
+    let policy = &expected.policy;
+    if let Some(installed) = &expected.installed
+        && installed.egress_dev != dev
+    {
+        return Err(format!(
+            "the egress interface is {dev}, setup installed the filters on {}",
+            installed.egress_dev
+        ));
+    }
     for family in [Family::V4, Family::V6] {
         let argv = crate::sandbox_netns::with_helper_labels(
             crate::sandbox_netns::readback_argv(holder, image, family),
@@ -552,13 +657,23 @@ pub fn verify_holder_containment<D: DockerCli>(
     let readback = cli
         .run(&argv)
         .map_err(|e| format!("tc readback on {dev}: {e}"))?;
-    match iface.verify_readback(&readback) {
-        Ok(()) => Ok(()),
-        Err(flower) => crate::sandbox_iface::U32Plan::derive(&iface)?
+    match expected.installed.as_ref().map(|i| i.classifier) {
+        Some(IfaceClassifier::Flower) => iface.verify_readback(&readback).map_err(|e| {
+            format!("egress filters on {dev} do not match the installed flower plan: {e}")
+        }),
+        Some(IfaceClassifier::U32) => crate::sandbox_iface::U32Plan::derive(&iface)?
             .verify_readback(&readback)
-            .map_err(|u32| {
-                format!("egress filters on {dev} match neither the flower plan ({flower}) nor the u32 plan ({u32})")
+            .map_err(|e| {
+                format!("egress filters on {dev} do not match the installed u32 plan: {e}")
             }),
+        None => match iface.verify_readback(&readback) {
+            Ok(()) => Ok(()),
+            Err(flower) => crate::sandbox_iface::U32Plan::derive(&iface)?
+                .verify_readback(&readback)
+                .map_err(|u32| {
+                    format!("egress filters on {dev} match neither the flower plan ({flower}) nor the u32 plan ({u32})")
+                }),
+        },
     }
 }
 
@@ -577,7 +692,7 @@ fn restore_and_verify<D: DockerCli>(
     holder: &str,
     image: &str,
     labels: &[String],
-    policy: &crate::sandbox_net::NetPolicy,
+    policy: &ExpectedContainment,
 ) -> Result<(), String> {
     let dev = holder_egress_dev(cli, holder, image, labels)
         .map_err(|e| format!("no restore, the holder's interface is not usable: {e}"))?;
@@ -652,8 +767,8 @@ fn restore_and_verify<D: DockerCli>(
 /// The §5.5 holder network check at resume, with the runsc restore.
 ///
 /// `runsc_policy` is `None` on a runc (or default-runtime) seat: the probe alone decides, exactly as
-/// before. On a runsc seat it carries the containment policy turn 1 installed (or why it could not be
-/// rebuilt); a namespace that lost its address or default route is then restored and re-verified
+/// before. On a runsc seat it carries the containment turn 1 installed ([`expected_containment`]),
+/// or why it could not be rebuilt; a namespace that lost its address or default route is then restored and re-verified
 /// ([`restore_and_verify`]). Every other probe answer — `Up`, or a probe that could not answer — is
 /// returned untouched. Returns the verdict and whether a restore was written and re-verified.
 pub fn resume_holder_network<D: DockerCli>(
@@ -661,7 +776,7 @@ pub fn resume_holder_network<D: DockerCli>(
     holder: &str,
     image: &str,
     labels: &[String],
-    runsc_policy: Option<Result<&crate::sandbox_net::NetPolicy, String>>,
+    runsc_policy: Option<Result<&ExpectedContainment, String>>,
 ) -> (HolderNetwork, bool) {
     let observed = observe_holder_network(cli, holder, image, labels);
     let Some(policy) = runsc_policy else {
@@ -905,6 +1020,9 @@ mod tests {
             state,
             proxy_host: None,
             base_oid: None,
+            holder_egress_dev: None,
+            holder_classifier: None,
+            holder_proxy_ports: None,
         }
     }
 
@@ -1213,6 +1331,14 @@ mod tests {
     const LINKS_LO_ONLY: &str = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00 promiscuity 0 minmtu 0 maxmtu 0 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535 \n";
     const HOLDER: &str = "maxplayer-netns-j";
 
+    /// A session parked before the installed containment was recorded.
+    fn legacy() -> ExpectedContainment {
+        ExpectedContainment {
+            policy: runsc_policy(),
+            installed: None,
+        }
+    }
+
     fn runsc_policy() -> crate::sandbox_net::NetPolicy {
         crate::sandbox_net::NetPolicy {
             gateway: "172.17.0.1".into(),
@@ -1330,7 +1456,7 @@ mod tests {
 
     fn resume(
         ns: &mut Ns,
-        policy: Option<Result<&crate::sandbox_net::NetPolicy, String>>,
+        policy: Option<Result<&ExpectedContainment, String>>,
     ) -> (HolderNetwork, bool) {
         resume_holder_network(ns, HOLDER, "img", &labels(), policy)
     }
@@ -1339,7 +1465,7 @@ mod tests {
     /// with the setup sidecar's shape, only after the filters were verified, and re-verified after.
     #[test]
     fn runsc_restore_puts_back_docker_recorded_address_and_route_then_reverifies() {
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut ns = Ns::parked(false, false);
         assert_eq!(
             resume(&mut ns, Some(Ok(&policy))),
@@ -1443,7 +1569,7 @@ mod tests {
 
     #[test]
     fn runsc_restore_writes_only_the_missing_address() {
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut ns = Ns::parked(false, true);
         assert_eq!(
             resume(&mut ns, Some(Ok(&policy))),
@@ -1456,7 +1582,7 @@ mod tests {
 
     #[test]
     fn runsc_restore_writes_only_the_missing_route() {
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut ns = Ns::parked(true, false);
         assert_eq!(
             resume(&mut ns, Some(Ok(&policy))),
@@ -1470,7 +1596,7 @@ mod tests {
     /// No veth (or one that is down): expire with no restore attempt.
     #[test]
     fn runsc_missing_interface_expires_without_a_restore() {
-        let policy = runsc_policy();
+        let policy = legacy();
         for links in [
             LINKS_LO_ONLY.to_owned(),
             LINKS_UP.replace("<BROADCAST,MULTICAST,UP,LOWER_UP>", "<BROADCAST,MULTICAST>"),
@@ -1501,7 +1627,7 @@ mod tests {
     /// Docker's record unusable (none, two networks, garbage, inspect error): no restore.
     #[test]
     fn runsc_unavailable_recorded_address_expires_without_a_restore() {
-        let policy = runsc_policy();
+        let policy = legacy();
         for recorded in [
             Ok("/0 \n".to_owned()),
             Ok(String::new()),
@@ -1525,7 +1651,7 @@ mod tests {
     /// a namespace without its filters.
     #[test]
     fn runsc_namespace_without_its_filters_is_never_given_a_route() {
-        let policy = runsc_policy();
+        let policy = legacy();
         let cases: [fn(&mut Ns); 4] = [
             |ns| ns.tc.clear(),
             |ns| ns.v4 = ns.v4.replace("-j DROP", "-j ACCEPT"),
@@ -1556,7 +1682,7 @@ mod tests {
     /// A restore that did not take, or that cost the veth its filters, fails re-verification.
     #[test]
     fn runsc_reverify_mismatch_expires() {
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut ns = Ns::parked(false, false);
         ns.write_wipes_tc = true;
         let (network, restored) = resume(&mut ns, Some(Ok(&policy)));
@@ -1587,7 +1713,7 @@ mod tests {
 
     #[test]
     fn runsc_helper_error_expires() {
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut ns = Ns::parked(false, false);
         ns.write_error = Some("exit 2: RTNETLINK answers: Operation not permitted".into());
         let (network, restored) = resume(&mut ns, Some(Ok(&policy)));
@@ -1604,7 +1730,7 @@ mod tests {
     /// restore over it.
     #[test]
     fn runsc_unexpected_namespace_state_is_not_overwritten() {
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut ns = Ns::parked(false, false);
         ns.route = true;
         ns.recorded = Ok("172.19.0.5/16 172.19.0.254\n".into());
@@ -1631,7 +1757,7 @@ mod tests {
             assert!(!ns.calls.iter().any(|c| c.iter().any(|a| a == "NET_ADMIN")));
         }
         // A healthy runsc holder is not touched either: probe only.
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut ns = Ns::parked(true, true);
         assert_eq!(
             resume(&mut ns, Some(Ok(&policy))),
@@ -1756,7 +1882,7 @@ mod tests {
     /// alike, and nothing is written.
     #[test]
     fn a_timed_out_holder_network_probe_expires_the_session() {
-        let policy = runsc_policy();
+        let policy = legacy();
         for runsc in [false, true] {
             let mut hung =
                 BoundedDockerCli::stand_in(&["sh", "-c", "sleep 30"], ms(150), ms(10_000));
@@ -1908,7 +2034,7 @@ mod tests {
                 self.ns.run(argv)
             }
         }
-        let policy = runsc_policy();
+        let policy = legacy();
         let mut cli = HangOnWrite {
             ns: Ns::parked(false, false),
             hung: BoundedDockerCli::stand_in(&["sh", "-c", "sleep 30"], ms(150), ms(10_000)),
@@ -1932,5 +2058,233 @@ mod tests {
             ),
             session::ResumeGate::Expire("holder_network_lost")
         );
+    }
+
+    // ── recorded holder containment (re-verify against what was installed, not current config) ──
+
+    const RESOLV: &str = "# Written by maxplayer\nnameserver 1.1.1.1\noptions ndots:0\n";
+
+    /// A runsc session row as turn 1 parks it, recording what its holder's containment installed.
+    fn recorded_session(classifier: crate::sandbox_iface::IfaceClassifier) -> SessionRecord {
+        let installed = crate::sandbox_netns::InstalledEgress {
+            egress_dev: "eth0".into(),
+            classifier,
+            proxy_ports: Some(crate::sandbox_net::PortRange::new(9320, 9325).unwrap()),
+        };
+        let (dev, cls, ports) = installed_egress_columns(Some(&installed));
+        SessionRecord {
+            proxy_host: Some("172.17.0.1".into()),
+            holder_egress_dev: dev,
+            holder_classifier: cls,
+            holder_proxy_ports: ports,
+            ..record("j", 0, 0, SessionState::Parked)
+        }
+    }
+
+    fn legacy_session() -> SessionRecord {
+        SessionRecord {
+            proxy_host: Some("172.17.0.1".into()),
+            ..record("j", 0, 0, SessionState::Parked)
+        }
+    }
+
+    /// The operator moved `proxy_port_range` between turns.
+    fn changed_config() -> Result<Option<crate::sandbox_net::PortRange>, String> {
+        Ok(Some(
+            crate::sandbox_net::PortRange::new(9400, 9499).unwrap(),
+        ))
+    }
+
+    fn expires(network: &HolderNetwork) -> bool {
+        session::resume_gate(
+            Some("t"),
+            &HolderObservation::Running {
+                started_at: "t".into(),
+            },
+            session::SESSION_PROTOCOL,
+            network,
+        ) == session::ResumeGate::Expire("holder_network_lost")
+    }
+
+    #[test]
+    fn recorded_containment_columns_round_trip_and_reject_partial_or_unknown_records() {
+        use crate::sandbox_iface::IfaceClassifier;
+        for classifier in [IfaceClassifier::Flower, IfaceClassifier::U32] {
+            let r = recorded_session(classifier);
+            assert_eq!(r.holder_classifier.as_deref(), Some(classifier.name()));
+            assert_eq!(r.holder_proxy_ports.as_deref(), Some("9320-9325"));
+            let back = recorded_installed_egress(&r).unwrap().unwrap();
+            assert_eq!(back.classifier, classifier);
+            assert_eq!(back.egress_dev, "eth0");
+        }
+        let none = crate::sandbox_netns::InstalledEgress {
+            egress_dev: "eth0".into(),
+            classifier: IfaceClassifier::Flower,
+            proxy_ports: None,
+        };
+        let (d, c, p) = installed_egress_columns(Some(&none));
+        assert_eq!(p.as_deref(), Some("none"));
+        let r = SessionRecord {
+            holder_egress_dev: d,
+            holder_classifier: c,
+            holder_proxy_ports: p,
+            ..legacy_session()
+        };
+        assert_eq!(recorded_installed_egress(&r).unwrap(), Some(none));
+        assert_eq!(installed_egress_columns(None), (None, None, None));
+        assert_eq!(recorded_installed_egress(&legacy_session()), Ok(None));
+        let bad: [fn(&mut SessionRecord); 5] = [
+            |r| r.holder_classifier = None,
+            |r| r.holder_proxy_ports = None,
+            |r| r.holder_classifier = Some("bpf".into()),
+            |r| r.holder_proxy_ports = Some("0-5".into()),
+            |r| r.holder_egress_dev = Some(" ".into()),
+        ];
+        for (i, break_it) in bad.into_iter().enumerate() {
+            let mut r = recorded_session(IfaceClassifier::Flower);
+            break_it(&mut r);
+            assert!(recorded_installed_egress(&r).is_err(), "case {i}");
+            // Fails closed: never falls back to the seat's config.
+            assert!(
+                expected_containment(&r, Some(RESOLV), || panic!("config read")).is_err(),
+                "case {i}"
+            );
+        }
+    }
+
+    /// The operator changed `proxy_port_range` between turns. A session that recorded what its
+    /// holder installed is verified against that record (config is never read) and resumes.
+    #[test]
+    fn config_changed_between_turns_resumes_against_the_recorded_containment() {
+        let r = recorded_session(crate::sandbox_iface::IfaceClassifier::Flower);
+        let expected = expected_containment(&r, Some(RESOLV), || {
+            panic!("a recorded session must not read the seat's config")
+        })
+        .unwrap();
+        assert_eq!(expected.policy, runsc_policy());
+        for (addr, route) in [(false, false), (false, true), (true, false)] {
+            let mut ns = Ns::parked(addr, route);
+            assert_eq!(
+                resume(&mut ns, Some(Ok(&expected))),
+                (HolderNetwork::Up, true),
+                "addr={addr} route={route}"
+            );
+        }
+    }
+
+    /// A legacy row (no recorded containment) keeps today's behaviour exactly: rebuilt from the
+    /// seat's CURRENT `proxy_port_range`, so unchanged config resumes and a changed one expires.
+    #[test]
+    fn legacy_session_without_recorded_containment_keeps_the_config_rebuild() {
+        let r = legacy_session();
+        let mut read = false;
+        let same = expected_containment(&r, Some(RESOLV), || {
+            read = true;
+            Ok(Some(
+                crate::sandbox_net::PortRange::new(9320, 9325).unwrap(),
+            ))
+        })
+        .unwrap();
+        assert!(read, "a legacy session reads the seat's config");
+        assert_eq!(same, legacy());
+        let mut ns = Ns::parked(false, false);
+        assert_eq!(resume(&mut ns, Some(Ok(&same))), (HolderNetwork::Up, true));
+
+        let changed = expected_containment(&r, Some(RESOLV), changed_config).unwrap();
+        assert_eq!(changed.installed, None);
+        let mut ns = Ns::parked(false, false);
+        let (network, restored) = resume(&mut ns, Some(Ok(&changed)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("containment")),
+            "{network:?}"
+        );
+        assert!(!restored);
+        assert!(ns.writes().is_empty());
+        assert!(expires(&network));
+        // A config that cannot be resolved is still an error for a legacy row.
+        assert!(expected_containment(&r, Some(RESOLV), || Err("bad".into())).is_err());
+    }
+
+    /// Recorded containment does not loosen anything: rules that differ from what was installed
+    /// still expire with `holder_network_lost`, and nothing is written.
+    #[test]
+    fn recorded_containment_against_tampered_rules_expires() {
+        use crate::sandbox_iface::IfaceClassifier;
+        let flower = expected_containment(
+            &recorded_session(IfaceClassifier::Flower),
+            Some(RESOLV),
+            changed_config,
+        )
+        .unwrap();
+        let cases: [fn(&mut Ns); 5] = [
+            |ns| ns.tc.clear(),
+            |ns| ns.v4 = ns.v4.replace("-j DROP", "-j ACCEPT"),
+            |ns| ns.v6.clear(),
+            |ns| ns.v4 = ns.v4.replace("9320:9325", "1:65535"),
+            // Rules for the CHANGED config instead of what was installed.
+            |ns| ns.v4 = ns.v4.replace("9320:9325", "9400:9499"),
+        ];
+        for (i, tamper) in cases.into_iter().enumerate() {
+            let mut ns = Ns::parked(false, false);
+            tamper(&mut ns);
+            let (network, restored) = resume(&mut ns, Some(Ok(&flower)));
+            assert!(
+                matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("containment")),
+                "case {i}: {network:?}"
+            );
+            assert!(!restored);
+            assert!(ns.writes().is_empty(), "case {i}");
+            assert!(expires(&network), "case {i}");
+        }
+        // Filters wiped by the restore itself: the re-verify against the record catches it.
+        let mut ns = Ns::parked(false, false);
+        ns.write_wipes_tc = true;
+        let (network, _) = resume(&mut ns, Some(Ok(&flower)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.starts_with("re-verify")),
+            "{network:?}"
+        );
+        assert!(expires(&network));
+    }
+
+    /// The recorded classifier is the one checked: a u32 session whose veth now carries a flower
+    /// plan (equivalent, but not what was installed) expires, while a legacy row still accepts
+    /// either. The recorded egress interface must also be the one present.
+    #[test]
+    fn recorded_classifier_and_interface_must_match_what_was_installed() {
+        use crate::sandbox_iface::IfaceClassifier;
+        let u32 = expected_containment(
+            &recorded_session(IfaceClassifier::U32),
+            Some(RESOLV),
+            changed_config,
+        )
+        .unwrap();
+        let mut ns = Ns::parked(false, false);
+        let (network, restored) = resume(&mut ns, Some(Ok(&u32)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("installed u32 plan")),
+            "{network:?}"
+        );
+        assert!(!restored);
+        assert!(ns.writes().is_empty());
+        assert!(expires(&network));
+        // The same flower readback passes for a legacy row (flower or u32 accepted, as before).
+        let mut ns = Ns::parked(false, false);
+        assert_eq!(
+            resume(&mut ns, Some(Ok(&legacy()))),
+            (HolderNetwork::Up, true)
+        );
+
+        let mut other_dev = recorded_session(IfaceClassifier::Flower);
+        other_dev.holder_egress_dev = Some("eth1".into());
+        let expected = expected_containment(&other_dev, Some(RESOLV), changed_config).unwrap();
+        let mut ns = Ns::parked(false, false);
+        let (network, _) = resume(&mut ns, Some(Ok(&expected)));
+        assert!(
+            matches!(&network, HolderNetwork::RestoreFailed(e) if e.contains("eth1")),
+            "{network:?}"
+        );
+        assert!(ns.writes().is_empty());
+        assert!(expires(&network));
     }
 }

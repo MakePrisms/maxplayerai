@@ -662,6 +662,13 @@ pub struct SessionRecord {
     pub proxy_host: Option<String>,
     /// The last git-delivered commit of the session: turn n+1's single parent (§7.1).
     pub base_oid: Option<String>,
+    /// What turn 1's containment actually installed into the holder, recorded at park so a resumed
+    /// turn re-verifies against it rather than against the seat's config at resume time: the egress
+    /// interface the filters were put on, the tc classifier (`flower` | `u32`) and the proxy pinhole
+    /// (`<start>-<end>`, or `none`). All three `None`: a row written before these were recorded.
+    pub holder_egress_dev: Option<String>,
+    pub holder_classifier: Option<String>,
+    pub holder_proxy_ports: Option<String>,
 }
 impl SessionRecord {
     pub fn size(&self) -> crate::session::SessionSize {
@@ -689,7 +696,7 @@ pub struct SessionTurnRecord {
 const SESSION_COLUMNS: &str =
     "job_id, buyer_pubkey, container, holder, holder_started_at, image_id,
     orchestrator_version, acp_session_id, harness, model, turn, last_turn_at, disk_bytes, state,
-    proxy_host, base_oid";
+    proxy_host, base_oid, holder_egress_dev, holder_classifier, holder_proxy_ports";
 
 fn bad_state(i: usize) -> rusqlite::Error {
     rusqlite::Error::InvalidColumnType(i, "state".into(), rusqlite::types::Type::Text)
@@ -714,6 +721,9 @@ fn session_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
             .ok_or_else(|| bad_state(13))?,
         proxy_host: r.get(14)?,
         base_oid: r.get(15)?,
+        holder_egress_dev: r.get(16)?,
+        holder_classifier: r.get(17)?,
+        holder_proxy_ports: r.get(18)?,
     })
 }
 
@@ -1264,7 +1274,8 @@ impl SellerStore {
                  turn INTEGER NOT NULL, last_turn_at INTEGER NOT NULL,
                  disk_bytes INTEGER NOT NULL DEFAULT 0,
                  state TEXT NOT NULL CHECK (state IN ('running','parked','closed','expired')),
-                 proxy_host TEXT, base_oid TEXT);
+                 proxy_host TEXT, base_oid TEXT, holder_egress_dev TEXT,
+                 holder_classifier TEXT, holder_proxy_ports TEXT);
              CREATE TABLE IF NOT EXISTS session_turns (
                  followup_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, turn INTEGER NOT NULL,
                  deadline_unix INTEGER NOT NULL, result_id TEXT, delivery_oid TEXT,
@@ -1292,8 +1303,15 @@ impl SellerStore {
     /// trade state.
     fn migrate(conn: &Connection) -> Result<(), StoreError> {
         // v15 (session jobs): the resume facts, additive on a sessions table an earlier build of
-        // the same version may have created without them.
-        for column in ["proxy_host", "base_oid"] {
+        // the same version may have created without them. The `holder_*` columns record what the
+        // holder's containment installed; NULL on older rows, which resume exactly as before.
+        for column in [
+            "proxy_host",
+            "base_oid",
+            "holder_egress_dev",
+            "holder_classifier",
+            "holder_proxy_ports",
+        ] {
             if !Self::column_exists(conn, "sessions", column)? {
                 conn.execute_batch(&format!("ALTER TABLE sessions ADD COLUMN {column} TEXT;"))?;
             }
@@ -2115,8 +2133,9 @@ impl SellerStore {
         conn.execute(
             "INSERT INTO sessions (job_id, buyer_pubkey, container, holder, holder_started_at,
                  image_id, orchestrator_version, acp_session_id, harness, model, turn,
-                 last_turn_at, disk_bytes, state, proxy_host, base_oid)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                 last_turn_at, disk_bytes, state, proxy_host, base_oid, holder_egress_dev,
+                 holder_classifier, holder_proxy_ports)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
              ON CONFLICT(job_id) DO UPDATE SET buyer_pubkey=excluded.buyer_pubkey,
                  container=excluded.container, holder=excluded.holder,
                  holder_started_at=excluded.holder_started_at, image_id=excluded.image_id,
@@ -2124,7 +2143,10 @@ impl SellerStore {
                  acp_session_id=excluded.acp_session_id, harness=excluded.harness,
                  model=excluded.model, turn=excluded.turn, last_turn_at=excluded.last_turn_at,
                  disk_bytes=excluded.disk_bytes, state=excluded.state,
-                 proxy_host=excluded.proxy_host, base_oid=excluded.base_oid",
+                 proxy_host=excluded.proxy_host, base_oid=excluded.base_oid,
+                 holder_egress_dev=excluded.holder_egress_dev,
+                 holder_classifier=excluded.holder_classifier,
+                 holder_proxy_ports=excluded.holder_proxy_ports",
             params![
                 s.job_id,
                 s.buyer_pubkey,
@@ -2141,7 +2163,10 @@ impl SellerStore {
                 s.disk_bytes as i64,
                 s.state.as_str(),
                 s.proxy_host,
-                s.base_oid
+                s.base_oid,
+                s.holder_egress_dev,
+                s.holder_classifier,
+                s.holder_proxy_ports
             ],
         )?;
         Ok(())
@@ -3637,7 +3662,73 @@ mod tests {
             state: crate::session::SessionState::Parked,
             proxy_host: Some("172.18.0.1".into()),
             base_oid: Some("a".repeat(40)),
+            holder_egress_dev: Some("eth0".into()),
+            holder_classifier: Some("flower".into()),
+            holder_proxy_ports: Some("9320-9325".into()),
         }
+    }
+
+    /// A sessions table as shipped before the holder's installed containment was recorded gains
+    /// the three nullable columns additively and re-entrantly; the existing row reads back intact
+    /// with them NULL (a legacy session), and new rows round-trip them.
+    #[test]
+    fn a_sessions_table_without_recorded_containment_migrates_additively() {
+        let path = temp_db("sessions-pre-holder-policy");
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).expect("create old store");
+            conn.execute_batch(
+                "CREATE TABLE seller_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO seller_meta VALUES ('schema_version', '15');
+                 CREATE TABLE sessions (
+                     job_id TEXT PRIMARY KEY, buyer_pubkey TEXT NOT NULL,
+                     container TEXT NOT NULL, holder TEXT, holder_started_at TEXT,
+                     image_id TEXT NOT NULL, orchestrator_version TEXT NOT NULL,
+                     acp_session_id TEXT, harness TEXT NOT NULL, model TEXT,
+                     turn INTEGER NOT NULL, last_turn_at INTEGER NOT NULL,
+                     disk_bytes INTEGER NOT NULL DEFAULT 0,
+                     state TEXT NOT NULL CHECK (state IN ('running','parked','closed','expired')),
+                     proxy_host TEXT, base_oid TEXT);
+                 INSERT INTO sessions VALUES ('old-job','bb','c-old','h-old','2026-10-21T10:00:00Z',
+                     'sha256:img','2','acp-1','claude',NULL,1,10,100,'parked','172.18.0.1',NULL);",
+            )
+            .expect("old schema");
+        }
+        let store = SellerStore::open(&path).expect("an old sessions table opens clean");
+        let old = store
+            .session("old-job")
+            .unwrap()
+            .expect("the old row survives");
+        assert_eq!(old.proxy_host.as_deref(), Some("172.18.0.1"));
+        assert_eq!(old.state, crate::session::SessionState::Parked);
+        assert_eq!(
+            (
+                old.holder_egress_dev,
+                old.holder_classifier,
+                old.holder_proxy_ports
+            ),
+            (None, None, None),
+            "an old row is a legacy session: nothing is backfilled"
+        );
+        store.put_session(&parked("new-job", 20, 0)).unwrap();
+        assert_eq!(
+            store.session("new-job").unwrap().unwrap(),
+            parked("new-job", 20, 0)
+        );
+        drop(store);
+        let store = SellerStore::open(&path).expect("second open is a no-op");
+        assert_eq!(
+            store
+                .session("new-job")
+                .unwrap()
+                .unwrap()
+                .holder_classifier
+                .as_deref(),
+            Some("flower")
+        );
+        assert_eq!(store.sessions().unwrap().len(), 2);
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Session jobs §5.4/§8: the v15 tables, the sweep keep-set, terminal states, the per-turn

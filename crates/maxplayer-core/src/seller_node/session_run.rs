@@ -185,6 +185,9 @@ impl SellerNodeRunner {
                 state: SessionState::Expired,
                 proxy_host: None,
                 base_oid: None,
+                holder_egress_dev: None,
+                holder_classifier: None,
+                holder_proxy_ports: None,
             },
             Err(error) => {
                 opline!("seller node follow-up ignore id={fid}: session read failed ({error})");
@@ -634,30 +637,31 @@ impl SellerNodeRunner {
         }
     }
 
-    /// `None` unless this seat's sandbox runtime is `runsc`. On a runsc seat: the containment policy
-    /// turn 1 installed into the session's holder, rebuilt from the recorded proxy address, this
-    /// seat's `proxy_port_range` and the session's resolver file — or why it could not be.
+    /// `None` unless this seat's sandbox runtime is `runsc`. On a runsc seat: the containment turn 1
+    /// installed into the session's holder, rebuilt from the recorded proxy address, the session's
+    /// resolver file and what setup recorded it installed (egress interface, tc classifier, proxy
+    /// pinhole) — or why it could not be. A session parked before that was recorded falls back to this
+    /// seat's current `proxy_port_range`, as before.
     fn runsc_session_policy(
         &self,
         record: &SessionRecord,
-    ) -> Option<Result<crate::sandbox_net::NetPolicy, String>> {
+    ) -> Option<Result<session_gc::ExpectedContainment, String>> {
         let home = self.node.home();
         let config = home.config.sandbox.as_ref()?;
         if config.runtime.as_deref().map(str::trim) != Some("runsc") {
             return None;
         }
-        let policy = SandboxPolicy::from_config(Some(config))
-            .map_err(|e| format!("sandbox policy: {e}"))
-            .and_then(|sandbox| {
-                let paths = session_gc::SessionPaths::for_job(&home.root, &record.job_id);
-                let resolv = std::fs::read_to_string(&paths.resolv_conf).ok();
-                session_gc::session_containment_policy(
-                    record.proxy_host.as_deref(),
-                    sandbox.proxy_ports(),
-                    resolv.as_deref(),
-                )
-            });
-        Some(policy)
+        let paths = session_gc::SessionPaths::for_job(&home.root, &record.job_id);
+        let resolv = std::fs::read_to_string(&paths.resolv_conf).ok();
+        Some(session_gc::expected_containment(
+            record,
+            resolv.as_deref(),
+            || {
+                SandboxPolicy::from_config(Some(config))
+                    .map(|sandbox| sandbox.proxy_ports())
+                    .map_err(|e| format!("sandbox policy: {e}"))
+            },
+        ))
     }
 
     /// The resumed container run and the turn's RESULT (§6.1 steps 2–4, §7, §8.2).
@@ -1262,6 +1266,7 @@ impl SellerNodeRunner {
         container: &str,
         holder: Option<String>,
         proxy_host: Option<String>,
+        installed: Option<crate::sandbox_netns::InstalledEgress>,
         harness: &str,
         outcome: &orch::SessionOutcome,
         base_oid: Option<&str>,
@@ -1283,6 +1288,8 @@ impl SellerNodeRunner {
             Ok((_, image)) => (None, image),
             Err(_) => (None, String::new()),
         };
+        let (holder_egress_dev, holder_classifier, holder_proxy_ports) =
+            session_gc::installed_egress_columns(installed.as_ref());
         let record = SessionRecord {
             job_id: job_id.to_owned(),
             buyer_pubkey: buyer.to_owned(),
@@ -1300,6 +1307,9 @@ impl SellerNodeRunner {
             state: SessionState::Parked,
             proxy_host,
             base_oid: base_oid.map(str::to_owned),
+            holder_egress_dev,
+            holder_classifier,
+            holder_proxy_ports,
         };
         if let Err(error) = self.node.store().put_session(&record) {
             opline!(

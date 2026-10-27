@@ -9923,6 +9923,7 @@ impl SellerNodeRunner {
         if let (true, Some(outcome)) = (park, session_outcome.as_ref()) {
             // §5.2 step 3: the proxy stops, the holder is detached and left running.
             let proxy_host = prepared.proxy_host.clone();
+            let installed = prepared.installed_egress();
             let holder = prepared.park();
             let harness = offer
                 .requested_agent
@@ -9935,6 +9936,7 @@ impl SellerNodeRunner {
                 &container_name,
                 holder,
                 proxy_host,
+                installed,
                 &harness,
                 outcome,
                 result
