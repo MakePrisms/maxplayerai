@@ -3075,6 +3075,14 @@ impl PreparedLaunch {
             .map(crate::sandbox_netns::Containment::park)
     }
 
+    /// What containment installed into the holder (egress device, tc classifier, proxy pinhole),
+    /// recorded on a session at park so a resume re-verifies against it. `None` uncontained.
+    pub fn installed_egress(&self) -> Option<crate::sandbox_netns::InstalledEgress> {
+        self._containment
+            .as_ref()
+            .map(crate::sandbox_netns::Containment::installed_egress)
+    }
+
     /// The per-turn values the orchestrator lays over the container env (§6.4): every env pair this
     /// launch minted. Placeholders and base URLs only, never a real contained credential.
     pub fn turn_env(&self) -> Vec<(String, String)> {

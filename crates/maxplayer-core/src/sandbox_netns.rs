@@ -1204,9 +1204,32 @@ pub struct Containment {
     /// guess like `eth0`. Carried so a caller, a log line or a test can name the interface that is
     /// actually filtered rather than the one everybody assumes.
     pub egress_dev: String,
+    /// The tc classifier the egress filters were installed with (flower, or the u32 fallback).
+    pub classifier: crate::sandbox_iface::IfaceClassifier,
+    /// The proxy pinhole the installed policy opened (`None`: no pinhole).
+    pub proxy_ports: Option<crate::sandbox_net::PortRange>,
+}
+
+/// What [`establish`] actually installed into a holder: the egress device, the tc classifier and the
+/// proxy pinhole. A session records it when it parks so a resumed turn re-verifies the parked
+/// namespace against what was installed, not against the seat's config at resume time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledEgress {
+    pub egress_dev: String,
+    pub classifier: crate::sandbox_iface::IfaceClassifier,
+    pub proxy_ports: Option<crate::sandbox_net::PortRange>,
 }
 
 impl Containment {
+    /// What this containment installed (see [`InstalledEgress`]).
+    pub fn installed_egress(&self) -> InstalledEgress {
+        InstalledEgress {
+            egress_dev: self.egress_dev.clone(),
+            classifier: self.classifier,
+            proxy_ports: self.proxy_ports,
+        }
+    }
+
     /// [`NetnsHolder::park`] for the whole containment.
     pub fn park(self) -> String {
         self.holder.park()
@@ -3186,7 +3209,7 @@ async fn establish_with(
     eprintln!("[sandbox] egress containment verified on {dev}: classifier={}{}", classifier.name(),
         if u32_plan.is_some() { " (compatibility mode: basic TCP/UDP/ICMP; options, fragments and encapsulation denied)" } else { "" });
 
-    Ok(Containment { holder, proxy_host, egress_dev: dev })
+    Ok(Containment { holder, proxy_host, egress_dev: dev, classifier, proxy_ports: policy.proxy_ports })
 }
 
 #[cfg(feature = "acp")]
