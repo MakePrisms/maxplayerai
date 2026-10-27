@@ -3209,7 +3209,13 @@ async fn establish_with(
     eprintln!("[sandbox] egress containment verified on {dev}: classifier={}{}", classifier.name(),
         if u32_plan.is_some() { " (compatibility mode: basic TCP/UDP/ICMP; options, fragments and encapsulation denied)" } else { "" });
 
-    Ok(Containment { holder, proxy_host, egress_dev: dev, classifier, proxy_ports: policy.proxy_ports })
+    Ok(Containment {
+        holder,
+        proxy_host,
+        egress_dev: dev,
+        classifier,
+        proxy_ports: policy.proxy_ports,
+    })
 }
 
 #[cfg(feature = "acp")]

@@ -3695,11 +3695,18 @@ mod tests {
             .expect("old schema");
         }
         let store = SellerStore::open(&path).expect("an old sessions table opens clean");
-        let old = store.session("old-job").unwrap().expect("the old row survives");
+        let old = store
+            .session("old-job")
+            .unwrap()
+            .expect("the old row survives");
         assert_eq!(old.proxy_host.as_deref(), Some("172.18.0.1"));
         assert_eq!(old.state, crate::session::SessionState::Parked);
         assert_eq!(
-            (old.holder_egress_dev, old.holder_classifier, old.holder_proxy_ports),
+            (
+                old.holder_egress_dev,
+                old.holder_classifier,
+                old.holder_proxy_ports
+            ),
             (None, None, None),
             "an old row is a legacy session: nothing is backfilled"
         );
@@ -3711,7 +3718,12 @@ mod tests {
         drop(store);
         let store = SellerStore::open(&path).expect("second open is a no-op");
         assert_eq!(
-            store.session("new-job").unwrap().unwrap().holder_classifier.as_deref(),
+            store
+                .session("new-job")
+                .unwrap()
+                .unwrap()
+                .holder_classifier
+                .as_deref(),
             Some("flower")
         );
         assert_eq!(store.sessions().unwrap().len(), 2);
