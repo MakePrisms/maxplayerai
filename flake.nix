@@ -179,8 +179,11 @@
       nixosModules.reviewer = import ./nix/reviewer.nix;
 
       # The launch relay as a deployable box: EC2 t3.small (x86_64) built from `nixosModules.relay`.
-      # Deploy, building ON the target so nothing cross-compiles from the workstation:
-      #   nixos-rebuild switch --flake .#relay --target-host root@<IP> --build-host root@<IP>
+      # Deploy from a CI-built tag (.github/workflows/relay-build.yml pushes it to maxplayer.cachix.org,
+      # which nix/relay-host.nix trusts): push tag `relay-vN`, wait for the "Relay build" run on it to go
+      # green, then on the relay:
+      #   nixos-rebuild switch --flake github:MakePrisms/maxplayerai/relay-vN#relay
+      # Without a green build for that commit the box compiles it itself (~2 h on the t3.small).
       # `nix/relay-host.nix` carries the human-owned config (identity URL, key path, backup, TLS); the
       # flake-local references (the module + the relay package + its schema) are wired here where
       # `self` is in scope.

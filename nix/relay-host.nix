@@ -171,6 +171,12 @@
     443
   ];
 
+  # Prebuilt relay systems from CI (.github/workflows/relay-build.yml pushes each `relay-v*` tag's closure).
+  # Merged with the NixOS default cache.nixos.org entry, not replacing it. Public key only; the push token
+  # lives in the repo's Actions secrets. A path missing from the cache still builds locally.
+  nix.settings.substituters = [ "https://maxplayer.cachix.org" ];
+  nix.settings.trusted-public-keys = [ "maxplayer.cachix.org-1:kagbHiSvJhLPUX6cKTnXM3IiM5rMcYpaJaj9phmOBEQ=" ];
+
   # A t3.small has 2 GB and no swap, but `nixos-rebuild --build-host` builds this box's own closure ON the box:
   # the coordinating `nix` process alone peaked at 1.57 GB RSS and was OOM-killed, taking the deploy with it
   # (ssh exit 255). Swap is what makes the box able to build itself. 4 GB on a 59 GB root volume is free real

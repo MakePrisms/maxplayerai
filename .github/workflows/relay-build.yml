@@ -1,12 +1,13 @@
 name: Relay build
 
-# Builds the deployable relay system (`nixosConfigurations.relay`) on a GitHub runner, so the
-# relay box (EC2 t3.small, 2 vCPU / 2 GB) no longer has to compile our Rust packages itself during
-# `nixos-rebuild switch` (~2 h there).
+# Builds the deployable relay system (`nixosConfigurations.relay`) on a GitHub runner and pushes its
+# runtime closure to the public Cachix cache `maxplayer`, so the relay box (EC2 t3.small, 2 vCPU /
+# 2 GB) no longer compiles our Rust packages itself during `nixos-rebuild switch` (~2 h there).
+# nix/relay-host.nix trusts this cache, so a deploy of a built commit only downloads and activates.
 #
-# Step 1 of the plan: build only, to measure the real CI build time. The follow-up adds the
-# binary-cache push (Cachix) and the relay's substituter + trusted key in nix/relay-host.nix,
-# after which a deploy of a `relay-v*` tag downloads this build instead of compiling it.
+# Deploy runbook: push tag `relay-vN` -> wait for this workflow to go green on it -> on the relay:
+#   nixos-rebuild switch --flake github:MakePrisms/maxplayerai/relay-vN#relay
+# An untagged / unbuilt commit still deploys, it just compiles on the box again.
 #
 # Triggers:
 #   - `relay-v*` tags: the explicit "build this commit for the relay" signal. Kept apart from the
@@ -43,6 +44,15 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
+      # Pull from the cache (unchanged packages, e.g. the buzz relay when only crates/ moved, are
+      # downloaded instead of rebuilt). skipPush: the daemon would push every path built here,
+      # toolchains and vendor dirs included; we push only the relay's runtime closure below.
+      - uses: cachix/cachix-action@v17
+        with:
+          name: maxplayer
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+
       - name: Disk before build
         run: df -h /
 
@@ -50,6 +60,18 @@ jobs:
         run: |
           nix build '.#nixosConfigurations.relay.config.system.build.toplevel' \
             --print-build-logs --no-link --print-out-paths | tee out-path.txt
+
+      # Runtime closure only; paths already on cache.nixos.org are not re-uploaded. Fork PRs get no
+      # secrets, so they build without pushing.
+      - name: Push relay system to Cachix
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          if [ -z "$CACHIX_AUTH_TOKEN" ]; then
+            echo "No CACHIX_AUTH_TOKEN (fork PR?): skipping push."
+            exit 0
+          fi
+          cachix push maxplayer "$(cat out-path.txt)"
 
       - name: Summary
         if: always()
