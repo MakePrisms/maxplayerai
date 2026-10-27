@@ -282,21 +282,6 @@ pub fn advertise_on_claim(
         .insert(at, TagSpec::new([SESSION_TAG, SESSION_TAG_VALUE]));
 }
 
-/// Whether this seat may advertise sessions at all (§2.2, §5.1): a docker seat on the
-/// container-delivery path whose sandbox runtime is NOT gVisor (`runsc`). On runsc the parked
-/// holder's namespace loses its network after turn 1 (rc1 sweep), so every turn 2 would expire;
-/// such a seat does not offer sessions until that is fixed. `runc`/the daemon default qualify.
-pub fn session_capable_seat(
-    sandbox: Option<&crate::home::SandboxConfig>,
-    container_uid: u32,
-) -> bool {
-    sandbox.is_some_and(|sandbox| {
-        sandbox.mode == crate::home::SandboxMode::Docker
-            && sandbox.container_delivery_enabled(container_uid)
-            && sandbox.runtime.as_deref().map(str::trim) != Some("runsc")
-    })
-}
-
 /// Exactly one `["session","1"]` row. Anything else — absent, another value, a duplicate — reads
 /// as no session support.
 pub fn claim_supports_sessions(tags: &[TagSpec]) -> bool {
@@ -458,7 +443,13 @@ impl SessionState {
 pub enum HolderObservation {
     Missing,
     NotRunning,
-    Running { started_at: String },
+    Running {
+        started_at: String,
+    },
+    /// The holder-state `docker inspect` did not answer within its bound (a hung daemon), so
+    /// whether the holder still exists is unknown. Not `Missing`: nothing said it is gone. Fails
+    /// closed with `holder_network_lost`, like every other resume check that could not answer.
+    Unanswered(String),
 }
 
 /// What the holder's network namespace looked like at resume, read by an unprivileged helper that
@@ -478,6 +469,10 @@ pub enum HolderNetwork {
     NoDefaultRoute,
     /// The probe could not answer (docker error, timeout, unreadable output). Fail-closed.
     ProbeFailed(String),
+    /// runsc only: the namespace lost its address or default route, and putting docker's recorded
+    /// values back was refused (no veth, no usable record, filters not as installed) or did not
+    /// re-verify afterwards. Fail-closed; the session expires and its holder is removed.
+    RestoreFailed(String),
     /// Not probed: the holder already failed its own check, or no probe was run at all.
     NotProbed,
 }
@@ -494,7 +489,8 @@ pub enum ResumeGate {
 /// namespace with no firewall rules) expires the session; so does an orchestrator that predates
 /// the inputs protocol the host would send. A holder that passes all of that must ALSO still have a
 /// network ([`HolderNetwork::Up`]); anything else — including a probe that could not answer or was
-/// never run — expires with `holder_network_lost`.
+/// never run — expires with `holder_network_lost`. A holder-state inspect that timed out
+/// ([`HolderObservation::Unanswered`]) expires with `holder_network_lost` too.
 pub fn resume_gate(
     recorded_holder_started_at: Option<&str>,
     observed: &HolderObservation,
@@ -510,6 +506,7 @@ pub fn resume_gate(
     match observed {
         HolderObservation::Missing => ResumeGate::Expire("holder_missing"),
         HolderObservation::NotRunning => ResumeGate::Expire("holder_not_running"),
+        HolderObservation::Unanswered(_) => ResumeGate::Expire("holder_network_lost"),
         HolderObservation::Running { started_at } if started_at != recorded => {
             ResumeGate::Expire("holder_restarted")
         }

@@ -1198,6 +1198,13 @@ impl NetPolicy {
     }
 }
 
+/// The kernel's spelling of this policy's own rules, for tests outside this module that need a
+/// readback a correctly contained namespace would print (synthetic; see the test helper it wraps).
+#[cfg(test)]
+pub(crate) fn readback_fixture(policy: &NetPolicy, family: Family) -> String {
+    tests::normalized_readback(policy, family)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2222,7 +2229,7 @@ mod tests {
     /// Synthetic, and labelled so: it is the *normalisation* contract under test, derived from what
     /// [`MEASURED_V4`] showed the kernel does. A namespace whose readback needs any other rewriting
     /// accepted is not covered by this helper.
-    fn normalized_readback(policy: &NetPolicy, family: Family) -> String {
+    pub(super) fn normalized_readback(policy: &NetPolicy, family: Family) -> String {
         policy
             .rules()
             .iter()
