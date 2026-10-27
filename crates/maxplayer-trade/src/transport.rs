@@ -73,7 +73,9 @@ static MINT_IDENTITY_HOME: RwLock<Option<std::path::PathBuf>> = RwLock::new(None
 /// key is read (or created) only when a mint request is built, so a command refused earlier never
 /// touches the home.
 pub fn configure_mint_identity(home: &std::path::Path) {
-    *MINT_IDENTITY_HOME.write().unwrap_or_else(|e| e.into_inner()) = Some(home.to_owned());
+    *MINT_IDENTITY_HOME
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(home.to_owned());
 }
 
 /// Whether `mint` uses the `nostr://` scheme (case-insensitive: such a URL never reaches HTTP).
