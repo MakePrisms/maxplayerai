@@ -1,0 +1,47 @@
+[package]
+name = "maxplayer-registration"
+version = "0.1.0"
+edition = "2024"
+description = "Email registration service for writing to the Maxplayer relay (npub -> email, NIP-43 membership)"
+repository = "https://github.com/MakePrisms/maxplayerai"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# ITS OWN WORKSPACE, like crates/maxplayer-mint and crates/maxplayer-challenges: sqlx/Postgres and
+# axum stay out of the root graph, so `cargo build --workspace` and the `maxplayer` binary are
+# byte-for-byte unchanged. Build it with `--manifest-path crates/maxplayer-registration/Cargo.toml`.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "maxplayer-registration"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+getrandom = "0.3"
+hex = "0.4"
+hmac = "0.12"
+nostr = { version = "0.44", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# Runtime queries only (no compile-time `query!` macros, so building needs no database);
+# `macros` + `migrate` are for the embedded `sqlx::migrate!()` migrator. No TLS: the service
+# reaches Postgres over the local unix socket.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "macros", "migrate", "chrono"] }
+subtle = "2.6"
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

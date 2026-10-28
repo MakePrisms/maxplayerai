@@ -293,6 +293,54 @@ jobs:
       # The e2e harness itself needs a relay/Postgres/Redis and stays manual (run-e2e.sh).
       - run: python3 -m unittest discover -s scripts/challenges -p 'test_*.py' -v
 
+  # The email registration service (crates/maxplayer-registration; spec: email signup v2.12). Its
+  # OWN cargo workspace with its own Cargo.lock, like the mint and challenges sidecars, so axum/sqlx
+  # never reach the root build. Integration tests need a real Postgres: each test creates a fresh
+  # database owned by a fresh NOSUPERUSER role from this admin URL, and talks to in-process fake
+  # relay + fake Resend servers. Nothing here reaches a real relay, Resend or any email address.
+  maxplayer-registration:
+    name: maxplayer-registration service
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      MAXPLAYER_REGISTRATION_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/maxplayer-registration -> target
+      - run: cargo fmt --manifest-path crates/maxplayer-registration/Cargo.toml --check
+      - run: cargo clippy --manifest-path crates/maxplayer-registration/Cargo.toml --locked --all-targets --no-deps -- -D warnings
+      - run: cargo test --manifest-path crates/maxplayer-registration/Cargo.toml --locked
+      - name: Binary builds and prints its usage
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path crates/maxplayer-registration/Cargo.toml --locked --bins
+          crates/maxplayer-registration/target/debug/maxplayer-registration --help | grep -q '^Usage: maxplayer-registration '
+      - name: Root build carries no sqlx
+        run: |
+          set -euo pipefail
+          if grep -qE '^name = "sqlx' Cargo.lock; then
+            echo "sqlx reached the root Cargo.lock; maxplayer-registration must stay its own workspace" >&2
+            exit 1
+          fi
+
   # The standalone Cashu trade CLI. It is its OWN cargo workspace (`[workspace]` in its manifest)
   # with its own Cargo.lock, so no root-workspace job above builds or tests it: before this job a
   # green CI said nothing about crates/maxplayer-trade. Its integration dev-dependencies start
