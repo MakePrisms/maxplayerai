@@ -1,0 +1,55 @@
+# Example systemd unit (DRAFT, not deployed). The relay box is NixOS; the module draft in
+# registration.nix generates the equivalent. Shown here for review and non-Nix hosts.
+#
+# Secrets are passed with LoadCredential: systemd copies them into a private per-service
+# directory. Those copies are 0440, which the service's secret_file_must_be_private check
+# refuses, so ExecStartPre re-installs them 0600 into the service's own RuntimeDirectory
+# (the same pattern the reviewer uses; see the deployment-readiness notes).
+
+[Unit]
+Description=Maxplayer registration service (email -> npub, NIP-43 membership)
+After=network.target postgresql.service buzz-relay.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=maxplayer-registration
+Group=maxplayer-registration
+RuntimeDirectory=maxplayer-registration
+RuntimeDirectoryMode=0700
+LoadCredential=admin-key:/var/lib/secrets/maxplayer-registration-admin-key
+LoadCredential=resend-key:/var/lib/secrets/maxplayer-registration-resend-key
+LoadCredential=resend-webhook:/var/lib/secrets/maxplayer-registration-resend-webhook
+ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/admin-key %t/maxplayer-registration/admin-key
+ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/resend-key %t/maxplayer-registration/resend-key
+ExecStartPre=/usr/bin/install -m 0600 ${CREDENTIALS_DIRECTORY}/resend-webhook %t/maxplayer-registration/resend-webhook
+# config.toml points admin_key_file / api_key_file / webhook_secret_file at the copies:
+#   /run/maxplayer-registration/{admin-key,resend-key,resend-webhook}
+ExecStart=/usr/local/bin/maxplayer-registration serve --config /etc/maxplayer-registration/config.toml
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Small: ~10 MB RSS idle (measured on a release build). The cap keeps it from
+# competing with the relay on a 2 GB box.
+MemoryMax=128M
+TasksMax=64
+
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

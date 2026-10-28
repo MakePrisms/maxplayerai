@@ -1,0 +1,49 @@
+# /etc/maxplayer-registration/config.toml — example for the relay box.
+# No secret goes in this file: it only names the secret FILES (mode 0600, owned by the
+# service user). Unknown keys are refused at startup.
+
+bind_addr = "127.0.0.1:3100"                       # nginx proxies /account/ here
+public_base_url = "https://relay.maxplayer.ai"     # NIP-98 `u` tags must be <this>/account/...
+# Own database + own non-superuser role, peer auth over the local socket.
+database_url = "postgresql:///maxplayer_registration?host=/run/postgresql&user=maxplayer_registration"
+max_db_connections = 4
+trust_x_real_ip = true                             # only behind the nginx below, which sets X-Real-IP
+
+[relay]
+base_url = "http://127.0.0.1:3000"                 # the relay's loopback bind
+auth_base_url = "https://relay.maxplayer.ai"       # what the relay checks NIP-98 against (+ Host header)
+admin_key_file = "/var/lib/secrets/maxplayer-registration-admin-key"   # 64-hex or nsec, 0600
+relay_pubkey = "<relay's own pubkey, hex or npub: signer of the 13534 member list>"
+timeout_secs = 10
+
+[email]
+from = "Maxplayer <noreply@mail.maxplayer.ai>"
+code_template = "maxplayer-code"                   # Resend template alias (must be PUBLISHED)
+welcome_template = "maxplayer-welcome"
+api_key_file = "/var/lib/secrets/maxplayer-registration-resend-key"           # re_..., 0600
+webhook_secret_file = "/var/lib/secrets/maxplayer-registration-resend-webhook" # whsec_..., 0600
+
+[legal]
+terms_versions = ["v1"]
+privacy_versions = ["v1"]
+marketing_notice_versions = ["v1"]
+terms_url = "https://www.maxplayer.ai/terms/{version}"
+privacy_url = "https://www.maxplayer.ai/privacy/{version}"
+
+[limits]                                           # defaults shown
+code_ttl_secs = 600
+max_attempts = 5
+resend_cooldown_secs = 60
+sends_per_email_per_hour = 5
+sends_per_pubkey_per_hour = 5
+sends_per_ip_per_hour = 20
+confirms_per_pubkey_per_hour = 30
+confirms_per_ip_per_hour = 60
+nip98_max_skew_secs = 60
+
+[sync]
+outbox_interval_secs = 30
+reconcile_interval_secs = 300
+reconcile_removals = false     # true = also remove unregistered `member` keys this service did not add
+keep_members = []              # e.g. the deploy probe's npub
+cleanup_interval_secs = 3600
