@@ -69,6 +69,59 @@ let
   // lib.optionalAttrs (cfg.ownerPubkey != null) { RELAY_OWNER_PUBKEY = cfg.ownerPubkey; };
 in
 {
+  # One dump unit per backup.extraDatabases entry, run as the database's OWN user (peer auth), so no
+  # cross-service grant is needed: `buzz` cannot read these databases and their owners cannot read the
+  # relay's. Same STAMP format, uploadCommand contract and OnFailure alert as the main dump. An inline
+  # module so these dynamically named units merge with the fixed systemd.services.* definitions below.
+  imports = [
+    {
+      config = lib.mkIf cfg.enable {
+        systemd.services = lib.listToAttrs (
+          map (
+            d:
+            lib.nameValuePair "buzz-relay-backup-${d.database}" {
+              description = "maxplayer relay backup — database ${d.database} to ${cfg.backup.destination}";
+              onFailure = [ "buzz-relay-backup-alert.service" ];
+              after = [ "buzz-relay-backup.service" ];
+              serviceConfig = {
+                Type = "oneshot";
+                User = d.user;
+                Group = d.user;
+                RuntimeDirectory = "buzz-relay-backup-${d.database}";
+              }
+              // lib.optionalAttrs (cfg.backup.environmentFile != null) {
+                EnvironmentFile = cfg.backup.environmentFile;
+              };
+              environment = {
+                DESTINATION = cfg.backup.destination;
+                # A service's system user may have no writable home (/var/empty); give the upload tool
+                # (aws-cli caches/config under $HOME) the unit's own private runtime directory instead.
+                HOME = "/run/buzz-relay-backup-${d.database}";
+              };
+              path = [
+                pkgs.postgresql
+                pkgs.gzip
+                pkgs.coreutils
+              ];
+              script = ''
+                set -euo pipefail
+                STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+                export DESTINATION STAMP
+                DUMP="$RUNTIME_DIRECTORY/${d.database}-$STAMP.sql.gz"
+                PGHOST=/run/postgresql pg_dump ${lib.escapeShellArg d.database} | gzip > "$DUMP"
+                echo "pg dump ok (${d.database}): $(wc -c < "$DUMP") bytes"
+                FILE="$DUMP"
+                KEY="pg/${d.database}-$STAMP.sql.gz"
+                export FILE KEY
+                ${cfg.backup.uploadCommand}
+              '';
+            }
+          ) cfg.backup.extraDatabases
+        );
+      };
+    }
+  ];
+
   options.services.maxplayer.relay = {
     enable = lib.mkEnableOption "the maxplayer launch relay (buzz-derived)";
 
@@ -268,6 +321,32 @@ in
         default = null;
         description = "Optional secrets for the backup unit. null by design when the instance IAM role authorizes S3.";
       };
+      extraDatabases = lib.mkOption {
+        type = lib.types.listOf (
+          lib.types.submodule {
+            options = {
+              database = lib.mkOption {
+                type = lib.types.strMatching "[a-z_][a-z0-9_]*";
+                description = "Database name on this box's Postgres.";
+              };
+              user = lib.mkOption {
+                type = lib.types.str;
+                description = "System user (= Postgres role, peer auth) that owns the database and runs its dump.";
+              };
+            };
+          }
+        );
+        default = [ ];
+        description = ''
+          Other services' databases dumped with every backup run (e.g. the registration service adds
+          its own). Each gets a `buzz-relay-backup-<database>` oneshot that runs AS that database's own
+          user, so the relay's `buzz` user is never granted access to another service's data. The main
+          `buzz-relay-backup` run pulls each one in (Wants=) and they run after it, so the timer and a
+          manual `systemctl start buzz-relay-backup.service` cover them. Each uploads
+          `pg/<database>-<stamp>.sql.gz` with the same uploadCommand and fires the same failure alert;
+          a failed extra dump does not fail or block the relay's own dump, and vice versa.
+        '';
+      };
     };
   };
 
@@ -408,6 +487,8 @@ in
     systemd.services.buzz-relay-backup = {
       description = "maxplayer relay backup — Postgres event log to ${cfg.backup.destination}";
       onFailure = [ "buzz-relay-backup-alert.service" ];
+      # Other services' databases (backup.extraDatabases): own units, own users, run after this one.
+      wants = map (d: "buzz-relay-backup-${d.database}.service") cfg.backup.extraDatabases;
       serviceConfig = {
         Type = "oneshot";
         User = cfg.user;
@@ -467,7 +548,10 @@ in
       path = [ pkgs.coreutils ];
       script = ''
         set -uo pipefail
-        msg="maxplayer relay NIGHTLY BACKUP FAILED at $(date -u +%Y%m%dT%H%M%SZ) on $(uname -n) — no Postgres event-log object written to ${cfg.backup.destination}. Off-box durable state is now STALE; investigate: journalctl -u buzz-relay-backup.service"
+        # MONITOR_UNIT is set by systemd for OnFailure= activations: buzz-relay-backup.service (the event
+        # log) or a buzz-relay-backup-<database>.service (backup.extraDatabases).
+        unit="''${MONITOR_UNIT:-buzz-relay-backup.service}"
+        msg="maxplayer relay NIGHTLY BACKUP FAILED at $(date -u +%Y%m%dT%H%M%SZ) on $(uname -n) — $unit wrote no Postgres dump to ${cfg.backup.destination}. Off-box durable state is now STALE; investigate: journalctl -u $unit"
         # Floor: an emerg-priority journal line, unmissable even with no external pager wired.
         printf '%s\n' "$msg" | ${pkgs.systemd}/bin/systemd-cat -t buzz-relay-backup-alert -p emerg || printf '%s\n' "$msg" >&2
         # Real out-of-band pager (host-supplied via backup.alertCommand; empty default = journal-only).

@@ -89,6 +89,12 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   (execution-safety reviews), included in `nixosConfigurations.relay` with
   `services.maxplayer.reviewer.package = packages.default`. Deployment and credentials:
   [`execution-reviews.md`](execution-reviews.md).
+- `packages.maxplayer-registration` + `nixosModules.registration` — `nix/registration.nix`, the email
+  registration service (crate `crates/maxplayer-registration`, its own Cargo.lock) on 127.0.0.1:3100
+  behind nginx `/account/`, with its own Postgres database/role, included in `nixosConfigurations.relay`.
+  Its database is dumped by `buzz-relay-backup` via `services.maxplayer.relay.backup.extraDatabases`.
+  Secrets and the one-time owner grant of `admin` to its key:
+  [`crates/maxplayer-registration/README.md`](../crates/maxplayer-registration/README.md#first-deploy-operator).
 - Root `Dockerfile` + `docker-compose.yml` — a **client** container only: a `maxplayer seller` daemon
   (the compose `seller` service) or an attached buyer `maxplayer mcp`. Standalone cargo build, not
   derived from the flake. See [`DOCKER.md`](DOCKER.md).

@@ -157,6 +157,21 @@
             ];
             meta.mainProgram = "buzz-relay";
           };
+
+          # Email registration service (crate `maxplayer-registration`, email-signup spec v2.12): its OWN
+          # cargo workspace with its own Cargo.lock (like maxplayer-mint / maxplayer-challenges), so the
+          # source is just that subtree and axum/sqlx never touch the root lock. Stock nixpkgs rustc
+          # (26.05: 1.95) meets its floor (sqlx 0.9 needs >= 1.94, edition 2024). sqlx uses runtime
+          # queries plus the embedded `sqlx::migrate!()` migrator, so the build needs no database.
+          # Its integration tests need Postgres (CI runs them), hence doCheck = false here.
+          maxplayer-registration = pkgs.rustPlatform.buildRustPackage {
+            pname = "maxplayer-registration";
+            version = "0.1.0";
+            src = ./crates/maxplayer-registration;
+            cargoLock.lockFile = ./crates/maxplayer-registration/Cargo.lock;
+            doCheck = false;
+            meta.mainProgram = "maxplayer-registration";
+          };
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           # For the system doing the building.
@@ -177,6 +192,7 @@
       # `nixosModules` block.
       nixosModules.relay = import ./nix/relay.nix;
       nixosModules.reviewer = import ./nix/reviewer.nix;
+      nixosModules.registration = import ./nix/registration.nix;
 
       # The launch relay as a deployable box: EC2 t3.small (x86_64) built from `nixosModules.relay`.
       # Deploy from a CI-built tag (.github/workflows/relay-build.yml pushes it to maxplayer.cachix.org,
@@ -197,10 +213,12 @@
         modules = [
           self.nixosModules.relay
           self.nixosModules.reviewer
+          self.nixosModules.registration
           ./nix/relay-host.nix
           {
             services.maxplayer.relay.package = self.packages.x86_64-linux.maxplayer-relay;
             services.maxplayer.reviewer.package = self.packages.x86_64-linux.default;
+            services.maxplayer.registration.package = self.packages.x86_64-linux.maxplayer-registration;
           }
         ];
       };
