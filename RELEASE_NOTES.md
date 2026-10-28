@@ -1,3 +1,37 @@
+## v0.6.2-rc2
+
+Second release candidate for 0.6.2, mostly session-job fixes from testing rc1.
+After publication, install with `npm install -g maxplayer@0.6.2-rc2`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.6.2-rc1
+
+- **Session jobs** (still experimental, off by default):
+  - Fixes from the rc1 seat sweep (#1201): a parked session whose holder lost its
+    network now expires with `holder_network_lost` instead of running a turn that
+    cannot reach the proxy; the inline answer marker is accepted as the first word of
+    the first line; a refused reply containing the marker no longer strikes the
+    harness; `get_job` no longer reports `done` for a turn with no result; review
+    paging no longer fails at 128 encrypted responses; replayed offers are skipped
+    quietly once our claim is awarded.
+  - runsc seats: on resume the seller restores the parked holder's address and route,
+    but only after re-checking its firewall and tc filters, and docker calls are
+    time-bounded. With that, runsc seats advertise sessions again (#1202).
+  - The firewall/egress settings installed for a session are recorded when turn 1
+    parks, and resume re-verifies against those rather than the seat's current
+    config, so changing `proxy_port_range` between turns no longer expires the
+    session (#1208). Adds nullable `sessions` columns (additive migration).
+    **Not yet live-tested on a runsc seat; that test is planned on this RC.**
+- Wallet: `nostr://` mint requests and their relay sign-in are signed with the home's
+  key instead of a throwaway key (#1210). Needed before the relay accepts only
+  registered keys; works the same against today's relay.
+- Seller: inline answers log a calm line instead of the git gate's refusal (#1205).
+- Web: buyer replies (kind 3412) show in the feed with a REPLY tag (#1200); Try it is
+  removed and placeholder `/terms` and `/privacy` pages are added (#1207); images for
+  the signup emails (#1209, #1211, #1212).
+- CI: the relay NixOS system builds on GitHub runners and pushes to Cachix (#1204);
+  fixed a 1-in-1,100 flaky money-path test (#1206).
+
 ## v0.6.2-rc1
 
 First release candidate for 0.6.2, prepared for testing before a stable release.
