@@ -85,12 +85,23 @@ pub async fn probe_relay(
 /// the `info` op over `relay_url` (plus the fallback relays) for a `nostr://` mint. `Ok` iff the
 /// mint answers a well-formed info document — the same reachability the wallet relies on before
 /// any mint op.
-pub async fn probe_mint(mint_url: &str, relay_url: &str, timeout: Duration) -> Result<(), String> {
+/// With `secret_key_hex` a `nostr://` probe signs as that key, like the wallet, so it also proves
+/// the key may write to a membership-gated relay.
+pub async fn probe_mint(
+    mint_url: &str,
+    relay_url: &str,
+    secret_key_hex: Option<&str>,
+    timeout: Duration,
+) -> Result<(), String> {
     use std::str::FromStr;
 
     let url = cashu::MintUrl::from_str(mint_url.trim())
         .map_err(|error| format!("invalid mint url: {error}"))?;
-    let client = crate::nostr_mint::mint_connector_for(&url, relay_url)
+    let identity = secret_key_hex
+        .map(nostr_sdk::Keys::parse)
+        .transpose()
+        .map_err(|error| format!("key parse: {error}"))?;
+    let client = crate::nostr_mint::mint_connector_for(&url, relay_url, identity)
         .map_err(|error| format!("invalid mint url: {error}"))?;
     tokio::time::timeout(timeout, client.get_mint_info())
         .await

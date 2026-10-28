@@ -4,7 +4,8 @@
 //! Maxplayer-specific and versioned; **not a NUT**. See `docs/specs/seller-credits.md` §3.
 //!
 //! - **Request**: kind [`REQUEST_KIND`] (23410), tag `["p", <mint hex>]`, NIP-44 v2 content to the
-//!   mint key, signed by a per-session throwaway client key. Plaintext is a [`Request`]:
+//!   mint key, signed by the wallet's registered key (a throwaway key when the connector has no
+//!   identity). Plaintext is a [`Request`]:
 //!   `{"v":1,"id":…,"op":…,"body":<NUT JSON>,"exp":<unix>}`.
 //! - **Response**: kind [`RESPONSE_KIND`] (23411), tags `["p", <client hex>]` and `["e", <request
 //!   event id>]`, NIP-44 v2 content to the client, signed by the mint key. Plaintext is a
@@ -23,8 +24,9 @@
 //! wallet gave up.
 //!
 //! **Trust.** The mint npub authenticates the transport; it does not make relay delivery reliable
-//! or the mint honest. Per-request throwaway keys hide the Nostr identity, but relay connection
-//! metadata, timing and request sizes can still link requests.
+//! or the mint honest. Product wallets sign with their registered key (email signup option C), so
+//! the mint and relays see which npub made a request; throwaway keys (no identity) hide it, but
+//! relay connection metadata, timing and request sizes can still link those requests.
 //!
 //! Both kinds are in the ephemeral range, so a well-behaved relay forwards them and stores nothing.
 //! No collision with [`crate::kinds`] (3400–3407, 30340).

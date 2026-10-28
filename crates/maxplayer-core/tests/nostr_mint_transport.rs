@@ -19,8 +19,8 @@ use maxplayer_core::nostr_mint::{NostrMintConnector, build_wallet_with_relays};
 use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
 use nostr_sdk::nips::nip44::{self, Version};
 use nostr_sdk::prelude::{
-    Client, Event, EventBuilder, EventId, Filter, Keys, Kind, RelayMessage, RelayPoolNotification,
-    Tag, Timestamp, ToBech32,
+    Client, Event, EventBuilder, EventId, Filter, Keys, Kind, PublicKey, RelayMessage,
+    RelayPoolNotification, Tag, Timestamp, ToBech32,
 };
 use serde_json::{Value, json};
 
@@ -51,6 +51,8 @@ enum Mode {
 struct Seen {
     /// (request event id, decrypted request) for every raw delivery.
     deliveries: Vec<(EventId, Request)>,
+    /// The signer of every request delivery, in order.
+    authors: Vec<PublicKey>,
 }
 
 struct Mint {
@@ -83,7 +85,10 @@ async fn reply(client: &Client, signer: &Keys, to: &Event, id: &str, plain: Stri
 }
 
 async fn start_mint(relay_url: &str, mode: Mode) -> Mint {
-    let keys = Keys::generate();
+    start_mint_as(relay_url, mode, Keys::generate()).await
+}
+
+async fn start_mint_as(relay_url: &str, mode: Mode, keys: Keys) -> Mint {
     let client = Client::new(keys.clone());
     client.add_relay(relay_url).await.unwrap();
     // On a sign-in-required relay the scripted mint, like the real one, re-sends its REQ after
@@ -130,6 +135,7 @@ async fn start_mint(relay_url: &str, mode: Mode) -> Mint {
             let nth = {
                 let mut seen = s.lock().unwrap();
                 seen.deliveries.push((event.id, request.clone()));
+                seen.authors.push(event.pubkey);
                 seen.deliveries
                     .iter()
                     .filter(|(id, _)| *id == event.id)
@@ -877,5 +883,78 @@ async fn nostr_mint_open_relay_adds_no_wait() {
         obs.relays
             .values()
             .all(|r| !r.challenged && r.auth == "unknown")
+    );
+}
+
+/// Email signup option C (Bob, 2026-10-22): once relay.maxplayer.ai only lets registered keys sign
+/// in, a wallet request must be signed, and the sign-in made, with the home's registered key. The
+/// registered identity gets its answer; a throwaway key is refused at sign-in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_identity_signs_in_on_a_members_only_relay() {
+    use auth_gated_relay::{AuthRelay, AuthRelayOptions};
+    let registered = Keys::generate();
+    let mint_keys = Keys::generate();
+    let relay = AuthRelay::start(AuthRelayOptions {
+        members: Some([registered.public_key(), mint_keys.public_key()]),
+        ..Default::default()
+    })
+    .await;
+    let mint = start_mint_as(&relay.url, Mode::Answer, mint_keys).await;
+    let url = MintUrl::from_str(&mint.url).unwrap();
+    let call = |identity: Option<Keys>| {
+        let c = NostrMintConnector::new(&url, vec![relay.url.clone()])
+            .unwrap()
+            .with_timing(
+                Duration::from_secs(4),
+                Duration::from_secs(10),
+                Duration::from_secs(3),
+            );
+        let c = match identity {
+            Some(keys) => c.with_identity(keys),
+            None => c,
+        };
+        async move { c.call_observed("info", Value::Null).await }
+    };
+
+    let (result, obs) = call(Some(registered.clone())).await;
+    assert!(
+        result.is_ok(),
+        "registered key gets its answer: {result:?} {obs:?}"
+    );
+    assert!(
+        obs.relays.values().all(|r| r.auth == "authenticated"),
+        "{obs:?}"
+    );
+
+    let (result, obs) = call(None).await;
+    let error = result.expect_err("a throwaway key is not a member");
+    assert!(!error.is_definitive_failure(), "{error:?}");
+    assert_eq!(obs.reachability, "auth_failed", "{obs:?}");
+}
+
+/// The request event itself is authored by the identity, so the mint sees (and replies to) it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nostr_mint_identity_authors_the_request() {
+    let (_relay, relay_url) = relay().await;
+    let mint = start_mint(&relay_url, Mode::Answer).await;
+    let registered = Keys::generate();
+    let c = connector(&mint, &relay_url, 4000, 10_000).with_identity(registered.clone());
+    let (result, obs) = c.call_observed("info", Value::Null).await;
+    assert!(result.is_ok(), "{result:?} {obs:?}");
+    let authors = mint.seen.lock().unwrap().authors.clone();
+    assert!(!authors.is_empty());
+    assert!(
+        authors.iter().all(|a| *a == registered.public_key()),
+        "{authors:?}"
+    );
+    // Without an identity, every request comes from a different throwaway key.
+    let plain = connector(&mint, &relay_url, 4000, 10_000);
+    plain.call_observed("info", Value::Null).await.0.unwrap();
+    plain.call_observed("info", Value::Null).await.0.unwrap();
+    let authors = mint.seen.lock().unwrap().authors.clone();
+    let tail = &authors[authors.len() - 2..];
+    assert!(
+        tail[0] != tail[1] && !tail.contains(&registered.public_key()),
+        "{authors:?}"
     );
 }

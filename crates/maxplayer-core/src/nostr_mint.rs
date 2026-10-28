@@ -11,9 +11,12 @@
 //! proofs instead of compensating them away. The mint rebuilds the original reply for a replayed
 //! swap (spec §3.3), so a re-send after a lost reply completes normally.
 //!
-//! Each request uses a fresh throwaway client key and its own short-lived relay connection, so
-//! relays cannot link requests to a wallet identity and the connector holds no state tied to one
-//! tokio runtime (the payment worker runs its own runtime).
+//! Each request uses its own short-lived relay connection, so the connector holds no state tied to
+//! one tokio runtime (the payment worker runs its own runtime). Product wallets sign requests and
+//! sign in to the relay with the home's registered key ([`NostrMintConnector::with_identity`]):
+//! relay.maxplayer.ai only accepts writes from registered keys (email signup spec v2.12 §2.1,
+//! option C, Bob 2026-10-22). The mint therefore sees which npub made each request. Without an
+//! identity (tests, diagnostics) every request uses a fresh throwaway key, as before.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -92,12 +95,14 @@ pub fn relays_for(relay_url: &str) -> Vec<String> {
 pub fn mint_connector_for(
     mint_url: &MintUrl,
     relay_url: &str,
+    identity: Option<Keys>,
 ) -> Result<Arc<dyn MintConnector + Send + Sync>, Error> {
     if mint_wire::is_nostr_scheme(&mint_url.to_string()) {
-        Ok(Arc::new(NostrMintConnector::new(
-            mint_url,
-            relays_for(relay_url),
-        )?))
+        let connector = NostrMintConnector::new(mint_url, relays_for(relay_url))?;
+        Ok(Arc::new(match identity {
+            Some(keys) => connector.with_identity(keys),
+            None => connector,
+        }))
     } else {
         Ok(Arc::new(HttpClient::new(mint_url.clone(), None)))
     }
@@ -105,7 +110,8 @@ pub fn mint_connector_for(
 
 /// Build a wallet at `mint_url`. `https://` is exactly `Wallet::new` as before. `nostr://` gets a
 /// [`NostrMintConnector`] and poll-mode subscriptions (cdk's WebSocket path joins `/v1/ws` onto the
-/// mint URL and panics on `nostr://`).
+/// mint URL and panics on `nostr://`). `identity` is the home's registered key: a `nostr://`
+/// request is signed with it and the relay sign-in uses it, so a membership-gated relay accepts it.
 pub fn build_wallet(
     mint_url: &str,
     unit: CurrencyUnit,
@@ -113,18 +119,14 @@ pub fn build_wallet(
     seed: [u8; 64],
     target_proof_count: Option<usize>,
     relay_url: &str,
+    identity: Keys,
 ) -> Result<Wallet, Error> {
     if !mint_wire::is_nostr_scheme(mint_url) {
         return Wallet::new(mint_url, unit, localstore, seed, target_proof_count);
     }
-    build_wallet_with_relays(
-        mint_url,
-        unit,
-        localstore,
-        seed,
-        target_proof_count,
-        relays_for(relay_url),
-    )
+    let url = MintUrl::from_str(mint_url)?;
+    let connector = NostrMintConnector::new(&url, relays_for(relay_url))?.with_identity(identity);
+    nostr_wallet(url, unit, localstore, seed, target_proof_count, connector)
 }
 
 /// [`build_wallet`] for a `nostr://` mint with an explicit relay list (tests use a local relay).
@@ -138,6 +140,17 @@ pub fn build_wallet_with_relays(
 ) -> Result<Wallet, Error> {
     let url = MintUrl::from_str(mint_url)?;
     let connector = NostrMintConnector::new(&url, relays)?;
+    nostr_wallet(url, unit, localstore, seed, target_proof_count, connector)
+}
+
+fn nostr_wallet(
+    url: MintUrl,
+    unit: CurrencyUnit,
+    localstore: Arc<dyn WalletDatabase<cdk_database::Error> + Send + Sync>,
+    seed: [u8; 64],
+    target_proof_count: Option<usize>,
+    connector: NostrMintConnector,
+) -> Result<Wallet, Error> {
     WalletBuilder::new()
         .mint_url(url)
         .unit(unit)
@@ -379,6 +392,9 @@ pub struct NostrMintConnector {
     window: Duration,
     resend_every: Duration,
     connect_timeout: Duration,
+    /// Signs every request and the relay sign-in. `None`: a fresh throwaway key per request.
+    /// (`Keys`' `Debug` prints only the public key.)
+    identity: Option<Keys>,
     last_observation: Arc<std::sync::Mutex<Option<RequestObservation>>>,
 }
 
@@ -402,8 +418,17 @@ impl NostrMintConnector {
             window: DEFAULT_WINDOW,
             resend_every: DEFAULT_RESEND_EVERY,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            identity: None,
             last_observation: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    /// Sign every request, and sign in to the relays, with `keys` (the home's registered key)
+    /// instead of a throwaway key. A membership-gated relay refuses a throwaway key's sign-in, and
+    /// the mint's reply is encrypted to `keys`.
+    pub fn with_identity(mut self, keys: Keys) -> Self {
+        self.identity = Some(keys);
+        self
     }
 
     /// Override the reply window, re-send interval and connect timeout (tests keep them short).
@@ -537,7 +562,7 @@ impl NostrMintConnector {
             ));
         }
 
-        let keys = Keys::generate();
+        let keys = self.identity.clone().unwrap_or_else(Keys::generate);
         let content = nip44::encrypt(keys.secret_key(), &self.mint_pk, &plaintext, Version::V2)
             .map_err(|error| Error::Custom(format!("encrypt {operation} request: {error}")))?;
         let event = EventBuilder::new(Kind::Custom(REQUEST_KIND), content)

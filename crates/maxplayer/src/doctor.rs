@@ -699,12 +699,21 @@ mod checks {
     /// this seller settle *anywhere*", so it BLOCKS (`Fail`) only when EVERY accepted mint is
     /// unreachable; a single mint down while another is reachable is an advisory `Warn`, never a
     /// boot-blocker. The pure verdict lives in [`fold_mint_reachability`].
-    pub(super) fn check_mints(mint_urls: Vec<String>, relay_url: String) -> Check {
+    pub(super) fn check_mints(
+        mint_urls: Vec<String>,
+        relay_url: String,
+        secret: Option<String>,
+    ) -> Check {
         let probes: Vec<(String, Result<(), String>)> = mint_urls
             .into_iter()
             .map(|url| {
                 let outcome = match build_runtime() {
-                    Ok(runtime) => runtime.block_on(doctor::probe_mint(&url, &relay_url, MINT_TIMEOUT)),
+                    Ok(runtime) => runtime.block_on(doctor::probe_mint(
+                        &url,
+                        &relay_url,
+                        secret.as_deref(),
+                        MINT_TIMEOUT,
+                    )),
                     Err(error) => Err(error),
                 };
                 (url, outcome.map_err(|error| error.to_string()))
@@ -2368,6 +2377,7 @@ fn build_checks(
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = build_environment_checks();
     checks.push(Box::new(checks::check_credential_helper));
     checks.push(Box::new(move || checks::check_seller_key(&key_path, key_present)));
+    let secret_for_mints = secret.clone();
     checks.push(Box::new(move || checks::check_relay(relay_url, secret)));
     // What the relay promises about a branch-scoped push token's lifetime. Information under the
     // default `fresh-after-agent` token mode, a boot-blocking gate under `long-lived` — and answered
@@ -2380,7 +2390,9 @@ fn build_checks(
         )
     }));
     // One aggregate mint check across the accept-policy: "can I settle anywhere?".
-    checks.push(Box::new(move || checks::check_mints(accepted_mints, relay_url_for_mints)));
+    checks.push(Box::new(move || {
+        checks::check_mints(accepted_mints, relay_url_for_mints, secret_for_mints)
+    }));
     let agent_host = maxplayer_core::agent_presets::AdapterHost::for_sandbox(sandbox.as_ref());
     checks.push(Box::new(move || {
         checks::check_agent_registry(seller, custom_agents, agent_host)

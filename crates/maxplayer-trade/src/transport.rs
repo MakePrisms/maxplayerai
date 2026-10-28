@@ -64,6 +64,19 @@ pub const MAX_MINT_RELAYS: usize = 8;
 pub const DEFAULT_MINT_RELAY: &str = "wss://relay.maxplayer.ai";
 
 static MINT_RELAYS: RwLock<Option<Vec<String>>> = RwLock::new(None);
+/// The home whose `trade.key` signs every `nostr://` mint request. The default mint relay only lets
+/// registered keys sign in (email signup option C, Bob 2026-10-22). `None` (no home, e.g.
+/// `doctor`): a fresh throwaway key per request.
+static MINT_IDENTITY_HOME: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
+
+/// Sign every later `nostr://` mint request, and the relay sign-in, as `home`'s `trade.key`. The
+/// key is read (or created) only when a mint request is built, so a command refused earlier never
+/// touches the home.
+pub fn configure_mint_identity(home: &std::path::Path) {
+    *MINT_IDENTITY_HOME
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(home.to_owned());
+}
 
 /// Whether `mint` uses the `nostr://` scheme (case-insensitive: such a URL never reaches HTTP).
 pub fn is_nostr(mint: &str) -> bool {
@@ -237,11 +250,20 @@ pub fn abandon_grace_seconds(mint: &str) -> u64 {
     }
 }
 
-/// The wallet connector for a `nostr://` mint over the configured mint relays.
+/// The wallet connector for a `nostr://` mint over the configured mint relays, signing as the
+/// configured mint identity ([`configure_mint_identity`]) when there is one.
 pub fn connector(mint: &str) -> Result<NostrMintConnector> {
     let url: MintUrl = mint.parse()?;
     let c = NostrMintConnector::new(&url, mint_relays())
         .map_err(|e| anyhow!("nostr mint {mint}: {e}"))?;
+    let home = MINT_IDENTITY_HOME
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let c = match home {
+        Some(home) => c.with_identity(crate::wallet::identity(&home)?),
+        None => c,
+    };
     Ok(match lab_window(mint) {
         Some(w) => c.with_timing(
             w,
