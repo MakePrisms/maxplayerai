@@ -1,5 +1,5 @@
-# Example systemd unit (DRAFT, not deployed). The relay box is NixOS; the module draft in
-# registration.nix generates the equivalent. Shown here for review and non-Nix hosts.
+# Example systemd unit for non-NixOS hosts. The relay box is NixOS: nix/registration.nix
+# (nixosModules.registration, part of nixosConfigurations.relay) generates the equivalent.
 #
 # Secrets are passed with LoadCredential: systemd copies them into a private per-service
 # directory. Those copies are 0440, which the service's secret_file_must_be_private check

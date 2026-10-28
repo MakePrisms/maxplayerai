@@ -6,7 +6,8 @@ accepted and the product-news setting, and tells the relay (NIP-43 kind 9030) th
 may write. Emails stay in this service's own Postgres database. The relay only ever sees npubs.
 
 It is its own cargo workspace (like `maxplayer-mint` and `maxplayer-challenges`), so axum and
-sqlx never reach the root build or the `maxplayer` binary. It is not deployed anywhere yet.
+sqlx never reach the root build or the `maxplayer` binary. On the relay box it is part of
+`nixosConfigurations.relay` (see [Deployment](#deployment)).
 
 ```sh
 cargo build --release --locked --manifest-path crates/maxplayer-registration/Cargo.toml
@@ -102,7 +103,7 @@ None of these are in the repo, the config file or the Nix store.
 
 Each secret file must be a regular file with no group/other access (`chmod 600`), or startup
 fails with `secret_file_must_be_private`. Under systemd `LoadCredential` the copies are 0440,
-so the unit re-installs them 0600 into its RuntimeDirectory (see the deploy drafts). Secret
+so the unit re-installs them 0600 into its RuntimeDirectory (`nix/registration.nix`). Secret
 values never appear in logs or errors.
 
 ### Resend templates
@@ -119,12 +120,54 @@ The subject comes from the template. Values are HTML-escaped because `{{{VAR}}}`
 Point a Resend webhook at `https://relay.maxplayer.ai/account/webhooks/resend` with the events
 `email.bounced`, `email.complained` and `contact.updated`.
 
-## Deployment (drafts only, nothing deployed)
+## Deployment
 
-- [`deploy/registration.nix`](deploy/registration.nix): a NixOS module draft, not wired into
-  `flake.nix`. It covers the database and role, unit, credentials, nginx location and swap.
-- [`deploy/maxplayer-registration.service`](deploy/maxplayer-registration.service): the
-  equivalent plain systemd unit.
+On the relay box the service comes from the flake: package `packages.maxplayer-registration`,
+NixOS module [`nix/registration.nix`](../../nix/registration.nix) (`nixosModules.registration`),
+enabled in `nix/relay-host.nix` with `relayPubkey` = the relay's NIP-11 `self` key. The module
+creates the database and role, the unit (127.0.0.1:3100, credentials re-installed 0600), the nginx
+`/account/` location and the backup entry. It defines no swap: the host already has a 4 GB swapfile.
+[`deploy/maxplayer-registration.service`](deploy/maxplayer-registration.service) is the equivalent
+plain systemd unit for non-NixOS hosts.
+
+### First deploy (operator)
+
+1. Before the switch, as root on the relay, place the three secrets (mode 0600, root-owned is fine;
+   systemd copies them in):
+   `/var/lib/secrets/maxplayer-registration-admin-key` (a NEW 64-hex or `nsec1` key, used only by this
+   service), `/var/lib/secrets/maxplayer-registration-resend-key` (`re_…`) and
+   `/var/lib/secrets/maxplayer-registration-resend-webhook` (`whsec_…`). A missing file fails only
+   `maxplayer-registration.service`.
+2. Deploy the relay as usual (`docs/DEPLOYMENT.md`, "Deploying the relay"). The same switch sets
+   `RELAY_OWNER_PUBKEY`, so buzz bootstraps the owner row at start (`Relay owner bootstrapped` in
+   `journalctl -u buzz-relay`).
+3. Read the service's admin pubkey on the box (either line works):
+
+   ```sh
+   nix run nixpkgs#nak -- key public "$(nix run nixpkgs#nak -- decode "$(cat /var/lib/secrets/maxplayer-registration-admin-key)" 2>/dev/null || cat /var/lib/secrets/maxplayer-registration-admin-key)"
+   journalctl -u maxplayer-registration -g 'relay admin key loaded' -n 1 -o cat    # admin=<hex>
+   ```
+
+   For a hex file the first command is just `nak key public "$(cat <file>)"`. Do not pass an
+   `nsec1…` string straight to `nak key public` (nak 0.17.4 returns a wrong key for it); decode first.
+4. The owner grants that key `admin`, once, from wherever the owner secret lives (websocket +
+   NIP-42; `--prompt-sec` reads the hex or nsec from the terminal, so it never lands in shell history):
+
+   ```sh
+   nak event --prompt-sec --auth -k 9030 -t - -p <service admin pubkey hex> -t role=admin wss://relay.maxplayer.ai
+   ```
+
+   `success` is the expected end of the output. Only an `owner` may grant `admin` (an admin gets
+   `only owner can grant admin role`); repeating the command is a harmless no-op.
+5. Read back (anonymous; the relay-signed kind-13534 member list):
+
+   ```sh
+   nak req -k 13534 -a 5fda3774ed565fd500ae7e4289f839a0f06dc2aee4cc19a1acf783b77bfe73ec -l 1 wss://relay.maxplayer.ai \
+     | jq -c '.tags[] | select(.[0]=="member")'
+   ```
+
+   It must show `["member","<service admin pubkey>","admin"]`. Until then every confirm answers
+   `relay_member:"pending"` and the outbox retries; nothing is lost.
 
 ### Database and role
 
@@ -144,14 +187,13 @@ than an hour.
 
 ### nginx
 
-On the `relay.maxplayer.ai` vhost, next to the relay's `location /`:
+The module adds, on the `relay.maxplayer.ai` vhost next to the relay's `location /`:
 
 ```nginx
 location /account/ {
     proxy_pass http://127.0.0.1:3100;
     client_max_body_size 64k;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
+    # recommendedProxySettings: Host, X-Real-IP, X-Forwarded-*
 }
 ```
 
@@ -160,23 +202,20 @@ rate-limit bucket.
 
 ### Backups
 
-Add the database to the nightly `pg_dump` in `nix/relay.nix` (`buzz-relay-backup`). The backup
-runs as the `buzz` user, which cannot read this database, so the dump must run as
-`maxplayer_registration` (or postgres), for example:
-
-```sh
-REG_DUMP="$RUNTIME_DIRECTORY/registration-$STAMP.sql.gz"
-PGHOST=/run/postgresql runuser -u maxplayer_registration -- pg_dump maxplayer_registration | gzip > "$REG_DUMP"
-FILE="$REG_DUMP"; KEY="pg/registration-$STAMP.sql.gz"; export FILE KEY
-${cfg.backup.uploadCommand}
-```
+The module registers the database in `services.maxplayer.relay.backup.extraDatabases`. That adds a
+`buzz-relay-backup-maxplayer_registration.service` oneshot which runs as `maxplayer_registration`
+(peer auth, so `buzz` gets no access to it), is pulled in by every `buzz-relay-backup` run
+(timer or manual start), uploads `pg/maxplayer_registration-<stamp>.sql.gz` with the same
+`uploadCommand`, and fires the same `buzz-relay-backup-alert` on failure. Check it with
+`systemctl show buzz-relay-backup-maxplayer_registration.service -p Result -p ExecMainStatus` and
+`journalctl -u buzz-relay-backup-maxplayer_registration` (`pg dump ok (maxplayer_registration): <N> bytes`).
 
 This database holds emails (personal data). The S3 backup bucket's access policy now covers it too.
 
 ### RAM
 
-A release build idles at about 10 MB RSS (measured). The unit caps it at `MemoryMax=128M`. The
-spec still asks for swap on the 2 GB box as a safety net.
+A release build idles at about 10 MB RSS (measured). The unit caps it at `MemoryMax=128M`. Swap
+(the spec's safety net) is the host's existing 4 GB swapfile in `nix/relay-host.nix`.
 
 ## Tests
 
