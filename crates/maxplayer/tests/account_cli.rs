@@ -212,7 +212,7 @@ fn requests_are_signed_over_the_public_url_with_the_payload_hash() {
         };
         let route = r.path.strip_prefix("/account").unwrap();
         assert_eq!(tag("u"), [format!("{}{route}", fake.base_url())]);
-        assert_eq!(tag("method"), [r.method.clone()]);
+        assert_eq!(tag("method"), std::slice::from_ref(&r.method));
         if r.body.is_empty() {
             assert!(tag("payload").is_empty());
         } else {

@@ -591,7 +591,7 @@ mod tests {
         let event = decode(&header);
         assert_eq!(event.kind, Kind::HttpAuth);
         assert_eq!(event.pubkey, keys.public_key());
-        assert_eq!(tag(&event, "u"), [url.clone()]);
+        assert_eq!(tag(&event, "u"), std::slice::from_ref(&url));
         assert_eq!(tag(&event, "method"), ["POST"]);
         assert_eq!(tag(&event, "payload"), [hex::encode(Sha256::digest(body))]);
         assert_eq!(tag(&event, "nonce"), ["n1"]);

@@ -293,6 +293,8 @@ fn tag_values(event: &Event, name: &str) -> Vec<String> {
 }
 
 /// The service's `nip98::verify` + single-use check, with its error codes.
+// Test-only fake: the refusal carries the answer and the decoded event for the request log.
+#[allow(clippy::result_large_err)]
 fn authenticate(
     state: &mut State,
     header: Option<&str>,
