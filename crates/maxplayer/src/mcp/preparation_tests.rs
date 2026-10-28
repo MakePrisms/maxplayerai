@@ -71,10 +71,7 @@ fn pending_post_and_poll_cross_the_mcp_daemon_boundary() {
             writeln!(socket, "{}", json!({"id":request["id"],"result":result})).unwrap();
         }
     });
-    let state = McpState {
-        home,
-        instructions: String::new(),
-    };
+    let state = McpState::new(home, String::new());
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let posted = runtime
         .block_on(call_tool_async(
@@ -84,6 +81,11 @@ fn pending_post_and_poll_cross_the_mcp_daemon_boundary() {
         .unwrap();
     assert_eq!(posted["structuredContent"]["status"], "preparing");
     assert!(posted["structuredContent"].get("job_id").is_none());
+    // The first successful post_job of this server process points at the buyer guides.
+    assert_eq!(
+        posted["structuredContent"]["guides"]["buyer_operate"],
+        crate::skill::BUYER_OPERATE_SKILL_URL
+    );
     let polled = runtime
         .block_on(call_tool_async(
             &state,
@@ -92,6 +94,7 @@ fn pending_post_and_poll_cross_the_mcp_daemon_boundary() {
         .unwrap();
     assert_eq!(polled["structuredContent"]["job_id"], "real-job");
     assert_eq!(polled["isError"], false);
+    assert!(polled["structuredContent"].get("guides").is_none());
     server.join().unwrap();
 }
 
@@ -126,10 +129,7 @@ fn slow_post_job_beats_the_general_deadline_without_a_duplicate_post() {
             writeln!(socket, "{}", json!({"id":request["id"],"result":result})).unwrap();
         }
     });
-    let state = McpState {
-        home,
-        instructions: String::new(),
-    };
+    let state = McpState::new(home, String::new());
     let call = McpRequest {
         id: Some(json!(7)),
         method: "tools/call".into(),
@@ -152,6 +152,10 @@ fn slow_post_job_beats_the_general_deadline_without_a_duplicate_post() {
     );
     assert_eq!(slow["result"]["structuredContent"]["status"], "preparing");
     assert_eq!(
+        slow["result"]["structuredContent"]["guides"]["debug_buying"],
+        crate::skill::DEBUG_BUYING_SKILL_URL
+    );
+    assert_eq!(
         posts.load(Ordering::SeqCst),
         1,
         "one call, one posting request"
@@ -160,6 +164,8 @@ fn slow_post_job_beats_the_general_deadline_without_a_duplicate_post() {
     assert_eq!(retry["result"]["isError"], false);
     assert_eq!(retry["result"]["structuredContent"]["job_id"], "only-job");
     assert_eq!(retry["result"]["structuredContent"]["deduplicated"], true);
+    // Once per process: the retry's result carries no second pointer.
+    assert!(retry["result"]["structuredContent"].get("guides").is_none());
     server.join().unwrap();
     assert_eq!(posts.load(Ordering::SeqCst), 2);
 }

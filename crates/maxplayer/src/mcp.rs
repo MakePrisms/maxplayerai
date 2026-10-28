@@ -9,6 +9,7 @@
 
 use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use maxplayer_core::home::{self, MaxplayerHome};
@@ -85,6 +86,47 @@ struct McpState {
     /// nix availability must continue to perform their own call-time checks: clients may discard
     /// the initialize `instructions` field, and there is no mechanism for updating it later.
     instructions: String,
+    /// Set once the first successful `post_job` result of THIS server process has carried the
+    /// `guides` field. In memory only: a restarted server (a new client session) points again, and
+    /// nothing is written to the home.
+    post_job_guides_sent: AtomicBool,
+}
+
+impl McpState {
+    fn new(home: MaxplayerHome, instructions: String) -> Self {
+        Self {
+            home,
+            instructions,
+            post_job_guides_sent: AtomicBool::new(false),
+        }
+    }
+
+    /// Attach the `guides` field to the first successful `post_job` result of this process, and to
+    /// no later one. A tool result is what an MCP client hands the agent whole, unlike a long tool
+    /// description (truncated) or the handshake `instructions` (read once, or dropped), and the
+    /// first post is the moment a new buyer starts depending on the setup it may have skipped. Once
+    /// is a pointer; on every result it would be noise the agent learns to skip. Existing result
+    /// fields are untouched; a failed post never reaches here, so it does not consume the flag.
+    fn with_first_post_job_guides(&self, body: Value) -> Value {
+        match body {
+            Value::Object(mut map) => {
+                if !self.post_job_guides_sent.swap(true, Ordering::SeqCst) {
+                    map.insert("guides".into(), post_job_guides());
+                }
+                Value::Object(map)
+            }
+            other => other,
+        }
+    }
+}
+
+/// The `guides` value on the first successful `post_job` result: where to read before relying on
+/// the trade loop, and where to go when it stalls. Both URLs come from `crate::skill`.
+fn post_job_guides() -> Value {
+    json!({
+        "buyer_operate": crate::skill::BUYER_OPERATE_SKILL_URL,
+        "debug_buying": crate::skill::DEBUG_BUYING_SKILL_URL,
+    })
 }
 
 /// Run the MCP server on the provided stdio handles until stdin EOF.
@@ -153,7 +195,7 @@ fn bootstrap_state() -> Result<McpState, String> {
     let root = home::default_home_dir().map_err(|error| error.to_string())?;
     let home = home::bootstrap(root).map_err(|error| error.to_string())?;
     let instructions = compose_instructions(nix_probe_succeeds());
-    Ok(McpState { home, instructions })
+    Ok(McpState::new(home, instructions))
 }
 
 fn nix_probe_succeeds() -> bool {
@@ -166,31 +208,65 @@ fn nix_probe_succeeds() -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// The docs pointer in the handshake, built from the ONE shared URL constant (`crate::skill`) so
-/// this route and the CLI routes (`--help`, `doctor`, seller first-run, `maxplayer skill`) cannot
-/// drift apart. Until those existed this line was the binary's only pointer to the docs — and a
-/// client may discard `instructions`, so it was advisory even for the buyers it reached.
-fn instruction_guides() -> String {
+/// The sentence `post_job`'s description LEADS with: the specific setup/operation skill, not the
+/// orientation page, because the agent reading it is about to spend and needs the buyer guide.
+fn post_job_guide_lead() -> String {
     format!(
-        "Setup, operation, and debugging guides: {} — start there before first use.",
-        crate::skill::SKILL_URL
+        "Before your first post_job, read {}.",
+        crate::skill::BUYER_OPERATE_SKILL_URL
     )
 }
 
-/// A tool description with the guides sentence appended as its final sentence.
+/// The sentence `collect`'s description LEADS with: the buyer debugging skill, named by the
+/// symptoms an agent has when it reaches for collect because something went wrong.
+fn collect_guide_lead() -> String {
+    format!(
+        "If a job stalls, a claim lapses or payment fails, read {}.",
+        crate::skill::DEBUG_BUYING_SKILL_URL
+    )
+}
+
+/// The docs pointer in the handshake, built from the shared URL constants (`crate::skill`) so
+/// this route and the CLI routes (`--help`, `doctor`, seller first-run, `maxplayer skill`) cannot
+/// drift apart. It keeps the orientation page (every companion skill hangs off it) and also names
+/// the two buyer skills, in the same sentences the tool descriptions lead with. A client may
+/// discard `instructions`, and an agent that receives them reads them once like a banner (see
+/// [`led_by`]), so this line is advisory; descriptions, results and errors carry pointers too.
+fn instruction_guides() -> String {
+    format!(
+        "Setup, operation, and debugging guides: {} — start there before first use. {} {}",
+        crate::skill::SKILL_URL,
+        post_job_guide_lead(),
+        collect_guide_lead()
+    )
+}
+
+/// A tool description with a guide pointer as its FIRST sentence.
 ///
 /// Observed on a real Grok Bot box (2026-09-08): the handshake `instructions` WERE delivered, and
 /// the agent could quote them back later — but it read them once, at connect, summarised
 /// registration as "connected + 4 tools", and went straight to hiring. It reached the guides only
 /// under debugging pressure, after it had started spending. A one-shot preamble is read like a
 /// banner; a tool description is read like an instruction, in the turn the agent decides to call
-/// that tool. So the pointer rides exactly two descriptions: `post_job`, the first tool a new buyer
+/// that tool. So a pointer rides exactly two descriptions: `post_job`, the first tool a new buyer
 /// calls and the one that spends money, and `collect`, the tool it reaches for when something has
 /// gone wrong. `get_job` and `award_claim` are deliberately left alone — two carriers are a
-/// pointer, four are noise. The existing text is not rewritten or reflowed; the sentence is the
-/// same shared one the handshake prints, from the same constant.
-fn with_guides(description: &str) -> String {
-    format!("{description} {}", instruction_guides())
+/// pointer, four are noise.
+///
+/// The pointer LEADS rather than trails. Both descriptions are long, and MCP clients truncate long
+/// descriptions: observed 2026-10-28 in OpenClaw, both rendered ending in "…" well before the
+/// sentence that used to be appended, so no agent on that client ever saw it. The rest of each
+/// description is unchanged, only now after the lead sentence.
+fn led_by(lead: String, description: &str) -> String {
+    format!("{lead} {description}")
+}
+
+/// The line every MCP tool ERROR result ends with. An error is the moment an agent needs the
+/// debugging guide, and an error result is short, so clients show it whole. Appended on its own
+/// line, so the original message still starts the text unchanged (readers such as
+/// `scripts/challenges/swarm.mjs` match on that text).
+fn tool_error_guide_line() -> String {
+    format!("Debugging guide: {}", crate::skill::DEBUG_BUYING_SKILL_URL)
 }
 
 fn compose_instructions(nix_available: bool) -> String {
@@ -261,7 +337,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": with_guides("Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Optional base_local_path is an absolute checkout or bare-repo path on the buyer daemon machine, valid only in contribution mode. For private posts it supplies only the pinned base and its history; the path stays local. If unavailable, the buyer downloads target_repo_url as usual. Direct jobs only: an open-pool (untargeted) post with base_local_path is refused, because open-pool sellers must read target_repo_url themselves before claiming. SAME RULE FOR PRIVATE REPOS: on an open-pool or public contribution job, target_repo_url must be publicly readable (sellers read it before claiming); a post whose base sellers cannot read is refused at post time with no money spent — for a private repository post a TARGETED private job (seller_pubkey), where the buyer uploads the base for its chosen seller. A PUBLIC contribution post additionally downloads the base once at post time to validate it (readability, base_oid exists, relay quotas) before anything is published, so the post takes roughly one clone of the repo; a bad pin is refused with the cause named instead of burning the job deadline at seller execution. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Slow preparation returns status=preparing with preparation_id; this is NOT a published job. Poll get_job with job_id=preparation_id until status=posted yields the real job_id, then use that job_id normally. Never repost with changed arguments to poll. An identical retry attaches to the same preparation (status=posted with deduplicated=true means nothing new was published); without request_id that only holds for 10 minutes after it finishes, so a later identical post is a new hire. A failure before any offer was queued re-runs on retry. request_id is a permanent idempotency key; a new one is a deliberate new hire. Never echoes secrets."),
+            "description": led_by(post_job_guide_lead(), "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Optional base_local_path is an absolute checkout or bare-repo path on the buyer daemon machine, valid only in contribution mode. For private posts it supplies only the pinned base and its history; the path stays local. If unavailable, the buyer downloads target_repo_url as usual. Direct jobs only: an open-pool (untargeted) post with base_local_path is refused, because open-pool sellers must read target_repo_url themselves before claiming. SAME RULE FOR PRIVATE REPOS: on an open-pool or public contribution job, target_repo_url must be publicly readable (sellers read it before claiming); a post whose base sellers cannot read is refused at post time with no money spent — for a private repository post a TARGETED private job (seller_pubkey), where the buyer uploads the base for its chosen seller. A PUBLIC contribution post additionally downloads the base once at post time to validate it (readability, base_oid exists, relay quotas) before anything is published, so the post takes roughly one clone of the repo; a bad pin is refused with the cause named instead of burning the job deadline at seller execution. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Slow preparation returns status=preparing with preparation_id; this is NOT a published job. Poll get_job with job_id=preparation_id until status=posted yields the real job_id, then use that job_id normally. Never repost with changed arguments to poll. An identical retry attaches to the same preparation (status=posted with deduplicated=true means nothing new was published); without request_id that only holds for 10 minutes after it finishes, so a later identical post is a new hire. A failure before any offer was queued re-runs on retry. request_id is a permanent idempotency key; a new one is a deliberate new hire. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -372,7 +448,7 @@ fn tools() -> Value {
         },
         {
             "name": "collect",
-            "description": with_guides("Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match — and the delivered tree must carry this job's execution sentinel), then materialize the files into <home>/results/<job_id>. What happens between verify and materialize depends on the mode the offer and claim AGREED on at accept, which collect reads off the local bind and never infers: a PRICED job (payment=sat) is auto-paid through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), and if the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. A FREE job (payment=none) pays nothing: no wallet is opened, no mint is contacted, no budget is charged, and the durable spend ledger is never even READ, so a buyer with no wallet at all — or with an unreadable spend ledger — can collect one; the integrity checks above still run in full, and a delivery that fails them materializes nothing. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting re-materializes without a second payment. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used}; for a free collect pay.state is \"none\", pay.attempt_id is null and pay.amount_sats is 0, because no payment attempt was ever made, and pay.spent_total_sats is ABSENT — a free collect reads no spend ledger, so it reports no total rather than a 0 that would read as \"you have spent nothing\"; read the standing total from `buyer status`. agent_used/model_used are the seller-claimed harness/model that produced the delivered result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets."),
+            "description": led_by(collect_guide_lead(), "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match — and the delivered tree must carry this job's execution sentinel), then materialize the files into <home>/results/<job_id>. What happens between verify and materialize depends on the mode the offer and claim AGREED on at accept, which collect reads off the local bind and never infers: a PRICED job (payment=sat) is auto-paid through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), and if the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. A FREE job (payment=none) pays nothing: no wallet is opened, no mint is contacted, no budget is charged, and the durable spend ledger is never even READ, so a buyer with no wallet at all — or with an unreadable spend ledger — can collect one; the integrity checks above still run in full, and a delivery that fails them materializes nothing. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting re-materializes without a second payment. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used}; for a free collect pay.state is \"none\", pay.attempt_id is null and pay.amount_sats is 0, because no payment attempt was ever made, and pay.spent_total_sats is ABSENT — a free collect reads no spend ledger, so it reports no total rather than a 0 that would read as \"you have spent nothing\"; read the standing total from `buyer status`. agent_used/model_used are the seller-claimed harness/model that produced the delivered result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -460,15 +536,27 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
     // single money authority. Everything else moved to the `maxplayer` CLI; a stale client calling a
     // moved tool gets a pointer to the command that replaced it. `award_claim` maps to the daemon's
     // `award` RPC (manual, claim_id-named award).
-    match name {
-        "post_job" => route_tool(state, "post_job", "prepare_post_job", arguments).await,
-        "get_job" => route_tool(state, "get_job", "get_job", arguments).await,
-        "collect" => route_tool(state, "collect", "collect", arguments).await,
-        "award_claim" => route_tool(state, "award_claim", "award", arguments).await,
+    let body = match name {
+        "post_job" => route_tool(state, "post_job", "prepare_post_job", arguments).await?,
+        "get_job" => route_tool(state, "get_job", "get_job", arguments).await?,
+        "collect" => route_tool(state, "collect", "collect", arguments).await?,
+        "award_claim" => route_tool(state, "award_claim", "award", arguments).await?,
         "reply" if state.home.config.sessions.enabled => {
-            route_tool(state, "reply", "reply", arguments).await
+            route_tool(state, "reply", "reply", arguments).await?
         }
-        moved => Err(moved_tool_error(moved)),
+        moved => return Err(moved_tool_error(moved)),
+    };
+    Ok(tool_ok(shape_result(state, name, body)))
+}
+
+/// The MCP result body for a successful daemon reply: tagged `ok: true`, and — on the first
+/// successful `post_job` of this process only — carrying `guides`.
+fn shape_result(state: &McpState, tool: &str, body: Value) -> Value {
+    let body = with_ok(body);
+    if tool == "post_job" {
+        state.with_first_post_job_guides(body)
+    } else {
+        body
     }
 }
 
@@ -476,7 +564,7 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
 /// name (for errors/hints); `method` is the daemon RPC. The tool arguments are forwarded verbatim as
 /// RPC params — the daemon is the sole authority for validation and money, so the MCP adds no
 /// second-guessing. The daemon never returns the secret key; the never-echo guard is defense in
-/// depth over its reply.
+/// depth over its reply. Returns the daemon's result body; `call_tool_async` shapes the MCP result.
 #[cfg(feature = "wallet")]
 async fn route_tool(
     state: &McpState,
@@ -493,7 +581,7 @@ async fn route_tool(
         .map_err(|error| format!("buyer daemon call task failed: {error}"))?
         .map_err(|error| with_prereq_hint(tool, error))?;
     guard_never_echo(state, tool, &body)?;
-    Ok(tool_ok(with_ok(body)))
+    Ok(body)
 }
 
 #[cfg(not(feature = "wallet"))]
@@ -601,11 +689,14 @@ fn error_response(id: Value, code: i32, message: String) -> Value {
     })
 }
 
+/// Every tool error (daemon refusal, deadline, moved tool, never-echo refusal) flows through here,
+/// so every one carries the debugging-guide line (see [`tool_error_guide_line`]).
 fn tool_error(id: Value, message: String) -> Value {
+    let text = format!("{message}\n{}", tool_error_guide_line());
     ok(
         id,
         json!({
-            "content": [{ "type": "text", "text": message }],
+            "content": [{ "type": "text", "text": text }],
             "isError": true
         }),
     )
@@ -863,60 +954,184 @@ mod tests {
 
     fn state_at(root: &std::path::Path) -> McpState {
         let home = home::bootstrap(root).expect("bootstrap");
-        McpState {
-            home,
-            instructions: compose_instructions(true),
-        }
+        McpState::new(home, compose_instructions(true))
+    }
+
+    fn listed_description(name: &str) -> String {
+        let listed = tools();
+        listed
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} tool listed"))["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} description is a string"))
+            .to_owned()
     }
 
     // The docs pointer rides the two tool descriptions an agent reads at decision time. Observed on
     // a real Grok Bot box (2026-09-08): the handshake `instructions` were delivered and quotable,
     // and still skimmed past — the agent summarised registration as "connected + 4 tools" and went
     // straight to hiring. `post_job` is the tool that spends money; `collect` is the one reached
-    // for when something has gone wrong. Asserted against the ONE shared constant (`crate::skill`)
-    // and the ONE shared sentence, never a copied URL; and the two OTHER tools are asserted clean,
-    // so a fifth copy cannot creep in without a reviewer deciding it should.
+    // for when something has gone wrong. The pointer is the FIRST sentence: both descriptions are
+    // long, and OpenClaw (2026-10-28) truncated both with "…" before the old appended pointer, so
+    // a prefix check is what guards delivery. Asserted against the shared constants
+    // (`crate::skill`), never a copied URL; the two OTHER tools are asserted clean, so a fifth copy
+    // cannot creep in without a reviewer deciding it should.
     #[test]
-    fn post_job_and_collect_descriptions_end_with_the_guides_pointer() {
-        let guides = instruction_guides();
-        assert!(guides.contains(crate::skill::SKILL_URL));
-        let listed = tools();
-        let listed = listed.as_array().expect("tools array");
-        let description = |name: &str| {
-            listed
-                .iter()
-                .find(|tool| tool["name"] == name)
-                .unwrap_or_else(|| panic!("{name} tool listed"))["description"]
-                .as_str()
-                .unwrap_or_else(|| panic!("{name} description is a string"))
-                .to_owned()
-        };
+    fn post_job_and_collect_descriptions_lead_with_their_specific_guide() {
+        let post = listed_description("post_job");
+        let lead = format!(
+            "Before your first post_job, read {}. ",
+            crate::skill::BUYER_OPERATE_SKILL_URL
+        );
+        assert!(
+            post.starts_with(&lead),
+            "post_job's description must START with the buyer-operate pointer:\n{post}"
+        );
+        assert!(
+            post[lead.len()..].starts_with("Publish a real maxplayer job offer (OFFER kind)"),
+            "the original post_job text follows the lead unchanged:\n{post}"
+        );
 
-        for carrier in ["post_job", "collect"] {
-            let text = description(carrier);
-            assert!(
-                text.ends_with(&guides),
-                "{carrier}'s description must END with the guides sentence, verbatim:\n{text}"
-            );
+        let collect = listed_description("collect");
+        let lead = format!(
+            "If a job stalls, a claim lapses or payment fails, read {}. ",
+            crate::skill::DEBUG_BUYING_SKILL_URL
+        );
+        assert!(
+            collect.starts_with(&lead),
+            "collect's description must START with the debug-buying pointer:\n{collect}"
+        );
+        assert!(
+            collect[lead.len()..].starts_with("Single-call buyer collect: "),
+            "the original collect text follows the lead unchanged:\n{collect}"
+        );
+
+        for (carrier, url) in [
+            ("post_job", crate::skill::BUYER_OPERATE_SKILL_URL),
+            ("collect", crate::skill::DEBUG_BUYING_SKILL_URL),
+        ] {
+            let text = listed_description(carrier);
             assert_eq!(
-                text.matches(crate::skill::SKILL_URL).count(),
+                text.matches(url).count(),
                 1,
-                "{carrier} carries the URL exactly once:\n{text}"
+                "{carrier} carries its URL once:\n{text}"
             );
-            // The original text is intact ahead of the pointer: still its own closing sentence.
+            // The pointer is not ALSO trailing: the original closing sentence still ends it.
             assert!(
-                text.contains("Never echoes secrets. "),
-                "{carrier}'s existing text is appended to, not rewritten:\n{text}"
+                text.ends_with("Never echoes secrets."),
+                "{carrier}'s original text still ends the description:\n{text}"
+            );
+            // A client that shows only the first ~200 characters still shows the whole URL.
+            let shown: String = text.chars().take(200).collect();
+            assert!(
+                shown.contains(url),
+                "{carrier}: URL not in first 200 chars:\n{shown}"
             );
         }
 
         // Two carriers are a pointer; four are noise. A third is the ordering seat's call.
         for quiet in ["get_job", "award_claim"] {
-            let text = description(quiet);
+            let text = listed_description(quiet);
             assert!(
-                !text.contains(crate::skill::SKILL_URL),
-                "{quiet} deliberately does not carry the docs pointer:\n{text}"
+                !text.contains("maxplayer.ai"),
+                "{quiet} deliberately does not carry a docs pointer:\n{text}"
             );
+        }
+    }
+
+    // The handshake keeps the orientation pointer and names both specific skills.
+    #[test]
+    fn instruction_guides_keep_orientation_and_name_both_specific_skills() {
+        let guides = instruction_guides();
+        assert!(guides.starts_with(&format!(
+            "Setup, operation, and debugging guides: {} — start there before first use.",
+            crate::skill::SKILL_URL
+        )));
+        assert!(
+            guides.contains(crate::skill::BUYER_OPERATE_SKILL_URL),
+            "{guides}"
+        );
+        assert!(
+            guides.contains(crate::skill::DEBUG_BUYING_SKILL_URL),
+            "{guides}"
+        );
+        assert!(
+            !guides.contains('\n'),
+            "the guides stay one handshake line: {guides:?}"
+        );
+    }
+
+    // (a) The first successful post_job result of a server process carries `guides`; later ones,
+    // and other tools' results, do not. Existing fields are kept as-is.
+    #[test]
+    fn first_post_job_result_carries_guides_once_per_process() {
+        let root = temp_home("first-post-guides");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        let daemon_reply = || json!({"status": "posted", "job_id": "j1", "deduplicated": false});
+
+        // Another tool's success first does not consume the post_job pointer.
+        let polled = shape_result(&state, "get_job", json!({"job_id": "j0"}));
+        assert!(polled.get("guides").is_none(), "{polled}");
+
+        let first = shape_result(&state, "post_job", daemon_reply());
+        assert_eq!(
+            first["guides"],
+            json!({
+                "buyer_operate": crate::skill::BUYER_OPERATE_SKILL_URL,
+                "debug_buying": crate::skill::DEBUG_BUYING_SKILL_URL,
+            })
+        );
+        assert_eq!(first["ok"], true);
+        assert_eq!(first["status"], "posted");
+        assert_eq!(first["job_id"], "j1");
+        assert_eq!(first["deduplicated"], false);
+
+        let second = shape_result(&state, "post_job", daemon_reply());
+        assert!(
+            second.get("guides").is_none(),
+            "second post carries no guides: {second}"
+        );
+        assert_eq!(second, with_ok(daemon_reply()));
+
+        let collected = shape_result(&state, "collect", json!({"path": "/x"}));
+        assert!(collected.get("guides").is_none(), "{collected}");
+
+        // A fresh server process (new state) points again: the flag is in memory only.
+        let fresh = state_at(&root);
+        assert!(
+            shape_result(&fresh, "post_job", daemon_reply())
+                .get("guides")
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // (b) Every tool ERROR result ends with the debug-buying pointer, on its own line, after the
+    // unchanged original message.
+    #[test]
+    fn tool_error_results_carry_the_debug_buying_pointer() {
+        for message in [
+            "task must be non-empty".to_owned(),
+            deadline_message(Some("collect"), 15),
+            moved_tool_error("stub_pay"),
+        ] {
+            let response = tool_error(json!(3), message.clone());
+            assert_eq!(response["result"]["isError"], true);
+            let text = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("text");
+            assert_eq!(
+                text,
+                format!(
+                    "{message}\nDebugging guide: {}",
+                    crate::skill::DEBUG_BUYING_SKILL_URL
+                )
+            );
+            assert!(text.starts_with(&message), "original message leads: {text}");
         }
     }
 
@@ -925,7 +1140,7 @@ mod tests {
         let expected = concat!(
             "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.\n",
             "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.\n",
-            "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.\n",
+            "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use. Before your first post_job, read https://www.maxplayer.ai/.well-known/skills/buyer-operate/skill.md. If a job stalls, a claim lapses or payment fails, read https://www.maxplayer.ai/.well-known/skills/debug-buying/skill.md.\n",
             "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.",
         );
         assert_eq!(compose_instructions(true), expected);
@@ -938,7 +1153,7 @@ mod tests {
         let expected = concat!(
             "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.\n",
             "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.\n",
-            "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use.\n",
+            "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use. Before your first post_job, read https://www.maxplayer.ai/.well-known/skills/buyer-operate/skill.md. If a job stalls, a claim lapses or payment fails, read https://www.maxplayer.ai/.well-known/skills/debug-buying/skill.md.\n",
             "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.\n",
             "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).",
         );
@@ -1159,6 +1374,21 @@ mod tests {
         let rendered = response.to_string();
         assert!(!rendered.contains(&secret));
         assert_eq!(response["result"]["isError"], true);
+        // The error that reaches the client through dispatch carries the debugging pointer.
+        let text = response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("text");
+        assert!(
+            text.starts_with("tool `stub_pay` moved to the maxplayer CLI"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&format!(
+                "Debugging guide: {}",
+                crate::skill::DEBUG_BUYING_SKILL_URL
+            )),
+            "{text}"
+        );
     }
 
     // post_job/collect/award business validation (targeting, zero/past deadline, contribution pins,
