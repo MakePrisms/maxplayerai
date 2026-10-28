@@ -22,12 +22,45 @@ use std::io::Write;
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 
+/// The site every published skill is served from, as a literal so `concat!` can derive each URL
+/// from it at compile time. The ONE place the origin is spelled: every URL below is built from it.
+macro_rules! site_base {
+    () => {
+        "https://www.maxplayer.ai"
+    };
+}
+
+/// The site path of a published skill, as `web/app/.well-known/skills/index.json` lists it.
+macro_rules! skill_path {
+    ($name:literal) => {
+        concat!("/.well-known/skills/", $name, "/skill.md")
+    };
+}
+
+/// The site origin (no trailing slash). Exposed so tests can assert every URL derives from it.
+pub const SITE_BASE: &str = site_base!();
+
 /// The orientation page: the homepage skill, which links every companion skill (buyer, seller,
 /// multi-turn buying, debugging, per-box operator notes). Also the URL the MCP handshake points at.
-pub const SKILL_URL: &str = "https://www.maxplayer.ai/skill.md";
+pub const SKILL_URL: &str = concat!(site_base!(), "/skill.md");
 
 /// The machine-readable inventory of every published skill: `{name, description, path}` entries.
-pub const SKILL_INDEX_URL: &str = "https://www.maxplayer.ai/.well-known/skills/index.json";
+pub const SKILL_INDEX_URL: &str = concat!(site_base!(), "/.well-known/skills/index.json");
+
+/// Site path of the buyer setup/operation skill (`maxplayer-buyer-operate`).
+pub const BUYER_OPERATE_SKILL_PATH: &str = skill_path!("buyer-operate");
+
+/// The buyer setup/operation skill: wallet funding, MCP registration, the post_job → collect loop.
+/// The MCP `post_job` description LEADS with it, and the first successful post_job result of each
+/// MCP server process carries it (`mcp.rs`).
+pub const BUYER_OPERATE_SKILL_URL: &str = concat!(site_base!(), skill_path!("buyer-operate"));
+
+/// Site path of the buyer debugging skill (`maxplayer-debug-buying`).
+pub const DEBUG_BUYING_SKILL_PATH: &str = skill_path!("debug-buying");
+
+/// The buyer debugging skill: stalled jobs, lapsed claims, unpaid sellers, stuck reservations. The
+/// MCP `collect` description LEADS with it, and every MCP tool error result points at it (`mcp.rs`).
+pub const DEBUG_BUYING_SKILL_URL: &str = concat!(site_base!(), skill_path!("debug-buying"));
 
 /// The one-line pointer shared by `maxplayer --help`, `maxplayer doctor` and the seller first-run
 /// path. One function, not three strings, so the pointer cannot be present on one surface and
@@ -119,6 +152,61 @@ mod tests {
         let origin = "https://www.maxplayer.ai/";
         assert!(SKILL_URL.starts_with(origin));
         assert!(SKILL_INDEX_URL.starts_with(origin));
+    }
+
+    // The specific skill URLs the MCP surface links are the site base + the published path, never a
+    // second hand-typed copy of either.
+    #[test]
+    fn specific_skill_urls_are_the_site_base_plus_their_published_path() {
+        assert_eq!(SITE_BASE, "https://www.maxplayer.ai");
+        assert_eq!(
+            BUYER_OPERATE_SKILL_URL,
+            format!("{SITE_BASE}{BUYER_OPERATE_SKILL_PATH}")
+        );
+        assert_eq!(
+            DEBUG_BUYING_SKILL_URL,
+            format!("{SITE_BASE}{DEBUG_BUYING_SKILL_PATH}")
+        );
+        assert_eq!(
+            BUYER_OPERATE_SKILL_URL,
+            "https://www.maxplayer.ai/.well-known/skills/buyer-operate/skill.md"
+        );
+        assert_eq!(
+            DEBUG_BUYING_SKILL_URL,
+            "https://www.maxplayer.ai/.well-known/skills/debug-buying/skill.md"
+        );
+        assert_eq!(SKILL_URL, format!("{SITE_BASE}/skill.md"));
+        assert_eq!(
+            SKILL_INDEX_URL,
+            format!("{SITE_BASE}/.well-known/skills/index.json")
+        );
+    }
+
+    // Link-rot guard: every skill the MCP surface links by path must be listed in the published
+    // inventory (`web/app/.well-known/skills/index.json`, compiled in so a move fails the build of
+    // this test) and its file must exist in the tree the site is built from. Renaming or removing
+    // either skill without updating these constants fails here, not on an agent's first fetch.
+    #[test]
+    fn linked_skill_paths_exist_in_the_published_skill_index() {
+        let index: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../web/app/.well-known/skills/index.json"
+        ))
+        .expect("index.json parses");
+        let listed: Vec<&str> = index["skills"]
+            .as_array()
+            .expect("index.json has a skills array")
+            .iter()
+            .filter_map(|skill| skill["path"].as_str())
+            .collect();
+        let web_app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/app");
+        for path in [BUYER_OPERATE_SKILL_PATH, DEBUG_BUYING_SKILL_PATH] {
+            assert!(
+                listed.contains(&path),
+                "{path} is not listed in web/app/.well-known/skills/index.json: {listed:?}"
+            );
+            let file = web_app.join(path.trim_start_matches('/'));
+            assert!(file.is_file(), "{} does not exist", file.display());
+        }
     }
 
     #[test]
