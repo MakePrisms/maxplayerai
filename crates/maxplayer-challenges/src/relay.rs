@@ -580,6 +580,16 @@ impl Relays {
         };
         let result = tokio::time::timeout(TIMEOUT, client.send_event(event)).await;
         client.disconnect().await;
+        if let Ok(Ok(output)) = &result {
+            for reason in output.failed.values() {
+                if maxplayer_core::relay_refusal::is_registration_refusal(reason) {
+                    eprintln!(
+                        "relay {url}: {}",
+                        maxplayer_core::relay_refusal::with_hint(reason.as_str())
+                    );
+                }
+            }
+        }
         matches!(result, Ok(Ok(ref output)) if !output.success.is_empty())
     }
     /// Re-send queued events (exactly as signed, never re-signed) to the relays that missed them,

@@ -31,6 +31,7 @@
 //! | Field | Variable |
 //! |-------|----------|
 //! | `relay_url` | `MAXPLAYER_RELAY_URL` |
+//! | `registration_url` | `MAXPLAYER_REGISTRATION_URL` |
 //! | `accepted_mints` (list) | `MAXPLAYER_ACCEPTED_MINTS=a,b` |
 //! | `per_job_budget_sats` | `MAXPLAYER_PER_JOB_BUDGET_SATS` |
 //! | `extra_mints` (list) | `MAXPLAYER_EXTRA_MINTS=a,b` |
@@ -69,6 +70,9 @@ use serde::{Deserialize, Serialize};
 
 /// Open-market relay — the maxplayer launch relay.
 pub const DEFAULT_RELAY_URL: &str = "wss://relay.maxplayer.ai";
+
+/// The email registration service (email signup spec v2.12 §11), behind the relay's nginx.
+pub const DEFAULT_REGISTRATION_URL: &str = "https://relay.maxplayer.ai/account";
 /// Standing CDK test mint — its bolt11 invoices auto-settle, so it moves no real money. Kept as the
 /// testnut/dev allow-list anchor: `mint_allowed` admits exactly this when `allow_real_mints` is false.
 pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
@@ -1817,6 +1821,16 @@ pub struct MaxplayerConfig {
     /// Open-market relay. Absent in the file ⇒ the built-in [`DEFAULT_RELAY_URL`].
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
+    /// Base URL of the email registration service (`maxplayer account …`). Absent in the file ⇒
+    /// the built-in [`DEFAULT_REGISTRATION_URL`]; never written while
+    /// default. Point it at a staging service or a test server with this key or
+    /// `MAXPLAYER_REGISTRATION_URL`. NIP-98 requests are signed over `<this><path>`, so it must be
+    /// the service's PUBLIC URL.
+    #[serde(
+        default = "default_registration_url",
+        skip_serializing_if = "is_default_registration_url"
+    )]
+    pub registration_url: String,
     /// Seller-side accept policy: the mints this seller will accept payment at. The first
     /// entry is the mint the seller advertises first and also the buyer-side wallet default
     /// mint (read via [`MaxplayerConfig::default_mint`]). Defaults to `[DEFAULT_MINT_URL]`.
@@ -1974,6 +1988,15 @@ fn default_relay_url() -> String {
     DEFAULT_RELAY_URL.to_owned()
 }
 
+/// Serde default for [`MaxplayerConfig::registration_url`].
+fn default_registration_url() -> String {
+    DEFAULT_REGISTRATION_URL.to_owned()
+}
+
+fn is_default_registration_url(url: &str) -> bool {
+    url == DEFAULT_REGISTRATION_URL
+}
+
 /// Serde default for [`MaxplayerConfig::per_job_budget_sats`] — [`DEFAULT_PER_JOB_BUDGET_SATS`].
 fn default_per_job_budget_sats() -> u64 {
     DEFAULT_PER_JOB_BUDGET_SATS
@@ -2027,6 +2050,7 @@ impl Default for MaxplayerConfig {
             review: crate::review::ReviewConfig::default(),
             privacy: PrivacyConfig::default(),
             relay_url: DEFAULT_RELAY_URL.to_owned(),
+            registration_url: default_registration_url(),
             accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             extra_mints: Vec::new(),

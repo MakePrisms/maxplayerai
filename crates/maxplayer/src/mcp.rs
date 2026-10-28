@@ -692,6 +692,8 @@ fn error_response(id: Value, code: i32, message: String) -> Value {
 /// Every tool error (daemon refusal, deadline, moved tool, never-echo refusal) flows through here,
 /// so every one carries the debugging-guide line (see [`tool_error_guide_line`]).
 fn tool_error(id: Value, message: String) -> Value {
+    // Email signup spec §6: a relay refusal of an unregistered key says how to fix it.
+    let message = maxplayer_core::relay_refusal::with_hint(message);
     let text = format!("{message}\n{}", tool_error_guide_line());
     ok(
         id,

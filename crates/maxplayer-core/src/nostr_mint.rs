@@ -794,10 +794,10 @@ impl NostrMintConnector {
             {
                 break Err(Error::HttpError(
                     None,
-                    format!(
+                    crate::relay_refusal::with_hint(format!(
                         "relay sign-in (NIP-42) failed on every reachable relay for mint {}",
                         self.mint_url
-                    ),
+                    )),
                 ));
             }
             if Instant::now() >= deadline {

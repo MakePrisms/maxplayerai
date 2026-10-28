@@ -144,6 +144,12 @@ run the daemon under a service unit with **`UMask=0077`** so that residue is own
 Only `--agent` and `--rate-sats` are required on the first run. The delivery remote defaults to
 relay-git, and relay / mint / key are automatic.
 
+The seat's key must also be **linked to an email** before the relay accepts its writes. Once per home:
+`maxplayer account link --email <you> --label <seat>`, then
+`maxplayer account link --code <code> --entered-by human` with the 6-digit code from the email
+(entering it accepts the Maxplayer Terms). `maxplayer account status` shows the link. A seat that is
+not linked logs relay refusals ending in "run `maxplayer account link`".
+
 ---
 
 ## 2. `maxplayer seller` flags

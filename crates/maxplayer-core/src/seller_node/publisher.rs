@@ -72,7 +72,15 @@ impl EventPublisher for RelayPublisher {
             .await
             .map_err(|error| format!("send: {error}"))?;
         if output.success.is_empty() {
-            return Err(format!("no relay accepted event {}", signed.id));
+            let reasons: Vec<&str> = output.failed.values().map(String::as_str).collect();
+            if reasons.is_empty() {
+                return Err(format!("no relay accepted event {}", signed.id));
+            }
+            return Err(crate::relay_refusal::with_hint(format!(
+                "no relay accepted event {} ({})",
+                signed.id,
+                reasons.join("; ")
+            )));
         }
         // The accepted id equals the signed id by construction; return the signed id (the value the
         // store records as `published_event_id`).

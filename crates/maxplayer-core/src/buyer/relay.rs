@@ -110,7 +110,11 @@ pub enum PublishError {
 impl std::fmt::Display for PublishError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused(reason) => write!(formatter, "relay refused the write: {reason}"),
+            Self::Refused(reason) => write!(
+                formatter,
+                "{}",
+                crate::relay_refusal::with_hint(format!("relay refused the write: {reason}"))
+            ),
             Self::TimedOut => write!(
                 formatter,
                 "relay write did not complete within {PUBLISH_TIMEOUT:?}"

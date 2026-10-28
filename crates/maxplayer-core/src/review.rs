@@ -436,7 +436,9 @@ pub mod wire {
                 .next()
                 .map(String::as_str)
                 .unwrap_or("no relay accepted the event");
-            return Err(format!("review: relay refused the review request: {reason}"));
+            return Err(crate::relay_refusal::with_hint(format!(
+                "review: relay refused the review request: {reason}"
+            )));
         }
         Ok(())
     }

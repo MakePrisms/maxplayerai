@@ -1,0 +1,710 @@
+//! `maxplayer account link | status | marketing on|off` — link this agent's key to a human's email
+//! (email signup spec v2.12 §3–4, §8.1). The relay only accepts writes from linked keys.
+//!
+//! Signup is agent-only. The agent runs `account link`, the service emails the human a 6-digit
+//! code, and entering that code links the key and accepts the Terms. Two forms:
+//!
+//! - **Interactive** (stdin is a terminal): asks for whatever was not given as a flag (email, label,
+//!   then the code) and confirms in one run.
+//! - **Two steps** (an agent without a terminal): `account link --email <e> --label <l>` sends the
+//!   code and exits; `account link --code <6 digits>` confirms it.
+//!
+//! There is no way to link without the emailed code, and no flag that accepts the Terms on the
+//! human's behalf (spec §12: no non-interactive terms acceptance). There is no unlink (spec §4).
+//!
+//! The key is the home `key` file (the same key the wallet signs mint requests with, #1210), or
+//! with `--mint` the mint server's `<home>/mint/nostr.key`. The secret is never printed.
+
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+
+const SUCCESS: i32 = 0;
+const USAGE_ERROR: i32 = 1;
+const RUNTIME_ERROR: i32 = 2;
+
+fn write_usage(out: &mut dyn Write) {
+    let _ = writeln!(
+        out,
+        "Usage:\n\
+         \x20 maxplayer account link [--email <email>] [--label <name>] [--home <dir>] [--mint]\n\
+         \x20 maxplayer account link --code <6 digits> [--entered-by human|agent] [--home <dir>] [--mint]\n\
+         \x20 maxplayer account status [--json] [--home <dir>] [--mint]\n\
+         \x20 maxplayer account marketing on|off [--home <dir>] [--mint]\n\
+         \n\
+         Links this agent's key to your email so the Maxplayer relay accepts its writes. `link`\n\
+         emails you a 6-digit code; entering it links the key and accepts the Maxplayer Terms.\n\
+         In a terminal, `link` asks for anything missing and then for the code. Without one,\n\
+         run `link --email <email> --label <name>` first, then `link --code <code>`.\n\
+         --entered-by: who typed the code (default: human at the prompt, agent with --code).\n\
+         --mint: use this home's mint server key (<home>/mint/nostr.key) instead of the agent key.\n\
+         Service: registration_url in config.toml or MAXPLAYER_REGISTRATION_URL\n\
+         (default https://relay.maxplayer.ai/account).\n\
+         Exit codes: 0 success, 1 usage error, 2 runtime error"
+    );
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Opts {
+    email: Option<String>,
+    label: Option<String>,
+    code: Option<String>,
+    entered_by: Option<String>,
+    home: Option<PathBuf>,
+    mint: bool,
+    json: bool,
+}
+
+fn parse(args: &[String], allowed: &[&str]) -> Result<Opts, String> {
+    let mut opts = Opts::default();
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !allowed.contains(&flag) {
+            return Err(format!("unknown argument {flag}"));
+        }
+        let mut value = || {
+            index += 1;
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| format!("{flag} requires a value"))
+        };
+        match flag {
+            "--email" => opts.email = Some(value()?),
+            "--label" => opts.label = Some(value()?),
+            "--code" => opts.code = Some(value()?),
+            "--entered-by" => opts.entered_by = Some(value()?),
+            "--home" => opts.home = Some(PathBuf::from(value()?)),
+            "--mint" => opts.mint = true,
+            "--json" => opts.json = true,
+            _ => return Err(format!("unknown argument {flag}")),
+        }
+        index += 1;
+    }
+    Ok(opts)
+}
+
+const LINK_FLAGS: &[&str] = &[
+    "--email",
+    "--label",
+    "--code",
+    "--entered-by",
+    "--home",
+    "--mint",
+];
+const STATUS_FLAGS: &[&str] = &["--json", "--home", "--mint"];
+const MARKETING_FLAGS: &[&str] = &["--home", "--mint"];
+
+/// Entry from `cli::run` for `maxplayer account ...`.
+pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // #570: a sole `--help` prints usage to STDOUT and exits 0 before any parse, home or network.
+    if crate::cli::is_help_request(args) {
+        write_usage(out);
+        return SUCCESS;
+    }
+    let (sub, rest) = match args.split_first() {
+        Some((sub, rest)) => (sub.as_str(), rest),
+        None => return usage_error(err, None),
+    };
+    let parsed = match sub {
+        "link" => parse(rest, LINK_FLAGS).and_then(|o| check_link_opts(&o).map(|()| o)),
+        "status" => parse(rest, STATUS_FLAGS),
+        "marketing" => match rest.split_first() {
+            Some((switch, rest)) if switch == "on" || switch == "off" => {
+                parse(rest, MARKETING_FLAGS)
+            }
+            _ => Err("account marketing takes `on` or `off`".to_owned()),
+        },
+        other => Err(format!("unknown account command {other}")),
+    };
+    let opts = match parsed {
+        Ok(opts) => opts,
+        Err(message) => return usage_error(err, Some(&message)),
+    };
+    #[cfg(not(feature = "wallet"))]
+    {
+        let _ = (opts, out);
+        let _ = writeln!(
+            err,
+            "maxplayer account requires the wallet feature (rebuild with default features)"
+        );
+        USAGE_ERROR
+    }
+    #[cfg(feature = "wallet")]
+    {
+        let ctx = match wallet::Context::open(&opts, err) {
+            Ok(ctx) => ctx,
+            Err(code) => return code,
+        };
+        match sub {
+            "link" => {
+                use std::io::IsTerminal;
+                let stdin = std::io::stdin();
+                let interactive = stdin.is_terminal();
+                wallet::link(&ctx, &opts, &mut stdin.lock(), interactive, out, err)
+            }
+            "status" => wallet::status(&ctx, opts.json, out, err),
+            _ => wallet::marketing(
+                &ctx,
+                args.get(1).map(String::as_str) == Some("on"),
+                out,
+                err,
+            ),
+        }
+    }
+}
+
+fn usage_error(err: &mut dyn Write, message: Option<&str>) -> i32 {
+    if let Some(message) = message {
+        let _ = writeln!(err, "{message}");
+    }
+    write_usage(err);
+    USAGE_ERROR
+}
+
+/// Flag combinations that are refused before anything is read or sent.
+fn check_link_opts(opts: &Opts) -> Result<(), String> {
+    if opts.code.is_some() && (opts.email.is_some() || opts.label.is_some()) {
+        // A new request would replace the code being entered.
+        return Err(
+            "--code confirms a code that was already sent; do not combine it with --email or \
+             --label"
+                .to_owned(),
+        );
+    }
+    if let Some(who) = &opts.entered_by {
+        if opts.code.is_none() {
+            return Err("--entered-by goes with --code".to_owned());
+        }
+        if who != "human" && who != "agent" {
+            return Err("--entered-by must be human or agent".to_owned());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "wallet")]
+mod wallet {
+    use super::*;
+    use maxplayer_core::home;
+    use maxplayer_core::registration::{
+        self, CodeSent, EnteredBy, Linked, MARKETING_NOTICE, RegistrationClient, RegistrationError,
+        TERMS_VERSION,
+    };
+    use nostr_sdk::prelude::{Keys, ToBech32};
+
+    /// The key being linked and where to send requests.
+    pub struct Context {
+        pub keys: Keys,
+        pub npub: String,
+        pub base_url: String,
+        /// "this agent's key" / "this mint's key", for messages.
+        pub whose: &'static str,
+    }
+
+    impl Context {
+        pub fn open(opts: &Opts, err: &mut dyn Write) -> Result<Self, i32> {
+            let fail = |err: &mut dyn Write, message: String| {
+                let _ = writeln!(err, "{message}");
+                RUNTIME_ERROR
+            };
+            let explicit = opts.home.is_some();
+            let root = match &opts.home {
+                Some(path) => path.clone(),
+                None => home::default_home_dir().map_err(|e| fail(err, e.to_string()))?,
+            };
+            // An explicit --home must already hold a key: linking a typo'd path would register a
+            // brand-new identity nobody uses. The default home is created like any first command.
+            if explicit && !home::is_initialized(&root) {
+                return Err(fail(
+                    err,
+                    format!(
+                        "account refused: no maxplayer home with a key at {} (check the path, or \
+                         run `maxplayer whoami --home {}` to create one)",
+                        root.display(),
+                        root.display()
+                    ),
+                ));
+            }
+            let home = home::bootstrap(&root).map_err(|e| fail(err, e.to_string()))?;
+            let (keys, whose) = if opts.mint {
+                let path = home.root.join("mint").join("nostr.key");
+                let secret = std::fs::read_to_string(&path).map_err(|_| {
+                    fail(
+                        err,
+                        format!(
+                            "no mint key at {} (run `maxplayer-mint init` first)",
+                            path.display()
+                        ),
+                    )
+                })?;
+                let keys = Keys::parse(secret.trim())
+                    .map_err(|_| fail(err, format!("{} is not a valid key", path.display())))?;
+                (keys, "this mint's key")
+            } else {
+                let secret =
+                    home::read_secret_key_hex(&home).map_err(|e| fail(err, e.to_string()))?;
+                let keys = Keys::parse(&secret)
+                    .map_err(|_| fail(err, "the home key is not a valid key".to_owned()))?;
+                (keys, "this agent's key")
+            };
+            let npub = keys
+                .public_key()
+                .to_bech32()
+                .map_err(|e| fail(err, format!("npub encode: {e}")))?;
+            if home.key_created {
+                let _ = writeln!(
+                    err,
+                    "Created a new agent key in {} ({npub}).",
+                    home.root.display()
+                );
+            }
+            Ok(Self {
+                keys,
+                npub,
+                base_url: home.config.registration_url.clone(),
+                whose,
+            })
+        }
+
+        fn client(&self, err: &mut dyn Write) -> Result<RegistrationClient, i32> {
+            RegistrationClient::new(&self.base_url, self.keys.clone()).map_err(|e| {
+                let _ = writeln!(err, "{e}");
+                RUNTIME_ERROR
+            })
+        }
+    }
+
+    fn report(err: &mut dyn Write, error: &RegistrationError) -> i32 {
+        let _ = writeln!(err, "{error}");
+        RUNTIME_ERROR
+    }
+
+    /// Reads one line; `None` on end of input.
+    fn prompt(input: &mut dyn BufRead, out: &mut dyn Write, question: &str) -> Option<String> {
+        let _ = write!(out, "{question}");
+        let _ = out.flush();
+        let mut line = String::new();
+        match input.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim().to_owned()),
+        }
+    }
+
+    fn next_step(out: &mut dyn Write) {
+        let _ = writeln!(
+            out,
+            "When you have the code, run:\n  maxplayer account link --code <6 digits>\n(add \
+             `--entered-by human` when the human typed or read the code to you, `--entered-by \
+             agent` when you read it from the inbox yourself)."
+        );
+    }
+
+    fn print_code_sent(out: &mut dyn Write, email: &str, sent: &CodeSent) {
+        let minutes = sent.expires_in_secs.div_ceil(60);
+        let _ = writeln!(
+            out,
+            "Check {email} for a 6-digit code (it expires in {minutes} minutes, {} tries).\n\
+             Entering it accepts the Maxplayer Terms of Service, version {TERMS_VERSION}: {}",
+            sent.max_attempts, sent.terms_url
+        );
+    }
+
+    fn print_linked(out: &mut dyn Write, ctx: &Context, linked: &Linked) {
+        let _ = writeln!(
+            out,
+            "Done, linked to {} (agent \"{}\", {}).",
+            linked.email, linked.label, ctx.npub
+        );
+        if !linked.first_link {
+            let _ = writeln!(
+                out,
+                "This key was already linked to this email; the link was refreshed."
+            );
+        }
+        let _ = writeln!(out, "Terms of Service {} accepted.", linked.terms_version);
+        let relay = if linked.relay_member == "added" {
+            "The relay now accepts writes from this key.".to_owned()
+        } else {
+            "The relay will accept writes from this key within a few minutes (the membership is \
+             queued)."
+                .to_owned()
+        };
+        let _ = writeln!(out, "{relay}");
+        let _ = writeln!(out, "{}", marketing_line(&linked.marketing));
+    }
+
+    fn marketing_line(state: &str) -> String {
+        match state {
+            "subscribed" => "Product news: on. Turn it off any time with `maxplayer account \
+                 marketing off`."
+                .to_owned(),
+            "unsubscribed" => "Product news: off. `maxplayer account marketing on` turns it back \
+                 on."
+            .to_owned(),
+            _ => "Product news: off.".to_owned(),
+        }
+    }
+
+    /// `account link`. `interactive` = stdin is a terminal (the prompts are allowed).
+    pub fn link(
+        ctx: &Context,
+        opts: &Opts,
+        input: &mut dyn BufRead,
+        interactive: bool,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> i32 {
+        let client = match ctx.client(err) {
+            Ok(client) => client,
+            Err(code) => return code,
+        };
+        if let Some(code) = &opts.code {
+            let who = match opts.entered_by.as_deref() {
+                Some(who) => EnteredBy::parse(who).unwrap_or(EnteredBy::Agent),
+                None => EnteredBy::Agent,
+            };
+            return match client.confirm(code, who) {
+                Ok(linked) => {
+                    print_linked(out, ctx, &linked);
+                    SUCCESS
+                }
+                Err(error) => report(err, &error),
+            };
+        }
+
+        let missing_email = opts.email.is_none();
+        let missing_label = opts.label.is_none();
+        if !interactive && (missing_email || missing_label) {
+            let _ = writeln!(
+                err,
+                "account link needs --email and --label when it cannot ask (no terminal). Ask the \
+                 human for their email, then run:\n  maxplayer account link --email <email> \
+                 --label <a name for this agent>"
+            );
+            return USAGE_ERROR;
+        }
+
+        let _ = writeln!(out, "Linking {} ({}) to an email.", ctx.whose, ctx.npub);
+        // Spec §3 steps 1 and 6: both notices, when the email is asked for or before it is sent.
+        let _ = writeln!(out, "{}", registration::privacy_notice());
+        let _ = writeln!(out, "{MARKETING_NOTICE}");
+
+        let email = match &opts.email {
+            Some(email) => email.trim().to_owned(),
+            None => loop {
+                match prompt(input, out, "Email: ") {
+                    None => return aborted(err),
+                    Some(email) if registration::looks_like_email(&email) => break email,
+                    Some(_) => {
+                        let _ = writeln!(out, "That does not look like an email address.");
+                    }
+                }
+            },
+        };
+        let label = match &opts.label {
+            Some(label) => label.clone(),
+            None => loop {
+                match prompt(input, out, "A name for this agent (e.g. my-laptop): ") {
+                    None => return aborted(err),
+                    Some(label) if registration::normalize_label(&label).is_some() => break label,
+                    Some(_) => {
+                        let _ = writeln!(out, "Use 1-64 letters, digits, spaces, '.', '_' or '-'.");
+                    }
+                }
+            },
+        };
+
+        let sent = match client.request_code(&email, &label) {
+            Ok(sent) => sent,
+            Err(error) => return report(err, &error),
+        };
+        print_code_sent(out, &email, &sent);
+        if !interactive {
+            next_step(out);
+            return SUCCESS;
+        }
+
+        loop {
+            let Some(code) = prompt(input, out, "Code from the email: ") else {
+                let _ = writeln!(out);
+                next_step(out);
+                return RUNTIME_ERROR;
+            };
+            if code.is_empty() {
+                next_step(out);
+                return RUNTIME_ERROR;
+            }
+            if registration::normalize_code(&code).is_none() {
+                // Caught here, so a typo never spends one of the code's tries.
+                let _ = writeln!(out, "A code is the 6 digits from the email.");
+                continue;
+            }
+            match client.confirm(&code, EnteredBy::Human) {
+                Ok(linked) => {
+                    print_linked(out, ctx, &linked);
+                    return SUCCESS;
+                }
+                Err(error) if error.code() == Some("wrong_code") => {
+                    let _ = writeln!(out, "{error}");
+                }
+                Err(error) => return report(err, &error),
+            }
+        }
+    }
+
+    fn aborted(err: &mut dyn Write) -> i32 {
+        let _ = writeln!(err, "account link cancelled; nothing was sent.");
+        RUNTIME_ERROR
+    }
+
+    pub fn status(ctx: &Context, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+        let client = match ctx.client(err) {
+            Ok(client) => client,
+            Err(code) => return code,
+        };
+        let status = match client.status() {
+            Ok(status) => status,
+            Err(error) => return report(err, &error),
+        };
+        if json {
+            let mut value = serde_json::to_value(&status).unwrap_or_default();
+            value["npub"] = serde_json::json!(ctx.npub);
+            value["pubkey"] = serde_json::json!(ctx.keys.public_key().to_hex());
+            let _ = writeln!(out, "{value}");
+            return SUCCESS;
+        }
+        if !status.registered {
+            let _ = writeln!(
+                out,
+                "Not linked: {} ({}) is not linked to an email, so the relay may refuse its \
+                 writes.\nRun `maxplayer account link` to link it.",
+                ctx.whose, ctx.npub
+            );
+            return SUCCESS;
+        }
+        let field = |v: &Option<String>| v.clone().unwrap_or_else(|| "?".to_owned());
+        let _ = writeln!(
+            out,
+            "Linked: {} ({})\n  email:     {}\n  label:     {}\n  terms:     {} (accepted {})\n  \
+             privacy:   {}\n  linked at: {}\n  relay:     {}\n  {}",
+            ctx.whose,
+            ctx.npub,
+            field(&status.email),
+            field(&status.label),
+            field(&status.terms_version),
+            field(&status.accepted_at),
+            field(&status.privacy_version),
+            field(&status.linked_at),
+            match status.relay_member.as_deref() {
+                Some("added") => "member (writes accepted)",
+                Some("pending") => "membership queued (writes accepted within a few minutes)",
+                _ => "membership state unknown",
+            },
+            marketing_line(status.marketing.as_deref().unwrap_or("none")),
+        );
+        SUCCESS
+    }
+
+    pub fn marketing(ctx: &Context, on: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+        let client = match ctx.client(err) {
+            Ok(client) => client,
+            Err(code) => return code,
+        };
+        match client.set_marketing(on) {
+            Ok(answer) => {
+                let _ = writeln!(out, "{}", marketing_line(&answer.marketing));
+                if answer.marketing == "unsubscribed" {
+                    let _ = writeln!(
+                        out,
+                        "Account emails (codes, terms changes, service notices) still arrive."
+                    );
+                }
+                SUCCESS
+            }
+            Err(error) => report(err, &error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn help_needs_no_home_or_network() {
+        for list in [
+            &["--help"][..],
+            &["link", "--help"],
+            &["marketing", "--help"],
+        ] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(run(&args(list), &mut out, &mut err), SUCCESS);
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.contains("maxplayer account link"), "{text}");
+            assert!(text.contains("marketing on|off"), "{text}");
+        }
+    }
+
+    #[test]
+    fn refused_combinations_are_usage_errors() {
+        for list in [
+            &["link", "--code", "123456", "--email", "a@b.co"][..],
+            &["link", "--entered-by", "human"],
+            &["link", "--code", "123456", "--entered-by", "robot"],
+            &["link", "--accept-terms"],
+            &["marketing"],
+            &["marketing", "maybe"],
+            &["status", "--email", "a@b.co"],
+            &["unlink"],
+            &[],
+        ] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run(&args(list), &mut out, &mut err),
+                USAGE_ERROR,
+                "{list:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_reads_every_link_flag() {
+        let opts = parse(
+            &args(&[
+                "--email", "a@b.co", "--label", "x", "--home", "/h", "--mint",
+            ]),
+            LINK_FLAGS,
+        )
+        .unwrap();
+        assert_eq!(opts.email.as_deref(), Some("a@b.co"));
+        assert_eq!(opts.label.as_deref(), Some("x"));
+        assert_eq!(opts.home, Some(PathBuf::from("/h")));
+        assert!(opts.mint);
+        assert!(parse(&args(&["--email"]), LINK_FLAGS).is_err());
+    }
+}
+
+/// Interactive-path tests: the binary tests run without a terminal, so the prompt loop is driven
+/// here with a scripted stdin against the fake registration service.
+#[cfg(all(test, feature = "wallet"))]
+#[path = "../tests/support/fake_registration.rs"]
+mod fake_registration;
+
+#[cfg(all(test, feature = "wallet"))]
+mod interactive_tests {
+    use super::fake_registration::FakeRegistration;
+    use super::wallet::{Context, link};
+    use super::*;
+    use nostr_sdk::prelude::{Keys, ToBech32};
+
+    fn ctx(fake: &FakeRegistration, keys: &Keys) -> Context {
+        Context {
+            keys: keys.clone(),
+            npub: keys.public_key().to_bech32().unwrap(),
+            base_url: fake.base_url(),
+            whose: "this agent's key",
+        }
+    }
+
+    fn drive(
+        fake: &FakeRegistration,
+        keys: &Keys,
+        opts: Opts,
+        stdin: &str,
+    ) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = link(
+            &ctx(fake, keys),
+            &opts,
+            &mut std::io::Cursor::new(stdin.as_bytes().to_vec()),
+            true,
+            &mut out,
+            &mut err,
+        );
+        (
+            code,
+            String::from_utf8(out).unwrap(),
+            String::from_utf8(err).unwrap(),
+        )
+    }
+
+    #[test]
+    fn interactive_link_asks_shows_notices_and_retries_a_wrong_code() {
+        let fake = FakeRegistration::start();
+        let keys = Keys::generate();
+        // The fake hands out a known code; a malformed entry and a wrong code come first.
+        fake.set_next_code("482913");
+        let stdin = "not-an-email\nyou@example.com\n<bad>\nmy laptop\n12\n111111\n482 913\n";
+        let (code, out, err) = drive(&fake, &keys, Opts::default(), stdin);
+        assert_eq!(code, SUCCESS, "{out}\n{err}");
+        assert!(out.contains("https://www.maxplayer.ai/privacy/v1"), "{out}");
+        assert!(out.contains("maxplayer account marketing off"), "{out}");
+        assert!(
+            out.contains("accepts the Maxplayer Terms of Service, version v1"),
+            "{out}"
+        );
+        assert!(out.contains("https://www.maxplayer.ai/terms/v1"), "{out}");
+        assert!(
+            out.contains("That does not look like an email address."),
+            "{out}"
+        );
+        assert!(out.contains("A code is the 6 digits"), "{out}");
+        assert!(
+            out.contains("That code is not right. 4 tries left."),
+            "{out}"
+        );
+        assert!(out.contains("Done, linked to you@example.com"), "{out}");
+        assert!(out.contains("Product news: on."), "{out}");
+        // The notices come before the email is asked for.
+        assert!(out.find("Privacy Policy").unwrap() < out.find("Email: ").unwrap());
+        let reg = fake.registration(&keys.public_key().to_hex()).unwrap();
+        assert_eq!(reg.label, "my laptop");
+        assert_eq!(reg.entered_by, "human");
+        // Only the real wrong code reached the service: the "12" typo spent no try.
+        assert_eq!(fake.confirm_calls(), 2);
+    }
+
+    #[test]
+    fn interactive_end_of_input_at_the_code_prompt_says_how_to_finish() {
+        let fake = FakeRegistration::start();
+        let keys = Keys::generate();
+        let opts = Opts {
+            email: Some("you@example.com".into()),
+            label: Some("box".into()),
+            ..Opts::default()
+        };
+        let (code, out, _) = drive(&fake, &keys, opts, "");
+        assert_eq!(code, RUNTIME_ERROR);
+        assert!(
+            out.contains("maxplayer account link --code <6 digits>"),
+            "{out}"
+        );
+        assert!(fake.registration(&keys.public_key().to_hex()).is_none());
+    }
+
+    #[test]
+    fn interactive_too_many_wrong_codes_stops_with_a_plain_message() {
+        let fake = FakeRegistration::start();
+        let keys = Keys::generate();
+        fake.set_next_code("482913");
+        let opts = Opts {
+            email: Some("you@example.com".into()),
+            label: Some("box".into()),
+            ..Opts::default()
+        };
+        let (code, out, err) = drive(
+            &fake,
+            &keys,
+            opts,
+            "111111\n222222\n333333\n444444\n555555\n482913\n",
+        );
+        assert_eq!(code, RUNTIME_ERROR, "{out}");
+        assert!(out.contains("1 try left."), "{out}");
+        assert!(err.contains("Too many wrong tries"), "{err}");
+        assert!(fake.registration(&keys.public_key().to_hex()).is_none());
+    }
+}

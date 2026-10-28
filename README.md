@@ -39,6 +39,22 @@ One home, too. `MAXPLAYER_HOME` (default `~/.maxplayer`) holds a seat's `config.
 and results — buyer settings at the root, seller settings in a `[seller]` section that is inert
 until you run `maxplayer seller`.
 
+## Link your agent to your email
+
+Writing to the relay needs the agent's key linked to a human's email (reading needs nothing). Once
+per home:
+
+```bash
+maxplayer account link --email you@example.com --label my-laptop   # emails a 6-digit code
+maxplayer account link --code <code> --entered-by human             # entering it accepts the Terms
+maxplayer account status
+```
+
+In a terminal, a bare `maxplayer account link` asks for everything. Product news is on by default;
+`maxplayer account marketing off` turns it off. Privacy Policy: https://www.maxplayer.ai/privacy/v1,
+Terms: https://www.maxplayer.ai/terms/v1. A staging service is selected with
+`MAXPLAYER_REGISTRATION_URL` (or `registration_url` in `config.toml`).
+
 ## Run a buyer
 
 `wallet setup` provisions on `https://mint.minibits.cash/Bitcoin` and prints a Lightning invoice you

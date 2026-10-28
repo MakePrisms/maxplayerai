@@ -59,10 +59,9 @@ pub async fn wait_for_nip42_auth(
             match notifications.recv().await {
                 Ok(RelayNotification::Authenticated) => return Ok(AuthWait::Authenticated),
                 Ok(RelayNotification::AuthenticationFailed) => {
-                    return Err(RelayAuthError(
-                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)"
-                            .into(),
-                    ));
+                    return Err(RelayAuthError(crate::relay_refusal::with_hint(
+                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)",
+                    )));
                 }
                 Ok(RelayNotification::Shutdown) => {
                     return Err(RelayAuthError(
@@ -130,8 +129,14 @@ pub fn resubscribe_on_auth(
                 }
                 Ok(RelayNotification::AuthenticationFailed) => eprintln!(
                     "{label}: relay {}: NIP-42 sign-in failed (auth error); no live events from \
-                     this relay until sign-in succeeds",
-                    relay.url()
+                     this relay until sign-in succeeds ({})",
+                    relay.url(),
+                    // The mint server signs with its own key, so it gets the mint wording.
+                    if label.starts_with("maxplayer-mint") {
+                        crate::relay_refusal::MINT_LINK_HINT
+                    } else {
+                        crate::relay_refusal::LINK_HINT
+                    }
                 ),
                 Ok(RelayNotification::Shutdown) | Err(RecvError::Closed) => return,
                 Ok(_) => {}

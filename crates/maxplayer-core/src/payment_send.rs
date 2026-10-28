@@ -244,9 +244,15 @@ fn payment_sent(
     relay_failed: Vec<PaymentRelayFailure>,
 ) -> Result<PaymentSent, PaymentSendError> {
     if relay_success.is_empty() {
-        return Err(PaymentSendError::Transport(
-            "no relay accepted the NIP-17 payment".into(),
-        ));
+        let refused = relay_failed
+            .iter()
+            .any(|f| crate::relay_refusal::is_registration_refusal(&f.error));
+        let message = "no relay accepted the NIP-17 payment";
+        return Err(PaymentSendError::Transport(if refused {
+            format!("{message} ({})", crate::relay_refusal::LINK_HINT)
+        } else {
+            message.into()
+        }));
     }
 
     Ok(PaymentSent {

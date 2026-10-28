@@ -1392,8 +1392,11 @@ fn publish_receipt_event(
                                 .map(|(url, reason)| format!("{url}: {reason}"))
                                 .collect();
                             eprintln!(
-                                "receipt publish: relay rejected kind-3400 ({})",
-                                reasons.join("; ")
+                                "{}",
+                                crate::relay_refusal::with_hint(format!(
+                                    "receipt publish: relay rejected kind-3400 ({})",
+                                    reasons.join("; ")
+                                ))
                             );
                         }
                         output.success.iter().map(|url| url.to_string()).collect()
