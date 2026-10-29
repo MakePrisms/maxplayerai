@@ -310,6 +310,11 @@ The buyer copies only objects reachable from that commit: other branches,
 unreachable objects and uncommitted changes are not uploaded. It does not check
 the pin against the remote, run Git hooks, or require the Git command-line tool.
 The local path is never included in the offer, seller task, or relay request.
+Neither is `target_repo_url` on a direct job: after posting, the job's repository
+is the copy uploaded to the relay, and the seller, reviewer, `collect` and every
+follow-up turn read only that. The URL, branch and commit you posted stay on your
+machine in `<home>/contribution-sources/<job_id>.json`, for porting the accepted
+result back to the real repository.
 
 If the path is missing, cannot be opened, or lacks the commit or its history, the
 buyer logs one line and tries the usual URL download. A private upstream without

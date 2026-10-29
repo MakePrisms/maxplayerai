@@ -107,7 +107,9 @@ pub struct AuthorizePayRequest {
 pub struct ContributionPayBinds {
     /// Pinned target owner pubkey (hex) — from the buyer's signed offer.
     pub target_owner_pubkey: String,
-    /// Pinned target clone URL — base_oid is fetched from HERE, never the seller echo.
+    /// Pinned target clone URL from the signed offer. Read as the base source ONLY on the public
+    /// lane; a private job verifies against its relay job repository instead
+    /// ([`contribution_base_source`]). Still part of the signed authorship tuple.
     pub target_clone_url: String,
     /// Base branch the exact `base_oid` lives on in the pinned target.
     pub base_branch: String,
@@ -450,14 +452,14 @@ pub async fn authorize_pay_async(
                 "a contribution job cannot settle an inline delivery".to_owned(),
             ))?;
         let policy = contribution_policy(home);
+        let base_source = contribution_base_source(
+            private_receipt.as_ref().map(|p| (&p.evidence, &p.policy)),
+            &binds.target_clone_url,
+            &binds.base_branch,
+        )
+        .map_err(AuthorizePayError::Input)?;
         verifier
-            .verify_contribution(
-                &fork,
-                &binds.target_clone_url,
-                &binds.base_branch,
-                &base_oid,
-                &policy,
-            )
+            .verify_contribution(&fork, &base_source, &base_oid, &policy)
             .map_err(AuthorizePayError::Delivery)?;
         // Reconstruct the exact tuple the seller signed (from BUYER-controlled binds) and carry its
         // digest + the seller's signature to the pre-pay seam. A tuple field tampered post-signing
@@ -933,6 +935,46 @@ pub async fn complete_recovered_locked_async(
     })
 }
 
+/// Where the buyer reads a contribution's pinned base from at verify time.
+///
+/// A PRIVATE job (v2 evidence on a non-public offer — targeted or open pool) reads ONLY its relay
+/// job repository: the buyer uploaded `base_oid` there before the offer was published, so the
+/// offer's `target_clone_url` (possibly a private GitHub URL the buyer's anonymous transport can
+/// never read) is never dialed after posting. The job repository is derived from the buyer's
+/// trusted host policy and the signed offer's `job` id, never from a URL on the wire, so this also
+/// reads correctly for offers published before the wire stopped naming the external source.
+///
+/// Public v2 and legacy jobs upload no base; they keep reading the pinned target on its branch.
+pub(crate) fn contribution_base_source(
+    private: Option<(
+        &crate::private_content::evidence::PrivateEvidence,
+        &crate::private_content::runtime::Policy,
+    )>,
+    target_clone_url: &str,
+    base_branch: &str,
+) -> Result<crate::delivery_git::ContributionBaseSource, String> {
+    use crate::delivery_git::{ContributionBaseSource, RelayJobRepo};
+    match private {
+        Some((evidence, policy))
+            if !crate::private_content::public_v2::is_public(&evidence.offer) =>
+        {
+            let tags =
+                crate::private_content::wire::validate_private(&evidence.offer, &policy.host)
+                    .map_err(|e| format!("private contribution offer: {e}"))?;
+            let job = tags
+                .required("job")
+                .map_err(|e| format!("private contribution offer: {e}"))?;
+            RelayJobRepo::for_job(&policy.host, &evidence.offer.pubkey.to_hex(), job)
+                .map(ContributionBaseSource::JobRepo)
+                .map_err(|e| format!("private contribution job repository: {e}"))
+        }
+        _ => Ok(ContributionBaseSource::PublicTarget {
+            clone_url: target_clone_url.to_owned(),
+            branch: base_branch.to_owned(),
+        }),
+    }
+}
+
 /// Resolve the buyer's content policy hook from `[contribution]` config, or the
 /// FLOOR (refuse only empty diffs) when unconfigured. Buyer-side; never seller-influenced.
 pub(crate) fn contribution_policy(home: &MaxplayerHome) -> crate::contribution::ContentPolicy {
@@ -1377,6 +1419,81 @@ mod tests {
 
     // A real (non-testnut) mint — admissible ONLY when `allow_real_mints` is true.
     const REAL_MINT: &str = "https://minibits.example";
+
+    /// Field report (v0.6.2-rc2): a private contribution's verify fetched `base_oid` from the
+    /// offer's external target URL (a private GitHub repo) and could never pay. A private job's base
+    /// source is its relay job repository, derived from trusted policy — whatever URL the pin names.
+    #[test]
+    fn a_private_contribution_base_is_its_relay_job_repo_never_the_pinned_url() {
+        use crate::delivery_git::ContributionBaseSource;
+        let (evidence, _, buyer, policy) =
+            crate::private_content::evidence::inline_fixture_with_payment(true, true);
+        let external = "https://github.com/owner/private-repo.git";
+        let job = crate::private_content::wire::validate_private(&evidence.offer, &policy.host)
+            .unwrap()
+            .required("job")
+            .unwrap()
+            .to_owned();
+        let expected = policy
+            .host
+            .job_repo(&buyer.public_key().to_hex(), &job)
+            .unwrap();
+        match contribution_base_source(Some((&evidence, &policy)), external, "main").unwrap() {
+            ContributionBaseSource::JobRepo(repo) => {
+                assert_eq!(repo.url(), expected);
+                assert!(repo.url().starts_with(&policy.host.git_prefix));
+            }
+            other => panic!("a private job must not read the pinned URL: {other:?}"),
+        }
+        // Public v2 / legacy binds (no private evidence) still read their pinned target.
+        assert_eq!(
+            contribution_base_source(None, external, "main").unwrap(),
+            ContributionBaseSource::PublicTarget {
+                clone_url: external.into(),
+                branch: "main".into()
+            }
+        );
+    }
+
+    /// Structural guard: after posting, only `contribution_base_source` may decide to read a
+    /// pinned target URL, and it does so only for a non-private job. Any other production site that
+    /// constructs `PublicTarget` (e.g. a new verify/collect/turn path handing it `target_clone_url`)
+    /// fails here.
+    #[test]
+    fn only_the_base_source_resolver_may_name_a_pinned_target_url() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut hits = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                // Production code only: unit tests sit below the file's test module.
+                let production = text.split("#[cfg(test)]\nmod tests").next().unwrap();
+                let needle = ["ContributionBaseSource", "::PublicTarget {"].concat();
+                for (at, _) in production.match_indices(&needle) {
+                    // A construction initializes fields (`clone_url: …`); a match arm binds them.
+                    let body = &production[at + needle.len()..];
+                    let body = &body[..body.find('}').unwrap_or(body.len())];
+                    if body.contains(':') {
+                        hits.push(path.file_name().unwrap().to_string_lossy().into_owned());
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            hits,
+            ["authorize_pay.rs"],
+            "PublicTarget constructed outside the resolver"
+        );
+    }
 
     // Empty creq list → pay from the buyer's configured mint (config-driven).
     // Default flag (false): the configured testnut/dev mint plans a direct payment.

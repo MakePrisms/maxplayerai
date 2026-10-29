@@ -15,6 +15,50 @@ use crate::delivery::{CommitOid, DeliveryError, DeliveryVerifier, GitDelivery, V
 use crate::delivery_transport::AllowlistedDeliveryVerifier;
 use crate::git_transport;
 
+/// The per-job repository on the configured relay — the ONLY repository a private job reads after
+/// it is posted (the buyer uploaded the base there before the offer became visible).
+///
+/// Constructible solely through [`HostPolicy::job_repo`](maxplayer_private_protocol::wire::HostPolicy::job_repo)
+/// — the configured relay Git prefix plus the offer's buyer key and `job` id — so a value of this
+/// type is always a `<git_base><buyer>/<job>` route, never an external source URL (GitHub, a local
+/// path) and never a seller echo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayJobRepo(String);
+
+impl RelayJobRepo {
+    /// The job's relay repository, derived from trusted policy — never read off the wire.
+    pub fn for_job(
+        host: &maxplayer_private_protocol::wire::HostPolicy,
+        buyer_pubkey: &str,
+        job: &str,
+    ) -> Result<Self, DeliveryError> {
+        host.job_repo(buyer_pubkey, job).map(Self).map_err(|error| {
+            DeliveryError::GitCommandFailed {
+                operation: "job-repo",
+                cause: error.to_string(),
+            }
+        })
+    }
+
+    /// The authenticated relay-git URL of the job repository.
+    pub fn url(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Where the buyer reads a contribution's pinned base from while verifying a delivery.
+///
+/// Two lanes, and the type is the fence between them: a private job verifies against
+/// [`RelayJobRepo`] (its own upload), so no verify/collect call site can hand it the offer's
+/// external `target_clone_url`. Only the public lane — which uploads no base — names a target URL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContributionBaseSource {
+    /// Private job (targeted or open pool): fetch `base_oid` by id from the per-job relay repo.
+    JobRepo(RelayJobRepo),
+    /// Public job: the pinned target the offer names, on `branch`.
+    PublicTarget { clone_url: String, branch: String },
+}
+
 /// Real git-backed verifier that retains fetched objects in a buyer-owned repository.
 ///
 /// Crate-private on purpose: bare git verify can fetch `ext::` (RCE). The pay path
@@ -234,6 +278,57 @@ impl GitDeliveryVerifier {
         })
     }
 
+    /// Private contribution: prove `base_oid` is the buyer's OWN upload in the job's relay
+    /// repository, then fetch it BY ID into the buyer store.
+    ///
+    /// The proof is the advertisement: some `refs/heads/input/<id>` must point at exactly
+    /// `base_oid`. The relay lets only the buyer create `input/*` refs, and only before the award
+    /// (`PrivateJobRepo::can_create_ref`), so a seller's delivery ref can never stand in for it —
+    /// mere reachability from any ref would not prove that. This is what [`Self::fetch_base`]
+    /// proves of a public target ("the pinned source really holds this base"), for the one source
+    /// a private job has after posting, and it dials no other host.
+    fn fetch_base_from_job_repo(
+        &self,
+        job_repo: &RelayJobRepo,
+        base_oid: &CommitOid,
+    ) -> Result<(), DeliveryError> {
+        git_transport::off_runtime(|| {
+            self.compact_store()?;
+            let repo = self.open_store()?;
+            let parsed = Self::parse_oid(base_oid)?;
+            let advertised =
+                git_transport::list_remote_in(&repo, job_repo.url(), self.read_auth(), true)
+                    .map_err(|error| DeliveryError::GitCommandFailed {
+                        operation: "list-job-repo",
+                        cause: error.to_string(),
+                    })?;
+            let Some((input_ref, _)) = advertised.iter().find(|(name, oid)| {
+                name.starts_with("refs/heads/input/") && oid == base_oid.as_str()
+            }) else {
+                return Err(DeliveryError::MissingBaseObject);
+            };
+            let fetched_ref = format!("refs/maxplayer/bases/{}", base_oid.as_str());
+            git_transport::fetch_refspecs(
+                &repo,
+                job_repo.url(),
+                &[&format!("+{input_ref}:{fetched_ref}")],
+                self.read_auth(),
+                true,
+            )
+            .map_err(|error| DeliveryError::GitCommandFailed {
+                operation: "fetch-base",
+                cause: error.to_string(),
+            })?;
+            // The fetched ref must land on exactly the advertised commit, and it must be in the store.
+            repo.find_commit(parsed)
+                .map_err(|_| DeliveryError::MissingBaseObject)?;
+            match repo.refname_to_id(&fetched_ref) {
+                Ok(tip) if tip == parsed => Ok(()),
+                _ => Err(DeliveryError::MissingBaseObject),
+            }
+        })
+    }
+
     /// Contribution: refuse unless `commit_oid` descends from `base_oid`, in-process via
     /// `graph_descendant_of`. Equal oids count as ancestor (parity with `merge-base --is-ancestor`,
     /// exit 0) — the empty diff is then refused by the content gate. Both oids must be in the store.
@@ -361,8 +456,7 @@ impl GitDeliveryVerifier {
     fn contribution_verify(
         &mut self,
         fork: &GitDelivery,
-        base_clone_url: &str,
-        base_branch: &str,
+        base: &ContributionBaseSource,
         base_oid: &CommitOid,
         policy: &crate::contribution::ContentPolicy,
     ) -> Result<VerifiedContribution, DeliveryError> {
@@ -373,8 +467,16 @@ impl GitDeliveryVerifier {
         self.seed_base(fork, base_oid);
         // 1. fetch fork tip into the store + tip-match (retains the object under refs/maxplayer/deliveries/…).
         let verified = self.verify(fork)?;
-        // 2. base-from-pin into the same buyer store (fail-closed if absent from the pinned target).
-        self.fetch_base(base_clone_url, base_branch, base_oid)?;
+        // 2. base-from-pin into the same buyer store (fail-closed if absent from the pinned source).
+        // A private job reads ONLY its relay job repository here; the public lane its target.
+        match base {
+            ContributionBaseSource::JobRepo(job_repo) => {
+                self.fetch_base_from_job_repo(job_repo, base_oid)?
+            }
+            ContributionBaseSource::PublicTarget { clone_url, branch } => {
+                self.fetch_base(clone_url, branch, base_oid)?
+            }
+        }
         // 3. descendant gate.
         self.assert_descendant(base_oid, verified.commit_oid())?;
         // 4. content gate + buyer policy hook.
@@ -470,8 +572,9 @@ impl PayPathDeliveryVerifier {
     /// BUYER-CONTROLLED inputs (`fork` = the delivered object; `base_*` come from the buyer's
     /// SIGNED offer pin, NEVER the seller echo). In order:
     ///   1. fetch the fork tip into the store + tip-match (allowlisted);
-    ///   2. base-from-pin: fetch `base_oid` from the PINNED target clone URL into the same buyer
-    ///      store (allowlisted) — fail-closed if absent from the pinned target;
+    ///   2. base-from-pin: fetch `base_oid` from `base` into the same buyer store (allowlisted) —
+    ///      a private job's relay job repository, or a public job's pinned target — fail-closed
+    ///      if absent;
     ///   3. descendant gate: `commit_oid` must descend from `base_oid`;
     ///   4. content gate + policy hook: refuse an empty / out-of-scope / forbidden / too-large diff.
     /// Returns the store proof + LOCAL store ref for the later merge. Authorship (the seller's
@@ -480,8 +583,7 @@ impl PayPathDeliveryVerifier {
     pub fn verify_contribution(
         &mut self,
         fork: &GitDelivery,
-        base_clone_url: &str,
-        base_branch: &str,
+        base: &ContributionBaseSource,
         base_oid: &CommitOid,
         policy: &crate::contribution::ContentPolicy,
     ) -> Result<VerifiedContribution, DeliveryError> {
@@ -489,10 +591,14 @@ impl PayPathDeliveryVerifier {
         // (https + relay-git; `ext::`/file/ssh refused) — defense-in-depth even though the base pin
         // is buyer-signed. Enforced here BEFORE the bare orchestration touches git.
         crate::delivery_transport::assert_allowed_repo_locator(fork.repo())?;
-        crate::delivery_transport::assert_allowed_repo_locator(base_clone_url)?;
+        let base_url = match base {
+            ContributionBaseSource::JobRepo(job_repo) => job_repo.url(),
+            ContributionBaseSource::PublicTarget { clone_url, .. } => clone_url.as_str(),
+        };
+        crate::delivery_transport::assert_allowed_repo_locator(base_url)?;
         self.inner
             .inner_mut()
-            .contribution_verify(fork, base_clone_url, base_branch, base_oid, policy)
+            .contribution_verify(fork, base, base_oid, policy)
     }
 
     /// Merge the RETAINED local `commit_oid` into a buyer-owned target working clone, FF-preferred
@@ -1167,6 +1273,13 @@ mod contribution_tests {
         Fx { root, target_git, fork_git, store, base_oid, fork_tip }
     }
 
+    fn public_target(fx: &Fx) -> ContributionBaseSource {
+        ContributionBaseSource::PublicTarget {
+            clone_url: fx.target_git.to_str().unwrap().into(),
+            branch: "main".into(),
+        }
+    }
+
     fn fork_delivery(fx: &Fx) -> GitDelivery {
         GitDelivery::new(fx.fork_git.to_str().unwrap(), "contribution", fx.fork_tip.clone())
             .expect("fork delivery")
@@ -1181,8 +1294,7 @@ mod contribution_tests {
         let verified = v
             .contribution_verify(
                 &fork_delivery(&fx),
-                fx.target_git.to_str().unwrap(),
-                "main",
+                &public_target(&fx),
                 &fx.base_oid,
                 &ContentPolicy::floor(),
             )
@@ -1227,8 +1339,7 @@ mod contribution_tests {
         GitDeliveryVerifier::new(&fx.store)
             .contribution_verify(
                 &fork_delivery(&fx),
-                fx.target_git.to_str().unwrap(),
-                "main",
+                &public_target(&fx),
                 &fx.base_oid,
                 &ContentPolicy::floor(),
             )
@@ -1288,8 +1399,7 @@ mod contribution_tests {
         let verified = v
             .contribution_verify(
                 &delivery,
-                fx.target_git.to_str().unwrap(),
-                "main",
+                &public_target(&fx),
                 &fx.base_oid,
                 &ContentPolicy::floor(),
             )
@@ -1315,8 +1425,7 @@ mod contribution_tests {
         let mut v = GitDeliveryVerifier::new(&fx.store);
         let refused = v.contribution_verify(
             &delivery,
-            fx.target_git.to_str().unwrap(),
-            "main",
+            &public_target(&fx),
             &fx.base_oid,
             &ContentPolicy::floor(),
         );
@@ -1456,8 +1565,10 @@ mod contribution_tests {
         let err = v
             .contribution_verify(
                 &GitDelivery::new(fg.to_str().unwrap(), "contribution", fork_tip).unwrap(),
-                tg.to_str().unwrap(),
-                "main",
+                &ContributionBaseSource::PublicTarget {
+                    clone_url: tg.to_str().unwrap().into(),
+                    branch: "main".into(),
+                },
                 &base_oid,
                 &ContentPolicy::floor(),
             )
@@ -1473,15 +1584,25 @@ mod contribution_tests {
         let mut v = GitDeliveryVerifier::new(&fx.store);
         let policy = ContentPolicy { allowed_paths: vec!["src".into()], ..Default::default() };
         let err = v
-            .contribution_verify(&fork_delivery(&fx), fx.target_git.to_str().unwrap(), "main", &fx.base_oid, &policy)
+            .contribution_verify(
+                &fork_delivery(&fx),
+                &public_target(&fx),
+                &fx.base_oid,
+                &policy,
+            )
             .expect_err("out-of-scope refuse");
         assert!(matches!(err, DeliveryError::ContentRefused(_)), "got {err}");
 
         // in-scope: change under "src/", same policy → pass.
         let fx2 = scenario(1, "src/ok.rs");
         let mut v2 = GitDeliveryVerifier::new(&fx2.store);
-        v2.contribution_verify(&fork_delivery(&fx2), fx2.target_git.to_str().unwrap(), "main", &fx2.base_oid, &policy)
-            .expect("in-scope must pass");
+        v2.contribution_verify(
+            &fork_delivery(&fx2),
+            &public_target(&fx2),
+            &fx2.base_oid,
+            &policy,
+        )
+        .expect("in-scope must pass");
     }
 
     // ── Retention (the STRAND-PROOF): after verify, the object is in the buyer store; the
@@ -1493,7 +1614,12 @@ mod contribution_tests {
         // Fetch into the store via the bare verifier (local path; allowlist tested separately).
         let mut bare = GitDeliveryVerifier::new(&fx.store);
         let verified = bare
-            .contribution_verify(&fork_delivery(&fx), fx.target_git.to_str().unwrap(), "main", &fx.base_oid, &ContentPolicy::floor())
+            .contribution_verify(
+                &fork_delivery(&fx),
+                &public_target(&fx),
+                &fx.base_oid,
+                &ContentPolicy::floor(),
+            )
             .expect("verify");
         // Simulate the seller DELETING the fork remote after accept.
         fs::remove_dir_all(&fx.fork_git).expect("delete fork");
@@ -1518,8 +1644,15 @@ mod contribution_tests {
         // ext:: fork repo refused before any fetch.
         let ext_fork = GitDelivery::new("ext::sh -c evil", "contribution", fx.fork_tip.clone()).unwrap();
         assert!(matches!(
-            pay.verify_contribution(&ext_fork, fx.target_git.to_str().unwrap(), "main", &fx.base_oid, &ContentPolicy::floor()),
-            Err(DeliveryError::Transport(TransportRefuse::ForbiddenScheme(_)))
+            pay.verify_contribution(
+                &ext_fork,
+                &public_target(&fx),
+                &fx.base_oid,
+                &ContentPolicy::floor()
+            ),
+            Err(DeliveryError::Transport(TransportRefuse::ForbiddenScheme(
+                _
+            )))
         ));
         // ext:: base clone url refused too — the fork here is an allowlisted https URL so the base
         // is the value under test (neither fetch runs; both URLs are allowlist-checked up front).
@@ -1527,8 +1660,18 @@ mod contribution_tests {
             GitDelivery::new("https://example.invalid/fork.git", "contribution", fx.fork_tip.clone())
                 .unwrap();
         assert!(matches!(
-            pay.verify_contribution(&https_fork, "ext::sh -c evil", "main", &fx.base_oid, &ContentPolicy::floor()),
-            Err(DeliveryError::Transport(TransportRefuse::ForbiddenScheme(_)))
+            pay.verify_contribution(
+                &https_fork,
+                &ContributionBaseSource::PublicTarget {
+                    clone_url: "ext::sh -c evil".into(),
+                    branch: "main".into()
+                },
+                &fx.base_oid,
+                &ContentPolicy::floor()
+            ),
+            Err(DeliveryError::Transport(TransportRefuse::ForbiddenScheme(
+                _
+            )))
         ));
     }
 }
