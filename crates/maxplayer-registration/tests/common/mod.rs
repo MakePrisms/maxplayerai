@@ -487,7 +487,7 @@ impl TestApp {
         self.post(
             keys,
             api::PATH_LINK_REQUEST,
-            json!({ "email": email, "label": label, "terms_version": "v1", "privacy_version": "v1" }),
+            json!({ "email": email, "label": label, "terms_version": "20261029", "privacy_version": "20261029" }),
         )
         .await
     }

@@ -46,11 +46,11 @@ async fn link_flow_sends_code_links_key_sends_9030_and_welcome() {
     assert_eq!(code_mail.var("AGENT_LABEL"), "my-laptop");
     assert_eq!(
         code_mail.var("TERMS_URL"),
-        "https://www.maxplayer.ai/terms/v1"
+        "https://www.maxplayer.ai/terms/20261029"
     );
     assert_eq!(
         code_mail.var("PRIVACY_URL"),
-        "https://www.maxplayer.ai/privacy/v1"
+        "https://www.maxplayer.ai/privacy/20261029"
     );
     let npub = agent.public_key().to_bech32().unwrap();
     assert_eq!(
@@ -112,15 +112,21 @@ async fn link_flow_sends_code_links_key_sends_9030_and_welcome() {
         .collect();
     assert_eq!(vars.len(), 3);
     assert_eq!(w.var("AGENT_LABEL"), "my-laptop");
-    assert_eq!(w.var("TERMS_URL"), "https://www.maxplayer.ai/terms/v1");
-    assert_eq!(w.var("PRIVACY_URL"), "https://www.maxplayer.ai/privacy/v1");
+    assert_eq!(
+        w.var("TERMS_URL"),
+        "https://www.maxplayer.ai/terms/20261029"
+    );
+    assert_eq!(
+        w.var("PRIVACY_URL"),
+        "https://www.maxplayer.ai/privacy/20261029"
+    );
 
     // Rows per spec §5.
     let reg = db::get_registration(&app.db, &pk).await.unwrap().unwrap();
     assert_eq!(reg.email, EMAIL);
     assert_eq!(reg.label, "my-laptop");
-    assert_eq!(reg.terms_version, "v1");
-    assert_eq!(reg.privacy_version, "v1");
+    assert_eq!(reg.terms_version, "20261029");
+    assert_eq!(reg.privacy_version, "20261029");
     assert_eq!(reg.code_entered_by, "human");
     let consent = db::get_consent(&app.db, EMAIL).await.unwrap().unwrap();
     assert_eq!(consent.method, "signup_default");
@@ -133,7 +139,7 @@ async fn link_flow_sends_code_links_key_sends_9030_and_welcome() {
     assert_eq!(s.status, 200);
     assert_eq!(s.body["registered"], true);
     assert_eq!(s.body["email"], EMAIL);
-    assert_eq!(s.body["terms_version"], "v1");
+    assert_eq!(s.body["terms_version"], "20261029");
     assert_eq!(s.body["marketing"], "subscribed");
     assert_eq!(s.body["relay_member"], "added");
     let other = app.get(&Keys::generate(), api::PATH_STATUS).await;
@@ -350,7 +356,7 @@ async fn nip98_rejects_bad_signature_url_method_age_payload_and_replay() {
     let agent = Keys::generate();
     let path = api::PATH_LINK_REQUEST;
     let body =
-        json!({ "email": EMAIL, "label": "a", "terms_version": "v1", "privacy_version": "v1" })
+        json!({ "email": EMAIL, "label": "a", "terms_version": "20261029", "privacy_version": "20261029" })
             .to_string()
             .into_bytes();
     let send = |auth: Option<String>, b: Vec<u8>| app.send("POST", path, auth, Some(b), &[]);
@@ -441,7 +447,7 @@ async fn nip98_rejects_bad_signature_url_method_age_payload_and_replay() {
     );
 
     // Payload: signed for another body, and no payload at all.
-    let other = json!({ "email": "attacker@evil.example", "label": "a", "terms_version": "v1", "privacy_version": "v1" }).to_string().into_bytes();
+    let other = json!({ "email": "attacker@evil.example", "label": "a", "terms_version": "20261029", "privacy_version": "20261029" }).to_string().into_bytes();
     let r = send(Some(app.auth(&agent, path, "POST", Some(&body))), other).await;
     assert_eq!(
         (r.status, r.body["error"].as_str()),
@@ -551,23 +557,23 @@ async fn bad_inputs_are_refused_before_any_email() {
     let agent = Keys::generate();
     let cases = [
         (
-            json!({ "email": "nope", "label": "a", "terms_version": "v1", "privacy_version": "v1" }),
+            json!({ "email": "nope", "label": "a", "terms_version": "20261029", "privacy_version": "20261029" }),
             "invalid_email",
         ),
         (
-            json!({ "email": EMAIL, "label": "<b>x</b>", "terms_version": "v1", "privacy_version": "v1" }),
+            json!({ "email": EMAIL, "label": "<b>x</b>", "terms_version": "20261029", "privacy_version": "20261029" }),
             "invalid_label",
         ),
         (
-            json!({ "email": EMAIL, "label": "a", "terms_version": "v9", "privacy_version": "v1" }),
+            json!({ "email": EMAIL, "label": "a", "terms_version": "v9", "privacy_version": "20261029" }),
             "unknown_terms_version",
         ),
         (
-            json!({ "email": EMAIL, "label": "a", "terms_version": "v1", "privacy_version": "v9" }),
+            json!({ "email": EMAIL, "label": "a", "terms_version": "20261029", "privacy_version": "v9" }),
             "unknown_privacy_version",
         ),
         (
-            json!({ "email": EMAIL, "label": "a", "terms_version": "v1", "privacy_version": "v1", "notice_version": "v9" }),
+            json!({ "email": EMAIL, "label": "a", "terms_version": "20261029", "privacy_version": "20261029", "notice_version": "v9" }),
             "unknown_notice_version",
         ),
         (json!({ "email": EMAIL }), "invalid_body"),

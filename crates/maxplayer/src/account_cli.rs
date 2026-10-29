@@ -345,7 +345,7 @@ mod wallet {
         let _ = writeln!(
             out,
             "Check {email} for a 6-digit code (it expires in {minutes} minutes, {} tries).\n\
-             Entering it accepts the Maxplayer Terms of Service, version {TERMS_VERSION}: {}",
+             Entering it accepts the Maxplayer Terms of Service, effective {TERMS_VERSION}: {}",
             sent.max_attempts, sent.terms_url
         );
     }
@@ -362,7 +362,11 @@ mod wallet {
                 "This key was already linked to this email; the link was refreshed."
             );
         }
-        let _ = writeln!(out, "Terms of Service {} accepted.", linked.terms_version);
+        let _ = writeln!(
+            out,
+            "Terms of Service (effective {}) accepted.",
+            linked.terms_version
+        );
         let relay = if linked.relay_member == "added" {
             "The relay now accepts writes from this key.".to_owned()
         } else {
@@ -688,13 +692,19 @@ mod interactive_tests {
         let stdin = "not-an-email\nyou@example.com\n<bad>\nmy laptop\n12\n111111\n482 913\n";
         let (code, out, err) = drive(&fake, &keys, Opts::default(), stdin);
         assert_eq!(code, SUCCESS, "{out}\n{err}");
-        assert!(out.contains("https://www.maxplayer.ai/privacy/v1"), "{out}");
-        assert!(out.contains("maxplayer account marketing off"), "{out}");
         assert!(
-            out.contains("accepts the Maxplayer Terms of Service, version v1"),
+            out.contains("https://www.maxplayer.ai/privacy/20261029"),
             "{out}"
         );
-        assert!(out.contains("https://www.maxplayer.ai/terms/v1"), "{out}");
+        assert!(out.contains("maxplayer account marketing off"), "{out}");
+        assert!(
+            out.contains("accepts the Maxplayer Terms of Service, effective 20261029"),
+            "{out}"
+        );
+        assert!(
+            out.contains("https://www.maxplayer.ai/terms/20261029"),
+            "{out}"
+        );
         assert!(
             out.contains("That does not look like an email address."),
             "{out}"

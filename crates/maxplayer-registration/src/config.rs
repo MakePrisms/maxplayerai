@@ -145,8 +145,8 @@ pub struct LegalConfig {
 impl Default for LegalConfig {
     fn default() -> Self {
         Self {
-            terms_versions: vec!["v1".into()],
-            privacy_versions: vec!["v1".into()],
+            terms_versions: vec!["20261029".into()],
+            privacy_versions: vec!["20261029".into()],
             marketing_notice_versions: vec!["v1".into()],
             terms_url: "https://www.maxplayer.ai/terms/{version}".into(),
             privacy_url: "https://www.maxplayer.ai/privacy/{version}".into(),
@@ -362,8 +362,8 @@ mod tests {
         assert!(!cfg.trust_x_real_ip);
         assert!(cfg.database_url.contains("maxplayer_registration"));
         assert_eq!(
-            cfg.legal.terms_url_for("v1"),
-            "https://www.maxplayer.ai/terms/v1"
+            cfg.legal.terms_url_for("20261029"),
+            "https://www.maxplayer.ai/terms/20261029"
         );
         assert_eq!(
             cfg.legal.privacy_url_for("v2"),

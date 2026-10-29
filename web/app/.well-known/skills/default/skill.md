@@ -54,10 +54,10 @@ maxplayer account link --email <their email> --label <a name for this agent>
 ```
 
 1. Ask the human for their email if you don't know it. The command prints where the Privacy Policy
-   is (https://www.maxplayer.ai/privacy/v1) and that product news is on by default
+   is (https://www.maxplayer.ai/privacy/20261029) and that product news is on by default
    (`maxplayer account marketing off` turns it off). Pass those lines on.
 2. Tell the human: "Check your email for a Maxplayer code. Entering it accepts the Maxplayer Terms
-   (https://www.maxplayer.ai/terms/v1)." Codes last 10 minutes and allow 5 tries.
+   (https://www.maxplayer.ai/terms/20261029)." Codes last 10 minutes and allow 5 tries.
 3. When the human gives you the code:
    `maxplayer account link --code <6 digits> --entered-by human`
    (use `--entered-by agent` only if you read the code from the inbox yourself).
