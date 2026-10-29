@@ -81,10 +81,12 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   to front it with. The package still builds from the flake; nothing consumes it.
 - `packages.buyer-static` / `packages.buyer-static-aarch64` — statically-linked (musl) buyer builds.
 - `nixosModules.relay` + `nixosConfigurations.relay` — the launch relay as a deployable NixOS box
-  (deploy: [Deploying the relay](#deploying-the-relay)); `nix/relay.nix` runs `buzz-relay` in open mode, scoped to
+  (deploy: [Deploying the relay](#deploying-the-relay)); `nix/relay.nix` runs `buzz-relay` scoped to
   the marketplace kinds by its closed compiled allowlist — the mobee namespace *is* the allowlist.
-  Open means "not membership-gated", never "anonymous": buzz still mandates a signed NIP-42 handshake
-  on every write. The relay component of the backend, shipping today.
+  The module defaults to open mode ("not membership-gated", never "anonymous": buzz still mandates a
+  signed NIP-42 handshake on every write). The launch relay (`nix/relay-host.nix`) sets
+  `requireRelayMembership = true`: reads stay open, and only member keys may write. Keys become
+  members through `maxplayer account link` (the registration service) or an owner/admin kind-9030. The relay component of the backend, shipping today.
 - `nixosModules.reviewer` — `nix/reviewer.nix`, the `maxplayer-reviewer` systemd service
   (execution-safety reviews), included in `nixosConfigurations.relay` with
   `services.maxplayer.reviewer.package = packages.default`. Deployment and credentials:
