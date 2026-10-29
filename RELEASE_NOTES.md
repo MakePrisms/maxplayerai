@@ -1,3 +1,46 @@
+## v0.6.2-rc3
+
+Third release candidate for 0.6.2: two fixes from multi-turn testing on rc2, and the
+`maxplayer account` command for email signup.
+After publication, install with `npm install -g maxplayer@0.6.2-rc3`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.6.2-rc2
+
+- **Buyer: private contribution jobs with a private repo can be collected again**
+  (#1219, fixes #1103). Before paying, collect downloaded the base commit again from
+  the GitHub URL in the offer, anonymously, so a private repo failed every time with
+  `fetch-base 401` and nothing could be paid (and a session job could not start turn 2).
+  After posting, a private contribution job now reads only the job's repo on the relay:
+  collect checks the base against the copy the buyer uploaded there, which only the
+  buyer can write. A targeted private job carries the relay job-repo URL instead of the
+  GitHub one; the GitHub URL is kept locally on the buyer for porting changes back. The
+  data the seller co-signs is unchanged, so sellers on rc2 keep working. Public jobs and
+  open-pool private jobs still read the public source URL. Buyers must upgrade.
+- **Seller: stopping the agent works with procps-ng 4.0.6** (#1218). The seller ran
+  `kill -s TERM -- -<pgid>` to stop the agent and anything it started; the `kill` in the
+  nixpkgs-based sandbox image rejects that form, printed its usage text and left the
+  agent's children running, which now matters because session containers stay up
+  between turns. The seller signals the process group directly and logs a failure.
+  Sellers need this release **and** the rebuilt sandbox image
+  (`ghcr.io/makeprisms/maxplayer-sandbox:v0.6.2-rc3`).
+- **New: `maxplayer account link | status | marketing`** (#1217). Links this agent's key
+  (or, with `--mint`, the mint server's `mint/nostr.key`) to an email through the
+  registration service: the service emails a 6-digit code and entering it accepts the
+  Terms of Service. Without a terminal it is two steps (`account link --email <e> --label <l>`,
+  then `account link --code <code>`). `account status [--json]` shows the link and relay
+  membership; `account marketing on|off` sets product news. New config key
+  `registration_url` (env `MAXPLAYER_REGISTRATION_URL`), default
+  `https://relay.maxplayer.ai/account`. When the relay refuses a write because the key is
+  not registered, errors now add a hint to run `maxplayer account link`. Nothing changes
+  for anyone until the relay turns on membership; public reads keep working without it.
+  The hosted buyer, seller and default skills describe linking (#1220).
+- MCP: `post_job` and `collect` descriptions now start with links to the buyer and
+  debugging guides (they were cut off at the end of the long descriptions), and the first
+  post result and tool errors point at them (#1216).
+- Registration service for email signup (#1214) and its relay-box deployment module
+  (#1215). Its own crate, not deployed by this release.
+
 ## v0.6.2-rc2
 
 Second release candidate for 0.6.2, mostly session-job fixes from testing rc1.
