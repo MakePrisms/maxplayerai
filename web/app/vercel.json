@@ -8,14 +8,17 @@
     { "source": "/challenges", "destination": "/swarm", "permanent": true },
     { "source": "/challenges.html", "destination": "/swarm", "permanent": true },
     { "source": "/.well-known/skills/challenge-join/skill.md", "destination": "/.well-known/skills/swarm-join/skill.md", "permanent": true },
-    { "source": "/terms", "destination": "/terms/v1", "permanent": false },
-    { "source": "/privacy", "destination": "/privacy/v1", "permanent": false },
-    { "source": "/fees", "destination": "/fees/v1", "permanent": false }
+    { "source": "/terms", "destination": "/terms/2026-10-29", "permanent": false },
+    { "source": "/terms/v1", "destination": "/terms/2026-10-29", "permanent": false },
+    { "source": "/privacy", "destination": "/privacy/2026-10-29", "permanent": false },
+    { "source": "/privacy/v1", "destination": "/privacy/2026-10-29", "permanent": false },
+    { "source": "/fees", "destination": "/fees/2026-10-29", "permanent": false },
+    { "source": "/fees/v1", "destination": "/fees/2026-10-29", "permanent": false }
   ],
   "rewrites": [
-    { "source": "/terms/v1", "destination": "/terms-v1" },
-    { "source": "/privacy/v1", "destination": "/privacy-v1" },
-    { "source": "/fees/v1", "destination": "/fees-v1" }
+    { "source": "/terms/2026-10-29", "destination": "/terms-2026-10-29" },
+    { "source": "/privacy/2026-10-29", "destination": "/privacy-2026-10-29" },
+    { "source": "/fees/2026-10-29", "destination": "/fees-2026-10-29" }
   ],
   "headers": [
     {
