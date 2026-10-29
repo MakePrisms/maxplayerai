@@ -523,14 +523,17 @@ impl Driver for AcpDriver {
                     // shutdown signal", which looks like infrastructure rather than like us.
                     match process_group_of(pid) {
                         Some(pgid) if pgid == pid => {
-                            // `--` ends option parsing so an external `kill` cannot read the
-                            // negative operand as a signal spec.
-                            let _ = Command::new("kill")
-                                .arg("-s")
-                                .arg("TERM")
-                                .arg("--")
-                                .arg(format!("-{pgid}"))
-                                .status();
+                            // kill(2) directly, not an external `kill`: procps-ng 4.0.6 (the
+                            // nixpkgs one in the seller sandbox image) rejects
+                            // `kill -s TERM -- -<pgid>` with a usage dump and exit 1, so the group
+                            // was never signalled and the agent's grandchildren (the CLI an ACP
+                            // adapter launches) outlived shutdown in the parked container.
+                            if let Err(error) = term_process_group(pgid) {
+                                eprintln!(
+                                    "acp: shutdown: TERM to agent process group {pgid} failed: \
+                                     {error}; only the direct child is killed"
+                                );
+                            }
                         }
                         // Not the group leader (or the group is unreadable): kill this process
                         // alone. Leaking a grandchild is recoverable; signalling a group we do not
@@ -545,6 +548,45 @@ impl Driver for AcpDriver {
         }
         Ok(())
     }
+}
+
+/// Send SIGTERM to every process in group `pgid` (`kill(-pgid, SIGTERM)`).
+///
+/// Declared against the C library std already links rather than through the `libc` crate, which
+/// this module cannot use (optional, `wallet`-only; see [`process_group_of`]), and rather than an
+/// external `kill` binary, whose argv grammar differs between procps-ng releases (4.0.6 refuses
+/// `-s TERM -- -<pgid>`). `SIGTERM` is 15 and `pid_t` is a 32-bit int on every unix this crate
+/// targets (Linux, macOS, the BSDs). A group that is already empty (`ESRCH`) is not an error: there
+/// is nothing left to signal.
+///
+/// The caller MUST have established that it owns `pgid` (the child it spawned leads it); `pgid`
+/// values that would widen the signal — 0 (our own group) or 1 (`-1` means every process we may
+/// signal) — are refused here as well.
+#[cfg(unix)]
+fn term_process_group(pgid: u32) -> std::io::Result<()> {
+    unsafe extern "C" {
+        fn kill(pid: std::ffi::c_int, sig: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    const SIGTERM: std::ffi::c_int = 15;
+    let pgid = std::ffi::c_int::try_from(pgid)
+        .ok()
+        .filter(|pgid| *pgid > 1)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing to signal process group {pgid}"),
+            )
+        })?;
+    // SAFETY: kill(2) takes two ints and touches no memory of ours.
+    if unsafe { kill(-pgid, SIGTERM) } == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(3) {
+        // ESRCH (3 on Linux, macOS and the BSDs): the group already has no members.
+        return Ok(());
+    }
+    Err(error)
 }
 
 /// The process group id of `pid`, or `None` if it cannot be established.
@@ -593,6 +635,20 @@ mod group_scope_tests {
             Some(4242)
         );
         assert_eq!(parse_pgrp_from_stat("77 (a b c d e) S 1 555 555 0"), Some(555));
+    }
+
+    /// `kill(0, …)` would hit our own group and `kill(-1, …)` every process we may signal: both
+    /// are refused before any syscall.
+    #[test]
+    fn term_process_group_refuses_widening_group_ids() {
+        for pgid in [0, 1, u32::MAX] {
+            let error = super::term_process_group(pgid).expect_err("must refuse");
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "pgid {pgid}"
+            );
+        }
     }
 
     /// Unreadable ⇒ `None`, and `None` must mean "never signal a group".
