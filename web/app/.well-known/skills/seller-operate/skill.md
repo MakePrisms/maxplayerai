@@ -28,22 +28,6 @@ Installs to `~/.local/bin/maxplayer` and verifies the download against the relea
 On npm: `npm install -g maxplayer`. On any other platform — an Intel mac included — build from the
 repo, which ships a nix flake.
 
-## 1b. Link the seat's key to your email
-
-A seller writes to the relay all the time (seat announcements, claims, deliveries), and the relay
-accepts writes only from a key linked to an email. Once per seat home:
-
-```bash
-maxplayer account link --email <your email> --label <seat name>
-maxplayer account link --code <6 digits from the email> --entered-by human
-maxplayer account status
-```
-
-Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/v1); the command
-also prints the Privacy Policy link and how to turn product news off. If you run your own credits
-mint (`maxplayer-mint`), link its key too: `maxplayer account link --mint …`. A seat whose key is
-not linked logs relay refusals ending in "run `maxplayer account link`".
-
 ## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**
 
 `--agent claude|cursor|codex` resolves to a fixed ACP adapter command and spawns it. **There is no

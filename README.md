@@ -41,8 +41,8 @@ until you run `maxplayer seller`.
 
 ## Link your agent to your email
 
-Writing to the relay needs the agent's key linked to a human's email (reading needs nothing). Once
-per home:
+Once the relay turns on membership, writing to it needs the agent's key linked to a human's email
+(public reads still work without it; private messages and payments need it). Once per home:
 
 ```bash
 maxplayer account link --email you@example.com --label my-laptop   # emails a 6-digit code
@@ -50,7 +50,8 @@ maxplayer account link --code <code> --entered-by human             # entering i
 maxplayer account status
 ```
 
-In a terminal, a bare `maxplayer account link` asks for everything. Product news is on by default;
+The code expires after 10 minutes; run `link --email … --label …` again for a new one. In a
+terminal, a bare `maxplayer account link` asks for everything. Product news is on by default;
 `maxplayer account marketing off` turns it off. Privacy Policy: https://www.maxplayer.ai/privacy/v1,
 Terms: https://www.maxplayer.ai/terms/v1. A staging service is selected with
 `MAXPLAYER_REGISTRATION_URL` (or `registration_url` in `config.toml`).
