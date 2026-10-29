@@ -1081,6 +1081,40 @@ pub fn list_remote(
     Ok(heads)
 }
 
+/// [`list_remote`] in the fetch direction, hosted on the caller's own repository (no scratch repo)
+/// and on the short fail-closed money-path client when `short_timeout`. The buyer verify path uses
+/// it to read a private job repository's advertisement before fetching a pinned base by id.
+pub fn list_remote_in(
+    repo: &Repository,
+    remote_url: &str,
+    auth: Option<&str>,
+    short_timeout: bool,
+) -> Result<Vec<(String, String)>, TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    ensure_registered()?;
+    let header = header_for(remote_url, auth)?;
+    let mut remote = bound_remote(repo, remote_url)?;
+    let context = LegContext {
+        mint: header.map(static_auth),
+        authority: None,
+        lifetime: None,
+        short: short_timeout,
+        read_budget: None,
+        intended_url: remote_url.to_owned(),
+    };
+    let heads = with_context(context, || {
+        remote.connect(Direction::Fetch)?;
+        let list = remote
+            .list()?
+            .iter()
+            .map(|h| (h.name().to_owned(), h.oid().to_string()))
+            .collect::<Vec<_>>();
+        let _ = remote.disconnect();
+        Ok::<_, git2::Error>(list)
+    })?;
+    Ok(heads)
+}
+
 /// `ls-remote` over the upload-pack advertisement: list the remote's refs without transferring a
 /// pack. Thin wrapper over [`list_remote`] in the fetch direction so callers outside this crate need
 /// not name `git2::Direction`. Used by the seller's post-announce relay-git seed probe.

@@ -139,9 +139,23 @@ pub async fn post(
         } else {
             None
         };
+    // After posting, the job's repository IS the relay copy the buyer uploads below. A targeted
+    // job therefore names that copy, never the external source (which may be a private GitHub
+    // URL nobody else can read): the chosen seller, the reviewer and the buyer's own verify all
+    // read only the job repository. The external source stays buyer-local (`write_source_record`)
+    // for porting the result back. An open-pool task is still public at discovery and every bidder
+    // reads the source before claiming, so it keeps naming it there.
+    let job_repo = ctx
+        .policy
+        .host
+        .job_repo(&keys.public_key().to_hex(), &job)?;
     let pin = contribution.map(|c| super::Contribution {
         target_owner_pubkey: c.target.owner_pubkey().into(),
-        target_clone_url: c.target.clone_url().into(),
+        target_clone_url: if offer.seller_pubkey.is_some() {
+            job_repo.clone()
+        } else {
+            c.target.clone_url().into()
+        },
         base_branch: c.base.branch().into(),
         base_oid: c.base.oid().into(),
         accepts: c.accepts.clone(),
@@ -297,6 +311,9 @@ pub async fn post(
         transport.disconnect().await;
     }
     let id = prepared.event.id.to_hex();
+    if let Some(c) = contribution {
+        write_source_record(home, &id, c, &job_repo);
+    }
     // A terminal refusal recorded by that first flush goes to the caller now, not
     // only to a later get_job: the post succeeded locally but no seller can see it.
     let publish_refused = ctx.store.refusal_for_event(&id).ok().flatten();
@@ -312,6 +329,42 @@ pub async fn post(
         output: offer.output,
         publish_refused,
     })
+}
+
+/// Where a private contribution's EXTERNAL source is kept for the buyer: `<home>/contribution-sources/<job_id>.json`.
+pub fn source_record_path(home: &MaxplayerHome, job_id: &str) -> std::path::PathBuf {
+    home.root
+        .join("contribution-sources")
+        .join(format!("{job_id}.json"))
+}
+
+/// Buyer-local record of where a private contribution came from (the URL, branch and pinned
+/// commit given at post), so the buyer's agent can port an accepted result back to the real
+/// repository. No job leg reads it: from posting on, the job repository is the relay copy.
+/// Advisory: a write failure is logged and never fails a post that is already queued.
+fn write_source_record(
+    home: &MaxplayerHome,
+    job_id: &str,
+    contribution: &crate::contribution::ContributionOffer,
+    job_repo: &str,
+) {
+    let record = serde_json::json!({
+        "job_id": job_id,
+        "job_repo": job_repo,
+        "target_repo_owner": contribution.target.owner_pubkey(),
+        "target_repo_url": contribution.target.clone_url(),
+        "base_branch": contribution.base.branch(),
+        "base_oid": contribution.base.oid(),
+    });
+    let path = source_record_path(home, job_id);
+    let written = path
+        .parent()
+        .map(std::fs::create_dir_all)
+        .unwrap_or(Ok(()))
+        .and_then(|_| std::fs::write(&path, format!("{record:#}\n")));
+    if let Err(error) = written {
+        crate::opline!("buyer contribution source record not kept ({error})");
+    }
 }
 
 /// Called under the buyer daemon home lock; each live staging directory also has its own lease.

@@ -212,6 +212,12 @@ Adapt the last line per turn. Keep the rest byte-stable — see common step 3.
   history is not payment provenance; the store is.
 - From turn 2 on the chain **is** checked: the base commit is resolved from your pin,
   never from the seller's echo, and the delivery must descend from it.
+- **Private repo instead:** post a TARGETED private job (`seller_pubkey`,
+  `visibility=private`) with `base_local_path` pointing at your local clone. The buyer
+  uploads the base to the job's relay repository at post time, and every later leg —
+  seller, review, `collect`, turn n — reads only that copy, never your URL. Port the
+  accepted result back yourself; `<home>/contribution-sources/<job_id>.json` records
+  where it came from. The rule below is for every other job shape.
 - ⛔ **Your repo must be a public, credential-free `https` repo.** Unsafe schemes
   (`ext::`, `file`, `ssh`) and credentials-in-URL are refused outright, so a private repo
   cannot be a target. Relay-git targets validate, but a plain `git push` to relay-git

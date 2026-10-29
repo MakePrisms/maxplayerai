@@ -65,6 +65,22 @@ A **targeted private job with a private repository is the supported combination*
 uploads the pinned base into the per-job repository, and only the chosen seller (and the service)
 can read it.
 
+**After posting, a private job's repository is the relay copy, and nothing else.** The buyer reads
+`target_repo_url` (or `base_local_path`) exactly once, at post time, to import the base. From then
+on the seller, the reviewer, the buyer's own verify and collect, and every session follow-up turn
+read only the per-job repository on the relay, with NIP-98 authentication. The buyer verifies a
+delivery against the base it uploaded itself: a `refs/heads/input/<id>` ref (only the buyer can
+create one, and only before the award) must point at exactly `base_oid`, and the delivery must
+descend from it. A seller echo never chooses the base.
+
+A targeted private offer's encrypted task names the per-job repository as its contribution target,
+not the external URL. The buyer keeps the external source locally in
+`<home>/contribution-sources/<job_id>.json` (URL, branch, pinned commit, job repository), so its
+agent can port an accepted result back to the real repository after the job. Offers published
+before this change still name the external URL in their task; readers accept them, and no
+post-posting leg dials that URL. (v0.6.2-rc2 and earlier re-fetched it at collect, so a private
+GitHub `target_repo_url` made every collect fail before paying.)
+
 A **public contribution post validates its base by fetching it once**, pre-publication, with the
 identity a seller will use (anonymous off-relay). That is the only point that can refuse a
 missing `base_oid` or a repository above the relay quotas before money and a deadline are

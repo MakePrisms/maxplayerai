@@ -429,12 +429,26 @@ fn collect_free(
     let store = delivery_store_path(home);
     let mut verifier = PayPathDeliveryVerifier::new(store.clone(), Some(secret_hex));
 
-    if bind.private_evidence.is_some() {
-        if let Some(pin) = &bind.contribution {
-            let base = CommitOid::parse(pin.base_oid.clone()).map_err(|e| CollectError::Integrity(e.to_string()))?;
-            verifier.verify_contribution(&delivery, &pin.target_clone_url, &pin.base_branch, &base,
-                &authorize_pay::contribution_policy(home)).map_err(|e| CollectError::Integrity(e.to_string()))?;
-        }
+    if let (Some(evidence), Some(pin)) = (&bind.private_evidence, &bind.contribution) {
+        let base = CommitOid::parse(pin.base_oid.clone())
+            .map_err(|e| CollectError::Integrity(e.to_string()))?;
+        let policy = crate::private_content::runtime::Policy::for_evidence(home, evidence)
+            .map_err(|e| CollectError::Integrity(e.to_string()))?;
+        // Private jobs read only their relay job repository here, never the offer's target URL.
+        let source = authorize_pay::contribution_base_source(
+            Some((evidence, &policy)),
+            &pin.target_clone_url,
+            &pin.base_branch,
+        )
+        .map_err(CollectError::Integrity)?;
+        verifier
+            .verify_contribution(
+                &delivery,
+                &source,
+                &base,
+                &authorize_pay::contribution_policy(home),
+            )
+            .map_err(|e| CollectError::Integrity(e.to_string()))?;
     }
 
     // 1. THE TIP-MATCH. Same verifier, same allowlist, same fetch, same compare as the paid path —
