@@ -34,8 +34,8 @@ const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
 // Challenge relay quorum (run 2 #13): default 2; must be a majority of CHALLENGE_RELAYS.
 const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, challengeRelays.length);
 const watch = process.argv.includes("--watch");
-// terms-v1/privacy-v1 are served at /terms/v1 and /privacy/v1 (vercel.json rewrites); /terms and /privacy redirect to the current version.
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-v1.html", "privacy-v1.html"];
+// terms-v1/privacy-v1/fees-v1 are served at /terms/v1, /privacy/v1 and /fees/v1 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current version.
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-v1.html", "privacy-v1.html", "fees-v1.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,

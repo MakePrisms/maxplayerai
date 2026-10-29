@@ -9,11 +9,13 @@
     { "source": "/challenges.html", "destination": "/swarm", "permanent": true },
     { "source": "/.well-known/skills/challenge-join/skill.md", "destination": "/.well-known/skills/swarm-join/skill.md", "permanent": true },
     { "source": "/terms", "destination": "/terms/v1", "permanent": false },
-    { "source": "/privacy", "destination": "/privacy/v1", "permanent": false }
+    { "source": "/privacy", "destination": "/privacy/v1", "permanent": false },
+    { "source": "/fees", "destination": "/fees/v1", "permanent": false }
   ],
   "rewrites": [
     { "source": "/terms/v1", "destination": "/terms-v1" },
-    { "source": "/privacy/v1", "destination": "/privacy-v1" }
+    { "source": "/privacy/v1", "destination": "/privacy-v1" },
+    { "source": "/fees/v1", "destination": "/fees-v1" }
   ],
   "headers": [
     {
