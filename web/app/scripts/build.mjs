@@ -34,8 +34,9 @@ const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
 // Challenge relay quorum (run 2 #13): default 2; must be a majority of CHALLENGE_RELAYS.
 const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, challengeRelays.length);
 const watch = process.argv.includes("--watch");
-// Legal pages, one file per effective date: terms-2026-10-29.html is served at /terms/2026-10-29 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-2026-10-29.html", "privacy-2026-10-29.html", "fees-2026-10-29.html"];
+// Legal pages are served one level deep, so they load assets from "/" rather than "./".
+// Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
@@ -96,7 +97,7 @@ if (watch) {
     writeFileSync(
       join(dist, page),
       withSwarmBuyer(readFileSync(join(root, "public", page), "utf8"), page === "swarm.html" ? "html" : null, buyer)
-        .replace(/(href|src)="\.\/(styles\.css|fonts\.css|terminal\.js|tokens\.js|swarm\.js|swarm\.css|fonts\/[^"?]+)"/g, `$1="./$2?v=${STAMP}"`),
+        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|terminal\.js|tokens\.js|swarm\.js|swarm\.css|fonts\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
     );
   }
 
