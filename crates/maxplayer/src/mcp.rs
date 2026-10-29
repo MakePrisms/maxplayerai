@@ -759,6 +759,32 @@ mod tests {
     use std::io::Cursor;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    fn tool_error_text(message: &str) -> String {
+        let response = tool_error(json!(1), message.to_owned());
+        assert_eq!(response["result"]["isError"], true);
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// Email signup spec §6: an MCP tool error from a relay membership refusal names the link
+    /// command; a git credential failure (same words, different cause) does not.
+    #[test]
+    fn tool_errors_add_the_link_hint_only_for_a_relay_registration_refusal() {
+        let refused =
+            tool_error_text("no relay accepted event (wss://r: restricted: not a relay member)");
+        assert!(
+            refused.contains("run `maxplayer account link`"),
+            "{refused}"
+        );
+        assert!(refused.ends_with(&tool_error_guide_line()), "{refused}");
+        let git = "collect: fatal: Authentication failed for 'https://github.com/a/b.git/'";
+        let text = tool_error_text(git);
+        assert!(!text.contains("maxplayer account link"), "{text}");
+        assert!(text.starts_with(git), "{text}");
+    }
+
     #[test]
     fn post_job_alone_gets_the_longer_deadline_and_errors_name_their_tool() {
         assert_eq!(tool_deadline_secs(Some("post_job")), POST_JOB_DEADLINE_SECS);

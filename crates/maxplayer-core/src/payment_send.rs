@@ -381,6 +381,31 @@ mod tests {
     }
 
     #[test]
+    fn a_payment_refused_for_registration_names_the_link_command() {
+        let error = payment_sent(
+            "event".into(),
+            Vec::new(),
+            vec![
+                PaymentRelayFailure {
+                    relay: "wss://a.example".into(),
+                    error: "timeout".into(),
+                },
+                PaymentRelayFailure {
+                    relay: "wss://relay.example".into(),
+                    error: "restricted: not a relay member".into(),
+                },
+            ],
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.starts_with("payment send failed: no relay accepted the NIP-17 payment ("),
+            "{text}"
+        );
+        assert!(text.contains("run `maxplayer account link`"), "{text}");
+    }
+
+    #[test]
     fn payment_send_preserves_partial_relay_outcome() {
         let failed = PaymentRelayFailure {
             relay: "wss://failed.example".into(),

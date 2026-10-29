@@ -13,8 +13,8 @@
 //! | `restricted: you were removed from this relay` | buzz closes a live session after a NIP-43 remove (`handlers/relay_admin.rs`) |
 //! | `relay_membership_required` / `You must be a relay member` | buzz HTTP API 403 (`api/mod.rs`) |
 //! | `relay membership required` | buzz media API (`buzz-media/src/error.rs`) |
-//! | `auth-required:` | buzz refuses an EVENT from a session that never signed in (`handlers/event.rs`); a refused sign-in leaves the session there |
-//! | `authentication failed` | nostr-sdk `Error::AuthenticationFailed` and the NIP-42 messages in `relay_auth`/`doctor` |
+//! | `auth-required:` | buzz refuses an EVENT from a session that never signed in (`handlers/event.rs`); a refused sign-in leaves the session there. Except `auth-required: verification failed` (a bad or clock-skewed AUTH event), `auth-required: already authenticated` and `auth-required: agent owner recorded; reconnect`, which linking does not fix |
+//! | `authentication failed` | nostr-sdk `Error::AuthenticationFailed` and the NIP-42 messages in `relay_auth`/`doctor`. Not git's `Authentication failed for '<url>'` nor this workspace's git `auth failed: …` (HTTP credentials, not the relay key) |
 //! | `NIP-42 sign-in failed`, `sign-in (NIP-42) failed`, `NIP-42 rejected`, `NIP-42 failed`, `auth rejected` | this workspace's own wording of the same refusal (resubscribe task, mint connector, chat sidecar, test relay) |
 //!
 //! nostr-sdk drops the relay's AUTH refusal text and only reports `AuthenticationFailed`, so a
@@ -31,7 +31,8 @@ pub const LINK_COMMAND: &str = "maxplayer account link";
 
 /// Appended to a refusal from a client that signs with the agent's home key.
 pub const LINK_HINT: &str = "this agent's key may not be registered yet: run `maxplayer account link` \
-     to link it to your email (reading still works without it)";
+     to link it to your email (public reads still work without it; private messages and payments \
+     need it)";
 
 /// Appended to a refusal seen by the mint server, which signs with its own `<home>/mint/nostr.key`.
 pub const MINT_LINK_HINT: &str = "this mint's key may not be registered yet: run \
@@ -45,7 +46,6 @@ const MARKERS: &[&str] = &[
     "must be a relay member",
     "relay membership required",
     "auth-required:",
-    "authentication failed",
     "nip-42 sign-in failed",
     "sign-in (nip-42) failed",
     "nip-42 rejected",
@@ -53,11 +53,33 @@ const MARKERS: &[&str] = &[
     "auth rejected",
 ];
 
+/// Lowercased refusals that contain a marker but are not about registration. They are cut out of
+/// the text before matching, so a message listing several relays still matches on the others.
+const NOT_REGISTRATION: &[&str] = &[
+    "auth-required: verification failed",
+    "auth-required: already authenticated",
+    "auth-required: agent owner recorded",
+];
+
+/// nostr-sdk's bare `authentication failed` (its `Error::AuthenticationFailed` text, which is all a
+/// client learns of a refused NIP-42 sign-in). git uses the same words for HTTP credentials:
+/// `Authentication failed for '<url>'` from the git CLI, and `auth failed: …` is this workspace's
+/// git transport error, so those two forms are not counted.
+fn sdk_authentication_failed(lower: &str) -> bool {
+    const TEXT: &str = "authentication failed";
+    lower.match_indices(TEXT).any(|(at, _)| {
+        !lower[at + TEXT.len()..].starts_with(" for ") && !lower[..at].ends_with("auth failed: ")
+    })
+}
+
 /// True when `text` reads like the relay refused this key at sign-in or write for lack of
 /// registration (see the module table).
 pub fn is_registration_refusal(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-    MARKERS.iter().any(|marker| lower.contains(marker))
+    let mut lower = text.to_ascii_lowercase();
+    for excluded in NOT_REGISTRATION {
+        lower = lower.replace(excluded, "");
+    }
+    MARKERS.iter().any(|marker| lower.contains(marker)) || sdk_authentication_failed(&lower)
 }
 
 /// `text`, plus [`LINK_HINT`] when it is a registration refusal that does not already name the
@@ -107,6 +129,12 @@ mod tests {
             "relay sign-in (NIP-42) failed on every reachable relay for mint nostr://x",
             "auth: NIP-42 rejected",
             "wss://relay.example: restricted: auth rejected",
+            "no relay accepted event (wss://r: authentication failed)",
+            "relay authentication failed",
+            // A listed relay with an unrelated refusal does not hide a real one.
+            "no relay accepted event (wss://a: auth-required: verification failed; wss://b: \
+             restricted: not a relay member)",
+            "wss://r: auth-required: authentication already failed",
         ] {
             assert!(is_registration_refusal(text), "{text}");
         }
@@ -122,9 +150,32 @@ mod tests {
             "rate-limited: slow down",
             "error: internal error checking relay membership",
             "timeout",
+            // git's HTTP credential failures: a GitHub token problem, not the relay key.
+            "fatal: Authentication failed for 'https://github.com/acme/private.git/'",
+            "collect: git fetch failed: remote: Authentication failed for 'https://github.com/a/b'",
+            "auth failed: authentication failed",
+            // buzz AUTH texts that linking does not fix.
+            "auth-required: verification failed",
+            "wss://r: auth-required: already authenticated",
+            "auth-required: agent owner recorded; reconnect",
         ] {
             assert_eq!(with_hint(text), text, "{text}");
         }
+    }
+
+    /// Review L1: the hint is attached to sign-in failures, where private receive is broken, so it
+    /// must not claim reading is unaffected.
+    #[test]
+    fn the_hint_says_private_messages_and_payments_need_the_link() {
+        let hinted =
+            with_hint("NIP-42 authentication failed (required for kind-1059 p-gated receive)");
+        assert!(
+            hinted.contains(
+                "public reads still work without it; private messages and payments need it"
+            ),
+            "{hinted}"
+        );
+        assert!(!hinted.contains("reading still works"), "{hinted}");
     }
 
     #[test]

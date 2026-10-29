@@ -323,6 +323,11 @@ fn resend_cooldown_and_rate_limit_say_when_to_try_again() {
         err.contains("A code was sent to this key moments ago"),
         "{err}"
     );
+    // It names the command that enters the code already sent.
+    assert!(
+        err.contains("`maxplayer account link --code <6 digits>`"),
+        "{err}"
+    );
     assert!(err.contains("seconds"), "{err}");
 
     fake.set_cooldown_secs(0);
@@ -447,4 +452,188 @@ fn top_level_help_lists_the_account_command() {
     ] {
         assert!(text.contains(needle), "{needle}\n{text}");
     }
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Review M1: a home that holds only a mint server (`maxplayer-mint init` creates `<home>/mint/`
+/// and nothing else). `--mint` links and reports that key, creates no agent key, `config.toml` or
+/// `wallet/`, and every "run link" hint keeps `--mint --home <h>`. Both ways of naming the home.
+#[test]
+fn mint_only_home_links_the_mint_key_and_creates_nothing_else() {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = FakeRegistration::start();
+    let root = std::env::temp_dir().join(format!(
+        "maxplayer-account-mint-only-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    let mint_dir = root.join("mint");
+    std::fs::create_dir_all(&mint_dir).unwrap();
+    let mint_keys = nostr_sdk::prelude::Keys::generate();
+    let key_path = mint_dir.join("nostr.key");
+    std::fs::write(&key_path, mint_keys.secret_key().to_secret_hex()).unwrap();
+    std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mint_hex = mint_keys.public_key().to_hex();
+    let home_arg = root.to_str().unwrap().to_owned();
+    let flags = format!("--mint --home {home_arg}");
+    let run_mint = |args: &[&str], via_env: bool| {
+        let mut cmd = maxplayer();
+        cmd.env("MAXPLAYER_REGISTRATION_URL", fake.base_url())
+            .stdin(Stdio::null())
+            .arg("account")
+            .args(args)
+            .arg("--mint");
+        if via_env {
+            cmd.env("MAXPLAYER_HOME", &root);
+        } else {
+            cmd.args(["--home", &home_arg]);
+        }
+        let out = cmd.output().unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8(out.stdout).unwrap(),
+            String::from_utf8(out.stderr).unwrap(),
+        )
+    };
+
+    // Not linked yet: status names this key and the exact command, through --home ...
+    let (code, out, err) = run_mint(&["status"], false);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("this mint's key"), "{out}");
+    assert!(
+        out.contains(&format!("`maxplayer account link {flags}`")),
+        "{out}"
+    );
+    assert!(!err.contains("Created a new agent key"), "{err}");
+    // ... and through MAXPLAYER_HOME (it used to bootstrap an agent key there).
+    let (code, out, err) = run_mint(&["status"], true);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("Run `maxplayer account link --mint` to link it."),
+        "{out}"
+    );
+    assert_eq!(names_in(&root), ["mint"], "status created nothing");
+
+    // A service refusal names the flags too.
+    let (code, _, err) = run_mint(&["link", "--code", "123456"], false);
+    assert_eq!(code, 2);
+    assert!(
+        err.contains(&format!("`maxplayer account link {flags} --email")),
+        "{err}"
+    );
+
+    fake.set_next_code("482913");
+    let (code, out, err) = run_mint(
+        &["link", "--email", "ops@example.com", "--label", "mint-1"],
+        false,
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("this mint's key"), "{out}");
+    assert!(
+        out.contains(&format!("maxplayer account link {flags} --code <6 digits>")),
+        "{out}"
+    );
+    assert!(fake.pending(&mint_hex).is_some());
+    let (code, out, err) = run_mint(&["link", "--code", "482913"], true);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        fake.registration(&mint_hex).unwrap().email,
+        "ops@example.com"
+    );
+    let (code, out, err) = run_mint(&["status", "--json"], false);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let status: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(status["registered"], true);
+    assert_eq!(status["pubkey"], mint_hex);
+
+    assert_eq!(
+        names_in(&root),
+        ["mint"],
+        "no key, config.toml or wallet/ was created"
+    );
+    assert_eq!(names_in(&mint_dir), ["nostr.key"]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `--mint` on a home with no mint key is refused before any request, and creates nothing.
+#[test]
+fn mint_flag_without_a_mint_key_is_refused_and_creates_nothing() {
+    let fake = FakeRegistration::start();
+    let root = std::env::temp_dir().join(format!(
+        "maxplayer-account-no-mint-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let out = maxplayer()
+        .env("MAXPLAYER_HOME", &root)
+        .env("MAXPLAYER_REGISTRATION_URL", fake.base_url())
+        .args(["account", "status", "--mint"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("no mint key at"), "{err}");
+    assert!(names_in(&root).is_empty(), "nothing created");
+    assert!(fake.requests().is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Review L6: `status --json` failures are JSON on stdout (`{"error", "message"}`), not stderr text.
+#[test]
+fn status_json_errors_are_json_on_stdout() {
+    let home = new_home();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("http://127.0.0.1:{port}/account");
+    let (code, out, err) = run(&home, &url, &["status", "--json"]);
+    assert_eq!(code, 2, "{err}");
+    let value: Value = serde_json::from_str(out.trim()).expect("stdout is JSON");
+    assert_eq!(value["error"], "network");
+    assert!(
+        value["message"]
+            .as_str()
+            .unwrap()
+            .contains("Could not reach the registration service"),
+        "{value}"
+    );
+
+    let fake = FakeRegistration::start();
+    fake.set_public_base("https://relay.maxplayer.ai/account");
+    let (code, out, _) = run(&home, &fake.base_url(), &["status", "--json"]);
+    assert_eq!(code, 2);
+    let value: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(value["error"], "url_mismatch");
+
+    let missing = std::env::temp_dir().join(format!(
+        "maxplayer-account-json-missing-{}",
+        std::process::id()
+    ));
+    let out = maxplayer()
+        .args([
+            "account",
+            "status",
+            "--json",
+            "--home",
+            missing.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let value: Value = serde_json::from_str(String::from_utf8(out.stdout).unwrap().trim()).unwrap();
+    assert_eq!(value["error"], "home");
+    assert!(!missing.exists());
 }

@@ -131,9 +131,17 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     }
     #[cfg(feature = "wallet")]
     {
+        let json_errors = sub == "status" && opts.json;
         let ctx = match wallet::Context::open(&opts, err) {
             Ok(ctx) => ctx,
-            Err(code) => return code,
+            Err(message) => {
+                if json_errors {
+                    wallet::json_error(out, "home", &message);
+                } else {
+                    let _ = writeln!(err, "{message}");
+                }
+                return RUNTIME_ERROR;
+            }
         };
         match sub {
             "link" => {
@@ -199,58 +207,62 @@ mod wallet {
         pub base_url: String,
         /// "this agent's key" / "this mint's key", for messages.
         pub whose: &'static str,
+        /// The flags that select this key (` --mint`, ` --home <dir>`), repeated in every command
+        /// a message tells the user to run, so it acts on the same key.
+        pub flags: String,
+    }
+
+    /// `{"error": <code>, "message": <text>}` on stdout: the `--json` failure shape.
+    pub fn json_error(out: &mut dyn Write, code: &str, message: &str) {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::json!({ "error": code, "message": message })
+        );
     }
 
     impl Context {
-        pub fn open(opts: &Opts, err: &mut dyn Write) -> Result<Self, i32> {
-            let fail = |err: &mut dyn Write, message: String| {
-                let _ = writeln!(err, "{message}");
-                RUNTIME_ERROR
-            };
+        /// `maxplayer account <sub>` with this key's flags.
+        pub fn command(&self, sub: &str) -> String {
+            format!("maxplayer account {sub}{}", self.flags)
+        }
+
+        /// Opens the key `opts` selects. `Err` is the message to show. `err` only receives the
+        /// "Created a new agent key" notice (default agent home on first use).
+        pub fn open(opts: &Opts, err: &mut dyn Write) -> Result<Self, String> {
+            let mut flags = String::new();
+            if opts.mint {
+                flags.push_str(" --mint");
+            }
+            if let Some(home) = &opts.home {
+                flags.push_str(&format!(" --home {}", home.display()));
+            }
             let explicit = opts.home.is_some();
             let root = match &opts.home {
                 Some(path) => path.clone(),
-                None => home::default_home_dir().map_err(|e| fail(err, e.to_string()))?,
+                None => home::default_home_dir().map_err(|e| e.to_string())?,
             };
+            if opts.mint {
+                return Self::open_mint(&root, flags);
+            }
             // An explicit --home must already hold a key: linking a typo'd path would register a
             // brand-new identity nobody uses. The default home is created like any first command.
             if explicit && !home::is_initialized(&root) {
-                return Err(fail(
-                    err,
-                    format!(
-                        "account refused: no maxplayer home with a key at {} (check the path, or \
-                         run `maxplayer whoami --home {}` to create one)",
-                        root.display(),
-                        root.display()
-                    ),
+                return Err(format!(
+                    "account refused: no maxplayer home with a key at {} (check the path, or run \
+                     `maxplayer whoami --home {}` to create one)",
+                    root.display(),
+                    root.display()
                 ));
             }
-            let home = home::bootstrap(&root).map_err(|e| fail(err, e.to_string()))?;
-            let (keys, whose) = if opts.mint {
-                let path = home.root.join("mint").join("nostr.key");
-                let secret = std::fs::read_to_string(&path).map_err(|_| {
-                    fail(
-                        err,
-                        format!(
-                            "no mint key at {} (run `maxplayer-mint init` first)",
-                            path.display()
-                        ),
-                    )
-                })?;
-                let keys = Keys::parse(secret.trim())
-                    .map_err(|_| fail(err, format!("{} is not a valid key", path.display())))?;
-                (keys, "this mint's key")
-            } else {
-                let secret =
-                    home::read_secret_key_hex(&home).map_err(|e| fail(err, e.to_string()))?;
-                let keys = Keys::parse(&secret)
-                    .map_err(|_| fail(err, "the home key is not a valid key".to_owned()))?;
-                (keys, "this agent's key")
-            };
+            let home = home::bootstrap(&root).map_err(|e| e.to_string())?;
+            let secret = home::read_secret_key_hex(&home).map_err(|e| e.to_string())?;
+            let keys =
+                Keys::parse(&secret).map_err(|_| "the home key is not a valid key".to_owned())?;
             let npub = keys
                 .public_key()
                 .to_bech32()
-                .map_err(|e| fail(err, format!("npub encode: {e}")))?;
+                .map_err(|e| format!("npub encode: {e}"))?;
             if home.key_created {
                 let _ = writeln!(
                     err,
@@ -262,20 +274,48 @@ mod wallet {
                 keys,
                 npub,
                 base_url: home.config.registration_url.clone(),
-                whose,
+                whose: "this agent's key",
+                flags,
             })
         }
 
-        fn client(&self, err: &mut dyn Write) -> Result<RegistrationClient, i32> {
-            RegistrationClient::new(&self.base_url, self.keys.clone()).map_err(|e| {
-                let _ = writeln!(err, "{e}");
-                RUNTIME_ERROR
+        /// `--mint`: the mint server's `<root>/mint/nostr.key`, read with the home key's checks.
+        /// Nothing is created: no agent key, `config.toml` or `wallet/` (a mint-only home has
+        /// none, and making one would leave an unused identity the operator might link instead).
+        fn open_mint(root: &std::path::Path, flags: String) -> Result<Self, String> {
+            let path = root.join("mint").join("nostr.key");
+            if std::fs::symlink_metadata(&path).is_err() {
+                return Err(format!(
+                    "account refused: no mint key at {} (run `maxplayer-mint init` with \
+                     MAXPLAYER_HOME={} first, or check --home)",
+                    path.display(),
+                    root.display()
+                ));
+            }
+            let secret = home::read_key_file_hex(&path).map_err(|e| e.to_string())?;
+            let keys = Keys::parse(&secret)
+                .map_err(|_| format!("{} is not a valid key", path.display()))?;
+            let npub = keys
+                .public_key()
+                .to_bech32()
+                .map_err(|e| format!("npub encode: {e}"))?;
+            let config = home::resolve_config_read_only(root).map_err(|e| e.to_string())?;
+            Ok(Self {
+                keys,
+                npub,
+                base_url: config.registration_url,
+                whose: "this mint's key",
+                flags,
             })
+        }
+
+        fn client(&self) -> Result<RegistrationClient, RegistrationError> {
+            RegistrationClient::new(&self.base_url, self.keys.clone())
         }
     }
 
-    fn report(err: &mut dyn Write, error: &RegistrationError) -> i32 {
-        let _ = writeln!(err, "{error}");
+    fn report(ctx: &Context, err: &mut dyn Write, error: &RegistrationError) -> i32 {
+        let _ = writeln!(err, "{}", error.message_for(&ctx.command("link")));
         RUNTIME_ERROR
     }
 
@@ -290,12 +330,13 @@ mod wallet {
         }
     }
 
-    fn next_step(out: &mut dyn Write) {
+    fn next_step(ctx: &Context, out: &mut dyn Write) {
         let _ = writeln!(
             out,
-            "When you have the code, run:\n  maxplayer account link --code <6 digits>\n(add \
+            "When you have the code (it expires in 10 minutes), run:\n  {} --code <6 digits>\n(add \
              `--entered-by human` when the human typed or read the code to you, `--entered-by \
-             agent` when you read it from the inbox yourself)."
+             agent` when you read it from the inbox yourself).",
+            ctx.command("link")
         );
     }
 
@@ -325,9 +366,10 @@ mod wallet {
         let relay = if linked.relay_member == "added" {
             "The relay now accepts writes from this key.".to_owned()
         } else {
-            "The relay will accept writes from this key within a few minutes (the membership is \
-             queued)."
-                .to_owned()
+            format!(
+                "Relay membership queued; `{}` shows when it is added.",
+                ctx.command("status")
+            )
         };
         let _ = writeln!(out, "{relay}");
         let _ = writeln!(out, "{}", marketing_line(&linked.marketing));
@@ -354,9 +396,9 @@ mod wallet {
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> i32 {
-        let client = match ctx.client(err) {
+        let client = match ctx.client() {
             Ok(client) => client,
-            Err(code) => return code,
+            Err(error) => return report(ctx, err, &error),
         };
         if let Some(code) = &opts.code {
             let who = match opts.entered_by.as_deref() {
@@ -368,7 +410,7 @@ mod wallet {
                     print_linked(out, ctx, &linked);
                     SUCCESS
                 }
-                Err(error) => report(err, &error),
+                Err(error) => report(ctx, err, &error),
             };
         }
 
@@ -378,8 +420,9 @@ mod wallet {
             let _ = writeln!(
                 err,
                 "account link needs --email and --label when it cannot ask (no terminal). Ask the \
-                 human for their email, then run:\n  maxplayer account link --email <email> \
-                 --label <a name for this agent>"
+                 human for their email, then run:\n  {} --email <email> --label <a name for this \
+                 agent>",
+                ctx.command("link")
             );
             return USAGE_ERROR;
         }
@@ -416,22 +459,22 @@ mod wallet {
 
         let sent = match client.request_code(&email, &label) {
             Ok(sent) => sent,
-            Err(error) => return report(err, &error),
+            Err(error) => return report(ctx, err, &error),
         };
         print_code_sent(out, &email, &sent);
         if !interactive {
-            next_step(out);
+            next_step(ctx, out);
             return SUCCESS;
         }
 
         loop {
             let Some(code) = prompt(input, out, "Code from the email: ") else {
                 let _ = writeln!(out);
-                next_step(out);
+                next_step(ctx, out);
                 return RUNTIME_ERROR;
             };
             if code.is_empty() {
-                next_step(out);
+                next_step(ctx, out);
                 return RUNTIME_ERROR;
             }
             if registration::normalize_code(&code).is_none() {
@@ -447,7 +490,7 @@ mod wallet {
                 Err(error) if error.code() == Some("wrong_code") => {
                     let _ = writeln!(out, "{error}");
                 }
-                Err(error) => return report(err, &error),
+                Err(error) => return report(ctx, err, &error),
             }
         }
     }
@@ -458,13 +501,18 @@ mod wallet {
     }
 
     pub fn status(ctx: &Context, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-        let client = match ctx.client(err) {
-            Ok(client) => client,
-            Err(code) => return code,
-        };
-        let status = match client.status() {
+        let status = match ctx.client().and_then(|client| client.status()) {
             Ok(status) => status,
-            Err(error) => return report(err, &error),
+            Err(error) if json => {
+                // An agent parsing `--json` gets a structured failure on stdout, not stderr text.
+                json_error(
+                    out,
+                    error.json_code(),
+                    &error.message_for(&ctx.command("link")),
+                );
+                return RUNTIME_ERROR;
+            }
+            Err(error) => return report(ctx, err, &error),
         };
         if json {
             let mut value = serde_json::to_value(&status).unwrap_or_default();
@@ -477,8 +525,10 @@ mod wallet {
             let _ = writeln!(
                 out,
                 "Not linked: {} ({}) is not linked to an email, so the relay may refuse its \
-                 writes.\nRun `maxplayer account link` to link it.",
-                ctx.whose, ctx.npub
+                 writes.\nRun `{}` to link it.",
+                ctx.whose,
+                ctx.npub,
+                ctx.command("link")
             );
             return SUCCESS;
         }
@@ -497,7 +547,7 @@ mod wallet {
             field(&status.linked_at),
             match status.relay_member.as_deref() {
                 Some("added") => "member (writes accepted)",
-                Some("pending") => "membership queued (writes accepted within a few minutes)",
+                Some("pending") => "membership queued; this command shows when it is added",
                 _ => "membership state unknown",
             },
             marketing_line(status.marketing.as_deref().unwrap_or("none")),
@@ -506,11 +556,7 @@ mod wallet {
     }
 
     pub fn marketing(ctx: &Context, on: bool, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-        let client = match ctx.client(err) {
-            Ok(client) => client,
-            Err(code) => return code,
-        };
-        match client.set_marketing(on) {
+        match ctx.client().and_then(|client| client.set_marketing(on)) {
             Ok(answer) => {
                 let _ = writeln!(out, "{}", marketing_line(&answer.marketing));
                 if answer.marketing == "unsubscribed" {
@@ -521,7 +567,7 @@ mod wallet {
                 }
                 SUCCESS
             }
-            Err(error) => report(err, &error),
+            Err(error) => report(ctx, err, &error),
         }
     }
 }
@@ -607,6 +653,7 @@ mod interactive_tests {
             npub: keys.public_key().to_bech32().unwrap(),
             base_url: fake.base_url(),
             whose: "this agent's key",
+            flags: String::new(),
         }
     }
 

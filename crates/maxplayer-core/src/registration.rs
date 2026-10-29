@@ -174,6 +174,29 @@ pub fn wait_text(secs: u64) -> String {
     }
 }
 
+impl RegistrationError {
+    /// The plain message, naming `link_command` (e.g. `maxplayer account link --mint --home /srv/m`)
+    /// wherever it tells the user to run `link` again, so a mint operator or a non-default home is
+    /// pointed at the same key. [`Display`](std::fmt::Display) uses the bare command.
+    pub fn message_for(&self, link_command: &str) -> String {
+        match self {
+            Self::Api(api) => plain_message_for(api, link_command),
+            other => other.to_string(),
+        }
+    }
+
+    /// A stable machine-readable code for `--json` output: the service's code, or `network`,
+    /// `bad_response`, `invalid_input` for failures the service never answered.
+    pub fn json_code(&self) -> &str {
+        match self {
+            Self::Api(api) => api.code.as_str(),
+            Self::Network { .. } => "network",
+            Self::BadResponse { .. } => "bad_response",
+            Self::Input(_) => "invalid_input",
+        }
+    }
+}
+
 impl std::fmt::Display for RegistrationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -195,8 +218,16 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
+/// The command every "link again" message names when no flags apply.
+pub const LINK_COMMAND: &str = "maxplayer account link";
+
 /// A plain-language message for each service error code (README "Errors"). Never echoes the email.
 pub fn plain_message(api: &ApiError) -> String {
+    plain_message_for(api, LINK_COMMAND)
+}
+
+/// [`plain_message`] naming `link` (the `maxplayer account link …` command with this key's flags).
+pub fn plain_message_for(api: &ApiError, link: &str) -> String {
     let wait = api.retry_after_secs.map(wait_text);
     match api.code.as_str() {
         "wrong_code" => match api.attempts_left {
@@ -204,20 +235,19 @@ pub fn plain_message(api: &ApiError) -> String {
             Some(n) => format!("That code is not right. {n} tries left."),
             None => "That code is not right.".to_owned(),
         },
-        "code_expired" => "That code has expired (codes last 10 minutes). Run `maxplayer account \
-             link` again to get a new one."
-            .to_owned(),
-        "too_many_attempts" => "Too many wrong tries for this code. Run `maxplayer account link` \
-             again to get a new code."
-            .to_owned(),
-        "no_pending_code" => {
-            "No code is waiting for this key. Run `maxplayer account link --email \
-             <your email> --label <name>` first to get one."
-                .to_owned()
+        "code_expired" => format!(
+            "That code has expired (codes last 10 minutes). Run `{link}` again to get a new one."
+        ),
+        "too_many_attempts" => {
+            format!("Too many wrong tries for this code. Run `{link}` again to get a new code.")
         }
+        "no_pending_code" => format!(
+            "No code is waiting for this key. Run `{link} --email <your email> --label <name>` \
+             first to get one."
+        ),
         "resend_cooldown" => format!(
-            "A code was sent to this key moments ago. Use that code, or wait {} and ask for a new \
-             one.",
+            "A code was sent to this key moments ago. Enter it with `{link} --code <6 digits>`, or \
+             wait {} and ask for a new one.",
             wait.unwrap_or_else(|| "a minute".to_owned())
         ),
         "rate_limited" => format!(
@@ -245,7 +275,7 @@ pub fn plain_message(api: &ApiError) -> String {
             "The registration service could not send the code email. Try again later.".to_owned()
         }
         "not_registered" => {
-            "This key is not linked to an email yet. Run `maxplayer account link` first.".to_owned()
+            format!("This key is not linked to an email yet. Run `{link}` first.")
         }
         "stale_auth" => "The registration service refused the request's signature as too old or \
              too new. Check that this computer's clock is right, then try again."
@@ -352,7 +382,8 @@ fn random_nonce() -> String {
     hex::encode(bytes)
 }
 
-/// Validate the configured base: `http(s)://host[:port][/path]`, no query, fragment or userinfo.
+/// Validate the configured base: `https://host[:port][/path]` (plain `http://` only for a loopback
+/// host: the requests carry the email and the code), no query, fragment or userinfo.
 pub fn validate_base_url(base: &str) -> Result<String, RegistrationError> {
     let bad = |why: &str| {
         RegistrationError::Input(format!(
@@ -363,7 +394,13 @@ pub fn validate_base_url(base: &str) -> Result<String, RegistrationError> {
     };
     let parsed = Url::parse(base.trim()).map_err(|_| bad("not a URL"))?;
     if !matches!(parsed.scheme(), "https" | "http") {
-        return Err(bad("must be https:// or http://"));
+        return Err(bad("must be https://"));
+    }
+    if parsed.scheme() == "http" && !is_loopback_host(base.trim()) {
+        // The email, label and code would cross the network in cleartext.
+        return Err(bad(
+            "http:// is only allowed for localhost or a loopback IP; use https://",
+        ));
     }
     if parsed.host_str().is_none()
         || parsed.query().is_some()
@@ -642,7 +679,15 @@ mod tests {
             validate_base_url("http://127.0.0.1:8080/account").unwrap(),
             "http://127.0.0.1:8080/account"
         );
+        assert_eq!(
+            validate_base_url("http://localhost:8080/account").unwrap(),
+            "http://localhost:8080/account"
+        );
+        assert!(validate_base_url("http://[::1]:8080/account").is_ok());
         for bad in [
+            "http://relay.maxplayer.ai/account",
+            "http://10.0.0.5:8080/account",
+            "http://localhost.evil.example/account",
             "relay.maxplayer.ai/account",
             "wss://relay.maxplayer.ai/account",
             "https://relay.maxplayer.ai/account?x=1",
@@ -707,6 +752,19 @@ mod tests {
         };
         assert!(plain_message(&limited).contains("about an hour"));
         assert!(plain_message(&api("code_expired", 410)).contains("maxplayer account link"));
+        assert!(plain_message(&cooldown).contains("`maxplayer account link --code <6 digits>`"));
+        // The mint/home flags reach every "run link again" message.
+        let link = "maxplayer account link --mint --home /srv/m";
+        for code in [
+            "code_expired",
+            "too_many_attempts",
+            "no_pending_code",
+            "not_registered",
+            "resend_cooldown",
+        ] {
+            let text = plain_message_for(&api(code, 400), link);
+            assert!(text.contains(&format!("`{link}")), "{code}: {text}");
+        }
         assert!(plain_message(&api("key_linked_to_other_email", 409)).contains("different email"));
         assert!(plain_message(&api("internal", 500)).contains("Try again"));
         // README error list: none falls through to the generic text by accident.
@@ -741,6 +799,86 @@ mod tests {
             let text = plain_message(&api(code, 400));
             assert!(!text.contains("refused the request ("), "{code}: {text}");
         }
+    }
+
+    /// A redirect is not followed: the signed `Authorization` header must never reach a URL it
+    /// was not signed for. Service A answers 307 to service B; B must see no request at all.
+    #[test]
+    fn a_redirect_is_not_followed_and_the_signed_header_goes_nowhere_else() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        target.set_nonblocking(true).unwrap();
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&target_hits);
+        let target_thread = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while std::time::Instant::now() < deadline {
+                match target.accept() {
+                    Ok((mut stream, _)) => {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 18\r\n\r\n{\"registered\":true}",
+                        );
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        let origin_thread = std::thread::spawn(move || {
+            let (stream, _) = origin.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut saw_auth = false;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                saw_auth |= line
+                    .to_ascii_lowercase()
+                    .starts_with("authorization: nostr ");
+            }
+            let location = format!("http://127.0.0.1:{target_port}/account/status");
+            let _ = reader.get_mut().write_all(
+                format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nlocation: {location}\r\n\
+                     content-length: 0\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            saw_auth
+        });
+
+        let client = RegistrationClient::new(
+            &format!("http://127.0.0.1:{origin_port}/account"),
+            Keys::generate(),
+        )
+        .unwrap();
+        let error = client.status().unwrap_err();
+        assert!(
+            origin_thread.join().unwrap(),
+            "the origin got the signed request"
+        );
+        assert_eq!(
+            error,
+            RegistrationError::BadResponse {
+                url: format!("http://127.0.0.1:{origin_port}/account/status"),
+                status: 307,
+            }
+        );
+        target_thread.join().unwrap();
+        assert_eq!(
+            target_hits.load(Ordering::SeqCst),
+            0,
+            "the redirect target was never contacted"
+        );
     }
 
     #[test]
