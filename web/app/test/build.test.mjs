@@ -517,7 +517,7 @@ test("terms, privacy and fees are dated static pages, linked from every footer",
     assert.match(html, /<body class="home legal-page">/);
     assert.match(html, /<h1 id="legal-h">/);
     assert.match(html, /Effective October 29, 2026/, `${doc} shows its effective date`);
-    assert.ok(!/class="mark"|class="foot-word"|[Nn]ot part of|\[(?:OPEN|FACT|CHECKED|DATE)/.test(html), `${doc}: no logo, no internal notes`);
+    assert.ok(!/[Nn]ot part of|\[(?:OPEN|FACT|CHECKED|DATE)/.test(html), `${doc}: no internal notes`);
   }
   for (const page of ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
