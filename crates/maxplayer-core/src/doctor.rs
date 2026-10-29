@@ -59,10 +59,9 @@ pub async fn probe_relay(
             match notifications.recv().await {
                 Ok(RelayNotification::Authenticated) => return Ok(RelayProbe::Authenticated),
                 Ok(RelayNotification::AuthenticationFailed) => {
-                    return Err(
-                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)"
-                            .to_string(),
-                    );
+                    return Err(crate::relay_refusal::with_hint(
+                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)",
+                    ));
                 }
                 Ok(RelayNotification::Shutdown) => {
                     return Err("relay shut down before NIP-42 authentication".to_string());

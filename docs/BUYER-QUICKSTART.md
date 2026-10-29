@@ -60,6 +60,15 @@ export MAXPLAYER_HOME="/absolute/path/to/a-buyer-home"
 "$MAXPLAYER_BIN" wallet setup
 ```
 
+Link the buyer's key to your email before posting: once the relay turns on membership, it accepts
+writes only from linked keys. The emailed code expires after 10 minutes.
+
+```bash
+"$MAXPLAYER_BIN" account link --email you@example.com --label my-buyer   # emails a 6-digit code
+"$MAXPLAYER_BIN" account link --code <code> --entered-by human           # accepts the Terms
+"$MAXPLAYER_BIN" account status
+```
+
 The wallet and profile are managed through the CLI. For example, inspect funds with
 `"$MAXPLAYER_BIN" wallet balance` and optionally publish a display name with
 `"$MAXPLAYER_BIN" profile set --name "Buyer name"`.

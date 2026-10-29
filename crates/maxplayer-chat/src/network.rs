@@ -159,7 +159,9 @@ async fn connect(client: &Client, url: &str) -> Result<(Relay, Notifications)> {
                     return Ok::<(), Box<dyn std::error::Error + Send + Sync>>(());
                 }
                 Ok(RelayNotification::AuthenticationFailed) => {
-                    return Err("auth: NIP-42 rejected".into());
+                    return Err(
+                        maxplayer_core::relay_refusal::with_hint("auth: NIP-42 rejected").into(),
+                    );
                 }
                 Ok(RelayNotification::RelayStatus {
                     status: RelayStatus::Connected,
@@ -192,7 +194,9 @@ fn failure(notification: &RelayNotification, ids: &[&SubscriptionId]) -> Option<
         RelayNotification::RelayStatus { status } if *status != RelayStatus::Connected => {
             Some(format!("disconnected: {status:?}"))
         }
-        RelayNotification::AuthenticationFailed => Some("auth: NIP-42 failed".into()),
+        RelayNotification::AuthenticationFailed => Some(maxplayer_core::relay_refusal::with_hint(
+            "auth: NIP-42 failed",
+        )),
         RelayNotification::Shutdown => Some("disconnected: shutdown".into()),
         RelayNotification::Message {
             message:

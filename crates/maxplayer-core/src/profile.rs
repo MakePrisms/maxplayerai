@@ -310,10 +310,10 @@ async fn publish_metadata_merged_async(
             .into_iter()
             .map(|(url, err)| format!("{url}: {err}"))
             .collect();
-        return Err(ProfileError::Relay(format!(
+        return Err(ProfileError::Relay(crate::relay_refusal::with_hint(format!(
             "no relay accepted kind-0 ({})",
             failed.join("; ")
-        )));
+        ))));
     }
     Ok(output.val.to_hex())
 }
@@ -461,10 +461,10 @@ pub(crate) async fn send_signed_event(
             .into_iter()
             .map(|(url, err)| format!("{url}: {err}"))
             .collect();
-        return Err(ProfileError::Relay(format!(
+        return Err(ProfileError::Relay(crate::relay_refusal::with_hint(format!(
             "no relay accepted {label} ({})",
             failed.join("; ")
-        )));
+        ))));
     }
     Ok(output.val.to_hex())
 }

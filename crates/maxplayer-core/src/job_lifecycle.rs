@@ -2881,10 +2881,10 @@ async fn publish_signed_event_async(home: &MaxplayerHome, keys: &nostr_sdk::Keys
             .into_iter()
             .map(|(url, err)| format!("{url}: {err}"))
             .collect();
-        return Err(JobLifecycleError::Relay(format!(
+        return Err(JobLifecycleError::Relay(crate::relay_refusal::with_hint(format!(
             "no relay accepted event ({})",
             failed.join("; ")
-        )));
+        ))));
     }
     Ok(output.val.to_hex())
 }

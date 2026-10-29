@@ -244,9 +244,15 @@ fn payment_sent(
     relay_failed: Vec<PaymentRelayFailure>,
 ) -> Result<PaymentSent, PaymentSendError> {
     if relay_success.is_empty() {
-        return Err(PaymentSendError::Transport(
-            "no relay accepted the NIP-17 payment".into(),
-        ));
+        let refused = relay_failed
+            .iter()
+            .any(|f| crate::relay_refusal::is_registration_refusal(&f.error));
+        let message = "no relay accepted the NIP-17 payment";
+        return Err(PaymentSendError::Transport(if refused {
+            format!("{message} ({})", crate::relay_refusal::LINK_HINT)
+        } else {
+            message.into()
+        }));
     }
 
     Ok(PaymentSent {
@@ -372,6 +378,31 @@ mod tests {
             error,
             PaymentSendError::Transport("no relay accepted the NIP-17 payment".into())
         );
+    }
+
+    #[test]
+    fn a_payment_refused_for_registration_names_the_link_command() {
+        let error = payment_sent(
+            "event".into(),
+            Vec::new(),
+            vec![
+                PaymentRelayFailure {
+                    relay: "wss://a.example".into(),
+                    error: "timeout".into(),
+                },
+                PaymentRelayFailure {
+                    relay: "wss://relay.example".into(),
+                    error: "restricted: not a relay member".into(),
+                },
+            ],
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.starts_with("payment send failed: no relay accepted the NIP-17 payment ("),
+            "{text}"
+        );
+        assert!(text.contains("run `maxplayer account link`"), "{text}");
     }
 
     #[test]

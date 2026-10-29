@@ -307,7 +307,14 @@ impl Server {
             return;
         };
         if let Err(error) = self.client.send_event(&event).await {
-            eprintln!("maxplayer-mint: reply {} not published: {error}", to.id);
+            eprintln!(
+                "maxplayer-mint: reply {} not published: {}",
+                to.id,
+                maxplayer_core::relay_refusal::with_hint_for(
+                    error.to_string(),
+                    maxplayer_core::relay_refusal::MINT_LINK_HINT
+                )
+            );
         }
     }
 }

@@ -31,6 +31,7 @@
 //! | Field | Variable |
 //! |-------|----------|
 //! | `relay_url` | `MAXPLAYER_RELAY_URL` |
+//! | `registration_url` | `MAXPLAYER_REGISTRATION_URL` |
 //! | `accepted_mints` (list) | `MAXPLAYER_ACCEPTED_MINTS=a,b` |
 //! | `per_job_budget_sats` | `MAXPLAYER_PER_JOB_BUDGET_SATS` |
 //! | `extra_mints` (list) | `MAXPLAYER_EXTRA_MINTS=a,b` |
@@ -69,6 +70,9 @@ use serde::{Deserialize, Serialize};
 
 /// Open-market relay — the maxplayer launch relay.
 pub const DEFAULT_RELAY_URL: &str = "wss://relay.maxplayer.ai";
+
+/// The email registration service (email signup spec v2.12 §11), behind the relay's nginx.
+pub const DEFAULT_REGISTRATION_URL: &str = "https://relay.maxplayer.ai/account";
 /// Standing CDK test mint — its bolt11 invoices auto-settle, so it moves no real money. Kept as the
 /// testnut/dev allow-list anchor: `mint_allowed` admits exactly this when `allow_real_mints` is false.
 pub const DEFAULT_MINT_URL: &str = "https://testnut.cashudevkit.org";
@@ -1817,6 +1821,16 @@ pub struct MaxplayerConfig {
     /// Open-market relay. Absent in the file ⇒ the built-in [`DEFAULT_RELAY_URL`].
     #[serde(default = "default_relay_url")]
     pub relay_url: String,
+    /// Base URL of the email registration service (`maxplayer account …`). Absent in the file ⇒
+    /// the built-in [`DEFAULT_REGISTRATION_URL`]; never written while
+    /// default. Point it at a staging service or a test server with this key or
+    /// `MAXPLAYER_REGISTRATION_URL`. NIP-98 requests are signed over `<this><path>`, so it must be
+    /// the service's PUBLIC URL.
+    #[serde(
+        default = "default_registration_url",
+        skip_serializing_if = "is_default_registration_url"
+    )]
+    pub registration_url: String,
     /// Seller-side accept policy: the mints this seller will accept payment at. The first
     /// entry is the mint the seller advertises first and also the buyer-side wallet default
     /// mint (read via [`MaxplayerConfig::default_mint`]). Defaults to `[DEFAULT_MINT_URL]`.
@@ -1974,6 +1988,15 @@ fn default_relay_url() -> String {
     DEFAULT_RELAY_URL.to_owned()
 }
 
+/// Serde default for [`MaxplayerConfig::registration_url`].
+fn default_registration_url() -> String {
+    DEFAULT_REGISTRATION_URL.to_owned()
+}
+
+fn is_default_registration_url(url: &str) -> bool {
+    url == DEFAULT_REGISTRATION_URL
+}
+
 /// Serde default for [`MaxplayerConfig::per_job_budget_sats`] — [`DEFAULT_PER_JOB_BUDGET_SATS`].
 fn default_per_job_budget_sats() -> u64 {
     DEFAULT_PER_JOB_BUDGET_SATS
@@ -2027,6 +2050,7 @@ impl Default for MaxplayerConfig {
             review: crate::review::ReviewConfig::default(),
             privacy: PrivacyConfig::default(),
             relay_url: DEFAULT_RELAY_URL.to_owned(),
+            registration_url: default_registration_url(),
             accepted_mints: default_accepted_mints(),
             per_job_budget_sats: DEFAULT_PER_JOB_BUDGET_SATS,
             extra_mints: Vec::new(),
@@ -2260,6 +2284,51 @@ pub fn read_secret_key_hex(home: &MaxplayerHome) -> Result<String, HomeError> {
     let secret = contents.trim().to_owned();
     validate_secret_hex(&secret)?;
     Ok(secret)
+}
+
+/// Read a secret key file that is NOT the home key (e.g. the mint server's `<home>/mint/nostr.key`)
+/// with the home key's checks, without bootstrapping anything: a symlink or non-regular file is
+/// refused, a group/world-readable mode is re-chmod'd to `0600` (refused if that fails), and the
+/// contents must be 64 non-zero hex chars. Callers must not log, print, or return the result.
+pub fn read_key_file_hex(path: &Path) -> Result<String, HomeError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| HomeError::Key(format!("{}: {error}", path.display())))?;
+    if metadata.file_type().is_symlink() {
+        return Err(HomeError::Key(format!(
+            "{} is a symlink; refusing to read a key through it",
+            path.display()
+        )));
+    }
+    if !metadata.is_file() {
+        return Err(HomeError::Key(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    ensure_key_permissions(path)?;
+    let mut contents = String::new();
+    File::open(path)
+        .and_then(|mut file| file.read_to_string(&mut contents))
+        .map_err(|error| HomeError::Key(format!("{}: {error}", path.display())))?;
+    let secret = contents.trim().to_owned();
+    validate_secret_hex(&secret)?;
+    Ok(secret)
+}
+
+/// The resolved config for `root` (file layer + `MAXPLAYER_*` environment) WITHOUT creating or
+/// rewriting anything: no directory, key, `config.toml` or `wallet/` is written, and a dead-mint
+/// migration is applied in memory only. An absent `config.toml` resolves to the defaults. For
+/// commands that act on another key in the home (`maxplayer account --mint`) and must not mint an
+/// agent identity as a side effect.
+pub fn resolve_config_read_only(root: impl AsRef<Path>) -> Result<MaxplayerConfig, HomeError> {
+    let config_path = root.as_ref().join(CONFIG_FILE);
+    let mut file_config = if config_path.exists() {
+        load_config(&config_path)?
+    } else {
+        MaxplayerConfig::default()
+    };
+    migrate_dead_mint_url(&mut file_config);
+    apply_env_layer(&file_config, config_env_from_process())
 }
 
 /// Hex-encode the buyer's nostr public key derived from the packaged secret.
@@ -2779,6 +2848,49 @@ mod tests {
             "maxplayer-home-{label}-{}-{id}",
             std::process::id()
         ))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_key_file_hex_applies_the_home_key_checks_and_creates_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let key = tmp.path().join("nostr.key");
+        let secret = "ab".repeat(32);
+        fs::write(&key, format!("{secret}\n")).unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(read_key_file_hex(&key).unwrap(), secret);
+        assert_eq!(
+            fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let link = tmp.path().join("link.key");
+        std::os::unix::fs::symlink(&key, &link).unwrap();
+        assert!(
+            read_key_file_hex(&link)
+                .unwrap_err()
+                .to_string()
+                .contains("symlink")
+        );
+        assert!(
+            read_key_file_hex(tmp.path()).is_err(),
+            "a directory is refused"
+        );
+        fs::write(tmp.path().join("bad.key"), "0".repeat(64)).unwrap();
+        assert!(read_key_file_hex(&tmp.path().join("bad.key")).is_err());
+        assert!(read_key_file_hex(&tmp.path().join("absent.key")).is_err());
+        let config = resolve_config_read_only(tmp.path()).unwrap();
+        assert_eq!(config.registration_url, DEFAULT_REGISTRATION_URL);
+        let mut names: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["bad.key", "link.key", "nostr.key"],
+            "nothing was created"
+        );
     }
 
     #[test]

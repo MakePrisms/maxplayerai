@@ -110,7 +110,11 @@ pub enum PublishError {
 impl std::fmt::Display for PublishError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Refused(reason) => write!(formatter, "relay refused the write: {reason}"),
+            Self::Refused(reason) => write!(
+                formatter,
+                "{}",
+                crate::relay_refusal::with_hint(format!("relay refused the write: {reason}"))
+            ),
             Self::TimedOut => write!(
                 formatter,
                 "relay write did not complete within {PUBLISH_TIMEOUT:?}"
@@ -524,6 +528,23 @@ pub(crate) async fn probe_relay_serves_our_reqs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Email signup spec §6: a buyer write refused by the membership gate names the link command;
+    /// any other refusal is shown as the relay sent it.
+    #[test]
+    fn a_refused_write_names_the_link_command_only_for_a_membership_refusal() {
+        let refused = PublishError::Refused("restricted: not a relay member".into()).to_string();
+        assert!(
+            refused.starts_with("relay refused the write: restricted: not a relay member ("),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("run `maxplayer account link`"),
+            "{refused}"
+        );
+        let other = PublishError::Refused("blocked: banned".into()).to_string();
+        assert_eq!(other, "relay refused the write: blocked: banned");
+    }
 
     // TOOTH — the DEPENDENCY CONTRACT the buyer's write path rests on.
     //

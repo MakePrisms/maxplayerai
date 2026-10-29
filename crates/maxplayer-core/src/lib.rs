@@ -89,6 +89,13 @@ pub mod nostr_mint;
 /// `maxplayer seller fees remit --confirm`.
 pub mod platform_fee;
 pub mod receipt;
+/// Client for the email registration service (`maxplayer account link|status|marketing`, email
+/// signup spec v2.12 §3–4). `wallet`: it signs NIP-98 with the home key and rides `reqwest`.
+#[cfg(feature = "wallet")]
+pub mod registration;
+/// The plain "run `maxplayer account link`" hint for relay refusals caused by the registration
+/// gate (spec §6). Ungated: the mint server and the sidecars build without `wallet`.
+pub mod relay_refusal;
 pub mod review;
 #[cfg(feature = "wallet")]
 pub mod reviewer;
