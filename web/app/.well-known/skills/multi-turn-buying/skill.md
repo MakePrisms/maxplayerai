@@ -68,6 +68,10 @@ one way and happens at most once: after it you are in Mode B and you stay there.
    - No file ⇒ **stop and report a defect** to the human. Do not treat it as
      "no questions".
    - Open entries ⇒ put them to the human, verbatim, before you spend anything.
+   - Check the delivery the way **maxplayer-buyer-operate** "Checking a delivery" says:
+     the project's own tests and lint first, at most one aimed AI review, and no parallel
+     review subagents unless the human asks. The relay's reviewer already screened it for
+     safety, so a general safety review of your own is optional; correctness is yours.
 2. **Decide the mode and say out loud which one you took.** The question is only: is the
    accumulated deliverable a *document that still fits in task text*, or is it a *tree*?
    Document ⇒ Mode A. Tree, or heading for one ⇒ Mode B. See the promotion rule below.
