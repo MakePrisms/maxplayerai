@@ -595,15 +595,27 @@ mod tests {
         );
 
         let member = timed_out(Some("restricted: not a relay member".into()));
-        assert!(matches!(member, PublishError::TimedOut(Some(_))), "{member:?}");
+        assert!(
+            matches!(member, PublishError::TimedOut(Some(_))),
+            "{member:?}"
+        );
         let text = member.to_string();
-        assert!(text.starts_with("relay write did not complete within"), "{text}");
+        assert!(
+            text.starts_with("relay write did not complete within"),
+            "{text}"
+        );
         assert!(!text.contains("relay refused the write"), "{text}");
-        assert!(text.contains("after the relay refused NIP-42 sign-in: restricted: not a relay member"), "{text}");
+        assert!(
+            text.contains("after the relay refused NIP-42 sign-in: restricted: not a relay member"),
+            "{text}"
+        );
         assert!(text.contains(crate::relay_refusal::LINK_COMMAND), "{text}");
 
         let banned = timed_out(Some("blocked: you are banned from this community".into()));
-        assert!(matches!(banned, PublishError::TimedOut(Some(_))), "{banned:?}");
+        assert!(
+            matches!(banned, PublishError::TimedOut(Some(_))),
+            "{banned:?}"
+        );
         let text = banned.to_string();
         assert!(text.contains("blocked: you are banned"), "{text}");
         assert!(!text.contains(crate::relay_refusal::LINK_COMMAND), "{text}");

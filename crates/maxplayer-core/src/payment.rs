@@ -2332,7 +2332,8 @@ mod tests {
     /// is retried and then closes.
     #[test]
     fn a_receipt_refused_at_sign_in_names_why_and_still_holds_at_sent() {
-        const WHY: &str = "receipt not sent: NIP-42 sign-in refused: restricted: not a relay member";
+        const WHY: &str =
+            "receipt not sent: NIP-42 sign-in refused: restricted: not a relay member";
         let mut evidence = valid_evidence(&key());
         evidence.relay_success.clear();
         evidence.relay_failure = Some(WHY.into());
@@ -2341,7 +2342,10 @@ mod tests {
             matches!(&error, PaymentError::NoRelayAccepted { detail: Some(detail) } if detail == WHY),
             "{error:?}"
         );
-        assert_eq!(error.to_string(), format!("no relay accepted the payment: {WHY}"));
+        assert_eq!(
+            error.to_string(),
+            format!("no relay accepted the payment: {WHY}")
+        );
 
         let journal = MemoryPaymentJournal::default();
         let shared = FakeShared::default();
@@ -2367,7 +2371,11 @@ mod tests {
                 .unwrap(),
             PaymentState::Closed { .. }
         ));
-        assert_eq!(shared.send_count.load(Ordering::SeqCst), 1, "never a re-sent payment");
+        assert_eq!(
+            shared.send_count.load(Ordering::SeqCst),
+            1,
+            "never a re-sent payment"
+        );
         assert_eq!(shared.receipt_count.load(Ordering::SeqCst), 2);
     }
 

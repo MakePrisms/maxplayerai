@@ -1453,7 +1453,10 @@ mod tests {
         assert!(why.contains(&refused), "{why}");
         assert!(why.contains(crate::relay_refusal::LINK_COMMAND), "{why}");
         let error = PaymentError::NoRelayAccepted { detail: Some(why) }.to_string();
-        assert!(error.starts_with("no relay accepted the payment: receipt not sent:"), "{error}");
+        assert!(
+            error.starts_with("no relay accepted the payment: receipt not sent:"),
+            "{error}"
+        );
         assert!(error.contains("not a relay member"), "{error}");
         assert!(receipt_not_sent(&Ok(AuthWait::NoChallenge)).is_some());
     }

@@ -543,7 +543,8 @@ mod sign_in_tests {
 
     fn hinted(state: &SignInState) -> (String, String) {
         let refusal = state.refusal().expect("refused");
-        let annotated = crate::relay_refusal::annotate_refused_sign_in("wss://r: timeout", Some(refusal));
+        let annotated =
+            crate::relay_refusal::annotate_refused_sign_in("wss://r: timeout", Some(refusal));
         (
             crate::relay_refusal::with_hint(format!("NIP-42 sign-in refused: {refusal}")),
             crate::relay_refusal::with_hint(annotated),
@@ -552,10 +553,14 @@ mod sign_in_tests {
 
     #[test]
     fn a_ban_read_after_the_close_keeps_the_ban_text_and_gets_no_link_hint() {
-        let state = refused_then_closed_then_sdk_failure("blocked: you are banned from this community");
+        let state =
+            refused_then_closed_then_sdk_failure("blocked: you are banned from this community");
         for message in <[String; 2]>::from(hinted(&state)) {
             assert!(message.contains("blocked: you are banned"), "{message}");
-            assert!(!message.contains(crate::relay_refusal::LINK_COMMAND), "{message}");
+            assert!(
+                !message.contains(crate::relay_refusal::LINK_COMMAND),
+                "{message}"
+            );
         }
     }
 
@@ -564,7 +569,10 @@ mod sign_in_tests {
         let state = refused_then_closed_then_sdk_failure("auth-required: verification failed");
         for message in <[String; 2]>::from(hinted(&state)) {
             assert!(message.contains("verification failed"), "{message}");
-            assert!(!message.contains(crate::relay_refusal::LINK_COMMAND), "{message}");
+            assert!(
+                !message.contains(crate::relay_refusal::LINK_COMMAND),
+                "{message}"
+            );
         }
     }
 
@@ -573,7 +581,10 @@ mod sign_in_tests {
         let state = refused_then_closed_then_sdk_failure("restricted: not a relay member");
         for message in <[String; 2]>::from(hinted(&state)) {
             assert!(message.contains("not a relay member"), "{message}");
-            assert!(message.contains(crate::relay_refusal::LINK_COMMAND), "{message}");
+            assert!(
+                message.contains(crate::relay_refusal::LINK_COMMAND),
+                "{message}"
+            );
         }
         // A NEW challenge that fails with no text of its own is the SDK's words again.
         let mut state = state;

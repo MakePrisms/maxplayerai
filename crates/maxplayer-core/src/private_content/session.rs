@@ -134,7 +134,9 @@ impl From<Error> for ConnectError {
 
 /// The connect failure for a sign-in that did not complete: the `wait_for_nip42_auth` error
 /// (already hinted for a registration refusal) after the old static text.
-fn sign_in_not_completed(auth: &std::result::Result<AuthWait, crate::relay_auth::RelayAuthError>) -> ConnectError {
+fn sign_in_not_completed(
+    auth: &std::result::Result<AuthWait, crate::relay_auth::RelayAuthError>,
+) -> ConnectError {
     match auth {
         Err(error) => ConnectError(format!("content relay authentication required: {error}")),
         Ok(_) => Error("content relay authentication required").into(),
@@ -333,7 +335,10 @@ impl ContentSender for AuthenticatedContentRelay {
         let sent = match sent {
             Ok(sent) => sent,
             Err(_) => {
-                return Err(send_failure("content publication failed".into(), refusal().as_deref()));
+                return Err(send_failure(
+                    "content publication failed".into(),
+                    refusal().as_deref(),
+                ));
             }
         };
         if sent.success.is_empty() {
@@ -431,9 +436,15 @@ mod tests {
             "NIP-42 sign-in refused: restricted: not a relay member",
         ));
         let error = sign_in_not_completed(&Err(refused)).to_string();
-        assert!(error.starts_with("content relay authentication required: "), "{error}");
+        assert!(
+            error.starts_with("content relay authentication required: "),
+            "{error}"
+        );
         assert!(error.contains("not a relay member"), "{error}");
-        assert!(error.contains(crate::relay_refusal::LINK_COMMAND), "{error}");
+        assert!(
+            error.contains(crate::relay_refusal::LINK_COMMAND),
+            "{error}"
+        );
         assert_eq!(
             sign_in_not_completed(&Ok(AuthWait::NoChallenge)).to_string(),
             "content relay authentication required"
@@ -447,14 +458,34 @@ mod tests {
         let member = Some("restricted: not a relay member");
         let timeout = send_failure("timeout".into(), member);
         assert!(!timeout.permanent);
-        assert!(timeout.reason.contains("after the relay refused NIP-42 sign-in: restricted: not a relay member"), "{}", timeout.reason);
-        assert!(timeout.reason.contains(crate::relay_refusal::LINK_COMMAND), "{}", timeout.reason);
+        assert!(
+            timeout
+                .reason
+                .contains("after the relay refused NIP-42 sign-in: restricted: not a relay member"),
+            "{}",
+            timeout.reason
+        );
+        assert!(
+            timeout.reason.contains(crate::relay_refusal::LINK_COMMAND),
+            "{}",
+            timeout.reason
+        );
 
         let terminal = send_failure("invalid: bad signature".into(), member);
         assert!(terminal.permanent, "classified on the relay's own prefix");
-        let banned = send_failure("timeout".into(), Some("blocked: you are banned from this community"));
-        assert!(!banned.permanent, "a banned sign-in does not make a timeout terminal");
-        assert!(!banned.reason.contains(crate::relay_refusal::LINK_COMMAND), "{}", banned.reason);
+        let banned = send_failure(
+            "timeout".into(),
+            Some("blocked: you are banned from this community"),
+        );
+        assert!(
+            !banned.permanent,
+            "a banned sign-in does not make a timeout terminal"
+        );
+        assert!(
+            !banned.reason.contains(crate::relay_refusal::LINK_COMMAND),
+            "{}",
+            banned.reason
+        );
 
         let plain = send_failure("rate-limited: slow down".into(), None);
         assert!(!plain.permanent);
@@ -582,7 +613,12 @@ mod tests {
                 .unwrap(),
             AuthWait::Authenticated
         );
-        let mut relay = AuthenticatedContentRelay { client, relay: raw, owns_connection: true, sign_in: None };
+        let mut relay = AuthenticatedContentRelay {
+            client,
+            relay: raw,
+            owns_connection: true,
+            sign_in: None,
+        };
         let valid = PreparedContent::new(body()).unwrap();
         let recipient = keys(2).public_key();
         let unrelated = EventBuilder::new(Kind::GiftWrap, "another application's payload")
