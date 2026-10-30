@@ -75,9 +75,15 @@ pub async fn wait_for_nip42_auth(
             match notification {
                 Ok(RelayNotification::Authenticated) => return Ok(AuthWait::Authenticated),
                 Ok(RelayNotification::AuthenticationFailed) => {
-                    return Err(RelayAuthError(crate::relay_refusal::with_hint(
-                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)",
-                    )));
+                    // #1228: name the relay's own refusal when it sent one, so a ban is not told
+                    // to link and an unregistered key reads `not a relay member`.
+                    let base = "NIP-42 authentication failed (required for kind-1059 p-gated receive)";
+                    return Err(RelayAuthError(match sign_in.refusal() {
+                        Some(refusal) if refusal != "authentication failed" => {
+                            crate::relay_refusal::with_hint(format!("{base}: {refusal}"))
+                        }
+                        _ => crate::relay_refusal::with_hint(base),
+                    }));
                 }
                 Ok(RelayNotification::Shutdown) => {
                     return Err(RelayAuthError(

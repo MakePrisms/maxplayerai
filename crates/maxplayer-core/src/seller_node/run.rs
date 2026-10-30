@@ -18893,6 +18893,40 @@ mod tests {
     }
     // END R3-2 run-loop tests
 
+    // BEGIN #1228 tests
+    /// #1228: a seat whose sign-in the relay refuses must not report ADVERTISING, and only a
+    /// registration refusal tells the operator to link the key.
+    #[test]
+    fn issue_1228_a_refused_seat_does_not_claim_to_be_advertising() {
+        assert_eq!(advertising_state(false, true), "ADVERTISING, ready for work");
+        assert_eq!(advertising_state(false, false), "NOT serving — no live harness");
+        assert!(advertising_state(true, true).starts_with("NOT ADVERTISING"));
+        assert!(hint_suffix("restricted: not a relay member").contains("maxplayer account link"));
+        assert_eq!(hint_suffix("blocked: access revoked"), "");
+    }
+
+    /// #1228: buzz refuses an unregistered seat's sign-in and closes the socket, and nostr-sdk
+    /// never reports `AuthenticationFailed`. Boot used to read that as "no challenge", start
+    /// degraded and log ADVERTISING while every ad timed out. It now stops with the link hint.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1228_a_seat_refused_at_boot_says_link_the_key() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        fixture.refuse_auth_and_close();
+        let root = throwaway_root("1228-boot-refused");
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = fixture.url();
+        home.config.review.seller_offer = false;
+        home.config.seller = Some(seller_cfg(1, false));
+        let error = match SellerNodeRunner::boot(home).await {
+            Ok(_) => panic!("a seat whose sign-in is refused must not boot as if it were served"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("not a relay member"), "{error}");
+        assert!(error.contains("run `maxplayer account link`"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END #1228 tests
+
     /// Every kind-30340 seat announcement that reached the relay, in arrival order.
     fn seat_announcements(events: &[PublishedEvent]) -> Vec<&PublishedEvent> {
         events

@@ -649,6 +649,27 @@ pub async fn check_buyer(
 }
 
 #[cfg(all(test, feature = "gateway"))]
+mod issue_1228_tests {
+    use super::*;
+
+    /// #1228: a review request refused after a refused sign-in names it; other review errors and
+    /// requests with no refused sign-in are unchanged.
+    #[test]
+    fn a_review_request_refused_at_sign_in_names_the_refusal() {
+        let refused = "review: relay refused the review request: timeout";
+        let named = annotate_request_refusal(refused, Some("restricted: not a relay member".into()));
+        assert!(named.contains("not a relay member"), "{named}");
+        assert!(named.contains("run `maxplayer account link`"), "{named}");
+        assert_eq!(annotate_request_refusal(refused, None), refused);
+        let unrelated = "review: offer unavailable";
+        assert_eq!(
+            annotate_request_refusal(unrelated, Some("restricted: not a relay member".into())),
+            unrelated
+        );
+    }
+}
+
+#[cfg(all(test, feature = "gateway"))]
 mod tests {
     use super::*;
     use nostr_sdk::prelude::*;

@@ -102,3 +102,42 @@ impl EventPublisher for RelayPublisher {
         Ok(signed.id)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::seller_node::p_gate_relay_fixture::PGateRelay;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// #1228: an outbox write (ad, claim, result) refused because the relay refused the seat's
+    /// sign-in names the refusal and the link command, instead of a bare `timeout`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1228_a_write_refused_at_sign_in_names_the_refusal() {
+        let relay = PGateRelay::start(Duration::from_millis(0)).await;
+        relay.refuse_auth_and_close();
+        let dir = tempfile::tempdir().unwrap();
+        let home = crate::home::bootstrap(dir.path()).unwrap();
+        let signer = crate::seller_node::signer::spawn(&home).unwrap();
+        let client = Client::new(Keys::generate());
+        client.add_relay(relay.url()).await.unwrap();
+        let handle = client.relay(relay.url()).await.unwrap();
+        let sign_in = Arc::new(crate::relay_auth::SignInWatch::new(&handle));
+        client.connect().await;
+        let publisher =
+            RelayPublisher::new(signer, client.clone(), &relay.url()).with_sign_in(sign_in);
+        let item = OutboxItem {
+            id: 1,
+            dedup_key: "issue-1228".into(),
+            draft: crate::gateway::EventDraft::new(1, Vec::new(), "ad stand-in"),
+            created_at_unix: Timestamp::now().as_secs() as i64,
+            attempts: 0,
+            expires_at_unix: i64::MAX,
+        };
+        let error = publisher.publish(&item).await.expect_err("the write is refused");
+        client.disconnect().await;
+        assert!(error.contains("after the relay refused NIP-42 sign-in"), "{error}");
+        assert!(error.contains("not a relay member"), "{error}");
+        assert!(error.contains("run `maxplayer account link`"), "{error}");
+    }
+}

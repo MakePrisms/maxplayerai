@@ -326,6 +326,27 @@ mod tests {
         }
     }
 
+    /// #1228: a payment the relay never answered because it refused this key's sign-in says to
+    /// link the key (it used to be a bare "no relay accepted the NIP-17 payment").
+    #[cfg(all(feature = "gateway", feature = "wallet"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1228_a_payment_refused_at_sign_in_names_the_link_command() {
+        let relay = crate::seller_node::p_gate_relay_fixture::PGateRelay::start(
+            std::time::Duration::from_millis(0),
+        )
+        .await;
+        relay.refuse_auth_and_close();
+        let mut send = NostrPaymentSend::new(relay.url(), nostr_sdk::prelude::Keys::generate());
+        let mut payment = payload();
+        payment.seller_pubkey = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+        let error = send
+            .send_payment(payment)
+            .await
+            .expect_err("refused")
+            .to_string();
+        assert!(error.contains("run `maxplayer account link`"), "{error}");
+    }
+
     #[cfg(feature = "wallet")]
     #[test]
     fn nut18_wire_json_is_the_payment_request_payload() {
