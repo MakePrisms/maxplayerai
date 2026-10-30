@@ -92,12 +92,14 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-v1.html", "privacy-v1.html"]) {
+  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
-      assert.ok(pageHtml.includes(`./${asset}?v=${stamp}`), `${asset} is stamped in ${page}`);
-      assert.ok(!pageHtml.includes(`"./${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
+      // Legal pages live at /terms/<date> etc., one level deep: "./styles.css" would miss, so they use "/".
+      const prefix = /^(terms|privacy|fees)-/.test(page) ? "/" : "./";
+      assert.ok(pageHtml.includes(`"${prefix}${asset}?v=${stamp}"`), `${asset} is stamped in ${page}`);
+      assert.ok(!pageHtml.includes(`"./${asset}"`) && !pageHtml.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
     }
   }
   // Font preload URLs must match fonts.css URLs byte-for-byte or the browser
@@ -163,7 +165,7 @@ test("the live market ships at /market and the homepage links it", () => {
 });
 
 test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
-  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html", "terms-v1.html", "privacy-v1.html"];
+  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -200,7 +202,7 @@ test("all site pages share navigation and footer links, with a current page and 
     assert.match(brand, /<p>The Multiplayer Marketplace<\/p>\s*<a class="foot-x" href="https:\/\/x\.com\/maxplayerai"[^>]*>@maxplayerai<\/a>/, `${page}: X handle under the tagline`);
     assert.ok(!footer.includes("x.com/maxplayerai"), `${page}: X handle is not in the link rows`);
     const current = [...nav.matchAll(/aria-current="page"/g)].length;
-    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "swarm.html" || page === "terms-v1.html" || page === "privacy-v1.html") {
+    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "swarm.html" || page === "terms-20261029.html" || page === "privacy-20261029.html" || page === "fees-20261029.html") {
       assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
     } else {
       const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
@@ -503,17 +505,22 @@ test('challenge relay connection is allowed on the unlisted route', () => {
 
 // Email signup spec v2.10 §7.1 (Bob, Petar, Josip, 2026-10-27): the terms and privacy policy are
 // static pages on this site, one fixed URL per version; /terms and /privacy point at the current one.
-test("terms and privacy are versioned static pages, linked from every footer", () => {
+test("terms, privacy and fees are dated static pages, linked from every footer", () => {
+  // Bob (20261029): versions are effective dates, not v1/v2; each date keeps its own URL.
   const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
-  for (const doc of ["terms", "privacy"]) {
-    assert.ok(existsSync(join(root, "dist", `${doc}-v1.html`)), `${doc} v1 builds`);
-    assert.ok(cfg.rewrites.some((r) => r.source === `/${doc}/v1` && r.destination === `/${doc}-v1`), `/${doc}/v1 serves v1`);
+  const date = "20261029";
+  for (const doc of ["terms", "privacy", "fees"]) {
+    assert.ok(existsSync(join(root, "dist", `${doc}-${date}.html`)), `${doc} ${date} builds`);
+    assert.ok(cfg.rewrites.some((r) => r.source === `/${doc}/${date}` && r.destination === `/${doc}-${date}`), `/${doc}/${date} serves it`);
     const current = cfg.redirects.find((r) => r.source === `/${doc}`);
-    assert.equal(current?.destination, `/${doc}/v1`, `/${doc} points at the current version`);
+    assert.equal(current?.destination, `/${doc}/${date}`, `/${doc} points at the current version`);
     assert.equal(current?.permanent, false, `/${doc} is a temporary redirect, so a new version can replace it`);
-    const html = readFileSync(join(root, "dist", `${doc}-v1.html`), "utf8");
+    const html = readFileSync(join(root, "dist", `${doc}-${date}.html`), "utf8");
     assert.match(html, /<body class="home legal-page">/);
     assert.match(html, /<h1 id="legal-h">/);
+    assert.match(html, /Effective October 29, 2026/, `${doc} shows its effective date`);
+    assert.ok(!/[Nn]ot part of|\[(?:OPEN|FACT|CHECKED|DATE)/.test(html), `${doc}: no internal notes`);
+    assert.ok(!/(?:href|src)="\.\//.test(html), `${doc}: no relative asset paths (the page is served one level deep)`);
   }
   for (const page of ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
