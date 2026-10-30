@@ -141,6 +141,12 @@
     enable = true;
     recommendedProxySettings = true; # sets X-Forwarded-For, which the relay reads as realIpHeader.
     recommendedTlsSettings = true;
+    # No per-request access log (Bob, 29 Oct 2026): nginx's default would write every client IP,
+    # path and user agent to /var/log/nginx/access.log and keep ~6 months of it (NixOS logrotate:
+    # weekly, 26 rotations). Errors still go to the journal via logError.
+    commonHttpConfig = ''
+      access_log off;
+    '';
     virtualHosts."relay.maxplayer.ai" = {
       # DNS: relay.maxplayer.ai → 34.225.223.145 (live); ACME issues on first switch.
       enableACME = true;
