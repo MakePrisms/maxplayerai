@@ -1571,6 +1571,9 @@ pub async fn send_signed_award_async(
     if let Err(error) = client.add_relay(relay_url).await {
         return SendOutcome::Unresolved { detail: format!("add relay: {error}") };
     }
+    // Before connect (#1228): only the DETAIL text changes, never the outcome — a refused
+    // sign-in is a verdict about this session, not about the event, so it stays `Unresolved`.
+    let sign_in = crate::relay_auth::SignInWatch::for_client(&client, relay_url).await;
     client.connect().await;
     let outcome = match client.relay(relay_url).await {
         Err(error) => SendOutcome::Unresolved { detail: format!("relay handle: {error}") },
@@ -1593,7 +1596,12 @@ pub async fn send_signed_award_async(
         }
     };
     client.disconnect().await;
-    outcome
+    match (outcome, sign_in) {
+        (SendOutcome::Unresolved { detail }, Some(sign_in)) => SendOutcome::Unresolved {
+            detail: crate::relay_refusal::with_hint(sign_in.annotate(&detail)),
+        },
+        (outcome, _) => outcome,
+    }
 }
 
 /// Classify one send's typed failure into a [`SendOutcome`]. Only [`RelayMessage`] — the relay's
@@ -2869,6 +2877,8 @@ async fn publish_signed_event_async(home: &MaxplayerHome, keys: &nostr_sdk::Keys
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|error| JobLifecycleError::Relay(format!("add relay: {error}")))?;
+    // Before connect, so a sign-in refused on the first socket is seen (#1228).
+    let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &home.config.relay_url).await;
     client.connect().await;
     let output = client
         .send_event_to([&home.config.relay_url], &event)
@@ -2876,14 +2886,9 @@ async fn publish_signed_event_async(home: &MaxplayerHome, keys: &nostr_sdk::Keys
     client.disconnect().await;
     let output = output.map_err(|error| JobLifecycleError::Relay(format!("send event: {error}")))?;
     if output.success.is_empty() {
-        let failed: Vec<String> = output
-            .failed
-            .into_iter()
-            .map(|(url, err)| format!("{url}: {err}"))
-            .collect();
+        let failed = crate::relay_auth::failed_reasons(&output, sign_in.as_ref());
         return Err(JobLifecycleError::Relay(crate::relay_refusal::with_hint(format!(
-            "no relay accepted event ({})",
-            failed.join("; ")
+            "no relay accepted event ({failed})"
         ))));
     }
     Ok(output.val.to_hex())

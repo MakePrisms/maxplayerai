@@ -87,3 +87,4 @@ async fn a_refused_write_reason_is_recognised() {
     );
     assert!(relay_refusal::with_hint(reason).contains(LINK_COMMAND));
 }
+

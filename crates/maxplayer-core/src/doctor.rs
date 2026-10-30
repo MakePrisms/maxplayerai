@@ -55,8 +55,20 @@ pub async fn probe_relay(
         .map_err(|error| format!("could not connect: {error}"))?;
 
     let auth = tokio::time::timeout(timeout, async {
+        let mut sign_in = crate::relay_auth::SignInState::default();
         loop {
-            match notifications.recv().await {
+            let notification = notifications.recv().await;
+            // #1228: buzz refuses an unregistered key and closes the socket without the SDK ever
+            // reporting `AuthenticationFailed`; without this the probe read "no challenge" (pass).
+            if let Ok(notification) = &notification
+                && let Some(refusal) = sign_in.observe(notification)
+                && matches!(notification, RelayNotification::RelayStatus { .. })
+            {
+                return Err(crate::relay_refusal::with_hint(format!(
+                    "NIP-42 sign-in refused: {refusal}"
+                )));
+            }
+            match notification {
                 Ok(RelayNotification::Authenticated) => return Ok(RelayProbe::Authenticated),
                 Ok(RelayNotification::AuthenticationFailed) => {
                     return Err(crate::relay_refusal::with_hint(

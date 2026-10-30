@@ -332,6 +332,21 @@ fn reviewer_error(code: &str) -> String {
         format!("review: reviewer error ({code}); next step blocked; explicit retry available")
     }
 }
+/// #1228: a review request the relay did not accept because it refused this key's sign-in names
+/// that refusal (and the link hint). Other review errors (an unavailable offer, a reviewer
+/// timeout) are not about the write and are left as they are.
+#[cfg(feature = "gateway")]
+fn annotate_request_refusal(error: &str, refusal: Option<String>) -> String {
+    if error.starts_with("review: relay refused the review request") {
+        crate::relay_refusal::with_hint(crate::relay_refusal::annotate_refused_sign_in(
+            error,
+            refusal.as_deref(),
+        ))
+    } else {
+        error.to_owned()
+    }
+}
+
 pub(crate) fn permanent_error(error: &str) -> bool {
     error.starts_with("review: permanent input error")
 }
@@ -574,6 +589,9 @@ pub async fn check_buyer(
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|e| e.to_string())?;
+    // Before connect (#1228): a review request the relay never answered because it refused this
+    // key's sign-in says so.
+    let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &home.config.relay_url).await;
     client.connect().await;
     state::write(
         &home.root,
@@ -617,6 +635,9 @@ pub async fn check_buyer(
         }
     }.await;
     client.disconnect().await;
+    let result = result.map_err(|error| {
+        annotate_request_refusal(&error, sign_in.as_ref().and_then(|watch| watch.refusal()))
+    });
     state::completed(&home.root, subject, &result)?;
     result.map_err(|e| {
         if permanent_error(&e) {

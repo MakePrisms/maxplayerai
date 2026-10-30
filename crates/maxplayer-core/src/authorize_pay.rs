@@ -1369,12 +1369,18 @@ fn publish_receipt_event(
                     // NIP-42 AUTH. On timeout/failure we fail CLOSED with an empty relay set
                     // (send not reached, never a forced success) — the designed-safe
                     // direction (no double-pay; payment holds at `Sent` and retries).
+                    let auth = crate::relay_auth::wait_for_nip42_auth(
+                        &mut relay_notifications,
+                        Duration::from_secs(20),
+                    )
+                    .await;
+                    // #1228: a refused sign-in held the receipt back; say so (the payment itself
+                    // holds at `Sent` and retries, unchanged).
+                    if let Err(error) = &auth {
+                        eprintln!("receipt publish: not sent: {error}");
+                    }
                     let relay_success = if matches!(
-                        crate::relay_auth::wait_for_nip42_auth(
-                            &mut relay_notifications,
-                            Duration::from_secs(20),
-                        )
-                        .await,
+                        auth,
                         Ok(crate::relay_auth::AuthWait::Authenticated)
                     ) {
                         let output = client.send_event_to([relay_url], event).await;

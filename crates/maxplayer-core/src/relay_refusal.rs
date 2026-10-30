@@ -20,7 +20,8 @@
 //! nostr-sdk drops the relay's AUTH refusal text and only reports `AuthenticationFailed`, so a
 //! client cannot tell "not a member" from any other refused sign-in. The hint therefore says the key
 //! *may* not be registered. Bans (`blocked: …`) and timeouts are not matched: linking does not lift
-//! them. Plain `restricted:` is not matched either, because buzz also uses it for p-gated reads and
+//! them. A timeout that follows a refused sign-in on the same connection is reported with the
+//! relay's refusal text ([`annotate_refused_sign_in`], issue #1228), so it is matched on that text. Plain `restricted:` is not matched either, because buzz also uses it for p-gated reads and
 //! channel rules that have nothing to do with registration.
 //!
 //! Ungated on purpose: the mint server, the chat and swarm sidecars build `maxplayer-core` without
@@ -98,9 +99,79 @@ pub fn with_hint_for(text: impl Into<String>, hint: &str) -> String {
     }
 }
 
+/// Words that tie a failed write to the refused sign-in that caused it (issue #1228).
+pub const AFTER_REFUSED_SIGN_IN: &str = "after the relay refused NIP-42 sign-in";
+
+/// `reason` (a write's failure, e.g. `wss://r: timeout`), naming the relay's sign-in refusal when
+/// one was seen on the same connection.
+///
+/// Issue #1228: buzz refuses an unregistered key's AUTH with `restricted: not a relay member` and
+/// closes the socket. nostr-sdk then waits for a sign-in that never comes, and the write's reason
+/// is a bare `timeout`, which this module deliberately does not hint. A timeout that FOLLOWS a
+/// refused sign-in is a different fact, so it is stated with the relay's own refusal text, and
+/// [`with_hint`] then matches on that text exactly as it would on the refusal itself: `restricted:
+/// not a relay member` gets the link hint; a ban (`blocked: …`) or a clock-skew refusal
+/// (`auth-required: verification failed`) does not.
+///
+/// The SDK's own `authentication failed` (all it reports of a refused sign-in) is reworded to
+/// `sign-in refused` when the relay's text is known, so the relay's text alone decides the hint: a
+/// banned key is not told to link itself.
+///
+/// `refusal` is `None` when the connection's sign-in was not refused: `reason` is returned
+/// unchanged, so a plain timeout stays a plain timeout. A reason that already carries the
+/// refusal text is returned unchanged too.
+pub fn annotate_refused_sign_in(reason: &str, refusal: Option<&str>) -> String {
+    match refusal {
+        Some(refusal) if !reason.contains(refusal) => {
+            let reason = reason.replace("authentication failed", "sign-in refused");
+            format!("{reason} ({AFTER_REFUSED_SIGN_IN}: {refusal})")
+        }
+        _ => reason.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #1228: a write that timed out after a refused sign-in gets the hint; the same timeout
+    /// without one, or after a ban / clock-skew refusal, does not.
+    #[test]
+    fn a_timeout_after_a_refused_sign_in_gets_the_hint_only_for_registration_refusals() {
+        let timeout = "no relay accepted kind-0 (wss://relay.maxplayer.ai: timeout)";
+        assert_eq!(with_hint(timeout), timeout, "a bare timeout stays unhinted");
+        assert_eq!(annotate_refused_sign_in(timeout, None), timeout);
+
+        for refusal in ["restricted: not a relay member", "authentication failed"] {
+            let annotated = annotate_refused_sign_in(timeout, Some(refusal));
+            assert!(annotated.contains(AFTER_REFUSED_SIGN_IN), "{annotated}");
+            assert!(annotated.contains(refusal), "{annotated}");
+            assert!(with_hint(annotated.clone()).contains(LINK_COMMAND), "{annotated}");
+        }
+        for refusal in [
+            "blocked: you are banned from this community",
+            "auth-required: verification failed",
+            "restricted: you are timed out until 2026-10-28T00:00:00Z",
+        ] {
+            let annotated = annotate_refused_sign_in(timeout, Some(refusal));
+            assert!(annotated.contains(refusal), "{annotated}");
+            assert_eq!(with_hint(annotated.clone()), annotated, "{annotated}");
+        }
+        // The SDK's bare `authentication failed` is replaced by the relay's own words, so a ban
+        // does not inherit the hint the SDK text would get on its own.
+        let sdk = "wss://r: authentication failed";
+        assert!(with_hint(sdk).contains(LINK_COMMAND), "unchanged without a known refusal");
+        let banned = annotate_refused_sign_in(sdk, Some("blocked: access revoked"));
+        assert_eq!(with_hint(banned.clone()), banned, "{banned}");
+        let unregistered = annotate_refused_sign_in(sdk, Some("restricted: not a relay member"));
+        assert!(with_hint(unregistered.clone()).contains(LINK_COMMAND), "{unregistered}");
+        // A reason that already names the refusal is left as it is.
+        let named = "wss://r: restricted: not a relay member";
+        assert_eq!(
+            annotate_refused_sign_in(named, Some("restricted: not a relay member")),
+            named
+        );
+    }
 
     /// Every buzz refusal string the membership gate produces, copied from `crates/buzz`.
     const BUZZ_REFUSALS: &[&str] = &[

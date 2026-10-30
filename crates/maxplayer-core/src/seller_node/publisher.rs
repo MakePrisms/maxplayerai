@@ -26,6 +26,9 @@ pub struct RelayPublisher {
     relay_url: String,
     home: Option<crate::home::MaxplayerHome>,
     authenticated: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The shared connection's NIP-42 sign-in state (#1228): a write refused because the relay
+    /// refused this key's sign-in says so, instead of a bare `timeout`.
+    sign_in: Option<std::sync::Arc<crate::relay_auth::SignInWatch>>,
 }
 
 impl RelayPublisher {
@@ -36,6 +39,7 @@ impl RelayPublisher {
         Self {
             home: None,
             authenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sign_in: None,
             signer,
             client,
             relay_url: relay_url.to_owned(),
@@ -43,6 +47,10 @@ impl RelayPublisher {
     }
     pub fn with_auth(mut self, auth: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self { self.authenticated = auth; self }
     pub fn with_home(mut self, home: crate::home::MaxplayerHome) -> Self { self.home = Some(home); self }
+    pub fn with_sign_in(mut self, sign_in: std::sync::Arc<crate::relay_auth::SignInWatch>) -> Self {
+        self.sign_in = Some(sign_in);
+        self
+    }
 }
 
 impl EventPublisher for RelayPublisher {
@@ -72,10 +80,17 @@ impl EventPublisher for RelayPublisher {
             .await
             .map_err(|error| format!("send: {error}"))?;
         if output.success.is_empty() {
-            let reasons: Vec<&str> = output.failed.values().map(String::as_str).collect();
-            if reasons.is_empty() {
+            if output.failed.is_empty() {
                 return Err(format!("no relay accepted event {}", signed.id));
             }
+            let reasons: Vec<String> = output
+                .failed
+                .values()
+                .map(|reason| match &self.sign_in {
+                    Some(sign_in) => sign_in.annotate(reason),
+                    None => reason.clone(),
+                })
+                .collect();
             return Err(crate::relay_refusal::with_hint(format!(
                 "no relay accepted event {} ({})",
                 signed.id,

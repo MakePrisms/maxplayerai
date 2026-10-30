@@ -290,6 +290,22 @@ pub async fn spawn(keys: Keys, relay_url: &str) -> Result<RelayHandle, RelayBoot
     // the channel depth, not at all.
     let command_client = client.clone();
     let event_sender = events.clone();
+    // #1228: taken before the actor connects, so a sign-in the relay refuses on the first socket
+    // is kept and every refused write names it. Tracked in the background: the daemon's job-event
+    // traffic would otherwise lag a receiver that is only read when a write fails.
+    let sign_in = Arc::new(relay_auth::SignInWatch::new(&relay));
+    sign_in.track(&relay, |refusal| {
+        crate::opline!(
+            "buyer relay: the relay refused this key's NIP-42 sign-in ({refusal}); offers, awards \
+             and replies will not be accepted{}",
+            if crate::relay_refusal::is_registration_refusal(refusal) {
+                format!(" ({})", crate::relay_refusal::LINK_HINT)
+            } else {
+                String::new()
+            }
+        )
+    });
+    let command_sign_in = sign_in.clone();
     tokio::spawn(async move {
         connect_and_authenticate(&client, &relay, "boot").await;
         // AFTER auth, never before: an unauthenticated `#p` REQ can be CLOSED with `restricted:`,
@@ -303,7 +319,15 @@ pub async fn spawn(keys: Keys, relay_url: &str) -> Result<RelayHandle, RelayBoot
                 match command {
                     Command::Publish { event, reply } => {
                         let _ =
-                            reply.send(publish_bounded(&command_client, &owned_url, &event).await);
+                            reply.send(
+                            publish_bounded(
+                                &command_client,
+                                &owned_url,
+                                &event,
+                                Some(&command_sign_in),
+                            )
+                            .await,
+                        );
                     }
                     Command::Probe { reply } => {
                         let _ = reply.send(
@@ -456,20 +480,28 @@ async fn publish_bounded(
     client: &Client,
     relay_url: &str,
     event: &Event,
+    sign_in: Option<&relay_auth::SignInWatch>,
 ) -> Result<PublishReceipt, PublishError> {
     let sent = tokio::time::timeout(PUBLISH_TIMEOUT, client.send_event_to([relay_url], event)).await;
     let output = match sent {
-        Err(_) => return Err(PublishError::TimedOut),
+        // #1228: a write that never got an answer because the relay refused the sign-in is a
+        // refusal, and says which.
+        Err(_) => {
+            return Err(match sign_in.and_then(|watch| watch.refusal()) {
+                Some(refusal) => PublishError::Refused(
+                    crate::relay_refusal::annotate_refused_sign_in(
+                        &format!("{relay_url}: no answer within {PUBLISH_TIMEOUT:?}"),
+                        Some(&refusal),
+                    ),
+                ),
+                None => PublishError::TimedOut,
+            });
+        }
         Ok(Err(error)) => return Err(PublishError::Transport(error.to_string())),
         Ok(Ok(output)) => output,
     };
     if output.success.is_empty() {
-        let reason = output
-            .failed
-            .iter()
-            .map(|(url, reason)| format!("{url}: {reason}"))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let reason = relay_auth::failed_reasons(&output, sign_in);
         return Err(PublishError::Refused(if reason.is_empty() {
             "no relay accepted the write and none gave a reason".to_owned()
         } else {
@@ -619,7 +651,7 @@ mod tests {
             .sign(&buyer)
             .await
             .expect("sign");
-        let refused = publish_bounded(&drifted, &relay_url, &drifted_note).await;
+        let refused = publish_bounded(&drifted, &relay_url, &drifted_note, None).await;
         assert!(
             matches!(refused, Err(PublishError::Refused(_))),
             "with automatic_authentication(false) the auth-gated write must stay refused — if this \
@@ -805,7 +837,7 @@ mod tests {
             .sign(&buyer)
             .await
             .expect("sign");
-        match publish_bounded(&client, &relay_url, &note).await {
+        match publish_bounded(&client, &relay_url, &note, None).await {
             Err(PublishError::Refused(reason)) => assert!(
                 !reason.is_empty(),
                 "a refusal must carry the relay's own reason, or an operator cannot triage it"

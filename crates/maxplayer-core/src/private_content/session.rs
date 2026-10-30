@@ -128,8 +128,13 @@ impl AuthenticatedContentRelay {
             .ok_or(Error("content relay unavailable"))?;
         let mut notifications = relay.notifications();
         client.connect().await;
-        if wait_for_nip42_auth(&mut notifications, IO_TIMEOUT).await != Ok(AuthWait::Authenticated)
-        {
+        let auth = wait_for_nip42_auth(&mut notifications, IO_TIMEOUT).await;
+        if auth != Ok(AuthWait::Authenticated) {
+            // #1228: the error type carries static text only, so name a refused sign-in (and the
+            // link hint, for a registration refusal) in the log.
+            if let Err(error) = &auth {
+                crate::opline!("private content relay: {error}");
+            }
             client.disconnect().await;
             return Err(Error("content relay authentication required"));
         }

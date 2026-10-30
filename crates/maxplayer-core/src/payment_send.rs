@@ -208,6 +208,9 @@ impl PaymentSend for NostrPaymentSend {
         client.add_relay(&self.relay).await.map_err(|error| {
             PaymentSendError::Transport(format!("failed to add relay: {error}"))
         })?;
+        // Before connect (#1228): a payment refused because the relay refused this key's sign-in
+        // names that refusal instead of a bare `timeout`.
+        let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &self.relay).await;
         client.connect().await;
 
         let output = client
@@ -230,7 +233,10 @@ impl PaymentSend for NostrPaymentSend {
                 .into_iter()
                 .map(|(url, error)| PaymentRelayFailure {
                     relay: url.to_string(),
-                    error,
+                    error: match &sign_in {
+                        Some(sign_in) => sign_in.annotate(&error),
+                        None => error,
+                    },
                 })
                 .collect(),
         )

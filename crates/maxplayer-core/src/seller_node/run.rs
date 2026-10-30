@@ -290,6 +290,28 @@ impl SlotGate {
 /// both sweepable and executing. When nothing is parked, the task WAITS for a permit INSIDE itself,
 /// so the loop is never blocked on capacity (issue #223): tokio's semaphore is fair, the excess
 /// queues in waves, and awarded work is never dropped.
+/// The status line's first field. #1228: while the relay refuses this seat's sign-in it refuses
+/// every write from it, ads included, so buyers cannot see the seat whatever the roster says.
+fn advertising_state(sign_in_refused: bool, serving: bool) -> &'static str {
+    if sign_in_refused {
+        "NOT ADVERTISING — the relay refused this seat's sign-in"
+    } else if serving {
+        "ADVERTISING, ready for work"
+    } else {
+        "NOT serving — no live harness"
+    }
+}
+
+/// ` (<link hint>)` when `refusal` is a registration refusal, else empty (#1228). A ban or a
+/// clock-skew refusal is named without telling the operator to link the key.
+fn hint_suffix(refusal: &str) -> String {
+    if crate::relay_refusal::is_registration_refusal(refusal) {
+        format!(" ({})", crate::relay_refusal::LINK_HINT)
+    } else {
+        String::new()
+    }
+}
+
 fn spawn_bounded_execution<F, Fut>(slots: &Arc<SlotGate>, job_id: String, execute: F)
 where
     F: FnOnce(String, Option<OwnedSemaphorePermit>) -> Fut + 'static,
@@ -4624,6 +4646,8 @@ pub struct SellerNodeRunner {
     /// socket is authenticated. `NoChallenge` is not authentication.
     boot_auth: AuthWait,
     private_authenticated: Arc<std::sync::atomic::AtomicBool>,
+    /// The relay's refusal of this seat's NIP-42 sign-in, if the current one was refused (#1228).
+    sign_in: Arc<crate::relay_auth::SignInWatch>,
     /// The harnesses this node is serving with. Resolved once at boot, then narrowed at RUNTIME as
     /// harnesses fail: every claim decision, every advertisement, and every dispatch reads THIS —
     /// never the config, and never the boot registry directly — so what the node advertises is what
@@ -5081,6 +5105,17 @@ impl SellerNodeRunner {
             .cloned()
             .ok_or_else(|| NodeError::Relay("relay missing after add_relay".into()))?;
         let mut relay_notifications = relay.notifications();
+        // #1228: keep the relay's refusal of this key's sign-in, so every write and the status line
+        // can name it. Logged once per refusal with the link hint, here because a refused seat
+        // otherwise keeps logging ADVERTISING while every write it makes times out.
+        let sign_in = Arc::new(crate::relay_auth::SignInWatch::new(&relay));
+        sign_in.track(&relay, |refusal| {
+            opline!(
+                "seller node ERROR: the relay refused this seat's NIP-42 sign-in ({refusal}); its \
+                 ads, claims and results are not reaching buyers{}",
+                hint_suffix(refusal)
+            )
+        });
         client.connect().await;
         client.wait_for_connection(CONNECT_WAIT).await;
         let boot_auth =
@@ -5101,7 +5136,7 @@ impl SellerNodeRunner {
             };
 
         let private_authenticated = Arc::new(std::sync::atomic::AtomicBool::new(matches!(boot_auth, AuthWait::Authenticated)));
-        let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url).with_home(node.home().clone()).with_auth(private_authenticated.clone());
+        let publisher = RelayPublisher::new(node.signer().clone(), client.clone(), &relay_url).with_home(node.home().clone()).with_auth(private_authenticated.clone()).with_sign_in(sign_in.clone());
 
         // Execution-slot admission from config: `slots` (default 1 = serial) and the claim-lapse
         // timeout (default when unset). A node with no `[seller]` block never claims, so its slot
@@ -5131,6 +5166,7 @@ impl SellerNodeRunner {
             seller_pubkey,
             boot_auth,
             private_authenticated,
+            sign_in,
             agents,
             announced_serving_generation: std::sync::atomic::AtomicU64::new(0),
             job_nix: std::sync::atomic::AtomicBool::new(false),
@@ -6164,7 +6200,11 @@ impl SellerNodeRunner {
                     // The status line comes from the LOOP, so it keeps its cadence — and says so —
                     // while the lane is stuck on a slow relay.
                     let now = tokio::time::Instant::now();
-                    let relay_state = if !heartbeat_enabled {
+                    let relay_state = if let Some(refusal) = self.sign_in.refusal() {
+                        // #1228: no write lands while sign-in is refused, so "relay confirmed Ns
+                        // ago" would describe an older socket. Say what is wrong and what to do.
+                        format!("relay REFUSED sign-in ({refusal}){}", hint_suffix(&refusal))
+                    } else if !heartbeat_enabled {
                         "relay watchdog off".to_owned()
                     } else if recovering.get() {
                         "relay RECOVERING".to_owned()
@@ -6738,14 +6778,16 @@ impl SellerNodeRunner {
                             true
                         }
                         Ok(Ok(output)) => {
-                            let reasons: Vec<String> = output
-                                .failed
-                                .iter()
-                                .map(|(url, reason)| format!("{url}: {reason}"))
-                                .collect();
                             opline!(
                                 "seller node WARN: buyer feedback not confirmed offer={offer_id} ({})",
-                                if reasons.is_empty() { "no acknowledgement".to_owned() } else { reasons.join("; ") }
+                                if output.failed.is_empty() {
+                                    "no acknowledgement".to_owned()
+                                } else {
+                                    crate::relay_refusal::with_hint(crate::relay_auth::failed_reasons(
+                                        &output,
+                                        Some(&self.sign_in),
+                                    ))
+                                }
                             );
                             false
                         }
@@ -6817,11 +6859,7 @@ impl SellerNodeRunner {
         };
         opline!(
             "seller node status: {} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
-            if roster.serving {
-                "ADVERTISING, ready for work"
-            } else {
-                "NOT serving — no live harness"
-            },
+            advertising_state(self.sign_in.refusal().is_some(), roster.serving),
             self.slots.capacity
         );
     }
@@ -7172,15 +7210,13 @@ impl SellerNodeRunner {
                         // `success`, or a top-level `Err`/timeout is the health-RED signal.
                         Ok(output) if publish_confirmed(&output) => true,
                         Ok(output) => {
-                            let reasons: Vec<String> = output
-                                .failed
-                                .iter()
-                                .map(|(url, reason)| format!("{url}: {reason}"))
-                                .collect();
-                            let detail = if reasons.is_empty() {
+                            let detail = if output.failed.is_empty() {
                                 "no relay acknowledged the event".to_string()
                             } else {
-                                reasons.join("; ")
+                                crate::relay_refusal::with_hint(crate::relay_auth::failed_reasons(
+                                    &output,
+                                    Some(&self.sign_in),
+                                ))
                             };
                             opline!(
                                 "seller node {what} publish NOT confirmed by relay (continuing): \

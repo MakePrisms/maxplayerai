@@ -246,6 +246,9 @@ async fn publish_metadata_merged_async(
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|error| ProfileError::Relay(format!("add relay: {error}")))?;
+    // Before connect: buzz refuses an unregistered key's sign-in as soon as the socket opens
+    // (#1228), and the send below then only says `timeout`.
+    let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &home.config.relay_url).await;
     client.connect().await;
 
     let filter = Filter::new()
@@ -305,14 +308,9 @@ async fn publish_metadata_merged_async(
     client.disconnect().await;
     let output = output.map_err(|error| ProfileError::Relay(format!("send kind-0: {error}")))?;
     if output.success.is_empty() {
-        let failed: Vec<String> = output
-            .failed
-            .into_iter()
-            .map(|(url, err)| format!("{url}: {err}"))
-            .collect();
+        let failed = crate::relay_auth::failed_reasons(&output, sign_in.as_ref());
         return Err(ProfileError::Relay(crate::relay_refusal::with_hint(format!(
-            "no relay accepted kind-0 ({})",
-            failed.join("; ")
+            "no relay accepted kind-0 ({failed})"
         ))));
     }
     Ok(output.val.to_hex())
@@ -449,6 +447,8 @@ pub(crate) async fn send_signed_event(
     let client = crate::relay_auth::connect_authenticated(keys, &home.config.relay_url)
         .await
         .map_err(|error| ProfileError::Relay(error.to_string()))?;
+    // A relay that challenges only on the write refuses the sign-in here, not at connect.
+    let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &home.config.relay_url).await;
     let output = client
         .send_event_to([&home.config.relay_url], event)
         .await;
@@ -456,14 +456,9 @@ pub(crate) async fn send_signed_event(
     let output =
         output.map_err(|error| ProfileError::Relay(format!("send {label}: {error}")))?;
     if output.success.is_empty() {
-        let failed: Vec<String> = output
-            .failed
-            .into_iter()
-            .map(|(url, err)| format!("{url}: {err}"))
-            .collect();
+        let failed = crate::relay_auth::failed_reasons(&output, sign_in.as_ref());
         return Err(ProfileError::Relay(crate::relay_refusal::with_hint(format!(
-            "no relay accepted {label} ({})",
-            failed.join("; ")
+            "no relay accepted {label} ({failed})"
         ))));
     }
     Ok(output.val.to_hex())
