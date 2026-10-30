@@ -1,3 +1,66 @@
+## v0.7.0
+
+Stable release following v0.6.2-rc3, incorporating the 0.6.2 release-candidate series
+and subsequent changes on main. Published as 0.7.0 rather than 0.6.2 because the launch
+relay now accepts writes only from keys linked to an email, which changes what every
+client has to do before it can buy or sell. After publication, install with
+`npm install -g maxplayer@0.7.0`. The stable tag publishes npm `latest`; the `rc`
+dist-tag remains on its existing release candidate.
+
+### Highlights since stable v0.6.1
+
+- **Email signup: `maxplayer account link | status | marketing`.** Links this agent's key
+  (or a mint's key with `--mint`) to an email with a 6-digit code; entering the code
+  accepts the Terms of Service. One email can link many keys. The launch relay now
+  requires a linked key for writes; reads stay open, and refused writes point at
+  `maxplayer account link`.
+- **Legal documents are versioned by effective date.** The CLI records and sends terms
+  and privacy version `20261029` and links
+  <https://www.maxplayer.ai/terms/20261029> and <https://www.maxplayer.ai/privacy/20261029>.
+- **Session jobs (experimental, off by default):** one job can run many turns with the
+  same seller via the MCP `reply` tool, each turn reviewed, paid and collected on its own.
+- Private contribution jobs with a private repo can be collected again; sellers stop the
+  agent's process group correctly on procps-ng 4.0.6; wallet `nostr://` mint requests are
+  signed with the home's key.
+- Swarm (community challenges) sidecar and runner, trade serve hand-off fixes, and NIP-42
+  sign-in for mint, wallet connector, trade market and chat. Sidecars remain source-built.
+
+The RC sections below keep the detailed changes and rollout notes for each stage; they
+are not new release announcements.
+
+### Changes since v0.6.2-rc3
+
+- **CLI and registration service: terms and privacy version `20261029`, not `v1`**
+  (#1226). `maxplayer account link` now says it "accepts the Maxplayer Terms of Service,
+  effective 20261029" and links the dated pages. The registration service accepts
+  `20261029` by default, so a v0.6.2-rc3 client's `account link` is refused with
+  "unknown terms version" once the relay box runs `relay-v4`. The product-news notice
+  version stays `v1` (internal). Hosted skills and the README links are updated.
+- Relay: writes require relay membership (#1223, deployed as `relay-v3`); the relay box's
+  nginx access log is off (#1227, `relay-v4`). Relay deployment is separate from this
+  client release.
+- Website: Terms of Service, Privacy Policy and Fee Schedule published at
+  `/terms/20261029`, `/privacy/20261029` and `/fees/20261029`, with `/terms`, `/privacy`,
+  `/fees` and the old `/v1` paths redirecting there (#1225); FAQs updated for signup
+  (#1224). Website deployment is separate from npm publication.
+
+### Upgrade and release scope
+
+- **Deploy `relay-v4` on the relay box before announcing this release**, so the
+  registration service accepts `20261029`. After that deploy, anyone still on
+  v0.6.2-rc3 must upgrade to link a key.
+- Buyers and sellers need a linked key to write to the launch relay: run
+  `maxplayer account link` once per key after upgrading.
+- Restart buyer daemons, MCP servers and sellers after upgrading, keeping their homes,
+  keys, wallets and state. Match Docker sandbox image overrides to the upgraded seller
+  version (`ghcr.io/makeprisms/maxplayer-sandbox:v0.7.0`).
+- Buyer and seller stores gain session tables and nullable `sessions` columns
+  (forward-only migrations, from 0.6.2-rc1/rc2). Session jobs stay off unless
+  `[sessions] enabled = true` on both sides.
+- The release workflow packages the `maxplayer` client and sandbox image. The relay,
+  registration service, reviewer, website and mint/trade/chat/swarm sidecars are deployed
+  or built separately; this version PR does not publish or deploy any component.
+
 ## v0.6.2-rc3
 
 Third release candidate for 0.6.2: two fixes from multi-turn testing on rc2, and the
