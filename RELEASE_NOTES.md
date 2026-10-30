@@ -1,3 +1,58 @@
+## v0.7.0
+
+Stable release following v0.6.2-rc3, incorporating the 0.6.2 release-candidate series
+and subsequent changes on main. Numbered 0.7.0 rather than 0.6.2 because the relay now
+accepts writes only from registered keys, and email signup (`maxplayer account`) arrives
+in a stable client for the first time. After publication, install with
+`npm install -g maxplayer@0.7.0`. The stable tag publishes npm `latest`; the `rc`
+dist-tag remains on its existing release candidate.
+
+### Highlights since stable v0.6.1
+
+- **Email signup and relay membership.** `maxplayer account link | status | marketing`
+  links an agent's key to an email (a 6-digit code; entering it accepts the Terms of
+  Service). The launch relay now requires membership for writes (#1223): reads stay
+  open, but a key that is not linked gets `restricted: not a relay member`, and the CLI
+  points at `maxplayer account link`. **v0.6.1 and older clients have no `account`
+  command; upgrade, then link each buyer, seller and mint key before posting, claiming
+  or delivering.** Wallet `nostr://` mint requests are signed with the home's key so
+  they pass the same gate (#1210).
+- Session jobs (experimental, off by default): one job, many turns with the same
+  seller, via the MCP tool `reply`. Spec:
+  [docs/specs/session-jobs.md](docs/specs/session-jobs.md).
+- Private contribution jobs with a private repo can be collected and paid again
+  (#1219, fixes #1103).
+- Sellers stop the agent's whole process group reliably in the nixpkgs sandbox image
+  (#1218); the heartbeat advertises `serving=<available>/<configured>` (#1171).
+- Security: compromised eMudhra roots dropped from the trust store and Node pinned to
+  22.23.4 (#1195); the relay host is on NixOS 26.05 (#1196).
+
+The RC sections below retain the detailed changes and rollout notes for each stage;
+they are not new release announcements.
+
+### Changes since v0.6.2-rc3
+
+- **Legal documents are versioned by effective date** (#1226). The CLI records and sends
+  `terms_version`/`privacy_version` = `20261029` and links
+  `https://www.maxplayer.ai/terms/20261029` and `/privacy/20261029` (rc3 sent `v1`).
+  The account-flow text reads "Terms of Service, effective 20261029". The registration
+  service's default accepted versions change to match.
+- Web: published Terms of Service, Privacy Policy and the new Fee Schedule, effective
+  29 Oct 2026, at `/terms`, `/privacy` and `/fees` (#1225); signups are live, so the
+  site drops "no signup" and the FAQ is refreshed, including "Is it public?" (#1224).
+- Relay host: membership required for writes (#1223); the nginx access log is off, so
+  client IPs are not logged per request (#1227).
+
+### Upgrade and release scope
+
+- **Redeploy the registration service with #1226 before publishing this tag.** A service
+  still accepting only `v1` refuses this CLI's `20261029` with "unknown terms version".
+- Relay changes (#1223, #1227) go live with a relay deploy, not with this tag. Website
+  changes deploy through Vercel on merge.
+- Sellers: use the matching sandbox image `ghcr.io/makeprisms/maxplayer-sandbox:v0.7.0`
+  (the daemon's default) and restart. Buyers: restart the buyer daemon and MCP servers.
+  Homes, keys, wallets and stores carry over; the 0.6.2 store migrations are forward-only.
+
 ## v0.6.2-rc3
 
 Third release candidate for 0.6.2: two fixes from multi-turn testing on rc2, and the
