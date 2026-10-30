@@ -354,16 +354,17 @@ fn spawn_private_content_worker(context: Arc<BuyerContext>) {
             ticker.tick().await;
             let result=async {
                 use crate::private_content::{channel::ContentContext,session};
-                let keys=buyer_keys(&context.home).map_err(|_| crate::private_content::Error("buyer content signer unavailable"))?;
-                let mut content=ContentContext::open(&context.home,&keys.public_key().to_hex())?;
-                let mut relay=session::AuthenticatedContentRelay::connect(&keys,&context.home.config.relay_url).await?;
+                let keys=buyer_keys(&context.home).map_err(|_| crate::private_content::Error("buyer content signer unavailable").to_string())?;
+                let mut content=ContentContext::open(&context.home,&keys.public_key().to_hex()).map_err(|e| e.to_string())?;
+                // #1228: the connect error names a refused sign-in (and the link hint).
+                let mut relay=session::AuthenticatedContentRelay::connect(&keys,&context.home.config.relay_url).await.map_err(|e| e.to_string())?;
                 let result=async {
                     session::flush(&mut content.store,&keys,&mut relay,64).await?;
                     relay.backfill(&mut content.store,&keys,now_unix().max(0) as u64).await?;
                     Ok::<_,crate::private_content::Error>(())
                 }.await;
                 relay.disconnect().await;
-                result
+                result.map_err(|e| e.to_string())
             }.await;
             if let Err(error)=result {crate::opline!("buyer private content retry pending: {error}");}
         }

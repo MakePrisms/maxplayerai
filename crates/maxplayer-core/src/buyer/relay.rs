@@ -101,8 +101,11 @@ pub struct PublishReceipt {
 pub enum PublishError {
     /// The relay answered and refused. Carries the relay's own reason verbatim.
     Refused(String),
-    /// The write did not complete within [`PUBLISH_TIMEOUT`].
-    TimedOut,
+    /// The write did not complete within [`PUBLISH_TIMEOUT`]: no answer, so the relay never said it
+    /// examined the event. Carries the relay's refusal of this connection's sign-in when one was
+    /// seen (#1228), for the message only: it is a fact about the session, not a refusal of the
+    /// event, so it never turns the timeout into [`Self::Refused`].
+    TimedOut(Option<String>),
     /// The write could not be attempted (relay not added, bad url, database error).
     Transport(String),
 }
@@ -115,9 +118,17 @@ impl std::fmt::Display for PublishError {
                 "{}",
                 crate::relay_refusal::with_hint(format!("relay refused the write: {reason}"))
             ),
-            Self::TimedOut => write!(
+            Self::TimedOut(None) => write!(
                 formatter,
                 "relay write did not complete within {PUBLISH_TIMEOUT:?}"
+            ),
+            Self::TimedOut(Some(refusal)) => write!(
+                formatter,
+                "{}",
+                crate::relay_refusal::with_hint(crate::relay_refusal::annotate_refused_sign_in(
+                    &format!("relay write did not complete within {PUBLISH_TIMEOUT:?}"),
+                    Some(refusal),
+                ))
             ),
             Self::Transport(error) => write!(formatter, "relay write could not be sent: {error}"),
         }
@@ -484,19 +495,7 @@ async fn publish_bounded(
 ) -> Result<PublishReceipt, PublishError> {
     let sent = tokio::time::timeout(PUBLISH_TIMEOUT, client.send_event_to([relay_url], event)).await;
     let output = match sent {
-        // #1228: a write that never got an answer because the relay refused the sign-in is a
-        // refusal, and says which.
-        Err(_) => {
-            return Err(match sign_in.and_then(|watch| watch.refusal()) {
-                Some(refusal) => {
-                    PublishError::Refused(crate::relay_refusal::annotate_refused_sign_in(
-                        &format!("{relay_url}: no answer within {PUBLISH_TIMEOUT:?}"),
-                        Some(&refusal),
-                    ))
-                }
-                None => PublishError::TimedOut,
-            });
-        }
+        Err(_) => return Err(timed_out(sign_in.and_then(|watch| watch.refusal()))),
         Ok(Err(error)) => return Err(PublishError::Transport(error.to_string())),
         Ok(Ok(output)) => output,
     };
@@ -512,6 +511,12 @@ async fn publish_bounded(
         event_id: output.val.to_string(),
         relay: relay_url.to_owned(),
     })
+}
+
+/// A publish with no answer. #1228: it names a refused sign-in when one was seen, but stays
+/// [`PublishError::TimedOut`] (advisor round 1): no `OK` came, so the event was never examined.
+fn timed_out(sign_in_refusal: Option<String>) -> PublishError {
+    PublishError::TimedOut(sign_in_refusal)
 }
 
 /// Ask the relay to serve one trivial REQ on the CURRENT session and wait for its `EOSE`.
@@ -576,6 +581,32 @@ mod tests {
         );
         let other = PublishError::Refused("blocked: banned".into()).to_string();
         assert_eq!(other, "relay refused the write: blocked: banned");
+    }
+
+    /// Advisor round 1, finding 2: a write with no answer is a timeout even after a refused
+    /// sign-in. The refusal (and the link hint, only for a registration refusal) is in the text.
+    #[test]
+    fn a_timeout_after_a_refused_sign_in_stays_a_timeout_and_names_the_refusal() {
+        let plain = timed_out(None);
+        assert!(matches!(plain, PublishError::TimedOut(None)), "{plain:?}");
+        assert_eq!(
+            plain.to_string(),
+            format!("relay write did not complete within {PUBLISH_TIMEOUT:?}")
+        );
+
+        let member = timed_out(Some("restricted: not a relay member".into()));
+        assert!(matches!(member, PublishError::TimedOut(Some(_))), "{member:?}");
+        let text = member.to_string();
+        assert!(text.starts_with("relay write did not complete within"), "{text}");
+        assert!(!text.contains("relay refused the write"), "{text}");
+        assert!(text.contains("after the relay refused NIP-42 sign-in: restricted: not a relay member"), "{text}");
+        assert!(text.contains(crate::relay_refusal::LINK_COMMAND), "{text}");
+
+        let banned = timed_out(Some("blocked: you are banned from this community".into()));
+        assert!(matches!(banned, PublishError::TimedOut(Some(_))), "{banned:?}");
+        let text = banned.to_string();
+        assert!(text.contains("blocked: you are banned"), "{text}");
+        assert!(!text.contains(crate::relay_refusal::LINK_COMMAND), "{text}");
     }
 
     // TOOTH — the DEPENDENCY CONTRACT the buyer's write path rests on.

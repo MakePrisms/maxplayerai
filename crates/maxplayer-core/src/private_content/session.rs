@@ -110,9 +110,39 @@ pub struct AuthenticatedContentRelay {
     client: Client,
     relay: Relay,
     owns_connection: bool,
+    /// This connection's sign-in state (#1228), so a later refused write names a refused
+    /// re-sign-in. `None` on a shared connection, whose owner watches its own sign-in.
+    sign_in: Option<crate::relay_auth::SignInWatch>,
 }
+
+/// [`AuthenticatedContentRelay::connect`] failed. Unlike the protocol [`Error`], it carries text
+/// built at run time: the relay's refusal of the sign-in and the link hint (#1228, advisor round 1
+/// finding 4). The static prefix is kept so readers of the old message still match.
+#[derive(Debug)]
+pub struct ConnectError(pub String);
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+impl std::error::Error for ConnectError {}
+impl From<Error> for ConnectError {
+    fn from(error: Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+/// The connect failure for a sign-in that did not complete: the `wait_for_nip42_auth` error
+/// (already hinted for a registration refusal) after the old static text.
+fn sign_in_not_completed(auth: &std::result::Result<AuthWait, crate::relay_auth::RelayAuthError>) -> ConnectError {
+    match auth {
+        Err(error) => ConnectError(format!("content relay authentication required: {error}")),
+        Ok(_) => Error("content relay authentication required").into(),
+    }
+}
+
 impl AuthenticatedContentRelay {
-    pub async fn connect(keys: &Keys, url: &str) -> Result<Self> {
+    pub async fn connect(keys: &Keys, url: &str) -> std::result::Result<Self, ConnectError> {
         let client = Client::new(keys.clone());
         client.automatic_authentication(true);
         client
@@ -127,21 +157,20 @@ impl AuthenticatedContentRelay {
             .cloned()
             .ok_or(Error("content relay unavailable"))?;
         let mut notifications = relay.notifications();
+        let sign_in = crate::relay_auth::SignInWatch::new(&relay);
         client.connect().await;
         let auth = wait_for_nip42_auth(&mut notifications, IO_TIMEOUT).await;
         if auth != Ok(AuthWait::Authenticated) {
-            // #1228: the error type carries static text only, so name a refused sign-in (and the
-            // link hint, for a registration refusal) in the log.
-            if let Err(error) = &auth {
-                crate::opline!("private content relay: {error}");
-            }
+            let error = sign_in_not_completed(&auth);
+            crate::opline!("private content relay: {error}");
             client.disconnect().await;
-            return Err(Error("content relay authentication required"));
+            return Err(error);
         }
         Ok(Self {
             client,
             relay,
             owns_connection: true,
+            sign_in: Some(sign_in),
         })
     }
     /// Attach to the seller's existing connection only after its live connection
@@ -158,6 +187,7 @@ impl AuthenticatedContentRelay {
             client,
             relay,
             owns_connection: false,
+            sign_in: None,
         })
     }
     pub async fn disconnect(self) {
@@ -298,11 +328,14 @@ impl AuthenticatedContentRelay {
 }
 impl ContentSender for AuthenticatedContentRelay {
     async fn send(&mut self, event: Event) -> std::result::Result<(), SendFailure> {
-        let sent = self
-            .client
-            .send_event(&event)
-            .await
-            .map_err(|_| Error("content publication failed"))?;
+        let sent = self.client.send_event(&event).await;
+        let refusal = || self.sign_in.as_ref().and_then(|watch| watch.refusal());
+        let sent = match sent {
+            Ok(sent) => sent,
+            Err(_) => {
+                return Err(send_failure("content publication failed".into(), refusal().as_deref()));
+            }
+        };
         if sent.success.is_empty() {
             let reason = sent
                 .failed
@@ -310,12 +343,23 @@ impl ContentSender for AuthenticatedContentRelay {
                 .next()
                 .cloned()
                 .unwrap_or_else(|| "content publication refused".into());
-            // NIP-01 terminal prefixes. `rate-limited:`/`error:` stay retryable.
-            let permanent = reason.starts_with("invalid:") || reason.starts_with("blocked:");
-            return Err(SendFailure { permanent, reason });
+            return Err(send_failure(reason, refusal().as_deref()));
         }
         Ok(())
     }
+}
+
+/// A failed content write. `permanent` is decided on the relay's own reason ONLY; the refused
+/// sign-in (#1228) is added to the text afterwards, so it can never turn a retryable failure
+/// terminal or a terminal one retryable.
+fn send_failure(reason: String, sign_in_refusal: Option<&str>) -> SendFailure {
+    // NIP-01 terminal prefixes. `rate-limited:`/`error:` stay retryable.
+    let permanent = reason.starts_with("invalid:") || reason.starts_with("blocked:");
+    let reason = crate::relay_refusal::with_hint(crate::relay_refusal::annotate_refused_sign_in(
+        &reason,
+        sign_in_refusal,
+    ));
+    SendFailure { permanent, reason }
 }
 
 async fn collect_window(
@@ -378,6 +422,44 @@ async fn collect_window(
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    /// Advisor round 1, finding 4: a sign-in that did not complete returns the hinted relay
+    /// refusal, not only the static text.
+    #[test]
+    fn a_refused_content_sign_in_returns_the_hinted_refusal() {
+        let refused = crate::relay_auth::RelayAuthError(crate::relay_refusal::with_hint(
+            "NIP-42 sign-in refused: restricted: not a relay member",
+        ));
+        let error = sign_in_not_completed(&Err(refused)).to_string();
+        assert!(error.starts_with("content relay authentication required: "), "{error}");
+        assert!(error.contains("not a relay member"), "{error}");
+        assert!(error.contains(crate::relay_refusal::LINK_COMMAND), "{error}");
+        assert_eq!(
+            sign_in_not_completed(&Ok(AuthWait::NoChallenge)).to_string(),
+            "content relay authentication required"
+        );
+    }
+
+    /// Advisor round 1, finding 4: a later content write names a refused re-sign-in like every
+    /// other write path, and the refusal never changes whether the failure is permanent.
+    #[test]
+    fn a_content_write_after_a_refused_sign_in_names_it_without_changing_permanence() {
+        let member = Some("restricted: not a relay member");
+        let timeout = send_failure("timeout".into(), member);
+        assert!(!timeout.permanent);
+        assert!(timeout.reason.contains("after the relay refused NIP-42 sign-in: restricted: not a relay member"), "{}", timeout.reason);
+        assert!(timeout.reason.contains(crate::relay_refusal::LINK_COMMAND), "{}", timeout.reason);
+
+        let terminal = send_failure("invalid: bad signature".into(), member);
+        assert!(terminal.permanent, "classified on the relay's own prefix");
+        let banned = send_failure("timeout".into(), Some("blocked: you are banned from this community"));
+        assert!(!banned.permanent, "a banned sign-in does not make a timeout terminal");
+        assert!(!banned.reason.contains(crate::relay_refusal::LINK_COMMAND), "{}", banned.reason);
+
+        let plain = send_failure("rate-limited: slow down".into(), None);
+        assert!(!plain.permanent);
+        assert_eq!(plain.reason, "rate-limited: slow down");
+    }
     #[tokio::test]
     async fn foreign_wrapper_does_not_poison_mixed_inbox_or_hide_full_page() {
         let keys = Keys::generate();
@@ -500,7 +582,7 @@ mod tests {
                 .unwrap(),
             AuthWait::Authenticated
         );
-        let mut relay = AuthenticatedContentRelay { client, relay: raw, owns_connection: true };
+        let mut relay = AuthenticatedContentRelay { client, relay: raw, owns_connection: true, sign_in: None };
         let valid = PreparedContent::new(body()).unwrap();
         let recipient = keys(2).public_key();
         let unrelated = EventBuilder::new(Kind::GiftWrap, "another application's payload")

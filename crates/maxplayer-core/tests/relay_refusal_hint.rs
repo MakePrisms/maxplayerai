@@ -244,3 +244,67 @@ async fn issue_1228_a_payment_refused_at_sign_in_names_the_link_command() {
         .to_string();
     assert_hinted(&error);
 }
+
+/// Advisor round 1, finding 4: private content's own connection returns the hinted refusal, not
+/// only the static `content relay authentication required`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_1228_private_content_connect_names_the_refused_sign_in() {
+    let relay = buzz_gate().await;
+    let error = match maxplayer_core::private_content::session::AuthenticatedContentRelay::connect(
+        &Keys::generate(),
+        &relay.url,
+    )
+    .await
+    {
+        Ok(_) => panic!("a non-member must be refused"),
+        Err(error) => error.to_string(),
+    };
+    assert!(
+        error.starts_with("content relay authentication required: "),
+        "{error}"
+    );
+    assert_hinted(&error);
+}
+
+/// Advisor round 1, finding 5: a public offer (`post_job` -> `publish_signed_event_async`) from a
+/// non-member names the refused sign-in and the link command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_1228_a_public_offer_names_the_refused_sign_in() {
+    use maxplayer_core::job_lifecycle::{JobKind, PostJobRequest, post_job_async};
+    let relay = buzz_gate().await;
+    let (_dir, home) = home_on(&relay.url);
+    let deadline = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let error = post_job_async(
+        &home,
+        PostJobRequest {
+            visibility: Some(maxplayer_core::private_content::wire::Visibility::Public),
+            output_category: None,
+            inputs: vec![],
+            accepts_delivery: Vec::new(),
+            // Free: no wallet or mint is opened, so the relay is the only thing under test.
+            payment_mode: maxplayer_core::gateway::PaymentMode::None,
+            task: "offer from an unlinked key".into(),
+            output: "text/plain".into(),
+            amount_sats: 0,
+            seller_pubkey: None,
+            untargeted: true,
+            deadline_unix: Some(deadline),
+            repo: None,
+            branch: None,
+            job: JobKind::FromScratch,
+            requested_agent: None,
+            requested_harness_family: None,
+            requested_model: None,
+            required_capabilities: Vec::new(),
+        },
+    )
+    .await
+    .expect_err("a non-member's offer is refused")
+    .to_string();
+    assert!(error.contains("no relay accepted event"), "{error}");
+    assert_hinted(&error);
+}

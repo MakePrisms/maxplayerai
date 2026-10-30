@@ -214,6 +214,9 @@ pub struct SignInState {
     challenged: bool,
     /// The last `OK false` text seen on this socket since the challenge.
     last_ok_false: Option<String>,
+    /// The relay's own text already ended THIS challenge as refused (the socket closed first).
+    /// A later `AuthenticationFailed` carries no text of its own and must not replace it.
+    refused_this_challenge: bool,
     refusal: Option<String>,
 }
 
@@ -229,6 +232,7 @@ impl SignInState {
             } => {
                 self.challenged = true;
                 self.last_ok_false = None;
+                self.refused_this_challenge = false;
                 None
             }
             RelayNotification::Message {
@@ -247,14 +251,19 @@ impl SignInState {
                 None
             }
             RelayNotification::AuthenticationFailed => {
-                let text = self
-                    .last_ok_false
-                    .take()
-                    .filter(|text| !text.is_empty())
-                    // No text reached us: the SDK's own words.
-                    .unwrap_or_else(|| "authentication failed".to_owned());
+                let text = self.last_ok_false.take().filter(|text| !text.is_empty());
                 self.challenged = false;
-                self.refusal = Some(text);
+                match text {
+                    Some(text) => self.refusal = Some(text),
+                    // buzz closes right after its `OK false`, so the close can be read before the
+                    // SDK's `AuthenticationFailed`: the relay's text is already recorded for this
+                    // challenge. Keep it, or a ban / clock-skew refusal reads as the SDK's generic
+                    // words and is told to link the key (#1234 review).
+                    None if self.refused_this_challenge => {}
+                    // No text reached us: the SDK's own words.
+                    None => self.refusal = Some("authentication failed".to_owned()),
+                }
+                self.refused_this_challenge = true;
                 self.refusal.as_deref()
             }
             RelayNotification::Authenticated => {
@@ -271,8 +280,10 @@ impl SignInState {
                 match refused.filter(|text| !text.is_empty()) {
                     Some(text) => {
                         self.refusal = Some(text);
+                        self.refused_this_challenge = true;
                         self.refusal.as_deref()
                     }
+                    // No new text: a refusal already recorded stays as the relay worded it.
                     None => None,
                 }
             }
@@ -506,6 +517,66 @@ mod sign_in_tests {
         assert_eq!(state.observe(&disconnected()), None);
         assert_eq!(state.refusal(), None);
         // The SDK says it failed but no text arrived: its own words.
+        state.observe(&challenge());
+        assert_eq!(
+            state.observe(&RelayNotification::AuthenticationFailed),
+            Some("authentication failed")
+        );
+    }
+
+    /// Advisor round 1, finding 1: buzz sends `OK false`, closes, and the SDK's
+    /// `AuthenticationFailed` can be read AFTER the close. The relay's text recorded at the close
+    /// stays the refusal, so a ban or clock-skew refusal is not told to link the key.
+    fn refused_then_closed_then_sdk_failure(text: &'static str) -> SignInState {
+        let mut state = SignInState::default();
+        state.observe(&challenge());
+        state.observe(&ok_false(text));
+        assert_eq!(state.observe(&disconnected()), Some(text));
+        assert_eq!(
+            state.observe(&RelayNotification::AuthenticationFailed),
+            Some(text),
+            "a text-less AuthenticationFailed must not replace the relay's words"
+        );
+        assert_eq!(state.refusal(), Some(text));
+        state
+    }
+
+    fn hinted(state: &SignInState) -> (String, String) {
+        let refusal = state.refusal().expect("refused");
+        let annotated = crate::relay_refusal::annotate_refused_sign_in("wss://r: timeout", Some(refusal));
+        (
+            crate::relay_refusal::with_hint(format!("NIP-42 sign-in refused: {refusal}")),
+            crate::relay_refusal::with_hint(annotated),
+        )
+    }
+
+    #[test]
+    fn a_ban_read_after_the_close_keeps_the_ban_text_and_gets_no_link_hint() {
+        let state = refused_then_closed_then_sdk_failure("blocked: you are banned from this community");
+        for message in <[String; 2]>::from(hinted(&state)) {
+            assert!(message.contains("blocked: you are banned"), "{message}");
+            assert!(!message.contains(crate::relay_refusal::LINK_COMMAND), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_clock_skew_refusal_read_after_the_close_keeps_its_text_and_gets_no_link_hint() {
+        let state = refused_then_closed_then_sdk_failure("auth-required: verification failed");
+        for message in <[String; 2]>::from(hinted(&state)) {
+            assert!(message.contains("verification failed"), "{message}");
+            assert!(!message.contains(crate::relay_refusal::LINK_COMMAND), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_membership_refusal_read_after_the_close_still_gets_the_link_hint() {
+        let state = refused_then_closed_then_sdk_failure("restricted: not a relay member");
+        for message in <[String; 2]>::from(hinted(&state)) {
+            assert!(message.contains("not a relay member"), "{message}");
+            assert!(message.contains(crate::relay_refusal::LINK_COMMAND), "{message}");
+        }
+        // A NEW challenge that fails with no text of its own is the SDK's words again.
+        let mut state = state;
         state.observe(&challenge());
         assert_eq!(
             state.observe(&RelayNotification::AuthenticationFailed),

@@ -1273,7 +1273,7 @@ fn build_and_publish_receipt(
     // Non-deterministic per publish attempt (fresh `created_at`); `receipt_id` records
     // whichever id the accepted publish produced — verify-irrelevant metadata.
     let receipt_id = event.id.to_hex();
-    let relay_success = publish_receipt_event(relay_url, buyer_keys, &event)?;
+    let (relay_success, relay_failure) = publish_receipt_event(relay_url, buyer_keys, &event)?;
 
     Ok(ReceiptEvidence {
         receipt_id,
@@ -1282,6 +1282,7 @@ fn build_and_publish_receipt(
         seller_signature: seller_signature.to_owned(),
         buyer_signature,
         relay_success,
+        relay_failure,
     })
 }
 
@@ -1313,7 +1314,8 @@ fn receipt_created_at(_digest: &[u8; 32]) -> Timestamp {
     Timestamp::now()
 }
 
-/// Publish the signed kind-3400 to the relay and return the accepted relay set.
+/// Publish the signed kind-3400 to the relay and return the accepted relay set, plus why it is
+/// empty when that is known (#1228; message text only, see [`receipt_not_sent`]).
 ///
 /// Runs on a fresh OS thread with its own current-thread runtime: publishing is async and
 /// the caller may already hold a Tokio runtime (a nested `block_on` would panic).
@@ -1329,7 +1331,7 @@ fn publish_receipt_event(
     relay_url: &str,
     keys: &Keys,
     event: &nostr_sdk::Event,
-) -> Result<Vec<String>, EffectError> {
+) -> Result<(Vec<String>, Option<String>), EffectError> {
     use nostr_sdk::prelude::{Client, RelayUrl};
     use std::time::Duration;
     std::thread::scope(|scope| {
@@ -1374,10 +1376,11 @@ fn publish_receipt_event(
                         Duration::from_secs(20),
                     )
                     .await;
-                    // #1228: a refused sign-in held the receipt back; say so (the payment itself
-                    // holds at `Sent` and retries, unchanged).
-                    if let Err(error) = &auth {
-                        eprintln!("receipt publish: not sent: {error}");
+                    // #1228: a refused sign-in held the receipt back; say so, in the payment
+                    // error too (the payment itself holds at `Sent` and retries, unchanged).
+                    let mut relay_failure = receipt_not_sent(&auth);
+                    if let Some(why) = &relay_failure {
+                        eprintln!("receipt publish: {why}");
                     }
                     let relay_success = if matches!(
                         auth,
@@ -1397,20 +1400,19 @@ fn publish_receipt_event(
                                 .iter()
                                 .map(|(url, reason)| format!("{url}: {reason}"))
                                 .collect();
-                            eprintln!(
-                                "{}",
-                                crate::relay_refusal::with_hint(format!(
-                                    "receipt publish: relay rejected kind-3400 ({})",
-                                    reasons.join("; ")
-                                ))
-                            );
+                            let why = crate::relay_refusal::with_hint(format!(
+                                "relay rejected kind-3400 ({})",
+                                reasons.join("; ")
+                            ));
+                            eprintln!("receipt publish: {why}");
+                            relay_failure = Some(format!("receipt {why}"));
                         }
                         output.success.iter().map(|url| url.to_string()).collect()
                     } else {
                         client.disconnect().await;
                         Vec::new()
                     };
-                    Ok::<Vec<String>, EffectError>(relay_success)
+                    Ok::<_, EffectError>((relay_success, relay_failure))
                 })
             })
             .join()
@@ -1418,10 +1420,43 @@ fn publish_receipt_event(
     })
 }
 
+/// Why the receipt was not sent, from its NIP-42 wait (#1228, advisor round 1 finding 3): the
+/// `wait_for_nip42_auth` error, which names a refused sign-in and carries the link hint for a
+/// registration refusal. `None` when sign-in succeeded. A window with no challenge also holds the
+/// receipt back, so it says so too. Text only: the accepted set stays empty either way.
+fn receipt_not_sent(
+    auth: &Result<crate::relay_auth::AuthWait, crate::relay_auth::RelayAuthError>,
+) -> Option<String> {
+    match auth {
+        Ok(crate::relay_auth::AuthWait::Authenticated) => None,
+        Ok(crate::relay_auth::AuthWait::NoChallenge) => {
+            Some("receipt not sent: the relay did not complete NIP-42 sign-in".to_owned())
+        }
+        Err(error) => Some(format!("receipt not sent: {error}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use cashu::MintUrl;
+
+    /// Advisor round 1, finding 3: the sign-in error reaches the receipt failure the CLI prints.
+    #[test]
+    fn a_receipt_held_back_by_a_refused_sign_in_carries_the_auth_error() {
+        use crate::relay_auth::{AuthWait, RelayAuthError};
+        assert_eq!(receipt_not_sent(&Ok(AuthWait::Authenticated)), None);
+        let refused = crate::relay_refusal::with_hint(
+            "NIP-42 sign-in refused: restricted: not a relay member",
+        );
+        let why = receipt_not_sent(&Err(RelayAuthError(refused.clone()))).expect("not sent");
+        assert!(why.contains(&refused), "{why}");
+        assert!(why.contains(crate::relay_refusal::LINK_COMMAND), "{why}");
+        let error = PaymentError::NoRelayAccepted { detail: Some(why) }.to_string();
+        assert!(error.starts_with("no relay accepted the payment: receipt not sent:"), "{error}");
+        assert!(error.contains("not a relay member"), "{error}");
+        assert!(receipt_not_sent(&Ok(AuthWait::NoChallenge)).is_some());
+    }
 
     use crate::budget::BudgetGate;
     use crate::home::{self, DEFAULT_MINT_URL};
