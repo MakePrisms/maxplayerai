@@ -88,7 +88,6 @@ async fn a_refused_write_reason_is_recognised() {
     assert!(relay_refusal::with_hint(reason).contains(LINK_COMMAND));
 }
 
-
 // ---- Issue #1228: buzz refuses an unregistered key's sign-in AND closes the socket. nostr-sdk then
 // never reports `AuthenticationFailed`, and every write used to fail with a bare `timeout` (no hint).
 
@@ -105,7 +104,10 @@ async fn buzz_gate() -> AuthRelay {
 }
 
 fn assert_hinted(error: &str) {
-    assert!(error.contains("not a relay member"), "the relay's refusal is named: {error}");
+    assert!(
+        error.contains("not a relay member"),
+        "the relay's refusal is named: {error}"
+    );
     assert!(error.contains(&format!("run `{LINK_COMMAND}`")), "{error}");
 }
 
@@ -124,8 +126,11 @@ fn home_on(relay_url: &str) -> (tempfile::TempDir, maxplayer_core::home::Maxplay
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn issue_1228_a_refused_and_closed_sign_in_is_reported_with_the_hint() {
     let relay = buzz_gate().await;
-    let error = match maxplayer_core::relay_auth::connect_authenticated(&Keys::generate(), &relay.url)
-        .await
+    let error = match maxplayer_core::relay_auth::connect_authenticated(
+        &Keys::generate(),
+        &relay.url,
+    )
+    .await
     {
         Ok(_) => panic!("a non-member must be refused"),
         Err(error) => error.to_string(),
@@ -159,7 +164,10 @@ async fn issue_1228_profile_set_names_the_refused_sign_in() {
     .await
     .expect_err("a non-member's kind-0 is refused")
     .to_string();
-    assert!(error.contains("after the relay refused NIP-42 sign-in"), "{error}");
+    assert!(
+        error.contains("after the relay refused NIP-42 sign-in"),
+        "{error}"
+    );
     assert_hinted(&error);
 }
 
@@ -170,7 +178,9 @@ async fn issue_1228_a_refused_award_send_names_the_refused_sign_in() {
     use nostr_sdk::prelude::JsonUtil;
     let relay = buzz_gate().await;
     let buyer = Keys::generate();
-    let award = EventBuilder::text_note("award stand-in").sign_with_keys(&buyer).unwrap();
+    let award = EventBuilder::text_note("award stand-in")
+        .sign_with_keys(&buyer)
+        .unwrap();
     let outcome = maxplayer_core::job_lifecycle::send_signed_award_async(
         &buyer,
         &relay.url,
@@ -192,7 +202,9 @@ async fn issue_1228_the_buyer_daemon_names_the_refused_sign_in() {
     let handle = maxplayer_core::buyer::relay::spawn(buyer.clone(), &relay.url)
         .await
         .expect("spawn");
-    let note = EventBuilder::text_note("follow-up stand-in").sign_with_keys(&buyer).unwrap();
+    let note = EventBuilder::text_note("follow-up stand-in")
+        .sign_with_keys(&buyer)
+        .unwrap();
     let error = handle
         .publish(note)
         .await

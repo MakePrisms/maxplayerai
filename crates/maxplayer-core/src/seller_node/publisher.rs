@@ -134,9 +134,15 @@ mod tests {
             attempts: 0,
             expires_at_unix: i64::MAX,
         };
-        let error = publisher.publish(&item).await.expect_err("the write is refused");
+        let error = publisher
+            .publish(&item)
+            .await
+            .expect_err("the write is refused");
         client.disconnect().await;
-        assert!(error.contains("after the relay refused NIP-42 sign-in"), "{error}");
+        assert!(
+            error.contains("after the relay refused NIP-42 sign-in"),
+            "{error}"
+        );
         assert!(error.contains("not a relay member"), "{error}");
         assert!(error.contains("run `maxplayer account link`"), "{error}");
     }

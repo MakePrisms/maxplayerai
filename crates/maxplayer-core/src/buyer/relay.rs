@@ -488,12 +488,12 @@ async fn publish_bounded(
         // refusal, and says which.
         Err(_) => {
             return Err(match sign_in.and_then(|watch| watch.refusal()) {
-                Some(refusal) => PublishError::Refused(
-                    crate::relay_refusal::annotate_refused_sign_in(
+                Some(refusal) => {
+                    PublishError::Refused(crate::relay_refusal::annotate_refused_sign_in(
                         &format!("{relay_url}: no answer within {PUBLISH_TIMEOUT:?}"),
                         Some(&refusal),
-                    ),
-                ),
+                    ))
+                }
                 None => PublishError::TimedOut,
             });
         }

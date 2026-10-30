@@ -471,8 +471,11 @@ async fn serve_connection(
                         .close_after_refused_auth
                         .load(std::sync::atomic::Ordering::SeqCst)
                 {
-                    send(&writer, json!(["OK", id, false, "auth-required: not authenticated"]))
-                        .await?;
+                    send(
+                        &writer,
+                        json!(["OK", id, false, "auth-required: not authenticated"]),
+                    )
+                    .await?;
                     continue;
                 }
                 // Record what was published, by kind, BEFORE the OK: what reaches the wire is exactly

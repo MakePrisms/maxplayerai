@@ -657,7 +657,8 @@ mod issue_1228_tests {
     #[test]
     fn a_review_request_refused_at_sign_in_names_the_refusal() {
         let refused = "review: relay refused the review request: timeout";
-        let named = annotate_request_refusal(refused, Some("restricted: not a relay member".into()));
+        let named =
+            annotate_request_refusal(refused, Some("restricted: not a relay member".into()));
         assert!(named.contains("not a relay member"), "{named}");
         assert!(named.contains("run `maxplayer account link`"), "{named}");
         assert_eq!(annotate_request_refusal(refused, None), refused);

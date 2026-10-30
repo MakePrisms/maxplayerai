@@ -18898,8 +18898,14 @@ mod tests {
     /// registration refusal tells the operator to link the key.
     #[test]
     fn issue_1228_a_refused_seat_does_not_claim_to_be_advertising() {
-        assert_eq!(advertising_state(false, true), "ADVERTISING, ready for work");
-        assert_eq!(advertising_state(false, false), "NOT serving — no live harness");
+        assert_eq!(
+            advertising_state(false, true),
+            "ADVERTISING, ready for work"
+        );
+        assert_eq!(
+            advertising_state(false, false),
+            "NOT serving — no live harness"
+        );
         assert!(advertising_state(true, true).starts_with("NOT ADVERTISING"));
         assert!(hint_suffix("restricted: not a relay member").contains("maxplayer account link"));
         assert_eq!(hint_suffix("blocked: access revoked"), "");
