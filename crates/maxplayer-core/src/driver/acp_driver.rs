@@ -307,6 +307,28 @@ impl AcpDriver {
             return Ok(response.result.unwrap_or(Value::Null));
         }
     }
+    /// Drop every update `session/load` streamed: the whole earlier conversation, which ACP
+    /// requires the agent to replay as `session/update` notifications BEFORE it answers the load
+    /// (claude-agent-acp: `loadSession` awaits `replaySessionHistory`). Left in the channel, it was
+    /// handed to the engine as part of the next turn's stream, and every earlier answer was read as
+    /// part of this turn's (#1233).
+    ///
+    /// Complete and safe because of ordering, not timing: the one reader thread routes stdout lines
+    /// in order, so every replayed notification is in `updates` before the load's response reaches
+    /// `responses`, and `session/prompt` has not been sent yet, so nothing of the new turn can be
+    /// here. Nothing is lost for bookkeeping: the model comes off the load response and the Claude
+    /// init frame (both read elsewhere), and usage off the prompt result.
+    fn discard_replayed_history(&mut self) -> usize {
+        let Some(updates) = self.updates.as_mut() else {
+            return 0;
+        };
+        let mut dropped = 0;
+        while updates.try_recv().is_ok() {
+            dropped += 1;
+        }
+        dropped
+    }
+
     /// Forget any turn-resolved model, because a new session has resolved none yet.
     ///
     /// Every current call site builds a fresh driver per run, so this clears nothing today. A REUSED
@@ -431,7 +453,11 @@ impl Driver for AcpDriver {
             "session/load",
             session_load_params(cfg, session_id, self.is_claude_adapter)?,
         )?;
-        let result = self.wait_response(id).await?;
+        let result = self.wait_response(id).await;
+        // #1233: drop the replayed history, on success AND failure (a failed load falls back to
+        // `session/new`, and a partial replay must not reach that turn either).
+        self.discard_replayed_history();
+        let result = result?;
         self.session_model = session_model_from_result(&result);
         self.reset_turn_model();
         // `session/load` answers with no id of its own (ACP); the loaded session keeps the id asked
@@ -3207,6 +3233,236 @@ mod tests {
             Some("claude-opus-5[1m]"),
             "the init frame arrived DURING the turn, so the reset must already have happened — a \
              reset that ran any later would have wiped this"
+        );
+    }
+
+    // ---- #1233: `session/load` history replay must not reach the next turn ----------------------
+
+    fn wire_update(kind: &str, text: &str) -> Value {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1",
+            "update": {"sessionUpdate": kind, "content": {"type": "text", "text": text}}}})
+    }
+
+    fn usage_wire() -> Value {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1",
+            "update": {"sessionUpdate": "usage_update", "used": 1, "size": 2}}})
+    }
+
+    /// Turns 1 and 2 of #1233's session, as claude-agent-acp replays them on `session/load`: each
+    /// user message, then the agent's marked answer streamed in chunks.
+    fn replayed_history() -> Vec<Value> {
+        vec![
+            wire_update("user_message_chunk", "remember 934"),
+            wire_update("agent_message_chunk", INLINE_ANSWER),
+            wire_update("agent_message_chunk", "\nT1|934"),
+            usage_wire(),
+            wire_update("user_message_chunk", "which number"),
+            wire_update("agent_message_chunk", INLINE_ANSWER),
+            wire_update("agent_message_chunk", "\nT2|934"),
+        ]
+    }
+
+    const INLINE_ANSWER: &str = crate::engine::INLINE_ANSWER_MARKER;
+
+    /// A `/bin/sh` agent that advertises `loadSession` and, like every ACP agent must (ACP "Session
+    /// Setup → Loading sessions": "The Agent MUST replay the entire conversation to the Client in
+    /// the form of `session/update` notifications"), streams `replay` BEFORE it answers
+    /// `session/load`. claude-agent-acp 0.85.0 does exactly this: `loadSession` awaits
+    /// `replaySessionHistory`, which sends prior user turns as `user_message_chunk` and prior
+    /// answers as `agent_message_chunk`. `session/prompt` streams `answer`, then ends the turn.
+    fn replaying_stub(replay: &[Value], answer: &[Value]) -> AgentCommand {
+        replaying_stub_answering_load(replay, answer, r#""result":{}"#)
+    }
+
+    /// [`replaying_stub`] whose `session/load` answer body is `load_reply` (e.g. an error).
+    fn replaying_stub_answering_load(
+        replay: &[Value],
+        answer: &[Value],
+        load_reply: &str,
+    ) -> AgentCommand {
+        let emit = |frames: &[Value]| {
+            frames
+                .iter()
+                .map(|frame| {
+                    let line = frame.to_string();
+                    assert!(!line.contains('\''), "the stub single-quotes each frame");
+                    format!("      printf '%s\\n' '{line}'\n")
+                })
+                .collect::<String>()
+        };
+        let script = format!(
+            concat!(
+                "while IFS= read -r line; do\n",
+                "  id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\\([0-9]*\\).*/\\1/p')\n",
+                "  case \"$line\" in\n",
+                "    *'\"initialize\"'*)\n",
+                "      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"protocolVersion\":1,",
+                "\"agentCapabilities\":{{\"loadSession\":true}},\"authMethods\":[]}}}}\\n' \"$id\" ;;\n",
+                "    *'\"session/new\"'*)\n",
+                "      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"sessionId\":\"s1\"}}}}\\n' \"$id\" ;;\n",
+                "    *'\"session/load\"'*)\n",
+                "{replay}",
+                "      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,{load_reply}}}\\n' \"$id\" ;;\n",
+                "    *'\"session/prompt\"'*)\n",
+                "{answer}",
+                "      printf '{{\"jsonrpc\":\"2.0\",\"id\":%s,\"result\":{{\"stopReason\":\"end_turn\"}}}}\\n' \"$id\" ;;\n",
+                "  esac\n",
+                "done\n",
+            ),
+            replay = emit(replay),
+            answer = emit(answer),
+            load_reply = load_reply,
+        );
+        AgentCommand::new("/bin/sh".into(), vec!["-c".into(), script])
+    }
+
+    /// One session turn through the real driver, engine and capture, as
+    /// `seller_exec::run_session_agent_in_env` runs it: the captured last message, every update the
+    /// turn's stream carried, and whether the conversation was reset.
+    async fn session_turn(
+        agent: AgentCommand,
+        resume: Option<&str>,
+    ) -> (Option<String>, Vec<SessionUpdate>, bool) {
+        use crate::engine::{AgentMessageCapture, RunEvent, SessionTurnEnd, SessionTurnParams};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let mut driver = AcpDriver::new(agent, PermissionOutcome::Allow, Duration::from_secs(10));
+        let path = std::env::temp_dir().join(format!(
+            "maxplayer-acp-1233-{}-{}.jsonl",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        let mut log = crate::log::EventLog::open(&path).expect("open log");
+        let mut capture = AgentMessageCapture::default();
+        let mut seen = Vec::new();
+        let ended = crate::engine::run_session_job(
+            &mut driver,
+            &mut log,
+            &crate::event::JobId("j1233".into()),
+            SessionTurnParams {
+                session_config: SessionConfig {
+                    cwd: std::env::temp_dir(),
+                    mcp_servers: Vec::new(),
+                    env: Vec::new(),
+                },
+                resume: resume.map(str::to_owned),
+                wrap_up_at: None,
+            },
+            Box::new(|_reset| {
+                Ok(Some(PromptTurn {
+                    input: vec![ContentBlock::Text { text: "add 1".into() }],
+                }))
+            }),
+            &mut |event| {
+                if let RunEvent::Update(update) = &event {
+                    seen.push((*update).clone());
+                }
+                capture.observe(event);
+            },
+        )
+        .await
+        .expect("the turn runs");
+        let _ = std::fs::remove_file(&path);
+        let SessionTurnEnd::Ran(outcome) = ended else {
+            panic!("the prompt was released");
+        };
+        (capture.into_last_message(), seen, outcome.context_reset)
+    }
+
+    fn mentions(update: &SessionUpdate, needle: &str) -> bool {
+        serde_json::to_string(update).expect("encode").contains(needle)
+    }
+
+    /// #1233 (a): turn 3 of a reloaded session delivers turn 3's answer only. Before the fix the
+    /// replayed turns 1 and 2 rode in the turn's own stream and glued onto the new answer —
+    /// `T1|934MAXPLAYER-ANSWER-V1\nT2|934MAXPLAYER-ANSWER-V1\nT3|935`, the issue's exact string.
+    #[tokio::test]
+    async fn a_reloaded_session_turn_delivers_only_its_own_answer() {
+        let agent = replaying_stub(
+            &replayed_history(),
+            &[
+                wire_update("agent_message_chunk", INLINE_ANSWER),
+                wire_update("agent_message_chunk", "\nT3|935"),
+            ],
+        );
+        let (message, seen, reset) = session_turn(agent, Some("s1")).await;
+        assert!(!reset, "POSITIVE CONTROL: the session was reloaded, not reset");
+        let message = message.expect("the agent answered");
+        assert_eq!(
+            crate::engine::marked_inline_answer(&message),
+            Some("T3|935"),
+            "captured message: {message:?}"
+        );
+        assert_eq!(message, format!("{INLINE_ANSWER}\nT3|935"));
+        assert!(
+            !seen.iter().any(|u| mentions(u, "T1|934")
+                || mentions(u, "T2|934")
+                || mentions(u, "user_message_chunk")),
+            "the replayed history must not reach the turn's stream: {seen:?}"
+        );
+    }
+
+    /// #1233 (b): a reloaded turn whose agent marks NO answer is refused — it must not be delivered
+    /// (and paid) off a marker replayed from an earlier turn.
+    #[tokio::test]
+    async fn a_reloaded_turn_without_a_marked_answer_is_refused() {
+        let agent = replaying_stub(
+            &replayed_history(),
+            &[wire_update("agent_message_chunk", "I could not work that out")],
+        );
+        let (message, _, reset) = session_turn(agent, Some("s1")).await;
+        assert!(!reset, "POSITIVE CONTROL: the session was reloaded, not reset");
+        let message = message.expect("the agent said something");
+        assert_eq!(message, "I could not work that out");
+        assert_eq!(crate::engine::marked_inline_answer(&message), None);
+        assert_eq!(
+            crate::session::session_delivery_content(
+                false,
+                crate::session::TurnStatus::Done,
+                &message
+            ),
+            None,
+            "an unmarked reply is refused (no_sentinel), never delivered or paid"
+        );
+    }
+
+    /// #1233: a `session/load` that replays part of the history and then FAILS falls back to
+    /// `session/new` (context reset); the partial replay must not reach that turn either.
+    #[tokio::test]
+    async fn a_failed_reload_does_not_leak_its_partial_replay() {
+        let agent = replaying_stub_answering_load(
+            &replayed_history(),
+            &[
+                wire_update("agent_message_chunk", INLINE_ANSWER),
+                wire_update("agent_message_chunk", "\nT3|935"),
+            ],
+            r#""error":{"code":-32603,"message":"transcript gone"}"#,
+        );
+        let (message, seen, reset) = session_turn(agent, Some("s1")).await;
+        assert!(reset, "POSITIVE CONTROL: the failed load fell back to a new session");
+        assert_eq!(message.as_deref(), Some(format!("{INLINE_ANSWER}\nT3|935").as_str()));
+        assert!(
+            !seen.iter().any(|u| mentions(u, "T1|934") || mentions(u, "user_message_chunk")),
+            "the partial replay must not reach the turn's stream: {seen:?}"
+        );
+    }
+
+    /// #1233 (d): turn 1 opens with `session/new`, which replays nothing; its answer is unchanged.
+    #[tokio::test]
+    async fn a_first_turn_still_delivers_its_answer() {
+        let agent = replaying_stub(
+            &replayed_history(),
+            &[
+                wire_update("agent_message_chunk", INLINE_ANSWER),
+                wire_update("agent_message_chunk", "\nT1|934"),
+            ],
+        );
+        let (message, seen, reset) = session_turn(agent, None).await;
+        assert!(!reset);
+        let message = message.expect("the agent answered");
+        assert_eq!(crate::engine::marked_inline_answer(&message), Some("T1|934"));
+        assert!(
+            seen.iter().any(|u| mentions(u, "T1|934")),
+            "the turn's own chunks reach the stream"
         );
     }
 
