@@ -3349,7 +3349,9 @@ mod tests {
             },
             Box::new(|_reset| {
                 Ok(Some(PromptTurn {
-                    input: vec![ContentBlock::Text { text: "add 1".into() }],
+                    input: vec![ContentBlock::Text {
+                        text: "add 1".into(),
+                    }],
                 }))
             }),
             &mut |event| {
@@ -3369,7 +3371,9 @@ mod tests {
     }
 
     fn mentions(update: &SessionUpdate, needle: &str) -> bool {
-        serde_json::to_string(update).expect("encode").contains(needle)
+        serde_json::to_string(update)
+            .expect("encode")
+            .contains(needle)
     }
 
     /// #1233 (a): turn 3 of a reloaded session delivers turn 3's answer only. Before the fix the
@@ -3385,7 +3389,10 @@ mod tests {
             ],
         );
         let (message, seen, reset) = session_turn(agent, Some("s1")).await;
-        assert!(!reset, "POSITIVE CONTROL: the session was reloaded, not reset");
+        assert!(
+            !reset,
+            "POSITIVE CONTROL: the session was reloaded, not reset"
+        );
         let message = message.expect("the agent answered");
         assert_eq!(
             crate::engine::marked_inline_answer(&message),
@@ -3407,10 +3414,16 @@ mod tests {
     async fn a_reloaded_turn_without_a_marked_answer_is_refused() {
         let agent = replaying_stub(
             &replayed_history(),
-            &[wire_update("agent_message_chunk", "I could not work that out")],
+            &[wire_update(
+                "agent_message_chunk",
+                "I could not work that out",
+            )],
         );
         let (message, _, reset) = session_turn(agent, Some("s1")).await;
-        assert!(!reset, "POSITIVE CONTROL: the session was reloaded, not reset");
+        assert!(
+            !reset,
+            "POSITIVE CONTROL: the session was reloaded, not reset"
+        );
         let message = message.expect("the agent said something");
         assert_eq!(message, "I could not work that out");
         assert_eq!(crate::engine::marked_inline_answer(&message), None);
@@ -3438,10 +3451,18 @@ mod tests {
             r#""error":{"code":-32603,"message":"transcript gone"}"#,
         );
         let (message, seen, reset) = session_turn(agent, Some("s1")).await;
-        assert!(reset, "POSITIVE CONTROL: the failed load fell back to a new session");
-        assert_eq!(message.as_deref(), Some(format!("{INLINE_ANSWER}\nT3|935").as_str()));
         assert!(
-            !seen.iter().any(|u| mentions(u, "T1|934") || mentions(u, "user_message_chunk")),
+            reset,
+            "POSITIVE CONTROL: the failed load fell back to a new session"
+        );
+        assert_eq!(
+            message.as_deref(),
+            Some(format!("{INLINE_ANSWER}\nT3|935").as_str())
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|u| mentions(u, "T1|934") || mentions(u, "user_message_chunk")),
             "the partial replay must not reach the turn's stream: {seen:?}"
         );
     }
@@ -3459,7 +3480,10 @@ mod tests {
         let (message, seen, reset) = session_turn(agent, None).await;
         assert!(!reset);
         let message = message.expect("the agent answered");
-        assert_eq!(crate::engine::marked_inline_answer(&message), Some("T1|934"));
+        assert_eq!(
+            crate::engine::marked_inline_answer(&message),
+            Some("T1|934")
+        );
         assert!(
             seen.iter().any(|u| mentions(u, "T1|934")),
             "the turn's own chunks reach the stream"
