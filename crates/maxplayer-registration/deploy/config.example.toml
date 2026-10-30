@@ -24,8 +24,8 @@ api_key_file = "/var/lib/secrets/maxplayer-registration-resend-key"           # 
 webhook_secret_file = "/var/lib/secrets/maxplayer-registration-resend-webhook" # whsec_..., 0600
 
 [legal]
-terms_versions = ["v1"]
-privacy_versions = ["v1"]
+terms_versions = ["20261029"]
+privacy_versions = ["20261029"]
 marketing_notice_versions = ["v1"]
 terms_url = "https://www.maxplayer.ai/terms/{version}"
 privacy_url = "https://www.maxplayer.ai/privacy/{version}"

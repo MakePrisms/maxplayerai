@@ -114,14 +114,14 @@ fn two_step_link_then_status_and_marketing() {
     assert_eq!(code, 0, "{out}\n{err}");
     // Spec §3 steps 1, 2 and 6: privacy link, terms notice, marketing notice with the off switch.
     assert!(
-        out.contains("Privacy Policy: https://www.maxplayer.ai/privacy/v1"),
+        out.contains("Privacy Policy: https://www.maxplayer.ai/privacy/20261029"),
         "{out}"
     );
     assert!(out.contains("maxplayer account marketing off"), "{out}");
     assert!(
         out.contains(
-            "Entering it accepts the Maxplayer Terms of Service, version v1: \
-             https://www.maxplayer.ai/terms/v1"
+            "Entering it accepts the Maxplayer Terms of Service, effective 20261029: \
+             https://www.maxplayer.ai/terms/20261029"
         ),
         "{out}"
     );
@@ -157,7 +157,7 @@ fn two_step_link_then_status_and_marketing() {
             reg.privacy_version.as_str(),
             reg.notice_version.as_str()
         ),
-        ("v1", "v1", "v1")
+        ("20261029", "20261029", "v1")
     );
 
     let (code, out, _) = run(&home, &fake.base_url(), &["status"]);
@@ -221,8 +221,8 @@ fn requests_are_signed_over_the_public_url_with_the_payload_hash() {
         assert!(ids.insert(auth.id), "each request signs a new event");
     }
     let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(body["terms_version"], "v1");
-    assert_eq!(body["privacy_version"], "v1");
+    assert_eq!(body["terms_version"], "20261029");
+    assert_eq!(body["privacy_version"], "20261029");
     assert_eq!(body["notice_version"], "v1");
     let confirm: Value = serde_json::from_slice(&requests[1].body).unwrap();
     assert_eq!(

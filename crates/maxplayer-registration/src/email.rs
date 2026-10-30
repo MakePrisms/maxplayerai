@@ -147,8 +147,8 @@ mod tests {
             code: "482913",
             agent_label: "my-laptop",
             npub_short: "npub1qz7…8k3x",
-            terms_url: "https://www.maxplayer.ai/terms/v1",
-            privacy_url: "https://www.maxplayer.ai/privacy/v1",
+            terms_url: "https://www.maxplayer.ai/terms/20261029",
+            privacy_url: "https://www.maxplayer.ai/privacy/20261029",
         });
         let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort();
@@ -164,8 +164,8 @@ mod tests {
         );
         let w = welcome_variables(&WelcomeEmail {
             agent_label: "my-laptop",
-            terms_url: "https://www.maxplayer.ai/terms/v1",
-            privacy_url: "https://www.maxplayer.ai/privacy/v1",
+            terms_url: "https://www.maxplayer.ai/terms/20261029",
+            privacy_url: "https://www.maxplayer.ai/privacy/20261029",
         });
         let mut keys: Vec<&str> = w.as_object().unwrap().keys().map(String::as_str).collect();
         keys.sort();

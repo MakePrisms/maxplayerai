@@ -39,7 +39,7 @@ maxplayer account link --code <6 digits from the email> --entered-by human
 maxplayer account status
 ```
 
-Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/v1); the command
+Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261029); the command
 also prints the Privacy Policy link and how to turn product news off. If you run your own credits
 mint (`maxplayer-mint`), link its key too: `maxplayer account link --mint …`. A seat whose key is
 not linked logs relay refusals ending in "run `maxplayer account link`".

@@ -52,8 +52,8 @@ maxplayer account status
 
 The code expires after 10 minutes; run `link --email … --label …` again for a new one. In a
 terminal, a bare `maxplayer account link` asks for everything. Product news is on by default;
-`maxplayer account marketing off` turns it off. Privacy Policy: https://www.maxplayer.ai/privacy/v1,
-Terms: https://www.maxplayer.ai/terms/v1. A staging service is selected with
+`maxplayer account marketing off` turns it off. Privacy Policy: https://www.maxplayer.ai/privacy/20261029,
+Terms: https://www.maxplayer.ai/terms/20261029. A staging service is selected with
 `MAXPLAYER_REGISTRATION_URL` (or `registration_url` in `config.toml`).
 
 ## Run a buyer

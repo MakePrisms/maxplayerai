@@ -182,8 +182,8 @@ impl FakeRegistration {
                 email: email.to_owned(),
                 label: "earlier".into(),
                 entered_by: "human".into(),
-                terms_version: "v1".into(),
-                privacy_version: "v1".into(),
+                terms_version: "20261029".into(),
+                privacy_version: "20261029".into(),
                 notice_version: "v1".into(),
             },
         );
@@ -423,10 +423,10 @@ fn link_request(state: &mut State, pk: &str, body: &Value) -> Answer {
             "label must be 1-64 letters, digits, spaces, '.', '_' or '-'",
         );
     }
-    if terms != "v1" {
+    if terms != "20261029" {
         return fail(400, "unknown_terms_version", "terms version is not offered");
     }
-    if privacy != "v1" {
+    if privacy != "20261029" {
         return fail(
             400,
             "unknown_privacy_version",
@@ -478,8 +478,8 @@ fn link_request(state: &mut State, pk: &str, body: &Value) -> Answer {
             "status": "code_sent",
             "expires_in_secs": CODE_TTL_SECS,
             "max_attempts": MAX_ATTEMPTS,
-            "terms_url": "https://www.maxplayer.ai/terms/v1",
-            "privacy_url": "https://www.maxplayer.ai/privacy/v1",
+            "terms_url": "https://www.maxplayer.ai/terms/20261029",
+            "privacy_url": "https://www.maxplayer.ai/privacy/20261029",
         }),
     )
 }
@@ -551,8 +551,8 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             email: pending.email.clone(),
             label: pending.label.clone(),
             entered_by: entered_by.to_owned(),
-            terms_version: "v1".into(),
-            privacy_version: "v1".into(),
+            terms_version: "20261029".into(),
+            privacy_version: "20261029".into(),
             notice_version: "v1".into(),
         },
     );
@@ -564,8 +564,8 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             "first_link": first_link,
             "email": pending.email,
             "label": pending.label,
-            "terms_version": "v1",
-            "privacy_version": "v1",
+            "terms_version": "20261029",
+            "privacy_version": "20261029",
             "relay_member": "added",
             "marketing": if subscribed { "subscribed" } else { "unsubscribed" },
         }),
