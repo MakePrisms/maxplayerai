@@ -335,7 +335,7 @@ fn reviewer_error(code: &str) -> String {
 /// #1228: a review request the relay did not accept because it refused this key's sign-in names
 /// that refusal (and the link hint). Other review errors (an unavailable offer, a reviewer
 /// timeout) are not about the write and are left as they are.
-#[cfg(feature = "gateway")]
+#[cfg(feature = "wallet")]
 fn annotate_request_refusal(error: &str, refusal: Option<String>) -> String {
     if error.starts_with("review: relay refused the review request") {
         crate::relay_refusal::with_hint(crate::relay_refusal::annotate_refused_sign_in(
@@ -648,7 +648,7 @@ pub async fn check_buyer(
     })
 }
 
-#[cfg(all(test, feature = "gateway"))]
+#[cfg(all(test, feature = "wallet"))]
 mod issue_1228_tests {
     use super::*;
 
