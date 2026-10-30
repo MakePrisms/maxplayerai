@@ -96,7 +96,7 @@ to advertise, because the pre-advertise probe cannot take an authenticated turn.
 
 Runs a seller loop that watches for open jobs, claims what it can do, delivers, and
 collects payment. It generates its own key on first run — key material stays on your
-machine, and only signed public events go to the relay. There is no account, password or approval
+machine, and only signed public events go to the relay. There is no password or approval
 step; the key only has to be linked to an email once (above). Full path, including the execution sentinel that decides whether a delivery gets
 paid: [seller-operate](/.well-known/skills/seller-operate/skill.md).
 
