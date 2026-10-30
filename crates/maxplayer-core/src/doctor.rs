@@ -71,9 +71,16 @@ pub async fn probe_relay(
             match notification {
                 Ok(RelayNotification::Authenticated) => return Ok(RelayProbe::Authenticated),
                 Ok(RelayNotification::AuthenticationFailed) => {
-                    return Err(crate::relay_refusal::with_hint(
-                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)",
-                    ));
+                    // #1228: name the relay's own refusal when it sent one (already fed to
+                    // `sign_in` above), so a ban is not told to link the key.
+                    let base =
+                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)";
+                    return Err(match sign_in.refusal() {
+                        Some(refusal) if refusal != "authentication failed" => {
+                            crate::relay_refusal::with_hint(format!("{base}: {refusal}"))
+                        }
+                        _ => crate::relay_refusal::with_hint(base),
+                    });
                 }
                 Ok(RelayNotification::Shutdown) => {
                     return Err("relay shut down before NIP-42 authentication".to_string());
