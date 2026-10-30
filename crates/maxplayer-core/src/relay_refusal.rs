@@ -146,7 +146,10 @@ mod tests {
             let annotated = annotate_refused_sign_in(timeout, Some(refusal));
             assert!(annotated.contains(AFTER_REFUSED_SIGN_IN), "{annotated}");
             assert!(annotated.contains(refusal), "{annotated}");
-            assert!(with_hint(annotated.clone()).contains(LINK_COMMAND), "{annotated}");
+            assert!(
+                with_hint(annotated.clone()).contains(LINK_COMMAND),
+                "{annotated}"
+            );
         }
         for refusal in [
             "blocked: you are banned from this community",
@@ -160,11 +163,17 @@ mod tests {
         // The SDK's bare `authentication failed` is replaced by the relay's own words, so a ban
         // does not inherit the hint the SDK text would get on its own.
         let sdk = "wss://r: authentication failed";
-        assert!(with_hint(sdk).contains(LINK_COMMAND), "unchanged without a known refusal");
+        assert!(
+            with_hint(sdk).contains(LINK_COMMAND),
+            "unchanged without a known refusal"
+        );
         let banned = annotate_refused_sign_in(sdk, Some("blocked: access revoked"));
         assert_eq!(with_hint(banned.clone()), banned, "{banned}");
         let unregistered = annotate_refused_sign_in(sdk, Some("restricted: not a relay member"));
-        assert!(with_hint(unregistered.clone()).contains(LINK_COMMAND), "{unregistered}");
+        assert!(
+            with_hint(unregistered.clone()).contains(LINK_COMMAND),
+            "{unregistered}"
+        );
         // A reason that already names the refusal is left as it is.
         let named = "wss://r: restricted: not a relay member";
         assert_eq!(

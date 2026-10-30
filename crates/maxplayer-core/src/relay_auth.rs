@@ -77,7 +77,8 @@ pub async fn wait_for_nip42_auth(
                 Ok(RelayNotification::AuthenticationFailed) => {
                     // #1228: name the relay's own refusal when it sent one, so a ban is not told
                     // to link and an unregistered key reads `not a relay member`.
-                    let base = "NIP-42 authentication failed (required for kind-1059 p-gated receive)";
+                    let base =
+                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)";
                     return Err(RelayAuthError(match sign_in.refusal() {
                         Some(refusal) if refusal != "authentication failed" => {
                             crate::relay_refusal::with_hint(format!("{base}: {refusal}"))
@@ -219,10 +220,7 @@ pub struct SignInState {
 impl SignInState {
     /// Feed one relay notification. Returns the refusal when this notification ended a sign-in
     /// as refused (so a caller can log it once per refusal).
-    pub fn observe(
-        &mut self,
-        notification: &nostr_sdk::pool::RelayNotification,
-    ) -> Option<&str> {
+    pub fn observe(&mut self, notification: &nostr_sdk::pool::RelayNotification) -> Option<&str> {
         use nostr_sdk::RelayMessage;
         use nostr_sdk::pool::RelayNotification;
         match notification {
@@ -295,9 +293,8 @@ impl SignInState {
 /// is current the moment a send returns: the SDK broadcasts `AuthenticationFailed` to every
 /// receiver at once, so a send that ended on it has already put it in this receiver's queue.
 pub struct SignInWatch {
-    notifications: std::sync::Mutex<
-        tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>,
-    >,
+    notifications:
+        std::sync::Mutex<tokio::sync::broadcast::Receiver<nostr_sdk::pool::RelayNotification>>,
     state: std::sync::Mutex<SignInState>,
     /// Refused periods seen so far (a successful sign-in ends one), so [`Self::track`] logs each
     /// once whoever drained it.
@@ -330,8 +327,8 @@ impl SignInWatch {
         on_refused: impl Fn(&str) + Send + 'static,
     ) -> tokio::task::JoinHandle<()> {
         use nostr_sdk::pool::RelayNotification;
-        use tokio::sync::broadcast::error::RecvError;
         use std::sync::atomic::Ordering;
+        use tokio::sync::broadcast::error::RecvError;
         let mut wake = relay.notifications();
         let watch = std::sync::Arc::clone(self);
         tokio::spawn(async move {
@@ -363,7 +360,10 @@ impl SignInWatch {
             .notifications
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let mut state = self.state.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         loop {
             match notifications.try_recv() {
                 Ok(notification) => {
@@ -460,9 +460,15 @@ mod sign_in_tests {
     fn a_refused_sign_in_keeps_the_relay_text_until_one_succeeds() {
         let mut state = SignInState::default();
         state.observe(&challenge());
-        assert_eq!(state.observe(&ok_false("restricted: not a relay member")), None);
+        assert_eq!(
+            state.observe(&ok_false("restricted: not a relay member")),
+            None
+        );
         // An EVENT refusal for the unauthenticated session in between is not the AUTH answer.
-        assert_eq!(state.observe(&ok_false("auth-required: not authenticated")), None);
+        assert_eq!(
+            state.observe(&ok_false("auth-required: not authenticated")),
+            None
+        );
         assert_eq!(
             state.observe(&RelayNotification::AuthenticationFailed),
             Some("restricted: not a relay member")
