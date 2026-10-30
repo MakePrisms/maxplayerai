@@ -252,12 +252,18 @@ fn payment_sent(
     if relay_success.is_empty() {
         let refused = relay_failed
             .iter()
-            .any(|f| crate::relay_refusal::is_registration_refusal(&f.error));
+            .find(|f| crate::relay_refusal::is_registration_refusal(&f.error));
         let message = "no relay accepted the NIP-17 payment";
-        return Err(PaymentSendError::Transport(if refused {
-            format!("{message} ({})", crate::relay_refusal::LINK_HINT)
-        } else {
-            message.into()
+        return Err(PaymentSendError::Transport(match refused {
+            // #1228: name the relay's refusal (e.g. `restricted: not a relay member`), not just
+            // the hint, so an operator can tell an unregistered key from a bad token.
+            Some(failure) => format!(
+                "{message} ({}: {}) ({})",
+                failure.relay,
+                failure.error,
+                crate::relay_refusal::LINK_HINT
+            ),
+            None => message.into(),
         }));
     }
 
@@ -324,27 +330,6 @@ mod tests {
             seller_pubkey: "seller".into(),
             payload: nut18_payload("job"),
         }
-    }
-
-    /// #1228: a payment the relay never answered because it refused this key's sign-in says to
-    /// link the key (it used to be a bare "no relay accepted the NIP-17 payment").
-    #[cfg(all(feature = "gateway", feature = "wallet"))]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn issue_1228_a_payment_refused_at_sign_in_names_the_link_command() {
-        let relay = crate::seller_node::p_gate_relay_fixture::PGateRelay::start(
-            std::time::Duration::from_millis(0),
-        )
-        .await;
-        relay.refuse_auth_and_close();
-        let mut send = NostrPaymentSend::new(relay.url(), nostr_sdk::prelude::Keys::generate());
-        let mut payment = payload();
-        payment.seller_pubkey = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
-        let error = send
-            .send_payment(payment)
-            .await
-            .expect_err("refused")
-            .to_string();
-        assert!(error.contains("run `maxplayer account link`"), "{error}");
     }
 
     #[cfg(feature = "wallet")]

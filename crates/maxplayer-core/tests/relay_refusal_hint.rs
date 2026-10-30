@@ -213,3 +213,34 @@ async fn issue_1228_the_buyer_daemon_names_the_refused_sign_in() {
         .to_string();
     assert_hinted(&error);
 }
+
+/// Buyer NIP-17 payment send: the relay's refusal of the sign-in reaches the payment error. Before
+/// #1228 the failure here was `relay not connected`, which carries no hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_1228_a_payment_refused_at_sign_in_names_the_link_command() {
+    use maxplayer_core::payment_send::{NostrPaymentSend, PaymentPayload, PaymentSend};
+    use std::str::FromStr;
+    let relay = buzz_gate().await;
+    let proof = cashu::Proof::new(
+        cashu::Amount::from(7),
+        cashu::Id::from_str("009a1f293253e41e").unwrap(),
+        cashu::secret::Secret::new("issue-1228"),
+        cashu::SecretKey::generate().public_key(),
+    );
+    let payment = PaymentPayload {
+        seller_pubkey: Keys::generate().public_key().to_hex(),
+        payload: cashu::nuts::nut18::PaymentRequestPayload {
+            id: Some("job".into()),
+            memo: None,
+            mint: cashu::MintUrl::from_str("https://testnut.cashu.space").unwrap(),
+            unit: cashu::CurrencyUnit::Sat,
+            proofs: vec![proof],
+        },
+    };
+    let error = NostrPaymentSend::new(relay.url.clone(), Keys::generate())
+        .send_payment(payment)
+        .await
+        .expect_err("refused")
+        .to_string();
+    assert_hinted(&error);
+}
