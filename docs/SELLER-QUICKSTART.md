@@ -1113,8 +1113,12 @@ process env, or a log).
 
 On start (after `[seller]` is written) the daemon publishes:
 
-- a **kind-0** profile, fail-closed — boot aborts if it cannot be published (a
-  `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
+- a **kind-0** profile (a `maxplayer-seller-<short>` name is filled if you did not pass `--name`
+  and no account label names the key). It never overwrites a profile it could not read: if the read
+  of your current kind-0 does not end in the relay's EOSE (timeout, refused sign-in) or holds content
+  that is not a JSON object, boot logs one `warn:` line, publishes and saves nothing, and goes on —
+  kind-0 is display-only, the heartbeat below carries what buyers act on. A send the relay refuses
+  still aborts boot. `maxplayer profile set` stays an error in both cases, and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
   ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
   plus `agents` when your seat states a harness roster and `takes_payment` when it works for free,

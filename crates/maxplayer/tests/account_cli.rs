@@ -876,6 +876,7 @@ fn link_confirm_publish_failure_still_succeeds_with_a_hint() {
         err.contains("Could not publish \"my-laptop\" as this agent's public name"),
         "{err}"
     );
+    assert!(err.contains("the next maxplayer start tries again"), "{err}");
     assert!(
         err.contains("maxplayer profile set --name \"my-laptop\""),
         "{err}"

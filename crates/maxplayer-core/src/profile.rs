@@ -53,6 +53,11 @@ pub enum ProfileError {
     Input(String),
     Home(HomeError),
     Relay(String),
+    /// This key's stored kind-0 could not be read: the read did not end in the relay's EOSE (timeout,
+    /// refused sign-in, dropped connection), or its content is not a JSON object where a merge needs
+    /// one. Nothing was published or saved. `profile set` reports it as an error; seller start and
+    /// the automatic label fill skip the kind-0 update with a warning (kind-0 is display-only).
+    Unread(String),
 }
 
 impl fmt::Display for ProfileError {
@@ -60,7 +65,9 @@ impl fmt::Display for ProfileError {
         match self {
             Self::Input(message) => write!(formatter, "profile input: {message}"),
             Self::Home(error) => write!(formatter, "{error}"),
-            Self::Relay(message) => write!(formatter, "profile relay: {message}"),
+            Self::Relay(message) | Self::Unread(message) => {
+                write!(formatter, "profile relay: {message}")
+            }
         }
     }
 }
@@ -110,7 +117,6 @@ pub async fn set_profile_async(
         &keys,
         profile.name.as_deref(),
         profile.about.as_deref(),
-        None,
     )
     .await?
     .event_id;
@@ -125,8 +131,9 @@ pub async fn set_profile_async(
     })
 }
 
-/// Seller start: publish the clobber-safe kind-0 identity. Fetch → merge name/about → publish;
-/// **abort on fetch failure**.
+/// Seller start: publish the clobber-safe kind-0 identity. Fetch → merge name/about → publish.
+/// A fetch that did not complete, or a stored kind-0 that is not a JSON object, publishes and
+/// saves nothing and returns [`ProfileError::Unread`]; seller start logs it and boots on.
 ///
 /// Kind-0 is the ONLY event this publishes. Issue #645 retired the kind-31990 handler announce
 /// that used to ride alongside it: every capability it carried (mints, rate, harness,
@@ -177,39 +184,46 @@ pub async fn publish_seller_discoverability_with(
     let local_name = configured_name(home);
     let fallback = (local_name.is_none() && allow_default_name)
         .then(|| format!("maxplayer-seller-{short}"));
+    let keys = buyer_keys(home)?;
+    // Read before anything is saved: a profile that cannot be read leaves config.toml untouched
+    // (no generated about, no default name) as well as the relay.
+    let (session, mut fields) = open_merge_base(home, &keys, true).await?;
+
     let existing_about = home.config.profile.as_ref().and_then(|p| p.about.as_deref());
     let existing_generated = home.config.profile.as_ref().and_then(|p| p.about_generated);
     let live_about = default_seller_about(agent.as_deref(), rate_sats, &home.config.accepted_mints);
     if let Some((about, about_generated)) =
         generated_about_update(existing_about, existing_generated, live_about)
     {
-        home::save_config(home, |config| {
+        let saved = home::save_config(home, |config| {
             let profile = config.profile.get_or_insert_with(ProfileConfig::default);
             profile.about = Some(about);
             profile.about_generated = Some(about_generated);
-        })?;
+        });
+        if let Err(error) = saved {
+            session.client.disconnect().await;
+            return Err(error.into());
+        }
     }
 
     let about = home.config.profile.as_ref().and_then(|p| p.about.clone());
-    let keys = buyer_keys(home)?;
-    let published = publish_metadata_merged_async(
-        home,
-        &keys,
+    let name = merge_name_about(
+        &mut fields,
         local_name.as_deref(),
         about.as_deref(),
         fallback.as_deref(),
-    )
-    .await?;
+    );
+    let event_id = send_metadata(session, home, &keys, fields).await?;
     if local_name.is_none()
-        && let Some(name) = &published.name
+        && let Some(name) = &name
     {
         save_profile_name(home, name)?;
     }
 
     Ok(SellerDiscoverabilityOutcome {
         pubkey: keys.public_key().to_hex(),
-        kind0_event_id: published.event_id,
-        name: published.name,
+        kind0_event_id: event_id,
+        name,
         relay_url: home.config.relay_url.clone(),
     })
 }
@@ -298,33 +312,68 @@ fn kind0_read_deadline() -> std::time::Instant {
 /// What [`publish_metadata_merged_async`] published.
 struct MergedPublish {
     event_id: String,
-    /// The kind-0 `name` now on the relay: the given name, the relay's own, the fallback, or none.
-    name: Option<String>,
 }
 
-/// Fail-closed read-merge-write for replaceable kind-0 (never blind-overwrite). Reads this key's
-/// kind-0 to the relay's EOSE and republishes every field it holds as published, with `about` set
-/// when given and the name set to `name`, else left as the relay has it, else `fallback_name`. A read
-/// that did not end in EOSE publishes nothing. Callers hold [`profile_write_lock`].
-async fn publish_metadata_merged_async(
+/// Connect and read this key's kind-0 as the base of a merge: every field as published, or empty
+/// when the relay holds none. A read that did not end in EOSE is [`ProfileError::Unread`]; so is a
+/// stored kind-0 whose content is not a JSON object when `unreadable_is_error` (seller start, which
+/// must not replace what it cannot read). Callers hold [`profile_write_lock`].
+async fn open_merge_base(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
-    name: Option<&str>,
-    about: Option<&str>,
-    fallback_name: Option<&str>,
-) -> Result<MergedPublish, ProfileError> {
+    unreadable_is_error: bool,
+) -> Result<(Kind0Session, serde_json::Map<String, serde_json::Value>), ProfileError> {
     let session = connect_metadata_client(home, keys).await?;
-    let mut fields = match read_own_kind0(&session, keys, kind0_read_deadline()).await {
+    let fields = match read_own_kind0(&session, keys, kind0_read_deadline()).await {
         Ok(OwnKind0::Fields(fields)) => fields,
-        // Nothing stored, or content that is not a JSON object: no field can be read out of it, so
-        // there is nothing to keep (this publish carries an explicit name and about anyway).
-        Ok(OwnKind0::Absent | OwnKind0::NotAnObject) => serde_json::Map::new(),
+        Ok(OwnKind0::Absent) => serde_json::Map::new(),
+        Ok(OwnKind0::NotAnObject) if unreadable_is_error => {
+            session.client.disconnect().await;
+            return Err(not_an_object());
+        }
+        // An explicit `profile set`: no field can be read out of it, so there is nothing to keep
+        // (this publish carries the operator's own name and about).
+        Ok(OwnKind0::NotAnObject) => serde_json::Map::new(),
         Err(error) => {
             session.client.disconnect().await;
             return Err(error);
         }
     };
-    let name = match (name, remote_name(&fields)) {
+    Ok((session, fields))
+}
+
+fn not_an_object() -> ProfileError {
+    ProfileError::Unread(
+        "this key's kind-0 content is not a JSON object, so it cannot be read or merged; nothing \
+         was published"
+            .into(),
+    )
+}
+
+/// Fail-closed read-merge-write for replaceable kind-0 (never blind-overwrite), for `profile set`.
+/// Reads this key's kind-0 to the relay's EOSE and republishes every field it holds as published,
+/// with the given name and about set. A read that did not end in EOSE publishes nothing.
+async fn publish_metadata_merged_async(
+    home: &MaxplayerHome,
+    keys: &nostr_sdk::Keys,
+    name: Option<&str>,
+    about: Option<&str>,
+) -> Result<MergedPublish, ProfileError> {
+    let (session, mut fields) = open_merge_base(home, keys, false).await?;
+    merge_name_about(&mut fields, name, about, None);
+    let event_id = send_metadata(session, home, keys, fields).await?;
+    Ok(MergedPublish { event_id })
+}
+
+/// Set `about` when given and the name to `name`, else leave it as the relay has it, else
+/// `fallback_name`. Returns the kind-0 `name` the merged content carries.
+fn merge_name_about(
+    fields: &mut serde_json::Map<String, serde_json::Value>,
+    name: Option<&str>,
+    about: Option<&str>,
+    fallback_name: Option<&str>,
+) -> Option<String> {
+    let name = match (name, remote_name(fields)) {
         (Some(name), _) => {
             fields.insert("name".into(), name.into());
             Some(name.to_owned())
@@ -339,8 +388,7 @@ async fn publish_metadata_merged_async(
     if let Some(about) = about {
         fields.insert("about".into(), about.into());
     }
-    let event_id = send_metadata(session, home, keys, fields).await?;
-    Ok(MergedPublish { event_id, name })
+    name
 }
 
 /// One connection for a kind-0 read and the send that follows it.
@@ -397,7 +445,7 @@ async fn read_own_kind0(
     use nostr_sdk::prelude::{Filter, Kind};
 
     let incomplete = |reason: String| {
-        ProfileError::Relay(crate::relay_refusal::with_hint(format!(
+        ProfileError::Unread(crate::relay_refusal::with_hint(format!(
             "kind-0 read incomplete, so nothing was published (refusing to write over a profile \
              it could not read): {}",
             session.sign_in.annotate(&reason)
@@ -515,7 +563,7 @@ fn save_profile_name(home: &mut MaxplayerHome, name: &str) -> Result<(), Profile
 /// yet: `[profile].name` unset or blank AND the relay's kind-0 has no `name`. An operator-set name
 /// is never replaced. The read must end in the relay's EOSE and every other kind-0 field is kept as
 /// published; a read that did not finish, or a kind-0 whose content is not a JSON object, publishes
-/// nothing. `[profile].name` is written only after the relay accepted the event, so a failure
+/// nothing ([`ProfileError::Unread`]; callers warn and the next start's backfill tries again). `[profile].name` is written only after the relay accepted the event, so a failure
 /// leaves the key eligible for the startup backfill.
 pub async fn fill_name_from_label_async(
     home: &mut MaxplayerHome,
@@ -548,11 +596,7 @@ async fn fill_name_until(
         Ok(OwnKind0::Fields(fields)) => fields,
         Ok(OwnKind0::NotAnObject) => {
             session.client.disconnect().await;
-            return Err(ProfileError::Relay(
-                "this key's kind-0 content is not a JSON object, so whether it already names the \
-                 key cannot be read; nothing was published"
-                    .into(),
-            ));
+            return Err(not_an_object());
         }
         Err(error) => {
             session.client.disconnect().await;
@@ -786,7 +830,10 @@ async fn backfill_name_within(home: &mut MaxplayerHome, budget: Duration) -> Nam
             match fill_name_until(home, &label, Some(deadline)).await {
                 Ok(fill) => NameBackfill::Filled(fill),
                 Err(error) => {
-                    crate::opline!("warn: public name backfill skipped: {error}");
+                    crate::opline!(
+                        "warn: public name backfill skipped, nothing published (retried next \
+                         start): {error}"
+                    );
                     NameBackfill::Failed(error.to_string())
                 }
             }
@@ -1911,9 +1958,21 @@ mod name_fill_tests {
         let error = fill_name_from_label_async(&mut fx.home, "my laptop")
             .await
             .expect_err("unreadable content must not be overwritten");
+        assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
         assert!(error.to_string().contains("not a JSON object"), "{error}");
         assert_eq!(kind0_contents(&fx).await, vec!["not json at all".to_owned()]);
         assert_eq!(saved_name(&mut fx.home), None);
+
+        // Seller start skips it the same way: nothing published, nothing saved.
+        let seller = super::tests::wiring_seller(1);
+        home::save_config(&mut fx.home, |config| config.seller = Some(seller)).unwrap();
+        let error = publish_seller_discoverability_with(&mut fx.home, true)
+            .await
+            .expect_err("seller start must not replace unreadable content");
+        assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
+        assert_eq!(kind0_contents(&fx).await, vec!["not json at all".to_owned()]);
+        home::reload_config(&mut fx.home).unwrap();
+        assert!(fx.home.config.profile.is_none(), "{:?}", fx.home.config.profile);
     }
 
     /// A home on the EOSE-withholding fixture relay, with a seller section.
@@ -1969,10 +2028,18 @@ mod name_fill_tests {
             "{:?}",
             started.elapsed()
         );
+        assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
         let error = publish_seller_discoverability_with(&mut home, true)
             .await
             .expect_err("seller start must not publish over an unread profile");
+        assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
         assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
+        home::reload_config(&mut home).unwrap();
+        assert!(
+            home.config.profile.is_none(),
+            "seller start saved {:?} without reading the profile",
+            home.config.profile
+        );
         let error = set_profile_async(
             &mut home,
             SetProfileRequest {
@@ -1981,7 +2048,8 @@ mod name_fill_tests {
             },
         )
         .await
-        .expect_err("profile set must not publish over an unread profile");
+        .expect_err("profile set stays an error over an unread profile");
+        assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
         assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
         assert_eq!(relay.event_kind_count(0).await, 0, "no kind-0 reached the relay");
         assert_eq!(saved_name(&mut home), None);

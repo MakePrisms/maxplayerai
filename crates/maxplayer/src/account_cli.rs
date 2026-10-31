@@ -449,8 +449,9 @@ mod wallet {
             Err(error) => {
                 let _ = writeln!(
                     err,
-                    "Could not publish \"{label}\" as this agent's public name ({error}). Run \
-                     `{set_hint}` to set it."
+                    "warning: Could not publish \"{label}\" as this agent's public name yet \
+                     ({error}). Nothing was changed; the next maxplayer start tries again, or run \
+                     `{set_hint}` to set it now."
                 );
             }
         }

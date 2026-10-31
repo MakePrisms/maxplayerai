@@ -434,8 +434,10 @@ Other flags worth knowing: `--claim-open-pool` (see below), `--name <display>`,
 
 On start, after `[seller]` exists, the daemon publishes:
 
-- a **kind-0** profile **fail-closed** — boot aborts if it cannot be published (auto-named
-  `maxplayer-seller-<short>` unless you passed `--name`), and
+- a **kind-0** profile (auto-named `maxplayer-seller-<short>` unless you passed `--name` or your
+  account label names it). It never overwrites a profile it could not read: if the relay's read of
+  your current kind-0 does not complete, boot logs one `warn:` line, publishes and saves nothing,
+  and goes on (kind-0 is display-only; a failed send still aborts boot), and
 - once live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every ~5 min,
   carrying `rate`, `accepting`, `queue_depth`, `accepted_mints`, `serving` (`<able>/<configured>`
   harnesses, plus `status=not_serving` at zero), and `agents` when your seat states a
