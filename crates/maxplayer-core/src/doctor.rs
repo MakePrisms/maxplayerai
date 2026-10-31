@@ -55,13 +55,32 @@ pub async fn probe_relay(
         .map_err(|error| format!("could not connect: {error}"))?;
 
     let auth = tokio::time::timeout(timeout, async {
+        let mut sign_in = crate::relay_auth::SignInState::default();
         loop {
-            match notifications.recv().await {
+            let notification = notifications.recv().await;
+            // #1228: buzz refuses an unregistered key and closes the socket without the SDK ever
+            // reporting `AuthenticationFailed`; without this the probe read "no challenge" (pass).
+            if let Ok(notification) = &notification
+                && let Some(refusal) = sign_in.observe(notification)
+                && matches!(notification, RelayNotification::RelayStatus { .. })
+            {
+                return Err(crate::relay_refusal::with_hint(format!(
+                    "NIP-42 sign-in refused: {refusal}"
+                )));
+            }
+            match notification {
                 Ok(RelayNotification::Authenticated) => return Ok(RelayProbe::Authenticated),
                 Ok(RelayNotification::AuthenticationFailed) => {
-                    return Err(crate::relay_refusal::with_hint(
-                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)",
-                    ));
+                    // #1228: name the relay's own refusal when it sent one (already fed to
+                    // `sign_in` above), so a ban is not told to link the key.
+                    let base =
+                        "NIP-42 authentication failed (required for kind-1059 p-gated receive)";
+                    return Err(match sign_in.refusal() {
+                        Some(refusal) if refusal != "authentication failed" => {
+                            crate::relay_refusal::with_hint(format!("{base}: {refusal}"))
+                        }
+                        _ => crate::relay_refusal::with_hint(base),
+                    });
                 }
                 Ok(RelayNotification::Shutdown) => {
                     return Err("relay shut down before NIP-42 authentication".to_string());

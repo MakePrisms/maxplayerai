@@ -4897,6 +4897,7 @@ mod tests {
             buyer_signature: receipt_buyer_keys().sign_schnorr(&message).to_string(),
             preimage,
             relay_success: vec!["memory://relay".into()],
+            relay_failure: None,
         }
     }
 

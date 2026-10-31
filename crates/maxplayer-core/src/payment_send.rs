@@ -208,6 +208,9 @@ impl PaymentSend for NostrPaymentSend {
         client.add_relay(&self.relay).await.map_err(|error| {
             PaymentSendError::Transport(format!("failed to add relay: {error}"))
         })?;
+        // Before connect (#1228): a payment refused because the relay refused this key's sign-in
+        // names that refusal instead of a bare `timeout`.
+        let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &self.relay).await;
         client.connect().await;
 
         let output = client
@@ -230,7 +233,10 @@ impl PaymentSend for NostrPaymentSend {
                 .into_iter()
                 .map(|(url, error)| PaymentRelayFailure {
                     relay: url.to_string(),
-                    error,
+                    error: match &sign_in {
+                        Some(sign_in) => sign_in.annotate(&error),
+                        None => error,
+                    },
                 })
                 .collect(),
         )
@@ -246,12 +252,18 @@ fn payment_sent(
     if relay_success.is_empty() {
         let refused = relay_failed
             .iter()
-            .any(|f| crate::relay_refusal::is_registration_refusal(&f.error));
+            .find(|f| crate::relay_refusal::is_registration_refusal(&f.error));
         let message = "no relay accepted the NIP-17 payment";
-        return Err(PaymentSendError::Transport(if refused {
-            format!("{message} ({})", crate::relay_refusal::LINK_HINT)
-        } else {
-            message.into()
+        return Err(PaymentSendError::Transport(match refused {
+            // #1228: name the relay's refusal (e.g. `restricted: not a relay member`), not just
+            // the hint, so an operator can tell an unregistered key from a bad token.
+            Some(failure) => format!(
+                "{message} ({}: {}) ({})",
+                failure.relay,
+                failure.error,
+                crate::relay_refusal::LINK_HINT
+            ),
+            None => message.into(),
         }));
     }
 

@@ -525,6 +525,10 @@ pub struct ReceiptEvidence {
     pub buyer_signature: String,
     /// Relays that accepted the receipt publish. EMPTY ⇒ fail closed before evidence.
     pub relay_success: Vec<String>,
+    /// Why no relay accepted it, when the publisher knows (#1228: a refused NIP-42 sign-in,
+    /// with the link hint for a registration refusal). Message text only: it never changes the
+    /// fail-closed decision on an empty `relay_success`.
+    pub relay_failure: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,7 +551,9 @@ impl ReceiptAuthority {
         // evidence (mirrors `send_payment`'s empty-relay gate). Recovery retries only the
         // idempotent receipt publish.
         if evidence.relay_success.is_empty() {
-            return Err(PaymentError::NoRelayAccepted);
+            return Err(PaymentError::NoRelayAccepted {
+                detail: evidence.relay_failure,
+            });
         }
         // Author must be the externally-anchored buyer (offer author).
         if evidence.author != self.buyer {
@@ -944,7 +950,7 @@ impl<'a, J: PaymentJournal> PaymentService<'a, J> {
             require_verified_matches_terms(&verified, terms)?;
             let payment = effects.send_payment(key, &attempt_id, terms, locked, &verified)?;
             if payment.relay_success.is_empty() {
-                return Err(PaymentError::NoRelayAccepted);
+                return Err(PaymentError::NoRelayAccepted { detail: None });
             }
             let sent = PaymentState::Sent {
                 attempt_id,
@@ -1275,7 +1281,11 @@ pub enum PaymentError {
     Journal(JournalError),
     Delivery(DeliveryError),
     Effect(EffectError),
-    NoRelayAccepted,
+    /// No relay accepted the payment or its receipt. `detail` is the publisher's reason when it
+    /// has one (#1228: the receipt's refused sign-in); the classification is the same either way.
+    NoRelayAccepted {
+        detail: Option<String>,
+    },
     AmbiguousSendRefused,
     /// A recovered `Locked` token's proofs read Spent/Pending at the mint during operator
     /// completion — the seller already redeemed by some path. Completion STOPS (never resends)
@@ -1299,7 +1309,12 @@ impl fmt::Display for PaymentError {
             Self::Journal(error) => error.fmt(formatter),
             Self::Delivery(error) => write!(formatter, "delivery verification refused: {error}"),
             Self::Effect(error) => write!(formatter, "payment effect failed: {error}"),
-            Self::NoRelayAccepted => formatter.write_str("no relay accepted the payment"),
+            Self::NoRelayAccepted { detail: None } => {
+                formatter.write_str("no relay accepted the payment")
+            }
+            Self::NoRelayAccepted {
+                detail: Some(detail),
+            } => write!(formatter, "no relay accepted the payment: {detail}"),
             Self::AmbiguousSendRefused => {
                 formatter.write_str("payment send state is ambiguous; refusing automatic resend")
             }
@@ -1760,7 +1775,7 @@ mod tests {
 
         let first =
             PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut effects);
-        assert!(matches!(first, Err(PaymentError::NoRelayAccepted)));
+        assert!(matches!(first, Err(PaymentError::NoRelayAccepted { .. })));
         assert!(matches!(
             journal.records().last().map(|record| &record.value),
             Some(PaymentState::Locked { .. })
@@ -2115,7 +2130,7 @@ mod tests {
         let error = PaymentService::new(&journal)
             .complete_recovered_locked(&key(), &terms(), &authority(), &mut effects)
             .unwrap_err();
-        assert!(matches!(error, PaymentError::NoRelayAccepted));
+        assert!(matches!(error, PaymentError::NoRelayAccepted { .. }));
         assert_eq!(journal.records().len(), before, "no Sent appended on relay reject");
         assert!(matches!(
             journal.records().last().map(|record| &record.value),
@@ -2308,8 +2323,60 @@ mod tests {
         evidence.relay_success.clear();
         assert!(matches!(
             authority().verify(evidence, &key()),
-            Err(PaymentError::NoRelayAccepted)
+            Err(PaymentError::NoRelayAccepted { detail: None })
         ));
+    }
+
+    /// Advisor round 1, finding 3: the receipt's sign-in refusal reaches the payment error, and
+    /// the money path is unchanged: verify fails closed, the journal holds at `Sent`, the receipt
+    /// is retried and then closes.
+    #[test]
+    fn a_receipt_refused_at_sign_in_names_why_and_still_holds_at_sent() {
+        const WHY: &str =
+            "receipt not sent: NIP-42 sign-in refused: restricted: not a relay member";
+        let mut evidence = valid_evidence(&key());
+        evidence.relay_success.clear();
+        evidence.relay_failure = Some(WHY.into());
+        let error = authority().verify(evidence, &key()).unwrap_err();
+        assert!(
+            matches!(&error, PaymentError::NoRelayAccepted { detail: Some(detail) } if detail == WHY),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("no relay accepted the payment: {WHY}")
+        );
+
+        let journal = MemoryPaymentJournal::default();
+        let shared = FakeShared::default();
+        let mut effects = FakeEffects::new(shared.clone());
+        effects.empty_receipt_relay = true;
+        effects.receipt_failure = Some(WHY.into());
+        let first =
+            PaymentService::new(&journal).advance(&key(), &terms(), &authority(), &mut effects);
+        match &first {
+            Err(error @ PaymentError::NoRelayAccepted { .. }) => {
+                assert!(error.to_string().contains(WHY), "{error}")
+            }
+            other => panic!("an unaccepted receipt is NoRelayAccepted, got {other:?}"),
+        }
+        assert!(matches!(
+            journal.records().last().map(|record| &record.value),
+            Some(PaymentState::Sent { .. })
+        ));
+        let mut retry = FakeEffects::new(shared.clone());
+        assert!(matches!(
+            PaymentService::new(&journal)
+                .advance(&key(), &terms(), &authority(), &mut retry)
+                .unwrap(),
+            PaymentState::Closed { .. }
+        ));
+        assert_eq!(
+            shared.send_count.load(Ordering::SeqCst),
+            1,
+            "never a re-sent payment"
+        );
+        assert_eq!(shared.receipt_count.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2517,6 +2584,7 @@ mod tests {
         fail_receipt: bool,
         forged_receipt: bool,
         empty_receipt_relay: bool,
+        receipt_failure: Option<String>,
         ordering_journal: Option<MemoryPaymentJournal>,
         replay_sync_journal: Option<MemoryPaymentJournal>,
         /// The recovered-`Locked` proof-state gate reports a Spent proof (STOP + alarm path).
@@ -2564,6 +2632,7 @@ mod tests {
                 fail_receipt: false,
                 forged_receipt: false,
                 empty_receipt_relay: false,
+                receipt_failure: None,
                 ordering_journal: None,
                 replay_sync_journal: None,
                 locked_gate_spent: false,
@@ -2671,6 +2740,7 @@ mod tests {
             }
             if self.empty_receipt_relay {
                 evidence.relay_success.clear();
+                evidence.relay_failure = self.receipt_failure.clone();
             }
             Ok(evidence)
         }
@@ -2917,6 +2987,7 @@ mod tests {
             buyer_signature: sign_hex(&buyer_keys(), digest),
             preimage,
             relay_success: vec!["memory://relay".into()],
+            relay_failure: None,
         }
     }
 

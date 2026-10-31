@@ -42,6 +42,9 @@ pub struct AuthRelayOptions {
     /// Membership: accept a sign-in only from these keys (buzz with
     /// `BUZZ_REQUIRE_RELAY_MEMBERSHIP`; repeat a key for one member). `None` accepts any sign-in.
     pub members: Option<[PublicKey; 2]>,
+    /// Refuse a sign-in the way buzz does (issue #1228): `OK false` with `restricted: not a relay
+    /// member`, then close the socket. `false` keeps the refusal text above and the socket open.
+    pub buzz_refusal: bool,
 }
 
 impl Default for AuthRelayOptions {
@@ -52,6 +55,7 @@ impl Default for AuthRelayOptions {
             challenge_delay: Duration::from_millis(150),
             gate: true,
             members: None,
+            buzz_refusal: false,
         }
     }
 }
@@ -231,8 +235,16 @@ async fn connection(
                             authenticated = true;
                             counters.auths.fetch_add(1, Ordering::SeqCst);
                         }
-                        let reason = if ok { "" } else { "restricted: auth rejected" };
+                        let reason = match (ok, options.buzz_refusal) {
+                            (true, _) => "",
+                            (false, true) => "restricted: not a relay member",
+                            (false, false) => "restricted: auth rejected",
+                        };
                         if front.send(text(json!(["OK", v[1]["id"], ok, reason]))).await.is_err() {
+                            return;
+                        }
+                        if !ok && options.buzz_refusal {
+                            let _ = front.close(None).await;
                             return;
                         }
                         continue;

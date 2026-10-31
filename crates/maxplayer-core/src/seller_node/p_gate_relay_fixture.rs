@@ -111,6 +111,8 @@ struct Controls {
     /// When set, the relay answers each AUTH with `OK false`, and the socket stays
     /// unauthenticated. The deployed relay sends no second challenge after that.
     refuse_auth: std::sync::atomic::AtomicBool,
+    /// With `refuse_auth`: close the socket right after the refusal, as buzz does (#1228).
+    close_after_refused_auth: std::sync::atomic::AtomicBool,
     /// EVENT kinds the relay records but never answers with `OK` — a relay that stopped
     /// acknowledging publications, which is what a stuck outbox drain waits on.
     withheld_ok_kinds: std::sync::Mutex<Vec<u64>>,
@@ -287,6 +289,15 @@ impl PGateRelay {
             .unwrap_or_else(|poison| poison.into_inner()) = kinds.to_vec();
     }
 
+    /// Refuse every later AUTH the way buzz refuses an unregistered key (#1228): `OK false`
+    /// `restricted: not a relay member`, then close the socket.
+    pub(crate) fn refuse_auth_and_close(&self) {
+        self.controls
+            .close_after_refused_auth
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.refuse_auth();
+    }
+
     /// Answer every later AUTH with `OK false`.
     pub(crate) fn refuse_auth(&self) {
         self.controls
@@ -426,6 +437,13 @@ async fn serve_connection(
                     let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
                     let refusal = json!(["OK", id, false, "restricted: not a relay member"]);
                     send(&writer, refusal).await?;
+                    if controls
+                        .close_after_refused_auth
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        let _ = writer.lock().await.close().await;
+                        return Ok(());
+                    }
                     continue;
                 }
                 if event.get("kind").and_then(Value::as_u64) == Some(22242) {
@@ -446,6 +464,20 @@ async fn serve_connection(
             Some("EVENT") => {
                 let Some(event) = frame.get(1) else { continue };
                 let id = event.get("id").and_then(Value::as_str).unwrap_or_default();
+                // buzz refuses an EVENT from a session that has not signed in (#1228 mode only, so
+                // every older test keeps its ungated writes).
+                if authed_pubkey.is_none()
+                    && controls
+                        .close_after_refused_auth
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    send(
+                        &writer,
+                        json!(["OK", id, false, "auth-required: not authenticated"]),
+                    )
+                    .await?;
+                    continue;
+                }
                 // Record what was published, by kind, BEFORE the OK: what reaches the wire is exactly
                 // the property the pre-advertise gate is asserted against (#357).
                 let kind = event.get("kind").and_then(Value::as_u64);
