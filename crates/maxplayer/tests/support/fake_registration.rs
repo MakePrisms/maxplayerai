@@ -70,6 +70,8 @@ struct State {
     cooldown_secs: u64,
     confirm_calls: usize,
     requests: Vec<Recorded>,
+    /// What confirm and status report as `relay_member` (`added` unless a test changes it).
+    relay_member: String,
 }
 
 pub struct FakeRegistration {
@@ -132,6 +134,7 @@ impl FakeRegistration {
             cooldown_secs: 60,
             confirm_calls: 0,
             requests: Vec::new(),
+            relay_member: "added".into(),
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -156,6 +159,11 @@ impl FakeRegistration {
     /// Pretend the service's public URL is something else (a client signing the wrong URL).
     pub fn set_public_base(&self, base: &str) {
         self.state.lock().unwrap().public_base = base.trim_end_matches('/').to_owned();
+    }
+
+    /// `added` or `pending`: the relay membership confirm and status report.
+    pub fn set_relay_member(&self, state: &str) {
+        self.state.lock().unwrap().relay_member = state.to_owned();
     }
 
     pub fn set_cooldown_secs(&self, secs: u64) {
@@ -566,7 +574,7 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             "label": pending.label,
             "terms_version": "20261029",
             "privacy_version": "20261029",
-            "relay_member": "added",
+            "relay_member": state.relay_member,
             "marketing": if subscribed { "subscribed" } else { "unsubscribed" },
         }),
     )
@@ -589,7 +597,7 @@ fn status(state: &State, pk: &str) -> Answer {
             "code_entered_by": reg.entered_by,
             "linked_at": "2026-10-28T12:00:00+00:00",
             "marketing": if subscribed { "subscribed" } else { "unsubscribed" },
-            "relay_member": "added",
+            "relay_member": state.relay_member,
         }),
     )
 }

@@ -239,9 +239,28 @@ async fn publish_metadata_merged_async(
     keys: &nostr_sdk::Keys,
     profile: &ProfileConfig,
 ) -> Result<String, ProfileError> {
-    use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind, Metadata};
+    let (client, sign_in) = connect_metadata_client(home, keys).await?;
+    let mut metadata = match fetch_own_metadata(&client, keys).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            client.disconnect().await;
+            return Err(error);
+        }
+    };
+    if let Some(name) = &profile.name {
+        metadata = metadata.name(name);
+    }
+    if let Some(about) = &profile.about {
+        metadata = metadata.about(about);
+    }
+    send_metadata(client, sign_in, home, keys, &metadata).await
+}
 
-    let client = Client::new(keys.clone());
+async fn connect_metadata_client(
+    home: &MaxplayerHome,
+    keys: &nostr_sdk::Keys,
+) -> Result<(nostr_sdk::Client, Option<crate::relay_auth::SignInWatch>), ProfileError> {
+    let client = nostr_sdk::Client::new(keys.clone());
     client
         .add_relay(&home.config.relay_url)
         .await
@@ -250,22 +269,30 @@ async fn publish_metadata_merged_async(
     // (#1228), and the send below then only says `timeout`.
     let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &home.config.relay_url).await;
     client.connect().await;
+    Ok((client, sign_in))
+}
+
+/// This key's current kind-0 as the relay holds it (empty when it has none). A failed fetch is an
+/// error, never an empty profile: the caller must not publish over metadata it could not read.
+async fn fetch_own_metadata(
+    client: &nostr_sdk::Client,
+    keys: &nostr_sdk::Keys,
+) -> Result<nostr_sdk::prelude::Metadata, ProfileError> {
+    use nostr_sdk::prelude::{Filter, Kind, Metadata};
 
     let filter = Filter::new()
         .author(keys.public_key())
         .kind(Kind::Metadata)
         .limit(1);
     let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
-    let fetched = client.fetch_events(filter, timeout).await;
-    let fetched = match fetched {
-        Ok(events) => events,
-        Err(error) => {
-            client.disconnect().await;
-            return Err(ProfileError::Relay(format!(
+    let fetched = client
+        .fetch_events(filter, timeout)
+        .await
+        .map_err(|error| {
+            ProfileError::Relay(format!(
                 "kind-0 fetch failed (fail-closed, refuse blind overwrite): {error}"
-            )));
-        }
-    };
+            ))
+        })?;
 
     use nostr_sdk::JsonUtil;
     let mut metadata = Metadata::new();
@@ -289,19 +316,26 @@ async fn publish_metadata_merged_async(
             }
         }
     }
-    if let Some(name) = &profile.name {
-        metadata = metadata.name(name);
-    }
-    if let Some(about) = &profile.about {
-        metadata = metadata.about(about);
-    }
+    Ok(metadata)
+}
 
-    let event = EventBuilder::metadata(&metadata)
-        .sign_with_keys(keys)
-        .map_err(|error| {
-            // disconnect best-effort before returning
-            ProfileError::Relay(format!("sign kind-0: {error}"))
-        })?;
+/// Sign and send `metadata` as this key's kind-0; disconnects `client` either way.
+async fn send_metadata(
+    client: nostr_sdk::Client,
+    sign_in: Option<crate::relay_auth::SignInWatch>,
+    home: &MaxplayerHome,
+    keys: &nostr_sdk::Keys,
+    metadata: &nostr_sdk::prelude::Metadata,
+) -> Result<String, ProfileError> {
+    use nostr_sdk::prelude::EventBuilder;
+
+    let event = match EventBuilder::metadata(metadata).sign_with_keys(keys) {
+        Ok(event) => event,
+        Err(error) => {
+            client.disconnect().await;
+            return Err(ProfileError::Relay(format!("sign kind-0: {error}")));
+        }
+    };
     let output = client
         .send_event_to([&home.config.relay_url], &event)
         .await;
@@ -314,6 +348,175 @@ async fn publish_metadata_merged_async(
         ))));
     }
     Ok(output.val.to_hex())
+}
+
+/// How [`fill_name_from_label_async`] ended. Only `Published` wrote a kind-0.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NameFill {
+    /// The label was published as kind-0 `name` (other kind-0 fields kept) and saved to
+    /// `[profile].name`.
+    Published { name: String, event_id: String },
+    /// `[profile].name` was already set; nothing was fetched or published.
+    KeptLocal(String),
+    /// The relay already held a kind-0 `name` for this key. Nothing was published; the name was
+    /// saved to `[profile].name` so later republishes (seller start) keep it too.
+    KeptRemote(String),
+}
+
+impl NameFill {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Published { name, .. } | Self::KeptLocal(name) | Self::KeptRemote(name) => name,
+        }
+    }
+}
+
+fn configured_name(home: &MaxplayerHome) -> Option<String> {
+    home.config
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.name.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+/// Publish the account-link `label` as this key's kind-0 `name`, but only when the key has no name
+/// yet: `[profile].name` unset or blank AND the relay's kind-0 has no `name`. An operator-set name
+/// is never replaced. Uses the fail-closed fetch-merge-write, so `about` and every other kind-0 field
+/// survives, and a failed fetch publishes nothing. `[profile].name` is written only after the relay
+/// accepted the event, so a failure leaves the key eligible for the startup backfill.
+pub async fn fill_name_from_label_async(
+    home: &mut MaxplayerHome,
+    label: &str,
+) -> Result<NameFill, ProfileError> {
+    home::reload_config(home)?;
+    if let Some(name) = configured_name(home) {
+        return Ok(NameFill::KeptLocal(name));
+    }
+    let name = crate::registration::normalize_label(label)
+        .ok_or_else(|| ProfileError::Input("the account label is not a usable name".into()))?;
+    let keys = buyer_keys(home)?;
+    let (client, sign_in) = connect_metadata_client(home, &keys).await?;
+    let metadata = match fetch_own_metadata(&client, &keys).await {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            client.disconnect().await;
+            return Err(error);
+        }
+    };
+    let save_name = |home: &mut MaxplayerHome, name: &str| {
+        home::save_config(home, |config| {
+            config
+                .profile
+                .get_or_insert_with(ProfileConfig::default)
+                .name = Some(name.to_owned());
+        })
+    };
+    if let Some(remote) = metadata
+        .name
+        .as_deref()
+        .and_then(|remote| clamp_field(remote, PROFILE_NAME_MAX))
+    {
+        client.disconnect().await;
+        save_name(home, &remote)?;
+        return Ok(NameFill::KeptRemote(remote));
+    }
+    let event_id = send_metadata(client, sign_in, home, &keys, &metadata.name(&name)).await?;
+    save_name(home, &name)?;
+    Ok(NameFill::Published { name, event_id })
+}
+
+/// Sync twin of [`fill_name_from_label_async`] for the CLI (`account link`).
+pub fn fill_name_from_label(
+    home: &mut MaxplayerHome,
+    label: &str,
+) -> Result<NameFill, ProfileError> {
+    crate::runtime_guard::refuse_nested_block_on("fill_name_from_label")
+        .map_err(ProfileError::Relay)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| ProfileError::Relay(error.to_string()))?;
+    runtime.block_on(fill_name_from_label_async(home, label))
+}
+
+/// Whether an account label from `registration_url` may name this key on `relay_url`: only when
+/// both are on the same host. A registration service vouches for membership on the relay it fronts
+/// (`https://relay.maxplayer.ai/account` ↔ `wss://relay.maxplayer.ai`); a link made with a
+/// different service says nothing about this relay, and a home pointed at a test or self-hosted
+/// relay must not consult the public service at all.
+pub fn registration_pairs_with_relay(registration_url: &str, relay_url: &str) -> bool {
+    use nostr_sdk::prelude::Url;
+    let host = |raw: &str| {
+        Url::parse(raw.trim())
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+    };
+    matches!((host(registration_url), host(relay_url)), (Some(a), Some(b)) if a == b)
+}
+
+/// Upper bound on the startup backfill (status call + fill), so a slow service never holds a
+/// seller's start for longer than this.
+pub const NAME_BACKFILL_BUDGET: Duration = Duration::from_secs(15);
+
+/// Startup backfill for keys linked before `account link` published the label: when
+/// `[profile].name` is unset, ask the registration service for this key's link, and if it is linked
+/// with a label and is a relay member, run [`fill_name_from_label_async`]. A fill saves the name, so
+/// the next start makes no status call at all. Best effort: every failure is one `warn:` line and
+/// `None`, never an error.
+pub async fn backfill_name_from_link_async(home: &mut MaxplayerHome) -> Option<NameFill> {
+    backfill_name_within(home, NAME_BACKFILL_BUDGET).await
+}
+
+async fn backfill_name_within(home: &mut MaxplayerHome, budget: Duration) -> Option<NameFill> {
+    if let Err(error) = home::reload_config(home) {
+        crate::opline!("warn: public name backfill skipped: {error}");
+        return None;
+    }
+    if configured_name(home).is_some()
+        || !registration_pairs_with_relay(&home.config.registration_url, &home.config.relay_url)
+    {
+        return None;
+    }
+    match tokio::time::timeout(budget, backfill_name_inner(home)).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(message)) => {
+            crate::opline!("warn: public name backfill skipped: {message}");
+            None
+        }
+        Err(_) => {
+            crate::opline!(
+                "warn: public name backfill skipped: no answer within {}s",
+                budget.as_secs()
+            );
+            None
+        }
+    }
+}
+
+async fn backfill_name_inner(home: &mut MaxplayerHome) -> Result<Option<NameFill>, String> {
+    let keys = buyer_keys(home).map_err(|error| error.to_string())?;
+    let base = home.config.registration_url.clone();
+    // The registration client is blocking reqwest; keep it off the async workers.
+    let status = tokio::task::spawn_blocking(move || {
+        crate::registration::RegistrationClient::new(&base, keys)?.status()
+    })
+    .await
+    .map_err(|error| format!("status task: {error}"))?
+    .map_err(|error| error.to_string())?;
+    let label = match (
+        status.registered,
+        status.relay_member.as_deref(),
+        status.label,
+    ) {
+        (true, Some("added"), Some(label)) => label,
+        _ => return Ok(None),
+    };
+    fill_name_from_label_async(home, &label)
+        .await
+        .map(Some)
+        .map_err(|error| error.to_string())
 }
 
 fn apply_profile_updates(profile: &mut ProfileConfig, name: Option<String>, about: Option<String>) {
@@ -932,5 +1135,366 @@ mod tests {
         );
         assert_eq!(mint_host_label("http://cashu.example/path?q=1"), "cashu.example");
         assert_eq!(mint_host_label("custom-mint-label"), "custom-mint-label");
+    }
+}
+
+/// A stand-in for the registration service's `GET /status` (loopback, no auth check): answers every
+/// request with the configured link and counts the calls. Shared with the seller-start tests.
+#[cfg(test)]
+pub(crate) mod fake_status {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    pub(crate) struct FakeStatus {
+        base: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl FakeStatus {
+        /// `label`/`relay_member` as `GET /status` reports them for a linked key.
+        pub(crate) fn linked(label: &str, relay_member: &str) -> Self {
+            let body = serde_json::json!({
+                "registered": true,
+                "email": "you@example.com",
+                "label": label,
+                "relay_member": relay_member,
+            })
+            .to_string();
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake status");
+            let base = format!(
+                "http://127.0.0.1:{}/account",
+                listener.local_addr().unwrap().port()
+            );
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counter = calls.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming().flatten() {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut length = 0usize;
+                    let mut line = String::new();
+                    while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap_or(0);
+                        }
+                        line.clear();
+                    }
+                    let mut rest = vec![0u8; length];
+                    let _ = reader.read_exact(&mut rest);
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut stream = stream;
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+            });
+            Self { base, calls }
+        }
+
+        pub(crate) fn base_url(&self) -> String {
+            self.base.clone()
+        }
+
+        pub(crate) fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+}
+
+#[cfg(test)]
+mod name_fill_tests {
+    use super::fake_status::FakeStatus;
+    use super::*;
+    use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+    use nostr_sdk::prelude::{Client, EventBuilder, Filter, Kind, Metadata};
+
+    struct Fixture {
+        _relay: LocalRelay,
+        relay_url: String,
+        home: MaxplayerHome,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.home.root);
+        }
+    }
+
+    /// nostr-relay-builder 0.44.1 probes a free port, releases it, then binds it again, so a
+    /// parallel test can take it in between: retry only that AddrInUse, with a fresh relay.
+    async fn start_relay() -> LocalRelay {
+        for attempt in 1..=8 {
+            let relay = LocalRelay::new(RelayBuilder::default());
+            match relay.run().await {
+                Ok(()) => return relay,
+                Err(nostr_relay_builder::Error::IO(error))
+                    if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 8 => {}
+                Err(error) => panic!("relay run: {error}"),
+            }
+        }
+        unreachable!("the last attempt returns or panics")
+    }
+
+    /// A fresh home on a local relay, with `registration_url` (or an unused loopback port).
+    async fn fixture(label: &str, registration_url: Option<String>) -> Fixture {
+        let relay = start_relay().await;
+        let relay_url = relay.url().await.to_string();
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-name-fill-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("home");
+        let registration_url = registration_url.unwrap_or_else(|| {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            format!("http://127.0.0.1:{port}/account")
+        });
+        let url = relay_url.clone();
+        home::save_config(&mut home, |config| {
+            config.relay_url = url;
+            config.registration_url = registration_url;
+        })
+        .expect("persist fixture config");
+        Fixture {
+            _relay: relay,
+            relay_url,
+            home,
+        }
+    }
+
+    fn keys(home: &MaxplayerHome) -> nostr_sdk::Keys {
+        buyer_keys(home).expect("keys")
+    }
+
+    /// Every kind-0 this key has on the relay (a replaceable event: the relay keeps the newest).
+    async fn kind0s(fx: &Fixture) -> Vec<Metadata> {
+        use nostr_sdk::JsonUtil;
+        let client = Client::default();
+        client.add_relay(&fx.relay_url).await.unwrap();
+        client.connect().await;
+        let filter = Filter::new()
+            .author(keys(&fx.home).public_key())
+            .kind(Kind::Metadata);
+        let events = client
+            .fetch_events(filter, Duration::from_secs(5))
+            .await
+            .expect("read kind-0");
+        client.disconnect().await;
+        events
+            .into_iter()
+            .map(|e| Metadata::from_json(&e.content).expect("kind-0 json"))
+            .collect()
+    }
+
+    async fn seed_kind0(fx: &Fixture, metadata: &Metadata) {
+        let keys = keys(&fx.home);
+        let client = Client::new(keys.clone());
+        client.add_relay(&fx.relay_url).await.unwrap();
+        client.connect().await;
+        let event = EventBuilder::metadata(metadata)
+            .sign_with_keys(&keys)
+            .unwrap();
+        client.send_event(&event).await.expect("seed kind-0");
+        client.disconnect().await;
+    }
+
+    fn saved_name(home: &mut MaxplayerHome) -> Option<String> {
+        home::reload_config(home).unwrap();
+        home.config.profile.as_ref().and_then(|p| p.name.clone())
+    }
+
+    /// No local and no remote name: the label is published and saved, and the fail-closed merge
+    /// keeps every other kind-0 field.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn label_fill_publishes_when_nameless_and_keeps_other_fields() {
+        let mut fx = fixture("publish", None).await;
+        seed_kind0(
+            &fx,
+            &Metadata::new()
+                .about("operator about")
+                .website(nostr_sdk::Url::parse("https://example.com").unwrap()),
+        )
+        .await;
+        let outcome = fill_name_from_label_async(&mut fx.home, "  my laptop ")
+            .await
+            .expect("fill");
+        assert!(
+            matches!(&outcome, NameFill::Published { name, .. } if name == "my laptop"),
+            "{outcome:?}"
+        );
+        let remote = kind0s(&fx).await;
+        assert_eq!(remote.len(), 1, "{remote:?}");
+        assert_eq!(remote[0].name.as_deref(), Some("my laptop"));
+        assert_eq!(remote[0].about.as_deref(), Some("operator about"));
+        assert_eq!(remote[0].website.as_deref(), Some("https://example.com/"));
+        assert_eq!(saved_name(&mut fx.home).as_deref(), Some("my laptop"));
+    }
+
+    /// `[profile].name` set: nothing is read or published, and the name stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn label_fill_never_replaces_a_local_name() {
+        let mut fx = fixture("local", None).await;
+        home::save_config(&mut fx.home, |config| {
+            config
+                .profile
+                .get_or_insert_with(ProfileConfig::default)
+                .name = Some("ops-box".into());
+        })
+        .unwrap();
+        let outcome = fill_name_from_label_async(&mut fx.home, "my laptop")
+            .await
+            .expect("fill");
+        assert_eq!(outcome, NameFill::KeptLocal("ops-box".into()));
+        assert!(kind0s(&fx).await.is_empty(), "no kind-0 may be published");
+        assert_eq!(saved_name(&mut fx.home).as_deref(), Some("ops-box"));
+    }
+
+    /// The relay already names this key: no publish, and the remote name is saved locally so a
+    /// later republish (seller start) keeps it rather than writing a default over it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn label_fill_never_replaces_a_remote_name() {
+        let mut fx = fixture("remote", None).await;
+        seed_kind0(&fx, &Metadata::new().name("set-elsewhere").about("a")).await;
+        let outcome = fill_name_from_label_async(&mut fx.home, "my laptop")
+            .await
+            .expect("fill");
+        assert_eq!(outcome, NameFill::KeptRemote("set-elsewhere".into()));
+        let remote = kind0s(&fx).await;
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].name.as_deref(), Some("set-elsewhere"));
+        assert_eq!(saved_name(&mut fx.home).as_deref(), Some("set-elsewhere"));
+    }
+
+    /// A relay that cannot be read publishes nothing and saves nothing (fail closed), so the
+    /// backfill can try again later.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn label_fill_fails_closed_on_an_unreachable_relay() {
+        let mut fx = fixture("dead-relay", None).await;
+        home::save_config(&mut fx.home, |config| {
+            config.relay_url = "ws://127.0.0.1:1".into();
+        })
+        .unwrap();
+        assert!(
+            fill_name_from_label_async(&mut fx.home, "my laptop")
+                .await
+                .is_err()
+        );
+        assert_eq!(saved_name(&mut fx.home), None);
+    }
+
+    /// Linked + member + no name: the first start asks `/status` once and fills; the saved name
+    /// means the next start makes no status call at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_fills_once_then_skips_the_status_call() {
+        let status = FakeStatus::linked("old-buyer", "added");
+        let mut fx = fixture("backfill", Some(status.base_url())).await;
+        let first = backfill_name_from_link_async(&mut fx.home).await;
+        assert!(
+            matches!(&first, Some(NameFill::Published { name, .. }) if name == "old-buyer"),
+            "{first:?}"
+        );
+        assert_eq!(status.calls(), 1);
+        assert_eq!(kind0s(&fx).await[0].name.as_deref(), Some("old-buyer"));
+        assert_eq!(saved_name(&mut fx.home).as_deref(), Some("old-buyer"));
+
+        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        assert_eq!(status.calls(), 1, "a named key never calls /status again");
+    }
+
+    /// Membership still queued: no publish (the relay would refuse it) and nothing saved, so a
+    /// later start tries again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_waits_for_relay_membership() {
+        let status = FakeStatus::linked("old-buyer", "pending");
+        let mut fx = fixture("pending", Some(status.base_url())).await;
+        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        assert_eq!(status.calls(), 1);
+        assert!(kind0s(&fx).await.is_empty());
+        assert_eq!(saved_name(&mut fx.home), None);
+    }
+
+    /// An unreachable service is a quiet `None` well inside the budget, and changes nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_status_failure_does_not_block() {
+        let mut fx = fixture("status-down", None).await;
+        let started = std::time::Instant::now();
+        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        assert!(
+            started.elapsed() < NAME_BACKFILL_BUDGET,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(kind0s(&fx).await.is_empty());
+        assert_eq!(saved_name(&mut fx.home), None);
+    }
+
+    /// A service that never answers is cut off at the budget rather than holding startup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_gives_up_at_its_budget() {
+        // Accepts the connection, then never answers.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/account",
+            listener.local_addr().unwrap().port()
+        );
+        let mut fx = fixture("status-hang", Some(url)).await;
+        let started = std::time::Instant::now();
+        assert_eq!(
+            backfill_name_within(&mut fx.home, Duration::from_millis(300)).await,
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(listener);
+    }
+
+    /// A home whose relay is not the one the registration service fronts never asks it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_skips_a_registration_service_for_another_relay() {
+        let status = FakeStatus::linked("old-buyer", "added");
+        let mut fx = fixture(
+            "unpaired",
+            Some(status.base_url().replace("127.0.0.1", "localhost")),
+        )
+        .await;
+        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        assert_eq!(status.calls(), 0);
+    }
+
+    #[test]
+    fn registration_pairs_only_with_its_own_relay_host() {
+        assert!(registration_pairs_with_relay(
+            home::DEFAULT_REGISTRATION_URL,
+            home::DEFAULT_RELAY_URL
+        ));
+        assert!(registration_pairs_with_relay(
+            "http://127.0.0.1:9/account",
+            "ws://127.0.0.1:7777"
+        ));
+        assert!(!registration_pairs_with_relay(
+            home::DEFAULT_REGISTRATION_URL,
+            "ws://127.0.0.1:7777"
+        ));
+        assert!(!registration_pairs_with_relay(
+            "not a url",
+            home::DEFAULT_RELAY_URL
+        ));
     }
 }

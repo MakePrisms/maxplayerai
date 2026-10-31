@@ -314,6 +314,8 @@ pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
     // the seller's report. NULL must mean "seller never reported", so boot re-reads the bind and
     // lands it through the same row-level write-once gate (it can never rewrite recorded truth).
     heal_award_attribution(&context.store, &context.home);
+    // A key linked before `account link` published its label has no kind-0 name: fill it once.
+    spawn_name_backfill(&context);
     // The award-attempt sweep (#322) rides the reconcile task — its boot pass runs there first,
     // spawned off the socket's 10s readiness budget (`daemon::ensure` gives up and every
     // cold-start MCP call fails if one slow relay eats it), and one task means the boot pass and
@@ -341,6 +343,21 @@ pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
     spawn_private_content_worker(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
+}
+
+/// A key linked to an email before `account link` published its label has no kind-0 name: fill it
+/// from the account label once (`profile::backfill_name_from_link_async`). Off the boot path so a
+/// slow registration service never delays the socket; it only writes `[profile].name`, which the
+/// daemon does not read.
+fn spawn_name_backfill(context: &Arc<BuyerContext>) {
+    let mut home = context.home.clone();
+    tokio::spawn(async move {
+        if let Some(crate::profile::NameFill::Published { name, .. }) =
+            crate::profile::backfill_name_from_link_async(&mut home).await
+        {
+            crate::opline!("buyer: public name set from the account label: {name}");
+        }
+    });
 }
 
 /// Recipient-copy retries outlive job completion. A delayed Maxplayer copy must

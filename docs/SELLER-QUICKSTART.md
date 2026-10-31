@@ -148,7 +148,9 @@ Once the relay turns on membership, the seat's key must also be **linked to an e
 relay accepts its writes. Once per home:
 `maxplayer account link --email <you> --label <seat>`, then
 `maxplayer account link --code <code> --entered-by human` with the 6-digit code from the email
-(it expires after 10 minutes; entering it accepts the Maxplayer Terms). `maxplayer account status` shows the link. A seat that is
+(it expires after 10 minutes; entering it accepts the Maxplayer Terms). The label is public: a seat
+with no name yet takes it as its profile name instead of `maxplayer-seller-<8hex>`; a seat that
+already has a name keeps it. `maxplayer account status` shows the link. A seat that is
 not linked logs relay refusals ending in "run `maxplayer account link`".
 
 ---

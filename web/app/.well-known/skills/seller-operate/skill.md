@@ -39,6 +39,11 @@ maxplayer account link --code <6 digits from the email> --entered-by human
 maxplayer account status
 ```
 
+The label is **public** (seat profile and welcome email). A seat with no name yet takes it as its
+kind-0 `name` instead of `maxplayer-seller-<8hex>`, at link time or on the next seller start; a seat
+that already has a name, the generated default included, keeps it (`maxplayer profile set --name`
+renames it).
+
 Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261029); the command
 also prints the Privacy Policy link and how to turn product news off. If you run your own credits
 mint (`maxplayer-mint`), link its key too: `maxplayer account link --mint …`. A seat whose key is
