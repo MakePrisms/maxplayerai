@@ -8,7 +8,7 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync, readFileSync, openSync, closeSync, fsyncSync, writeSync, renameSync, unlinkSync, readSync, fstatSync, lstatSync, statSync, linkSync, readdirSync, opendirSync, realpathSync, constants as fsConstants } from 'node:fs';
 import { resolve, dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { coordinate, relayReady, tradeReady, snapshotFresh, TRANSIENT_REASONS, waitingOnHarnessProbe } from './coordinator.mjs';
+import { coordinate, relayReady, tradeReady, authSatisfied, snapshotFresh, TRANSIENT_REASONS, waitingOnHarnessProbe } from './coordinator.mjs';
 const here = dirname(fileURLToPath(import.meta.url));
 const seconds = () => Math.floor(Date.now()/1000);
 // Process groups of in-flight commands, so a runner told to stop can kill them (planner, MCP).
@@ -986,10 +986,10 @@ export function readinessBlocker(snap,now) {
     const r=snap?.relay;
     if(!r)return 'no relay status';
     const trade=r.relays?.find(x=>x.role==='trade');
-    if(trade&&!tradeReady(snap))return `trade relay not ready: ${trade.url} (${trade.error??(!trade.connected?'disconnected':!trade.authenticated?'not authenticated':'history incomplete')})`;
+    if(trade&&!tradeReady(snap))return `trade relay not ready: ${trade.url} (${trade.error??(!trade.connected?'disconnected':!authSatisfied(trade)?'not authenticated':'history incomplete')})`;
     if(r.error)return r.error;
     if(!r.connected)return 'disconnected';
-    if(!r.authenticated)return 'not authenticated';
+    if(!authSatisfied(r))return 'not authenticated';
     const q=r.quorum,missing=r.missingRelays??r.failedRelays??[];
     return `history incomplete${q?` (${q.complete} of ${q.total} challenge relays complete, need ${q.required})`:''}${missing.length?`: ${missing.join(', ')}`:''}`;
   }
@@ -1804,9 +1804,10 @@ export function relayCoverageLine(r) {
   if(!r)return 'Relay coverage unknown';
   const q=r.quorum,missing=r.missingRelays??r.failedRelays??[];
   const trade=r.relays?.find(x=>x.role==='trade');
-  // Same condition as tradeReady (coordinator.mjs): connected, authenticated, history complete, no error.
+  // Same condition as tradeReady (coordinator.mjs): connected, AUTH as expected (authenticated or
+  // anonymous posture, #1243), history complete, no error.
   const tradeDown=trade&&!tradeReady({relay:r});
-  if(tradeDown)return `Relay coverage incomplete; trade relay not ready: ${trade.url} (required${trade.error?`: ${trade.error}`:!trade.connected?': disconnected':!trade.authenticated?': not authenticated':': history incomplete'}); nothing is posted or published`;
+  if(tradeDown)return `Relay coverage incomplete; trade relay not ready: ${trade.url} (required${trade.error?`: ${trade.error}`:!trade.connected?': disconnected':!authSatisfied(trade)?': not authenticated':': history incomplete'}); nothing is posted or published`;
   if(q&&q.complete<q.required)return `Relay coverage below quorum (${q.complete} of ${q.total} challenge relays complete, need ${q.required}); unavailable: ${missing.join(', ')}`;
   if(r.degraded)return `WARNING: relay coverage degraded (${q.complete} of ${q.total} challenge relays complete, quorum ${q.required}); missing: ${missing.join(', ')}`;
   return r.failedRelays?.length?`Relay coverage incomplete; unavailable: ${r.failedRelays.join(', ')}`:'All configured relays available';
@@ -1824,10 +1825,10 @@ export function relayHealthLines({status,sockets={}},now) {
   const rows=[{role:'overall',url:'',...status},...(status?.relays??[])];
   return rows.map(r=>{
     const s=r.role==='overall'?null:sockets[r.url];
-    const fields={connected:!!r.connected,authenticated:!!r.authenticated,historyComplete:!!r.historyComplete,error:r.error??null,warnings:r.warnings??[],
+    const fields={connected:!!r.connected,authenticated:!!r.authenticated,authMode:r.authMode??null,historyComplete:!!r.historyComplete,error:r.error??null,warnings:r.warnings??[],
       ...(r.role==='overall'?{failedRelays:r.failedRelays??[],quorum:r.quorum??null,degraded:!!r.degraded}:{socket:s?.readyState??null,sockets:s?.sockets??0})};
     const key=JSON.stringify([r.role,r.url,fields]);
-    const text=`relay ${r.role}${r.url?` ${r.url}`:''}: connected=${fields.connected} authenticated=${fields.authenticated} historyComplete=${fields.historyComplete} error=${JSON.stringify(fields.error)} warnings=${JSON.stringify(fields.warnings)}`+
+    const text=`relay ${r.role}${r.url?` ${r.url}`:''}: connected=${fields.connected} authenticated=${fields.authenticated}${fields.authMode?` authMode=${fields.authMode}`:''} historyComplete=${fields.historyComplete} error=${JSON.stringify(fields.error)} warnings=${JSON.stringify(fields.warnings)}`+
       (r.role==='overall'?` failed=${JSON.stringify(fields.failedRelays)}${fields.quorum?` quorum=${fields.quorum.complete}/${fields.quorum.total} (need ${fields.quorum.required}) degraded=${fields.degraded}`:''}`:` socket=${fields.socket} reconnects=${Math.max(0,fields.sockets-1)} lastMessage=${age(s?.lastMessageAt,now)} ago messages=${s?.messages??0}`);
     return {id:`${r.role} ${r.url}`,key,text};
   });

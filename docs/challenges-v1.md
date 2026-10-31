@@ -374,8 +374,17 @@ The community HTTP/SSE server and review page have been removed; use
   `RELAY_URL` feeds the existing app config (default `wss://relay.maxplayer.ai`). Custom
   hosted relay origins must also be allowed in `web/app/vercel.json` CSP.
 - The buyer runner takes `--relay-url` / `RELAY_URL` and derives the buyer public key
-  from its configured CLI home. Its admission gate still requires authenticated,
-  complete trade-relay history and complete history from at least the quorum of challenge relays.
+  from its configured CLI home. Its admission gate requires complete, error-free trade-relay
+  history with AUTH as the reader expects it, and complete history from at least the quorum of
+  challenge relays. Each reader status carries `authMode`: `authenticated` (AUTH OK),
+  `pending` (AUTH expected and not done: a challenge not yet answered, a reconnect waiting for the
+  challenge an earlier connection got, or a recovery that needs AUTH OK) or `anonymous` (the relay
+  never challenged, or refused or never answered AUTH outside recovery). `authenticated` and
+  `anonymous` count; `pending` does not, and a status without `authMode` still needs
+  `authenticated`. Since relay membership gates AUTH (#1223), `wss://relay.maxplayer.ai` refuses the
+  reader's throwaway key with `restricted: not a relay member` and serves it the same open reads as
+  an anonymous connection, so that read is `anonymous` and ready (#1243). The page shows "Live" for
+  both counted modes and "Polling" while AUTH is pending.
   `SWARM_CHALLENGE_RELAYS` selects the same default public relay list; public relays need no AUTH.
   Partial coverage is exposed as `relay.failedRelays`, `relay.missingRelays`, `relay.quorum`
   (`required`, `complete`, `total`), `relay.degraded` and per-source `relay.relays` status.

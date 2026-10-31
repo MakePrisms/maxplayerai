@@ -4,18 +4,28 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 const nonnegative = n => Number.isFinite(n) && n >= 0;
-// Our trade relay alone: connected, authenticated, history complete, no error. Required for every
-// read the runner trusts and before every challenge publish, whatever the challenge quorum says.
+// #1243: AUTH counts only where the reader expects it. The reader signs AUTH with a throwaway key;
+// a member-gated relay refuses it ("restricted: not a relay member") and serves the same open
+// reads it serves an anonymous connection. The reader then reports authMode 'anonymous', and a
+// complete, error-free anonymous read is trusted. Every strict-round rule (recovery that needs
+// AUTH OK, a challenge not yet answered) stays in the reader: there authMode is 'pending' and
+// historyComplete needs AUTH OK anyway. A status without authMode (older reader) still needs
+// authenticated.
+export const authSatisfied = r => !!(r?.authenticated || r?.authMode === 'anonymous');
+// One relay status: connected, history complete, no error, AUTH as expected (authSatisfied).
+export const readReady = r => !!(r?.connected && r?.historyComplete && !r?.error && authSatisfied(r));
+// Our trade relay alone: readReady. Required for every read the runner trusts and before every
+// challenge publish, whatever the challenge quorum says.
 export const tradeReady = snapshot => {
   const r = snapshot.relay, t = r?.relays?.find(x => x.role === 'trade') ?? r;
-  return !!(t?.connected && t?.authenticated && t?.historyComplete && !t?.error);
+  return readReady(t);
 };
-// Exactly the relay_not_ready condition: connected, authenticated, complete, no error, our trade
-// relay ready, and the challenge relay quorum met (run 2 #13). Quorum met with a relay missing
-// (degraded) is ready. A snapshot without quorum fields (older reader) needs every relay.
+// Exactly the relay_not_ready condition: the aggregate readReady, our trade relay ready, and the
+// challenge relay quorum met (run 2 #13). Quorum met with a relay missing (degraded) is ready. A
+// snapshot without quorum fields (older reader) needs every relay.
 export const relayReady = snapshot => {
   const r = snapshot.relay;
-  if (!(r?.connected && r?.authenticated && r?.historyComplete && !r?.error && tradeReady(snapshot))) return false;
+  if (!(readReady(r) && tradeReady(snapshot))) return false;
   if (r.relays && r.failedRelays?.includes(r.relays.find(x => x.role === 'trade')?.url)) return false;
   if (r.quorum === undefined) return !r.failedRelays?.length;
   // Re-checks the quorum rule itself (a strict majority of the challenge relays, at most all of
