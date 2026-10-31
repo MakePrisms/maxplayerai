@@ -199,7 +199,12 @@ minimum N`, or, with the default-off `SWARM_AUTO_RAISE_TO_RATE`, raised to the m
 headroom. Rejected assignments of the last `assign` batch, with their reasons, are returned to
 the planner as `rejectedAssignments` on its next calls, with the plan's ids as `validWorkstreams`;
 the next eligible tick calls `assign` again at once, at most twice per day for the same error, then
-the normal cadence applies (logged).
+the normal cadence applies (logged). An unknown (not stale) plain workstream id in an otherwise
+valid assignment is adopted as a new plan workstream instead (at most 8 per call, journaled as
+`adoptedWorkstreams`). A planner command that fails (exit, empty or non-JSON output) is retried once
+in the same call with a reduced input (`plannerRetries`). An empty, placeholder or trivially short
+delivery is collected and paid as before but journaled `deliveryFlag: unusable` and shown to the
+planner as not completed work.
 Job status shown to the planner comes from the runner's journal, never from the planner's own plan
 text: `running` holds only jobs the journal says are running, a finished job whose relay meter is
 still open is in `awaitingAccept`, each plan workstream carries its `record` (status and newest
@@ -234,8 +239,8 @@ whose remaining minutes cannot fit it gets no assignment) and `SWARM_MAX_DURATIO
 Exhaustion means no free seller can fit the minimum duration and no work is running; choosing
 wait alone never exhausts a challenge. Minutes can end a run before the work window does: the
 stop `Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)` is
-published as soon as every accepted seller's remaining donated minutes (or the time left before
-`ends`) is below `SWARM_MIN_DURATION`, nothing is running or unsettled and no seller is benched, even
+published as soon as every accepted seller's remaining donated minutes is below `SWARM_MIN_DURATION`
+(when the time left before `ends` is the limit, the stop is `Unsolved: work window ended …` instead), nothing is running or unsettled and no seller is benched, even
 hours before `ends`. The runner does not post a shorter final task to use leftover minutes. Bundled planners are a deterministic capability-routing
 stub and non-interactive Claude; verified-solution rules remain, including both Hutton keywords
 and checked English decryption. Verification can itself be a delegated task.

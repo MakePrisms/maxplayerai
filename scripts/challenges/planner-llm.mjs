@@ -5,7 +5,13 @@ import { command, validatePlan, plannerTimeouts } from './swarm.mjs';
 const input=JSON.parse(readFileSync(0,'utf8'));
 const prompt=`You are the buyer. You plan cooperative research. Return ONLY one JSON object.
 In mode analyze, study the goal and full eligible roster before allocating any work. Return:
-{"approach":"...","workstreams":[{"id":"...","description":"...","needs":{"skills":[],"harness":[],"hardware":[]},"estMinutes":5,"dependsOn":[]}],"verification":"..."}.
+{"approach":"...","workstreams":[{"id":"...","description":"...","needs":{"skills":[],"harness":[],"hardware":[]},"estMinutes":5,"dependsOn":[],"feasibility":"..."}],"verification":"..."}.
+FEASIBILITY: give every workstream (in analyze and in every revised plan) a one-line "feasibility" note: the
+best this family of approaches can reach and the bar it must beat, when known ("best this family can reach is
+X; bar is Y"), or what is still unknown about that. Drop or replace a workstream whose ceiling is below the bar.
+CLOSED QUESTIONS: a delivered result that reports an exhaustive search (every case of a stated space checked)
+closes that question: record it in the plan and do not re-propose the same search or a subset of it; only a
+DIFFERENT space or method is new work.
 In mode assign, use the current plan, all results and running jobs (seller/task/since) to return
 {"assignments":[{"seller":"pubkey from free roster","workstream":"plan id","task":"concrete task with context","durationSeconds":600,"amountSats":0,"includeAnswers":[]}]},
 {"wait":true,"idleReason":"..."}, or {"solved":true,"result":"verified complete answer","summary":"verification"}.
@@ -21,7 +27,11 @@ price too high...). awaitingAccept lists finished jobs whose seller is still hel
 accept is seen: that is NOT running work. statusCorrections, when present, lists plan fields that
 claimed running work the record shows finished; trust the record and do not write "running" for them.
 validWorkstreams lists the plan ids an assignment may name (the plan you were sent; ids in a revised plan
-you return are valid too). Never invent an id: add a workstream with a revised "plan" first.
+you return are valid too). COPY IDS VERBATIM from validWorkstreams or your revised plan: never rename, suffix
+or re-letter one. Never invent an id: put new work in a revised "plan" first. If you do name an id that is in
+neither, the runner adopts it as a new workstream (description = your task's first line, no dependencies) only
+when that assignment is otherwise valid, at most 8 per call, and never for an id a revision dropped; so give
+new work a short plain id (A-Z a-z 0-9 _ . : -, at most 64) and a task whose first line describes it.
 Choose durations per task within minDurationSeconds/maxDurationSeconds, donated minutes and
 challenge.ends. A real seller agent spends several minutes of every task just starting its
 sandbox and agent before any work happens; minDurationSeconds is the floor for that, so size each
@@ -61,6 +71,9 @@ least the minimum within budget headroom, or do not assign that seller. rejected
 last batch's rejected entries with the reason; correct them (price, workstream id, seller, includeAnswers)
 instead of repeating them. previousPlannerError, when present, is why the runner rejected your last
 response or plan (it names the field, e.g. "ws9.dependsOn names unknown workstream ws7"): fix exactly that.
+A result with deliveryFlag "unusable" (deliveryFlagReason says why: empty, placeholder text, trivially
+short) was collected but carries no usable answer: it is NOT completed work. Reassign that workstream
+(preferably to a different seller) and do not build on it.
 A result with outcome "refused" (also listed in refusals) means the seller declined or was stopped
 by a safety system: it is NOT completed work. Reassign that workstream to a DIFFERENT seller; the
 runner rejects giving it to the same seller again. taskContext, when present, is operator context

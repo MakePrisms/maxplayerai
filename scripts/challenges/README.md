@@ -187,6 +187,9 @@ Flags (environment equivalents):
 | — | `SWARM_PLANNER_FULL_RESULTS` | 8 (newest results sent with full answer text) |
 | — | `SWARM_PLANNER_DIGEST_CHARS` | 600 (head kept from each older result's answer/task) |
 | — | `SWARM_PLANNER_MAX_INPUT_CHARS` | 200000 (hard cap on one planner call's JSON input) |
+| — | `SWARM_PLANNER_MAX_INPUT_TOKENS` | 0 = off (optional token-ish cap: the input cap becomes the smaller of `SWARM_PLANNER_MAX_INPUT_CHARS` and this × `SWARM_PLANNER_CHARS_PER_TOKEN`; at least 100) |
+| — | `SWARM_PLANNER_CHARS_PER_TOKEN` | 3 (chars-per-token estimate for the cap above; no tokenizer, no specific LLM assumed) |
+| — | `SWARM_UNUSABLE_ANSWER_CHARS` | 20 (a collected answer with fewer non-space chars is flagged `deliveryFlag: unusable`; 0 flags only empty or placeholder answers; see *Unusable deliveries*) |
 | — | `SWARM_PLANNER_IDLE_SECONDS` | 600 (with no change, `assign` is called again after this long; `0` = every tick, the pre-S-2 cadence; see *Planner cadence*) |
 | — | `SWARM_EXPIRED_SLOT_GRACE_SECONDS` | 600 (strictly after an expired undelivered job's deadline + this, free its seller; sats stay reserved; minimum 480 = 420 s seller kill instant + 60 s teardown) |
 | — | `SWARM_MAX_DEFER_SECONDS` | 120 (max wait for a deferred assignment while the snapshot stays not ready) |
@@ -403,7 +406,14 @@ fields (see *Minimum buyer build*), calls also include `paidWorkRefused`.
   id is valid if it is in the plan sent with that same `assign` call or in the revised `plan` the
   response returns, so a revision by the previous `assess` (or by this response) never invalidates
   the ids the planner was shown (R3-7); otherwise the reason is `unknown workstream "<id>": …` with
-  the valid ids. Duration must fit configured min/max, remaining
+  the valid ids. **Adopted workstreams (#1242 F-2).** An unknown id is instead adopted as a new plan
+  workstream when the assignment passes every other check: `{id, description: <the task's first
+  line>, needs: {}, estMinutes: <duration in minutes>, dependsOn: [], adopted: true}` is added to the
+  day's plan right before its job is journaled, recorded in `days[…].adoptedWorkstreams`
+  (`{id,description,seller,at}`, newest 200) and logged `Adopted workstream "<id>" from the assign
+  response …`. Only plain ids (1-64 chars of `A-Z a-z 0-9 _ . : -`), at most 8 per call, and only
+  while the plan has fewer than 100 workstreams; the reason then ends `; not adopted: …`. A stale id
+  (dropped by a revision) is never adopted. Duration must fit configured min/max, remaining
   minutes and window; fresh admission and serial budget reservations apply before each post.
 - `assess`: checks newly settled results, including after posting stops; returns wait or solved.
   `assign` and `assess` may include `plan` containing a complete revised analysis plan, saved
@@ -447,6 +457,27 @@ planner calls today: …`. A planner should treat
 truncated text as incomplete and may re-request detail as a task. The full answers stay in the
 journal. A collected result whose answer could not be read is `[collected, answer unreadable: …]`
 with `answerError`.
+
+**Reduced-input retry (#1242 F-1).** When the planner command itself fails (non-zero exit, e.g.
+`exited 1: empty content (finish_reason=length)`, or empty/non-JSON output), the runner retries it
+ONCE in the same call with a reduced input: a quarter of `SWARM_PLANNER_FULL_RESULTS` in full,
+quarter-size digests (at least 100 chars), the answers of results older than the newest
+`SWARM_PLANNER_FULL_RESULTS` omitted, and half the input cap (the full cap if the fixed parts need
+it). Goal, challenge, plan with its record, seller profiles and running jobs are unchanged. Both
+attempts are journaled in `days[…].plannerRetries` (`{mode,at,first:{chars,results,fullText,seconds,
+error},retry:{chars,…,ok,seconds,error?}}`, newest 20), logged `Planner <mode> failed …; retrying once
+with reduced input (…)`, and each counts as a planner call. Validation rejections (answered via
+`previousPlannerError` on the next call), timeouts and kills are not retried in the same call.
+
+**Unusable deliveries (#1242 F-4).** A collected answer that is empty, placeholder text only
+(`placeholder…`, `Initializing…`) or has fewer than `SWARM_UNUSABLE_ANSWER_CHARS` (20) non-space
+characters (runner framing of delivered files not counted) is annotated, never refused: its journal
+row gets `deliveryFlag: "unusable"` and `deliveryFlagReason`, the runner logs `Job <id>: seller <pk>
+delivered an UNUSABLE answer (…); collected and settled as usual …`, and the planner sees
+`deliveryFlag` on the result, its answer prefixed `[unusable delivery: …; collected, but NOT completed
+work; reassign this workstream]`, the record status `collected (unusable delivery)` and
+`trackRecord.unusable` (not counted as `delivered`). Collect and payment are exactly as before:
+whether to withhold payment for such a delivery is an operator policy decision this runner does not make.
 
 **Collect failures.** A `collect` error containing `review: permanent input error` anywhere in its
 text (stderr may precede the tool-error JSON; the recorded reason starts at that marker) (the buyer's
@@ -688,8 +719,13 @@ cap for the planner's text.
 
 **Minutes can end a run before the window (R4-5).** `Unsolved: all eligible sellers exhausted (no
 task fits remaining minutes/work window)` means no accepted seller can take even a
-`SWARM_MIN_DURATION` task any more (each seller's remaining donated minutes, or the time left in the
-work window, is below it), nothing is running or awaiting settlement, and no seller is benched. With
+`SWARM_MIN_DURATION` task any more (each seller's remaining donated minutes is below it), nothing is
+running or awaiting settlement, and no seller is benched. When the work window is the binding limit
+instead (#1242 F-7: `now >= ends`, or the time left before `ends` is below `SWARM_MIN_DURATION`), the
+same stop says `Unsolved: work window ended` (with `(<n>s left, less than the <m>s minimum task)`
+before `ends`), the prefix the runner already published at `ends`. An assignment past `ends` is now
+rejected as `work window exceeded (deadline D is after ends E)`, a changed challenge as `challenge
+changed` (one combined reason before). With
 the 300 s default floor, sellers who each donated, say, 30 minutes are used up after a handful of
 tasks each, so this stop can come hours before `ends`. It is final for the day: the runner does
 not shorten tasks to use the leftover minutes. More donated minutes (or a lower `SWARM_MIN_DURATION`,
