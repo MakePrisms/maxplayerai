@@ -1,0 +1,35 @@
+{
+  "name": "status",
+  "url": "file:///Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/runs/generative-current/workspace/status.html",
+  "viewport": "mobile",
+  "engine": "axe-core 4.11.4",
+  "tags": [
+    "wcag2a",
+    "wcag2aa",
+    "wcag21a",
+    "wcag21aa",
+    "wcag22aa"
+  ],
+  "generatedAt": "2026-09-09T17:50:48.460Z",
+  "loadProof": {
+    "title": "Nova service status",
+    "elements": 225,
+    "textLength": 1281,
+    "stylesheets": 2,
+    "url": "file:///Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/runs/generative-current/workspace/status.html",
+    "rulesConsidered": 63,
+    "httpStatus": 200
+  },
+  "counts": {
+    "violations": 0,
+    "passes": 15,
+    "incomplete": 1,
+    "inapplicable": 47,
+    "rulesConsidered": 63,
+    "nodesFlagged": 0
+  },
+  "violations": [],
+  "incompleteIds": [
+    "color-contrast"
+  ]
+}
