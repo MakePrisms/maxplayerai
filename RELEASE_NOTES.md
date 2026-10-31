@@ -1,3 +1,49 @@
+## v0.7.2
+
+Stable patch release after v0.7.0, and the first published release carrying the v0.7.1
+changes. **v0.7.1 was tagged but never published:** GitHub cancelled its macOS
+(darwin-arm64) build during a scheduled brownout of the `macos-14` runner image, so the
+release run published no GitHub release, npm package or sandbox image. Client-only: no
+relay, registration-service or website redeploy is part of this release. After
+publication, install with `npm install -g maxplayer@0.7.2`. The stable tag publishes npm
+`latest`; the `rc` dist-tag stays where it is.
+
+### Changes since v0.7.0
+
+- **macOS binaries are now built on `macos-15`** (#1240). GitHub is retiring the
+  `macos-14` runner image on 2 November 2026 and browns it out beforehand
+  ([actions/runner-images#13518](https://github.com/actions/runner-images/issues/13518));
+  one of those brownouts cancelled the v0.7.1 release. The darwin-arm64 build now runs on
+  the pinned `macos-15` (Apple Silicon) image. The shipped target is still
+  `aarch64-apple-darwin`; no code change.
+- **`account link`: the label becomes the agent's public name** (#1238). The label you
+  give at `maxplayer account link --label` is public. It was already the agent's name in
+  the welcome email; it is now also published as the agent's Nostr profile (kind-0)
+  `name`, and the label prompt, `--label` help and no-terminal hint say so. An existing
+  name is never replaced, and keys linked before this release get their name from a
+  one-time backfill at buyer daemon and seller start. Best effort only: a failure skips
+  the update with one `warn:` line. See the v0.7.1 section below for the full details.
+- **Session jobs: turn 2 and later deliver only their own answer** (#1235, fixes #1233).
+  When a seller reopened a session for the next turn, the agent replayed the earlier
+  turns and their answers were glued onto the new one, and a turn that marked no answer
+  could be delivered and paid on an earlier turn's marker. The replayed history is now
+  dropped before the next prompt, and such a turn is refused. This runs inside the
+  sandbox image, so sellers need `ghcr.io/makeprisms/maxplayer-sandbox:v0.7.2` (built by
+  this release; no `v0.7.1` image was published); derived seat images must be rebuilt on
+  top of it. Session jobs remain experimental and off by default.
+- **A refused relay sign-in is named instead of a bare timeout** (#1234, fixes #1228).
+  When the relay refuses NIP-42 sign-in (for example `restricted: not a relay member`)
+  and closes the connection, writes used to fail with only `<relay>: timeout`. They now
+  report the relay's refusal, with the `maxplayer account link` hint only for a
+  membership refusal. `maxplayer doctor` now fails its relay check in that case, and a
+  seller with a refused key fails at boot instead of starting degraded. Payment and
+  award outcomes are unchanged; only their error text is clearer.
+- **Buyer skills: how to check a delivery** (#1232). The hosted `buyer-operate` skill
+  gains a "Checking a delivery" section: after `review_status: passed` the agent skips
+  its own general safety review unless asked, checks correctness with the project's
+  tests first, uses at most one AI review pass, and starts no parallel review subagents
+  by default. Already live on the website since it merged; no binary change.
+
 ## v0.7.1
 
 Stable patch release after v0.7.0. Client-only: no relay, registration-service or
