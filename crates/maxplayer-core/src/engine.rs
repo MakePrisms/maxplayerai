@@ -518,8 +518,9 @@ fn after_leading_marker(text: &str) -> Option<&str> {
 /// Named rather than written inline at the call site so the retention rule can be tested on its own.
 /// An inline closure is reachable only through the driver it is installed beside, which is why the
 /// rule went untested when it was one.
-/// Whether `update` ends the agent message being streamed: only tool-call-type updates (and the
-/// turn's end) do. See [`AgentMessageCapture::observe`].
+/// Whether `update` ends the agent message being streamed: only tool-call-type updates, a USER
+/// message (#1233: agent text must never glue across one), and the turn's end do. See
+/// [`AgentMessageCapture::observe`].
 fn closes_message(update: &SessionUpdate) -> bool {
     match update {
         SessionUpdate::ToolCall { .. }
@@ -533,7 +534,10 @@ fn closes_message(update: &SessionUpdate) -> bool {
                 .unwrap_or(&ext.params)
                 .get("sessionUpdate")
                 .and_then(serde_json::Value::as_str);
-            matches!(kind, Some("tool_call" | "tool_call_update"))
+            matches!(
+                kind,
+                Some("tool_call" | "tool_call_update" | "user_message_chunk" | "user_message")
+            )
         }
         SessionUpdate::Plan { .. }
         | SessionUpdate::AgentMessage(_)
@@ -559,7 +563,8 @@ impl AgentMessageCapture {
     ///
     /// A TOOL-CALL-type update closes the run of chunks (`tool_call`, `tool_call_update`, a tool
     /// result, a permission request): an agent streams its text, then calls a tool, and the text
-    /// after that call is a new message, not a continuation. `TurnEnded` closes the last one.
+    /// after that call is a new message, not a continuation. A user message closes it too: the
+    /// agent's text after it answers something else (#1233). `TurnEnded` closes the last one.
     /// Non-content updates — usage, thoughts, plans, mode/command/session-info notices — do NOT:
     /// harnesses emit them mid-stream (the ACP driver passes them through as `Ext`), and closing on
     /// one made the captured message only the tail after it, which then failed the marker gate.
@@ -1211,6 +1216,54 @@ mod tests {
             );
             assert_eq!(marked_inline_answer(&message), Some("WORKER1 47"));
         }
+    }
+
+    /// #1233 defence in depth: a USER message closes the agent message being streamed, so agent text
+    /// can never glue across one. The ACP driver passes `user_message_chunk` through as `Ext` (it is
+    /// what `session/load` replays prior turns' prompts as); before the fix it closed nothing, and a
+    /// replayed history read as one message `MARKER\nT1|934MARKER\nT2|934MARKER\nT3|935`.
+    #[test]
+    fn a_user_message_closes_the_agent_message() {
+        let user = |text: &str| {
+            SessionUpdate::Ext(crate::driver::ExtMethod {
+                method: "session/update".into(),
+                params: serde_json::json!({"sessionId": "s", "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": text}}}),
+            })
+        };
+        let mut capture = AgentMessageCapture::default();
+        for update in [
+            user("remember 934"),
+            chunk(INLINE_ANSWER_MARKER),
+            chunk("\nT1|934"),
+            user("which number"),
+            chunk(INLINE_ANSWER_MARKER),
+            chunk("\nT2|934"),
+            user("add 1"),
+            chunk(INLINE_ANSWER_MARKER),
+            chunk("\nT3|935"),
+            SessionUpdate::TurnEnded(StopReason::Completed),
+        ] {
+            capture.observe(RunEvent::Update(&update));
+        }
+        let message = capture.into_last_message().expect("a message");
+        assert_eq!(message, format!("{INLINE_ANSWER_MARKER}\nT3|935"));
+        assert_eq!(marked_inline_answer(&message), Some("T3|935"));
+
+        // And a turn that marks nothing is not rescued by a marker before the user message.
+        let mut capture = AgentMessageCapture::default();
+        for update in [
+            chunk(INLINE_ANSWER_MARKER),
+            chunk("\nT2|934"),
+            user("add 1"),
+            chunk("I could not work that out"),
+        ] {
+            capture.observe(RunEvent::Update(&update));
+        }
+        let message = capture.into_last_message().expect("a message");
+        assert_eq!(message, "I could not work that out");
+        assert_eq!(marked_inline_answer(&message), None);
     }
 
     /// A tool call still closes the message: the text after it is a new message, and the last wins.
