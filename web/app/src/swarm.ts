@@ -1,4 +1,4 @@
-import { parseSnapshot, renderLiveState, TRADE_WINDOW_MARGIN_S, UPDATING, type Snapshot, type Tracker } from "./challenge/live.js";
+import { parseSnapshot, relayStatusWord, renderLiveState, TRADE_WINDOW_MARGIN_S, UPDATING, type Snapshot, type Tracker } from "./challenge/live.js";
 import { paint } from "./challenge/page.js";
 import { wireMore } from "./challenge/more.js";
 import { coalesce } from "./challenge/coalesce.js";
@@ -83,7 +83,7 @@ function tick(): void {
   if (!snapshot) return;
   // The reader's current status, read every tick (not only the one copied into the last snapshot).
   const relay = (reader ? reader.status : snapshot.relay) as Snapshot["relay"];
-  const status = demoStatus ?? (relay?.authenticated ? "Live" : "Polling");
+  const status = demoStatus ?? relayStatusWord(relay);
   const now = snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000);
   const budget = (sats: number) => budgetValue(sats, spotUsd() === null ? null : usd(sats), performance.now());
   tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status, budget });

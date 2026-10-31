@@ -9,8 +9,16 @@ export interface Snapshot {
   challenge: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: Challenge['status']; result: string }|null;
   sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;
-  relay?: { connected: boolean; authenticated: boolean; historyComplete: boolean; error: string|null; windowComplete?: boolean; windowSince?: number|null; failedRelays?: string[]; missingRelays?: string[]; degraded?: boolean; quorum?: {required: number; complete: number; total: number}; warnings?: string[]; applicantsIncomplete?: boolean;
+  relay?: { connected: boolean; authenticated: boolean; authMode?: 'authenticated'|'pending'|'anonymous'; historyComplete: boolean; error: string|null; windowComplete?: boolean; windowSince?: number|null; failedRelays?: string[]; missingRelays?: string[]; degraded?: boolean; quorum?: {required: number; complete: number; total: number}; warnings?: string[]; applicantsIncomplete?: boolean;
     relays?: { role: string; url: string; connected: boolean; historyComplete: boolean; error: string|null }[] };
+}
+// The status word: "Live" when AUTH is as the reader expects it (authenticated, or the relay's
+// posture is anonymous), "Polling" while AUTH is pending. #1243: the member-gated relay refuses the
+// reader's throwaway AUTH key and serves it the same open reads as an anonymous connection
+// (authMode "anonymous"), so that read is Live too. A status without authMode (older reader, demo)
+// keeps the old rule.
+export function relayStatusWord(r: Snapshot['relay']): "Live" | "Polling" {
+  return r?.authenticated || r?.authMode === "anonymous" ? "Live" : "Polling";
 }
 // What follows the status word on the relay status line: the relay's own reason (e.g. a CLOSED)
 // at once, unavailable relays, and the reader's warnings. Degraded (run 2 #13: quorum met, a

@@ -142,8 +142,26 @@ export class RelayReader {
     this.status=this.freshStatus();
     this.stopped=false; this.retry=retryMs; this.lag=0; // this reader's observed event-loop lag (P-3), ms
   }
-  freshStatus(){return {connected:false,authenticated:false,historyComplete:false,windowComplete:false,pollInProgress:false,error:null,
-    warnings:[...this.metaWarnings,...(this.closedStreak?[`${RECOVERING} (${this.lastClosed}); reconnect ${this.closedStreak}`]:[])],applicantsIncomplete:false};}
+  freshStatus(){const s={connected:false,authenticated:false,historyComplete:false,windowComplete:false,pollInProgress:false,error:null,
+    warnings:[...this.metaWarnings,...(this.closedStreak?[`${RECOVERING} (${this.lastClosed}); reconnect ${this.closedStreak}`]:[])],applicantsIncomplete:false};
+    // Always computed from the live state, never stored, so no code path can leave it stale.
+    Object.defineProperty(s,'authMode',{enumerable:true,get:()=>this.authMode(s)});
+    return s;}
+  // #1243. What AUTH means for readiness right now:
+  //   'authenticated': AUTH OK on this connection.
+  //   'pending': AUTH is expected and has not completed: the relay challenged and has not refused,
+  //     a recovery round needs AUTH OK (needsAuth), or the connection is still waiting for the
+  //     challenge an earlier connection got (expectAuth hold).
+  //   'anonymous': the relay's posture is anonymous: it never challenged, or refused (or never
+  //     answered) AUTH outside recovery. Reads are the relay's open reads; a member-gated relay
+  //     refuses our throwaway key this way and gives it exactly the anonymous view.
+  // historyComplete already enforces every strict-round rule; authMode only says whether the
+  // missing `authenticated` is expected, so readers of the status need not guess from warnings.
+  authMode(s=this.status){
+    if(s.authenticated)return 'authenticated';
+    if(this.needsAuth()||this.authExpected()||this.expectAuth&&!this.challenged&&!this.holdExpired)return 'pending';
+    return 'anonymous';
+  }
   // Applicant and profile/heartbeat reads are display-only: they never gate readiness.
   trustedPending(){for(const id of this.pages.keys())if(!soft(id))return true;return false;}
   // A pending trusted page that must complete before history counts as complete (R3-4): any page of
@@ -587,6 +605,9 @@ export class ChallengeReader {
     const degradedWarning=`Degraded: ${complete.length} of ${quorum.total} challenge relays complete (quorum ${this.quorum}); missing: ${missingRelays.join(', ')}`;
     return {connected:this.trade.status.connected&&available.length>0,
       authenticated:this.trade.status.authenticated,
+      // #1243: the trade relay's AUTH posture (see RelayReader.authMode); readiness needs
+      // authenticated, or 'anonymous' (AUTH refused or never asked outside recovery).
+      authMode:this.trade.status.authMode,
       historyComplete:this.trade.status.historyComplete&&quorumMet,
       // A poll round re-reading history already held (R3-4); never part of readiness.
       pollInProgress:[this.trade,...this.challenges].some(r=>r.status.pollInProgress),
