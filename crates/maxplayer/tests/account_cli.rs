@@ -637,3 +637,289 @@ fn status_json_errors_are_json_on_stdout() {
     assert_eq!(value["error"], "home");
     assert!(!missing.exists());
 }
+
+// ---- The label becomes the agent's kind-0 name (fill-only) --------------------------------------
+
+/// A local relay the binary can publish to, kept alive on its own runtime.
+struct TestRelay {
+    rt: tokio::runtime::Runtime,
+    _relay: nostr_relay_builder::prelude::LocalRelay,
+    url: String,
+}
+
+impl TestRelay {
+    fn start() -> Self {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // nostr-relay-builder 0.44.1 probes a free port, releases it, then binds it again, so a
+        // parallel test can take it in between: retry only that AddrInUse, with a fresh relay.
+        let (relay, url) = rt.block_on(async {
+            for attempt in 1..=8 {
+                let relay = LocalRelay::new(RelayBuilder::default());
+                match relay.run().await {
+                    Ok(()) => {
+                        let url = relay.url().await.to_string();
+                        return (relay, url);
+                    }
+                    Err(nostr_relay_builder::Error::IO(error))
+                        if error.kind() == std::io::ErrorKind::AddrInUse && attempt < 8 => {}
+                    Err(error) => panic!("relay run: {error}"),
+                }
+            }
+            unreachable!("the last attempt returns or panics")
+        });
+        Self {
+            rt,
+            _relay: relay,
+            url,
+        }
+    }
+
+    /// This key's kind-0 events, as `(name, about)`.
+    fn kind0(&self, home: &Home) -> Vec<(Option<String>, Option<String>)> {
+        use nostr_sdk::prelude::{Client, Filter, JsonUtil, Kind, Metadata, PublicKey};
+        self.rt.block_on(async {
+            let client = Client::default();
+            client.add_relay(&self.url).await.unwrap();
+            client.connect().await;
+            let filter = Filter::new()
+                .author(PublicKey::from_hex(&home.pubkey).unwrap())
+                .kind(Kind::Metadata);
+            let events = client
+                .fetch_events(filter, std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+            client.disconnect().await;
+            events
+                .into_iter()
+                .map(|e| {
+                    let m = Metadata::from_json(&e.content).unwrap();
+                    (m.name, m.about)
+                })
+                .collect()
+        })
+    }
+
+    /// Publish a kind-0 for `home`'s key (as another client would have).
+    fn seed_kind0(&self, home: &Home, name: Option<&str>, about: &str) {
+        use nostr_sdk::prelude::{Client, EventBuilder, Keys, Metadata};
+        let secret = std::fs::read_to_string(home.root.join("key")).unwrap();
+        let keys = Keys::parse(secret.trim()).unwrap();
+        let mut metadata = Metadata::new().about(about);
+        if let Some(name) = name {
+            metadata = metadata.name(name);
+        }
+        self.rt.block_on(async {
+            let client = Client::new(keys.clone());
+            client.add_relay(&self.url).await.unwrap();
+            client.connect().await;
+            let event = EventBuilder::metadata(&metadata)
+                .sign_with_keys(&keys)
+                .unwrap();
+            client.send_event(&event).await.unwrap();
+            client.disconnect().await;
+        });
+    }
+}
+
+fn run_on_relay(home: &Home, url: &str, relay_url: &str, args: &[&str]) -> (i32, String, String) {
+    let out = base_command(&home.root, url)
+        .env("MAXPLAYER_RELAY_URL", relay_url)
+        .arg("account")
+        .args(args)
+        .output()
+        .expect("run maxplayer account");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// `[profile].name` as `config.toml` holds it.
+fn config_name(home: &Home) -> Option<String> {
+    let text = std::fs::read_to_string(home.root.join("config.toml")).unwrap_or_default();
+    let mut in_profile = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_profile = line == "[profile]";
+        } else if in_profile && let Some(value) = line.strip_prefix("name = ") {
+            return Some(value.trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
+fn set_config_name(home: &Home, name: &str) {
+    let path = home.root.join("config.toml");
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(!text.contains("[profile]"), "{text}");
+    text.push_str(&format!("\n[profile]\nname = \"{name}\"\n"));
+    std::fs::write(path, text).unwrap();
+}
+
+fn link_with_code(fake: &FakeRegistration, home: &Home, relay_url: &str) -> (i32, String, String) {
+    fake.set_next_code("482913");
+    let (code, out, err) = run_on_relay(
+        home,
+        &fake.base_url(),
+        relay_url,
+        &["link", "--email", "you@example.com", "--label", "my-laptop"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    run_on_relay(
+        home,
+        &fake.base_url(),
+        relay_url,
+        &["link", "--code", "482913"],
+    )
+}
+
+/// Confirmed, relay member, no name anywhere: the label is published as kind-0 `name` and saved
+/// to `[profile].name`.
+#[test]
+fn link_confirm_publishes_the_label_as_the_public_name() {
+    let fake = FakeRegistration::start();
+    let relay = TestRelay::start();
+    let home = new_home();
+    let (code, out, err) = link_with_code(&fake, &home, &relay.url);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("Published \"my-laptop\" as this agent's public name."),
+        "{out}\n{err}"
+    );
+    assert_eq!(relay.kind0(&home), vec![(Some("my-laptop".into()), None)]);
+    assert_eq!(config_name(&home).as_deref(), Some("my-laptop"));
+}
+
+/// An operator-set `[profile].name` is never replaced, and nothing is published.
+#[test]
+fn link_confirm_keeps_an_existing_local_name() {
+    let fake = FakeRegistration::start();
+    let relay = TestRelay::start();
+    let home = new_home();
+    set_config_name(&home, "ops-box");
+    let (code, out, err) = link_with_code(&fake, &home, &relay.url);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("This agent keeps its public name \"ops-box\""),
+        "{out}\n{err}"
+    );
+    assert!(relay.kind0(&home).is_empty(), "nothing published");
+    assert_eq!(config_name(&home).as_deref(), Some("ops-box"));
+}
+
+/// A name already on the relay (set from another machine) is kept; it is saved locally so later
+/// republishes keep it too, and the relay's kind-0 is untouched.
+#[test]
+fn link_confirm_keeps_an_existing_remote_name() {
+    let fake = FakeRegistration::start();
+    let relay = TestRelay::start();
+    let home = new_home();
+    relay.seed_kind0(&home, Some("set-elsewhere"), "kept about");
+    let (code, out, err) = link_with_code(&fake, &home, &relay.url);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("This agent keeps its public name \"set-elsewhere\""),
+        "{out}\n{err}"
+    );
+    assert_eq!(
+        relay.kind0(&home),
+        vec![(Some("set-elsewhere".into()), Some("kept about".into()))]
+    );
+    assert_eq!(config_name(&home).as_deref(), Some("set-elsewhere"));
+}
+
+/// A remote kind-0 without a name gets the label, and its other fields survive the merge.
+#[test]
+fn link_confirm_fills_a_nameless_remote_profile_and_keeps_its_about() {
+    let fake = FakeRegistration::start();
+    let relay = TestRelay::start();
+    let home = new_home();
+    relay.seed_kind0(&home, None, "kept about");
+    let (code, out, err) = link_with_code(&fake, &home, &relay.url);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        relay.kind0(&home),
+        vec![(Some("my-laptop".into()), Some("kept about".into()))]
+    );
+}
+
+/// Membership queued: no publish, nothing saved (the startup backfill fills it later).
+#[test]
+fn link_confirm_with_pending_membership_publishes_nothing() {
+    let fake = FakeRegistration::start();
+    fake.set_relay_member("pending");
+    let relay = TestRelay::start();
+    let home = new_home();
+    let (code, out, err) = link_with_code(&fake, &home, &relay.url);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("Relay membership queued"), "{out}");
+    assert!(
+        out.contains("becomes this agent's public name once the relay adds this key"),
+        "{out}"
+    );
+    assert!(relay.kind0(&home).is_empty());
+    assert_eq!(config_name(&home), None);
+}
+
+/// A publish that fails (relay unreachable) still links with exit 0 and says how to set the name.
+#[test]
+fn link_confirm_publish_failure_still_succeeds_with_a_hint() {
+    let fake = FakeRegistration::start();
+    let home = new_home();
+    let (code, out, err) = link_with_code(&fake, &home, "ws://127.0.0.1:1");
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("Done, linked to you@example.com"), "{out}");
+    assert!(
+        err.contains("Could not publish \"my-laptop\" as this agent's public name"),
+        "{err}"
+    );
+    assert!(err.contains("the next maxplayer start tries again"), "{err}");
+    assert!(
+        err.contains("maxplayer profile set --name \"my-laptop\""),
+        "{err}"
+    );
+    assert_eq!(
+        config_name(&home),
+        None,
+        "nothing saved, so the backfill retries"
+    );
+}
+
+/// The label help and the no-terminal hint both say the name is public.
+#[test]
+fn label_help_says_the_name_is_public() {
+    let out = maxplayer().args(["account", "--help"]).output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(
+            "This name is public on Maxplayer (shown on your profile and in the welcome email)."
+        ),
+        "{text}"
+    );
+    let fake = FakeRegistration::start();
+    let home = new_home();
+    let (_, _, err) = run(&home, &fake.base_url(), &["link", "--email", "a@b.co"]);
+    assert!(err.contains("This name is public on Maxplayer"), "{err}");
+}
+
+/// `link --email --label` sends the label without asking for it, so it says the name is public
+/// before the request goes out.
+#[test]
+fn link_with_a_label_flag_says_the_name_is_public_before_sending() {
+    let fake = FakeRegistration::start();
+    let home = new_home();
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &["link", "--email", "you@example.com", "--label", "my-laptop"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let notice = out
+        .find("This name is public on Maxplayer")
+        .unwrap_or_else(|| panic!("no public-name notice: {out}"));
+    let sent = out.find("Check you@example.com").expect("code sent line");
+    assert!(notice < sent, "the notice comes before the request: {out}");
+}

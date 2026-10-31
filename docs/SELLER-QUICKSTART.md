@@ -148,7 +148,9 @@ Once the relay turns on membership, the seat's key must also be **linked to an e
 relay accepts its writes. Once per home:
 `maxplayer account link --email <you> --label <seat>`, then
 `maxplayer account link --code <code> --entered-by human` with the 6-digit code from the email
-(it expires after 10 minutes; entering it accepts the Maxplayer Terms). `maxplayer account status` shows the link. A seat that is
+(it expires after 10 minutes; entering it accepts the Maxplayer Terms). The label is public: a seat
+with no name yet takes it as its profile name instead of `maxplayer-seller-<8hex>`; a seat that
+already has a name keeps it. `maxplayer account status` shows the link. A seat that is
 not linked logs relay refusals ending in "run `maxplayer account link`".
 
 ---
@@ -1111,8 +1113,13 @@ process env, or a log).
 
 On start (after `[seller]` is written) the daemon publishes:
 
-- a **kind-0** profile, fail-closed — boot aborts if it cannot be published (a
-  `maxplayer-seller-<short>` name is filled if you did not pass `--name`), and
+- a **kind-0** profile (a `maxplayer-seller-<short>` name is filled if you did not pass `--name`
+  and no account label names the key). It never overwrites a profile it could not read: if the read
+  of your current kind-0 does not end in the relay's EOSE (timeout, refused sign-in) or holds content
+  that is not a JSON object, or another maxplayer process on the same home is still writing its
+  profile after 30s, boot logs one `warn:` line, publishes and saves nothing, and goes on —
+  kind-0 is display-only, the heartbeat below carries what buyers act on. A send the relay refuses
+  still aborts boot. `maxplayer profile set` stays an error in both cases, and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
   ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
   plus `agents` when your seat states a harness roster and `takes_payment` when it works for free,

@@ -4600,15 +4600,50 @@ pub async fn boot_advertising_only_proven(
         if job_nix { "works (job prompts name `nix shell`)" } else { "absent" }
     );
 
-    let disco = crate::profile::publish_seller_discoverability_async(&mut home)
-        .await
-        .map_err(|error| NodeError::Relay(format!("discoverability publish failed: {error}")))?;
-    opline!(
-        "seller node discoverable kind0={} name={} pubkey={}",
-        disco.kind0_event_id,
-        disco.name.as_deref().unwrap_or(""),
-        disco.pubkey
-    );
+    // A key linked to an email before `account link` published its label has no name yet: name the
+    // seat after its account label rather than the `maxplayer-seller-<8hex>` default below. Only
+    // when `[profile].name` is unset (a seat that already has one, the generated default included,
+    // keeps it), best effort and bounded; a failure is one warn line and boot goes on. While the
+    // label may still apply (membership pending, the service failing or out of time) the seat takes
+    // no default name this start, so a later start can still name it.
+    let backfill = crate::profile::backfill_name_from_link_async(&mut home).await;
+    if let crate::profile::NameBackfill::Filled(crate::profile::NameFill::Published {
+        name, ..
+    }) = &backfill
+    {
+        opline!("seller node public name set from the account label: {name}");
+    }
+    let allow_default_name = backfill.allows_default_name();
+    if !allow_default_name {
+        opline!(
+            "seller node public name: no default name this start ({}); the account label can \
+             still name this seat",
+            backfill.reason()
+        );
+    }
+    // Kind-0 is display-only (the kind-30340 heartbeat carries everything a buyer acts on), so a
+    // profile this start cannot read (no EOSE, timeout, content that is not a JSON object), or one
+    // another process on this home is still writing (profile.lock held past the wait), is skipped,
+    // not fatal: nothing is published or saved, one warn line, and boot goes on.
+    match crate::profile::publish_seller_discoverability_with(&mut home, allow_default_name).await {
+        Ok(disco) => opline!(
+            "seller node discoverable kind0={} name={} pubkey={}",
+            disco.kind0_event_id,
+            disco.name.as_deref().unwrap_or(""),
+            disco.pubkey
+        ),
+        Err(
+            crate::profile::ProfileError::Unread(cause) | crate::profile::ProfileError::Busy(cause),
+        ) => opline!(
+            "warn: seller node public profile (kind-0) not updated this start, nothing published \
+             or saved: {cause}"
+        ),
+        Err(error) => {
+            return Err(NodeError::Relay(format!(
+                "discoverability publish failed: {error}"
+            )));
+        }
+    }
 
     let runner = SellerNodeRunner::boot_with_lock(home, lock).await?;
     runner.narrow_roster_to(&verdicts);
@@ -20547,6 +20582,195 @@ mod tests {
 
         runner.client.disconnect().await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Boot a proven `claude` seat on `fixture` with `registration_url` and an optional preset
+    /// `[profile].name`; returns the name seller start left in `config.toml` (if any) and the pubkey.
+    async fn boot_named_seat(
+        label: &str,
+        fixture: &PGateRelay,
+        registration_url: String,
+        preset_name: Option<&str>,
+    ) -> (Option<String>, String) {
+        boot_named_seat_at(
+            throwaway_root(label),
+            fixture,
+            registration_url,
+            preset_name,
+        )
+        .await
+    }
+
+    /// [`boot_named_seat`] on a given (possibly pre-populated) home directory.
+    async fn boot_named_seat_at(
+        root: std::path::PathBuf,
+        fixture: &PGateRelay,
+        registration_url: String,
+        preset_name: Option<&str>,
+    ) -> (Option<String>, String) {
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        let pubkey = crate::home::public_key_hex(&home).expect("pubkey");
+        let preset = preset_name.map(str::to_owned);
+        crate::home::save_config(&mut home, |config| {
+            config.seller = Some(seller_cfg(1, false));
+            config.relay_url = fixture.url();
+            config.registration_url = registration_url;
+            if let Some(name) = preset {
+                config.profile.get_or_insert_with(Default::default).name = Some(name);
+            }
+        })
+        .expect("persist config");
+        let verdicts = vec![HarnessProbeVerdict {
+            index: 0,
+            name: Some("claude".to_owned()),
+            result: Ok(None),
+        }];
+        let runner = boot_advertising_only_proven(home, verdicts)
+            .await
+            .expect("a proven seat must boot");
+        runner.client.disconnect().await;
+        let mut reloaded = crate::home::bootstrap(&root).expect("reload home");
+        crate::home::reload_config(&mut reloaded).expect("reload config");
+        let name = reloaded.config.profile.and_then(|p| p.name);
+        let _ = std::fs::remove_dir_all(&root);
+        (name, pubkey)
+    }
+
+    /// The `name` of every kind-0 the seat put on the wire, in order.
+    async fn kind0_names(fixture: &PGateRelay) -> Vec<Option<String>> {
+        fixture
+            .events()
+            .await
+            .iter()
+            .filter(|event| event.kind == 0)
+            .map(|event| {
+                serde_json::from_str::<serde_json::Value>(&event.content)
+                    .ok()
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+            })
+            .collect()
+    }
+
+    /// A nameless seat whose key is linked (and a relay member) is named after its account label,
+    /// not `maxplayer-seller-<8hex>`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_names_a_nameless_linked_seat_after_its_label() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let status = crate::profile::fake_status::FakeStatus::linked("seat-label", "added");
+        let (name, _) = boot_named_seat("label-name", &fixture, status.base_url(), None).await;
+        assert_eq!(name.as_deref(), Some("seat-label"));
+        assert_eq!(status.calls(), 1);
+        // The label fill, then the discoverability republish: both carry the label, and the last
+        // kind-0 (the one the relay keeps) still names the seat after it.
+        assert_eq!(
+            kind0_names(&fixture).await,
+            vec![Some("seat-label".to_owned()), Some("seat-label".to_owned())]
+        );
+    }
+
+    /// Bob's call (#buyer-generated-names): a relay that never ends the kind-0 read with EOSE does
+    /// not stop boot. The seat boots, puts no kind-0 on the wire and saves no `[profile].name` (not
+    /// even the hex default an unlinked key would otherwise take).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_boots_without_kind0_when_the_read_gets_no_eose() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        fixture.withhold_eose_for(&[0]);
+        let status = crate::profile::fake_status::FakeStatus::unlinked();
+        // `boot_named_seat` expects the boot to return a runner: an unread kind-0 is not fatal.
+        let (name, _) = boot_named_seat("no-eose", &fixture, status.base_url(), None).await;
+        assert_eq!(name, None, "no name saved over an unread profile");
+        assert_eq!(fixture.event_kind_count(0).await, 0, "no kind-0 published");
+        assert_eq!(
+            status.calls(),
+            1,
+            "the backfill ran (key not linked), then the read skipped"
+        );
+    }
+
+    /// Another process on this home holds `profile.lock` for the whole wait (a buyer label fill
+    /// stuck on a slow send): seller start does not take it over, publishes no kind-0, saves no
+    /// name, and still boots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_boots_while_another_holder_keeps_the_profile_lock() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let status = crate::profile::fake_status::FakeStatus::unlinked();
+        let root = throwaway_root("profile-lock-held");
+        std::fs::create_dir_all(&root).expect("home dir");
+        // Held for the whole boot, released only when the test ends.
+        let _held = crate::buyer::lock::HomeLock::acquire(root.join("profile.lock"))
+            .expect("hold profile.lock");
+        let (name, _) = boot_named_seat_at(root, &fixture, status.base_url(), None).await;
+        assert_eq!(name, None, "no name saved without the lock");
+        assert_eq!(
+            fixture.event_kind_count(0).await,
+            0,
+            "no kind-0 published without the lock"
+        );
+    }
+
+    /// Membership still pending: the seat boots, publishes kind-0 WITHOUT a name, saves none, and
+    /// the next start asks again, so the label can still name it once the relay adds the key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_with_pending_membership_takes_no_default_name() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let status = crate::profile::fake_status::FakeStatus::linked("seat-label", "pending");
+        let (name, _) = boot_named_seat("pending", &fixture, status.base_url(), None).await;
+        assert_eq!(
+            name, None,
+            "no default saved while the label may still apply"
+        );
+        assert_eq!(status.calls(), 1);
+        assert_eq!(kind0_names(&fixture).await, vec![None]);
+    }
+
+    /// A key the registration service says is not linked has no label coming: the seat takes the
+    /// hex default as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_of_an_unlinked_key_takes_the_hex_default() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let status = crate::profile::fake_status::FakeStatus::unlinked();
+        let (name, pubkey) = boot_named_seat("unlinked", &fixture, status.base_url(), None).await;
+        let default = format!("maxplayer-seller-{}", &pubkey[..8]);
+        assert_eq!(name.as_deref(), Some(default.as_str()));
+        assert_eq!(kind0_names(&fixture).await, vec![Some(default)]);
+    }
+
+    /// A seat that already has a name keeps it, the generated default included, and never asks the
+    /// registration service (known gap: such a seat is not renamed after its label).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_keeps_an_existing_name_even_the_generated_default() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let status = crate::profile::fake_status::FakeStatus::linked("seat-label", "added");
+        let (name, _) = boot_named_seat(
+            "keep-default",
+            &fixture,
+            status.base_url(),
+            Some("maxplayer-seller-0badc0de"),
+        )
+        .await;
+        assert_eq!(name.as_deref(), Some("maxplayer-seller-0badc0de"));
+        assert_eq!(status.calls(), 0, "a named seat makes no status call");
+    }
+
+    /// Unreachable registration service: boot goes on, but takes no hex default (the label may
+    /// still apply once the service answers) and keeps no name the relay does not have.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_without_a_reachable_link_takes_no_default_name() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let (name, _) = boot_named_seat(
+            "no-link",
+            &fixture,
+            format!("http://127.0.0.1:{port}/account"),
+            None,
+        )
+        .await;
+        assert_eq!(name, None);
+        assert_eq!(kind0_names(&fixture).await, vec![None]);
     }
 
     /// Point ⑤ of #784: the FIRST advertisement carries the MEASURED capability set.

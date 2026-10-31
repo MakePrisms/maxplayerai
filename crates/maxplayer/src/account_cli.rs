@@ -18,6 +18,10 @@
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
+/// Shown wherever the label is asked for: the label is the agent's public name, not a private tag.
+const PUBLIC_NAME_NOTICE: &str =
+    "This name is public on Maxplayer (shown on your profile and in the welcome email).";
+
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
@@ -35,6 +39,8 @@ fn write_usage(out: &mut dyn Write) {
          emails you a 6-digit code; entering it links the key and accepts the Maxplayer Terms.\n\
          In a terminal, `link` asks for anything missing and then for the code. Without one,\n\
          run `link --email <email> --label <name>` first, then `link --code <code>`.\n\
+         --label: a name for this agent. {PUBLIC_NAME_NOTICE} Once linked, it becomes the\n\
+         agent's Nostr profile name unless the agent already has one (`maxplayer profile set`).\n\
          --entered-by: who typed the code (default: human at the prompt, agent with --code).\n\
          --mint: use this home's mint server key (<home>/mint/nostr.key) instead of the agent key.\n\
          Service: registration_url in config.toml or MAXPLAYER_REGISTRATION_URL\n\
@@ -193,7 +199,8 @@ fn check_link_opts(opts: &Opts) -> Result<(), String> {
 #[cfg(feature = "wallet")]
 mod wallet {
     use super::*;
-    use maxplayer_core::home;
+    use maxplayer_core::home::{self, MaxplayerHome};
+    use maxplayer_core::profile::{self, NameFill};
     use maxplayer_core::registration::{
         self, CodeSent, EnteredBy, Linked, MARKETING_NOTICE, RegistrationClient, RegistrationError,
         TERMS_VERSION,
@@ -210,6 +217,11 @@ mod wallet {
         /// The flags that select this key (` --mint`, ` --home <dir>`), repeated in every command
         /// a message tells the user to run, so it acts on the same key.
         pub flags: String,
+        /// The agent home whose kind-0 the label may name. `None` for `--mint`: a mint key has no
+        /// agent profile, so linking it publishes nothing.
+        pub home: Option<MaxplayerHome>,
+        /// `[profile].name` when it is a valid label: the label prompt's default.
+        pub profile_name: Option<String>,
     }
 
     /// `{"error": <code>, "message": <text>}` on stdout: the `--json` failure shape.
@@ -270,12 +282,20 @@ mod wallet {
                     home.root.display()
                 );
             }
+            let profile_name = home
+                .config
+                .profile
+                .as_ref()
+                .and_then(|p| p.name.as_deref())
+                .and_then(registration::normalize_label);
             Ok(Self {
                 keys,
                 npub,
                 base_url: home.config.registration_url.clone(),
                 whose: "this agent's key",
                 flags,
+                home: Some(home),
+                profile_name,
             })
         }
 
@@ -306,6 +326,8 @@ mod wallet {
                 base_url: config.registration_url,
                 whose: "this mint's key",
                 flags,
+                home: None,
+                profile_name: None,
             })
         }
 
@@ -379,6 +401,62 @@ mod wallet {
         let _ = writeln!(out, "{}", marketing_line(&linked.marketing));
     }
 
+    /// After a confirmed link: publish the label as the agent's kind-0 `name` when it has none.
+    /// Best effort: it prints one line and never changes the exit code. A queued membership
+    /// publishes nothing now (the relay would refuse the write); the next buyer or seller start
+    /// fills the name once the key is a member.
+    fn publish_label(ctx: &Context, linked: &Linked, out: &mut dyn Write, err: &mut dyn Write) {
+        let Some(home) = &ctx.home else {
+            return;
+        };
+        // A "not linked" answer or a failure backoff remembered by the startup backfill is stale now.
+        profile::forget_name_backfill(home);
+        let label = &linked.label;
+        if linked.relay_member != "added" {
+            let _ = writeln!(
+                out,
+                "\"{label}\" becomes this agent's public name once the relay adds this key (the \
+                 next `maxplayer buyer` or seller start sets it)."
+            );
+            return;
+        }
+        let set_hint = format!("maxplayer profile set --name \"{label}\"{}", ctx.flags);
+        if !profile::registration_pairs_with_relay(
+            &home.config.registration_url,
+            &home.config.relay_url,
+        ) {
+            let _ = writeln!(
+                err,
+                "Did not publish \"{label}\" as this agent's public name: this home writes to {}, \
+                 not the relay this link is for. To name it there, run `{set_hint}`.",
+                home.config.relay_url
+            );
+            return;
+        }
+        let mut home = home.clone();
+        match profile::fill_name_from_label(&mut home, label) {
+            Ok(NameFill::Published { name, .. }) => {
+                let _ = writeln!(out, "Published \"{name}\" as this agent's public name.");
+            }
+            Ok(NameFill::KeptLocal(name) | NameFill::KeptRemote(name)) => {
+                let _ = writeln!(
+                    out,
+                    "This agent keeps its public name \"{name}\" (change it with `maxplayer \
+                     profile set --name <name>{}`).",
+                    ctx.flags
+                );
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "warning: Could not publish \"{label}\" as this agent's public name yet \
+                     ({error}). Nothing was changed; the next maxplayer start tries again, or run \
+                     `{set_hint}` to set it now."
+                );
+            }
+        }
+    }
+
     fn marketing_line(state: &str) -> String {
         match state {
             "subscribed" => "Product news: on. Turn it off any time with `maxplayer account \
@@ -412,6 +490,7 @@ mod wallet {
             return match client.confirm(code, who) {
                 Ok(linked) => {
                     print_linked(out, ctx, &linked);
+                    publish_label(ctx, &linked, out, err);
                     SUCCESS
                 }
                 Err(error) => report(ctx, err, &error),
@@ -425,7 +504,7 @@ mod wallet {
                 err,
                 "account link needs --email and --label when it cannot ask (no terminal). Ask the \
                  human for their email, then run:\n  {} --email <email> --label <a name for this \
-                 agent>",
+                 agent>\n{PUBLIC_NAME_NOTICE}",
                 ctx.command("link")
             );
             return USAGE_ERROR;
@@ -449,16 +528,32 @@ mod wallet {
             },
         };
         let label = match &opts.label {
-            Some(label) => label.clone(),
-            None => loop {
-                match prompt(input, out, "A name for this agent (e.g. my-laptop): ") {
-                    None => return aborted(err),
-                    Some(label) if registration::normalize_label(&label).is_some() => break label,
-                    Some(_) => {
-                        let _ = writeln!(out, "Use 1-64 letters, digits, spaces, '.', '_' or '-'.");
+            Some(label) => {
+                let _ = writeln!(out, "{PUBLIC_NAME_NOTICE}");
+                label.clone()
+            }
+            None => {
+                let _ = writeln!(out, "{PUBLIC_NAME_NOTICE}");
+                let question = match &ctx.profile_name {
+                    Some(name) => format!("A name for this agent [{name}]: "),
+                    None => "A name for this agent (e.g. my-laptop): ".to_owned(),
+                };
+                loop {
+                    match prompt(input, out, &question) {
+                        None => return aborted(err),
+                        Some(label) if label.is_empty() && ctx.profile_name.is_some() => {
+                            break ctx.profile_name.clone().unwrap_or_default();
+                        }
+                        Some(label) if registration::normalize_label(&label).is_some() => {
+                            break label;
+                        }
+                        Some(_) => {
+                            let _ =
+                                writeln!(out, "Use 1-64 letters, digits, spaces, '.', '_' or '-'.");
+                        }
                     }
                 }
-            },
+            }
         };
 
         let sent = match client.request_code(&email, &label) {
@@ -489,6 +584,7 @@ mod wallet {
             match client.confirm(&code, EnteredBy::Human) {
                 Ok(linked) => {
                     print_linked(out, ctx, &linked);
+                    publish_label(ctx, &linked, out, err);
                     return SUCCESS;
                 }
                 Err(error) if error.code() == Some("wrong_code") => {
@@ -658,6 +754,8 @@ mod interactive_tests {
             base_url: fake.base_url(),
             whose: "this agent's key",
             flags: String::new(),
+            home: None,
+            profile_name: None,
         }
     }
 
@@ -723,6 +821,66 @@ mod interactive_tests {
         assert_eq!(reg.entered_by, "human");
         // Only the real wrong code reached the service: the "12" typo spent no try.
         assert_eq!(fake.confirm_calls(), 2);
+    }
+
+    /// The label prompt warns the name is public, offers `[profile].name` as the default, and
+    /// Enter accepts it.
+    #[test]
+    fn interactive_label_prompt_warns_and_accepts_the_profile_name_default() {
+        let fake = FakeRegistration::start();
+        let keys = Keys::generate();
+        fake.set_next_code("482913");
+        let mut context = ctx(&fake, &keys);
+        context.profile_name = Some("ops-box".into());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let opts = Opts {
+            email: Some("you@example.com".into()),
+            ..Opts::default()
+        };
+        let code = link(
+            &context,
+            &opts,
+            &mut std::io::Cursor::new(b"\n482913\n".to_vec()),
+            true,
+            &mut out,
+            &mut err,
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(code, SUCCESS, "{out}");
+        let warning = out
+            .find("This name is public on Maxplayer (shown on your profile and in the welcome email).")
+            .expect("public-name warning");
+        let prompt = out
+            .find("A name for this agent [ops-box]: ")
+            .expect("default offered");
+        assert!(warning < prompt, "{out}");
+        let reg = fake.registration(&keys.public_key().to_hex()).unwrap();
+        assert_eq!(reg.label, "ops-box");
+    }
+
+    /// Without a usable `[profile].name` there is no default: an empty answer is asked again.
+    #[test]
+    fn interactive_label_prompt_without_a_default_asks_again_on_enter() {
+        let fake = FakeRegistration::start();
+        let keys = Keys::generate();
+        fake.set_next_code("482913");
+        let opts = Opts {
+            email: Some("you@example.com".into()),
+            ..Opts::default()
+        };
+        let (code, out, _) = drive(&fake, &keys, opts, "\nbox\n482913\n");
+        assert_eq!(code, SUCCESS, "{out}");
+        assert!(
+            out.contains("A name for this agent (e.g. my-laptop): "),
+            "{out}"
+        );
+        assert!(out.contains("This name is public on Maxplayer"), "{out}");
+        assert_eq!(
+            fake.registration(&keys.public_key().to_hex())
+                .unwrap()
+                .label,
+            "box"
+        );
     }
 
     #[test]

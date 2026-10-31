@@ -69,8 +69,12 @@ writes only from linked keys. The emailed code expires after 10 minutes.
 "$MAXPLAYER_BIN" account status
 ```
 
+The label is public (profile and welcome email). Once the key is a relay member, `account link`
+publishes it as the buyer's display name unless one is already set; keys linked earlier get it on the
+next `maxplayer buyer` start.
+
 The wallet and profile are managed through the CLI. For example, inspect funds with
-`"$MAXPLAYER_BIN" wallet balance` and optionally publish a display name with
+`"$MAXPLAYER_BIN" wallet balance` and change the display name with
 `"$MAXPLAYER_BIN" profile set --name "Buyer name"`.
 
 **`wallet setup` does not leave you funded.** It prints a `quote_id` and a Lightning invoice, then

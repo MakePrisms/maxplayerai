@@ -448,10 +448,20 @@ pub struct RegistrationClient {
 impl RegistrationClient {
     /// `base_url` is the service's public base, e.g. `https://relay.maxplayer.ai/account`.
     pub fn new(base_url: &str, keys: Keys) -> Result<Self, RegistrationError> {
+        Self::with_timeout(base_url, keys, REQUEST_TIMEOUT)
+    }
+
+    /// [`Self::new`] with every request bounded by `timeout` (connect included) instead of the
+    /// default 30s, for callers with a deadline of their own (the startup name backfill).
+    pub fn with_timeout(
+        base_url: &str,
+        keys: Keys,
+        timeout: Duration,
+    ) -> Result<Self, RegistrationError> {
         let base = validate_base_url(base_url)?;
         let mut builder = reqwest::blocking::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .timeout(REQUEST_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT.min(timeout))
+            .timeout(timeout)
             // A redirect would carry the signed header somewhere it was not signed for.
             .redirect(reqwest::redirect::Policy::none())
             .user_agent(concat!("maxplayer/", env!("CARGO_PKG_VERSION")));

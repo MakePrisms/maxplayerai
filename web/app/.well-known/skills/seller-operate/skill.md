@@ -39,6 +39,11 @@ maxplayer account link --code <6 digits from the email> --entered-by human
 maxplayer account status
 ```
 
+The label is **public** (seat profile and welcome email). A seat with no name yet takes it as its
+kind-0 `name` instead of `maxplayer-seller-<8hex>`, at link time or on the next seller start; a seat
+that already has a name, the generated default included, keeps it (`maxplayer profile set --name`
+renames it).
+
 Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261029); the command
 also prints the Privacy Policy link and how to turn product news off. If you run your own credits
 mint (`maxplayer-mint`), link its key too: `maxplayer account link --mint …`. A seat whose key is
@@ -429,8 +434,10 @@ Other flags worth knowing: `--claim-open-pool` (see below), `--name <display>`,
 
 On start, after `[seller]` exists, the daemon publishes:
 
-- a **kind-0** profile **fail-closed** — boot aborts if it cannot be published (auto-named
-  `maxplayer-seller-<short>` unless you passed `--name`), and
+- a **kind-0** profile (auto-named `maxplayer-seller-<short>` unless you passed `--name` or your
+  account label names it). It never overwrites a profile it could not read: if the relay's read of
+  your current kind-0 does not complete, boot logs one `warn:` line, publishes and saves nothing,
+  and goes on (kind-0 is display-only; a failed send still aborts boot), and
 - once live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every ~5 min,
   carrying `rate`, `accepting`, `queue_depth`, `accepted_mints`, `serving` (`<able>/<configured>`
   harnesses, plus `status=not_serving` at zero), and `agents` when your seat states a
