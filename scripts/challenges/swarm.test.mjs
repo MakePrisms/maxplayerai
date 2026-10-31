@@ -22,7 +22,9 @@ function fixture() {
   }};
   // plannerIdleSeconds 0: these tests swap the fake planner's reply between ticks with unchanged
   // input, so they keep the pre-S-2 call-every-tick cadence. The S-2 tests use the real default.
-  const c={minDuration:30,maxDuration:90,duration:30,amount:0,updateEvery:180,awardAfter:5,awardFallback:false,plannerIdleSeconds:0};
+  // unusableAnswerChars 0: the fake answers ('verified answer', 'I cannot help.') are short on
+  // purpose; #1242 F-4's length check is tested on its own (placeholder text is still flagged here).
+  const c={minDuration:30,maxDuration:90,duration:30,amount:0,updateEvery:180,awardAfter:5,awardFallback:false,plannerIdleSeconds:0,unusableAnswerChars:0};
   const runner=new Swarm(c,io,journal);
   return {snap,c,io,runner,journal,calls,publishes,inputs,remote,setPlan:p=>{planner=p;},time:n=>{now=n;}};
 }
@@ -1447,7 +1449,8 @@ test('R3-2 advisor r1: a not-serving seller whose minimum task cannot finish bef
   f.snap.sellers[0].servingState='not_serving';f.snap.sellers[0].serving={available:0,configured:1};
   f.time(980); // 980 + minDuration 30 > ends 1000, still inside the window
   await f.runner.tick();
-  assert.match(f.publishes.at(-1)?.[3]??'',/Unsolved: all eligible sellers exhausted/);
+  // #1242 F-7: the window, not the roster, is the binding limit here.
+  assert.equal(f.publishes.at(-1)?.[3]??'','Unsolved: work window ended (20s left, less than the 30s minimum task)');
 });
 
 // Run 2 #13: challenge relay quorum in the runner.
@@ -1598,15 +1601,15 @@ test('R3-7: workstreams validate against the plan sent with the assign call (or 
   f.setPlan(input=>{call++;
     if(call===1){assert.deepEqual(input.plan.workstreams.map(w=>w.id),['piece']);
       // Revises the plan AND assigns: one task from the plan it was sent, one from its revision, one unknown.
-      return {plan:revised,assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30},{seller:'b',workstream:'gone',task:'t',durationSeconds:30}]};}
+      return {plan:revised,assignments:[{seller:'a',workstream:'piece',task:'t',durationSeconds:30},{seller:'b',workstream:'gone!',task:'t',durationSeconds:30}]};}
     return {wait:true};});
   await f.runner.tick();
   assert.deepEqual(posts(f).map(([,a])=>a.seller_pubkey),['a'],'the sent-plan workstream posts');
   assert.equal(f.journal.state.jobs[0].workstream,'piece');
   assert.equal(Object.values(f.journal.state.days)[0].plan.workstreams[0].id,'next','revision saved');
-  assert.ok(reports.some(r=>/^Rejected assignment for b: unknown workstream "gone": not in the plan sent with this assign call or the plan it returned \(ids: piece, next\)/.test(r)),reports.join('\n'));
+  assert.ok(reports.some(r=>/^Rejected assignment for b: unknown workstream "gone!": not in the plan sent with this assign call or the plan it returned \(ids: piece, next\); not adopted: a workstream id must be 1-64 characters/.test(r)),reports.join('\n'));
   f.time(101);await f.runner.tick();
-  assert.match(f.inputs.at(-1).rejectedAssignments[0].reason,/unknown workstream "gone"/);
+  assert.match(f.inputs.at(-1).rejectedAssignments[0].reason,/unknown workstream "gone!"/);
   assert.equal(f.inputs.at(-1).rejectedAssignments[0].seller,'b');
   // The revision's ids are valid on the same and later calls; a stale id after the revision is not.
   const g=fixture(),gr=[];g.io.report=m=>gr.push(m);
@@ -2769,9 +2772,9 @@ test('S-2 re-call after a failed call (retried next tick, as before) and once af
   await f.ticks(110,5);assert.equal(f.assigns().length,2);
   // Rejections are new input for the planner: F-5 (c) re-asks at once, at most twice for the same
   // error; then the normal cadence applies (logged).
-  const g=s2Fixture();g.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'nope',task:'t',durationSeconds:300}]}:s2Wait());
+  const g=s2Fixture();g.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:'nope!',task:'t',durationSeconds:300}]}:s2Wait());
   await g.ticks(100,1);assert.equal(g.assigns().length,1);
-  await g.ticks(105,1);assert.equal(g.assigns().length,2);assert.match(g.assigns()[1].rejectedAssignments[0].reason,/unknown workstream "nope"/);
+  await g.ticks(105,1);assert.equal(g.assigns().length,2);assert.match(g.assigns()[1].rejectedAssignments[0].reason,/unknown workstream "nope!"/);
   await g.ticks(110,10);assert.equal(g.assigns().length,3,'the same rejection again: one more immediate retry, then the cap');
   assert.equal(g.reports.filter(r=>/not retried at once: its error already had 2 immediate retries today; falling back to the normal cadence/.test(r)).length,1);
 });
@@ -2857,7 +2860,7 @@ const f5Model=x=>{
   const done=new Set(x.plan.workstreams.filter(w=>['collected','done'].includes(st(w))).map(w=>w.id));
   const open=x.plan.workstreams.filter(w=>!['running','deferred','collected','done'].includes(st(w))&&w.dependsOn.every(d=>done.has(d)));
   const refusedBy=new Set((x.refusals??[]).map(r=>r.seller+'|'+r.workstream)),free=x.sellers.map(s=>s.pubkey),out=[];
-  if(!x.rejectedAssignments&&free.length)out.push({seller:free.shift(),workstream:'ws3-new',task:'start a new line of work',durationSeconds:600});
+  if(!x.rejectedAssignments&&free.length)out.push({seller:free.shift(),workstream:'ws3/new',task:'start a new line of work',durationSeconds:600}); // '/': not adoptable (#1242 F-2)
   for(const w of open){const i=free.findIndex(s=>!refusedBy.has(s+'|'+w.id));if(i>=0)out.push({seller:free.splice(i,1)[0],workstream:w.id,task:`do ${w.id}`,durationSeconds:600});}
   if(out.length)return {assignments:out};
   return /idleReason/.test(x.previousPlannerError?.reason??'')?{wait:true,idleReason:'ws2 waits for ws1, which is running'}:{wait:true};
@@ -2890,7 +2893,7 @@ test('F-5 scenario: 3 idle sellers, a refused job the plan calls running, an inv
   // (c) the next tick re-asks with the rejection and the valid ids; (a) its silent wait is asked once more.
   assert.deepEqual(f.assigns().map(i=>i.now),[100,105,105]);
   const [,retry,again]=f.assigns();
-  assert.match(retry.rejectedAssignments[0].reason,/unknown workstream "ws3-new"/);assert.deepEqual(retry.validWorkstreams,['ws1','ws2']);
+  assert.match(retry.rejectedAssignments[0].reason,/unknown workstream "ws3\/new"/);assert.deepEqual(retry.validWorkstreams,['ws1','ws2']);
   assert.ok(f.reports.some(r=>/assign call 2 today \(trigger: assignments rejected \(immediate retry 1 of 2\)\)/.test(r)));
   assert.match(again.previousPlannerError.reason,/^Invalid planner response \(assign\): 2 free sellers the budget can pay \(a, c; headroom 900 sats\) but no assignment and no idleReason/);
   const day=Object.values(f.journal.state.days)[0];
@@ -2932,12 +2935,12 @@ test('F-5 (b): a finished job is never presented as running: plan fields, plan r
   assert.equal(f.reports.filter(r=>r.startsWith('Planner plan status corrected')).length,1);
 });
 test('F-5 (c): a rejected assignment re-asks at once with validWorkstreams, at most 2 immediate retries per distinct error per day, then the normal cadence (logged)',async()=>{
-  const f=s2Fixture({sellers:['a','b']});let target='nope';
+  const f=s2Fixture({sellers:['a','b']});let target='nope!'; // '!': not adoptable (#1242 F-2)
   f.setPlan(x=>x.mode==='assign'?{assignments:[{seller:'a',workstream:target,task:'t',durationSeconds:300}],idleReason:'b: nothing else to do'}:{wait:true});
   await f.ticks(100,60);
   assert.deepEqual(f.assigns().map(i=>i.now),[100,105,110],'first call plus 2 immediate retries in 60 ticks (8d03b49c: 2 calls)');
   assert.deepEqual(f.assigns()[1].validWorkstreams,['piece']);
-  assert.match(f.assigns()[1].rejectedAssignments[0].reason,/unknown workstream "nope": not in the plan sent with this assign call \(ids: piece\)/);
+  assert.match(f.assigns()[1].rejectedAssignments[0].reason,/unknown workstream "nope!": not in the plan sent with this assign call \(ids: piece\)/);
   const capped=f.reports.filter(r=>r.startsWith('Planner assign: 1 rejected assignment not retried at once'));
   assert.deepEqual(capped,['Planner assign: 1 rejected assignment not retried at once: its error already had 2 immediate retries today; falling back to the normal cadence (the rejections stay in the next call\'s input)']);
   const day=Object.values(f.journal.state.days)[0];assert.deepEqual(Object.values(day.rejectionRetries),[2]);assert.equal('rejectedUnseen' in day,false);
@@ -2947,7 +2950,7 @@ test('F-5 (c): a rejected assignment re-asks at once with validWorkstreams, at m
   f.runner=new Swarm(f.c,f.io,f.journal);await f.ticks(720,6);
   assert.deepEqual(f.assigns().map(i=>i.now).slice(4),[720],'restart: first call only, the capped error is not retried');
   // A different error is a new error with its own two retries.
-  target='nope2';f.snap.budget.totalSats=20;await f.ticks(750,6);
+  target='nope2!';f.snap.budget.totalSats=20;await f.ticks(750,6);
   assert.deepEqual(f.assigns().map(i=>i.now).slice(5),[750,755,760],'budget change, then 2 immediate retries for the new error');
 });
 test('F-5 (a): free payable sellers and no assignment need an idleReason: one retry, then journaled and logged; no capacity stays quiet',async()=>{

@@ -376,7 +376,9 @@ export const TRUNCATION_MARKER = '[truncated:';
 // a relay error string cannot span lines and a non-hex seller string cannot grow the line.
 const indexField=(v,n)=>{const s=String(v),c=s.length>n?s.slice(0,n)+'…':s;return c.replace(/[\u0000-\u001f\u007f]/g,ch=>({'\n':'\\n','\r':'\\r','\t':'\\t'})[ch]??`\\u${ch.charCodeAt(0).toString(16).padStart(4,'0')}`);};
 export const MIN_DIGEST_CHARS = 100;
-export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000,fieldChars=2000,trackRecordTasks=10,minDigestChars=MIN_DIGEST_CHARS}={}) {
+// `answersKept` (default: all) omits the answer of every result older than the newest answersKept
+// up front, as step 3 would (#1242 F-1: the reduced retry after a failed planner command).
+export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputChars=200000,fieldChars=2000,trackRecordTasks=10,minDigestChars=MIN_DIGEST_CHARS,answersKept=Infinity}={}) {
   const all=input.results??[],total=all.length;
   let fieldsCut=0;
   const cut=(text,n,why)=>{
@@ -402,14 +404,16 @@ export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputC
     ...(Array.isArray(input.refusals)?{refusals:input.refusals.map(r=>r&&typeof r==='object'?{...r,task:field(r.task,fieldChars,'refused task')}:r)}:{})};
   let digestNow=digestChars;
   const digest=r=>({...r,task:cut(r.task,digestNow,'older task'),answer:cut(r.answer,digestNow,'older result digest'),...(typeof r.answer==='string'&&r.answer.length>digestNow?{answerChars:r.answer.length}:{})});
-  let results=all.map((r,i)=>i<total-fullResults?digest(r):r);
+  const omit=(r,i)=>{const o={...r,task:cut(r.task,200,'older task'),answer:`${TRUNCATION_MARKER} answer omitted to fit the planner input budget; ${typeof all[i].answer==='string'?all[i].answer.length:0} chars]`,answerOmitted:true};delete o.answerChars;return o;};
+  const keep=Math.max(answersKept,fullResults);
+  let results=all.map((r,i)=>i<total-keep?omit(r,i):i<total-fullResults?digest(r):r);
   let refusals=base.refusals,rejected=base.rejectedAssignments;
   let dropped=0,indexOmitted=0,refusalsDropped=0,rejectedDropped=0;const droppedIndex=[];
   const build=()=>{
     const full=results.filter(r=>!r.answerChars&&!r.answerOmitted).length;
     const digested=results.filter(r=>r.answerChars).length,answersOmitted=results.filter(r=>r.answerOmitted).length,fullText=Math.min(full,total-dropped);
     const summary=`${total-fullText} of ${total} results are not shown in full: ${digested} digested (head and tail, ${digestNow} chars), ${answersOmitted} with the answer omitted, ${dropped} dropped (${dropped-indexOmitted} listed in droppedIndex${indexOmitted?`, ${indexOmitted} not listed at all`:''})${refusalsDropped?`; ${refusalsDropped} older refusals feed entries dropped`:''}${rejectedDropped?`; ${rejectedDropped} older rejected assignments dropped`:''}`;
-    const history={results:total,fullText,digested,answersOmitted,resultsDropped:dropped,droppedIndex:droppedIndex.slice(indexOmitted),droppedIndexOmitted:indexOmitted,refusalsDropped,rejectedDropped,fieldsCut,fullResultsKept:fullResults,digestChars,digestCharsUsed:digestNow,maxInputChars,marker:TRUNCATION_MARKER,summary};
+    const history={results:total,fullText,digested,answersOmitted,resultsDropped:dropped,droppedIndex:droppedIndex.slice(indexOmitted),droppedIndexOmitted:indexOmitted,refusalsDropped,rejectedDropped,fieldsCut,fullResultsKept:fullResults,digestChars,digestCharsUsed:digestNow,maxInputChars,...(Number.isFinite(answersKept)?{answersKept:keep}:{}),marker:TRUNCATION_MARKER,summary};
     return {...base,results,...(refusals!==undefined?{refusals}:{}),...(rejected!==undefined?{rejectedAssignments:rejected}:{}),history};
   };
   const size=x=>JSON.stringify(x).length;
@@ -417,11 +421,9 @@ export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputC
   // 1. Fewer full results: newest answers to digests, oldest of them first.
   for(let i=Math.max(0,total-fullResults);size(out)>maxInputChars&&i<results.length;i++){results[i]=digest(all[i]);out=build();}
   // 2. Shorter digests (every entry is a digest by now): halve, down to minDigestChars.
-  while(size(out)>maxInputChars&&digestNow>minDigestChars){digestNow=Math.max(minDigestChars,Math.floor(digestNow/2));results=all.map(digest);out=build();}
+  while(size(out)>maxInputChars&&digestNow>minDigestChars){digestNow=Math.max(minDigestChars,Math.floor(digestNow/2));results=all.map((r,i)=>i<total-keep?omit(r,i):digest(r));out=build();}
   // 3. Older answers omitted, oldest first (the newest digests stay).
-  for(let i=0;size(out)>maxInputChars&&i<Math.max(0,results.length-fullResults);i++){
-    const r=results[i];results[i]={...r,task:cut(r.task,200,'older task'),answer:`${TRUNCATION_MARKER} answer omitted to fit the planner input budget; ${typeof all[i].answer==='string'?all[i].answer.length:0} chars]`,answerOmitted:true};delete results[i].answerChars;out=build();
-  }
+  for(let i=0;size(out)>maxInputChars&&i<Math.max(0,results.length-fullResults);i++){results[i]=omit(results[i],i);out=build();}
   // 4. Oldest refusals feed entries (the refused results themselves stay in results).
   while(size(out)>maxInputChars&&refusals?.length){refusals=refusals.slice(1);refusalsDropped++;out=build();}
   // 5. Older entries dropped, oldest first; each leaves its index line.
@@ -434,6 +436,77 @@ export function boundPlannerInput(input,{fullResults=8,digestChars=600,maxInputC
   while(size(out)>maxInputChars&&indexOmitted<droppedIndex.length){indexOmitted++;out=build();}
   while(size(out)>maxInputChars&&rejected?.length){rejected=rejected.slice(1);rejectedDropped++;out=build();}
   return size(out)>maxInputChars?null:out;
+}
+// #1242 F-1: the planner input cap. SWARM_PLANNER_MAX_INPUT_CHARS always applies; the optional
+// SWARM_PLANNER_MAX_INPUT_TOKENS adds a token-ish cap, converted with SWARM_PLANNER_CHARS_PER_TOKEN
+// (default 3, a deliberately low estimate for JSON with hex keys; no tokenizer, no specific LLM).
+export const DEFAULT_CHARS_PER_TOKEN = 3;
+export function plannerInputCap(c={}) {
+  const chars=c.plannerMaxInputChars??200000;
+  return c.plannerMaxInputTokens?Math.min(chars,Math.floor(c.plannerMaxInputTokens*(c.plannerCharsPerToken??DEFAULT_CHARS_PER_TOKEN))):chars;
+}
+// The one retry after a failed planner COMMAND (it exited non-zero, or printed empty/unparseable
+// output): a quarter of the full results, quarter-size digests, answers older than the configured
+// full-result count omitted, half the input cap. Goal, challenge, plan (with its record), seller
+// profiles and running jobs are the fixed parts and are kept as they are.
+export function reducedPlannerBounds({fullResults=8,digestChars=600,maxInputChars=200000}={}) {
+  return {fullResults:Math.floor(fullResults/4),digestChars:Math.max(MIN_DIGEST_CHARS,Math.floor(digestChars/4)),maxInputChars:Math.max(100,Math.floor(maxInputChars/2)),answersKept:Math.max(1,fullResults)};
+}
+// Retried: a process exit with a code (e.g. `exited 1: empty content (finish_reason=length)`) or
+// output that is not JSON. Never retried: a validation rejection (the planner answered, the answer
+// was wrong: previousPlannerError covers it), a timeout (runner kill or the bundled LLM call's own;
+// a second one would double the blocked time), a signal kill (a stopping runner).
+export const retryablePlannerFailure = e => !plannerValidationError(e)&&((Number.isSafeInteger(e?.exitCode)&&!/\bCommand timed out\b/.test(String(e?.message??'')))||e instanceof SyntaxError);
+export const PLANNER_RETRIES_KEPT = 20;
+const oneLine = (s,n=300) => String(s??'').replace(/\s+/g,' ').trim().slice(0,n);
+// #1242 F-4: a collected delivery with no usable answer: empty, placeholder text only, or fewer
+// than minChars non-space characters (runner framing of delivered files is not counted). This only
+// annotates the journal row and tells the planner; collect and payment are unchanged.
+// 20, not 40: an exact short answer is legitimate (the E2E fixture answer "Challenge fixture result:
+// 42." has 26 non-space chars). Placeholders are caught by text, whatever their length.
+export const DEFAULT_UNUSABLE_ANSWER_CHARS = 20;
+const PLACEHOLDER_ANSWER = /^\W*(?:placeholder|initiali[sz]ing)\b/i;
+export function unusableDelivery(answer,{minChars=DEFAULT_UNUSABLE_ANSWER_CHARS}={}) {
+  if(typeof answer!=='string')return 'no answer text';
+  const content=answer.replace(/^Delivered files \(no inline answer\):\n/,'').split('\n')
+    .filter(l=>!/^===== .* =====$/.test(l)&&!/^\[(?:truncated|skipped):/.test(l)&&l.trim()!=='[delivery contained no readable text files]').join('\n').trim();
+  const n=(content.match(/\S/g)??[]).length;
+  if(!n)return 'empty delivery (no answer text)';
+  if(n<200&&PLACEHOLDER_ANSWER.test(content))return `placeholder text only (${n} non-space chars: ${JSON.stringify(content.slice(0,60))})`;
+  if(n<minChars)return `trivially short answer (${n} non-space chars, under ${minChars})`;
+  return null;
+}
+// #1242 F-2: an assign response naming a workstream id that is in neither the plan it was sent nor
+// the plan it returned. The id is adopted as a new plan workstream (description = the task's first
+// line, needs {}, dependsOn []), journaled in days[…].adoptedWorkstreams, when the id is plain
+// (WORKSTREAM_ID: 1-64 chars of A-Z a-z 0-9 _ . : -), it was never dropped by a revision (a stale id
+// stays rejected), at most MAX_ADOPTED_PER_CALL ids were adopted in this call, the plan holds fewer
+// than MAX_PLAN_WORKSTREAMS, and its assignment passes every other check (it is adopted right before
+// it is journaled; a rejected assignment adopts nothing).
+export const WORKSTREAM_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
+export const MAX_ADOPTED_PER_CALL = 8;
+export const MAX_PLAN_WORKSTREAMS = 100;
+export const ADOPTED_KEPT = 200;
+export function adoptionProblem(id,{adopted=0,planSize=0}={}) {
+  if(typeof id!=='string'||!WORKSTREAM_ID.test(id))return 'a workstream id must be 1-64 characters of A-Z a-z 0-9 _ . : -';
+  if(adopted>=MAX_ADOPTED_PER_CALL)return `at most ${MAX_ADOPTED_PER_CALL} new workstreams are adopted per assign call; add the rest to a revised "plan"`;
+  if(planSize>=MAX_PLAN_WORKSTREAMS)return `the plan already has ${planSize} workstreams (at most ${MAX_PLAN_WORKSTREAMS}); return a revised "plan" instead`;
+  return null;
+}
+export const firstTaskLine = task => String(task).split('\n').map(l=>l.trim()).find(Boolean)?.slice(0,200)??'';
+export function adoptedWorkstream(id,task,durationSeconds) {
+  return {id,description:firstTaskLine(task),needs:{},estMinutes:Math.max(1,Math.ceil(durationSeconds/60)),dependsOn:[],adopted:true};
+}
+// #1242 F-7: the stop text when no free seller is left and nothing runs. The work window is the
+// binding limit once it has ended or cannot fit one minimum task (live clock: a planner call can
+// cross `ends`); `all eligible sellers exhausted` is kept for a roster that is out of minutes.
+// Both window texts start with `Unsolved: work window ended`, the stop the runner already published
+// at `ends`, so every reader of that text keeps working.
+export const EXHAUSTED_STOP = 'Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)';
+export function exhaustionStop(c,now,minSeconds) {
+  if(now>=c.ends)return 'Unsolved: work window ended';
+  if(now+minSeconds>c.ends)return `Unsolved: work window ended (${c.ends-now}s left, less than the ${minSeconds}s minimum task)`;
+  return EXHAUSTED_STOP;
 }
 // get_job fields the budget release proofs (expired paid jobs) depend on. They first reached main
 // in #1162 (merge 7a14298d, from 942b40e7 and 49925c79) and are in NO release tag: v0.6.1 lacks
@@ -738,13 +811,13 @@ export function sellerProfile(s,jobs) {
   const price=sellerPricing(s);
   const own=jobs.filter(j=>j.seller===s.pubkey);
   const tasks=own.filter(j=>j.done||j.outcome).map(j=>({task:jobTask(j),workstream:j.workstream??null,
-    outcome:j.outcome,delivered:j.outcome==='collected',turnaroundSeconds:(j.ts??j.created)-j.created}));
+    outcome:j.outcome,delivered:j.outcome==='collected'&&j.deliveryFlag!=='unusable',...(j.deliveryFlag==='unusable'?{unusable:true}:{}),turnaroundSeconds:(j.ts??j.created)-j.created}));
   return {pubkey:s.pubkey,npub:s.npub??'',name:s.name??'',agents:values('agents'),
     harness:{family:values('harness_family'),model:values('harness_model'),variant:values('harness_variant')},
     capabilities:values('capabilities'),hardware:values('hardware'),minutesRemaining:s.minutesRemaining,note:s.note??'',
     pricing:{rateSats:values('rate'),takesPayment:values('takes_payment'),free:price.free,minimumSats:price.minimumSats},
     challengeSpend:{paidSats:own.reduce((n,j)=>n+jobBudget(j).paidSats,0),reservedSats:own.reduce((n,j)=>n+jobBudget(j).reservedSats,0)},
-    trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,refused:tasks.filter(t=>t.outcome==='refused').length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
+    trackRecord:{tasksDone:tasks.length,delivered:tasks.filter(t=>t.delivered).length,unusable:tasks.filter(t=>t.unusable).length,refused:tasks.filter(t=>t.outcome==='refused').length,expired:tasks.filter(t=>t.outcome==='expired/undelivered').length,tasks}};
 }
 export function requestId(c,s,n) {return 'swarm-'+createHash('sha256').update(JSON.stringify([c.buyer,c.id,s,n])).digest('hex');}
 // This is the buyer's explicit-request preparation identity (buyer/preparations.rs).
@@ -910,7 +983,7 @@ export function missingIdleReason(sellers,headroomSats) {
 // is held), or its recorded outcome (collected, refused, expired/undelivered, collect refused,
 // payment stuck, price too high…) once done or once its slot was freed.
 export function recordedStatus(j) {
-  if(j.done||j.slotFreed)return String(j.outcome??(j.done?'finished':'expired/undelivered')).slice(0,200);
+  if(j.done||j.slotFreed)return String(j.outcome??(j.done?'finished':'expired/undelivered')).slice(0,200)+(j.deliveryFlag==='unusable'?' (unusable delivery)':'');
   return j.deferred?'deferred':'running';
 }
 const recordedActive = status => status==='running'||status==='deferred';
@@ -1343,7 +1416,8 @@ export class Swarm {
   // Full fresh admission for one assignment: challenge identity and window, eligibility,
   // leave/deny, minutes, budget headroom and one-job-per-seller. Returns failing reasons.
   admission(fresh,c,seller,durationSeconds,amountSats,at,except=null) {
-    if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer||at+durationSeconds>fresh.challenge.ends)return ['challenge changed or work window exceeded'];
+    if(fresh.challenge?.id!==c.id||fresh.challenge?.buyer!==c.buyer)return ['challenge changed'];
+    if(at+durationSeconds>fresh.challenge.ends)return [`work window exceeded (deadline ${at+durationSeconds} is after ends ${fresh.challenge.ends})`];
     const key=JSON.stringify([c.buyer,c.id]);
     const check=coordinate(fresh,{now:at,durationSeconds,amountSats,budgetState:reservedBudget(fresh,this.state.jobs.filter(j=>j.key===key&&j!==except),at),pendingSellers:this.pendingSellers(fresh,key,at,except)});
     const candidate=check.sellers.find(x=>x.seller_pubkey===seller);
@@ -1513,7 +1587,11 @@ export class Swarm {
         // its own outcome: never counted as work, shown to the planner for reassignment.
         const refusal=answerError?null:detectRefusal(answer);
         // done records collection, not release of the seller slot; pending() waits for meter closure.
-        Object.assign(j,{answer,ts:now,done:true,outcome:refusal?'refused':'collected',pay:collected?.pay,...(answerError?{answerError}:{}),...(refusal?{refusal}:{})});this.save();
+        // #1242 F-4: an empty, placeholder or trivially short delivery is annotated (journal row and
+        // planner input), never refused: collect and payment above are unchanged.
+        const unusable=answerError||refusal?null:unusableDelivery(answer,{minChars:this.c.unusableAnswerChars??DEFAULT_UNUSABLE_ANSWER_CHARS});
+        Object.assign(j,{answer,ts:now,done:true,outcome:refusal?'refused':'collected',pay:collected?.pay,...(answerError?{answerError}:{}),...(refusal?{refusal}:{}),...(unusable?{deliveryFlag:'unusable',deliveryFlagReason:unusable}:{})});this.save();
+        if(unusable)this.io.report?.(`Job ${j.id}: seller ${j.seller} delivered an UNUSABLE answer (${unusable}); collected and settled as usual (pay ${collected?.pay?.state}); the planner is told to reassign workstream ${j.workstream??'?'}`);
         if(refusal)this.io.report?.(`Job ${j.id}: seller ${j.seller} REFUSED (${refusal.by}${refusal.kind?`: ${refusal.kind}`:''}); recorded as refused, not as work; the planner is told to reassign workstream ${j.workstream??'?'} to a different seller: ${refusal.reason.slice(0,200)}`);
       } else if(state.publish_refused && !state.awarded && !state.claims?.length) {j.released=true;j.done=true;j.outcome=`publication refused: ${state.publish_refused}`;j.ts=now;this.save();}
       else if(now>j.args.deadline_unix) {
@@ -1560,7 +1638,8 @@ export class Swarm {
     const jobs=this.state.jobs.filter(j=>j.key===key);
     const refusedAnswer=j=>`[refused: the seller declined or was stopped (${j.refusal.by}${j.refusal.kind?`: ${j.refusal.kind}`:''}); NOT completed work; assign this workstream to a different seller]\n${j.answer}`;
     const quotedIds=j=>j.quoted?.jobs?.length?{quotedAnswers:j.quoted.jobs.map(q=>q.id)}:{};
-    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({jobId:j.id??null,...quotedIds(j),seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:jobTask(j),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.outcome==='refused'&&j.refusal?refusedAnswer(j):j.answer??`[${j.outcome}]`,...(j.outcome==='refused'?{refused:true}:{}),...(j.answerError?{answerError:j.answerError}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),...(j.paymentStuck?{paymentStuck:j.paymentStuck.reason}:{}),ts:j.ts??now}));
+    const unusableAnswer=j=>`[unusable delivery: ${j.deliveryFlagReason??'no usable answer'}; collected, but NOT completed work; reassign this workstream]\n${j.answer}`;
+    const results=jobs.filter(j=>j.done||j.outcome).map(j=>({jobId:j.id??null,...quotedIds(j),seller:j.seller,workstream:j.workstream??null,outcome:j.outcome,task:jobTask(j),amountSats:j.args.amount_sats,...jobBudget(j),priceAsked:j.priceAsked??null,answer:j.outcome==='refused'&&j.refusal?refusedAnswer(j):j.deliveryFlag==='unusable'&&typeof j.answer==='string'?unusableAnswer(j):j.answer??`[${j.outcome}]`,...(j.outcome==='refused'?{refused:true}:{}),...(j.answerError?{answerError:j.answerError}:{}),...(j.deliveryFlag?{deliveryFlag:j.deliveryFlag,deliveryFlagReason:j.deliveryFlagReason??null}:{}),...(j.collectRefused?{collectRefused:j.collectRefused}:{}),...(j.paymentStuck?{paymentStuck:j.paymentStuck.reason}:{}),ts:j.ts??now}));
     // R3-3 (c): this challenge's refusals, newest last. sameContext: the task was posted with the
     // current operator context (only then is a reassignment to the same seller refused).
     const sameContext=j=>(j.taskContext??null)===(this.c.taskContext??null);
@@ -1606,15 +1685,34 @@ export class Swarm {
         ...(day.plannerError?{previousPlannerError:day.plannerError}:{}),
         ...(refusals.length?{refusals}:{}),
         ...(this.releaseMissing?.length?{paidWorkRefused:`buyer get_job lacks ${this.releaseMissing.join(', ')}; assign only amountSats 0`}:{})};
-      const input=boundPlannerInput(raw,{fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:this.c.plannerMaxInputChars??200000});
-      if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${this.c.plannerMaxInputChars??200000}) even with every result, refusal and rejected assignment dropped: its fixed parts (goal, challenge, plan, seller profiles, running jobs) alone do not fit`);
-      const chars=JSON.stringify(input).length,h=input.history,started=Date.now();let ok=false;
+      const bounds={fullResults:this.c.plannerFullResults??8,digestChars:this.c.plannerDigestChars??600,maxInputChars:plannerInputCap(this.c)};
+      let input=boundPlannerInput(raw,bounds);
+      if(!input)throw Error(`Planner ${mode} input exceeds SWARM_PLANNER_MAX_INPUT_CHARS (${bounds.maxInputChars}${bounds.maxInputChars<(this.c.plannerMaxInputChars??200000)?` via SWARM_PLANNER_MAX_INPUT_TOKENS ${this.c.plannerMaxInputTokens} × SWARM_PLANNER_CHARS_PER_TOKEN ${this.c.plannerCharsPerToken??DEFAULT_CHARS_PER_TOKEN}`:''}) even with every result, refusal and rejected assignment dropped: its fixed parts (goal, challenge, plan, seller profiles, running jobs) alone do not fit`);
+      let chars=JSON.stringify(input).length,h=input.history,started=Date.now(),ok=false,retried='';
       // S-2: calls per day and mode (journaled), counted when the planner command is run.
       const calls=day.plannerCalls??={analyze:0,assign:0,assess:0};calls[mode]=(calls[mode]??0)+1;this.save();
+      const historyText=x=>`results ${x.results} (${x.fullText} full, ${x.digested} digested, ${x.answersOmitted} answers omitted, ${x.resultsDropped} dropped)${x.digestCharsUsed<x.digestChars?`, digests cut to ${x.digestCharsUsed} chars`:''}`;
       try {
         let p;
-        try {p=validatePlan(await this.io.plan(input),mode);}
-        catch(e) {
+        try {
+          try {p=validatePlan(await this.io.plan(input),mode);}
+          catch(e) {
+            // #1242 F-1: a failed planner COMMAND (exit code, empty or non-JSON output; e.g. the
+            // LLM spent its whole completion and returned no content) is retried ONCE in this same
+            // call with a reduced input. Validation rejections, timeouts and kills are not.
+            const less=reducedPlannerBounds(bounds),reduced=retryablePlannerFailure(e)?boundPlannerInput(raw,less)??boundPlannerInput(raw,{...less,maxInputChars:bounds.maxInputChars}):null;
+            if(!reduced)throw e;
+            const firstSeconds=(Date.now()-started)/1000,error=oneLine(e?.message);
+            const entry={mode,at:this.io.now(),first:{chars,results:h.results,fullText:h.fullText,seconds:+firstSeconds.toFixed(1),error},retry:{chars:JSON.stringify(reduced).length,results:reduced.history.results,fullText:reduced.history.fullText,answersOmitted:reduced.history.answersOmitted,digestCharsUsed:reduced.history.digestCharsUsed,maxInputChars:reduced.history.maxInputChars}};
+            (day.plannerRetries??=[]).push(entry);day.plannerRetries=day.plannerRetries.slice(-PLANNER_RETRIES_KEPT);
+            calls[mode]=(calls[mode]??0)+1;this.save();
+            this.io.report?.(`Planner ${mode} failed in ${firstSeconds.toFixed(1)}s; input ${chars} chars, ${historyText(h)}: ${error}; retrying once with reduced input (${entry.retry.chars} chars, ${historyText(reduced.history)})`);
+            input=reduced;chars=entry.retry.chars;h=reduced.history;started=Date.now();retried=' (reduced-input retry)';
+            try {p=validatePlan(await this.io.plan(input),mode);entry.retry.ok=true;}
+            catch(e2) {entry.retry.ok=false;entry.retry.error=oneLine(e2?.message);throw e2;}
+            finally {entry.retry.seconds=+((Date.now()-started)/1000).toFixed(1);this.save();}
+          }
+        } catch(e) {
           // R4-3: journal why the response was rejected; the next call (the retry) shows it.
           const reason=plannerValidationError(e);
           if(reason){day.plannerError={mode,reason,at:this.io.now()};this.save();this.io.report?.(`Planner ${mode} response rejected: ${reason}`);}
@@ -1639,7 +1737,7 @@ export class Swarm {
         if(cleared||next)this.save();
         return p;
       } finally {
-        this.io.report?.(`Planner ${mode} ${ok?'ok':'failed'} in ${((Date.now()-started)/1000).toFixed(1)}s; input ${chars} chars, results ${h.results} (${h.fullText} full, ${h.digested} digested, ${h.answersOmitted} answers omitted, ${h.resultsDropped} dropped)${h.digestCharsUsed<h.digestChars?`, digests cut to ${h.digestCharsUsed} chars`:''}; ${mode} call ${calls[mode]} today${trigger?` (trigger: ${trigger})`:''}; ${this.plannerCallsText(key,day)}`);
+        this.io.report?.(`Planner ${mode} ${ok?'ok':'failed'}${retried} in ${((Date.now()-started)/1000).toFixed(1)}s; input ${chars} chars, ${historyText(h)}; ${mode} call ${calls[mode]} today${trigger?` (trigger: ${trigger})`:''}; ${this.plannerCallsText(key,day)}`);
       }
     };
     const planGate=ready&&c.status==='in_progress'&&now>=c.starts&&now<c.ends;
@@ -1692,7 +1790,7 @@ export class Swarm {
           } else if(day.idle){delete day.idle;this.save();}
           const planIds=new Set([...sentPlans.flatMap(x=>x?.workstreams??[]),...(p.plan?.workstreams??[])].map(w=>w?.id).filter(id=>typeof id==='string'));
           if(p.solved)stop(p.summary??'Solved',p.result);
-          let budgetRejected=0;
+          let budgetRejected=0,adoptedNow=0;
           // Replaced by every assign batch (journaled with the next save), shown to the planner on its next calls.
           const hadRejected=!!day.rejected?.length,rejected=day.rejected=[];
           for(const assignment of p.assignments??[]) {
@@ -1719,7 +1817,13 @@ export class Swarm {
             if(benchedSet.has(seller)){const b=benchedSet.get(seller);reject(`seller benched until ${b.until}: ${b.reason}`);continue;}
             if(!candidates.some(s=>s.seller_pubkey===seller)){reject(`seller busy or ineligible (not in free roster): ${this.notFreeReason(snap,key,now,seller,min,c)}`);continue;}
             if(typeof task!=='string'||!task.trim()){reject('invalid task (empty or not text)');continue;}
-            if(!planIds.has(workstream)){const stale=(day.retiredWorkstreams??[]).includes(workstream);reject(`${stale?'stale':'unknown'} workstream ${JSON.stringify(String(workstream)).slice(0,120)}${stale?' (it was in an earlier plan; a later revision dropped it)':''}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})`);continue;}
+            let adopt=false;
+            if(!planIds.has(workstream)) {
+              const stale=(day.retiredWorkstreams??[]).includes(workstream);
+              const why=stale?null:adoptionProblem(workstream,{adopted:adoptedNow,planSize:day.plan?.workstreams?.length??0});
+              if(stale||why){reject(`${stale?'stale':'unknown'} workstream ${JSON.stringify(String(workstream)).slice(0,120)}${stale?' (it was in an earlier plan; a later revision dropped it)':''}: not in the plan sent with this assign call${p.plan?' or the plan it returned':''} (ids: ${[...planIds].join(', ').slice(0,400)})${why?`; not adopted: ${why}`:''}`);continue;}
+              adopt=true;
+            }
             // R3-3 (c): a seller that refused this workstream is not given it again under the same
             // operator context (a changed SWARM_TASK_CONTEXT may be what lets it proceed).
             const refusedBy=jobs.find(j=>j.outcome==='refused'&&j.seller===seller&&j.workstream===workstream&&sameContext(j));
@@ -1740,6 +1844,15 @@ export class Swarm {
             // (journaled, no offer, no budget held); any other reason drops.
             const deferred=reasons.length>0&&reasons.every(r=>TRANSIENT_REASONS.includes(r));
             if(reasons.length&&!deferred){if(reasons.includes('budget_exceeded'))budgetRejected++;reject(`${reasons.join(', ')} (amountSats ${amountSats}, durationSeconds ${durationSeconds}, deadline ${at+durationSeconds}, work window ends ${fresh.challenge?.ends??'?'})`);continue;}
+            if(adopt) {
+              // F-2: every other check passed; the new workstream joins the plan before its job is journaled.
+              const w=adoptedWorkstream(workstream,task,durationSeconds);
+              day.plan={...day.plan,workstreams:[...(day.plan?.workstreams??[]),w]};planIds.add(workstream);adoptedNow++;
+              day.adoptedWorkstreams=[...(day.adoptedWorkstreams??[]),{id:workstream,description:w.description,seller,at}].slice(-ADOPTED_KEPT);this.save();
+              this.io.report?.(`Adopted workstream ${JSON.stringify(workstream)} from the assign response (it was not in the plan): ${JSON.stringify(w.description)}; added to the plan with no dependencies`);
+              // The planner named this work itself: the adopted plan is not new input, so it does not trigger another assign call.
+              const cad=this.cadence.get(key);if(cad)cad.facts={...cad.facts,plan:factHash(day.plan)};
+            }
             const sequence=jobs.filter(j=>j.seller===seller).length+1;
             const args={task:postedTask,output:'text/plain',visibility:'public',seller_pubkey:seller,payment:amountSats?'sat':'none',amount_sats:amountSats,max_sats:amountSats,deadline_unix:at+durationSeconds,request_id:requestId(c,seller,sequence)};
             const j={key,challenge:c,seller,workstream,durationSeconds,created:at,args,reportBack,...(quote.jobs.length?{quoted:{jobs:quote.jobs,chars:quote.block.length}}:{}),...(this.c.taskContext?{taskContext:this.c.taskContext}:{})};
@@ -1762,7 +1875,7 @@ export class Swarm {
         // that would otherwise fit is exhausted. Keep both named checks.
         const benchedSellerWillReturn=bench.length>0;
         const reprobing=waitingOnHarnessProbe(decision,c.ends);
-        if(!day.stop&&!candidates.length&&!benchedSellerWillReturn&&!reprobing&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop('Unsolved: all eligible sellers exhausted (no task fits remaining minutes/work window)');
+        if(!day.stop&&!candidates.length&&!benchedSellerWillReturn&&!reprobing&&!pending().length&&!(snap.jobs??[]).some(j=>j.running)&&!snap.sellers.some(s=>s.currentJobStart!=null))stop(exhaustionStop(c,this.io.now(),min));
       }
     }
     if(day.stop&&!day.stop.external&&!day.published) {
@@ -1859,7 +1972,7 @@ export function config(argv,env=process.env) {
   if(env.SWARM_AMOUNT_SATS!==undefined)throw Error('SWARM_AMOUNT_SATS removed; use assignment.amountSats');
   const values={};for(let i=0;i<argv.length;i++){const k=argv[i];if(k==='--award-fallback'){values[k]=true;continue;}if(!['--home','--binary','--relay-url','--planner','--duration-seconds','--poll-seconds','--update-seconds','--award-after-seconds'].includes(k)||argv[i+1]===undefined)throw Error(`Unknown or incomplete option ${k}`);values[k]=argv[++i];}
   const flag=(name,value)=>{const v=String(value??'').trim().toLowerCase();if(['','0','false','no','off'].includes(v))return false;if(['1','true','yes','on'].includes(v))return true;throw Error(`Invalid ${name}: use 1/true/yes/on or 0/false/no/off`);};
-  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),benchAfterUnclaimed:+(env.SWARM_BENCH_AFTER_UNCLAIMED??DEFAULT_BENCH_AFTER_UNCLAIMED),benchSeconds:+(env.SWARM_BENCH_SECONDS??DEFAULT_BENCH_SECONDS),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000),plannerIdleSeconds:+(env.SWARM_PLANNER_IDLE_SECONDS??DEFAULT_PLANNER_IDLE_SECONDS)};
+  const c={autoRaiseToRate:flag('SWARM_AUTO_RAISE_TO_RATE',env.SWARM_AUTO_RAISE_TO_RATE),challengeRelays:parseChallengeRelays(env.SWARM_CHALLENGE_RELAYS),home:values['--home']??env.MAXPLAYER_HOME,binary:values['--binary']??env.SWARM_MAXPLAYER_BINARY??'maxplayer',url:values['--relay-url']??env.RELAY_URL,planner:values['--planner']??env.SWARM_PLANNER??`node ${JSON.stringify(join(here,'planner-llm.mjs'))}`,duration:+(values['--duration-seconds']??env.SWARM_DURATION_SECONDS??300),minDuration:+(env.SWARM_MIN_DURATION??DEFAULT_MIN_DURATION),maxDuration:+(env.SWARM_MAX_DURATION??1800),poll:+(values['--poll-seconds']??env.SWARM_POLL_SECONDS??5),updateEvery:+(values['--update-seconds']??env.SWARM_UPDATE_SECONDS??180),awardAfter:+(values['--award-after-seconds']??env.SWARM_AWARD_AFTER_SECONDS??30),maxDefer:+(env.SWARM_MAX_DEFER_SECONDS??120),benchAfterUnclaimed:+(env.SWARM_BENCH_AFTER_UNCLAIMED??DEFAULT_BENCH_AFTER_UNCLAIMED),benchSeconds:+(env.SWARM_BENCH_SECONDS??DEFAULT_BENCH_SECONDS),expiredSlotGrace:+(env.SWARM_EXPIRED_SLOT_GRACE_SECONDS??EXPIRED_SLOT_GRACE_SECONDS),awardFallback:values['--award-fallback']===true,plannerFullResults:+(env.SWARM_PLANNER_FULL_RESULTS??8),plannerDigestChars:+(env.SWARM_PLANNER_DIGEST_CHARS??600),plannerMaxInputChars:+(env.SWARM_PLANNER_MAX_INPUT_CHARS??200000),plannerMaxInputTokens:+(env.SWARM_PLANNER_MAX_INPUT_TOKENS??0),plannerCharsPerToken:+(env.SWARM_PLANNER_CHARS_PER_TOKEN??DEFAULT_CHARS_PER_TOKEN),unusableAnswerChars:+(env.SWARM_UNUSABLE_ANSWER_CHARS??DEFAULT_UNUSABLE_ANSWER_CHARS),plannerIdleSeconds:+(env.SWARM_PLANNER_IDLE_SECONDS??DEFAULT_PLANNER_IDLE_SECONDS)};
   c.challengeQuorum=parseChallengeQuorum(env.SWARM_CHALLENGE_QUORUM,c.challengeRelays.length);
   // R3-3 (a): operator task context, inline or from a file (not both).
   if(env.SWARM_TASK_CONTEXT!==undefined&&env.SWARM_TASK_CONTEXT_FILE!==undefined)throw Error('Set SWARM_TASK_CONTEXT or SWARM_TASK_CONTEXT_FILE, not both');
@@ -1871,6 +1984,9 @@ export function config(argv,env=process.env) {
   c.plannerTimeouts=plannerTimeouts(env);
   if(!Number.isSafeInteger(c.plannerFullResults)||c.plannerFullResults<0)throw Error('Invalid plannerFullResults');
   for(const k of ['plannerDigestChars','plannerMaxInputChars'])if(!Number.isSafeInteger(c[k])||c[k]<100)throw Error(`Invalid ${k}`);
+  if(!Number.isSafeInteger(c.plannerMaxInputTokens)||c.plannerMaxInputTokens<0||(c.plannerMaxInputTokens&&c.plannerMaxInputTokens<100))throw Error('Invalid SWARM_PLANNER_MAX_INPUT_TOKENS: must be 0 (off) or an integer >= 100');
+  if(!Number.isFinite(c.plannerCharsPerToken)||c.plannerCharsPerToken<=0||c.plannerCharsPerToken>100)throw Error('Invalid SWARM_PLANNER_CHARS_PER_TOKEN: must be a number > 0 and <= 100');
+  if(!Number.isSafeInteger(c.unusableAnswerChars)||c.unusableAnswerChars<0)throw Error('Invalid SWARM_UNUSABLE_ANSWER_CHARS: must be an integer >= 0 (0 flags only empty or placeholder deliveries)');
   if(!Number.isSafeInteger(c.plannerIdleSeconds)||c.plannerIdleSeconds<0)throw Error('Invalid SWARM_PLANNER_IDLE_SECONDS: must be an integer >= 0 (0 calls assign on every tick)');
   if(!c.home||!c.url)throw Error('Explicit buyer home and relay URL required');
   if(!['ws:','wss:'].includes(new URL(c.url).protocol))throw Error('Invalid relay URL');
