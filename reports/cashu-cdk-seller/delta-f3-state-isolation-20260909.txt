@@ -1,0 +1,16 @@
+===F3-ISOLATION===
+state root:      /var/lib/cashu-test-state
+mint state dir:  /var/lib/cashu-test-state/mint
+delivered dir:   /work
+state inside delivered dir: no
+state contents (names and sizes only, no values):
+  mintd.pid 5 bytes
+  mintd.log 8118 bytes
+  cdk-mintd.sqlite-wal 1998232 bytes
+  cdk-mintd.sqlite 4096 bytes
+  seed 76 bytes
+  cdk-mintd.sqlite-shm 32768 bytes
+  config.toml 2571 bytes
+seed mode: 600
+delivered dir entries matching test-mint state:
+  none
