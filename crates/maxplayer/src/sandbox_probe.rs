@@ -27,9 +27,11 @@
 //! A payload that decided its own verdict would be a program inside the sandbox reporting on the
 //! sandbox.
 
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use maxplayer_core::seller_exec::{
@@ -52,15 +54,25 @@ const WORKDIR_WRITE_DENIED: &str = "workdir_write=denied";
 /// a cold box is slower than a steady-state one, and a timeout here reads as a refusal.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The probe's workdir, under the same `seller-jobs` root real jobs use. Dotted so it sorts out of
-/// the way of job ids and reads as machinery rather than as a job.
-const PROBE_WORKDIR_NAME: &str = ".sandbox-probe";
-/// The canary, in the home root beside the seller key. Its NAME says what it is: a leftover from a
-/// crashed probe should not look like something an operator must protect.
-const CANARY_NAME: &str = ".sandbox-canary-not-a-secret";
+/// Prefix of the probe's workdir, under the same `seller-jobs` root real jobs use. Dotted so it
+/// sorts out of the way of job ids and reads as machinery rather than as a job. The rest of the
+/// leaf is a per-invocation stamp (#1013): a fixed leaf made every doctor probe share
+/// `maxplayer-job-sandbox-probe`, so two seats restarting together collided and one seat's
+/// `docker rm -f` could kill the other's live probe.
+const PROBE_WORKDIR_PREFIX: &str = ".sandbox-probe";
+/// Prefix of the canary, in the home root beside the seller key. Its NAME says what it is: a leftover
+/// from a crashed probe should not look like something an operator must protect. Suffixed with the
+/// same per-invocation stamp as the workdir so two probes of one home cannot delete each other's
+/// canary mid-run (a shared canary going missing can make a launcher look contained).
+const CANARY_PREFIX: &str = ".sandbox-canary-not-a-secret";
 /// The file the container payload touches to prove the workdir is writable. Relative to the session
 /// cwd, which the docker launch pins to the in-container mount point.
 const PROBE_WRITE_NAME: &str = ".sandbox-probe-write";
+/// Distinguishes two layouts minted in the same process in the same nanosecond — same-home concurrent
+/// doctor/boot probes, and the regression tests that spawn them. Mirrors the seq half of PR #996's
+/// live-scope identity rather than sharing that helper: #996 rewrites `seller_exec` / `sandbox_netns`
+/// heavily, and this probe only needs a stamp.
+static PROBE_LAYOUT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// The verdict the boot gate acts on. Every variant that is not [`Contained`] carries the sentence
 /// an operator needs to fix it — a refusal that only says "sandbox failed" sends them to the source.
@@ -272,6 +284,91 @@ fn summarize(output: &str) -> String {
     }
 }
 
+/// Files one doctor/boot containment probe owns. Unique per invocation so two seats (or two probes
+/// of one home) never share a workdir, canary, or docker `--name`.
+///
+/// The leaf follows the capability-probe pattern already in `seller_exec::ProbeWorkdir` (#784):
+/// pid + nanosecond stamp, plus a process-local seq and a fingerprint of the home so two containers
+/// sharing a host docker daemon — including pid-namespace clones that both look like pid 1 — still
+/// differ. Cleanup is RAII and only ever names these two paths; it does not sweep `.sandbox-probe*`
+/// or the historical shared canary, which is how a concurrent probe would otherwise disappear.
+struct ProbeLayout {
+    workdir: PathBuf,
+    canary: PathBuf,
+}
+
+impl ProbeLayout {
+    fn create(home_root: &Path) -> std::io::Result<Self> {
+        let stamp = unique_probe_stamp(home_root);
+        let workdir = home_root
+            .join("seller-jobs")
+            .join(format!("{PROBE_WORKDIR_PREFIX}-{stamp}"));
+        let canary = home_root.join(format!("{CANARY_PREFIX}-{stamp}"));
+        std::fs::create_dir_all(&workdir)?;
+        if let Err(error) = std::fs::write(
+            &canary,
+            b"maxplayer sandbox probe canary; not a secret. See sandbox_probe.rs\n",
+        ) {
+            let _ = std::fs::remove_dir_all(&workdir);
+            return Err(error);
+        }
+        Ok(Self { workdir, canary })
+    }
+}
+
+impl Drop for ProbeLayout {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.workdir);
+        let _ = std::fs::remove_file(&self.canary);
+    }
+}
+
+/// Per-invocation identity for the workdir leaf / canary / derived container name.
+///
+/// `home` so two seats whose pid namespaces both report pid 1 still differ; `pid` so two native
+/// processes on one host differ the same way job containers already do; `nanos`+`seq` so one seat
+/// across two boots, and two threads of one process (same-home concurrent), never reuse a leaf.
+fn unique_probe_stamp(home_root: &Path) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = PROBE_LAYOUT_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{:016x}-{}-{}-{}",
+        home_fingerprint(home_root),
+        std::process::id(),
+        nanos,
+        seq
+    )
+}
+
+fn home_fingerprint(home_root: &Path) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    home_root.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// RAII `docker rm -f` of THIS probe's container, by exact name. Adopted after the launch argv is
+/// built, so the name is the one `SandboxPolicy::launch` embedded as `--name`. Drop removes only
+/// that name — never a prefix match, never the historical `maxplayer-job-sandbox-probe`.
+struct ProbeContainer<'a> {
+    name: &'a str,
+}
+
+impl<'a> ProbeContainer<'a> {
+    fn adopt(name: &'a str) -> Self {
+        remove_probe_container(name);
+        Self { name }
+    }
+}
+
+impl Drop for ProbeContainer<'_> {
+    fn drop(&mut self) {
+        remove_probe_container(self.name);
+    }
+}
+
 /// Run the two-leg probe through `policy` and judge it.
 ///
 /// The controls come first and are not optional. A canary that was never written, or a workdir that
@@ -295,26 +392,16 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
     //   this gate exists to keep a stranger's job away from. The key itself is never read: a file
     //   next to it answers the same question — is the seat's private tree reachable from inside the
     //   launcher — without a secret passing through the probe at all.
-    let workdir = home_root.join("seller-jobs").join(PROBE_WORKDIR_NAME);
-    let canary = home_root.join(CANARY_NAME);
-
-    let setup = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all(&workdir)?;
-        std::fs::write(
-            &canary,
-            b"maxplayer sandbox probe canary; not a secret. See sandbox_probe.rs\n",
-        )?;
-        Ok(())
-    })();
-    if let Err(error) = setup {
-        cleanup(&workdir, &canary);
-        return Containment::Inconclusive(format!("cannot lay out the probe files ({error})"));
-    }
+    let layout = match ProbeLayout::create(home_root) {
+        Ok(layout) => layout,
+        Err(error) => {
+            return Containment::Inconclusive(format!("cannot lay out the probe files ({error})"))
+        }
+    };
 
     // Control one: the canary IS readable without the launcher. Without this, "denied" could mean
     // the file was never there.
-    if std::fs::read(&canary).is_err() {
-        cleanup(&workdir, &canary);
+    if std::fs::read(&layout.canary).is_err() {
         return Containment::Inconclusive(
             "the canary is not readable even outside the launcher, so a refusal inside it would \
              prove nothing"
@@ -322,9 +409,8 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
         );
     }
     // Control two: the workdir IS writable without the launcher.
-    let control_write = workdir.join(".control");
+    let control_write = layout.workdir.join(".control");
     if std::fs::write(&control_write, b"control\n").is_err() {
-        cleanup(&workdir, &canary);
         return Containment::Inconclusive(
             "the probe workdir is not writable even outside the launcher, so a refusal inside it \
              would prove nothing"
@@ -337,13 +423,11 @@ pub fn probe_containment(policy: &SandboxPolicy, home_root: &Path) -> Containmen
     // job — but they can only be asked it in their own shape, so the payload differs and the verdict
     // does not. Both emit the same markers, and `verdict_from_payload` judges both without knowing
     // which produced them.
-    let verdict = match policy.docker_image() {
-        Some(_) => run_in_container(policy, &canary, &workdir),
-        None => run_under_launcher(policy, &canary, &workdir),
-    };
-
-    cleanup(&workdir, &canary);
-    verdict
+    match policy.docker_image() {
+        Some(_) => run_in_container(policy, &layout.canary, &layout.workdir),
+        None => run_under_launcher(policy, &layout.canary, &layout.workdir),
+    }
+    // `layout` drops here: only this invocation's workdir and canary are removed.
 }
 
 /// The launcher probe: spawn OUR binary under the launcher and let it report what it could reach.
@@ -434,28 +518,21 @@ fn run_in_container(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> Co
     argv.push(launch.program);
     argv.extend(launch.args);
 
-    // The probe container carries a FIXED name (its workdir leaf is the constant `PROBE_WORKDIR_NAME`,
-    // not a per-boot one), and like every job container it runs with no `--rm`. So a probe left by an
-    // earlier run — a prior boot, an earlier `maxplayer doctor`, a hard kill — sits there exited and the
-    // next `docker run` fails with a name conflict, which surfaces as "the launcher produced no probe
-    // result" and refuses the boot. Force-remove that exact name before AND after: before clears a
-    // leftover so this run can start, after keeps a clean boot from leaving one behind. Both are
-    // best-effort and idempotent (`docker rm -f` exits 0 for an absent container), and this is a
-    // self-probe with no buyer evidence to preserve — unlike a real job, where the missing `--rm` is
-    // deliberate. Scoped to the docker arm; the launcher arm has no container to remove.
+    // Container name is derived from THIS invocation's workdir leaf (unique via [`ProbeLayout`]),
+    // the same `job_id_of` → `job_container_name` path awarded jobs use. Like every job container it
+    // runs with no `--rm`, so a leftover from a crashed probe of this same identity would still
+    // collide — force-remove that exact name before AND after. Both are best-effort and idempotent
+    // (`docker rm -f` exits 0 for an absent container), and this is a self-probe with no buyer
+    // evidence to preserve. Scoped to the docker arm and to this name only: a prefix sweep, or the
+    // historical shared `maxplayer-job-sandbox-probe`, would be the cross-removal #1013 names.
     let probe_container = probe_container_name(policy, workdir);
-    if let Some(name) = &probe_container {
-        remove_probe_container(name);
-    }
-    let verdict = spawn_and_read(&argv);
-    if let Some(name) = &probe_container {
-        remove_probe_container(name);
-    }
-    verdict
+    let _guard = probe_container.as_deref().map(ProbeContainer::adopt);
+    spawn_and_read(&argv)
 }
 
 /// Best-effort `docker rm -f` of the probe container by exact name. Never fails the probe: a removal
-/// error is not evidence about containment, and the name is force-removed again on the next run.
+/// error is not evidence about containment, and the name is force-removed again on the next run of
+/// this same identity. The argv is [`force_remove_argv`], which names one container — not a filter.
 fn remove_probe_container(name: &str) {
     let argv = force_remove_argv(name);
     let Some((program, args)) = argv.split_first() else {
@@ -549,7 +626,9 @@ fn spawn_and_read(argv: &[String]) -> Containment {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(error) => {
-                return Containment::Inconclusive(format!("could not wait for the launcher ({error})"))
+                return Containment::Inconclusive(format!(
+                    "could not wait for the launcher ({error})"
+                ))
             }
         }
     }
@@ -557,7 +636,9 @@ fn spawn_and_read(argv: &[String]) -> Containment {
     let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(error) => {
-            return Containment::Inconclusive(format!("could not read the probe's output ({error})"))
+            return Containment::Inconclusive(format!(
+                "could not read the probe's output ({error})"
+            ))
         }
     };
 
@@ -568,14 +649,6 @@ fn spawn_and_read(argv: &[String]) -> Containment {
     combined.push('\n');
     combined.push_str(&String::from_utf8_lossy(&output.stderr));
     verdict_from_payload(&combined)
-}
-
-/// Leave nothing behind in the seat's home. Best-effort on purpose: a probe that failed to clean up
-/// must not turn into a boot failure of its own, and both names are fixed so a crashed run's
-/// leftovers are recognisable rather than mysterious.
-fn cleanup(workdir: &Path, canary: &Path) {
-    let _ = std::fs::remove_dir_all(workdir);
-    let _ = std::fs::remove_file(canary);
 }
 
 /// Whether a seat serving the OPEN POOL may boot, given what the probe found and whether the
@@ -674,7 +747,9 @@ mod tests {
             &mut out,
             &mut err,
         );
-        assert!(String::from_utf8(out).expect("utf8").contains(CANARY_READ_OK));
+        assert!(String::from_utf8(out)
+            .expect("utf8")
+            .contains(CANARY_READ_OK));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -691,19 +766,27 @@ mod tests {
     #[test]
     fn a_readable_canary_is_not_containment() {
         let verdict = verdict_from_payload("canary_read=ok\nworkdir_write=ok\n");
-        assert!(matches!(verdict, Containment::NotContained(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, Containment::NotContained(_)),
+            "{verdict:?}"
+        );
     }
 
     #[test]
     fn both_legs_as_required_is_containment() {
-        let verdict = verdict_from_payload("canary_read=denied (permission denied)\nworkdir_write=ok\n");
+        let verdict =
+            verdict_from_payload("canary_read=denied (permission denied)\nworkdir_write=ok\n");
         assert_eq!(verdict, Containment::Contained);
     }
 
     #[test]
     fn a_sandbox_too_tight_to_write_is_refused_on_its_own_terms() {
-        let verdict = verdict_from_payload("canary_read=denied\nworkdir_write=denied (read-only)\n");
-        assert!(matches!(verdict, Containment::WorkdirUnwritable(_)), "{verdict:?}");
+        let verdict =
+            verdict_from_payload("canary_read=denied\nworkdir_write=denied (read-only)\n");
+        assert!(
+            matches!(verdict, Containment::WorkdirUnwritable(_)),
+            "{verdict:?}"
+        );
     }
 
     // The motivating live failure: bubblewrap resolves, then dies at spawn. No probe line is
@@ -711,8 +794,14 @@ mod tests {
     #[test]
     fn a_launcher_that_never_ran_the_payload_is_not_containment() {
         let verdict = verdict_from_payload("bwrap: setting up uid map: Permission denied\n");
-        assert!(matches!(verdict, Containment::LauncherUnusable(_)), "{verdict:?}");
-        assert!(verdict.detail().contains("uid map"), "the launcher's own diagnostic must survive: {verdict:?}");
+        assert!(
+            matches!(verdict, Containment::LauncherUnusable(_)),
+            "{verdict:?}"
+        );
+        assert!(
+            verdict.detail().contains("uid map"),
+            "the launcher's own diagnostic must survive: {verdict:?}"
+        );
     }
 
     #[test]
@@ -720,7 +809,10 @@ mod tests {
         // Only the read leg reported: the payload died between the two writes, so nothing is known
         // about the workdir.
         let verdict = verdict_from_payload("canary_read=denied\n");
-        assert!(matches!(verdict, Containment::LauncherUnusable(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, Containment::LauncherUnusable(_)),
+            "{verdict:?}"
+        );
     }
 
     // ── Admission ───────────────────────────────────────────────────────────────────────────────
@@ -741,7 +833,9 @@ mod tests {
     #[test]
     fn the_override_is_the_only_way_past_a_failed_probe() {
         assert!(open_pool_admission(true, &Containment::NotContained("x".into()), true).is_ok());
-        assert!(open_pool_admission(true, &Containment::LauncherUnusable("x".into()), true).is_ok());
+        assert!(
+            open_pool_admission(true, &Containment::LauncherUnusable("x".into()), true).is_ok()
+        );
     }
 
     // Every non-Contained variant must refuse an open-pool seat. Enumerated rather than sampled:
@@ -766,8 +860,14 @@ mod tests {
         let root = scratch();
         let verdict = probe_containment(&SandboxPolicy::passthrough(), &root);
         let _ = std::fs::remove_dir_all(&root);
-        assert!(matches!(verdict, Containment::NotContained(_)), "{verdict:?}");
-        assert!(verdict.detail().contains("no [sandbox] launcher"), "{verdict:?}");
+        assert!(
+            matches!(verdict, Containment::NotContained(_)),
+            "{verdict:?}"
+        );
+        assert!(
+            verdict.detail().contains("no [sandbox] launcher"),
+            "{verdict:?}"
+        );
     }
 
     // ── the container payload ───────────────────────────────────────────────────────────────────
@@ -791,13 +891,16 @@ mod tests {
         let root = scratch();
         let workdir = root.join("work");
         std::fs::create_dir_all(&workdir).expect("mk workdir");
-        let canary = root.join(CANARY_NAME);
+        let canary = root.join("canary");
 
         // Canary REACHABLE (as it would be if someone mounted the home in) ⇒ not contained.
         std::fs::write(&canary, b"canary\n").expect("write canary");
         let reachable = run_payload_on_host(&canary, &workdir);
         assert!(
-            matches!(verdict_from_payload(&reachable), Containment::NotContained(_)),
+            matches!(
+                verdict_from_payload(&reachable),
+                Containment::NotContained(_)
+            ),
             "a readable canary must read as NotContained, got: {reachable:?}"
         );
 
@@ -823,7 +926,10 @@ mod tests {
             if super::owner_of(&readonly).map(|(uid, _)| uid) != Some(0) {
                 let denied = run_payload_on_host(&canary, &readonly);
                 assert!(
-                    matches!(verdict_from_payload(&denied), Containment::WorkdirUnwritable(_)),
+                    matches!(
+                        verdict_from_payload(&denied),
+                        Containment::WorkdirUnwritable(_)
+                    ),
                     "an unwritable workdir must not read as contained, got: {denied:?}"
                 );
             }
@@ -866,5 +972,326 @@ mod tests {
             Containment::Contained,
             "a container mounting only the job workdir must prove containment; got {verdict:?}"
         );
+    }
+
+    // ── #1013: per-invocation identity, no cross-removal ─────────────────────────────────────────
+    // The defect was a FIXED workdir leaf (`.sandbox-probe`) feeding a FIXED docker `--name`
+    // (`maxplayer-job-sandbox-probe`). Two seats probing together collided, and the loser's
+    // `docker rm -f` could kill the winner. These tests prove the identity and the cleanup
+    // boundary without a docker daemon: live daemon behaviour stays behind the opt-in e2e above.
+
+    fn docker_policy() -> SandboxPolicy {
+        SandboxPolicy::from_config(Some(&maxplayer_core::home::SandboxConfig {
+            mode: maxplayer_core::home::SandboxMode::Docker,
+            image: Some("alpine:latest".into()),
+            ..Default::default()
+        }))
+        .expect("mode=docker with an image resolves")
+    }
+
+    fn flag_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+        argv.windows(2)
+            .find(|pair| pair[0] == flag)
+            .map(|pair| pair[1].as_str())
+    }
+
+    /// The `--name` [`SandboxPolicy::launch`] actually embeds — the production argv, not a
+    /// restatement of `probe_container_name`. A helper that only asked the latter would stay green
+    /// if launch stopped using the workdir leaf.
+    fn launched_container_name(policy: &SandboxPolicy, workdir: &Path) -> String {
+        let job = JobLaunch {
+            workdir,
+            env: &[],
+            uid: 1000,
+            gid: 1000,
+            netns: None,
+            mcp_servers: &[],
+            resolv_conf: None,
+        };
+        let launch = policy
+            .launch(&["sh".into()], &job)
+            .expect("a docker policy builds a launch");
+        let mut argv = Vec::with_capacity(launch.args.len() + 1);
+        argv.push(launch.program);
+        argv.extend(launch.args);
+        flag_value(&argv, "--name")
+            .expect("docker run must name the container")
+            .to_owned()
+    }
+
+    #[test]
+    fn two_same_home_layouts_own_distinct_files_and_container_names() {
+        let home = scratch();
+        let policy = docker_policy();
+        let first = ProbeLayout::create(&home).expect("first layout");
+        let second = ProbeLayout::create(&home).expect("second layout");
+
+        assert_ne!(
+            first.workdir, second.workdir,
+            "same-home probes must not share a workdir"
+        );
+        assert_ne!(
+            first.canary, second.canary,
+            "same-home probes must not share a canary"
+        );
+        assert!(first.workdir.starts_with(home.join("seller-jobs")));
+        assert!(second.workdir.starts_with(home.join("seller-jobs")));
+        assert_eq!(first.canary.parent(), Some(home.as_path()));
+        assert_eq!(second.canary.parent(), Some(home.as_path()));
+
+        let first_leaf = first.workdir.file_name().and_then(|n| n.to_str()).unwrap();
+        let second_leaf = second.workdir.file_name().and_then(|n| n.to_str()).unwrap();
+        assert_ne!(
+            first_leaf, ".sandbox-probe",
+            "the historical fixed leaf is the collision #1013 names: {first_leaf}"
+        );
+        assert_ne!(second_leaf, ".sandbox-probe");
+
+        let first_name = launched_container_name(&policy, &first.workdir);
+        let second_name = launched_container_name(&policy, &second.workdir);
+        assert_ne!(
+            first_name, second_name,
+            "the production docker argv must not reuse a container name"
+        );
+        assert_ne!(
+            first_name, "maxplayer-job-sandbox-probe",
+            "the historical shared name must not be produced: {first_name}"
+        );
+        assert_eq!(
+            probe_container_name(&policy, &first.workdir).as_deref(),
+            Some(first_name.as_str()),
+            "cleanup must address the same name launch embedded"
+        );
+        assert_eq!(
+            probe_container_name(&policy, &second.workdir).as_deref(),
+            Some(second_name.as_str())
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dropping_one_layout_does_not_remove_another_or_historical_shared_names() {
+        let home = scratch();
+        let jobs = home.join("seller-jobs");
+        std::fs::create_dir_all(&jobs).expect("seller-jobs");
+        let leftover_workdir = jobs.join(".sandbox-probe");
+        let leftover_canary = home.join(".sandbox-canary-not-a-secret");
+        std::fs::create_dir_all(&leftover_workdir).expect("plant historical workdir");
+        std::fs::write(&leftover_canary, b"not this probe\n").expect("plant historical canary");
+
+        let first = ProbeLayout::create(&home).expect("first");
+        let second = ProbeLayout::create(&home).expect("second");
+        let first_workdir = first.workdir.clone();
+        let first_canary = first.canary.clone();
+        let second_workdir = second.workdir.clone();
+        let second_canary = second.canary.clone();
+
+        drop(first);
+        assert!(
+            !first_workdir.exists() && !first_canary.exists(),
+            "drop must remove the dropped invocation's files"
+        );
+        assert!(
+            second_workdir.is_dir() && second_canary.is_file(),
+            "drop must not remove a live sibling probe's files"
+        );
+        assert!(
+            leftover_workdir.is_dir(),
+            "cleanup must not sweep the historical shared workdir: a concurrent old binary still owns it"
+        );
+        assert_eq!(
+            std::fs::read(&leftover_canary).expect("read leftover"),
+            b"not this probe\n",
+            "cleanup must not sweep the historical shared canary"
+        );
+
+        drop(second);
+        assert!(!second_workdir.exists() && !second_canary.exists());
+        assert!(leftover_workdir.is_dir() && leftover_canary.is_file());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn force_remove_argv_names_only_the_owned_container() {
+        let home = scratch();
+        let policy = docker_policy();
+        let first = ProbeLayout::create(&home).expect("first");
+        let second = ProbeLayout::create(&home).expect("second");
+        let first_name = probe_container_name(&policy, &first.workdir).expect("docker name");
+        let second_name = probe_container_name(&policy, &second.workdir).expect("docker name");
+
+        let remove_first = force_remove_argv(&first_name);
+        assert_eq!(
+            remove_first.last().map(String::as_str),
+            Some(first_name.as_str()),
+            "removal must address the container by exact name: {remove_first:?}"
+        );
+        assert!(
+            remove_first[..remove_first.len() - 1]
+                .iter()
+                .all(|arg| arg != &first_name && arg != &second_name && !arg.contains("sandbox-probe")),
+            "only the final argument is the container name; a prefix or sibling would be #1013: {remove_first:?}"
+        );
+        assert!(
+            !remove_first.iter().any(|arg| arg == &second_name),
+            "removal of one probe must not name the other: {remove_first:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn concurrent_same_home_layouts_never_collide_or_cross_remove() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, Barrier, Mutex};
+
+        let home = scratch();
+        let policy = docker_policy();
+        const N: usize = 8;
+        let barrier = Arc::new(Barrier::new(N));
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut joins = Vec::with_capacity(N);
+        for _ in 0..N {
+            let home = home.clone();
+            let policy = policy.clone();
+            let barrier = Arc::clone(&barrier);
+            let collected = Arc::clone(&collected);
+            joins.push(std::thread::spawn(move || {
+                let layout = ProbeLayout::create(&home).expect("layout");
+                let identity = (
+                    layout.workdir.clone(),
+                    layout.canary.clone(),
+                    launched_container_name(&policy, &layout.workdir),
+                );
+                barrier.wait();
+                collected.lock().expect("collect").push(identity);
+                barrier.wait();
+            }));
+        }
+        for join in joins {
+            join.join().expect("thread");
+        }
+        let rows = collected.lock().expect("rows");
+        assert_eq!(rows.len(), N);
+        let workdirs: HashSet<_> = rows.iter().map(|(w, _, _)| w.clone()).collect();
+        let canaries: HashSet<_> = rows.iter().map(|(_, c, _)| c.clone()).collect();
+        let names: HashSet<_> = rows.iter().map(|(_, _, n)| n.clone()).collect();
+        assert_eq!(
+            workdirs.len(),
+            N,
+            "concurrent same-home workdirs collided: {workdirs:?}"
+        );
+        assert_eq!(
+            canaries.len(),
+            N,
+            "concurrent same-home canaries collided: {canaries:?}"
+        );
+        assert_eq!(
+            names.len(),
+            N,
+            "concurrent same-home container names collided: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .all(|name| name != "maxplayer-job-sandbox-probe"),
+            "no concurrent probe may still use the historical shared name: {names:?}"
+        );
+        for (workdir, canary, _) in rows.iter() {
+            assert!(
+                !workdir.exists() && !canary.exists(),
+                "each invocation must drop only its own files, and all threads have joined"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn concurrent_same_home_probes_keep_containment_judgement_and_do_not_cross_clean() {
+        use std::sync::{Arc, Barrier};
+
+        let home = scratch();
+        let leftover_workdir = home.join("seller-jobs").join(".sandbox-probe");
+        let leftover_canary = home.join(".sandbox-canary-not-a-secret");
+        std::fs::create_dir_all(&leftover_workdir).expect("plant historical workdir");
+        std::fs::write(&leftover_canary, b"keep\n").expect("plant historical canary");
+
+        // A host launcher that reports a readable canary (uncontained). The cargo test binary is
+        // not the `maxplayer` CLI, so wrapping `current_exe()` would not speak the payload
+        // contract; this argv still goes through `probe_containment`'s real layout, spawn, verdict
+        // and Drop, which is what concurrent seats share.
+        let policy = SandboxPolicy::wrapped(vec![
+            "sh".into(),
+            "-c".into(),
+            format!("echo {CANARY_READ_OK}; echo {WORKDIR_WRITE_OK}"),
+        ]);
+        const N: usize = 4;
+        let barrier = Arc::new(Barrier::new(N));
+        let mut joins = Vec::with_capacity(N);
+        for _ in 0..N {
+            let home = home.clone();
+            let policy = policy.clone();
+            let barrier = Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                probe_containment(&policy, &home)
+            }));
+        }
+        let verdicts: Vec<_> = joins
+            .into_iter()
+            .map(|join| join.join().expect("thread"))
+            .collect();
+        for verdict in &verdicts {
+            assert!(
+                matches!(verdict, Containment::NotContained(_)),
+                "an uncontained launcher must still fail closed under concurrency, got {verdict:?}"
+            );
+            assert!(
+                !verdict.detail().contains("already in use")
+                    && !verdict.detail().contains("Conflict"),
+                "a name collision must not surface as a probe failure: {verdict:?}"
+            );
+        }
+        assert!(
+            leftover_workdir.is_dir(),
+            "concurrent probes must not remove a historical/shared workdir they do not own"
+        );
+        assert_eq!(
+            std::fs::read(&leftover_canary).expect("leftover"),
+            b"keep\n"
+        );
+        let jobs = home.join("seller-jobs");
+        if jobs.exists() {
+            for entry in std::fs::read_dir(&jobs).expect("seller-jobs") {
+                let name = entry.expect("entry").file_name();
+                assert_eq!(
+                    name, ".sandbox-probe",
+                    "a finished probe left a workdir behind (or removed the planted leftover): {name:?}"
+                );
+            }
+        }
+        assert!(
+            open_pool_admission(true, &verdicts[0], false).is_err(),
+            "fail-closed admission must still refuse an open-pool seat after a concurrent probe"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn two_homes_never_share_a_container_name() {
+        let policy = docker_policy();
+        let a = scratch();
+        let b = scratch();
+        let layout_a = ProbeLayout::create(&a).expect("a");
+        let layout_b = ProbeLayout::create(&b).expect("b");
+        let name_a = launched_container_name(&policy, &layout_a.workdir);
+        let name_b = launched_container_name(&policy, &layout_b.workdir);
+        assert_ne!(
+            name_a, name_b,
+            "distinct homes must not collide on docker --name"
+        );
+        let _ = std::fs::remove_dir_all(&a);
+        let _ = std::fs::remove_dir_all(&b);
     }
 }
