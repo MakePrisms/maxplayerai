@@ -10,16 +10,28 @@ import { KIND_LABELS } from "../model/kinds.js";
 import type { MarketView } from "../market/engine.js";
 import type { ParsedEvent } from "../model/events.js";
 import { WINDOWS } from "../market/participants.js";
+import { displayName } from "../model/names.js";
 
 const RACER_ACTIVE_SECONDS = 86400;
 
 const el = (id: string): HTMLElement => document.getElementById(id) as HTMLElement;
 
-const nameOf = (names: Map<string, string>, pubkey: string): string | null =>
-  names.get(pubkey) || null;
+/**
+ * A participant's display name: kind-0 first, then — only where the key is
+ * shown AS A BUYER (buyer column, buyer dock, a buyer-authored feed line, the
+ * buyer side of a counterparty) — the generated name (src/model/names.ts).
+ * Otherwise null and the caller shows the key, exactly as before: sellers,
+ * including a key seen in its seller role that also buys, are unchanged.
+ */
+/** Stages a BUYER authors (the same set `racerLastActivity` counts). */
+const BUYER_STAGES = new Set(["offer", "award", "accept", "receipt", "reply"]);
+export const authoredByBuyer = (e: ParsedEvent): boolean => !!e.stage && BUYER_STAGES.has(e.stage);
 
-const identity = (names: Map<string, string>, pubkey: string): string => {
-  const name = nameOf(names, pubkey);
+export const participantName = (view: MarketView, pubkey: string, asBuyer = false): string | null =>
+  displayName(view.names.get(pubkey), pubkey, asBuyer);
+
+const identity = (view: MarketView, pubkey: string, asBuyer = false): string => {
+  const name = participantName(view, pubkey, asBuyer);
   return name ? `<span class="person">${esc(name)}</span>` : `<code>${short(pubkey)}</code>`;
 };
 
@@ -29,8 +41,8 @@ const identity = (names: Map<string, string>, pubkey: string): string => {
  * so a week window would strip the name off anyone whose profile predates it
  * and leave a hex stub beside a fully named activity feed.
  */
-function label(view: MarketView, r: { pubkey: string; name: string | null }): string {
-  const name = view.names.get(r.pubkey) ?? r.name;
+function label(view: MarketView, r: { pubkey: string; name: string | null }, asBuyer = false): string {
+  const name = displayName(view.names.get(r.pubkey) ?? r.name, r.pubkey, asBuyer);
   return name ? esc(name) : `<code>${short(r.pubkey)}</code>`;
 }
 
@@ -48,12 +60,12 @@ function counterparty(view: MarketView, e: ParsedEvent, want: "buyer" | "seller"
   const t = e.offerId ? view.trades.get(e.offerId) : null;
   if (want === "buyer") {
     const pk = e.buyer || t?.buyer;
-    return pk && pk !== e.pubkey ? identity(view.names, pk) : null;
+    return pk && pk !== e.pubkey ? identity(view, pk, true) : null;
   }
   // An award states its own winner directly; accept/receipt lines defer to the
   // trade's resolved winner. A conflicted trade names no one — it says so.
   const pk = e.awardedSeller || e.targetSeller || t?.seller;
-  if (pk && pk !== e.pubkey) return identity(view.names, pk);
+  if (pk && pk !== e.pubkey) return identity(view, pk);
   return t?.sellerConflict ? CONFLICTED_SELLER : null;
 }
 
@@ -71,7 +83,7 @@ function turnSuffix(view: MarketView, e: ParsedEvent): string {
 
 /** One line of plain English per event kind — the feed reads, not decodes. */
 export function feedLine(view: MarketView, e: ParsedEvent): string {
-  const who = identity(view.names, e.pubkey);
+  const who = identity(view, e.pubkey, authoredByBuyer(e));
   switch (e.stage) {
     // The job itself is the most interesting thing on the board. Price after
     // it, not before.
@@ -127,7 +139,7 @@ export function renderBuyers(view: MarketView): void {
       html: `<span class="agent">
           ${posMark(view.buyerClimbs.get(r.pubkey), i + 1)}
           ${statusDot(active, view.activeByBuyer.get(r.pubkey) || [], context)}
-          <span class="nm">${label(view, r)}</span>
+          <span class="nm">${label(view, r, true)}</span>
         </span>
         <span class="num">${nf.format(r.posted)}</span>
         <span class="num ${r.receipted ? "" : "dim"}">${nf.format(r.receipted)}</span>

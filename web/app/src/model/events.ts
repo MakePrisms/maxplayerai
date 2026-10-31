@@ -262,6 +262,10 @@ function boundSeller(event: RawEvent): string | null {
   return null;
 }
 
+/** A kind-0 text field that actually says something: a non-blank string. */
+const profileText = (value: unknown): string | null =>
+  typeof value === "string" && value.trim() ? value : null;
+
 function parseJsonContent(event: RawEvent): Record<string, unknown> {
   try {
     const value = JSON.parse(event.content || "{}");
@@ -528,7 +532,9 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
     case PROFILE: {
       const p = parseJsonContent(event);
       return { ...base,
-               name: (p.name as string) || (p.display_name as string) || null,
+               // Only a non-blank string names anyone; otherwise the board
+               // falls back (a generated name for a buyer, src/model/names.ts).
+               name: profileText(p.name) || profileText(p.display_name) || null,
                about: (p.about as string) || null,
                profile: p };
     }

@@ -10,7 +10,7 @@ import { writeClipboard } from "./clipboard.js";
 export { writeClipboard };
 import { usd } from "./spot.js";
 import { statusDot } from "./indicators.js";
-import { feedLine } from "./board.js";
+import { authoredByBuyer, feedLine, participantName } from "./board.js";
 import { KIND_LABELS, PROFILE } from "../model/kinds.js";
 import { parseEvent, type HarnessModel, type ParsedEvent } from "../model/events.js";
 import {
@@ -164,7 +164,8 @@ function wireWindow(key: DockKey): void {
 /** Filter only the job lifecycle, in the order a successful trade occurs. */
 const ACTIVITY_FILTER_ORDER = ["offer", "claim", "award", "result", "accept", "receipt", "reply"];
 
-const nameOf = (view: MarketView, pubkey: string): string | null => view.names.get(pubkey) || null;
+const nameOf = (view: MarketView, pubkey: string, asBuyer = false): string | null =>
+  participantName(view, pubkey, asBuyer);
 
 const dockBody = (key: DockKey): HTMLElement => el(`dock-${key}-body`);
 
@@ -199,8 +200,9 @@ function profileRows(profile: Record<string, unknown> | undefined): [string, str
 }
 
 function activityLine(view: MarketView, e: ParsedEvent): string {
-  const who = view.names.get(e.pubkey)
-    ? `<span class="person">${esc(view.names.get(e.pubkey))}</span>`
+  const authorName = nameOf(view, e.pubkey, authoredByBuyer(e));
+  const who = authorName
+    ? `<span class="person">${esc(authorName)}</span>`
     : `<code>${short(e.pubkey)}</code>`;
   if (e.stage === "offer") {
     return `${who} posted${e.description ? ` · ${esc(e.description)}` : " a job"}${e.amount != null ? ` · <span class="sats">${usd(e.amount)}</span>` : ""}`;
@@ -318,7 +320,7 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
   const b = d.buyer;
   const s = d.seller;
   const isSeller = role === "seller";
-  const name = nameOf(view, pubkey);
+  const name = nameOf(view, pubkey, role === "buyer");
   const title = name ? esc(name) : short(pubkey);
 
   // The headline wears the same streaks as the board row that opened it.
@@ -451,7 +453,7 @@ function eventSheet(view: MarketView, id: string, jobExpanded = false): string {
   const runnerPk = e?.awardedSeller || e?.targetSeller || trade?.seller || (authorRole === "seller" ? raw.pubkey : null);
 
   const personLink = (role: string, pk: string): string => {
-    const label = nameOf(view, pk) || short(pk);
+    const label = nameOf(view, pk, role === "buyer") || short(pk);
     return `<button type="button" class="detail-person" data-open="${role}" data-pk="${esc(pk)}" aria-label="Open ${esc(label)} details">${esc(label)}</button>`;
   };
   /** Truncated id, click copies the full value. */
