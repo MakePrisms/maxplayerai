@@ -80,6 +80,7 @@ pub async fn set_profile_async(
     home: &mut MaxplayerHome,
     request: SetProfileRequest,
 ) -> Result<SetProfileOutcome, ProfileError> {
+    let _lock = profile_write_lock(home, PROFILE_LOCK_WAIT).await?;
     home::reload_config(home)?;
 
     let name = match &request.name {
@@ -104,7 +105,15 @@ pub async fn set_profile_async(
     let profile = home.config.profile.clone().unwrap_or_default();
     let keys = buyer_keys(home)?;
     // Fail-closed read-merge-write: never blind-overwrite a replaceable kind-0.
-    let event_id = publish_metadata_merged_async(home, &keys, &profile).await?;
+    let event_id = publish_metadata_merged_async(
+        home,
+        &keys,
+        profile.name.as_deref(),
+        profile.about.as_deref(),
+        None,
+    )
+    .await?
+    .event_id;
 
     Ok(SetProfileOutcome {
         ok: true,
@@ -135,10 +144,24 @@ pub fn publish_seller_discoverability(
     runtime.block_on(publish_seller_discoverability_async(home))
 }
 
-/// Async twin of [`publish_seller_discoverability`].
+/// Async twin of [`publish_seller_discoverability`]. A nameless seat may take the
+/// `maxplayer-seller-<8hex>` default (see [`publish_seller_discoverability_with`]).
 pub async fn publish_seller_discoverability_async(
     home: &mut MaxplayerHome,
 ) -> Result<SellerDiscoverabilityOutcome, ProfileError> {
+    publish_seller_discoverability_with(home, true).await
+}
+
+/// Seller start's kind-0 publish. The name is `[profile].name` when set; otherwise the name the
+/// relay already holds, kept as published and saved to `[profile].name`; otherwise, only when
+/// `allow_default_name`, `maxplayer-seller-<8hex>`, saved once the relay accepted it. With
+/// `allow_default_name` false a nameless seat publishes no name and saves none, so its account
+/// label can still name it on a later start ([`NameBackfill::allows_default_name`]).
+pub async fn publish_seller_discoverability_with(
+    home: &mut MaxplayerHome,
+    allow_default_name: bool,
+) -> Result<SellerDiscoverabilityOutcome, ProfileError> {
+    let _lock = profile_write_lock(home, PROFILE_LOCK_WAIT).await?;
     home::reload_config(home)?;
     let seller = home.config.seller.as_ref().ok_or_else(|| {
         ProfileError::Input("missing [seller] config for discoverability publish".into())
@@ -149,22 +172,11 @@ pub async fn publish_seller_discoverability_async(
     // reader must never target, pay, or dispatch on (§4.1).
     let agent = seller.agents.first().cloned();
 
-    // Ensure a display name exists (config or short-hex default).
     let pubkey = home::public_key_hex(home)?;
     let short = &pubkey[..8.min(pubkey.len())];
-    if home
-        .config
-        .profile
-        .as_ref()
-        .and_then(|p| p.name.as_ref())
-        .map(|n| n.trim().is_empty())
-        .unwrap_or(true)
-    {
-        let name = format!("maxplayer-seller-{short}");
-        home::save_config(home, |config| {
-            config.profile.get_or_insert_with(ProfileConfig::default).name = Some(name);
-        })?;
-    }
+    let local_name = configured_name(home);
+    let fallback = (local_name.is_none() && allow_default_name)
+        .then(|| format!("maxplayer-seller-{short}"));
     let existing_about = home.config.profile.as_ref().and_then(|p| p.about.as_deref());
     let existing_generated = home.config.profile.as_ref().and_then(|p| p.about_generated);
     let live_about = default_seller_about(agent.as_deref(), rate_sats, &home.config.accepted_mints);
@@ -178,14 +190,26 @@ pub async fn publish_seller_discoverability_async(
         })?;
     }
 
-    let profile = home.config.profile.clone().unwrap_or_default();
+    let about = home.config.profile.as_ref().and_then(|p| p.about.clone());
     let keys = buyer_keys(home)?;
-    let kind0_event_id = publish_metadata_merged_async(home, &keys, &profile).await?;
+    let published = publish_metadata_merged_async(
+        home,
+        &keys,
+        local_name.as_deref(),
+        about.as_deref(),
+        fallback.as_deref(),
+    )
+    .await?;
+    if local_name.is_none()
+        && let Some(name) = &published.name
+    {
+        save_profile_name(home, name)?;
+    }
 
     Ok(SellerDiscoverabilityOutcome {
         pubkey: keys.public_key().to_hex(),
-        kind0_event_id,
-        name: profile.name,
+        kind0_event_id: published.event_id,
+        name: published.name,
         relay_url: home.config.relay_url.clone(),
     })
 }
@@ -233,103 +257,199 @@ fn buyer_keys(home: &MaxplayerHome) -> Result<nostr_sdk::Keys, ProfileError> {
         .map_err(|error| ProfileError::Home(HomeError::Key(format!("buyer key parse: {error}"))))
 }
 
-/// Fail-closed read-merge-write for replaceable kind-0 (never blind-overwrite).
+/// Every kind-0 read-merge-write on a home holds this lock from reading `[profile].name` until the
+/// event is sent and the name saved. The buyer daemon and the seller node hold different home locks
+/// (`buyer.lock`, `seller.lock`) and can both run on one home, so without it a seller start could read
+/// the relay before a buyer's label fill landed and then publish over it.
+const PROFILE_LOCK_FILE: &str = "profile.lock";
+/// How long a kind-0 write waits for another one on the same home (each is one read and one send).
+const PROFILE_LOCK_WAIT: Duration = Duration::from_secs(30);
+
+async fn profile_write_lock(
+    home: &MaxplayerHome,
+    wait: Duration,
+) -> Result<crate::buyer::lock::HomeLock, ProfileError> {
+    use crate::buyer::lock::{HomeLock, LockError};
+    let path = home.root.join(PROFILE_LOCK_FILE);
+    let started = std::time::Instant::now();
+    loop {
+        match HomeLock::acquire(&path) {
+            Ok(lock) => return Ok(lock),
+            Err(LockError::Held { .. }) if started.elapsed() < wait => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(LockError::Held { .. }) => {
+                return Err(ProfileError::Relay(format!(
+                    "another maxplayer process on this home is still publishing its profile \
+                     (waited {}s); nothing was published",
+                    wait.as_secs()
+                )));
+            }
+            Err(error) => return Err(ProfileError::Relay(format!("profile lock: {error}"))),
+        }
+    }
+}
+
+/// When a kind-0 read started now must have finished (connect included).
+fn kind0_read_deadline() -> std::time::Instant {
+    std::time::Instant::now() + Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS)
+}
+
+/// What [`publish_metadata_merged_async`] published.
+struct MergedPublish {
+    event_id: String,
+    /// The kind-0 `name` now on the relay: the given name, the relay's own, the fallback, or none.
+    name: Option<String>,
+}
+
+/// Fail-closed read-merge-write for replaceable kind-0 (never blind-overwrite). Reads this key's
+/// kind-0 to the relay's EOSE and republishes every field it holds as published, with `about` set
+/// when given and the name set to `name`, else left as the relay has it, else `fallback_name`. A read
+/// that did not end in EOSE publishes nothing. Callers hold [`profile_write_lock`].
 async fn publish_metadata_merged_async(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
-    profile: &ProfileConfig,
-) -> Result<String, ProfileError> {
-    let (client, sign_in) = connect_metadata_client(home, keys).await?;
-    let mut metadata = match fetch_own_metadata(&client, keys).await {
-        Ok(metadata) => metadata,
+    name: Option<&str>,
+    about: Option<&str>,
+    fallback_name: Option<&str>,
+) -> Result<MergedPublish, ProfileError> {
+    let session = connect_metadata_client(home, keys).await?;
+    let mut fields = match read_own_kind0(&session, keys, kind0_read_deadline()).await {
+        Ok(OwnKind0::Fields(fields)) => fields,
+        // Nothing stored, or content that is not a JSON object: no field can be read out of it, so
+        // there is nothing to keep (this publish carries an explicit name and about anyway).
+        Ok(OwnKind0::Absent | OwnKind0::NotAnObject) => serde_json::Map::new(),
         Err(error) => {
-            client.disconnect().await;
+            session.client.disconnect().await;
             return Err(error);
         }
     };
-    if let Some(name) = &profile.name {
-        metadata = metadata.name(name);
+    let name = match (name, remote_name(&fields)) {
+        (Some(name), _) => {
+            fields.insert("name".into(), name.into());
+            Some(name.to_owned())
+        }
+        // Kept exactly as published.
+        (None, Some(remote)) => Some(remote),
+        (None, None) => fallback_name.map(|fallback| {
+            fields.insert("name".into(), fallback.into());
+            fallback.to_owned()
+        }),
+    };
+    if let Some(about) = about {
+        fields.insert("about".into(), about.into());
     }
-    if let Some(about) = &profile.about {
-        metadata = metadata.about(about);
-    }
-    send_metadata(client, sign_in, home, keys, &metadata).await
+    let event_id = send_metadata(session, home, keys, fields).await?;
+    Ok(MergedPublish { event_id, name })
+}
+
+/// One connection for a kind-0 read and the send that follows it.
+struct Kind0Session {
+    client: nostr_sdk::Client,
+    relay: nostr_sdk::prelude::Relay,
+    sign_in: crate::relay_auth::SignInWatch,
 }
 
 async fn connect_metadata_client(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
-) -> Result<(nostr_sdk::Client, Option<crate::relay_auth::SignInWatch>), ProfileError> {
+) -> Result<Kind0Session, ProfileError> {
     let client = nostr_sdk::Client::new(keys.clone());
     client
         .add_relay(&home.config.relay_url)
         .await
         .map_err(|error| ProfileError::Relay(format!("add relay: {error}")))?;
+    let relay = client
+        .relay(&home.config.relay_url)
+        .await
+        .map_err(|error| ProfileError::Relay(format!("relay handle: {error}")))?;
     // Before connect: buzz refuses an unregistered key's sign-in as soon as the socket opens
-    // (#1228), and the send below then only says `timeout`.
-    let sign_in = crate::relay_auth::SignInWatch::for_client(&client, &home.config.relay_url).await;
+    // (#1228), and the read or send below then only says `timeout`.
+    let sign_in = crate::relay_auth::SignInWatch::new(&relay);
     client.connect().await;
-    Ok((client, sign_in))
+    Ok(Kind0Session {
+        client,
+        relay,
+        sign_in,
+    })
 }
 
-/// This key's current kind-0 as the relay holds it (empty when it has none). A failed fetch is an
-/// error, never an empty profile: the caller must not publish over metadata it could not read.
-async fn fetch_own_metadata(
-    client: &nostr_sdk::Client,
-    keys: &nostr_sdk::Keys,
-) -> Result<nostr_sdk::prelude::Metadata, ProfileError> {
-    use nostr_sdk::prelude::{Filter, Kind, Metadata};
+/// This key's kind-0 as the relay holds it.
+enum OwnKind0 {
+    /// The relay sent EOSE without a kind-0 for this key.
+    Absent,
+    /// The stored kind-0's content, every field as published (types the SDK would reject included).
+    Fields(serde_json::Map<String, serde_json::Value>),
+    /// A stored kind-0 whose content is not a JSON object.
+    NotAnObject,
+}
 
+/// Read this key's kind-0 to the relay's EOSE, by `until`. `Client::fetch_events` reports a read
+/// that timed out without EOSE as `Ok(empty)`, the same as a key with no kind-0, so a slow relay
+/// read that way made a real profile look absent and got it overwritten. Only an EOSE-ended read
+/// proves absence; anything else is an error and the caller publishes nothing.
+async fn read_own_kind0(
+    session: &Kind0Session,
+    keys: &nostr_sdk::Keys,
+    until: std::time::Instant,
+) -> Result<OwnKind0, ProfileError> {
+    use crate::seller_node::stored_read::{StoredRead, read_stored};
+    use nostr_sdk::prelude::{Filter, Kind};
+
+    let incomplete = |reason: String| {
+        ProfileError::Relay(crate::relay_refusal::with_hint(format!(
+            "kind-0 read incomplete, so nothing was published (refusing to write over a profile \
+             it could not read): {}",
+            session.sign_in.annotate(&reason)
+        )))
+    };
+    let left = || until.saturating_duration_since(std::time::Instant::now());
+    session.client.wait_for_connection(left()).await;
+    if !session.relay.is_connected() {
+        return Err(incomplete(format!("no connection to {}", session.relay.url())));
+    }
     let filter = Filter::new()
         .author(keys.public_key())
         .kind(Kind::Metadata)
         .limit(1);
-    let timeout = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
-    let fetched = client
-        .fetch_events(filter, timeout)
-        .await
-        .map_err(|error| {
-            ProfileError::Relay(format!(
-                "kind-0 fetch failed (fail-closed, refuse blind overwrite): {error}"
-            ))
-        })?;
-
-    use nostr_sdk::JsonUtil;
-    let mut metadata = Metadata::new();
-    // Preserve existing fields when present; local config wins for name/about.
-    if let Some(existing) = fetched.into_iter().next() {
-        if let Ok(parsed) = Metadata::from_json(&existing.content) {
-            metadata = parsed;
-        } else {
-            // Defensive fallback: at least keep name/about if content is partial JSON.
-            if let Some(name) = parse_kind0_name(&existing.content) {
-                metadata = metadata.name(name);
-            }
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&existing.content) {
-                if let Some(about) = value
-                    .get("about")
-                    .and_then(|v| v.as_str())
-                    .and_then(|a| clamp_field(a, PROFILE_ABOUT_MAX))
-                {
-                    metadata = metadata.about(about);
-                }
-            }
-        }
-    }
-    Ok(metadata)
+    let events = match read_stored(&session.relay, vec![filter], left()).await {
+        StoredRead::Complete(events) => events,
+        StoredRead::Incomplete { reason, .. } => return Err(incomplete(reason)),
+    };
+    // Newest first.
+    let Some(event) = events.into_iter().next() else {
+        return Ok(OwnKind0::Absent);
+    };
+    Ok(
+        match serde_json::from_str::<serde_json::Value>(&event.content) {
+            Ok(serde_json::Value::Object(fields)) => OwnKind0::Fields(fields),
+            _ => OwnKind0::NotAnObject,
+        },
+    )
 }
 
-/// Sign and send `metadata` as this key's kind-0; disconnects `client` either way.
+/// The kind-0 `name` in `fields`, when it is a usable string.
+fn remote_name(fields: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    fields
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|name| clamp_field(name, PROFILE_NAME_MAX))
+}
+
+/// Sign and send `fields` as this key's kind-0 content; disconnects either way.
 async fn send_metadata(
-    client: nostr_sdk::Client,
-    sign_in: Option<crate::relay_auth::SignInWatch>,
+    session: Kind0Session,
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
-    metadata: &nostr_sdk::prelude::Metadata,
+    fields: serde_json::Map<String, serde_json::Value>,
 ) -> Result<String, ProfileError> {
-    use nostr_sdk::prelude::EventBuilder;
+    use nostr_sdk::prelude::{EventBuilder, Kind};
 
-    let event = match EventBuilder::metadata(metadata).sign_with_keys(keys) {
+    let Kind0Session {
+        client, sign_in, ..
+    } = session;
+    let content = serde_json::Value::Object(fields).to_string();
+    let event = match EventBuilder::new(Kind::Metadata, content).sign_with_keys(keys) {
         Ok(event) => event,
         Err(error) => {
             client.disconnect().await;
@@ -342,7 +462,7 @@ async fn send_metadata(
     client.disconnect().await;
     let output = output.map_err(|error| ProfileError::Relay(format!("send kind-0: {error}")))?;
     if output.success.is_empty() {
-        let failed = crate::relay_auth::failed_reasons(&output, sign_in.as_ref());
+        let failed = crate::relay_auth::failed_reasons(&output, Some(&sign_in));
         return Err(ProfileError::Relay(crate::relay_refusal::with_hint(format!(
             "no relay accepted kind-0 ({failed})"
         ))));
@@ -381,15 +501,39 @@ fn configured_name(home: &MaxplayerHome) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn save_profile_name(home: &mut MaxplayerHome, name: &str) -> Result<(), ProfileError> {
+    home::save_config(home, |config| {
+        config
+            .profile
+            .get_or_insert_with(ProfileConfig::default)
+            .name = Some(name.to_owned());
+    })?;
+    Ok(())
+}
+
 /// Publish the account-link `label` as this key's kind-0 `name`, but only when the key has no name
 /// yet: `[profile].name` unset or blank AND the relay's kind-0 has no `name`. An operator-set name
-/// is never replaced. Uses the fail-closed fetch-merge-write, so `about` and every other kind-0 field
-/// survives, and a failed fetch publishes nothing. `[profile].name` is written only after the relay
-/// accepted the event, so a failure leaves the key eligible for the startup backfill.
+/// is never replaced. The read must end in the relay's EOSE and every other kind-0 field is kept as
+/// published; a read that did not finish, or a kind-0 whose content is not a JSON object, publishes
+/// nothing. `[profile].name` is written only after the relay accepted the event, so a failure
+/// leaves the key eligible for the startup backfill.
 pub async fn fill_name_from_label_async(
     home: &mut MaxplayerHome,
     label: &str,
 ) -> Result<NameFill, ProfileError> {
+    fill_name_until(home, label, None).await
+}
+
+/// [`fill_name_from_label_async`], giving up before the send once `deadline` has passed. A send that
+/// started is never abandoned: the relay accepting the label is always followed by saving it.
+async fn fill_name_until(
+    home: &mut MaxplayerHome,
+    label: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<NameFill, ProfileError> {
+    let left = || deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+    let lock_wait = left().map_or(PROFILE_LOCK_WAIT, |left| left.min(PROFILE_LOCK_WAIT));
+    let _lock = profile_write_lock(home, lock_wait).await?;
     home::reload_config(home)?;
     if let Some(name) = configured_name(home) {
         return Ok(NameFill::KeptLocal(name));
@@ -397,33 +541,40 @@ pub async fn fill_name_from_label_async(
     let name = crate::registration::normalize_label(label)
         .ok_or_else(|| ProfileError::Input("the account label is not a usable name".into()))?;
     let keys = buyer_keys(home)?;
-    let (client, sign_in) = connect_metadata_client(home, &keys).await?;
-    let metadata = match fetch_own_metadata(&client, &keys).await {
-        Ok(metadata) => metadata,
+    let session = connect_metadata_client(home, &keys).await?;
+    let read_until = deadline.map_or_else(kind0_read_deadline, |d| d.min(kind0_read_deadline()));
+    let mut fields = match read_own_kind0(&session, &keys, read_until).await {
+        Ok(OwnKind0::Absent) => serde_json::Map::new(),
+        Ok(OwnKind0::Fields(fields)) => fields,
+        Ok(OwnKind0::NotAnObject) => {
+            session.client.disconnect().await;
+            return Err(ProfileError::Relay(
+                "this key's kind-0 content is not a JSON object, so whether it already names the \
+                 key cannot be read; nothing was published"
+                    .into(),
+            ));
+        }
         Err(error) => {
-            client.disconnect().await;
+            session.client.disconnect().await;
             return Err(error);
         }
     };
-    let save_name = |home: &mut MaxplayerHome, name: &str| {
-        home::save_config(home, |config| {
-            config
-                .profile
-                .get_or_insert_with(ProfileConfig::default)
-                .name = Some(name.to_owned());
-        })
-    };
-    if let Some(remote) = metadata
-        .name
-        .as_deref()
-        .and_then(|remote| clamp_field(remote, PROFILE_NAME_MAX))
-    {
-        client.disconnect().await;
-        save_name(home, &remote)?;
+    if let Some(remote) = remote_name(&fields) {
+        session.client.disconnect().await;
+        save_profile_name(home, &remote)?;
         return Ok(NameFill::KeptRemote(remote));
     }
-    let event_id = send_metadata(client, sign_in, home, &keys, &metadata.name(&name)).await?;
-    save_name(home, &name)?;
+    if left().is_some_and(|left| left.is_zero()) {
+        session.client.disconnect().await;
+        return Err(ProfileError::Relay(
+            "the start-up time for the public name ran out before publishing; nothing was \
+             published"
+                .into(),
+        ));
+    }
+    fields.insert("name".into(), name.clone().into());
+    let event_id = send_metadata(session, home, &keys, fields).await?;
+    save_profile_name(home, &name)?;
     Ok(NameFill::Published { name, event_id })
 }
 
@@ -456,67 +607,218 @@ pub fn registration_pairs_with_relay(registration_url: &str, relay_url: &str) ->
     matches!((host(registration_url), host(relay_url)), (Some(a), Some(b)) if a == b)
 }
 
-/// Upper bound on the startup backfill (status call + fill), so a slow service never holds a
-/// seller's start for longer than this.
+/// Upper bound on the startup backfill's wait: the status call, then the kind-0 read. A send that
+/// started runs to its end (see [`fill_name_until`]).
 pub const NAME_BACKFILL_BUDGET: Duration = Duration::from_secs(15);
+/// A key the registration service reported as not linked is asked again after this long (sooner
+/// after `account link` on this home, which forgets the answer).
+pub const NOT_LINKED_RECHECK: Duration = Duration::from_secs(7 * 24 * 3600);
+/// After a failed status call the next start waits this long, doubling per failure up to
+/// [`FAILURE_BACKOFF_MAX`].
+const FAILURE_BACKOFF_FIRST: Duration = Duration::from_secs(3600);
+const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(24 * 3600);
+const BACKFILL_STATE_FILE: &str = "name-backfill.json";
+
+/// How a startup backfill ([`backfill_name_from_link_async`]) ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NameBackfill {
+    /// `[profile].name` is set, or the registration service does not front this home's relay.
+    NotNeeded,
+    /// Linked with a label and a relay member: the fill ran.
+    Filled(NameFill),
+    /// The registration service says this key is not linked (now, or at a check remembered for
+    /// [`NOT_LINKED_RECHECK`]).
+    NotLinked,
+    /// Linked, but the relay has not added the key yet: asked again on every start.
+    Pending,
+    /// Not asked this start: an earlier status call failed and its retry is not due yet.
+    Deferred,
+    /// This start's attempt failed (status call, time budget, or the kind-0 fill).
+    Failed(String),
+}
+
+impl NameBackfill {
+    /// Whether seller start may give the key the `maxplayer-seller-<8hex>` default now: only when no
+    /// account label can name it. A pending membership, a failure or a deferral may still end in
+    /// the label, and a saved default would keep it from ever applying.
+    pub fn allows_default_name(&self) -> bool {
+        matches!(self, Self::NotNeeded | Self::Filled(_) | Self::NotLinked)
+    }
+
+    /// Why no default name was chosen, for the seller's start line.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::NotNeeded | Self::Filled(_) => "named",
+            Self::NotLinked => "not linked",
+            Self::Pending => "relay membership is still pending",
+            Self::Deferred => "the registration service failed earlier; retrying later",
+            Self::Failed(reason) => reason,
+        }
+    }
+}
+
+/// What the last status call said, so an unlinked key or a down service is not asked on every
+/// start. Keyed by pubkey: a home whose key changed starts over.
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct BackfillState {
+    pubkey: String,
+    #[serde(default)]
+    not_linked_until: Option<u64>,
+    #[serde(default)]
+    failures: u32,
+    #[serde(default)]
+    retry_after: Option<u64>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+fn load_backfill_state(home: &MaxplayerHome, pubkey: &str) -> BackfillState {
+    std::fs::read(home.root.join(BACKFILL_STATE_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<BackfillState>(&bytes).ok())
+        .filter(|state| state.pubkey == pubkey)
+        .unwrap_or_else(|| BackfillState {
+            pubkey: pubkey.to_owned(),
+            ..BackfillState::default()
+        })
+}
+
+fn save_backfill_state(home: &MaxplayerHome, state: &BackfillState) {
+    let path = home.root.join(BACKFILL_STATE_FILE);
+    let tmp = home.root.join(format!("{BACKFILL_STATE_FILE}.tmp"));
+    let written = serde_json::to_vec(state)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| std::fs::write(&tmp, bytes).map_err(|error| error.to_string()))
+        .and_then(|()| std::fs::rename(&tmp, &path).map_err(|error| error.to_string()));
+    if let Err(error) = written {
+        crate::opline!("warn: public name backfill state not saved: {error}");
+    }
+}
+
+/// Forget a remembered "not linked" answer and any failure backoff, so the next start asks the
+/// registration service again. `account link` calls this after linking.
+pub fn forget_name_backfill(home: &MaxplayerHome) {
+    let _ = std::fs::remove_file(home.root.join(BACKFILL_STATE_FILE));
+}
+
+fn failure_backoff(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    FAILURE_BACKOFF_FIRST
+        .saturating_mul(1 << doublings)
+        .min(FAILURE_BACKOFF_MAX)
+}
 
 /// Startup backfill for keys linked before `account link` published the label: when
 /// `[profile].name` is unset, ask the registration service for this key's link, and if it is linked
-/// with a label and is a relay member, run [`fill_name_from_label_async`]. A fill saves the name, so
-/// the next start makes no status call at all. Best effort: every failure is one `warn:` line and
-/// `None`, never an error.
-pub async fn backfill_name_from_link_async(home: &mut MaxplayerHome) -> Option<NameFill> {
+/// with a label and is a relay member, fill the name from it. Never an error: a failure is one
+/// `warn:` line and [`NameBackfill::Failed`]. A definitive "not linked" is remembered for
+/// [`NOT_LINKED_RECHECK`] and a failed status call backs off; a pending membership is asked again
+/// on every start.
+pub async fn backfill_name_from_link_async(home: &mut MaxplayerHome) -> NameBackfill {
     backfill_name_within(home, NAME_BACKFILL_BUDGET).await
 }
 
-async fn backfill_name_within(home: &mut MaxplayerHome, budget: Duration) -> Option<NameFill> {
+async fn backfill_name_within(home: &mut MaxplayerHome, budget: Duration) -> NameBackfill {
     if let Err(error) = home::reload_config(home) {
         crate::opline!("warn: public name backfill skipped: {error}");
-        return None;
+        return NameBackfill::Failed(error.to_string());
     }
     if configured_name(home).is_some()
         || !registration_pairs_with_relay(&home.config.registration_url, &home.config.relay_url)
     {
-        return None;
+        return NameBackfill::NotNeeded;
     }
-    match tokio::time::timeout(budget, backfill_name_inner(home)).await {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(message)) => {
-            crate::opline!("warn: public name backfill skipped: {message}");
-            None
+    let keys = match buyer_keys(home) {
+        Ok(keys) => keys,
+        Err(error) => {
+            crate::opline!("warn: public name backfill skipped: {error}");
+            return NameBackfill::Failed(error.to_string());
         }
-        Err(_) => {
+    };
+    let pubkey = keys.public_key().to_hex();
+    let mut state = load_backfill_state(home, &pubkey);
+    let now = unix_now();
+    if state.not_linked_until.is_some_and(|until| now < until) {
+        return NameBackfill::NotLinked;
+    }
+    if state.retry_after.is_some_and(|at| now < at) {
+        return NameBackfill::Deferred;
+    }
+    let deadline = std::time::Instant::now() + budget;
+    let status = match registration_status(home, keys, budget).await {
+        Ok(status) => status,
+        Err(message) => {
+            state.failures = state.failures.saturating_add(1);
+            let backoff = failure_backoff(state.failures);
+            state.retry_after = Some(now.saturating_add(backoff.as_secs()));
+            state.not_linked_until = None;
+            save_backfill_state(home, &state);
             crate::opline!(
-                "warn: public name backfill skipped: no answer within {}s",
-                budget.as_secs()
+                "warn: public name backfill skipped: {message} (next try in {})",
+                crate::registration::wait_text(backoff.as_secs())
             );
-            None
+            return NameBackfill::Failed(message);
         }
-    }
-}
-
-async fn backfill_name_inner(home: &mut MaxplayerHome) -> Result<Option<NameFill>, String> {
-    let keys = buyer_keys(home).map_err(|error| error.to_string())?;
-    let base = home.config.registration_url.clone();
-    // The registration client is blocking reqwest; keep it off the async workers.
-    let status = tokio::task::spawn_blocking(move || {
-        crate::registration::RegistrationClient::new(&base, keys)?.status()
-    })
-    .await
-    .map_err(|error| format!("status task: {error}"))?
-    .map_err(|error| error.to_string())?;
-    let label = match (
+    };
+    match (
         status.registered,
         status.relay_member.as_deref(),
         status.label,
     ) {
-        (true, Some("added"), Some(label)) => label,
-        _ => return Ok(None),
-    };
-    fill_name_from_label_async(home, &label)
-        .await
-        .map(Some)
-        .map_err(|error| error.to_string())
+        (false, _, _) => {
+            save_backfill_state(
+                home,
+                &BackfillState {
+                    pubkey,
+                    not_linked_until: Some(now.saturating_add(NOT_LINKED_RECHECK.as_secs())),
+                    ..BackfillState::default()
+                },
+            );
+            NameBackfill::NotLinked
+        }
+        (true, Some("added"), Some(label)) => {
+            forget_name_backfill(home);
+            match fill_name_until(home, &label, Some(deadline)).await {
+                Ok(fill) => NameBackfill::Filled(fill),
+                Err(error) => {
+                    crate::opline!("warn: public name backfill skipped: {error}");
+                    NameBackfill::Failed(error.to_string())
+                }
+            }
+        }
+        _ => {
+            forget_name_backfill(home);
+            NameBackfill::Pending
+        }
+    }
+}
+
+/// `GET /status` for this key, bounded by `budget`. The registration client is blocking reqwest, so
+/// it runs off the async workers with its own request timeout set to `budget`: the thread ends
+/// within the budget instead of running on for the client's default 30s after boot moved on.
+async fn registration_status(
+    home: &MaxplayerHome,
+    keys: nostr_sdk::Keys,
+    budget: Duration,
+) -> Result<crate::registration::Status, String> {
+    let base = home.config.registration_url.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        crate::registration::RegistrationClient::with_timeout(&base, keys, budget)?.status()
+    });
+    // A backstop only: the request timeout above ends the task first.
+    match tokio::time::timeout(budget + Duration::from_secs(1), task).await {
+        Err(_) => Err(format!(
+            "no answer within {:.1}s",
+            budget.as_secs_f32()
+        )),
+        Ok(Err(error)) => Err(format!("status task: {error}")),
+        Ok(Ok(result)) => result.map_err(|error| error.to_string()),
+    }
 }
 
 fn apply_profile_updates(profile: &mut ProfileConfig, name: Option<String>, about: Option<String>) {
@@ -965,7 +1267,7 @@ mod tests {
         root
     }
 
-    fn wiring_seller(rate_sats: u64) -> home::SellerConfig {
+    pub(super) fn wiring_seller(rate_sats: u64) -> home::SellerConfig {
         home::SellerConfig {
             takes_no_payment: false,
             agent_command: vec!["claude".into()],
@@ -1155,13 +1457,21 @@ pub(crate) mod fake_status {
     impl FakeStatus {
         /// `label`/`relay_member` as `GET /status` reports them for a linked key.
         pub(crate) fn linked(label: &str, relay_member: &str) -> Self {
-            let body = serde_json::json!({
+            Self::answering(serde_json::json!({
                 "registered": true,
                 "email": "you@example.com",
                 "label": label,
                 "relay_member": relay_member,
-            })
-            .to_string();
+            }))
+        }
+
+        /// `GET /status` for a key that is not linked to any email.
+        pub(crate) fn unlinked() -> Self {
+            Self::answering(serde_json::json!({ "registered": false }))
+        }
+
+        fn answering(body: serde_json::Value) -> Self {
+            let body = body.to_string();
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake status");
             let base = format!(
                 "http://127.0.0.1:{}/account",
@@ -1404,35 +1714,89 @@ mod name_fill_tests {
         let mut fx = fixture("backfill", Some(status.base_url())).await;
         let first = backfill_name_from_link_async(&mut fx.home).await;
         assert!(
-            matches!(&first, Some(NameFill::Published { name, .. }) if name == "old-buyer"),
+            matches!(&first, NameBackfill::Filled(NameFill::Published { name, .. }) if name == "old-buyer"),
             "{first:?}"
         );
         assert_eq!(status.calls(), 1);
         assert_eq!(kind0s(&fx).await[0].name.as_deref(), Some("old-buyer"));
         assert_eq!(saved_name(&mut fx.home).as_deref(), Some("old-buyer"));
 
-        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        assert_eq!(
+            backfill_name_from_link_async(&mut fx.home).await,
+            NameBackfill::NotNeeded
+        );
         assert_eq!(status.calls(), 1, "a named key never calls /status again");
     }
 
-    /// Membership still queued: no publish (the relay would refuse it) and nothing saved, so a
-    /// later start tries again.
+    /// Membership still queued: no publish (the relay would refuse it), nothing saved, no default
+    /// allowed, and the next start asks again (no backoff for `pending`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backfill_waits_for_relay_membership() {
         let status = FakeStatus::linked("old-buyer", "pending");
         let mut fx = fixture("pending", Some(status.base_url())).await;
-        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        let outcome = backfill_name_from_link_async(&mut fx.home).await;
+        assert_eq!(outcome, NameBackfill::Pending);
+        assert!(!outcome.allows_default_name());
         assert_eq!(status.calls(), 1);
         assert!(kind0s(&fx).await.is_empty());
         assert_eq!(saved_name(&mut fx.home), None);
+        assert_eq!(
+            backfill_name_from_link_async(&mut fx.home).await,
+            NameBackfill::Pending
+        );
+        assert_eq!(status.calls(), 2, "pending is asked again on every start");
     }
 
-    /// An unreachable service is a quiet `None` well inside the budget, and changes nothing.
+    /// A definitive "not linked" is remembered: the next start makes no status call, until
+    /// `account link` forgets the answer. Seller start may then use its default name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_remembers_a_key_that_is_not_linked() {
+        let status = FakeStatus::unlinked();
+        let mut fx = fixture("unlinked", Some(status.base_url())).await;
+        let outcome = backfill_name_from_link_async(&mut fx.home).await;
+        assert_eq!(outcome, NameBackfill::NotLinked);
+        assert!(outcome.allows_default_name());
+        assert_eq!(status.calls(), 1);
+        assert_eq!(
+            backfill_name_from_link_async(&mut fx.home).await,
+            NameBackfill::NotLinked
+        );
+        assert_eq!(status.calls(), 1, "a remembered \"not linked\" is not asked again");
+        forget_name_backfill(&fx.home);
+        assert_eq!(
+            backfill_name_from_link_async(&mut fx.home).await,
+            NameBackfill::NotLinked
+        );
+        assert_eq!(status.calls(), 2, "after `account link` the service is asked again");
+        assert!(kind0s(&fx).await.is_empty());
+    }
+
+    /// A failed status call backs off: the next start is deferred without asking, and only
+    /// `account link` (or the backoff running out) asks again. No default name while deferred.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn backfill_backs_off_after_a_failed_status_call() {
+        let mut fx = fixture("backoff", None).await;
+        let first = backfill_name_from_link_async(&mut fx.home).await;
+        assert!(matches!(first, NameBackfill::Failed(_)), "{first:?}");
+        assert!(!first.allows_default_name());
+        let second = backfill_name_from_link_async(&mut fx.home).await;
+        assert_eq!(second, NameBackfill::Deferred);
+        assert!(!second.allows_default_name());
+        forget_name_backfill(&fx.home);
+        let third = backfill_name_from_link_async(&mut fx.home).await;
+        assert!(matches!(third, NameBackfill::Failed(_)), "{third:?}");
+        assert_eq!(failure_backoff(1), FAILURE_BACKOFF_FIRST);
+        assert_eq!(failure_backoff(2), FAILURE_BACKOFF_FIRST * 2);
+        assert_eq!(failure_backoff(40), FAILURE_BACKOFF_MAX);
+    }
+
+    /// An unreachable service fails quietly well inside the budget, and changes nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backfill_status_failure_does_not_block() {
         let mut fx = fixture("status-down", None).await;
         let started = std::time::Instant::now();
-        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        let outcome = backfill_name_from_link_async(&mut fx.home).await;
+        assert!(matches!(outcome, NameBackfill::Failed(_)), "{outcome:?}");
         assert!(
             started.elapsed() < NAME_BACKFILL_BUDGET,
             "{:?}",
@@ -1442,7 +1806,8 @@ mod name_fill_tests {
         assert_eq!(saved_name(&mut fx.home), None);
     }
 
-    /// A service that never answers is cut off at the budget rather than holding startup.
+    /// A service that never answers is cut off at the budget rather than holding startup, and the
+    /// blocking request itself ends there (its timeout is the budget), not 30s later.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn backfill_gives_up_at_its_budget() {
         // Accepts the connection, then never answers.
@@ -1453,10 +1818,9 @@ mod name_fill_tests {
         );
         let mut fx = fixture("status-hang", Some(url)).await;
         let started = std::time::Instant::now();
-        assert_eq!(
-            backfill_name_within(&mut fx.home, Duration::from_millis(300)).await,
-            None
-        );
+        let outcome = backfill_name_within(&mut fx.home, Duration::from_millis(300)).await;
+        assert!(matches!(outcome, NameBackfill::Failed(_)), "{outcome:?}");
+        assert!(!outcome.allows_default_name());
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -1474,8 +1838,229 @@ mod name_fill_tests {
             Some(status.base_url().replace("127.0.0.1", "localhost")),
         )
         .await;
-        assert_eq!(backfill_name_from_link_async(&mut fx.home).await, None);
+        assert_eq!(
+            backfill_name_from_link_async(&mut fx.home).await,
+            NameBackfill::NotNeeded
+        );
         assert_eq!(status.calls(), 0);
+    }
+
+    /// Every kind-0 content this key has on the relay, raw.
+    async fn kind0_contents(fx: &Fixture) -> Vec<String> {
+        let client = Client::default();
+        client.add_relay(&fx.relay_url).await.unwrap();
+        client.connect().await;
+        let filter = Filter::new()
+            .author(keys(&fx.home).public_key())
+            .kind(Kind::Metadata);
+        let events = client
+            .fetch_events(filter, Duration::from_secs(5))
+            .await
+            .expect("read kind-0");
+        client.disconnect().await;
+        events.into_iter().map(|e| e.content).collect()
+    }
+
+    async fn seed_raw_kind0(fx: &Fixture, content: &str) {
+        let keys = keys(&fx.home);
+        let client = Client::new(keys.clone());
+        client.add_relay(&fx.relay_url).await.unwrap();
+        client.connect().await;
+        let event = EventBuilder::new(Kind::Metadata, content)
+            .sign_with_keys(&keys)
+            .unwrap();
+        client.send_event(&event).await.expect("seed kind-0");
+        client.disconnect().await;
+    }
+
+    /// A kind-0 the SDK cannot parse as metadata (a number where it wants a string, a bad URL)
+    /// keeps every field exactly as published; it is not rebuilt from name and about.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn label_fill_keeps_fields_the_sdk_cannot_parse() {
+        let mut fx = fixture("odd-fields", None).await;
+        seed_raw_kind0(
+            &fx,
+            r#"{"about":"kept","website":"not a url","lud16":5,"custom":{"x":1}}"#,
+        )
+        .await;
+        let outcome = fill_name_from_label_async(&mut fx.home, "my laptop")
+            .await
+            .expect("fill");
+        assert!(matches!(outcome, NameFill::Published { .. }), "{outcome:?}");
+        let contents = kind0_contents(&fx).await;
+        assert_eq!(contents.len(), 1, "{contents:?}");
+        let published: serde_json::Value = serde_json::from_str(&contents[0]).unwrap();
+        assert_eq!(
+            published,
+            serde_json::json!({
+                "about": "kept",
+                "website": "not a url",
+                "lud16": 5,
+                "custom": {"x": 1},
+                "name": "my laptop",
+            })
+        );
+    }
+
+    /// A kind-0 whose content is not a JSON object cannot say whether the key is named: publish
+    /// nothing, save nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn label_fill_publishes_nothing_over_unreadable_content() {
+        let mut fx = fixture("not-json", None).await;
+        seed_raw_kind0(&fx, "not json at all").await;
+        let error = fill_name_from_label_async(&mut fx.home, "my laptop")
+            .await
+            .expect_err("unreadable content must not be overwritten");
+        assert!(error.to_string().contains("not a JSON object"), "{error}");
+        assert_eq!(kind0_contents(&fx).await, vec!["not json at all".to_owned()]);
+        assert_eq!(saved_name(&mut fx.home), None);
+    }
+
+    /// A home on the EOSE-withholding fixture relay, with a seller section.
+    fn pgate_home(label: &str, relay_url: &str) -> MaxplayerHome {
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-name-fill-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = home::bootstrap(&root).expect("home");
+        let url = relay_url.to_owned();
+        home::save_config(&mut home, |config| {
+            config.relay_url = url;
+            config.seller = Some(super::tests::wiring_seller(1));
+        })
+        .expect("persist config");
+        home
+    }
+
+    fn published_kind0_names(events: &[crate::seller_node::p_gate_relay_fixture::PublishedEvent]) -> Vec<Option<String>> {
+        events
+            .iter()
+            .filter(|event| event.kind == 0)
+            .map(|event| {
+                serde_json::from_str::<serde_json::Value>(&event.content)
+                    .ok()
+                    .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+            })
+            .collect()
+    }
+
+    /// The finding: `fetch_events` answers a read that never got EOSE with `Ok(empty)`, which read
+    /// as "no kind-0" and let the label (or seller start's merge) overwrite the real profile. Now a
+    /// read without EOSE publishes nothing on every kind-0 write path, and saves no name.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kind0_read_without_eose_publishes_nothing() {
+        use crate::seller_node::p_gate_relay_fixture::PGateRelay;
+        let relay = PGateRelay::start(Duration::from_millis(0)).await;
+        relay.withhold_eose_for(&[0]);
+        let mut home = pgate_home("no-eose", &relay.url());
+
+        let started = std::time::Instant::now();
+        let error = fill_name_from_label_async(&mut home, "my laptop")
+            .await
+            .expect_err("a read without EOSE must not publish");
+        assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS + 4),
+            "{:?}",
+            started.elapsed()
+        );
+        let error = publish_seller_discoverability_with(&mut home, true)
+            .await
+            .expect_err("seller start must not publish over an unread profile");
+        assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
+        let error = set_profile_async(
+            &mut home,
+            SetProfileRequest {
+                name: None,
+                about: Some("operator".into()),
+            },
+        )
+        .await
+        .expect_err("profile set must not publish over an unread profile");
+        assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
+        assert_eq!(relay.event_kind_count(0).await, 0, "no kind-0 reached the relay");
+        assert_eq!(saved_name(&mut home), None);
+
+        // Positive control: the same relay answering with EOSE gets the label.
+        relay.withhold_eose_for(&[]);
+        let outcome = fill_name_from_label_async(&mut home, "my laptop")
+            .await
+            .expect("fill once the read completes");
+        assert!(matches!(outcome, NameFill::Published { .. }), "{outcome:?}");
+        assert_eq!(
+            published_kind0_names(&relay.events().await),
+            vec![Some("my laptop".to_owned())]
+        );
+        let _ = std::fs::remove_dir_all(&home.root);
+    }
+
+    /// Buyer daemon and seller node hold different home locks, so a buyer label fill and a seller
+    /// start can run at once. Seller start waits for the profile lock: it neither reads nor
+    /// publishes while a fill holds it, and then keeps the name the fill saved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn seller_start_waits_for_a_label_fill_on_the_same_home() {
+        let mut fx = fixture("overlap", None).await;
+        let seller = super::tests::wiring_seller(1);
+        home::save_config(&mut fx.home, |config| config.seller = Some(seller)).unwrap();
+
+        // Stands in for a buyer fill between its kind-0 read and its save.
+        let held = profile_write_lock(&fx.home, Duration::from_secs(1))
+            .await
+            .expect("lock");
+        let mut seller_home = fx.home.clone();
+        let seller_start = tokio::spawn(async move {
+            publish_seller_discoverability_with(&mut seller_home, true).await
+        });
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            kind0s(&fx).await.is_empty(),
+            "seller start published while another kind-0 write held the home"
+        );
+        assert!(!seller_start.is_finished());
+        // The fill lands (published, then saved) and releases the lock.
+        seed_kind0(&fx, &Metadata::new().name("my laptop")).await;
+        save_profile_name(&mut fx.home, "my laptop").unwrap();
+        drop(held);
+
+        let outcome = seller_start
+            .await
+            .unwrap()
+            .expect("seller publish after the fill");
+        assert_eq!(outcome.name.as_deref(), Some("my laptop"));
+        let remote = kind0s(&fx).await;
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].name.as_deref(), Some("my laptop"));
+        assert_eq!(saved_name(&mut fx.home).as_deref(), Some("my laptop"));
+    }
+
+    /// Run for real at the same time, whichever goes first, the relay and `[profile].name` agree:
+    /// either the label everywhere, or the default everywhere with the fill keeping it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_concurrent_label_fill_and_seller_start_agree_on_one_name() {
+        for round in 0..3 {
+            let fx = fixture(&format!("race-{round}"), None).await;
+            let mut buyer_home = fx.home.clone();
+            let seller = super::tests::wiring_seller(1);
+            home::save_config(&mut buyer_home, |config| config.seller = Some(seller)).unwrap();
+            let mut seller_home = buyer_home.clone();
+            let (fill, seller_start) = tokio::join!(
+                fill_name_from_label_async(&mut buyer_home, "my laptop"),
+                publish_seller_discoverability_with(&mut seller_home, true),
+            );
+            let fill = fill.expect("fill");
+            let seller_start = seller_start.expect("seller start");
+            let remote = kind0s(&fx).await;
+            assert_eq!(remote.len(), 1);
+            let mut reader = fx.home.clone();
+            let saved = saved_name(&mut reader);
+            assert_eq!(remote[0].name, saved, "round {round}: {fill:?} / {seller_start:?}");
+            assert_eq!(saved.as_deref(), Some(fill.name()), "round {round}");
+        }
     }
 
     #[test]

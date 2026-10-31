@@ -352,8 +352,10 @@ pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
 fn spawn_name_backfill(context: &Arc<BuyerContext>) {
     let mut home = context.home.clone();
     tokio::spawn(async move {
-        if let Some(crate::profile::NameFill::Published { name, .. }) =
-            crate::profile::backfill_name_from_link_async(&mut home).await
+        if let crate::profile::NameBackfill::Filled(crate::profile::NameFill::Published {
+            name,
+            ..
+        }) = crate::profile::backfill_name_from_link_async(&mut home).await
         {
             crate::opline!("buyer: public name set from the account label: {name}");
         }

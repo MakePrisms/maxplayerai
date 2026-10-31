@@ -67,6 +67,8 @@ pub(crate) struct PublishedEvent {
     /// kind-30340, so a count of kind-30340s cannot tell a seat retracting itself from a seat
     /// announcing that it is open.
     pub tags: Vec<Vec<String>>,
+    /// The event's content, as it arrived (kind-0 metadata JSON, for one).
+    pub content: String,
 }
 
 impl PublishedEvent {
@@ -497,10 +499,16 @@ async fn serve_connection(
                                 .collect()
                         })
                         .unwrap_or_default();
+                    let content = event
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned();
                     events.lock().await.push(PublishedEvent {
                         id: id.to_owned(),
                         kind,
                         tags,
+                        content,
                     });
                 }
                 if controls.ok_withheld(kind) {

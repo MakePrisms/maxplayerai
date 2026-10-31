@@ -409,6 +409,8 @@ mod wallet {
         let Some(home) = &ctx.home else {
             return;
         };
+        // A "not linked" answer or a failure backoff remembered by the startup backfill is stale now.
+        profile::forget_name_backfill(home);
         let label = &linked.label;
         if linked.relay_member != "added" {
             let _ = writeln!(
@@ -525,7 +527,10 @@ mod wallet {
             },
         };
         let label = match &opts.label {
-            Some(label) => label.clone(),
+            Some(label) => {
+                let _ = writeln!(out, "{PUBLIC_NAME_NOTICE}");
+                label.clone()
+            }
             None => {
                 let _ = writeln!(out, "{PUBLIC_NAME_NOTICE}");
                 let question = match &ctx.profile_name {

@@ -903,3 +903,22 @@ fn label_help_says_the_name_is_public() {
     let (_, _, err) = run(&home, &fake.base_url(), &["link", "--email", "a@b.co"]);
     assert!(err.contains("This name is public on Maxplayer"), "{err}");
 }
+
+/// `link --email --label` sends the label without asking for it, so it says the name is public
+/// before the request goes out.
+#[test]
+fn link_with_a_label_flag_says_the_name_is_public_before_sending() {
+    let fake = FakeRegistration::start();
+    let home = new_home();
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &["link", "--email", "you@example.com", "--label", "my-laptop"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let notice = out
+        .find("This name is public on Maxplayer")
+        .unwrap_or_else(|| panic!("no public-name notice: {out}"));
+    let sent = out.find("Check you@example.com").expect("code sent line");
+    assert!(notice < sent, "the notice comes before the request: {out}");
+}
