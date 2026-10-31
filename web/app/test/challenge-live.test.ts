@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {relayStatusWord,connectionLine,isLive,liveState,observe,challengeReady,renderLiveState,parseSnapshot,sellerLine,sellerMinutes,sellerState,renderSellers,UPDATING,type Snapshot} from '../src/challenge/live.js';
+import * as live from '../src/challenge/live.js';
+import {connectionLine,isLive,liveState,observe,challengeReady,renderLiveState,parseSnapshot,sellerLine,sellerMinutes,sellerState,renderSellers,UPDATING,type Snapshot} from '../src/challenge/live.js';
 import {npubEncode} from '../src/trade/nip19.js';
 const buyer='79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798';
 const seller={pubkey:buyer,npub:npubEncode(buyer),name:'<script>untrusted</script>',minutesOffered:60,minutesUsed:32,minutesRemaining:28,state:'working',eligible:true,decision:'accepted',currentJobStart:1000};
@@ -127,6 +128,9 @@ test('readiness for "Running now": challenge relays only, refreshed on each read
 // #1243: the member-gated relay refuses the reader's throwaway AUTH and serves the same open reads,
 // so the swarm page showed "Polling" for a complete read. Anonymous posture is Live; pending is not.
 test('status word: authenticated or anonymous posture is Live; pending AUTH or an older status without it is Polling',()=>{
+  // Namespace import: on a base without the helper this fails here, not at module load.
+  assert.equal(typeof live.relayStatusWord,'function','relayStatusWord is exported');
+  const relayStatusWord=live.relayStatusWord;
   const r={connected:true,authenticated:false,historyComplete:true,error:null};
   assert.equal(relayStatusWord({...r,authMode:'anonymous'}),'Live');
   assert.equal(relayStatusWord({...r,authenticated:true,authMode:'authenticated'}),'Live');
