@@ -58,6 +58,10 @@ pub enum ProfileError {
     /// one. Nothing was published or saved. `profile set` reports it as an error; seller start and
     /// the automatic label fill skip the kind-0 update with a warning (kind-0 is display-only).
     Unread(String),
+    /// Another maxplayer process on this home held `profile.lock` for the whole wait (it is still
+    /// writing its own kind-0). Nothing was read, published or saved. Seller start skips with a
+    /// warning, like [`ProfileError::Unread`]; `profile set` reports it.
+    Busy(String),
 }
 
 impl fmt::Display for ProfileError {
@@ -65,7 +69,7 @@ impl fmt::Display for ProfileError {
         match self {
             Self::Input(message) => write!(formatter, "profile input: {message}"),
             Self::Home(error) => write!(formatter, "{error}"),
-            Self::Relay(message) | Self::Unread(message) => {
+            Self::Relay(message) | Self::Unread(message) | Self::Busy(message) => {
                 write!(formatter, "profile relay: {message}")
             }
         }
@@ -80,7 +84,8 @@ impl From<HomeError> for ProfileError {
     }
 }
 
-/// Write optional name/about into `[profile]`, then publish/replace buyer kind-0.
+/// Publish/replace buyer kind-0 with the optional name/about, then write them into `[profile]` once
+/// the relay accepted it. Nothing is saved when the read or the send fails.
 ///
 /// For callers already on a Tokio runtime (MCP dispatch). Never echoes the secret key.
 pub async fn set_profile_async(
@@ -103,13 +108,10 @@ pub async fn set_profile_async(
         None => None,
     };
 
-    home::save_config(home, |config| {
-        // Ensure the section exists even when re-publishing empties (idempotent replace).
-        let profile = config.profile.get_or_insert_with(ProfileConfig::default);
-        apply_profile_updates(profile, name, about);
-    })?;
-
-    let profile = home.config.profile.clone().unwrap_or_default();
+    // What `[profile]` becomes, saved only once the relay accepted it: a read or send that failed
+    // leaves config.toml as it was, so the next seller start or label fill sees the old state.
+    let mut profile = home.config.profile.clone().unwrap_or_default();
+    apply_profile_updates(&mut profile, name.clone(), about.clone());
     let keys = buyer_keys(home)?;
     // Fail-closed read-merge-write: never blind-overwrite a replaceable kind-0.
     let event_id = publish_metadata_merged_async(
@@ -120,6 +122,11 @@ pub async fn set_profile_async(
     )
     .await?
     .event_id;
+    home::save_config(home, |config| {
+        // Ensure the section exists even when re-publishing empties (idempotent replace).
+        let profile = config.profile.get_or_insert_with(ProfileConfig::default);
+        apply_profile_updates(profile, name, about);
+    })?;
 
     Ok(SetProfileOutcome {
         ok: true,
@@ -182,31 +189,22 @@ pub async fn publish_seller_discoverability_with(
     let pubkey = home::public_key_hex(home)?;
     let short = &pubkey[..8.min(pubkey.len())];
     let local_name = configured_name(home);
-    let fallback = (local_name.is_none() && allow_default_name)
-        .then(|| format!("maxplayer-seller-{short}"));
+    let fallback =
+        (local_name.is_none() && allow_default_name).then(|| format!("maxplayer-seller-{short}"));
     let keys = buyer_keys(home)?;
-    // Read before anything is saved: a profile that cannot be read leaves config.toml untouched
-    // (no generated about, no default name) as well as the relay.
-    let (session, mut fields) = open_merge_base(home, &keys, true).await?;
+    // Nothing is saved until the relay accepted the event: a profile that cannot be read, or a send
+    // the relay refuses, leaves config.toml untouched (no generated about, no default name).
+    let (session, mut fields) = open_merge_base(home, &keys).await?;
 
-    let existing_about = home.config.profile.as_ref().and_then(|p| p.about.as_deref());
+    let existing_about = home.config.profile.as_ref().and_then(|p| p.about.clone());
     let existing_generated = home.config.profile.as_ref().and_then(|p| p.about_generated);
     let live_about = default_seller_about(agent.as_deref(), rate_sats, &home.config.accepted_mints);
-    if let Some((about, about_generated)) =
-        generated_about_update(existing_about, existing_generated, live_about)
-    {
-        let saved = home::save_config(home, |config| {
-            let profile = config.profile.get_or_insert_with(ProfileConfig::default);
-            profile.about = Some(about);
-            profile.about_generated = Some(about_generated);
-        });
-        if let Err(error) = saved {
-            session.client.disconnect().await;
-            return Err(error.into());
-        }
-    }
-
-    let about = home.config.profile.as_ref().and_then(|p| p.about.clone());
+    let about_update =
+        generated_about_update(existing_about.as_deref(), existing_generated, live_about);
+    let about = about_update
+        .as_ref()
+        .map(|(about, _)| about.clone())
+        .or(existing_about);
     let name = merge_name_about(
         &mut fields,
         local_name.as_deref(),
@@ -214,10 +212,23 @@ pub async fn publish_seller_discoverability_with(
         fallback.as_deref(),
     );
     let event_id = send_metadata(session, home, &keys, fields).await?;
-    if local_name.is_none()
-        && let Some(name) = &name
-    {
-        save_profile_name(home, name)?;
+    // Saved only after the relay accepted the event: a refused send leaves config.toml unchanged.
+    let new_name = if local_name.is_none() {
+        name.clone()
+    } else {
+        None
+    };
+    if about_update.is_some() || new_name.is_some() {
+        home::save_config(home, |config| {
+            let profile = config.profile.get_or_insert_with(ProfileConfig::default);
+            if let Some((about, about_generated)) = about_update {
+                profile.about = Some(about);
+                profile.about_generated = Some(about_generated);
+            }
+            if let Some(name) = new_name {
+                profile.name = Some(name);
+            }
+        })?;
     }
 
     Ok(SellerDiscoverabilityOutcome {
@@ -293,7 +304,7 @@ async fn profile_write_lock(
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(LockError::Held { .. }) => {
-                return Err(ProfileError::Relay(format!(
+                return Err(ProfileError::Busy(format!(
                     "another maxplayer process on this home is still publishing its profile \
                      (waited {}s); nothing was published",
                     wait.as_secs()
@@ -315,25 +326,21 @@ struct MergedPublish {
 }
 
 /// Connect and read this key's kind-0 as the base of a merge: every field as published, or empty
-/// when the relay holds none. A read that did not end in EOSE is [`ProfileError::Unread`]; so is a
-/// stored kind-0 whose content is not a JSON object when `unreadable_is_error` (seller start, which
-/// must not replace what it cannot read). Callers hold [`profile_write_lock`].
+/// when the relay holds none. A read that did not end in EOSE, or a stored kind-0 whose content is
+/// not a JSON object, is [`ProfileError::Unread`]: no writer replaces what it cannot read (the
+/// explicit `profile set` included). Callers hold [`profile_write_lock`].
 async fn open_merge_base(
     home: &MaxplayerHome,
     keys: &nostr_sdk::Keys,
-    unreadable_is_error: bool,
 ) -> Result<(Kind0Session, serde_json::Map<String, serde_json::Value>), ProfileError> {
     let session = connect_metadata_client(home, keys).await?;
     let fields = match read_own_kind0(&session, keys, kind0_read_deadline()).await {
         Ok(OwnKind0::Fields(fields)) => fields,
         Ok(OwnKind0::Absent) => serde_json::Map::new(),
-        Ok(OwnKind0::NotAnObject) if unreadable_is_error => {
+        Ok(OwnKind0::NotAnObject) => {
             session.client.disconnect().await;
             return Err(not_an_object());
         }
-        // An explicit `profile set`: no field can be read out of it, so there is nothing to keep
-        // (this publish carries the operator's own name and about).
-        Ok(OwnKind0::NotAnObject) => serde_json::Map::new(),
         Err(error) => {
             session.client.disconnect().await;
             return Err(error);
@@ -359,7 +366,7 @@ async fn publish_metadata_merged_async(
     name: Option<&str>,
     about: Option<&str>,
 ) -> Result<MergedPublish, ProfileError> {
-    let (session, mut fields) = open_merge_base(home, keys, false).await?;
+    let (session, mut fields) = open_merge_base(home, keys).await?;
     merge_name_about(&mut fields, name, about, None);
     let event_id = send_metadata(session, home, keys, fields).await?;
     Ok(MergedPublish { event_id })
@@ -454,7 +461,10 @@ async fn read_own_kind0(
     let left = || until.saturating_duration_since(std::time::Instant::now());
     session.client.wait_for_connection(left()).await;
     if !session.relay.is_connected() {
-        return Err(incomplete(format!("no connection to {}", session.relay.url())));
+        return Err(incomplete(format!(
+            "no connection to {}",
+            session.relay.url()
+        )));
     }
     let filter = Filter::new()
         .author(keys.public_key())
@@ -504,16 +514,14 @@ async fn send_metadata(
             return Err(ProfileError::Relay(format!("sign kind-0: {error}")));
         }
     };
-    let output = client
-        .send_event_to([&home.config.relay_url], &event)
-        .await;
+    let output = client.send_event_to([&home.config.relay_url], &event).await;
     client.disconnect().await;
     let output = output.map_err(|error| ProfileError::Relay(format!("send kind-0: {error}")))?;
     if output.success.is_empty() {
         let failed = crate::relay_auth::failed_reasons(&output, Some(&sign_in));
-        return Err(ProfileError::Relay(crate::relay_refusal::with_hint(format!(
-            "no relay accepted kind-0 ({failed})"
-        ))));
+        return Err(ProfileError::Relay(crate::relay_refusal::with_hint(
+            format!("no relay accepted kind-0 ({failed})"),
+        )));
     }
     Ok(output.val.to_hex())
 }
@@ -859,10 +867,7 @@ async fn registration_status(
     });
     // A backstop only: the request timeout above ends the task first.
     match tokio::time::timeout(budget + Duration::from_secs(1), task).await {
-        Err(_) => Err(format!(
-            "no answer within {:.1}s",
-            budget.as_secs_f32()
-        )),
+        Err(_) => Err(format!("no answer within {:.1}s", budget.as_secs_f32())),
         Ok(Err(error)) => Err(format!("status task: {error}")),
         Ok(Ok(result)) => result.map_err(|error| error.to_string()),
     }
@@ -1808,13 +1813,21 @@ mod name_fill_tests {
             backfill_name_from_link_async(&mut fx.home).await,
             NameBackfill::NotLinked
         );
-        assert_eq!(status.calls(), 1, "a remembered \"not linked\" is not asked again");
+        assert_eq!(
+            status.calls(),
+            1,
+            "a remembered \"not linked\" is not asked again"
+        );
         forget_name_backfill(&fx.home);
         assert_eq!(
             backfill_name_from_link_async(&mut fx.home).await,
             NameBackfill::NotLinked
         );
-        assert_eq!(status.calls(), 2, "after `account link` the service is asked again");
+        assert_eq!(
+            status.calls(),
+            2,
+            "after `account link` the service is asked again"
+        );
         assert!(kind0s(&fx).await.is_empty());
     }
 
@@ -1960,7 +1973,10 @@ mod name_fill_tests {
             .expect_err("unreadable content must not be overwritten");
         assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
         assert!(error.to_string().contains("not a JSON object"), "{error}");
-        assert_eq!(kind0_contents(&fx).await, vec!["not json at all".to_owned()]);
+        assert_eq!(
+            kind0_contents(&fx).await,
+            vec!["not json at all".to_owned()]
+        );
         assert_eq!(saved_name(&mut fx.home), None);
 
         // Seller start skips it the same way: nothing published, nothing saved.
@@ -1970,9 +1986,82 @@ mod name_fill_tests {
             .await
             .expect_err("seller start must not replace unreadable content");
         assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
-        assert_eq!(kind0_contents(&fx).await, vec!["not json at all".to_owned()]);
+        assert_eq!(
+            kind0_contents(&fx).await,
+            vec!["not json at all".to_owned()]
+        );
         home::reload_config(&mut fx.home).unwrap();
-        assert!(fx.home.config.profile.is_none(), "{:?}", fx.home.config.profile);
+        assert!(
+            fx.home.config.profile.is_none(),
+            "{:?}",
+            fx.home.config.profile
+        );
+
+        // The explicit `profile set` refuses it too, rather than replacing it with its own fields.
+        let config_path = fx.home.root.join("config.toml");
+        let config_before = std::fs::read(&config_path).unwrap();
+        let error = set_profile_async(
+            &mut fx.home,
+            SetProfileRequest {
+                name: Some("operator-name".into()),
+                about: None,
+            },
+        )
+        .await
+        .expect_err("profile set must not replace unreadable content");
+        assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
+        assert!(error.to_string().contains("not a JSON object"), "{error}");
+        assert_eq!(
+            kind0_contents(&fx).await,
+            vec!["not json at all".to_owned()]
+        );
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+    }
+
+    /// A send the relay refuses leaves config.toml as it was: no generated `about`, no default name
+    /// from seller start, no name/about from `profile set`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_kind0_send_saves_nothing() {
+        use crate::seller_node::p_gate_relay_fixture::PGateRelay;
+        let relay = PGateRelay::start(Duration::from_millis(0)).await;
+        let mut home = pgate_home("refused-send", &relay.url());
+        let config_path = home.root.join("config.toml");
+        let config_before = std::fs::read(&config_path).unwrap();
+        relay.withhold_ok_for(&[0]);
+        let error = publish_seller_discoverability_with(&mut home, true)
+            .await
+            .expect_err("no OK, no accept");
+        assert!(matches!(error, ProfileError::Relay(_)), "{error:?}");
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "seller start saved about/name before the relay accepted them"
+        );
+        let error = set_profile_async(
+            &mut home,
+            SetProfileRequest {
+                name: Some("operator-name".into()),
+                about: Some("operator".into()),
+            },
+        )
+        .await
+        .expect_err("no OK, no accept");
+        assert!(matches!(error, ProfileError::Relay(_)), "{error:?}");
+        assert_eq!(std::fs::read(&config_path).unwrap(), config_before);
+
+        // Positive control: once the relay acknowledges, both are saved.
+        relay.withhold_ok_for(&[]);
+        publish_seller_discoverability_with(&mut home, true)
+            .await
+            .expect("accepted");
+        home::reload_config(&mut home).unwrap();
+        let profile = home.config.profile.clone().expect("profile saved");
+        assert!(
+            profile
+                .name
+                .is_some_and(|n| n.starts_with("maxplayer-seller-"))
+        );
+        assert_eq!(profile.about_generated, Some(true));
     }
 
     /// A home on the EOSE-withholding fixture relay, with a seller section.
@@ -1996,7 +2085,9 @@ mod name_fill_tests {
         home
     }
 
-    fn published_kind0_names(events: &[crate::seller_node::p_gate_relay_fixture::PublishedEvent]) -> Vec<Option<String>> {
+    fn published_kind0_names(
+        events: &[crate::seller_node::p_gate_relay_fixture::PublishedEvent],
+    ) -> Vec<Option<String>> {
         events
             .iter()
             .filter(|event| event.kind == 0)
@@ -2022,7 +2113,10 @@ mod name_fill_tests {
         let error = fill_name_from_label_async(&mut home, "my laptop")
             .await
             .expect_err("a read without EOSE must not publish");
-        assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
+        assert!(
+            error.to_string().contains("kind-0 read incomplete"),
+            "{error}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS + 4),
             "{:?}",
@@ -2033,25 +2127,42 @@ mod name_fill_tests {
             .await
             .expect_err("seller start must not publish over an unread profile");
         assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
-        assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
+        assert!(
+            error.to_string().contains("kind-0 read incomplete"),
+            "{error}"
+        );
         home::reload_config(&mut home).unwrap();
         assert!(
             home.config.profile.is_none(),
             "seller start saved {:?} without reading the profile",
             home.config.profile
         );
+        let config_path = home.root.join("config.toml");
+        let config_before = std::fs::read(&config_path).unwrap();
         let error = set_profile_async(
             &mut home,
             SetProfileRequest {
-                name: None,
+                name: Some("operator-name".into()),
                 about: Some("operator".into()),
             },
         )
         .await
         .expect_err("profile set stays an error over an unread profile");
         assert!(matches!(error, ProfileError::Unread(_)), "{error:?}");
-        assert!(error.to_string().contains("kind-0 read incomplete"), "{error}");
-        assert_eq!(relay.event_kind_count(0).await, 0, "no kind-0 reached the relay");
+        assert!(
+            error.to_string().contains("kind-0 read incomplete"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            config_before,
+            "profile set saved its name/about without publishing them"
+        );
+        assert_eq!(
+            relay.event_kind_count(0).await,
+            0,
+            "no kind-0 reached the relay"
+        );
         assert_eq!(saved_name(&mut home), None);
 
         // Positive control: the same relay answering with EOSE gets the label.
@@ -2126,7 +2237,10 @@ mod name_fill_tests {
             assert_eq!(remote.len(), 1);
             let mut reader = fx.home.clone();
             let saved = saved_name(&mut reader);
-            assert_eq!(remote[0].name, saved, "round {round}: {fill:?} / {seller_start:?}");
+            assert_eq!(
+                remote[0].name, saved,
+                "round {round}: {fill:?} / {seller_start:?}"
+            );
             assert_eq!(saved.as_deref(), Some(fill.name()), "round {round}");
         }
     }

@@ -1116,7 +1116,8 @@ On start (after `[seller]` is written) the daemon publishes:
 - a **kind-0** profile (a `maxplayer-seller-<short>` name is filled if you did not pass `--name`
   and no account label names the key). It never overwrites a profile it could not read: if the read
   of your current kind-0 does not end in the relay's EOSE (timeout, refused sign-in) or holds content
-  that is not a JSON object, boot logs one `warn:` line, publishes and saves nothing, and goes on —
+  that is not a JSON object, or another maxplayer process on the same home is still writing its
+  profile after 30s, boot logs one `warn:` line, publishes and saves nothing, and goes on —
   kind-0 is display-only, the heartbeat below carries what buyers act on. A send the relay refuses
   still aborts boot. `maxplayer profile set` stays an error in both cases, and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every

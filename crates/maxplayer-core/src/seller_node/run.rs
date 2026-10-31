@@ -4622,17 +4622,19 @@ pub async fn boot_advertising_only_proven(
         );
     }
     // Kind-0 is display-only (the kind-30340 heartbeat carries everything a buyer acts on), so a
-    // profile this start cannot read (no EOSE, timeout, content that is not a JSON object) is
-    // skipped, not fatal: nothing is published or saved, one warn line, and boot goes on.
-    match crate::profile::publish_seller_discoverability_with(&mut home, allow_default_name).await
-    {
+    // profile this start cannot read (no EOSE, timeout, content that is not a JSON object), or one
+    // another process on this home is still writing (profile.lock held past the wait), is skipped,
+    // not fatal: nothing is published or saved, one warn line, and boot goes on.
+    match crate::profile::publish_seller_discoverability_with(&mut home, allow_default_name).await {
         Ok(disco) => opline!(
             "seller node discoverable kind0={} name={} pubkey={}",
             disco.kind0_event_id,
             disco.name.as_deref().unwrap_or(""),
             disco.pubkey
         ),
-        Err(crate::profile::ProfileError::Unread(cause)) => opline!(
+        Err(
+            crate::profile::ProfileError::Unread(cause) | crate::profile::ProfileError::Busy(cause),
+        ) => opline!(
             "warn: seller node public profile (kind-0) not updated this start, nothing published \
              or saved: {cause}"
         ),
@@ -20590,7 +20592,22 @@ mod tests {
         registration_url: String,
         preset_name: Option<&str>,
     ) -> (Option<String>, String) {
-        let root = throwaway_root(label);
+        boot_named_seat_at(
+            throwaway_root(label),
+            fixture,
+            registration_url,
+            preset_name,
+        )
+        .await
+    }
+
+    /// [`boot_named_seat`] on a given (possibly pre-populated) home directory.
+    async fn boot_named_seat_at(
+        root: std::path::PathBuf,
+        fixture: &PGateRelay,
+        registration_url: String,
+        preset_name: Option<&str>,
+    ) -> (Option<String>, String) {
         let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
         let pubkey = crate::home::public_key_hex(&home).expect("pubkey");
         let preset = preset_name.map(str::to_owned);
@@ -20663,7 +20680,32 @@ mod tests {
         let (name, _) = boot_named_seat("no-eose", &fixture, status.base_url(), None).await;
         assert_eq!(name, None, "no name saved over an unread profile");
         assert_eq!(fixture.event_kind_count(0).await, 0, "no kind-0 published");
-        assert_eq!(status.calls(), 1, "the backfill ran (key not linked), then the read skipped");
+        assert_eq!(
+            status.calls(),
+            1,
+            "the backfill ran (key not linked), then the read skipped"
+        );
+    }
+
+    /// Another process on this home holds `profile.lock` for the whole wait (a buyer label fill
+    /// stuck on a slow send): seller start does not take it over, publishes no kind-0, saves no
+    /// name, and still boots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn seller_start_boots_while_another_holder_keeps_the_profile_lock() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let status = crate::profile::fake_status::FakeStatus::unlinked();
+        let root = throwaway_root("profile-lock-held");
+        std::fs::create_dir_all(&root).expect("home dir");
+        // Held for the whole boot, released only when the test ends.
+        let _held = crate::buyer::lock::HomeLock::acquire(root.join("profile.lock"))
+            .expect("hold profile.lock");
+        let (name, _) = boot_named_seat_at(root, &fixture, status.base_url(), None).await;
+        assert_eq!(name, None, "no name saved without the lock");
+        assert_eq!(
+            fixture.event_kind_count(0).await,
+            0,
+            "no kind-0 published without the lock"
+        );
     }
 
     /// Membership still pending: the seat boots, publishes kind-0 WITHOUT a name, saves none, and
@@ -20673,7 +20715,10 @@ mod tests {
         let fixture = PGateRelay::start(Duration::from_millis(0)).await;
         let status = crate::profile::fake_status::FakeStatus::linked("seat-label", "pending");
         let (name, _) = boot_named_seat("pending", &fixture, status.base_url(), None).await;
-        assert_eq!(name, None, "no default saved while the label may still apply");
+        assert_eq!(
+            name, None,
+            "no default saved while the label may still apply"
+        );
         assert_eq!(status.calls(), 1);
         assert_eq!(kind0_names(&fixture).await, vec![None]);
     }
