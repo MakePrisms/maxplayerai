@@ -183,7 +183,7 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 |---|---|---|
 | linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
 | linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
-| darwin-arm64 | `macos-14` | archive + `@maxplayerai/darwin-arm64` |
+| darwin-arm64 | `macos-15` | archive + `@maxplayerai/darwin-arm64` |
 
 **darwin-x64 and Windows are out of scope.**
 
