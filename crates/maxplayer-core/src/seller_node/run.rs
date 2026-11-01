@@ -4716,6 +4716,9 @@ pub struct SellerNodeRunner {
     capacity_skip_pending: std::sync::atomic::AtomicBool,
     // Bounded off-loop review work; None is pending, Some is terminal until restart.
     review_checks: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Option<Result<Option<String>, String>>>>>,
+    /// #1057: the review failure already logged per offer, so a re-drive of the same outcome stays
+    /// quiet. Cleared with the cached check by an explicit `review retry`; pruned to `review_checks`.
+    review_blocked_logged: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
     /// Pre-claim private input staging, off the event loop (#1096 review B2): a large base
     /// can take minutes for the relay to pack. Finished offers are re-driven on the drain tick.
     private_preflight: super::preflight::PreflightGate<nostr_sdk::Event>,
@@ -5209,6 +5212,7 @@ impl SellerNodeRunner {
             slots,
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
             review_checks: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            review_blocked_logged: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             private_preflight: super::preflight::PreflightGate::new(),
             delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             session_rt: session_run::SessionRuntime::default(),
@@ -5598,16 +5602,26 @@ impl SellerNodeRunner {
     /// only those still `Claim` are re-driven through [`Self::claim_offer`]. Idempotency there
     /// (`claim_and_enqueue` dedups) is the double-claim guard. The pending flag is consumed only when
     /// a slot is actually free, and re-armed if more recorded offers remain than freed slots.
-    async fn reconsider_capacity_skips(&self) {
+    ///
+    /// #1057: an offer whose review ended TERMINALLY (policy refusal, permanent input error) is not
+    /// re-driven: re-requesting it reproduces the same answer. Its explicit `review retry` ticket is
+    /// what brings it back, so a queued ticket for such an offer arms the tick by itself. The return
+    /// value counts only offers that actually reached a claim, not ones stopped at the review gate.
+    async fn reconsider_capacity_skips(&self) -> usize {
+        let retries = self.terminal_review_retries();
+        if !retries.is_empty() {
+            self.capacity_skip_pending
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if self.slots.available() == 0
             || !self
                 .capacity_skip_pending
                 .swap(false, std::sync::atomic::Ordering::Relaxed)
         {
-            return;
+            return 0;
         }
         let Some(seller) = self.node.home().config.seller.clone() else {
-            return;
+            return 0;
         };
         let now = now_unix();
         let pending = match self.node.store().offers_awaiting_claim(now) {
@@ -5616,11 +5630,11 @@ impl SellerNodeRunner {
                 opline!("seller node capacity-skip reconsider: store read failed ({error}); re-arming for the next tick");
                 self.capacity_skip_pending
                     .store(true, std::sync::atomic::Ordering::Relaxed);
-                return;
+                return 0;
             }
         };
         if pending.is_empty() {
-            return;
+            return 0;
         }
         let seller_pubkey = self.seller_pubkey.to_hex();
         let mut reclaimed = 0usize;
@@ -5635,6 +5649,10 @@ impl SellerNodeRunner {
             // Reconstruct the parsed offer from the stored row. Only offers that already passed the
             // targeting gate are ever recorded (`rate_gate_allows` refuses a foreign `p`-tag BEFORE
             // `record_offer`), so `targeted ⇒ p-tag == self` and the reconstruction is exact.
+            if self.terminal_review_outcome(&row.offer_id) && !retries.contains(&row.offer_id) {
+                // Already logged once by `claim_offer`; stays parked until a retry ticket or expiry.
+                continue;
+            }
             let Some(offer) = capacity_retry_offer(&row, &seller_pubkey) else {
                 opline!("seller node offer skip id={}: stored capability request unknown; awaiting relay re-ingest", row.offer_id);
                 continue;
@@ -5666,7 +5684,11 @@ impl SellerNodeRunner {
                         None,
                     )
                     .await;
-                    reclaimed += 1;
+                    // Count a re-drive only if it reached a claim: one stopped at the review gate
+                    // (pending or blocked) is not a `re-drove` (#1057).
+                    if matches!(self.node.store().claim_row_state(&row.offer_id), Ok(Some(_))) {
+                        reclaimed += 1;
+                    }
                 }
                 ClaimDecision::Skip(skip) => {
                     opline_verbose!(
@@ -5683,6 +5705,7 @@ impl SellerNodeRunner {
                 self.slots.available()
             );
         }
+        reclaimed
     }
 
     /// Subscribe the marketplace filters: offers, awards, and payment gift-wraps. `since` is
@@ -7595,6 +7618,45 @@ impl SellerNodeRunner {
     /// once a slot frees). Idempotent via `claim_and_enqueue`: an offer we already claimed is a
     /// `Claimed::Idempotent` no-op and its fresh reservation is released, so re-driving a recorded
     /// offer can never double-claim — the same property the restart backfill relies on.
+    /// #1057: the cached pre-claim review of `job_id` ended in an outcome that waiting cannot change.
+    fn terminal_review_outcome(&self, job_id: &str) -> bool {
+        self.review_checks.lock().is_ok_and(|checks| {
+            matches!(checks.get(job_id), Some(Some(Err(e))) if crate::review::state::terminal(e))
+        })
+    }
+
+    /// #1057: offers with a queued `review retry` ticket whose cached review is terminal. Only these
+    /// need the tick armed for the ticket: an availability outcome keeps the tick armed on its own.
+    fn terminal_review_retries(&self) -> std::collections::BTreeSet<String> {
+        crate::review::state::queued_retries(&self.node.home().root)
+            .into_iter()
+            .filter(|id| self.terminal_review_outcome(id))
+            .collect()
+    }
+
+    /// #1057: log a review failure once per offer and outcome; a re-drive of the same outcome is quiet.
+    fn log_review_blocked(&self, job_id: &str, error: &str) {
+        // Snapshot the live ids first: `offer_review_ready` takes `review_checks` then this map, so
+        // never hold this map while taking `review_checks`.
+        let live: Option<std::collections::BTreeSet<String>> =
+            self.review_checks.lock().ok().map(|checks| checks.keys().cloned().collect());
+        let Ok(mut logged) = self.review_blocked_logged.lock() else { return };
+        if logged.get(job_id).is_some_and(|previous| previous == error) {
+            opline_verbose!("seller node review still blocked id={job_id}");
+            return;
+        }
+        if let Some(live) = live {
+            logged.retain(|id, _| live.contains(id));
+        }
+        logged.insert(job_id.to_owned(), error.to_owned());
+        let parked = if crate::review::state::terminal(error) {
+            "; not reconsidered until an explicit retry or the offer expires"
+        } else {
+            ""
+        };
+        opline!("seller node review blocked id={job_id}: {error}; inspect: maxplayer review status {job_id}; retry: maxplayer review retry {job_id}{parked}");
+    }
+
     fn offer_review_ready(&self, job_id: &str, buyer: &str) -> Result<bool, String> {
         let home = self.node.home();
         if !home
@@ -7623,6 +7685,9 @@ impl SellerNodeRunner {
         if crate::review::state::take_retry(&home.root, job_id) {
             if matches!(checks.get(job_id), Some(Some(Err(_)))) {
                 checks.remove(job_id);
+                if let Ok(mut logged) = self.review_blocked_logged.lock() {
+                    logged.remove(job_id);
+                }
             }
         }
         if let Some(value) = checks.get(job_id) {
@@ -7812,8 +7877,14 @@ impl SellerNodeRunner {
                 return;
             }
             Err(error) => {
-                self.capacity_skip_pending.store(true, std::sync::atomic::Ordering::Relaxed);
-                opline!("seller node review blocked id={job_id}: {error}; inspect: maxplayer review status {job_id}; retry: maxplayer review retry {job_id}");
+                // #1057: only an outcome that can change (timeout, reviewer unreachable) re-arms
+                // the reconsider tick. A terminal one (policy refusal, permanent input error) would
+                // return the same cached error every ~5s until the offer expires; its explicit
+                // `review retry` ticket re-arms the tick instead (`terminal_review_retries`).
+                if !crate::review::state::terminal(&error) {
+                    self.capacity_skip_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.log_review_blocked(job_id, &error);
                 return;
             }
         }
@@ -14655,6 +14726,101 @@ mod tests {
         }).await;
         runner.client.disconnect().await;
         publisher.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1057: a TERMINAL pre-claim review outcome (policy refusal, permanent input error) must not be
+    /// re-driven by the capacity reconsider tick for the rest of the offer's life. Before the fix every
+    /// cached `Err` re-armed `capacity_skip_pending`, so the tick picked the offer up again every ~5s,
+    /// logged `review blocked` again and counted it as `re-drove 1`. An AVAILABILITY outcome (timeout,
+    /// reviewer unreachable) keeps being re-driven, and an explicit `review retry` of a retryable
+    /// terminal outcome is still picked up by the tick.
+    ///
+    /// RED ON REVERT: drop the `terminal` branch in `claim_offer`'s review `Err` arm (re-arm
+    /// unconditionally) and the first `!pending()` assertion fails; drop the claim-row check in
+    /// `reconsider_capacity_skips` and the `re-drove` count is non-zero.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_review_outcome_is_not_redriven_by_the_reconsider_tick() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let root = temp_dir("review-terminal-1057");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).unwrap();
+        home.config.relay_url = url.clone();
+        home.config.seller = Some(seller_cfg(1, true));
+        // A reviewer that never answers: only the retried offer ever sends a request.
+        home.config.review.reviewers.insert(url.clone(), Keys::generate().public_key().to_hex());
+        home.config.review.timeout_seconds = 2;
+        let runner = SellerNodeRunner::boot(home).await.unwrap();
+        let review_root = runner.node.home().root.clone();
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller_hex = runner.seller_pubkey.to_hex();
+        let pending = || runner.capacity_skip_pending.load(std::sync::atomic::Ordering::Relaxed);
+        let offer = |task: &str| {
+            let draft = crate::gateway::OfferDraft::untargeted(task, "", 100, now_unix() as u64 + 600)
+                .to_event_draft();
+            let event = crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&buyer).unwrap();
+            (event.id.to_hex(), crate::gateway::parse_offer(&draft).unwrap())
+        };
+        // The review task's finished state: the operator-visible status file plus the cached result,
+        // exactly what `offer_review_ready`'s spawned review writes.
+        let settle = |id: &str, error: &str| {
+            let subject = crate::review::Subject { offer: id.into(), event: id.into(), kind: JOB_OFFER_KIND, commit: None };
+            let result: Result<Option<String>, String> = Err(error.to_owned());
+            crate::review::state::completed(&review_root, &subject, &result).unwrap();
+            runner.review_checks.lock().unwrap().insert(id.to_owned(), Some(result));
+        };
+        const REFUSED: &str = "review: execution-safety probability exceeds local threshold";
+        const PERMANENT: &str = "review: permanent input error (invalid_subject); retrying unchanged input cannot help; correct the input or update the reviewer before explicitly retrying";
+        const TIMEOUT: &str = "review: timeout; next step blocked; retry available";
+
+        // 1. Terminal outcomes: no claim, and the reconsider flag is NOT re-armed.
+        let (refused, refused_offer) = offer("#1057 nohup sleep 1200 &");
+        let (permanent, permanent_offer) = offer("#1057 invalid subject");
+        for (id, parsed, error) in [(&refused, &refused_offer, REFUSED), (&permanent, &permanent_offer, PERMANENT)] {
+            settle(id, error);
+            runner.claim_offer(id, &buyer_hex, parsed, &seller_hex, parsed.deadline_unix, now_unix(), None).await;
+            assert!(runner.node.store().claim_row_state(id).unwrap().is_none(), "a blocked review never claims");
+            assert!(!pending(), "a terminal review outcome ({error}) must not re-arm the reconsider tick");
+            // A relay re-delivery or backfill re-drive of the same offer stays quiet too.
+            runner.claim_offer(id, &buyer_hex, parsed, &seller_hex, parsed.deadline_unix, now_unix(), None).await;
+            assert!(!pending(), "a repeated terminal outcome must not re-arm the reconsider tick");
+        }
+        for _ in 0..3 {
+            assert_eq!(runner.reconsider_capacity_skips().await, 0);
+            assert!(!pending(), "nothing retryable is waiting, so the tick stays disarmed");
+        }
+
+        // 2. The explicit way back in: a retry ticket for the retryable terminal outcome (a permanent
+        // input error) is noticed by the tick, which re-drives that offer and re-requests its review.
+        crate::review::state::retry(&review_root, &permanent).unwrap();
+        assert!(crate::review::state::retry(&review_root, &refused).is_err(), "policy refusals have no retry ticket");
+        assert_eq!(runner.reconsider_capacity_skips().await, 0, "a pending review is not a claim");
+        assert!(!crate::review::state::take_retry(&review_root, &permanent), "the tick consumed the retry ticket");
+        assert!(
+            !matches!(runner.review_checks.lock().unwrap().get(&permanent), Some(Some(Err(e))) if e == PERMANENT),
+            "the retried offer's failed review was cleared and requested again"
+        );
+        assert!(pending(), "the re-requested review is pending, so the tick stays armed");
+
+        // 3. Availability outcome: keeps being re-driven every tick (the retry ticket path depends on
+        // it), but it is neither a claim nor counted as one, and the refused offer is still skipped.
+        let (timeout, timeout_offer) = offer("#1057 reviewer timed out");
+        settle(&timeout, TIMEOUT);
+        runner.claim_offer(&timeout, &buyer_hex, &timeout_offer, &seller_hex, timeout_offer.deadline_unix, now_unix(), None).await;
+        assert!(pending(), "an availability outcome keeps the reconsider tick armed");
+        for _ in 0..3 {
+            assert_eq!(runner.reconsider_capacity_skips().await, 0, "offers stopped at the review gate are not `re-drove`");
+            assert!(pending(), "an availability outcome is re-armed on every tick");
+        }
+        for id in [&refused, &permanent, &timeout] {
+            assert!(runner.node.store().claim_row_state(id).unwrap().is_none());
+        }
+        assert_eq!(runner.slots.available(), 1, "no slot was ever reserved for a blocked review");
+        runner.client.disconnect().await;
         let _ = std::fs::remove_dir_all(root);
     }
 

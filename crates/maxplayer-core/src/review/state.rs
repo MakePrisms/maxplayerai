@@ -122,7 +122,7 @@ pub fn completed(
             subject,
             if permanent_error(e) {
                 "input_refused"
-            } else if e.contains("threshold") || e.contains("conflicting") {
+            } else if policy_refusal(e) {
                 "policy_refused"
             } else {
                 "error"
@@ -130,6 +130,25 @@ pub fn completed(
             e,
         ),
     }
+}
+fn policy_refusal(error: &str) -> bool {
+    error.contains("threshold") || error.contains("conflicting")
+}
+/// #1057: a review failure that cannot change by waiting (`input_refused` or `policy_refused`).
+/// Re-requesting it reproduces the same answer, so the seller stops re-driving the offer until an
+/// explicit `review retry` (permanent input errors only) or a restart (a changed local threshold).
+/// Everything else (`error`: timeouts, reviewer unreachable, relay refusals) is availability.
+pub fn terminal(error: &str) -> bool {
+    permanent_error(error) || policy_refusal(error)
+}
+/// Offer ids with an explicit retry ticket waiting to be consumed by the seller's reconsider tick.
+pub fn queued_retries(root: &Path) -> Vec<String> {
+    let Ok(dir) = std::fs::read_dir(root.join("review-retry")) else {
+        return Vec::new();
+    };
+    dir.filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|id| hex_id(id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -152,6 +171,30 @@ mod tests {
         write(&root, &s, "policy_refused", "unsafe").unwrap();
         assert!(retry(&root, &s.event).is_err());
         assert!(read(&root, "../../elsewhere").is_err());
+    }
+
+    #[test]
+    fn terminal_outcomes_are_refusals_and_permanent_input_errors_only() {
+        assert!(terminal("review: execution-safety probability exceeds local threshold"));
+        assert!(terminal("review: conflicting results"));
+        assert!(terminal("review: permanent input error (invalid_subject); retrying unchanged input cannot help"));
+        for availability in [
+            "review: timeout; next step blocked; retry available",
+            "review: timeout; last reviewer error (rate_limited); next step blocked; retry available",
+            "review: reviewer error (queue_full); next step blocked; explicit retry available",
+            "review: relay refused the review request: rate-limited",
+            "review: configure a reviewer key for this relay, or explicitly skip review",
+        ] {
+            assert!(!terminal(availability), "{availability}");
+        }
+        let root = tempfile::tempdir().unwrap();
+        assert!(queued_retries(root.path()).is_empty());
+        let s = Subject { offer: "c".repeat(64), event: "c".repeat(64), kind: JOB_OFFER_KIND, commit: None };
+        write(root.path(), &s, "input_refused", "review: permanent input error").unwrap();
+        retry(root.path(), &s.event).unwrap();
+        assert_eq!(queued_retries(root.path()), vec![s.event.clone()]);
+        assert!(take_retry(root.path(), &s.event));
+        assert!(queued_retries(root.path()).is_empty());
     }
 }
 
