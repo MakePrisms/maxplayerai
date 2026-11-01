@@ -1,0 +1,21 @@
+maxplayer doctor — seller environment self-check (home=/Users/forge/forge/v2/seats/cashu-cdk-seller)
+Docs for agents: https://www.maxplayer.ai/skill.md  (or run `maxplayer skill`)
+PASS nix — working nix on PATH (`nix --version` ran in this process's environment)
+PASS credential helper — git-credential-nostr not found — OK, not required (seller signs NIP-98 in-process via libgit2)
+PASS seller key — /Users/forge/forge/v2/seats/cashu-cdk-seller/key present
+PASS relay reachability — wss://relay.maxplayer.ai: connected + NIP-42 authenticated
+PASS relay token policy — delivery path: CONTAINER (the default for [sandbox] mode = "docker"; this seat does not set container_delivery); relay advertises scoped_token_max_lifetime_secs=21600 s — `fresh-after-agent` (in use) works, and `long-lived` is available up to 21600 s
+PASS mint reachability — all 1 accepted mint(s) reachable
+PASS agent preset — registry resolves: claude (preferred argv0=claude-agent-acp) — RESOLUTION ONLY: this proves the registry resolves the way boot does, NOT that any harness can deliver; executability is proven at the pre-advertise self-probe at boot, never here (a resolvable harness can still fail to run — #470/#252)
+PASS telemetry — armed, no sink command configured (episodes.jsonl still captured)
+PASS sandbox launcher — [sandbox] mode=docker, image 'maxplayer-cashu-sandbox:v0.5.8-local' — docker resolvable
+PASS sandbox credential containment — every credential in the built-in table and in [sandbox] file_credentials is contained; no unrecognized forward_env var is set
+PASS sandbox egress — network 'maxplayer-cashu-jobs' exists and the policy renders 23 rules; each job gets them installed in its own network namespace before it starts
+PASS sandbox image — image 'maxplayer-cashu-sandbox:v0.5.8-local' present locally
+PASS sandbox engine floor — Docker Engine 29.5.2 ≥ 25.0.0 — the default seccomp profile blocks io_uring_setup/io_uring_enter/io_uring_register
+PASS sandbox containment — launcher confines: a file outside the workdir was refused, the workdir was writable (assumed deny-list for this platform: probed paths only — unlisted paths remain reachable)
+WARN seat reachability — this seat can claim NOTHING: it names no buyers, does not accept targeted offers from unnamed buyers, and does not claim the open pool (fix: list the buyers you work with in `[seller] accept_offers_only_from`, or set `accept_open_targeted = true` to accept targeted offers from buyers you have not named, or set `claim_open_pool = true` to claim untargeted jobs from the open pool)
+PASS home permissions — home and wallet are owner-only (0700)
+PASS harness credential permissions — not group/world-writable: /Users/forge/.claude
+
+17 check(s), exit 0

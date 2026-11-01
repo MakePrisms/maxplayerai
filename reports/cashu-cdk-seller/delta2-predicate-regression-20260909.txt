@@ -1,0 +1,41 @@
+   Compiling cdk-sqlite v0.17.2
+   Compiling mint-acceptance v0.1.0 (/tmp/acc)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 33.47s
+predicate-regression — do the corrected F4/F5 oracles actually discriminate?
+mint http://127.0.0.1:8085 (fakewallet, worthless test ecash)
+
+[precondition] active keyset 014f0a4b3043b8287d216e5549a5fc1dce0a964fc75f8d2d82079586b184ea6484 charges input_fee_ppk 0
+
+[A] HEALTHY sweep — the control. Both oracles must pass.
+      funded 40, locked 40, quoted fee 0, received 40; source pools spendable 0 pending 0 reserved 0
+  ok    A: old drain oracle
+        oracle says PASS, required PASS — nothing is actually stranded, so the weak oracle is right here too
+  ok    A: corrected drain oracle
+        oracle says PASS, required PASS — all three pools empty
+  ok    A: corrected quoted-fee conservation
+        oracle says PASS, required PASS — every sat arrived and the quoted fee was zero
+
+[B] STRANDED RESERVE — the counterexample. Old oracles must pass, corrected must fail.
+      funded 43, abandoned prepare_send of 42; pools now spendable 1 pending 0 reserved 42
+      swept 1 with quoted fee 0; pools now spendable 0 pending 0 reserved 42 — 42 sats stranded out of 43
+  ok    B: old drain oracle accepts a wallet with value stranded in Reserved
+        oracle says PASS, required PASS — this is the defect, reproduced: it reports fully drained
+  ok    B: corrected drain oracle REJECTS it
+        oracle says FAIL, required FAIL — reserved is non-zero, so the wallet is not drained
+  ok    B: old derived-fee conservation accepts the shortfall as a fee
+        oracle says PASS, required PASS — this is the defect, reproduced: the missing value is relabelled a fee
+  ok    B: corrected quoted-fee conservation REJECTS it
+        oracle says FAIL, required FAIL — CDK quoted no fee, so the shortfall has no explanation
+
+[C] RECOVERY oracles on a partial reclaim (arithmetic on the oracles, not a forced mint failure).
+  ok    C: old recovery oracle accepts reclaiming 1 of 12
+        oracle says PASS, required PASS — this is the defect: any positive reclaim passed
+  ok    C: corrected recovery oracle REJECTS reclaiming 1 of 12
+        oracle says FAIL, required FAIL — partial reclaim, so the funded total is not restored
+  ok    C: corrected recovery oracle accepts a COMPLETE reclaim
+        oracle says PASS, required PASS — whole stranded amount back, funded total spendable, both other pools empty
+
+=====================================================
+PASS — 10 oracle requirements met across 3 fixtures
+The corrected predicates reject a case the shipped ones accepted.
+=====================================================
