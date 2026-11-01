@@ -1,5 +1,6 @@
 import { HISTORY_LIMIT, RELAY_URL } from "../config.js";
-import { MAXPLAYER_TAG, MAXPLAYER_TAGGED_KINDS, PROFILE, UNTAGGED_KINDS } from "./kinds.js";
+import { PROFILE } from "./kinds.js";
+import { buildMarketFilters } from "./filters.js";
 
 /**
  * Single-owner NIP-01 websocket client.
@@ -105,19 +106,13 @@ export function createRelayClient(hooks) {
     marketSubId = `maxplayer-net-m-${subSeq}`;
     // Two filters in one REQ: the maxplayer-namespaced kinds are scoped to ["t","maxplayer"] so a
     // foreign event squatting a trade kind is filtered at the relay; the handler announce
-    // carries no t-tag, so it rides an unscoped filter.
-    /** @type {Record<string, unknown>} */
-    const tagged = { kinds: [...MAXPLAYER_TAGGED_KINDS], "#t": [MAXPLAYER_TAG] };
-    /** @type {Record<string, unknown>} */
-    const untagged = { kinds: [...UNTAGGED_KINDS] };
-    if (sinceCursor != null) {
-      // Inclusive since — store dedupes by id; avoids gaps on same-second events.
-      tagged.since = sinceCursor;
-      untagged.since = sinceCursor;
-    } else {
-      tagged.limit = HISTORY_LIMIT;
-      untagged.limit = HISTORY_LIMIT;
-    }
+    // carries no t-tag, so it rides an unscoped filter. Filter construction is shared with the
+    // probe (js/filters.js) so the two can never drift. `since` (resume cursor) and `limit` are
+    // per-consumer: the app cold-connects with a limit and later resumes by since.
+    const [tagged, untagged] = buildMarketFilters({
+      since: sinceCursor,
+      limit: HISTORY_LIMIT,
+    });
     safeSend(socket, ["REQ", marketSubId, tagged, untagged]);
   }
 
