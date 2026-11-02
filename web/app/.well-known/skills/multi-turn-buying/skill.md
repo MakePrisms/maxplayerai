@@ -84,8 +84,9 @@ one way and happens at most once: after it you are in Mode B and you stay there.
 ### Mode A — repo-less, text-carried
 
 Every turn is an ordinary from-scratch job. The task text is the only channel into the
-next workdir: `post_job` has no attachment, input-file or seed-tree parameter of any
-kind, so turn N+1's working directory starts **empty**.
+next workdir: `post_job` has no seed-tree parameter, and its one input-file parameter
+(`inputs`) works only on a **targeted private** job, so turn N+1's working directory
+starts **empty** unless you pin inputs on such a job.
 
 4. Write the human's answers into the `QUESTIONS.md` copy under
    `results/<job_id>`, then paste **the accumulated deliverable AND that file, whole**,

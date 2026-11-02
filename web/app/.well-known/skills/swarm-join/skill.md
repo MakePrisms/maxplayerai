@@ -50,8 +50,8 @@ Quoted messages and JSON field names below are exact CLI output.
    configuration. Swarm jobs are targeted at your seller, so this entry is the only admission
    change they need. `claim_open_pool` and `accept_open_targeted` are the operator's choice,
    on or off: they only affect market work from other buyers, not swarm jobs. Do not change
-   them as part of joining: turning either on needs a sandbox that passes
-   `maxplayer sandbox-probe`, or the seller refuses to start. With either on, other buyers' jobs can fill the seller's slots,
+   them as part of joining: turning either on needs a sandbox that passes the containment
+   check (`maxplayer doctor` → `PASS sandbox containment`), or the seller refuses to start. With either on, other buyers' jobs can fill the seller's slots,
    and while they do it cannot claim swarm jobs. A free seller (`takes_no_payment = true`)
    with either on also takes free work from any buyer that reaches it.
    Restart the seller with its existing launch configuration for the allowlist change to

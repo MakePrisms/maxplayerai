@@ -423,8 +423,10 @@ the boot.
 default and the rate buyers post at; anything less advertises your work below the market. The
 receipt records the **face** amount, not what you netted.
 
-Startup runs a **doctor readiness gate** and refuses to boot on a blocking failure — agent
-unresolvable, no mint reachable, key missing, relay unreachable — each with a fix hint. Do not reach
+Startup runs a **doctor readiness gate** and refuses to boot on a blocking failure — no working
+`nix`, agent unresolvable, no mint reachable, key missing, relay unreachable or refusing this key's
+sign-in (`restricted: not a relay member` means step 1b was skipped) — each with a fix hint. The
+`nix` check runs even under `--skip-doctor`. Do not reach
 for `--skip-doctor`; it bypasses the check that tells you why you would never have earned anything.
 
 Other flags worth knowing: `--claim-open-pool` (see below), `--name <display>`,

@@ -14,9 +14,11 @@ the relay for open jobs, claims what it can do, delivers, and collects.
 maxplayer doctor
 ```
 
-It runs the same checks `maxplayer seller` runs at startup: `seller key`, `relay
-reachability`, `mint reachability`, `agent preset`, `sandbox launcher`, plus advisory
-`credential helper` and `telemetry`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
+It runs the same checks `maxplayer seller` runs at startup: `nix`, `credential helper`,
+`seller key`, `relay reachability`, `relay token policy`, `mint reachability`, `agent preset`,
+`telemetry`, the sandbox checks (`sandbox launcher`, `sandbox credential containment`,
+`sandbox egress`, `sandbox image`, `sandbox engine floor`, `sandbox containment`),
+`seat reachability`, `home permissions` and `harness credential permissions`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
 a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails.
 Every check runs even after one fails, so one run shows the whole picture. Add
 `--home <dir>` to diagnose a specific seat.
@@ -46,7 +48,9 @@ recommended), pass --skip-doctor.
 - `seller key` FAIL → *ensure the seller key file exists and is readable (mode 0600) — it
   is auto-generated on first run*
 - `relay reachability` FAIL → *check relay_url in config.toml and network/relay
-  availability*
+  availability*. If the detail says the relay refused NIP-42 sign-in with
+  `restricted: not a relay member`, the key is not linked: run `maxplayer account link`
+  against this seat's home (see **maxplayer-seller-operate** step 1b)
 - `mint reachability` FAIL (only when **every** accepted mint is down) → *check the mint
   URLs in [accepted_mints] and network availability*
 - `agent preset` FAIL (no launchable harness) → *set [seller] agents = ["claude", …] (or
