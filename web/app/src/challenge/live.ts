@@ -24,7 +24,18 @@ export function relayStatusWord(r: Snapshot['relay']): "Live" | "Polling" {
 // at once, unavailable relays, and the reader's warnings. Degraded (run 2 #13: quorum met, a
 // challenge relay missing) stays live; the reader's "Degraded: … missing: …" warning says so.
 function relayDetail(r: Snapshot['relay']): string {
-  return (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (r?.warnings?.length ? ` · ${r.warnings.join("; ")}` : "");
+  const warnings=shownWarnings(r);
+  return (r?.error ? ` · ${r.error}` : "") + (r?.failedRelays?.length ? ` · Unavailable: ${r.failedRelays.join(", ")}` : "") + (warnings.length ? ` · ${warnings.join("; ")}` : "");
+}
+// #1243: the member-gated relay refuses the reader's throwaway AUTH key and serves it the same open
+// reads (authMode 'anonymous', status word "Live"). That refusal is the expected posture, not a
+// problem, so the page leaves the reader's "AUTH refused (…); polling" warning out. Display only:
+// status.warnings keeps it for the runner and CLI, and any other AUTH posture (pending,
+// authenticated, or a status without authMode) still shows it. Every other warning stays.
+const AUTH_REFUSED="AUTH refused (";
+function shownWarnings(r: Snapshot['relay']): string[] {
+  const warnings=r?.warnings??[];
+  return r?.authMode==="anonymous" ? warnings.filter(w=>!w.startsWith(AUTH_REFUSED)) : warnings;
 }
 export function connectionText(r: Snapshot['relay'], status: string): string {
   const connection = r && !r.connected ? "Reconnecting · showing last known" : r && !r.historyComplete ? "Incomplete / catching up · totals may be low" : status;
@@ -139,7 +150,8 @@ export function renderLiveState(doc: Document,state: LiveState): void {
 }
 export function connectionLine(r: Relay,status: string,wasLive=false,run?: Run): string {
   if(liveState(r,wasLive,run)!=='live')return UPDATING;
-  // Same detail as connectionText (error, unavailable relays, degraded warning); the word stays
+  // Same detail as connectionText (error, unavailable relays, degraded and other warnings, minus an
+  // expected AUTH refusal: see shownWarnings); the word stays
   // "Live" through a routine poll (latched), where connectionText would say catching up.
   return status+relayDetail(r);
 }
