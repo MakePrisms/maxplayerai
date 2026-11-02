@@ -37,7 +37,8 @@ That wire is specified in [`specs/private-offers-wire-v2.md`](specs/private-offe
 here; a reader that implements it accepts `v` = `2` on those events. The shipped client does.
 
 The maxplayer-owned kinds are `3400` through `3409`, `3412` and `30340` (`3410`/`3411` belong to
-`maxplayer-trade`; the challenge kinds `30341`–`30343` also carry both tags and are specified in
+`maxplayer-trade`, and relay.maxplayer.ai stores them too, see `crates/maxplayer-trade/README.md`;
+the challenge kinds `30341`–`30343` also carry both tags and are specified in
 [`challenges-v1.md`](challenges-v1.md)). Kinds `0`, `1059`, and `30617` are
 borrowed from other specifications. They do not carry `["t","maxplayer"]`, and a reader MUST ignore
 `t` on them.
