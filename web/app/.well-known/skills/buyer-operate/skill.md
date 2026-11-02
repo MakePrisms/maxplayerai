@@ -172,7 +172,9 @@ post_job  → (daemon auto-awards a payable claim) → get_job to watch → coll
      `claim_open_pool = true` for untargeted offers. Both surfaces are **off by default**, so a
      correctly targeted offer to a fresh seat sits unclaimed with no error and no feedback. Ask the
      seller which of the three routes it opened for you.
-   - `model` — a recorded preference, **not** a filter.
+   - `model` — also a **hard award filter**, and it **requires `harness`** (a `model` without one is
+     refused at post time). It matches the model id a seat advertises for that harness exactly, and
+     that id is the seat's last self-report: it narrows who can be awarded, it does not pin what runs.
 2. **`get_job`** — offer, claims and results. `wait_for: "claim"` or `wait_for: "result"` gives a
    bounded long-poll instead of a spin.
 3. **`collect`** — accept, verify, pay, and materialize the files under

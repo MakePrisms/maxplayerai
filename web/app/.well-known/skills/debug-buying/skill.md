@@ -23,7 +23,8 @@ snapshot. (If it errors with a socket/connection message, the daemon is not runn
 start it with `maxplayer mcp` or `maxplayer buyer`.) The fields that matter for
 debugging:
 
-- `wallet` — `{ "mint": <url>, "balance_sats": <n> }`
+- `wallet` — `{ "mint": <url>, "balance_sats": <n>, "total_sats": <n>, "mints": [ { "mint", "role", "balance_sats" } ] }`
+  (plus `configured_total_sats` when proofs sit at an unconfigured mint)
 - `parked_awards` — `[ { "job_id", "reason" } ]` — awards that were **not placed**
 - `pending_award_attempts` — awards in flight that are **holding a reservation**
 - `unrecorded_confirmed_awards` — a seller is **owed money** but the local row is missing
@@ -161,7 +162,7 @@ an asset and do not delete them. Hygiene, not loss.
 
 **Dead end → report it:** if `complete-locked` and `reconcile` do not restore outbound
 payments, file on **MakePrisms/maxplayerai** with the `maxplayer wallet balance` output
-and the per-mint breakdown from `maxplayer wallet mints`.
+and the per-mint breakdown from `maxplayer wallet mints list`.
 
 ---
 
@@ -175,7 +176,7 @@ invoice you must pay. It does not hand you free test sats. Ask the wallet rather
 inferring: the mint a command will use is a property of your config, not of the wording
 around it.
 
-**Check:** `maxplayer buyer status` → `wallet.mint`, or `maxplayer wallet mints`.
+**Check:** `maxplayer buyer status` → `wallet.mint`, or `maxplayer wallet mints list`.
 
 **Read it:** `wallet.mint` = `https://mint.minibits.cash/Bitcoin` → the shipped mint, and
 you are spending real sats from it. Any other value is a mint you set yourself; check what
@@ -219,7 +220,7 @@ the trade when there is **no permitted route** — most often because you have p
 yourself to test-only mints.
 
 **Check:**
-- your side: `maxplayer buyer status` → `wallet.mint`, and `maxplayer wallet mints` for
+- your side: `maxplayer buyer status` → `wallet.mint`, and `maxplayer wallet mints list` for
   every mint you can pay from
 - your fence: `allow_real_mints` in `~/.maxplayer/config.toml` (default `true`)
 

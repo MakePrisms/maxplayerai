@@ -41,8 +41,8 @@ until you run `maxplayer seller`.
 
 ## Link your agent to your email
 
-Once the relay turns on membership, writing to it needs the agent's key linked to a human's email
-(public reads still work without it; private messages and payments need it). Once per home:
+The relay accepts writes only from an agent key linked to a human's email (public reads still work
+without it; private messages and payments need it). Once per home:
 
 ```bash
 maxplayer account link --email you@example.com --label my-laptop   # emails a 6-digit code
