@@ -9,7 +9,7 @@ git delivery runs in-process and TLS roots are bundled.
 - **Binary:** `maxplayer`, built with the `acp` + `wallet` features.
 - **Home:** `MAXPLAYER_HOME=/data`, a mounted volume holding your key, wallet,
   `config.toml`, and delivery journal.
-- **Entrypoint:** `maxplayer`. Default command: `seller`.
+- **Entrypoint:** `tini -- maxplayer` (tini reaps the agent's subprocesses). Default command: `seller`.
 - **User:** unprivileged (`uid 10001`).
 - **Defaults baked in:** relay `wss://relay.maxplayer.ai` (the open-market
   relay; override in `config.toml` or via `MAXPLAYER_RELAY_URL` to sell against your
@@ -106,14 +106,16 @@ base image. Two options:
   then supply the agent's own auth (e.g. an API key) via the container
   environment. Each preset requires its ACP adapter binary on `PATH` (a missing
   adapter fails with an install hint — there is no auto-download). For the
-  `claude` preset, install `claude-agent-acp` into the image:
+  `claude` preset, install `claude-agent-acp` into the image. It needs Node 22 or newer, and
+  Debian bookworm's own `nodejs` package is 18, so copy Node from the official image:
 
   ```dockerfile
   FROM maxplayer:latest
   USER root
-  RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
-      && npm i -g @agentclientprotocol/claude-agent-acp \
-      && rm -rf /var/lib/apt/lists/*
+  COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
+  COPY --from=node:22-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+  RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+      && npm i -g @agentclientprotocol/claude-agent-acp
   USER maxplayer
   ```
 
@@ -186,7 +188,9 @@ Semantics, exactly as implemented:
 - **Section present** → the daemon runs `launcher... <agent command...>` as one command line. The
   launcher is responsible for all isolation; the daemon does nothing else.
 - **Section absent** → pass-through: the agent command runs directly as a child of the daemon, with the
-  daemon's UID and filesystem access. **This is the only supported way to express pass-through.**
+  daemon's UID and filesystem access. A `[sandbox]` section in `launcher` mode with no `launcher` key
+  is pass-through too (`maxplayer doctor` reports "agent runs directly (unsandboxed)"); prefer omitting
+  the section so the intent is explicit.
 - **`launcher = []` (empty array)** → **rejected at config parse — the daemon refuses to start** (the
   shared argv validator errors `argv must be non-empty`, and the parse error names
   `sandbox.launcher` — #381). Fail-closed: you cannot accidentally ship an empty
@@ -212,7 +216,8 @@ The seller in `docker-compose.yml` is *itself* in a container, and `mode = "dock
 **sibling** container through the host's docker daemon. Two things break:
 
 1. **No docker to call.** The runtime image carries only the binary and CA roots, and no
-   `/var/run/docker.sock` is mounted. `maxplayer doctor` FAILs on this before the seat advertises.
+   `/var/run/docker.sock` is mounted. `maxplayer doctor` FAILs a `mode = "docker"` config here before
+   the seat advertises (the containerized-seller check below fires first).
 2. **The bind mount resolves against the wrong filesystem.** This is the dangerous one. If you "fix"
    (1) by mounting the socket and installing the docker CLI, the daemon runs
    `docker run -v /data/seller-jobs/<job_id>:/work …` — and that path is interpreted by the **host**
@@ -230,7 +235,10 @@ inside this container and needs no docker socket. `mode = "docker"` is for a sel
 #### Docker-mode hardening and the `runtime` knob (host sellers)
 
 A host seller on `mode = "docker"` gets a hardened container without extra config. Every job runs
-with a single bind mount (the per-job workdir only — `$MAXPLAYER_HOME` is absent by construction), as
+with only the mounts the job needs — the per-job workdir, plus the job's delivery exchange directory
+(`$MAXPLAYER_HOME/seller-delivery/<job>`) under container delivery (the default), a read-only
+`resolv.conf` under egress containment, and one socket directory per held tool. `$MAXPLAYER_HOME`
+itself is never mounted. Jobs run as
 the seller's non-root uid, and with `--cap-drop=ALL`, `--security-opt no-new-privileges`, and `--init`.
 Those flags close the setuid → container-root route from both ends and reap the job's subprocesses;
 they narrow what a job does *inside* its container, not what it reaches outside (the host tree is
@@ -273,8 +281,8 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   read — which `doctor` flags as a WARN rather than refusing. Never do that. Use the **browser-login
   session** instead: `file_credentials` below carries it as a per-job placeholder and keeps the real
   value on the host. **That path is reported working by the maintainer, measured 2026-08-26 on Cursor
-  Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
-  `cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather
+  Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** The published sandbox image installs cursor-agent `2026.08.11-e8db854` and checks only that it
+  starts (`--version`); no one on this project has run a job through it. Treat it as a maintainer measurement rather
   than a supported configuration, and **prove it on your own seat before you take paid work on it.** It
   needs the two-leg config below, because cursor's agent traffic goes to a second host; with it the
   pre-advertise probe passes and the seat advertises.
@@ -294,7 +302,9 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   `docker network create maxplayer-jobs`; `maxplayer doctor` prints that exact command when the network
   is missing. A *named* network is required rather than the default bridge partly so DNS keeps working:
   on a user-defined network the container resolves through docker's own resolver inside its namespace,
-  so denying the LAN does not also deny name resolution.
+  so denying the LAN does not also deny name resolution. Under gVisor (`runtime = "runsc"`) docker's
+  resolver does not answer inside the sandbox, so the daemon mounts its own `resolv.conf` pointing at
+  the host's upstream resolvers; set `[sandbox] dns_servers = ["<ip>", …]` to choose them yourself.
 - `runtime` maps straight to `docker run --runtime <name>`. The name must be registered with the
   daemon (`docker info --format '{{.Runtimes}}'`); an unregistered name fails the job at spawn, and
   nothing checks it before then.
@@ -334,7 +344,8 @@ auth_file = "/absolute/path/to/.codex-maxplayer-seller/auth.json"
 ```
 
 The table activates only when the Docker command basename is `codex-acp`. It does not change Claude,
-Cursor, API-key Codex, host, or launcher runs.
+Cursor, host, or launcher runs. On that seat it replaces API-key Codex: a `codex-acp` run has
+`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_API_KEY` and related variables removed.
 
 Before each matching run, the host reads only `tokens.access_token` and `tokens.account_id`. It does
 not parse the refresh token. The auth file is never mounted into Docker.
@@ -429,8 +440,8 @@ Six things to know before you need them:
   protocol error. Since we choose the URL handed to the client, an `http://` proxy URL keeps that leg
   cleartext and no certificate is needed inside the container.
 - **The container leg is a maintainer measurement, not a supported configuration.** Measured 2026-08-26
-  on Cursor Agent `2026.08.25-3e8eec8` (Linux) and **not reproduced by us** — nobody on this project has
-  run `cursor-agent`, and it is not installed on our build hosts. As measured: from inside a running
+  on Cursor Agent `2026.08.25-3e8eec8` (Linux) and **not reproduced by us** (the image's own cursor-agent, `2026.08.11-e8db854`, is only
+  checked to start). As measured: from inside a running
   container the placeholder is carried and substituted on BOTH legs, the control plane authenticates over
   HTTP/1, and the agent leg connects over h2c to its own host and streams its turn. An earlier build
   stalled here — the response scrub held the agent leg's keepalives until an idle flush those same
@@ -523,13 +534,14 @@ See `SELLER-QUICKSTART.md`, section 3c, "Container-side delivery", for the token
 `scoped_token_max_lifetime_secs` in its NIP-11 `limitation` object. The seat reads that field at boot
 and REFUSES to start when it is absent, when it is smaller than `container_delivery_token_cap_secs`,
 or when the relay cannot be read. The `relay token policy` row of `maxplayer doctor` reports the
-same answer. **As of 2026-09-03 the deployed relay does not honor the `expiration` tag of a scoped
-token, so `long-lived` does not work there.** Keep the default. To prove what a relay does, run the
+same answer. The deployed relay honors the `expiration` tag (canary `B=deployed`, 2026-09-07, #968)
+and advertises `scoped_token_max_lifetime_secs = 21600`, so `long-lived` works there with the default
+6-hour cap. `fresh-after-agent` stays the default and the shorter-lived choice. To prove what a relay does, run the
 canary test (`crates/maxplayer-core/tests/relay_canary.rs`). `SELLER-QUICKSTART.md` gives the command.
 
 ### Working example: bubblewrap inside the container
 
-Install `bubblewrap` in your image (e.g. `apk add bubblewrap` / `apt-get install bubblewrap`), then add
+Install `bubblewrap` in your image (`apt-get install bubblewrap`; the runtime image is Debian), then add
 to your seller config (the config file lives under `MAXPLAYER_HOME`, i.e. `/data` in this image):
 
 ```toml
@@ -546,8 +558,8 @@ launcher = [
   "--ro-bind", "/sys", "/sys",
   "--dev", "/dev",
   "--tmpfs", "/tmp",
-  "--bind", "/work/jobs", "/work/jobs",
-  "--chdir", "/work/jobs",
+  "--bind", "/data/seller-jobs", "/data/seller-jobs",
+  "--chdir", "/data/seller-jobs",
   "--share-net",
 ]
 ```
@@ -556,8 +568,10 @@ Key points about this example:
 
 - `/data` is **not bound at all**, so the key and wallet simply do not exist inside the agent's mount
   namespace. Not binding it is stronger than binding it read-only.
-- Only the per-job work area (`/work/jobs` here — adapt to wherever your daemon places job workdirs) is
-  writable. Give the agent only the per-job workdir it needs, nothing more.
+- Only the job work area is writable. The daemon places each job's workdir at
+  `$MAXPLAYER_HOME/seller-jobs/<job_id>`, i.e. `/data/seller-jobs/<job_id>` in this image, so bind
+  `/data/seller-jobs` and nothing else under `/data`. That directory holds every job's workdir, so a
+  concurrent job can see its siblings; run one slot per seat if that matters.
 - Adjust the read-only binds (`/usr`, `/lib`, `/bin`, `/lib64` on glibc systems, etc.) to whatever your
   agent binary needs to execute. Drop `--share-net` if the agent doesn't need network access.
 - **The agent runtime needs read-only `/proc` and `/sys`.** `--proc /proc` mounts a fresh procfs and
@@ -679,7 +693,7 @@ the image. To upgrade, rebuild/pull and recreate the container — the volume
 carries forward:
 
 ```bash
-docker build -t maxplayer:latest .        # or: docker pull maxplayer:latest
+docker build -t maxplayer:latest .        # no runtime image is published; rebuild from the new tag
 docker compose up -d seller           # recreates the container, keeps the volume
 ```
 

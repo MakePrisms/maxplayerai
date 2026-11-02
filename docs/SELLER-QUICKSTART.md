@@ -637,8 +637,9 @@ read** — caught by a `doctor` WARN, not a refusal, so the seat runs and leaks.
 Use the browser-login **session** instead. `[[sandbox.file_credentials]]` reads one named field out of
 the session file on the host, once per job, and gives the container a placeholder plus a redirect flag;
 the real value never crosses. **This path is reported working by the maintainer, measured 2026-08-26 on
-Cursor Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** Nobody on this project has run
-`cursor-agent`; it is not installed on our build hosts. Treat it as a maintainer measurement rather than
+Cursor Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** The published sandbox image
+installs cursor-agent `2026.08.11-e8db854` and checks only that it starts (`--version`); no one on this
+project has run a job through it. Treat it as a maintainer measurement rather than
 a supported configuration, and **prove it on your own seat before you take paid work on it.** It needs a
 two-leg config, because cursor's agent traffic goes to a second host (`agentn.global.api5.cursor.sh`) —
 name it as a `[[sandbox.file_credentials.legs]]` entry. On macOS the session lives in the login Keychain,
@@ -799,9 +800,10 @@ The token mode selects when the host mints the branch-scoped push token:
 
 ##### `long-lived` needs a relay that advertises support
 
-**As of 2026-09-03 the deployed relay does NOT honor the `expiration` tag.** The relay refuses a
-scoped token older than 60 seconds with HTTP 401, even when the token carries a future `expiration`.
-Use `fresh-after-agent` on that relay.
+**The deployed relay honors the `expiration` tag** (canary `B=deployed` on 2026-09-07, #968) and
+advertises `scoped_token_max_lifetime_secs = 21600`, so `long-lived` works there with the default
+6-hour cap. A relay that does not honor it refuses a scoped token older than 60 seconds with HTTP 401,
+even when the token carries a future `expiration`; use `fresh-after-agent` on such a relay.
 
 A relay that does honor the tag advertises the cap it applies in its NIP-11 `limitation` object, as
 `scoped_token_max_lifetime_secs`. The seat reads that field before it advertises:
