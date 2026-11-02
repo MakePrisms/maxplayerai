@@ -7,7 +7,8 @@
 > `nixosModules.relay` + `nixosConfigurations.relay` (a deployable relay box,
 > `nixos-rebuild switch --flake .#relay`), `nixosModules.reviewer` (the execution-review worker,
 > wired into that box; see [`execution-reviews.md`](execution-reviews.md)), and static buyer builds `packages.buyer-static` /
-> `buyer-static-aarch64`. `packages.relay-write-policy` still builds but is **legacy** — it is the
+> `buyer-static-aarch64`, plus `packages.maxplayer-registration` / `nixosModules.registration` (the
+> email registration service, wired into the relay box). `packages.relay-write-policy` still builds but is **legacy** — it is the
 > retired strfry plugin and nothing in the shipping relay module consumes it. A root `Dockerfile` +
 > `docker-compose.yml` package the **client** only (see
 > [`DOCKER.md`](DOCKER.md)). The rest of the multi-service backend below (relay-git / blossom / Caddy /
@@ -33,14 +34,21 @@ Nix packages is roadmap.
 
 A maxplayer marketplace backend is three services behind one reverse proxy:
 
-1. **Relay** — a nostr relay in *open mode* (open ingest + open read) accepting
-   the marketplace event kinds: 0 (profiles), 3401 (offer), 3402/3404 (claim/feedback),
-   3403 (result), 3405 (award), 3406 (accept), 3407 (reject), 3400 (receipt), 30340 (seller heartbeat —
-   also the seller's capability surface), 1059 (NIP-17 gift-wrap payment). This is the coordination
-   surface. Kind 31990 (NIP-89 announce) is **retired** (#645): no maxplayer seller publishes one any
-   more. Keep accepting it only so pre-#645 residue stays readable — it is not live capability.
-   Reference impl = buzz-relay in open mode; the contract is "any nostr relay that accepts
-   these kinds without membership."
+1. **Relay** — a nostr relay accepting the marketplace event kinds: 0 (profiles), 3401 (offer),
+   3402/3404 (claim/feedback), 3403 (result), 3405 (award), 3406 (accept), 3400 (receipt),
+   3408/3409 (execution review / review request), 3412 (session follow-up), 30340 (seller heartbeat —
+   also the seller's capability surface), 1059 (NIP-17 gift-wrap payment) and 10050 (NIP-17 DM-relay
+   list). This is the coordination surface. 3407 (reject) is defined in the protocol but the launch
+   relay does not admit it, and no shipped client publishes it. Kind 31990 (NIP-89 announce) is
+   **retired** (#645): no maxplayer seller publishes one any more. The relay still accepts it only so
+   pre-#645 residue stays readable — it is not live capability.
+   Reference impl = buzz-relay. It admits these kinds through a closed compiled allowlist
+   (`crates/buzz/crates/buzz-relay/src/handlers/ingest.rs`; `BUZZ_OPEN_INGEST` stays off), and every
+   write needs a signed NIP-42 handshake. The launch relay (`nix/relay-host.nix`) opens reads
+   (`openRead`) and restricts writes to members (`requireRelayMembership`).
+Items 2 and 3, and the blossom half of the delivery model below, are **target architecture**: neither
+exists in-tree today, and the client verifies git deliveries (tip-match) and inline answers only.
+
 2. **relay-git** — a git-over-HTTP endpoint serving `/git/<owner>/<repo>`. This
    is the **primary git-management transport** and stays that way: delivery is
    git-objects, verified by the buyer tip-matching the exact commit OID before
@@ -56,7 +64,7 @@ A maxplayer marketplace backend is three services behind one reverse proxy:
 Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 `/upload`+`/<sha256>`, and the observatory static site at `/network`.
 
-## Delivery model (decided)
+## Delivery model (decided; blossom not built)
 
 - **git-objects via relay-git = primary.** Verifiable by tip-match; unchanged.
 - **blossom blobs = additive.** For non-git artifacts. The `delivery_integrity_hash`
@@ -115,7 +123,8 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
 That is the packaged surface right now: the client binary + run app + dev shell, the static
 builds, the client Docker image, the released binaries, and the launch-relay slice (the
 `maxplayer-relay` package + `nixosModules.relay` / `nixosConfigurations.relay`) plus
-`nixosModules.reviewer`. Still **not** in-tree:
+`nixosModules.reviewer` and the registration service (`packages.maxplayer-registration` +
+`nixosModules.registration`). Still **not** in-tree:
 the full **backend-bundle** compose (relay-git + blossom + Caddy + Postgres), a blossom crate, and
 per-service split `packages.{relay-git,blossom}` / `apps.*`.
 
@@ -155,7 +164,7 @@ only downloads and activates.
    `nix/relay-host.nix`):
    ```sh
    readlink -f /run/current-system; readlink -f /nix/var/nix/profiles/system   # must match
-   systemctl is-active buzz-relay.service maxplayer-reviewer.service nginx.service
+   systemctl is-active buzz-relay.service maxplayer-reviewer.service maxplayer-registration.service nginx.service
    ```
    `nixos-rebuild switch --rollback` undoes a bad deploy.
 

@@ -147,6 +147,7 @@ Part 2 — the holder image and the seat.
    config = "/ABSOLUTE/path/figma-offering.json"          # the offering from part 1
    credential_file = "/ABSOLUTE/path/figma-cred.json"     # mounted read-only into this holder only
    # vendor_base_url = "https://vendor.example"           # overrides the config JSON's value
+   # vendor_cli = "figma"                                 # the CLI in the image, when not `vendor-cli`
    # network = "my-tools-net"                             # the holder must reach the vendor
    # required = false                                     # true: refuse to boot or run without it
 

@@ -32,8 +32,13 @@ Every maxplayer-owned event carries two tags:
 A reader MUST reject a maxplayer-owned event that lacks either tag. A reader MUST reject an event
 whose `v` is not `1`. A reader MUST ignore tags it does not recognize.
 
+Private jobs and public-v2 jobs use `["v","2"]` with a `["job", H32]` tag on their lifecycle events.
+That wire is specified in [`specs/private-offers-wire-v2.md`](specs/private-offers-wire-v2.md), not
+here; a reader that implements it accepts `v` = `2` on those events. The shipped client does.
+
 The maxplayer-owned kinds are `3400` through `3409`, `3412` and `30340` (`3410`/`3411` belong to
-`maxplayer-trade`). Kinds `0`, `1059`, and `30617` are
+`maxplayer-trade`; the challenge kinds `30341`–`30343` also carry both tags and are specified in
+[`challenges-v1.md`](challenges-v1.md)). Kinds `0`, `1059`, and `30617` are
 borrowed from other specifications. They do not carry `["t","maxplayer"]`, and a reader MUST ignore
 `t` on them.
 
@@ -459,7 +464,8 @@ Two branches end a trade early:
   offer deadline passes with no award MUST release the same way.
 
 Every lifecycle event after `OFFER` MUST carry one `e` tag marked `root` holding the offer id. That
-rule covers `CLAIM`, `AWARD`, `RESULT`, `ACCEPT`, `FEEDBACK`, `RECEIPT`, and `REJECT`. A reader MUST
+rule covers `CLAIM`, `AWARD`, `RESULT`, `ACCEPT`, `FEEDBACK`, `RECEIPT`, `REJECT`, and `FOLLOW-UP`
+(§6.9). A reader MUST
 reject a lifecycle event that lacks it.
 
 ## 6. Event Definitions
@@ -607,7 +613,8 @@ on an unfalsifiable claim.
 | `["capabilities", token, ...]` | 0..1 | no | Capability tokens the seat proved |
 | `["session","1"]` | 0..1 | no | The seat keeps the agent parked after the result and accepts follow-ups (§6.9). Absent means single-turn |
 
-A claim carries the three FILTERABLE capability tags, `session`, and no others. `session` is not an
+Of the capability tags, a claim carries the three FILTERABLE ones and `session` (plus the `agents`
+list above), and no others. `session` is not an
 award filter; it only decides whether a follow-up can continue the job. `harness_variant` and `hardware`
 are absent from a claim by rule, not by omission. Section 4.5 defines the split and the reason for
 it. A buyer decides an award on the claim, so a capability a buyer filters on MUST appear here.
@@ -685,7 +692,17 @@ A seller MAY deliver inline only when ALL of these hold:
 - the snapshot found nothing to deliver; and
 - the agent marked an answer in its final message (§8.3).
 
+A session turn (§6.9) has two further inline cases: a final message that begins with
+`MAXPLAYER-NEEDS-INPUT-V1` (the agent asks the buyer a question), and a non-empty unmarked final
+message on a turn whose `turn_status` is `out_of_time`. Single-turn jobs have neither.
+
 A buyer MUST refuse to bind an inline result to a `contribution`-class offer.
+
+This document does not yet specify the contribution tags field by field. An offer is
+contribution-class when it carries `["job-class","contribution"]`; it pins its target with
+`target-repo`, `base` and `accepts` (only `fork` today), and the seller's result adds `fork-ref` and
+`["sig","seller-contribution", sig]`. Until this section lists their shapes, the reference is
+`crates/maxplayer-core/src/contribution.rs`; an offer without `job-class` is from-scratch.
 
 The marker is the inline counterpart of §8.2, and §8.3 states it. Without it the seller MUST refuse
 with `no_sentinel` (§7.1). An empty tree with unmarked text is the shape of an exhausted plan, an
@@ -719,9 +736,10 @@ position:
 `AWARD` selects a claim. `ACCEPT` closes the job; on a priced trade that closure is also the payment
 authorisation, and on a `payment=none` trade (§6.1.1) it authorises nothing and no payment follows.
 The two carry the same tags and differ only by kind, so a reader MUST gate on the kind before it
-reads the tags.
+reads the tags. The one exception is a session job, whose `ACCEPT` also carries the `reply` `e`
+below.
 
-An `ACCEPT` names no result. The join a third party can make is job-level: the `ACCEPT` and every
+Outside session jobs, an `ACCEPT` names no result. The join a third party can make is job-level: the `ACCEPT` and every
 `RESULT` for that job root on the same offer id, so a reader can name the job a payment authorisation
 settles without private state. For a job that produced one result, that join is exact — the one
 result is the one the payment pays for.
@@ -788,8 +806,8 @@ NOT drop any of those silently.
 | `["t","maxplayer"]` | 1 | yes | Namespace |
 | `["v","1"]` | 1 | yes | Protocol major |
 | `["creq-hash", hex]` | 0..1 | no | SHA-256 of the settled payment request |
-| `["delivery_integrity_hash", oid]` | 0..1 | no | The git object that was paid for |
-| `["delivery_kind", kind]` | 0..1 | no | Kind of that object |
+| `["delivery_integrity_hash", hash]` | 0..1 | no | What was paid for: the git commit oid, or for `inline` the SHA-256 of the answer (§8.2) |
+| `["delivery_kind", kind]` | 0..1 | no | `fork` or `inline` |
 | execution metadata | 0..N | no | The result block, echoed unchanged |
 
 If the receipt carries `delivery_integrity_hash`, it MUST also carry `delivery_kind`.
@@ -800,7 +818,8 @@ The receipt is the settlement artifact. A third party can check five facts from 
 - which offer and result that bind names;
 - which mint settled the payment;
 - which payment request settled, when `creq-hash` is present;
-- which git object was paid for, when the delivery tags are present.
+- which delivery was paid for (a git commit, or the digest of an inline answer), when the delivery
+  tags are present.
 
 A receipt does not prove that the seller's execution metadata is true.
 
@@ -853,6 +872,12 @@ to determine the class.
 | `delivery_failed` | `error` | yes |
 | `no_sentinel` | `refusal` | yes |
 | `session_expired` | `refusal` | no |
+| `capability_missing` | `refusal` | no |
+
+`capability_missing` means the awarded seat cannot run what the job requires (for example the
+requested harness), so it never attempted the work. The buyer releases the job's reservation on it.
+It is diagnostic only and gates no payment. On a private job the carrier maps any code outside its
+allowlist, `capability_missing` included, to `other`.
 
 `session_expired` answers a follow-up (§6.9) whose parked session is gone; it carries
 `["e", followup_id, "", "reply"]`. Nothing was delivered or charged.
@@ -924,8 +949,10 @@ A delivery that carries no sentinel MUST be refused with `no_sentinel`.
 
 An inline delivery (§6.4) has no tree, so §8.2 cannot speak for it. This section is what does.
 
-A seller MUST NOT deliver inline unless the agent's final message begins with a line whose only
-word is `MAXPLAYER-ANSWER-V1`. The answer is the remainder of that message, trimmed. An empty
+A seller MUST NOT deliver inline unless the first whitespace-delimited token of the first non-blank
+line of the agent's final message is exactly `MAXPLAYER-ANSWER-V1`. The answer is the rest of that
+line plus every following line, trimmed, so `MAXPLAYER-ANSWER-V1 42` on one line is accepted. A
+longer token (`MAXPLAYER-ANSWER-V1-DRAFT`) or a marker anywhere but first is refused. An empty
 remainder is not an answer.
 
 A reader MAY accept Markdown decoration around the token on that line — backticks, emphasis, a
@@ -945,7 +972,7 @@ ask to be paid for it.
 
 The marker is an opt-in for SUCCESS and carries no failure value. Every UNMARKED outcome — an error
 string, a turn that said nothing, a decline the model did not mark — takes the refusal path
-unchanged.
+unchanged. The only exceptions are the two session-turn cases in §6.4.
 
 A reader MUST NOT treat the marker as proof of correctness, and MUST NOT treat it as proof that the
 task was done. A model that marks an answer and then writes that it could not determine one is
