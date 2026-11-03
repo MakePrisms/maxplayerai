@@ -3,11 +3,27 @@ use anyhow::{Context, Result, bail, ensure};
 use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, time::Duration};
-pub const DEFAULT_RELAYS: [&str; 3] = [
+/// Market relays, in order. relay.maxplayer.ai comes first: since relay-v5 (#1246) it stores lots
+/// and statuses (3410/3411) from signed-in relay members. The public relays stay as fallbacks, so a
+/// key that is not a relay member (refused there) still lists, discovers and trades.
+pub const DEFAULT_RELAYS: [&str; 4] = [
+    "wss://relay.maxplayer.ai",
     "wss://nos.lol",
     "wss://relay.primal.net",
     "wss://offchain.pub",
 ];
+/// A market relay URL: `wss://`, or `ws://` on loopback only. Checked before any socket opens.
+pub fn check_market_relay(url: &str) -> Result<()> {
+    let u = url::Url::parse(url)?;
+    ensure!(
+        u.scheme() == "wss"
+            || u.scheme() == "ws"
+                && u.host_str()
+                    .is_some_and(|h| h == "127.0.0.1" || h == "localhost"),
+        "invalid relay URL"
+    );
+    Ok(())
+}
 pub struct Market {
     pub clients: Vec<Client>,
     pub keys: Keys,
@@ -74,20 +90,7 @@ impl Market {
         let (tx, inbox) = tokio::sync::mpsc::unbounded_channel();
         let mut clients = vec![];
         for url in urls {
-            let u = url::Url::parse(url)?;
-            // `url` lowercases and percent-decodes the host but keeps a trailing dot, which
-            // names the same server (`relay.maxplayer.ai.` / `relay.maxplayer.ai%2e`).
-            ensure!(
-                crate::transport::normalized_host(&u).as_deref() != Some("relay.maxplayer.ai"),
-                "production relay forbidden"
-            );
-            ensure!(
-                u.scheme() == "wss"
-                    || u.scheme() == "ws"
-                        && u.host_str()
-                            .is_some_and(|h| h == "127.0.0.1" || h == "localhost"),
-                "invalid relay URL"
-            );
+            check_market_relay(url)?;
             let c = Client::new(keys.clone());
             c.automatic_authentication(true);
             c.add_relay(url).await?;

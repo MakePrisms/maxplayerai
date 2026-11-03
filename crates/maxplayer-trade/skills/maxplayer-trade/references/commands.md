@@ -6,15 +6,17 @@ the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from t
 root fails; build it by manifest path, release profile, locked (no protoc needed for the binary).
 Optional repeated global `--relay <url>` goes before the subcommand; preserve the
 same relay set during recovery. Use the binary's default relays unless deliberately
-configured; defaults at verified base 1929972 are `wss://nos.lol`,
-`wss://relay.primal.net`, and `wss://offchain.pub`. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
+configured; the defaults are `wss://relay.maxplayer.ai` first, then `wss://nos.lol`,
+`wss://relay.primal.net` and `wss://offchain.pub` as fallbacks. `relay.maxplayer.ai` stores lots
+and statuses only from signed-in relay members; a non-member's copy is refused there and the
+public relays carry it. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
 backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
 Rate limiting pauses a relay for at least five minutes.
 A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
 carries `nostr://` mint requests only (kinds 23410/23411), never market traffic; it defaults
 to `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub` and `wss://nostr-pub.wellorder.net`, the
-default credits sidecar's own list. `relay.maxplayer.ai` is allowed as a `--mint-relay` only; as a
-`--relay` (market) it is refused. Preserve the same mint-relay set during recovery of a `nostr://` trade.
+default credits sidecar's own list. `relay.maxplayer.ai` is in both lists; the market and mint
+connections stay separate. Preserve the same mint-relay set during recovery of a `nostr://` trade.
 Relay ACK is not proof of stored readback or trade success. Respect backoff; do not
 restart loops or generate fresh identities to evade rate limits.
 
