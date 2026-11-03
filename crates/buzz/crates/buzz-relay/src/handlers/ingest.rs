@@ -71,9 +71,14 @@ const KIND_MOBEE_TRADE_ACCEPT: u32 = 3406;
 // Maxplayer execution reviews: signed assessments and requests (PR #1022).
 const KIND_MAXPLAYER_REVIEW: u32 = 3408;
 const KIND_MAXPLAYER_REVIEW_REQUEST: u32 = 3409;
+// maxplayer-trade order book (crates/maxplayer-trade/src/lib.rs LOT/STATUS): a
+// maker's signed fixed-lot listing and its status revisions. Stored like the job
+// kinds; the envelope is bounded at ingest by `validate_trade_envelope`. The
+// trade messages themselves (23412) are ephemeral and never reach ingest.
+const KIND_MAXPLAYER_TRADE_LOT: u32 = 3410;
+const KIND_MAXPLAYER_TRADE_STATUS: u32 = 3411;
 // Maxplayer session jobs: buyer-authored FOLLOW-UP (start a turn / close the
-// session) on an awarded job (docs/specs/session-jobs.md §2.1). 3410/3411 are
-// maxplayer-trade kinds and stay refused here.
+// session) on an awarded job (docs/specs/session-jobs.md §2.1).
 const KIND_MAXPLAYER_SESSION_FOLLOWUP: u32 = 3412;
 const KIND_MOBEE_SELLER_HEARTBEAT: u32 = 30340;
 const KIND_MOBEE_NIP89_HANDLER: u32 = 31990;
@@ -672,6 +677,8 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_MAXPLAYER_REVIEW
         | KIND_MAXPLAYER_REVIEW_REQUEST
         | KIND_MAXPLAYER_SESSION_FOLLOWUP
+        | KIND_MAXPLAYER_TRADE_LOT
+        | KIND_MAXPLAYER_TRADE_STATUS
         | KIND_MOBEE_SELLER_HEARTBEAT => Ok(Scope::MessagesWrite),
         // Mobee self-describing discovery/config kinds — the NIP-89 handler
         // advertisement and the NIP-17 DM-relay list. Grouped with kind-0's
@@ -1461,6 +1468,60 @@ async fn validate_forum_vote_target(
             return Err("target event has no channel".to_string());
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Envelope bounds for maxplayer-trade LOT (3410) and STATUS (3411) events.
+///
+/// Mirrors the outer checks every maxplayer-trade reader already applies
+/// (`maxplayer-trade/src/lib.rs` `common`, and the STATUS lot reference), so
+/// the relay never stores an event every client would discard: at most 8 KiB
+/// of content, 16 tags, 512 bytes per tag field, exactly one `["t","maxplayer"]`
+/// and one `["v","1"]`, and for STATUS exactly one 64-hex `e` tag naming the
+/// lot. Lot terms (assets, amounts, deadlines) stay a client concern: readers
+/// re-validate them, and the relay never holds funds or keys.
+fn validate_trade_envelope(event: &Event) -> Result<(), String> {
+    const MAX_CONTENT_BYTES: usize = 8 * 1024;
+    const MAX_TAGS: usize = 16;
+    const MAX_TAG_FIELD_BYTES: usize = 512;
+    if event.content.len() > MAX_CONTENT_BYTES {
+        return Err(format!(
+            "trade content exceeds {MAX_CONTENT_BYTES} bytes (got {})",
+            event.content.len()
+        ));
+    }
+    if event.tags.len() > MAX_TAGS {
+        return Err(format!("trade event has more than {MAX_TAGS} tags"));
+    }
+    if event
+        .tags
+        .iter()
+        .any(|t| t.as_slice().iter().any(|f| f.len() > MAX_TAG_FIELD_BYTES))
+    {
+        return Err(format!(
+            "trade tag field exceeds {MAX_TAG_FIELD_BYTES} bytes"
+        ));
+    }
+    let single = |name: &str| -> Result<&str, String> {
+        let mut found = event
+            .tags
+            .iter()
+            .map(|t| t.as_slice())
+            .filter(|t| t.first().map(String::as_str) == Some(name));
+        match (found.next(), found.next()) {
+            (Some(t), None) if t.len() == 2 => Ok(t[1].as_str()),
+            _ => Err(format!("trade event needs exactly one `{name}` tag")),
+        }
+    };
+    if single("t")? != "maxplayer" || single("v")? != "1" {
+        return Err("trade event must carry [\"t\",\"maxplayer\"] and [\"v\",\"1\"]".into());
+    }
+    if event_kind_u32(event) == KIND_MAXPLAYER_TRADE_STATUS {
+        let lot = single("e")?;
+        if !(lot.len() == 64 && lot.bytes().all(|b| b.is_ascii_hexdigit())) {
+            return Err("trade status `e` tag must be a 64-hex lot id".into());
+        }
     }
     Ok(())
 }
@@ -3131,6 +3192,11 @@ async fn ingest_event_inner(
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
+    if kind_u32 == KIND_MAXPLAYER_TRADE_LOT || kind_u32 == KIND_MAXPLAYER_TRADE_STATUS {
+        validate_trade_envelope(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
     // Track pre-created channel UUID for compensation on insert failure.
     let mut pre_created_channel: Option<Uuid> = None;
 
@@ -4512,11 +4578,11 @@ mod postgres_tests {
             );
             assert!(!requires_h_channel_scope(kind));
         }
-        assert!(required_scope_for_kind(3410, &dummy).is_err());
+        assert!(required_scope_for_kind(3413, &dummy).is_err());
     }
 
     #[test]
-    fn session_followup_kind_is_admitted_and_trade_kinds_stay_refused() {
+    fn session_followup_kind_is_admitted() {
         let dummy = make_dummy_event();
         assert!(
             !open_ingest_enabled(),
@@ -4528,9 +4594,77 @@ mod postgres_tests {
             Scope::MessagesWrite
         );
         assert!(!requires_h_channel_scope(3412));
-        // 3410/3411 belong to maxplayer-trade and remain unknown here.
-        assert!(required_scope_for_kind(3410, &dummy).is_err());
-        assert!(required_scope_for_kind(3411, &dummy).is_err());
+    }
+
+    #[test]
+    fn trade_lot_and_status_kinds_are_admitted_without_channel_scope() {
+        let dummy = make_dummy_event();
+        assert!(
+            !open_ingest_enabled(),
+            "run admission tests with BUZZ_OPEN_INGEST unset"
+        );
+        // Literal wire numbers: maxplayer-trade LOT and STATUS.
+        for kind in [3410, 3411] {
+            assert_eq!(
+                required_scope_for_kind(kind, &dummy).unwrap(),
+                Scope::MessagesWrite
+            );
+            assert!(!requires_h_channel_scope(kind));
+        }
+    }
+
+    const LOT_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn trade_lot(content: &str, extra: &[&[&str]]) -> Event {
+        let mut tags: Vec<&[&str]> =
+            vec![&["t", "maxplayer"], &["v", "1"], &["g", "nostr://npub1x"]];
+        tags.extend_from_slice(extra);
+        make_event_with_tags(3410, content, &tags)
+    }
+
+    #[test]
+    fn trade_envelope_accepts_what_maxplayer_trade_publishes() {
+        assert!(validate_trade_envelope(&trade_lot("{}", &[&["expiration", "1"]])).is_ok());
+        let status = make_event_with_tags(
+            3411,
+            "{}",
+            &[&["t", "maxplayer"], &["v", "1"], &["e", LOT_ID]],
+        );
+        assert!(validate_trade_envelope(&status).is_ok());
+        // Exactly at the content ceiling.
+        assert!(validate_trade_envelope(&trade_lot(&"x".repeat(8 * 1024), &[])).is_ok());
+    }
+
+    #[test]
+    fn trade_envelope_rejects_what_every_trade_reader_discards() {
+        let big = "x".repeat(8 * 1024 + 1);
+        assert!(validate_trade_envelope(&trade_lot(&big, &[])).is_err());
+        let long = "y".repeat(513);
+        assert!(validate_trade_envelope(&trade_lot("{}", &[&["w", long.as_str()]])).is_err());
+        let many: Vec<[&str; 2]> = (0..14).map(|_| ["z", "1"]).collect();
+        let many: Vec<&[&str]> = many.iter().map(|t| t.as_slice()).collect();
+        assert!(validate_trade_envelope(&trade_lot("{}", &many)).is_err());
+        // Missing, duplicated or wrong protocol tags.
+        assert!(
+            validate_trade_envelope(&make_event_with_tags(3410, "{}", &[&["v", "1"]])).is_err()
+        );
+        assert!(validate_trade_envelope(&trade_lot("{}", &[&["t", "maxplayer"]])).is_err());
+        assert!(validate_trade_envelope(&make_event_with_tags(
+            3410,
+            "{}",
+            &[&["t", "maxplayer"], &["v", "2"]]
+        ))
+        .is_err());
+        // STATUS needs exactly one 64-hex lot reference.
+        for e in [
+            &[][..],
+            &[&["e", "not-hex"][..]][..],
+            &[&["e", LOT_ID][..], &["e", LOT_ID][..]][..],
+        ] {
+            let mut tags: Vec<&[&str]> = vec![&["t", "maxplayer"], &["v", "1"]];
+            tags.extend_from_slice(e);
+            assert!(validate_trade_envelope(&make_event_with_tags(3411, "{}", &tags)).is_err());
+        }
     }
 
     #[test]
