@@ -115,7 +115,8 @@ a guarantee for other deployments or versions.
 Default market relays: `wss://relay.maxplayer.ai`, then `wss://nos.lol`,
 `wss://relay.primal.net`, `wss://offchain.pub` as fallbacks; repeat `--relay URL` before the
 command to configure alternatives. `relay.maxplayer.ai` accepts writes only from signed-in relay
-members (`maxplayer account link`); a non-member's lot is refused there and still reaches the
+members (`maxplayer account link --trade-home <home>` links a home's `trade.key`, creating it if
+needed); a non-member's lot is refused there and still reaches the
 public relays, so listing, discovery and trading work either way. Reads there need no sign-in.
 The dated live tests below ran before relay-v5 and made no production relay writes.
 
@@ -965,9 +966,10 @@ The skill documents these states and the CLI help regression includes `withdraw 
 ### Mint diagnostics
 
 `maxplayer-trade doctor nostr://<npub> --mint-relay ws://127.0.0.1:<port> --json`
-uses an ephemeral key and exactly one logical **info** request to the explicit relay,
-re-sending the identical event every 5 s like trade admission does.
-It needs no `--home`, wallet, seed or journal. `--timeout-seconds` changes only this
+uses exactly one logical **info** request to the explicit relay, re-sending the identical
+event every 5 s like trade admission does. It needs no `--home`, wallet, seed or journal; with
+`--home` before the command it signs as that home's existing `trade.key` (never created),
+otherwise with an ephemeral key, which `relay.maxplayer.ai` refuses unless it is a relay member. `--timeout-seconds` changes only this
 read-only probe's budget; silence within that budget does not prove the mint is offline.
 Doctor exits 0 for usable info (unknown compatibility warns), 1 for proven incompatibility,
 and 2 for an unsuccessful diagnostic. Existing monetary exit codes remain unchanged.

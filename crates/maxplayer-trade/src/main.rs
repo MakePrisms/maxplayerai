@@ -4,7 +4,7 @@ use fs2::FileExt;
 use std::{
     fs::{self, OpenOptions},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 #[derive(Parser)]
 struct Cli {
@@ -25,7 +25,9 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    /// One read-only info request to an explicit mint/relay pair; no wallet or journal.
+    /// One read-only info request to an explicit mint/relay pair; no wallet or journal. Signed
+    /// with the trade.key of --home when it exists (never created), else a throwaway key that
+    /// a sign-in-required relay (relay.maxplayer.ai) refuses.
     Doctor {
         mint: String,
         #[arg(long = "mint-relay")]
@@ -179,7 +181,14 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         timeout_seconds,
     } = &cli.command
     {
-        return doctor(mint, mint_relay, *json, *timeout_seconds).await;
+        return doctor(
+            mint,
+            mint_relay,
+            *json,
+            *timeout_seconds,
+            cli.home.as_deref(),
+        )
+        .await;
     }
     let home = cli
         .home
@@ -868,11 +877,17 @@ impl std::fmt::Display for DoctorExit {
     }
 }
 impl std::error::Error for DoctorExit {}
-async fn doctor(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Result<()> {
-    match doctor_inner(mint, relay, json_output, seconds).await {
+async fn doctor(
+    mint: &str,
+    relay: &str,
+    json_output: bool,
+    seconds: u64,
+    home: Option<&Path>,
+) -> Result<()> {
+    match doctor_inner(mint, relay, json_output, seconds, home).await {
         Err(error) if !error.is::<DoctorExit>() => {
-            let message =
-                "Diagnostic not started: check the mint identifier and explicit relay URL";
+            let message = "Diagnostic not started: check the mint identifier, the explicit relay \
+                 URL and the --home trade.key";
             if json_output {
                 println!(
                     "{}",
@@ -886,8 +901,15 @@ async fn doctor(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Res
         result => result,
     }
 }
-async fn doctor_inner(mint: &str, relay: &str, json_output: bool, seconds: u64) -> Result<()> {
+async fn doctor_inner(
+    mint: &str,
+    relay: &str,
+    json_output: bool,
+    seconds: u64,
+    home: Option<&Path>,
+) -> Result<()> {
     use maxplayer_core::nostr_mint::NostrMintConnector;
+    use nostr_sdk::prelude::ToBech32;
     use std::time::Duration;
     let asset = Asset::from_cli(mint)?;
     ensure!(
@@ -904,6 +926,30 @@ async fn doctor_inner(mint: &str, relay: &str, json_output: bool, seconds: u64) 
             maxplayer_core::nostr_mint::DEFAULT_RESEND_EVERY,
             Duration::from_secs(5).min(window),
         );
+    // A sign-in-required relay only admits registered keys (`maxplayer account link
+    // --trade-home`), so sign as the home's trade key when it has one. Never create it here.
+    let identity = match home {
+        Some(home) => maxplayer_trade::wallet::existing_identity(home)?,
+        None => None,
+    };
+    let signer = match &identity {
+        Some(keys) => {
+            let npub = keys.public_key().to_bech32()?;
+            eprintln!("Signing as this home's trade.key ({npub})");
+            serde_json::json!({"source":"home trade.key","npub":npub})
+        }
+        None => {
+            eprintln!(
+                "Signing with a throwaway key: a sign-in-required relay (relay.maxplayer.ai) \
+                 refuses it. Pass --home <trading home> once its trade.key is linked."
+            );
+            serde_json::json!({"source":"ephemeral"})
+        }
+    };
+    let connector = match identity {
+        Some(keys) => connector.with_identity(keys),
+        None => connector,
+    };
     eprintln!(
         "Waiting for mint info (read-only budget {seconds}s); no wallet, journal or trade is opened"
     );
@@ -931,7 +977,7 @@ async fn doctor_inner(mint: &str, relay: &str, json_output: bool, seconds: u64) 
     let slow = evidence.reply_ms.is_some_and(|ms| ms > 5000);
     let report = serde_json::json!({"observation":evidence,"compatibility":compatibility,
         "latency":if evidence.reply_ms.is_none() {"unknown"} else if slow {"slow"} else {"normal"},
-        "slow_warning_threshold_ms":5000,"exit":exit,
+        "slow_warning_threshold_ms":5000,"exit":exit,"signer":signer,
         "scope":"info only; keysets, swap, restore and witness emission not tested"});
     if json_output {
         println!("{report}");

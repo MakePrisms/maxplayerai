@@ -64,7 +64,9 @@ usage and exits 2 for `--help`; that alone is not an installation failure.
 - Configure the trading client to reach the mint using compatible **mint relays**.
   These are distinct from **market relays**, which carry lots and trade messages.
   Follow the trading references. `relay.maxplayer.ai` is the first default market relay
-  (it stores lots only from relay members); public relays are the fallbacks.
+  (it stores lots only from relay members); public relays are the fallbacks. To use it, link
+  the mint key (`maxplayer account link --mint`) and the trading home's key
+  (`maxplayer account link --trade-home <home>`), and run `doctor` with `--home <home>`.
 - Run the trading skill's read-only readiness checks against the mint's public
   `nostr://` URL. Verify an actual mint reply, not just a running process or relay
   acceptance. Record the trading home and relay settings for future commands.
