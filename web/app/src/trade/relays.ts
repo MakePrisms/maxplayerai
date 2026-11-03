@@ -20,14 +20,15 @@
  *
  * Never signs, never holds a key, never sends EVENT or AUTH, and never asks
  * for trade negotiation (private, NIP-44 encrypted). The production relay is
- * refused outright, as the CLI refuses it.
+ * not read here: by default the CLI also publishes every lot to the public
+ * relays below, and this page never signs in.
  *
  * The socket and clock are injectable so the whole loop runs in tests.
  */
 import { MAXPLAYER_TAG, TRADE_LOT, TRADE_STATUS } from "../model/kinds.js";
 import type { NostrEvent } from "./validate.js";
 
-/** market.rs DEFAULT_RELAYS. */
+/** market.rs DEFAULT_RELAYS without relay.maxplayer.ai (see above). */
 export const DEFAULT_TRADE_RELAYS: readonly string[] = Object.freeze([
   "wss://nos.lol",
   "wss://relay.primal.net",

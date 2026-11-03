@@ -56,28 +56,12 @@ async fn unreachable_is_not_empty_market() {
     let error = dead.discover(None).await.unwrap_err().to_string();
     assert!(error.contains("relays unreachable"), "{error}");
 }
-/// Bob, 2026-10-09: relay.maxplayer.ai carries mint traffic (23410/23411) only. Through the real
-/// CLI, the same host is accepted as `--mint-relay` and refused as `--relay`. Both checks run
+/// Through the real CLI, relay.maxplayer.ai is accepted as a `--mint-relay`. `status` returns
 /// before any socket opens, so this never contacts the real relay.
 #[test]
-fn production_relay_carries_mint_traffic_but_never_market_traffic() {
+fn production_relay_is_accepted_as_mint_relay() {
     for url in ["wss://relay.maxplayer.ai", "wss://RELAY.MAXPLAYER.AI/"] {
         let home = tempfile::tempdir().unwrap();
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-            .arg("--home")
-            .arg(home.path())
-            .args(["--relay", url, "--mint-relay", url, "discover"])
-            .output()
-            .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !out.status.success() && stderr.contains("production relay forbidden"),
-            "SAFETY: market traffic to {url} refused: {stderr}"
-        );
-        assert!(
-            !stderr.contains("mint relay"),
-            "mint traffic to {url} allowed: {stderr}"
-        );
         let mint_only = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
             .arg("--home")
             .arg(home.path())
@@ -87,22 +71,33 @@ fn production_relay_carries_mint_traffic_but_never_market_traffic() {
         assert!(mint_only.status.success(), "mint relay {url} accepted");
     }
 }
-#[tokio::test]
-async fn production_relay_is_forbidden() {
-    for url in [
-        "wss://relay.maxplayer.ai",
+/// relay-v5 (#1246) stores 3410/3411 from relay members, so relay.maxplayer.ai is the first
+/// market relay and the public relays stay as fallbacks. Checked without opening a socket.
+#[test]
+fn production_relay_is_the_first_market_relay_with_public_fallbacks() {
+    use maxplayer_trade::market::{DEFAULT_RELAYS, check_market_relay};
+    assert_eq!(DEFAULT_RELAYS[0], "wss://relay.maxplayer.ai");
+    let fallbacks = &DEFAULT_RELAYS[1..];
+    assert!(fallbacks.len() >= 2, "{fallbacks:?}");
+    assert!(
+        fallbacks.iter().all(|r| !r.contains("maxplayer.ai")),
+        "{fallbacks:?}"
+    );
+    for url in DEFAULT_RELAYS.iter().copied().chain([
         "wss://RELAY.MAXPLAYER.AI/",
         "wss://relay.maxplayer.ai./",
-        "wss://relay.maxplayer.ai%2e/",
-        "wss://Relay.Maxplayer.Ai.:443/x",
+        "ws://127.0.0.1:7777",
+        "ws://localhost:1",
+    ]) {
+        check_market_relay(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+    }
+    for url in [
+        "ws://relay.maxplayer.ai",
+        "https://relay.maxplayer.ai",
+        "ws://nos.lol",
+        "nope",
     ] {
-        let refused = Market::connect(Keys::generate(), &[url.into()]).await;
-        assert!(
-            refused
-                .as_ref()
-                .is_err_and(|e| e.to_string().contains("production relay forbidden")),
-            "SAFETY: market traffic to {url} refused"
-        );
+        assert!(check_market_relay(url).is_err(), "{url}");
     }
 }
 

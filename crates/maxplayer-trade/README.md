@@ -1,7 +1,8 @@
 # maxplayer-trade — standalone real-money Cashu trades
 
-A fixed-lot CLI, independent of jobs and the maxplayer daemon. Market traffic never uses
-`relay.maxplayer.ai`; `nostr://` mint traffic (kinds 23410/23411) may, by Bob's decision of 2026-10-09.
+A fixed-lot CLI, independent of jobs and the maxplayer daemon. Market traffic goes first to
+`relay.maxplayer.ai`, which stores lots and statuses from relay members since relay-v5 (#1246),
+with public relays as fallbacks; `nostr://` mint traffic (kinds 23410/23411) uses it too.
 **A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
 recovery, fee-inclusive net delivery, and a signed `sold` status. Real-money trading is a normal supported use; this is not a production safety certification
 or an unconditional atomicity guarantee.
@@ -111,9 +112,12 @@ Nutshell/0.21.0 at cashu.cz completed a real timed refund in the dated round-fou
 (two SPENT proofs, empty-preimage HTLC refund witnesses, one signature each); this is not
 a guarantee for other deployments or versions.
 
-Default relays: `wss://nos.lol`, `wss://relay.primal.net`, `wss://offchain.pub`; repeat
-`--relay URL` before the command to configure alternatives. The production relay is
-explicitly forbidden. No production relay writes were made.
+Default market relays: `wss://relay.maxplayer.ai`, then `wss://nos.lol`,
+`wss://relay.primal.net`, `wss://offchain.pub` as fallbacks; repeat `--relay URL` before the
+command to configure alternatives. `relay.maxplayer.ai` accepts writes only from signed-in relay
+members (`maxplayer account link`); a non-member's lot is refused there and still reaches the
+public relays, so listing, discovery and trading work either way. Reads there need no sign-in.
+The dated live tests below ran before relay-v5 and made no production relay writes.
 
 ### `nostr://` mints (Maxplayer credits sidecar)
 
@@ -129,8 +133,8 @@ the mint). CDK wallets for such mints are built with that connector and poll sub
   command; default `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub`,
   `wss://nostr-pub.wellorder.net` (`transport::default_mint_relays`), the same list and order a
   default credits sidecar listens on. They carry only kinds 23410/23411; market relays never carry
-  mint traffic. `relay.maxplayer.ai` is allowed for mint traffic only (Bob, 2026-10-09); the market
-  fence still refuses it for 3410/3411/23412 (`--relay`). Both sides must reach a relay
+  mint traffic. `relay.maxplayer.ai` is in both lists, but the two stay separate connections:
+  `--relay` carries 3410/3411/23412, `--mint-relay` carries 23410/23411. Both sides must reach a relay
   the mint listens on; preflight fails (nothing locked) otherwise.
 - Timing: a `nostr://` CDK wallet call is bounded at 40 s (30 s connector window + 10 s margin)
   instead of 15 s; a raw request is bounded by the connector, not the 20 s HTTP timeout. A

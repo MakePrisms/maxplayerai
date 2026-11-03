@@ -63,7 +63,8 @@ usage and exits 2 for `--help`; that alone is not an installation failure.
   record. Never print seeds, keys, proofs, token contents or raw databases.
 - Configure the trading client to reach the mint using compatible **mint relays**.
   These are distinct from **market relays**, which carry lots and trade messages.
-  Follow the trading references; do not use `relay.maxplayer.ai` as a market relay.
+  Follow the trading references. `relay.maxplayer.ai` is the first default market relay
+  (it stores lots only from relay members); public relays are the fallbacks.
 - Run the trading skill's read-only readiness checks against the mint's public
   `nostr://` URL. Verify an actual mint reply, not just a running process or relay
   acceptance. Record the trading home and relay settings for future commands.

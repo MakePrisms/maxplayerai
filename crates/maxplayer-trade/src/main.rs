@@ -11,13 +11,13 @@ struct Cli {
     /// Private, exclusively owned journal and wallet directory. Never delete a funded home.
     #[arg(long)]
     home: Option<PathBuf>,
-    /// Relay URL (repeatable); defaults to nos.lol, relay.primal.net and offchain.pub.
+    /// Market relay URL (repeatable); defaults to relay.maxplayer.ai, then nos.lol,
+    /// relay.primal.net and offchain.pub as fallbacks.
     #[arg(long)]
     relay: Vec<String>,
     /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://, or ws://
     /// on loopback). Defaults to wss://relay.maxplayer.ai, wss://relay.ditto.pub and
-    /// wss://nostr-pub.wellorder.net. Never used for market traffic; relay.maxplayer.ai carries
-    /// mint traffic only and is refused as a --relay.
+    /// wss://nostr-pub.wellorder.net. Never used for market traffic, which goes to --relay.
     #[arg(long = "mint-relay")]
     mint_relay: Vec<String>,
     #[command(subcommand)]

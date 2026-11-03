@@ -92,8 +92,7 @@ fn loopback(host: &str) -> bool {
 }
 
 /// The host of a parsed relay URL as one server name: lowercased (`url` already lowercases and
-/// percent-decodes `ws`/`wss` hosts) with trailing dots dropped. Shared by the market's
-/// production-relay fence and the mint-relay dedupe key so the two cannot drift apart.
+/// percent-decodes `ws`/`wss` hosts) with trailing dots dropped. The mint-relay dedupe key.
 pub fn normalized_host(u: &url::Url) -> Option<String> {
     Some(u.host_str()?.trim_end_matches('.').to_ascii_lowercase())
 }
