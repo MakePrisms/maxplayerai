@@ -19,6 +19,9 @@ struct CommonOpts {
     home: Option<PathBuf>,
     mint: Option<String>,
     amount: Option<u64>,
+    /// `receive --add-mint` (#1256): add the token's mint without prompting. Receive-only, so
+    /// `parse_common` never sets it; `parse_receive_args` strips the flag first.
+    add_mint: bool,
 }
 
 /// Default amount `maxplayer wallet setup` asks the mint for (mirrors the old setup_wallet MCP tool).
@@ -62,12 +65,13 @@ fn wallet_usage(err: &mut dyn Write) {
          \x20 maxplayer wallet mint <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet send <amount> [--mint <url>] [--home <path>]\n\
-         \x20 maxplayer wallet receive (--token-file <path> | -) [--home <path>]   # `-` reads the token from stdin (paste, then Ctrl-D); a <token> argument still works but lands in shell history\n\
+         \x20 maxplayer wallet receive (--token-file <path> | -) [--add-mint] [--home <path>]   # `-` reads the token from stdin (paste, then Ctrl-D); a <token> argument still works but lands in shell history\n\
+         \x20\x20\x20# a token from a mint not in your wallet: --add-mint adds it and receives; on a terminal you are asked (not with `-`)\n\
          \x20 maxplayer wallet melt <bolt11> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet invoice <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mints list [--home <path>]\n\
          \x20 maxplayer wallet mints add <url> [--home <path>]\n\
-         \x20 maxplayer wallet mints remove <url> [--home <path>]\n\
+         \x20 maxplayer wallet mints remove <url> [--force] [--home <path>]   # refused while the mint holds a balance; --force keeps the balance in the wallet, unspent by jobs until re-added\n\
          \x20 maxplayer wallet reconcile [--home <path>]   # retire eligible incomplete send sagas (no receipt/credit)\n\
          \x20 maxplayer wallet complete-locked --job-id <id> --result-id <id> --delivery-integrity-hash <hex> --job-hash <hex> --seller-pubkey <hex> --amount <sats> --seller-signature <hex> [--creq-hash <hex>] [--accepted-mint <url> ...] [--realized-mint <url>] [--home <path>]\n\
          \x20\x20\x20# operator: complete ONE payment wedged at Locked by proof-gated REUSE of the already-minted token (never re-mints; STOPS + alarms if the token reads spent)\n"
@@ -893,10 +897,13 @@ enum TokenSource {
 /// not know it), then pick exactly one token source. Never echoes token material in an error.
 fn parse_receive_args(args: &[String]) -> Result<(CommonOpts, TokenSource), String> {
     let mut token_file: Option<PathBuf> = None;
+    let mut add_mint = false;
     let mut rest = Vec::with_capacity(args.len());
     let mut index = 0;
     while index < args.len() {
-        if args[index] == "--token-file" {
+        if args[index] == "--add-mint" {
+            add_mint = true;
+        } else if args[index] == "--token-file" {
             index += 1;
             let value = args
                 .get(index)
@@ -909,7 +916,8 @@ fn parse_receive_args(args: &[String]) -> Result<(CommonOpts, TokenSource), Stri
         }
         index += 1;
     }
-    let (opts, positional) = parse_common(&rest)?;
+    let (mut opts, positional) = parse_common(&rest)?;
+    opts.add_mint = add_mint;
     let source = match (positional.as_slice(), token_file) {
         ([], Some(path)) => TokenSource::File(path),
         // Never read stdin implicitly: a caller that forgot the token while holding an open,
@@ -1066,6 +1074,46 @@ fn redact_secret_runs(text: &str) -> String {
 type ReceiveFn<'a> = &'a dyn Fn(&MaxplayerHome, &str) -> Result<wallet_ops::ReceiveOutcome, String>;
 
 #[cfg(feature = "wallet")]
+/// Reads the token's mint without redeeming (`wallet_ops::receive_token_mint`: real-mint fence, then
+/// membership). Injectable so tests that feed a fake token can still reach [`ReceiveFn`].
+type TokenMintFn<'a> =
+    &'a dyn Fn(&MaxplayerHome, &str) -> Result<wallet_ops::TokenMint, wallet_ops::WalletOpsError>;
+
+#[cfg(feature = "wallet")]
+/// The longest answer line the add-mint prompt reads; anything longer is not a yes.
+const MAX_ANSWER_BYTES: usize = 64;
+
+#[cfg(feature = "wallet")]
+/// Ask on `err` whether to add `mint_url`, and read one answer line from `stdin` (#1256). Only
+/// `y`/`yes` (any case, surrounding whitespace ignored) is a yes; an empty line, EOF, a read
+/// error or an over-long line is a no.
+fn confirm_add_mint(mint_url: &str, stdin: &mut dyn std::io::Read, err: &mut dyn Write) -> bool {
+    let _ = write!(
+        err,
+        "Mint {mint_url} is not in your wallet. Add it and receive? [y/N] "
+    );
+    let _ = err.flush();
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => {
+                if line.len() == MAX_ANSWER_BYTES {
+                    return false;
+                }
+                line.push(byte[0]);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return false,
+        }
+    }
+    let answer = String::from_utf8_lossy(&line).trim().to_ascii_lowercase();
+    matches!(answer.as_str(), "y" | "yes")
+}
+
+#[cfg(feature = "wallet")]
 fn cmd_receive_with_stdin(
     args: &[String],
     stdin: &mut dyn std::io::Read,
@@ -1073,9 +1121,15 @@ fn cmd_receive_with_stdin(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> i32 {
-    cmd_receive_with(args, stdin, stdin_is_tty, out, err, &|home, token| {
-        wallet_ops::receive_blocking(home, token).map_err(|error| error.to_string())
-    })
+    cmd_receive_with(
+        args,
+        stdin,
+        stdin_is_tty,
+        out,
+        err,
+        &wallet_ops::receive_token_mint,
+        &|home, token| wallet_ops::receive_blocking(home, token).map_err(|error| error.to_string()),
+    )
 }
 
 #[cfg(feature = "wallet")]
@@ -1085,6 +1139,7 @@ fn cmd_receive_with(
     stdin_is_tty: bool,
     out: &mut dyn Write,
     err: &mut dyn Write,
+    token_mint: TokenMintFn<'_>,
     receive: ReceiveFn<'_>,
 ) -> i32 {
     let (opts, source) = match parse_receive_args(args) {
@@ -1102,10 +1157,50 @@ fn cmd_receive_with(
             return USAGE_ERROR;
         }
     };
-    let home = match bootstrap_home(&opts, err) {
+    let mut home = match bootstrap_home(&opts, err) {
         Ok(home) => home,
         Err(code) => return code,
     };
+    // #1256: read the token's mint before redeeming. The real-mint fence runs inside
+    // `token_mint`, so a mint it refuses ends here: never prompted for, never written to config.
+    let mint = match token_mint(&home, &token) {
+        Ok(mint) => mint,
+        Err(error) => {
+            let _ = writeln!(err, "{}", redact_token(&error.to_string(), &token));
+            return RUNTIME_ERROR;
+        }
+    };
+    let mut added = None;
+    if !mint.configured {
+        // Ask only on a terminal, and never when the token came from stdin (`-`): stdin is then
+        // the token, not the user's answer.
+        let add = opts.add_mint
+            || (stdin_is_tty
+                && source != TokenSource::Stdin
+                && confirm_add_mint(&mint.mint_url, stdin, err));
+        if !add {
+            let refusal = wallet_ops::WalletOpsError::ReceiveMintNotConfigured {
+                mint_url: mint.mint_url,
+                default_mint: home.config.default_mint().to_string(),
+            };
+            let _ = writeln!(err, "{refusal}");
+            return RUNTIME_ERROR;
+        }
+        match wallet_ops::add_mint(&mut home, &mint.mint_url) {
+            Ok(normalized) => {
+                // stderr, so stdout stays the one `received_sats=…` line scripts parse.
+                let _ = writeln!(err, "added mint={normalized}");
+                if let Some(hint) = seller_mint_hint(&home, &normalized) {
+                    let _ = writeln!(err, "{hint}");
+                }
+                added = Some(normalized);
+            }
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+                return RUNTIME_ERROR;
+            }
+        }
+    }
     match receive(&home, &token) {
         Ok(outcome) => {
             let _ = writeln!(
@@ -1117,6 +1212,14 @@ fn cmd_receive_with(
         }
         Err(error) => {
             let _ = writeln!(err, "{}", redact_token(&error, &token));
+            // The add is kept on purpose: it is cheap and harmless, and a retry then needs no flag.
+            if let Some(mint_url) = added {
+                let _ = writeln!(
+                    err,
+                    "note: mint {mint_url} was added to your wallet and stays configured \
+                     (`maxplayer wallet mints remove {mint_url}` undoes it)"
+                );
+            }
             RUNTIME_ERROR
         }
     }
@@ -1225,7 +1328,18 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         wallet_usage(err);
         return USAGE_ERROR;
     };
-    let (opts, positional) = match parse_common(&args[1..]) {
+    // `--force` is `mints remove`-only; strip it there so `parse_common` refuses it elsewhere.
+    let mut force = false;
+    let rest: Vec<String> = args[1..]
+        .iter()
+        .filter(|arg| {
+            let is_force = sub == "remove" && arg.as_str() == "--force";
+            force |= is_force;
+            !is_force
+        })
+        .cloned()
+        .collect();
+    let (opts, positional) = match parse_common(&rest) {
         Ok(value) => value,
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -1286,9 +1400,27 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                     return USAGE_ERROR;
                 }
             };
-            match wallet_ops::remove_mint(&mut home, url) {
-                Ok(()) => {
+            match wallet_ops::remove_mint(&mut home, url, force) {
+                Ok(removed) => {
                     let _ = writeln!(out, "removed mint={url}");
+                    let stays = wallet_ops::REMOVED_BALANCE_STAYS;
+                    match removed {
+                        wallet_ops::RemovedBalance::Empty => {}
+                        wallet_ops::RemovedBalance::Kept(holdings) => {
+                            let _ = writeln!(
+                                err,
+                                "note: {} sats at this mint: the {stays} (`maxplayer wallet mints add {url}`)",
+                                holdings.total_sats()
+                            );
+                        }
+                        wallet_ops::RemovedBalance::Unknown(error) => {
+                            let _ = writeln!(
+                                err,
+                                "note: the balance at this mint could not be read ({error}); any {stays} \
+                                 (`maxplayer wallet mints add {url}`)"
+                            );
+                        }
+                    }
                     SUCCESS
                 }
                 Err(error) => {
@@ -2252,6 +2384,18 @@ mod tests {
         }
     }
 
+    /// A [`TokenMintFn`] for fake tokens whose mint is already configured.
+    #[cfg(feature = "wallet")]
+    fn configured_mint(
+        _: &MaxplayerHome,
+        _: &str,
+    ) -> Result<wallet_ops::TokenMint, wallet_ops::WalletOpsError> {
+        Ok(wallet_ops::TokenMint {
+            mint_url: "http://127.0.0.1:1".into(),
+            configured: true,
+        })
+    }
+
     #[cfg(feature = "wallet")]
     fn read_token(
         source: &TokenSource,
@@ -2309,6 +2453,7 @@ mod tests {
                     tty,
                     &mut out,
                     &mut err,
+                    &|_, _| panic!("no mint read without a token"),
                     &|_, _| panic!("no wallet call without a token"),
                 );
                 let err = String::from_utf8(err).expect("utf8");
@@ -2538,6 +2683,7 @@ mod tests {
             false,
             &mut out,
             &mut err,
+            &configured_mint,
             &|_, token| {
                 assert_eq!(token, FAKE_TOKEN, "the trimmed token reaches the wallet");
                 Err(echo.clone())
@@ -2567,6 +2713,7 @@ mod tests {
             false,
             &mut out,
             &mut err,
+            &configured_mint,
             &|_, _| {
                 Ok(wallet_ops::ReceiveOutcome {
                     mint_url: "http://127.0.0.1:1".into(),
@@ -2612,4 +2759,485 @@ mod tests {
         );
         assert_eq!(redact_token("plain", ""), "plain");
     }
+
+    // BEGIN #1256 tests
+    // ---- #1256: receive from a mint not in the wallet; mints remove with a balance ----
+
+    #[cfg(feature = "wallet")]
+    const NEW_MINT: &str = "https://new-mint.example";
+
+    #[cfg(feature = "wallet")]
+    const ADD_PROMPT: &str = "Add it and receive? [y/N]";
+
+    /// A home on disk (CLI bootstrap reads it) plus a token file holding [`FAKE_TOKEN`].
+    #[cfg(feature = "wallet")]
+    fn add_mint_case(label: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let dir = receive_tmp(label);
+        let home = dir.join("home");
+        home::bootstrap(&home).expect("bootstrap home");
+        let file = dir.join("t.token");
+        std::fs::write(&file, format!("{FAKE_TOKEN}\n")).expect("write token");
+        (dir, home, file)
+    }
+
+    #[cfg(feature = "wallet")]
+    fn extra_mints_on_disk(home: &std::path::Path) -> Vec<String> {
+        home::bootstrap(home).expect("reload home").config.extra_mints
+    }
+
+    /// A [`TokenMintFn`] for a fake token whose mint ([`NEW_MINT`]) is not in the wallet.
+    #[cfg(feature = "wallet")]
+    fn unconfigured_mint(
+        _: &MaxplayerHome,
+        _: &str,
+    ) -> Result<wallet_ops::TokenMint, wallet_ops::WalletOpsError> {
+        Ok(wallet_ops::TokenMint {
+            mint_url: NEW_MINT.into(),
+            configured: false,
+        })
+    }
+
+    /// The receive call after a successful add: the mint must already be configured in `home`.
+    #[cfg(feature = "wallet")]
+    fn receive_requiring_added_mint(
+        home: &MaxplayerHome,
+        token: &str,
+    ) -> Result<wallet_ops::ReceiveOutcome, String> {
+        assert_eq!(token, FAKE_TOKEN);
+        let configured = wallet_ops::configured_mints(home).expect("configured mints");
+        assert!(
+            configured.iter().any(|mint| mint == NEW_MINT),
+            "the mint must be added before the token is redeemed: {configured:?}"
+        );
+        Ok(wallet_ops::ReceiveOutcome {
+            mint_url: NEW_MINT.into(),
+            received_sats: 21,
+            balance_sats: 21,
+        })
+    }
+
+    #[cfg(feature = "wallet")]
+    fn no_redeem(_: &MaxplayerHome, _: &str) -> Result<wallet_ops::ReceiveOutcome, String> {
+        panic!("a refused receive must not redeem the token");
+    }
+
+    /// A syntactically real cashu token at `mint_url` (never redeemable: fake proof).
+    #[cfg(feature = "wallet")]
+    fn real_token_at(mint_url: &str) -> String {
+        use std::str::FromStr;
+
+        use cashu::secret::Secret;
+        use cashu::{Amount, CurrencyUnit, Id, MintUrl, Proof, SecretKey, Token};
+
+        let proof = Proof::new(
+            Amount::from(5),
+            Id::from_str("009a1f293253e41e").expect("keyset id"),
+            Secret::new("issue-1256-receive-add-mint"),
+            SecretKey::generate().public_key(),
+        );
+        Token::new(
+            MintUrl::from_str(mint_url).expect("mint url"),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string()
+    }
+
+    // y/yes on a terminal adds the mint, THEN redeems, in one command; stdout keeps the one
+    // `received_sats=` line. RED if the prompt is skipped or the add happens after the redeem.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_prompt_yes_adds_the_mint_then_receives() {
+        for answer in ["y\n", "yes\n", "  Y \r\n", "YES"] {
+            let (dir, home, file) = add_mint_case("prompt-yes");
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_receive_with(
+                &strings(&[
+                    "--token-file",
+                    file.to_str().unwrap(),
+                    "--home",
+                    home.to_str().unwrap(),
+                ]),
+                &mut std::io::Cursor::new(answer),
+                true,
+                &mut out,
+                &mut err,
+                &unconfigured_mint,
+                &receive_requiring_added_mint,
+            );
+            let err = String::from_utf8(err).expect("utf8");
+            assert_eq!(code, SUCCESS, "answer {answer:?}: {err}");
+            assert!(
+                err.contains(&format!("Mint {NEW_MINT} is not in your wallet. {ADD_PROMPT}")),
+                "{err}"
+            );
+            assert!(err.contains(&format!("added mint={NEW_MINT}")), "{err}");
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!("received_sats=21 balance_sats=21 mint={NEW_MINT}\n")
+            );
+            assert_eq!(extra_mints_on_disk(&home), vec![NEW_MINT.to_owned()]);
+            assert!(!err.contains(FAKE_TOKEN));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // Anything but y/yes — n, an empty line, EOF, other words, an over-long line — refuses as
+    // before: nothing redeemed, config unchanged, both remedies named. RED if the default flips
+    // to yes or a non-y answer is accepted.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_prompt_other_answers_refuse_and_leave_config_unchanged() {
+        let long = format!("y{}\n", " ".repeat(200));
+        for answer in ["n\n", "no\n", "\n", "", "yep\n", "maybe y\n", long.as_str()] {
+            let (dir, home, file) = add_mint_case("prompt-no");
+            let config_before = std::fs::read(home.join("config.toml")).expect("config");
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_receive_with(
+                &strings(&[
+                    "--token-file",
+                    file.to_str().unwrap(),
+                    "--home",
+                    home.to_str().unwrap(),
+                ]),
+                &mut std::io::Cursor::new(answer),
+                true,
+                &mut out,
+                &mut err,
+                &unconfigured_mint,
+                &no_redeem,
+            );
+            let err = String::from_utf8(err).expect("utf8");
+            assert_eq!(code, RUNTIME_ERROR, "answer {answer:?}: {err}");
+            assert!(err.contains(ADD_PROMPT), "{err}");
+            assert!(
+                err.contains("--add-mint")
+                    && err.contains(&format!("maxplayer wallet mints add {NEW_MINT}")),
+                "refusal names both remedies: {err}"
+            );
+            assert!(!err.contains("added mint="), "{err}");
+            assert!(out.is_empty());
+            assert_eq!(
+                std::fs::read(home.join("config.toml")).expect("config"),
+                config_before,
+                "answer {answer:?} must not touch config.toml"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // --add-mint adds without asking, on a terminal or not; stdin is never read. RED if the flag
+    // is ignored (refusal) or still prompts.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_add_mint_flag_adds_without_prompting() {
+        for tty in [false, true] {
+            let (dir, home, file) = add_mint_case("flag");
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_receive_with(
+                &strings(&[
+                    "--add-mint",
+                    "--token-file",
+                    file.to_str().unwrap(),
+                    "--home",
+                    home.to_str().unwrap(),
+                ]),
+                &mut UntouchedStdin,
+                tty,
+                &mut out,
+                &mut err,
+                &unconfigured_mint,
+                &receive_requiring_added_mint,
+            );
+            let err = String::from_utf8(err).expect("utf8");
+            assert_eq!(code, SUCCESS, "tty {tty}: {err}");
+            assert!(!err.contains(ADD_PROMPT), "{err}");
+            assert!(err.contains(&format!("added mint={NEW_MINT}")), "{err}");
+            assert!(String::from_utf8(out).unwrap().starts_with("received_sats=21 "));
+            assert_eq!(extra_mints_on_disk(&home), vec![NEW_MINT.to_owned()]);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let (_, source) = parse_receive_args(&strings(&["-", "--add-mint"])).expect("parse");
+        assert_eq!(source, TokenSource::Stdin, "--add-mint is a flag, not a token");
+    }
+
+    // No terminal and no flag (agents, MCP, scripts): refuse, never read stdin for an answer.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_without_terminal_or_flag_refuses_naming_both_remedies() {
+        let (dir, home, file) = add_mint_case("noninteractive");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with(
+            &strings(&[
+                "--token-file",
+                file.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+            ]),
+            &mut UntouchedStdin,
+            false,
+            &mut out,
+            &mut err,
+            &unconfigured_mint,
+            &no_redeem,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "{err}");
+        assert!(!err.contains(ADD_PROMPT), "{err}");
+        assert!(
+            err.contains("--add-mint") && err.contains("maxplayer wallet mints add"),
+            "{err}"
+        );
+        assert!(out.is_empty());
+        assert!(extra_mints_on_disk(&home).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // `-` makes stdin the token, so even on a terminal there is no prompt: refuse with the hint.
+    // RED if the prompt runs (it would print the question and read the exhausted stdin as EOF).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_token_from_stdin_never_prompts() {
+        let (dir, home, _) = add_mint_case("stdin-token");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with(
+            &strings(&["-", "--home", home.to_str().unwrap()]),
+            &mut std::io::Cursor::new(format!("{FAKE_TOKEN}\n")),
+            true,
+            &mut out,
+            &mut err,
+            &unconfigured_mint,
+            &no_redeem,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "{err}");
+        assert!(!err.contains(ADD_PROMPT), "{err}");
+        assert!(err.contains("--add-mint"), "{err}");
+        assert!(out.is_empty());
+        assert!(extra_mints_on_disk(&home).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The real-mint fence runs BEFORE any prompt or add, through the real token parse: a mint
+    // `allow_real_mints = false` refuses is never asked about and never written, even with
+    // --add-mint. RED if membership is checked first (prompt, or a written extra_mints entry).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_real_mint_fence_refuses_before_prompt_or_add() {
+        for flag in [false, true] {
+            let (dir, home, file) = add_mint_case("fence");
+            let mut seeded = home::bootstrap(&home).expect("bootstrap");
+            home::save_config(&mut seeded, |config| {
+                config.accepted_mints = vec![DEFAULT_MINT_URL.to_owned()];
+                config.allow_real_mints = false;
+            })
+            .expect("fence on");
+            let token = real_token_at("https://real-mint.example/");
+            std::fs::write(&file, &token).expect("token file");
+            let config_before = std::fs::read(home.join("config.toml")).expect("config");
+            let mut args = strings(&[
+                "--token-file",
+                file.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+            ]);
+            if flag {
+                args.push("--add-mint".into());
+            }
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_receive_with_stdin(&args, &mut UntouchedStdin, true, &mut out, &mut err);
+            let err = String::from_utf8(err).expect("utf8");
+            assert_eq!(code, RUNTIME_ERROR, "flag {flag}: {err}");
+            assert!(err.contains("allow_real_mints is off"), "{err}");
+            assert!(!err.contains(ADD_PROMPT), "{err}");
+            assert!(!err.contains("added mint="), "{err}");
+            assert!(!err.contains(&token), "token leaked:\n{err}");
+            assert_eq!(
+                std::fs::read(home.join("config.toml")).expect("config"),
+                config_before,
+                "a fenced mint must never reach config.toml"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    // The real (non-injected) path: an unconfigured mint the fence admits is refused before any
+    // wallet open with the two-remedy message, and the token is not quoted.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_real_path_refuses_unconfigured_mint_with_both_remedies() {
+        let (dir, home, file) = add_mint_case("real-unconfigured");
+        let token = real_token_at("https://unconfigured-mint.example/");
+        std::fs::write(&file, &token).expect("token file");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with_stdin(
+            &strings(&[
+                "--token-file",
+                file.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+            ]),
+            &mut UntouchedStdin,
+            false,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "{err}");
+        assert!(
+            err.contains("mint https://unconfigured-mint.example is not in your wallet"),
+            "{err}"
+        );
+        assert!(
+            err.contains("--add-mint")
+                && err.contains("maxplayer wallet mints add https://unconfigured-mint.example"),
+            "{err}"
+        );
+        assert!(!err.contains(&token), "token leaked:\n{err}");
+        assert!(extra_mints_on_disk(&home).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Add succeeded, redeem failed: the mint stays added and the user is told so (the chosen
+    // ordering). RED if the note is dropped or the add is rolled back.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn receive_failure_after_add_keeps_the_mint_and_says_so() {
+        let (dir, home, file) = add_mint_case("add-then-fail");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = cmd_receive_with(
+            &strings(&[
+                "--add-mint",
+                "--token-file",
+                file.to_str().unwrap(),
+                "--home",
+                home.to_str().unwrap(),
+            ]),
+            &mut UntouchedStdin,
+            false,
+            &mut out,
+            &mut err,
+            &unconfigured_mint,
+            &|_, _| Err(format!("wallet error: mint unreachable for {FAKE_TOKEN}")),
+        );
+        let err = String::from_utf8(err).expect("utf8");
+        assert_eq!(code, RUNTIME_ERROR, "{err}");
+        assert!(err.contains("mint unreachable for <redacted token>"), "{err}");
+        assert!(
+            err.contains(&format!("note: mint {NEW_MINT} was added to your wallet")),
+            "{err}"
+        );
+        assert!(out.is_empty());
+        assert_eq!(extra_mints_on_disk(&home), vec![NEW_MINT.to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wallet")]
+    fn run_mints(args: &[&str]) -> (i32, String, String) {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let mut full = strings(&["mints"]);
+        full.extend(strings(args));
+        let code = run(&full, &mut out, &mut err);
+        (
+            code,
+            String::from_utf8(out).expect("utf8"),
+            String::from_utf8(err).expect("utf8"),
+        )
+    }
+
+    // A mint holding a balance is not removed; the refusal names the amount and --force. RED if
+    // the balance check is skipped (the mint would be removed and the 37 sats stranded).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mints_remove_refuses_while_the_mint_holds_a_balance() {
+        let root = ux_test_home("remove-balance");
+        let _ = std::fs::remove_dir_all(&root);
+        let home_str = root.to_string_lossy().into_owned();
+        assert_eq!(run_mints(&["add", NEW_MINT, "--home", &home_str]).0, SUCCESS);
+        seed_mint_balance(&root, "https://new-mint.example/", 37);
+
+        let (code, out, err) = run_mints(&["remove", NEW_MINT, "--home", &home_str]);
+        assert_eq!(code, RUNTIME_ERROR, "{err}");
+        assert!(
+            err.contains(&format!("mint {NEW_MINT} still holds 37 sats")),
+            "{err}"
+        );
+        assert!(err.contains("--force"), "{err}");
+        assert!(out.is_empty());
+        assert_eq!(extra_mints_on_disk(&root), vec![NEW_MINT.to_owned()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // --force removes it anyway, says the balance stays but no job spends it, and leaves the
+    // proofs in the wallet (balance shows them as an unconfigured row).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mints_remove_force_removes_and_keeps_the_balance_in_the_wallet() {
+        let root = ux_test_home("remove-force");
+        let _ = std::fs::remove_dir_all(&root);
+        let home_str = root.to_string_lossy().into_owned();
+        assert_eq!(run_mints(&["add", NEW_MINT, "--home", &home_str]).0, SUCCESS);
+        seed_mint_balance(&root, "https://new-mint.example/", 37);
+
+        let (code, out, err) = run_mints(&["remove", NEW_MINT, "--force", "--home", &home_str]);
+        assert_eq!(code, SUCCESS, "{err}");
+        assert_eq!(out, format!("removed mint={NEW_MINT}\n"));
+        assert!(
+            err.contains("37 sats at this mint")
+                && err.contains("balance stays in the wallet, but no job will spend it until the mint is added back"),
+            "{err}"
+        );
+        assert!(extra_mints_on_disk(&root).is_empty());
+        let home = home::bootstrap(&root).expect("reload");
+        let row = wallet_ops::balances_blocking(&home)
+            .expect("balances")
+            .into_iter()
+            .find(|row| row.mint_url == NEW_MINT)
+            .expect("the removed mint's balance is still listed");
+        assert_eq!(row.balance_sats, 37);
+        assert!(!row.configured);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A mint with nothing in the wallet removes as before, with no note; the pinned default is
+    // still refused, --force or not; --force is not a flag of other subcommands.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn mints_remove_zero_balance_removes_and_default_stays_pinned() {
+        let root = ux_test_home("remove-empty");
+        let _ = std::fs::remove_dir_all(&root);
+        let home_str = root.to_string_lossy().into_owned();
+        assert_eq!(run_mints(&["add", NEW_MINT, "--home", &home_str]).0, SUCCESS);
+        let (code, out, err) = run_mints(&["remove", NEW_MINT, "--home", &home_str]);
+        assert_eq!(code, SUCCESS, "{err}");
+        assert_eq!(out, format!("removed mint={NEW_MINT}\n"));
+        assert!(err.is_empty(), "{err}");
+        assert!(extra_mints_on_disk(&root).is_empty());
+
+        let default = home::bootstrap(&root).expect("reload").config.default_mint().to_owned();
+        for args in [
+            vec!["remove", default.as_str(), "--home", &home_str],
+            vec!["remove", default.as_str(), "--force", "--home", &home_str],
+        ] {
+            let (code, _, err) = run_mints(&args);
+            assert_eq!(code, RUNTIME_ERROR, "{err}");
+            assert!(err.contains("cannot remove the default mint"), "{err}");
+        }
+        let (code, _, err) = run_mints(&["add", NEW_MINT, "--force", "--home", &home_str]);
+        assert_eq!(code, USAGE_ERROR, "{err}");
+        assert!(err.contains("unknown flag: --force"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn wallet_usage_documents_add_mint_and_force() {
+        let mut err = Vec::new();
+        wallet_usage(&mut err);
+        let usage = String::from_utf8(err).expect("utf8");
+        assert!(usage.contains("receive (--token-file <path> | -) [--add-mint]"), "{usage}");
+        assert!(usage.contains("mints remove <url> [--force]"), "{usage}");
+    }
+    // END #1256 tests
 }

@@ -157,12 +157,15 @@ anyone holding it can spend them. Send it to the buyer privately. `issue` can ru
 service is running. If an issue is interrupted, the next `issue` (or `issue` with no amount)
 finishes it with the same outputs instead of issuing again.
 
-The buyer adds your mint, then receives the token:
+The buyer receives the token and adds your mint in the same step:
 
 ```bash
-maxplayer wallet mints add nostr://npub1…
-maxplayer wallet receive --token-file <id>.token
+maxplayer wallet receive --add-mint --token-file <id>.token
 ```
+
+Without `--add-mint`, `receive` refuses a token from a mint the wallet does not have, and the
+token stays unredeemed. On a terminal it asks first (`Add it and receive? [y/N]`). Running
+`maxplayer wallet mints add nostr://npub1…` before `receive` works too.
 
 `--token-file` (or `-` with the token piped on stdin) keeps the token out of shell history and the
 process list; avoid passing it as a command-line argument.

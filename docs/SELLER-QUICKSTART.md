@@ -1621,7 +1621,9 @@ an unconfigured mint, its row has `role=unconfigured` and a separate `configured
 appears before the whole-wallet total — and that configured subset is what job payment can actually
 draw on: accept-time source selection deliberately ignores unconfigured balances, so money at an
 unconfigured mint is yours to `send`/`melt` manually but does not fund jobs until you
-`wallet mints add` it. The daemon's own `seller node
+`wallet mints add` it. For the same reason `wallet mints remove` refuses a mint that still holds a
+balance and names the amount; `--force` removes it anyway and leaves that balance in the wallet as an
+unconfigured row. The daemon's own `seller node
 status` line every ~5 minutes ([§9](#9-minimal-runbook)) tells you the loop is turning; `wallet
 balance` tells you what it earned.
 
