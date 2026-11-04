@@ -434,6 +434,13 @@ The agent marks a question by beginning its final message with `MAXPLAYER-NEEDS-
 pattern, `docs/protocol-v1.md:870 @e0262420`); the composed prompt (`compose_agent_prompt`,
 `core/seller_exec.rs:2328`) gains a session section saying so.
 
+Every turn n ≥ 2 prompt — the follow-up and the context-reset prompt — restates that session section
+**and**, when the turn's delivery gate allows inline (buyer reads inline, not a contribution), the
+ANSWER JOBS rule, from the same source turn 1 uses (`seller_exec::inline_answer_rule`). A turn must
+not depend on the agent remembering turn 1: a context reset (or a resume that silently reads back an
+empty conversation) starts a new conversation, and an unmarked, file-less answer is refused
+`no_sentinel`. The marker gate itself is unchanged.
+
 - Tree changed ⇒ git delivery; the question (if any) is the result content.
 - Tree unchanged since the session base ⇒ inline delivery, content = the marked message
   (`MAXPLAYER-ANSWER-V1` or `MAXPLAYER-NEEDS-INPUT-V1`), or for `out_of_time` the agent's last message.

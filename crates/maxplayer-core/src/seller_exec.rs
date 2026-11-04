@@ -2285,6 +2285,28 @@ where
     }
 }
 
+/// The ANSWER JOBS delivery rule: how the hired agent marks an answer-only reply so the seller can
+/// deliver it inline (§6.1). The ONE source of this wording — the turn-1 prompt
+/// ([`compose_agent_prompt`]) and every later session turn (follow-up and context-reset prompts,
+/// `seller_node::session_run`) state it from here, so the turns cannot drift apart. Callers state
+/// it ONLY when the buyer declared it can read an inline answer; the marker gate that reads the
+/// reply is unchanged and strict.
+pub fn inline_answer_rule() -> String {
+    format!(
+        "ANSWER JOBS: when the task asks you for information and you leave NO files on disk, \
+         put this exact line first in your final message, alone on its line:\n\
+         {marker}\n\
+         and put your answer on the lines after it, as plain text with no code fence around \
+         the whole reply. Keep the answer under {answer_limit} bytes; a longer one cannot be \
+         delivered, so write a longer one to a file and leave it on disk instead. The daemon \
+         then delivers that answer to the buyer as the deliverable. Without that first line, \
+         only files on disk are delivered.",
+        marker = crate::engine::INLINE_ANSWER_MARKER,
+        // The cap the seller enforces, which already allows for the marker line above.
+        answer_limit = crate::seller_node::run::INLINE_ANSWER_MAX_BYTES,
+    )
+}
+
 /// Daemon/node-owned delivery, plus the job agent's PROMPT PREAMBLE — identity, job context,
 /// boundaries (#685, #731), and the buyer's declared output type (#686).
 ///
@@ -2358,22 +2380,10 @@ pub fn compose_agent_prompt(
     // caused. An offer from a build that never heard of inline delivery declares nothing, so it
     // never sees this and behaves exactly as it does today.
     let answer_section = if accepts_inline {
-        format!(
-            // Leads with its OWN newline. The prompt must end where its last sentence ends when
-            // this section is absent — `seller_memory_read_on_start` anchors the memory invariant
-            // on exactly that, and a separator left behind by an empty section breaks it.
-            "\nANSWER JOBS: when the task asks you for information and you leave NO files on disk, \
-             put this exact line first in your final message, alone on its line:\n\
-             {marker}\n\
-             and put your answer on the lines after it, as plain text with no code fence around \
-             the whole reply. Keep the answer under {answer_limit} bytes; a longer one cannot be \
-             delivered, so write a longer one to a file and leave it on disk instead. The daemon \
-             then delivers that answer to the buyer as the deliverable. Without that first line, \
-             only files on disk are delivered.",
-            marker = crate::engine::INLINE_ANSWER_MARKER,
-            // The cap the seller enforces, which already allows for the marker line above.
-            answer_limit = crate::seller_node::run::INLINE_ANSWER_MAX_BYTES,
-        )
+        // Leads with its OWN newline. The prompt must end where its last sentence ends when
+        // this section is absent — `seller_memory_read_on_start` anchors the memory invariant
+        // on exactly that, and a separator left behind by an empty section breaks it.
+        format!("\n{}", inline_answer_rule())
     } else {
         String::new()
     };
