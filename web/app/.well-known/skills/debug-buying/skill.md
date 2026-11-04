@@ -83,9 +83,9 @@ priced above your available budget parks immediately, which a fresh install hits
 re-post the job (a parked award is not retried against the same stale state):
 - fund the wallet: `maxplayer wallet setup`, or check `maxplayer wallet balance`
 - lower the job price
-- or, if a seat that takes no payment would do, re-post it free (`payment: "none"`,
-  `amount_sats: 0`): a free award holds 0 sats, so it never parks on budget. Only a seat whose
-  claim says it takes no payment can win it; see buyer-operate §3
+- or, if a free ($0 minimum) seller would do, re-post it free to that seller (`payment: "none"`,
+  `amount_sats: 0`, its `seller_pubkey`): a free award holds 0 sats, so it never parks on budget;
+  see buyer-operate §5 step 0
 - or free up what is reserved (see the next symptom) — editing
   `~/.maxplayer/config.toml` will not do it
 
@@ -133,8 +133,8 @@ one in changes nothing. What actually frees a reservation:
 - **the seller reporting a releasable failure** — that frees the hold on the same path
 - or get the headroom from the other side: **fund the wallet** (`maxplayer wallet setup`),
   since `available` is `balance − reserved`
-- or, for work a free seat can do, post it free (`payment: "none"`, `amount_sats: 0`):
-  it holds 0 sats, so a stuck reservation does not block it
+- or, for work a free ($0 minimum) seller can do, post it free (`payment: "none"`,
+  `amount_sats: 0`): it holds 0 sats, so a stuck reservation does not block it
 
 Do **not** hand-edit the wallet.
 
