@@ -2782,7 +2782,10 @@ mod tests {
 
     #[cfg(feature = "wallet")]
     fn extra_mints_on_disk(home: &std::path::Path) -> Vec<String> {
-        home::bootstrap(home).expect("reload home").config.extra_mints
+        home::bootstrap(home)
+            .expect("reload home")
+            .config
+            .extra_mints
     }
 
     /// A [`TokenMintFn`] for a fake token whose mint ([`NEW_MINT`]) is not in the wallet.
@@ -2869,7 +2872,9 @@ mod tests {
             let err = String::from_utf8(err).expect("utf8");
             assert_eq!(code, SUCCESS, "answer {answer:?}: {err}");
             assert!(
-                err.contains(&format!("Mint {NEW_MINT} is not in your wallet. {ADD_PROMPT}")),
+                err.contains(&format!(
+                    "Mint {NEW_MINT} is not in your wallet. {ADD_PROMPT}"
+                )),
                 "{err}"
             );
             assert!(err.contains(&format!("added mint={NEW_MINT}")), "{err}");
@@ -2954,12 +2959,20 @@ mod tests {
             assert_eq!(code, SUCCESS, "tty {tty}: {err}");
             assert!(!err.contains(ADD_PROMPT), "{err}");
             assert!(err.contains(&format!("added mint={NEW_MINT}")), "{err}");
-            assert!(String::from_utf8(out).unwrap().starts_with("received_sats=21 "));
+            assert!(
+                String::from_utf8(out)
+                    .unwrap()
+                    .starts_with("received_sats=21 ")
+            );
             assert_eq!(extra_mints_on_disk(&home), vec![NEW_MINT.to_owned()]);
             let _ = std::fs::remove_dir_all(&dir);
         }
         let (_, source) = parse_receive_args(&strings(&["-", "--add-mint"])).expect("parse");
-        assert_eq!(source, TokenSource::Stdin, "--add-mint is a flag, not a token");
+        assert_eq!(
+            source,
+            TokenSource::Stdin,
+            "--add-mint is a flag, not a token"
+        );
     }
 
     // No terminal and no flag (agents, MCP, scripts): refuse, never read stdin for an answer.
@@ -3123,7 +3136,10 @@ mod tests {
         );
         let err = String::from_utf8(err).expect("utf8");
         assert_eq!(code, RUNTIME_ERROR, "{err}");
-        assert!(err.contains("mint unreachable for <redacted token>"), "{err}");
+        assert!(
+            err.contains("mint unreachable for <redacted token>"),
+            "{err}"
+        );
         assert!(
             err.contains(&format!("note: mint {NEW_MINT} was added to your wallet")),
             "{err}"
@@ -3154,7 +3170,10 @@ mod tests {
         let root = ux_test_home("remove-balance");
         let _ = std::fs::remove_dir_all(&root);
         let home_str = root.to_string_lossy().into_owned();
-        assert_eq!(run_mints(&["add", NEW_MINT, "--home", &home_str]).0, SUCCESS);
+        assert_eq!(
+            run_mints(&["add", NEW_MINT, "--home", &home_str]).0,
+            SUCCESS
+        );
         seed_mint_balance(&root, "https://new-mint.example/", 37);
 
         let (code, out, err) = run_mints(&["remove", NEW_MINT, "--home", &home_str]);
@@ -3177,7 +3196,10 @@ mod tests {
         let root = ux_test_home("remove-force");
         let _ = std::fs::remove_dir_all(&root);
         let home_str = root.to_string_lossy().into_owned();
-        assert_eq!(run_mints(&["add", NEW_MINT, "--home", &home_str]).0, SUCCESS);
+        assert_eq!(
+            run_mints(&["add", NEW_MINT, "--home", &home_str]).0,
+            SUCCESS
+        );
         seed_mint_balance(&root, "https://new-mint.example/", 37);
 
         let (code, out, err) = run_mints(&["remove", NEW_MINT, "--force", "--home", &home_str]);
@@ -3208,14 +3230,21 @@ mod tests {
         let root = ux_test_home("remove-empty");
         let _ = std::fs::remove_dir_all(&root);
         let home_str = root.to_string_lossy().into_owned();
-        assert_eq!(run_mints(&["add", NEW_MINT, "--home", &home_str]).0, SUCCESS);
+        assert_eq!(
+            run_mints(&["add", NEW_MINT, "--home", &home_str]).0,
+            SUCCESS
+        );
         let (code, out, err) = run_mints(&["remove", NEW_MINT, "--home", &home_str]);
         assert_eq!(code, SUCCESS, "{err}");
         assert_eq!(out, format!("removed mint={NEW_MINT}\n"));
         assert!(err.is_empty(), "{err}");
         assert!(extra_mints_on_disk(&root).is_empty());
 
-        let default = home::bootstrap(&root).expect("reload").config.default_mint().to_owned();
+        let default = home::bootstrap(&root)
+            .expect("reload")
+            .config
+            .default_mint()
+            .to_owned();
         for args in [
             vec!["remove", default.as_str(), "--home", &home_str],
             vec!["remove", default.as_str(), "--force", "--home", &home_str],
@@ -3236,7 +3265,10 @@ mod tests {
         let mut err = Vec::new();
         wallet_usage(&mut err);
         let usage = String::from_utf8(err).expect("utf8");
-        assert!(usage.contains("receive (--token-file <path> | -) [--add-mint]"), "{usage}");
+        assert!(
+            usage.contains("receive (--token-file <path> | -) [--add-mint]"),
+            "{usage}"
+        );
         assert!(usage.contains("mints remove <url> [--force]"), "{usage}");
     }
     // END #1256 tests

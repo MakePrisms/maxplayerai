@@ -2865,7 +2865,8 @@ mod tests {
         assert_eq!(added, "https://example.mint.test");
         assert_eq!(list_mints(&home).expect("list2").len(), 2);
 
-        let err = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL, false).expect_err("pin");
+        let err =
+            remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL, false).expect_err("pin");
         assert!(matches!(err, WalletOpsError::MintPinnedDefault { .. }));
 
         assert_eq!(
@@ -3306,7 +3307,12 @@ mod tests {
         .to_string()
     }
 
-    async fn seed_proof_1256(home: &MaxplayerHome, mint_url: &str, amount: u64, state: cashu::State) {
+    async fn seed_proof_1256(
+        home: &MaxplayerHome,
+        mint_url: &str,
+        amount: u64,
+        state: cashu::State,
+    ) {
         use cashu::secret::Secret;
         use cashu::{Amount, Id, Proof, SecretKey};
         use cdk::wallet::types::ProofInfo;
@@ -3356,7 +3362,11 @@ mod tests {
 
         home.config.allow_real_mints = true;
         home.config.extra_mints = vec!["https://unlisted-mint.example/".into()];
-        assert!(receive_token_mint(&home, &token).expect("configured").configured);
+        assert!(
+            receive_token_mint(&home, &token)
+                .expect("configured")
+                .configured
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3368,7 +3378,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let home = bootstrap(&root).expect("bootstrap");
         let token = token_at_1256("https://unlisted-mint.example/");
-        let err = receive_async(&home, &token).await.expect_err("unconfigured");
+        let err = receive_async(&home, &token)
+            .await
+            .expect_err("unconfigured");
         assert!(
             matches!(&err, WalletOpsError::ReceiveMintNotConfigured { mint_url, .. } if mint_url == "https://unlisted-mint.example"),
             "{err:?}"
@@ -3410,7 +3422,10 @@ mod tests {
         );
         let message = err.to_string();
         assert!(message.contains("still holds 38 sats"), "{message}");
-        assert!(message.contains("30 spendable, 8 pending or reserved"), "{message}");
+        assert!(
+            message.contains("30 spendable, 8 pending or reserved"),
+            "{message}"
+        );
         assert!(message.contains("--force"), "{message}");
         assert_eq!(configured_mints(&home).expect("mints").len(), 2);
 
