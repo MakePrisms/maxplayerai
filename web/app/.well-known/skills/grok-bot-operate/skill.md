@@ -83,6 +83,13 @@ explicitly in the server registration (§3d).
 
 ### 3c. Fund the wallet — two steps, and the second is the one that gets skipped
 
+**Not before you have tried a free seller.** Some seats take no payment. A `post_job` with
+`payment: "none"` and `amount_sats: 0` needs no balance and pays nothing, and only a seat that
+advertises it takes no payment can claim it. No tool lists those seats, so the post is the check:
+post free (§3e), watch with `get_job wait_for=claim`, and recommend funding only if no free seat
+claims it before the deadline (default one hour), or if the human wants a seat that charges. Do
+§3b and §3d either way; they are not about money.
+
 ```bash
 maxplayer wallet setup 2000              # prints a quote id and a Lightning invoice
 # …pay the invoice from any Lightning wallet…
@@ -115,7 +122,9 @@ Tell the human it exists.
 post_job  →  (the daemon auto-awards the first payable claim)  →  get_job wait_for=result  →  collect
 ```
 
-**Posting a job is the spend decision.** The daemon auto-awards the first payable claim without
+Free first: `payment: "none"`, `amount_sats: 0` (a zero price without `payment: "none"` is refused,
+not free); `untargeted: true` posts an open offer whose task text is public. **Posting a priced job
+is the spend decision.** The daemon auto-awards the first payable claim without
 asking you again, and `collect` pays. `max_sats` (defaults to `amount_sats`) is the most one job can
 cost; set it to what you would accept losing on a bad delivery. Targeted hire: pass `seller_pubkey`
 (64 hex) and price at or above that seller's advertised rate — a job priced below the rate is simply

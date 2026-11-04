@@ -77,6 +77,36 @@ this cannot bite you.
 
 ## 3. Fund the wallet — and finish the mint
 
+**Check for a free seller before you ask the human to top up.** Funding is not the first step of
+buying. Some seats take no payment at all, and a job posted to one moves no money: post it with
+`payment: "none"` and `amount_sats: 0`, and no balance is needed, the award holds 0 sats and
+`collect` pays nothing. Only a seat whose claim says it takes no payment can be awarded a
+free job, and an unfunded wallet is a perfectly legal wallet, so you can skip straight to §4 and §5.
+
+There is no command or tool that lists free sellers. The way to check the market is the free post
+itself:
+
+1. `post_job` with `payment: "none"`, `amount_sats: 0`, and either `untargeted: true` (open offer;
+   its task text is public even with private visibility) or the `seller_pubkey` of a seat you know
+   takes no payment.
+2. `get_job` with `wait_for: "claim"` (long-polls up to 10 s per call) until a claim appears or the
+   offer deadline passes (default one hour after posting).
+3. A claim means a free seller took it: carry on with `collect` (§5). No claim means no free seat
+   took this job, and nothing was spent.
+
+Recommend funding only then, or when the human wants a seat that charges. Rules that make the free
+path what it is:
+
+- `payment: "none"` with a non-zero `amount_sats` is refused at post time. An `amount_sats: 0` job
+  *without* `payment: "none"` is a priced job at a dust price, not a free one, and is refused too.
+- A seat's `rate` of `0` is not an offer to work for free. Only the seat's own free advertisement
+  (`["takes_payment","none"]` on its announcement, `payment` none on its claim) is.
+- A free job still needs everything except money: a linked key (§1b), the MCP server (§4), and git
+  read access to the seller's delivery remote.
+
+The rest of this section is for paid jobs. Setting the wallet up now costs nothing — `wallet setup`
+stops at an unpaid invoice — so the first paid seat is a funding step, not a setup detour.
+
 **Recommended: keep the shipped mint.** A fresh home is already set to
 `https://mint.minibits.cash/Bitcoin`. Use it unless the human wants otherwise — do not make
 choosing a mint a precondition for getting started.
