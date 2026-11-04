@@ -280,6 +280,18 @@ pub fn identity(home: &std::path::Path) -> Result<nostr_sdk::Keys> {
     }
     Ok(nostr_sdk::Keys::parse(&fs::read_to_string(p)?)?)
 }
+/// This home's `trade.key` when it already exists. Never creates the key or the home: for
+/// read-only callers such as `doctor`.
+pub fn existing_identity(home: &std::path::Path) -> Result<Option<nostr_sdk::Keys>> {
+    let p = home.join("trade.key");
+    match fs::symlink_metadata(&p) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+        Ok(_) => Ok(Some(nostr_sdk::Keys::parse(
+            fs::read_to_string(&p)?.trim(),
+        )?)),
+    }
+}
 
 /// Read-only SQLite snapshot: no seed creation, migrations, recovery or owner lock.
 pub fn read_balance(home: &std::path::Path, mint: &str) -> Result<u64> {

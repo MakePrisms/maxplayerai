@@ -514,7 +514,8 @@ jobs:
           - suite: default
             group: lib + other binaries # ~360s
             targets: >-
-              --lib --bins --test auth_gated --test backoff --test cli --test e2e --test lifecycle
+              --lib --bins --test auth_gated --test doctor_members_relay --test backoff --test cli
+              --test e2e --test lifecycle
               --test money --test pinned_quote_recovery --test receive --test relays
               --test review_regressions --test round5 --test round7 --test send
               --test serve_receive --test serve_review_r2 --test serve_send_fund
@@ -589,6 +590,7 @@ jobs:
             group: lib + round5, e2e # ~400s
             targets: >-
               --lib --bins --test round5 --test e2e --test money --test auth_gated
+              --test doctor_members_relay
               --test lifecycle --test cli --test pinned_quote_recovery
             doc: true
           - suite: lab

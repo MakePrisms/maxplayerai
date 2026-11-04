@@ -9,7 +9,9 @@ same relay set during recovery. Use the binary's default relays unless deliberat
 configured; the defaults are `wss://relay.maxplayer.ai` first, then `wss://nos.lol`,
 `wss://relay.primal.net` and `wss://offchain.pub` as fallbacks. `relay.maxplayer.ai` stores lots
 and statuses only from signed-in relay members; a non-member's copy is refused there and the
-public relays carry it. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
+public relays carry it. To make a home's `trade.key` a member, link it with `maxplayer account
+link` and its trading-home option (crate README, "Default market relays"); that creates the key if
+the home has none yet. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
 backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
 Rate limiting pauses a relay for at least five minutes.
 A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
@@ -57,7 +59,10 @@ Never use a lab-feature binary for the human's funds.
 ## Doctor and admission diagnostics
 
 `doctor <mint> --mint-relay <url> --json` makes one read-only info request to that
-explicit nostr mint/relay pair. It needs no home and creates no seed or journal; no
+explicit nostr mint/relay pair. It needs no home and creates no seed or journal. With a
+global `--home` it signs as that home's existing `trade.key` (never created); without one,
+or when the home has no key yet, it signs with a throwaway key, which a sign-in-required relay
+such as `relay.maxplayer.ai` refuses (`signer` in the JSON says which). No
 market connection, keysets, swap, checkstate or restore probe. It re-sends the identical
 event every 5 s, like trade admission. `--timeout-seconds`
 changes only this read-only budget, never monetary windows.
