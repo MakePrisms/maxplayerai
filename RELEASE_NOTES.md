@@ -1,3 +1,32 @@
+## v0.7.3-rc1
+
+Release candidate for 0.7.3, cut so that `maxplayer account link --trade-home` can be tested
+without building the CLI from source. The only change to the `maxplayer` binary since v0.7.2 is
+#1252's `account --trade-home`. `maxplayer-trade` and `maxplayer-mint` are still not release
+binaries: build them from source at this tag. Client-only: no relay, registration-service or
+website redeploy is part of this release (relay-v5, which admits the trade kinds, is already
+deployed). After publication, install with `npm install -g maxplayer@0.7.3-rc1`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.7.2
+
+- **New: `maxplayer account link | status | marketing --trade-home <dir>`** (#1252). Registers
+  or checks a maxplayer-trade home's `<dir>/trade.key` instead of the agent key. relay.maxplayer.ai
+  admits only member keys, and trade listings and mint requests are signed with `trade.key`, so a
+  trading home must be linked before it can trade through our relay. `link` creates a missing
+  `trade.key` the same way `maxplayer-trade` does, so a home can be linked before its first
+  listing; `status` and `marketing` never create one. `--trade-home` and `--mint` are exclusive.
+- **maxplayer-trade (source only): `doctor` can sign as a home's `trade.key`** (#1252).
+  `maxplayer-trade --home <dir> doctor …` signs with that home's existing `trade.key`, so doctor
+  works against a members-only relay; without `--home`, or when the home has no key, it still
+  signs with a throwaway key and never creates one. The JSON reports the key used as `signer`.
+- **maxplayer-trade (source only): relay.maxplayer.ai is the first market relay** (#1251), with
+  the public relays kept as fallbacks. Needs relay-v5 (#1246), which admits LOT (3410) and
+  STATUS (3411) events.
+- Docs and site: free-seller check before telling buyers to top up (#1255); v0.7.2 accuracy
+  passes (#1247, #1249); swarm page hides the expected anonymous AUTH-refused warning (#1248);
+  challenges runner planner robustness (#1244, #1245).
+
 ## v0.7.2
 
 Stable patch release after v0.7.0, and the first published release carrying the v0.7.1
