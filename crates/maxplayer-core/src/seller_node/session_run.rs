@@ -824,11 +824,15 @@ impl SellerNodeRunner {
 
         // §6.1 step 2: the review runs while the container starts and loads the conversation.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let section = session::prompt_session_section();
+        let (prompt, reset_prompt) = turn_prompts(
+            &text,
+            &session::reset_history(&offer.task, &texts),
+            inline_allowed,
+        );
         let prompt = orch::SessionPrompt {
             nonce: nonce.clone(),
-            prompt: format!("{text}\n\n{section}"),
-            reset_prompt: format!("{}\n{section}", session::reset_history(&offer.task, &texts)),
+            prompt,
+            reset_prompt,
         };
         {
             let review = home.config.review.clone();
@@ -1389,6 +1393,33 @@ enum TurnDelivery {
     },
 }
 
+/// The two prompts of a session turn n ≥ 2 (§7.2): the follow-up sent into a resumed conversation,
+/// and the context-reset prompt sent when the conversation could not be reloaded.
+///
+/// BOTH restate the delivery rules. The turn-1 prompt states the ANSWER JOBS rule only once, and a
+/// follow-up must not rely on the agent still remembering it: a context reset (and, field case
+/// 2026-11-04, a runsc seat whose resume read back `messages=0`) starts a NEW conversation that
+/// never saw turn 1, so the agent answered without `MAXPLAYER-ANSWER-V1`, left no files, and the
+/// strict marker gate refused the turn `no_sentinel`. The rule is stated under the SAME condition
+/// the turn's delivery gate uses (`inline_allowed`), from the same source as turn 1
+/// ([`crate::seller_exec::inline_answer_rule`]), so prompt and gate cannot disagree and the wording
+/// cannot drift. The gate itself is untouched.
+fn turn_prompts(text: &str, reset_history: &str, inline_allowed: bool) -> (String, String) {
+    let session_section = session::prompt_session_section();
+    let rules = if inline_allowed {
+        format!(
+            "{}\n\n{session_section}",
+            crate::seller_exec::inline_answer_rule()
+        )
+    } else {
+        session_section
+    };
+    (
+        format!("{text}\n\n{rules}"),
+        format!("{reset_history}\n{rules}"),
+    )
+}
+
 struct TurnResult<'a> {
     job_id: &'a str,
     fid: &'a str,
@@ -1485,6 +1516,66 @@ mod tests {
         gate.poll(&dir, "nonce-2", "job").await;
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "released once");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Field case 2026-11-04 (runsc Claude seats): turn 2 ran in a NEW conversation that never saw
+    /// turn 1's ANSWER JOBS rule, the agent answered unmarked, and the strict gate refused it
+    /// `no_sentinel`. Every turn n >= 2 prompt (follow-up AND context reset) must restate the rule,
+    /// word for word from the turn-1 source, whenever the turn's delivery gate allows inline.
+    #[test]
+    fn every_session_turn_prompt_restates_the_answer_rule_when_inline_is_allowed() {
+        let rule = crate::seller_exec::inline_answer_rule();
+        let (followup, reset) =
+            turn_prompts("What is 2+2?", "The conversation could not be reloaded.", true);
+        let section = session::prompt_session_section();
+        // Exact bytes: the buyer's text (or the reset history) FIRST, then the shared rule, then
+        // the needs-input section, and nothing else. A `contains` check would still pass with the
+        // rule reordered, wrapped in text that neutralizes it, or followed by extra prose.
+        assert_eq!(followup, format!("What is 2+2?\n\n{rule}\n\n{section}"));
+        assert_eq!(
+            reset,
+            format!("The conversation could not be reloaded.\n{rule}\n\n{section}")
+        );
+        for (name, prompt) in [("follow-up", &followup), ("reset", &reset)] {
+            assert!(
+                prompt.contains(crate::engine::INLINE_ANSWER_MARKER),
+                "{name} prompt never names the marker"
+            );
+        }
+        // Turn 1 states the very same text, so the two cannot drift.
+        let turn_one =
+            crate::seller_exec::compose_agent_prompt("t", "r", 1_000, None, None, true, false);
+        assert!(turn_one.contains(&rule), "turn-1 prompt no longer uses the shared rule");
+    }
+
+    /// The rule follows the delivery gate: a git-only buyer (or a contribution) is never told to
+    /// answer inline, because the gate would refuse that answer and strike the harness for it.
+    #[test]
+    fn session_turn_prompts_omit_the_answer_rule_when_inline_is_not_allowed() {
+        let (followup, reset) = turn_prompts("do it", "history", false);
+        for prompt in [&followup, &reset] {
+            assert!(!prompt.contains("ANSWER JOBS"));
+            assert!(!prompt.contains(crate::engine::INLINE_ANSWER_MARKER));
+            assert!(prompt.contains(&session::prompt_session_section()));
+        }
+        assert_eq!(followup, format!("do it\n\n{}", session::prompt_session_section()));
+        assert_eq!(reset, format!("history\n{}", session::prompt_session_section()));
+    }
+
+    /// The gate stays strict: the fix is in the prompt, never in what the gate accepts. An unmarked
+    /// answer with no files is still refused; one that follows the restated rule is delivered.
+    #[test]
+    fn the_session_turn_gate_still_refuses_an_unmarked_answer() {
+        assert_eq!(
+            session::session_delivery_content(false, TurnStatus::Done, "4"),
+            None,
+            "an unmarked, file-less turn must stay refused (no_sentinel)"
+        );
+        let marked = format!("{}\n4", crate::engine::INLINE_ANSWER_MARKER);
+        assert!(matches!(
+            session::session_delivery_content(false, TurnStatus::Done, &marked),
+            Some(session::SessionDelivery::Inline(_))
+        ));
     }
 
     /// A review task that dies without a verdict withholds the prompt.
