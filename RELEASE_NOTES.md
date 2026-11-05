@@ -1,15 +1,31 @@
 ## v0.7.3-rc1
 
-Release candidate for 0.7.3, cut so that `maxplayer account link --trade-home` can be tested
-without building the CLI from source. The only change to the `maxplayer` binary since v0.7.2 is
-#1252's `account --trade-home`. `maxplayer-trade` and `maxplayer-mint` are still not release
-binaries: build them from source at this tag. Client-only: no relay, registration-service or
+Release candidate for 0.7.3, cut so that `maxplayer account link --trade-home` and the wallet's
+handling of tokens from a mint not yet in the wallet can be tested without building the CLI from
+source. The changes to the `maxplayer` binary since v0.7.2 are #1252's `account --trade-home` and
+#1259's `wallet receive --add-mint` / `wallet mints remove` balance guard. `maxplayer-trade`
+and `maxplayer-mint` are still not release binaries: build them from source at this tag. Client-only: no relay, registration-service or
 website redeploy is part of this release (relay-v5, which admits the trade kinds, is already
 deployed). After publication, install with `npm install -g maxplayer@0.7.3-rc1`.
 Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
 
 ### Changes since v0.7.2
 
+- **New: `maxplayer wallet receive` can add the token's mint** (#1259, fixes #1256). A token
+  from a mint not in the wallet (default + `extra_mints`) used to be refused with only a
+  `wallet mints add` hint. Now, on a terminal, receive asks
+  `Mint <url> is not in your wallet. Add it and receive? [y/N]`; only `y`/`yes` adds the mint to
+  `extra_mints` and receives in the same command, and any other answer (or EOF) refuses with the
+  config unchanged. `--add-mint` does the same without asking, for agents and scripts. It never
+  prompts when the token is read from stdin (`-`) or there is no terminal. The real-mint fence
+  (`allow_real_mints`) now runs first, so a refused real mint is never offered or added. The
+  default mint never changes. If the mint is added but the receive then fails, the mint stays
+  added and stderr names the `mints remove` command that undoes it. `added mint=…` goes to
+  stderr; stdout is still the single `received_sats=…` line.
+- **Changed: `maxplayer wallet mints remove` refuses while the mint holds a balance** (#1259),
+  naming the amount (spendable plus pending/reserved). `--force` removes it anyway; the balance
+  stays in the wallet but no job spends it until the mint is added back. A failed balance read
+  also refuses unless `--force`.
 - **New: `maxplayer account link | status | marketing --trade-home <dir>`** (#1252). Registers
   or checks a maxplayer-trade home's `<dir>/trade.key` instead of the agent key. relay.maxplayer.ai
   admits only member keys, and trade listings and mint requests are signed with `trade.key`, so a
@@ -26,6 +42,8 @@ Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
 - Docs and site: free-seller check before telling buyers to top up (#1255); v0.7.2 accuracy
   passes (#1247, #1249); swarm page hides the expected anonymous AUTH-refused warning (#1248);
   challenges runner planner robustness (#1244, #1245).
+- Relay host (not part of this release; ships with the next relay deploy): the systemd journal
+  is kept for 30 days (#1260).
 
 ## v0.7.2
 
