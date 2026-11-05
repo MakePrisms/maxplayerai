@@ -809,18 +809,13 @@ impl SellerNodeRunner {
             relay_url: seller.git_remote.clone(),
             push_token,
             handoff_nonce: nonce.clone(),
-            session: Some(orch::SessionInputs {
-                session_protocol: session::SESSION_PROTOCOL,
-                turn: n,
-                resume_acp_session_id: record.acp_session_id.clone(),
-                base_oid: record.base_oid.clone(),
-                wrap_up_unix: session::wrap_up_at(deadline, home.config.sessions.wrap_up_secs),
-                prompt_from_exchange: true,
-                agent_env_overrides: prepared.turn_env(),
-                // Bug 2 (§6.3): only a runsc seat treats an empty reload as a reset; every other
-                // seat keeps main's behaviour (and its inputs bytes: `false` is not serialized).
-                reset_on_empty_reload: session::seat_runs_runsc(home.config.sandbox.as_ref()),
-            }),
+            session: Some(followup_session_inputs(
+                &home.config,
+                &record,
+                n,
+                deadline,
+                prepared.turn_env(),
+            )),
         };
         orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)
             .map_err(setup)?;
@@ -1437,9 +1432,112 @@ struct TurnResult<'a> {
     delivery: TurnDelivery,
 }
 
+/// The session block of a follow-up turn's inputs file (§6.1). Bug 2 (§6.3): only a runsc seat sets
+/// `reset_on_empty_reload`; every other seat keeps main's behaviour, and — since `false` is not
+/// serialized — main's inputs bytes.
+fn followup_session_inputs(
+    config: &crate::home::MaxplayerConfig,
+    record: &SessionRecord,
+    n: u32,
+    deadline: u64,
+    agent_env_overrides: Vec<(String, String)>,
+) -> orch::SessionInputs {
+    orch::SessionInputs {
+        session_protocol: session::SESSION_PROTOCOL,
+        turn: n,
+        resume_acp_session_id: record.acp_session_id.clone(),
+        base_oid: record.base_oid.clone(),
+        wrap_up_unix: session::wrap_up_at(deadline, config.sessions.wrap_up_secs),
+        prompt_from_exchange: true,
+        agent_env_overrides,
+        reset_on_empty_reload: session::seat_runs_runsc(config.sandbox.as_ref()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bug 2 (Petar 15:33): the empty-reload reset is requested ONLY by a runsc seat. Every other seat
+    /// writes `reset_on_empty_reload = false`, which is not serialized: its follow-up inputs JSON
+    /// carries no new key, exactly as on main.
+    #[test]
+    fn followup_inputs_request_the_empty_reload_reset_only_on_runsc() {
+        use crate::home::{SandboxConfig, SandboxMode};
+        let record = SessionRecord {
+            job_id: "j".into(),
+            buyer_pubkey: "b".into(),
+            container: "c".into(),
+            holder: None,
+            holder_started_at: None,
+            image_id: String::new(),
+            orchestrator_version: String::new(),
+            acp_session_id: Some("acp-1".into()),
+            harness: "claude".into(),
+            model: None,
+            turn: 1,
+            last_turn_at: 0,
+            disk_bytes: 0,
+            state: SessionState::Parked,
+            proxy_host: None,
+            base_oid: Some("0".repeat(40)),
+            holder_egress_dev: None,
+            holder_classifier: None,
+            holder_proxy_ports: None,
+        };
+        let mut config = crate::home::MaxplayerConfig::default();
+        config.sessions.enabled = true;
+        let docker = SandboxConfig {
+            mode: SandboxMode::Docker,
+            ..Default::default()
+        };
+        config.sandbox = Some(SandboxConfig {
+            runtime: Some("runsc".into()),
+            ..docker.clone()
+        });
+        let runsc = followup_session_inputs(&config, &record, 2, 0, Vec::new());
+        assert!(runsc.reset_on_empty_reload);
+        assert!(
+            serde_json::to_string(&runsc)
+                .unwrap()
+                .contains("reset_on_empty_reload")
+        );
+        for (label, sandbox) in [
+            (
+                "runtime unset",
+                Some(SandboxConfig {
+                    runtime: None,
+                    ..docker.clone()
+                }),
+            ),
+            (
+                "runtime runc",
+                Some(SandboxConfig {
+                    runtime: Some("runc".into()),
+                    ..docker.clone()
+                }),
+            ),
+            (
+                "launcher",
+                Some(SandboxConfig {
+                    mode: SandboxMode::Launcher,
+                    runtime: Some("runsc".into()),
+                    ..Default::default()
+                }),
+            ),
+            ("no sandbox", None),
+        ] {
+            config.sandbox = sandbox;
+            let inputs = followup_session_inputs(&config, &record, 2, 0, Vec::new());
+            assert!(!inputs.reset_on_empty_reload, "{label}");
+            let json = serde_json::to_string(&inputs).unwrap();
+            assert!(
+                !json.contains("reset_on_empty_reload"),
+                "{label}: main's bytes: {json}"
+            );
+            assert_eq!(inputs.resume_acp_session_id.as_deref(), Some("acp-1"));
+        }
+    }
 
     fn exchange(tag: &str) -> std::path::PathBuf {
         let dir =
