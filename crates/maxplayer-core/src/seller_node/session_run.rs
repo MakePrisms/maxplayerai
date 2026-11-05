@@ -1527,20 +1527,21 @@ mod tests {
         let rule = crate::seller_exec::inline_answer_rule();
         let (followup, reset) =
             turn_prompts("What is 2+2?", "The conversation could not be reloaded.", true);
+        let section = session::prompt_session_section();
+        // Exact bytes: the buyer's text (or the reset history) FIRST, then the shared rule, then
+        // the needs-input section, and nothing else. A `contains` check would still pass with the
+        // rule reordered, wrapped in text that neutralizes it, or followed by extra prose.
+        assert_eq!(followup, format!("What is 2+2?\n\n{rule}\n\n{section}"));
+        assert_eq!(
+            reset,
+            format!("The conversation could not be reloaded.\n{rule}\n\n{section}")
+        );
         for (name, prompt) in [("follow-up", &followup), ("reset", &reset)] {
-            assert!(prompt.contains(&rule), "{name} prompt lacks the shared ANSWER JOBS rule");
             assert!(
                 prompt.contains(crate::engine::INLINE_ANSWER_MARKER),
                 "{name} prompt never names the marker"
             );
-            assert!(
-                prompt.contains(&session::prompt_session_section()),
-                "{name} prompt lost the needs-input section"
-            );
         }
-        // The buyer's text and the reset history stay FIRST: our prose never pushes them down.
-        assert!(followup.starts_with("What is 2+2?\n\n"));
-        assert!(reset.starts_with("The conversation could not be reloaded.\n"));
         // Turn 1 states the very same text, so the two cannot drift.
         let turn_one =
             crate::seller_exec::compose_agent_prompt("t", "r", 1_000, None, None, true, false);
