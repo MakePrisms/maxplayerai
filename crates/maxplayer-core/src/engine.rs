@@ -139,7 +139,8 @@ pub struct SessionTurnOutcome {
     pub run: RunOutcome,
     /// The session the turn ran in: recorded for the next turn's `session/load`.
     pub session_id: crate::driver::SessionId,
-    /// The previous conversation could not be reloaded and a new one was started (§6.3).
+    /// The previous conversation could not be reloaded — the load failed, was unsupported, or
+    /// answered with an empty history — and a new one was started (§6.3).
     pub context_reset: bool,
     /// The wrap-up cancel fired before the turn ended on its own (§4, `out_of_time`).
     pub cancelled_for_wrap_up: bool,
@@ -196,11 +197,17 @@ async fn run_session_turn<D: Driver>(
 
     // §6.3: reload only when the agent advertised it and an id was recorded; any failure falls back
     // to a new conversation in the same container (files and tools stay) and says so.
+    //
+    // A load that SUCCEEDS but replays no history is a failure too. A recorded id means turn 1 ran,
+    // so a real reload replays at least its user message; an empty replay is an agent that lost its
+    // transcript and kept the id (a parked container restarted under gVisor's default rootfs
+    // overlay). Prompting it would hand the follow-up to an empty conversation with no task, and
+    // tell the buyer the context was kept. Reset instead, so the prompt restates the task.
     let (session_id, context_reset) = match params.resume.as_ref() {
         Some(id) if driver.supports_load_session() => {
             match driver.load_session(params.session_config.clone(), id).await {
-                Ok(loaded) => (loaded, false),
-                Err(_) => (driver.start_session(params.session_config).await?, true),
+                Ok(loaded) if loaded.replayed_history > 0 => (loaded.session_id, false),
+                Ok(_) | Err(_) => (driver.start_session(params.session_config).await?, true),
             }
         }
         Some(_) => (driver.start_session(params.session_config).await?, true),
@@ -1495,6 +1502,90 @@ mod tests {
         .expect("turn"));
         assert!(driver.load_calls().is_empty());
         assert!(!out.context_reset);
+    }
+
+    /// Bug 2 (gVisor, docs/specs/session-jobs.md §6.3): a `session/load` that SUCCEEDS but replays
+    /// no history reloaded an empty conversation. It must be treated like a failed load — a new
+    /// session, `context_reset`, and the release told so before the prompt exists — never as a kept
+    /// conversation. Positive control: the same load replaying history keeps the conversation.
+    #[test]
+    fn an_empty_reload_is_a_context_reset() {
+        let done = vec![SessionUpdate::TurnEnded(StopReason::Completed)];
+        // Empty replay: the load answers (and consumes its script), then `session/new` runs.
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![
+                session_script("acp-1", done.clone()),
+                session_script("fresh", done.clone()),
+            ],
+        )
+        .with_load_replay(0);
+        let mut log = EventLog::open(test_path("session-load-empty")).expect("open log");
+        let mut reset_seen = None;
+        let release: Box<super::PromptRelease<'_>> = Box::new(|reset| {
+            reset_seen = Some(reset);
+            Ok(Some(RunParams::mock_defaults().prompt))
+        });
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(Some("acp-1"), None),
+            release,
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert_eq!(driver.load_calls(), &["acp-1".to_owned()]);
+        assert_eq!(
+            driver.new_calls(),
+            1,
+            "an empty reload falls back to session/new"
+        );
+        assert!(
+            out.context_reset,
+            "an empty reload must be reported as a reset"
+        );
+        assert_eq!(out.session_id, "fresh");
+        assert_eq!(
+            reset_seen,
+            Some(true),
+            "the release must choose the reset prompt (original task + follow-ups)"
+        );
+        assert_eq!(
+            driver
+                .prompt_history()
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"],
+            "the follow-up never reaches the empty reloaded conversation"
+        );
+
+        // Positive control: the same load replaying history keeps the conversation.
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script("acp-1", done)],
+        )
+        .with_load_replay(7);
+        let mut log = EventLog::open(test_path("session-load-replayed")).expect("open log");
+        let mut reset_seen = None;
+        let release: Box<super::PromptRelease<'_>> = Box::new(|reset| {
+            reset_seen = Some(reset);
+            Ok(Some(RunParams::mock_defaults().prompt))
+        });
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(Some("acp-1"), None),
+            release,
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert_eq!(driver.new_calls(), 0);
+        assert!(!out.context_reset);
+        assert_eq!(out.session_id, "acp-1");
+        assert_eq!(reset_seen, Some(false));
     }
 
     /// Failure test 5 (orchestrator half): a withheld prompt never reaches the agent.
