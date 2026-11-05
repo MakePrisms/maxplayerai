@@ -109,7 +109,15 @@ choosing a mint a precondition for getting started.
 
 `--mint` selects the mint for **that one command** — it is not a pin. The default is the first entry
 of `accepted_mints` in `$MAXPLAYER_HOME/config.toml`; edit that (or set `MAXPLAYER_ACCEPTED_MINTS`)
-to move it for good. `wallet mints remove` refuses to remove the default.
+to move it for good. `wallet mints remove` refuses to remove the default, and refuses any mint that
+still holds a balance (it names the amount). `--force` removes it anyway: the balance stays in the
+wallet, but no job spends it until the mint is added back.
+
+A token from a mint the wallet does not have yet (a seller's credits, say) is refused by
+`wallet receive`, and the token stays unredeemed. To add the mint and receive in one step, pass
+`--add-mint`: `maxplayer wallet receive --add-mint --token-file <path>`. Only a human on a
+terminal is asked instead. Adding a mint lets the wallet pay jobs from it, so check with the
+human before you add one.
 
 This is the step with a hole in it. `wallet setup` does **not** leave you funded:
 

@@ -48,6 +48,26 @@ pub enum WalletOpsError {
     MintPinnedDefault {
         mint_url: String,
     },
+    /// `receive` refused a token whose mint is not in this home's configured set (#1256). Checked
+    /// before redeeming, so the token is untouched. Unlike [`Self::MintNotAllowed`] it names the
+    /// receive-only remedy `--add-mint` too.
+    ReceiveMintNotConfigured {
+        mint_url: String,
+        default_mint: String,
+    },
+    /// `remove_mint` without `force` refused: the wallet database still holds this balance at the
+    /// mint (#1256). Removing it would strand the proofs: they stay in the database as an
+    /// unconfigured row that `crossmint::select_source_mint` never spends.
+    MintHoldsBalance {
+        mint_url: String,
+        holdings: MintHoldings,
+    },
+    /// `remove_mint` without `force` refused because the balance at the mint could not be read
+    /// (#1256). Fails closed: an unknown balance is treated as one that may be stranded.
+    MintBalanceUnreadable {
+        mint_url: String,
+        error: String,
+    },
     /// A melt run under a [`MeltCeiling`] was REFUSED before any proof was selected, prepared or
     /// spent: the quote the mint raised at payment time would take more out of the wallet than the
     /// caller's hard maximum, or quoted a different invoice amount than the caller planned. The
@@ -121,6 +141,39 @@ impl std::fmt::Display for WalletOpsError {
                 formatter,
                 "cannot remove the default mint ({mint_url}); only extra_mints are removable"
             ),
+            Self::ReceiveMintNotConfigured {
+                mint_url,
+                default_mint,
+            } => write!(
+                formatter,
+                "mint {mint_url} is not in your wallet; the token was not redeemed. Rerun \
+                 `maxplayer wallet receive` with --add-mint to add the mint and receive in one step, \
+                 or add it first with `maxplayer wallet mints add {mint_url}` (default stays {default_mint})"
+            ),
+            Self::MintHoldsBalance { mint_url, holdings } => {
+                write!(
+                    formatter,
+                    "mint {mint_url} still holds {} sats in this wallet",
+                    holdings.total_sats()
+                )?;
+                if holdings.in_flight_sats > 0 {
+                    write!(
+                        formatter,
+                        " ({} spendable, {} pending or reserved)",
+                        holdings.spendable_sats, holdings.in_flight_sats
+                    )?;
+                }
+                write!(
+                    formatter,
+                    "; not removed. Spend or send it first, or pass --force to remove the mint anyway \
+                     ({REMOVED_BALANCE_STAYS})"
+                )
+            }
+            Self::MintBalanceUnreadable { mint_url, error } => write!(
+                formatter,
+                "cannot read the balance at mint {mint_url} ({error}); not removed. Pass --force to \
+                 remove the mint anyway (any {REMOVED_BALANCE_STAYS})"
+            ),
             Self::MeltExceedsCeiling {
                 mint_url,
                 quote_id,
@@ -185,6 +238,46 @@ impl From<HomeError> for WalletOpsError {
     fn from(value: HomeError) -> Self {
         Self::Home(value)
     }
+}
+
+/// What `--force` leaves behind when it removes a mint that holds money. Shared by the refusal and
+/// the forced-removal note so the two never describe the consequence differently.
+pub const REMOVED_BALANCE_STAYS: &str =
+    "balance stays in the wallet, but no job will spend it until the mint is added back";
+
+/// Money the wallet database holds at one mint, in sats (#1256 `mints remove` guard).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MintHoldings {
+    /// `Unspent` proofs: the figure `wallet balance` shows for the mint.
+    pub spendable_sats: u64,
+    /// `Pending`, `Reserved` and `PendingSpent` proofs: in-flight sends, melts and job payments.
+    pub in_flight_sats: u64,
+}
+
+impl MintHoldings {
+    pub fn total_sats(&self) -> u64 {
+        self.spendable_sats.saturating_add(self.in_flight_sats)
+    }
+}
+
+/// What [`remove_mint`] found at the mint it removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemovedBalance {
+    /// The wallet held nothing at the mint.
+    Empty,
+    /// `force` removed a mint that still holds this balance; the proofs stay in the wallet database.
+    Kept(MintHoldings),
+    /// `force` removed the mint without a balance figure: the read failed with this error.
+    Unknown(String),
+}
+
+/// The mint a cashu token would be redeemed at, read WITHOUT redeeming it (#1256).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenMint {
+    /// Normalized mint URL.
+    pub mint_url: String,
+    /// Whether the mint is in this home's configured set (default + `extra_mints`).
+    pub configured: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -806,6 +899,70 @@ fn mint_is_allowed(home: &MaxplayerHome, mint_url: &str) -> Result<String, Walle
     }
 }
 
+/// Read the mint a cashu token would be redeemed at, WITHOUT redeeming it, and apply the real-mint
+/// fence first (#1256). A mint `allow_real_mints` refuses is reported as
+/// [`WalletOpsError::RealMintDisallowed`] whether or not it is configured, so a caller never offers
+/// to add (or adds) a mint that receive would refuse anyway. `configured` tells the caller whether
+/// the mint must be added before [`receive_async`] accepts the token. Offline: no wallet is opened.
+/// Errors never quote the token.
+pub fn receive_token_mint(home: &MaxplayerHome, token: &str) -> Result<TokenMint, WalletOpsError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(WalletOpsError::Wallet("token is empty".into()));
+    }
+    let parsed = Token::from_str(token)
+        .map_err(|error| WalletOpsError::Wallet(format!("invalid cashu token: {error}")))?;
+    let raw = parsed
+        .mint_url()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
+        .to_string();
+    let mint_url = normalize_mint_url(&raw)?;
+    // Real-mint fence (issue #49) BEFORE membership: `mints add` cannot clear it, so a membership
+    // miss must never be reported (or prompted for) when the fence would refuse the mint anyway.
+    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
+        return Err(WalletOpsError::RealMintDisallowed { mint_url });
+    }
+    let configured = configured_mints(home)?
+        .iter()
+        .any(|entry| entry == &mint_url);
+    Ok(TokenMint {
+        mint_url,
+        configured,
+    })
+}
+
+/// Money the shared wallet database holds at `mint_url`: unspent plus in-flight sat proofs. One
+/// store open, no network, no seed.
+pub async fn mint_holdings_async(
+    home: &MaxplayerHome,
+    mint_url: &str,
+) -> Result<MintHoldings, WalletOpsError> {
+    let mint = MintUrl::from_str(&normalize_mint_url(mint_url)?)
+        .map_err(|error| WalletOpsError::Wallet(format!("invalid mint URL: {error}")))?;
+    let store = open_balance_store(home).await?;
+    let read = |states: Vec<cashu::State>| {
+        let store = &store;
+        let mint = mint.clone();
+        async move {
+            store
+                .get_balance(Some(mint), Some(CurrencyUnit::Sat), Some(states))
+                .await
+                .map_err(|error| WalletOpsError::Wallet(error.to_string()))
+        }
+    };
+    let spendable_sats = read(vec![cashu::State::Unspent]).await?;
+    let in_flight_sats = read(vec![
+        cashu::State::Pending,
+        cashu::State::Reserved,
+        cashu::State::PendingSpent,
+    ])
+    .await?;
+    Ok(MintHoldings {
+        spendable_sats,
+        in_flight_sats,
+    })
+}
+
 /// Resolve the reported post-confirm balance from a balance-read result (finding U). A cashu
 /// `confirm` is the effect boundary — the ecash has already moved — so a read failure, or a
 /// stale/equal balance, must NEVER make the caller discard the confirmed token/outcome: report the
@@ -1254,19 +1411,18 @@ pub async fn receive_async(
     if token.is_empty() {
         return Err(WalletOpsError::Wallet("token is empty".into()));
     }
-    let parsed = Token::from_str(token)
-        .map_err(|error| WalletOpsError::Wallet(format!("invalid cashu token: {error}")))?;
-    let mint_url = parsed
-        .mint_url()
-        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?
-        .to_string();
-    let mint_url = mint_is_allowed(home, &mint_url)?;
-    // Real-mint fence (issue #49): `mint_is_allowed` only checks the mint is in the CONFIGURED list;
-    // this additionally fails closed on a real mint unless the operator opted in, the same gate
-    // send/melt enforce. Without it a real mint left in the configured list would redeem while
-    // `allow_real_mints == false`.
-    if !home::mint_allowed(&mint_url, home.config.allow_real_mints) {
-        return Err(WalletOpsError::RealMintDisallowed { mint_url });
+    // Real-mint fence (issue #49) first, then membership (#1256): a real mint left in the configured
+    // list must not redeem while `allow_real_mints == false`, and an unconfigured mint the fence
+    // refuses must not be answered with an `add it` remedy that cannot work.
+    let TokenMint {
+        mint_url,
+        configured,
+    } = receive_token_mint(home, token)?;
+    if !configured {
+        return Err(WalletOpsError::ReceiveMintNotConfigured {
+            mint_url,
+            default_mint: home.config.default_mint().to_string(),
+        });
     }
     let wallet = open_wallet_async(home, &mint_url).await?;
     let before = wallet
@@ -2096,7 +2252,31 @@ pub fn add_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<String, Wall
 }
 
 /// Remove an opt-in extra mint. Default mint is pinned and cannot be removed.
-pub fn remove_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<(), WalletOpsError> {
+///
+/// #1256: while the wallet database holds a balance at the mint (spendable or in flight), the
+/// removal is refused with [`WalletOpsError::MintHoldsBalance`], because the proofs would stay as an
+/// unconfigured row no job spends. An unreadable balance refuses too
+/// ([`WalletOpsError::MintBalanceUnreadable`], fail closed). `force` removes anyway and reports what
+/// stayed behind; the proofs are never touched.
+pub fn remove_mint(
+    home: &mut MaxplayerHome,
+    mint_url: &str,
+    force: bool,
+) -> Result<RemovedBalance, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("remove_mint").map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(remove_mint_async(home, mint_url, force))
+}
+
+/// Async form of [`remove_mint`].
+pub async fn remove_mint_async(
+    home: &mut MaxplayerHome,
+    mint_url: &str,
+    force: bool,
+) -> Result<RemovedBalance, WalletOpsError> {
     let normalized = normalize_mint_url(mint_url)?;
     let default = normalize_mint_url(home.config.default_mint())?;
     if normalized == default {
@@ -2113,13 +2293,30 @@ pub fn remove_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<(), Walle
             default_mint: home.config.default_mint().to_string(),
         });
     }
+    let removed = match mint_holdings_async(home, &normalized).await {
+        Ok(holdings) if holdings.total_sats() == 0 => RemovedBalance::Empty,
+        Ok(holdings) if force => RemovedBalance::Kept(holdings),
+        Ok(holdings) => {
+            return Err(WalletOpsError::MintHoldsBalance {
+                mint_url: normalized,
+                holdings,
+            });
+        }
+        Err(error) if force => RemovedBalance::Unknown(error.to_string()),
+        Err(error) => {
+            return Err(WalletOpsError::MintBalanceUnreadable {
+                mint_url: normalized,
+                error: error.to_string(),
+            });
+        }
+    };
     let to_remove = normalized.clone();
     home::save_config(home, |config| {
         config
             .extra_mints
             .retain(|entry| normalize_mint_url(entry).ok().as_deref() != Some(to_remove.as_str()));
     })?;
-    Ok(())
+    Ok(removed)
 }
 
 pub fn balances_blocking(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsError> {
@@ -2668,10 +2865,14 @@ mod tests {
         assert_eq!(added, "https://example.mint.test");
         assert_eq!(list_mints(&home).expect("list2").len(), 2);
 
-        let err = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL).expect_err("pin");
+        let err =
+            remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL, false).expect_err("pin");
         assert!(matches!(err, WalletOpsError::MintPinnedDefault { .. }));
 
-        remove_mint(&mut home, "https://example.mint.test").expect("remove");
+        assert_eq!(
+            remove_mint(&mut home, "https://example.mint.test", false).expect("remove"),
+            RemovedBalance::Empty
+        );
         assert_eq!(list_mints(&home).expect("list3").len(), 1);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2737,7 +2938,7 @@ mod tests {
         assert_eq!(default, crate::home::DEFAULT_MINIBITS_MINT_URL);
         assert_ne!(default, crate::home::DEFAULT_MINT_URL);
 
-        let message = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL)
+        let message = remove_mint(&mut home, crate::home::DEFAULT_MINIBITS_MINT_URL, false)
             .expect_err("removing the pinned default must error")
             .to_string();
         assert!(
@@ -3086,4 +3287,204 @@ mod tests {
         assert!(refuse_nostr_melt("https://mint.example").is_ok());
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // BEGIN #1256 tests
+    fn token_at_1256(mint_url: &str) -> String {
+        use cashu::secret::Secret;
+        use cashu::{Amount, Id, Proof, SecretKey};
+        let proof = Proof::new(
+            Amount::from(5),
+            Id::from_str("009a1f293253e41e").expect("keyset id"),
+            Secret::new("issue-1256-core"),
+            SecretKey::generate().public_key(),
+        );
+        Token::new(
+            MintUrl::from_str(mint_url).expect("mint url"),
+            vec![proof],
+            None,
+            CurrencyUnit::Sat,
+        )
+        .to_string()
+    }
+
+    async fn seed_proof_1256(
+        home: &MaxplayerHome,
+        mint_url: &str,
+        amount: u64,
+        state: cashu::State,
+    ) {
+        use cashu::secret::Secret;
+        use cashu::{Amount, Id, Proof, SecretKey};
+        use cdk::wallet::types::ProofInfo;
+        let store = WalletSqliteDatabase::new(sqlite_path(&home.wallet_dir))
+            .await
+            .expect("open on-disk wallet database");
+        let proof = Proof::new(
+            Amount::from(amount),
+            Id::from_str("009a1f293253e41e").expect("keyset id"),
+            Secret::new(format!("issue-1256-{mint_url}-{amount}-{state:?}")),
+            SecretKey::generate().public_key(),
+        );
+        let info = ProofInfo::new(
+            proof,
+            MintUrl::from_str(mint_url).expect("mint url"),
+            state,
+            CurrencyUnit::Sat,
+        )
+        .expect("proof info");
+        store
+            .update_proofs(vec![info], vec![])
+            .await
+            .expect("seed proof");
+    }
+
+    // #1256: the real-mint fence runs before membership, so an unconfigured mint the fence refuses
+    // is RealMintDisallowed (no `add it` remedy), and the read never redeems or opens a wallet.
+    // RED if membership is checked first.
+    #[test]
+    fn receive_token_mint_applies_the_fence_before_membership() {
+        let root = temp_home("1256-token-mint");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let token = token_at_1256("https://unlisted-mint.example/");
+
+        let read = receive_token_mint(&home, &token).expect("fence admits real mints by default");
+        assert_eq!(read.mint_url, "https://unlisted-mint.example");
+        assert!(!read.configured);
+
+        home.config.allow_real_mints = false;
+        let err = receive_token_mint(&home, &token).expect_err("fenced");
+        assert!(
+            matches!(&err, WalletOpsError::RealMintDisallowed { mint_url } if mint_url == "https://unlisted-mint.example"),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("mints add"), "{err}");
+
+        home.config.allow_real_mints = true;
+        home.config.extra_mints = vec!["https://unlisted-mint.example/".into()];
+        assert!(
+            receive_token_mint(&home, &token)
+                .expect("configured")
+                .configured
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1256: an unconfigured (fence-admitted) mint is refused before redeeming, naming --add-mint
+    // and the exact `mints add <url>` command.
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_refuses_unconfigured_mint_naming_both_remedies() {
+        let root = temp_home("1256-receive-unconfigured");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let token = token_at_1256("https://unlisted-mint.example/");
+        let err = receive_async(&home, &token)
+            .await
+            .expect_err("unconfigured");
+        assert!(
+            matches!(&err, WalletOpsError::ReceiveMintNotConfigured { mint_url, .. } if mint_url == "https://unlisted-mint.example"),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("--add-mint"), "{message}");
+        assert!(
+            message.contains("maxplayer wallet mints add https://unlisted-mint.example"),
+            "{message}"
+        );
+        assert!(!message.contains(&token));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1256: remove_mint refuses while the DB holds money at the mint (spendable or in flight),
+    // removes with `force` and reports what stayed; the proofs are untouched.
+    #[test]
+    fn remove_mint_guards_a_balance_and_force_keeps_the_proofs() {
+        let root = temp_home("1256-remove-guard");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let mint = "https://held-mint.example";
+        add_mint(&mut home, mint).expect("add");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(seed_proof_1256(&home, mint, 30, cashu::State::Unspent));
+        runtime.block_on(seed_proof_1256(&home, mint, 8, cashu::State::Reserved));
+
+        let err = remove_mint(&mut home, mint, false).expect_err("holds a balance");
+        let want = MintHoldings {
+            spendable_sats: 30,
+            in_flight_sats: 8,
+        };
+        assert!(
+            matches!(&err, WalletOpsError::MintHoldsBalance { holdings, .. } if *holdings == want),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("still holds 38 sats"), "{message}");
+        assert!(
+            message.contains("30 spendable, 8 pending or reserved"),
+            "{message}"
+        );
+        assert!(message.contains("--force"), "{message}");
+        assert_eq!(configured_mints(&home).expect("mints").len(), 2);
+
+        assert_eq!(
+            remove_mint(&mut home, mint, true).expect("forced"),
+            RemovedBalance::Kept(want)
+        );
+        assert_eq!(configured_mints(&home).expect("mints").len(), 1);
+        let held = runtime
+            .block_on(mint_holdings_async(&home, mint))
+            .expect("read");
+        assert_eq!(held, want, "force never touches the proofs");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1256: an in-flight-only balance still blocks (a pending job payment is money at the mint).
+    #[test]
+    fn remove_mint_counts_in_flight_proofs() {
+        let root = temp_home("1256-remove-in-flight");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let mint = "https://pending-mint.example";
+        add_mint(&mut home, mint).expect("add");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(seed_proof_1256(&home, mint, 4, cashu::State::Pending));
+        let err = remove_mint(&mut home, mint, false).expect_err("in flight");
+        assert!(err.to_string().contains("still holds 4 sats"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1256: an unreadable balance fails closed; `force` still removes and reports Unknown.
+    #[test]
+    fn remove_mint_fails_closed_when_the_balance_is_unreadable() {
+        let root = temp_home("1256-remove-unreadable");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        let mint = "https://unread-mint.example";
+        add_mint(&mut home, mint).expect("add");
+        let db = sqlite_path(&home.wallet_dir);
+        let _ = std::fs::remove_file(&db);
+        std::fs::create_dir_all(&db).expect("a directory where the database should be");
+
+        let err = remove_mint(&mut home, mint, false).expect_err("unreadable");
+        assert!(
+            matches!(&err, WalletOpsError::MintBalanceUnreadable { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("--force"), "{err}");
+        assert_eq!(configured_mints(&home).expect("mints").len(), 2);
+
+        assert!(matches!(
+            remove_mint(&mut home, mint, true).expect("forced"),
+            RemovedBalance::Unknown(_)
+        ));
+        assert_eq!(configured_mints(&home).expect("mints").len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END #1256 tests
 }
