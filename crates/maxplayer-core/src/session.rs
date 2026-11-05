@@ -992,6 +992,17 @@ impl RunscOverlayGate {
     }
 }
 
+/// Whether an awarded job runs as a SESSION (parks after turn 1): sessions enabled, the gate not
+/// closed NOW, and this seat's claim advertised `["session","1"]`. A gate that closed after the
+/// claim runs the job single-turn rather than parking a container whose rootfs would not survive.
+pub fn runs_as_session(
+    cfg: &SessionsConfig,
+    runsc_gate: &RunscOverlayGate,
+    claim_advertised: bool,
+) -> bool {
+    cfg.enabled && runsc_gate.allows_sessions() && claim_advertised
+}
+
 /// Whether the gate applies: `[sessions] enabled`, `mode = "docker"` and `runtime = "runsc"`
 /// (trimmed, as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and
 /// never asks docker anything.

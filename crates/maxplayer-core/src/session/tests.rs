@@ -867,3 +867,28 @@ fn closed_runsc_gate_keeps_the_session_tag_off_the_claim() {
         assert!(claim_supports_sessions(&claim.tags), "{open:?}");
     }
 }
+
+/// A gate that closed between claim and execution runs the job single-turn (never parks).
+#[test]
+fn closed_runsc_gate_runs_an_advertised_job_single_turn() {
+    let closed = runsc_overlay_gate(true, Err("docker daemon did not answer"));
+    assert!(
+        !runs_as_session(&on(), &closed, true),
+        "closed gate: no park"
+    );
+    assert!(runs_as_session(&on(), &RunscOverlayGate::Open, true));
+    assert!(runs_as_session(
+        &on(),
+        &RunscOverlayGate::NotApplicable,
+        true
+    ));
+    assert!(
+        !runs_as_session(&on(), &RunscOverlayGate::Open, false),
+        "not advertised"
+    );
+    assert!(!runs_as_session(
+        &SessionsConfig::default(),
+        &RunscOverlayGate::Open,
+        true
+    ));
+}

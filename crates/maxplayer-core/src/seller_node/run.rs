@@ -9862,13 +9862,14 @@ impl SellerNodeRunner {
         let sessions_config = &self.node.home().config.sessions;
         // §5.6: a gate that closed after the claim (the daemon lost `--overlay2=none`) runs the
         // job single-turn rather than parking a container whose rootfs would not survive.
-        let session_job = sessions_config.enabled
-            && self.runsc_gate().allows_sessions()
-            && self
-                .node
+        let session_job = crate::session::runs_as_session(
+            sessions_config,
+            &self.runsc_gate(),
+            self.node
                 .store()
                 .claim_advertised_session(job_id)
-                .unwrap_or(false);
+                .unwrap_or(false),
+        );
         let prompt = if session_job {
             format!("{prompt}\n\n{}", crate::session::prompt_session_section())
         } else {
