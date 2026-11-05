@@ -3370,6 +3370,16 @@ mod tests {
         agent: AgentCommand,
         resume: Option<&str>,
     ) -> (Option<String>, Vec<SessionUpdate>, bool) {
+        session_turn_on(agent, resume, false).await
+    }
+
+    /// [`session_turn`] with the seat's runtime rule: `runsc = true` is the bug-2 empty-reload
+    /// reset; `false` is main's rule (every non-runsc seat).
+    async fn session_turn_on(
+        agent: AgentCommand,
+        resume: Option<&str>,
+        runsc: bool,
+    ) -> (Option<String>, Vec<SessionUpdate>, bool) {
         use crate::engine::{AgentMessageCapture, RunEvent, SessionTurnEnd, SessionTurnParams};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut driver = AcpDriver::new(agent, PermissionOutcome::Allow, Duration::from_secs(10));
@@ -3393,6 +3403,7 @@ mod tests {
                 },
                 resume: resume.map(str::to_owned),
                 wrap_up_at: None,
+                reset_on_empty_reload: runsc,
             },
             Box::new(|_reset| {
                 Ok(Some(PromptTurn {
@@ -3536,7 +3547,7 @@ mod tests {
             ("housekeeping only", &housekeeping[..]),
         ] {
             let (message, _, reset) =
-                session_turn(replaying_stub(replay, &answer), Some("s1")).await;
+                session_turn_on(replaying_stub(replay, &answer), Some("s1"), true).await;
             assert!(
                 reset,
                 "a load replaying {label} reloaded an empty conversation"
@@ -3548,15 +3559,29 @@ mod tests {
             );
         }
         // Positive control in the same test: one replayed user message keeps the conversation.
-        let (_, _, reset) = session_turn(
+        let (_, _, reset) = session_turn_on(
             replaying_stub(
                 &[wire_update("user_message_chunk", "remember 934")],
                 &answer,
             ),
             Some("s1"),
+            true,
         )
         .await;
         assert!(!reset, "a load that replays history keeps the conversation");
+        // Non-runsc seats: the SAME empty reload keeps the conversation, exactly as on main.
+        for (label, replay) in [
+            ("nothing", &[][..]),
+            ("housekeeping only", &housekeeping[..]),
+        ] {
+            let (message, _, reset) =
+                session_turn_on(replaying_stub(replay, &answer), Some("s1"), false).await;
+            assert!(!reset, "off runsc, a load replaying {label} is not a reset (main)");
+            assert_eq!(
+                message.as_deref(),
+                Some(format!("{INLINE_ANSWER}\nT2|935").as_str())
+            );
+        }
     }
 
     /// The history classifier: messages, thoughts, tool calls and plans are history; session

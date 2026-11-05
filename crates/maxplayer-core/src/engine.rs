@@ -131,6 +131,11 @@ pub struct SessionTurnParams {
     /// The wall-clock instant of the wrap-up `session/cancel` (§4); `None` = never. Slot wait,
     /// review and `session/load` all count against it.
     pub wrap_up_at: Option<std::time::SystemTime>,
+    /// Bug 2 (§6.3): treat a `session/load` that answers with NO replayed history as a failed
+    /// reload. Set ONLY on runsc seats (`session::seat_runs_runsc`); `false` is main's behaviour,
+    /// where any successful load keeps the conversation (an adapter that does not replay history
+    /// would otherwise reset every turn).
+    pub reset_on_empty_reload: bool,
 }
 
 /// What a session turn adds to a [`RunOutcome`].
@@ -198,15 +203,19 @@ async fn run_session_turn<D: Driver>(
     // §6.3: reload only when the agent advertised it and an id was recorded; any failure falls back
     // to a new conversation in the same container (files and tools stay) and says so.
     //
-    // A load that SUCCEEDS but replays no history is a failure too. A recorded id means turn 1 ran,
-    // so a real reload replays at least its user message; an empty replay is an agent that lost its
-    // transcript and kept the id (a parked container restarted under gVisor's default rootfs
-    // overlay). Prompting it would hand the follow-up to an empty conversation with no task, and
-    // tell the buyer the context was kept. Reset instead, so the prompt restates the task.
+    // On a runsc seat only (`reset_on_empty_reload`), a load that SUCCEEDS but replays no history is
+    // a failure too. A recorded id means turn 1 ran, so a real reload replays at least its user
+    // message; an empty replay is an agent that lost its transcript and kept the id (a parked
+    // container restarted under gVisor's default rootfs overlay). Prompting it would hand the
+    // follow-up to an empty conversation with no task, and tell the buyer the context was kept.
+    // Every other seat keeps main's rule: any successful load keeps the conversation.
+    let reset_on_empty_reload = params.reset_on_empty_reload;
     let (session_id, context_reset) = match params.resume.as_ref() {
         Some(id) if driver.supports_load_session() => {
             match driver.load_session(params.session_config.clone(), id).await {
-                Ok(loaded) if loaded.replayed_history > 0 => (loaded.session_id, false),
+                Ok(loaded) if !reset_on_empty_reload || loaded.replayed_history > 0 => {
+                    (loaded.session_id, false)
+                }
                 Ok(_) | Err(_) => (driver.start_session(params.session_config).await?, true),
             }
         }
@@ -1389,6 +1398,16 @@ mod tests {
             session_config: RunParams::mock_defaults().session_config,
             resume: resume.map(str::to_owned),
             wrap_up_at: wrap,
+            // main's rule (every non-runsc seat); the bug-2 tests opt in explicitly.
+            reset_on_empty_reload: false,
+        }
+    }
+
+    /// [`session_params`] on a runsc seat: an empty reload is a reset (bug 2, §6.3).
+    fn runsc_session_params(resume: Option<&str>) -> super::SessionTurnParams {
+        super::SessionTurnParams {
+            reset_on_empty_reload: true,
+            ..session_params(resume, None)
         }
     }
 
@@ -1530,7 +1549,7 @@ mod tests {
             &mut driver,
             &mut log,
             &JobId("j".into()),
-            session_params(Some("acp-1"), None),
+            runsc_session_params(Some("acp-1")),
             release,
             &mut |_| {},
         ))
@@ -1577,7 +1596,7 @@ mod tests {
             &mut driver,
             &mut log,
             &JobId("j".into()),
-            session_params(Some("acp-1"), None),
+            runsc_session_params(Some("acp-1")),
             release,
             &mut |_| {},
         ))
@@ -1586,6 +1605,38 @@ mod tests {
         assert!(!out.context_reset);
         assert_eq!(out.session_id, "acp-1");
         assert_eq!(reset_seen, Some(false));
+    }
+
+    /// Non-runsc seats are unchanged (Petar, 15:33): an empty reload KEEPS the conversation exactly
+    /// as on main — an adapter that does not replay history on `session/load` must not have every
+    /// follow-up flipped to the reset prompt.
+    #[test]
+    fn an_empty_reload_keeps_the_conversation_off_runsc() {
+        let done = vec![SessionUpdate::TurnEnded(StopReason::Completed)];
+        let mut driver = MockDriver::new(
+            RuntimeId("mock".into()),
+            vec![session_script("acp-1", done)],
+        )
+        .with_load_replay(0);
+        let mut log = EventLog::open(test_path("session-load-empty-runc")).expect("open log");
+        let mut reset_seen = None;
+        let release: Box<super::PromptRelease<'_>> = Box::new(|reset| {
+            reset_seen = Some(reset);
+            Ok(Some(RunParams::mock_defaults().prompt))
+        });
+        let out = ran(block_on(super::run_session_job(
+            &mut driver,
+            &mut log,
+            &JobId("j".into()),
+            session_params(Some("acp-1"), None),
+            release,
+            &mut |_| {},
+        ))
+        .expect("turn"));
+        assert_eq!(driver.new_calls(), 0, "no session/new off runsc");
+        assert!(!out.context_reset, "no reset off runsc, as on main");
+        assert_eq!(out.session_id, "acp-1");
+        assert_eq!(reset_seen, Some(false), "the normal follow-up prompt, as on main");
     }
 
     /// Failure test 5 (orchestrator half): a withheld prompt never reaches the agent.

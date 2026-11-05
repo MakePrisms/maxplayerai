@@ -1010,11 +1010,53 @@ pub fn runsc_overlay_gate_applies(
     sandbox: Option<&SandboxConfig>,
     sessions: &SessionsConfig,
 ) -> bool {
-    sessions.enabled
-        && sandbox.is_some_and(|sandbox| {
-            sandbox.mode == SandboxMode::Docker
-                && sandbox.runtime.as_deref().map(str::trim) == Some(RUNSC_RUNTIME)
-        })
+    sessions.enabled && seat_runs_runsc(sandbox)
+}
+
+/// Whether this seat's jobs run under gVisor: `[sandbox] mode = "docker"` and `runtime` trims to
+/// EXACTLY `runsc` (case-sensitive, as docker matches runtime names). Unset (docker's default runc),
+/// any other name, launcher mode and no sandbox are all `false`, and every bug-2 behaviour keyed on
+/// this — the overlay gate, its probe and log line, the doctor row, and the empty-reload reset —
+/// is then absent: a non-runsc seat behaves exactly as before.
+pub fn seat_runs_runsc(sandbox: Option<&SandboxConfig>) -> bool {
+    sandbox.is_some_and(|sandbox| {
+        sandbox.mode == SandboxMode::Docker
+            && sandbox.runtime.as_deref().map(str::trim) == Some(RUNSC_RUNTIME)
+    })
+}
+
+/// The §5.6 verdict for a seat. `read_runtimes` performs the `docker info` read and is awaited ONLY
+/// when the gate applies ([`runsc_overlay_gate_applies`]); any other seat gets
+/// [`RunscOverlayGate::NotApplicable`] without docker being asked anything.
+pub async fn resolve_runsc_gate<F, Fut>(
+    sandbox: Option<&SandboxConfig>,
+    sessions: &SessionsConfig,
+    read_runtimes: F,
+) -> RunscOverlayGate
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if !runsc_overlay_gate_applies(sandbox, sessions) {
+        return RunscOverlayGate::NotApplicable;
+    }
+    let probed = read_runtimes().await;
+    runsc_overlay_gate(true, probed.as_deref().map_err(String::as_str))
+}
+
+/// The one operator line for a §5.6 verdict; `None` for [`RunscOverlayGate::NotApplicable`], so a
+/// non-runsc seat logs nothing new.
+pub fn runsc_gate_log_line(gate: &RunscOverlayGate) -> Option<String> {
+    match gate {
+        RunscOverlayGate::NotApplicable => None,
+        RunscOverlayGate::Open => Some(
+            "seller node sessions: runsc runs with --overlay2=none; session jobs are advertised"
+                .to_owned(),
+        ),
+        RunscOverlayGate::Closed { reason, fix } => Some(format!(
+            "seller node sessions DISABLED on this runsc seat (single-turn jobs continue): {reason}. Fix: {fix}"
+        )),
+    }
 }
 
 /// Whether a runtime's argv leaves `--overlay2` at `none`: `--overlay2=none`, `--overlay2 none`,

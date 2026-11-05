@@ -817,6 +817,9 @@ impl SellerNodeRunner {
                 wrap_up_unix: session::wrap_up_at(deadline, home.config.sessions.wrap_up_secs),
                 prompt_from_exchange: true,
                 agent_env_overrides: prepared.turn_env(),
+                // Bug 2 (§6.3): only a runsc seat treats an empty reload as a reset; every other
+                // seat keeps main's behaviour (and its inputs bytes: `false` is not serialized).
+                reset_on_empty_reload: session::seat_runs_runsc(home.config.sandbox.as_ref()),
             }),
         };
         orch::write_phase1_inputs(&io_dir.join(orch::PHASE1_INPUTS_FILE), &inputs)

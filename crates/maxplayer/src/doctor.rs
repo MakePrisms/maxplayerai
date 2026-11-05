@@ -2498,9 +2498,16 @@ fn build_checks(
     }));
     // Session jobs §5.6 (bug 2): the seller's own runsc `--overlay2=none` gate, reported here with
     // the daemon.json fix. Advisory: a closed gate disables sessions, not the seat.
-    checks.push(Box::new(move || {
-        checks::check_sandbox_runsc_sessions(sandbox_for_runsc_sessions, sessions_for_runsc)
-    }));
+    // Pushed ONLY on a runsc seat with sessions on: every other seat's doctor output is exactly
+    // main's (no new row, no docker read).
+    if maxplayer_core::session::runsc_overlay_gate_applies(
+        sandbox_for_runsc_sessions.as_ref(),
+        &sessions_for_runsc,
+    ) {
+        checks.push(Box::new(move || {
+            checks::check_sandbox_runsc_sessions(sandbox_for_runsc_sessions, sessions_for_runsc)
+        }));
+    }
     // Blocking for a seat strangers can reach (#451). Placed after the resolve check so that a
     // launcher which is not there reports as the missing file it is, not as a containment failure.
     checks.push(Box::new(move || {
@@ -4645,6 +4652,58 @@ mod tests {
             "build_checks must run the runsc sessions check; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
         );
+
+        // Non-runsc seats (Petar, 15:33): the row is ABSENT — no new WARN/FAIL/PASS line, no docker
+        // read — for an unset runtime, another runtime name, launcher mode, no sandbox, and a runsc
+        // seat with sessions off.
+        let docker = home.config.sandbox.clone().expect("set above");
+        for (label, sandbox, sessions) in [
+            (
+                "runtime unset",
+                Some(SandboxConfig {
+                    runtime: None,
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            (
+                "runtime runc",
+                Some(SandboxConfig {
+                    runtime: Some("runc".into()),
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            (
+                "runtime sysbox-runc",
+                Some(SandboxConfig {
+                    runtime: Some("sysbox-runc".into()),
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            (
+                "launcher mode",
+                Some(SandboxConfig {
+                    mode: SandboxMode::Launcher,
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            ("no sandbox", None, true),
+            ("runsc, sessions off", Some(docker.clone()), false),
+        ] {
+            home.config.sandbox = sandbox;
+            home.config.sessions.enabled = sessions;
+            let results = run_checks(build_checks(&home, false));
+            assert!(
+                !results
+                    .iter()
+                    .any(|check| check.name == "sandbox runsc sessions"),
+                "{label}: the runsc sessions row must be absent; got: {:?}",
+                results.iter().map(Check::render).collect::<Vec<_>>()
+            );
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

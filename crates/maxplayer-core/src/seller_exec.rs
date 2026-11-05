@@ -2925,6 +2925,7 @@ pub async fn run_session_agent_in_env(
     attachments: JobAttachments,
     resume: Option<String>,
     wrap_up_at: Option<std::time::SystemTime>,
+    reset_on_empty_reload: bool,
     release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
 ) -> Result<SessionAgentReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
@@ -2974,6 +2975,7 @@ pub async fn run_session_agent_in_env(
         },
         resume,
         wrap_up_at,
+        reset_on_empty_reload,
     };
     let mut capture = crate::engine::AgentMessageCapture::default();
     let ended = run_session_job(
@@ -4412,6 +4414,7 @@ pub async fn run_session_agent_in_env(
     _attachments: JobAttachments,
     _resume: Option<String>,
     _wrap_up_at: Option<std::time::SystemTime>,
+    _reset_on_empty_reload: bool,
     _release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
 ) -> Result<SessionAgentReport, ExecError> {
     Err(ExecError::AcpRequired)

@@ -1352,46 +1352,37 @@ fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter 
 const RUNSC_GATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not docker + runsc +
-/// `[sessions] enabled`) runs NO docker command; otherwise one bounded
-/// `docker info --format '{{json .Runtimes}}'`, folded by [`crate::session::runsc_overlay_gate`].
+/// `[sessions] enabled`) runs NO docker command ([`crate::session::resolve_runsc_gate`] awaits the
+/// read only when it applies); otherwise one bounded `docker info --format '{{json .Runtimes}}'`.
 async fn probe_runsc_gate(
     config: &crate::home::MaxplayerConfig,
 ) -> crate::session::RunscOverlayGate {
-    let applies =
-        crate::session::runsc_overlay_gate_applies(config.sandbox.as_ref(), &config.sessions);
-    if !applies {
-        return crate::session::RunscOverlayGate::NotApplicable;
-    }
-    let read = tokio::time::timeout(
-        RUNSC_GATE_PROBE_TIMEOUT,
-        tokio::task::spawn_blocking(|| {
-            use crate::seller_exec::DockerCli as _;
-            crate::seller_exec::RealDockerCli
-                .run(&["docker", "info", "--format", "{{json .Runtimes}}"].map(str::to_owned))
-        }),
-    )
-    .await;
-    let probe: Result<String, String> = match read {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(format!("docker info task failed: {error}")),
-        Err(_) => Err(format!(
-            "docker info did not answer within {}s",
-            RUNSC_GATE_PROBE_TIMEOUT.as_secs()
-        )),
-    };
-    crate::session::runsc_overlay_gate(true, probe.as_deref().map_err(String::as_str))
+    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, || async {
+        let read = tokio::time::timeout(
+            RUNSC_GATE_PROBE_TIMEOUT,
+            tokio::task::spawn_blocking(|| {
+                use crate::seller_exec::DockerCli as _;
+                crate::seller_exec::RealDockerCli
+                    .run(&["docker", "info", "--format", "{{json .Runtimes}}"].map(str::to_owned))
+            }),
+        )
+        .await;
+        match read {
+            Ok(Ok(result)) => result,
+            Ok(Err(error)) => Err(format!("docker info task failed: {error}")),
+            Err(_) => Err(format!(
+                "docker info did not answer within {}s",
+                RUNSC_GATE_PROBE_TIMEOUT.as_secs()
+            )),
+        }
+    })
+    .await
 }
 
-/// The one operator line for a §5.6 verdict. `NotApplicable` says nothing.
+/// Log the §5.6 verdict; a non-runsc seat (`NotApplicable`) logs nothing.
 fn log_runsc_gate(gate: &crate::session::RunscOverlayGate) {
-    match gate {
-        crate::session::RunscOverlayGate::NotApplicable => {}
-        crate::session::RunscOverlayGate::Open => opline!(
-            "seller node sessions: runsc runs with --overlay2=none; session jobs are advertised"
-        ),
-        crate::session::RunscOverlayGate::Closed { reason, fix } => opline!(
-            "seller node sessions DISABLED on this runsc seat (single-turn jobs continue): {reason}. Fix: {fix}"
-        ),
+    if let Some(line) = crate::session::runsc_gate_log_line(gate) {
+        opline!("{line}");
     }
 }
 

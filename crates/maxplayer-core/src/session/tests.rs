@@ -892,3 +892,82 @@ fn closed_runsc_gate_runs_an_advertised_job_single_turn() {
         true
     ));
 }
+
+// ───────────── Non-runsc seats are unchanged (Petar, 15:33): no probe, no log, main's claims ─────────────
+
+/// Every seat whose `[sandbox] runtime` does not trim to exactly `runsc` — unset (runc), another
+/// name, launcher mode, no sandbox — gets `NotApplicable` WITHOUT the docker probe being called
+/// (the stub panics), logs nothing, advertises sessions exactly as on main, and runs advertised jobs
+/// as sessions exactly as on main.
+#[tokio::test]
+async fn non_runsc_seats_never_probe_and_advertise_as_on_main() {
+    let docker = SandboxConfig {
+        mode: SandboxMode::Docker,
+        ..Default::default()
+    };
+    let seats: Vec<(&str, Option<SandboxConfig>)> = vec![
+        ("runtime unset (runc default)", Some(SandboxConfig { runtime: None, ..docker.clone() })),
+        ("runtime runc", Some(SandboxConfig { runtime: Some("runc".into()), ..docker.clone() })),
+        ("runtime sysbox-runc", Some(SandboxConfig { runtime: Some("sysbox-runc".into()), ..docker.clone() })),
+        ("runtime kata", Some(SandboxConfig { runtime: Some("kata-runtime".into()), ..docker.clone() })),
+        ("runtime RUNSC (case differs)", Some(SandboxConfig { runtime: Some("RUNSC".into()), ..docker.clone() })),
+        ("runtime runsc-debug (other name)", Some(SandboxConfig { runtime: Some("runsc-debug".into()), ..docker.clone() })),
+        ("runtime empty", Some(SandboxConfig { runtime: Some("  ".into()), ..docker.clone() })),
+        ("launcher mode, runtime runsc", Some(SandboxConfig {
+            mode: SandboxMode::Launcher,
+            runtime: Some("runsc".into()),
+            ..Default::default()
+        })),
+        ("no sandbox", None),
+    ];
+    let before = gateway::claim_draft(
+        OFFER,
+        BUYER,
+        SELLER,
+        ClaimPayment::None,
+        &["claude".into()],
+        &Default::default(),
+    );
+    // main's claim on an enabled docker container-delivery seat: exactly the session tag added.
+    let mut on_main = before.clone();
+    advertise_on_claim(&mut on_main, &on(), true, &RunscOverlayGate::NotApplicable);
+    assert!(claim_supports_sessions(&on_main.tags));
+    for (label, sandbox) in seats {
+        assert!(!seat_runs_runsc(sandbox.as_ref()), "{label}");
+        let gate = resolve_runsc_gate(sandbox.as_ref(), &on(), || async {
+            panic!("{label}: a non-runsc seat must never call docker info")
+        })
+        .await;
+        assert_eq!(gate, RunscOverlayGate::NotApplicable, "{label}");
+        assert_eq!(runsc_gate_log_line(&gate), None, "{label}: no new log line");
+        let mut claim = before.clone();
+        advertise_on_claim(&mut claim, &on(), true, &gate);
+        assert_eq!(claim, on_main, "{label}: claim bytes exactly as on main");
+        assert!(runs_as_session(&on(), &gate, true), "{label}: still runs as a session");
+    }
+}
+
+/// Positive control for the probe stub: a runsc seat with sessions on DOES call it exactly once,
+/// and logs one line; with sessions off it does not.
+#[tokio::test]
+async fn runsc_seat_probes_once_only_with_sessions_on() {
+    let runsc = SandboxConfig {
+        mode: SandboxMode::Docker,
+        runtime: Some(" runsc ".into()),
+        ..Default::default()
+    };
+    let calls = std::cell::Cell::new(0);
+    let gate = resolve_runsc_gate(Some(&runsc), &on(), || async {
+        calls.set(calls.get() + 1);
+        Ok(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#.to_owned())
+    })
+    .await;
+    assert_eq!(calls.get(), 1);
+    assert_eq!(gate, RunscOverlayGate::Open);
+    assert!(runsc_gate_log_line(&gate).is_some());
+    let off = resolve_runsc_gate(Some(&runsc), &SessionsConfig::default(), || async {
+        panic!("sessions off: no probe")
+    })
+    .await;
+    assert_eq!(off, RunscOverlayGate::NotApplicable);
+}
