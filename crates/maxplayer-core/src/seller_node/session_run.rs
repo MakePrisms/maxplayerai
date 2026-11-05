@@ -811,7 +811,7 @@ impl SellerNodeRunner {
             handoff_nonce: nonce.clone(),
             session: Some(followup_session_inputs(
                 &home.config,
-                &record,
+                record,
                 n,
                 deadline,
                 prepared.turn_env(),

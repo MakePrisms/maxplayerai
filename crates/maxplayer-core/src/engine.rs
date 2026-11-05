@@ -1636,7 +1636,11 @@ mod tests {
         assert_eq!(driver.new_calls(), 0, "no session/new off runsc");
         assert!(!out.context_reset, "no reset off runsc, as on main");
         assert_eq!(out.session_id, "acp-1");
-        assert_eq!(reset_seen, Some(false), "the normal follow-up prompt, as on main");
+        assert_eq!(
+            reset_seen,
+            Some(false),
+            "the normal follow-up prompt, as on main"
+        );
     }
 
     /// Failure test 5 (orchestrator half): a withheld prompt never reaches the agent.

@@ -3576,7 +3576,10 @@ mod tests {
         ] {
             let (message, _, reset) =
                 session_turn_on(replaying_stub(replay, &answer), Some("s1"), false).await;
-            assert!(!reset, "off runsc, a load replaying {label} is not a reset (main)");
+            assert!(
+                !reset,
+                "off runsc, a load replaying {label} is not a reset (main)"
+            );
             assert_eq!(
                 message.as_deref(),
                 Some(format!("{INLINE_ANSWER}\nT2|935").as_str())

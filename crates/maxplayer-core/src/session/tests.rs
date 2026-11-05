@@ -906,18 +906,63 @@ async fn non_runsc_seats_never_probe_and_advertise_as_on_main() {
         ..Default::default()
     };
     let seats: Vec<(&str, Option<SandboxConfig>)> = vec![
-        ("runtime unset (runc default)", Some(SandboxConfig { runtime: None, ..docker.clone() })),
-        ("runtime runc", Some(SandboxConfig { runtime: Some("runc".into()), ..docker.clone() })),
-        ("runtime sysbox-runc", Some(SandboxConfig { runtime: Some("sysbox-runc".into()), ..docker.clone() })),
-        ("runtime kata", Some(SandboxConfig { runtime: Some("kata-runtime".into()), ..docker.clone() })),
-        ("runtime RUNSC (case differs)", Some(SandboxConfig { runtime: Some("RUNSC".into()), ..docker.clone() })),
-        ("runtime runsc-debug (other name)", Some(SandboxConfig { runtime: Some("runsc-debug".into()), ..docker.clone() })),
-        ("runtime empty", Some(SandboxConfig { runtime: Some("  ".into()), ..docker.clone() })),
-        ("launcher mode, runtime runsc", Some(SandboxConfig {
-            mode: SandboxMode::Launcher,
-            runtime: Some("runsc".into()),
-            ..Default::default()
-        })),
+        (
+            "runtime unset (runc default)",
+            Some(SandboxConfig {
+                runtime: None,
+                ..docker.clone()
+            }),
+        ),
+        (
+            "runtime runc",
+            Some(SandboxConfig {
+                runtime: Some("runc".into()),
+                ..docker.clone()
+            }),
+        ),
+        (
+            "runtime sysbox-runc",
+            Some(SandboxConfig {
+                runtime: Some("sysbox-runc".into()),
+                ..docker.clone()
+            }),
+        ),
+        (
+            "runtime kata",
+            Some(SandboxConfig {
+                runtime: Some("kata-runtime".into()),
+                ..docker.clone()
+            }),
+        ),
+        (
+            "runtime RUNSC (case differs)",
+            Some(SandboxConfig {
+                runtime: Some("RUNSC".into()),
+                ..docker.clone()
+            }),
+        ),
+        (
+            "runtime runsc-debug (other name)",
+            Some(SandboxConfig {
+                runtime: Some("runsc-debug".into()),
+                ..docker.clone()
+            }),
+        ),
+        (
+            "runtime empty",
+            Some(SandboxConfig {
+                runtime: Some("  ".into()),
+                ..docker.clone()
+            }),
+        ),
+        (
+            "launcher mode, runtime runsc",
+            Some(SandboxConfig {
+                mode: SandboxMode::Launcher,
+                runtime: Some("runsc".into()),
+                ..Default::default()
+            }),
+        ),
         ("no sandbox", None),
     ];
     let before = gateway::claim_draft(
@@ -943,7 +988,10 @@ async fn non_runsc_seats_never_probe_and_advertise_as_on_main() {
         let mut claim = before.clone();
         advertise_on_claim(&mut claim, &on(), true, &gate);
         assert_eq!(claim, on_main, "{label}: claim bytes exactly as on main");
-        assert!(runs_as_session(&on(), &gate, true), "{label}: still runs as a session");
+        assert!(
+            runs_as_session(&on(), &gate, true),
+            "{label}: still runs as a session"
+        );
     }
 }
 
