@@ -145,7 +145,7 @@ fn disabled_sessions_leave_claim_bytes_identical() {
             &Default::default(),
         );
         let mut after = before.clone();
-        advertise_on_claim(&mut after, &off, true);
+        advertise_on_claim(&mut after, &off, true, &RunscOverlayGate::NotApplicable);
         assert_eq!(
             serde_json::to_string(&before).unwrap(),
             serde_json::to_string(&after).unwrap()
@@ -153,12 +153,12 @@ fn disabled_sessions_leave_claim_bytes_identical() {
         assert!(!claim_supports_sessions(&after.tags));
         // Enabled but not a docker container-delivery seat: still identical.
         let mut host = before.clone();
-        advertise_on_claim(&mut host, &on(), false);
+        advertise_on_claim(&mut host, &on(), false, &RunscOverlayGate::NotApplicable);
         assert_eq!(before, host);
         // Enabled on a docker seat: exactly one tag added, nothing else moves.
         let mut adv = before.clone();
-        advertise_on_claim(&mut adv, &on(), true);
-        advertise_on_claim(&mut adv, &on(), true);
+        advertise_on_claim(&mut adv, &on(), true, &RunscOverlayGate::Open);
+        advertise_on_claim(&mut adv, &on(), true, &RunscOverlayGate::Open);
         assert!(claim_supports_sessions(&adv.tags));
         let mut stripped = adv.clone();
         stripped.tags.retain(|t| t.first() != Some(SESSION_TAG));
@@ -689,5 +689,181 @@ fn state_vocabularies_round_trip() {
         TurnStatus::OutOfTime,
     ] {
         assert_eq!(TurnStatus::parse(s.as_str()), Some(s));
+    }
+}
+
+// ───────────────────────────── §5.6 runsc overlay gate ─────────────────────────────
+
+fn runsc_json(args: &str) -> String {
+    format!(
+        r#"{{"io.containerd.runc.v2":{{"path":"runc"}},"runc":{{"path":"runc"}},"runsc":{{"path":"/usr/bin/runsc","runtimeArgs":{args}}}}}"#
+    )
+}
+
+/// Bug 2: the gate opens ONLY for a registered `runsc` whose args leave `--overlay2=none`; every
+/// other probe result closes it with a reason and the daemon.json fix.
+#[test]
+fn runsc_gate_opens_only_with_overlay2_none() {
+    // Flag present, in every spelling runsc accepts, alone or beside other args.
+    for args in [
+        r#"["--overlay2=none"]"#,
+        r#"["--overlay2","none"]"#,
+        r#"["-overlay2=none"]"#,
+        r#"["--platform=systrap","--overlay2=none"]"#,
+        r#"["--overlay2=root:self","--overlay2=none"]"#,
+    ] {
+        assert_eq!(
+            runsc_overlay_gate(true, Ok(&runsc_json(args))),
+            RunscOverlayGate::Open,
+            "{args}"
+        );
+    }
+    // Flag absent, other args only, another overlay value, or overridden later: closed.
+    for args in [
+        "[]",
+        r#"["--platform=systrap"]"#,
+        r#"["--overlay2=root:memory"]"#,
+        r#"["--overlay2=none","--overlay2=root:self"]"#,
+    ] {
+        let gate = runsc_overlay_gate(true, Ok(&runsc_json(args)));
+        assert!(!gate.allows_sessions(), "{args}: {gate:?}");
+    }
+    // No runtimeArgs key at all (the default registration).
+    let default = runsc_overlay_gate(true, Ok(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#));
+    let RunscOverlayGate::Closed { reason, fix } = &default else {
+        panic!("default runsc must close the gate: {default:?}");
+    };
+    assert!(reason.contains("--overlay2=none"), "{reason}");
+    assert!(
+        reason.contains("stopped and restarted"),
+        "says why: {reason}"
+    );
+    assert!(
+        fix.contains(r#""runsc": {"path": "/usr/bin/runsc", "runtimeArgs": ["--overlay2=none"]}"#),
+        "the exact daemon.json member, runtime still named runsc: {fix}"
+    );
+    assert!(
+        fix.contains("restart docker (this stops running containers)"),
+        "{fix}"
+    );
+    // Other args are kept and the overlay setting is replaced, not duplicated.
+    let RunscOverlayGate::Closed { fix, .. } = runsc_overlay_gate(
+        true,
+        Ok(&runsc_json(
+            r#"["--platform=systrap","--overlay2","root:memory"]"#,
+        )),
+    ) else {
+        panic!("closed");
+    };
+    assert!(
+        fix.contains(r#""runtimeArgs": ["--platform=systrap", "--overlay2=none"]"#),
+        "{fix}"
+    );
+}
+
+/// Unreadable, unparseable and unregistered all fail closed — never open by default.
+#[test]
+fn runsc_gate_fails_closed_when_docker_cannot_confirm() {
+    for (label, probe) in [
+        ("unreadable", Err("docker daemon did not answer")),
+        ("unparseable", Ok("not json")),
+        ("empty", Ok("")),
+        ("unregistered", Ok(r#"{"runc":{"path":"runc"}}"#)),
+        ("not an object", Ok(r#"{"runsc":"x"}"#)),
+    ] {
+        let gate = runsc_overlay_gate(true, probe);
+        let RunscOverlayGate::Closed { reason, fix } = &gate else {
+            panic!("{label} must close the gate: {gate:?}");
+        };
+        assert!(
+            !reason.is_empty() && fix.contains("--overlay2=none"),
+            "{label}: {gate:?}"
+        );
+    }
+    let RunscOverlayGate::Closed { reason, fix } =
+        runsc_overlay_gate(true, Err("docker daemon did not answer"))
+    else {
+        panic!("closed");
+    };
+    assert!(
+        reason.contains("docker daemon did not answer"),
+        "carries the cause: {reason}"
+    );
+    assert!(
+        fix.contains(r#""path": "<runsc path>""#),
+        "unknown path is named, not guessed: {fix}"
+    );
+}
+
+/// The gate is scoped: a seat that is not docker + runsc + sessions is never gated, whatever docker
+/// would say — including a probe that would close it.
+#[test]
+fn runsc_gate_leaves_other_seats_alone() {
+    let runsc = SandboxConfig {
+        mode: SandboxMode::Docker,
+        runtime: Some("runsc".into()),
+        ..Default::default()
+    };
+    assert!(runsc_overlay_gate_applies(Some(&runsc), &on()));
+    let padded = SandboxConfig {
+        runtime: Some(" runsc ".into()),
+        ..runsc.clone()
+    };
+    assert!(
+        runsc_overlay_gate_applies(Some(&padded), &on()),
+        "trimmed like the seat resolves it"
+    );
+    let runc = SandboxConfig {
+        runtime: None,
+        ..runsc.clone()
+    };
+    let other = SandboxConfig {
+        runtime: Some("sysbox-runc".into()),
+        ..runsc.clone()
+    };
+    let launcher = SandboxConfig {
+        mode: SandboxMode::Launcher,
+        ..runsc.clone()
+    };
+    for (label, sandbox, sessions) in [
+        ("default runtime", Some(&runc), on()),
+        ("non-runsc runtime", Some(&other), on()),
+        ("launcher mode", Some(&launcher), on()),
+        ("no sandbox", None, on()),
+        ("sessions off", Some(&runsc), SessionsConfig::default()),
+    ] {
+        let applies = runsc_overlay_gate_applies(sandbox, &sessions);
+        assert!(!applies, "{label}");
+        let gate = runsc_overlay_gate(applies, Err("would close"));
+        assert_eq!(gate, RunscOverlayGate::NotApplicable, "{label}");
+        assert!(
+            gate.allows_sessions(),
+            "{label}: an unaffected seat keeps advertising"
+        );
+    }
+}
+
+/// A closed gate keeps `["session","1"]` off the claim; an open or inapplicable one does not.
+#[test]
+fn closed_runsc_gate_keeps_the_session_tag_off_the_claim() {
+    let before = gateway::claim_draft(
+        OFFER,
+        BUYER,
+        SELLER,
+        ClaimPayment::None,
+        &["claude".into()],
+        &Default::default(),
+    );
+    let closed = runsc_overlay_gate(true, Ok(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#));
+    let mut claim = before.clone();
+    advertise_on_claim(&mut claim, &on(), true, &closed);
+    assert_eq!(
+        claim, before,
+        "closed: the claim bytes are a single-turn claim's"
+    );
+    for open in [RunscOverlayGate::Open, RunscOverlayGate::NotApplicable] {
+        let mut claim = before.clone();
+        advertise_on_claim(&mut claim, &on(), true, &open);
+        assert!(claim_supports_sessions(&claim.tags), "{open:?}");
     }
 }

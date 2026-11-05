@@ -6,7 +6,7 @@
 //! is the only place a `session` tag can enter a claim, and it is a no-op when disabled, which is
 //! what keeps every claim/offer/result/accept byte identical to today's (failure test 13).
 use crate::gateway::{EventDraft, TagSpec};
-use crate::home::SessionsConfig;
+use crate::home::{SandboxConfig, SandboxMode, SessionsConfig};
 use crate::kinds::{JOB_ACCEPT_KIND, JOB_CLAIM_KIND, JOB_RESULT_KIND, SESSION_FOLLOWUP_KIND};
 use sha2::{Digest, Sha256};
 
@@ -258,14 +258,20 @@ pub fn admit_followup(
 
 // ───────────────────────────── §2.2–§2.4 tags ─────────────────────────────
 
-/// Append `["session","1"]` to a claim draft — ONLY when sessions are enabled and the seat runs
-/// docker with container delivery (§2.2, §5.1). With `enabled = false` the draft is untouched.
+/// Append `["session","1"]` to a claim draft — ONLY when sessions are enabled, the seat runs
+/// docker with container delivery (§2.2, §5.1), and the runsc overlay gate is not closed (§5.6).
+/// With `enabled = false` the draft is untouched.
 pub fn advertise_on_claim(
     draft: &mut EventDraft,
     cfg: &SessionsConfig,
     docker_container_seat: bool,
+    runsc_gate: &RunscOverlayGate,
 ) {
-    if draft.kind != JOB_CLAIM_KIND || !cfg.enabled || !docker_container_seat {
+    if draft.kind != JOB_CLAIM_KIND
+        || !cfg.enabled
+        || !docker_container_seat
+        || !runsc_gate.allows_sessions()
+    {
         return;
     }
     if claim_supports_sessions(&draft.tags) {
@@ -955,6 +961,171 @@ pub fn prompt_session_section() -> String {
          answer from the buyer before you can continue, end your final message with a line that \
          begins `{NEEDS_INPUT_MARKER}` followed by your question; the turn then ends and the buyer \
          replies in the next turn."
+    )
+}
+
+// ───────────────────────────── §5.6 runsc overlay gate ─────────────────────────────
+
+/// The docker runtime name a gVisor seat uses. Seat code keys gVisor handling (the resolver file,
+/// containment) on exactly this name, so the fix keeps it.
+pub const RUNSC_RUNTIME: &str = "runsc";
+
+/// The runsc flag a session seat needs: rootfs writes go to the container's own writable layer on
+/// the host, which docker keeps across stop/start, instead of a sandbox-private overlay that is
+/// discarded when the container stops.
+pub const RUNSC_OVERLAY_NONE: &str = "--overlay2=none";
+
+/// Whether this seat may advertise sessions as far as the gVisor rootfs overlay is concerned (§5.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunscOverlayGate {
+    /// Not a docker + runsc seat with sessions on: nothing to check, nothing gated.
+    NotApplicable,
+    /// The docker runtime named `runsc` runs with `--overlay2=none`.
+    Open,
+    /// Fail closed: no session is advertised. `reason` says why; `fix` is the daemon.json change.
+    Closed { reason: String, fix: String },
+}
+
+impl RunscOverlayGate {
+    pub fn allows_sessions(&self) -> bool {
+        !matches!(self, Self::Closed { .. })
+    }
+}
+
+/// Whether the gate applies: `[sessions] enabled`, `mode = "docker"` and `runtime = "runsc"`
+/// (trimmed, as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and
+/// never asks docker anything.
+pub fn runsc_overlay_gate_applies(
+    sandbox: Option<&SandboxConfig>,
+    sessions: &SessionsConfig,
+) -> bool {
+    sessions.enabled
+        && sandbox.is_some_and(|sandbox| {
+            sandbox.mode == SandboxMode::Docker
+                && sandbox.runtime.as_deref().map(str::trim) == Some(RUNSC_RUNTIME)
+        })
+}
+
+/// Whether a runtime's argv leaves `--overlay2` at `none`: `--overlay2=none`, `--overlay2 none`,
+/// or one leading dash (Go's flag package accepts both). The LAST setting wins, as in runsc.
+pub fn runtime_args_disable_overlay(args: &[String]) -> bool {
+    let mut value: Option<&str> = None;
+    let mut iter = args.iter().map(String::as_str);
+    while let Some(arg) = iter.next() {
+        let flag = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'));
+        match flag {
+            Some(rest) if rest.starts_with("overlay2=") => {
+                value = Some(&rest["overlay2=".len()..]);
+            }
+            Some("overlay2") => value = iter.next(),
+            _ => {}
+        }
+    }
+    value.map(str::trim) == Some("none")
+}
+
+/// The daemon.json member that fixes a closed gate, keeping the runtime NAMED `runsc`, its `path`,
+/// and any other args it already has (any `--overlay2` setting is replaced). With no other args this
+/// is exactly `"runsc": {"path": "<path>", "runtimeArgs": ["--overlay2=none"]}`.
+pub fn runsc_daemon_json_fix(path: Option<&str>, args: &[String]) -> String {
+    let quote = |value: &str| serde_json::Value::from(value).to_string();
+    let path = path
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or("<runsc path>");
+    let mut keep: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let flag = arg.trim_start_matches('-');
+        if flag.starts_with("overlay2=") {
+            continue;
+        }
+        if flag == "overlay2" {
+            iter.next();
+            continue;
+        }
+        keep.push(quote(arg));
+    }
+    keep.push(quote(RUNSC_OVERLAY_NONE));
+    format!(
+        "in /etc/docker/daemon.json under \"runtimes\" set {}: {{\"path\": {}, \"runtimeArgs\": [{}]}}, \
+         then restart docker (this stops running containers)",
+        quote(RUNSC_RUNTIME),
+        quote(path),
+        keep.join(", ")
+    )
+}
+
+/// The gate's verdict from what `docker info --format '{{json .Runtimes}}'` returned (`Err` = the
+/// daemon could not be asked). Pure: the seller's claim path and `maxplayer doctor` both fold the
+/// same probe through here. Fails CLOSED on everything but a registered `runsc` whose args leave
+/// `--overlay2=none`: unreadable, unparseable, unregistered, and default args all close it.
+///
+/// ⛔ Why: a parked session container is resumed with `docker start`, and gVisor's default
+/// `--overlay2=root:self` discards every rootfs write at stop — the agent's transcript under
+/// `~/.claude`/`~/.codex`, tools it installed, its caches (bug 2; runsc 20261102.0). A seat that
+/// cannot show the flag is set does not advertise sessions; it keeps taking single-turn jobs.
+pub fn runsc_overlay_gate(applies: bool, probe: Result<&str, &str>) -> RunscOverlayGate {
+    if !applies {
+        return RunscOverlayGate::NotApplicable;
+    }
+    const WHY: &str = "parked session containers are stopped and restarted, and gVisor's default \
+        rootfs overlay discards their writes at stop";
+    let closed = |reason: String, path: Option<&str>, args: &[String]| RunscOverlayGate::Closed {
+        reason,
+        fix: runsc_daemon_json_fix(path, args),
+    };
+    let raw = match probe {
+        Ok(raw) => raw,
+        Err(error) => {
+            return closed(
+                format!(
+                    "could not read the docker runtimes ({error}), so `--overlay2=none` on the \
+                     runtime \"runsc\" is unconfirmed; {WHY}"
+                ),
+                None,
+                &[],
+            );
+        }
+    };
+    let runtimes: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(runtimes) => runtimes,
+        Err(error) => {
+            return closed(
+                format!("unparseable docker runtimes ({error}); {WHY}"),
+                None,
+                &[],
+            );
+        }
+    };
+    let Some(runsc) = runtimes
+        .get(RUNSC_RUNTIME)
+        .filter(|runsc| runsc.is_object())
+    else {
+        return closed(
+            "the docker daemon registers no runtime named \"runsc\"".to_owned(),
+            None,
+            &[],
+        );
+    };
+    let path = runsc.get("path").and_then(serde_json::Value::as_str);
+    let args: Vec<String> = runsc
+        .get("runtimeArgs")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if runtime_args_disable_overlay(&args) {
+        return RunscOverlayGate::Open;
+    }
+    closed(
+        format!(
+            "the docker runtime \"runsc\" runs without {RUNSC_OVERLAY_NONE} (runtimeArgs {args:?}); {WHY}"
+        ),
+        path,
+        &args,
     )
 }
 

@@ -1348,6 +1348,53 @@ fn award_filter(seller_pubkey: nostr_sdk::PublicKey, open_pool: bool) -> Filter 
     award_filter_with(seller_pubkey, open_pool, false)
 }
 
+/// Bound on the §5.6 `docker info` read. A daemon that does not answer in time closes the gate.
+const RUNSC_GATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The §5.6 runsc overlay gate for this config. A seat it does not apply to (not docker + runsc +
+/// `[sessions] enabled`) runs NO docker command; otherwise one bounded
+/// `docker info --format '{{json .Runtimes}}'`, folded by [`crate::session::runsc_overlay_gate`].
+async fn probe_runsc_gate(
+    config: &crate::home::MaxplayerConfig,
+) -> crate::session::RunscOverlayGate {
+    let applies =
+        crate::session::runsc_overlay_gate_applies(config.sandbox.as_ref(), &config.sessions);
+    if !applies {
+        return crate::session::RunscOverlayGate::NotApplicable;
+    }
+    let read = tokio::time::timeout(
+        RUNSC_GATE_PROBE_TIMEOUT,
+        tokio::task::spawn_blocking(|| {
+            use crate::seller_exec::DockerCli as _;
+            crate::seller_exec::RealDockerCli
+                .run(&["docker", "info", "--format", "{{json .Runtimes}}"].map(str::to_owned))
+        }),
+    )
+    .await;
+    let probe: Result<String, String> = match read {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("docker info task failed: {error}")),
+        Err(_) => Err(format!(
+            "docker info did not answer within {}s",
+            RUNSC_GATE_PROBE_TIMEOUT.as_secs()
+        )),
+    };
+    crate::session::runsc_overlay_gate(true, probe.as_deref().map_err(String::as_str))
+}
+
+/// The one operator line for a §5.6 verdict. `NotApplicable` says nothing.
+fn log_runsc_gate(gate: &crate::session::RunscOverlayGate) {
+    match gate {
+        crate::session::RunscOverlayGate::NotApplicable => {}
+        crate::session::RunscOverlayGate::Open => opline!(
+            "seller node sessions: runsc runs with --overlay2=none; session jobs are advertised"
+        ),
+        crate::session::RunscOverlayGate::Closed { reason, fix } => opline!(
+            "seller node sessions DISABLED on this runsc seat (single-turn jobs continue): {reason}. Fix: {fix}"
+        ),
+    }
+}
+
 /// [`award_filter`], plus kind-3412 FOLLOW-UPs when `[sessions] enabled` (docs/specs/session-jobs.md
 /// §11 row 11). Disabled ⇒ byte-identical to today's filter.
 fn award_filter_with(
@@ -4732,6 +4779,10 @@ pub struct SellerNodeRunner {
     delivery_push_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Session jobs: follow-up tasks in flight and private follow-ups awaiting their message.
     session_rt: session_run::SessionRuntime,
+    /// Session jobs §5.6: the runsc `--overlay2=none` gate, probed at boot and on every heartbeat
+    /// tick (never per claim). Closed ⇒ no claim advertises `["session","1"]` and no job parks;
+    /// single-turn jobs are unaffected.
+    runsc_gate: std::sync::Mutex<crate::session::RunscOverlayGate>,
     /// #541: relay-derived set of SETTLED offer ids (a co-signed kind-3400 receipt has been seen).
     /// Read before any claim to skip a terminal offer that re-appears via backfill or redelivery.
     /// Populated by [`Self::on_receipt`] from the live receipt subscription and its boot/reconnect
@@ -5192,6 +5243,8 @@ impl SellerNodeRunner {
             capacity.max(1),
             lapse_secs.unwrap_or(DEFAULT_CLAIM_AWARD_TIMEOUT_SECS)
         );
+        let runsc_gate = probe_runsc_gate(&node.home().config).await;
+        log_runsc_gate(&runsc_gate);
 
         Ok(Self {
             node,
@@ -5212,6 +5265,7 @@ impl SellerNodeRunner {
             private_preflight: super::preflight::PreflightGate::new(),
             delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             session_rt: session_run::SessionRuntime::default(),
+            runsc_gate: std::sync::Mutex::new(runsc_gate),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
@@ -5339,6 +5393,31 @@ impl SellerNodeRunner {
 
     /// The seller public key (hex).
     /// The session GC for this node, or `None` with `[sessions] enabled = false`.
+    /// The current §5.6 runsc overlay verdict (a clone; the lock is never held across an await).
+    fn runsc_gate(&self) -> crate::session::RunscOverlayGate {
+        self.runsc_gate
+            .lock()
+            .map(|gate| gate.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    /// Re-probe the §5.6 gate and log ONE line when the verdict changes (never every beat).
+    async fn refresh_runsc_gate(&self) {
+        let fresh = probe_runsc_gate(&self.node.home().config).await;
+        let changed = {
+            let mut current = self
+                .runsc_gate
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let changed = *current != fresh;
+            *current = fresh.clone();
+            changed
+        };
+        if changed {
+            log_runsc_gate(&fresh);
+        }
+    }
+
     fn session_gc(&self) -> Option<super::session_gc::SessionGc> {
         let config = &self.node.home().config.sessions;
         config.enabled.then(|| super::session_gc::SessionGc {
@@ -7876,7 +7955,13 @@ impl SellerNodeRunner {
                 sandbox.mode == crate::home::SandboxMode::Docker
                     && sandbox.container_delivery_enabled(crate::seller_exec::job_identity().0)
             });
-            crate::session::advertise_on_claim(&mut claim, &config.sessions, docker_container_seat);
+            let runsc_gate = self.runsc_gate();
+            crate::session::advertise_on_claim(
+                &mut claim,
+                &config.sessions,
+                docker_container_seat,
+                &runsc_gate,
+            );
         }
         let chosen = offer.requested_agent.as_ref().or_else(|| roster.names.first()).cloned();
         let capability = roster.capability(&self.node.home().config.seat);
@@ -9775,7 +9860,10 @@ impl SellerNodeRunner {
         // Session jobs (docs/specs/session-jobs.md §5.2): only when `[sessions] enabled` AND this
         // seat's claim carried `["session","1"]`. Otherwise `None`, and the inputs file is today's.
         let sessions_config = &self.node.home().config.sessions;
+        // §5.6: a gate that closed after the claim (the daemon lost `--overlay2=none`) runs the
+        // job single-turn rather than parking a container whose rootfs would not survive.
         let session_job = sessions_config.enabled
+            && self.runsc_gate().allows_sessions()
             && self
                 .node
                 .store()
@@ -11313,6 +11401,9 @@ impl SellerNodeRunner {
             probe_relay_serves_our_reqs(&self.client, self.seller_pubkey, LIVENESS_PROBE_TIMEOUT)
                 .await;
         let publish_ok = self.publish_heartbeat_bounded().await;
+        // §5.6: re-read the runsc runtime args on the heartbeat cadence, so a daemon.json fix (or
+        // its removal) takes effect without a seat restart. One `docker info`, bounded.
+        self.refresh_runsc_gate().await;
         let mut clock = input.clock;
         let confirmed = relay_liveness_confirmed(probe_ok, publish_ok);
         if confirmed {
