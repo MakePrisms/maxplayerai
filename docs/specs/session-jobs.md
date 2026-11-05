@@ -348,8 +348,11 @@ at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker
 `--overlay2=none` in `runtimeArgs` (last setting wins; `--overlay2 none` and one leading dash accepted).
 
 - **Probe.** `docker info --format '{{json .Runtimes}}'`, bounded at 10 s, at seat boot and on every
-  heartbeat tick (`refresh_runsc_gate`) — never per claim. The verdict is held in memory. Other seats
-  never run it.
+  heartbeat tick (`refresh_runsc_gate`) — never per claim. The verdict is held in memory.
+- **Non-runsc seats are untouched.** The gate applies only when `[sandbox] mode = "docker"` and `runtime`
+  trims to exactly `runsc` (`session::seat_runs_runsc`). Unset runtime (docker's default runc), any
+  other name, launcher mode and no sandbox get `NotApplicable`: no `docker info`, no log line, no doctor
+  row, claims and session parking exactly as before.
 - **Verdict** (`session::runsc_overlay_gate`, pure, shared with `maxplayer doctor`): `Open` only for a
   registered `runsc` whose args leave `--overlay2=none`; `Closed { reason, fix }` for a missing flag,
   other args only, an unreadable daemon, unparseable output, or no `runsc` registered. Fails closed.
@@ -409,8 +412,13 @@ follow-up then ran in an empty conversation with no `["context","reset"]`. `Driv
 therefore returns the number of replayed history notifications (`LoadedSession::replayed_history`:
 user/agent messages, thoughts, tool calls, plans; not `available_commands_update`, usage or mode
 updates), and a successful load with zero is treated exactly like a failed one: `session/new`, the reset
-prompt, `["context","reset"]`. This holds on every runtime; §5.6 is what keeps the transcript there on
-runsc in the first place.
+prompt, `["context","reset"]`. **runsc seats only:** the host sets `SessionInputs.reset_on_empty_reload`
+from `session::seat_runs_runsc` (serde default `false`, not serialized when `false`). Every other seat
+keeps the earlier rule — any successful load keeps the conversation — because an ACP adapter that does
+not replay history on `session/load` would otherwise turn every follow-up into a reset. Whether to widen
+this depends on each shipped adapter replaying history (claude-agent-acp 0.85.0 and codex-acp 2.1.1 do,
+from source; Cursor's `cursor-agent acp` is closed source and unverified). §5.6 is what keeps the
+transcript there on runsc in the first place.
 
 ### 6.4 Credentials across turns — answers
 

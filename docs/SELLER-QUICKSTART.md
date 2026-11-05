@@ -620,7 +620,8 @@ Register the runtime with the overlay off, **keeping its name `runsc`**, in `/et
 
 Then restart docker (`sudo systemctl restart docker` — **this stops running containers**, so do it
 between jobs). `maxplayer doctor` reports the same verdict (`sandbox runsc sessions`) and prints the
-exact entry for your seat.
+exact entry for your seat. None of this applies to a seat whose `runtime` is not `runsc` (unset/runc or
+any other runtime): it needs no flag, runs no extra check, and offers sessions as before.
 
 `scripts/runsc-session-persistence.sh` checks on the box itself that a container file survives
 `docker stop` + `docker start` under your runsc runtime.

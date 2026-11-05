@@ -221,7 +221,8 @@ Register the runtime with the overlay off, **keeping its name `runsc`**, in `/et
 
 Then restart docker (`sudo systemctl restart docker` — **this stops running containers**, so do it
 between jobs). `maxplayer doctor` reports the same verdict (`sandbox runsc sessions`) and prints the
-exact entry for your seat.
+exact entry for your seat. None of this applies to a seat whose `runtime` is not `runsc` (unset/runc or
+any other runtime): it needs no flag, runs no extra check, and offers sessions as before.
 
 `network` is the switch that turns egress containment on. A job launched into it runs in a network
 namespace whose rules were installed **before the job process existed**: it cannot reach your LAN, your
