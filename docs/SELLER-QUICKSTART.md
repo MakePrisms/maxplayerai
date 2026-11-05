@@ -601,6 +601,30 @@ docker info --format '{{.Runtimes}}'        # runsc must be listed before you se
 maxplayer doctor                            # checks the image, the network and the containment probe
 ```
 
+**Sessions on a `runsc` seat REQUIRE `--overlay2=none`.** With `[sessions] enabled`, a session's
+container is parked between turns: it is stopped, and resumed later with `docker start`. gVisor's
+default rootfs overlay (`--overlay2=root:self`) keeps everything the agent writes outside `/work` in
+sandbox memory and **discards it when the container stops** — the agent's own conversation under
+`~/.claude`/`~/.codex` included, so the next turn would start with nothing. So a runsc seat
+advertises session jobs **only** when docker's runtime named `runsc` has `--overlay2=none` in its
+`runtimeArgs`. If the flag is missing — or `docker info` cannot be read — the seat fails closed: it
+logs one `sessions DISABLED` line with the reason and the fix, advertises no sessions, and keeps
+taking single-turn jobs as before. The seat re-reads this at boot and on every heartbeat.
+
+Register the runtime with the overlay off, **keeping its name `runsc`**, in `/etc/docker/daemon.json`
+(merge into the existing file; use the `path` that `docker info --format '{{json .Runtimes}}'` shows):
+
+```json
+{ "runtimes": { "runsc": { "path": "/usr/local/bin/runsc", "runtimeArgs": ["--overlay2=none"] } } }
+```
+
+Then restart docker (`sudo systemctl restart docker` — **this stops running containers**, so do it
+between jobs). `maxplayer doctor` reports the same verdict (`sandbox runsc sessions`) and prints the
+exact entry for your seat.
+
+`scripts/runsc-session-persistence.sh` checks on the box itself that a container file survives
+`docker stop` + `docker start` under your runsc runtime.
+
 ⚠ **Two things block a working docker seat, and neither is caught before a job runs.**
 
 **1. `proxy_port_range` is mandatory once `network` is set.** Your model credential is held by a per-job

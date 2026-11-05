@@ -59,6 +59,14 @@ The Linux laptop is the only platform that *can* run a local microVM and the onl
 
 On Linux, ship gVisor (`runsc`) as the Docker runtime — the primary boundary on the platform whose containers otherwise share the host kernel. Install `runsc` from the signed repo (it's part of the security boundary — keep it patched) and confirm **systrap** + **directfs** are active (the defaults that make it fast). On Macs, no gVisor: the boundary is the platform VM plus the hardening below.
 
+**Session seats: `--overlay2=none` is required.** gVisor's default `--overlay2=root:self` keeps a container's rootfs writes in a sandbox-private overlay that is discarded when the container stops. One-shot jobs never notice (their container is removed anyway), but a session job's container is parked and resumed with `docker start`, and everything its agent wrote outside the bind mounts — its conversation transcript included — is gone at the next turn (reproduced on runsc 20261102.0, arm64: a file under `/root/.claude` vanished across `docker stop` + `docker start`; with `--overlay2=none` it survived). A runsc seat therefore advertises sessions only when docker's runtime **named** `runsc` (seat code keys gVisor handling on that exact name) carries `--overlay2=none`; otherwise it fails closed to single-turn jobs (docs/specs/session-jobs.md §5.6):
+
+```json
+{ "runtimes": { "runsc": { "path": "/usr/local/bin/runsc", "runtimeArgs": ["--overlay2=none"] } } }
+```
+
+The trade-off: with the overlay off, rootfs writes propagate to the container's writable layer on host disk (gVisor's filesystem guide: "If you need to propagate rootfs changes to the host filesystem, disable it with `--overlay2=none`") rather than staying in a sandbox-private overlay. That is slower for rootfs-heavy I/O and removes one layer between the job and host disk; gVisor still mediates every access (the Sentry handles the syscalls, and the gofer owns the mounts). `maxplayer doctor` reports the verdict (`sandbox runsc sessions`) with the exact fix; `scripts/runsc-session-persistence.sh` proves the behaviour on the box.
+
 **Mac residual risk (accepted).** Job-to-job isolation inside the shared VM is Docker's defaults, so a kernel LPE that works from a confined, non-root container yields root in the VM. Such bugs are rare and expensive — most public LPEs die against Docker's seccomp + dropped caps — but the consequences stack:
 
 - *Integrity:* read/write every concurrent job on the seat — a backdoor planted in another buyer's delivery. Job content being open source kills the secrecy loss, not this one.

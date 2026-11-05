@@ -338,6 +338,29 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   carrying its `session_protocol`) as the proof: no block ⇒ remove, never park. A newer protocol than
   the orchestrator speaks is refused before the agent runs.
 
+### 5.6 runsc seats: `--overlay2=none` gate (bug 2)
+
+A parked container is resumed with `docker start` (§5.2). Under gVisor's default
+`--overlay2=root:self` the rootfs overlay is sandbox-private and discarded at stop, so the agent's
+transcript (`~/.claude`, `~/.codex` under `HOME=/home/agent`), its installed tools and caches are gone
+at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker"` and
+`runtime = "runsc"`, session support is therefore gated on docker's runtime named `runsc` carrying
+`--overlay2=none` in `runtimeArgs` (last setting wins; `--overlay2 none` and one leading dash accepted).
+
+- **Probe.** `docker info --format '{{json .Runtimes}}'`, bounded at 10 s, at seat boot and on every
+  heartbeat tick (`refresh_runsc_gate`) — never per claim. The verdict is held in memory. Other seats
+  never run it.
+- **Verdict** (`session::runsc_overlay_gate`, pure, shared with `maxplayer doctor`): `Open` only for a
+  registered `runsc` whose args leave `--overlay2=none`; `Closed { reason, fix }` for a missing flag,
+  other args only, an unreadable daemon, unparseable output, or no `runsc` registered. Fails closed.
+- **Closed means:** `advertise_on_claim` adds no `["session","1"]`, and a job claimed while the gate was
+  open but executed after it closed runs single-turn (not parked). The seat logs one
+  `sessions DISABLED` line (on boot and on each change, not every beat) with the reason and the fix
+  `"runsc": {"path": "<runsc path>", "runtimeArgs": ["--overlay2=none"]}` plus "restart docker (this
+  stops running containers)". Single-turn jobs are unaffected. Already-parked sessions are not touched.
+- **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open, WARN with the fix when
+  closed (WARN, not FAIL: the seat still serves single-turn jobs, and the seller enforces the gate).
+
 ---
 
 ## 6. Resume
@@ -377,6 +400,17 @@ advertised `agentCapabilities.loadSession` (next to `start_session`,
 `acp_session_id` was recorded, the orchestrator runs `session/new` in the same container: files and
 installed tools stay, and the result carries `["context","reset"]`. The prompt then also states the
 original task and the follow-ups so far (buyer messages only, newest last, cut at 64 KiB).
+
+**An empty reload is a failed reload (bug 2).** A recorded `acp_session_id` means turn 1 ran, and ACP
+requires an agent to replay the whole conversation as `session/update` notifications before answering
+`session/load`, so a real reload replays at least turn 1's user message. An agent whose transcript is
+gone can still answer the load — claude-agent-acp keeps the id and reads an empty history — and the
+follow-up then ran in an empty conversation with no `["context","reset"]`. `Driver::load_session`
+therefore returns the number of replayed history notifications (`LoadedSession::replayed_history`:
+user/agent messages, thoughts, tool calls, plans; not `available_commands_update`, usage or mode
+updates), and a successful load with zero is treated exactly like a failed one: `session/new`, the reset
+prompt, `["context","reset"]`. This holds on every runtime; §5.6 is what keeps the transcript there on
+runsc in the first place.
 
 ### 6.4 Credentials across turns — answers
 
