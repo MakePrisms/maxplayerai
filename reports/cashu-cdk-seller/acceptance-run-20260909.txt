@@ -1,0 +1,59 @@
+mint-acceptance — sandbox-local fakewallet mint at http://127.0.0.1:8085
+WORTHLESS TEST ECASH. No real funds, no external payment.
+
+
+[1] mint info (NUT-06)
+  ok   mint version: "cdk-mintd/0.17.2"
+  ok   mint advertises NUT-04 mint support: 3 method(s)
+
+[2] mint quote + issue
+  ok   proofs minted: 64 sats (wanted 64)
+  ok   wallet balance after issue: 64 sats
+
+[3] send + receive across wallets
+  ok   token is non-empty: 954 chars
+  ok   sender debited exactly amount+fee: 43 sats (issued 64 - sent 21 - fee 0 = 43)
+  ok   receiver credited: 21 sats (wanted 21)
+  ok   receiver balance: 21 sats
+
+[4] double spend rejected
+  ok   second receive of same token: rejected: Token Already Spent
+  ok   double-spender balance stays zero: 0 sats
+
+[5] melt
+  ok   melt amount: 5 sats
+  ok   balance fell by amount+fee: 21 -> 15 (melt 5, fee 1)
+
+[6] failed payment + no balance lost
+  injected description: {"pay_invoice_state":"UNPAID","check_payment_state":"UNPAID","pay_err":true,"check_err":false}
+  invoice description read back: {"pay_invoice_state":"UNPAID","check_payment_state":"UNPAID","pay_err":true,"check_err":false}
+  ok   failure payload survives the BOLT11 description round trip: parsed=true
+  ok   mint did NOT pay the failing invoice: wallet call errored: Payment failed
+  reclaimed 0 sats of reserved proofs after the failure
+  ok   no test ecash lost to the failed payment: 15 -> 15 sats
+
+[7] mint restart, no lost or duplicate balance
+  test-mint restart -> test-mint: stopped (pid 14)
+test-mint: up at http://127.0.0.1:8085/ (pid 73, work-dir /work/.test-mint)
+  ok   sender balance unchanged by restart: 43 -> 43 sats
+  ok   receiver balance unchanged by restart: 15 -> 15 sats
+  ok   spend works after restart: 1 sat received
+  ok   pre-restart spent token still rejected: rejected: Token Already Spent
+
+[8] loopback-only reachability
+  ok   a listener exists on 8085: ["0100007F"]
+  ok   every 8085 listener is bound to loopback: /proc/net/tcp local_address ["0100007F"]
+  ok   mint NOT reachable on the container's own routable address: 172.17.0.2:8085 refused
+
+=====================================================
+PASS — 22 assertions across 8 legs
+  1. mint info (NUT-06)
+  2. mint quote + issue
+  3. send + receive across wallets
+  4. double spend rejected
+  5. melt
+  6. failed payment + no balance lost
+  7. mint restart, no lost or duplicate balance
+  8. loopback-only reachability
+mint: http://127.0.0.1:8085 (fakewallet, worthless test ecash)
+=====================================================

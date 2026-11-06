@@ -1,0 +1,28 @@
+[package]
+name = "mint-acceptance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Pinned to the SAME CDK the workspace pins (=0.17.2). The point of the harness is to prove the
+# mint and the wallet our seller actually links against agree; a different wallet version would
+# prove something else.
+[dependencies]
+cdk = { version = "=0.17.2", default-features = false, features = ["wallet"] }
+cdk-sqlite = "=0.17.2"
+# for FakeInvoiceDescription / create_fake_invoice — the exact structs cdk-mintd's fakewallet
+# backend parses, so the failure-injection payload cannot drift from what the mint reads.
+cdk-fake-wallet = "=0.17.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+rand = "0.9"
+serde_json = "1"
+anyhow = "1"
+
+[[bin]]
+name = "mint-acceptance"
+path = "src/main.rs"
+
+# Standalone crate root. These image-local crates are deliberately NOT members of the
+# product workspace: adding them there would drag image tooling into every product build, and
+# an empty [workspace] table is the supported way to say "this is its own root".
+[workspace]

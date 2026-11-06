@@ -1,0 +1,36 @@
+maxplayer seller home=/Users/forge/forge/v2/seats/cashu-cdk-seller key_present=true mint=https://mint.minibits.cash/Bitcoin relay=wss://relay.maxplayer.ai
+agent preset=claude argv0=claude-agent-acp
+  claude also requires the `claude` CLI (npm i -g @anthropic-ai/claude-code), signed in — run `claude` once and complete `/login`, or set ANTHROPIC_API_KEY in the daemon's environment
+  the seat refuses to advertise until a probe turn actually succeeds, so an unauthenticated CLI fails at boot, not silently mid-job
+git_remote defaulting to relay-git https://relay.maxplayer.ai/git/ece4939aa2ac61c661891ef81295d169be1762e4b74994e4929d57882343a86b/mece4939aa2ac61c6.git
+wrote [seller] to /Users/forge/forge/v2/seats/cashu-cdk-seller/config.toml
+Docs for agents: https://www.maxplayer.ai/skill.md  (or run `maxplayer skill`)
+maxplayer seller — startup readiness checks (auto-doctor; pass --skip-doctor to bypass)
+PASS nix — working nix on PATH (`nix --version` ran in this process's environment)
+PASS credential helper — git-credential-nostr not found — OK, not required (seller signs NIP-98 in-process via libgit2)
+PASS seller key — /Users/forge/forge/v2/seats/cashu-cdk-seller/key present
+PASS relay reachability — wss://relay.maxplayer.ai: connected + NIP-42 authenticated
+PASS relay token policy — delivery path: CONTAINER (the default for [sandbox] mode = "docker"; this seat does not set container_delivery); relay advertises scoped_token_max_lifetime_secs=21600 s — `fresh-after-agent` (in use) works, and `long-lived` is available up to 21600 s
+PASS mint reachability — all 1 accepted mint(s) reachable
+PASS agent preset — registry resolves: claude (preferred argv0=claude-agent-acp) — RESOLUTION ONLY: this proves the registry resolves the way boot does, NOT that any harness can deliver; executability is proven at the pre-advertise self-probe at boot, never here (a resolvable harness can still fail to run — #470/#252)
+PASS telemetry — armed, no sink command configured (episodes.jsonl still captured)
+PASS sandbox launcher — [sandbox] mode=docker, image 'maxplayer-cashu-sandbox:v0.5.8-local' — docker resolvable
+PASS sandbox credential containment — every credential in the built-in table and in [sandbox] file_credentials is contained; no unrecognized forward_env var is set
+PASS sandbox egress — network 'maxplayer-cashu-jobs' exists and the policy renders 23 rules; each job gets them installed in its own network namespace before it starts
+PASS sandbox image — image 'maxplayer-cashu-sandbox:v0.5.8-local' present locally
+PASS sandbox engine floor — Docker Engine 29.5.2 ≥ 25.0.0 — the default seccomp profile blocks io_uring_setup/io_uring_enter/io_uring_register
+PASS sandbox containment — launcher confines: a file outside the workdir was refused, the workdir was writable (assumed deny-list for this platform: probed paths only — unlisted paths remain reachable)
+WARN seat reachability — this seat can claim NOTHING: it names no buyers, does not accept targeted offers from unnamed buyers, and does not claim the open pool (fix: list the buyers you work with in `[seller] accept_offers_only_from`, or set `accept_open_targeted = true` to accept targeted offers from buyers you have not named, or set `claim_open_pool = true` to claim untargeted jobs from the open pool)
+PASS home permissions — home and wallet are owner-only (0700)
+PASS harness credential permissions — not group/world-writable: /Users/forge/.claude
+readiness OK — 17 check(s), 1 warning(s); starting seller
+relay-git NIP-34 announce ok id=8ab00b30ae1c8635031abda272d351a5ceb75537bc3689738873d3a788a8f304 remote=https://relay.maxplayer.ai/git/ece4939aa2ac61c661891ef81295d169be1762e4b74994e4929d57882343a86b/mece4939aa2ac61c6.git
+relay-git seed probe ok (info/refs reachable)
+04:52:54Z seller node agent PASS claude binary resolves argv0=claude-agent-acp (auth not checked here — proven at the pre-advertise probe)
+04:52:54Z seller node agents ready: ["claude"] (execution concurrency set by [seller] slots)
+04:52:54Z seller node delivery path: CONTAINER — one container runs the agent and every git step. This is the default for [sandbox] mode = "docker", and this seat does not set container_delivery. Set container_delivery = false for the host path.
+sandbox: capture_skipped=probe container=maxplayer-job-maxplayer-selfprobe-0-0-1788929574
+sandbox: job_cleanup=ok container=maxplayer-job-maxplayer-selfprobe-0-0-1788929574
+04:53:05Z seller node pre-advertise probe FAILED claude: this is an AUTHENTICATION failure (seller agent error: ACP request 3 failed: {"code":-32000,"message":"Authentication required"}), not a containment/launcher fault — sign in to the agent CLI on this machine (e.g. run `claude`, then `/login`), then restart
+04:53:05Z seller node pre-advertise probe: serving 0/1 configured harness(es)
+seller node prove-before-advertise: none of 1 configured harness(es) produced a probe artifact; refusing to advertise (fix the harness/launcher, then restart)

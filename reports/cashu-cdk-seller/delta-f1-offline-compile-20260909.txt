@@ -1,0 +1,38 @@
+===F1-TOOLCHAIN-OFFLINE-COMPILE===
+== toolchain identity
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+CARGO_HOME=/opt/rust/cargo
+CARGO_NET_OFFLINE=true
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+473M	/out/rust/toolchain
+112M	/out/rust/cargo/registry
+# runtime build environment, recorded at image build
+rustc 1.98.1 (48a229cea 2026-09-01)
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+gcc (Debian 12.2.0-14+deb12u1) 12.2.0
+GNU ld (GNU Binutils for Debian) 2.40
+gcc 4:12.2.0-3
+libc6-dev 2.36-9+deb12u14
+binutils 2.40-2
+
+== dependency cache
+cached .crate archives: 557
+  present: cdk-0.17.2.crate
+  present: cashu-0.17.2.crate
+  present: cdk-sqlite-0.17.2.crate
+
+== offline build of /opt/cashu/examples/wallet-roundtrip
+built: /var/lib/cashu-test-state/toolchain-check/target/debug/wallet-roundtrip
+-rwxr-xr-x 2 root root 189977856 Sep  9 22:01 target/debug/wallet-roundtrip
+
+== running it against the test mint
+mint: Some("cdk-mintd/0.17.2")
+issued: 32 sats
+alice after send: 24 sats
+bob received: 8 sats
+bob melted: state=Paid amount=4 fee=1
+bob final: 3 sats
+
+PASS — offline toolchain + CDK cache verified in-image
