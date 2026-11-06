@@ -214,6 +214,9 @@ pub async fn list(
 ) -> Result<String> {
     give.asset.fence()?;
     want.asset.fence()?;
+    // In a maxplayer home both legs must be mints the buyer wallet may use.
+    crate::wallet::check_mint(home, &give.asset.mint_url)?;
+    crate::wallet::check_mint(home, &want.asset.mint_url)?;
     // A lot id is a hash of second-granular terms: two identical lists in the same second
     // (back-to-back requests handed to serve) would share an id, and the second journal row
     // would overwrite the first, orphaning its reservation. Wait for a fresh id instead.
@@ -253,8 +256,7 @@ pub async fn list(
         cancelled: false,
     };
     // Persist reservation intent first; recovery completes it before any new wallet operation.
-    j.put("listing", &id, &row).await?;
-    mint::reserve(home, &row.plan, &row.reservation).await?;
+    mint::reserve_new(home, &row.plan, &row.reservation, || j.put("listing", &id, &row)).await?;
     m.publish_durable(j, &row.event).await?;
     m.publish_durable(j, &row.statuses[0]).await?;
     row.published = 1;
@@ -336,6 +338,8 @@ pub async fn start_take(
     let l = parse_lot(&lot, now())?;
     ensure!(lot.pubkey != m.keys.public_key(), "self trade");
     ensure!(l.give.net >= min_receive, "minimum receive cap");
+    crate::wallet::check_mint(home, &l.give.asset.mint_url)?;
+    crate::wallet::check_mint(home, &l.want.asset.mint_url)?;
     check_nostr_timing(&l)?;
     preflight(&l).await?;
     let mint_url = &l.want.asset.mint_url;
@@ -369,8 +373,7 @@ pub async fn start_take(
         incoming: vec![],
         max_fees,
     };
-    save(j, &s).await?;
-    mint::reserve(home, &s.plan, &s.id).await?;
+    mint::reserve_new(home, &s.plan, &s.id, || save(j, &s)).await?;
     send(m, j, &s, "request", serde_json::to_value(&s.request)?).await?;
     println!("{}", serde_json::json!({"swap_id":s.id,"state":s.state}));
     Ok(s.id)

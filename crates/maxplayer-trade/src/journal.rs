@@ -6,7 +6,7 @@ use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path, sync::Arc};
 pub struct Journal(pub Arc<cdk_sqlite::WalletSqliteDatabase>);
 impl Journal {
     pub async fn open(home: &Path) -> Result<Self> {
-        let p = home.join("trade.sqlite");
+        let p = crate::wallet::ensure_state_dir(home)?.join("trade.sqlite");
         OpenOptions::new()
             .create(true)
             .truncate(false)

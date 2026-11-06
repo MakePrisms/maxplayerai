@@ -145,37 +145,12 @@ pub async fn select_guard(wallet_dir: Option<&Path>) -> Result<Option<SelectLock
     }
 }
 
-/// The policy for trading at `mint_url` from this home: the mint must be in the configured set
-/// (default + `extra_mints`) AND pass the real-mint fence (`home::mint_allowed` under
-/// `allow_real_mints`). Returns the normalized URL or the refusal to show.
-pub fn tradable_mint(home: &MaxplayerHome, mint_url: &str) -> Result<String, String> {
-    let normalized =
-        crate::wallet_ops::normalize_mint_url(mint_url).map_err(|error| error.to_string())?;
-    if !home::mint_allowed(&normalized, home.config.allow_real_mints) {
-        return Err(format!(
-            "mint {normalized} is refused by this home's real-mint fence (allow_real_mints is off \
-             in {}/config.toml)",
-            home.root.display()
-        ));
-    }
-    let configured = crate::wallet_ops::configured_mints(home).map_err(|error| error.to_string())?;
-    if !configured.iter().any(|entry| entry == &normalized) {
-        return Err(format!(
-            "mint {normalized} is not in this home's configured mints ({}); add it first with \
-             `maxplayer wallet mints add {normalized} --home {}`",
-            configured.join(", "),
-            home.root.display()
-        ));
-    }
-    Ok(normalized)
-}
-
 /// Open this home's shared wallet at `mint_url` for another local process (`maxplayer-trade`):
 /// the same database ([`wallet_db_path`]) and the same seed ([`seed_from_secret_hex`] of the home
 /// key) the buyer uses, never a second database under the same seed (its derivation counters and
 /// secrets would collide with this one's).
 ///
-/// Policy is the caller's: check [`tradable_mint`] first. A `nostr://` mint needs the caller's `connector` (built over the caller's mint relays, signing
+/// Policy (configured mints, real-mint fence) is the caller's. A `nostr://` mint needs the caller's `connector` (built over the caller's mint relays, signing
 /// as the home key); an `https://` mint is exactly `Wallet::new`.
 pub async fn open_shared_wallet(
     home: &MaxplayerHome,

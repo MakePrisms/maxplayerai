@@ -290,6 +290,10 @@ pub struct MintBalance {
     /// for a mint the config no longer (or never) names. Display surfaces them (#266); accept-time
     /// source selection deliberately ignores them (see `crossmint::holds_at_least`).
     pub configured: bool,
+    /// Sats in `Pending`, `Reserved` and `PendingSpent` proofs at the mint: held by an in-flight
+    /// operation (a job payment, send or melt, or a local `maxplayer-trade` lot/swap/send on this
+    /// home). Never part of `balance_sats` and never spendable until the owner releases them.
+    pub reserved_sats: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1159,7 +1163,22 @@ pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, Wa
             )
             .await
             .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let reserved = store
+            .get_balance(
+                Some(MintUrl::from_str(&mint_url).map_err(|error| {
+                    WalletOpsError::Wallet(format!("invalid normalized mint URL: {error}"))
+                })?),
+                Some(CurrencyUnit::Sat),
+                Some(vec![
+                    cashu::State::Pending,
+                    cashu::State::Reserved,
+                    cashu::State::PendingSpent,
+                ]),
+            )
+            .await
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
         rows.push(MintBalance {
+            reserved_sats: reserved,
             is_default: mint_url == default,
             configured: configured.iter().any(|entry| entry == &mint_url),
             mint_url,
@@ -2229,6 +2248,7 @@ pub fn list_mints(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsErr
             configured: true,
             mint_url,
             balance_sats: 0,
+            reserved_sats: 0,
         })
         .collect())
 }

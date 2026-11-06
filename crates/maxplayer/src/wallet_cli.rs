@@ -408,8 +408,14 @@ fn setup_needs_payment_summary(quote: &wallet_ops::MintQuote) -> String {
 /// dev play mint; ordinary mints carry no class label — the URL is the mint's identity (#577).
 #[cfg(feature = "wallet")]
 fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
+    // `reserved_sats` only when something is held, so the common line keeps its exact grammar.
+    let reserved = if row.reserved_sats > 0 {
+        format!(" reserved_sats={}", row.reserved_sats)
+    } else {
+        String::new()
+    };
     format!(
-        "mint={} role={} balance_sats={}{}",
+        "mint={} role={} balance_sats={}{reserved}{}",
         row.mint_url,
         if !row.configured {
             "unconfigured"
@@ -2207,12 +2213,14 @@ mod tests {
             balance_sats: 5,
             is_default: true,
             configured: true,
+            reserved_sats: 0,
         };
         let real_extra = MintBalance {
             mint_url: "https://real-mint.example".to_owned(),
             balance_sats: 0,
             is_default: false,
             configured: true,
+            reserved_sats: 0,
         };
         let balance = balance_row_line(&testnut_default);
         assert!(

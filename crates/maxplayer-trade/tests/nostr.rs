@@ -426,8 +426,8 @@ async fn env() -> Env {
     let root = tempfile::tempdir().unwrap();
     let maker = root.path().join("maker");
     let taker = root.path().join("taker");
-    std::fs::create_dir_all(&maker).unwrap();
-    std::fs::create_dir_all(&taker).unwrap();
+    support::configure(&maker, &[]);
+    support::configure(&taker, &[]);
     let mm = Market::connect(
         wallet::identity(&maker).unwrap(),
         std::slice::from_ref(&market_url),
@@ -468,6 +468,7 @@ impl Env {
             .await
             .unwrap();
         self.tap.mints.lock().unwrap().push(keys.clone());
+        support::register_mint(&url);
         let server = Server::connect(
             mint.clone(),
             keys.clone(),
@@ -2700,7 +2701,7 @@ async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(e.taker.join("owner.lock"))
+        .open(maxplayer_trade::wallet::state_dir(&e.taker).join("owner.lock"))
         .unwrap();
     fs2::FileExt::try_lock_exclusive(&lock).unwrap();
     let mut jobs = maxplayer_trade::serve::bind(&e.taker, vec![e._market_url.clone()]).unwrap();
@@ -2717,7 +2718,7 @@ async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
         },
     };
     let client = async {
-        let mut stream = tokio::net::UnixStream::connect(e.taker.join("serve.sock"))
+        let mut stream = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&e.taker).join("serve.sock"))
             .await
             .unwrap();
         stream
