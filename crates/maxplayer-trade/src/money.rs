@@ -689,7 +689,10 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
                 "withdrawal exceeds max-debit"
             );
             ensure!(input.len() <= 128, "too many melt inputs");
-            mint::unspent(&a.mint, &input).await?;
+            if let Err(error) = mint::unspent(&a.mint, &input).await {
+                crate::wallet::refuse_if_taken(home, &a.mint, &input.ys()?).await?;
+                return Err(error);
+            }
             a.outputs = outputs(PreMintSecrets::blank(
                 k.id,
                 (total - u64::from(q.amount) - input_fee).into(),

@@ -241,7 +241,10 @@ pub async fn plan_excluding(
         if total >= gross + lock_fee {
             ensure!(inputs.len() <= 128, "too many inputs");
             ensure!(claim_fee + lock_fee <= max_fee, "fee cap exceeded");
-            unspent(mint, &inputs).await?;
+            if let Err(error) = unspent(mint, &inputs).await {
+                crate::wallet::refuse_if_taken(home, mint, &inputs.ys()?).await?;
+                return Err(error);
+            }
             return Ok(Plan {
                 mint: mint.into(),
                 inputs,

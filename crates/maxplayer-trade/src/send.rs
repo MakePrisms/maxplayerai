@@ -464,9 +464,11 @@ pub async fn send(
     let (total, fee) = chosen.context("insufficient unreserved balance for amount plus fee")?;
     check_fee(fee, max_fees)?;
     ensure!(inputs.len() <= MAX_PROOFS, "too many send inputs");
-    mint::unspent(mint, &inputs)
-        .await
-        .context("selected proofs are not UNSPENT at the mint")?;
+    if let Err(error) = mint::unspent(mint, &inputs).await {
+        // Taken locally since the snapshot (a concurrent buyer send): retryable, nothing done.
+        crate::wallet::refuse_if_taken(home, mint, &inputs.ys()?).await?;
+        return Err(error.context("selected proofs are not UNSPENT at the mint"));
+    }
     let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request not answered")??;
