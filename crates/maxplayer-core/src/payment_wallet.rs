@@ -1650,10 +1650,10 @@ async fn complete_spent_swap_saga(
     crate::shared_wallet::restore_keeping_other_reservations(wallet, wallet_dir)
         .await
         .map_err(|error| {
-        PaymentWalletError::Reconcile(format!(
-            "swap-saga restore refused (leave wedged for a later retry): {error}"
-        ))
-    })?;
+            PaymentWalletError::Reconcile(format!(
+                "swap-saga restore refused (leave wedged for a later retry): {error}"
+            ))
+        })?;
 
     // The inputs are confirmed Spent at the mint — record that truthfully (no
     // phantom credit) and clear their operation binding. `restore` may already have

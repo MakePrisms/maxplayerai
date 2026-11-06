@@ -138,7 +138,9 @@ pub fn try_acquire(wallet_dir: &Path) -> Result<Option<SelectLock>, SelectLockEr
 /// as they return: the chosen proofs are then RESERVED under their operation and no other selector
 /// can take them. Take it OUTSIDE any mint timeout, so a busy wallet reads as busy, not as a dead
 /// mint.
-pub async fn select_guard(wallet_dir: Option<&Path>) -> Result<Option<SelectLock>, SelectLockError> {
+pub async fn select_guard(
+    wallet_dir: Option<&Path>,
+) -> Result<Option<SelectLock>, SelectLockError> {
     match wallet_dir {
         Some(dir) => acquire(dir, SELECT_LOCK_TIMEOUT).await.map(Some),
         None => Ok(None),
@@ -333,7 +335,10 @@ mod tests {
         let _held = acquire(&wallet, SELECT_LOCK_TIMEOUT).await.unwrap();
         let started = std::time::Instant::now();
         let outcome = select_guard(Some(&wallet)).await;
-        assert!(matches!(outcome, Err(SelectLockError::Busy { .. })), "{outcome:?}");
+        assert!(
+            matches!(outcome, Err(SelectLockError::Busy { .. })),
+            "{outcome:?}"
+        );
         let waited = started.elapsed();
         assert!(
             waited >= SELECT_LOCK_TIMEOUT && waited < SELECT_LOCK_TIMEOUT * 3,
@@ -382,7 +387,11 @@ mod tests {
     async fn a_holder_killed_with_sigkill_releases_the_lock() {
         let wallet = dir("kill9");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "shared_wallet::tests::select_lock_kill_child", "--nocapture"])
+            .args([
+                "--exact",
+                "shared_wallet::tests::select_lock_kill_child",
+                "--nocapture",
+            ])
             .env("MAXPLAYER_TEST_SELECT_LOCK_CHILD_DIR", &wallet)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -391,17 +400,26 @@ mod tests {
         let ready = wallet.join("child.ready");
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         while !ready.exists() {
-            assert!(std::time::Instant::now() < deadline, "child never took the lock");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child never took the lock"
+            );
             assert!(child.try_wait().unwrap().is_none(), "child exited early");
             std::thread::sleep(Duration::from_millis(20));
         }
         let busy = acquire(&wallet, Duration::from_millis(200)).await;
-        assert!(matches!(busy, Err(SelectLockError::Busy { .. })), "{busy:?}");
+        assert!(
+            matches!(busy, Err(SelectLockError::Busy { .. })),
+            "{busy:?}"
+        );
         // Safety: plain kill(2) on our own child's pid.
         assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGKILL) }, 0);
         let status = child.wait().unwrap();
         assert!(!status.success(), "killed, not exited: {status:?}");
         let after = acquire(&wallet, Duration::from_secs(2)).await;
-        assert!(after.is_ok(), "the kernel must release a killed holder's flock: {after:?}");
+        assert!(
+            after.is_ok(),
+            "the kernel must release a killed holder's flock: {after:?}"
+        );
     }
 }
