@@ -367,6 +367,20 @@ fn send_failure(reason: String, sign_in_refusal: Option<&str>) -> SendFailure {
     SendFailure { permanent, reason }
 }
 
+/// [`super::history::lifecycle_refusal`] for the content backfill: the old text plus the class of
+/// the relay's `CLOSED` reason, so a quota refusal is distinguishable from a policy refusal.
+fn content_refusal(message: &str) -> &'static str {
+    if message.starts_with("rate-limited:") {
+        "content subscription refused: rate-limited by the relay"
+    } else if message.starts_with("restricted:") {
+        "content subscription refused: restricted by the relay"
+    } else if message.starts_with("error:") {
+        "content subscription refused: relay error"
+    } else {
+        "content subscription refused"
+    }
+}
+
 async fn collect_window(
     notifications: &mut tokio::sync::broadcast::Receiver<RelayNotification>,
     id: &SubscriptionId,
@@ -408,10 +422,15 @@ async fn collect_window(
             RelayNotification::Message {
                 message:
                     RelayMessage::Closed {
-                        subscription_id, ..
+                        subscription_id,
+                        message,
                     },
             } if subscription_id.as_ref() == id => {
-                return Err(Error("content subscription refused"));
+                crate::opline!(
+                    "private content relay closed a backfill read: {}",
+                    crate::gateway::log_safe_text(&message)
+                );
+                return Err(Error(content_refusal(&message)));
             }
             RelayNotification::AuthenticationFailed
             | RelayNotification::Shutdown
@@ -427,6 +446,25 @@ async fn collect_window(
 mod tests {
     use super::*;
     use std::borrow::Cow;
+
+    /// 2026-11-03 canary: the content backfill reported every relay CLOSED as one bare string.
+    #[tokio::test]
+    async fn a_closed_content_window_names_the_relay_refusal_class() {
+        let recipient = Keys::generate().public_key();
+        for (reason, expected) in [
+            ("rate-limited: quota exceeded; retry in 5s", "content subscription refused: rate-limited by the relay"),
+            ("restricted: p-gated events require #p matching your pubkey", "content subscription refused: restricted by the relay"),
+            ("error: database error", "content subscription refused: relay error"),
+            ("", "content subscription refused"),
+        ] {
+            let id = SubscriptionId::new("window");
+            let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+            tx.send(RelayNotification::Message { message: RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()), message: Cow::Owned(reason.to_owned()),
+            }}).unwrap();
+            assert_eq!(collect_window(&mut rx, &id, recipient, 0, 10).await, Err(Error(expected)), "{reason}");
+        }
+    }
 
     /// Advisor round 1, finding 4: a sign-in that did not complete returns the hinted relay
     /// refusal, not only the static text.

@@ -1207,8 +1207,14 @@ where
         Err(error) => {
             // Provably wire-free: prepare failed before anything signed was persisted or
             // transmitted (a signed-in-memory event that was never pinned was never sent — the
-            // send below only ever transmits pinned bytes). Releasing cannot strand an award.
-            store.release(job_id, now_unix).map_err(AwardError::Store)?;
+            // send below only ever transmits pinned bytes). The Fresh step only runs with no
+            // prior reservation, so the row is this call's own: DISCARD it, leaving the job
+            // freely re-plannable. Marking it `released` instead turned the next attempt into a
+            // legacy probe that terminally refused the job (2026-11-03 canary). If the row is not
+            // ours to discard (it gained an attempt or award meanwhile), fall back to release.
+            if !store.discard_unpinned_reservation(job_id).map_err(AwardError::Store)? {
+                store.release(job_id, now_unix).map_err(AwardError::Store)?;
+            }
             return Err(AwardError::Publish(error));
         }
     };
@@ -2396,9 +2402,13 @@ mod tests {
         .expect_err("prepare failed");
         assert!(matches!(error, AwardError::Publish(_)));
         assert_eq!(store.reserved_in_flight().expect("r"), 0, "prepare failure reclaimed the reserve");
+        // The row is GONE, not `released`: a released row with no attempt reads as a legacy job
+        // and the next award attempt would be terminally refused (2026-11-03 canary).
+        assert_eq!(store.reservation(&job).expect("read").map(|(state, _)| state), None);
         assert_eq!(
-            store.reservation(&job).expect("read").map(|(state, _)| state),
-            Some(super::super::reservations::ReservationState::Released)
+            award_step(false, None, None),
+            AwardStep::Fresh,
+            "after a failed prepare the job must plan as Fresh again"
         );
         // Nothing was signed or pinned, so nothing may be recorded as awarded — otherwise the
         // delivery watcher would sweep a job that has no award on the relay.
