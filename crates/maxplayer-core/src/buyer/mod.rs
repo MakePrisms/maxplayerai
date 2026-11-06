@@ -4313,6 +4313,7 @@ mod tests {
             balance_sats: sats,
             is_default,
             configured,
+            reserved_sats: 0,
         }
     }
 

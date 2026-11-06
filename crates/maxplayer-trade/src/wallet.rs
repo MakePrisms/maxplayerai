@@ -477,7 +477,7 @@ pub fn check_shared_mint(root: &Path, mint: &str) -> Result<()> {
     let configured =
         maxplayer_core::wallet_ops::configured_mints(&mh).map_err(|e| anyhow::anyhow!("{e}"))?;
     ensure!(
-        configured.iter().any(|m| *m == normalized),
+        configured.contains(&normalized),
         "mint {normalized} is not one of this home's configured mints ({}); add it with \
          `maxplayer wallet mints add {normalized} --home {}` first",
         configured.join(", "),

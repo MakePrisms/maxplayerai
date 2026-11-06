@@ -1,6 +1,10 @@
 # Commands and monetary bounds
 
-Every invocation except wallet-free `doctor` starts `maxplayer-trade --home <private-absolute-home>`.
+Every invocation trades from a maxplayer home: `--home <home>` (a directory with `key` /
+`config.toml`), else `$MAXPLAYER_HOME`, else `~/.maxplayer`. It signs with the home `key` and
+pays from the buyer wallet; only that home's configured mints that pass its real-mint fence are
+traded; trade state is in `<home>/trade/`. A legacy standalone home (`wallet.seed`/`trade.key`)
+is drain-only: new `list`/`take`/`fund`/`receive` are refused (crate README, "Home and wallet").
 Build the production binary as in the crate README's "Build and automated tests" section:
 the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from the repository
 root fails; build it by manifest path, release profile, locked (no protoc needed for the binary).
@@ -9,9 +13,8 @@ same relay set during recovery. Use the binary's default relays unless deliberat
 configured; the defaults are `wss://relay.maxplayer.ai` first, then `wss://nos.lol`,
 `wss://relay.primal.net` and `wss://offchain.pub` as fallbacks. `relay.maxplayer.ai` stores lots
 and statuses only from signed-in relay members; a non-member's copy is refused there and the
-public relays carry it. To make a home's `trade.key` a member, link it with `maxplayer account
-link` and its trading-home option (crate README, "Default market relays"); that creates the key if
-the home has none yet. These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
+public relays carry it. To make the home's key a member, link it with `maxplayer account
+link` (crate README, "Default market relays"). These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
 backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
 Rate limiting pauses a relay for at least five minutes.
 A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
@@ -43,7 +46,7 @@ recover
 
 Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
-`--home <HOME>` is required for operational commands; `--relay <RELAY>` is
+`--home <HOME>` defaults to the maxplayer home; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
 `--timeout-seconds` (doctor: default 30 seconds), `--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`, `--check-sends`,
 and `--max-fees` (default 16 on list/take; on send it is required unless the mint's input fee is 0). `send` takes either `<mint> --amount --out` or `--reclaim <send-id>`. Positional mint arguments are
@@ -60,7 +63,8 @@ Never use a lab-feature binary for the human's funds.
 
 `doctor <mint> --mint-relay <url> --json` makes one read-only info request to that
 explicit nostr mint/relay pair. It needs no home and creates no seed or journal. With a
-global `--home` it signs as that home's existing `trade.key` (never created); without one,
+global `--home` it signs as that home's key (a legacy home: its existing `trade.key`; never
+created); without one,
 or when the home has no key yet, it signs with a throwaway key, which a sign-in-required relay
 such as `relay.maxplayer.ai` refuses (`signer` in the JSON says which). No
 market connection, keysets, swap, checkstate or restore probe. It re-sends the identical
