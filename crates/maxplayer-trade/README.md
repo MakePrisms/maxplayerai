@@ -141,8 +141,12 @@ sections below describe their dated runs, not current coverage totals.
 Any canonical HTTPS mint (or a `nostr://<npub>` mint, see below) can be used if automatic preflight passes: advertised NUT-07/09/11/12/14,
 an active sat keyset, and clock skew at most 60 seconds. Preflight runs before each `list`,
 `take`, funding quotes and lock submission; successful earlier preflight is not cached
-as permission for a later lock. Test mints and loopback HTTP(S) fixtures remain supported.
-HTTP is refused except on loopback, and redirects are disabled. There is no real-money
+as permission for a later lock. Plain `http://` mints are refused everywhere, localhost
+included ("http:// mints are not supported; use https:// or nostr://"), the same rule as the
+buyer wallet's real-mint fence; redirects are disabled. Loopback HTTP fixture mints exist only in
+test builds (the `local-test-mints` feature, below), never in a `cargo build`/`cargo install`
+binary. A lot advertising an `http://` mint is skipped by `discover` and refused by `take` before
+anything is journaled. There is no real-money
 opt-in environment variable or allow-list flag. Each lock's gross amount is capped at
 **100,000 sats**. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home, including pending/lost funding intents.
 Each withdrawal invoice is also capped at **100,000 sats**, plus at most max(32 sats, ceil(invoice amount × 2%)) of
@@ -175,7 +179,7 @@ through one dispatch (`src/transport.rs`): HTTP(S) mints keep the raw requests u
 request / 23411 reply per call, identical re-send on a lost reply, request `exp` enforced by
 the mint). CDK wallets for such mints are built with that connector and poll subscriptions.
 
-- Relays: repeat `--mint-relay URL` (max 8, `wss://`, `ws://` only on loopback) before the
+- Relays: repeat `--mint-relay URL` (max 8, `wss://` only; `ws://` is refused) before the
   command; default `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub`,
   `wss://nostr-pub.wellorder.net` (`transport::default_mint_relays`), the same list and order a
   default credits sidecar listens on. They carry only kinds 23410/23411; market relays never carry
@@ -274,6 +278,17 @@ cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bin max
 Long runs should be backgrounded once, redirected to a log and awaited through that process;
 do not pipe a build through tail/grep or start duplicate watchers. If cargo is unavailable,
 wrap the command with `nix develop --extra-experimental-features 'nix-command flakes' --command`.
+
+`local-test-mints` is a test-only feature: it admits plain-HTTP loopback mints and `ws://`
+loopback mint relays (the fake CDK mints and local relays in `tests/`). Every `cargo test`,
+`--examples` and `clippy --all-targets` build gets it through a self dev-dependency in
+`Cargo.toml`; `lab` implies it. `cargo build`/`cargo install` never resolve dev-dependencies, so
+the binary users install refuses both. CI checks that with
+`scripts/check-user-build-mint-fence.sh` (builds without features, then checks `preflight`,
+`balance`, `fund`, `withdraw`, `receive`, `send`, `list`, `doctor` and `--mint-relay` refuse
+`http://127.0.0.1:<port>` and `ws://127.0.0.1:<port>` before any connection or home write).
+Without that feature `transport::loopback_only` is always false, so no production timing ever
+depends on a host being loopback.
 
 `lab` is compile-time-only test instrumentation. `TRADE_LAB_SECONDS=1` uses 48/16-second locks,
 2-second claim cutoff and 1-second refund margin, **only for 127.0.0.1 mints**. Production builds

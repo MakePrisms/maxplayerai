@@ -17,8 +17,8 @@ struct Cli {
     /// relay.primal.net and offchain.pub as fallbacks.
     #[arg(long)]
     relay: Vec<String>,
-    /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://, or ws://
-    /// on loopback). Defaults to wss://relay.maxplayer.ai, wss://relay.ditto.pub and
+    /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://).
+    /// Defaults to wss://relay.maxplayer.ai, wss://relay.ditto.pub and
     /// wss://nostr-pub.wellorder.net. Never used for market traffic, which goes to --relay.
     #[arg(long = "mint-relay")]
     mint_relay: Vec<String>,
@@ -217,6 +217,27 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         );
     }
     maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
+    // Argument-only mint fence (no http:// mints in a user build): before any home is resolved,
+    // created or locked, any hand-off, and any mint or relay is contacted.
+    let arg_mints: Vec<&String> = match &cli.command {
+        Command::Preflight { mint }
+        | Command::Fund { mint, .. }
+        | Command::Balance { mint }
+        | Command::Withdraw { mint, .. }
+        | Command::Receive { mint, .. }
+        | Command::Send {
+            mint: Some(mint), ..
+        } => vec![mint],
+        Command::List {
+            give_mint,
+            want_mint,
+            ..
+        } => vec![give_mint, want_mint],
+        _ => vec![],
+    };
+    for mint in arg_mints {
+        Asset::from_cli(mint)?.fence()?;
+    }
     // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
     match &cli.command {
         Command::Fund { mint, .. } => maxplayer_trade::transport::require_http(mint, "fund")?,
@@ -959,8 +980,20 @@ async fn doctor(
 ) -> Result<()> {
     match doctor_inner(mint, relay, json_output, seconds, home).await {
         Err(error) if !error.is::<DoctorExit>() => {
-            let message = "Diagnostic not started: check the mint identifier, the explicit relay \
-                 URL and the --home trade.key";
+            // Caller text stays out of the message (a relay URL may hold a token); a scheme
+            // refusal is a fixed string, so name it.
+            let text = format!("{error:#}");
+            let reason = [
+                maxplayer_trade::transport::HTTP_MINT_REFUSED,
+                maxplayer_trade::transport::WS_MINT_RELAY_REFUSED,
+            ]
+            .into_iter()
+            .find(|r| text.contains(r));
+            let message = format!(
+                "Diagnostic not started: check the mint identifier, the explicit relay URL and \
+                 the --home trade.key{}",
+                reason.map(|r| format!(" ({r})")).unwrap_or_default()
+            );
             if json_output {
                 println!(
                     "{}",
@@ -985,6 +1018,7 @@ async fn doctor_inner(
     use nostr_sdk::prelude::ToBech32;
     use std::time::Duration;
     let asset = Asset::from_cli(mint)?;
+    asset.fence()?;
     ensure!(
         maxplayer_trade::transport::is_nostr(&asset.mint_url),
         "doctor requires a nostr:// mint and one explicit --mint-relay"
