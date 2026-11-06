@@ -961,7 +961,10 @@ fn trade_home_is_deprecated_ignored_and_never_creates_a_trade_key() {
         !out.contains("--trade-home"),
         "follow-up commands must not repeat the ignored flag: {out}"
     );
-    assert!(names_in(&trade).is_empty(), "nothing created in the trade dir");
+    assert!(
+        names_in(&trade).is_empty(),
+        "nothing created in the trade dir"
+    );
     assert!(
         fake.pending(&home.pubkey).is_some(),
         "the home (agent) key is the one linked"
