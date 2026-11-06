@@ -4,7 +4,7 @@
  * Exit 0 on successful connect + EOSE (or timeout with ≥1 event).
  */
 import { RELAY_URL, HISTORY_LIMIT } from "../config.js";
-import { SUBSCRIBE_KINDS } from "../js/kinds.js";
+import { buildMarketFilters } from "../js/filters.js";
 import { parseEvent } from "../js/parse.js";
 import { createStore } from "../js/store.js";
 
@@ -54,13 +54,10 @@ const timer = setTimeout(() => {
 ws.addEventListener("open", () => {
   report.connected = true;
   const subId = "live-check-1";
-  ws.send(
-    JSON.stringify([
-      "REQ",
-      subId,
-      { kinds: [...SUBSCRIBE_KINDS], limit: HISTORY_LIMIT },
-    ]),
-  );
+  // Same filter construction the app uses (js/filters.js) — the probe must exercise the
+  // subscription the product actually sends, never a drifted copy.
+  const filters = buildMarketFilters({ limit: HISTORY_LIMIT });
+  ws.send(JSON.stringify(["REQ", subId, ...filters]));
 });
 
 ws.addEventListener("message", (msg) => {
