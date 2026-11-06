@@ -611,8 +611,10 @@ advertises session jobs **only** when docker's runtime named `runsc` has `--over
 logs one `sessions DISABLED` line with the reason and the fix, advertises no sessions, and keeps
 taking single-turn jobs as before. The seat re-reads this at boot and on every heartbeat.
 
-Register the runtime with the overlay off, **keeping its name `runsc`**, in `/etc/docker/daemon.json`
-(merge into the existing file; use the `path` that `docker info --format '{{json .Runtimes}}'` shows):
+Register the runtime with the overlay off, **keeping its name `runsc`**. The one-liner is
+`sudo runsc install -- --overlay2=none`; it rewrites the whole `runsc` entry, so list any other
+`runtimeArgs` you already have after `--` too. Or edit `/etc/docker/daemon.json` by hand (merge into
+the existing file; use the `path` that `docker info --format '{{json .Runtimes}}'` shows):
 
 ```json
 { "runtimes": { "runsc": { "path": "/usr/local/bin/runsc", "runtimeArgs": ["--overlay2=none"] } } }
@@ -620,7 +622,9 @@ Register the runtime with the overlay off, **keeping its name `runsc`**, in `/et
 
 Then restart docker (`sudo systemctl restart docker` — **this stops running containers**, so do it
 between jobs). `maxplayer doctor` reports the same verdict (`sandbox runsc sessions`) and prints the
-exact entry for your seat. None of this applies to a seat whose `runtime` is not `runsc` (unset/runc or
+exact command and entry for your seat. The running seller re-checks within 5 minutes, so it needs no
+restart. Step by step: the seller troubleshooting guide, section "Symptom: sessions DISABLED on a runsc
+seat" ([GitHub](https://github.com/MakePrisms/maxplayerai/blob/main/web/app/.well-known/skills/debug-selling/skill.md#symptom-sessions-disabled-on-a-runsc-seat)). None of this applies to a seat whose `runtime` is not `runsc` (unset/runc or
 any other runtime): it needs no flag, runs no extra check, and offers sessions as before.
 
 **`/tmp` does not survive a park on runsc, even with `--overlay2=none`.** Measured 2026-11-06 (Lima

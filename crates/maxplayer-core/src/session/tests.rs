@@ -761,6 +761,82 @@ fn runsc_gate_opens_only_with_overlay2_none() {
     );
 }
 
+/// The fix a human can act on without reading code: the one-liner with the seat's own binary path
+/// and its other args, the heartbeat re-check, doctor, and the troubleshooting guide (site + GitHub).
+#[test]
+fn runsc_fix_names_the_one_liner_the_recheck_and_the_guide() {
+    let RunscOverlayGate::Closed { fix, .. } =
+        runsc_overlay_gate(true, Ok(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#))
+    else {
+        panic!("closed");
+    };
+    assert!(
+        fix.contains("`sudo /usr/bin/runsc install -- --overlay2=none`"),
+        "{fix}"
+    );
+    assert!(fix.contains("re-checks within 5 minutes"), "{fix}");
+    assert!(fix.contains("`maxplayer doctor`"), "{fix}");
+    assert!(fix.contains(RUNSC_GUIDE_GITHUB_URL), "{fix}");
+    assert!(fix.contains(RUNSC_GUIDE_URL), "{fix}");
+    assert!(fix.contains(RUNSC_GUIDE_HEADING), "{fix}");
+
+    // `runsc install` rewrites the whole entry, so the other args ride along in the one-liner.
+    let RunscOverlayGate::Closed { fix, .. } = runsc_overlay_gate(
+        true,
+        Ok(&runsc_json(
+            r#"["--platform=systrap","--overlay2=root:self"]"#,
+        )),
+    ) else {
+        panic!("closed");
+    };
+    assert!(
+        fix.contains("install -- --platform=systrap --overlay2=none`"),
+        "{fix}"
+    );
+
+    // Unknown path: the bare binary name, never a guessed path.
+    let RunscOverlayGate::Closed { fix, .. } =
+        runsc_overlay_gate(true, Err("docker daemon did not answer"))
+    else {
+        panic!("closed");
+    };
+    assert!(
+        fix.contains("`sudo runsc install -- --overlay2=none`"),
+        "{fix}"
+    );
+}
+
+/// The guide section the fix links to exists under the exact heading, and the GitHub anchor is that
+/// heading's slug — so a renamed heading fails here instead of shipping a dead link in a binary.
+#[test]
+fn runsc_guide_heading_exists_and_matches_the_github_anchor() {
+    let guide = include_str!("../../../../web/app/.well-known/skills/debug-selling/skill.md");
+    let heading = format!("## {RUNSC_GUIDE_HEADING}");
+    assert!(
+        guide.lines().any(|line| line == heading),
+        "debug-selling guide lacks `{heading}`"
+    );
+    let slug: String = RUNSC_GUIDE_HEADING
+        .to_lowercase()
+        .chars()
+        .filter_map(|c| match c {
+            ' ' => Some('-'),
+            c if c.is_ascii_alphanumeric() || c == '-' => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        RUNSC_GUIDE_GITHUB_URL,
+        format!(
+            "https://github.com/MakePrisms/maxplayerai/blob/main/web/app/.well-known/skills/debug-selling/skill.md#{slug}"
+        )
+    );
+    assert_eq!(
+        RUNSC_GUIDE_URL,
+        "https://www.maxplayer.ai/.well-known/skills/debug-selling/skill.md"
+    );
+}
+
 /// Unreadable, unparseable and unregistered all fail closed — never open by default.
 #[test]
 fn runsc_gate_fails_closed_when_docker_cannot_confirm() {

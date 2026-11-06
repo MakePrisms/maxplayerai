@@ -4581,6 +4581,14 @@ mod tests {
             rendered.contains("restart docker (this stops running containers)"),
             "{rendered}"
         );
+        assert!(
+            rendered.contains("`sudo /usr/bin/runsc install -- --overlay2=none`"),
+            "one-liner with the seat's own path: {rendered}"
+        );
+        assert!(
+            rendered.contains("debug-selling/skill.md#symptom-sessions-disabled-on-a-runsc-seat"),
+            "guide link: {rendered}"
+        );
 
         let other =
             reported(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--platform=systrap"]}}"#);

@@ -1077,14 +1077,39 @@ pub fn runtime_args_disable_overlay(args: &[String]) -> bool {
     value.map(str::trim) == Some("none")
 }
 
-/// The daemon.json member that fixes a closed gate, keeping the runtime NAMED `runsc`, its `path`,
-/// and any other args it already has (any `--overlay2` setting is replaced). With no other args this
-/// is exactly `"runsc": {"path": "<path>", "runtimeArgs": ["--overlay2=none"]}`.
+/// The heading of the seller troubleshooting guide's section on a closed gate. The GitHub anchor in
+/// [`RUNSC_GUIDE_GITHUB_URL`] is this heading's slug; a test pins both against the guide file.
+pub const RUNSC_GUIDE_HEADING: &str = "Symptom: sessions DISABLED on a runsc seat";
+
+/// The guide as the site serves it (raw markdown, for agents). Printed by name, not by anchor: a raw
+/// page cannot jump to a section.
+pub const RUNSC_GUIDE_URL: &str =
+    "https://www.maxplayer.ai/.well-known/skills/debug-selling/skill.md";
+
+/// The same guide rendered on GitHub (for people), on `main`, anchored at the section.
+pub const RUNSC_GUIDE_GITHUB_URL: &str = "https://github.com/MakePrisms/maxplayerai/blob/main/web/app/.well-known/skills/debug-selling/skill.md#symptom-sessions-disabled-on-a-runsc-seat";
+
+/// One shell word: left bare when it holds only flag-safe characters, single-quoted otherwise.
+fn shell_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_=./:,+@%".contains(c));
+    if safe {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// The fix for a closed gate, keeping the runtime NAMED `runsc`, its `path`, and any other args it
+/// already has (any `--overlay2` setting is replaced): the `runsc install` one-liner (it rewrites
+/// the whole entry, so the kept args ride along), the daemon.json member for a hand edit, the docker
+/// restart, the heartbeat re-check, and the troubleshooting guide. With no other args the member is
+/// exactly `"runsc": {"path": "<path>", "runtimeArgs": ["--overlay2=none"]}`.
 pub fn runsc_daemon_json_fix(path: Option<&str>, args: &[String]) -> String {
     let quote = |value: &str| serde_json::Value::from(value).to_string();
-    let path = path
-        .filter(|path| !path.trim().is_empty())
-        .unwrap_or("<runsc path>");
+    let known_path = path.map(str::trim).filter(|path| !path.is_empty());
     let mut keep: Vec<String> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -1096,15 +1121,29 @@ pub fn runsc_daemon_json_fix(path: Option<&str>, args: &[String]) -> String {
             iter.next();
             continue;
         }
-        keep.push(quote(arg));
+        keep.push(arg.clone());
     }
-    keep.push(quote(RUNSC_OVERLAY_NONE));
+    keep.push(RUNSC_OVERLAY_NONE.to_owned());
+    let json_args = keep
+        .iter()
+        .map(|arg| quote(arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shell_args = keep
+        .iter()
+        .map(|arg| shell_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let binary = known_path.map_or_else(|| RUNSC_RUNTIME.to_owned(), shell_word);
     format!(
-        "in /etc/docker/daemon.json under \"runtimes\" set {}: {{\"path\": {}, \"runtimeArgs\": [{}]}}, \
-         then restart docker (this stops running containers)",
+        "run `sudo {binary} install -- {shell_args}` (it rewrites the whole \"runsc\" entry in \
+         /etc/docker/daemon.json), or by hand in /etc/docker/daemon.json under \"runtimes\" set {}: \
+         {{\"path\": {}, \"runtimeArgs\": [{json_args}]}}; then restart docker (this stops running \
+         containers). The running seller re-checks within 5 minutes, no restart needed; confirm with \
+         `maxplayer doctor`. Guide, section \"{RUNSC_GUIDE_HEADING}\": {RUNSC_GUIDE_GITHUB_URL} \
+         (raw: {RUNSC_GUIDE_URL})",
         quote(RUNSC_RUNTIME),
-        quote(path),
-        keep.join(", ")
+        quote(known_path.unwrap_or("<runsc path>")),
     )
 }
 
