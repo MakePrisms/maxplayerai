@@ -143,6 +143,20 @@ pub fn build_wallet_with_relays(
     nostr_wallet(url, unit, localstore, seed, target_proof_count, connector)
 }
 
+/// [`build_wallet`] for a `nostr://` mint with a connector the caller built (its own relays,
+/// identity and timing): `maxplayer-trade` reaching its configured mint relays.
+pub fn build_wallet_with_connector(
+    mint_url: &str,
+    unit: CurrencyUnit,
+    localstore: Arc<dyn WalletDatabase<cdk_database::Error> + Send + Sync>,
+    seed: [u8; 64],
+    target_proof_count: Option<usize>,
+    connector: NostrMintConnector,
+) -> Result<Wallet, Error> {
+    let url = MintUrl::from_str(mint_url)?;
+    nostr_wallet(url, unit, localstore, seed, target_proof_count, connector)
+}
+
 fn nostr_wallet(
     url: MintUrl,
     unit: CurrencyUnit,

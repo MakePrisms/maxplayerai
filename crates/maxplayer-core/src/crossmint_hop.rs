@@ -860,6 +860,9 @@ pub(crate) struct CdkHopEffects {
     target: Wallet,
     /// `[buyer] hop_fee_buffer_multiplier`. Applied only when writing the Planned record.
     hop_fee_buffer_multiplier: u64,
+    /// The home's `wallet/` dir: the melt's proof selection holds its selection lock
+    /// ([`crate::shared_wallet`]). `None` only for in-memory test wallets.
+    wallet_dir: Option<PathBuf>,
 }
 
 impl CdkHopEffects {
@@ -892,6 +895,7 @@ impl CdkHopEffects {
             source,
             target,
             hop_fee_buffer_multiplier: home.config.buyer.hop_fee_buffer_multiplier,
+            wallet_dir: Some(home.wallet_dir.clone()),
         })
     }
 
@@ -1105,6 +1109,7 @@ impl HopEffects for CdkHopEffects {
             source: self.source.clone(),
             target: self.target.clone(),
             hop_fee_buffer_multiplier: self.hop_fee_buffer_multiplier,
+            wallet_dir: self.wallet_dir.clone(),
         };
         let bolt11 = bolt11.to_owned();
         block_on_leg("source melt quote", async move {
@@ -1120,6 +1125,7 @@ impl HopEffects for CdkHopEffects {
             source: self.source.clone(),
             target: self.target.clone(),
             hop_fee_buffer_multiplier: self.hop_fee_buffer_multiplier,
+            wallet_dir: self.wallet_dir.clone(),
         };
         block_on_leg("source coverage", async move {
             effects.require_source_covers(planned_cost).await
@@ -1129,13 +1135,19 @@ impl HopEffects for CdkHopEffects {
     fn melt(&mut self, melt_quote_id: &str) -> Result<u64, HopError> {
         let wallet = self.source.clone();
         let quote_id = melt_quote_id.to_owned();
+        let wallet_dir = self.wallet_dir.clone();
         block_on_leg("melt", async move {
+            // Held across prepare_melt's selection + reservation only, outside the mint bound.
+            let select = crate::shared_wallet::select_guard(wallet_dir.as_deref())
+                .await
+                .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
             let prepared = bounded(
                 "prepare melt",
                 MINT_TOUCH_TIMEOUT,
                 wallet.prepare_melt(&quote_id, HashMap::new()),
             )
             .await?;
+            drop(select);
             let melted = bounded("melt confirm", HOP_LEG_TIMEOUT, prepared.confirm()).await?;
             // `confirm` is the effect boundary — the melt has settled and the fee actually paid is
             // known here. The mint returned the unused reserve as change; reporting the real fee lets
@@ -1852,6 +1864,7 @@ mod tests {
             )
             .unwrap(),
             hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
+            wallet_dir: None,
         }
     }
 
@@ -1876,6 +1889,7 @@ mod tests {
             )
             .unwrap(),
             hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
+            wallet_dir: None,
         }
     }
 
