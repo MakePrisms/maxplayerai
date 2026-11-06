@@ -1,3 +1,45 @@
+## Unreleased
+
+Not yet released. `maxplayer-trade` stays a separate binary built from source; this changes the
+`maxplayer` binary (account, wallet) and `maxplayer-core` (shared wallet lock), and is client-only:
+no relay, registration-service or website redeploy (the mint-and-trade skill page goes live with
+the merge, Vercel).
+
+- **Changed: `maxplayer-trade` trades from the maxplayer home.** Default home is
+  `$MAXPLAYER_HOME`, else `~/.maxplayer`; `--home <dir>` picks another maxplayer home. Lots,
+  statuses and `nostr://` mint requests are signed with the home `key` (the one
+  `maxplayer account link` registers); no `trade.key` is created. Trading spends and receives in
+  the buyer wallet (`wallet/cdk-wallet.sqlite`, same seed), so received sats show in
+  `maxplayer wallet balance`. Only the home's configured mints (default + `extra_mints`) that
+  pass the real-mint fence can be traded. Trades are not in the buyer spend ledger, do not count
+  against `per_job_budget_sats`, and pay no platform fee. Trade state lives in `<home>/trade/`.
+- **Changed: `maxplayer-trade` refuses plain `http://` mints, localhost included**, with
+  `http:// mints are not supported; use https:// or nostr://`, and refuses `ws://` mint relays
+  (`--mint-relay`), the same rule as the buyer wallet's real-mint fence. This covers every command
+  (`preflight`, `balance`, `fund`, `withdraw`, `receive`, `send`, `list`, `take`, `doctor`), serve
+  hand-offs and lots from the market: `discover` skips a lot naming an `http://` mint and `take`
+  refuses it before anything is journaled. Loopback HTTP fake mints remain only in test builds
+  (test-only cargo feature `local-test-mints`); `cargo install --locked --path
+  crates/maxplayer-trade` never enables it.
+- **New: wallet selection lock.** The buyer (job payments, `wallet send`/`melt`, the cross-mint
+  hop, NUT-13 restore) and `maxplayer-trade` (lot, take, send and withdraw reservations) take an
+  exclusive `flock` on `<home>/wallet/select.lock` only while they pick and reserve proofs;
+  a caller waits at most 5 s, then refuses retryably with nothing reserved. The kernel releases
+  it if the holder dies, including `kill -9`. Reservations are owner-named (`used_by_operation`);
+  the buyer's NUT-13 restore no longer releases proofs another owner reserved.
+- **Changed: `maxplayer wallet balance`** prints `reserved_sats=<n>` on a mint line when proofs
+  there are reserved by an in-flight operation (job payment, send, melt or a trade); they were
+  never in `balance_sats`. Lines with nothing reserved are unchanged.
+- **Deprecated: `maxplayer account link|status|marketing --trade-home <dir>`.** Still parses,
+  prints `--trade-home is deprecated and ignored: trading now uses this home's key; it will be
+  removed in a future release` on stderr, and acts on the home key (or on the mint key with
+  `--mint`). It never creates a `trade.key`.
+- **Deprecated: standalone trading homes** (`maxplayer-trade --home <dir>` with `wallet.seed`
+  or `trade.key`). Every command warns; `balance`, `status`, `recover`, `send`, `withdraw`,
+  `doctor`, `serve` and `cancel` still run so funds can be drained and in-flight trades finished;
+  new `list`, `take`, `fund` and `receive` are refused with the drain steps
+  (`send … --out <file>`, then `maxplayer wallet receive "$(cat <file>)"`).
+
 ## v0.7.3-rc1
 
 Release candidate for 0.7.3, cut so that `maxplayer account link --trade-home` and the wallet's

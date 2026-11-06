@@ -330,10 +330,7 @@ pub fn fund_poll(mint: &str) -> std::time::Duration {
 }
 pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()> {
     if f.done {
-        database(home, &f.mint)
-            .await?
-            .release_proofs(&f.op().parse()?)
-            .await?;
+        crate::wallet::release(home, &f.mint, &f.op().parse()?).await?;
         return Ok(());
     }
     let id = f
@@ -420,10 +417,7 @@ pub async fn resume_fund(home: &Path, j: &Journal, f: &mut Funding) -> Result<()
     .await?;
     f.done = true;
     j.put("funding", &f.id, f).await?;
-    database(home, &f.mint)
-        .await?
-        .release_proofs(&f.op().parse()?)
-        .await?;
+    crate::wallet::release(home, &f.mint, &f.op().parse()?).await?;
     Ok(())
 }
 
@@ -695,34 +689,38 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
                 "withdrawal exceeds max-debit"
             );
             ensure!(input.len() <= 128, "too many melt inputs");
-            mint::unspent(&a.mint, &input).await?;
+            if let Err(error) = mint::unspent(&a.mint, &input).await {
+                crate::wallet::refuse_if_taken(home, &a.mint, &input.ys()?).await?;
+                return Err(error);
+            }
             a.outputs = outputs(PreMintSecrets::blank(
                 k.id,
                 (total - u64::from(q.amount) - input_fee).into(),
             )?);
             a.input_fee = input_fee;
+            // Journal the inputs and reserve them under one selection lock: on a shared home
+            // another process may have taken one of them since they were chosen.
+            let ys = input.ys()?;
+            let sel = crate::wallet::select(home, &a.mint).await?;
+            sel.verify_free(&ys).await?;
             a.inputs = input;
             j.put("withdrawal", &a.id, a).await?;
+            sel.reserve(&ys, &a.id.parse()?).await?;
             return Ok(());
         }
     }
     anyhow::bail!("insufficient unreserved funds for melt, reserve and provable change")
 }
 async fn reserve_withdraw(home: &Path, a: &Withdrawal) -> Result<()> {
-    let db = database(home, &a.mint).await?;
-    let id = a.id.parse()?;
-    let existing = db.get_reserved_proofs(&id).await?;
-    let intended: HashSet<_> = a.inputs.ys()?.into_iter().collect();
-    ensure!(
-        existing.iter().all(|p| intended.contains(&p.y)),
-        "withdraw reservation conflict"
-    );
-    let held: HashSet<_> = existing.iter().map(|p| p.y).collect();
-    let missing = intended.difference(&held).copied().collect::<Vec<_>>();
-    if !missing.is_empty() {
-        db.reserve_proofs(missing, &id).await?;
-    }
-    Ok(())
+    crate::wallet::reserve(home, &a.mint, &a.inputs.ys()?, &a.id.parse()?)
+        .await
+        .map_err(|e| {
+            if e.to_string() == "reservation conflict" {
+                anyhow::anyhow!("withdraw reservation conflict")
+            } else {
+                e
+            }
+        })
 }
 fn bind(a: &Withdrawal, q: &MeltQuoteBolt11Response<String>) -> Result<()> {
     let old = a.quote.as_ref().context("missing bound quote")?;
@@ -781,10 +779,7 @@ async fn resume_withdraw_inner(
     explicit: bool,
 ) -> Result<()> {
     if a.terminal() {
-        database(home, &a.mint)
-            .await?
-            .release_proofs(&a.id.parse()?)
-            .await?;
+        crate::wallet::release(home, &a.mint, &a.id.parse()?).await?;
         return Ok(());
     }
     crate::Asset::new(&a.mint)?.fence()?;
@@ -801,10 +796,7 @@ async fn resume_withdraw_inner(
             }
             a.state = MeltState::Refused;
             j.put("withdrawal", &a.id, a).await?;
-            database(home, &a.mint)
-                .await?
-                .release_proofs(&a.id.parse()?)
-                .await?;
+            crate::wallet::release(home, &a.mint, &a.id.parse()?).await?;
             return Ok(());
         }
         // Recovery must never turn an unsent failed command into a payment.
@@ -943,10 +935,7 @@ async fn resume_withdraw_inner(
     }
     j.put("withdrawal", &a.id, a).await?;
     if a.terminal() {
-        database(home, &a.mint)
-            .await?
-            .release_proofs(&a.id.parse()?)
-            .await?;
+        crate::wallet::release(home, &a.mint, &a.id.parse()?).await?;
     }
     Ok(())
 }

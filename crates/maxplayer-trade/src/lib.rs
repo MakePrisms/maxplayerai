@@ -97,15 +97,13 @@ impl Asset {
             return Ok(());
         }
         let u = url::Url::parse(&self.mint_url)?;
-        let h = u.host_str().context("missing mint host")?;
-        let local = h == "localhost"
-            || h.trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .map(|x| x.is_loopback())
-                .unwrap_or(false);
+        u.host_str().context("missing mint host")?;
+        // A user build accepts https:// only (plus nostr:// above), the same rule as core's
+        // `home::mint_allowed`; loopback http:// exists only in `local-test-mints` test builds.
         ensure!(
-            u.scheme() == "https" || (local && u.scheme() == "http"),
-            "HTTP allowed only on loopback"
+            u.scheme() == "https" || transport::local_test_http_mint(&u),
+            "{}",
+            transport::HTTP_MINT_REFUSED
         );
         Ok(())
     }
@@ -179,8 +177,10 @@ pub fn parse_lot(e: &Event, now: u64) -> Result<Lot> {
     common(e, LOT)?;
     let l: Lot = serde_json::from_str(&e.content)?;
     ensure!(l.trade_v == 1, "unknown protocol version");
-    l.give.asset.validate()?;
-    l.want.asset.validate()?;
+    // The transport fence, not just canonical form: a lot naming an http:// mint is not a lot
+    // this build can trade, so discovery skips it and take refuses it before any journal write.
+    l.give.asset.fence()?;
+    l.want.asset.fence()?;
     ensure!(l.give.asset != l.want.asset, "same-asset swap");
     ensure!(
         l.give.net > 0 && l.want.net > 0 && l.give.net <= 1_000_000 && l.want.net <= 1_000_000,
@@ -523,7 +523,59 @@ mod tests {
     }
     #[test]
     fn nonloopback_http_denied() {
-        assert!(Asset::new("http://mint.example").unwrap().fence().is_err());
+        let e = Asset::new("http://mint.example")
+            .unwrap()
+            .fence()
+            .unwrap_err()
+            .to_string();
+        assert_eq!(e, transport::HTTP_MINT_REFUSED);
+    }
+    /// A lot from the market is fenced like a CLI mint: one naming a plain-HTTP mint is refused
+    /// by `parse_lot` itself, so discovery skips it and `take` refuses it before any journal row.
+    /// (In a user build every http:// mint takes this path; here a non-loopback one does.)
+    #[test]
+    fn lot_with_an_http_mint_is_refused_at_parse() {
+        let keys = Keys::generate();
+        let now = Timestamp::now();
+        let leg = |mint: &str| Leg {
+            asset: Asset {
+                mint_url: mint.into(),
+                unit: "sat".into(),
+            },
+            net: 10,
+        };
+        for (give, want) in [
+            ("http://mint.example", "https://testnut.cashudevkit.org"),
+            ("https://testnut.cashudevkit.org", "http://mint.example"),
+        ] {
+            let l = Lot {
+                trade_v: 1,
+                give: leg(give),
+                want: leg(want),
+                maker_trade_pubkey: keys.public_key().to_hex(),
+                expires_at: now.as_secs() + 86400,
+                deadline_policy: DeadlinePolicy::default(),
+                fee_policy: "sender-funds-net-v1".into(),
+            };
+            let tags = [
+                ("t", "maxplayer".to_string()),
+                ("v", "1".to_string()),
+                ("g", give.to_string()),
+                ("w", want.to_string()),
+                ("u", "sat".to_string()),
+                ("x", "sat".to_string()),
+                ("expiration", l.expires_at.to_string()),
+            ]
+            .into_iter()
+            .map(|(a, b)| Tag::parse([a.to_string(), b]).unwrap());
+            let e = EventBuilder::new(Kind::Custom(LOT), serde_json::to_string(&l).unwrap())
+                .custom_created_at(now)
+                .tags(tags)
+                .sign_with_keys(&keys)
+                .unwrap();
+            let err = parse_lot(&e, now.as_secs()).unwrap_err().to_string();
+            assert_eq!(err, transport::HTTP_MINT_REFUSED, "{give} -> {want}");
+        }
     }
     #[test]
     fn same_unit_different_fee() {

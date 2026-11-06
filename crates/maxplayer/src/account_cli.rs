@@ -12,10 +12,10 @@
 //! There is no way to link without the emailed code, and no flag that accepts the Terms on the
 //! human's behalf (spec §12: no non-interactive terms acceptance). There is no unlink (spec §4).
 //!
-//! The key is the home `key` file (the same key the wallet signs mint requests with, #1210), with
-//! `--mint` the mint server's `<home>/mint/nostr.key`, or with `--trade-home <dir>` a
-//! `maxplayer-trade` home's `trade.key` (it signs listings and mint requests). The secret is never
-//! printed.
+//! The key is the home `key` file (the same key the wallet signs mint requests with, #1210, and the
+//! key `maxplayer-trade` signs listings and mint requests with), or with `--mint` the mint server's
+//! `<home>/mint/nostr.key`. `--trade-home <dir>` is deprecated: it still parses, is ignored with a
+//! warning on stderr, and never creates a `trade.key`. The secret is never printed.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -32,10 +32,10 @@ fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
         "Usage:\n\
-         \x20 maxplayer account link [--email <email>] [--label <name>] [--home <dir>] [--mint | --trade-home <dir>]\n\
-         \x20 maxplayer account link --code <6 digits> [--entered-by human|agent] [--home <dir>] [--mint | --trade-home <dir>]\n\
-         \x20 maxplayer account status [--json] [--home <dir>] [--mint | --trade-home <dir>]\n\
-         \x20 maxplayer account marketing on|off [--home <dir>] [--mint | --trade-home <dir>]\n\
+         \x20 maxplayer account link [--email <email>] [--label <name>] [--home <dir>] [--mint]\n\
+         \x20 maxplayer account link --code <6 digits> [--entered-by human|agent] [--home <dir>] [--mint]\n\
+         \x20 maxplayer account status [--json] [--home <dir>] [--mint]\n\
+         \x20 maxplayer account marketing on|off [--home <dir>] [--mint]\n\
          \n\
          Links this agent's key to your email so the Maxplayer relay accepts its writes. `link`\n\
          emails you a 6-digit code; entering it links the key and accepts the Maxplayer Terms.\n\
@@ -45,8 +45,8 @@ fn write_usage(out: &mut dyn Write) {
          agent's Nostr profile name unless the agent already has one (`maxplayer profile set`).\n\
          --entered-by: who typed the code (default: human at the prompt, agent with --code).\n\
          --mint: use this home's mint server key (<home>/mint/nostr.key) instead of the agent key.\n\
-         --trade-home: use a maxplayer-trade home's key (<dir>/trade.key) instead of the agent\n\
-         key; `link` creates it when that home has none yet.\n\
+         The agent key is also the key maxplayer-trade trades with, so linking it covers trading.\n\
+         --trade-home <dir>: deprecated and ignored (trading uses this home's key).\n\
          Service: registration_url in config.toml or MAXPLAYER_REGISTRATION_URL\n\
          (default https://relay.maxplayer.ai/account).\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
@@ -61,9 +61,8 @@ struct Opts {
     entered_by: Option<String>,
     home: Option<PathBuf>,
     mint: bool,
+    /// Deprecated `--trade-home <dir>`: parsed so old commands keep working, then ignored.
     trade_home: Option<PathBuf>,
-    /// Set for `link` only: `--trade-home` may create a missing `trade.key` there.
-    create_trade_key: bool,
     json: bool,
 }
 
@@ -130,13 +129,14 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             _ => Err("account marketing takes `on` or `off`".to_owned()),
         },
         other => Err(format!("unknown account command {other}")),
-    }
-    .and_then(|o| check_key_choice(&o).map(|()| o));
-    let mut opts = match parsed {
+    };
+    let opts = match parsed {
         Ok(opts) => opts,
         Err(message) => return usage_error(err, Some(&message)),
     };
-    opts.create_trade_key = sub == "link";
+    if opts.trade_home.is_some() {
+        let _ = writeln!(err, "{TRADE_HOME_DEPRECATED}");
+    }
     #[cfg(not(feature = "wallet"))]
     {
         let _ = (opts, out);
@@ -186,13 +186,10 @@ fn usage_error(err: &mut dyn Write, message: Option<&str>) -> i32 {
     USAGE_ERROR
 }
 
-/// One key per command: the agent key (default), `--mint` or `--trade-home`.
-fn check_key_choice(opts: &Opts) -> Result<(), String> {
-    if opts.mint && opts.trade_home.is_some() {
-        return Err("--mint and --trade-home name different keys; use one".to_owned());
-    }
-    Ok(())
-}
+/// Printed (stderr) whenever `--trade-home` is given. The flag no longer selects a key: the command
+/// acts on the home key (or on `--mint` when that is given too) and never creates a `trade.key`.
+pub(crate) const TRADE_HOME_DEPRECATED: &str = "--trade-home is deprecated and ignored: trading now \
+     uses this home's key; it will be removed in a future release";
 
 /// Flag combinations that are refused before anything is read or sent.
 fn check_link_opts(opts: &Opts) -> Result<(), String> {
@@ -265,9 +262,6 @@ mod wallet {
             if opts.mint {
                 flags.push_str(" --mint");
             }
-            if let Some(dir) = &opts.trade_home {
-                flags.push_str(&format!(" --trade-home {}", dir.display()));
-            }
             if let Some(home) = &opts.home {
                 flags.push_str(&format!(" --home {}", home.display()));
             }
@@ -278,9 +272,6 @@ mod wallet {
             };
             if opts.mint {
                 return Self::open_mint(&root, flags);
-            }
-            if let Some(dir) = &opts.trade_home {
-                return Self::open_trade(dir, &root, flags, opts.create_trade_key, err);
             }
             // An explicit --home must already hold a key: linking a typo'd path would register a
             // brand-new identity nobody uses. The default home is created like any first command.
@@ -350,66 +341,6 @@ mod wallet {
                 npub,
                 base_url: config.registration_url,
                 whose: "this mint's key",
-                flags,
-                home: None,
-                profile_name: None,
-            })
-        }
-
-        /// `--trade-home <dir>`: the `maxplayer-trade` home's `trade.key`. The directory must
-        /// exist (a typo'd path would register an identity nobody uses). A missing key is created
-        /// only for `link` (`create`), exactly as `maxplayer-trade` creates it (64 hex, `0600`,
-        /// `create_new`), so a home can be linked before its first listing. Nothing else in that
-        /// home is touched; the registration service comes from `root`'s config, read-only.
-        fn open_trade(
-            dir: &std::path::Path,
-            root: &std::path::Path,
-            flags: String,
-            create: bool,
-            err: &mut dyn Write,
-        ) -> Result<Self, String> {
-            if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
-                return Err(format!(
-                    "account refused: no trading home directory at {} (check --trade-home)",
-                    dir.display()
-                ));
-            }
-            let path = dir.join("trade.key");
-            if std::fs::symlink_metadata(&path).is_err() {
-                if !create {
-                    return Err(format!(
-                        "account refused: no trade key at {} yet (`maxplayer account link{flags}` \
-                         creates it)",
-                        path.display()
-                    ));
-                }
-                use std::os::unix::fs::OpenOptionsExt;
-                let keys = Keys::generate();
-                let mut file = std::fs::OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .mode(0o600)
-                    .open(&path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                file.write_all(keys.secret_key().to_secret_hex().as_bytes())
-                    .and_then(|()| file.sync_all())
-                    .and_then(|()| std::fs::File::open(dir)?.sync_all())
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                let _ = writeln!(err, "Created a new trade key at {}.", path.display());
-            }
-            let secret = home::read_key_file_hex(&path).map_err(|e| e.to_string())?;
-            let keys = Keys::parse(&secret)
-                .map_err(|_| format!("{} is not a valid key", path.display()))?;
-            let npub = keys
-                .public_key()
-                .to_bech32()
-                .map_err(|e| format!("npub encode: {e}"))?;
-            let config = home::resolve_config_read_only(root).map_err(|e| e.to_string())?;
-            Ok(Self {
-                keys,
-                npub,
-                base_url: config.registration_url,
-                whose: "this trading home's key",
                 flags,
                 home: None,
                 profile_name: None,
@@ -791,7 +722,6 @@ mod tests {
             &["marketing", "maybe"],
             &["status", "--email", "a@b.co"],
             &["unlink"],
-            &["status", "--mint", "--trade-home", "/t"],
             &["link", "--trade-home"],
             &[],
         ] {

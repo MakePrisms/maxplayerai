@@ -408,8 +408,14 @@ fn setup_needs_payment_summary(quote: &wallet_ops::MintQuote) -> String {
 /// dev play mint; ordinary mints carry no class label — the URL is the mint's identity (#577).
 #[cfg(feature = "wallet")]
 fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
+    // `reserved_sats` only when something is held, so the common line keeps its exact grammar.
+    let reserved = if row.reserved_sats > 0 {
+        format!(" reserved_sats={}", row.reserved_sats)
+    } else {
+        String::new()
+    };
     format!(
-        "mint={} role={} balance_sats={}{}",
+        "mint={} role={} balance_sats={}{reserved}{}",
         row.mint_url,
         if !row.configured {
             "unconfigured"
@@ -468,7 +474,7 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         let wallet = buyer_fund::open_wallet_async(&home)
             .await
             .map_err(|error| error.to_string())?;
-        payment_wallet::retire_eligible_incomplete_sagas(&wallet)
+        payment_wallet::retire_eligible_incomplete_sagas_in(&wallet, Some(&home.wallet_dir))
             .await
             .map_err(|error| error.to_string())
     });
@@ -2195,6 +2201,30 @@ mod tests {
         );
     }
 
+    // Shared home with maxplayer-trade: sats a trade (or any in-flight operation) holds RESERVED are
+    // shown as `reserved_sats=`, never inside `balance_sats`; a row with nothing held keeps the
+    // exact old grammar (scripts parse it).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_row_shows_reserved_sats_apart_from_spendable() {
+        use maxplayer_core::wallet_ops::MintBalance;
+        let row = |reserved_sats| MintBalance {
+            mint_url: "https://real-mint.example".to_owned(),
+            balance_sats: 3,
+            is_default: true,
+            configured: true,
+            reserved_sats,
+        };
+        assert_eq!(
+            balance_row_line(&row(4)),
+            "mint=https://real-mint.example role=default balance_sats=3 reserved_sats=4"
+        );
+        assert_eq!(
+            balance_row_line(&row(0)),
+            "mint=https://real-mint.example role=default balance_sats=3"
+        );
+    }
+
     // #577: `wallet balance` and `wallet mints list` rows mark play money ONLY on a testnut (play)
     // row; an ordinary/real row carries no money-class label. Pure row formatters, asserted for a
     // play (testnut) and a real row. The absence asserts red-on-revert if the class fork returns.
@@ -2207,12 +2237,14 @@ mod tests {
             balance_sats: 5,
             is_default: true,
             configured: true,
+            reserved_sats: 0,
         };
         let real_extra = MintBalance {
             mint_url: "https://real-mint.example".to_owned(),
             balance_sats: 0,
             is_default: false,
             configured: true,
+            reserved_sats: 0,
         };
         let balance = balance_row_line(&testnut_default);
         assert!(

@@ -924,38 +924,20 @@ fn link_with_a_label_flag_says_the_name_is_public_before_sending() {
     assert!(notice < sent, "the notice comes before the request: {out}");
 }
 
-/// `--trade-home <dir>` links a `maxplayer-trade` home's `trade.key` (it signs listings and mint
-/// requests). `link` creates a missing key the way the trade CLI does (64 hex, 0600) and touches
-/// nothing else there; `status` never creates one; a missing directory or `--mint` with it is
-/// refused before any request.
+/// `--trade-home <dir>` is deprecated (trading now signs with the home key): it still parses on
+/// link/status/marketing, prints the deprecation line on stderr, acts on the HOME key, and never
+/// creates a `trade.key` (or anything else) in that directory, whether it exists or not. With
+/// `--mint` it is ignored the same way and the command acts on the mint key.
+const TRADE_HOME_DEPRECATED: &str = "--trade-home is deprecated and ignored: trading now uses this \
+home's key; it will be removed in a future release";
+
 #[test]
-fn trade_home_links_the_trading_key_and_creates_it_only_for_link() {
-    use std::os::unix::fs::PermissionsExt;
+fn trade_home_is_deprecated_ignored_and_never_creates_a_trade_key() {
     let fake = FakeRegistration::start();
     let home = new_home();
     let trade = home.root.join("trade-a");
     std::fs::create_dir(&trade).unwrap();
     let trade_arg = trade.to_str().unwrap().to_owned();
-
-    // status on a home without trade.key: refused, nothing created, nothing sent.
-    let (code, _, err) = run(
-        &home,
-        &fake.base_url(),
-        &["status", "--trade-home", &trade_arg],
-    );
-    assert_eq!(code, 2, "{err}");
-    assert!(err.contains("no trade key at"), "{err}");
-    assert!(names_in(&trade).is_empty());
-    assert!(fake.requests().is_empty());
-
-    for args in [
-        &["status", "--trade-home", "/definitely/not/here"][..],
-        &["status", "--mint", "--trade-home", trade_arg.as_str()],
-    ] {
-        let (code, _, err) = run(&home, &fake.base_url(), args);
-        assert_ne!(code, 0, "{args:?}: {err}");
-        assert!(fake.requests().is_empty(), "{args:?}");
-    }
 
     fake.set_next_code("482913");
     let (code, out, err) = run(
@@ -972,30 +954,20 @@ fn trade_home_links_the_trading_key_and_creates_it_only_for_link() {
         ],
     );
     assert_eq!(code, 0, "{out}\n{err}");
-    assert!(err.contains("Created a new trade key"), "{err}");
-    assert!(out.contains("this trading home's key"), "{out}");
+    assert!(err.contains(TRADE_HOME_DEPRECATED), "{err}");
+    assert!(!err.contains("Created a new trade key"), "{err}");
+    assert!(out.contains("this agent's key"), "{out}");
     assert!(
-        out.contains(&format!(
-            "maxplayer account link --trade-home {trade_arg} --code"
-        )),
-        "{out}"
+        !out.contains("--trade-home"),
+        "follow-up commands must not repeat the ignored flag: {out}"
     );
-    assert_eq!(names_in(&trade), ["trade.key"]);
-    let key_path = trade.join("trade.key");
-    assert_eq!(
-        std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let secret = std::fs::read_to_string(&key_path).unwrap();
-    assert_eq!(secret.len(), 64);
-    let trade_hex = nostr_sdk::prelude::Keys::parse(&secret)
-        .unwrap()
-        .public_key()
-        .to_hex();
-    assert!(fake.pending(&trade_hex).is_some());
     assert!(
-        fake.pending(&home.pubkey).is_none(),
-        "the agent key is not linked"
+        names_in(&trade).is_empty(),
+        "nothing created in the trade dir"
+    );
+    assert!(
+        fake.pending(&home.pubkey).is_some(),
+        "the home (agent) key is the one linked"
     );
 
     let (code, out, err) = run(
@@ -1004,22 +976,45 @@ fn trade_home_links_the_trading_key_and_creates_it_only_for_link() {
         &["link", "--trade-home", &trade_arg, "--code", "482913"],
     );
     assert_eq!(code, 0, "{out}\n{err}");
+    assert!(err.contains(TRADE_HOME_DEPRECATED), "{err}");
     assert_eq!(
-        fake.registration(&trade_hex).unwrap().email,
+        fake.registration(&home.pubkey).unwrap().email,
         "ops@example.com"
     );
-    assert_eq!(
-        std::fs::read_to_string(&key_path).unwrap(),
-        secret,
-        "key kept"
-    );
-    let (code, out, _) = run(
+
+    // status: a missing directory no longer refuses (the flag is ignored); still nothing created.
+    for dir in [trade_arg.as_str(), "/definitely/not/here"] {
+        let (code, out, err) = run(
+            &home,
+            &fake.base_url(),
+            &["status", "--json", "--trade-home", dir],
+        );
+        assert_eq!(code, 0, "{dir}: {out}\n{err}");
+        assert!(err.contains(TRADE_HOME_DEPRECATED), "{err}");
+        let status: Value = serde_json::from_str(out.trim()).unwrap();
+        assert_eq!(status["registered"], true);
+        assert_eq!(status["pubkey"], home.pubkey);
+    }
+    assert!(!std::path::Path::new("/definitely/not/here").exists());
+
+    let (code, _, err) = run(
         &home,
         &fake.base_url(),
-        &["status", "--json", "--trade-home", &trade_arg],
+        &["marketing", "off", "--trade-home", &trade_arg],
     );
-    assert_eq!(code, 0);
-    let status: Value = serde_json::from_str(out.trim()).unwrap();
-    assert_eq!(status["registered"], true);
-    assert_eq!(status["pubkey"], trade_hex);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains(TRADE_HOME_DEPRECATED), "{err}");
+    assert!(names_in(&trade).is_empty());
+
+    // --trade-home + --mint: warned, ignored, acts as --mint (this home has no mint key: the
+    // --mint refusal, not a trade-key one, and still nothing created).
+    let (code, _, err) = run(
+        &home,
+        &fake.base_url(),
+        &["status", "--mint", "--trade-home", &trade_arg],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains(TRADE_HOME_DEPRECATED), "{err}");
+    assert!(err.contains("no mint key at"), "{err}");
+    assert!(names_in(&trade).is_empty());
 }

@@ -1978,6 +1978,7 @@ mod tests {
             balance_sats: 10,
             is_default: false,
             configured: true,
+            reserved_sats: 0,
         }];
         let mut f = filters(10, 10);
         f.allow_real_mints = true;
@@ -2012,6 +2013,7 @@ mod tests {
             balance_sats: 100,
             is_default: false,
             configured: true,
+            reserved_sats: 0,
         });
         let rows =
             super::super::store::available_balances(&db, "job-b", DEFAULT_MINT_URL, &raw).unwrap();

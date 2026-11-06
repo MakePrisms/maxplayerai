@@ -388,6 +388,7 @@ jobs:
         .cargo/
         .github/workflows/ci.yml
         scripts/verify-trade-test-matrix.py
+        scripts/check-user-build-mint-fence.sh
     steps:
       # A pull_request run checks out the merge commit refs/pull/N/merge: its first parent is the
       # base branch tip and its diff against that parent is exactly what merging the PR changes.
@@ -480,12 +481,22 @@ jobs:
         run: python3 scripts/verify-trade-test-matrix.py
       - name: Clippy (default features)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
+      # --all-targets builds the lib with the test-only `local-test-mints` feature (self
+      # dev-dependency); this lints the lib + bin exactly as users build them, feature off.
+      - name: Clippy (user build, no dev-dependencies)
+        run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --lib --bins --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
       - name: Clippy (lab)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --features lab --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
       # Builds the test dependencies into the cache this job saves. `lab` adds no dependency, so
       # one default build covers both suites.
       - name: Build the tests (cache warm-up)
         run: cargo test --manifest-path "$TRADE_MANIFEST" --locked --no-run
+      # Every `cargo test` build gets the test-only `local-test-mints` feature (loopback http://
+      # mints, ws:// mint relays) through a self dev-dependency, so no test binary can show what
+      # users install. This builds the binary as users do (no features, no dev-dependencies) and
+      # checks it refuses http:// mints and ws:// mint relays before any connection or home write.
+      - name: User build refuses http:// mints and ws:// mint relays
+        run: scripts/check-user-build-mint-fence.sh
 
   # The lab suite (`--features lab`, TRADE_LAB_SECONDS=1 short deadlines) is where refund/claim
   # recovery, slow/dead-mint and deadline regressions live; the default suite compiles them out.
@@ -519,7 +530,7 @@ jobs:
               --test money --test pinned_quote_recovery --test receive --test relays
               --test review_regressions --test round5 --test round7 --test send
               --test serve_receive --test serve_review_r2 --test serve_send_fund
-              --test serve_socket_uid --test ux
+              --test serve_socket_uid --test shared_home --test ux
             doc: true
           # lab suite (~2870s total)
           - suite: lab
@@ -598,7 +609,7 @@ jobs:
             targets: >-
               --test serve_receive --test backoff --test ux --test send --test receive
               --test serve_send_fund --test round7 --test relays --test serve_review_r2
-              --test serve_socket_uid
+              --test serve_socket_uid --test shared_home
     env:
       TRADE_MANIFEST: crates/maxplayer-trade/Cargo.toml
     steps:

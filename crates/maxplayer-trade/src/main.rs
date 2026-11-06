@@ -8,15 +8,17 @@ use std::{
 };
 #[derive(Parser)]
 struct Cli {
-    /// Private, exclusively owned journal and wallet directory. Never delete a funded home.
+    /// The maxplayer home to trade from (default: $MAXPLAYER_HOME, else ~/.maxplayer): its `key`
+    /// signs and its wallet pays; trade's journal lives in <home>/trade. A legacy standalone
+    /// trading home (wallet.seed / trade.key) is still accepted to drain it. Never delete a funded home.
     #[arg(long)]
     home: Option<PathBuf>,
     /// Market relay URL (repeatable); defaults to relay.maxplayer.ai, then nos.lol,
     /// relay.primal.net and offchain.pub as fallbacks.
     #[arg(long)]
     relay: Vec<String>,
-    /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://, or ws://
-    /// on loopback). Defaults to wss://relay.maxplayer.ai, wss://relay.ditto.pub and
+    /// Relay for nostr:// mint requests only (kinds 23410/23411; repeatable, max 8; wss://).
+    /// Defaults to wss://relay.maxplayer.ai, wss://relay.ditto.pub and
     /// wss://nostr-pub.wellorder.net. Never used for market traffic, which goes to --relay.
     #[arg(long = "mint-relay")]
     mint_relay: Vec<String>,
@@ -190,21 +192,6 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         )
         .await;
     }
-    let home = cli
-        .home
-        .as_ref()
-        .context("--home is required for this command")?;
-    maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
-    // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
-    match &cli.command {
-        Command::Fund { mint, .. } => maxplayer_trade::transport::require_http(mint, "fund")?,
-        Command::Withdraw { mint, .. } => {
-            maxplayer_trade::transport::require_http(mint, "withdraw")?
-        }
-        _ => {}
-    }
-    // Mint requests sign as this home's key: the default mint relay only admits registered keys.
-    maxplayer_trade::transport::configure_mint_identity(home);
     // A zero amount can never succeed: refuse it before any cap check, home, lock or mint.
     let zero = match &cli.command {
         Command::Fund { amount, .. }
@@ -222,6 +209,57 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     if let Some(flag) = zero {
         anyhow::bail!("amount must be at least 1 sat ({flag} 0)");
     }
+    // Argument-only refusal, like the zero check: before any home is resolved or created.
+    if let Command::Fund { amount, .. } = &cli.command {
+        ensure!(
+            *amount <= maxplayer_trade::real_money::CAP,
+            "funding cap exceeds 100,000 sats"
+        );
+    }
+    maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
+    // Argument-only mint fence (no http:// mints in a user build): before any home is resolved,
+    // created or locked, any hand-off, and any mint or relay is contacted.
+    let arg_mints: Vec<&String> = match &cli.command {
+        Command::Preflight { mint }
+        | Command::Fund { mint, .. }
+        | Command::Balance { mint }
+        | Command::Withdraw { mint, .. }
+        | Command::Receive { mint, .. }
+        | Command::Send {
+            mint: Some(mint), ..
+        } => vec![mint],
+        Command::List {
+            give_mint,
+            want_mint,
+            ..
+        } => vec![give_mint, want_mint],
+        _ => vec![],
+    };
+    for mint in arg_mints {
+        Asset::from_cli(mint)?.fence()?;
+    }
+    // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
+    match &cli.command {
+        Command::Fund { mint, .. } => maxplayer_trade::transport::require_http(mint, "fund")?,
+        Command::Withdraw { mint, .. } => {
+            maxplayer_trade::transport::require_http(mint, "withdraw")?
+        }
+        _ => {}
+    }
+    let resolved = resolve_home(cli.home.as_deref(), &cli.command)?;
+    let home = &resolved;
+    // A maxplayer home moves money only at mints its buyer wallet may use (configured + fence).
+    match &cli.command {
+        Command::Fund { mint, .. }
+        | Command::Withdraw { mint, .. }
+        | Command::Receive { mint, .. }
+        | Command::Send {
+            mint: Some(mint), ..
+        } => maxplayer_trade::wallet::check_mint(home, &Asset::from_cli(mint)?.mint_url)?,
+        _ => {}
+    }
+    // Mint requests sign as this home's key: the default mint relay only admits registered keys.
+    maxplayer_trade::transport::configure_mint_identity(home);
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
         let asset = Asset::from_cli(mint)?;
@@ -402,15 +440,18 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             }
         }
     }
-    fs::create_dir_all(home)?;
-    fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
+    if !maxplayer_trade::wallet::is_maxplayer_home(home) {
+        fs::create_dir_all(home)?;
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
+    }
+    let state = maxplayer_trade::wallet::ensure_state_dir(home)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(home.join("owner.lock"))?;
+        .open(state.join("owner.lock"))?;
     if let Err(busy) = lock.try_lock_exclusive() {
         // Another process owns the home: a serve (possibly still binding its socket) gets the
         // request; a short-lived writer such as recover is waited out. Never two writers.
@@ -648,6 +689,58 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     unreachable!()
 }
 
+/// The home a command runs against. `--home` (else the maxplayer home: $MAXPLAYER_HOME, else
+/// ~/.maxplayer) names either a maxplayer home (`key`/`config.toml`: shared mode) or a legacy
+/// standalone trading home (`wallet.seed`/`trade.key`/root `trade.sqlite`: drain-only, warned).
+/// A directory that is neither serves read-only commands only; nothing is created there.
+fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
+    use maxplayer_trade::wallet;
+    let home = match arg {
+        Some(path) => path.to_path_buf(),
+        None => maxplayer_core::home::default_home_dir().map_err(|e| anyhow::anyhow!("{e}"))?,
+    };
+    if wallet::is_legacy_dir(&home) {
+        eprintln!("{}", wallet::legacy_warning(&home));
+        if matches!(
+            command,
+            Command::List { .. }
+                | Command::Take { .. }
+                | Command::Fund { .. }
+                | Command::Receive { .. }
+        ) {
+            anyhow::bail!("{}", wallet::legacy_refusal(&home));
+        }
+        return Ok(home);
+    }
+    if wallet::is_maxplayer_home(&home) {
+        ensure!(
+            fs::symlink_metadata(home.join("key")).is_ok(),
+            "maxplayer home {h} has no key yet: create it with `maxplayer whoami --home {h}` and \
+             link it with `maxplayer account link --home {h}`",
+            h = home.display()
+        );
+        return Ok(home);
+    }
+    let read_only = matches!(
+        command,
+        Command::Balance { .. }
+            | Command::Status { .. }
+            | Command::Discover
+            | Command::Preflight { .. }
+            | Command::List { dry_run: true, .. }
+            | Command::Take { dry_run: true, .. }
+    );
+    ensure!(
+        read_only,
+        "no maxplayer home at {h} (no key or config.toml): trading uses a maxplayer home's key and \
+         wallet. Create one with `maxplayer wallet setup --home {h}` (or `maxplayer whoami --home \
+         {h}`), link its key with `maxplayer account link --home {h}`, then retry; nothing was \
+         created",
+        h = home.display()
+    );
+    Ok(home)
+}
+
 /// Read one token from `--token-file` or stdin, at most `MAX_TOKEN_BYTES` + 1 bytes (the
 /// excess byte lets `receive::inspect` refuse an oversized token instead of truncating it).
 fn read_token(token_file: Option<&std::path::Path>) -> Result<String> {
@@ -778,9 +871,10 @@ mod lockfree {
             .context("lot unavailable, invalid, expired or cancelled")?;
         let l = parse_lot(&e, maxplayer_trade::coordinator::now())?;
         // Self-trade check without creating a trade key.
-        let own = std::fs::read_to_string(home.join("trade.key"))
-            .ok()
-            .and_then(|k| nostr_sdk::Keys::parse(&k).ok());
+        let own = wallet::existing_identity(home).ok().flatten();
+        for mint in [&l.give.asset.mint_url, &l.want.asset.mint_url] {
+            wallet::check_mint(home, mint)?;
+        }
         ensure!(own.is_none_or(|k| k.public_key() != e.pubkey), "self trade");
         let [gks, wks] = preflight([&l.give.asset.mint_url, &l.want.asset.mint_url]).await?;
         let p = dryrun::plan(
@@ -886,8 +980,20 @@ async fn doctor(
 ) -> Result<()> {
     match doctor_inner(mint, relay, json_output, seconds, home).await {
         Err(error) if !error.is::<DoctorExit>() => {
-            let message = "Diagnostic not started: check the mint identifier, the explicit relay \
-                 URL and the --home trade.key";
+            // Caller text stays out of the message (a relay URL may hold a token); a scheme
+            // refusal is a fixed string, so name it.
+            let text = format!("{error:#}");
+            let reason = [
+                maxplayer_trade::transport::HTTP_MINT_REFUSED,
+                maxplayer_trade::transport::WS_MINT_RELAY_REFUSED,
+            ]
+            .into_iter()
+            .find(|r| text.contains(r));
+            let message = format!(
+                "Diagnostic not started: check the mint identifier, the explicit relay URL and \
+                 the --home trade.key{}",
+                reason.map(|r| format!(" ({r})")).unwrap_or_default()
+            );
             if json_output {
                 println!(
                     "{}",
@@ -912,6 +1018,7 @@ async fn doctor_inner(
     use nostr_sdk::prelude::ToBech32;
     use std::time::Duration;
     let asset = Asset::from_cli(mint)?;
+    asset.fence()?;
     ensure!(
         maxplayer_trade::transport::is_nostr(&asset.mint_url),
         "doctor requires a nostr:// mint and one explicit --mint-relay"
@@ -929,19 +1036,29 @@ async fn doctor_inner(
     // A sign-in-required relay only admits registered keys (`maxplayer account link
     // --trade-home`), so sign as the home's trade key when it has one. Never create it here.
     let identity = match home {
-        Some(home) => maxplayer_trade::wallet::existing_identity(home)?,
+        Some(home) => maxplayer_trade::wallet::existing_identity(home)
+            .ok()
+            .flatten(),
         None => None,
     };
     let signer = match &identity {
         Some(keys) => {
             let npub = keys.public_key().to_bech32()?;
-            eprintln!("Signing as this home's trade.key ({npub})");
-            serde_json::json!({"source":"home trade.key","npub":npub})
+            let source = if home.is_some_and(maxplayer_trade::wallet::is_maxplayer_home) {
+                "home key"
+            } else {
+                "home trade.key"
+            };
+            eprintln!(
+                "Signing as this home's {} ({npub})",
+                source.trim_start_matches("home ")
+            );
+            serde_json::json!({"source":source,"npub":npub})
         }
         None => {
             eprintln!(
                 "Signing with a throwaway key: a sign-in-required relay (relay.maxplayer.ai) \
-                 refuses it. Pass --home <trading home> once its trade.key is linked."
+                 refuses it. Pass --home <maxplayer home> once its key is linked."
             );
             serde_json::json!({"source":"ephemeral"})
         }

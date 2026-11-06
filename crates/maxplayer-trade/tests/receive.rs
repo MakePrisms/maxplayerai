@@ -38,7 +38,7 @@ fn encode(mint: &str, proofs: Proofs) -> String {
     .to_string()
 }
 async fn home() -> (tempfile::TempDir, Journal) {
-    let h = tempfile::tempdir().unwrap();
+    let h = maxplayer_home();
     let j = Journal::open(h.path()).await.unwrap();
     (h, j)
 }

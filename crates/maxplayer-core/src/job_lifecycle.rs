@@ -4446,6 +4446,7 @@ mod tests {
             balance_sats: sats,
             is_default,
             configured: true,
+            reserved_sats: 0,
         }
     }
 

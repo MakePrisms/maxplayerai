@@ -36,7 +36,7 @@ pub fn open(path: &Path) -> Result<Option<rusqlite::Connection>> {
 
 /// `(key, value, updated_time)` for one journal namespace, read-only.
 pub fn journal_rows(home: &Path, ns: &str) -> Result<Vec<(String, Vec<u8>, u64)>> {
-    let Some(db) = open(&home.join("trade.sqlite"))? else {
+    let Some(db) = open(&crate::wallet::state_dir(home).join("trade.sqlite"))? else {
         return Ok(vec![]);
     };
     let mut stmt = db.prepare(

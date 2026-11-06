@@ -604,8 +604,9 @@ pub async fn authorize_pay_async(
     // instead run as a WORKER preflight just below (pre-reserve, so a dead mint burns zero budget) and
     // re-checked inside lock_or_reconcile (payment_wallet.rs).
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
-    let mut effects = CdkPaymentEffects::spawn(
+    let mut effects = CdkPaymentEffects::spawn_for_home(
         wallet,
+        home.wallet_dir.clone(),
         payment_send,
         move |key: &PaymentKey, _payment: &crate::payment_send::PaymentSent| {
             build_and_publish_receipt(
@@ -900,8 +901,9 @@ pub async fn complete_recovered_locked_async(
     let wallet = buyer_fund::open_wallet_at_mint_async(home, &wallet_open_mint_url(home, &terms))
         .await?;
     let payment_send = NostrPaymentSend::new(home.config.relay_url.clone(), keys);
-    let mut effects = CdkPaymentEffects::spawn(
+    let mut effects = CdkPaymentEffects::spawn_for_home(
         wallet,
+        home.wallet_dir.clone(),
         payment_send,
         move |key: &PaymentKey, _payment: &crate::payment_send::PaymentSent| {
             build_and_publish_receipt(

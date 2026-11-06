@@ -9,7 +9,6 @@
 //! against the same wallet and keysets.
 use crate::{Asset, Lot, fee, gross, observe};
 use anyhow::{Context, Result, ensure};
-use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 /// One mint's published sat keysets: id -> (active, input_fee_ppk).
@@ -104,8 +103,7 @@ impl Preview {
 
 /// Unreserved plain proofs `(amount, keyset)` in the order `mint::plan` sorts them.
 pub fn spendable(home: &Path, mint: &str) -> Result<Vec<(u64, String)>> {
-    let asset = hex::encode(Sha256::digest(format!("{mint}|sat")));
-    let Some(db) = observe::open(&home.join(format!("{asset}.sqlite")))? else {
+    let Some(db) = observe::open(&crate::wallet::db_path(home, mint))? else {
         return Ok(vec![]);
     };
     let mut stmt = db.prepare(

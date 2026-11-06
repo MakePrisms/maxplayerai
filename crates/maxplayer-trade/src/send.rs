@@ -464,9 +464,11 @@ pub async fn send(
     let (total, fee) = chosen.context("insufficient unreserved balance for amount plus fee")?;
     check_fee(fee, max_fees)?;
     ensure!(inputs.len() <= MAX_PROOFS, "too many send inputs");
-    mint::unspent(mint, &inputs)
-        .await
-        .context("selected proofs are not UNSPENT at the mint")?;
+    if let Err(error) = mint::unspent(mint, &inputs).await {
+        // Taken locally since the snapshot (a concurrent buyer send): retryable, nothing done.
+        crate::wallet::refuse_if_taken(home, mint, &inputs.ys()?).await?;
+        return Err(error.context("selected proofs are not UNSPENT at the mint"));
+    }
     let amounts = bounded_for(mint, w.get_keyset_fees_and_amounts_by_id(k.id))
         .await
         .context("CDK wallet request not answered")??;
@@ -521,9 +523,16 @@ pub async fn send(
         rewritten: false,
         released: false,
     };
+    // Journal and reserve under one selection lock: on a shared home another process may have
+    // taken an input since it was chosen; then nothing is journaled.
+    let ys = r.swap.inputs.ys()?;
+    let sel = crate::wallet::select(home, mint).await?;
+    sel.verify_free(&ys).await?;
     j.put("send", &r.id, &r).await?;
     lab_crash("TRADE_CRASH_AFTER_SEND_JOURNAL", 84);
-    if let Err(error) = reserve(home, &r).await {
+    let reserved = sel.reserve(&ys, &r.op()?).await;
+    drop(sel);
+    if let Err(error) = reserved {
         // Nothing was POSTed: record the refusal, then release anything held.
         finish(j, &mut r, SendState::Refused).await?;
         release(home, j, &mut r).await?;
@@ -568,10 +577,7 @@ async fn release(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result<()> {
     if !r.releasable() || r.released {
         return Ok(());
     }
-    database(home, &r.mint)
-        .await?
-        .release_proofs(&r.op()?)
-        .await?;
+    crate::wallet::release(home, &r.mint, &r.op()?).await?;
     if r.terminal() {
         update(j, r, |n| {
             n.released = true;
@@ -584,21 +590,15 @@ async fn release(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result<()> {
 
 /// Hold the journaled inputs under this attempt's operation id (idempotent).
 async fn reserve(home: &Path, r: &SendAttempt) -> Result<()> {
-    let db = database(home, &r.mint).await?;
-    let op = r.op()?;
-    let held: HashSet<_> = db
-        .get_reserved_proofs(&op)
-        .await?
-        .into_iter()
-        .map(|p| p.y)
-        .collect();
-    let intended: HashSet<_> = r.swap.inputs.ys()?.into_iter().collect();
-    ensure!(held.is_subset(&intended), "send reservation conflict");
-    let missing: Vec<_> = intended.difference(&held).copied().collect();
-    if !missing.is_empty() {
-        db.reserve_proofs(missing, &op).await?;
-    }
-    Ok(())
+    crate::wallet::reserve(home, &r.mint, &r.swap.inputs.ys()?, &r.op()?)
+        .await
+        .map_err(|e| {
+            if e.to_string() == "reservation conflict" {
+                anyhow!("send reservation conflict")
+            } else {
+                e
+            }
+        })
 }
 
 /// NUT-09 restore of the SAME outputs: None when wholly absent, else all of them.
@@ -1185,7 +1185,7 @@ pub async fn pending(j: &Journal) -> Result<bool> {
 
 /// Lock-free, read-only: NUT-07 check of every sent token. Prints one public line each.
 pub async fn check_redeemed(home: &Path) -> Result<()> {
-    let path = home.join("trade.sqlite");
+    let path = crate::wallet::state_dir(home).join("trade.sqlite");
     if !path.exists() {
         return Ok(());
     }

@@ -7,7 +7,7 @@
 //! FakeWallet-auto-pays mint quotes. For other configured mints, [`begin_mint_async`]
 //! returns the bolt11 and callers must pay it, then [`complete_mint_async`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -290,6 +290,10 @@ pub struct MintBalance {
     /// for a mint the config no longer (or never) names. Display surfaces them (#266); accept-time
     /// source selection deliberately ignores them (see `crossmint::holds_at_least`).
     pub configured: bool,
+    /// Sats in `Pending`, `Reserved` and `PendingSpent` proofs at the mint: held by an in-flight
+    /// operation (a job payment, send or melt, or a local `maxplayer-trade` lot/swap/send on this
+    /// home). Never part of `balance_sats` and never spendable until the owner releases them.
+    pub reserved_sats: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1159,7 +1163,22 @@ pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, Wa
             )
             .await
             .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let reserved = store
+            .get_balance(
+                Some(MintUrl::from_str(&mint_url).map_err(|error| {
+                    WalletOpsError::Wallet(format!("invalid normalized mint URL: {error}"))
+                })?),
+                Some(CurrencyUnit::Sat),
+                Some(vec![
+                    cashu::State::Pending,
+                    cashu::State::Reserved,
+                    cashu::State::PendingSpent,
+                ]),
+            )
+            .await
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
         rows.push(MintBalance {
+            reserved_sats: reserved,
             is_default: mint_url == default,
             configured: configured.iter().any(|entry| entry == &mint_url),
             mint_url,
@@ -1376,10 +1395,14 @@ pub async fn send_async(
             "insufficient funds: balance={before} need={amount_sats}"
         )));
     }
-    let prepared = wallet
-        .prepare_send(Amount::from(amount_sats), SendOptions::default())
-        .await
-        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    let prepared = crate::shared_wallet::prepare_send_locked(
+        &wallet,
+        Some(&home.wallet_dir),
+        Amount::from(amount_sats),
+        SendOptions::default(),
+    )
+    .await
+    .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // `confirm` is the effect boundary: it consumes the input proofs and mints the outgoing token, so
     // past this point the ecash has left the spendable balance and the caller MUST receive the token.
     // The post-confirm balance read is observational; a read failure must never discard the token
@@ -1512,7 +1535,7 @@ pub async fn melt_within_async(
     // [`PreparedMeltPayment::confirm`] (since addendum 8; [`pay_melt_quote_async`] is retained but
     // no longer called on that path, removal owed) — with its store fence in between, so that it
     // only ever pays the quote its admission bound (addendum 5 §1, rule 1).
-    pay_quote_on_wallet(&wallet, mint_url, &quote, ceiling).await
+    pay_quote_on_wallet(&wallet, &home.wallet_dir, mint_url, &quote, ceiling).await
 }
 
 /// **Pay a melt quote the wallet already holds, by id, and never raise another.** The seller fee
@@ -1557,7 +1580,7 @@ pub async fn pay_melt_quote_async(
                 "melt quote {quote_id} is not in this wallet; refusing to pay a quote this wallet did not raise"
             ))
         })?;
-    pay_quote_on_wallet(&wallet, mint_url, &quote, Some(ceiling)).await
+    pay_quote_on_wallet(&wallet, &home.wallet_dir, mint_url, &quote, Some(ceiling)).await
 }
 
 /// The pay step shared by [`melt_within_async`] (quote raised a moment ago) and
@@ -1565,6 +1588,7 @@ pub async fn pay_melt_quote_async(
 /// reserve, balance check, `prepare_melt` on this quote's id, `confirm`.
 async fn pay_quote_on_wallet(
     wallet: &Wallet,
+    wallet_dir: &Path,
     mint_url: String,
     quote: &cdk::wallet::MeltQuote,
     ceiling: Option<&MeltCeiling>,
@@ -1599,8 +1623,7 @@ async fn pay_quote_on_wallet(
             "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
         )));
     }
-    let prepared = wallet
-        .prepare_melt(&quote.id, HashMap::new())
+    let prepared = crate::shared_wallet::prepare_melt_locked(wallet, Some(wallet_dir), &quote.id)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // Reported, not bounded: this operator path keeps its reserve-only ceiling (addendum 8 §6); the
@@ -1881,10 +1904,10 @@ fn prepared_melt_thread(
                 "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
             )));
         }
-        let prepared = wallet
-            .prepare_melt(&quote.id, HashMap::new())
-            .await
-            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let prepared =
+            crate::shared_wallet::prepare_melt_locked(&wallet, Some(&home.wallet_dir), &quote.id)
+                .await
+                .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
         let input_fee_sats = prepared.input_fee().to_u64();
         let swap_fee_sats = prepared.swap_fee().to_u64();
         let requires_swap = prepared.requires_swap();
@@ -2225,6 +2248,7 @@ pub fn list_mints(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsErr
             configured: true,
             mint_url,
             balance_sats: 0,
+            reserved_sats: 0,
         })
         .collect())
 }
