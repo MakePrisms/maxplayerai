@@ -13,6 +13,14 @@ the merge, Vercel).
   `maxplayer wallet balance`. Only the home's configured mints (default + `extra_mints`) that
   pass the real-mint fence can be traded. Trades are not in the buyer spend ledger, do not count
   against `per_job_budget_sats`, and pay no platform fee. Trade state lives in `<home>/trade/`.
+- **Changed: `maxplayer-trade` refuses plain `http://` mints, localhost included**, with
+  `http:// mints are not supported; use https:// or nostr://`, and refuses `ws://` mint relays
+  (`--mint-relay`), the same rule as the buyer wallet's real-mint fence. This covers every command
+  (`preflight`, `balance`, `fund`, `withdraw`, `receive`, `send`, `list`, `take`, `doctor`), serve
+  hand-offs and lots from the market: `discover` skips a lot naming an `http://` mint and `take`
+  refuses it before anything is journaled. Loopback HTTP fake mints remain only in test builds
+  (test-only cargo feature `local-test-mints`); `cargo install --locked --path
+  crates/maxplayer-trade` never enables it.
 - **New: wallet selection lock.** The buyer (job payments, `wallet send`/`melt`, the cross-mint
   hop, NUT-13 restore) and `maxplayer-trade` (lot, take, send and withdraw reservations) take an
   exclusive `flock` on `<home>/wallet/select.lock` only while they pick and reserve proofs;

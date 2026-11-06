@@ -17,11 +17,14 @@ public relays carry it. To make the home's key a member, link it with `maxplayer
 link` (crate README, "Default market relays"). These source defaults are also listed in root help. ACKed copies are not resent; retries use exponential
 backoff with jitter, at most 12 attempts per event/relay and a 24-hour age cutoff.
 Rate limiting pauses a relay for at least five minutes.
-A separate repeated global `--mint-relay <url>` (max 8; `wss://`, `ws://` only on loopback)
+A separate repeated global `--mint-relay <url>` (max 8; `wss://` only, `ws://` is refused)
 carries `nostr://` mint requests only (kinds 23410/23411), never market traffic; it defaults
 to `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub` and `wss://nostr-pub.wellorder.net`, the
 default credits sidecar's own list. `relay.maxplayer.ai` is in both lists; the market and mint
 connections stay separate. Preserve the same mint-relay set during recovery of a `nostr://` trade.
+Every `<mint>` below is `https://…` or `nostr://<npub>`. Plain `http://` mints are refused
+everywhere, localhost included ("http:// mints are not supported; use https:// or nostr://"), and
+lots naming one are never shown or taken; loopback HTTP fixtures exist only in test builds.
 Relay ACK is not proof of stored readback or trade success. Respect backoff; do not
 restart loops or generate fresh identities to evade rate limits.
 

@@ -453,23 +453,24 @@ fn shared_identity(root: &Path) -> Result<nostr_sdk::Keys> {
     Ok(nostr_sdk::Keys::parse(&secret)?)
 }
 /// In a maxplayer home only a mint in the home's configured set (default + `extra_mints`) that the
-/// real-mint fence (`allow_real_mints`) admits may be traded. A plain-HTTP mint on loopback (test
-/// and local fixtures; trade's own fence allows no other HTTP) passes the real-mint fence.
+/// real-mint fence (`allow_real_mints`) admits may be traded. Plain HTTP is refused outright (no
+/// http:// mints in a user build); only a `local-test-mints` test build lets a loopback HTTP
+/// fixture mint past the real-mint fence.
 pub fn check_shared_mint(root: &Path, mint: &str) -> Result<()> {
     let mh = maxplayer_home(root)?;
     let normalized =
         maxplayer_core::wallet_ops::normalize_mint_url(mint).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let loopback = url::Url::parse(&normalized).is_ok_and(|u| {
-        u.scheme() == "http"
-            && u.host_str().is_some_and(|h| {
-                h == "localhost"
-                    || h.trim_matches(['[', ']'])
-                        .parse::<std::net::IpAddr>()
-                        .is_ok_and(|ip| ip.is_loopback())
-            })
-    });
+    let parsed = url::Url::parse(&normalized).ok();
+    let local_test = parsed
+        .as_ref()
+        .is_some_and(crate::transport::local_test_http_mint);
     ensure!(
-        loopback || maxplayer_core::home::mint_allowed(&normalized, mh.config.allow_real_mints),
+        local_test || parsed.as_ref().is_none_or(|u| u.scheme() != "http"),
+        "{}",
+        crate::transport::HTTP_MINT_REFUSED
+    );
+    ensure!(
+        local_test || maxplayer_core::home::mint_allowed(&normalized, mh.config.allow_real_mints),
         "mint {normalized} is refused by this home's real-mint fence (allow_real_mints is off in \
          {}); trading uses only mints the buyer wallet may use",
         root.join("config.toml").display()

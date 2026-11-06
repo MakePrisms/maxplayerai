@@ -2212,6 +2212,7 @@ dependencies = [
  "httpdate",
  "maxplayer-core",
  "maxplayer-mint",
+ "maxplayer-trade",
  "nostr-relay-builder",
  "nostr-sdk",
  "reqwest",
