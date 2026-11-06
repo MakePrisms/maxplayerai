@@ -257,29 +257,27 @@ pub async fn plan_excluding(
     }
     bail!("insufficient unreserved balance (overlisting refused)")
 }
+/// Re-apply a journaled reservation (recovery): owner-checked, under the wallet selection lock.
 pub async fn reserve(home: &Path, p: &Plan, op: &str) -> Result<()> {
-    let db = database(home, &p.mint).await?;
-    let id = uuid::Uuid::parse_str(op)?;
-    let existing = db.get_reserved_proofs(&id).await?;
-    let intended: HashSet<_> = p.inputs.ys()?.into_iter().collect();
-    ensure!(
-        existing.iter().all(|p| intended.contains(&p.y)),
-        "reservation conflict"
-    );
-    let reserved: HashSet<_> = existing.iter().map(|p| p.y).collect();
-    let missing = intended.difference(&reserved).copied().collect::<Vec<_>>();
-    if !missing.is_empty() {
-        db.reserve_proofs(missing, &id).await?;
-    }
-    Ok(())
+    crate::wallet::reserve(home, &p.mint, &p.inputs.ys()?, &uuid::Uuid::parse_str(op)?).await
+}
+/// First reservation of a freshly planned lot/take: under ONE selection lock, check the planned
+/// inputs are still free (another process on a shared home may have taken one since `plan`),
+/// journal the intent with `journal`, then reserve. Nothing is journaled if a proof was taken.
+pub async fn reserve_new<F, Fut>(home: &Path, p: &Plan, op: &str, journal: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let ys = p.inputs.ys()?;
+    let sel = crate::wallet::select(home, &p.mint).await?;
+    sel.verify_free(&ys).await?;
+    journal().await?;
+    sel.reserve(&ys, &uuid::Uuid::parse_str(op)?).await
 }
 pub async fn release(home: &Path, p: &Plan, op: &str) -> Result<()> {
     unspent(&p.mint, &p.inputs).await?;
-    database(home, &p.mint)
-        .await?
-        .release_proofs(&uuid::Uuid::parse_str(op)?)
-        .await?;
-    Ok(())
+    crate::wallet::release(home, &p.mint, &uuid::Uuid::parse_str(op)?).await
 }
 pub fn conditions(
     hash: &str,

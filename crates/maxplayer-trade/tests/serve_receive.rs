@@ -199,7 +199,7 @@ fn lock_is_held(home: &Path) -> bool {
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(home.join("owner.lock"))
+        .open(maxplayer_trade::wallet::state_dir(&home).join("owner.lock"))
         .unwrap();
     f.try_lock_exclusive().is_err()
 }
@@ -593,7 +593,7 @@ async fn max_size_token_accepted_and_over_limit_refused() {
     assert!(!serve.output().contains("\"serve_request\":\"receive\""));
     // A raw request over serve's frame limit: refused, nothing executed, bytes not echoed.
     {
-        let mut s = tokio::net::UnixStream::connect(f.taker.join("serve.sock"))
+        let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"))
             .await
             .unwrap();
         let mut junk = vec![b'Q'; maxplayer_trade::serve::MAX_REQUEST_BYTES + 1024];
@@ -645,7 +645,7 @@ async fn socket_permissions_refuse_and_never_fall_back_to_a_second_writer() {
     let c = MintFixture::start(0).await;
     let (_s, proofs, token) = issue(&c, 16).await;
     let mut serve = start_serve(&f.taker, &f.relay_url, f.root.path(), "serve").await;
-    let sock = f.taker.join("serve.sock");
+    let sock = maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock");
     let mode = std::fs::metadata(&sock).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o600, "SAFETY: socket mode");
     let home_mode = std::fs::metadata(&f.taker).unwrap().permissions().mode();
@@ -701,7 +701,7 @@ async fn spent_and_invalid_tokens_refused_without_leaking() {
     assert!(stderr.contains("contents withheld"), "{stderr}");
     assert!(!(stdout + &stderr).contains(&junk), "SAFETY: token echoed");
     // A malformed request whose mistyped field holds the token: serde would quote it.
-    let mut s = tokio::net::UnixStream::connect(f.taker.join("serve.sock"))
+    let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"))
         .await
         .unwrap();
     let line = serde_json::json!({"v":token,"relays":[f.relay_url],"command":{"receive":{"mint":c.url,"token":token}}});
@@ -798,7 +798,7 @@ async fn receive_with_home_locked_and_no_serve_is_refused() {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(f.taker.join("owner.lock"))
+        .open(maxplayer_trade::wallet::state_dir(&f.taker).join("owner.lock"))
         .unwrap();
     held.lock_exclusive().unwrap();
     let out = receive_cli(&f.taker, &f.relay_url, &c.url, Input::Stdin(&token)).await;
@@ -886,6 +886,9 @@ async fn handed_off_receive_checks_only_the_relays_it_uses() {
     };
     // nostr:// receive with a different mint relay set: refused before queueing.
     let npub = "nostr://npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d";
+    // A configured mint of the taker's maxplayer home, so the refusal under test is serve's
+    // relay-set check, not the configured-mint fence that runs before any hand-off.
+    configure(&f.taker, &[npub]);
     let other = run(
         Some(f.relay_url.clone()),
         Some("ws://127.0.0.1:10".into()),
@@ -1183,7 +1186,7 @@ async fn receive_and_serve_error_lines_redact_token_text() {
     assert!(err.contains("handed_to_serve"), "{err}");
     leaked("handed-off client", &(out + &err));
     // serve's relay-mismatch reply quotes the requested relays: a mistyped one may be a token.
-    let mut s = tokio::net::UnixStream::connect(f.taker.join("serve.sock"))
+    let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"))
         .await
         .unwrap();
     let line = serde_json::json!({"v":maxplayer_trade::serve::PROTOCOL_V,"relays":[leak],"mint_relays":[],"command":{"cancel":{"lot":"x"}}});

@@ -485,10 +485,7 @@ async fn release(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
     if let Ok(text) = std::env::var("TRADE_LAB_RECEIVE_RELEASE_ERROR") {
         anyhow::bail!("lab fault: release failed: {text}");
     }
-    database(home, &r.mint)
-        .await?
-        .release_proofs(&operation(r)?)
-        .await?;
+    crate::wallet::release(home, &r.mint, &operation(r)?).await?;
     let mut next = r.clone();
     next.released = true;
     j.put("receive", &next.id, &next).await?;

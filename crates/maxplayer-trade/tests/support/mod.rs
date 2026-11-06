@@ -116,6 +116,7 @@ impl MintFixture {
     pub async fn with_melt_reserve(ppk: u64, percent: f32) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        register_mint(&url);
         let db = Arc::new(cdk_sqlite::mint::memory::empty().await.unwrap());
         let mut b = MintBuilder::new(db.clone());
         b.configure_unit(
@@ -475,8 +476,75 @@ impl MintFixture {
         }
     }
 }
-pub async fn fund(home: &Path, mint: &str, n: u64) {
+/// Every fixture mint started in this test process, and every fixture home: each home may trade at
+/// every fixture mint (all loopback), so tests that move tokens between mints never have to list
+/// them. The configured-mint fence itself is tested with homes built outside this registry.
+static MINTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static HOMES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+fn write_mints(home: &Path, extra: &[&str]) {
+    let cfg = home.join("config.toml");
+    let mut list: Vec<String> = std::fs::read_to_string(&cfg)
+        .map(|s| s.split('"').skip(1).step_by(2).map(str::to_owned).collect())
+        .unwrap_or_default();
+    let known = MINTS.lock().unwrap().clone();
+    for m in extra.iter().map(|m| m.to_string()).chain(known) {
+        let m = m.trim_end_matches('/').to_owned();
+        if !list.contains(&m) {
+            list.push(m);
+        }
+    }
+    let quoted: Vec<_> = list.iter().map(|m| format!("{m:?}")).collect();
+    let _ = std::fs::write(&cfg, format!("extra_mints = [{}]\n", quoted.join(", ")));
+}
+/// Register a fixture mint: every existing and later fixture home may trade at it.
+pub fn register_mint(url: &str) {
+    MINTS.lock().unwrap().push(url.trim_end_matches('/').to_owned());
+    for home in HOMES.lock().unwrap().iter() {
+        if home.join("config.toml").exists() {
+            write_mints(home, &[]);
+        }
+    }
+}
+/// Make `home` a maxplayer home (0600 `key` + `config.toml`) that may trade at `mints` and at every
+/// registered fixture mint (idempotent). Every fixture home is one, so the suite runs in
+/// shared-home mode.
+pub fn configure(home: &Path, mints: &[&str]) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     std::fs::create_dir_all(home).unwrap();
+    std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let key = home.join("key");
+    if !key.exists() {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&key)
+            .unwrap();
+        std::io::Write::write_all(
+            &mut f,
+            nostr_sdk::Keys::generate()
+                .secret_key()
+                .to_secret_hex()
+                .as_bytes(),
+        )
+        .unwrap();
+    }
+    {
+        let mut homes = HOMES.lock().unwrap();
+        if !homes.iter().any(|h| h == home) {
+            homes.push(home.to_path_buf());
+        }
+    }
+    write_mints(home, mints);
+}
+/// A fresh maxplayer home (see [`configure`]) in a new temp dir.
+pub fn maxplayer_home() -> tempfile::TempDir {
+    let h = tempfile::tempdir().unwrap();
+    configure(h.path(), &[]);
+    h
+}
+pub async fn fund(home: &Path, mint: &str, n: u64) {
+    configure(home, &[mint]);
     let w = wallet::wallet(home, mint).await.unwrap();
     let q = w
         .mint_quote(PaymentMethod::BOLT11, Some(n.into()), None, None)
@@ -523,6 +591,8 @@ impl Fixture {
         let b = MintFixture::start(ppk).await;
         let maker = root.path().join("maker");
         let taker = root.path().join("taker");
+        configure(&maker, &[&a.url, &b.url]);
+        configure(&taker, &[&a.url, &b.url]);
         fund(&maker, &a.url, 128).await;
         fund(&taker, &b.url, 128).await;
         let relay = LocalRelay::new(RelayBuilder::default());

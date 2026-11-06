@@ -199,7 +199,7 @@ pub fn finished(code: u8, error: Option<&anyhow::Error>) {
     // This process still holds owner.lock, so the socket is ours: remove it, so a later
     // `stale_removed` at startup means the previous serve ended without this line (SIGKILL, OOM,
     // power loss). Removing it says nothing about settlement; `unfinished` does.
-    let socket = home.join(crate::serve::SOCKET);
+    let socket = crate::wallet::state_dir(home).join(crate::serve::SOCKET);
     if std::fs::symlink_metadata(&socket).is_ok_and(|m| {
         use std::os::unix::fs::FileTypeExt;
         m.file_type().is_socket()
