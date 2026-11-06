@@ -468,7 +468,7 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         let wallet = buyer_fund::open_wallet_async(&home)
             .await
             .map_err(|error| error.to_string())?;
-        payment_wallet::retire_eligible_incomplete_sagas(&wallet)
+        payment_wallet::retire_eligible_incomplete_sagas_in(&wallet, Some(&home.wallet_dir))
             .await
             .map_err(|error| error.to_string())
     });

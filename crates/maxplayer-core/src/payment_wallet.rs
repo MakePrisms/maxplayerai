@@ -394,12 +394,24 @@ pub fn assert_redeem_mint(
 /// Buyer wallet adapter backed by CDK's persisted send sagas.
 pub struct CdkBuyerMint<'a> {
     wallet: &'a Wallet,
+    /// The home's `wallet/` dir: its selection lock is held across proof selection
+    /// ([`crate::shared_wallet`]). `None` only for wallets no other process opens (tests).
+    wallet_dir: Option<std::path::PathBuf>,
 }
 
 impl<'a> CdkBuyerMint<'a> {
     /// Creates an adapter over one mint-and-unit wallet.
     pub fn new(wallet: &'a Wallet) -> Self {
-        Self { wallet }
+        Self {
+            wallet,
+            wallet_dir: None,
+        }
+    }
+
+    /// Select proofs under `wallet_dir`'s selection lock (the shared home wallet).
+    pub fn with_wallet_dir(mut self, wallet_dir: Option<std::path::PathBuf>) -> Self {
+        self.wallet_dir = wallet_dir;
+        self
     }
 
     /// Returns the existing token for an attempt or creates one seller-locked send.
@@ -432,6 +444,11 @@ impl<'a> CdkBuyerMint<'a> {
         // park the worker (and, through the bridge, the caller) forever (#387). On timeout we fail
         // closed: no `prepared`, no proofs committed, no money moved.
         let mutation_bound = mint_mutation_timeout(&self.wallet.mint_url);
+        // Selection lock OUTSIDE the mint bound: a busy wallet is a retryable refusal, never a
+        // dead-mint verdict. Held until prepare_send has reserved its inputs, then released.
+        let select = crate::shared_wallet::select_guard(self.wallet_dir.as_deref())
+            .await
+            .map_err(|error| PaymentWalletError::Wallet(error.to_string()))?;
         let prepared = match tokio::time::timeout(
             mutation_bound,
             self.wallet.prepare_send(terms.amount, options),
@@ -447,6 +464,7 @@ impl<'a> CdkBuyerMint<'a> {
                 ));
             }
         };
+        drop(select);
         // Redeem fee = CDK input-count fee on the proofs the seller will present.
         // prepared.send_fee() is that same fee API the send path uses.
         let send_fee = prepared.send_fee();
@@ -665,7 +683,8 @@ impl<'a> CdkBuyerMint<'a> {
     }
 
     async fn recover_unmapped_sagas(&self) -> Result<(), PaymentWalletError> {
-        let report = retire_eligible_incomplete_sagas(self.wallet).await?;
+        let report =
+            retire_eligible_incomplete_sagas_in(self.wallet, self.wallet_dir.as_deref()).await?;
         // A fail-closed refuse that only lands in `report.unresolved` is silent on this
         // path — the daemon already runs this every pay attempt, and nothing else prints
         // the vector. Surface the resolver's own reason so a wedged wallet names why.
@@ -946,6 +965,15 @@ fn require_realized_locked_token(
 pub async fn retire_eligible_incomplete_sagas(
     wallet: &Wallet,
 ) -> Result<RetireReport, PaymentWalletError> {
+    retire_eligible_incomplete_sagas_in(wallet, None).await
+}
+
+/// [`retire_eligible_incomplete_sagas`] for the home wallet in `wallet_dir`: the NUT-13 restore a
+/// spent swap saga needs runs under that wallet's selection lock.
+pub async fn retire_eligible_incomplete_sagas_in(
+    wallet: &Wallet,
+    wallet_dir: Option<&std::path::Path>,
+) -> Result<RetireReport, PaymentWalletError> {
     let incomplete = wallet
         .localstore
         .get_incomplete_sagas()
@@ -1012,7 +1040,9 @@ pub async fn retire_eligible_incomplete_sagas(
             // forever — retire never handled them and recover_unmapped_sagas refused
             // them via its `other` arm. Resolve deletes resolvable sagas.
             WalletSagaState::Swap(_) => {
-                if let Err(refusal) = resolve_one_swap_saga(wallet, &saga, &mut report).await {
+                if let Err(refusal) =
+                    resolve_one_swap_saga(wallet, wallet_dir, &saga, &mut report).await
+                {
                     report.unresolved.push(format!("{}: {refusal}", saga.id));
                 }
             }
@@ -1426,6 +1456,7 @@ fn classify_reserved_inputs(
 ///     present, refuse exactly as before.
 async fn resolve_one_swap_saga(
     wallet: &Wallet,
+    wallet_dir: Option<&std::path::Path>,
     saga: &cdk::wallet::types::WalletSaga,
     report: &mut RetireReport,
 ) -> Result<(), PaymentWalletError> {
@@ -1470,7 +1501,7 @@ async fn resolve_one_swap_saga(
             report.swap_rolled_back += 1;
         }
         ReservedInputTruth::AllSpent => {
-            complete_spent_swap_saga(wallet, saga).await?;
+            complete_spent_swap_saga(wallet, wallet_dir, saga).await?;
             report.swap_recovered += 1;
         }
     }
@@ -1610,11 +1641,15 @@ async fn rollback_swap_saga(
 /// later retry rather than losing the outputs).
 async fn complete_spent_swap_saga(
     wallet: &Wallet,
+    wallet_dir: Option<&std::path::Path>,
     saga: &cdk::wallet::types::WalletSaga,
 ) -> Result<(), PaymentWalletError> {
     // Re-derive the swap outputs from seed+counter (NUT-13). Idempotent: a re-run
-    // rebuilds the same proofs. Any error aborts before we touch local state.
-    wallet.restore().await.map_err(|error| {
+    // rebuilds the same proofs. Any error aborts before we touch local state. Never a plain
+    // `Wallet::restore`: it would release proofs another owner (maxplayer-trade) has reserved.
+    crate::shared_wallet::restore_keeping_other_reservations(wallet, wallet_dir)
+        .await
+        .map_err(|error| {
         PaymentWalletError::Reconcile(format!(
             "swap-saga restore refused (leave wedged for a later retry): {error}"
         ))
@@ -2020,10 +2055,30 @@ impl<R> CdkPaymentEffects<R> {
             // A nostr:// wallet already holds its relay connector; verify through that same one.
             // Never an HttpClient for a nostr:// mint.
             let connector = crate::nostr_mint::SharedMintConnector(wallet.mint_connector());
-            return Self::spawn_worker(wallet, connector, payment_send, receipt);
+            return Self::spawn_worker(wallet, None, connector, payment_send, receipt);
         }
         let connector = HttpClient::new(wallet.mint_url.clone(), None);
-        Self::spawn_worker(wallet, connector, payment_send, receipt)
+        Self::spawn_worker(wallet, None, connector, payment_send, receipt)
+    }
+
+    /// [`Self::spawn`] for the home wallet in `wallet_dir`: every proof selection takes that
+    /// wallet's selection lock ([`crate::shared_wallet`]), so a local `maxplayer-trade` on the
+    /// same home can never reserve inside it.
+    pub fn spawn_for_home<S>(
+        wallet: Wallet,
+        wallet_dir: std::path::PathBuf,
+        payment_send: S,
+        receipt: R,
+    ) -> Result<Self, PaymentWalletError>
+    where
+        S: PaymentSend + Send + 'static,
+    {
+        if crate::mint_wire::is_nostr_scheme(&wallet.mint_url.to_string()) {
+            let connector = crate::nostr_mint::SharedMintConnector(wallet.mint_connector());
+            return Self::spawn_worker(wallet, Some(wallet_dir), connector, payment_send, receipt);
+        }
+        let connector = HttpClient::new(wallet.mint_url.clone(), None);
+        Self::spawn_worker(wallet, Some(wallet_dir), connector, payment_send, receipt)
     }
 
     /// Starts a worker with an injected connector for hermetic tests.
@@ -2038,11 +2093,12 @@ impl<R> CdkPaymentEffects<R> {
         C: MintConnector + Send + Sync + 'static,
         S: PaymentSend + Send + 'static,
     {
-        Self::spawn_worker(wallet, connector, payment_send, receipt)
+        Self::spawn_worker(wallet, None, connector, payment_send, receipt)
     }
 
     fn spawn_worker<C, S>(
         wallet: Wallet,
+        wallet_dir: Option<std::path::PathBuf>,
         connector: C,
         mut payment_send: S,
         receipt: R,
@@ -2077,6 +2133,7 @@ impl<R> CdkPaymentEffects<R> {
                                 response,
                             } => {
                                 let result = CdkBuyerMint::new(&wallet)
+                                    .with_wallet_dir(wallet_dir.clone())
                                     .lock_or_reconcile(&attempt_id, &terms)
                                     .await;
                                 let _ = response.send(result);
@@ -2126,6 +2183,7 @@ impl<R> CdkPaymentEffects<R> {
                                 // request itself as delivered (transport failures surface via
                                 // `request()`'s own recv).
                                 let verdict = CdkBuyerMint::new(&wallet)
+                                    .with_wallet_dir(wallet_dir.clone())
                                     .reconcile_locked_token_if_unspent(&attempt_id, &terms)
                                     .await;
                                 let _ = response.send(Ok(verdict));
@@ -3367,7 +3425,7 @@ mod tests {
             .unwrap()
             .clone();
         let mut report = RetireReport::default();
-        let refusal = resolve_one_swap_saga(&wallet, &swap, &mut report)
+        let refusal = resolve_one_swap_saga(&wallet, None, &swap, &mut report)
             .await
             .expect_err("kept");
         assert!(
