@@ -21,7 +21,7 @@ async fn serve_drops_a_peer_of_another_uid_before_reading() {
     )
     .unwrap();
     let mut s = tokio::net::UnixStream::connect(
-        maxplayer_trade::wallet::state_dir(&home.path()).join("serve.sock"),
+        maxplayer_trade::wallet::state_dir(home.path()).join("serve.sock"),
     )
     .await
     .unwrap();
@@ -44,7 +44,7 @@ async fn serve_drops_a_peer_of_another_uid_before_reading() {
 async fn client_writes_nothing_to_a_serve_of_another_uid() {
     let home = tempfile::tempdir().unwrap();
     let l = tokio::net::UnixListener::bind(
-        maxplayer_trade::wallet::state_dir(&home.path()).join("serve.sock"),
+        maxplayer_trade::wallet::state_dir(home.path()).join("serve.sock"),
     )
     .unwrap();
     let req = Request {
