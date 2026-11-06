@@ -535,10 +535,11 @@ impl Select {
         Ok(())
     }
     /// Reserve exactly `ys` under `op`. Proofs `op` already holds stay held (idempotent); `op`
-    /// may hold nothing outside `ys` ("reservation conflict"). Every other proof must be UNSPENT
-    /// and unowned, or nothing is reserved (`ProofNotUnspent`). cdk reserves row by row: if it
-    /// fails part-way, the rows THIS call reserved under `op` are released before the error is
-    /// returned, so a retry starts from the same state.
+    /// may hold nothing outside `ys` ("reservation conflict"). Every other proof must be UNSPENT,
+    /// or `ProofNotUnspent`. cdk reserves row by row: if it fails part-way, the rows THIS call
+    /// reserved under `op` (and only those) are released before the error is returned, so a
+    /// retry starts from the same state and nothing is left reserved under an operation that
+    /// failed.
     pub async fn reserve(&self, ys: &[cashu::PublicKey], op: &uuid::Uuid) -> Result<()> {
         use cashu::State;
         let db = database(&self.home, &self.mint).await?;
@@ -547,21 +548,12 @@ impl Select {
             held.iter().all(|p| ys.contains(&p.y)),
             "reservation conflict"
         );
-        let rows = db.get_proofs_by_ys(ys.to_vec()).await?;
-        let mut missing = vec![];
-        for y in ys {
-            match rows.iter().find(|r| r.y == *y) {
-                Some(r) if r.state == State::Reserved && r.used_by_operation == Some(*op) => {}
-                Some(r) if r.state == State::Unspent && r.used_by_operation.is_none() => {
-                    missing.push(*y)
-                }
-                _ => {
-                    return Err(anyhow::Error::new(
-                        cdk_common::database::Error::ProofNotUnspent,
-                    ));
-                }
-            }
-        }
+        // cdk's reserve_proofs takes each proof only `WHERE state = 'UNSPENT'`, one row at a time.
+        let missing: Vec<_> = ys
+            .iter()
+            .filter(|y| !held.iter().any(|p| p.y == **y))
+            .copied()
+            .collect();
         if missing.is_empty() {
             return Ok(());
         }
