@@ -13,6 +13,8 @@
 #              rule the seller's gate applies; last setting wins).
 #   2. ROOTFS: whether a file the container writes to its own rootfs (/home/agent/.claude, the
 #              path claude-agent-acp keeps transcripts under) survives docker stop + docker start.
+#   3. /tmp (info only): runsc mounts its own tmpfs at /tmp, so files there are lost on stop/start
+#              whatever --overlay2 says. The agent's transcript is not under /tmp.
 # It uses the same create-once / start-again lifecycle and the same --user, --cap-drop ALL,
 # no-new-privileges and --init flags a session container gets.
 #
@@ -38,7 +40,10 @@ die() { printf 'SETUP ERROR: %s\n' "$*" >&2; exit 4; }
 
 # Invoked only via the EXIT trap below, which shellcheck cannot see (SC2317 false positive).
 # shellcheck disable=SC2317
-cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
+cleanup() {
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  if [ -n "${state_dir:-}" ]; then rm -rf "$state_dir"; fi
+}
 trap cleanup EXIT
 
 command -v docker >/dev/null 2>&1 || die "docker is not on PATH"
@@ -81,34 +86,52 @@ fi
 
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull -q "$IMAGE" >/dev/null || die "cannot pull $IMAGE"
 
-# One script for both starts: the first start writes, the second reports what it finds. HOME is
-# pointed at a path the job uid can create, like the sandbox image's 0777 /home/agent.
-# Single-quoted on purpose: $HOME must expand INSIDE the container, not here (SC2016).
+# The turn counter lives on a HOST bind mount, which survives any runtime's stop/start, so the
+# second start always knows it is the second one. (The first version kept the counter in /tmp and
+# reported a setup error on every runsc run: /tmp did not survive a stop/start even with
+# --overlay2=none, consistent with runsc mounting its own tmpfs at /tmp. Field run 2026-11-06, Lima arm64, runsc 20261102.0.)
+# The markers are written to the container ROOTFS (what --overlay2 governs) and, for information,
+# to /tmp. ROOTFS decides the exit code; TMP is printed only.
+state_dir="$(mktemp -d)"
+chown "$UID_GID" "$state_dir" 2>/dev/null || true
+chmod 0777 "$state_dir"
+
+# Rootfs directory: /home/agent (the sandbox image's HOME, 0777) when it is writable, otherwise
+# /mx-home, which only uid 0 can create on a stock image (run this script with sudo).
+# Single-quoted on purpose: the variables expand INSIDE the container, not here (SC2016).
 # shellcheck disable=SC2016
 probe='
-mkdir -p "$HOME/.claude"
-if [ -f /tmp/.mx-turn ]; then
-  [ -f "$HOME/.claude/rootfs-marker" ] && echo ROOTFS=kept || echo ROOTFS=lost
+d=/home/agent; [ -d "$d" ] && [ -w "$d" ] || d=/mx-home
+mkdir -p "$d/.claude" 2>/dev/null || { echo NOROOTFSDIR; exit 0; }
+if [ -f /mx-state/turn ]; then
+  [ -f "$d/.claude/rootfs-marker" ] && echo ROOTFS=kept || echo ROOTFS=lost
+  [ -f /tmp/.mx-tmp-marker ] && echo TMP=kept || echo TMP=lost
 else
-  echo turn1 > /tmp/.mx-turn
-  echo turn1 > "$HOME/.claude/rootfs-marker"
-  echo WROTE
+  echo turn1 > /mx-state/turn
+  echo turn1 > "$d/.claude/rootfs-marker"
+  echo turn1 > /tmp/.mx-tmp-marker
+  echo "WROTE $d"
 fi'
 
 docker create --name "$NAME" --runtime "$RUNTIME" \
   --init --security-opt no-new-privileges --cap-drop ALL \
-  --user "$UID_GID" -e HOME=/tmp/agent \
+  --user "$UID_GID" -v "$state_dir:/mx-state" \
   "$IMAGE" sh -c "$probe" >/dev/null || die "docker create failed for runtime $RUNTIME"
 
 first="$(docker start -a "$NAME")" || die "first docker start failed"
 case "$first" in
-  *WROTE*) ;;
+  *NOROOTFSDIR*) die "uid $UID_GID cannot create a rootfs directory in $IMAGE: run with sudo, or IMAGE=<sandbox image>" ;;
+  *WROTE*) say "rootfs dir:   ${first#WROTE }/.claude" ;;
   *) die "the first start did not write its marker: $first" ;;
 esac
 # The container has exited on its own; stop is a no-op then, and is here to mirror a park.
 docker stop -t 5 "$NAME" >/dev/null 2>&1 || true
 second="$(docker start -a "$NAME")" || die "second docker start failed"
 
+case "$second" in
+  *TMP=kept*) say "info /tmp:    kept across stop + start" ;;
+  *TMP=lost*) say "info /tmp:    LOST across stop + start (runsc's own /tmp tmpfs; not what --overlay2 controls)" ;;
+esac
 case "$second" in
   *ROOTFS=kept*)
     say "PASS rootfs:  a file in the container rootfs survived docker stop + start"
