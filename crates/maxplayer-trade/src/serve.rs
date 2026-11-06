@@ -780,12 +780,17 @@ async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Resul
     if crate::wallet::is_legacy_dir(home)
         && matches!(
             c,
-            Command::List { .. } | Command::Take { .. } | Command::Fund { .. } | Command::Receive { .. }
+            Command::List { .. }
+                | Command::Take { .. }
+                | Command::Fund { .. }
+                | Command::Receive { .. }
         )
     {
         anyhow::bail!("{}", crate::wallet::legacy_refusal(home));
     }
-    if let Command::Receive { mint, .. } | Command::Send { mint, .. } | Command::Fund { mint, .. } = c {
+    if let Command::Receive { mint, .. } | Command::Send { mint, .. } | Command::Fund { mint, .. } =
+        c
+    {
         crate::wallet::check_mint(home, &Asset::from_cli(mint)?.mint_url)?;
     }
     match c {

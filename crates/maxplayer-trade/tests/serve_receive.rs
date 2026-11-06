@@ -593,9 +593,11 @@ async fn max_size_token_accepted_and_over_limit_refused() {
     assert!(!serve.output().contains("\"serve_request\":\"receive\""));
     // A raw request over serve's frame limit: refused, nothing executed, bytes not echoed.
     {
-        let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"))
-            .await
-            .unwrap();
+        let mut s = tokio::net::UnixStream::connect(
+            maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"),
+        )
+        .await
+        .unwrap();
         let mut junk = vec![b'Q'; maxplayer_trade::serve::MAX_REQUEST_BYTES + 1024];
         junk.push(b'\n');
         let _ = s.write_all(&junk).await;
@@ -701,9 +703,11 @@ async fn spent_and_invalid_tokens_refused_without_leaking() {
     assert!(stderr.contains("contents withheld"), "{stderr}");
     assert!(!(stdout + &stderr).contains(&junk), "SAFETY: token echoed");
     // A malformed request whose mistyped field holds the token: serde would quote it.
-    let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"))
-        .await
-        .unwrap();
+    let mut s = tokio::net::UnixStream::connect(
+        maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"),
+    )
+    .await
+    .unwrap();
     let line = serde_json::json!({"v":token,"relays":[f.relay_url],"command":{"receive":{"mint":c.url,"token":token}}});
     s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
     let mut reply = String::new();
@@ -1186,9 +1190,11 @@ async fn receive_and_serve_error_lines_redact_token_text() {
     assert!(err.contains("handed_to_serve"), "{err}");
     leaked("handed-off client", &(out + &err));
     // serve's relay-mismatch reply quotes the requested relays: a mistyped one may be a token.
-    let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"))
-        .await
-        .unwrap();
+    let mut s = tokio::net::UnixStream::connect(
+        maxplayer_trade::wallet::state_dir(&f.taker).join("serve.sock"),
+    )
+    .await
+    .unwrap();
     let line = serde_json::json!({"v":maxplayer_trade::serve::PROTOCOL_V,"relays":[leak],"mint_relays":[],"command":{"cancel":{"lot":"x"}}});
     s.write_all(format!("{line}\n").as_bytes()).await.unwrap();
     let mut reply = String::new();

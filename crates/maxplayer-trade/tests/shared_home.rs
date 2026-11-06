@@ -102,9 +102,14 @@ async fn concurrent_core_and_trade_selection_never_double_reserves_or_loses_proo
             }
         }
     }
-    assert!(core_sent > 0 && trade_sent > 0, "both sides spent: {refusals} refusals");
     assert!(
-        rows(home, &m.url, vec![State::Reserved, State::Pending]).await.is_empty(),
+        core_sent > 0 && trade_sent > 0,
+        "both sides spent: {refusals} refusals"
+    );
+    assert!(
+        rows(home, &m.url, vec![State::Reserved, State::Pending])
+            .await
+            .is_empty(),
         "SAFETY: nothing left reserved after both sides finished"
     );
     // cdk keeps a confirmed core send's token proofs PendingSpent until the payee claims them.
@@ -113,7 +118,10 @@ async fn concurrent_core_and_trade_selection_never_double_reserves_or_loses_proo
         .iter()
         .map(|p| u64::from(p.proof.amount))
         .sum();
-    assert_eq!(pending, core_sent, "exactly the core tokens are awaiting claim");
+    assert_eq!(
+        pending, core_sent,
+        "exactly the core tokens are awaiting claim"
+    );
     assert_eq!(
         balance(home, &m.url).await + core_sent + trade_sent,
         128,
@@ -144,8 +152,14 @@ async fn a_held_select_lock_blocks_both_sides_and_sigkill_of_the_holder_frees_it
         .spawn()
         .expect("flock(1)");
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
-    while shared_wallet::try_acquire(&home.join("wallet")).unwrap().is_some() {
-        assert!(std::time::Instant::now() < deadline, "holder never took the lock");
+    while shared_wallet::try_acquire(&home.join("wallet"))
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "holder never took the lock"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let w = core_wallet(home, &m.url).await;
@@ -164,8 +178,14 @@ async fn a_held_select_lock_blocks_both_sides_and_sigkill_of_the_holder_frees_it
     let blocked = send::send(home, &j, &m.url, 5, &out, None).await;
     let e = format!("{:#}", blocked.err().expect("trade must refuse"));
     assert!(e.contains("busy") && e.contains("retry"), "{e}");
-    assert!(j.all::<send::SendAttempt>("send").await.unwrap().is_empty(), "nothing journaled");
-    assert!(rows(home, &m.url, IN_FLIGHT.to_vec()).await.is_empty(), "nothing reserved");
+    assert!(
+        j.all::<send::SendAttempt>("send").await.unwrap().is_empty(),
+        "nothing journaled"
+    );
+    assert!(
+        rows(home, &m.url, IN_FLIGHT.to_vec()).await.is_empty(),
+        "nothing reserved"
+    );
     assert_eq!(balance(home, &m.url).await, 64);
     // Safety: plain kill(2) of our own child.
     assert_eq!(unsafe { libc_kill(holder.id() as i32, 9) }, 0);
@@ -222,13 +242,21 @@ async fn partial_reserve_failure_releases_exactly_its_own_rows() {
             (r.state, r.used_by_operation)
         }
     };
-    assert_eq!(state(y0).await, (State::Reserved, Some(op)), "held before: kept");
+    assert_eq!(
+        state(y0).await,
+        (State::Reserved, Some(op)),
+        "held before: kept"
+    );
     assert_eq!(
         state(y1).await,
         (State::Unspent, None),
         "SAFETY: reserved by the failed call: released"
     );
-    assert_eq!(state(y2).await, (State::Reserved, Some(other)), "other owner untouched");
+    assert_eq!(
+        state(y2).await,
+        (State::Reserved, Some(other)),
+        "other owner untouched"
+    );
     // A retry from the same state now succeeds once the other owner lets go.
     db.release_proofs(&other).await.unwrap();
     sel.reserve(&[y0, y1, y2], &op).await.unwrap();
@@ -252,9 +280,15 @@ async fn buyer_restore_and_saga_retire_leave_trade_reservations_alone() {
         .map(|p| p.y)
         .collect();
     wallet::reserve(raw.path(), &m.url, &ys, &op).await.unwrap();
-    core_wallet(raw.path(), &m.url).await.restore().await.unwrap();
+    core_wallet(raw.path(), &m.url)
+        .await
+        .restore()
+        .await
+        .unwrap();
     assert!(
-        rows(raw.path(), &m.url, vec![State::Reserved]).await.is_empty(),
+        rows(raw.path(), &m.url, vec![State::Reserved])
+            .await
+            .is_empty(),
         "cdk 0.17.2 Wallet::restore clears foreign reservations (why core wraps it)"
     );
 
@@ -291,7 +325,11 @@ async fn buyer_restore_and_saga_retire_leave_trade_reservations_alone() {
         "SAFETY: trade's reservation survives buyer recovery"
     );
     assert!(held.iter().all(|p| p.state == State::Reserved));
-    assert_eq!(balance(home, &m.url).await, 0, "reserved is never spendable");
+    assert_eq!(
+        balance(home, &m.url).await,
+        0,
+        "reserved is never spendable"
+    );
 }
 
 /// The reverse: trade's recovery passes never release a buyer saga's reservation.
@@ -345,7 +383,9 @@ async fn buyer_balance_reports_trade_reserved_sats_as_reserved_not_spendable() {
         .await
         .unwrap();
     let mh = wallet::maxplayer_home(home).unwrap();
-    let rows = maxplayer_core::wallet_ops::balances_async(&mh).await.unwrap();
+    let rows = maxplayer_core::wallet_ops::balances_async(&mh)
+        .await
+        .unwrap();
     let row = rows
         .iter()
         .find(|r| r.mint_url == m.url.trim_end_matches('/'))
@@ -356,7 +396,11 @@ async fn buyer_balance_reports_trade_reserved_sats_as_reserved_not_spendable() {
         "SAFETY: reserved sats are shown as reserved, never as spendable"
     );
     assert!(row.configured);
-    assert_eq!(wallet::read_balance(home, &m.url).unwrap(), 7 - held_sats, "trade agrees");
+    assert_eq!(
+        wallet::read_balance(home, &m.url).unwrap(),
+        7 - held_sats,
+        "trade agrees"
+    );
 }
 
 /// Only mints in the home's configured list AND admitted by the real-mint fence are traded.
@@ -366,28 +410,51 @@ async fn shared_home_trades_only_configured_fenced_mints() {
     let h = tempfile::tempdir().unwrap();
     let home = h.path();
     // Outside the fixture registry: only the default mint is configured.
-    std::fs::write(home.join("key"), nostr_sdk::Keys::generate().secret_key().to_secret_hex())
-        .unwrap();
+    std::fs::write(
+        home.join("key"),
+        nostr_sdk::Keys::generate().secret_key().to_secret_hex(),
+    )
+    .unwrap();
     std::fs::write(home.join("config.toml"), "").unwrap();
     let e = wallet::check_mint(home, &m.url).unwrap_err().to_string();
     assert!(e.contains("not one of this home's configured mints"), "{e}");
     assert!(e.contains("maxplayer wallet mints add"), "{e}");
-    let out = trade(Some(home), &["send", &m.url, "--amount", "5", "--out", "/nonexistent/t"]);
+    let out = trade(
+        Some(home),
+        &["send", &m.url, "--amount", "5", "--out", "/nonexistent/t"],
+    );
     assert_eq!(out.status.code(), Some(1), "{}", err(&out));
-    assert!(err(&out).contains("not one of this home's configured mints"), "{}", err(&out));
-    assert!(!home.join("trade").exists(), "SAFETY: refused before any journal");
+    assert!(
+        err(&out).contains("not one of this home's configured mints"),
+        "{}",
+        err(&out)
+    );
+    assert!(
+        !home.join("trade").exists(),
+        "SAFETY: refused before any journal"
+    );
     let out = trade(Some(home), &["fund", &m.url, "--amount", "5"]);
-    assert!(err(&out).contains("not one of this home's configured mints"), "{}", err(&out));
+    assert!(
+        err(&out).contains("not one of this home's configured mints"),
+        "{}",
+        err(&out)
+    );
     // Configured, but the fence (allow_real_mints = false) refuses a real https mint.
     std::fs::write(
         home.join("config.toml"),
         "allow_real_mints = false\nextra_mints = [\"https://mint.example\"]\n",
     )
     .unwrap();
-    let e = wallet::check_mint(home, "https://mint.example").unwrap_err().to_string();
+    let e = wallet::check_mint(home, "https://mint.example")
+        .unwrap_err()
+        .to_string();
     assert!(e.contains("real-mint fence"), "{e}");
     // Configured loopback fixture mint: admitted.
-    std::fs::write(home.join("config.toml"), format!("extra_mints = [{:?}]\n", m.url)).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!("extra_mints = [{:?}]\n", m.url),
+    )
+    .unwrap();
     wallet::check_mint(home, &m.url).unwrap();
 }
 
@@ -430,9 +497,15 @@ async fn shared_home_layout_and_default_home() {
     );
     assert!(state.join("trade.sqlite").exists() && state.join("owner.lock").exists());
     for f in ["trade.key", "wallet.seed", "trade.sqlite", "owner.lock"] {
-        assert!(!home.join(f).exists(), "SAFETY: {f} created at the home root");
+        assert!(
+            !home.join(f).exists(),
+            "SAFETY: {f} created at the home root"
+        );
     }
-    assert!(home.join("wallet/cdk-wallet.sqlite").exists(), "the buyer's wallet DB");
+    assert!(
+        home.join("wallet/cdk-wallet.sqlite").exists(),
+        "the buyer's wallet DB"
+    );
 }
 
 /// Legacy standalone homes: every command warns; NEW list/take/fund/receive are refused with the
@@ -447,19 +520,41 @@ async fn legacy_home_allow_refuse_matrix() {
     std::fs::write(&token, "cashuB").unwrap();
     let token = token.to_str().unwrap();
     let refused: Vec<Vec<&str>> = vec![
-        vec!["list", "--give-mint", mint, "--give", "5", "--want-mint", "https://b.example", "--want", "5"],
+        vec![
+            "list",
+            "--give-mint",
+            mint,
+            "--give",
+            "5",
+            "--want-mint",
+            "https://b.example",
+            "--want",
+            "5",
+        ],
         vec!["take", "abc", "--max-give", "5", "--min-receive", "1"],
         vec!["fund", mint, "--amount", "5"],
         vec!["receive", mint, "--token-file", token],
     ];
     for args in refused {
-        let before: Vec<_> = std::fs::read_dir(home).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let before: Vec<_> = std::fs::read_dir(home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         let out = trade(Some(home), &args);
         let e = err(&out);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {e}");
-        assert!(e.contains("legacy standalone trading home") && e.contains("deprecated"), "{e}");
-        assert!(e.contains("refused:") && e.contains("maxplayer wallet receive"), "{e}");
-        let after: Vec<_> = std::fs::read_dir(home).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert!(
+            e.contains("legacy standalone trading home") && e.contains("deprecated"),
+            "{e}"
+        );
+        assert!(
+            e.contains("refused:") && e.contains("maxplayer wallet receive"),
+            "{e}"
+        );
+        let after: Vec<_> = std::fs::read_dir(home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(before, after, "SAFETY: {args:?} changed the legacy home");
     }
     let allowed: Vec<Vec<&str>> = vec![
@@ -477,20 +572,37 @@ async fn legacy_home_allow_refuse_matrix() {
     // Drain paths run (and fail only on money/mint grounds, never the legacy refusal).
     let out_file = home.join("drain-token");
     for args in [
-        vec!["send", "http://127.0.0.1:9", "--amount", "5", "--out", out_file.to_str().unwrap()],
+        vec![
+            "send",
+            "http://127.0.0.1:9",
+            "--amount",
+            "5",
+            "--out",
+            out_file.to_str().unwrap(),
+        ],
         vec!["cancel", "abc"],
     ] {
         let out = trade(Some(home), &args);
         let e = err(&out);
         assert!(e.contains("deprecated"), "{args:?}: {e}");
-        assert!(!e.contains("refused:"), "SAFETY: drain path refused: {args:?}: {e}");
+        assert!(
+            !e.contains("refused:"),
+            "SAFETY: drain path refused: {args:?}: {e}"
+        );
     }
     // A directory that is neither home: read-only commands only, nothing created.
     let empty = tempfile::tempdir().unwrap();
-    let out = trade(Some(empty.path()), &["send", mint, "--amount", "5", "--out", "/nonexistent/t"]);
+    let out = trade(
+        Some(empty.path()),
+        &["send", mint, "--amount", "5", "--out", "/nonexistent/t"],
+    );
     assert_eq!(out.status.code(), Some(1));
     assert!(err(&out).contains("no maxplayer home at"), "{}", err(&out));
-    assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0, "nothing created");
+    assert_eq!(
+        std::fs::read_dir(empty.path()).unwrap().count(),
+        0,
+        "nothing created"
+    );
     assert!(trade(Some(empty.path()), &["status"]).status.success());
 }
 
@@ -549,7 +661,10 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
     for o in outs {
         let o = o.unwrap();
         let e = err(&o);
-        assert!(!e.contains("database is locked"), "SAFETY: SQLITE_BUSY leaked: {e}");
+        assert!(
+            !e.contains("database is locked"),
+            "SAFETY: SQLITE_BUSY leaked: {e}"
+        );
         if o.status.success() {
             cli_sent += 7;
         } else {
@@ -560,7 +675,11 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
         }
     }
     assert!(cli_sent > 0 && core_sent > 0, "both processes spent");
-    assert!(rows(&home, &m.url, vec![State::Reserved, State::Pending]).await.is_empty());
+    assert!(
+        rows(&home, &m.url, vec![State::Reserved, State::Pending])
+            .await
+            .is_empty()
+    );
     let pending: u64 = rows(&home, &m.url, vec![State::PendingSpent])
         .await
         .iter()

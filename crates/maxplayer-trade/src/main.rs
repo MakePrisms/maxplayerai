@@ -682,7 +682,10 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
         eprintln!("{}", wallet::legacy_warning(&home));
         if matches!(
             command,
-            Command::List { .. } | Command::Take { .. } | Command::Fund { .. } | Command::Receive { .. }
+            Command::List { .. }
+                | Command::Take { .. }
+                | Command::Fund { .. }
+                | Command::Receive { .. }
         ) {
             anyhow::bail!("{}", wallet::legacy_refusal(&home));
         }
@@ -999,7 +1002,9 @@ async fn doctor_inner(
     // A sign-in-required relay only admits registered keys (`maxplayer account link
     // --trade-home`), so sign as the home's trade key when it has one. Never create it here.
     let identity = match home {
-        Some(home) => maxplayer_trade::wallet::existing_identity(home).ok().flatten(),
+        Some(home) => maxplayer_trade::wallet::existing_identity(home)
+            .ok()
+            .flatten(),
         None => None,
     };
     let signer = match &identity {
@@ -1010,7 +1015,10 @@ async fn doctor_inner(
             } else {
                 "home trade.key"
             };
-            eprintln!("Signing as this home's {} ({npub})", source.trim_start_matches("home "));
+            eprintln!(
+                "Signing as this home's {} ({npub})",
+                source.trim_start_matches("home ")
+            );
             serde_json::json!({"source":source,"npub":npub})
         }
         None => {
