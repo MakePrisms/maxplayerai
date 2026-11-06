@@ -1,0 +1,9 @@
+{
+  "job": "review-redesign",
+  "name": "meridian-invoices",
+  "baseline": "/samples/redesign/before/",
+  "candidate": "/samples/redesign/after/",
+  "expectBaselineViolations": 4,
+  "maxCandidateViolations": 0,
+  "minChangeRatio": 0.02
+}

@@ -1,0 +1,5 @@
+node_modules/
+evidence/tmp/
+runs/*/workspace/node_modules
+runs/generative-smoke/
+runs/generative-sabotage.*/

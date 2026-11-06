@@ -1,0 +1,209 @@
+{
+  "agent": "ui-ux-designer",
+  "identity": "Plainsong (PROPOSED — not adopted. See design-identity/IDENTITY.md §0.)",
+  "job": "review-redesign",
+  "name": "meridian-invoices",
+  "startedAt": "2026-09-09T18:02:01.202Z",
+  "finishedAt": "2026-09-09T18:02:07.230Z",
+  "environment": {
+    "node": "v26.5.0",
+    "chromium": "151.0.7922.34",
+    "axe": "axe-core 4.11.4",
+    "sharp": "0.34.5 / libvips 8.17.3"
+  },
+  "accessibility": {
+    "baselineViolations": {
+      "desktop": 4,
+      "mobile": 4
+    },
+    "candidateViolations": {
+      "desktop": 0,
+      "mobile": 0
+    },
+    "baselineFindings": [
+      "button-name (1)",
+      "color-contrast (34)",
+      "html-has-lang (1)",
+      "image-alt (1)"
+    ]
+  },
+  "visualChange": {
+    "desktop": "8.51%",
+    "mobile": "8.25%"
+  },
+  "steps": [
+    {
+      "step": "image-pipeline",
+      "sharp": "0.34.5",
+      "vips": "8.17.3",
+      "svgInput": true,
+      "pngOutput": true,
+      "webpOutput": true,
+      "concurrency": 14
+    },
+    {
+      "step": "preview",
+      "origin": "http://127.0.0.1:49613",
+      "root": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer"
+    },
+    {
+      "step": "screenshot:baseline",
+      "captures": [
+        {
+          "viewport": "desktop",
+          "size": "1280x900",
+          "bytes": 60634,
+          "distinctColors": 1374,
+          "inkRatio": 0.046,
+          "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-baseline-desktop.png"
+        },
+        {
+          "viewport": "mobile",
+          "size": "780x1687",
+          "bytes": 48998,
+          "distinctColors": 1489,
+          "inkRatio": 0.0202,
+          "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-baseline-mobile.png"
+        }
+      ]
+    },
+    {
+      "step": "screenshot:candidate",
+      "captures": [
+        {
+          "viewport": "desktop",
+          "size": "1280x900",
+          "bytes": 93810,
+          "distinctColors": 1744,
+          "inkRatio": 0.0383,
+          "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-candidate-desktop.png"
+        },
+        {
+          "viewport": "mobile",
+          "size": "780x1688",
+          "bytes": 125764,
+          "distinctColors": 1698,
+          "inkRatio": 0.0707,
+          "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-candidate-mobile.png"
+        }
+      ]
+    },
+    {
+      "step": "axe:baseline:desktop",
+      "engine": "axe-core 4.11.4",
+      "violations": 4,
+      "nodesFlagged": 37,
+      "passes": 13,
+      "rulesConsidered": 64,
+      "loadProof": "70 elements / 698 chars",
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-baseline-desktop.json"
+    },
+    {
+      "step": "axe:baseline:mobile",
+      "engine": "axe-core 4.11.4",
+      "violations": 4,
+      "nodesFlagged": 37,
+      "passes": 13,
+      "rulesConsidered": 64,
+      "loadProof": "70 elements / 698 chars",
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-baseline-mobile.json"
+    },
+    {
+      "step": "axe:candidate:desktop",
+      "engine": "axe-core 4.11.4",
+      "violations": 0,
+      "nodesFlagged": 0,
+      "passes": 29,
+      "rulesConsidered": 62,
+      "loadProof": "103 elements / 1045 chars",
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-candidate-desktop.json"
+    },
+    {
+      "step": "axe:candidate:mobile",
+      "engine": "axe-core 4.11.4",
+      "violations": 0,
+      "nodesFlagged": 0,
+      "passes": 30,
+      "rulesConsidered": 63,
+      "loadProof": "103 elements / 1045 chars",
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-candidate-mobile.json"
+    },
+    {
+      "step": "vdiff:desktop",
+      "changed": 98008,
+      "total": 1152000,
+      "ratio": 0.0851,
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/diff/meridian-invoices-desktop.png"
+    },
+    {
+      "step": "vdiff:mobile",
+      "changed": 108516,
+      "total": 1315860,
+      "ratio": 0.0825,
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/diff/meridian-invoices-mobile.png"
+    },
+    {
+      "step": "raster",
+      "output": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/images/meridian-invoices-mark.png",
+      "bytes": 4475,
+      "size": "480x192"
+    }
+  ],
+  "manifest": [
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-baseline-desktop.png",
+      "bytes": 60634,
+      "sha256": "5d40fc37979617c2872825b9526af59aee9d065f55d14cb9505ca3f9b7f31a73"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-baseline-mobile.png",
+      "bytes": 48998,
+      "sha256": "8d5d3acf13bcce74b051d07a4c2e92c89e2190a32682438a84b5deef1d17f5e1"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-candidate-desktop.png",
+      "bytes": 93810,
+      "sha256": "93d705a22651530527357a995039199518819fd487e634a3d06f0cc87be9b8b1"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/screenshots/meridian-invoices-candidate-mobile.png",
+      "bytes": 125764,
+      "sha256": "a15b9d35add1c328d21a042ef4e27397bf3614f6ef4cc6f841322e13241e47ad"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-baseline-desktop.json",
+      "bytes": 2239,
+      "sha256": "fee78452372c394cd6a5d2d6a7366af846636b79cdf5297d1b09b3c832cabe73"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-baseline-mobile.json",
+      "bytes": 2238,
+      "sha256": "3f2fb5cad655b8028cbaca2cfa5769e1ce57cf4bfd74533f754f505f92466ae8"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-candidate-desktop.json",
+      "bytes": 728,
+      "sha256": "64d168666ff484b803a050ddce0c7bab0430b446587f5fb6465a457fffafb9cc"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/a11y/meridian-invoices-candidate-mobile.json",
+      "bytes": 751,
+      "sha256": "d383cac8d43860e12db9669877563ce599425570b14adf72c110660652ba4fbb"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/diff/meridian-invoices-desktop.png",
+      "bytes": 94671,
+      "sha256": "96fd4dffb38b9a2ef8c4800be1d97de9dd9bcb36a2ce0de7479d3403c4b9eb89"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/diff/meridian-invoices-mobile.png",
+      "bytes": 95776,
+      "sha256": "c69b99570211b4efca5ce0d05c437288d9799f6dc57ecca674fd0a1c0524b6fd"
+    },
+    {
+      "file": "/Users/forge/forge/v2/wt/w-ui-ux-designer-seller/sellers/ui-ux-designer/evidence/images/meridian-invoices-mark.png",
+      "bytes": 4475,
+      "sha256": "dfd2cf14ca7231b4bfede0457fddfe5d8ffcdf1ecf60410903b616ae64d3d72c"
+    }
+  ]
+}

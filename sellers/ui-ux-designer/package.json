@@ -1,0 +1,26 @@
+{
+  "name": "@maxplayer/ui-ux-designer-seller",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Runnable UI/UX designer seller package for maxplayer: pinned Chromium/Playwright harness, axe accessibility checks, visual comparison, SVG/image handling.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "smoke": "bash scripts/smoke.sh",
+    "harness:verify": "node tools/verify-harness.mjs"
+  },
+  "dependencies": {
+    "playwright": "1.62.0",
+    "@axe-core/playwright": "4.11.2",
+    "axe-core": "4.11.4",
+    "pixelmatch": "6.0.0",
+    "pngjs": "7.0.0",
+    "sharp": "0.34.5"
+  },
+  "overrides": {
+    "playwright-core": "1.62.0",
+    "axe-core": "4.11.4"
+  }
+}

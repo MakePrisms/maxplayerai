@@ -1,0 +1,107 @@
+<!doctype html>
+<!-- SAMPLE "BEFORE": deliberately flawed, authored for this package. Every defect here is one of
+     the named anti-patterns in design-identity/IDENTITY.md §7, so the redesign has something real
+     to fix and axe has something real to find. Invented product, invented copy, no third-party
+     assets. Do not copy this file into anything. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Meridian</title>
+    <style>
+      body {
+        font-family: Helvetica, Arial, sans-serif;
+        font-size: 12px;
+        color: #8b93a1;
+        background: #ffffff;
+        margin: 0;
+        padding: 18px 14px;
+      }
+      .top { background: #2b6cb0; padding: 9px 14px; margin: -18px -14px 22px; }
+      .top a { color: #b9d2ee; margin-right: 13px; text-decoration: none; font-size: 11px; }
+      h3 { font-size: 26px; color: #6b7280; margin: 0 0 6px; letter-spacing: 0.4px; }
+      h5 { font-size: 15px; color: #9aa3b2; margin: 21px 0 5px; }
+      p { line-height: 1.25; max-width: 100%; text-align: justify; }
+      .card { border: 1px solid #ececec; padding: 11px; margin-bottom: 9px; }
+      .ghost {
+        border: 1px solid #c9d4e4; color: #aab6c8; background: transparent;
+        padding: 3px 9px; font-size: 11px; border-radius: 13px; cursor: pointer;
+      }
+      .ghost:focus { outline: none; }
+      .go {
+        background: #4c9ae0; color: #ffffff; border: 0; padding: 4px 10px;
+        font-size: 11px; border-radius: 3px; cursor: pointer;
+      }
+      .go:focus { outline: none; }
+      input { border: 1px solid #e3e3e3; padding: 4px; font-size: 11px; width: 190px; }
+      .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+      .paid { background: #47b881; }
+      .late { background: #d64545; }
+      table { border-collapse: collapse; width: 100%; font-size: 11px; }
+      td, th { padding: 3px 5px; text-align: left; color: #9aa3b2; }
+      .icobtn { width: 17px; height: 17px; border: 0; background: #eef1f5; cursor: pointer; }
+      .foot { margin-top: 26px; font-size: 10px; color: #b4bcc8; }
+      .banner { background: #fdf3d7; padding: 7px; font-size: 11px; color: #b9a15f; }
+    </style>
+  </head>
+  <body>
+    <div class="top">
+      <a href="#">Dashboard</a><a href="#">Invoices</a><a href="#">Clients</a><a href="#">Settings</a>
+      <button class="icobtn" style="float: right"></button>
+    </div>
+
+    <h3>INVOICES</h3>
+    <p>
+      Manage everything about your invoices from this one screen. You can filter, search, export and
+      send reminders. Click here to read more about how reminders work and when they are sent to
+      your clients automatically after a due date passes.
+    </p>
+
+    <div class="banner">Two invoices are overdue.</div>
+
+    <h5>Find an invoice</h5>
+    <div class="card">
+      <input placeholder="Client name" />
+      <input placeholder="Amount" />
+      <button class="go">Go</button>
+      <button class="ghost">Reset</button>
+    </div>
+
+    <h5>Recent</h5>
+    <div class="card">
+      <table>
+        <tr><th>Invoice</th><th>Client</th><th>Amount</th><th>Status</th><th></th></tr>
+        <tr>
+          <td>MRD-1041</td><td>Halden Works</td><td>$2,400.00</td>
+          <td><span class="dot paid"></span></td>
+          <td><div class="go" onclick="void 0" style="display:inline-block">Send</div></td>
+        </tr>
+        <tr>
+          <td>MRD-1040</td><td>Corbin &amp; Vale</td><td>$860.00</td>
+          <td><span class="dot late"></span></td>
+          <td><div class="go" onclick="void 0" style="display:inline-block">Send</div></td>
+        </tr>
+        <tr>
+          <td>MRD-1039</td><td>Okonkwo Studio</td><td>$5,125.00</td>
+          <td><span class="dot late"></span></td>
+          <td><div class="go" onclick="void 0" style="display:inline-block">Send</div></td>
+        </tr>
+        <tr>
+          <td>MRD-1038</td><td>Pine Street Co-op</td><td>$310.00</td>
+          <td><span class="dot paid"></span></td>
+          <td><div class="go" onclick="void 0" style="display:inline-block">Send</div></td>
+        </tr>
+      </table>
+    </div>
+
+    <h5>Your plan</h5>
+    <div class="card">
+      <p>You are on the Starter plan. Upgrade for unlimited invoices and automatic reminders.</p>
+      <button class="ghost">Upgrade</button>
+      <button class="ghost" disabled>Cancel plan</button>
+    </div>
+
+    <img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIyMjAiIGhlaWdodD0iNDgiPjxyZWN0IHdpZHRoPSIyMjAiIGhlaWdodD0iNDgiIGZpbGw9IiNlOGVkZjMiLz48dGV4dCB4PSIxNCIgeT0iMzAiIGZvbnQtZmFtaWx5PSJIZWx2ZXRpY2EiIGZvbnQtc2l6ZT0iMTQiIGZpbGw9IiM3ODg1OTYiPlBheW1lbnRzIGJ5IE1lcmlkaWFuPC90ZXh0Pjwvc3ZnPg==" />
+
+    <div class="foot">© 2026 Meridian. All rights reserved. Terms. Privacy.</div>
+  </body>
+</html>
