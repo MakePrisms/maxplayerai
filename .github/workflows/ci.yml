@@ -519,7 +519,7 @@ jobs:
               --test money --test pinned_quote_recovery --test receive --test relays
               --test review_regressions --test round5 --test round7 --test send
               --test serve_receive --test serve_review_r2 --test serve_send_fund
-              --test serve_socket_uid --test ux
+              --test serve_socket_uid --test shared_home --test ux
             doc: true
           # lab suite (~2870s total)
           - suite: lab
@@ -598,7 +598,7 @@ jobs:
             targets: >-
               --test serve_receive --test backoff --test ux --test send --test receive
               --test serve_send_fund --test round7 --test relays --test serve_review_r2
-              --test serve_socket_uid
+              --test serve_socket_uid --test shared_home
     env:
       TRADE_MANIFEST: crates/maxplayer-trade/Cargo.toml
     steps:

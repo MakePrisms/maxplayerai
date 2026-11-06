@@ -493,3 +493,83 @@ async fn legacy_home_allow_refuse_matrix() {
     assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0, "nothing created");
     assert!(trade(Some(empty.path()), &["status"]).status.success());
 }
+
+/// 4(b): two PROCESSES write the one wallet database at once (cdk-sqlite 0.17.2 opens it with WAL,
+/// `busy_timeout = 10000` and `BEGIN IMMEDIATE`). `maxplayer-trade send` subprocesses run while this
+/// process selects and confirms core sends in a loop. Every command either completes or refuses
+/// retryably (lock busy / inputs changed) — never `database is locked` — and the sats add up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_processes_write_the_shared_wallet_database_concurrently() {
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path().to_path_buf();
+    fund(&home, &m.url, 256).await;
+    let w = core_wallet(&home, &m.url).await;
+    let wallet_dir = home.join("wallet");
+    let mut children = vec![];
+    for i in 0..4 {
+        let out = h.path().join(format!("cli-token-{i}"));
+        let mut c = tokio::process::Command::new(BIN);
+        for (k, _) in std::env::vars_os() {
+            if k.to_string_lossy().starts_with("MAXPLAYER_") {
+                c.env_remove(k);
+            }
+        }
+        c.arg("--home")
+            .arg(&home)
+            .args(["send", &m.url, "--amount", "7", "--out"])
+            .arg(&out)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true);
+        children.push(c.output());
+    }
+    let cli = futures_util::future::join_all(children);
+    let core = async {
+        let mut sent = 0u64;
+        for _ in 0..12 {
+            match shared_wallet::prepare_send_locked(
+                &w,
+                Some(&wallet_dir),
+                Amount::from(3),
+                SendOptions::default(),
+            )
+            .await
+            {
+                Ok(p) => {
+                    p.confirm(None).await.unwrap();
+                    sent += 3;
+                }
+                Err(e) => assert!(e.to_string().contains("busy"), "{e}"),
+            }
+        }
+        sent
+    };
+    let (outs, core_sent) = tokio::join!(cli, core);
+    let mut cli_sent = 0u64;
+    for o in outs {
+        let o = o.unwrap();
+        let e = err(&o);
+        assert!(!e.contains("database is locked"), "SAFETY: SQLITE_BUSY leaked: {e}");
+        if o.status.success() {
+            cli_sent += 7;
+        } else {
+            assert!(
+                e.contains("busy") || e.contains("changed while this operation chose"),
+                "only a retryable refusal: {e}"
+            );
+        }
+    }
+    assert!(cli_sent > 0 && core_sent > 0, "both processes spent");
+    assert!(rows(&home, &m.url, vec![State::Reserved, State::Pending]).await.is_empty());
+    let pending: u64 = rows(&home, &m.url, vec![State::PendingSpent])
+        .await
+        .iter()
+        .map(|p| u64::from(p.proof.amount))
+        .sum();
+    assert_eq!(pending, core_sent);
+    assert_eq!(
+        balance(&home, &m.url).await + core_sent + cli_sent,
+        256,
+        "SAFETY: no proof lost or double-spent across processes"
+    );
+}
