@@ -270,10 +270,10 @@ pub async fn restore_keeping_other_reservations(
     // stay deleted: that is true, and their owner reconciles it.
     let mut foreign = Vec::new();
     for row in in_flight {
-        if let Some(op) = row.used_by_operation {
-            if wallet.localstore.get_saga(&op).await?.is_none() {
-                foreign.push(row);
-            }
+        if let Some(op) = row.used_by_operation
+            && wallet.localstore.get_saga(&op).await?.is_none()
+        {
+            foreign.push(row);
         }
     }
     let restored = wallet.restore().await?;

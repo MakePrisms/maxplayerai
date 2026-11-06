@@ -524,17 +524,7 @@ impl Select {
     /// Every proof in `ys` is still UNSPENT, unowned and unlocked in the wallet database (another
     /// process may have taken one since it was selected). Nothing changes on a refusal.
     pub async fn verify_free(&self, ys: &[cashu::PublicKey]) -> Result<()> {
-        let db = database(&self.home, &self.mint).await?;
-        let rows = db.get_proofs_by_ys(ys.to_vec()).await?;
-        ensure!(
-            ys.iter().all(|y| rows.iter().any(|r| r.y == *y
-                && r.state == cashu::State::Unspent
-                && r.used_by_operation.is_none()
-                && r.spending_condition.is_none())),
-            "the wallet's spendable proofs changed while this operation chose its inputs (another \
-             process on this home spent or reserved one); nothing was journaled or reserved; retry"
-        );
-        Ok(())
+        refuse_if_taken(&self.home, &self.mint, ys).await
     }
     /// Reserve exactly `ys` under `op`. Proofs `op` already holds stay held (idempotent); `op`
     /// may hold nothing outside `ys` ("reservation conflict"). Every other proof must be UNSPENT,
@@ -616,4 +606,24 @@ pub fn legacy_refusal(home: &Path) -> String {
          (`maxplayer-trade` with no --home uses $MAXPLAYER_HOME or ~/.maxplayer).",
         h = home.display()
     )
+}
+
+/// Refusal when a chosen input was taken by another operation on this home after it was chosen.
+pub const INPUTS_CHANGED: &str = "the wallet's spendable proofs changed while this operation chose \
+     its inputs (another process on this home spent or reserved one); nothing was journaled or \
+     reserved; retry";
+/// `Err(INPUTS_CHANGED)` unless every proof in `ys` is still UNSPENT, unowned and unlocked in the
+/// wallet database. Proofs are chosen from a snapshot without the selection lock; on a shared home
+/// the buyer may reserve or spend one before the choice is checked (NUT-07) or reserved.
+pub async fn refuse_if_taken(home: &Path, mint: &str, ys: &[cashu::PublicKey]) -> Result<()> {
+    let db = database(home, mint).await?;
+    let rows = db.get_proofs_by_ys(ys.to_vec()).await?;
+    ensure!(
+        ys.iter().all(|y| rows.iter().any(|r| r.y == *y
+            && r.state == cashu::State::Unspent
+            && r.used_by_operation.is_none()
+            && r.spending_condition.is_none())),
+        "{INPUTS_CHANGED}"
+    );
+    Ok(())
 }
