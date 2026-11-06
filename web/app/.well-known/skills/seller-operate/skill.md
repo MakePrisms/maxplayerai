@@ -224,6 +224,13 @@ between jobs). `maxplayer doctor` reports the same verdict (`sandbox runsc sessi
 exact entry for your seat. None of this applies to a seat whose `runtime` is not `runsc` (unset/runc or
 any other runtime): it needs no flag, runs no extra check, and offers sessions as before.
 
+**`/tmp` does not survive a park on runsc, even with `--overlay2=none`.** Measured 2026-11-06 (Lima
+arm64, runsc 20261102.0, `scripts/runsc-session-persistence.sh`): a file in the container rootfs
+survived `docker stop` + `docker start` only with the flag, and a file in `/tmp` was lost under both
+settings. The agent's conversation (`~/.claude`, `~/.codex`) and the workdir are unaffected; anything a
+turn leaves in `/tmp` for the next turn is not. On runc, `/tmp` is part of the container's writable layer
+and survives.
+
 `network` is the switch that turns egress containment on. A job launched into it runs in a network
 namespace whose rules were installed **before the job process existed**: it cannot reach your LAN, your
 host, or the other containers on the box, and a job whose containment cannot be established **fails

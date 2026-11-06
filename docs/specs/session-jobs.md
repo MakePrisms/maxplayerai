@@ -363,6 +363,10 @@ at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker
   stops running containers)". Single-turn jobs are unaffected. Already-parked sessions are not touched.
 - **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open, WARN with the fix when
   closed (WARN, not FAIL: the seat still serves single-turn jobs, and the seller enforces the gate).
+- **`/tmp` is not covered.** Measured 2026-11-06 (runsc 20261102.0, arm64): with `--overlay2=none` a
+  rootfs file survives stop/start but a `/tmp` file does not, under either setting. The transcript lives
+  under `HOME`, so the gate is sufficient for conversation continuity; state a turn leaves in `/tmp` is
+  lost on runsc seats.
 
 ---
 
