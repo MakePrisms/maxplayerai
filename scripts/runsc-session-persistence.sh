@@ -66,7 +66,10 @@ for arg in it:
     elif flag == "overlay2": value = next(it, None)
 print(("yes" if (value or "").strip() == "none" else "no") + "\t" + json.dumps(args))
 '
-flag_line="$(printf '%s' "$runtimes" | python3 -c "$read_flag" "$RUNTIME")"
+# A parse failure is a setup error (4), never "rootfs file lost" (1): under `set -e` a failing
+# substitution would otherwise exit with python's own status.
+flag_line="$(printf '%s' "$runtimes" | python3 -c "$read_flag" "$RUNTIME")" \
+  || die "could not read docker's runtimes (\`docker info --format '{{json .Runtimes}}'\` is not the expected JSON)"
 [ "$flag_line" != "UNREGISTERED" ] || die "the docker daemon registers no runtime named '$RUNTIME'"
 flag="${flag_line%%$'\t'*}"
 args="${flag_line#*$'\t'}"

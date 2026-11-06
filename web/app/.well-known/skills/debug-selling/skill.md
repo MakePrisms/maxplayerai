@@ -415,11 +415,11 @@ Until then it keeps taking single-turn jobs as before; nothing else is affected.
    that name only. The one-liner:
 
    ```
-   sudo runsc install -- --overlay2=none
+   sudo -- runsc install -- --overlay2=none
    ```
 
    `runsc install` rewrites the whole `runsc` entry in `/etc/docker/daemon.json`, so if the entry
-   already has other `runtimeArgs`, list them too (`sudo runsc install -- --platform=systrap
+   already has other `runtimeArgs`, list them too (`sudo -- runsc install -- --platform=systrap
    --overlay2=none`). The seller's log line and `doctor` print the exact command for your seat, with
    your args. To edit by hand instead, merge this into `/etc/docker/daemon.json`, using the `path`
    that `docker info --format '{{json .Runtimes}}'` shows and keeping any other args:
@@ -433,8 +433,10 @@ Until then it keeps taking single-turn jobs as before; nothing else is affected.
 
 3. Check: `docker info --format '{{json .Runtimes}}'` shows `"runtimeArgs":["--overlay2=none"]` on
    `runsc`, and `maxplayer doctor` shows `PASS sandbox runsc sessions`. The running seller re-checks
-   on its next heartbeat (within 5 minutes) and logs `sessions: runsc runs with --overlay2=none;
-   session jobs are advertised`. No seller restart is needed.
+   on its next heartbeat (every 5 minutes by default) and logs `sessions: runsc runs with
+   --overlay2=none; session jobs are advertised`. If the heartbeat is off (`[seller_heartbeat]
+   enabled = false`, or `MAXPLAYER_HEARTBEAT_ENABLED=0`) or its interval is long, restart the seller
+   instead: the gate is otherwise only checked at startup.
 
 **To test the box itself**, `scripts/runsc-session-persistence.sh` in the repository writes a file
 inside a container, stops and starts it, and reports whether the file survived (exit 0) or was lost
@@ -443,7 +445,7 @@ inside a container, stops and starts it, and reports whether the file survived (
 **Know the trade-offs:**
 
 - With the flag, files the agent writes go to the container's writable layer on the host disk instead
-  of sandbox memory. gVisor still handles every file access; rootfs-heavy work is somewhat slower.
+  of a sandbox-private overlay that is discarded at stop. gVisor still handles every file access; rootfs-heavy work is somewhat slower.
 - `/tmp` is still lost between turns on runsc, even with the flag (runsc mounts its own `/tmp`). The
   agent's conversation and the work folder are not under `/tmp`.
 - A docker or host restart still ends parked sessions, on any runtime.

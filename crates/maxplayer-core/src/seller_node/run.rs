@@ -1357,26 +1357,30 @@ const RUNSC_GATE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 async fn probe_runsc_gate(
     config: &crate::home::MaxplayerConfig,
 ) -> crate::session::RunscOverlayGate {
-    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, || async {
-        let read = tokio::time::timeout(
-            RUNSC_GATE_PROBE_TIMEOUT,
-            tokio::task::spawn_blocking(|| {
-                use crate::seller_exec::DockerCli as _;
-                crate::seller_exec::RealDockerCli
-                    .run(&["docker", "info", "--format", "{{json .Runtimes}}"].map(str::to_owned))
-            }),
-        )
-        .await;
-        match read {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(format!("docker info task failed: {error}")),
-            Err(_) => Err(format!(
-                "docker info did not answer within {}s",
-                RUNSC_GATE_PROBE_TIMEOUT.as_secs()
-            )),
-        }
+    crate::session::resolve_runsc_gate(config.sandbox.as_ref(), &config.sessions, || {
+        bounded_runtimes_read(RUNSC_GATE_PROBE_TIMEOUT, || {
+            use crate::seller_exec::DockerCli as _;
+            crate::seller_exec::RealDockerCli
+                .run(&["docker", "info", "--format", "{{json .Runtimes}}"].map(str::to_owned))
+        })
     })
     .await
+}
+
+/// Run the blocking `docker info` read off the runtime, bounded by `timeout`. A read that fails,
+/// panics or does not answer in time is an `Err`, which closes the gate.
+async fn bounded_runtimes_read<F>(timeout: Duration, read: F) -> Result<String, String>
+where
+    F: FnOnce() -> Result<String, String> + Send + 'static,
+{
+    match tokio::time::timeout(timeout, tokio::task::spawn_blocking(read)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(format!("docker info task failed: {error}")),
+        Err(_) => Err(format!(
+            "docker info did not answer within {}s",
+            timeout.as_secs()
+        )),
+    }
 }
 
 /// Log the §5.6 verdict; a non-runsc seat (`NotApplicable`) logs nothing.
@@ -12117,6 +12121,85 @@ mod tests {
         }
     }
     use super::*;
+
+    // §5.6: the bounded `docker info` read maps every failure to an `Err` (which closes the gate):
+    // a read that does not answer in time, and a read that panics. A good read passes through.
+    #[tokio::test]
+    async fn runsc_gate_read_maps_timeout_and_panic_to_err() {
+        assert_eq!(
+            bounded_runtimes_read(Duration::from_secs(10), || Ok("{}".to_owned())).await,
+            Ok("{}".to_owned())
+        );
+        let slow = bounded_runtimes_read(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(800));
+            Ok("{}".to_owned())
+        })
+        .await;
+        assert!(
+            matches!(&slow, Err(error) if error.contains("did not answer within")),
+            "{slow:?}"
+        );
+        let panicked =
+            bounded_runtimes_read(Duration::from_secs(10), || -> Result<String, String> {
+                panic!("probe panicked")
+            })
+            .await;
+        assert!(
+            matches!(&panicked, Err(error) if error.contains("docker info task failed")),
+            "{panicked:?}"
+        );
+    }
+
+    // §5.6 wiring, pinned in the source: the claim and the execution each read the node's LIVE gate
+    // (`self.runsc_gate()`), there is exactly one of each call, and the heartbeat refreshes it. A
+    // call site that passed `RunscOverlayGate::Open`/`NotApplicable`, or a stale copy, fails here;
+    // the gate functions themselves are covered in `session::tests`.
+    #[test]
+    fn claim_and_execution_read_the_live_runsc_gate() {
+        let source = include_str!("run.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {\n")
+            .expect("tests module")];
+        assert_eq!(
+            production
+                .matches("crate::session::advertise_on_claim(")
+                .count(),
+            1
+        );
+        let claim = production
+            .find("crate::session::advertise_on_claim(")
+            .unwrap();
+        // Char-based windows: the source has multi-byte characters, so byte offsets could split one.
+        let before: String = {
+            let mut tail: Vec<char> = production[..claim].chars().rev().take(120).collect();
+            tail.reverse();
+            tail.into_iter().collect()
+        };
+        let call: String = production[claim..].chars().take(200).collect();
+        assert!(
+            before.contains("let runsc_gate = self.runsc_gate();") && call.contains("&runsc_gate,"),
+            "the claim must advertise against the live gate: {before}{call}"
+        );
+        assert_eq!(
+            production
+                .matches("crate::session::runs_as_session(")
+                .count(),
+            1
+        );
+        let execute = production.find("crate::session::runs_as_session(").unwrap();
+        assert!(
+            production[execute..]
+                .chars()
+                .take(120)
+                .collect::<String>()
+                .contains("&self.runsc_gate(),"),
+            "execution must decide single-turn vs session on the live gate"
+        );
+        assert!(
+            production.contains("self.refresh_runsc_gate().await;"),
+            "the heartbeat must re-probe the gate"
+        );
+    }
 
     const SELLER: &str = "aa";
     const BUYER: &str = "bb";

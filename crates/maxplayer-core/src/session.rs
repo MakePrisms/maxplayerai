@@ -1059,19 +1059,38 @@ pub fn runsc_gate_log_line(gate: &RunscOverlayGate) -> Option<String> {
     }
 }
 
+/// How one runtime arg sets runsc's `--overlay2`, read as runsc's flag parser (Go's `flag`) reads
+/// it: one or two leading dashes, then `overlay2=<value>`, or `overlay2` with the value in the next
+/// arg. A word without a leading dash is never the flag (it is some other flag's value). The gate
+/// and the fix text both read args through this, so they cannot disagree about which arg is which.
+enum OverlayArg<'a> {
+    /// `--overlay2=<value>`.
+    Inline(&'a str),
+    /// `--overlay2`: the value is the next arg.
+    NextArg,
+}
+
+fn overlay_arg(arg: &str) -> Option<OverlayArg<'_>> {
+    let flag = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    if let Some(value) = flag.strip_prefix("overlay2=") {
+        Some(OverlayArg::Inline(value))
+    } else if flag == "overlay2" {
+        Some(OverlayArg::NextArg)
+    } else {
+        None
+    }
+}
+
 /// Whether a runtime's argv leaves `--overlay2` at `none`: `--overlay2=none`, `--overlay2 none`,
 /// or one leading dash (Go's flag package accepts both). The LAST setting wins, as in runsc.
 pub fn runtime_args_disable_overlay(args: &[String]) -> bool {
     let mut value: Option<&str> = None;
     let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
-        let flag = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'));
-        match flag {
-            Some(rest) if rest.starts_with("overlay2=") => {
-                value = Some(&rest["overlay2=".len()..]);
-            }
-            Some("overlay2") => value = iter.next(),
-            _ => {}
+        match overlay_arg(arg) {
+            Some(OverlayArg::Inline(inline)) => value = Some(inline),
+            Some(OverlayArg::NextArg) => value = iter.next(),
+            None => {}
         }
     }
     value.map(str::trim) == Some("none")
@@ -1089,7 +1108,9 @@ pub const RUNSC_GUIDE_URL: &str =
 /// The same guide rendered on GitHub (for people), on `main`, anchored at the section.
 pub const RUNSC_GUIDE_GITHUB_URL: &str = "https://github.com/MakePrisms/maxplayerai/blob/main/web/app/.well-known/skills/debug-selling/skill.md#symptom-sessions-disabled-on-a-runsc-seat";
 
-/// One shell word: left bare when it holds only flag-safe characters, single-quoted otherwise.
+/// One shell word: left bare when it holds only flag-safe characters, single-quoted otherwise (a `'`
+/// inside becomes `'\''`). Never starts a comment or an expansion: `#`, `$`, backtick, quotes and
+/// whitespace are all outside the bare set.
 fn shell_word(word: &str) -> String {
     let safe = !word.is_empty()
         && word
@@ -1103,25 +1124,27 @@ fn shell_word(word: &str) -> String {
 }
 
 /// The fix for a closed gate, keeping the runtime NAMED `runsc`, its `path`, and any other args it
-/// already has (any `--overlay2` setting is replaced): the `runsc install` one-liner (it rewrites
-/// the whole entry, so the kept args ride along), the daemon.json member for a hand edit, the docker
-/// restart, the heartbeat re-check, and the troubleshooting guide. With no other args the member is
-/// exactly `"runsc": {"path": "<path>", "runtimeArgs": ["--overlay2=none"]}`.
+/// already has (any `--overlay2` setting is replaced, read by [`overlay_arg`] exactly as the gate
+/// reads it). The text STARTS with the command and everything after it is a shell comment, so the
+/// whole line pastes safely: `sudo -- <path> install -- <kept args> --overlay2=none # ...`. `sudo
+/// --` keeps a path that begins with `-` from being read as a sudo option, and the path and args are
+/// shell-quoted. `runsc install` rewrites the whole entry, which is why the kept args are in it. The
+/// comment carries the daemon.json member for a hand edit (exactly `"runsc": {"path": "<path>",
+/// "runtimeArgs": ["--overlay2=none"]}` with no other args), the docker restart, the heartbeat
+/// re-check and the troubleshooting guide.
 pub fn runsc_daemon_json_fix(path: Option<&str>, args: &[String]) -> String {
     let quote = |value: &str| serde_json::Value::from(value).to_string();
     let known_path = path.map(str::trim).filter(|path| !path.is_empty());
     let mut keep: Vec<String> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        let flag = arg.trim_start_matches('-');
-        if flag.starts_with("overlay2=") {
-            continue;
+        match overlay_arg(arg) {
+            Some(OverlayArg::Inline(_)) => {}
+            Some(OverlayArg::NextArg) => {
+                iter.next();
+            }
+            None => keep.push(arg.clone()),
         }
-        if flag == "overlay2" {
-            iter.next();
-            continue;
-        }
-        keep.push(arg.clone());
     }
     keep.push(RUNSC_OVERLAY_NONE.to_owned());
     let json_args = keep
@@ -1136,12 +1159,13 @@ pub fn runsc_daemon_json_fix(path: Option<&str>, args: &[String]) -> String {
         .join(" ");
     let binary = known_path.map_or_else(|| RUNSC_RUNTIME.to_owned(), shell_word);
     format!(
-        "run `sudo {binary} install -- {shell_args}` (it rewrites the whole \"runsc\" entry in \
-         /etc/docker/daemon.json), or by hand in /etc/docker/daemon.json under \"runtimes\" set {}: \
-         {{\"path\": {}, \"runtimeArgs\": [{json_args}]}}; then restart docker (this stops running \
-         containers). The running seller re-checks within 5 minutes, no restart needed; confirm with \
-         `maxplayer doctor`. Guide, section \"{RUNSC_GUIDE_HEADING}\": {RUNSC_GUIDE_GITHUB_URL} \
-         (raw: {RUNSC_GUIDE_URL})",
+        "sudo -- {binary} install -- {shell_args} # this rewrites the whole \"runsc\" entry in \
+         /etc/docker/daemon.json, other args included; or by hand, under \"runtimes\" set {}: \
+         {{\"path\": {}, \"runtimeArgs\": [{json_args}]}}. Then restart docker (this stops running \
+         containers). The running seller re-checks on its next heartbeat (every 5 minutes by \
+         default); if the seller heartbeat is turned off, restart the seller. Confirm with maxplayer \
+         doctor. Guide, section \"{RUNSC_GUIDE_HEADING}\": {RUNSC_GUIDE_GITHUB_URL} (raw: \
+         {RUNSC_GUIDE_URL})",
         quote(RUNSC_RUNTIME),
         quote(known_path.unwrap_or("<runsc path>")),
     )

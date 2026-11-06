@@ -762,7 +762,8 @@ fn runsc_gate_opens_only_with_overlay2_none() {
 }
 
 /// The fix a human can act on without reading code: the one-liner with the seat's own binary path
-/// and its other args, the heartbeat re-check, doctor, and the troubleshooting guide (site + GitHub).
+/// and its other args, the heartbeat re-check (and the restart when the heartbeat is off), doctor,
+/// and the troubleshooting guide (site + GitHub).
 #[test]
 fn runsc_fix_names_the_one_liner_the_recheck_and_the_guide() {
     let RunscOverlayGate::Closed { fix, .. } =
@@ -771,14 +772,29 @@ fn runsc_fix_names_the_one_liner_the_recheck_and_the_guide() {
         panic!("closed");
     };
     assert!(
-        fix.contains("`sudo /usr/bin/runsc install -- --overlay2=none`"),
+        fix.starts_with("sudo -- /usr/bin/runsc install -- --overlay2=none # "),
+        "the command comes first and the rest is a shell comment: {fix}"
+    );
+    assert!(
+        !fix.contains("within 5 minutes"),
+        "the re-check is the heartbeat, which can be off or slower: {fix}"
+    );
+    assert!(
+        fix.contains("next heartbeat (every 5 minutes by default)"),
         "{fix}"
     );
-    assert!(fix.contains("re-checks within 5 minutes"), "{fix}");
-    assert!(fix.contains("`maxplayer doctor`"), "{fix}");
+    assert!(
+        fix.contains("if the seller heartbeat is turned off, restart the seller"),
+        "{fix}"
+    );
+    assert!(fix.contains("maxplayer doctor"), "{fix}");
     assert!(fix.contains(RUNSC_GUIDE_GITHUB_URL), "{fix}");
     assert!(fix.contains(RUNSC_GUIDE_URL), "{fix}");
     assert!(fix.contains(RUNSC_GUIDE_HEADING), "{fix}");
+    assert!(
+        !fix.contains('`'),
+        "no backticks around a pasteable command: {fix}"
+    );
 
     // `runsc install` rewrites the whole entry, so the other args ride along in the one-liner.
     let RunscOverlayGate::Closed { fix, .. } = runsc_overlay_gate(
@@ -790,7 +806,7 @@ fn runsc_fix_names_the_one_liner_the_recheck_and_the_guide() {
         panic!("closed");
     };
     assert!(
-        fix.contains("install -- --platform=systrap --overlay2=none`"),
+        fix.contains("install -- --platform=systrap --overlay2=none # "),
         "{fix}"
     );
 
@@ -801,9 +817,88 @@ fn runsc_fix_names_the_one_liner_the_recheck_and_the_guide() {
         panic!("closed");
     };
     assert!(
-        fix.contains("`sudo runsc install -- --overlay2=none`"),
+        fix.starts_with("sudo -- runsc install -- --overlay2=none # "),
         "{fix}"
     );
+}
+
+/// The fix reads overlay args exactly as the gate does: a bare `overlay2` word (no dash) is some
+/// other flag's value, not the flag, so neither it nor the arg after it is dropped.
+#[test]
+fn runsc_fix_strips_overlay_args_exactly_as_the_gate_reads_them() {
+    let args = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+    let bare = args(&["--debug-log", "overlay2", "--platform=systrap"]);
+    assert!(
+        !runtime_args_disable_overlay(&bare),
+        "a bare word is not the flag"
+    );
+    let fix = runsc_daemon_json_fix(Some("/usr/bin/runsc"), &bare);
+    assert!(
+        fix.starts_with(
+            "sudo -- /usr/bin/runsc install -- --debug-log overlay2 --platform=systrap --overlay2=none # "
+        ),
+        "{fix}"
+    );
+    assert!(
+        fix.contains(
+            r#""runtimeArgs": ["--debug-log", "overlay2", "--platform=systrap", "--overlay2=none"]"#
+        ),
+        "{fix}"
+    );
+
+    // Every dashed spelling is replaced, the separate-value form with its value.
+    let dashed = args(&[
+        "--overlay2",
+        "root:self",
+        "-overlay2=root:memory",
+        "--platform=systrap",
+    ]);
+    let fix = runsc_daemon_json_fix(Some("/usr/bin/runsc"), &dashed);
+    assert!(
+        fix.starts_with("sudo -- /usr/bin/runsc install -- --platform=systrap --overlay2=none # "),
+        "{fix}"
+    );
+}
+
+/// The printed command, pasted into bash, hands `sudo` exactly the argv it shows: `--` before the
+/// binary (a leading-dash path is not a sudo option), and spaces, quotes, `$(...)` and backticks in
+/// the path or args stay literal. Run for real under bash with `sudo` replaced by a function that
+/// prints its argv; a command substitution that ran would create the marker file.
+#[test]
+fn runsc_fix_command_pastes_into_bash_with_the_exact_argv() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let marker = dir.path().join("ran");
+    let marker_s = marker.display().to_string();
+    let cases: Vec<(String, Vec<String>)> = vec![
+        ("--preserve-env".into(), vec![]),
+        ("/opt/my runsc/runsc".into(), vec!["--flag=a b".into()]),
+        (
+            format!("/x/$(touch {marker_s})"),
+            vec![format!("--a=`touch {marker_s}`")],
+        ),
+        ("/x/it's".into(), vec!["x';touch /dev/null;'".into()]),
+        ("/usr/bin/runsc".into(), vec!["--platform=systrap".into()]),
+    ];
+    for (path, extra) in cases {
+        let fix = runsc_daemon_json_fix(Some(&path), &extra);
+        let script = format!("sudo() {{ printf '%s\\n' \"$@\"; }}\n{fix}\n");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("bash runs");
+        assert!(out.status.success(), "{fix}: {out:?}");
+        let argv: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let mut want = vec!["--".to_owned(), path.clone(), "install".into(), "--".into()];
+        want.extend(extra.iter().cloned());
+        want.push(RUNSC_OVERLAY_NONE.to_owned());
+        assert_eq!(argv, want, "{fix}");
+        assert!(!marker.exists(), "a substitution in the fix ran: {fix}");
+    }
 }
 
 /// The guide section the fix links to exists under the exact heading, and the GitHub anchor is that

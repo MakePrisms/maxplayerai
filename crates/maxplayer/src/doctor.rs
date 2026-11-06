@@ -1475,7 +1475,7 @@ mod checks {
         // gVisor filters syscalls in the Sentry and does not apply the OCI seccomp profile at all
         // unless `--oci-seccomp` is set, so on a runsc seat the Engine default governs nothing and no
         // Engine version could change this verdict. Answered before the probe, not after it.
-        if runtime == Some("runsc") {
+        if runtime.map(str::trim) == Some("runsc") {
             return Check::pass(
                 SANDBOX_ENGINE_CHECK,
                 format!(
@@ -1573,24 +1573,65 @@ mod checks {
     }
 
     /// `docker info --format '{{json .Runtimes}}'`: the daemon's runtimes and their args. `Err`
-    /// when docker cannot be run or the daemon does not answer.
+    /// when docker cannot be run, the daemon does not answer, or it takes longer than
+    /// [`DOCKER_PROBE_TIMEOUT`] (the same 10s the seller's own gate probe allows).
     fn probe_docker_runtimes() -> Result<String, String> {
         if !argv0_resolvable("docker") {
             return Err("docker is not on PATH".to_owned());
         }
-        let probe = std::process::Command::new("docker")
-            .args(["info", "--format", "{{json .Runtimes}}"])
+        let mut command = std::process::Command::new("docker");
+        command.args(["info", "--format", "{{json .Runtimes}}"]);
+        read_stdout_bounded(&mut command, DOCKER_PROBE_TIMEOUT)
+    }
+
+    /// Run `command` with stdin and stderr nulled, capture its stdout, and wait at most `timeout`.
+    /// On expiry the child is killed and reaped and the read is an `Err`, which closes the runsc
+    /// gate (WARN) instead of hanging `doctor` and the seller's boot readiness gate.
+    pub(super) fn read_stdout_bounded(
+        command: &mut std::process::Command,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let mut child = command
             .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
-            .output()
+            .spawn()
             .map_err(|error| format!("could not run docker: {error}"))?;
-        if !probe.status.success() {
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("could not read docker's output".to_owned());
+        };
+        // Read on a thread so a large answer cannot fill the pipe and stall the child.
+        let reader = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+            out
+        });
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "docker info did not answer within {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(error) => return Err(format!("could not wait for docker: {error}")),
+            }
+        };
+        let out = reader.join().unwrap_or_default();
+        if !status.success() {
             return Err(
                 "docker daemon did not answer `docker info` (not running, or not permitted)"
                     .to_owned(),
             );
         }
-        Ok(String::from_utf8_lossy(&probe.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
     /// Ask the daemon for the SERVER version — the Engine that applies the seccomp profile.
@@ -4392,6 +4433,41 @@ mod tests {
         );
     }
 
+    // The runsc-sessions check's `docker info` read is bounded like the image probes: a daemon that
+    // never answers returns at the deadline as an `Err` (which closes the gate, WARN) instead of
+    // hanging `doctor` and the seller's boot readiness gate. Positive controls: stdout comes back,
+    // and a non-zero exit is an `Err`.
+    #[test]
+    fn doctor_runsc_runtimes_read_is_bounded_and_returns_stdout() {
+        use std::time::{Duration, Instant};
+
+        let mut hung = std::process::Command::new("sleep");
+        hung.arg("60");
+        let started = Instant::now();
+        let read = checks::read_stdout_bounded(&mut hung, Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the read must RETURN at its deadline — waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&read, Err(error) if error.contains("did not answer within")),
+            "{read:?}"
+        );
+
+        let mut echo = std::process::Command::new("echo");
+        echo.arg(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#);
+        assert_eq!(
+            checks::read_stdout_bounded(&mut echo, Duration::from_secs(10))
+                .expect("stdout")
+                .trim(),
+            r#"{"runsc":{"path":"/usr/bin/runsc"}}"#
+        );
+
+        let mut bad = std::process::Command::new("false");
+        assert!(checks::read_stdout_bounded(&mut bad, Duration::from_secs(10)).is_err());
+    }
+
     // RED-PROVE: a timed-out probe must NOT be folded into `Absent`. `Absent` says the registry was
     // reached and did not have the image, which sends the operator after a publish/auth problem that
     // may not exist. A probe that never returned learned nothing, so it WARNs and names the command
@@ -4582,7 +4658,7 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("`sudo /usr/bin/runsc install -- --overlay2=none`"),
+            rendered.contains("(fix: sudo -- /usr/bin/runsc install -- --overlay2=none # "),
             "one-liner with the seat's own path: {rendered}"
         );
         assert!(

@@ -359,9 +359,11 @@ at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker
 - **Closed means:** `advertise_on_claim` adds no `["session","1"]`, and a job claimed while the gate was
   open but executed after it closed runs single-turn (not parked). The seat logs one
   `sessions DISABLED` line (on boot and on each change, not every beat) with the reason and the fix
-  (`session::runsc_daemon_json_fix`): the `sudo <runsc path> install -- <kept args> --overlay2=none`
-  one-liner, the daemon.json member `"runsc": {"path": "<runsc path>", "runtimeArgs": [..., "--overlay2=none"]}`,
-  "restart docker (this stops running containers)", the heartbeat re-check, and the guide section
+  (`session::runsc_daemon_json_fix`): first the command `sudo -- <runsc path> install -- <kept args>
+  --overlay2=none` (shell-quoted; everything after it is a `#` comment, so the line pastes safely;
+  overlay args are stripped by the same reader the gate uses), the daemon.json member `"runsc": {"path": "<runsc path>", "runtimeArgs": [..., "--overlay2=none"]}`,
+  "restart docker (this stops running containers)", the heartbeat re-check (next heartbeat, default 5 minutes; with the heartbeat off, restart the
+  seller), and the guide section
   `debug-selling` "Symptom: sessions DISABLED on a runsc seat" (GitHub-rendered on `main`, plus the site's
   raw copy). A test pins the heading against the guide file, so a rename cannot ship a dead link. Single-turn jobs are unaffected. Already-parked sessions are not touched.
 - **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open, WARN with the fix when
