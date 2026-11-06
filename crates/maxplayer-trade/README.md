@@ -1,6 +1,7 @@
-# maxplayer-trade — standalone real-money Cashu trades
+# maxplayer-trade — real-money Cashu trades from your maxplayer home
 
-A fixed-lot CLI, independent of jobs and the maxplayer daemon. Market traffic goes first to
+A fixed-lot CLI, independent of jobs (still a separate binary from `maxplayer`). It trades from
+the **maxplayer home** (see [Home and wallet](#home-and-wallet)). Market traffic goes first to
 `relay.maxplayer.ai`, which stores lots and statuses from relay members since relay-v5 (#1246),
 with public relays as fallbacks; `nostr://` mint traffic (kinds 23410/23411) uses it too.
 **A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
@@ -8,6 +9,48 @@ recovery, fee-inclusive net delivery, and a signed `sold` status. Real-money tra
 or an unconditional atomicity guarantee.
 
 Current operating policy is in [Round 5](#round-5-final-review-policy).
+
+## Home and wallet
+
+- **Home.** `--home <dir>` names a maxplayer home (a directory with `key` and/or `config.toml`);
+  without `--home` it is the buyer's home, `$MAXPLAYER_HOME` else `~/.maxplayer` (resolved by
+  `maxplayer_core::home`). Create one with `maxplayer wallet setup --home <dir>` (or
+  `maxplayer whoami --home <dir>`). A directory that is neither a maxplayer home nor a legacy
+  trading home runs read-only commands only (`balance`, `status`, `discover`, `preflight`, dry
+  runs); writing commands refuse and create nothing.
+- **Identity.** Lots, statuses and `nostr://` mint requests are signed with the home's `key`,
+  the key `maxplayer account link --home <dir>` registers. There is no `trade.key` in a
+  maxplayer home. `maxplayer account … --trade-home <dir>` is deprecated: it still parses,
+  prints a warning on stderr, is ignored, and acts on the home key (or on the mint key with
+  `--mint`); it never creates a `trade.key`.
+- **Wallet.** Trading spends and receives in the buyer's wallet: the same database
+  (`<home>/wallet/cdk-wallet.sqlite`) and the same seed (derived from the home key), so sats a
+  trade brings in show in `maxplayer wallet balance`. Only mints in the home's configured list
+  (default + `extra_mints`, see `maxplayer wallet mints add`) that the real-mint fence
+  (`allow_real_mints`) admits may be traded; any other mint is refused before anything is
+  journaled. Trades are not recorded in the buyer's spend ledger, do not count against
+  `per_job_budget_sats`, and pay no platform fee. Trade's own per-mint caps still apply.
+- **Trade state.** The journal (`trade.sqlite`), `owner.lock` and `serve.sock` live in
+  `<home>/trade/` (0700).
+- **Two writers, one wallet.** The buyer daemon / `maxplayer wallet` and `maxplayer-trade` may run
+  at once. Every step that picks unspent proofs and reserves them holds an exclusive OS advisory
+  lock (`flock`) on `<home>/wallet/select.lock`, in both programs: core's `prepare_send` /
+  `prepare_melt` (job payments, `wallet send`/`melt`, the cross-mint hop) and trade's
+  verify-journal-reserve for lots, takes, sends and withdrawals. It is held only across that
+  step, never across a mint request; a caller waits at most 5 s, then refuses with "the wallet
+  is busy … nothing was reserved, retry". The kernel releases a `flock` when its holder exits,
+  including `kill -9`, so a crash never leaves it held. Every reservation names its owner
+  (`used_by_operation`: a cdk saga id for the buyer, trade's journal operation id for trade);
+  recovery on either side releases only its own. `maxplayer wallet balance` shows reserved sats
+  as `reserved_sats=` on the mint's line, never in `balance_sats`.
+- **Legacy standalone homes** (a directory with `wallet.seed`, `trade.key`, or a root
+  `trade.sqlite`/`owner.lock`, given with `--home`) are deprecated. Every command there prints a
+  warning. Draining and finishing still work: `balance`, `status`, `recover`, `send`
+  (incl. `--reclaim`), `withdraw`, `preflight`, `doctor`, and `serve`/`cancel` for lots and
+  swaps already in flight. New `list`, `take`, `fund` and `receive` are refused. Move the money
+  with `maxplayer-trade --home <legacy> send <mint> --amount <n> --out <file>`, then
+  `maxplayer wallet receive "$(cat <file>)"` on the maxplayer home; never delete a legacy home
+  that still holds funds or unfinished records.
 Earlier dated verification sections are historical snapshots, not current coverage totals.
 
 ## Round 5 final-review policy
@@ -115,8 +158,8 @@ a guarantee for other deployments or versions.
 Default market relays: `wss://relay.maxplayer.ai`, then `wss://nos.lol`,
 `wss://relay.primal.net`, `wss://offchain.pub` as fallbacks; repeat `--relay URL` before the
 command to configure alternatives. `relay.maxplayer.ai` accepts writes only from signed-in relay
-members (`maxplayer account link --trade-home <home>` links a home's `trade.key`, creating it if
-needed); a non-member's lot is refused there and still reaches the
+members (`maxplayer account link --home <home>` links the home key that trading signs with);
+a non-member's lot is refused there and still reaches the
 public relays, so listing, discovery and trading work either way. Reads there need no sign-in.
 The dated live tests below ran before relay-v5 and made no production relay writes.
 
@@ -968,7 +1011,8 @@ The skill documents these states and the CLI help regression includes `withdraw 
 `maxplayer-trade doctor nostr://<npub> --mint-relay ws://127.0.0.1:<port> --json`
 uses exactly one logical **info** request to the explicit relay, re-sending the identical
 event every 5 s like trade admission does. It needs no `--home`, wallet, seed or journal; with
-`--home` before the command it signs as that home's existing `trade.key` (never created),
+`--home` before the command it signs as that home's `key` (a legacy home: its existing
+`trade.key`; neither is ever created),
 otherwise with an ephemeral key, which `relay.maxplayer.ai` refuses unless it is a relay member. `--timeout-seconds` changes only this
 read-only probe's budget; silence within that budget does not prove the mint is offline.
 Doctor exits 0 for usable info (unknown compatibility warns), 1 for proven incompatibility,
