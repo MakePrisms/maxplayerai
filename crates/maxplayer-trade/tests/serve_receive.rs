@@ -199,7 +199,7 @@ fn lock_is_held(home: &Path) -> bool {
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(maxplayer_trade::wallet::state_dir(&home).join("owner.lock"))
+        .open(maxplayer_trade::wallet::state_dir(home).join("owner.lock"))
         .unwrap();
     f.try_lock_exclusive().is_err()
 }

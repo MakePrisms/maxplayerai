@@ -41,7 +41,7 @@ fn text(o: &std::process::Output) -> (String, String) {
 type KvRow = (String, String, Vec<u8>, i64, i64);
 /// Every journal row including its timestamps: any write shows up here.
 fn kv_dump(home: &Path) -> Vec<KvRow> {
-    let path = maxplayer_trade::wallet::state_dir(&home).join("trade.sqlite");
+    let path = maxplayer_trade::wallet::state_dir(home).join("trade.sqlite");
     if !path.exists() {
         return vec![];
     }
@@ -901,7 +901,7 @@ async fn dry_run_refusals_and_unsolvable_amounts_are_reported() {
 
 /// `status` before this change, verbatim from 7d8cd74 `wallet::read_status` — the golden.
 fn status_golden(home: &Path) -> String {
-    let path = maxplayer_trade::wallet::state_dir(&home).join("trade.sqlite");
+    let path = maxplayer_trade::wallet::state_dir(home).join("trade.sqlite");
     if !path.exists() {
         return format!("{}\n", serde_json::json!({"records":[]}));
     }

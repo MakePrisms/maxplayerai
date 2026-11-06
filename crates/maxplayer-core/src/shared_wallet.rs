@@ -357,10 +357,12 @@ mod tests {
             ("crossmint_hop.rs", include_str!("crossmint_hop.rs")),
             ("buyer_fund.rs", include_str!("buyer_fund.rs")),
         ] {
-            assert!(
-                !source.contains(".restore().await"),
-                "{name} calls Wallet::restore directly; use restore_keeping_other_reservations"
-            );
+            for call in [".restore()", ".restore_with_opts("] {
+                assert!(
+                    !source.contains(call),
+                    "{name} calls Wallet{call} directly; use restore_keeping_other_reservations"
+                );
+            }
         }
     }
 
