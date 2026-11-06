@@ -473,6 +473,41 @@ fn sign_event(keys: &Keys, draft: &EventDraft, created_at: i64) -> Result<Signed
     })
 }
 
+/// A kind-1059 that ANY stranger can publish to a seller: the outer NIP-44 v2 payload carries a
+/// VALID HMAC (a gift wrap's outer layer is keyed by the sender's own throwaway key, so the sender
+/// knows the conversation key) over an EMPTY ciphertext. nostr <= 0.44.4 indexes `buffer[0..2]`
+/// after the HMAC check and panics (RUSTSEC-2026-0216 / GHSA-hrqp-8w79-gwgw, fixed in 0.44.5).
+#[cfg(test)]
+pub(crate) fn hostile_short_nip44_wrap(recipient: &nostr_sdk::PublicKey) -> nostr_sdk::Event {
+    use base64::Engine as _;
+    use nostr_sdk::nostr::hashes::hmac::{Hmac, HmacEngine};
+    use nostr_sdk::nostr::hashes::sha256::Hash as Sha256Hash;
+    use nostr_sdk::nostr::hashes::{Hash as _, HashEngine as _};
+    use nostr_sdk::nostr::nips::nip44::v2::ConversationKey;
+    use nostr_sdk::nostr::util::hkdf;
+    use nostr_sdk::prelude::{EventBuilder, Kind, Tag};
+
+    let stranger = Keys::generate();
+    let conversation =
+        ConversationKey::derive(stranger.secret_key(), recipient).expect("conversation key");
+    let nonce = [7u8; 32];
+    // NIP-44 v2 message keys: chacha key (32) | chacha nonce (12) | hmac key (32).
+    let message_keys = hkdf::expand(conversation.as_bytes(), &nonce, 76);
+    let mut engine = HmacEngine::<Sha256Hash>::new(&message_keys[44..76]);
+    engine.input(&nonce); // ciphertext is empty: nothing else is authenticated
+    let mac = Hmac::<Sha256Hash>::from_engine(engine).to_byte_array();
+    let mut payload = vec![2u8];
+    payload.extend_from_slice(&nonce);
+    payload.extend_from_slice(&mac);
+    EventBuilder::new(
+        Kind::GiftWrap,
+        base64::engine::general_purpose::STANDARD.encode(payload),
+    )
+    .tag(Tag::public_key(*recipient))
+    .sign_with_keys(&stranger)
+    .expect("sign hostile wrap")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,6 +589,41 @@ mod tests {
         assert_eq!(cached, via_actor);
         assert_eq!(cached.len(), 64);
         assert_ne!(cached, secret, "public key must never equal the secret");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // TOOTH (RUSTSEC-2026-0216) — an unauthenticated stranger's kind-1059 must not kill the signer.
+    // Both seller unwrap legs (private content v2, then the payment wrap) decrypt it INSIDE the actor
+    // task; on nostr 0.44.4 the NIP-44 panic unwinds that task, the reply is dropped, and every later
+    // claim/heartbeat/delivery signature fails "signer actor gone" until the operator restarts.
+    // BITE: `cargo update -p nostr --precise 0.44.4` → the first unwrap returns SignerActorGone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_strangers_short_nip44_wrap_cannot_kill_the_signer() {
+        let root = temp_home("nip44-short");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let signer = spawn(&home).expect("spawn signer");
+        let me = nostr_sdk::PublicKey::from_hex(signer.public_key_hex()).expect("pubkey");
+        let wrap = hostile_short_nip44_wrap(&me);
+
+        match signer.unwrap_private_content(wrap.clone()).await {
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => panic!("a hostile empty wrap must not decode as private content"),
+            Err(gone) => panic!("private-content unwrap killed the signer actor: {gone}"),
+        }
+        match signer.unwrap_payment_wrap(wrap).await {
+            Ok(Ok(None)) => {}
+            Ok(other) => panic!(
+                "a hostile empty wrap is not a payment: {:?}",
+                other.map(|p| p.is_some())
+            ),
+            Err(gone) => panic!("payment unwrap killed the signer actor: {gone}"),
+        }
+        signer
+            .sign(claim_draft(), 1_700_000_000)
+            .await
+            .expect("the signer actor must survive a stranger's wrap")
+            .expect("and still sign claims");
         let _ = std::fs::remove_dir_all(&root);
     }
 
