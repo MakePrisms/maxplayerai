@@ -2201,6 +2201,30 @@ mod tests {
         );
     }
 
+    // Shared home with maxplayer-trade: sats a trade (or any in-flight operation) holds RESERVED are
+    // shown as `reserved_sats=`, never inside `balance_sats`; a row with nothing held keeps the
+    // exact old grammar (scripts parse it).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_row_shows_reserved_sats_apart_from_spendable() {
+        use maxplayer_core::wallet_ops::MintBalance;
+        let row = |reserved_sats| MintBalance {
+            mint_url: "https://real-mint.example".to_owned(),
+            balance_sats: 3,
+            is_default: true,
+            configured: true,
+            reserved_sats,
+        };
+        assert_eq!(
+            balance_row_line(&row(4)),
+            "mint=https://real-mint.example role=default balance_sats=3 reserved_sats=4"
+        );
+        assert_eq!(
+            balance_row_line(&row(0)),
+            "mint=https://real-mint.example role=default balance_sats=3"
+        );
+    }
+
     // #577: `wallet balance` and `wallet mints list` rows mark play money ONLY on a testnut (play)
     // row; an ordinary/real row carries no money-class label. Pure row formatters, asserted for a
     // play (testnut) and a real row. The absence asserts red-on-revert if the class fork returns.
