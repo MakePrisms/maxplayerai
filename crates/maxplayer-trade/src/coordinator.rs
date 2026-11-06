@@ -256,7 +256,10 @@ pub async fn list(
         cancelled: false,
     };
     // Persist reservation intent first; recovery completes it before any new wallet operation.
-    mint::reserve_new(home, &row.plan, &row.reservation, || j.put("listing", &id, &row)).await?;
+    mint::reserve_new(home, &row.plan, &row.reservation, || {
+        j.put("listing", &id, &row)
+    })
+    .await?;
     m.publish_durable(j, &row.event).await?;
     m.publish_durable(j, &row.statuses[0]).await?;
     row.published = 1;

@@ -498,7 +498,10 @@ fn write_mints(home: &Path, extra: &[&str]) {
 }
 /// Register a fixture mint: every existing and later fixture home may trade at it.
 pub fn register_mint(url: &str) {
-    MINTS.lock().unwrap().push(url.trim_end_matches('/').to_owned());
+    MINTS
+        .lock()
+        .unwrap()
+        .push(url.trim_end_matches('/').to_owned());
     for home in HOMES.lock().unwrap().iter() {
         if home.join("config.toml").exists() {
             write_mints(home, &[]);

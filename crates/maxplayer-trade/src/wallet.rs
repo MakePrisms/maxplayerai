@@ -289,7 +289,9 @@ pub async fn database(
 /// maxplayer home, or the legacy per-mint `<home>/<sha256(mint|sat)>.sqlite`.
 pub fn db_path(home: &std::path::Path, mint: &str) -> std::path::PathBuf {
     match layout(home) {
-        Layout::Shared { root } => maxplayer_core::shared_wallet::wallet_db_path(&root.join("wallet")),
+        Layout::Shared { root } => {
+            maxplayer_core::shared_wallet::wallet_db_path(&root.join("wallet"))
+        }
         Layout::Legacy => {
             let asset = hex::encode(Sha256::digest(format!("{mint}|sat")));
             home.join(format!("{asset}.sqlite"))
@@ -446,8 +448,8 @@ fn shared_identity(root: &Path) -> Result<nostr_sdk::Keys> {
         root.display(),
         root.display()
     );
-    let secret = maxplayer_core::home::read_key_file_hex(&path)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let secret =
+        maxplayer_core::home::read_key_file_hex(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(nostr_sdk::Keys::parse(&secret)?)
 }
 /// In a maxplayer home only a mint in the home's configured set (default + `extra_mints`) that the
@@ -455,8 +457,8 @@ fn shared_identity(root: &Path) -> Result<nostr_sdk::Keys> {
 /// and local fixtures; trade's own fence allows no other HTTP) passes the real-mint fence.
 pub fn check_shared_mint(root: &Path, mint: &str) -> Result<()> {
     let mh = maxplayer_home(root)?;
-    let normalized = maxplayer_core::wallet_ops::normalize_mint_url(mint)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let normalized =
+        maxplayer_core::wallet_ops::normalize_mint_url(mint).map_err(|e| anyhow::anyhow!("{e}"))?;
     let loopback = url::Url::parse(&normalized).is_ok_and(|u| {
         u.scheme() == "http"
             && u.host_str().is_some_and(|h| {
@@ -578,7 +580,12 @@ impl Select {
     }
 }
 /// [`Select::reserve`] under a fresh selection lock (recovery re-applies a journaled reservation).
-pub async fn reserve(home: &Path, mint: &str, ys: &[cashu::PublicKey], op: &uuid::Uuid) -> Result<()> {
+pub async fn reserve(
+    home: &Path,
+    mint: &str,
+    ys: &[cashu::PublicKey],
+    op: &uuid::Uuid,
+) -> Result<()> {
     select(home, mint).await?.reserve(ys, op).await
 }
 /// Release every proof `op` holds (`UPDATE … WHERE used_by_operation = op`), under the selection

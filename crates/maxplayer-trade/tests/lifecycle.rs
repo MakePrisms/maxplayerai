@@ -129,7 +129,11 @@ async fn term_and_int_on_idle_serve_exit_5_with_one_final_line() {
                 .any(|v| v["serve"] == "stopping" && v["signal"] == format!("SIG{sig}")),
             "{raw}"
         );
-        assert!(!maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock").exists());
+        assert!(
+            !maxplayer_trade::wallet::state_dir(&f.maker)
+                .join("serve.sock")
+                .exists()
+        );
         let out = tokio::time::timeout(
             Duration::from_secs(60),
             cmd(&f.maker, &f.relay_url, &["recover"]).output(),
@@ -487,7 +491,10 @@ async fn final_socket_cleanup_keeps_home_locked_until_exit() {
                 break;
             }
         }
-        while maxplayer_trade::wallet::state_dir(&home).join("serve.sock").exists() {
+        while maxplayer_trade::wallet::state_dir(&home)
+            .join("serve.sock")
+            .exists()
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })

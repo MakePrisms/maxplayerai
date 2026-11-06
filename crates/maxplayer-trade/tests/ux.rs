@@ -434,8 +434,17 @@ async fn stale_socket_and_bounded_protocol() {
     let f = Fixture::new(0).await;
     let lot = f.list(false).await;
     // Stale: a bound-then-dropped listener leaves a socket file nobody serves.
-    drop(std::os::unix::net::UnixListener::bind(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock")).unwrap());
-    assert!(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock").exists());
+    drop(
+        std::os::unix::net::UnixListener::bind(
+            maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        )
+        .unwrap(),
+    );
+    assert!(
+        maxplayer_trade::wallet::state_dir(&f.maker)
+            .join("serve.sock")
+            .exists()
+    );
     let out = run(&f.maker, &f.relay_url, &["cancel", &lot]).await;
     let (stdout, stderr) = text(&out);
     assert!(
@@ -455,15 +464,19 @@ async fn stale_socket_and_bounded_protocol() {
     // Oversized request: refused, connection closed, serve alive and still serving.
     {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"))
-            .await
-            .unwrap();
+        let mut s = tokio::net::UnixStream::connect(
+            maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        )
+        .await
+        .unwrap();
         let _ = s.write_all(&vec![b'x'; 64 * 1024]).await;
         let mut buf = vec![];
         let _ = tokio::time::timeout(Duration::from_secs(15), s.read_to_end(&mut buf)).await;
-        let mut s = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"))
-            .await
-            .unwrap();
+        let mut s = tokio::net::UnixStream::connect(
+            maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        )
+        .await
+        .unwrap();
         s.write_all(
             b"{\"v\":1,\"relays\":[],\"command\":{\"cancel\":{\"lot\":\"x\",\"extra\":1}}}\n",
         )
@@ -498,7 +511,11 @@ async fn stale_socket_and_bounded_protocol() {
     serve.wait().await.unwrap();
     // A non-socket file at the socket path is never removed.
     std::fs::remove_file(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock")).unwrap();
-    std::fs::write(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"), b"not a socket").unwrap();
+    std::fs::write(
+        maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        b"not a socket",
+    )
+    .unwrap();
     let out = run(&f.maker, &f.relay_url, &["serve"]).await;
     assert!(!out.status.success());
     assert!(text(&out).1.contains("not a socket"));

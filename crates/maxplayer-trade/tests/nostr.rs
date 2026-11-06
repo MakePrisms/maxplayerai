@@ -2718,9 +2718,11 @@ async fn incompatible_counterparty_blocks_cli_and_ipc_before_new_effects() {
         },
     };
     let client = async {
-        let mut stream = tokio::net::UnixStream::connect(maxplayer_trade::wallet::state_dir(&e.taker).join("serve.sock"))
-            .await
-            .unwrap();
+        let mut stream = tokio::net::UnixStream::connect(
+            maxplayer_trade::wallet::state_dir(&e.taker).join("serve.sock"),
+        )
+        .await
+        .unwrap();
         stream
             .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
             .await
