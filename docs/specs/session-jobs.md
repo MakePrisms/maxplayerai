@@ -338,6 +338,48 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   carrying its `session_protocol`) as the proof: no block ⇒ remove, never park. A newer protocol than
   the orchestrator speaks is refused before the agent runs.
 
+### 5.6 runsc seats: `--overlay2=none` gate (bug 2)
+
+A parked container is resumed with `docker start` (§5.2). Under gVisor's default
+`--overlay2=root:self` the rootfs overlay is sandbox-private and discarded at stop, so the agent's
+transcript (`~/.claude`, `~/.codex` under `HOME=/home/agent`), its installed tools and caches are gone
+at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker"` and
+`runtime = "runsc"`, session support is therefore gated on docker's runtime named `runsc` carrying
+`--overlay2=none` in `runtimeArgs` (last setting wins; `--overlay2 none` and one leading dash accepted).
+
+- **Probe.** `docker info --format '{{json .Runtimes}}'`, bounded at 10 s, at seat boot and on every
+  heartbeat tick (`refresh_runsc_gate`) — never per claim. The verdict is held in memory.
+- **Non-runsc seats are untouched.** The gate applies only when `[sandbox] mode = "docker"` and `runtime`
+  trims to exactly `runsc` (`session::seat_runs_runsc`). Unset runtime (docker's default runc), any
+  other name, launcher mode and no sandbox get `NotApplicable`: no `docker info`, no log line, no doctor
+  row, claims and session parking exactly as before.
+- **Verdict** (`session::runsc_overlay_gate`, pure, shared with `maxplayer doctor`): `Open` only for a
+  registered `runsc` whose args leave `--overlay2=none`; `Closed { reason, fix }` for a missing flag,
+  other args only, an unreadable daemon, unparseable output, or no `runsc` registered. Fails closed.
+- **Closed means:** `advertise_on_claim` adds no `["session","1"]`, and a job claimed while the gate was
+  open but executed after it closed runs single-turn (not parked). The seat logs one
+  `sessions DISABLED` line (on boot and on each change, not every beat) with the reason and the fix
+  (`session::runsc_daemon_json_fix`): first the command `sudo -- <runsc path> install -- <kept args>
+  --overlay2=none` (shell-quoted; everything after it is a `#` comment, so the line pastes safely;
+  overlay args are stripped by the same reader the gate uses), the daemon.json member `"runsc": {"path": "<runsc path>", "runtimeArgs": [..., "--overlay2=none"]}`,
+  "restart docker (this stops running containers)", the heartbeat re-check (next heartbeat, default 5 minutes; with the heartbeat off, restart the
+  seller), and the guide section
+  `debug-selling` "Symptom: sessions DISABLED on a runsc seat" (GitHub-rendered on `main`, plus the site's
+  raw copy). A test pins the heading against the guide file, so a rename cannot ship a dead link. Single-turn jobs are unaffected. Already-parked sessions are not touched.
+- **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open; **FAIL** with the fix
+  when docker answered and shows the seat cannot keep a session (`runsc` without the flag, another
+  overlay value, or no `runsc` registered: `Closed { misconfigured: true }`); WARN when docker could not
+  confirm (unreadable, timed out, unparseable: `misconfigured: false`). FAIL is part of the seller boot
+  gate, so a runsc seat with `[sessions] enabled` and no flag **does not start** until the operator sets
+  the flag (and restarts docker) or turns `[sessions]` off — operator intent the seat cannot honour is
+  surfaced, not silently degraded (Petar, 2026-11-07). WARN keeps a daemon hiccup at boot from blocking
+  the seat; it starts single-turn and the heartbeat re-probes. A gate that closes at runtime (heartbeat)
+  only stops advertising and logs; it never stops a running seller. Non-runsc seats get no row at all.
+- **`/tmp` is not covered.** Measured 2026-11-06 (runsc 20261102.0, arm64): with `--overlay2=none` a
+  rootfs file survives stop/start but a `/tmp` file does not, under either setting. The transcript lives
+  under `HOME`, so the gate is sufficient for conversation continuity; state a turn leaves in `/tmp` is
+  lost on runsc seats.
+
 ---
 
 ## 6. Resume
@@ -377,6 +419,22 @@ advertised `agentCapabilities.loadSession` (next to `start_session`,
 `acp_session_id` was recorded, the orchestrator runs `session/new` in the same container: files and
 installed tools stay, and the result carries `["context","reset"]`. The prompt then also states the
 original task and the follow-ups so far (buyer messages only, newest last, cut at 64 KiB).
+
+**An empty reload is a failed reload (bug 2).** A recorded `acp_session_id` means turn 1 ran, and ACP
+requires an agent to replay the whole conversation as `session/update` notifications before answering
+`session/load`, so a real reload replays at least turn 1's user message. An agent whose transcript is
+gone can still answer the load — claude-agent-acp keeps the id and reads an empty history — and the
+follow-up then ran in an empty conversation with no `["context","reset"]`. `Driver::load_session`
+therefore returns the number of replayed history notifications (`LoadedSession::replayed_history`:
+user/agent messages, thoughts, tool calls, plans; not `available_commands_update`, usage or mode
+updates), and a successful load with zero is treated exactly like a failed one: `session/new`, the reset
+prompt, `["context","reset"]`. **runsc seats only:** the host sets `SessionInputs.reset_on_empty_reload`
+from `session::seat_runs_runsc` (serde default `false`, not serialized when `false`). Every other seat
+keeps the earlier rule — any successful load keeps the conversation — because an ACP adapter that does
+not replay history on `session/load` would otherwise turn every follow-up into a reset. Whether to widen
+this depends on each shipped adapter replaying history (claude-agent-acp 0.85.0 and codex-acp 2.1.1 do,
+from source; Cursor's `cursor-agent acp` is closed source and unverified). §5.6 is what keeps the
+transcript there on runsc in the first place.
 
 ### 6.4 Credentials across turns — answers
 

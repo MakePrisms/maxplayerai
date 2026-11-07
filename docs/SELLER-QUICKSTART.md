@@ -601,6 +601,45 @@ docker info --format '{{.Runtimes}}'        # runsc must be listed before you se
 maxplayer doctor                            # checks the image, the network and the containment probe
 ```
 
+**Sessions on a `runsc` seat REQUIRE `--overlay2=none`.** With `[sessions] enabled`, a session's
+container is parked between turns: it is stopped, and resumed later with `docker start`. gVisor's
+default rootfs overlay (`--overlay2=root:self`) keeps everything the agent writes outside `/work` in
+a sandbox-private overlay and **discards it when the container stops** — the agent's own conversation under
+`~/.claude`/`~/.codex` included, so the next turn would start with nothing. So a runsc seat
+advertises session jobs **only** when docker's runtime named `runsc` has `--overlay2=none` in its
+`runtimeArgs`. **If the flag is missing, the seller refuses to start** (`maxplayer doctor`:
+`FAIL sandbox runsc sessions`, with the fix): set the flag, or turn `[sessions]` off to run
+single-turn only. If `docker info` cannot be read at startup, the row is a WARN and the seat starts
+without offering sessions. If the flag disappears while the seller runs, it logs one
+`sessions DISABLED` line with the reason and the fix, stops offering sessions and keeps taking
+single-turn jobs. The seat re-reads this at boot and on every heartbeat.
+
+Register the runtime with the overlay off, **keeping its name `runsc`**. The one-liner is
+`sudo -- runsc install -- --overlay2=none`; it rewrites the whole `runsc` entry, so list any other
+`runtimeArgs` you already have after `--` too. Or edit `/etc/docker/daemon.json` by hand (merge into
+the existing file; use the `path` that `docker info --format '{{json .Runtimes}}'` shows):
+
+```json
+{ "runtimes": { "runsc": { "path": "/usr/local/bin/runsc", "runtimeArgs": ["--overlay2=none"] } } }
+```
+
+Then restart docker (`sudo systemctl restart docker` — **this stops running containers**, so do it
+between jobs). `maxplayer doctor` reports the same verdict (`sandbox runsc sessions`) and prints the
+exact command and entry for your seat. The running seller re-checks on its next heartbeat (every 5
+minutes by default); if `[seller_heartbeat] enabled = false`, restart the seller. Step by step: the seller troubleshooting guide, section "Symptom: sessions DISABLED on a runsc
+seat" ([GitHub](https://github.com/MakePrisms/maxplayerai/blob/main/web/app/.well-known/skills/debug-selling/skill.md#symptom-sessions-disabled-on-a-runsc-seat)). None of this applies to a seat whose `runtime` is not `runsc` (unset/runc or
+any other runtime): it needs no flag, runs no extra check, and offers sessions as before.
+
+**`/tmp` does not survive a park on runsc, even with `--overlay2=none`.** Measured 2026-11-06 (Lima
+arm64, runsc 20261102.0, `scripts/runsc-session-persistence.sh`): a file in the container rootfs
+survived `docker stop` + `docker start` only with the flag, and a file in `/tmp` was lost under both
+settings. The agent's conversation (`~/.claude`, `~/.codex`) and the workdir are unaffected; anything a
+turn leaves in `/tmp` for the next turn is not. On runc, `/tmp` is part of the container's writable layer
+and survives.
+
+`scripts/runsc-session-persistence.sh` checks on the box itself that a container file survives
+`docker stop` + `docker start` under your runsc runtime.
+
 ⚠ **Two things block a working docker seat, and neither is caught before a job runs.**
 
 **1. `proxy_port_range` is mandatory once `network` is set.** Your model credential is held by a per-job

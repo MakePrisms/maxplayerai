@@ -1475,7 +1475,7 @@ mod checks {
         // gVisor filters syscalls in the Sentry and does not apply the OCI seccomp profile at all
         // unless `--oci-seccomp` is set, so on a runsc seat the Engine default governs nothing and no
         // Engine version could change this verdict. Answered before the probe, not after it.
-        if runtime == Some("runsc") {
+        if runtime.map(str::trim) == Some("runsc") {
             return Check::pass(
                 SANDBOX_ENGINE_CHECK,
                 format!(
@@ -1522,6 +1522,137 @@ mod checks {
                 }
             }
         }
+    }
+
+    const SANDBOX_RUNSC_SESSIONS_CHECK: &str = "sandbox runsc sessions";
+
+    /// Session jobs §5.6: the SAME verdict the seller's claim path reaches
+    /// ([`maxplayer_core::session::runsc_overlay_gate`]), from the same probe. A docker + runsc seat
+    /// with `[sessions] enabled` advertises sessions only when the runtime named `runsc` runs with
+    /// `--overlay2=none`; otherwise it fails closed and keeps taking single-turn jobs.
+    ///
+    /// FAIL when docker ANSWERED and shows the seat cannot keep a session (`runsc` without the flag,
+    /// or no `runsc` registered): the operator turned sessions on, and a seat that silently runs
+    /// without them is a misconfiguration nobody notices (Petar, 2026-11-07). FAIL blocks the seller
+    /// boot until the flag is set or `[sessions]` is turned off. WARN when docker could not confirm
+    /// either way (unreadable, timed out, unparseable): that can be a passing daemon hiccup, so the
+    /// seat starts single-turn and the heartbeat re-probes.
+    pub(super) fn check_sandbox_runsc_sessions(
+        sandbox: Option<SandboxConfig>,
+        sessions: maxplayer_core::home::SessionsConfig,
+    ) -> Check {
+        check_sandbox_runsc_sessions_with(sandbox, sessions, probe_docker_runtimes)
+    }
+
+    /// [`check_sandbox_runsc_sessions`] with the `docker info` read injected. Called only for a seat
+    /// the gate applies to, so a test can prove the scoping with a probe that would close it.
+    pub(super) fn check_sandbox_runsc_sessions_with(
+        sandbox: Option<SandboxConfig>,
+        sessions: maxplayer_core::home::SessionsConfig,
+        probe: impl FnOnce() -> Result<String, String>,
+    ) -> Check {
+        use maxplayer_core::session::{
+            RunscOverlayGate, runsc_overlay_gate, runsc_overlay_gate_applies,
+        };
+        if !runsc_overlay_gate_applies(sandbox.as_ref(), &sessions) {
+            return Check::pass(
+                SANDBOX_RUNSC_SESSIONS_CHECK,
+                "not a docker + runsc seat with [sessions] enabled; no runsc overlay gate",
+            );
+        }
+        let probed = probe();
+        match runsc_overlay_gate(true, probed.as_deref().map_err(String::as_str)) {
+            RunscOverlayGate::NotApplicable | RunscOverlayGate::Open => Check::pass(
+                SANDBOX_RUNSC_SESSIONS_CHECK,
+                "runsc runs with --overlay2=none — session jobs are advertised",
+            ),
+            RunscOverlayGate::Closed {
+                reason,
+                fix,
+                misconfigured: true,
+            } => Check::fail(
+                SANDBOX_RUNSC_SESSIONS_CHECK,
+                format!(
+                    "[sessions] is enabled but this runsc seat cannot keep a session past turn 1: \
+                     {reason}. Set the flag, or turn [sessions] off to run single-turn only"
+                ),
+                fix,
+            ),
+            RunscOverlayGate::Closed {
+                reason,
+                fix,
+                misconfigured: false,
+            } => Check::warn(
+                SANDBOX_RUNSC_SESSIONS_CHECK,
+                format!(
+                    "session jobs are NOT advertised on this seat until docker confirms the flag \
+                     (single-turn jobs continue): {reason}"
+                ),
+                fix,
+            ),
+        }
+    }
+
+    /// `docker info --format '{{json .Runtimes}}'`: the daemon's runtimes and their args. `Err`
+    /// when docker cannot be run, the daemon does not answer, or it takes longer than
+    /// [`DOCKER_PROBE_TIMEOUT`] (the same 10s the seller's own gate probe allows).
+    fn probe_docker_runtimes() -> Result<String, String> {
+        if !argv0_resolvable("docker") {
+            return Err("docker is not on PATH".to_owned());
+        }
+        let mut command = std::process::Command::new("docker");
+        command.args(["info", "--format", "{{json .Runtimes}}"]);
+        read_stdout_bounded(&mut command, DOCKER_PROBE_TIMEOUT)
+    }
+
+    /// Run `command` with stdin and stderr nulled, capture its stdout, and wait at most `timeout`.
+    /// On expiry the child is killed and reaped and the read is an `Err`, which closes the runsc
+    /// gate (WARN) instead of hanging `doctor` and the seller's boot readiness gate.
+    pub(super) fn read_stdout_bounded(
+        command: &mut std::process::Command,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("could not run docker: {error}"))?;
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("could not read docker's output".to_owned());
+        };
+        // Read on a thread so a large answer cannot fill the pipe and stall the child.
+        let reader = std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stdout, &mut out);
+            out
+        });
+        let deadline = std::time::Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "docker info did not answer within {}s",
+                        timeout.as_secs()
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+                Err(error) => return Err(format!("could not wait for docker: {error}")),
+            }
+        };
+        let out = reader.join().unwrap_or_default();
+        if !status.success() {
+            return Err(
+                "docker daemon did not answer `docker info` (not running, or not permitted)"
+                    .to_owned(),
+            );
+        }
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
     /// Ask the daemon for the SERVER version — the Engine that applies the seccomp profile.
@@ -2332,6 +2463,8 @@ fn build_checks(
     let sandbox_for_creds = sandbox.clone();
     let sandbox_for_image = sandbox.clone();
     let sandbox_for_engine = sandbox.clone();
+    let sandbox_for_runsc_sessions = sandbox.clone();
+    let sessions_for_runsc = home.config.sessions.clone();
     let sandbox_for_egress = sandbox.clone();
     let sandbox_for_token_policy = sandbox.clone();
     // The probe runs in the seat's OWN home, because that is where a launcher's config points.
@@ -2425,6 +2558,19 @@ fn build_checks(
     checks.push(Box::new(move || {
         checks::check_sandbox_engine_floor(sandbox_for_engine, serves_strangers)
     }));
+    // Session jobs §5.6 (bug 2): the seller's own runsc `--overlay2=none` gate, reported here with
+    // the daemon.json fix. BLOCKING when docker shows the flag missing (sessions are on and cannot
+    // work past turn 1); advisory WARN when docker cannot be read.
+    // Pushed ONLY on a runsc seat with sessions on: every other seat's doctor output is exactly
+    // main's (no new row, no docker read).
+    if maxplayer_core::session::runsc_overlay_gate_applies(
+        sandbox_for_runsc_sessions.as_ref(),
+        &sessions_for_runsc,
+    ) {
+        checks.push(Box::new(move || {
+            checks::check_sandbox_runsc_sessions(sandbox_for_runsc_sessions, sessions_for_runsc)
+        }));
+    }
     // Blocking for a seat strangers can reach (#451). Placed after the resolve check so that a
     // launcher which is not there reports as the missing file it is, not as a containment failure.
     checks.push(Box::new(move || {
@@ -4309,6 +4455,41 @@ mod tests {
         );
     }
 
+    // The runsc-sessions check's `docker info` read is bounded like the image probes: a daemon that
+    // never answers returns at the deadline as an `Err` (which closes the gate, WARN) instead of
+    // hanging `doctor` and the seller's boot readiness gate. Positive controls: stdout comes back,
+    // and a non-zero exit is an `Err`.
+    #[test]
+    fn doctor_runsc_runtimes_read_is_bounded_and_returns_stdout() {
+        use std::time::{Duration, Instant};
+
+        let mut hung = std::process::Command::new("sleep");
+        hung.arg("60");
+        let started = Instant::now();
+        let read = checks::read_stdout_bounded(&mut hung, Duration::from_millis(300));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the read must RETURN at its deadline — waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(&read, Err(error) if error.contains("did not answer within")),
+            "{read:?}"
+        );
+
+        let mut echo = std::process::Command::new("echo");
+        echo.arg(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#);
+        assert_eq!(
+            checks::read_stdout_bounded(&mut echo, Duration::from_secs(10))
+                .expect("stdout")
+                .trim(),
+            r#"{"runsc":{"path":"/usr/bin/runsc"}}"#
+        );
+
+        let mut bad = std::process::Command::new("false");
+        assert!(checks::read_stdout_bounded(&mut bad, Duration::from_secs(10)).is_err());
+    }
+
     // RED-PROVE: a timed-out probe must NOT be folded into `Absent`. `Absent` says the registry was
     // reached and did not have the image, which sends the operator after a publish/auth problem that
     // may not exist. A probe that never returned learned nothing, so it WARNs and names the command
@@ -4457,6 +4638,209 @@ mod tests {
             Status::Fail,
             "a non-gVisor runtime still applies the OCI profile and stays exposed"
         );
+    }
+
+    /// Session jobs §5.6: doctor reports the seller's gate verdict — PASS with `--overlay2=none`;
+    /// FAIL (blocks the seller boot) with the exact daemon.json fix when docker shows the flag
+    /// missing (absent, other args only, another overlay value, no `runsc` registered); WARN when
+    /// docker cannot confirm (unreadable, unparseable) — and never asks docker on a seat the gate
+    /// does not apply to.
+    #[test]
+    fn doctor_runsc_sessions_reports_the_gate_verdict() {
+        use checks::check_sandbox_runsc_sessions_with;
+        use maxplayer_core::home::{SandboxConfig, SandboxMode, SessionsConfig};
+        let on = SessionsConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let runsc = SandboxConfig {
+            mode: SandboxMode::Docker,
+            runtime: Some("runsc".into()),
+            ..Default::default()
+        };
+        let reported = |json: &'static str| {
+            check_sandbox_runsc_sessions_with(Some(runsc.clone()), on.clone(), move || {
+                Ok(json.to_owned())
+            })
+        };
+        let open =
+            reported(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#);
+        assert_eq!(open.status, Status::Pass, "{}", open.render());
+
+        let absent = reported(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#);
+        assert_eq!(
+            absent.status,
+            Status::Fail,
+            "sessions on + flag missing blocks boot: {}",
+            absent.render()
+        );
+        let rendered = absent.render();
+        assert!(
+            rendered.contains("cannot keep a session past turn 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("turn [sessions] off"),
+            "names the other way out: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                r#""runsc": {"path": "/usr/bin/runsc", "runtimeArgs": ["--overlay2=none"]}"#
+            ),
+            "the exact daemon.json fix, runtime named runsc: {rendered}"
+        );
+        assert!(
+            rendered.contains("restart docker (this stops running containers)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("(fix: sudo -- /usr/bin/runsc install -- --overlay2=none # "),
+            "one-liner with the seat's own path: {rendered}"
+        );
+        assert!(
+            rendered.contains("debug-selling/skill.md#symptom-sessions-disabled-on-a-runsc-seat"),
+            "guide link: {rendered}"
+        );
+
+        for json in [
+            r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--platform=systrap"]}}"#,
+            r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=root:memory"]}}"#,
+            r#"{"runc":{"path":"runc"}}"#,
+        ] {
+            let check = reported(json);
+            assert_eq!(check.status, Status::Fail, "{json}: {}", check.render());
+        }
+        // Docker could not confirm either way: a possible hiccup, so WARN (boot continues
+        // single-turn and the heartbeat re-probes), never PASS.
+        let unreadable = check_sandbox_runsc_sessions_with(Some(runsc.clone()), on.clone(), || {
+            Err("docker daemon did not answer".into())
+        });
+        assert_eq!(
+            unreadable.status,
+            Status::Warn,
+            "fail closed: {}",
+            unreadable.render()
+        );
+        assert!(
+            unreadable.render().contains("NOT advertised"),
+            "{}",
+            unreadable.render()
+        );
+        for json in ["not json", "", r#"{"runsc":"x"}"#, "[]"] {
+            let check = reported(json);
+            assert_eq!(check.status, Status::Warn, "{json:?}: {}", check.render());
+        }
+
+        // Out of scope: never probed, always Pass.
+        let runc = SandboxConfig {
+            runtime: None,
+            ..runsc.clone()
+        };
+        for (sandbox, sessions) in [
+            (Some(runc), on.clone()),
+            (None, on.clone()),
+            (Some(runsc.clone()), SessionsConfig::default()),
+        ] {
+            let mut probed = false;
+            let check = check_sandbox_runsc_sessions_with(sandbox.clone(), sessions, || {
+                probed = true;
+                Err("would close".into())
+            });
+            assert_eq!(
+                check.status,
+                Status::Pass,
+                "{sandbox:?}: {}",
+                check.render()
+            );
+            assert!(!probed, "an out-of-scope seat never asks docker");
+        }
+    }
+
+    // RED-PROVE (wiring, §5.6): the runsc sessions check sits in the ONE registry `maxplayer
+    // doctor` and the seller boot gate both run. Asserts on the NAME, present under every verdict.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn sandbox_runsc_sessions_check_is_wired_into_the_boot_gate() {
+        use maxplayer_core::home::{SandboxConfig, SandboxMode};
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-runsc-sessions-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        home.config.sandbox = Some(SandboxConfig {
+            mode: SandboxMode::Docker,
+            image: Some("maxplayer-sandbox:test".into()),
+            runtime: Some("runsc".into()),
+            ..Default::default()
+        });
+        home.config.sessions.enabled = true;
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+        let results = run_checks(build_checks(&home, false));
+        assert!(
+            results
+                .iter()
+                .any(|check| check.name == "sandbox runsc sessions"),
+            "build_checks must run the runsc sessions check; got: {:?}",
+            results.iter().map(Check::render).collect::<Vec<_>>()
+        );
+
+        // Non-runsc seats (Petar, 15:33): the row is ABSENT — no new WARN/FAIL/PASS line, no docker
+        // read — for an unset runtime, another runtime name, launcher mode, no sandbox, and a runsc
+        // seat with sessions off.
+        let docker = home.config.sandbox.clone().expect("set above");
+        for (label, sandbox, sessions) in [
+            (
+                "runtime unset",
+                Some(SandboxConfig {
+                    runtime: None,
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            (
+                "runtime runc",
+                Some(SandboxConfig {
+                    runtime: Some("runc".into()),
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            (
+                "runtime sysbox-runc",
+                Some(SandboxConfig {
+                    runtime: Some("sysbox-runc".into()),
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            (
+                "launcher mode",
+                Some(SandboxConfig {
+                    mode: SandboxMode::Launcher,
+                    ..docker.clone()
+                }),
+                true,
+            ),
+            ("no sandbox", None, true),
+            ("runsc, sessions off", Some(docker.clone()), false),
+        ] {
+            home.config.sandbox = sandbox;
+            home.config.sessions.enabled = sessions;
+            let results = run_checks(build_checks(&home, false));
+            assert!(
+                !results
+                    .iter()
+                    .any(|check| check.name == "sandbox runsc sessions"),
+                "{label}: the runsc sessions row must be absent; got: {:?}",
+                results.iter().map(Check::render).collect::<Vec<_>>()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     // `0.0.0` sorts BELOW the floor, so parsing an unrecognized string into it would report an
