@@ -1531,8 +1531,12 @@ mod checks {
     /// with `[sessions] enabled` advertises sessions only when the runtime named `runsc` runs with
     /// `--overlay2=none`; otherwise it fails closed and keeps taking single-turn jobs.
     ///
-    /// WARN, not FAIL, on a closed gate: FAIL blocks the seller boot, and a seat whose gate is closed
-    /// is still a working single-turn seat — the seller enforces the gate itself.
+    /// FAIL when docker ANSWERED and shows the seat cannot keep a session (`runsc` without the flag,
+    /// or no `runsc` registered): the operator turned sessions on, and a seat that silently runs
+    /// without them is a misconfiguration nobody notices (Petar, 2026-11-07). FAIL blocks the seller
+    /// boot until the flag is set or `[sessions]` is turned off. WARN when docker could not confirm
+    /// either way (unreadable, timed out, unparseable): that can be a passing daemon hiccup, so the
+    /// seat starts single-turn and the heartbeat re-probes.
     pub(super) fn check_sandbox_runsc_sessions(
         sandbox: Option<SandboxConfig>,
         sessions: maxplayer_core::home::SessionsConfig,
@@ -1562,10 +1566,27 @@ mod checks {
                 SANDBOX_RUNSC_SESSIONS_CHECK,
                 "runsc runs with --overlay2=none — session jobs are advertised",
             ),
-            RunscOverlayGate::Closed { reason, fix } => Check::warn(
+            RunscOverlayGate::Closed {
+                reason,
+                fix,
+                misconfigured: true,
+            } => Check::fail(
                 SANDBOX_RUNSC_SESSIONS_CHECK,
                 format!(
-                    "session jobs are NOT advertised on this seat (single-turn jobs continue): {reason}"
+                    "[sessions] is enabled but this runsc seat cannot keep a session past turn 1: \
+                     {reason}. Set the flag, or turn [sessions] off to run single-turn only"
+                ),
+                fix,
+            ),
+            RunscOverlayGate::Closed {
+                reason,
+                fix,
+                misconfigured: false,
+            } => Check::warn(
+                SANDBOX_RUNSC_SESSIONS_CHECK,
+                format!(
+                    "session jobs are NOT advertised on this seat until docker confirms the flag \
+                     (single-turn jobs continue): {reason}"
                 ),
                 fix,
             ),
@@ -2538,7 +2559,8 @@ fn build_checks(
         checks::check_sandbox_engine_floor(sandbox_for_engine, serves_strangers)
     }));
     // Session jobs §5.6 (bug 2): the seller's own runsc `--overlay2=none` gate, reported here with
-    // the daemon.json fix. Advisory: a closed gate disables sessions, not the seat.
+    // the daemon.json fix. BLOCKING when docker shows the flag missing (sessions are on and cannot
+    // work past turn 1); advisory WARN when docker cannot be read.
     // Pushed ONLY on a runsc seat with sessions on: every other seat's doctor output is exactly
     // main's (no new row, no docker read).
     if maxplayer_core::session::runsc_overlay_gate_applies(
@@ -4618,9 +4640,11 @@ mod tests {
         );
     }
 
-    /// Session jobs §5.6: doctor reports the seller's gate verdict — PASS with `--overlay2=none`,
-    /// WARN with the exact daemon.json fix otherwise (absent, other args only, unreadable) — and
-    /// never asks docker on a seat the gate does not apply to.
+    /// Session jobs §5.6: doctor reports the seller's gate verdict — PASS with `--overlay2=none`;
+    /// FAIL (blocks the seller boot) with the exact daemon.json fix when docker shows the flag
+    /// missing (absent, other args only, another overlay value, no `runsc` registered); WARN when
+    /// docker cannot confirm (unreadable, unparseable) — and never asks docker on a seat the gate
+    /// does not apply to.
     #[test]
     fn doctor_runsc_sessions_reports_the_gate_verdict() {
         use checks::check_sandbox_runsc_sessions_with;
@@ -4644,9 +4668,21 @@ mod tests {
         assert_eq!(open.status, Status::Pass, "{}", open.render());
 
         let absent = reported(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#);
-        assert_eq!(absent.status, Status::Warn, "{}", absent.render());
+        assert_eq!(
+            absent.status,
+            Status::Fail,
+            "sessions on + flag missing blocks boot: {}",
+            absent.render()
+        );
         let rendered = absent.render();
-        assert!(rendered.contains("NOT advertised"), "{rendered}");
+        assert!(
+            rendered.contains("cannot keep a session past turn 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("turn [sessions] off"),
+            "names the other way out: {rendered}"
+        );
         assert!(
             rendered.contains(
                 r#""runsc": {"path": "/usr/bin/runsc", "runtimeArgs": ["--overlay2=none"]}"#
@@ -4666,9 +4702,16 @@ mod tests {
             "guide link: {rendered}"
         );
 
-        let other =
-            reported(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--platform=systrap"]}}"#);
-        assert_eq!(other.status, Status::Warn, "{}", other.render());
+        for json in [
+            r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--platform=systrap"]}}"#,
+            r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=root:memory"]}}"#,
+            r#"{"runc":{"path":"runc"}}"#,
+        ] {
+            let check = reported(json);
+            assert_eq!(check.status, Status::Fail, "{json}: {}", check.render());
+        }
+        // Docker could not confirm either way: a possible hiccup, so WARN (boot continues
+        // single-turn and the heartbeat re-probes), never PASS.
         let unreadable = check_sandbox_runsc_sessions_with(Some(runsc.clone()), on.clone(), || {
             Err("docker daemon did not answer".into())
         });
@@ -4678,6 +4721,15 @@ mod tests {
             "fail closed: {}",
             unreadable.render()
         );
+        assert!(
+            unreadable.render().contains("NOT advertised"),
+            "{}",
+            unreadable.render()
+        );
+        for json in ["not json", "", r#"{"runsc":"x"}"#, "[]"] {
+            let check = reported(json);
+            assert_eq!(check.status, Status::Warn, "{json:?}: {}", check.render());
+        }
 
         // Out of scope: never probed, always Pass.
         let runc = SandboxConfig {

@@ -983,7 +983,16 @@ pub enum RunscOverlayGate {
     /// The docker runtime named `runsc` runs with `--overlay2=none`.
     Open,
     /// Fail closed: no session is advertised. `reason` says why; `fix` is the daemon.json change.
-    Closed { reason: String, fix: String },
+    /// `misconfigured` is `true` when docker ANSWERED and shows the seat cannot keep a session (no
+    /// `runsc` registered, or `runsc` without `--overlay2=none`) — `maxplayer doctor` FAILs that,
+    /// which blocks the seller boot — and `false` when docker could not confirm either way
+    /// (unreadable, timed out, unparseable): doctor WARNs, the seat runs single-turn, and the
+    /// heartbeat re-probes.
+    Closed {
+        reason: String,
+        fix: String,
+        misconfigured: bool,
+    },
 }
 
 impl RunscOverlayGate {
@@ -1053,7 +1062,7 @@ pub fn runsc_gate_log_line(gate: &RunscOverlayGate) -> Option<String> {
             "seller node sessions: runsc runs with --overlay2=none; session jobs are advertised"
                 .to_owned(),
         ),
-        RunscOverlayGate::Closed { reason, fix } => Some(format!(
+        RunscOverlayGate::Closed { reason, fix, .. } => Some(format!(
             "seller node sessions DISABLED on this runsc seat (single-turn jobs continue): {reason}. Fix: {fix}"
         )),
     }
@@ -1186,9 +1195,12 @@ pub fn runsc_overlay_gate(applies: bool, probe: Result<&str, &str>) -> RunscOver
     }
     const WHY: &str = "parked session containers are stopped and restarted, and gVisor's default \
         rootfs overlay discards their writes at stop";
-    let closed = |reason: String, path: Option<&str>, args: &[String]| RunscOverlayGate::Closed {
-        reason,
-        fix: runsc_daemon_json_fix(path, args),
+    let closed = |reason: String, misconfigured: bool, path: Option<&str>, args: &[String]| {
+        RunscOverlayGate::Closed {
+            reason,
+            fix: runsc_daemon_json_fix(path, args),
+            misconfigured,
+        }
     };
     let raw = match probe {
         Ok(raw) => raw,
@@ -1198,6 +1210,7 @@ pub fn runsc_overlay_gate(applies: bool, probe: Result<&str, &str>) -> RunscOver
                     "could not read the docker runtimes ({error}), so `--overlay2=none` on the \
                      runtime \"runsc\" is unconfirmed; {WHY}"
                 ),
+                false,
                 None,
                 &[],
             );
@@ -1208,21 +1221,38 @@ pub fn runsc_overlay_gate(applies: bool, probe: Result<&str, &str>) -> RunscOver
         Err(error) => {
             return closed(
                 format!("unparseable docker runtimes ({error}); {WHY}"),
+                false,
                 None,
                 &[],
             );
         }
     };
-    let Some(runsc) = runtimes
-        .get(RUNSC_RUNTIME)
-        .filter(|runsc| runsc.is_object())
-    else {
+    if !runtimes.is_object() {
+        return closed(
+            format!("unexpected docker runtimes (not a JSON object: {runtimes}); {WHY}"),
+            false,
+            None,
+            &[],
+        );
+    }
+    let Some(runsc) = runtimes.get(RUNSC_RUNTIME) else {
         return closed(
             "the docker daemon registers no runtime named \"runsc\"".to_owned(),
+            true,
             None,
             &[],
         );
     };
+    if !runsc.is_object() {
+        return closed(
+            format!(
+                "unexpected docker runtime entry for \"runsc\" (not a JSON object: {runsc}); {WHY}"
+            ),
+            false,
+            None,
+            &[],
+        );
+    }
     let path = runsc.get("path").and_then(serde_json::Value::as_str);
     let args: Vec<String> = runsc
         .get("runtimeArgs")
@@ -1240,6 +1270,7 @@ pub fn runsc_overlay_gate(applies: bool, probe: Result<&str, &str>) -> RunscOver
         format!(
             "the docker runtime \"runsc\" runs without {RUNSC_OVERLAY_NONE} (runtimeArgs {args:?}); {WHY}"
         ),
+        true,
         path,
         &args,
     )

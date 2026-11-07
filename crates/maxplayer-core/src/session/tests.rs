@@ -730,7 +730,7 @@ fn runsc_gate_opens_only_with_overlay2_none() {
     }
     // No runtimeArgs key at all (the default registration).
     let default = runsc_overlay_gate(true, Ok(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#));
-    let RunscOverlayGate::Closed { reason, fix } = &default else {
+    let RunscOverlayGate::Closed { reason, fix, .. } = &default else {
         panic!("default runsc must close the gate: {default:?}");
     };
     assert!(reason.contains("--overlay2=none"), "{reason}");
@@ -943,7 +943,7 @@ fn runsc_gate_fails_closed_when_docker_cannot_confirm() {
         ("not an object", Ok(r#"{"runsc":"x"}"#)),
     ] {
         let gate = runsc_overlay_gate(true, probe);
-        let RunscOverlayGate::Closed { reason, fix } = &gate else {
+        let RunscOverlayGate::Closed { reason, fix, .. } = &gate else {
             panic!("{label} must close the gate: {gate:?}");
         };
         assert!(
@@ -951,7 +951,7 @@ fn runsc_gate_fails_closed_when_docker_cannot_confirm() {
             "{label}: {gate:?}"
         );
     }
-    let RunscOverlayGate::Closed { reason, fix } =
+    let RunscOverlayGate::Closed { reason, fix, .. } =
         runsc_overlay_gate(true, Err("docker daemon did not answer"))
     else {
         panic!("closed");
@@ -963,6 +963,57 @@ fn runsc_gate_fails_closed_when_docker_cannot_confirm() {
     assert!(
         fix.contains(r#""path": "<runsc path>""#),
         "unknown path is named, not guessed: {fix}"
+    );
+}
+
+/// A closed gate says whether docker ANSWERED and showed the seat cannot keep a session
+/// (`misconfigured`, doctor FAILs and the seller does not boot) or could not confirm either way
+/// (doctor WARNs). A hiccup must never read as a misconfiguration, and a missing flag never as one.
+#[test]
+fn runsc_gate_tells_a_missing_flag_from_an_unconfirmed_one() {
+    let misconfigured = |probe: Result<&str, &str>| match runsc_overlay_gate(true, probe) {
+        RunscOverlayGate::Closed { misconfigured, .. } => Some(misconfigured),
+        _ => None,
+    };
+    for (label, probe) in [
+        (
+            "default registration",
+            Ok(r#"{"runsc":{"path":"/usr/bin/runsc"}}"#),
+        ),
+        (
+            "other args only",
+            Ok(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--platform=systrap"]}}"#),
+        ),
+        (
+            "another overlay value",
+            Ok(r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=root:memory"]}}"#),
+        ),
+        (
+            "overridden later",
+            Ok(
+                r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none","--overlay2=root:self"]}}"#,
+            ),
+        ),
+        ("no runsc registered", Ok(r#"{"runc":{"path":"runc"}}"#)),
+    ] {
+        assert_eq!(misconfigured(probe), Some(true), "{label}");
+    }
+    for (label, probe) in [
+        ("unreadable", Err("docker daemon did not answer")),
+        ("timed out", Err("docker info timed out after 10s")),
+        ("unparseable", Ok("not json")),
+        ("empty", Ok("")),
+        ("not an object", Ok("[]")),
+        ("runsc entry not an object", Ok(r#"{"runsc":"x"}"#)),
+    ] {
+        assert_eq!(misconfigured(probe), Some(false), "{label}");
+    }
+    assert_eq!(
+        misconfigured(Ok(
+            r#"{"runsc":{"path":"/usr/bin/runsc","runtimeArgs":["--overlay2=none"]}}"#
+        )),
+        None,
+        "the flag opens the gate"
     );
 }
 

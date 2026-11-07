@@ -366,8 +366,15 @@ at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker
   seller), and the guide section
   `debug-selling` "Symptom: sessions DISABLED on a runsc seat" (GitHub-rendered on `main`, plus the site's
   raw copy). A test pins the heading against the guide file, so a rename cannot ship a dead link. Single-turn jobs are unaffected. Already-parked sessions are not touched.
-- **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open, WARN with the fix when
-  closed (WARN, not FAIL: the seat still serves single-turn jobs, and the seller enforces the gate).
+- **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open; **FAIL** with the fix
+  when docker answered and shows the seat cannot keep a session (`runsc` without the flag, another
+  overlay value, or no `runsc` registered: `Closed { misconfigured: true }`); WARN when docker could not
+  confirm (unreadable, timed out, unparseable: `misconfigured: false`). FAIL is part of the seller boot
+  gate, so a runsc seat with `[sessions] enabled` and no flag **does not start** until the operator sets
+  the flag (and restarts docker) or turns `[sessions]` off — operator intent the seat cannot honour is
+  surfaced, not silently degraded (Petar, 2026-11-07). WARN keeps a daemon hiccup at boot from blocking
+  the seat; it starts single-turn and the heartbeat re-probes. A gate that closes at runtime (heartbeat)
+  only stops advertising and logs; it never stops a running seller. Non-runsc seats get no row at all.
 - **`/tmp` is not covered.** Measured 2026-11-06 (runsc 20261102.0, arm64): with `--overlay2=none` a
   rootfs file survives stop/start but a `/tmp` file does not, under either setting. The transcript lives
   under `HOME`, so the gate is sufficient for conversation continuity; state a turn leaves in `/tmp` is

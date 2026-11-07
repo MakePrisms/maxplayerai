@@ -607,9 +607,12 @@ default rootfs overlay (`--overlay2=root:self`) keeps everything the agent write
 a sandbox-private overlay and **discards it when the container stops** — the agent's own conversation under
 `~/.claude`/`~/.codex` included, so the next turn would start with nothing. So a runsc seat
 advertises session jobs **only** when docker's runtime named `runsc` has `--overlay2=none` in its
-`runtimeArgs`. If the flag is missing — or `docker info` cannot be read — the seat fails closed: it
-logs one `sessions DISABLED` line with the reason and the fix, advertises no sessions, and keeps
-taking single-turn jobs as before. The seat re-reads this at boot and on every heartbeat.
+`runtimeArgs`. **If the flag is missing, the seller refuses to start** (`maxplayer doctor`:
+`FAIL sandbox runsc sessions`, with the fix): set the flag, or turn `[sessions]` off to run
+single-turn only. If `docker info` cannot be read at startup, the row is a WARN and the seat starts
+without offering sessions. If the flag disappears while the seller runs, it logs one
+`sessions DISABLED` line with the reason and the fix, stops offering sessions and keeps taking
+single-turn jobs. The seat re-reads this at boot and on every heartbeat.
 
 Register the runtime with the overlay off, **keeping its name `runsc`**. The one-liner is
 `sudo -- runsc install -- --overlay2=none`; it rewrites the whole `runsc` entry, so list any other

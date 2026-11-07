@@ -393,21 +393,30 @@ backlog full (cap 32)` line and a count of `claimed` rows past their deadline
 
 Only a seat with `[sandbox] mode = "docker"`, `runtime = "runsc"` and `[sessions] enabled` can see
 this. Any other seat (no runtime set, runc, any other runtime name, launcher mode) never runs this
-check and never logs this line. The seat logs it once at startup, and again only when the verdict
-changes:
+check and never logs this line.
+
+**At startup, a missing flag stops the seller.** When docker shows the runtime named `runsc` without
+`--overlay2=none` (or no `runsc` at all), `maxplayer doctor` reports `FAIL sandbox runsc sessions`,
+and the seller refuses to start with that row and the fix below. Either set the flag (below) or turn
+`[sessions]` off to run single-turn only. If docker cannot be read at startup (timeout, bad output),
+the row is a WARN instead: the seller starts without offering sessions and re-checks on each
+heartbeat. While running, the seller logs this line when the verdict changes (for example if the flag
+disappears after a docker reconfigure); it then stops offering sessions but keeps running:
 
 ```
 seller node sessions DISABLED on this runsc seat (single-turn jobs continue): the docker runtime "runsc" runs without --overlay2=none (runtimeArgs []); ...
 ```
 
-`maxplayer doctor` reports the same verdict as `WARN sandbox runsc sessions`, with the same fix.
+`maxplayer doctor` reports the same verdict as `sandbox runsc sessions` (FAIL for a missing flag,
+WARN when docker could not be read), with the same fix.
 
 **Read it:** a session job's container is stopped between turns and started again for the next one.
 gVisor's default (`--overlay2=root:self`) keeps every file the agent writes outside the job's work
 folder in a sandbox-private layer that is thrown away when the container stops. That includes the
 agent's own conversation under `~/.claude` or `~/.codex`, so turn 2 would start with nothing. The
 seat therefore offers session jobs only when docker's runtime named `runsc` has `--overlay2=none`.
-Until then it keeps taking single-turn jobs as before; nothing else is affected.
+A seller that is already running when this happens keeps taking single-turn jobs; a seller that
+starts with sessions on and no flag refuses to start until the flag is set or `[sessions]` is off.
 
 **Fix:**
 
