@@ -17,9 +17,9 @@ use serde_json::{Value, json};
 
 use crate::driver::acp::{PROTOCOL_VERSION, UpdateStream, parse_acp_usage};
 use crate::driver::{
-    Artifact, Caps, ContentBlock, Driver, DriverError, Initialize, PermissionOutcome,
-    PermissionRequest, PromptTurn, Readiness, RuntimeId, SessionConfig, SessionId, SessionUpdate,
-    StopReason, UsageMetadata,
+    Artifact, Caps, ContentBlock, Driver, DriverError, Initialize, LoadedSession,
+    PermissionOutcome, PermissionRequest, PromptTurn, Readiness, RuntimeId, SessionConfig,
+    SessionId, SessionUpdate, StopReason, UsageMetadata,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,15 +318,20 @@ impl AcpDriver {
     /// `responses`, and `session/prompt` has not been sent yet, so nothing of the new turn can be
     /// here. Nothing is lost for bookkeeping: the model comes off the load response and the Claude
     /// init frame (both read elsewhere), and usage off the prompt result.
+    ///
+    /// Returns how many of the dropped updates were conversation HISTORY ([`is_replayed_history`]):
+    /// the engine reads zero on a successful load as "the conversation did not come back" (§6.3).
     fn discard_replayed_history(&mut self) -> usize {
         let Some(updates) = self.updates.as_mut() else {
             return 0;
         };
-        let mut dropped = 0;
-        while updates.try_recv().is_ok() {
-            dropped += 1;
+        let mut history = 0;
+        while let Ok(update) = updates.try_recv() {
+            if is_replayed_history(&update) {
+                history += 1;
+            }
         }
-        dropped
+        history
     }
 
     /// Forget any turn-resolved model, because a new session has resolved none yet.
@@ -443,7 +448,7 @@ impl Driver for AcpDriver {
         &mut self,
         cfg: SessionConfig,
         session_id: &SessionId,
-    ) -> Result<SessionId, DriverError> {
+    ) -> Result<LoadedSession, DriverError> {
         if !self.load_session_supported {
             return Err(DriverError::Other(
                 "the agent did not advertise agentCapabilities.loadSession".into(),
@@ -455,8 +460,9 @@ impl Driver for AcpDriver {
         )?;
         let result = self.wait_response(id).await;
         // #1233: drop the replayed history, on success AND failure (a failed load falls back to
-        // `session/new`, and a partial replay must not reach that turn either).
-        self.discard_replayed_history();
+        // `session/new`, and a partial replay must not reach that turn either). The count is kept:
+        // a load that answers yet replays nothing reloaded an EMPTY conversation (§6.3).
+        let replayed_history = self.discard_replayed_history();
         let result = result?;
         self.session_model = session_model_from_result(&result);
         self.reset_turn_model();
@@ -468,7 +474,10 @@ impl Driver for AcpDriver {
             ))),
             _ => {
                 self.configure_codex_session(session_id, &result).await?;
-                Ok(session_id.clone())
+                Ok(LoadedSession {
+                    session_id: session_id.clone(),
+                    replayed_history,
+                })
             }
         }
     }
@@ -1194,6 +1203,44 @@ fn permission_option_id(option: &Value) -> Option<String> {
         .or_else(|| option.get("id"))
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// ACP `sessionUpdate` kinds that carry conversation history when an agent replays a session on
+/// `session/load`: user and agent messages, thoughts, tool calls and plans (claude-agent-acp
+/// 0.85.0 `replaySessionHistory`, codex-acp 2.1.1 `streamThreadHistory`). Everything else an agent
+/// may send around a load — `available_commands_update`, `usage_update`, `current_mode_update`,
+/// `config_option_update`, `session_info_update` — describes the session, not what was said in it.
+const HISTORY_UPDATE_KINDS: &[&str] = &[
+    "user_message_chunk",
+    "user_message",
+    "agent_message_chunk",
+    "agent_message",
+    "agent_thought_chunk",
+    "tool_call",
+    "tool_call_update",
+    "plan",
+];
+
+/// Whether `update`, streamed before a `session/load` answered, is part of the replayed
+/// conversation (§6.3). Typed message/tool variants are history; an `Ext` counts only when its
+/// wire `sessionUpdate` kind is in [`HISTORY_UPDATE_KINDS`]. A permission request or a turn end is
+/// never history.
+fn is_replayed_history(update: &SessionUpdate) -> bool {
+    match update {
+        SessionUpdate::AgentMessage(_)
+        | SessionUpdate::AgentMessageChunk(_)
+        | SessionUpdate::ToolCall { .. }
+        | SessionUpdate::ToolResult { .. }
+        | SessionUpdate::Plan { .. } => true,
+        SessionUpdate::Ext(ext) => ext
+            .params
+            .get("update")
+            .unwrap_or(&ext.params)
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| HISTORY_UPDATE_KINDS.contains(&kind)),
+        SessionUpdate::PermissionRequest(_) | SessionUpdate::TurnEnded(_) => false,
+    }
 }
 
 fn session_update_from_method(method: &str, params: Value) -> SessionUpdate {
@@ -3323,6 +3370,16 @@ mod tests {
         agent: AgentCommand,
         resume: Option<&str>,
     ) -> (Option<String>, Vec<SessionUpdate>, bool) {
+        session_turn_on(agent, resume, false).await
+    }
+
+    /// [`session_turn`] with the seat's runtime rule: `runsc = true` is the bug-2 empty-reload
+    /// reset; `false` is main's rule (every non-runsc seat).
+    async fn session_turn_on(
+        agent: AgentCommand,
+        resume: Option<&str>,
+        runsc: bool,
+    ) -> (Option<String>, Vec<SessionUpdate>, bool) {
         use crate::engine::{AgentMessageCapture, RunEvent, SessionTurnEnd, SessionTurnParams};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut driver = AcpDriver::new(agent, PermissionOutcome::Allow, Duration::from_secs(10));
@@ -3346,6 +3403,7 @@ mod tests {
                 },
                 resume: resume.map(str::to_owned),
                 wrap_up_at: None,
+                reset_on_empty_reload: runsc,
             },
             Box::new(|_reset| {
                 Ok(Some(PromptTurn {
@@ -3465,6 +3523,98 @@ mod tests {
                 .any(|u| mentions(u, "T1|934") || mentions(u, "user_message_chunk")),
             "the partial replay must not reach the turn's stream: {seen:?}"
         );
+    }
+
+    /// Bug 2 (gVisor): the parked container restarted and the agent's transcript is gone, yet the
+    /// agent still ANSWERS `session/load` — having replayed nothing, or only housekeeping
+    /// (`available_commands_update`, usage). That reloaded an empty conversation: the turn must be a
+    /// context reset (a fresh `session/new`), not a kept conversation. Positive control: the
+    /// identical stub replaying the history is not reset
+    /// ([`a_reloaded_session_turn_delivers_only_its_own_answer`]).
+    #[tokio::test]
+    async fn an_empty_reload_falls_back_to_a_new_session() {
+        let answer = [
+            wire_update("agent_message_chunk", INLINE_ANSWER),
+            wire_update("agent_message_chunk", "\nT2|935"),
+        ];
+        let housekeeping = [
+            json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1",
+                "update": {"sessionUpdate": "available_commands_update", "availableCommands": []}}}),
+            usage_wire(),
+        ];
+        for (label, replay) in [
+            ("nothing", &[][..]),
+            ("housekeeping only", &housekeeping[..]),
+        ] {
+            let (message, _, reset) =
+                session_turn_on(replaying_stub(replay, &answer), Some("s1"), true).await;
+            assert!(
+                reset,
+                "a load replaying {label} reloaded an empty conversation"
+            );
+            assert_eq!(
+                message.as_deref(),
+                Some(format!("{INLINE_ANSWER}\nT2|935").as_str()),
+                "the reset turn still runs and answers"
+            );
+        }
+        // Positive control in the same test: one replayed user message keeps the conversation.
+        let (_, _, reset) = session_turn_on(
+            replaying_stub(
+                &[wire_update("user_message_chunk", "remember 934")],
+                &answer,
+            ),
+            Some("s1"),
+            true,
+        )
+        .await;
+        assert!(!reset, "a load that replays history keeps the conversation");
+        // Non-runsc seats: the SAME empty reload keeps the conversation, exactly as on main.
+        for (label, replay) in [
+            ("nothing", &[][..]),
+            ("housekeeping only", &housekeeping[..]),
+        ] {
+            let (message, _, reset) =
+                session_turn_on(replaying_stub(replay, &answer), Some("s1"), false).await;
+            assert!(
+                !reset,
+                "off runsc, a load replaying {label} is not a reset (main)"
+            );
+            assert_eq!(
+                message.as_deref(),
+                Some(format!("{INLINE_ANSWER}\nT2|935").as_str())
+            );
+        }
+    }
+
+    /// The history classifier: messages, thoughts, tool calls and plans are history; session
+    /// housekeeping, permission requests and turn ends are not.
+    #[test]
+    fn replayed_history_counts_conversation_not_housekeeping() {
+        let ext = |kind: &str| {
+            SessionUpdate::Ext(crate::driver::ExtMethod {
+                method: "session/update".into(),
+                params: json!({"sessionId": "s1", "update": {"sessionUpdate": kind}}),
+            })
+        };
+        for kind in HISTORY_UPDATE_KINDS {
+            assert!(is_replayed_history(&ext(kind)), "{kind} is history");
+        }
+        for kind in [
+            "available_commands_update",
+            "usage_update",
+            "current_mode_update",
+            "config_option_update",
+            "session_info_update",
+        ] {
+            assert!(!is_replayed_history(&ext(kind)), "{kind} is not history");
+        }
+        assert!(is_replayed_history(&SessionUpdate::AgentMessageChunk(
+            ContentBlock::Text { text: "x".into() }
+        )));
+        assert!(!is_replayed_history(&SessionUpdate::TurnEnded(
+            StopReason::Completed
+        )));
     }
 
     /// #1233 (d): turn 1 opens with `session/new`, which replays nothing; its answer is unchanged.

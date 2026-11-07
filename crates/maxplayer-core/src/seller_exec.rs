@@ -582,10 +582,14 @@ impl SandboxPolicy {
                     .clone()
                     .filter(|image| !image.trim().is_empty())
                     .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string());
+                // Trimmed ONCE here, so `--runtime` gets the same name the §5.6 runsc gate
+                // (`session::seat_runs_runsc`, which trims) keyed on: `" runsc "` is runsc for both.
                 let runtime = config
                     .runtime
-                    .clone()
-                    .filter(|runtime| !runtime.trim().is_empty());
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|runtime| !runtime.is_empty())
+                    .map(str::to_owned);
                 let network = config
                     .network
                     .clone()
@@ -2925,6 +2929,7 @@ pub async fn run_session_agent_in_env(
     attachments: JobAttachments,
     resume: Option<String>,
     wrap_up_at: Option<std::time::SystemTime>,
+    reset_on_empty_reload: bool,
     release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
 ) -> Result<SessionAgentReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
@@ -2974,6 +2979,7 @@ pub async fn run_session_agent_in_env(
         },
         resume,
         wrap_up_at,
+        reset_on_empty_reload,
     };
     let mut capture = crate::engine::AgentMessageCapture::default();
     let ended = run_session_job(
@@ -4412,6 +4418,7 @@ pub async fn run_session_agent_in_env(
     _attachments: JobAttachments,
     _resume: Option<String>,
     _wrap_up_at: Option<std::time::SystemTime>,
+    _reset_on_empty_reload: bool,
     _release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
 ) -> Result<SessionAgentReport, ExecError> {
     Err(ExecError::AcpRequired)
@@ -6889,6 +6896,30 @@ mod tests {
     // argv carries no `--runtime` (the daemon default, `runc`); set ⇒ `docker run --runtime <name>`,
     // and it must precede the image or docker reads it as the agent command. A Mac seat is the unset
     // case — the platform VM is its boundary, so no runtime override is named.
+    // A padded `runtime` is runsc for the §5.6 gate (which trims), so `--runtime` must be the
+    // trimmed name too, or the gate would vouch for a runtime docker is never asked to run.
+    #[test]
+    fn a_padded_runtime_is_trimmed_once_for_the_gate_and_the_argv() {
+        let config =
+            crate::home::parse_config_toml("[sandbox]\nmode='docker'\nruntime=' runsc '\n")
+                .unwrap();
+        assert!(crate::session::seat_runs_runsc(config.sandbox.as_ref()));
+        let policy = SandboxPolicy::from_config(config.sandbox.as_ref()).unwrap();
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            windowed(&launch.args, &["--runtime", "runsc"]),
+            "{:?}",
+            launch.args
+        );
+        assert!(
+            !launch.args.iter().any(|a| a == " runsc "),
+            "{:?}",
+            launch.args
+        );
+    }
+
     #[test]
     fn docker_runtime_is_named_only_when_configured_and_precedes_the_image() {
         // Unset: no --runtime anywhere.

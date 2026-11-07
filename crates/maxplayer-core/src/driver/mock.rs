@@ -6,8 +6,8 @@ use std::sync::{
 
 use crate::driver::acp::{PROTOCOL_VERSION, UpdateStream};
 use crate::driver::{
-    Artifact, Driver, DriverError, PermissionOutcome, PermissionRequest, PromptTurn, Readiness,
-    RuntimeId, SessionConfig, SessionId, SessionUpdate, UsageMetadata,
+    Artifact, Driver, DriverError, LoadedSession, PermissionOutcome, PermissionRequest, PromptTurn,
+    Readiness, RuntimeId, SessionConfig, SessionId, SessionUpdate, UsageMetadata,
 };
 
 #[derive(Clone, Debug, serde::Deserialize, PartialEq, Eq, serde::Serialize)]
@@ -37,8 +37,9 @@ pub struct MockDriver {
     usage: Option<UsageMetadata>,
     shutdown_calls: u32,
     shutdown_error: Option<DriverError>,
-    /// Session jobs §6.3: what `loadSession` the mock advertises, and whether a load succeeds.
-    load_session: Option<Result<(), DriverError>>,
+    /// Session jobs §6.3: what `loadSession` the mock advertises, and whether a load succeeds
+    /// (`Ok(n)`: it answers having replayed `n` history notifications).
+    load_session: Option<Result<usize, DriverError>>,
     load_calls: Vec<SessionId>,
     new_calls: u32,
     /// Set only by a cancel fired through [`Driver::cancel_trigger`] (the wrap-up path); a
@@ -67,9 +68,16 @@ impl MockDriver {
     }
 
     /// Advertise `loadSession`; `Ok(())` reloads the asked-for id (reusing the next script's
-    /// updates), `Err` makes the load fail.
+    /// updates) with one replayed history notification, `Err` makes the load fail.
     pub fn with_load_session(mut self, result: Result<(), DriverError>) -> Self {
-        self.load_session = Some(result);
+        self.load_session = Some(result.map(|()| 1));
+        self
+    }
+
+    /// Advertise `loadSession` and answer every load successfully having replayed `replayed`
+    /// history notifications — `0` is the agent whose transcript is gone (§6.3).
+    pub fn with_load_replay(mut self, replayed: usize) -> Self {
+        self.load_session = Some(Ok(replayed));
         self
     }
 
@@ -150,10 +158,10 @@ impl Driver for MockDriver {
         &mut self,
         _cfg: SessionConfig,
         session_id: &SessionId,
-    ) -> Result<SessionId, DriverError> {
+    ) -> Result<LoadedSession, DriverError> {
         self.load_calls.push(session_id.clone());
         match self.load_session.clone() {
-            Some(Ok(())) => {
+            Some(Ok(replayed_history)) => {
                 let script = self
                     .scripts
                     .pop_front()
@@ -164,7 +172,10 @@ impl Driver for MockDriver {
                     artifacts: script.artifacts,
                     cancelled: Arc::new(AtomicBool::new(false)),
                 });
-                Ok(session_id.clone())
+                Ok(LoadedSession {
+                    session_id: session_id.clone(),
+                    replayed_history,
+                })
             }
             Some(Err(error)) => Err(error),
             None => Err(DriverError::Other("loadSession not advertised".into())),

@@ -482,6 +482,12 @@ pub struct SessionInputs {
     /// is re-minted per turn, so the placeholders and base URLs baked in at create are stale).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_env_overrides: Vec<(String, String)>,
+    /// Bug 2 (§6.3): the seat runs gVisor (`[sandbox] runtime = "runsc"`), so a `session/load` that
+    /// answers with NO replayed history is treated as a failed reload (context reset). `false` —
+    /// every non-runsc seat — is main's behaviour exactly, and is never serialized, so a non-runsc
+    /// seat's inputs file is byte-identical to main's. An older orchestrator ignores the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_on_empty_reload: bool,
 }
 
 /// Host → container: the released follow-up prompt (§6.1 step 3), written only after review.
@@ -922,6 +928,7 @@ fn drive_session_turn(
         },
         session.resume_acp_session_id.clone(),
         wrap_up_at,
+        session.reset_on_empty_reload,
         Box::new(release),
     ));
     if let Some(error) = release_error.into_inner() {
