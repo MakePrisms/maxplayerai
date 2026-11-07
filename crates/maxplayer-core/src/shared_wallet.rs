@@ -366,6 +366,71 @@ mod tests {
         }
     }
 
+    /// A seller is paid into this same wallet and `maxplayer-trade` reserves in it, so every seller
+    /// path that selects, reserves, releases or restores proofs must go through this module's locked
+    /// primitives. The only seller-side selection is the platform-fee remittance melt:
+    /// `fee_remit::LiveEffects::prepare_melt` -> `wallet_ops::prepare_melt_payment_blocking` ->
+    /// [`prepare_melt_locked`]. The seller node itself only receives (cdk `receive` adds new proofs
+    /// and selects none) and reads balances.
+    #[test]
+    fn seller_paths_select_proofs_only_under_the_select_lock() {
+        let seller = [
+            ("seller.rs", include_str!("seller.rs")),
+            ("fee_remit.rs", include_str!("fee_remit.rs")),
+            ("seller_node/mod.rs", include_str!("seller_node/mod.rs")),
+            ("seller_node/run.rs", include_str!("seller_node/run.rs")),
+            (
+                "seller_node/session_run.rs",
+                include_str!("seller_node/session_run.rs"),
+            ),
+            (
+                "seller_node/session_gc.rs",
+                include_str!("seller_node/session_gc.rs"),
+            ),
+            (
+                "seller_node/wallet_actor.rs",
+                include_str!("seller_node/wallet_actor.rs"),
+            ),
+            ("seller_node/store.rs", include_str!("seller_node/store.rs")),
+        ];
+        for (name, source) in seller {
+            for call in [
+                "wallet.prepare_melt(",
+                ".prepare_send(",
+                ".reserve_proofs(",
+                ".release_proofs(",
+                ".recover_incomplete_sagas(",
+                ".check_all_pending_proofs(",
+                ".restore()",
+                ".restore_with_opts(",
+                "get_unspent_proofs(",
+            ] {
+                assert!(
+                    !source.contains(call),
+                    "{name} calls {call} outside the shared-wallet lock primitives"
+                );
+            }
+        }
+        let fee_remit = include_str!("fee_remit.rs");
+        assert!(
+            fee_remit.contains("wallet_ops::prepare_melt_payment_blocking(&self.home, quote_id"),
+            "the live remittance melt must go through wallet_ops' locked prepare"
+        );
+        let wallet_ops = include_str!("wallet_ops.rs");
+        assert!(
+            wallet_ops.contains(
+                "crate::shared_wallet::prepare_melt_locked(&wallet, Some(&home.wallet_dir), &quote.id)"
+            ),
+            "prepare_melt_payment_blocking must select under the home's select lock"
+        );
+        for call in ["wallet.prepare_melt(", ".prepare_send("] {
+            assert!(
+                !wallet_ops.contains(call),
+                "wallet_ops.rs calls {call} without the select lock"
+            );
+        }
+    }
+
     /// Child half of [`a_holder_killed_with_sigkill_releases_the_lock`]: run only when re-executed
     /// with the env var set; holds the lock, signals readiness, then sleeps until killed.
     #[test]

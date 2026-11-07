@@ -28,9 +28,10 @@ revision and paths without displaying secrets.
 The mint lives under `<MAXPLAYER_HOME>/mint` (default `~/.maxplayer/mint`).
 Trading uses the **same maxplayer home**: `maxplayer-trade` signs with its `key`, pays from
 its wallet, and keeps its journal in `<MAXPLAYER_HOME>/trade` (pass `--home <path>` only to
-pick a home other than `$MAXPLAYER_HOME`/`~/.maxplayer`). Only mints in that home's wallet list
-(`maxplayer wallet mints add`) can be traded. An older standalone trading home (with
-`wallet.seed`/`trade.key`) is drain-only: move its funds with its `send`, then
+pick a home other than `$MAXPLAYER_HOME`/`~/.maxplayer`). Only the home's mints can be traded: the
+default, `extra_mints` (`maxplayer wallet mints add`) and, on a seller, `accepted_mints`. A seller
+can trade from its own home: job payments land in the same wallet. An older standalone trading
+home (with `wallet.seed`/`trade.key`) is drain-only: move its funds with its `send`, then
 `maxplayer wallet receive`. Preserve all state across restarts.
 
 ## 2. Install and connect both tools

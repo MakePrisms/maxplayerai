@@ -2,8 +2,8 @@
 
 Every invocation trades from a maxplayer home: `--home <home>` (a directory with `key` /
 `config.toml`), else `$MAXPLAYER_HOME`, else `~/.maxplayer`. It signs with the home `key` and
-pays from the buyer wallet; only that home's configured mints that pass its real-mint fence are
-traded; trade state is in `<home>/trade/`. A legacy standalone home (`wallet.seed`/`trade.key`)
+pays from the home's wallet (a seller's too); only the home's mints (default, `extra_mints` and
+the seller's `accepted_mints`) that pass its real-mint fence are traded; trade state is in `<home>/trade/`. A legacy standalone home (`wallet.seed`/`trade.key`)
 is drain-only: new `list`/`take`/`fund`/`receive` are refused (crate README, "Home and wallet").
 Build the production binary as in the crate README's "Build and automated tests" section:
 the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from the repository

@@ -25,10 +25,13 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   `--mint`); it never creates a `trade.key`.
 - **Wallet.** Trading spends and receives in the buyer's wallet: the same database
   (`<home>/wallet/cdk-wallet.sqlite`) and the same seed (derived from the home key), so sats a
-  trade brings in show in `maxplayer wallet balance`. Only mints in the home's configured list
-  (default + `extra_mints`, see `maxplayer wallet mints add`) that the real-mint fence
-  (`allow_real_mints`) admits may be traded; any other mint is refused before anything is
-  journaled. Trades are not recorded in the buyer's spend ledger, do not count against
+  trade brings in show in `maxplayer wallet balance`. Only the home's mints may be traded: the
+  default, `extra_mints` (`maxplayer wallet mints add`) and the seller's `accepted_mints`
+  (`config.toml`), each still admitted by the real-mint fence (`allow_real_mints`) and https:// or
+  nostr:// only; any other mint is refused before anything is journaled. A seller can trade: its
+  job payments land in this same wallet at every accepted mint, and it can trade each of them.
+  The seller node's only proof-selecting step (the platform-fee remittance melt) takes the same
+  selection lock, and its recovery releases only its own reservations. Trades are not recorded in the buyer's spend ledger, do not count against
   `per_job_budget_sats`, and pay no platform fee. Trade's own per-mint caps still apply.
 - **Trade state.** The journal (`trade.sqlite`), `owner.lock` and `serve.sock` live in
   `<home>/trade/` (0700).

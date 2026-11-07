@@ -868,6 +868,23 @@ pub fn configured_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsEr
     Ok(out)
 }
 
+/// Mints `maxplayer-trade` may trade from this home: [`configured_mints`] (default + `extra_mints`),
+/// then every seller `accepted_mints` entry, normalized and deduplicated. A seller on this home is
+/// paid at each accepted mint into this same wallet, so it must be able to trade every one of them.
+/// Membership only: the caller still applies the real-mint fence ([`home::mint_allowed`]) and its
+/// own scheme rules to the mint it admits. Buyer paths keep [`configured_mints`]; adding
+/// `accepted_mints` there would change which balances pay for jobs.
+pub fn tradeable_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsError> {
+    let mut out = configured_mints(home)?;
+    for accepted in &home.config.accepted_mints {
+        let normalized = normalize_mint_url(accepted)?;
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
 /// Refuse every melt-side call on a `nostr://` mint: raising a melt quote, preparing or confirming a
 /// melt, and asking a melt quote's status.
 ///
@@ -3174,6 +3191,52 @@ mod tests {
         let home = bootstrap(&root).expect("bootstrap");
         let err = complete_mint_by_id_blocking(&home, "quote", Some(21), None).expect_err("nested");
         assert!(err.to_string().contains("nested block_on refused"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Trade's admission set is configured mints + every seller accepted mint; the buyer's
+    // configured set is unchanged by it.
+    #[test]
+    fn tradeable_mints_adds_every_accepted_mint_and_leaves_configured_mints_alone() {
+        let root = temp_home("tradeable");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        home.config.accepted_mints = vec![
+            "https://a.example/".into(),
+            "https://b.example".into(),
+            " https://c.example ".into(),
+        ];
+        home.config.extra_mints = vec!["https://d.example".into(), "https://b.example/".into()];
+        assert_eq!(
+            configured_mints(&home).expect("configured"),
+            [
+                "https://a.example",
+                "https://d.example",
+                "https://b.example"
+            ]
+        );
+        assert_eq!(
+            tradeable_mints(&home).expect("tradeable"),
+            [
+                "https://a.example",
+                "https://d.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
+        home.config.extra_mints.clear();
+        assert_eq!(
+            configured_mints(&home).expect("configured"),
+            ["https://a.example"]
+        );
+        assert_eq!(
+            tradeable_mints(&home).expect("tradeable"),
+            [
+                "https://a.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

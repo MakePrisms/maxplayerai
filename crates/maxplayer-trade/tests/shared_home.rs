@@ -2,7 +2,12 @@
 //! In-process fake mints only. SAFETY assertions first.
 mod support;
 use cashu::State;
-use cdk::{Amount, cdk_database::WalletDatabase, wallet::SendOptions};
+use cdk::{
+    Amount,
+    cdk_database::WalletDatabase,
+    nuts::{MeltQuoteState, PaymentMethod},
+    wallet::SendOptions,
+};
 use maxplayer_core::shared_wallet;
 use maxplayer_trade::{journal::Journal, money, receive, send, wallet};
 use std::{path::Path, process::Command, time::Duration};
@@ -417,15 +422,16 @@ async fn shared_home_trades_only_configured_fenced_mints() {
     .unwrap();
     std::fs::write(home.join("config.toml"), "").unwrap();
     let e = wallet::check_mint(home, &m.url).unwrap_err().to_string();
-    assert!(e.contains("not one of this home's configured mints"), "{e}");
+    assert!(e.contains("not one of this home's mints"), "{e}");
     assert!(e.contains("maxplayer wallet mints add"), "{e}");
+    assert!(e.contains("accepted_mints"), "{e}");
     let out = trade(
         Some(home),
         &["send", &m.url, "--amount", "5", "--out", "/nonexistent/t"],
     );
     assert_eq!(out.status.code(), Some(1), "{}", err(&out));
     assert!(
-        err(&out).contains("not one of this home's configured mints"),
+        err(&out).contains("not one of this home's mints"),
         "{}",
         err(&out)
     );
@@ -435,7 +441,7 @@ async fn shared_home_trades_only_configured_fenced_mints() {
     );
     let out = trade(Some(home), &["fund", &m.url, "--amount", "5"]);
     assert!(
-        err(&out).contains("not one of this home's configured mints"),
+        err(&out).contains("not one of this home's mints"),
         "{}",
         err(&out)
     );
@@ -690,5 +696,351 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
         balance(&home, &m.url).await + core_sent + cli_sent,
         256,
         "SAFETY: no proof lost or double-spent across processes"
+    );
+}
+
+fn invoice(sats: u64) -> String {
+    cdk_fake_wallet::create_fake_invoice(sats * 1000, String::new()).to_string()
+}
+/// A seller's maxplayer home outside the fixture registry: `accepted_mints` exactly as given, no
+/// `extra_mints`, a `[seller]` table; `top` is prepended (top-level keys).
+fn seller_home(home: &Path, accepted: &[&str], top: &str) {
+    if !home.join("key").exists() {
+        std::fs::write(
+            home.join("key"),
+            nostr_sdk::Keys::generate().secret_key().to_secret_hex(),
+        )
+        .unwrap();
+    }
+    let list: Vec<_> = accepted.iter().map(|m| format!("{m:?}")).collect();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "{top}accepted_mints = [{}]\n\n[seller]\nagent_command = [\"true\"]\nrate_sats = 1\n\
+             git_remote = \"https://relay.example/git/x/y.git\"\n",
+            list.join(", ")
+        ),
+    )
+    .unwrap();
+}
+/// Fund `home` at `mint` without registering the mint in its config.
+async fn fund_unregistered(home: &Path, mint: &str, n: u64) {
+    let w = wallet::wallet(home, mint).await.unwrap();
+    let q = w
+        .mint_quote(PaymentMethod::BOLT11, Some(n.into()), None, None)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if w.check_mint_quote(&q.id).await.unwrap().state == cashu::nuts::nut23::QuoteState::Paid {
+            w.mint(&q.id, cdk::amount::SplitTarget::default(), None)
+                .await
+                .unwrap();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("unpaid fake quote")
+}
+
+/// A seller is paid at every mint it accepts, into this same wallet, so it trades every one of
+/// them: with `accepted_mints = [A, B, C]` and no `extra_mints`, B and C are admitted (B end to end
+/// through the CLI) although the buyer's configured set is only A; a mint in neither list is
+/// refused before anything is journaled, and the refusal names both lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seller_home_trades_every_accepted_mint() {
+    let m = MintFixture::start(0).await;
+    let h = tempfile::tempdir().unwrap();
+    let home = h.path();
+    let b = m.url.trim_end_matches('/').to_owned();
+    seller_home(home, &["https://a.example", &b, "https://c.example/"], "");
+    let mh = wallet::maxplayer_home(home).unwrap();
+    assert_eq!(
+        maxplayer_core::wallet_ops::configured_mints(&mh).unwrap(),
+        ["https://a.example"],
+        "the buyer's configured set is unchanged: B and C come only from accepted_mints"
+    );
+    for mint in [
+        "https://a.example",
+        b.as_str(),
+        "https://c.example",
+        "https://c.example/",
+    ] {
+        wallet::check_mint(home, mint).unwrap_or_else(|e| panic!("{mint} must trade: {e:#}"));
+    }
+    let e = wallet::check_mint(home, "https://d.example")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("not one of this home's mints"), "{e}");
+    assert!(e.contains("accepted_mints"), "{e}");
+    assert!(
+        e.contains("maxplayer wallet mints add https://d.example"),
+        "{e}"
+    );
+    let out = trade(
+        Some(home),
+        &[
+            "send",
+            "https://d.example",
+            "--amount",
+            "1",
+            "--out",
+            "/nonexistent/t",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
+    assert!(
+        err(&out).contains("not one of this home's mints"),
+        "{}",
+        err(&out)
+    );
+    assert!(
+        !home.join("trade").exists(),
+        "SAFETY: refused before any journal"
+    );
+    // B trades for real: a CLI send from the seller's second accepted mint (off the runtime, which
+    // serves the fixture mint).
+    fund_unregistered(home, &b, 9).await;
+    let token = home.join("token-b");
+    let (cli_home, cli_b, cli_token) = (home.to_path_buf(), b.clone(), token.clone());
+    let out = tokio::task::spawn_blocking(move || {
+        trade(
+            Some(&cli_home),
+            &[
+                "send",
+                &cli_b,
+                "--amount",
+                "4",
+                "--out",
+                cli_token.to_str().unwrap(),
+            ],
+        )
+    })
+    .await
+    .unwrap();
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(token.exists());
+    assert_eq!(balance(home, &b).await, 5);
+}
+
+/// Listing a mint in `accepted_mints` never gets it past trade's other fences: no plain http://
+/// (outside a loopback test fixture), only https:// or a well-formed nostr:// under the real-mint
+/// fence, and `allow_real_mints = false` still refuses a real accepted mint.
+#[tokio::test]
+async fn accepted_mints_still_pass_the_scheme_and_real_mint_fences() {
+    let h = tempfile::tempdir().unwrap();
+    let home = h.path();
+    seller_home(
+        home,
+        &[
+            "https://a.example",
+            "http://mint.example",
+            "nostr://not-an-npub",
+            "ftp://mint.example",
+        ],
+        "",
+    );
+    let e = wallet::check_mint(home, "http://mint.example")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains(maxplayer_trade::transport::HTTP_MINT_REFUSED),
+        "{e}"
+    );
+    for mint in ["nostr://not-an-npub", "ftp://mint.example"] {
+        let e = wallet::check_mint(home, mint).unwrap_err().to_string();
+        assert!(e.contains("real-mint fence"), "{mint}: {e}");
+    }
+    let out = trade(
+        Some(home),
+        &[
+            "send",
+            "http://mint.example",
+            "--amount",
+            "1",
+            "--out",
+            "/nonexistent/t",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
+    assert!(
+        err(&out).contains(maxplayer_trade::transport::HTTP_MINT_REFUSED),
+        "{}",
+        err(&out)
+    );
+    seller_home(
+        home,
+        &["https://a.example", "https://b.example"],
+        "allow_real_mints = false\n",
+    );
+    let e = wallet::check_mint(home, "https://b.example")
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("real-mint fence"), "{e}");
+    assert!(!home.join("trade").exists(), "nothing journaled");
+}
+
+/// 4(c) for the seller: the one seller path that selects proofs is the platform-fee remittance
+/// melt (`fee_remit::LiveEffects::prepare_melt` -> `wallet_ops::prepare_melt_payment_blocking` ->
+/// `shared_wallet::prepare_melt_locked`). Core's wrapper refuses the loopback http fixture mint
+/// (real-mint fence), so this drives the primitive it calls (core's
+/// `shared_wallet::tests::seller_paths_select_proofs_only_under_the_select_lock` pins that path). While the
+/// lock is held it refuses, retryably, reserving nothing; run against trade sends on the same
+/// wallet, no proof is reserved twice and none is lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn seller_fee_melt_and_trade_selection_never_double_reserve_or_lose_proofs() {
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path();
+    fund(home, &m.url, 256).await;
+    let j = Journal::open(home).await.unwrap();
+    let w = core_wallet(home, &m.url).await;
+    let wallet_dir = home.join("wallet");
+
+    let q = w
+        .melt_quote(PaymentMethod::BOLT11, invoice(2), None, None)
+        .await
+        .unwrap();
+    {
+        let _held = shared_wallet::acquire(&wallet_dir, shared_wallet::SELECT_LOCK_TIMEOUT)
+            .await
+            .unwrap();
+        let e = shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id)
+            .await
+            .err()
+            .expect("SAFETY: the seller melt must not select while another holder has the lock")
+            .to_string();
+        assert!(e.contains("busy"), "{e}");
+        assert!(
+            rows(home, &m.url, IN_FLIGHT.to_vec()).await.is_empty(),
+            "SAFETY: a refused seller melt reserved nothing"
+        );
+    }
+
+    let (mut melted, mut trade_sent, mut refusals) = (0u64, 0u64, 0u32);
+    for round in 0..8u64 {
+        let q = w
+            .melt_quote(PaymentMethod::BOLT11, invoice(2 + round % 2), None, None)
+            .await
+            .unwrap();
+        let out = home.join(format!("token-{round}"));
+        let seller = async {
+            match shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id).await {
+                Ok(prepared) => {
+                    let done = prepared.confirm().await.unwrap();
+                    assert_eq!(done.state(), MeltQuoteState::Paid);
+                    Ok(u64::from(done.amount()) + u64::from(done.fee_paid()))
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        };
+        let trade = send::send(home, &j, &m.url, 5, &out, None);
+        let (s, t) = tokio::join!(seller, trade);
+        match s {
+            Ok(n) => melted += n,
+            Err(e) => {
+                assert!(e.contains("busy"), "seller refusal must be retryable: {e}");
+                refusals += 1;
+            }
+        }
+        match t {
+            Ok(r) => {
+                assert_eq!(r.state, send::SendState::Sent, "{}", r.summary());
+                trade_sent += r.amount;
+            }
+            Err(e) => {
+                let e = format!("{e:#}");
+                assert!(
+                    e.contains("busy") || e.contains("changed while this operation chose"),
+                    "trade refusal must be retryable and pre-journal: {e}"
+                );
+                refusals += 1;
+            }
+        }
+    }
+    assert!(
+        melted > 0 && trade_sent > 0,
+        "both sides spent: {refusals} refusals"
+    );
+    assert!(
+        rows(home, &m.url, IN_FLIGHT.to_vec()).await.is_empty(),
+        "SAFETY: nothing left reserved or pending after both sides finished"
+    );
+    assert_eq!(
+        balance(home, &m.url).await + melted + trade_sent,
+        256,
+        "SAFETY: no proof lost or spent twice (fee-free mint; melt debits invoice + fee paid)"
+    );
+    for r in j.all::<send::SendAttempt>("send").await.unwrap() {
+        assert_eq!(r.state, send::SendState::Sent, "{}", r.summary());
+    }
+}
+
+/// 4(d) for the seller: seller-side recovery never releases trade's reservations. A fee-remittance
+/// melt is prepared and abandoned (the node died between prepare and confirm), trade reserves
+/// every other proof, then the seller recovers: node start-up (`SellerNode::open`,
+/// `reconcile_on_start`, a wallet read) and the remittance reconciliation's
+/// `check_melt_quote_status` (what `wallet_ops::melt_status_for_quote_async` runs), which
+/// compensates the abandoned `ProofsReserved` melt saga. Only the seller's own proofs come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn seller_recovery_leaves_trade_reservations_alone() {
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path();
+    fund(home, &m.url, 32).await;
+    let w = core_wallet(home, &m.url).await;
+    let wallet_dir = home.join("wallet");
+    let db = wallet::database(home, &m.url).await.unwrap();
+
+    let q = w
+        .melt_quote(PaymentMethod::BOLT11, invoice(2), None, None)
+        .await
+        .unwrap();
+    let prepared = match shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id).await {
+        Ok(p) => p,
+        Err(e) => panic!("prepare seller melt: {e}"),
+    };
+    let seller_op = prepared.operation_id();
+    drop(prepared);
+    let seller_sats: u64 = db
+        .get_reserved_proofs(&seller_op)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| u64::from(p.proof.amount))
+        .sum();
+    assert!(seller_sats > 0);
+
+    let trade_op = uuid::Uuid::new_v4();
+    let ys: Vec<_> = rows(home, &m.url, vec![State::Unspent])
+        .await
+        .into_iter()
+        .map(|p| p.y)
+        .collect();
+    assert!(!ys.is_empty());
+    wallet::reserve(home, &m.url, &ys, &trade_op).await.unwrap();
+
+    let node = maxplayer_core::seller_node::SellerNode::open(wallet::maxplayer_home(home).unwrap())
+        .await
+        .unwrap();
+    node.reconcile_on_start(1).unwrap();
+    node.status_snapshot().await.unwrap();
+    drop(node);
+    w.check_melt_quote_status(&q.id).await.unwrap();
+
+    assert!(
+        db.get_reserved_proofs(&seller_op).await.unwrap().is_empty(),
+        "the seller's abandoned melt was compensated"
+    );
+    let held = db.get_reserved_proofs(&trade_op).await.unwrap();
+    assert_eq!(
+        held.len(),
+        ys.len(),
+        "SAFETY: trade's reservation survives seller recovery"
+    );
+    assert!(held.iter().all(|p| p.state == State::Reserved));
+    assert_eq!(
+        balance(home, &m.url).await,
+        seller_sats,
+        "only the seller's own proofs became spendable again"
     );
 }

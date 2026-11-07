@@ -14,7 +14,7 @@ Use the trade binary, not Maxplayer jobs. Read
 [recovery](references/recovery.md) for any interruption.
 
 Trade from the human's **maxplayer home** (`--home <home>`, default `$MAXPLAYER_HOME`/`~/.maxplayer`):
-its key signs, its wallet pays, only its configured mints trade. A legacy trade home only drains. Preserve that home, keys, databases and
+its key signs, its wallet pays (sellers too), only its mints trade. A legacy trade home only drains. Preserve that home, keys, databases and
 journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; keep it afterward for recovery.
 Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,

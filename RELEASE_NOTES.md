@@ -10,9 +10,10 @@ the merge, Vercel).
   statuses and `nostr://` mint requests are signed with the home `key` (the one
   `maxplayer account link` registers); no `trade.key` is created. Trading spends and receives in
   the buyer wallet (`wallet/cdk-wallet.sqlite`, same seed), so received sats show in
-  `maxplayer wallet balance`. Only the home's configured mints (default + `extra_mints`) that
-  pass the real-mint fence can be traded. Trades are not in the buyer spend ledger, do not count
-  against `per_job_budget_sats`, and pay no platform fee. Trade state lives in `<home>/trade/`.
+  `maxplayer wallet balance`. Only the home's mints (the default, `extra_mints` and a seller's
+  `accepted_mints`) that pass the real-mint fence can be traded, so a seller can trade every mint
+  it accepts payment at (its payments land in the same wallet). Trades are not in the buyer
+  spend ledger, do not count against `per_job_budget_sats`, and pay no platform fee. Trade state lives in `<home>/trade/`.
 - **Changed: `maxplayer-trade` refuses plain `http://` mints, localhost included**, with
   `http:// mints are not supported; use https:// or nostr://`, and refuses `ws://` mint relays
   (`--mint-relay`), the same rule as the buyer wallet's real-mint fence. This covers every command

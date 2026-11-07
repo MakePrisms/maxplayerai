@@ -214,7 +214,7 @@ pub async fn list(
 ) -> Result<String> {
     give.asset.fence()?;
     want.asset.fence()?;
-    // In a maxplayer home both legs must be mints the buyer wallet may use.
+    // In a maxplayer home both legs must be this home's mints (default, extra_mints, accepted_mints).
     crate::wallet::check_mint(home, &give.asset.mint_url)?;
     crate::wallet::check_mint(home, &want.asset.mint_url)?;
     // A lot id is a hash of second-granular terms: two identical lists in the same second

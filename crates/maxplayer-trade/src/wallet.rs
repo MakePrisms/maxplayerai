@@ -452,10 +452,11 @@ fn shared_identity(root: &Path) -> Result<nostr_sdk::Keys> {
         maxplayer_core::home::read_key_file_hex(&path).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(nostr_sdk::Keys::parse(&secret)?)
 }
-/// In a maxplayer home only a mint in the home's configured set (default + `extra_mints`) that the
-/// real-mint fence (`allow_real_mints`) admits may be traded. Plain HTTP is refused outright (no
-/// http:// mints in a user build); only a `local-test-mints` test build lets a loopback HTTP
-/// fixture mint past the real-mint fence.
+/// In a maxplayer home only one of the home's mints (`maxplayer_core::wallet_ops::tradeable_mints`:
+/// the default, `extra_mints` and the seller's `accepted_mints`) that the real-mint fence
+/// (`allow_real_mints`) admits may be traded: a seller is paid at every accepted mint into this same
+/// wallet. Plain HTTP is refused outright (no http:// mints in a user build); only a
+/// `local-test-mints` test build lets a loopback HTTP fixture mint past the real-mint fence.
 pub fn check_shared_mint(root: &Path, mint: &str) -> Result<()> {
     let mh = maxplayer_home(root)?;
     let normalized =
@@ -472,17 +473,19 @@ pub fn check_shared_mint(root: &Path, mint: &str) -> Result<()> {
     ensure!(
         local_test || maxplayer_core::home::mint_allowed(&normalized, mh.config.allow_real_mints),
         "mint {normalized} is refused by this home's real-mint fence (allow_real_mints is off in \
-         {}); trading uses only mints the buyer wallet may use",
+         {}); trading uses only mints this home's wallet may use",
         root.join("config.toml").display()
     );
-    let configured =
-        maxplayer_core::wallet_ops::configured_mints(&mh).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tradeable =
+        maxplayer_core::wallet_ops::tradeable_mints(&mh).map_err(|e| anyhow::anyhow!("{e}"))?;
     ensure!(
-        configured.contains(&normalized),
-        "mint {normalized} is not one of this home's configured mints ({}); add it with \
-         `maxplayer wallet mints add {normalized} --home {}` first",
-        configured.join(", "),
-        root.display()
+        tradeable.contains(&normalized),
+        "mint {normalized} is not one of this home's mints (default, extra_mints or the seller's \
+         accepted_mints: {}); add it to extra_mints with `maxplayer wallet mints add {normalized} \
+         --home {}`, or, on a seller, to accepted_mints in {} (then restart the seller node)",
+        tradeable.join(", "),
+        root.display(),
+        root.join("config.toml").display()
     );
     Ok(())
 }

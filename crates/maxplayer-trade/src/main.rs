@@ -248,7 +248,8 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     }
     let resolved = resolve_home(cli.home.as_deref(), &cli.command)?;
     let home = &resolved;
-    // A maxplayer home moves money only at mints its buyer wallet may use (configured + fence).
+    // A maxplayer home moves money only at its own mints (default, extra_mints, the seller's
+    // accepted_mints) that pass the real-mint fence.
     match &cli.command {
         Command::Fund { mint, .. }
         | Command::Withdraw { mint, .. }
