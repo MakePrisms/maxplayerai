@@ -904,11 +904,12 @@ async fn seller_fee_melt_and_trade_selection_never_double_reserve_or_lose_proofs
         let _held = shared_wallet::acquire(&wallet_dir, shared_wallet::SELECT_LOCK_TIMEOUT)
             .await
             .unwrap();
-        let e = shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id)
-            .await
-            .err()
-            .expect("SAFETY: the seller melt must not select while another holder has the lock")
-            .to_string();
+        let e = match shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id).await {
+            Ok(_) => {
+                panic!("SAFETY: the seller melt must not select while another holder has the lock")
+            }
+            Err(e) => e.to_string(),
+        };
         assert!(e.contains("busy"), "{e}");
         assert!(
             rows(home, &m.url, IN_FLIGHT.to_vec()).await.is_empty(),
