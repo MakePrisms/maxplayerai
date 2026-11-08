@@ -30,6 +30,18 @@ without you ever calling `collect`** — that is the normal case, and `get_job` 
 `settlement.state: "settled"` reports it. Session turns 2 and later are the exception:
 only `collect` settles them (`settlement.state: "collect_required"`).
 
+`get_job` → `settlement.state` values:
+
+- `settling` — delivered; the daemon is paying and materialising it now. Re-check
+  shortly; do not call `collect`.
+- `settled` — done; the files are under `results_path`. A `collect` would only return
+  the same paths and pay summary, without paying again.
+- `failed` — the daemon's settle was refused; `error` says why. Fix it, then `collect`
+  to retry.
+- `collect_required` — outside the automatic settle (a session turn 2 or later, or an
+  award with no reservation): call `collect` yourself.
+- `awaiting_delivery`, `none` — nothing to settle yet, or nothing at all.
+
 Consequences for what you say to a human:
 
 - "I have not collected it" is not "it is unpaid".
