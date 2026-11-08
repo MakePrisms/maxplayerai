@@ -1,3 +1,55 @@
+## v0.7.3-rc2
+
+Release candidate for 0.7.3, cut so that the session-job fixes for gVisor (`runsc`) seats can be
+tested live. The changes to the `maxplayer` binary since v0.7.3-rc1 are #1258 (every session turn
+restates the answer rule) and #1262 (session state survives park/resume on runsc seats, and a
+runsc seat only offers sessions when it can keep them). Everything in v0.7.3-rc1 is included.
+`maxplayer-trade` and `maxplayer-mint` are still not release binaries: build them from source at
+this tag. Client-only: no relay, registration-service or website redeploy is part of this release.
+After publication, install with `npm install -g maxplayer@0.7.3-rc2`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Upgrade note for runsc sellers with sessions on.** If your seat has `[sandbox] mode = "docker"`,
+`runtime = "runsc"` and `[sessions] enabled = true`, the seller **will not start** after this
+upgrade until docker's `runsc` runtime runs with `--overlay2=none`. `maxplayer doctor` shows
+`FAIL sandbox runsc sessions` with a pasteable fix
+(`sudo -- <runsc path> install -- <your other args> --overlay2=none`, then restart docker, which
+stops running containers). If you don't want sessions on that seat, turn `[sessions]` off instead
+and it runs single-turn jobs as before. Seats that don't use runsc, and runsc seats with sessions
+off, see no change at all: no docker check, no log line, no doctor row.
+
+### Changes since v0.7.3-rc1
+
+- **Fixed: session turns on runsc seats lost the agent's conversation** (#1262). Under gVisor's
+  default `--overlay2=root:self`, files the agent writes to the container's root filesystem are
+  thrown away when the parked session container stops, including claude-agent-acp's transcript
+  and `~/.codex`. Turn 2 then either reset or, worse, resumed an empty conversation while
+  reporting `context_reset=false`. Now:
+  - A runsc seat with sessions on offers sessions only when docker's runtime named `runsc` has
+    `--overlay2=none` (read from `docker info` at startup and on every heartbeat; last setting
+    wins). Docker clearly missing the flag, or no `runsc` runtime: doctor FAIL, the seller won't
+    start (see the upgrade note). Docker unreadable or slower than 10 s at startup: doctor WARN,
+    the seller starts without offering sessions and re-checks on each heartbeat. If the flag
+    disappears while the seller runs, it stops offering sessions, logs one
+    `sessions DISABLED on this runsc seat` line with the fix, and keeps taking single-turn jobs.
+    The running seller picks up a fix on its next heartbeat (every 5 minutes by default); with
+    `[seller_heartbeat] enabled = false`, restart it.
+  - On runsc seats, a session reload that comes back with no history is treated as a context
+    reset (fresh session, `context_reset=true`, the reset prompt with the original task), never
+    as a kept conversation.
+  - New `scripts/runsc-session-persistence.sh` checks a host directly: it reports whether the
+    flag is set and whether a file written in a container survives `docker stop` + `start`
+    (exit 0 kept, 1 lost, 4 setup error).
+  - Docs: the seller troubleshooting guide has a new section, "Symptom: sessions DISABLED on a
+    runsc seat"; SANDBOXING, the seller quickstart and the seller skill say `--overlay2=none` is
+    required for sessions on runsc, with the trade-off (rootfs writes go to the container's layer
+    on host disk instead of a sandbox-private overlay).
+- **Fixed: session turns after the first could be refused with `no_sentinel`** (#1258). The
+  ANSWER JOBS rule (end an answer with the `MAXPLAYER-ANSWER-V1` marker) was stated only in the
+  turn-1 prompt. A follow-up that ran in a fresh conversation never saw it, answered unmarked and
+  was refused. Follow-up and reset prompts now restate the rule whenever the turn may answer
+  inline; the turn-1 prompt and the delivery gate are unchanged.
+
 ## v0.7.3-rc1
 
 Release candidate for 0.7.3, cut so that `maxplayer account link --trade-home` and the wallet's
