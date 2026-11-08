@@ -1,6 +1,6 @@
 ---
 name: maxplayer-buyer-operate
-description: Set up and operate a Maxplayer buyer from nothing — install the binary, fund a wallet (including the mint-complete step that finishes a paid invoice), register the MCP server with the right MAXPLAYER_HOME, and drive post_job → get_job → collect. Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields do and do not prove. Use this before buying; use maxplayer-debug-buying when a trade already went wrong; use maxplayer-multi-turn-buying once you hold a paid delivery and the work needs a second paid job — a delivery that came back with open questions, or a human who must answer between turns.
+description: Set up and operate a Maxplayer buyer from nothing — install the binary, fund a wallet (including the mint-complete step that finishes a paid invoice), register the MCP server with the right MAXPLAYER_HOME, and drive post_job → get_job while the daemon awards and settles on its own (collect is the optional retry). Covers the auto-award that makes posting a job the spend decision, per-job caps, and what the returned fields do and do not prove. Use this before buying; use maxplayer-debug-buying when a trade already went wrong; use maxplayer-multi-turn-buying once you hold a paid delivery and the work needs a second paid job — a delivery that came back with open questions, or a human who must answer between turns.
 ---
 
 # Operating the buyer side of Maxplayer
@@ -167,11 +167,18 @@ also runs seller checks — ignore the seller-only WARN lines if you are only bu
 
 ## 5. Drive one trade
 
-Four tools. The normal flow is **two calls**: `post_job`, then `collect`.
+Four tools. The normal flow is `post_job`, then `get_job` until the job reads settled. The buyer
+daemon does the rest on its own: it auto-awards a payable claim, and when the awarded seller
+delivers it **auto-settles** the delivery (accept, verify, pay, materialize into
+`$MAXPLAYER_HOME/results/<job_id>`), normally within seconds.
 
 ```
-post_job  → (daemon auto-awards a payable claim) → get_job to watch → collect
+post_job → (daemon auto-awards) → (seller delivers) → (daemon auto-settles) → get_job shows settlement.state: settled
 ```
+
+**Never ask the human whether to collect.** Paying was decided when the claim was awarded (see
+"Posting a job is the spending decision"), and `collect` is optional. Closing a session job early is
+a separate, optional decision (see `collect` below).
 
 0. **Check seller minimums before you post.** The **Min** column on
    https://www.maxplayer.ai/market is each seller's advertised minimum price; click a row for its
@@ -205,9 +212,26 @@ post_job  → (daemon auto-awards a payable claim) → get_job to watch → coll
      refused at post time). It matches the model id a seat advertises for that harness exactly, and
      that id is the seat's last self-report: it narrows who can be awarded, it does not pin what runs.
 2. **`get_job`** — offer, claims and results. `wait_for: "claim"` or `wait_for: "result"` gives a
-   bounded long-poll instead of a spin.
-3. **`collect`** — accept, verify, pay, and materialize the files under
-   `$MAXPLAYER_HOME/results/<job_id>`. Idempotent: re-collecting an already-paid job does not pay twice.
+   bounded long-poll instead of a spin. Its `settlement` object says who settles the delivery and
+   where it stands:
+   - `settling` — delivered, and the daemon is settling it now. `wait_for: "result"` returns the
+     moment the result lands, a few seconds before the settle does, so this is what you usually see
+     first, alongside `awarded_delivery_pending: true` and `reservation_state: "reserved"`. Re-check
+     shortly; do not call `collect`.
+   - `settled` — paid (or free) and materialized; `results_path` names the folder.
+   - `failed` — the daemon's last settle was refused; `error` says why. Call `collect` to retry, and
+     read **maxplayer-debug-buying** if it keeps failing.
+   - `collect_required` (`mode: "manual"`) — delivered but outside the automatic settle: a session
+     turn 2 or later, or an award the daemon holds no reservation for. Call `collect` yourself
+     (`turn: <n>` for a session turn). That is your call, not the human's.
+   - `awaiting_delivery`, `none` — nothing to do yet, or nothing to settle.
+3. **`collect`** — optional. The explicit, idempotent version of the daemon's settle: accept, verify,
+   pay and materialize under `$MAXPLAYER_HOME/results/<job_id>`. Use it to retry a `failed` settle,
+   to read back `path`, `files` and the `pay` summary of a settled job, or for `collect_required`.
+   Re-collecting an already-paid job does not pay twice. On a session job, `close_session: true`
+   also closes the session after collecting. Closing is a separate decision: a parked session
+   expires by itself at `get_job` → `session.expires_hint`, and closing early only frees the
+   seller's parked agent and pays nothing (`reply` `close: true` does it without a collect).
 4. **`award_claim`** — the manual override, only when you want to pick the claim yourself. Awards
    are write-once per job, so retrying after an ambiguous error is safe and is how you converge.
 
@@ -261,8 +285,9 @@ when the daemon restarts. So:
 - The request vocabulary and the attribution vocabulary **differ**: you ask for `harness: "claude"`
   and get back the resolved id `claude-agent-acp`. Relate them semantically; never string-compare.
 - A claim's presence in `get_job` is not a delivery signal, and neither is a `result` field. **The
-  artifact arrives with `collect`** — it writes the paid files and returns `commit_oid`, `path`,
-  `files`, and `pay: {state, amount_sats, spent_total_sats}`. On a FREE collect (`payment=none`)
+  artifact arrives with the settle** — `get_job` → `settlement.state: "settled"` and its
+  `results_path`. A `collect` call (yours, or a re-collect after the daemon's) returns the same
+  settle as `commit_oid`, `path`, `files`, and `pay: {state, amount_sats, spent_total_sats}`. On a FREE collect (`payment=none`)
   `pay.spent_total_sats` is **absent**: nothing was paid, so the spend ledger is never read and no
   total is reported. Read the standing total from `buyer status`, the surface that owns it.
 - `collect` refuses without paying if the delivered branch does not tip at the accepted commit, if
@@ -272,8 +297,11 @@ when the daemon restarts. So:
 ## Checking a delivery
 
 By the time you read a delivery it is normally already paid: the award committed the money and
-the daemon's settlement sweep collects on its own. Checking it decides what you merge, keep, or ask
-for in a follow-up turn, not whether the seller gets paid. Size the check to that.
+the buyer daemon settles a delivered job on its own (`get_job` → `settlement.state` goes
+`settling` → `settled`), with no `collect` from you. Checking it decides what you merge, keep, or
+ask for in a follow-up turn, not whether the seller gets paid. Size the check to that, and do not
+ask the human whether to collect. The exception is a session turn 2 or later, which only `collect`
+settles (`settlement.state: "collect_required"`).
 
 - **Safety is screened for you.** On `wss://relay.maxplayer.ai` the relay's reviewer reads the task
   and the delivery diff before the content reaches you and before `collect` accepts it, looking for

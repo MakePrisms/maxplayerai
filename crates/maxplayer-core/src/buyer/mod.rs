@@ -32,6 +32,8 @@ mod preparations;
 mod auto_award_retry;
 /// Session jobs (docs/specs/session-jobs.md §8, §10): `reply`, `get_job.session`, turn collect.
 mod session_reply;
+/// `get_job.settlement`: whether the daemon settles a delivery on its own, and where it stands.
+mod settlement;
 
 /// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
 #[cfg(test)]
@@ -171,6 +173,11 @@ struct BuyerContext {
     /// The last reconcile-on-start report, surfaced in `status` so kept-uncertain reservations
     /// (funds committed to an ambiguous payment) are visible rather than silently discarded.
     last_reconcile: Mutex<Option<ReconcileReport>>,
+    /// The last refused settle per job (watcher or `collect`), cleared by a successful one. Read by
+    /// `get_job.settlement` so an agent sees `failed` instead of an endless "settling". In memory
+    /// on purpose: after a restart the watcher's boot sweep re-runs every unsettled job within
+    /// seconds and records any refusal again, and nothing reads this for a money decision.
+    settle_failures: std::sync::Mutex<BTreeMap<String, String>>,
 }
 
 fn now_unix() -> i64 {
@@ -271,6 +278,7 @@ async fn bootstrap(home: MaxplayerHome) -> Result<(HomeLock, Arc<BuyerContext>, 
         started_at_unix,
         money_lock: Mutex::new(()),
         last_reconcile: Mutex::new(None),
+        settle_failures: std::sync::Mutex::new(BTreeMap::new()),
     });
     Ok((lock, context, socket_path))
 }
@@ -608,8 +616,9 @@ fn post_job_kind(params: &PostJobParams) -> Result<JobKind, String> {
 
 /// Publish an offer (reuses [`job_lifecycle::post_job_async`], the same money-checked post path the
 /// CLI/MCP use), record its auto-award intent, and spawn the background auto-award task — the
-/// daemon-drives-the-award half of the 2-call trade loop (post_job → collect). No reservation is
-/// taken at post — funds are reserved at award.
+/// daemon-drives-the-award half of the trade loop (post_job → award → delivery → the watcher
+/// settles; `collect` is the explicit retry). No reservation is taken at post — funds are reserved
+/// at award.
 async fn post_job(context: &Arc<BuyerContext>, id: Value, params: Value) -> Response {
     let params: PostJobParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -863,6 +872,12 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             let awarded_delivery_pending = awarded.as_ref().is_some_and(|a| {
                 job_lifecycle::awarded_delivery_pending(&view, &a.claim_id, &a.seller_pubkey)
             });
+            // Read before `protect_job_view` may withhold result fields: delivery is a ledger fact
+            // here, never content. An accept-bind already present also counts as delivered.
+            let delivered = awarded_delivery_pending || view.accepted.is_some();
+            let settlement_hint = settlement::facts(context, &view.job_id, awarded.is_some(), delivered)
+                .map(|facts| settlement::hint(&facts))
+                .unwrap_or(Value::Null);
             let review_status = crate::review::protect_job_view(&context.home, &mut view, awarded.as_ref().map(|a| a.seller_pubkey.as_str())).await;
             // Read-only planner hints. Parsing stays with the existing Cashu parser;
             // these self-reported prices never authorize an award or payment.
@@ -881,6 +896,8 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             response["auto_award_state"] = json!(context.store.pending_award_state(response["job_id"].as_str().unwrap_or_default())
                 .ok().flatten().map(|(state, _)| state));
             response["claim_prices"] = json!(claim_prices);
+            // Who settles this delivery and where it stands; null only if the ledger is unreadable.
+            response["settlement"] = settlement_hint;
             // Session jobs (§10): absent unless `[sessions] enabled` (one-shot bytes unchanged).
             if let Some(session) = session {
                 response["session"] = session;
@@ -1503,6 +1520,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                 return Response::err(id, CODE_REFUSED, "a session turn collects into results/<job>-t<n>; omit out".to_owned());
             }
             let settled = session_reply::settle_turn(context, &row).await;
+            settlement::note_refusal(context, &row.followup_id, settled.as_ref().err().cloned());
             return match settled {
                 Ok(outcome) => {
                     let closed = if params.close_session {
@@ -1534,7 +1552,16 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
         Err(error) => return Response::err(id, CODE_REFUSED, error),
     }
     let close_session = params.close_session;
-    match settle_job(context, &params.job_id, params.out).await {
+    let settled = settle_job(context, &params.job_id, params.out).await;
+    match &settled {
+        Ok(_) => settlement::note_refusal(context, &params.job_id, None),
+        // Nothing delivered yet is not a settle refusal (the watcher treats it the same way).
+        Err(SettleJobError::Pay(collect::CollectError::Lifecycle(
+            job_lifecycle::JobLifecycleError::NotFound(_),
+        ))) => {}
+        Err(error) => settlement::note_refusal(context, &params.job_id, Some(error.to_string())),
+    }
+    match settled {
         Ok(outcome) if close_session => {
             let closed = collect_close(context, &params.job_id).await;
             Response::ok(
@@ -3027,25 +3054,32 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
         }
         // A review timeout needs an explicit retry, not an unbounded sequence of paid
         // provider calls from this background sweep. Never hold an accepted obligation.
-        let review_enabled = context.store.award_record(&job_id).ok().flatten()
-            .map(|award| context.home.config.review.enabled(crate::kinds::JOB_RESULT_KIND, &award.seller_pubkey).unwrap_or(true))
-            .unwrap_or(context.home.config.review.buyer_delivery);
-        if review_enabled && matches!(job_lifecycle::load_accepted_bind(&context.home, &job_id), Ok(None)) {
-            match crate::review::state::blocked_job(&context.home.root, &job_id) {
-                Ok(Some(status)) => {
-                    let replacement = wake.is_some_and(|event| {
-                        event.kind == nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND)
-                            && event.id.to_hex() != status.subject.event
-                            && context.store.award_record(&job_id).ok().flatten()
-                                .is_some_and(|award| award.seller_pubkey == event.pubkey.to_hex())
-                    });
-                    if !replacement { continue; }
-                }
-                Err(error) => { crate::opline!("buyer: {job_id}: {error}"); continue; }
-                Ok(None) => {}
+        // (`settlement::auto_settle_review_hold` is shared with `get_job.settlement`, so the hint
+        // reports exactly the hold this sweep skips on.)
+        match settlement::auto_settle_review_hold(context, &job_id) {
+            Ok(Some(status)) => {
+                let replacement = wake.is_some_and(|event| {
+                    event.kind == nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND)
+                        && event.id.to_hex() != status.subject.event
+                        && context.store.award_record(&job_id).ok().flatten()
+                            .is_some_and(|award| award.seller_pubkey == event.pubkey.to_hex())
+                });
+                if !replacement { continue; }
             }
+            Err(error) => { crate::opline!("buyer: {job_id}: {error}"); continue; }
+            Ok(None) => {}
         }
-        match settle_job(context, &job_id, None).await {
+        let settled = settle_job(context, &job_id, None).await;
+        // `get_job.settlement` reads this: a refusal shows as `failed`, a success clears it. "Not
+        // delivered yet" is neither, so it leaves any earlier record standing.
+        match &settled {
+            Ok(_) => settlement::note_refusal(context, &job_id, None),
+            Err(SettleJobError::Pay(collect::CollectError::Lifecycle(
+                job_lifecycle::JobLifecycleError::NotFound(_),
+            ))) => {}
+            Err(error) => settlement::note_refusal(context, &job_id, Some(error.to_string())),
+        }
+        match settled {
             // `agent=` is the seller-claimed attribution off the settled result (#261);
             // "unreported" is honest absence, never a guess at what was requested. Rendered
             // through `log_safe_agent`: this is the one place seller-authored free text reaches
@@ -6440,6 +6474,58 @@ mod tests {
         );
     }
 
+    // get_job.settlement through the REAL handler, across the ledger states the watcher acts on:
+    // no award ⇒ auto/none; an award with no reservation (outside the watcher's work set) ⇒
+    // manual; reserved ⇒ auto/awaiting_delivery; spent with files on disk ⇒ settled with the
+    // results path. Red-on-revert: drop `response["settlement"]` from get_job and every read fails.
+    #[tokio::test]
+    async fn get_job_reports_who_settles_and_where_it_stands() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let root = temp_home("get-job-settlement");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        let (_lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let job = "a".repeat(64);
+        let read = |n: u64| {
+            let context = context.clone();
+            let job = job.clone();
+            async move {
+                get_job(&context, json!(n), json!({ "job_id": job }))
+                    .await
+                    .result
+                    .expect("get_job returns a view")["settlement"]
+                    .clone()
+            }
+        };
+        let pair = |v: &Value| (v["mode"].clone(), v["state"].clone());
+
+        assert_eq!(pair(&read(1).await), (json!("auto"), json!("none")));
+
+        context
+            .store
+            .record_award(&job, &"c".repeat(64), &"e".repeat(64), &"5".repeat(64), 100, 7)
+            .expect("record award");
+        assert_eq!(pair(&read(2).await), (json!("manual"), json!("awaiting_delivery")));
+
+        context.store.reserve(&job, 100, 1_000, 7).expect("reserve");
+        let waiting = read(3).await;
+        assert_eq!(pair(&waiting), (json!("auto"), json!("awaiting_delivery")));
+        assert!(waiting["note"].as_str().unwrap().contains("collect is not needed"), "{waiting}");
+
+        let results = context.home.root.join("results").join(&job);
+        std::fs::create_dir_all(&results).expect("results dir");
+        context.store.convert_to_spent(&job, 100, 8).expect("settle");
+        let settled = read(4).await;
+        assert_eq!(pair(&settled), (json!("auto"), json!("settled")));
+        assert_eq!(settled["results_path"], json!(results.display().to_string()));
+
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
     // ★ #481: an operator reading get_job must SEE a committed award the moment the 3405 exists —
     // BEFORE any delivery or accept — so an in-flight, unstoppable spend never reads as "nothing
     // committed". The incident (job a719a8b5) was exactly this: `accepted` null for minutes after
@@ -7374,6 +7460,18 @@ mod tests {
             context.last_reconcile.lock().await.is_some(),
             "a refused settle must not clear the reconcile snapshot (#469 clear is success-gated)"
         );
+        // The refusal is recorded for `get_job.settlement`, and the REAL get_job handler reports
+        // it as `failed` with the refusal text — not an endless "settling". Red-on-revert: drop
+        // the watcher's `note_refusal` and both assertions fail.
+        let recorded = context.settle_failures.lock().unwrap().get(&job_id).cloned();
+        assert!(recorded.is_some(), "a refused watcher settle must be recorded for get_job");
+        let read = get_job(&context, json!(1), json!({ "job_id": job_id.clone() }))
+            .await
+            .result
+            .expect("get_job returns a view");
+        assert_eq!(read["settlement"]["mode"], json!("auto"), "{}", read["settlement"]);
+        assert_eq!(read["settlement"]["state"], json!("failed"), "{}", read["settlement"]);
+        assert_eq!(read["settlement"]["error"], json!(recorded.unwrap()));
 
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);

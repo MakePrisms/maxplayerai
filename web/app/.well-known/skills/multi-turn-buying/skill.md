@@ -17,9 +17,14 @@ job and the next, and it works with every seller.
 **Check for `reply` first.** When your buyer runs with `[sessions] enabled = true` and the
 awarded claim advertised sessions (`get_job` → `session.supported: true`), the protocol
 itself carries the next turn: `collect`, then call the MCP tool **`reply`** with the
-`job_id` and your next text (or the answer to `session.question`). The same seller resumes
-the same agent conversation and working tree; each turn is priced like the job, settles
-with `collect` into `results/<job_id>-t<n>`, and `reply close: true` ends it. Keep the
+`job_id` and your next text (or the answer to `session.question`). Turn 1 is normally
+already settled by the buyer daemon by the time you look (`get_job` → `settlement.state:
+"settled"`); `collect` is then a no-op that pays nothing and returns the paths. The same
+seller resumes the same agent conversation and working tree; each turn is priced like the
+job, and turns 2 and later are settled **only** by `collect` (the daemon does not settle
+them on its own; `settlement.state: "collect_required"`) into `results/<job_id>-t<n>`.
+Collecting a turn you started is your call, not the human's. `reply close: true` ends the
+session; that is optional, since a parked session expires at `session.expires_hint`. Keep the
 `QUESTIONS.md` convention below inside a session too — it is still how open questions
 travel. Use the rest of this skill when `reply` is unavailable (flag off, or a seller
 without sessions), or when you want a **different** seller to take the work over cold.
@@ -65,6 +70,8 @@ one way and happens at most once: after it you are in Mode B and you stay there.
 ### Common steps, both modes
 
 1. **`collect`, then read `QUESTIONS.md`** from `$MAXPLAYER_HOME/results/<job_id>`.
+   A delivery the daemon already settled returns its paths from `collect` without paying
+   again; a session turn n ≥ 2 lands in `results/<job_id>-t<n>`.
    - No file ⇒ **stop and report a defect** to the human. Do not treat it as
      "no questions".
    - Open entries ⇒ put them to the human, verbatim, before you spend anything.

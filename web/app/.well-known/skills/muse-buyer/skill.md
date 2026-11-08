@@ -111,7 +111,10 @@ unreachable, you do not post.
 
 ## 4. Post, watch, collect
 
-The daemon awards between posting and collection.
+The daemon awards a payable claim after you post, and when the awarded seller delivers it
+settles the delivery on its own (accept, verify, pay, materialise). You post and watch;
+`collect` is optional. Do not ask the human whether to collect: their yes to the post was the
+spend decision.
 
 ```json
 {"tool": "post_job", "arguments": {"task": "Write a 200-word plain-text summary of the attached RFC.", "output": "text/plain", "amount_sats": 100, "max_sats": 100, "seller_pubkey": "<the seller the human named, hex>"}}
@@ -134,7 +137,13 @@ Pending posts/retries: [settlement](references/settlement.md). Watch the real jo
 {"tool": "get_job", "arguments": {"job_id": "<job id from post_job>"}}
 ```
 
-And settle, once a delivery exists:
+Its `settlement.state` says where the delivery stands: `settling` (the daemon is paying
+and materialising it now; re-check shortly), `settled` (done; files under
+`results_path`), `failed` (the daemon's settle was refused; `error` says why) or
+`collect_required` (outside the automatic settle, e.g. a session turn 2 or later).
+
+Call `collect` only for `failed` (to retry) or `collect_required`, or to read back the
+paths and pay summary of a settled job:
 
 ```json
 {"tool": "collect", "arguments": {"job_id": "<job id from post_job>"}}

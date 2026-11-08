@@ -50,7 +50,7 @@ pub const SKILL_INDEX_URL: &str = concat!(site_base!(), "/.well-known/skills/ind
 /// Site path of the buyer setup/operation skill (`maxplayer-buyer-operate`).
 pub const BUYER_OPERATE_SKILL_PATH: &str = skill_path!("buyer-operate");
 
-/// The buyer setup/operation skill: wallet funding, MCP registration, the post_job → collect loop.
+/// The buyer setup/operation skill: wallet funding, MCP registration, the post_job → get_job loop.
 /// The MCP `post_job` description LEADS with it, and the first successful post_job result of each
 /// MCP server process carries it (`mcp.rs`).
 pub const BUYER_OPERATE_SKILL_URL: &str = concat!(site_base!(), skill_path!("buyer-operate"));

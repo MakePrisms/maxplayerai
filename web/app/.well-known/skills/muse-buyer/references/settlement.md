@@ -26,7 +26,9 @@ the real-money instruction constant).
 
 Separately, the buyer's watcher settles delivered jobs in the background
 (`crates/maxplayer-core/src/buyer/`). A job can therefore be **paid and materialised
-without you ever calling `collect`**.
+without you ever calling `collect`** — that is the normal case, and `get_job` →
+`settlement.state: "settled"` reports it. Session turns 2 and later are the exception:
+only `collect` settles them (`settlement.state: "collect_required"`).
 
 Consequences for what you say to a human:
 
