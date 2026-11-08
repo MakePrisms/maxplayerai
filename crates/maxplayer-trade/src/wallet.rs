@@ -386,19 +386,93 @@ pub enum Layout {
     /// kept so its money can be drained and its in-flight trades finished.
     Legacy,
 }
-/// A directory holding `wallet.seed`, `trade.key` or a root `trade.sqlite` / `owner.lock` is a
-/// legacy standalone trading home (a maxplayer home keeps those under `trade/`).
-pub fn is_legacy_dir(home: &Path) -> bool {
-    ["wallet.seed", "trade.key", "trade.sqlite", "owner.lock"]
+const LEGACY_MARKERS: [&str; 4] = ["wallet.seed", "trade.key", "trade.sqlite", "owner.lock"];
+fn has_legacy_marker(home: &Path) -> bool {
+    LEGACY_MARKERS
         .iter()
         .any(|f| fs::symlink_metadata(home.join(f)).is_ok())
 }
-/// A directory with a `key` or `config.toml` (and no legacy marker) is a maxplayer home.
+fn has_home_marker(home: &Path) -> bool {
+    ["key", "config.toml"]
+        .iter()
+        .any(|f| fs::symlink_metadata(home.join(f)).is_ok())
+}
+/// A directory holding `wallet.seed`, `trade.key` or a root `trade.sqlite` / `owner.lock`, and no
+/// `key` / `config.toml`, is a legacy standalone trading home (a maxplayer home keeps those under
+/// `trade/`).
+pub fn is_legacy_dir(home: &Path) -> bool {
+    has_legacy_marker(home) && !has_home_marker(home)
+}
+/// A directory with a `key` or `config.toml` is a maxplayer home, even when a legacy marker sits
+/// next to it ([`is_mixed_dir`]): its wallet is `wallet/cdk-wallet.sqlite` and its key is `key`, so
+/// no `wallet.seed` or `trade.key` is ever created there.
 pub fn is_maxplayer_home(home: &Path) -> bool {
-    !is_legacy_dir(home)
-        && ["key", "config.toml"]
-            .iter()
-            .any(|f| fs::symlink_metadata(home.join(f)).is_ok())
+    has_home_marker(home)
+}
+/// A maxplayer home that ALSO holds legacy standalone-trading files at its top level (an older
+/// `maxplayer-trade --home ~/.maxplayer` left them). The CLI refuses it ([`mixed_refusal`]); the
+/// library treats it as the maxplayer home it is.
+pub fn is_mixed_dir(home: &Path) -> bool {
+    has_legacy_marker(home) && has_home_marker(home)
+}
+/// The legacy standalone-trading files at the top level of `home`: the markers, `serve.sock` and
+/// the per-mint `<64 hex>.sqlite` wallet databases (with their `-wal` / `-shm`).
+pub fn stray_legacy_files(home: &Path) -> Vec<String> {
+    let mut out: Vec<String> = LEGACY_MARKERS
+        .iter()
+        .chain(["serve.sock"].iter())
+        .filter(|f| fs::symlink_metadata(home.join(f)).is_ok())
+        .map(|f| f.to_string())
+        .collect();
+    if let Ok(entries) = fs::read_dir(home) {
+        let mut dbs: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| {
+                let stem = name
+                    .strip_suffix(".sqlite")
+                    .or_else(|| name.strip_suffix(".sqlite-wal"))
+                    .or_else(|| name.strip_suffix(".sqlite-shm"));
+                stem.is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            .collect();
+        dbs.sort();
+        out.extend(dbs);
+    }
+    out
+}
+/// Why every command refuses a [`is_mixed_dir`] home, and what to do. Nothing is created or
+/// changed. The legacy files are self-contained (own seed, key, journal and wallet databases), so
+/// moving them to their own directory loses nothing and lets that legacy home be finished and
+/// drained on its own; mixing the two would hide the legacy money or create a second seed.
+pub fn mixed_refusal(home: &Path) -> String {
+    let stray = stray_legacy_files(home);
+    let only_lock = stray.iter().all(|f| f == "owner.lock" || f == "serve.sock");
+    format!(
+        "refused: {h} is a maxplayer home (key / config.toml) that also holds legacy standalone \
+         trading files at its top level: {files}. Nothing was created or changed. {what}",
+        h = home.display(),
+        files = stray.join(", "),
+        what = if only_lock {
+            format!(
+                "They hold no money (an older maxplayer-trade left its lock there): once no older \
+                 maxplayer-trade runs on this directory, delete them ({}) and retry.",
+                stray
+                    .iter()
+                    .map(|f| home.join(f).display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        } else {
+            format!(
+                "Move exactly those files into a new directory <dir> (e.g. {h}-legacy-trade), finish \
+                 and drain it there (`maxplayer-trade --home <dir> recover`, then `maxplayer-trade \
+                 --home <dir> send <mint> --amount <n> --out <file>` and `maxplayer wallet receive \
+                 \"$(cat <file>)\" --home {h}`), then retry here.",
+                h = home.display()
+            )
+        }
+    )
 }
 /// The layout of `home`. A directory that is neither a maxplayer home nor anything else is a
 /// legacy home for the LIBRARY (it creates `wallet.seed` on first use, as before); the CLI never
@@ -499,8 +573,9 @@ pub fn check_mint(home: &Path, mint: &str) -> Result<()> {
 
 /// The wallet selection lock for `home` (shared with the buyer daemon and `maxplayer wallet`; see
 /// `maxplayer_core::shared_wallet`). A legacy home has one owner (`owner.lock`) and takes none.
-/// Hold it across "verify these proofs are free, journal the intent, reserve them" and across any
-/// release; never across a mint request.
+/// Hold it across "verify these proofs are free, journal the intent, reserve them", any release and
+/// any credit ([`credit`]): local database work only, never across a mint request (the mint checks
+/// of a plan and of new proofs run before it is taken).
 pub struct Select {
     home: PathBuf,
     mint: String,
@@ -582,8 +657,74 @@ pub async fn reserve(
 ) -> Result<()> {
     select(home, mint).await?.reserve(ys, op).await
 }
+/// Whose spent inputs [`credit`] may drop.
+#[derive(Debug, Clone, Copy)]
+pub enum InputOwner {
+    /// Rows `used_by_operation = op`, or unowned (a consumed input nobody holds; leaving it would be
+    /// a phantom balance). A row another operation owns is never dropped.
+    Op(uuid::Uuid),
+    /// A journal written before attempts named their reservation: rows that are unowned or owned
+    /// by an operation that is not a cdk saga of this wallet (never a buyer saga's row).
+    NotACdkSaga,
+}
+/// Credit newly issued proofs and drop spent inputs, under the selection lock, in one SQLite
+/// transaction: `added` rows whose `y` is already in the wallet are skipped (a row another
+/// operation owns, or one a crash already credited, is never overwritten), and a `spent` input is
+/// deleted only while `owner` still owns it (or nobody does). cdk's `update_proofs` is an unconditional upsert plus
+/// `DELETE … WHERE y IN`, so the owner check is a re-read under the lock: every other selector and
+/// releaser on this wallet takes the same lock. Mint requests (NUT-07 of the new proofs) belong
+/// BEFORE this call, never inside it.
+pub async fn credit(
+    home: &Path,
+    mint: &str,
+    added: Vec<cdk_common::wallet::ProofInfo>,
+    spent: &[cashu::PublicKey],
+    owner: InputOwner,
+) -> Result<()> {
+    if added.is_empty() && spent.is_empty() {
+        return Ok(());
+    }
+    let _held = select(home, mint).await?;
+    let db = database(home, mint).await?;
+    let present: std::collections::HashSet<_> = if added.is_empty() {
+        Default::default()
+    } else {
+        db.get_proofs_by_ys(added.iter().map(|r| r.y).collect())
+            .await?
+            .into_iter()
+            .map(|r| r.y)
+            .collect()
+    };
+    let added: Vec<_> = added
+        .into_iter()
+        .filter(|r| !present.contains(&r.y))
+        .collect();
+    let mut remove = Vec::new();
+    if !spent.is_empty() {
+        for row in db.get_proofs_by_ys(spent.to_vec()).await? {
+            let ours = match (owner, row.used_by_operation) {
+                (InputOwner::Op(op), held) => held.is_none() || held == Some(op),
+                (InputOwner::NotACdkSaga, None) => true,
+                (InputOwner::NotACdkSaga, Some(id)) => db.get_saga(&id).await?.is_none(),
+            };
+            if ours {
+                remove.push(row.y);
+            } else {
+                crate::diagnostics::emit(format!(
+                    "credit: spent input {} is owned by another operation ({:?}); left alone",
+                    row.y, row.used_by_operation
+                ));
+            }
+        }
+    }
+    if added.is_empty() && remove.is_empty() {
+        return Ok(());
+    }
+    db.update_proofs(added, remove).await?;
+    Ok(())
+}
 /// Release every proof `op` holds (`UPDATE … WHERE used_by_operation = op`), under the selection
-/// lock so it never races a buyer-side NUT-13 restore that is putting this owner's rows back.
+/// lock like every other proof write on a shared wallet.
 pub async fn release(home: &Path, mint: &str, op: &uuid::Uuid) -> Result<()> {
     let _held = select(home, mint).await?;
     database(home, mint).await?.release_proofs(op).await?;

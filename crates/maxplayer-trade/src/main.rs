@@ -700,6 +700,12 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
         Some(path) => path.to_path_buf(),
         None => maxplayer_core::home::default_home_dir().map_err(|e| anyhow::anyhow!("{e}"))?,
     };
+    // A maxplayer home with legacy files next to it: neither layout can be used safely (the
+    // legacy money sits in per-mint databases under wallet.seed, the home's in
+    // wallet/cdk-wallet.sqlite). Refuse every command before anything is created or read.
+    if wallet::is_mixed_dir(&home) {
+        anyhow::bail!("{}", wallet::mixed_refusal(&home));
+    }
     if wallet::is_legacy_dir(&home) {
         eprintln!("{}", wallet::legacy_warning(&home));
         if matches!(

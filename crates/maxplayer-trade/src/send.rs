@@ -781,7 +781,11 @@ async fn credit(
         mint::unspent(mint, &missing).await?;
     }
     let url = MintUrl::from_str(mint)?;
-    db.update_proofs(
+    // Under the selection lock: rows another operation owns are never overwritten, and a spent
+    // input is dropped only while this send still owns it.
+    crate::wallet::credit(
+        home,
+        mint,
         missing
             .into_iter()
             .map(|p| {
@@ -795,7 +799,8 @@ async fn credit(
                 )
             })
             .collect::<std::result::Result<Vec<_>, _>>()?,
-        spent,
+        &spent,
+        crate::wallet::InputOwner::Op(op),
     )
     .await?;
     Ok(())

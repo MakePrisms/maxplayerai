@@ -125,10 +125,16 @@ async fn credit(
             )?)
         })
         .collect::<Result<Vec<_>>>()?;
-    database(home, url)
-        .await?
-        .update_proofs(rows, inputs.ys()?)
-        .await?;
+    // Under the selection lock: existing rows keep their owner; inputs are dropped only while
+    // this funding/withdrawal still owns them.
+    crate::wallet::credit(
+        home,
+        url,
+        rows,
+        &inputs.ys()?,
+        crate::wallet::InputOwner::Op(operation.parse()?),
+    )
+    .await?;
     Ok(())
 }
 #[derive(Clone, Serialize, Deserialize)]

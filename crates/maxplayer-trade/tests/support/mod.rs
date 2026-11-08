@@ -97,6 +97,22 @@ pub struct Faults {
     pub rate_limit_swap: std::sync::atomic::AtomicBool,
     /// Swap POSTs answered 429 by `rate_limit_swap` (not counted in `swaps`).
     pub limited_swaps: std::sync::atomic::AtomicU64,
+    /// `/restore` requests seen (reset by the test before arming the recovery faults below).
+    pub restores_seen: std::sync::atomic::AtomicU64,
+    /// `/checkstate` requests seen after the first `/restore` (reset with `restores_seen`).
+    pub checkstates_after_restore: std::sync::atomic::AtomicU64,
+    /// Non-zero `n`: every `/restore` after the first `n` is answered 503, unprocessed (a mint
+    /// that fails a NUT-13 scan on its second batch).
+    pub fail_restores_after: std::sync::atomic::AtomicU64,
+    /// Answer 503 to every `/checkstate` that follows a `/restore`.
+    pub fail_checkstate_after_restore: std::sync::atomic::AtomicBool,
+    /// One-shot: never answer the second `/restore` (a NUT-13 scan's second batch; the client is
+    /// killed while it waits). `recovery_held` is notified when it holds.
+    pub hold_second_restore: std::sync::atomic::AtomicBool,
+    /// One-shot: never answer the first `/checkstate` after a `/restore` (the mint already answered
+    /// the restore). `recovery_held` is notified when it holds.
+    pub hold_checkstate_after_restore: std::sync::atomic::AtomicBool,
+    pub recovery_held: tokio::sync::Notify,
 }
 pub struct MintFixture {
     pub faults: Arc<Faults>,
@@ -171,6 +187,27 @@ impl MintFixture {
                     use std::sync::atomic::Ordering::SeqCst;
                     let path = req.uri().path().to_owned();
                     control.requests.fetch_add(1, SeqCst);
+                    if path.ends_with("/restore") {
+                        let n = control.restores_seen.fetch_add(1, SeqCst) + 1;
+                        if n == 2 && control.hold_second_restore.swap(false, SeqCst) {
+                            control.recovery_held.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                        let after = control.fail_restores_after.load(SeqCst);
+                        if after != 0 && n > after {
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                    }
+                    if path.ends_with("/checkstate") && control.restores_seen.load(SeqCst) > 0 {
+                        let m = control.checkstates_after_restore.fetch_add(1, SeqCst) + 1;
+                        if control.fail_checkstate_after_restore.load(SeqCst) {
+                            return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+                        }
+                        if m == 1 && control.hold_checkstate_after_restore.swap(false, SeqCst) {
+                            control.recovery_held.notify_one();
+                            std::future::pending::<()>().await;
+                        }
+                    }
                     let swap_limited =
                         path.ends_with("/swap") && control.rate_limit_swap.load(SeqCst);
                     if swap_limited {

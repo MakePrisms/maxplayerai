@@ -270,8 +270,8 @@ async fn partial_reserve_failure_releases_exactly_its_own_rows() {
 
 /// 4(a): the buyer's saga recovery never releases trade's reservations. cdk's own saga recovery
 /// is owner-scoped (it releases only `get_reserved_proofs(saga.id)`), but a NUT-13
-/// `Wallet::restore` (core runs it to complete a spent swap saga) re-derives every seed proof and
-/// upserts it with NO owner. Shown here on the raw call, then proven fixed on core's wrapper.
+/// `Wallet::restore` re-derives every seed proof and upserts it with NO owner. Shown here on the
+/// raw call (why core never calls it), then on core's retire pass.
 #[tokio::test]
 async fn buyer_restore_and_saga_retire_leave_trade_reservations_alone() {
     let m = MintFixture::start(0).await;
@@ -308,9 +308,6 @@ async fn buyer_restore_and_saga_retire_leave_trade_reservations_alone() {
     let op = uuid::Uuid::new_v4();
     wallet::reserve(home, &m.url, &ys, &op).await.unwrap();
     let w = core_wallet(home, &m.url).await;
-    shared_wallet::restore_keeping_other_reservations(&w, Some(&home.join("wallet")))
-        .await
-        .unwrap();
     let report = maxplayer_core::payment_wallet::retire_eligible_incomplete_sagas_in(
         &w,
         Some(&home.join("wallet")),
@@ -1044,4 +1041,629 @@ async fn seller_recovery_leaves_trade_reservations_alone() {
         seller_sats,
         "only the seller's own proofs became spendable again"
     );
+}
+
+// ---- Review round 1: swap-saga recovery, lock scope, mixed homes, owner-checked credit ----------
+
+/// A shared home with three owners in flight on one wallet: a buyer swap saga whose swap the mint
+/// EXECUTED but whose reply was lost (inputs SPENT at the mint, saga `SwapRequested`), trade's
+/// reservation, and a second in-flight cdk saga (a prepared, undecided melt).
+struct SwapScene {
+    _dir: tempfile::TempDir,
+    home: std::path::PathBuf,
+    trade_op: uuid::Uuid,
+    trade_ys: Vec<cashu::PublicKey>,
+    melt_op: uuid::Uuid,
+    melt_ys: Vec<cashu::PublicKey>,
+    swap_saga: uuid::Uuid,
+    swap_amount: u64,
+    /// Spendable (unowned UNSPENT) sats besides the swap's outputs.
+    spare: u64,
+}
+async fn spent_swap_scene(m: &MintFixture) -> SwapScene {
+    use std::sync::atomic::Ordering::SeqCst;
+    let dir = maxplayer_home();
+    let home = dir.path().to_path_buf();
+    fund(&home, &m.url, 127).await;
+    let w = core_wallet(&home, &m.url).await;
+    let wallet_dir = home.join("wallet");
+    let db = wallet::database(&home, &m.url).await.unwrap();
+    let q = w
+        .melt_quote(PaymentMethod::BOLT11, invoice(2), None, None)
+        .await
+        .unwrap();
+    let prepared = match shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id).await {
+        Ok(p) => p,
+        Err(e) => panic!("prepare melt: {e}"),
+    };
+    let melt_op = prepared.operation_id();
+    drop(prepared); // undecided: stays reserved, like a melt whose process died
+    let melt_ys: Vec<_> = db
+        .get_reserved_proofs(&melt_op)
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.y)
+        .collect();
+    assert!(!melt_ys.is_empty());
+    let mut free: Vec<_> = rows(&home, &m.url, vec![State::Unspent])
+        .await
+        .into_iter()
+        .filter(|p| p.used_by_operation.is_none())
+        .collect();
+    free.sort_by_key(|p| std::cmp::Reverse(p.proof.amount));
+    assert!(free.len() >= 3, "{}", free.len());
+    let swap_input = free[0].clone();
+    let trade_ys = vec![free[1].y, free[2].y];
+    let trade_op = uuid::Uuid::new_v4();
+    wallet::reserve(&home, &m.url, &trade_ys, &trade_op)
+        .await
+        .unwrap();
+    let swap_amount = u64::from(swap_input.proof.amount);
+    let spare: u64 = free[3..].iter().map(|p| u64::from(p.proof.amount)).sum();
+    m.faults.lose_reply.store(true, SeqCst);
+    let lost = w
+        .swap(
+            None,
+            cdk::amount::SplitTarget::default(),
+            vec![swap_input.proof.clone()],
+            None,
+            false,
+            false,
+        )
+        .await;
+    m.faults.lose_reply.store(false, SeqCst);
+    assert!(lost.is_err(), "the swap reply must be lost");
+    let swap_saga = db
+        .get_incomplete_sagas()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| matches!(s.state, cdk::wallet::types::WalletSagaState::Swap(_)))
+        .expect("a stranded swap saga")
+        .id;
+    assert_eq!(
+        db.get_reserved_proofs(&swap_saga).await.unwrap().len(),
+        1,
+        "the swap's input is reserved under its saga"
+    );
+    m.faults.restores_seen.store(0, SeqCst);
+    m.faults.checkstates_after_restore.store(0, SeqCst);
+    SwapScene {
+        _dir: dir,
+        home,
+        trade_op,
+        trade_ys,
+        melt_op,
+        melt_ys,
+        swap_saga,
+        swap_amount,
+        spare,
+    }
+}
+fn clear_recovery_faults(m: &MintFixture) {
+    use std::sync::atomic::Ordering::SeqCst;
+    m.faults.fail_restores_after.store(0, SeqCst);
+    m.faults.fail_checkstate_after_restore.store(false, SeqCst);
+    m.faults.hold_second_restore.store(false, SeqCst);
+    m.faults.hold_checkstate_after_restore.store(false, SeqCst);
+}
+/// SAFETY: trade's and the melt saga's proofs are still RESERVED under their own owners, and
+/// neither core's selection nor trade's plan can take them: exactly `spendable` sats are selectable.
+async fn assert_owners_kept(m: &MintFixture, s: &SwapScene, recovered: bool) {
+    let db = wallet::database(&s.home, &m.url).await.unwrap();
+    let held = |op: uuid::Uuid| {
+        let db = db.clone();
+        async move {
+            let mut ys: Vec<_> = db
+                .get_reserved_proofs(&op)
+                .await
+                .unwrap()
+                .into_iter()
+                .inspect(|p| assert_eq!(p.state, State::Reserved, "SAFETY: {op} row not RESERVED"))
+                .map(|p| p.y)
+                .collect();
+            ys.sort();
+            ys
+        }
+    };
+    let mut want = s.trade_ys.clone();
+    want.sort();
+    assert_eq!(
+        held(s.trade_op).await,
+        want,
+        "SAFETY: trade's reservation kept its owner"
+    );
+    let mut want = s.melt_ys.clone();
+    want.sort();
+    assert_eq!(
+        held(s.melt_op).await,
+        want,
+        "SAFETY: the melt saga's reservation kept its owner"
+    );
+    let saga_left = db.get_saga(&s.swap_saga).await.unwrap().is_some();
+    assert_eq!(saga_left, !recovered, "swap saga row");
+    let spendable = s.spare + if recovered { s.swap_amount } else { 0 };
+    assert_eq!(balance(&s.home, &m.url).await, spendable, "spendable sats");
+    let w = core_wallet(&s.home, &m.url).await;
+    let wallet_dir = s.home.join("wallet");
+    assert!(
+        shared_wallet::prepare_send_locked(
+            &w,
+            Some(&wallet_dir),
+            Amount::from(spendable + 1),
+            SendOptions::default()
+        )
+        .await
+        .is_err(),
+        "SAFETY: core cannot select more than the unowned proofs"
+    );
+    let p = shared_wallet::prepare_send_locked(
+        &w,
+        Some(&wallet_dir),
+        Amount::from(spendable),
+        SendOptions::default(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("select the spendable sats: {e}"));
+    let taken: Vec<_> = db
+        .get_reserved_proofs(&p.operation_id())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.y)
+        .collect();
+    assert!(
+        taken
+            .iter()
+            .all(|y| !s.trade_ys.contains(y) && !s.melt_ys.contains(y)),
+        "SAFETY: core selected a proof another owner holds"
+    );
+    p.cancel().await.unwrap();
+    let e = maxplayer_trade::mint::plan(&s.home, &m.url, spendable + 1, 0)
+        .await
+        .err()
+        .expect("SAFETY: trade cannot plan over another owner's proofs");
+    assert!(format!("{e:#}").contains("insufficient"), "{e:#}");
+}
+async fn retire(m: &MintFixture, home: &Path) -> maxplayer_core::payment_wallet::RetireReport {
+    let w = core_wallet(home, &m.url).await;
+    maxplayer_core::payment_wallet::retire_eligible_incomplete_sagas_in(
+        &w,
+        Some(&home.join("wallet")),
+    )
+    .await
+    .unwrap()
+}
+
+/// H1 (advisor r1): recovering a spent swap saga never hands another owner's reservation back.
+/// The mint fails the recovery part-way (its check-state after the restore, then every `/restore`
+/// after the first: a full-wallet NUT-13 scan dies on its second batch after committing the first).
+/// After each failure, and after the recovery that finally completes, trade's and a second cdk
+/// saga's proofs are still reserved under the same owner and not selectable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_recovery_failing_on_the_second_restore_batch_keeps_every_reservation() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let m = MintFixture::start(0).await;
+    let s = spent_swap_scene(&m).await;
+    m.faults.fail_checkstate_after_restore.store(true, SeqCst);
+    let report = retire(&m, &s.home).await;
+    assert_eq!(report.swap_recovered, 0, "{:?}", report.unresolved);
+    assert!(!report.unresolved.is_empty());
+    clear_recovery_faults(&m);
+    assert_owners_kept(&m, &s, false).await;
+
+    m.faults.restores_seen.store(0, SeqCst);
+    m.faults.fail_restores_after.store(1, SeqCst);
+    let report = retire(&m, &s.home).await;
+    clear_recovery_faults(&m);
+    let recovered = report.swap_recovered == 1;
+    assert_owners_kept(&m, &s, recovered).await;
+    if !recovered {
+        let report = retire(&m, &s.home).await;
+        assert_eq!(report.swap_recovered, 1, "{:?}", report.unresolved);
+        assert_owners_kept(&m, &s, true).await;
+    }
+}
+
+/// H1: the success path with a second in-flight cdk saga (an undecided melt) and trade's
+/// reservation on the same wallet: recovery credits only the swap's own outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_recovery_leaves_a_second_cdk_sagas_inputs_and_trades_reservation_reserved() {
+    let m = MintFixture::start(0).await;
+    let s = spent_swap_scene(&m).await;
+    let report = retire(&m, &s.home).await;
+    assert_eq!(report.swap_recovered, 1, "{:?}", report.unresolved);
+    assert_owners_kept(&m, &s, true).await;
+    // Idempotent: a second pass finds nothing to do and changes nothing.
+    let report = retire(&m, &s.home).await;
+    assert_eq!(report.swap_recovered, 0);
+    assert_owners_kept(&m, &s, true).await;
+}
+
+/// Child half of [`swap_recovery_killed_mid_way_keeps_every_reservation`]: runs core's retire pass
+/// on the home and mint named by the env var, then exits.
+#[test]
+fn swap_recovery_kill_child() {
+    let Some(spec) = std::env::var_os("TRADE_TEST_SWAP_RECOVERY_CHILD") else {
+        return;
+    };
+    let spec = spec.to_string_lossy().into_owned();
+    let (home, mint) = spec.split_once('\n').unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mh = wallet::maxplayer_home(Path::new(home)).unwrap();
+            let w = shared_wallet::open_shared_wallet(&mh, mint, None)
+                .await
+                .unwrap();
+            let _ = maxplayer_core::payment_wallet::retire_eligible_incomplete_sagas_in(
+                &w,
+                Some(&Path::new(home).join("wallet")),
+            )
+            .await;
+        });
+}
+/// Run the retire pass in a child process; SIGKILL it as soon as the mint holds the armed request.
+/// Returns whether it was killed (false: it finished before reaching the hold).
+async fn retire_in_child_killed_at_hold(m: &MintFixture, home: &Path) -> bool {
+    let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+    for (k, _) in std::env::vars_os() {
+        let k = k.to_string_lossy().into_owned();
+        if k.starts_with("MAXPLAYER_") || k.to_ascii_lowercase().ends_with("_proxy") {
+            c.env_remove(k);
+        }
+    }
+    let mut child = c
+        .args(["--exact", "swap_recovery_kill_child", "--nocapture"])
+        .env(
+            "TRADE_TEST_SWAP_RECOVERY_CHILD",
+            format!("{}\n{}", home.display(), m.url),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        tokio::select! {
+            _ = m.faults.recovery_held.notified() => {
+                // Safety: plain kill(2) of our own child.
+                assert_eq!(unsafe { libc_kill(child.id() as i32, 9) }, 0);
+                assert!(!child.wait().unwrap().success(), "killed");
+                return true;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "child recovery failed: {status:?}");
+                    return false;
+                }
+                assert!(std::time::Instant::now() < deadline, "child never finished");
+            }
+        }
+    }
+}
+
+/// H1: `kill -9` of the recovering process (a) while the mint holds a second `/restore` (a
+/// full-wallet scan has committed its first batch by then) and (b) after the mint answered the
+/// saga's restore, before the local apply. Either way, trade's and the melt saga's proofs stay
+/// reserved under their owners; a later pass then completes the swap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_recovery_killed_mid_way_keeps_every_reservation() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let m = MintFixture::start(0).await;
+    let s = spent_swap_scene(&m).await;
+    m.faults.hold_second_restore.store(true, SeqCst);
+    let killed = retire_in_child_killed_at_hold(&m, &s.home).await;
+    clear_recovery_faults(&m);
+    let db = wallet::database(&s.home, &m.url).await.unwrap();
+    let recovered = db.get_saga(&s.swap_saga).await.unwrap().is_none();
+    assert!(
+        killed || recovered,
+        "the child either was killed or finished"
+    );
+    assert_owners_kept(&m, &s, recovered).await;
+
+    let s = spent_swap_scene(&m).await;
+    m.faults.hold_checkstate_after_restore.store(true, SeqCst);
+    assert!(
+        retire_in_child_killed_at_hold(&m, &s.home).await,
+        "the recovery must reach its post-restore check"
+    );
+    clear_recovery_faults(&m);
+    assert_owners_kept(&m, &s, false).await;
+    let report = retire(&m, &s.home).await;
+    assert_eq!(report.swap_recovered, 1, "{:?}", report.unresolved);
+    assert_owners_kept(&m, &s, true).await;
+}
+
+/// M2 (advisor r1): the selection lock is never held across a mint request. With every mint reply
+/// delayed 600 ms, core's send and melt selection and a trade send run while another holder takes
+/// the lock every few ms with a 250 ms budget: it never finds it busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_select_lock_is_not_held_across_a_slow_mint() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path();
+    fund(home, &m.url, 64).await;
+    let j = Journal::open(home).await.unwrap();
+    let w = core_wallet(home, &m.url).await;
+    let wallet_dir = home.join("wallet");
+    let q = w
+        .melt_quote(PaymentMethod::BOLT11, invoice(2), None, None)
+        .await
+        .unwrap();
+    m.faults.delay_ms.store(600, SeqCst);
+    let done = AtomicBool::new(false);
+    let probe = async {
+        let (mut busy, mut taken, mut worst) = (0u32, 0u32, Duration::ZERO);
+        while !done.load(SeqCst) {
+            let started = std::time::Instant::now();
+            match shared_wallet::acquire(&wallet_dir, Duration::from_millis(250)).await {
+                Ok(g) => {
+                    taken += 1;
+                    worst = worst.max(started.elapsed());
+                    drop(g);
+                }
+                Err(_) => busy += 1,
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        (busy, taken, worst)
+    };
+    let work = async {
+        let started = std::time::Instant::now();
+        let p = shared_wallet::prepare_send_locked(
+            &w,
+            Some(&wallet_dir),
+            Amount::from(3),
+            SendOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("core send selection: {e}"));
+        p.cancel().await.unwrap();
+        let p = match shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id).await {
+            Ok(p) => p,
+            Err(e) => panic!("core melt selection: {e}"),
+        };
+        p.cancel().await.unwrap();
+        let r = send::send(home, &j, &m.url, 5, &home.join("token"), None)
+            .await
+            .unwrap();
+        assert_eq!(r.state, send::SendState::Sent, "{}", r.summary());
+        done.store(true, SeqCst);
+        started.elapsed()
+    };
+    let ((busy, taken, worst), took) = tokio::join!(probe, work);
+    m.faults.delay_ms.store(0, SeqCst);
+    assert!(
+        took > Duration::from_millis(1800),
+        "the mint was slow: {took:?}"
+    );
+    assert!(taken > 10, "probe ran: {taken}");
+    assert_eq!(
+        busy, 0,
+        "SAFETY/liveness: the selection lock was held across a mint request (worst wait {worst:?})"
+    );
+}
+
+/// M3 (advisor r1): a maxplayer home (`key`, `config.toml`, `wallet/`) with a legacy root
+/// `owner.lock` (and then `wallet.seed`) left by an older binary. Every command refuses, naming the
+/// stray files and what to do; nothing is created (no `wallet.seed`, no `trade.key`). The library
+/// keeps reading the home's `wallet/cdk-wallet.sqlite` and signing with `key`.
+#[tokio::test]
+async fn a_maxplayer_home_with_a_legacy_marker_is_refused_and_never_gets_a_second_seed() {
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path();
+    fund(home, &m.url, 9).await;
+    std::fs::write(home.join("owner.lock"), b"").unwrap();
+    let listing = || {
+        let mut v: Vec<_> = std::fs::read_dir(home)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        v.sort();
+        v
+    };
+    let before = listing();
+    for args in [
+        vec!["balance", m.url.as_str()],
+        vec!["status"],
+        vec!["recover"],
+        vec![
+            "send",
+            m.url.as_str(),
+            "--amount",
+            "2",
+            "--out",
+            "/nonexistent/t",
+        ],
+        vec!["withdraw", m.url.as_str(), "--invoice", "lnbc1"],
+        vec!["serve"],
+    ] {
+        let out = trade(Some(home), &args);
+        let e = err(&out);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {e}");
+        assert!(
+            e.contains("refused:") && e.contains("owner.lock") && e.contains("delete them"),
+            "{args:?}: {e}"
+        );
+        assert_eq!(listing(), before, "{args:?}: SAFETY: nothing created");
+    }
+    assert_eq!(
+        wallet::db_path(home, &m.url),
+        home.join("wallet").join("cdk-wallet.sqlite"),
+        "the home's wallet, never a per-mint legacy database"
+    );
+    assert_eq!(wallet::read_balance(home, &m.url).unwrap(), 9);
+    let key = std::fs::read_to_string(home.join("key")).unwrap();
+    assert_eq!(
+        wallet::identity(home).unwrap().secret_key().to_secret_hex(),
+        key.trim()
+    );
+    assert_eq!(balance(home, &m.url).await, 9);
+    for f in ["wallet.seed", "trade.key"] {
+        assert!(!home.join(f).exists(), "SAFETY: {f} created");
+    }
+    // With money-bearing legacy files: move them, never delete.
+    std::fs::write(home.join("wallet.seed"), [7u8; 64]).unwrap();
+    let out = trade(Some(home), &["balance", &m.url]);
+    let e = err(&out);
+    assert_eq!(out.status.code(), Some(1), "{e}");
+    assert!(
+        e.contains("wallet.seed")
+            && e.contains("Move exactly those files")
+            && !e.contains("delete them"),
+        "{e}"
+    );
+    assert!(!home.join("trade.key").exists());
+    std::fs::remove_file(home.join("wallet.seed")).unwrap();
+    std::fs::remove_file(home.join("owner.lock")).unwrap();
+    let out = trade(Some(home), &["balance", &m.url]);
+    assert!(out.status.success(), "{}", err(&out));
+}
+
+/// L5 (advisor r1): trade's credit of new proofs runs under the selection lock and is owner
+/// checked: an existing row keeps its owner (never overwritten), and a spent input is dropped only
+/// while this operation (or nobody) owns it; never a row another operation or a cdk saga holds.
+#[tokio::test]
+async fn trade_credit_never_overwrites_or_drops_another_owners_rows() {
+    use cdk_common::wallet::ProofInfo;
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path();
+    fund(home, &m.url, 31).await;
+    let db = wallet::database(home, &m.url).await.unwrap();
+    let mut ys: Vec<_> = rows(home, &m.url, vec![State::Unspent])
+        .await
+        .into_iter()
+        .map(|p| p.y)
+        .collect();
+    ys.sort();
+    assert!(ys.len() >= 5);
+    let (a, b, c, d) = (ys[0], ys[1], ys[2], ys[3]);
+    let (other, mine) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    db.reserve_proofs(vec![a], &other).await.unwrap();
+    db.reserve_proofs(vec![b], &mine).await.unwrap();
+    let row_a = db.get_proofs_by_ys(vec![a]).await.unwrap().remove(0);
+    let relabelled = ProofInfo::new_with_operations(
+        row_a.proof.clone(),
+        row_a.mint_url.clone(),
+        State::Reserved,
+        cdk::nuts::CurrencyUnit::Sat,
+        Some(mine),
+        Some(mine),
+    )
+    .unwrap();
+    {
+        let _held =
+            shared_wallet::acquire(&home.join("wallet"), shared_wallet::SELECT_LOCK_TIMEOUT)
+                .await
+                .unwrap();
+        let e = wallet::credit(
+            home,
+            &m.url,
+            vec![relabelled.clone()],
+            &[a, b, c],
+            wallet::InputOwner::Op(mine),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("busy"), "{e:#}");
+        assert_eq!(db.get_proofs_by_ys(vec![a, b, c]).await.unwrap().len(), 3);
+    }
+    wallet::credit(
+        home,
+        &m.url,
+        vec![relabelled],
+        &[a, b, c],
+        wallet::InputOwner::Op(mine),
+    )
+    .await
+    .unwrap();
+    let state = |y| {
+        let db = db.clone();
+        async move {
+            db.get_proofs_by_ys(vec![y])
+                .await
+                .unwrap()
+                .first()
+                .map(|r| (r.state, r.used_by_operation))
+        }
+    };
+    assert_eq!(
+        state(a).await,
+        Some((State::Reserved, Some(other))),
+        "SAFETY: another owner's row is neither overwritten nor dropped"
+    );
+    assert_eq!(state(b).await, None, "this operation's spent input dropped");
+    assert_eq!(state(c).await, None, "an unowned spent input dropped");
+    assert_eq!(state(d).await, Some((State::Unspent, None)), "untouched");
+    // A journal without a recorded input owner never drops a cdk saga's row.
+    let w = core_wallet(home, &m.url).await;
+    let p = shared_wallet::prepare_send_locked(
+        &w,
+        Some(&home.join("wallet")),
+        Amount::from(1),
+        SendOptions::default(),
+    )
+    .await
+    .unwrap();
+    let saga_ys: Vec<_> = db
+        .get_reserved_proofs(&p.operation_id())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.y)
+        .collect();
+    wallet::credit(
+        home,
+        &m.url,
+        vec![],
+        &saga_ys,
+        wallet::InputOwner::NotACdkSaga,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        db.get_reserved_proofs(&p.operation_id())
+            .await
+            .unwrap()
+            .len(),
+        saga_ys.len(),
+        "SAFETY: a cdk saga's input is never dropped by trade"
+    );
+    p.cancel().await.unwrap();
+}
+
+/// L5: every proof-row write in trade goes through `wallet::{credit, reserve, release}` (selection
+/// lock, owner checked); no other module writes the shared wallet's proof table directly.
+#[test]
+fn trade_writes_proof_rows_only_through_the_locked_wallet_helpers() {
+    for (name, source) in [
+        ("mint.rs", include_str!("../src/mint.rs")),
+        ("money.rs", include_str!("../src/money.rs")),
+        ("receive.rs", include_str!("../src/receive.rs")),
+        ("send.rs", include_str!("../src/send.rs")),
+        ("coordinator.rs", include_str!("../src/coordinator.rs")),
+        ("serve.rs", include_str!("../src/serve.rs")),
+        ("main.rs", include_str!("../src/main.rs")),
+        ("lib.rs", include_str!("../src/lib.rs")),
+    ] {
+        for call in [
+            ".update_proofs(",
+            ".update_proofs_state(",
+            ".reserve_proofs(",
+            ".release_proofs(",
+        ] {
+            assert!(
+                !source.contains(call),
+                "{name} calls {call}: write proof rows through wallet::credit/reserve/release"
+            );
+        }
+    }
 }

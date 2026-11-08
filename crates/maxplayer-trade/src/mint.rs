@@ -46,6 +46,39 @@ pub struct Attempt {
     pub quarantined: bool,
     #[serde(default)]
     pub observed_preimage: Option<String>,
+    /// The operation that held `inputs` reserved in the wallet when this attempt was created (a
+    /// lock's plan reservation). Settlement drops a spent input only while that operation still
+    /// owns it. `None`: inputs not in the wallet (HTLC claims/refunds) or a journal written before
+    /// this field (then only rows no cdk saga owns are dropped).
+    #[serde(default)]
+    pub input_owner: Option<uuid::Uuid>,
+}
+impl Attempt {
+    fn input_owner(&self) -> crate::wallet::InputOwner {
+        match self.input_owner {
+            Some(op) => crate::wallet::InputOwner::Op(op),
+            None => crate::wallet::InputOwner::NotACdkSaga,
+        }
+    }
+}
+/// The single operation that holds every one of `ys` reserved, if there is one.
+async fn reservation_owner(
+    home: &Path,
+    mint: &str,
+    ys: Vec<PublicKey>,
+) -> Result<Option<uuid::Uuid>> {
+    if ys.is_empty() {
+        return Ok(None);
+    }
+    let rows = database(home, mint)
+        .await?
+        .get_proofs_by_ys(ys.clone())
+        .await?;
+    let owners: HashSet<_> = rows.iter().map(|r| r.used_by_operation).collect();
+    Ok(match owners.into_iter().collect::<Vec<_>>().as_slice() {
+        [Some(op)] if rows.len() == ys.len() => Some(*op),
+        _ => None,
+    })
 }
 /// HTTP per-request timeout (unchanged). A `nostr://` request is bounded by the connector window
 /// instead; see `crate::transport`.
@@ -392,6 +425,7 @@ pub async fn lock(
             })
             .collect();
         crate::transport::check_claim_fits(&p.mint, &locked, claim_outputs(p.net))?;
+        let input_owner = reservation_owner(home, &p.mint, p.inputs.ys()?).await?;
         j.put(
             "attempt",
             id,
@@ -405,6 +439,7 @@ pub async fn lock(
                 unforwardable: false,
                 quarantined: false,
                 observed_preimage: None,
+                input_owner,
                 send_before: Some(send_before),
             },
         )
@@ -521,6 +556,7 @@ async fn redeem_inner(
                 unforwardable: false,
                 quarantined: false,
                 observed_preimage: None,
+                input_owner: None,
                 send_before,
             },
         )
@@ -703,10 +739,7 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 )?)
             })
             .collect::<Result<Vec<_>>>()?;
-        database(home, &a.mint)
-            .await?
-            .update_proofs(owned, a.inputs.ys()?)
-            .await?;
+        crate::wallet::credit(home, &a.mint, owned, &a.inputs.ys()?, a.input_owner()).await?;
         if !result
             .iter()
             .zip(&a.outputs)
@@ -1096,16 +1129,17 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
         "lock output identity changed"
     );
     let mint_url = a.mint.parse::<cdk::mint_url::MintUrl>()?;
-    database(home, &a.mint)
-        .await?
-        .update_proofs(
-            owned
-                .into_iter()
-                .map(|p| ProofInfo::new(p, mint_url.clone(), State::Unspent, CurrencyUnit::Sat))
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-            a.inputs.ys()?,
-        )
-        .await?;
+    crate::wallet::credit(
+        home,
+        &a.mint,
+        owned
+            .into_iter()
+            .map(|p| ProofInfo::new(p, mint_url.clone(), State::Unspent, CurrencyUnit::Sat))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        &a.inputs.ys()?,
+        a.input_owner(),
+    )
+    .await?;
     a.result = Some(result);
     a.done = true;
     j.put("attempt", id, &a).await
