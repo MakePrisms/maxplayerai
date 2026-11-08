@@ -39,12 +39,16 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   at once. Every step that picks unspent proofs and reserves them holds an exclusive OS advisory
   lock (`flock`) on `<home>/wallet/select.lock`, in both programs: core's `prepare_send` /
   `prepare_melt` (job payments, `wallet send`/`melt`, the cross-mint hop) and trade's
-  verify-journal-reserve for lots, takes, sends and withdrawals. It is held only across that
-  step, never across a mint request; a caller waits at most 5 s, then refuses with "the wallet
-  is busy … nothing was reserved, retry". The kernel releases a `flock` when its holder exits,
+  verify-journal-reserve for lots, takes, sends and withdrawals, plus trade's credit of new proofs
+  and the local apply of a recovered buyer swap. It is held only across that local database
+  work, never across a mint request: mint info and keysets are fetched before it is taken, and a
+  mint call inside it is refused. A caller waits at most 5 s, then refuses with "the wallet is
+  busy … nothing was reserved, retry". The kernel releases a `flock` when its holder exits,
   including `kill -9`, so a crash never leaves it held. Every reservation names its owner
   (`used_by_operation`: a cdk saga id for the buyer, trade's journal operation id for trade);
-  recovery on either side releases only its own. `maxplayer wallet balance` shows reserved sats
+  recovery on either side releases only its own, and a credit never overwrites a row another
+  operation owns. The buyer never runs a full-wallet NUT-13 restore (it would hand every owner's
+  reservation back as spendable); a stranded buyer swap recovers only its own outputs. `maxplayer wallet balance` shows reserved sats
   as `reserved_sats=` on the mint's line, never in `balance_sats`.
 - **Legacy standalone homes** (a directory with `wallet.seed`, `trade.key`, or a root
   `trade.sqlite`/`owner.lock`, given with `--home`) are deprecated. Every command there prints a
@@ -54,6 +58,12 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   with `maxplayer-trade --home <legacy> send <mint> --amount <n> --out <file>`, then
   `maxplayer wallet receive "$(cat <file>)"` on the maxplayer home; never delete a legacy home
   that still holds funds or unfinished records.
+- **A maxplayer home with legacy files at its top level** (`key` or `config.toml` next to
+  `wallet.seed`, `trade.key`, a root `trade.sqlite` or `owner.lock`, as an older
+  `maxplayer-trade --home ~/.maxplayer` left them): every command refuses, names the stray files
+  and creates nothing (never a `wallet.seed` or `trade.key`). A lone `owner.lock`/`serve.sock`
+  holds no money: delete it once no older `maxplayer-trade` runs there. Otherwise move exactly
+  the named files into their own directory and finish and drain that legacy home from there.
 Earlier dated verification sections are historical snapshots, not current coverage totals.
 
 ## Round 5 final-review policy

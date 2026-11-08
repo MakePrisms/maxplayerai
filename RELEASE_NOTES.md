@@ -23,11 +23,17 @@ the merge, Vercel).
   (test-only cargo feature `local-test-mints`); `cargo install --locked --path
   crates/maxplayer-trade` never enables it.
 - **New: wallet selection lock.** The buyer (job payments, `wallet send`/`melt`, the cross-mint
-  hop, NUT-13 restore) and `maxplayer-trade` (lot, take, send and withdraw reservations) take an
-  exclusive `flock` on `<home>/wallet/select.lock` only while they pick and reserve proofs;
-  a caller waits at most 5 s, then refuses retryably with nothing reserved. The kernel releases
-  it if the holder dies, including `kill -9`. Reservations are owner-named (`used_by_operation`);
-  the buyer's NUT-13 restore no longer releases proofs another owner reserved.
+  hop, swap recovery) and `maxplayer-trade` (lot, take, send and withdraw reservations, credits)
+  take an exclusive `flock` on `<home>/wallet/select.lock` only for local database work (picking
+  and reserving proofs, writing recovered ones), never across a mint request; a caller waits at
+  most 5 s, then refuses retryably with nothing reserved. The kernel releases it if the holder
+  dies, including `kill -9`. Reservations are owner-named (`used_by_operation`) and recovery
+  releases only its own.
+- **Changed: a stranded buyer swap is recovered from its own outputs.** When the mint executed a
+  swap whose reply was lost, `maxplayer wallet reconcile` and the pay path re-derive that swap's
+  outputs (its stored counter range) and add only those, instead of running cdk's full-wallet
+  NUT-13 restore, which marked every seed proof the mint still calls unspent as spendable and
+  could hand another operation's reserved proofs to a second spender.
 - **Changed: `maxplayer wallet balance`** prints `reserved_sats=<n>` on a mint line when proofs
   there are reserved by an in-flight operation (job payment, send, melt or a trade); they were
   never in `balance_sats`. Lines with nothing reserved are unchanged.
@@ -39,7 +45,9 @@ the merge, Vercel).
   or `trade.key`). Every command warns; `balance`, `status`, `recover`, `send`, `withdraw`,
   `doctor`, `serve` and `cancel` still run so funds can be drained and in-flight trades finished;
   new `list`, `take`, `fund` and `receive` are refused with the drain steps
-  (`send … --out <file>`, then `maxplayer wallet receive "$(cat <file>)"`).
+  (`send … --out <file>`, then `maxplayer wallet receive "$(cat <file>)"`). A maxplayer home
+  that also has such files at its top level is refused by every command, which names the files
+  and what to do; nothing is created there.
 
 ## v0.7.3-rc5
 
