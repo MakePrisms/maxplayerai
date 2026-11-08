@@ -1137,14 +1137,24 @@ impl HopEffects for CdkHopEffects {
         let quote_id = melt_quote_id.to_owned();
         let wallet_dir = self.wallet_dir.clone();
         block_on_leg("melt", async move {
-            // Held across prepare_melt's selection + reservation only, outside the mint bound.
+            // Mint metadata first, outside the lock; the lock is then held only across prepare_melt's
+            // local selection + reservation (no mint request inside it), outside the mint bound.
+            let metadata = tokio::time::timeout(
+                MINT_TOUCH_TIMEOUT,
+                crate::shared_wallet::warm_metadata(&wallet),
+            )
+            .await
+            .unwrap_or_default();
             let select = crate::shared_wallet::select_guard(wallet_dir.as_deref())
                 .await
                 .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
             let prepared = bounded(
                 "prepare melt",
                 MINT_TOUCH_TIMEOUT,
-                wallet.prepare_melt(&quote_id, HashMap::new()),
+                crate::shared_wallet::local_only(
+                    metadata,
+                    wallet.prepare_melt(&quote_id, HashMap::new()),
+                ),
             )
             .await?;
             drop(select);

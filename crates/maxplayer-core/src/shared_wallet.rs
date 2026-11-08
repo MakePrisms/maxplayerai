@@ -10,16 +10,21 @@
 //! that failed half-way with proofs RESERVED under an operation nothing will ever release.
 //!
 //! [`SelectLock`] closes that window: an exclusive OS advisory lock (`flock`) on
-//! `<home>/wallet/select.lock`, held ONLY across "pick unspent proofs + reserve them" (cdk's
-//! `prepare_send` / `prepare_melt` via [`select_guard`], trade's verify-and-reserve) and across a NUT-13 restore, which
-//! rewrites proof rows wholesale. Acquisition is bounded ([`SELECT_LOCK_TIMEOUT`]); a timeout is a
-//! retryable refusal that has reserved nothing. The kernel drops a `flock` when its descriptor
+//! `<home>/wallet/select.lock`, held ONLY across LOCAL database work: "pick unspent proofs + reserve
+//! them" (cdk's `prepare_send` / `prepare_melt` via [`prepare_send_locked`] / [`prepare_melt_locked`],
+//! trade's verify-and-reserve), trade's credit of new proofs, and the local apply of a recovered swap
+//! saga. No mint request runs while it is held: the mint metadata cdk's prepare re-reads (info,
+//! keysets) is fetched BEFORE the lock ([`warm_metadata`]) and replayed inside it ([`local_only`]),
+//! which refuses every other mint call. Acquisition is bounded ([`SELECT_LOCK_TIMEOUT`]); a timeout
+//! is a retryable refusal that has reserved nothing. The kernel drops a `flock` when its descriptor
 //! closes, including when the holder is killed (`kill -9`), so a crash never leaves the lock held.
 //!
 //! Ownership: every reservation names its owner in `used_by_operation` (a cdk saga id for the buyer,
-//! a journal operation id for trade). Recovery only ever releases rows it owns; see
-//! `payment_wallet::restore_keeping_other_reservations` for the one cdk call (`Wallet::restore`)
-//! that would otherwise clear rows it does not own.
+//! a journal operation id for trade). Recovery only ever writes rows it owns or inserts rows that do
+//! not exist yet. cdk's full-wallet NUT-13 `Wallet::restore` upserts every re-derived seed proof with
+//! NO owner, one batch per commit, so it would publish other owners' reservations as spendable; it is
+//! never called (a crate-wide test enforces that), and a spent swap saga recovers only its own outputs
+//! (`payment_wallet::complete_spent_swap_saga`).
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
@@ -28,8 +33,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cdk::nuts::CurrencyUnit;
-use cdk::wallet::Wallet;
+use async_trait::async_trait;
+use cdk::nuts::{
+    BatchCheckMintQuoteRequest, BatchMintRequest, CheckStateRequest, CheckStateResponse,
+    CurrencyUnit, Id, KeySet, KeysetResponse, MeltRequest, MintInfo, MintRequest, MintResponse,
+    PaymentMethod, RestoreRequest, RestoreResponse, SwapRequest, SwapResponse,
+};
+use cdk::wallet::{AuthWallet, LnurlPayInvoiceResponse, LnurlPayResponse, MintConnector, Wallet};
+use cdk::{
+    Error as CdkError, MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse,
+    MintQuoteRequest, MintQuoteResponse,
+};
 use cdk_sqlite::wallet::WalletSqliteDatabase;
 
 use crate::buyer_fund::{FundError, seed_from_secret_hex};
@@ -134,10 +148,11 @@ pub fn try_acquire(wallet_dir: &Path) -> Result<Option<SelectLock>, SelectLockEr
 
 /// The selection guard for a wallet: `Some(dir)` takes `dir`'s lock (bounded wait), `None` takes
 /// nothing (only for wallets no other process shares: in-memory test wallets). Hold the returned
-/// guard across cdk's `prepare_send` / `prepare_melt` (selection + reservation) and drop it as soon
-/// as they return: the chosen proofs are then RESERVED under their operation and no other selector
-/// can take them. Take it OUTSIDE any mint timeout, so a busy wallet reads as busy, not as a dead
-/// mint.
+/// guard across cdk's `prepare_send` / `prepare_melt` (selection + reservation) run under
+/// [`local_only`], and drop it as soon as they return: the chosen proofs are then RESERVED under
+/// their operation and no other selector can take them. Take it OUTSIDE any mint timeout, so a busy
+/// wallet reads as busy, not as a dead mint, and AFTER [`warm_metadata`], so no mint request runs
+/// while it is held.
 pub async fn select_guard(
     wallet_dir: Option<&Path>,
 ) -> Result<Option<SelectLock>, SelectLockError> {
@@ -176,10 +191,258 @@ pub async fn open_shared_wallet(
             None,
             connector,
         )
+        .map(scoped)
         .map_err(|error| FundError::Wallet(error.to_string()));
     }
     Wallet::new(mint_url, CurrencyUnit::Sat, Arc::new(store), seed, None)
+        .map(scoped)
         .map_err(|error| FundError::Wallet(error.to_string()))
+}
+
+/// The wallet seed of the home whose `wallet/` directory is `wallet_dir`: `seed_from_secret_hex` of
+/// `<home>/key` (every home keeps `wallet/` next to `key`). Read only to re-derive a recovering
+/// saga's own outputs; the caller checks the re-derived blinded messages against the ones cdk
+/// stored, so a wrong key can never credit anything.
+pub fn home_seed(wallet_dir: &Path) -> Result<[u8; 64], String> {
+    let root = wallet_dir
+        .parent()
+        .ok_or_else(|| format!("{} has no parent home", wallet_dir.display()))?;
+    let secret = home::read_key_file_hex(&root.join("key")).map_err(|error| error.to_string())?;
+    seed_from_secret_hex(&secret).map_err(|error| error.to_string())
+}
+
+// ---- Mint metadata outside the selection lock -------------------------------------------------
+//
+// cdk's `prepare_send` (online send kinds) calls `refresh_keysets`, which ALWAYS fetches mint info
+// and keysets from the mint, and `prepare_melt` may fetch them on a cold cache. Both run while the
+// selection lock is held. Every wallet this crate builds for a home gets a [`LockScopedConnector`]:
+// outside any scope it is the plain connector; inside [`warm_metadata`] it records the info and
+// keyset answers; inside [`local_only`] it replays them and refuses every other mint call, so the
+// locked section is local database work only (milliseconds), whatever the mint's latency.
+
+#[derive(Debug, Default)]
+struct Recorded {
+    info: Option<MintInfo>,
+    keysets: Option<KeysetResponse>,
+}
+
+/// Mint info and keysets fetched by [`warm_metadata`], replayed by [`local_only`].
+#[derive(Debug, Default)]
+pub struct MetadataSnapshot {
+    recorded: std::sync::Mutex<Recorded>,
+}
+
+#[derive(Debug)]
+enum ScopeMode {
+    Record,
+    Replay,
+}
+
+#[derive(Debug)]
+struct MetadataScope {
+    mode: ScopeMode,
+    snapshot: Arc<MetadataSnapshot>,
+}
+
+tokio::task_local! {
+    static METADATA_SCOPE: Arc<MetadataScope>;
+}
+
+/// The refusal a mint call gets inside [`local_only`].
+pub const LOCAL_ONLY_REFUSAL: &str =
+    "mint request refused: the wallet selection lock is held (local-only section)";
+
+fn scope() -> Option<Arc<MetadataScope>> {
+    METADATA_SCOPE.try_with(Arc::clone).ok()
+}
+
+fn refused() -> CdkError {
+    CdkError::Custom(LOCAL_ONLY_REFUSAL.to_owned())
+}
+
+/// Fetch (outside the selection lock) the mint info, keysets and any missing keyset keys that cdk's
+/// selection will re-read, and return them for [`local_only`]. Never fails: a mint that does not
+/// answer leaves the snapshot empty, and the locked section then runs on the stored keysets exactly
+/// as cdk does when its own refresh fails. Callers bound it with their mint timeout.
+pub async fn warm_metadata(wallet: &Wallet) -> Arc<MetadataSnapshot> {
+    let snapshot = Arc::new(MetadataSnapshot::default());
+    let scope = Arc::new(MetadataScope {
+        mode: ScopeMode::Record,
+        snapshot: snapshot.clone(),
+    });
+    let _ = METADATA_SCOPE.scope(scope, wallet.refresh_keysets()).await;
+    snapshot
+}
+
+/// Run `future` (cdk selection + reservation, under the selection lock) with NO mint I/O: mint info
+/// and keysets come from `snapshot`, every other mint call is refused with [`LOCAL_ONLY_REFUSAL`].
+/// Only effective on a wallet whose connector is a [`LockScopedConnector`] (every home wallet).
+pub async fn local_only<F: std::future::Future>(
+    snapshot: Arc<MetadataSnapshot>,
+    future: F,
+) -> F::Output {
+    let scope = Arc::new(MetadataScope {
+        mode: ScopeMode::Replay,
+        snapshot,
+    });
+    METADATA_SCOPE.scope(scope, future).await
+}
+
+/// The connector every home wallet uses (see [`warm_metadata`] / [`local_only`]).
+#[derive(Debug, Clone)]
+pub struct LockScopedConnector(pub Arc<dyn MintConnector + Send + Sync>);
+
+/// Wrap `client` so [`local_only`] can keep mint I/O out of the selection lock.
+pub fn lock_scoped(
+    client: Arc<dyn MintConnector + Send + Sync>,
+) -> Arc<dyn MintConnector + Send + Sync> {
+    Arc::new(LockScopedConnector(client))
+}
+
+macro_rules! network_only {
+    ($call:expr) => {{
+        match scope() {
+            Some(scope) if matches!(scope.mode, ScopeMode::Replay) => Err(refused()),
+            _ => $call.await,
+        }
+    }};
+}
+
+#[async_trait]
+impl MintConnector for LockScopedConnector {
+    async fn fetch_lnurl_pay_request(&self, url: &str) -> Result<LnurlPayResponse, CdkError> {
+        network_only!(self.0.fetch_lnurl_pay_request(url))
+    }
+    async fn fetch_lnurl_invoice(&self, url: &str) -> Result<LnurlPayInvoiceResponse, CdkError> {
+        network_only!(self.0.fetch_lnurl_invoice(url))
+    }
+    async fn get_mint_keys(&self) -> Result<Vec<KeySet>, CdkError> {
+        network_only!(self.0.get_mint_keys())
+    }
+    async fn get_mint_keyset(&self, keyset_id: Id) -> Result<KeySet, CdkError> {
+        network_only!(self.0.get_mint_keyset(keyset_id))
+    }
+    async fn get_mint_keysets(&self) -> Result<KeysetResponse, CdkError> {
+        match scope() {
+            Some(scope) if matches!(scope.mode, ScopeMode::Replay) => scope
+                .snapshot
+                .recorded
+                .lock()
+                .map_err(|_| refused())?
+                .keysets
+                .clone()
+                .ok_or_else(refused),
+            Some(scope) => {
+                let answer = self.0.get_mint_keysets().await;
+                if let (Ok(keysets), Ok(mut recorded)) = (&answer, scope.snapshot.recorded.lock()) {
+                    recorded.keysets = Some(keysets.clone());
+                }
+                answer
+            }
+            None => self.0.get_mint_keysets().await,
+        }
+    }
+    async fn post_mint_quote(
+        &self,
+        request: MintQuoteRequest,
+    ) -> Result<MintQuoteResponse<String>, CdkError> {
+        network_only!(self.0.post_mint_quote(request))
+    }
+    async fn post_mint(
+        &self,
+        method: &PaymentMethod,
+        request: MintRequest<String>,
+    ) -> Result<MintResponse, CdkError> {
+        network_only!(self.0.post_mint(method, request))
+    }
+    async fn post_batch_check_mint_quote_status(
+        &self,
+        method: &PaymentMethod,
+        request: BatchCheckMintQuoteRequest<String>,
+    ) -> Result<Vec<MintQuoteResponse<String>>, CdkError> {
+        network_only!(self.0.post_batch_check_mint_quote_status(method, request))
+    }
+    async fn post_batch_mint(
+        &self,
+        method: &PaymentMethod,
+        request: BatchMintRequest<String>,
+    ) -> Result<MintResponse, CdkError> {
+        network_only!(self.0.post_batch_mint(method, request))
+    }
+    async fn post_melt_quote(
+        &self,
+        request: MeltQuoteRequest,
+    ) -> Result<MeltQuoteCreateResponse<String>, CdkError> {
+        network_only!(self.0.post_melt_quote(request))
+    }
+    async fn get_mint_quote_status(
+        &self,
+        method: PaymentMethod,
+        quote_id: &str,
+    ) -> Result<MintQuoteResponse<String>, CdkError> {
+        network_only!(self.0.get_mint_quote_status(method, quote_id))
+    }
+    async fn get_melt_quote_status(
+        &self,
+        method: PaymentMethod,
+        quote_id: &str,
+    ) -> Result<MeltQuoteResponse<String>, CdkError> {
+        network_only!(self.0.get_melt_quote_status(method, quote_id))
+    }
+    async fn post_melt(
+        &self,
+        method: &PaymentMethod,
+        request: MeltRequest<String>,
+    ) -> Result<MeltQuoteResponse<String>, CdkError> {
+        network_only!(self.0.post_melt(method, request))
+    }
+    async fn post_swap(&self, request: SwapRequest) -> Result<SwapResponse, CdkError> {
+        network_only!(self.0.post_swap(request))
+    }
+    async fn get_mint_info(&self) -> Result<MintInfo, CdkError> {
+        match scope() {
+            Some(scope) if matches!(scope.mode, ScopeMode::Replay) => scope
+                .snapshot
+                .recorded
+                .lock()
+                .map_err(|_| refused())?
+                .info
+                .clone()
+                .ok_or_else(refused),
+            Some(scope) => {
+                let answer = self.0.get_mint_info().await;
+                if let (Ok(info), Ok(mut recorded)) = (&answer, scope.snapshot.recorded.lock()) {
+                    recorded.info = Some(info.clone());
+                }
+                answer
+            }
+            None => self.0.get_mint_info().await,
+        }
+    }
+    async fn post_check_state(
+        &self,
+        request: CheckStateRequest,
+    ) -> Result<CheckStateResponse, CdkError> {
+        network_only!(self.0.post_check_state(request))
+    }
+    async fn post_restore(&self, request: RestoreRequest) -> Result<RestoreResponse, CdkError> {
+        network_only!(self.0.post_restore(request))
+    }
+    async fn get_auth_wallet(&self) -> Option<AuthWallet> {
+        self.0.get_auth_wallet().await
+    }
+    async fn set_auth_wallet(&self, wallet: Option<AuthWallet>) {
+        self.0.set_auth_wallet(wallet).await
+    }
+}
+
+/// `wallet` with its connector wrapped in a [`LockScopedConnector`]. Every wallet opened on a home's
+/// shared database goes through this (`open_shared_wallet`, `buyer_fund::open_wallet_at_mint_async`,
+/// `wallet_ops::open_wallet_async`), so [`local_only`] can keep its selection free of mint I/O.
+pub fn scoped(mut wallet: Wallet) -> Wallet {
+    let client = wallet.mint_connector();
+    wallet.set_client(lock_scoped(client));
+    wallet
 }
 
 /// Why [`prepare_send_locked`] / [`prepare_melt_locked`] did not prepare.
@@ -204,100 +467,40 @@ impl std::error::Error for LockedSelectError {}
 
 /// cdk `prepare_send` (select UNSPENT proofs, reserve them under a new saga) under the selection
 /// lock of `wallet_dir`. Every buyer-side send that selects proofs goes through this (or takes
-/// [`select_guard`] itself), so it can never interleave with `maxplayer-trade`'s reservation.
+/// [`select_guard`] itself), so it can never interleave with `maxplayer-trade`'s reservation. The
+/// mint metadata is fetched first, outside the lock; inside it the prepare is [`local_only`].
 pub async fn prepare_send_locked<'a>(
     wallet: &'a Wallet,
     wallet_dir: Option<&Path>,
     amount: cdk::Amount,
     options: cdk::wallet::SendOptions,
 ) -> Result<cdk::wallet::PreparedSend<'a>, LockedSelectError> {
+    let snapshot = warm_metadata(wallet).await;
     let _guard = select_guard(wallet_dir)
         .await
         .map_err(LockedSelectError::Lock)?;
-    wallet
-        .prepare_send(amount, options)
+    local_only(snapshot, wallet.prepare_send(amount, options))
         .await
         .map_err(LockedSelectError::Wallet)
 }
 
-/// cdk `prepare_melt` (select and reserve the melt inputs) under the selection lock.
+/// cdk `prepare_melt` (select and reserve the melt inputs) under the selection lock, local-only
+/// like [`prepare_send_locked`].
 pub async fn prepare_melt_locked<'a>(
     wallet: &'a Wallet,
     wallet_dir: Option<&Path>,
     quote_id: &str,
 ) -> Result<cdk::wallet::PreparedMelt<'a>, LockedSelectError> {
+    let snapshot = warm_metadata(wallet).await;
     let _guard = select_guard(wallet_dir)
         .await
         .map_err(LockedSelectError::Lock)?;
-    wallet
-        .prepare_melt(quote_id, std::collections::HashMap::new())
-        .await
-        .map_err(LockedSelectError::Wallet)
-}
-
-/// cdk `Wallet::restore` (NUT-13: re-derive every seed proof and upsert each one the mint still
-/// reports UNSPENT/PENDING) without releasing reservations it does not own.
-///
-/// cdk 0.17.2 writes each restored proof with `ProofInfo::new` (state from the mint, NO owner) and
-/// its upsert overwrites `state` and `used_by_operation` (cdk-sql-common `wallet/mod.rs`, `INSERT …
-/// ON CONFLICT(y) DO UPDATE`). A seed proof `maxplayer-trade` (or an in-flight buyer saga) has
-/// RESERVED is still UNSPENT at the mint, so a plain restore silently hands it back to the
-/// spendable balance while its owner still counts on it. This snapshots every in-flight row of the
-/// wallet's mint under the selection lock, restores, and writes back any snapshot row the restore
-/// changed. Use it for every restore; never call `Wallet::restore` directly.
-pub async fn restore_keeping_other_reservations(
-    wallet: &Wallet,
-    wallet_dir: Option<&Path>,
-) -> Result<cdk::wallet::types::Restored, cdk::Error> {
-    use cashu::State;
-    let _guard = select_guard(wallet_dir)
-        .await
-        .map_err(|error| cdk::Error::Custom(error.to_string()))?;
-    let in_flight = wallet
-        .localstore
-        .get_proofs(
-            Some(wallet.mint_url.clone()),
-            Some(wallet.unit.clone()),
-            Some(vec![State::Reserved, State::PendingSpent, State::Pending]),
-            None,
-        )
-        .await?;
-    // Classified BEFORE the restore: a row owned by an operation that is not a cdk saga of this
-    // wallet (`maxplayer-trade`'s journal operation id) is restored to exactly the state and owner it
-    // had. Releasing it is its owner's decision, never a restore's; that owner reserves and releases
-    // under this same lock, so the row cannot legitimately change while we hold it. Rows owned by a
-    // cdk saga are left to cdk as before, and rows the restore deleted (the mint reports them SPENT)
-    // stay deleted: that is true, and their owner reconciles it.
-    let mut foreign = Vec::new();
-    for row in in_flight {
-        if let Some(op) = row.used_by_operation
-            && wallet.localstore.get_saga(&op).await?.is_none()
-        {
-            foreign.push(row);
-        }
-    }
-    let restored = wallet.restore().await?;
-    if foreign.is_empty() {
-        return Ok(restored);
-    }
-    let now = wallet
-        .localstore
-        .get_proofs_by_ys(foreign.iter().map(|row| row.y).collect())
-        .await?;
-    let changed = foreign
-        .into_iter()
-        .filter(|before| {
-            now.iter().any(|after| {
-                after.y == before.y
-                    && (after.state != before.state
-                        || after.used_by_operation != before.used_by_operation)
-            })
-        })
-        .collect::<Vec<_>>();
-    if !changed.is_empty() {
-        wallet.localstore.update_proofs(changed, vec![]).await?;
-    }
-    Ok(restored)
+    local_only(
+        snapshot,
+        wallet.prepare_melt(quote_id, std::collections::HashMap::new()),
+    )
+    .await
+    .map_err(LockedSelectError::Wallet)
 }
 
 #[cfg(test)]
@@ -347,23 +550,109 @@ mod tests {
         assert!(select_guard(None).await.unwrap().is_none());
     }
 
-    /// Every NUT-13 restore in core goes through [`restore_keeping_other_reservations`]: a direct
-    /// `Wallet::restore` would hand trade-reserved seed proofs back to the spendable balance.
+    /// M2: the selection lock never spans a mint request. Every production `select_guard(` call
+    /// fetches the mint metadata first (`warm_metadata(` within the 15 lines before it) and runs
+    /// cdk's selection `local_only(` within the 15 lines after it, or is a marked local apply.
     #[test]
-    fn no_direct_wallet_restore_outside_this_module() {
+    fn every_select_guard_warms_metadata_first_and_selects_local_only() {
+        let call = format!("{}(", "select_guard");
+        let mut seen = 0;
         for (name, source) in [
+            ("shared_wallet.rs", include_str!("shared_wallet.rs")),
             ("payment_wallet.rs", include_str!("payment_wallet.rs")),
-            ("wallet_ops.rs", include_str!("wallet_ops.rs")),
             ("crossmint_hop.rs", include_str!("crossmint_hop.rs")),
+            ("wallet_ops.rs", include_str!("wallet_ops.rs")),
             ("buyer_fund.rs", include_str!("buyer_fund.rs")),
+            ("authorize_pay.rs", include_str!("authorize_pay.rs")),
         ] {
-            for call in [".restore()", ".restore_with_opts("] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let lines: Vec<&str> = production.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let code = line.trim_start();
+                if !code.contains(&call) || code.starts_with("//") || code.contains("fn ") {
+                    continue;
+                }
+                seen += 1;
+                let before = lines[i.saturating_sub(15)..i].join("\n");
+                let after = lines[i..(i + 15).min(lines.len())].join("\n");
+                if before.contains(&format!("LOCAL {} ONLY", "APPLY")) {
+                    continue;
+                }
                 assert!(
-                    !source.contains(call),
-                    "{name} calls Wallet{call} directly; use restore_keeping_other_reservations"
+                    before.contains(&format!("{}(", "warm_metadata")),
+                    "{name}:{}: select_guard without warm_metadata before it",
+                    i + 1
+                );
+                assert!(
+                    after.contains(&format!("{}(", "local_only")),
+                    "{name}:{}: select_guard without local_only selection after it",
+                    i + 1
                 );
             }
         }
+        assert_eq!(
+            seen, 5,
+            "select_guard call sites (prepare_send/melt_locked, pay, hop, swap apply)"
+        );
+    }
+
+    /// Rust sources under `dir`, recursively (relative path, contents).
+    fn rust_sources(dir: &Path, root: &Path, out: &mut Vec<(String, String)>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_sources(&path, root, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let name = path.strip_prefix(root).unwrap().display().to_string();
+                out.push((name, std::fs::read_to_string(&path).unwrap()));
+            }
+        }
+    }
+
+    /// No full-wallet NUT-13 restore anywhere in `maxplayer-core` or `maxplayer` (src, tests,
+    /// examples, benches): cdk 0.17.2's `Wallet::restore` / `restore_with_opts` upserts every
+    /// re-derived seed proof with NO owner, one committed batch at a time, so on the shared home
+    /// wallet it would publish trade's (and in-flight cdk sagas') reservations as spendable, and a
+    /// failure, dropped future or kill between batches leaves them that way. A spent swap saga
+    /// recovers only its own outputs (`payment_wallet::complete_spent_swap_saga`).
+    ///
+    /// `ALLOWED` is the explicit allowlist (`(path, reason)`): empty. The patterns are built at run
+    /// time so this test's own source never matches them.
+    #[test]
+    fn no_full_wallet_restore_anywhere_in_core_or_the_cli() {
+        const ALLOWED: &[(&str, &str)] = &[];
+        let calls = [
+            format!(".{}()", "restore"),
+            format!(".{}(", "restore_with_opts"),
+            format!("Wallet::{}(", "restore"),
+            format!("::{}(", "restore_with_opts"),
+        ];
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0;
+        for krate in [manifest.to_path_buf(), manifest.join("../maxplayer")] {
+            let mut sources = Vec::new();
+            for sub in ["src", "tests", "examples", "benches"] {
+                if krate.join(sub).is_dir() {
+                    rust_sources(&krate.join(sub), &krate, &mut sources);
+                }
+            }
+            assert!(!sources.is_empty(), "no sources under {}", krate.display());
+            for (name, source) in sources {
+                checked += 1;
+                let shown = format!("{}/{name}", krate.file_name().unwrap().to_string_lossy());
+                if ALLOWED.iter().any(|(path, _)| *path == shown) {
+                    continue;
+                }
+                for call in &calls {
+                    assert!(
+                        !source.contains(call.as_str()),
+                        "{shown} calls {call}: a full-wallet NUT-13 restore clears other owners' \
+                         reservations on the shared wallet; recover one saga's outputs instead"
+                    );
+                }
+            }
+        }
+        assert!(checked > 100, "walked only {checked} files");
     }
 
     /// A seller is paid into this same wallet and `maxplayer-trade` reserves in it, so every seller
@@ -401,8 +690,6 @@ mod tests {
                 ".release_proofs(",
                 ".recover_incomplete_sagas(",
                 ".check_all_pending_proofs(",
-                ".restore()",
-                ".restore_with_opts(",
                 "get_unspent_proofs(",
             ] {
                 assert!(
