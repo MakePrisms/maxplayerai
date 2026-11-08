@@ -501,7 +501,9 @@ fn tools_for(sessions: bool) -> Value {
             }
             Some("get_job") => {
                 let description = tool["description"].as_str().unwrap_or_default().to_owned();
-                tool["description"] = json!(format!("{description} On a session job the response carries session: {{supported, turn, status (running|parked|closed|expired|no_response), turn_status (done|needs_input|out_of_time from the current turn's result; pending|refused|no_response when that turn has no result), question (the seller's question when needs_input), context_reset, uncollected_turn, expires_hint}}. uncollected_turn 1 is normally settled by the daemon within seconds (settlement.mode auto); a turn 2 or later is settled only by collect turn=<n> (settlement.state collect_required). expires_hint is when a parked session ends by itself; closing it earlier is optional. no_response means the turn's deadline passed with no result: its reservation was released and reply may retry."));
+                tool["description"] = json!(format!(
+                    "{description} On a session job the response carries session: {{supported, turn, status (running|parked|closed|expired|no_response), turn_status (done|needs_input|out_of_time from the current turn's result; pending|refused|no_response when that turn has no result), question (the seller's question when needs_input), context_reset, uncollected_turn, expires_hint}}. uncollected_turn 1 is normally settled by the daemon within seconds (settlement.mode auto); a turn 2 or later is settled only by collect turn=<n> (settlement.state collect_required). expires_hint is when a parked session ends by itself; closing it earlier is optional. no_response means the turn's deadline passed with no result: its reservation was released and reply may retry."
+                ));
             }
             _ => {}
         }
@@ -1081,23 +1083,40 @@ mod tests {
         assert!(!post.contains("post_job then collect"), "{post}");
         assert!(post.contains("auto-settles it on its own"), "{post}");
         assert!(post.contains("collect is optional"), "{post}");
-        assert!(post.contains("Do not ask the human whether to collect"), "{post}");
+        assert!(
+            post.contains("Do not ask the human whether to collect"),
+            "{post}"
+        );
 
         let collect = listed_description("collect");
         let shown: String = collect.chars().take(400).collect();
-        assert!(shown.contains("usually NOT needed"), "said early, before truncation: {shown}");
+        assert!(
+            shown.contains("usually NOT needed"),
+            "said early, before truncation: {shown}"
+        );
         assert!(collect.contains("never pays twice"), "{collect}");
-        assert!(collect.contains("Never ask the human whether to collect"), "{collect}");
+        assert!(
+            collect.contains("Never ask the human whether to collect"),
+            "{collect}"
+        );
 
         let get = listed_description("get_job");
         for state in ["settling", "settled", "failed", "collect_required"] {
-            assert!(get.contains(state), "get_job documents settlement.state {state}: {get}");
+            assert!(
+                get.contains(state),
+                "get_job documents settlement.state {state}: {get}"
+            );
         }
         assert!(listed_description("award_claim").contains("settles the job on its own"));
 
         let on = tools_for(true);
         let find = |name: &str| {
-            on.as_array().unwrap().iter().find(|t| t["name"] == name).unwrap().clone()
+            on.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()
+                .clone()
         };
         let close = find("collect")["inputSchema"]["properties"]["close_session"]["description"]
             .as_str()
@@ -1105,7 +1124,10 @@ mod tests {
             .to_owned();
         assert!(close.contains("expires on its own"), "{close}");
         let reply = find("reply")["description"].as_str().unwrap().to_owned();
-        assert!(reply.contains("does not settle turns 2 and later"), "{reply}");
+        assert!(
+            reply.contains("does not settle turns 2 and later"),
+            "{reply}"
+        );
     }
 
     // The handshake keeps the orientation pointer and names both specific skills.

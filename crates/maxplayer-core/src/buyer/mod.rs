@@ -875,9 +875,10 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             // Read before `protect_job_view` may withhold result fields: delivery is a ledger fact
             // here, never content. An accept-bind already present also counts as delivered.
             let delivered = awarded_delivery_pending || view.accepted.is_some();
-            let settlement_hint = settlement::facts(context, &view.job_id, awarded.is_some(), delivered)
-                .map(|facts| settlement::hint(&facts))
-                .unwrap_or(Value::Null);
+            let settlement_hint =
+                settlement::facts(context, &view.job_id, awarded.is_some(), delivered)
+                    .map(|facts| settlement::hint(&facts))
+                    .unwrap_or(Value::Null);
             let review_status = crate::review::protect_job_view(&context.home, &mut view, awarded.as_ref().map(|a| a.seller_pubkey.as_str())).await;
             // Read-only planner hints. Parsing stays with the existing Cashu parser;
             // these self-reported prices never authorize an award or payment.
@@ -3061,12 +3062,21 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
                 let replacement = wake.is_some_and(|event| {
                     event.kind == nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND)
                         && event.id.to_hex() != status.subject.event
-                        && context.store.award_record(&job_id).ok().flatten()
+                        && context
+                            .store
+                            .award_record(&job_id)
+                            .ok()
+                            .flatten()
                             .is_some_and(|award| award.seller_pubkey == event.pubkey.to_hex())
                 });
-                if !replacement { continue; }
+                if !replacement {
+                    continue;
+                }
             }
-            Err(error) => { crate::opline!("buyer: {job_id}: {error}"); continue; }
+            Err(error) => {
+                crate::opline!("buyer: {job_id}: {error}");
+                continue;
+            }
             Ok(None) => {}
         }
         let settled = settle_job(context, &job_id, None).await;
@@ -6506,21 +6516,43 @@ mod tests {
 
         context
             .store
-            .record_award(&job, &"c".repeat(64), &"e".repeat(64), &"5".repeat(64), 100, 7)
+            .record_award(
+                &job,
+                &"c".repeat(64),
+                &"e".repeat(64),
+                &"5".repeat(64),
+                100,
+                7,
+            )
             .expect("record award");
-        assert_eq!(pair(&read(2).await), (json!("manual"), json!("awaiting_delivery")));
+        assert_eq!(
+            pair(&read(2).await),
+            (json!("manual"), json!("awaiting_delivery"))
+        );
 
         context.store.reserve(&job, 100, 1_000, 7).expect("reserve");
         let waiting = read(3).await;
         assert_eq!(pair(&waiting), (json!("auto"), json!("awaiting_delivery")));
-        assert!(waiting["note"].as_str().unwrap().contains("collect is not needed"), "{waiting}");
+        assert!(
+            waiting["note"]
+                .as_str()
+                .unwrap()
+                .contains("collect is not needed"),
+            "{waiting}"
+        );
 
         let results = context.home.root.join("results").join(&job);
         std::fs::create_dir_all(&results).expect("results dir");
-        context.store.convert_to_spent(&job, 100, 8).expect("settle");
+        context
+            .store
+            .convert_to_spent(&job, 100, 8)
+            .expect("settle");
         let settled = read(4).await;
         assert_eq!(pair(&settled), (json!("auto"), json!("settled")));
-        assert_eq!(settled["results_path"], json!(results.display().to_string()));
+        assert_eq!(
+            settled["results_path"],
+            json!(results.display().to_string())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
@@ -7463,14 +7495,32 @@ mod tests {
         // The refusal is recorded for `get_job.settlement`, and the REAL get_job handler reports
         // it as `failed` with the refusal text — not an endless "settling". Red-on-revert: drop
         // the watcher's `note_refusal` and both assertions fail.
-        let recorded = context.settle_failures.lock().unwrap().get(&job_id).cloned();
-        assert!(recorded.is_some(), "a refused watcher settle must be recorded for get_job");
+        let recorded = context
+            .settle_failures
+            .lock()
+            .unwrap()
+            .get(&job_id)
+            .cloned();
+        assert!(
+            recorded.is_some(),
+            "a refused watcher settle must be recorded for get_job"
+        );
         let read = get_job(&context, json!(1), json!({ "job_id": job_id.clone() }))
             .await
             .result
             .expect("get_job returns a view");
-        assert_eq!(read["settlement"]["mode"], json!("auto"), "{}", read["settlement"]);
-        assert_eq!(read["settlement"]["state"], json!("failed"), "{}", read["settlement"]);
+        assert_eq!(
+            read["settlement"]["mode"],
+            json!("auto"),
+            "{}",
+            read["settlement"]
+        );
+        assert_eq!(
+            read["settlement"]["state"],
+            json!("failed"),
+            "{}",
+            read["settlement"]
+        );
         assert_eq!(read["settlement"]["error"], json!(recorded.unwrap()));
 
         let _ = std::fs::remove_dir_all(&root);
