@@ -535,10 +535,20 @@ fn reply_preflight_refusals() {
         ),
         (
             ReplyPreflight {
-                uncollected_turn: Some(2),
+                uncollected_turn: Some((2, UncollectedTurn::Settling)),
                 ..ok.clone()
             },
-            ReplyRefusal::CollectFirst { turn: 2 },
+            ReplyRefusal::TurnSettling { turn: 2 },
+        ),
+        (
+            ReplyPreflight {
+                uncollected_turn: Some((2, UncollectedTurn::CollectRequired("held".into()))),
+                ..ok.clone()
+            },
+            ReplyRefusal::CollectFirst {
+                turn: 2,
+                reason: "held".into(),
+            },
         ),
         (
             ReplyPreflight {
@@ -572,10 +582,22 @@ fn reply_preflight_refusals() {
     for (p, want) in cases {
         assert_eq!(reply_preflight(&p), Err(want));
     }
-    assert!(
-        ReplyRefusal::CollectFirst { turn: 2 }
-            .to_string()
-            .starts_with("collect first")
+    // A turn the daemon is settling is never sent to `collect`; one it cannot settle is, with why.
+    let settling = ReplyRefusal::TurnSettling { turn: 2 }.to_string();
+    assert_eq!(
+        settling,
+        "turn 2 is still settling (the daemon settles it automatically); check get_job \
+         settlement and retry reply shortly"
+    );
+    assert!(!settling.contains("collect"), "{settling}");
+    assert_eq!(
+        ReplyRefusal::CollectFirst {
+            turn: 2,
+            reason: "review timed out".into()
+        }
+        .to_string(),
+        "turn 2 could not settle automatically (review timed out); run collect for turn 2, then \
+         retry reply"
     );
     // Free sessions: price 0 never trips a cap.
     assert_eq!(

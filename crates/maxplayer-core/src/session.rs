@@ -784,8 +784,16 @@ pub fn payment_gate(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyRefusal {
     NoSessionSupport,
+    /// The previous turn is delivered and the buyer daemon's delivery watcher settles it on its own
+    /// (`get_job.settlement` reads `auto`/`settling` for it): wait, do not collect.
+    TurnSettling {
+        turn: u32,
+    },
+    /// The previous turn is delivered but will not settle on its own (review hold, a recorded settle
+    /// refusal, no funds held): an explicit `collect` is needed. `reason` says which.
     CollectFirst {
         turn: u32,
+        reason: String,
     },
     SessionEnded,
     TurnInFlight,
@@ -803,9 +811,15 @@ impl std::fmt::Display for ReplyRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoSessionSupport => write!(f, "seller does not support sessions; post a new job"),
-            Self::CollectFirst { turn } => write!(
+            Self::TurnSettling { turn } => write!(
                 f,
-                "collect first: turn {turn} is delivered but not collected"
+                "turn {turn} is still settling (the daemon settles it automatically); check \
+                 get_job settlement and retry reply shortly"
+            ),
+            Self::CollectFirst { turn, reason } => write!(
+                f,
+                "turn {turn} could not settle automatically ({reason}); run collect for turn \
+                 {turn}, then retry reply"
             ),
             Self::SessionEnded => write!(f, "session is closed or expired; post a new job"),
             Self::TurnInFlight => write!(f, "a turn is already in flight; wait for its result"),
@@ -825,13 +839,22 @@ impl std::fmt::Display for ReplyRefusal {
     }
 }
 
+/// How a delivered, uncollected turn will settle, as `get_job.settlement` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UncollectedTurn {
+    /// The delivery watcher settles it on its own.
+    Settling,
+    /// It does not settle on its own; the reason (review hold, settle refusal, no funds held).
+    CollectRequired(String),
+}
+
 /// Buyer-side session view the preflight reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyPreflight {
     pub claim_supports_sessions: bool,
     pub session_live: bool,
-    /// Newest delivered turn not yet collected, if any.
-    pub uncollected_turn: Option<u32>,
+    /// Newest delivered turn not yet collected, if any, and how it will settle.
+    pub uncollected_turn: Option<(u32, UncollectedTurn)>,
     pub turn_in_flight: bool,
     /// Turn price (= job price). 0 on a free job.
     pub price_sats: u64,
@@ -847,8 +870,15 @@ pub fn reply_preflight(p: &ReplyPreflight) -> Result<(), ReplyRefusal> {
     if !p.session_live {
         return Err(ReplyRefusal::SessionEnded);
     }
-    if let Some(turn) = p.uncollected_turn {
-        return Err(ReplyRefusal::CollectFirst { turn });
+    if let Some((turn, settle)) = &p.uncollected_turn {
+        let turn = *turn;
+        return Err(match settle {
+            UncollectedTurn::Settling => ReplyRefusal::TurnSettling { turn },
+            UncollectedTurn::CollectRequired(reason) => ReplyRefusal::CollectFirst {
+                turn,
+                reason: reason.clone(),
+            },
+        });
     }
     if p.turn_in_flight {
         return Err(ReplyRefusal::TurnInFlight);

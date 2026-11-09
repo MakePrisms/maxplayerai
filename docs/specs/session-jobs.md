@@ -58,7 +58,8 @@ Final stakeholder summary: 21 Oct 2026 12:38 UTC.
     Josip, 22 Oct 12:43 UTC); parked disk budget = 20 GiB per seat (revisited after the
     test-env size measurement); no automatic close of abandoned private session repos in v1
     (seller-only, create-only, 5 GiB quota); `reply` with an uncollected previous turn is refused with
-    "collect first".
+    "collect first" (since the delivery watcher settles turns ≥ 2: "turn n is still settling" while it
+    does, "turn n could not settle automatically (<reason>); run collect for turn n" when it cannot).
 
 ---
 
@@ -525,7 +526,10 @@ empty conversation) starts a new conversation, and an unmarked, file-less answer
 
 `reply(job_id, text)` refuses locally, before anything is signed, when:
 - the claim had no `session` tag ("seller does not support sessions; post a new job");
-- the previous turn is delivered but not collected ("collect turn n first");
+- the previous turn is delivered but not collected: "turn n is still settling (the daemon settles it
+  automatically); check get_job settlement and retry reply shortly" while `get_job.settlement` reads
+  `auto`/`settling` for it, else "turn n could not settle automatically (<reason>); run collect for
+  turn n, then retry reply" (review hold, recorded settle refusal, no funds held — the same facts);
 - the session is closed/expired, or a turn is already in flight;
 - the per-job cap refuses the price (`BudgetGate::check`, `core/budget.rs:191 @e0262420` — still the
   sole spend gate, `:51`);
