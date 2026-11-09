@@ -728,9 +728,15 @@ mod tests {
         assert!(first.is_some() && second.is_some(), "operations share it");
         assert!(operation_in_flight(Some(&wallet)).unwrap());
         drop(first);
-        assert!(operation_in_flight(Some(&wallet)).unwrap(), "one still runs");
+        assert!(
+            operation_in_flight(Some(&wallet)).unwrap(),
+            "one still runs"
+        );
         drop(second);
-        assert!(!operation_in_flight(Some(&wallet)).unwrap(), "released on drop");
+        assert!(
+            !operation_in_flight(Some(&wallet)).unwrap(),
+            "released on drop"
+        );
         // A killed holder (another process) never looks alive: the kernel releases the flock. The
         // holder is `flock` plus the `sleep` it forks (which inherits the descriptor), in their own
         // process group, killed together.

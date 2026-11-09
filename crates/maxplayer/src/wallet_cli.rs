@@ -291,7 +291,10 @@ fn write_held_sagas(
         .into_iter()
         .filter(|held| {
             mint_filter.is_none_or(|filter| {
-                wallet_ops::normalize_mint_url(&held.mint_url).ok().as_deref() == Some(filter)
+                wallet_ops::normalize_mint_url(&held.mint_url)
+                    .ok()
+                    .as_deref()
+                    == Some(filter)
             })
         })
         .collect();
@@ -1912,18 +1915,33 @@ mod tests {
         };
         let (code, out, err) = balance(&[]);
         assert_eq!(code, SUCCESS, "{err}");
-        assert!(out.contains("swap_held=1 saga_ids=019a0000-swap\n"), "{out}");
-        assert!(out.contains("send_held=1 saga_ids=019a0000-send\n"), "{out}");
-        assert!(err.contains("swap saga 019a0000-swap kept: its outputs"), "{err}");
+        assert!(
+            out.contains("swap_held=1 saga_ids=019a0000-swap\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("send_held=1 saga_ids=019a0000-send\n"),
+            "{out}"
+        );
+        assert!(
+            err.contains("swap saga 019a0000-swap kept: its outputs"),
+            "{err}"
+        );
         assert!(err.contains("send saga 019a0000-send kept"), "{err}");
         let (_, out, _) = balance(&["--mint", "https://held-mint.example"]);
         assert!(out.contains("swap_held=1"), "{out}");
         let (_, out, _) = balance(&["--mint", DEFAULT_MINT_URL]);
-        assert!(!out.contains("_held="), "other mints' holds are filtered: {out}");
+        assert!(
+            !out.contains("_held="),
+            "other mints' holds are filtered: {out}"
+        );
         write(Vec::new());
         let (code, out, err) = balance(&[]);
         assert_eq!(code, SUCCESS);
-        assert!(!out.contains("_held=") && !err.contains("kept"), "{out}{err}");
+        assert!(
+            !out.contains("_held=") && !err.contains("kept"),
+            "{out}{err}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -840,8 +840,9 @@ impl<'a> CdkBuyerMint<'a> {
                 .find(|held| held.saga_id == saga.id.to_string())
                 && matches!(
                     saga.state,
-                    WalletSagaState::Send(SendSagaState::ProofsReserved | SendSagaState::RollingBack)
-                        | WalletSagaState::Melt(_)
+                    WalletSagaState::Send(
+                        SendSagaState::ProofsReserved | SendSagaState::RollingBack
+                    ) | WalletSagaState::Melt(_)
                 )
             {
                 if !held.transient {
@@ -1621,7 +1622,10 @@ fn classify_parent_inputs(
                 .into(),
         ));
     }
-    if states.iter().all(|proof_state| proof_state.state == State::Unspent) {
+    if states
+        .iter()
+        .all(|proof_state| proof_state.state == State::Unspent)
+    {
         Ok(ParentInputs::AllUnspent)
     } else {
         Ok(ParentInputs::SomeSpent)
@@ -3840,7 +3844,14 @@ mod tests {
         let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
         assert_eq!(report.retired_spent, 1, "{report:?}");
         assert_eq!(report.retired, 0, "{report:?}");
-        assert!(wallet.localstore.get_saga(&saga_id).await.unwrap().is_none());
+        assert!(
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
         let unspent = wallet
             .localstore
             .get_proofs(None, None, Some(vec![State::Unspent]), None)
@@ -3856,7 +3867,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spent.len(), 1, "check_proofs_spent must not delete it");
-        assert_eq!((spent[0].state, spent[0].used_by_operation), (State::Spent, None));
+        assert_eq!(
+            (spent[0].state, spent[0].used_by_operation),
+            (State::Spent, None)
+        );
     }
 
     #[tokio::test]
@@ -4444,7 +4458,9 @@ mod tests {
         // PR #1034 re-review: the hop sweep's cdk recovery compensated Send(ProofsReserved) and
         // deleted the empty SwapRequested row inside the window. The guard must not run it.
         let wallet = nostr_reserved_send_wallet(cashu::util::unix_time(), true).await;
-        let outcome = recover_incomplete_sagas_guarded(&wallet, None).await.unwrap();
+        let outcome = recover_incomplete_sagas_guarded(&wallet, None)
+            .await
+            .unwrap();
         let GuardedRecovery::Held(reason) = outcome else {
             panic!("cdk recovery ran inside the settle window");
         };
@@ -4484,7 +4500,9 @@ mod tests {
         );
         melt.updated_at = settled;
         wallet.localstore.add_saga(melt).await.unwrap();
-        let outcome = recover_incomplete_sagas_guarded(&wallet, None).await.unwrap();
+        let outcome = recover_incomplete_sagas_guarded(&wallet, None)
+            .await
+            .unwrap();
         let GuardedRecovery::Held(reason) = outcome else {
             panic!("cdk recovery ran with a nostr:// melt saga present");
         };
@@ -8228,7 +8246,11 @@ mod tests {
             assert_eq!(row(&wallet, *y).await, None, "nothing credited");
         }
         let held = load_held_sagas(&*wallet.localstore).await.unwrap();
-        assert_eq!(held.len(), 1, "recorded for `wallet balance` / `doctor`: {held:?}");
+        assert_eq!(
+            held.len(),
+            1,
+            "recorded for `wallet balance` / `doctor`: {held:?}"
+        );
         assert_eq!(held[0].saga_id, child.to_string());
     }
 
@@ -8285,7 +8307,12 @@ mod tests {
                 .iter()
                 .all(|k| *k == test_keyset().id)
         );
-        assert!(load_held_sagas(&*wallet.localstore).await.unwrap().is_empty());
+        assert!(
+            load_held_sagas(&*wallet.localstore)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         pay_recovery(&wallet, &wallet_dir)
             .await
             .expect("payments continue");
@@ -8351,7 +8378,11 @@ mod tests {
             .expect("a send in flight in another process must not wedge payments");
         let report = retire_in(&wallet, &wallet_dir).await;
         assert!(
-            report.swap_held.iter().chain(&report.send_held).all(|h| h.transient),
+            report
+                .swap_held
+                .iter()
+                .chain(&report.send_held)
+                .all(|h| h.transient),
             "{report:?}"
         );
         assert!(
@@ -8363,10 +8394,20 @@ mod tests {
             parent_before,
             "SAFETY: the in-flight send is untouched"
         );
-        assert_eq!(row(&wallet, input_y).await, Some((State::Reserved, Some(parent))));
-        assert_eq!(mint_fake.restores.load(Ordering::SeqCst), 0, "not even asked");
+        assert_eq!(
+            row(&wallet, input_y).await,
+            Some((State::Reserved, Some(parent)))
+        );
+        assert_eq!(
+            mint_fake.restores.load(Ordering::SeqCst),
+            0,
+            "not even asked"
+        );
         assert!(
-            load_held_sagas(&*wallet.localstore).await.unwrap().is_empty(),
+            load_held_sagas(&*wallet.localstore)
+                .await
+                .unwrap()
+                .is_empty(),
             "an in-flight hold is not recorded as needing attention"
         );
 
@@ -8392,7 +8433,11 @@ mod tests {
                 .unwrap()
             })
             .collect();
-        wallet.localstore.update_proofs(written, vec![]).await.unwrap();
+        wallet
+            .localstore
+            .update_proofs(written, vec![])
+            .await
+            .unwrap();
         wallet
             .localstore
             .update_proofs_state(vec![input_y], State::Spent)
