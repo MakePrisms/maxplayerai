@@ -74,6 +74,7 @@ fn result_of(job: &str, turn: u32) -> String {
 }
 
 /// Turn 1's accept-bind, as `collect` leaves it: an inline delivery of `answer`.
+#[allow(clippy::too_many_arguments)]
 fn write_turn_one_bind(
     home: &MaxplayerHome,
     job_id: &str,
