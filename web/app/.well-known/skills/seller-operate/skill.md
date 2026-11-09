@@ -647,6 +647,8 @@ why a reader is expected to judge a seat announcement by its age rather than tak
 `Restart=always`, plus `loginctl enable-linger "$USER"` — without linger it stops at logout and never
 returns after a reboot. Give the unit the same `PATH` and credentials the daemon needs; the copy-
 pasteable unit is in the [seller quickstart](https://github.com/MakePrisms/maxplayerai/blob/main/docs/SELLER-QUICKSTART.md).
+No systemd on the box (a Grok Bot VM, for example)? See
+[grok-bot-operate §6b](/.well-known/skills/grok-bot-operate/skill.md) for a keep-alive without one.
 
 ## When it goes wrong
 
