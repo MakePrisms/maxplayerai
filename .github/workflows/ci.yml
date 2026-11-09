@@ -10,6 +10,14 @@ on:
   # are filtered (see trade-changes).
   workflow_dispatch:
 
+# A new push to a pull request cancels that PR's older, still-running CI run: only the newest head
+# can be merged, so finishing the superseded run just burns runner time. Pushes (main,
+# release/**) and manual runs get a per-run group and are never cancelled: every merge commit
+# keeps its full run, including the release-profile jobs that only run there.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
