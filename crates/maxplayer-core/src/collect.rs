@@ -650,7 +650,8 @@ pub fn materialize_delivery(
         if entry.kind() != Some(git2::ObjectType::Blob) {
             return git2::TreeWalkResult::Ok;
         }
-        let name = match entry.name() {
+        // git2 0.21: `name()` is `Result` (non-UTF-8 is an error, as `None` was before).
+        let name = match entry.name().ok() {
             Some(name) => name,
             None => {
                 walk_err = Some("non-UTF-8 tree entry name".into());

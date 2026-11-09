@@ -46,7 +46,7 @@ config = { version = "0.15.25", default-features = false, features = ["json"] }
 # The guard is `crates/maxplayer-core/tests/no_system_git.rs`: it puts a tripwire
 # `git` on PATH and fails if a production leg calls it. Its required-features are
 # `["git-delivery"]`, so it runs in the money-path CI job and nowhere else (#826).
-git2 = { version = "0.19", default-features = false }
+git2 = { version = "0.21", default-features = false }
 # Blocking HTTP for the git smart subtransport; rustls-tls bundles Mozilla CA roots
 # (webpki-roots) so the seller needs no ambient SSL_CERT_FILE at runtime.
 # `http2` is what lets the credential proxy's upstream leg offer h2 in ALPN. Cursor's

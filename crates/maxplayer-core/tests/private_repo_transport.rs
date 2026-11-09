@@ -308,7 +308,7 @@ fn forward_conditions_fall_back_to_libgit2() {
             "non-empty" => { bare_with_commit(dest.path(),"refs/heads/main"); }
             other => {
                 let caps=if other=="no-report-status" {"ofs-delta"} else {"report-status"};
-                let line=format!("{} capabilities^{{}}\0{caps}\n",git2::Oid::zero());
+                let line=format!("{} capabilities^{{}}\0{caps}\n",git2::Oid::ZERO_SHA1);
                 let prelude="# service=git-receive-pack\n";
                 options.receive_advertisement=Some(format!("{:04x}{prelude}0000{:04x}{line}0000",prelude.len()+4,line.len()+4).into_bytes());
             }

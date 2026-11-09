@@ -2163,8 +2163,8 @@ mod snapshot_tests {
             base,
             "parented on the pinned base"
         );
-        assert_eq!(c.author().email(), Some(id.email.as_str()));
-        assert_eq!(c.committer().email(), Some(id.email.as_str()));
+        assert_eq!(c.author().email().ok(), Some(id.email.as_str()));
+        assert_eq!(c.committer().email().ok(), Some(id.email.as_str()));
         assert!(tree_paths(&dir, &oid).contains(&"src/feature.rs".to_owned()));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -2254,7 +2254,7 @@ mod snapshot_tests {
             "parented on base, not the scratch tip"
         );
         assert_eq!(
-            c.author().email(),
+            c.author().email().ok(),
             Some(id.email.as_str()),
             "delivery identity, not the agent's"
         );
@@ -2286,7 +2286,7 @@ mod snapshot_tests {
             0,
             "from-scratch delivery is a root commit"
         );
-        assert_eq!(c.author().email(), Some(id.email.as_str()));
+        assert_eq!(c.author().email().ok(), Some(id.email.as_str()));
         assert!(tree_paths(&dir, &oid).contains(&"out.rs".to_owned()));
         let _ = fs::remove_dir_all(&dir);
     }

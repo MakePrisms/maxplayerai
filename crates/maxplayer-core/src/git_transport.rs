@@ -477,7 +477,7 @@ fn bound_remote<'repo>(
     let remote = repo
         .remote_anonymous(remote_url)
         .map_err(|error| TransportError::Io(format!("anonymous remote: {error}")))?;
-    if remote.url() != Some(remote_url) {
+    if remote.url().ok() != Some(remote_url) {
         return Err(TransportError::Transport(format!(
             "repository config rewrote the remote url {remote_url:?} to {:?}; refusing the operation",
             String::from_utf8_lossy(remote.url_bytes())
@@ -1538,6 +1538,28 @@ impl Write for HttpStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // RUSTSEC-2026-0183: `git2::Remote::list()` passed a NULL pointer to `slice::from_raw_parts` when
+    // the remote advertises no refs — undefined behaviour in release builds, and on git2 0.19 a
+    // debug build aborts the whole process ("unsafe precondition(s) violated", non-unwinding). Both
+    // `list_remote` and `list_remote_in` call it, and an empty advertisement is normal (a seed probe
+    // or a job repository with nothing pushed yet). Pins the patched git2 (>= 0.21): listing an
+    // empty repository must return zero heads. On git2 0.19 this test aborts the test binary.
+    #[test]
+    fn remote_list_on_an_empty_advertisement_is_sound() {
+        let root = std::env::temp_dir().join(format!("mp-empty-ls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let empty = root.join("empty.git");
+        git2::Repository::init_bare(&empty).expect("init empty");
+        let scratch = git2::Repository::init_bare(root.join("scratch.git")).expect("init scratch");
+        let mut remote = scratch
+            .remote_anonymous(empty.to_str().expect("utf-8 path"))
+            .expect("anonymous remote");
+        remote.connect(git2::Direction::Fetch).expect("connect");
+        assert_eq!(remote.list().expect("list").len(), 0, "an empty advertisement lists no heads");
+        let _ = remote.disconnect();
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn git_error_classification_ignores_status_digits_and_auth_words_in_urls() {

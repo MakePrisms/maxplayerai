@@ -615,7 +615,7 @@ mod tests {
             .expect("references")
             .filter_map(|reference| reference.ok())
             .filter_map(|reference| {
-                let name = reference.name()?.to_owned();
+                let name = reference.name().ok()?.to_owned();
                 if !name.starts_with("refs/maxplayer/") {
                     return None;
                 }
