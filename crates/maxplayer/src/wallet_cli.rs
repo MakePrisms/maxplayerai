@@ -482,12 +482,16 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         Ok(report) => {
             let _ = writeln!(
                 out,
-                "retired={} mapped_token_created={} swap_rolled_back={} swap_recovered={}",
+                "retired={} mapped_token_created={} swap_rolled_back={} swap_recovered={} swap_held={}",
                 report.retired,
                 report.mapped_token_created,
                 report.swap_rolled_back,
-                report.swap_recovered
+                report.swap_recovered,
+                report.swap_held.len()
             );
+            for held in &report.swap_held {
+                let _ = writeln!(err, "{}", held.remediation());
+            }
             SUCCESS
         }
         Err(error) => {

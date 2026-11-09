@@ -191,9 +191,15 @@ pub struct RetireReport {
     /// were all UNSPENT — the swap never executed.
     pub swap_rolled_back: usize,
     /// Stranded Swap sagas completed after mint-truth said the reserved inputs
-    /// were all SPENT — the swap executed; inputs marked spent and outputs
-    /// re-derived from the wallet seed via NUT-13 `Wallet::restore`.
+    /// were all SPENT — the swap executed; every one of the saga's own outputs was
+    /// accounted for (restored, already in the wallet, or SPENT), the restored ones
+    /// were added, the inputs marked spent and the saga dropped.
     pub swap_recovered: usize,
+    /// Stranded Swap sagas whose inputs are all SPENT at the mint but whose outputs could not
+    /// all be accounted for this pass (no stored blinded messages, a seed/counter mismatch, or an
+    /// empty/partial `/restore`). Kept untouched and retried every pass; NOT a pay refusal (see
+    /// `recover_unmapped_sagas`).
+    pub swap_held: Vec<HeldSwap>,
     /// Stranded `Send(TokenCreated)` sagas completed after mint-truth said the
     /// reserved inputs were all SPENT — the send executed, so the inputs are
     /// recorded Spent and the saga dropped. The token's outputs are deliberately
@@ -204,6 +210,29 @@ pub struct RetireReport {
     /// `recover_unmapped_sagas` to refuse over, so the fail-closed property is
     /// unchanged while one unresolvable saga can no longer stop the resolvable ones.
     pub unresolved: Vec<String>,
+}
+
+/// A spent swap saga [`RetireReport::swap_held`] kept: its id and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSwap {
+    /// The cdk saga id.
+    pub saga_id: String,
+    /// Why its outputs are not all accounted for.
+    pub reason: String,
+}
+
+impl HeldSwap {
+    /// The operator line: what is kept, why, and what to do.
+    pub fn remediation(&self) -> String {
+        format!(
+            "swap saga {} kept: its inputs are SPENT at the mint but {}. Payments continue: its \
+             reserved inputs stay unspendable and its outputs' counters are never reused. Every \
+             wallet pass retries it (or run `maxplayer wallet reconcile`). If it never clears, \
+             its outputs exist only at the mint: keep this home's `key` and \
+             `wallet/cdk-wallet.sqlite` and report the saga id.",
+            self.saga_id, self.reason
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -737,6 +766,27 @@ impl<'a> CdkBuyerMint<'a> {
                         "wallet has an incomplete TokenCreated operation with no matching confirmed attempt",
                         &report,
                     ));
+                }
+                // Review r2 M2: a swap saga whose inputs this pass read SPENT at the mint and whose
+                // outputs are not all accounted for yet is kept, not a wedge. Its inputs stay
+                // RESERVED under its own id (no selection takes them; only its own completion
+                // writes them), SPENT at the mint is final, and its outputs' counters lie below
+                // the keyset counter every new operation increments past, so a payment can neither
+                // reuse nor release anything it owns. Any other swap refusal still blocks.
+                WalletSagaState::Swap(_)
+                    if report
+                        .swap_held
+                        .iter()
+                        .any(|held| held.saga_id == saga.id.to_string()) =>
+                {
+                    if let Some(held) = report
+                        .swap_held
+                        .iter()
+                        .find(|held| held.saga_id == saga.id.to_string())
+                    {
+                        crate::opline!("buyer wallet: {}", held.remediation());
+                    }
+                    continue;
                 }
                 WalletSagaState::Send(SendSagaState::RollingBack) => {
                     return Err(refuse_unmapped(
@@ -1535,8 +1585,13 @@ async fn resolve_one_swap_saga(
             report.swap_rolled_back += 1;
         }
         ReservedInputTruth::AllSpent => {
-            complete_spent_swap_saga(wallet, wallet_dir, seed, saga).await?;
-            report.swap_recovered += 1;
+            match complete_spent_swap_saga(wallet, wallet_dir, seed, saga).await? {
+                SwapCompletion::Recovered => report.swap_recovered += 1,
+                SwapCompletion::Held(reason) => report.swap_held.push(HeldSwap {
+                    saga_id: saga.id.to_string(),
+                    reason,
+                }),
+            }
         }
     }
     Ok(())
@@ -1666,6 +1721,41 @@ async fn rollback_swap_saga(
     revert_reserved_and_delete_saga(wallet, saga).await
 }
 
+/// Outcome of [`complete_spent_swap_saga`].
+enum SwapCompletion {
+    /// Every output accounted for: the returned ones added, the inputs recorded Spent, the saga
+    /// deleted.
+    Recovered,
+    /// Kept, nothing written: see [`HeldSwap`].
+    Held(String),
+}
+
+/// Outcome of [`recover_swap_saga_outputs`].
+enum SwapOutputs {
+    /// Every output this saga asked the mint for is accounted for: returned and verified, already a
+    /// wallet row, or SPENT at the mint. These are the returned ones to add (mint state; SPENT ones
+    /// dropped).
+    Complete(Vec<cdk::wallet::types::ProofInfo>),
+    /// Which outputs are this saga's cannot be established, or not every one is accounted for.
+    Held(String),
+}
+
+/// How far below a swap saga's stored `counter_start` [`recover_swap_saga_outputs`] looks when the
+/// stored range does not derive the saga's stored outputs (review r2 M2).
+///
+/// cdk 0.17.2 reserves the outputs' counters in `create_swap` (`increment_keyset_counter(id, n)`) and
+/// only then reads the counter again with a zero increment to store `counter_end`
+/// (`swap/saga/mod.rs:138-143`). A writer on the same home database (another process's pay, send,
+/// receive, issue or melt change) that increments that keyset in between moves the stored range UP by
+/// its increment `k`: the real range is `[start - k, end - k)`. It never moves it down (the counter
+/// only grows), so only counters below `start` are searched. One cdk operation increments by at most
+/// 128 (at most 64 binary-split outputs each for the sent amount and the change: amounts are u64), so
+/// 1024 covers eight maximal operations landing between two statements of one task. A counter is
+/// accepted only when the blinded message it derives EQUALS one of the saga's stored messages: `B_`
+/// is a function of (seed, keyset, counter), so equality proves the counter is one `create_swap`
+/// reserved for THIS saga, whatever range it falls in.
+const SWAP_COUNTER_SEARCH_WINDOW: u32 = 1024;
+
 /// Complete a Swap saga whose inputs are all SPENT at the mint: the swap executed. Recover ONLY
 /// this saga's outputs, then record its inputs Spent and drop the saga.
 ///
@@ -1673,37 +1763,62 @@ async fn rollback_swap_saga(
 /// module, and its full-wallet NUT-13 `Wallet::restore` re-derives EVERY seed proof and upserts each
 /// one the mint calls unspent with NO owner, one committed batch per mint round trip. On the home
 /// wallet `maxplayer-trade` shares, that publishes trade's reservations (and other in-flight cdk
-/// sagas' inputs) as spendable, and an error, a dropped future or a kill between two batches leaves
-/// them that way. So this does the NUT-09 step itself, scoped to the saga:
+/// sagas' inputs) as spendable. So this does the NUT-09 step itself, scoped to the saga:
 ///
-/// 1. Mint side, no lock, no local write: re-derive the saga's counter range from the seed, ask the
-///    mint `/restore` for exactly those outputs, check every signature (keyset, amount, DLEQ when
-///    present), build the proofs and read their NUT-07 state.
-/// 2. Local side, under the selection lock, ONE SQLite transaction: insert the recovered outputs
-///    whose `y` is not in the wallet yet (an existing row, whatever its state or owner, is never
-///    touched) and mark the rows THIS saga still owns Spent. No other row is written or deleted.
-///    Then the saga row is deleted.
+/// 1. Mint side, no lock, no local write ([`recover_swap_saga_outputs`]): the saga's STORED blinded
+///    messages that the home seed derives on their own keyset, and nothing else, go to `/restore`;
+///    every signature is checked, and every requested output must be accounted for (returned, already
+///    a wallet row, or SPENT at the mint). Anything less is [`SwapCompletion::Held`]: nothing is
+///    written and the saga stays for the next pass.
+/// 2. Local side, under the selection lock: re-read which recovered `y`s are already rows (an existing
+///    row, whatever its state or owner, is never touched) and which inputs THIS saga still owns, then
+///    ONE `update_proofs` transaction inserts the absent outputs and marks those inputs Spent. Then
+///    the saga row is deleted (a kill before that leaves an empty-reservation saga the next pass drops
+///    or refuses exactly as before; the outputs are already in).
 ///
-/// A failure or kill anywhere in step 1 writes nothing; step 2 is atomic, and a kill after it
-/// leaves only an empty saga row the next pass drops or refuses exactly as before. Any doubt
-/// (no seed, no counter range, a seed that does not derive the stored outputs, a bad signature, a
-/// mint that does not answer) refuses and leaves the saga wedged for a later retry.
+/// Why the cdk 0.17.2 store can't do 2 as one conditional statement, and why it is still safe: the
+/// `WalletDatabase` trait has no insert-if-absent and no owner-conditional update (`update_proofs`
+/// is `INSERT … ON CONFLICT(y) DO UPDATE`, `update_proofs_state` is `UPDATE … WHERE y IN`), and a
+/// second raw connection to `cdk-wallet.sqlite` is not used. Instead:
+/// * Every `y` inserted here is `hash_to_curve` of a secret derived at a counter whose blinded
+///   message equals one of THIS saga's stored messages. Counters are handed out by one atomic
+///   `INSERT … ON CONFLICT DO UPDATE counter = counter + n RETURNING` per keyset, so no other
+///   operation (a bearer `wallet send`'s outputs included; trade derives none, its secrets are
+///   random) can hold a proof with one of these `y`s. A concurrent writer that does not take the
+///   selection lock (send/melt `confirm`, `update_proofs_state(.., PendingSpent)`) only ever writes
+///   ITS OWN outputs and inputs, which are different `y`s.
+/// * The only writers of these exact `y`s are this saga's own completions: cdk's `execute` still
+///   finishing in the original process, or cdk's guarded saga recovery. Each writes the same proof
+///   (same secret, same `C`) as Unspent with no owner. Anyone who could change such a row afterwards
+///   (reserve it) must first take the selection lock, which is held from the re-read to the commit.
+/// * Inputs: only rows `get_reserved_proofs(saga)` returns under the lock (owner = this saga) are
+///   written. Rows owned by this saga are changed only by this saga's completion or compensation;
+///   compensation needs all inputs Unspent (they are SPENT, which is final), and a completion marks
+///   them Spent or deletes them.
+///
+/// Remaining window, stated: between the re-read and the commit (local SQLite only, milliseconds) a
+/// lock-free completion of this same saga can (a) insert one of these outputs first, which the upsert
+/// then rewrites with the identical proof and the mint's state (Unspent, or Pending if the mint said
+/// so), or (b) delete an input row, which the upsert re-inserts as Spent with no owner (never
+/// spendable). Neither credits anything not ours nor changes another owner's row.
 async fn complete_spent_swap_saga(
     wallet: &Wallet,
     wallet_dir: Option<&std::path::Path>,
     seed: Option<&[u8; 64]>,
     saga: &cdk::wallet::types::WalletSaga,
-) -> Result<(), PaymentWalletError> {
+) -> Result<SwapCompletion, PaymentWalletError> {
     let refuse = |why: String| {
         PaymentWalletError::Reconcile(format!(
             "swap-saga complete refused (leave wedged for a later retry): {why}"
         ))
     };
-    let seed =
-        seed.ok_or_else(|| refuse("no home seed to re-derive this saga's outputs".into()))?;
-    let outputs = recover_swap_saga_outputs(wallet, saga, seed)
+    let outputs = match recover_swap_saga_outputs(wallet, saga, seed)
         .await
-        .map_err(refuse)?;
+        .map_err(refuse)?
+    {
+        SwapOutputs::Complete(rows) => rows,
+        SwapOutputs::Held(why) => return Ok(SwapCompletion::Held(why)),
+    };
 
     // LOCAL APPLY ONLY (no mint request below): milliseconds, under the selection lock, one
     // transaction.
@@ -1721,7 +1836,7 @@ async fn complete_spent_swap_saga(
             "saga no longer a Swap saga before apply (TOCTOU)".into(),
         ));
     }
-    // cdk's `get_proofs_by_ys` refuses an empty list (no outputs recovered: nothing to look up).
+    // Insert-if-absent, re-read under the lock: cdk's `get_proofs_by_ys` refuses an empty list.
     let present: HashSet<CashuPublicKey> = if outputs.is_empty() {
         HashSet::new()
     } else {
@@ -1768,81 +1883,111 @@ async fn complete_spent_swap_saga(
                 "swap-saga complete failed deleting saga: {error}"
             ))
         })?;
-    Ok(())
+    Ok(SwapCompletion::Recovered)
 }
 
-/// Step 1 of [`complete_spent_swap_saga`]: the saga's own outputs as wallet rows (state from the
-/// mint; SPENT ones dropped), from mint answers only. Writes nothing.
+/// The saga's stored messages that the home seed derives on `keyset` at counters `from..end`, by
+/// `B_`. The only place a restore batch is derived.
+fn seed_derived_outputs(
+    seed: &[u8; 64],
+    keyset: cashu::Id,
+    from: u32,
+    end: u32,
+    stored: &[cashu::BlindedMessage],
+) -> Result<std::collections::HashMap<CashuPublicKey, cdk::nuts::PreMint>, String> {
+    let wanted: HashSet<CashuPublicKey> = stored.iter().map(|m| m.blinded_secret).collect();
+    Ok(
+        cdk::nuts::PreMintSecrets::restore_batch(keyset, seed, from, end)
+            .map_err(|error| format!("derive: {error}"))?
+            .secrets
+            .into_iter()
+            .filter(|premint| wanted.contains(&premint.blinded_message.blinded_secret))
+            .map(|premint| (premint.blinded_message.blinded_secret, premint))
+            .collect(),
+    )
+}
+
+/// Step 1 of [`complete_spent_swap_saga`], from mint answers only; writes nothing. The only place a
+/// `/restore` is sent, and it names only the stored messages' keyset (never the mint's keyset list).
 async fn recover_swap_saga_outputs(
     wallet: &Wallet,
     saga: &cdk::wallet::types::WalletSaga,
-    seed: &[u8; 64],
-) -> Result<Vec<cdk::wallet::types::ProofInfo>, String> {
-    use cdk::nuts::{PreMint, PreMintSecrets, RestoreRequest};
+    seed: Option<&[u8; 64]>,
+) -> Result<SwapOutputs, String> {
+    use cdk::nuts::RestoreRequest;
     use std::collections::HashMap;
     let cdk::wallet::types::OperationData::Swap(data) = &saga.data else {
         return Err("not swap operation data".into());
     };
+    // As cdk's own `extract_recovery_params` (`recovery.rs:538-547`): no stored messages, no
+    // recovery. Nothing else says which outputs are this saga's; a counter range on any keyset could
+    // name another operation's proofs.
+    let Some(stored) = data.blinded_messages.as_deref().filter(|m| !m.is_empty()) else {
+        return Ok(SwapOutputs::Held(
+            "no blinded messages stored (cdk stores them just before it posts the swap), so this \
+             saga's outputs cannot be identified; nothing was restored"
+                .into(),
+        ));
+    };
     let (Some(start), Some(end)) = (data.counter_start, data.counter_end) else {
-        return Err("no counter range stored".into());
+        return Ok(SwapOutputs::Held("no counter range stored".into()));
     };
     if end < start || end - start > 10_000 {
-        return Err(format!("implausible counter range {start}..{end}"));
+        return Ok(SwapOutputs::Held(format!(
+            "implausible counter range {start}..{end}"
+        )));
     }
-    let bound = mint_mutation_timeout(&wallet.mint_url);
-    let stored = data.blinded_messages.clone().unwrap_or_default();
-    let keysets: Vec<cashu::Id> = if stored.is_empty() {
-        tokio::time::timeout(bound, wallet.get_mint_keysets(KeysetFilter::All))
-            .await
-            .map_err(|_| format!("keysets exceeded {bound:?}"))?
-            .map_err(|error| format!("keysets: {error}"))?
-            .into_iter()
-            .map(|keyset| keyset.id)
-            .collect()
-    } else {
-        let mut ids = stored.iter().map(|m| m.keyset_id).collect::<Vec<_>>();
-        ids.sort();
-        ids.dedup();
-        ids
-    };
-    let mut derived: HashMap<CashuPublicKey, (cashu::Id, PreMint)> = HashMap::new();
-    for keyset in keysets {
-        for premint in PreMintSecrets::restore_batch(keyset, seed, start, end)
-            .map_err(|error| format!("derive: {error}"))?
-            .secrets
-        {
-            derived.insert(premint.blinded_message.blinded_secret, (keyset, premint));
+    // cdk derives every seed output of one swap on its one active keyset.
+    let keyset = stored[0].keyset_id;
+    if stored.iter().any(|m| m.keyset_id != keyset) {
+        return Ok(SwapOutputs::Held(
+            "stored outputs name more than one keyset".into(),
+        ));
+    }
+    let seed = seed.ok_or("no home seed to re-derive this saga's outputs")?;
+    let expected = (end - start) as usize;
+    let mut ours = seed_derived_outputs(seed, keyset, start, end, stored)?;
+    if ours.len() != expected {
+        let from = start.saturating_sub(SWAP_COUNTER_SEARCH_WINDOW);
+        ours = seed_derived_outputs(seed, keyset, from, end, stored)?;
+        if ours.len() != expected {
+            return Ok(SwapOutputs::Held(format!(
+                "the home seed derives {} of this saga's {expected} seed outputs on keyset {keyset} \
+                 at counters {from}..{end} (stored range {start}..{end})",
+                ours.len()
+            )));
         }
     }
-    // Ask for exactly this saga's outputs: the stored messages that the seed derives (P2PK send
-    // outputs are not seed-derived and are not ours to recover), else the derived range.
-    let request = if stored.is_empty() {
-        derived
-            .values()
-            .map(|(_, premint)| premint.blinded_message.clone())
-            .collect::<Vec<_>>()
-    } else {
-        let ours = stored
-            .iter()
-            .filter(|m| derived.contains_key(&m.blinded_secret))
-            .cloned()
-            .collect::<Vec<_>>();
-        if ours.is_empty() && end > start {
-            return Err("the home seed does not derive any of this saga's stored outputs".into());
-        }
-        ours
-    };
+    // Ask for exactly the stored messages the seed derives (P2PK send outputs are random, not ours).
+    let request: Vec<cashu::BlindedMessage> = stored
+        .iter()
+        .filter(|m| ours.contains_key(&m.blinded_secret))
+        .cloned()
+        .collect();
+    if request.len() != expected {
+        return Ok(SwapOutputs::Held(format!(
+            "{} stored messages match {expected} derived outputs",
+            request.len()
+        )));
+    }
+    if request.iter().any(|m| m.keyset_id != keyset) {
+        return Err("refusing a restore outside the stored messages' keyset".into());
+    }
     if request.is_empty() {
-        return Ok(vec![]);
+        // A zero-width counter range: every output went to a spending condition. None is ours.
+        return Ok(SwapOutputs::Complete(vec![]));
     }
     let requested: HashMap<CashuPublicKey, cashu::Amount> = request
         .iter()
         .map(|m| (m.blinded_secret, m.amount))
         .collect();
+    let bound = mint_mutation_timeout(&wallet.mint_url);
     let connector = wallet.mint_connector();
     let response = tokio::time::timeout(
         bound,
-        connector.post_restore(RestoreRequest { outputs: request }),
+        connector.post_restore(RestoreRequest {
+            outputs: request.clone(),
+        }),
     )
     .await
     .map_err(|_| format!("restore exceeded {bound:?}"))?
@@ -1850,23 +1995,24 @@ async fn recover_swap_saga_outputs(
     if response.outputs.len() != response.signatures.len() {
         return Err("restore answered unequal outputs and signatures".into());
     }
+    let keys = tokio::time::timeout(bound, wallet.load_keyset_keys(keyset))
+        .await
+        .map_err(|_| format!("keyset keys exceeded {bound:?}"))?
+        .map_err(|error| format!("keyset keys: {error}"))?;
+    let mut returned: HashSet<CashuPublicKey> = HashSet::new();
     let mut proofs = Vec::new();
     for (output, signature) in response.outputs.iter().zip(response.signatures) {
-        let (keyset, premint) = derived
+        let premint = ours
             .get(&output.blinded_secret)
             .ok_or("restore answered an output this saga did not ask for")?;
-        let asked = requested
-            .get(&output.blinded_secret)
-            .ok_or("restore answered an output this saga did not ask for")?;
-        if signature.keyset_id != *keyset
-            || (*asked != cashu::Amount::ZERO && signature.amount != *asked)
+        if !returned.insert(output.blinded_secret) {
+            return Err("restore answered the same output twice".into());
+        }
+        if signature.keyset_id != keyset
+            || requested.get(&output.blinded_secret) != Some(&signature.amount)
         {
             return Err("restore signature does not match the requested output".into());
         }
-        let keys = tokio::time::timeout(bound, wallet.load_keyset_keys(*keyset))
-            .await
-            .map_err(|_| format!("keyset keys exceeded {bound:?}"))?
-            .map_err(|error| format!("keyset keys: {error}"))?;
         let key = keys
             .amount_key(signature.amount)
             .ok_or("restore signature for an amount the keyset has no key for")?;
@@ -1884,29 +2030,75 @@ async fn recover_swap_saga_outputs(
             .map_err(|error| format!("unblind: {error}"))?,
         );
     }
-    if proofs.is_empty() {
-        return Ok(vec![]);
-    }
-    let ys = proofs
+    // An output the mint did not return is accounted for only if it is already a wallet row or
+    // SPENT at the mint (a mint answers UNSPENT for a `y` it never signed).
+    let unreturned = ours
+        .iter()
+        .filter(|(blinded, _)| !returned.contains(*blinded))
+        .map(|(_, premint)| cdk::dhke::hash_to_curve(premint.secret.as_bytes()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?;
+    let local: HashSet<CashuPublicKey> = if unreturned.is_empty() {
+        HashSet::new()
+    } else {
+        wallet
+            .localstore
+            .get_proofs_by_ys(unreturned.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|row| row.y)
+            .collect()
+    };
+    let unknown: Vec<CashuPublicKey> = unreturned
+        .into_iter()
+        .filter(|y| !local.contains(y))
+        .collect();
+    let proof_ys = proofs
         .iter()
         .map(|p| p.y())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| error.to_string())?;
-    let states = tokio::time::timeout(
-        bound,
-        connector.post_check_state(CheckStateRequest { ys: ys.clone() }),
-    )
-    .await
-    .map_err(|_| format!("check-state exceeded {bound:?}"))?
-    .map_err(|error| format!("check-state: {error}"))?
-    .states;
+    let ask: Vec<CashuPublicKey> = proof_ys.iter().chain(&unknown).copied().collect();
+    let states: HashMap<CashuPublicKey, State> = if ask.is_empty() {
+        HashMap::new()
+    } else {
+        tokio::time::timeout(
+            bound,
+            connector.post_check_state(CheckStateRequest { ys: ask }),
+        )
+        .await
+        .map_err(|_| format!("check-state exceeded {bound:?}"))?
+        .map_err(|error| format!("check-state: {error}"))?
+        .states
+        .into_iter()
+        .map(|s| (s.y, s.state))
+        .collect()
+    };
+    let state_of = |y: &CashuPublicKey| {
+        states
+            .get(y)
+            .copied()
+            .ok_or_else(|| "check-state did not answer for a requested output".to_owned())
+    };
+    let mut missing = 0;
+    for y in &unknown {
+        if state_of(y)? != State::Spent {
+            missing += 1;
+        }
+    }
+    if missing > 0 {
+        return Ok(SwapOutputs::Held(format!(
+            "the mint's /restore returned {} of this saga's {} outputs; {missing} are neither \
+             returned, in the wallet, nor SPENT at the mint (an empty, lagging or partial restore); \
+             nothing was written",
+            returned.len(),
+            request.len()
+        )));
+    }
     let mut rows = Vec::new();
-    for (proof, y) in proofs.into_iter().zip(ys) {
-        let state = states
-            .iter()
-            .find(|s| s.y == y)
-            .map(|s| s.state)
-            .ok_or("check-state did not answer for a recovered output")?;
+    for (proof, y) in proofs.into_iter().zip(proof_ys) {
+        let state = state_of(&y)?;
         if state == State::Spent {
             continue;
         }
@@ -1920,7 +2112,7 @@ async fn recover_swap_saga_outputs(
             .map_err(|error| error.to_string())?,
         );
     }
-    Ok(rows)
+    Ok(SwapOutputs::Complete(rows))
 }
 
 /// Mint-truth resolution for a stranded `Send(TokenCreated)` saga.
@@ -5643,6 +5835,18 @@ mod tests {
     /// per-saga isolation test pass with neither saga resolving.
     struct ReconcileTransport {
         states: std::collections::HashMap<CashuPublicKey, State>,
+        /// `/v1/restore` signs every requested output with [`test_keyset`]'s keys (default: an
+        /// empty, well-formed reply).
+        restore_signs: Arc<std::sync::atomic::AtomicBool>,
+        /// Non-zero `n`: keep only the first `n` outputs of a signed restore reply (a short restore).
+        restore_keep: Arc<AtomicUsize>,
+        /// The keyset of every output a `/v1/restore` asked for.
+        restore_keysets: Arc<Mutex<Vec<Id>>>,
+        /// Answer UNSPENT for a `y` not in `states` (a mint answers UNSPENT for a `y` it never
+        /// signed); default: omit it.
+        unknown_unspent: Arc<std::sync::atomic::AtomicBool>,
+        /// `/v1/restore` requests seen.
+        restores: Arc<AtomicUsize>,
     }
 
     impl ReconcileTransport {
@@ -5652,6 +5856,7 @@ mod tests {
                     .into_iter()
                     .map(|proof_state| (proof_state.y, proof_state.state))
                     .collect(),
+                ..Self::default()
             }
         }
     }
@@ -5699,10 +5904,12 @@ mod tests {
                 let states = request
                     .ys
                     .iter()
-                    .filter_map(|y| {
-                        self.states
-                            .get(y)
-                            .map(|state| ProofState::from((*y, *state)))
+                    .filter_map(|y| match self.states.get(y) {
+                        Some(state) => Some(ProofState::from((*y, *state))),
+                        None if self.unknown_unspent.load(Ordering::SeqCst) => {
+                            Some(ProofState::from((*y, State::Unspent)))
+                        }
+                        None => None,
                     })
                     .collect::<Vec<_>>();
                 return serde_json::from_value(
@@ -5712,11 +5919,45 @@ mod tests {
                 .map_err(|error| cdk::Error::Custom(error.to_string()));
             }
             if url.path().ends_with("/v1/restore") {
-                let empty = cashu::nuts::nut09::RestoreResponse {
-                    outputs: vec![],
-                    signatures: vec![],
+                self.restores.fetch_add(1, Ordering::SeqCst);
+                let request: cashu::nuts::RestoreRequest = serde_json::from_value(
+                    serde_json::to_value(payload)
+                        .map_err(|error| cdk::Error::Custom(error.to_string()))?,
+                )
+                .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+                self.restore_keysets
+                    .lock()
+                    .unwrap()
+                    .extend(request.outputs.iter().map(|m| m.keyset_id));
+                let mut outputs = if self.restore_signs.load(Ordering::SeqCst) {
+                    request.outputs
+                } else {
+                    vec![]
                 };
-                return serde_json::from_value(serde_json::to_value(empty).unwrap())
+                let keep = self.restore_keep.load(Ordering::SeqCst);
+                if keep != 0 {
+                    outputs.truncate(keep);
+                }
+                let signatures = outputs
+                    .iter()
+                    .map(|m| {
+                        let key = secret_key(m.amount.to_u64() as u8 + 10);
+                        let c = cashu::dhke::sign_message(&key, &m.blinded_secret).unwrap();
+                        cashu::nuts::BlindSignature::new(
+                            m.amount,
+                            c,
+                            m.keyset_id,
+                            &m.blinded_secret,
+                            key,
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                let reply = cashu::nuts::nut09::RestoreResponse {
+                    outputs,
+                    signatures,
+                };
+                return serde_json::from_value(serde_json::to_value(reply).unwrap())
                     .map_err(|error| cdk::Error::Custom(error.to_string()));
             }
             Err(cdk::Error::Custom("unexpected POST".into()))
@@ -5730,7 +5971,7 @@ mod tests {
         seed: u8,
         proofs: Vec<Proof>,
         states: Vec<ProofState>,
-    ) -> (Wallet, uuid::Uuid, Vec<CashuPublicKey>) {
+    ) -> (Wallet, uuid::Uuid, Vec<CashuPublicKey>, ReconcileTransport) {
         let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
         store
             .add_mint(mint(MINT), Some(MintInfo::new()))
@@ -5785,9 +6026,10 @@ mod tests {
         );
         store.add_saga(saga).await.unwrap();
 
+        let transport = ReconcileTransport::new(states);
         let connector = Arc::new(BaseHttpClient::with_transport(
             mint(MINT),
-            ReconcileTransport::new(states),
+            transport.clone(),
             None,
         ));
         let wallet = WalletBuilder::new()
@@ -5798,7 +6040,7 @@ mod tests {
             .shared_client(connector)
             .build()
             .unwrap();
-        (wallet, saga_id, ys)
+        (wallet, saga_id, ys, transport)
     }
 
     /// Build a wallet holding `proofs` (present and Unspent), keysets seeded so NUT-13
@@ -6682,7 +6924,7 @@ mod tests {
         let seller = secret_key(1).public_key();
         let proof = p2pk_proof(7, seller);
         let proof_y = proof.y().unwrap();
-        let (wallet, saga_id, ys) = swap_saga_wallet(
+        let (wallet, saga_id, ys, _mint) = swap_saga_wallet(
             40,
             vec![proof],
             vec![ProofState::from((proof_y, State::Unspent))],
@@ -6721,20 +6963,145 @@ mod tests {
         );
     }
 
+    // ---- Review r2: a spent swap saga recovers only outputs it can prove are its own, and only
+    // when every one is accounted for (H1); a racy counter range is searched on the stored keyset
+    // only (M2); a held saga does not wedge payments (M2 policy). ------------------------------
+
+    const SWAP_SECRET_HEX: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// A home with a `key` and a `wallet/` dir (its selection lock), and the seed that key derives.
+    fn swap_home() -> (tempfile::TempDir, std::path::PathBuf, [u8; 64]) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("key");
+        std::fs::write(&key, SWAP_SECRET_HEX).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let wallet_dir = dir.path().join("wallet");
+        std::fs::create_dir_all(&wallet_dir).unwrap();
+        let seed = crate::buyer_fund::seed_from_secret_hex(SWAP_SECRET_HEX).unwrap();
+        (dir, wallet_dir, seed)
+    }
+
+    /// The seed outputs [`store_swap_outputs`] stores: counters `at..at + 2` on [`test_keyset`].
+    fn seed_outputs(seed: &[u8; 64], at: u32) -> Vec<cdk::nuts::PreMint> {
+        cdk::nuts::PreMintSecrets::restore_batch(test_keyset().id, seed, at, at + 2)
+            .unwrap()
+            .secrets
+    }
+
+    fn seed_output_ys(seed: &[u8; 64], at: u32) -> Vec<CashuPublicKey> {
+        seed_outputs(seed, at)
+            .iter()
+            .map(|p| cashu::dhke::hash_to_curve(p.secret.as_bytes()).unwrap())
+            .collect()
+    }
+
+    /// Give `saga_id` stored outputs the way cdk's `execute` does: two seed outputs (4 and 2 sats)
+    /// derived at counters `derived_at..derived_at + 2`, plus one P2PK-style output that is not
+    /// seed-derived, with the stored counter range `stored_at..stored_at + 2`. Returns the seed
+    /// outputs' `y`s (4-sat first).
+    async fn store_swap_outputs(
+        wallet: &Wallet,
+        saga_id: uuid::Uuid,
+        seed: &[u8; 64],
+        derived_at: u32,
+        stored_at: u32,
+    ) -> Vec<CashuPublicKey> {
+        let keyset = test_keyset().id;
+        let mut messages: Vec<cashu::BlindedMessage> = seed_outputs(seed, derived_at)
+            .iter()
+            .zip([4_u64, 2])
+            .map(|(p, amount)| {
+                cashu::BlindedMessage::new(
+                    Amount::from(amount),
+                    keyset,
+                    p.blinded_message.blinded_secret,
+                )
+            })
+            .collect();
+        messages.push(cashu::BlindedMessage::new(
+            Amount::from(1),
+            keyset,
+            secret_key(77).public_key(),
+        ));
+        let mut saga = wallet.localstore.get_saga(&saga_id).await.unwrap().unwrap();
+        let cdk::wallet::types::OperationData::Swap(data) = &mut saga.data else {
+            panic!("swap saga data");
+        };
+        data.counter_start = Some(stored_at);
+        data.counter_end = Some(stored_at + 2);
+        data.blinded_messages = Some(messages);
+        saga.version += 1;
+        assert!(wallet.localstore.update_saga(saga).await.unwrap());
+        seed_output_ys(seed, derived_at)
+    }
+
+    async fn retire_in(wallet: &Wallet, wallet_dir: &std::path::Path) -> RetireReport {
+        retire_eligible_incomplete_sagas_in(wallet, Some(wallet_dir))
+            .await
+            .unwrap()
+    }
+
+    async fn pay_recovery(
+        wallet: &Wallet,
+        wallet_dir: &std::path::Path,
+    ) -> Result<(), PaymentWalletError> {
+        CdkBuyerMint::new(wallet)
+            .with_wallet_dir(Some(wallet_dir.to_path_buf()))
+            .recover_unmapped_sagas()
+            .await
+    }
+
+    async fn row(wallet: &Wallet, y: CashuPublicKey) -> Option<(State, Option<uuid::Uuid>)> {
+        wallet
+            .localstore
+            .get_proofs_by_ys(vec![y])
+            .await
+            .unwrap()
+            .first()
+            .map(|r| (r.state, r.used_by_operation))
+    }
+
+    /// SAFETY: a held saga left everything as it was: the saga row, its reserved input, no output.
+    async fn assert_swap_held(wallet: &Wallet, saga_id: uuid::Uuid, outputs: &[CashuPublicKey]) {
+        assert!(
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "SAFETY: the saga (the only record of its outputs) must remain"
+        );
+        let held = wallet
+            .localstore
+            .get_reserved_proofs(&saga_id)
+            .await
+            .unwrap();
+        assert_eq!(held.len(), 1, "its input stays reserved under it");
+        assert!(held.iter().all(|r| r.state == State::Reserved));
+        for y in outputs {
+            assert_eq!(row(wallet, *y).await, None, "nothing credited while held");
+        }
+    }
+
     #[tokio::test]
     async fn swap_saga_all_inputs_spent_recovers_via_restore() {
-        // A stranded swap_requested saga whose reserved inputs are all
-        // SPENT at the mint executed — complete it: recover this saga's own outputs
-        // (NUT-09 over its counter range; none at the fake), mark inputs Spent, drop the saga.
-        let seller = secret_key(1).public_key();
-        let proof = p2pk_proof(7, seller);
-        let proof_y = proof.y().unwrap();
-        let (wallet, saga_id, _ys) = swap_saga_wallet(
+        // r2 H1(b): an EMPTY /restore after a swap whose inputs are SPENT is the lost-reply case,
+        // not "nothing to recover": the saga stays (held, retryable), nothing is written, and the
+        // pay path is not wedged. Once the mint answers, every output is recovered.
+        let (_home, wallet_dir, seed) = swap_home();
+        let input = p2pk_proof(7, secret_key(1).public_key());
+        let input_y = input.y().unwrap();
+        let (wallet, saga_id, _ys, fake) = swap_saga_wallet(
             41,
-            vec![proof],
-            vec![ProofState::from((proof_y, State::Spent))],
+            vec![input],
+            vec![ProofState::from((input_y, State::Spent))],
         )
         .await;
+        let outputs = store_swap_outputs(&wallet, saga_id, &seed, 0, 0).await;
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
 
         // Without the wallet seed the outputs cannot be re-derived: refuse, leave it wedged.
         let refused = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
@@ -6747,43 +7114,329 @@ mod tests {
             "{:?}",
             refused.unresolved
         );
-        let report = retire_eligible_incomplete_sagas_with_seed(&wallet, [41; 64])
-            .await
-            .unwrap();
+
+        let report = retire_in(&wallet, &wallet_dir).await;
         assert_eq!(
-            report.swap_recovered, 1,
-            "spent inputs must complete via restore: {:?}",
-            report.unresolved
+            report.swap_recovered, 0,
+            "an empty restore must not complete"
         );
-        assert_eq!(report.swap_rolled_back, 0);
+        assert_eq!(report.swap_held.len(), 1, "{report:?}");
         assert!(
-            wallet
-                .localstore
-                .get_incomplete_sagas()
-                .await
-                .unwrap()
-                .is_empty(),
-            "saga must be dropped after completion"
+            report.swap_held[0]
+                .reason
+                .contains("returned 0 of this saga's 2 outputs"),
+            "{}",
+            report.swap_held[0].reason
         );
         assert!(
-            wallet
-                .localstore
-                .get_reserved_proofs(&saga_id)
-                .await
-                .unwrap()
-                .is_empty(),
-            "inputs must be released from the saga after completion"
+            report.swap_held[0]
+                .remediation()
+                .contains(&saga_id.to_string())
         );
-        // Truthful: spent inputs must NOT reappear as spendable (no phantom credit).
-        let unspent = wallet
-            .localstore
-            .get_proofs(None, None, Some(vec![State::Unspent]), None)
+        assert_swap_held(&wallet, saga_id, &outputs).await;
+        pay_recovery(&wallet, &wallet_dir)
             .await
-            .unwrap();
+            .expect("r2 M2: a held spent swap saga must not wedge payments");
+        assert_swap_held(&wallet, saga_id, &outputs).await;
+
+        fake.restore_signs.store(true, Ordering::SeqCst);
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(report.swap_recovered, 1, "{report:?}");
+        assert!(report.swap_held.is_empty());
         assert!(
-            unspent.iter().all(|info| info.y != proof_y),
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for y in &outputs {
+            assert_eq!(row(&wallet, *y).await, Some((State::Unspent, None)));
+        }
+        assert_eq!(
+            row(&wallet, input_y).await,
+            Some((State::Spent, None)),
             "spent inputs must never be credited back as Unspent"
         );
+        let asked = fake.restore_keysets.lock().unwrap().clone();
+        assert!(!asked.is_empty());
+        assert!(
+            asked.iter().all(|k| *k == test_keyset().id),
+            "only the stored messages' keyset is ever restored: {asked:?}"
+        );
+        // Three passes asked (held, the pay path's own retire pass, recovered): the two seed
+        // outputs each time, never the P2PK one.
+        assert_eq!(
+            asked.len(),
+            6,
+            "exactly the two seed outputs per pass: {asked:?}"
+        );
+        assert_eq!(fake.restores.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn swap_saga_short_restore_is_held_until_every_output_is_accounted_for() {
+        // r2 H1(b): a /restore that returns only some outputs keeps the saga. An output the mint
+        // did not return counts only when it is already a wallet row or SPENT at the mint.
+        let (_home, wallet_dir, seed) = swap_home();
+        let input = p2pk_proof(7, secret_key(1).public_key());
+        let input_y = input.y().unwrap();
+        let (wallet, saga_id, _ys, fake) = swap_saga_wallet(
+            43,
+            vec![input],
+            vec![ProofState::from((input_y, State::Spent))],
+        )
+        .await;
+        let outputs = store_swap_outputs(&wallet, saga_id, &seed, 0, 0).await;
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+        fake.restore_signs.store(true, Ordering::SeqCst);
+        fake.restore_keep.store(1, Ordering::SeqCst);
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(
+            report.swap_recovered, 0,
+            "a short restore must not complete"
+        );
+        assert_eq!(report.swap_held.len(), 1, "{report:?}");
+        assert!(
+            report.swap_held[0]
+                .reason
+                .contains("returned 1 of this saga's 2 outputs"),
+            "{}",
+            report.swap_held[0].reason
+        );
+        assert_swap_held(&wallet, saga_id, &outputs).await;
+
+        // The unreturned output is a wallet row by now (e.g. cdk's own execute finished): accounted.
+        let premint = seed_outputs(&seed, 0).remove(1);
+        let local = ProofInfo::new(
+            Proof::new(
+                Amount::from(2),
+                test_keyset().id,
+                premint.secret.clone(),
+                secret_key(9).public_key(),
+            ),
+            mint(MINT),
+            State::Unspent,
+            CurrencyUnit::Sat,
+        )
+        .unwrap();
+        wallet
+            .localstore
+            .update_proofs(vec![local], vec![])
+            .await
+            .unwrap();
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(report.swap_recovered, 1, "{report:?}");
+        assert_eq!(row(&wallet, outputs[0]).await, Some((State::Unspent, None)));
+        assert!(
+            wallet
+                .localstore
+                .get_saga(&saga_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_saga_unreturned_output_spent_at_the_mint_is_accounted_for() {
+        let (_home, wallet_dir, seed) = swap_home();
+        let input = p2pk_proof(7, secret_key(1).public_key());
+        let input_y = input.y().unwrap();
+        let spent_output = seed_output_ys(&seed, 0)[1];
+        let (wallet, saga_id, _ys, fake) = swap_saga_wallet(
+            44,
+            vec![input],
+            vec![
+                ProofState::from((input_y, State::Spent)),
+                ProofState::from((spent_output, State::Spent)),
+            ],
+        )
+        .await;
+        let outputs = store_swap_outputs(&wallet, saga_id, &seed, 0, 0).await;
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+        fake.restore_signs.store(true, Ordering::SeqCst);
+        fake.restore_keep.store(1, Ordering::SeqCst);
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(report.swap_recovered, 1, "{report:?}");
+        assert_eq!(row(&wallet, outputs[0]).await, Some((State::Unspent, None)));
+        assert_eq!(
+            row(&wallet, outputs[1]).await,
+            None,
+            "a SPENT output is not credited"
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_saga_recovery_never_overwrites_an_existing_row() {
+        // r2 H1(c): insert-if-absent. A recovered output whose `y` is already a row (whatever its
+        // state or owner) is left exactly as it is.
+        let (_home, wallet_dir, seed) = swap_home();
+        let input = p2pk_proof(7, secret_key(1).public_key());
+        let input_y = input.y().unwrap();
+        let (wallet, saga_id, _ys, fake) = swap_saga_wallet(
+            45,
+            vec![input],
+            vec![ProofState::from((input_y, State::Spent))],
+        )
+        .await;
+        let outputs = store_swap_outputs(&wallet, saga_id, &seed, 0, 0).await;
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+        let other = uuid::Uuid::now_v7();
+        let premint = seed_outputs(&seed, 0).remove(0);
+        let theirs = ProofInfo::new_with_operations(
+            Proof::new(
+                Amount::from(4),
+                test_keyset().id,
+                premint.secret.clone(),
+                secret_key(9).public_key(),
+            ),
+            mint(MINT),
+            State::Reserved,
+            CurrencyUnit::Sat,
+            Some(other),
+            Some(other),
+        )
+        .unwrap();
+        wallet
+            .localstore
+            .update_proofs(vec![theirs], vec![])
+            .await
+            .unwrap();
+        fake.restore_signs.store(true, Ordering::SeqCst);
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(report.swap_recovered, 1, "{report:?}");
+        assert_eq!(
+            row(&wallet, outputs[0]).await,
+            Some((State::Reserved, Some(other))),
+            "SAFETY: an existing row keeps its state and owner"
+        );
+        assert_eq!(row(&wallet, outputs[1]).await, Some((State::Unspent, None)));
+    }
+
+    #[tokio::test]
+    async fn swap_saga_without_stored_messages_is_held_and_never_restores() {
+        // r2 H1(a): cdk stores no blinded messages for the whole ProofsReserved window. Nothing then
+        // says which outputs are this saga's, so nothing is restored on any keyset (the old code
+        // restored the same counters on every keyset of the mint) and the saga is kept.
+        let (_home, wallet_dir, _seed) = swap_home();
+        let input = p2pk_proof(7, secret_key(1).public_key());
+        let input_y = input.y().unwrap();
+        let (wallet, saga_id, _ys, fake) = swap_saga_wallet(
+            46,
+            vec![input],
+            vec![ProofState::from((input_y, State::Spent))],
+        )
+        .await;
+        fake.restore_signs.store(true, Ordering::SeqCst);
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(report.swap_recovered, 0);
+        assert_eq!(report.swap_held.len(), 1, "{report:?}");
+        assert!(
+            report.swap_held[0]
+                .reason
+                .contains("no blinded messages stored")
+        );
+        assert_eq!(
+            fake.restores.load(Ordering::SeqCst),
+            0,
+            "SAFETY: no /restore at all"
+        );
+        assert_swap_held(&wallet, saga_id, &[]).await;
+        assert_eq!(
+            row(&wallet, input_y).await,
+            Some((State::Reserved, Some(saga_id)))
+        );
+        pay_recovery(&wallet, &wallet_dir)
+            .await
+            .expect("a held saga must not wedge payments");
+    }
+
+    #[tokio::test]
+    async fn swap_saga_counter_race_is_recovered_from_the_stored_keyset_within_a_bounded_window() {
+        // r2 M2: another writer incremented the keyset counter between cdk's `create_swap` and its
+        // zero-increment read, so the stored range sits above the real one. The stored messages
+        // are found by exact equality on the stored keyset within the window.
+        let (_home, wallet_dir, seed) = swap_home();
+        let input = p2pk_proof(7, secret_key(1).public_key());
+        let input_y = input.y().unwrap();
+        let (wallet, saga_id, _ys, fake) = swap_saga_wallet(
+            47,
+            vec![input.clone()],
+            vec![ProofState::from((input_y, State::Spent))],
+        )
+        .await;
+        let outputs = store_swap_outputs(&wallet, saga_id, &seed, 3, 10).await;
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+        fake.restore_signs.store(true, Ordering::SeqCst);
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(report.swap_recovered, 1, "{report:?}");
+        for y in &outputs {
+            assert_eq!(row(&wallet, *y).await, Some((State::Unspent, None)));
+        }
+        assert!(
+            fake.restore_keysets
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|k| *k == test_keyset().id)
+        );
+
+        // Beyond the window: held with an operator-visible reason, no restore, payments continue.
+        let (wallet, saga_id, _ys, fake) = swap_saga_wallet(
+            48,
+            vec![input],
+            vec![ProofState::from((input_y, State::Spent))],
+        )
+        .await;
+        let far = SWAP_COUNTER_SEARCH_WINDOW + 5;
+        let outputs = store_swap_outputs(&wallet, saga_id, &seed, 0, far).await;
+        fake.unknown_unspent.store(true, Ordering::SeqCst);
+        fake.restore_signs.store(true, Ordering::SeqCst);
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert_eq!(report.swap_recovered, 0);
+        assert_eq!(report.swap_held.len(), 1, "{report:?}");
+        assert!(
+            report.swap_held[0]
+                .reason
+                .contains("derives 0 of this saga's 2 seed outputs"),
+            "{}",
+            report.swap_held[0].reason
+        );
+        assert_eq!(fake.restores.load(Ordering::SeqCst), 0);
+        assert_swap_held(&wallet, saga_id, &outputs).await;
+        pay_recovery(&wallet, &wallet_dir)
+            .await
+            .expect("not a wedge");
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_swap_saga_still_blocks_payments() {
+        // The M2 policy is narrow: only a HELD spent swap (inputs read SPENT this pass) is let
+        // through. Any other swap refusal (mixed states, dead mint, missing seed) still refuses.
+        let (_home, wallet_dir, _seed) = swap_home();
+        let a = p2pk_proof(4, secret_key(1).public_key());
+        let b = p2pk_proof(3, secret_key(1).public_key());
+        let (ya, yb) = (a.y().unwrap(), b.y().unwrap());
+        let (wallet, _saga_id, _ys, _mint) = swap_saga_wallet(
+            49,
+            vec![a, b],
+            vec![
+                ProofState::from((ya, State::Spent)),
+                ProofState::from((yb, State::Unspent)),
+            ],
+        )
+        .await;
+        match pay_recovery(&wallet, &wallet_dir).await {
+            Err(PaymentWalletError::Reconcile(message))
+                if message.contains("non-eligible saga") => {}
+            other => panic!("an unresolved swap saga must still block payments, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -6795,7 +7448,7 @@ mod tests {
         let proof_b = p2pk_proof(3, seller);
         let y_a = proof_a.y().unwrap();
         let y_b = proof_b.y().unwrap();
-        let (wallet, saga_id, _ys) = swap_saga_wallet(
+        let (wallet, saga_id, _ys, _mint) = swap_saga_wallet(
             42,
             vec![proof_a, proof_b],
             vec![

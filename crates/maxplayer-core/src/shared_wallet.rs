@@ -616,11 +616,17 @@ mod tests {
     /// failure, dropped future or kill between batches leaves them that way. A spent swap saga
     /// recovers only its own outputs (`payment_wallet::complete_spent_swap_saga`).
     ///
-    /// `ALLOWED` is the explicit allowlist (`(path, reason)`): empty. The patterns are built at run
-    /// time so this test's own source never matches them.
+    /// Also walks `maxplayer-trade` (src and tests; review r2 L4): trade opens this same wallet.
+    ///
+    /// `ALLOWED` is the explicit allowlist (`(path, reason)`), exact paths only. The patterns are
+    /// built at run time so this test's own source never matches them.
     #[test]
     fn no_full_wallet_restore_anywhere_in_core_or_the_cli() {
-        const ALLOWED: &[(&str, &str)] = &[];
+        const ALLOWED: &[(&str, &str)] = &[(
+            "maxplayer-trade/tests/shared_home.rs",
+            "buyer_restore_and_saga_retire_leave_trade_reservations_alone calls cdk's restore on a \
+             throwaway home to show the hazard this test forbids",
+        )];
         let calls = [
             format!(".{}()", "restore"),
             format!(".{}(", "restore_with_opts"),
@@ -629,7 +635,12 @@ mod tests {
         ];
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut checked = 0;
-        for krate in [manifest.to_path_buf(), manifest.join("../maxplayer")] {
+        let mut allowed_seen = 0;
+        for krate in [
+            manifest.to_path_buf(),
+            manifest.join("../maxplayer"),
+            manifest.join("../maxplayer-trade"),
+        ] {
             let mut sources = Vec::new();
             for sub in ["src", "tests", "examples", "benches"] {
                 if krate.join(sub).is_dir() {
@@ -641,6 +652,7 @@ mod tests {
                 checked += 1;
                 let shown = format!("{}/{name}", krate.file_name().unwrap().to_string_lossy());
                 if ALLOWED.iter().any(|(path, _)| *path == shown) {
+                    allowed_seen += 1;
                     continue;
                 }
                 for call in &calls {
@@ -653,6 +665,130 @@ mod tests {
             }
         }
         assert!(checked > 100, "walked only {checked} files");
+        assert_eq!(
+            allowed_seen,
+            ALLOWED.len(),
+            "an allowlisted path no longer exists"
+        );
+    }
+
+    /// Review r2 H1: the only NUT-09 restore this workspace builds is a spent swap saga's, and it
+    /// names only that saga's STORED messages' keyset. Production `post_restore(` / `restore_batch(`
+    /// in `maxplayer-core`, `maxplayer` and `maxplayer-trade` occur only in the connector
+    /// pass-throughs and in `payment_wallet::{recover_swap_saga_outputs, seed_derived_outputs}`;
+    /// that pair never reads the mint's keyset list, derives on `stored[0].keyset_id` only, and
+    /// refuses a request naming any other keyset before it is sent. cdk's own restores are its
+    /// full-wallet `restore` (forbidden above) and saga recovery, which restores
+    /// `blinded_messages[0].keyset_id` only and is reached only through
+    /// `recover_incomplete_sagas_guarded`. Trade's own `/restore` RPCs send its journaled outputs
+    /// (random secrets), never a seed derivation.
+    #[test]
+    fn the_only_restore_names_the_stored_messages_keyset() {
+        let post = format!(".{}(", "post_restore");
+        let batch = format!("{}(", "restore_batch");
+        let cdk_recovery = format!(".{}()", "recover_incomplete_sagas");
+        let all = format!("{}::All", "KeysetFilter");
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (mut posts, mut batches, mut recoveries) = (Vec::new(), Vec::new(), Vec::new());
+        for krate in [
+            manifest.to_path_buf(),
+            manifest.join("../maxplayer"),
+            manifest.join("../maxplayer-trade"),
+        ] {
+            let mut sources = Vec::new();
+            for sub in ["src", "tests", "examples", "benches"] {
+                if krate.join(sub).is_dir() {
+                    rust_sources(&krate.join(sub), &krate, &mut sources);
+                }
+            }
+            for (name, source) in sources {
+                // `#[cfg(test)] mod tests` blocks are scanned too, except for derivations (below).
+                let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+                for (i, line) in source.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    let site = format!("{name}:{}: {code}", i + 1);
+                    if code.contains(&post) {
+                        posts.push(site.clone());
+                    }
+                    if code.contains(&cdk_recovery) {
+                        recoveries.push(site.clone());
+                    }
+                    // A derivation sends nothing; test fixtures may derive their expected outputs.
+                    if code.contains(&batch) && production.contains(line) {
+                        batches.push(site);
+                    }
+                }
+            }
+        }
+        // Connector pass-throughs, and the transport test's empty request (names no keyset).
+        let passthrough = |site: &&String| {
+            site.contains("self.0.post_restore(request)")
+                || site.contains("post_restore(RestoreRequest { outputs: vec![] })")
+        };
+        let requests: Vec<_> = posts.iter().filter(|s| !passthrough(s)).collect();
+        assert_eq!(requests.len(), 1, "exactly one restore request: {posts:#?}");
+        assert!(requests[0].contains("payment_wallet.rs"), "{requests:?}");
+        assert_eq!(
+            batches.len(),
+            1,
+            "exactly one restore derivation: {batches:#?}"
+        );
+        assert!(batches[0].contains("payment_wallet.rs"), "{batches:?}");
+        // cdk-wallet path: cdk's saga recovery restores `blinded_messages[0].keyset_id` only, and
+        // is reached only through the guarded wrapper.
+        assert_eq!(recoveries.len(), 1, "{recoveries:#?}");
+        assert!(
+            recoveries[0].contains("payment_wallet.rs"),
+            "{recoveries:?}"
+        );
+        let pw = include_str!("payment_wallet.rs");
+        let guarded = &pw[pw
+            .find("async fn recover_incomplete_sagas_guarded(")
+            .unwrap()..];
+        assert!(
+            guarded[..guarded.find("\n}\n").unwrap()].contains(&cdk_recovery),
+            "the one cdk recovery call is inside recover_incomplete_sagas_guarded"
+        );
+        let body = |name: &str| {
+            let start = pw.find(&format!("fn {name}(")).unwrap();
+            let rest = &pw[start..];
+            &rest[..rest.find("\n}\n").unwrap()]
+        };
+        let recover = body("recover_swap_saga_outputs");
+        let derive = body("seed_derived_outputs");
+        assert_eq!(
+            recover.matches(&post).count(),
+            1,
+            "the restore request is here"
+        );
+        assert_eq!(derive.matches(&batch).count(), 1, "the derivation is here");
+        assert!(
+            !recover.contains(&batch),
+            "derive only through seed_derived_outputs"
+        );
+        for (fun, text) in [("recover", recover), ("derive", derive)] {
+            assert!(
+                !text.contains(&all) && !text.contains("get_mint_keysets"),
+                "{fun}: never restores over the mint's keyset list"
+            );
+        }
+        let guard = recover
+            .find("refusing a restore outside the stored messages' keyset")
+            .expect("keyset guard");
+        assert!(
+            guard < recover.find(&post).unwrap(),
+            "guard before the request"
+        );
+        assert!(recover.contains("let keyset = stored[0].keyset_id;"));
+        assert!(recover.contains("seed_derived_outputs(seed, keyset,"));
+        assert!(
+            !recover.contains("seed_derived_outputs(seed, keyset_")
+                && !recover.contains("for keyset in"),
+            "one keyset only"
+        );
     }
 
     /// A seller is paid into this same wallet and `maxplayer-trade` reserves in it, so every seller
