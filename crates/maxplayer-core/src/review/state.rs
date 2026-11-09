@@ -202,7 +202,11 @@ mod tests {
             "invalid_request",
             "unauthorized_request",
         ] {
-            assert_eq!(failure_state(&reviewer_error(code)), "input_refused", "{code}");
+            assert_eq!(
+                failure_state(&reviewer_error(code)),
+                "input_refused",
+                "{code}"
+            );
         }
         assert_eq!(failure_state(CONFLICTING_RESULTS), "policy_refused");
         for code in [
@@ -220,7 +224,12 @@ mod tests {
             assert!(!terminal(&error), "{error}");
         }
         // The config validation message mentions "threshold" and is not a policy refusal.
-        let config = ReviewConfig { timeout_seconds: 0, ..Default::default() }.validate().unwrap_err();
+        let config = ReviewConfig {
+            timeout_seconds: 0,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap_err();
         assert!(config.contains("threshold"), "{config}");
         assert!(!terminal(&config), "{config}");
         // What `review status` shows and what `review retry` accepts, per class, for an offer.
@@ -233,19 +242,38 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let s = Subject { offer: format!("{:064x}", n + 1), event: format!("{:064x}", n + 1), kind: JOB_OFFER_KIND, commit: None };
+            let s = Subject {
+                offer: format!("{:064x}", n + 1),
+                event: format!("{:064x}", n + 1),
+                kind: JOB_OFFER_KIND,
+                commit: None,
+            };
             completed(root.path(), &s, &Err(error.clone())).unwrap();
             let status = read(root.path(), &s.event).unwrap();
             assert_eq!(status.state, state, "{error}");
             assert_eq!(retry(root.path(), &s.event).is_ok(), retryable, "{error}");
             if state == "policy_refused" {
-                assert_eq!(status.retry, SELLER_POLICY_REFUSAL_NEXT, "a policy refusal must not advise `review retry`");
+                assert_eq!(
+                    status.retry, SELLER_POLICY_REFUSAL_NEXT,
+                    "a policy refusal must not advise `review retry`"
+                );
             }
         }
         let root = tempfile::tempdir().unwrap();
         assert!(queued_retries(root.path()).is_empty());
-        let s = Subject { offer: "c".repeat(64), event: "c".repeat(64), kind: JOB_OFFER_KIND, commit: None };
-        write(root.path(), &s, "input_refused", "review: permanent input error").unwrap();
+        let s = Subject {
+            offer: "c".repeat(64),
+            event: "c".repeat(64),
+            kind: JOB_OFFER_KIND,
+            commit: None,
+        };
+        write(
+            root.path(),
+            &s,
+            "input_refused",
+            "review: permanent input error",
+        )
+        .unwrap();
         retry(root.path(), &s.event).unwrap();
         assert_eq!(queued_retries(root.path()), vec![s.event.clone()]);
         assert!(take_retry(root.path(), &s.event));

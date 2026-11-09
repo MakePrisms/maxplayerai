@@ -1304,11 +1304,16 @@ mod tests {
         use super::state::{failure_state, terminal};
         let keys = Keys::generate();
         let cfg = config(&keys);
-        let refused = check(&mock(vec![signed(&answer(0.9), &keys)], vec![]), &cfg).await.unwrap_err();
+        let refused = check(&mock(vec![signed(&answer(0.9), &keys)], vec![]), &cfg)
+            .await
+            .unwrap_err();
         assert!(refused.starts_with(VERDICT_REFUSED_PREFIX), "{refused}");
         assert_eq!(failure_state(&refused), "policy_refused");
         let conflict = check(
-            &mock(vec![signed(&answer(0.1), &keys), signed(&answer(0.9), &keys)], vec![]),
+            &mock(
+                vec![signed(&answer(0.1), &keys), signed(&answer(0.9), &keys)],
+                vec![],
+            ),
             &cfg,
         )
         .await
@@ -1319,15 +1324,25 @@ mod tests {
         error.status = "error".into();
         error.results.clear();
         error.error_code = Some("invalid_subject".into());
-        let permanent = check(&mock(vec![], vec![signed(&error, &keys)]), &cfg).await.unwrap_err();
+        let permanent = check(&mock(vec![], vec![signed(&error, &keys)]), &cfg)
+            .await
+            .unwrap_err();
         assert_eq!(failure_state(&permanent), "input_refused", "{permanent}");
         error.error_code = Some("rate_limited".into());
-        let busy = check(&mock(vec![], vec![signed(&error, &keys)]), &cfg).await.unwrap_err();
+        let busy = check(&mock(vec![], vec![signed(&error, &keys)]), &cfg)
+            .await
+            .unwrap_err();
         assert_eq!(failure_state(&busy), "error", "{busy}");
         let timeout = check(&mock(vec![], vec![]), &cfg).await.unwrap_err();
         assert_eq!(failure_state(&timeout), "error", "{timeout}");
-        let unconfigured = ReviewConfig { reviewers: BTreeMap::new(), timeout_seconds: 1, ..Default::default() };
-        let unconfigured = check(&mock(vec![], vec![]), &unconfigured).await.unwrap_err();
+        let unconfigured = ReviewConfig {
+            reviewers: BTreeMap::new(),
+            timeout_seconds: 1,
+            ..Default::default()
+        };
+        let unconfigured = check(&mock(vec![], vec![]), &unconfigured)
+            .await
+            .unwrap_err();
         assert_eq!(failure_state(&unconfigured), "error", "{unconfigured}");
         let mut output = nostr_sdk::prelude::Output {
             val: (),
@@ -1339,7 +1354,10 @@ mod tests {
             "blocked: conflicting writes above the rate threshold".into(),
         );
         let relay = wire::request_refused(&output).unwrap_err();
-        assert!(relay.contains("threshold") && relay.contains("conflicting"), "{relay}");
+        assert!(
+            relay.contains("threshold") && relay.contains("conflicting"),
+            "{relay}"
+        );
         assert_eq!(failure_state(&relay), "error", "{relay}");
         assert!(!terminal(&relay), "{relay}");
     }
