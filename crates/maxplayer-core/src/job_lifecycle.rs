@@ -3162,13 +3162,17 @@ pub(crate) async fn award_presence_async(
     // RC3-02: only awards that verify are evidence of what the relay holds; an unverifiable award
     // (e.g. a same-id content swap the SDK's id-keyed verification cache let through) must never
     // be parsed into a money row. Filtered BEFORE the emptiness discipline.
-    let mut events = authentic_events(
+    let (mut events, mut poisoned) = authentic_split(
         relay
             .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?,
     );
 
+    if events.is_empty() && poisoned {
+        client.disconnect().await;
+        return Ok(PresenceRead::Unverified);
+    }
     if events.is_empty() {
         // Emptiness means nothing until the relay shows it is answering us at all — and the
         // proof must PRECEDE the read it vouches for. The first fetch may have spent its window
@@ -3182,7 +3186,7 @@ pub(crate) async fn award_presence_async(
             client.disconnect().await;
             return Ok(PresenceRead::Unverified);
         }
-        events = authentic_events(
+        (events, poisoned) = authentic_split(
             relay
                 .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
                 .await
@@ -3190,7 +3194,7 @@ pub(crate) async fn award_presence_async(
         );
         if events.is_empty() {
             client.disconnect().await;
-            return Ok(PresenceRead::ConfirmedAbsent);
+            return Ok(if poisoned { PresenceRead::Unverified } else { PresenceRead::ConfirmedAbsent });
         }
     }
 
@@ -3315,13 +3319,13 @@ async fn presence_of_filter(
     // RC3-02: only events that verify count as presence. A forged event under the filtered author
     // must never make a probe answer `Present` (which HOLDS a refund), so unverifiable events are
     // dropped before the emptiness discipline below ever sees them.
-    let mut events = authentic_events(
+    let (mut events, mut poisoned) = authentic_split(
         relay
             .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| JobLifecycleError::Relay(format!("fetch: {error}")))?,
     );
-    if events.is_empty() {
+    if events.is_empty() && !poisoned {
         let confirmed =
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
                 .await;
@@ -3329,7 +3333,7 @@ async fn presence_of_filter(
             client.disconnect().await;
             return Ok(PresenceRead::Unverified);
         }
-        events = authentic_events(
+        (events, poisoned) = authentic_split(
             relay
                 .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
                 .await
@@ -3337,13 +3341,36 @@ async fn presence_of_filter(
         );
     }
 
-    let read = if events.is_empty() {
+    let read = if events.is_empty() && poisoned {
+        // Only unverifiable frames matched: the relay's answer is untrustworthy, not empty.
+        PresenceRead::Unverified
+    } else if events.is_empty() {
         PresenceRead::ConfirmedAbsent
     } else {
         PresenceRead::Present(())
     };
     client.disconnect().await;
     Ok(read)
+}
+
+/// RC3-02: split a raw fetch into the events that verify and whether ANY frame failed to verify.
+/// A read whose only matching frame is an unverifiable twin (relay-pool 0.44.3's id-keyed cache
+/// re-emits a same-id swap on the raw Message stream, and `fetch_events`' set keeps whichever frame
+/// arrived first) must NOT read as "the relay holds nothing": callers that would conclude absence
+/// treat a poisoned empty read as unanswered instead.
+fn authentic_split(
+    events: impl IntoIterator<Item = nostr_sdk::Event>,
+) -> (Vec<nostr_sdk::Event>, bool) {
+    let mut poisoned = false;
+    let kept = events
+        .into_iter()
+        .filter(|event| {
+            let ok = verified_author_hex(event).is_some();
+            poisoned |= !ok;
+            ok
+        })
+        .collect();
+    (kept, poisoned)
 }
 
 /// Keep only the events whose id and signature verify ([`verified_author_hex`]).
@@ -3620,7 +3647,7 @@ pub(crate) async fn fetch_job_view_async(
     // lists below carry `event.pubkey` straight into the seller/invoice that `prepare_award_async`
     // and `accept_claim_async` pay from, and relay-pool 0.44.3 can hand a fetch a same-id,
     // content-swapped event. (v2 and private events are additionally validated downstream.)
-    let mut offer_events = authentic_events(
+    let (mut offer_events, mut offer_poisoned) = authentic_split(
         relay
             .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
             .await
@@ -3641,6 +3668,11 @@ pub(crate) async fn fetch_job_view_async(
     let offer_probe_confirmed = if offer_present {
         // The offer is in hand; there is nothing to disambiguate and the relay owes no round trip.
         false
+    } else if offer_poisoned {
+        // RC3-02: the relay answered with an unverifiable frame for this filter. That is not an
+        // answered empty read; never let it certify absence (#602's park-terminal rule).
+        crate::opline!("buyer offer-read job={job_id}: only unverifiable frames returned; not absence");
+        false
     } else {
         // Empty offer read: pay the round trip the relay OWES us (a `limit(0)` REQ's `EOSE`) and,
         // only on that proof, RE-FETCH the offer once more before concluding absence — the proof
@@ -3650,7 +3682,7 @@ pub(crate) async fn fetch_job_view_async(
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
                 .await;
         if confirmed {
-            offer_events = authentic_events(
+            (offer_events, offer_poisoned) = authentic_split(
                 relay
                     .fetch_events(offer_filter, timeout, ReqExitPolicy::ExitOnEOSE)
                     .await
@@ -3667,7 +3699,8 @@ pub(crate) async fn fetch_job_view_async(
             offer_events.iter().any(|event| event.id == offer_id),
             offer_read_started.elapsed().as_millis()
         );
-        confirmed
+        // A recheck that again returned only unverifiable frames does not certify absence either.
+        confirmed && !(offer_poisoned && !offer_events.iter().any(|event| event.id == offer_id))
     };
     let read_confirmed = offer_read_answered(offer_present, offer_probe_confirmed);
 
@@ -4384,7 +4417,15 @@ mod tests {
         let kept = authentic_events(vec![bad_sig, same_id.clone(), genuine.clone()]);
         assert_eq!(kept.len(), 1, "only the genuine event survives");
         assert_eq!(kept[0].content, "result");
-        assert!(authentic_events(vec![same_id]).is_empty(), "forgeries alone read as absent");
+        assert!(authentic_events(vec![same_id.clone()]).is_empty());
+        // advisor r2: a read whose only frame is an unverifiable twin is POISONED, not empty — the
+        // presence probes and the offer read then answer Unverified / unconfirmed, never absence.
+        let (kept, poisoned) = authentic_split(vec![same_id.clone()]);
+        assert!(kept.is_empty() && poisoned, "a twin-only read is poisoned, not empty");
+        let (kept, poisoned) = authentic_split(Vec::<nostr_sdk::Event>::new());
+        assert!(kept.is_empty() && !poisoned, "a truly empty read is not poisoned");
+        let (kept, poisoned) = authentic_split(vec![genuine.clone(), same_id]);
+        assert!(kept.len() == 1 && poisoned, "a verifying frame is kept alongside a twin");
     }
 
     #[tokio::test(flavor = "multi_thread")]

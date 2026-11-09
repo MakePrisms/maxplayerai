@@ -397,6 +397,11 @@ async fn collect_window(
                 }
                 // Application shape/domain/signatures are checked by unwrap_content.
                 // Keep foreign matches in the page count so the limit is not hidden.
+                // RC3-02: an unverifiable same-id twin (relay-pool 0.44.3 re-emits one on this
+                // message lane) must never evict the genuine wrap; it never occupies the id.
+                if event.verify().is_err() {
+                    continue;
+                }
                 events.insert(event.id, event.into_owned());
                 if events.len() > WINDOW_LIMIT {
                     return Err(Error("content query overflow"));

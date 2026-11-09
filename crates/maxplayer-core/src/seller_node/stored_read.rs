@@ -99,9 +99,15 @@ async fn collect(
                         event,
                     },
             } if subscription_id.as_ref() == id => {
-                if filters
-                    .iter()
-                    .any(|filter| filter.match_event(&event, Default::default()))
+                // RC3-02: only frames that verify may occupy an id. relay-pool 0.44.3 re-emits a
+                // same-id, content-swapped twin on this (message) lane because its verification
+                // cache is keyed by id; inserting it would REPLACE the genuine frame and the handler
+                // would then (correctly) reject the survivor, silently dropping a valid offer or
+                // payment wrap. Two different bodies cannot both verify under one id.
+                if event.verify().is_ok()
+                    && filters
+                        .iter()
+                        .any(|filter| filter.match_event(&event, Default::default()))
                 {
                     events.insert(event.id, event.into_owned());
                 }
@@ -142,6 +148,49 @@ async fn collect(
 mod tests {
     use super::*;
     use crate::seller_node::p_gate_relay_fixture::PGateRelay;
+
+    // RC3-02 (advisor r2): the backfill collector keys frames by id. A same-id, content-swapped twin
+    // (re-emitted by relay-pool 0.44.3 on the message lane) arriving AFTER the genuine frame must not
+    // replace it, and one arriving FIRST must not occupy the id. Driven through `collect` with the
+    // exact notification shape the relay lane produces. Red on revert: drop the verify and the
+    // genuine offer is replaced by the twin.
+    #[tokio::test]
+    async fn an_unverifiable_twin_never_evicts_or_occupies_a_stored_id() {
+        use nostr_sdk::JsonUtil;
+        use std::borrow::Cow;
+        let keys = Keys::generate();
+        let genuine = EventBuilder::new(Kind::Custom(crate::kinds::JOB_OFFER_KIND), "genuine")
+            .sign_with_keys(&keys)
+            .unwrap();
+        let twin = {
+            let mut value = serde_json::to_value(&genuine).unwrap();
+            value["content"] = serde_json::Value::String("swapped".into());
+            Event::from_json(value.to_string()).unwrap()
+        };
+        assert_eq!(twin.id, genuine.id);
+        let filters = vec![Filter::new().kind(Kind::Custom(crate::kinds::JOB_OFFER_KIND))];
+        let id = SubscriptionId::generate();
+        let frame = |event: &Event| RelayNotification::Message {
+            message: RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()),
+                event: Cow::Owned(event.clone()),
+            },
+        };
+        let eose = RelayNotification::Message {
+            message: RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone())),
+        };
+        for order in [[&genuine, &twin], [&twin, &genuine]] {
+            let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+            for event in order {
+                tx.send(frame(event)).unwrap();
+            }
+            tx.send(eose.clone()).unwrap();
+            let mut events = BTreeMap::new();
+            collect(&mut rx, &id, &filters, &mut events).await.expect("complete");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[&genuine.id].content, "genuine", "the genuine frame survives either order");
+        }
+    }
 
     async fn connected(url: &str) -> (Client, Relay) {
         let client = Client::new(Keys::generate());
