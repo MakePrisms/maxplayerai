@@ -729,7 +729,11 @@ pub(super) async fn collect_target(
 
 /// What a [`TurnPay`] returns: the sealed collect's own result type.
 pub(super) type TurnPayFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<collect::CollectOutcome, collect::CollectError>> + Send + 'a>,
+    Box<
+        dyn std::future::Future<Output = Result<collect::CollectOutcome, collect::CollectError>>
+            + Send
+            + 'a,
+    >,
 >;
 
 /// The pay step of a turn settle, behind a seam so the ordering, lock and review-hold guards can be
@@ -919,7 +923,9 @@ pub(super) async fn settle_delivered_turns(
     let jobs = match context.store.unsettled_turn_job_ids() {
         Ok(jobs) => jobs,
         Err(error) => {
-            crate::opline!("buyer: delivery watcher could not read session turns ({error}); will retry");
+            crate::opline!(
+                "buyer: delivery watcher could not read session turns ({error}); will retry"
+            );
             return;
         }
     };
@@ -1015,7 +1021,11 @@ async fn settle_job_turns(
         let settled = settle_turn_locked(context, &current, &guard, pay).await;
         drop(guard);
         // `get_job.settlement` reads this per follow-up: a refusal shows `failed`, success clears it.
-        settlement::note_refusal(context, &current.followup_id, settled.as_ref().err().cloned());
+        settlement::note_refusal(
+            context,
+            &current.followup_id,
+            settled.as_ref().err().cloned(),
+        );
         match settled {
             Ok(outcome) => crate::opline!(
                 "buyer: delivery watcher settled session {job_id} turn {} — {} for commit {} ({} \

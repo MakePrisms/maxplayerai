@@ -141,7 +141,11 @@ async fn session_on_relay(daemon: &Daemon, amount: u64) -> Session {
     let (task, output) = ("keep talking", "text/plain");
     let deadline = now_unix() as u64 + 3_600;
     let free = amount == 0;
-    let mode = if free { PaymentMode::None } else { PaymentMode::Sat };
+    let mode = if free {
+        PaymentMode::None
+    } else {
+        PaymentMode::Sat
+    };
 
     let offer = OfferDraft::new(task, output, amount, deadline, &seller_hex)
         .with_payment_mode(mode)
@@ -162,7 +166,14 @@ async fn session_on_relay(daemon: &Daemon, amount: u64) -> Session {
         .expect("creq");
         ClaimPayment::Sat(&creq)
     };
-    let mut claim = gateway::claim_draft(&job_id, &buyer_hex, &seller_hex, payment, &[], &Default::default());
+    let mut claim = gateway::claim_draft(
+        &job_id,
+        &buyer_hex,
+        &seller_hex,
+        payment,
+        &[],
+        &Default::default(),
+    );
     claim.tags.push(TagSpec::new(["session", "1"]));
     let claim_id = daemon.publish(&seller, &claim).await.id.to_hex();
     let award = gateway::award_draft(&job_id, &claim_id, &buyer_hex, &seller_hex);
@@ -170,7 +181,14 @@ async fn session_on_relay(daemon: &Daemon, amount: u64) -> Session {
 
     let job_hash = job_lifecycle::job_hash_for_offer(&job_id, task, amount);
     let turn_one = gateway::inline_result_draft(
-        &job_id, &buyer_hex, output, amount, &job_hash, &"ab".repeat(32), "turn one answer", &[],
+        &job_id,
+        &buyer_hex,
+        output,
+        amount,
+        &job_hash,
+        &"ab".repeat(32),
+        "turn one answer",
+        &[],
     );
     let turn_one_id = daemon.publish(&seller, &turn_one).await.id.to_hex();
 
@@ -180,11 +198,24 @@ async fn session_on_relay(daemon: &Daemon, amount: u64) -> Session {
         .store
         .record_award(&job_id, &claim_id, &award_id, &seller_hex, amount, now)
         .expect("record award");
-    context.store.convert_to_spent(&job_id, amount, now).expect("turn 1 spent");
+    context
+        .store
+        .convert_to_spent(&job_id, amount, now)
+        .expect("turn 1 spent");
     write_turn_one_bind(
-        &context.home, &job_id, &claim_id, &turn_one_id, &seller_hex, mode, amount, &job_hash,
+        &context.home,
+        &job_id,
+        &claim_id,
+        &turn_one_id,
+        &seller_hex,
+        mode,
+        amount,
+        &job_hash,
     );
-    context.store.open_session(&job_id, amount * 10, now).expect("session");
+    context
+        .store
+        .open_session(&job_id, amount * 10, now)
+        .expect("session");
 
     // Turn 2: the buyer's signed follow-up, reserved (priced) and sent.
     let followup = crate::session::followup_draft(&crate::session::FollowUp {
@@ -203,14 +234,35 @@ async fn session_on_relay(daemon: &Daemon, amount: u64) -> Session {
         use nostr_sdk::JsonUtil;
         context
             .store
-            .put_turn(&followup_id, &job_id, 2, &followup.as_json(), amount, deadline, now)
+            .put_turn(
+                &followup_id,
+                &job_id,
+                2,
+                &followup.as_json(),
+                amount,
+                deadline,
+                now,
+            )
             .expect("put turn");
     }
     if !free {
-        context.store.reserve(&followup_id, amount, 1_000_000, now).expect("reserve turn 2");
+        context
+            .store
+            .reserve(&followup_id, amount, 1_000_000, now)
+            .expect("reserve turn 2");
     }
-    context.store.set_turn_state(&followup_id, "sent", None, now).expect("sent");
-    Session { job_id, followup_id, seller, output, job_hash, amount }
+    context
+        .store
+        .set_turn_state(&followup_id, "sent", None, now)
+        .expect("sent");
+    Session {
+        job_id,
+        followup_id,
+        seller,
+        output,
+        job_hash,
+        amount,
+    }
 }
 
 /// The seller's turn-2 result: an inline answer replying to the follow-up, with `creq` if given.
@@ -265,7 +317,11 @@ async fn a_free_turn_two_delivery_settles_with_no_collect_call() {
         "a sent free turn is in the watcher's turn work set"
     );
     assert!(
-        context.store.awarded_unsettled_job_ids().expect("awarded").is_empty(),
+        context
+            .store
+            .awarded_unsettled_job_ids()
+            .expect("awarded")
+            .is_empty(),
         "turn 1 is settled, so the job pass has nothing: only the turn pass can settle turn 2"
     );
 
@@ -284,7 +340,12 @@ async fn a_free_turn_two_delivery_settles_with_no_collect_call() {
         .await;
     settle_awarded(context, Some(&other)).await;
     assert_eq!(
-        context.store.turn(&session.followup_id).unwrap().unwrap().state,
+        context
+            .store
+            .turn(&session.followup_id)
+            .unwrap()
+            .unwrap()
+            .state,
         "sent",
         "a wake narrowed to another job must not settle this one"
     );
@@ -326,7 +387,11 @@ async fn a_free_turn_two_delivery_settles_with_no_collect_call() {
     );
     assert!(context.store.unsettled_turn_job_ids().unwrap().is_empty());
     assert_eq!(
-        context.store.session_row(&session.job_id).unwrap().map(|(_, s)| s),
+        context
+            .store
+            .session_row(&session.job_id)
+            .unwrap()
+            .map(|(_, s)| s),
         Some("open".to_owned()),
         "the watcher never closes a session"
     );
@@ -344,7 +409,12 @@ async fn a_free_turn_two_delivery_settles_with_no_collect_call() {
     // A later periodic or boot sweep (same function, no wake) finds nothing left to do.
     settle_awarded(context, None).await;
     assert_eq!(
-        context.store.turn(&session.followup_id).unwrap().unwrap().state,
+        context
+            .store
+            .turn(&session.followup_id)
+            .unwrap()
+            .unwrap()
+            .state,
         "collected"
     );
 }
@@ -381,7 +451,10 @@ async fn a_forged_turn_delivery_spends_nothing_and_reads_failed() {
             .is_none(),
         "a refused turn writes no bind"
     );
-    assert_eq!(BudgetGate::from_home(&context.home).expect("gate").spent(), 0);
+    assert_eq!(
+        BudgetGate::from_home(&context.home).expect("gate").spent(),
+        0
+    );
     assert!(!context.home.root.join("payment-journal").exists());
     assert!(
         !context
@@ -443,7 +516,9 @@ impl TurnPay for FakePay {
             let already = self.sent.lock().unwrap().contains(&row.followup_id);
             tokio::time::sleep(self.delay).await;
             let result = if self.refuse.contains(&row.turn) {
-                Err(collect::CollectError::Integrity("refused by the test".into()))
+                Err(collect::CollectError::Integrity(
+                    "refused by the test".into(),
+                ))
             } else {
                 if !already {
                     self.sent.lock().unwrap().insert(row.followup_id.clone());
@@ -479,9 +554,15 @@ fn seed_job(context: &BuyerContext, job: &str, turn_one_settled: bool) {
         .store
         .record_award(job, &hex(0xc1a1), &hex(0xa3a2), SELLER, 100, now)
         .expect("award");
-    context.store.reserve(job, 100, 1_000_000, now).expect("reserve turn 1");
+    context
+        .store
+        .reserve(job, 100, 1_000_000, now)
+        .expect("reserve turn 1");
     if turn_one_settled {
-        context.store.convert_to_spent(job, 100, now).expect("turn 1 spent");
+        context
+            .store
+            .convert_to_spent(job, 100, now)
+            .expect("turn 1 spent");
     }
 }
 
@@ -498,12 +579,19 @@ fn seed_turn(context: &BuyerContext, job: &str, turn: u32, state: &str) -> Strin
         .store
         .set_turn_state(&followup, state, result.as_deref(), now)
         .expect("state");
-    context.store.reserve(&followup, 100, 1_000_000, now).expect("reserve turn");
+    context
+        .store
+        .reserve(&followup, 100, 1_000_000, now)
+        .expect("reserve turn");
     followup
 }
 
 fn reservation_state(context: &BuyerContext, id: &str) -> Option<reservations::ReservationState> {
-    context.store.reservation(id).unwrap().map(|(state, _)| state)
+    context
+        .store
+        .reservation(id)
+        .unwrap()
+        .map(|(state, _)| state)
 }
 
 // ★ STRICT TURN ORDER. Two delivered turns (only reachable through a bug or a crash, which is
@@ -525,8 +613,15 @@ async fn turns_settle_strictly_in_order() {
         ..Default::default()
     };
     session_reply::settle_delivered_turns(context, None, &refusing).await;
-    assert_eq!(refusing.calls(), vec![2], "turn 2 is tried first, and turn 3 never");
-    assert_eq!(reservation_state(context, &three), Some(reservations::ReservationState::Reserved));
+    assert_eq!(
+        refusing.calls(),
+        vec![2],
+        "turn 2 is tried first, and turn 3 never"
+    );
+    assert_eq!(
+        reservation_state(context, &three),
+        Some(reservations::ReservationState::Reserved)
+    );
     assert!(context.settle_failures.lock().unwrap().contains_key(&two));
 
     let paying = FakePay::default();
@@ -534,7 +629,10 @@ async fn turns_settle_strictly_in_order() {
     assert_eq!(paying.calls(), vec![2, 3], "one pass settles 2, then 3");
     for id in [&two, &three] {
         assert_eq!(context.store.turn(id).unwrap().unwrap().state, "collected");
-        assert_eq!(reservation_state(context, id), Some(reservations::ReservationState::Spent));
+        assert_eq!(
+            reservation_state(context, id),
+            Some(reservations::ReservationState::Spent)
+        );
     }
     assert!(
         !context.settle_failures.lock().unwrap().contains_key(&two),
@@ -549,7 +647,10 @@ async fn turns_settle_strictly_in_order() {
     let waiting = FakePay::default();
     session_reply::settle_delivered_turns(context, None, &waiting).await;
     assert!(waiting.calls().is_empty(), "{:?}", waiting.calls());
-    assert_eq!(reservation_state(context, &three), Some(reservations::ReservationState::Reserved));
+    assert_eq!(
+        reservation_state(context, &three),
+        Some(reservations::ReservationState::Reserved)
+    );
 
     // Turn 1 not settled yet: no later turn settles before it.
     let job = hex(0x103);
@@ -558,7 +659,10 @@ async fn turns_settle_strictly_in_order() {
     let early = FakePay::default();
     session_reply::settle_delivered_turns(context, None, &early).await;
     assert!(early.calls().is_empty(), "{:?}", early.calls());
-    assert_eq!(reservation_state(context, &two), Some(reservations::ReservationState::Reserved));
+    assert_eq!(
+        reservation_state(context, &two),
+        Some(reservations::ReservationState::Reserved)
+    );
 }
 
 // ★ WATCHER vs COLLECT RACE. A watcher pass and a manual `collect turn=2` (the RPC's turn path,
@@ -589,7 +693,11 @@ async fn a_watcher_racing_collect_pays_a_turn_exactly_once() {
             collected
         };
         assert!(collected.is_ok(), "{collected:?}");
-        assert_eq!(pay.sends.load(Ordering::SeqCst), 1, "watcher_first={watcher_first}");
+        assert_eq!(
+            pay.sends.load(Ordering::SeqCst),
+            1,
+            "watcher_first={watcher_first}"
+        );
         assert!(
             !pay.overlapped.load(Ordering::SeqCst),
             "two pay steps ran at once (watcher_first={watcher_first})"
@@ -601,8 +709,14 @@ async fn a_watcher_racing_collect_pays_a_turn_exactly_once() {
                 "collect settled first: the watcher must re-read under the lock and skip"
             );
         }
-        assert_eq!(context.store.turn(&two).unwrap().unwrap().state, "collected");
-        assert_eq!(reservation_state(context, &two), Some(reservations::ReservationState::Spent));
+        assert_eq!(
+            context.store.turn(&two).unwrap().unwrap().state,
+            "collected"
+        );
+        assert_eq!(
+            reservation_state(context, &two),
+            Some(reservations::ReservationState::Spent)
+        );
     }
 }
 
@@ -640,7 +754,10 @@ async fn a_review_held_turn_is_not_retried_in_the_background() {
         .store
         .record_award(&job, &hex(0xc1a1), &hex(0xa3a2), &seller_hex, 100, now)
         .expect("award");
-    context.store.convert_to_spent(&job, 100, now).expect("turn 1 spent");
+    context
+        .store
+        .convert_to_spent(&job, 100, now)
+        .expect("turn 1 spent");
     let two = seed_turn(context, &job, 2, "delivered");
     let held = |event: String, state: &str, detail: &str| {
         crate::review::state::write(
@@ -669,8 +786,15 @@ async fn a_review_held_turn_is_not_retried_in_the_background() {
         &pay,
     )
     .await;
-    assert!(pay.calls().is_empty(), "a held turn is never retried by the watcher: {:?}", pay.calls());
-    assert_eq!(reservation_state(context, &two), Some(reservations::ReservationState::Reserved));
+    assert!(
+        pay.calls().is_empty(),
+        "a held turn is never retried by the watcher: {:?}",
+        pay.calls()
+    );
+    assert_eq!(
+        reservation_state(context, &two),
+        Some(reservations::ReservationState::Reserved)
+    );
     let hint = settlement::hint(&settlement::facts(context, &job, true, true).expect("facts"));
     assert_eq!(hint["mode"], json!("auto"), "{hint}");
     assert_eq!(hint["state"], json!("failed"), "{hint}");
@@ -685,7 +809,10 @@ async fn a_review_held_turn_is_not_retried_in_the_background() {
     )
     .await;
     assert_eq!(pay.calls(), vec![2]);
-    assert_eq!(context.store.turn(&two).unwrap().unwrap().state, "collected");
+    assert_eq!(
+        context.store.turn(&two).unwrap().unwrap().state,
+        "collected"
+    );
 
     // Turn 3: the job's status file still names turn 2's (now settled) result: history, no hold.
     held(result_of(&job, 2), "error", "an old timeout");
@@ -695,6 +822,13 @@ async fn a_review_held_turn_is_not_retried_in_the_background() {
         .set_turn_state(&two, "collected", Some(&result_of(&job, 2)), now)
         .unwrap();
     session_reply::settle_delivered_turns(context, None, &pay).await;
-    assert_eq!(pay.calls(), vec![2, 3], "an earlier turn's review status holds nothing");
-    assert_eq!(context.store.turn(&three).unwrap().unwrap().state, "collected");
+    assert_eq!(
+        pay.calls(),
+        vec![2, 3],
+        "an earlier turn's review status holds nothing"
+    );
+    assert_eq!(
+        context.store.turn(&three).unwrap().unwrap().state,
+        "collected"
+    );
 }

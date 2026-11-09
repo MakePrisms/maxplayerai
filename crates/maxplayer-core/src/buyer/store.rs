@@ -1764,7 +1764,8 @@ mod tests {
     /// finished turns drop out, and a job is listed once however many turns qualify.
     #[test]
     fn unsettled_turn_job_ids_holds_live_turns_with_held_funds_only() {
-        let dir = std::env::temp_dir().join(format!("mx-buyer-turn-workset-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mx-buyer-turn-workset-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let store = BuyerStore::open(dir.join("buyer.sqlite")).unwrap();
