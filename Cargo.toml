@@ -21,7 +21,7 @@ default-members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.7.2"
+version = "0.7.3-rc3"
 edition = "2024"
 description = "Maxplayer"
 repository = "https://github.com/MakePrisms/maxplayerai"
@@ -72,3 +72,17 @@ strip = true
 inherits = "release"
 debug = true
 strip = false
+
+# CI test profile for the release-only money-path and feature-union jobs. `release` (opt-level 3 +
+# thin LTO) spent ~21 of their ~27-30 minutes compiling maxplayer-core alone; the dependencies were
+# already cached. Here our own crates build at dev speed while third-party crates (crypto, cdk,
+# libgit2, tokio) are optimised, which costs nothing per run because rust-cache restores them.
+# Debug assertions and overflow checks stay ON, so the money suite runs with more checks than
+# release, not fewer. The debug-only #152 panic that kept these jobs in release was fixed in
+# 20965f2 (git_transport::off_runtime, with a regression test).
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+
+[profile.ci.package."*"]
+opt-level = 2

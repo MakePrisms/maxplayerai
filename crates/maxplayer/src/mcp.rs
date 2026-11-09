@@ -337,7 +337,7 @@ fn tools() -> Value {
     json!([
         {
             "name": "post_job",
-            "description": led_by(post_job_guide_lead(), "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, so the normal flow is just post_job then collect (two calls). max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Optional base_local_path is an absolute checkout or bare-repo path on the buyer daemon machine, valid only in contribution mode. For private posts it supplies only the pinned base and its history; the path stays local. If unavailable, the buyer downloads target_repo_url as usual. Direct jobs only: an open-pool (untargeted) post with base_local_path is refused, because open-pool sellers must read target_repo_url themselves before claiming. SAME RULE FOR PRIVATE REPOS: on an open-pool or public contribution job, target_repo_url must be publicly readable (sellers read it before claiming); a post whose base sellers cannot read is refused at post time with no money spent — for a private repository post a TARGETED private job (seller_pubkey), where the buyer uploads the base for its chosen seller. A PUBLIC contribution post additionally downloads the base once at post time to validate it (readability, base_oid exists, relay quotas) before anything is published, so the post takes roughly one clone of the repo; a bad pin is refused with the cause named instead of burning the job deadline at seller execution. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job settles through collect exactly like a priced one, but pays nothing. Slow preparation returns status=preparing with preparation_id; this is NOT a published job. Poll get_job with job_id=preparation_id until status=posted yields the real job_id, then use that job_id normally. Never repost with changed arguments to poll. An identical retry attaches to the same preparation (status=posted with deduplicated=true means nothing new was published); without request_id that only holds for 10 minutes after it finishes, so a later identical post is a new hire. A failure before any offer was queued re-runs on retry. request_id is a permanent idempotency key; a new one is a deliberate new hire. Never echoes secrets."),
+            "description": led_by(post_job_guide_lead(), "Publish a real maxplayer job offer (OFFER kind) to the configured maxplayer relay, then let the buyer daemon drive the award: once a payable seller claim appears the daemon auto-awards it under the hood, and once the awarded seller delivers the daemon auto-settles it on its own (accept, verify, pay, materialize into <home>/results/<job_id>). So the normal flow is post_job, then get_job wait_for=result until get_job.settlement.state is settled; collect is optional (a manual retry of that settle; get_job.settlement already reads back the paths, files and pay summary). Do not ask the human whether to collect: paying was decided at award. max_sats caps what the daemon will commit to (defaults to amount_sats); it never auto-awards a claim it cannot pay. harness, harness_family, model and capabilities are ALL hard award filters (only a seller advertising them can be awarded), enforced identically on the manual and automatic award paths; model requires harness (the preset), and a harness_family given alongside harness must name the same harness it does. Omit them all and every claim passes exactly as before. Targeted seller p-tag is the documented default (pass seller_pubkey); set untargeted=true for an open offer. Optional repo+branch attach git delivery tags. CONTRIBUTION (freelance-PR) mode: supply target_repo_owner + target_repo_url + base_branch + base_oid to post a job-class=contribution offer against a repo you own (seller forks it and delivers a PR); these four are ALL-OR-NOTHING (a partial set is refused). Omit all four ⇒ from-scratch job. Optional base_local_path is an absolute checkout or bare-repo path on the buyer daemon machine, valid only in contribution mode. For private posts it supplies only the pinned base and its history; the path stays local. If unavailable, the buyer downloads target_repo_url as usual. Direct jobs only: an open-pool (untargeted) post with base_local_path is refused, because open-pool sellers must read target_repo_url themselves before claiming. SAME RULE FOR PRIVATE REPOS: on an open-pool or public contribution job, target_repo_url must be publicly readable (sellers read it before claiming); a post whose base sellers cannot read is refused at post time with no money spent — for a private repository post a TARGETED private job (seller_pubkey), where the buyer uploads the base for its chosen seller. A PUBLIC contribution post additionally downloads the base once at post time to validate it (readability, base_oid exists, relay quotas) before anything is published, so the post takes roughly one clone of the repo; a bad pin is refused with the cause named instead of burning the job deadline at seller execution. PAYMENT MODE: payment defaults to \"sat\" — a priced job that commits real money at award and needs a funded wallet. payment=\"none\" posts a FREE job instead: it requires amount_sats=0, commits nothing, needs no wallet and no mint, and is awarded only to a seller whose claim also says none (a seat advertising takes_no_payment). A free job is settled by the daemon exactly like a priced one, but pays nothing. Slow preparation returns status=preparing with preparation_id; this is NOT a published job. Poll get_job with job_id=preparation_id until status=posted yields the real job_id, then use that job_id normally. Never repost with changed arguments to poll. An identical retry attaches to the same preparation (status=posted with deduplicated=true means nothing new was published); without request_id that only holds for 10 minutes after it finishes, so a later identical post is a new hire. A failure before any offer was queued re-runs on retry. request_id is a permanent idempotency key; a new one is a deliberate new hire. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -433,7 +433,7 @@ fn tools() -> Value {
         },
         {
             "name": "get_job",
-            "description": format!("Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll; timeout_secs bounds the wait, capped internally at {cap}s (values above {cap} are refused, not silently shortened) — omit timeout_secs to use the {cap}s default. Local accept-bind attached if present. Results may carry seller-claimed exec-metadata attribution (harness, model): harness is the RESOLVED id (e.g. claude-agent-acp) — a DIFFERENT vocabulary from post_job's harness labels (claude), so never string-compare the two — and every such value is an attribution, not a verification. Also accepts a preparation_id as job_id to poll a slow post: returns status=preparing or status=posted with the real job_id, or a terminal error; preparation polling is local and does not long-poll relay events. Never invents claims/results. awarded_delivery_pending is true when an award is committed, the awarded seller has delivered, and settlement (accept) has not yet run — a distinct fact from live_claim_id and from accepted. publish_refused, when present, means the relay permanently refused the offer's publication (the field carries the relay's reason): the job never became visible, no seller can claim it, and the recovery is to post the job again.", cap = long_poll::WAIT_FOR_CAP_SECS),
+            "description": format!("Read job state from the relay (offer + claims + results). Surfaces claim created_at and flags the most-recent LIVE claim. Optional include_display_names=true adds best-effort cosmetic kind-0 names; the default skips that extra network fetch and hex pubkeys remain authoritative. Optional wait_for=claim|result long-poll; timeout_secs bounds the wait, capped internally at {cap}s (values above {cap} are refused, not silently shortened) — omit timeout_secs to use the {cap}s default. Local accept-bind attached if present. Results may carry seller-claimed exec-metadata attribution (harness, model): harness is the RESOLVED id (e.g. claude-agent-acp) — a DIFFERENT vocabulary from post_job's harness labels (claude), so never string-compare the two — and every such value is an attribution, not a verification. Also accepts a preparation_id as job_id to poll a slow post: returns status=preparing or status=posted with the real job_id, or a terminal error; preparation polling is local and does not long-poll relay events. Never invents claims/results. awarded_delivery_pending is true when an award is committed, the awarded seller has delivered, and settlement (accept) has not yet run — a distinct fact from live_claim_id and from accepted; it is normally true only for the few seconds before the daemon's own settle lands. settlement says who settles the delivery and where it stands: {{mode: auto (the buyer daemon settles it on its own) | manual (only an explicit collect settles it), state: none | awaiting_delivery | settling | settled | failed | collect_required, turn, note, results_path (when settled and the files exist), error (when failed); once settled also commit_oid, files, file_count, pay {{state, amount_sats, attempt_id}}, agent_used and model_used — the same facts collect returns, read from the local records, so collect is never needed to read them back}}. settling = delivered and the daemon is settling it now: re-check get_job shortly, do not call collect and do not ask the human. settled = paid (or free) and materialized at results_path; collect is not needed. failed = the last settle was refused (error says why): fix the cause, then call collect to retry, and read the maxplayer-debug-buying skill if it keeps failing. A delivery review that did not finish (reviewer unreachable, timed out or failed) is retried only by collect; a review that refused the delivery cannot be overridden by collect, which re-runs the review. collect_required = delivered but outside the daemon's automatic settle (an award, or a session turn, the daemon holds no reservation for): call collect yourself (turn=<n> for a session turn); that call is yours, not the human's. Session turns 2 and later are settled by the daemon exactly like turn 1, strictly in turn order; settlement.turn names the turn the object describes. null means the reservation ledger could not be read. publish_refused, when present, means the relay permanently refused the offer's publication (the field carries the relay's reason): the job never became visible, no seller can claim it, and the recovery is to post the job again.", cap = long_poll::WAIT_FOR_CAP_SECS),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -448,12 +448,13 @@ fn tools() -> Value {
         },
         {
             "name": "collect",
-            "description": led_by(collect_guide_lead(), "Single-call buyer collect: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match — and the delivered tree must carry this job's execution sentinel), then materialize the files into <home>/results/<job_id>. What happens between verify and materialize depends on the mode the offer and claim AGREED on at accept, which collect reads off the local bind and never infers: a PRICED job (payment=sat) is auto-paid through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), and if the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. A FREE job (payment=none) pays nothing: no wallet is opened, no mint is contacted, no budget is charged, and the durable spend ledger is never even READ, so a buyer with no wallet at all — or with an unreadable spend ledger — can collect one; the integrity checks above still run in full, and a delivery that fails them materializes nothing. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting re-materializes without a second payment. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used}; for a free collect pay.state is \"none\", pay.attempt_id is null and pay.amount_sats is 0, because no payment attempt was ever made, and pay.spent_total_sats is ABSENT — a free collect reads no spend ledger, so it reports no total rather than a 0 that would read as \"you have spent nothing\"; read the standing total from `buyer status`. agent_used/model_used are the seller-claimed harness/model that produced the delivered result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets."),
+            "description": led_by(collect_guide_lead(), "Single-call buyer collect: usually NOT needed, and never a question for the human. It is a manual trigger of the buyer daemon's own settle, which runs on its own within seconds of a delivery landing (get_job.settlement.state goes settling → settled, and a settled settlement already carries results_path, commit_oid, files and pay, so collect is not needed to read them back). Call it only when get_job.settlement.state is failed (fix the cause first, e.g. fund the wallet at a mint the seller accepts), when the delivery review did not finish (settlement.error names a review that errored: reviewer unreachable, timed out or failed; the daemon does not retry that on its own, and collect re-runs the review), or when it is collect_required (an award or session turn with no reservation). Session turns 2 and later are settled by the daemon too. It never pays twice, and it never overrides a review that refused the delivery: it re-runs the review, so a refusal stays a refusal. Never ask the human whether to collect: paying was decided at award. To close a session use reply close: true; collect does not close. What it does: if no accept-bind exists yet, accept the delivered claim itself (fetch the seller's result from the relay and record the co-signed pay-bind — the same accept path `maxplayer accept` runs), verify the delivery integrity (the delivered branch must tip at the accepted commit — the PayPathDeliveryVerifier tip-match — and the delivered tree must carry this job's execution sentinel), then materialize the files into <home>/results/<job_id>. What happens between verify and materialize depends on the mode the offer and claim AGREED on at accept, which collect reads off the local bind and never infers: a PRICED job (payment=sat) is auto-paid through the sealed money path (BudgetGate → PaymentService::run, single-redeem + mint-compat intact), and if the wallet holds no funds it refuses with a message pointing at `maxplayer wallet setup`. A FREE job (payment=none) pays nothing: no wallet is opened, no mint is contacted, no budget is charged, and the durable spend ledger is never even READ, so a buyer with no wallet at all — or with an unreadable spend ledger — can collect one; the integrity checks above still run in full, and a delivery that fails them materializes nothing. On integrity mismatch or a bad seller co-signature: refuses and does NOT pay. Idempotent: re-collecting re-materializes without a second payment. Returns {pay: {state, attempt_id, amount_sats, spent_total_sats}, commit_oid, path, files, agent_used, model_used}; for a free collect pay.state is \"none\", pay.attempt_id is null and pay.amount_sats is 0, because no payment attempt was ever made, and pay.spent_total_sats is ABSENT — a free collect reads no spend ledger, so it reports no total rather than a 0 that would read as \"you have spent nothing\"; read the standing total from `buyer status`. agent_used/model_used are the seller-claimed harness/model that produced the delivered result (null = the seller reported nothing; an attribution, never a verification). agent_used is the RESOLVED harness id (e.g. claude-agent-acp), a different vocabulary from post_job's harness label (claude) — never string-compare the two. Never echoes secrets."),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": { "type": "string", "description": "Offer event id (hex)" },
-                    "out": { "type": "string", "description": "Optional folder NAME (no path separators) under <home>/results" }
+                    "out": { "type": "string", "description": "Optional folder NAME (no path separators) under <home>/results" },
+                    "accept_review_verdict": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Explicit buyer decision: I have seen this exact signed verdict and accept this delivery anyway. Pass the verdict event id from the refusal. Recorded only for this exact result; a different verdict or re-delivery fails closed. Never rewrites config or affects other jobs; an operator decision, not a retry." }
                 },
                 "required": ["job_id"],
                 "additionalProperties": false
@@ -461,7 +462,7 @@ fn tools() -> Value {
         },
         {
             "name": "award_claim",
-            "description": "Manually award a specific seller claim (the fine-grain override of the daemon's auto-award): reserve the funds and publish the buyer AWARD (kind-3405, status=accepted) selecting that claim so the seller executes and every other claimant releases without spending compute. The daemon refuses to award a claim it cannot pay or whose price exceeds max_sats (defaults to the offer amount). Awards are WRITE-ONCE per job: the first call pins one signed award event (sealing the claim AND the amount — max_sats applies to the first call only), and every retry re-sends that exact event — a retry can never award a different claim or publish a duplicate, so retrying after an ambiguous error (e.g. 'relay gave no verdict') is always safe and is the way to converge. A claim_id that contradicts an already-pinned attempt is refused. No pay-bind — settle after delivery with collect. Never echoes secrets.",
+            "description": "Manually award a specific seller claim (the fine-grain override of the daemon's auto-award): reserve the funds and publish the buyer AWARD (kind-3405, status=accepted) selecting that claim so the seller executes and every other claimant releases without spending compute. The daemon refuses to award a claim it cannot pay or whose price exceeds max_sats (defaults to the offer amount). Awards are WRITE-ONCE per job: the first call pins one signed award event (sealing the claim AND the amount — max_sats applies to the first call only), and every retry re-sends that exact event — a retry can never award a different claim or publish a duplicate, so retrying after an ambiguous error (e.g. 'relay gave no verdict') is always safe and is the way to converge. A claim_id that contradicts an already-pinned attempt is refused. No pay-bind — after delivery the daemon settles the job on its own, exactly as for an auto-award (collect only to retry). Never echoes secrets.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -481,7 +482,9 @@ fn tools() -> Value {
 }
 
 /// Session jobs (docs/specs/session-jobs.md §10): with `[sessions] enabled = true` the surface gains
-/// `reply`, `collect.turn`/`collect.close_session`, and `get_job` documents its `session` object.
+/// `reply`, `collect.turn`, and `get_job` documents its `session` object. `reply close: true` is the
+/// one advertised way to close; the daemon still accepts `collect close_session` as a deprecated
+/// alias for one release, but the schema no longer lists it.
 /// With the flag off the list is exactly [`tools`] — byte-identical to before sessions existed.
 fn tools_for(sessions: bool) -> Value {
     let mut list = tools();
@@ -497,18 +500,19 @@ fn tools_for(sessions: bool) -> Value {
             Some("collect") => {
                 let props = &mut tool["inputSchema"]["properties"];
                 props["turn"] = json!({"type": "integer", "minimum": 1, "description": "Session job: the turn to settle. Omit to settle the newest delivered, uncollected turn (turn 1 first). Turn n >= 2 materializes into <home>/results/<job_id>-t<n>; out is refused for it."});
-                props["close_session"] = json!({"type": "boolean", "description": "Session job: after collecting, close the session (the seller frees the parked agent; no further reply)."});
             }
             Some("get_job") => {
                 let description = tool["description"].as_str().unwrap_or_default().to_owned();
-                tool["description"] = json!(format!("{description} On a session job the response carries session: {{supported, turn, status (running|parked|closed|expired|no_response), turn_status (done|needs_input|out_of_time from the current turn's result; pending|refused|no_response when that turn has no result), question (the seller's question when needs_input), context_reset, uncollected_turn, expires_hint}}. no_response means the turn's deadline passed with no result: its reservation was released and reply may retry."));
+                tool["description"] = json!(format!(
+                    "{description} On a session job the response carries session: {{supported, turn, status (running|parked|closed|expired|no_response), turn_status (done|needs_input|out_of_time from the current turn's result; pending|refused|no_response when that turn has no result), question (the seller's question when needs_input), context_reset, uncollected_turn, expires_hint}}. uncollected_turn is normally settled by the daemon within seconds, turn 1 and every later turn alike, strictly in turn order (settlement.mode auto); collect turn=<n> is the explicit retry. expires_hint is when a parked session ends by itself; closing it earlier is optional. no_response means the turn's deadline passed with no result: its reservation was released and reply may retry."
+                ));
             }
             _ => {}
         }
     }
     tools.push(json!({
         "name": "reply",
-        "description": "Continue a SESSION job with the same seller and the same agent conversation: start the next turn with text (a follow-up instruction or the answer to the seller's needs_input question). Works only when the awarded claim advertised sessions (get_job.session.supported) and the previous turn is collected — otherwise it refuses before anything is signed or reserved ('collect turn n first', 'seller does not support sessions; post a new job'). Each turn costs the job's price, is reserved against the per-job cap AND the session cap (max_session_sats, default 10x the price), and is paid on collect. deadline_secs bounds the turn (default 3600). close: true (no text) ends the session and pays nothing. Retrying after an error re-sends the same signed follow-up; it never starts a second turn. Then wait with get_job wait_for=result and settle with collect.",
+        "description": "Continue a SESSION job with the same seller and the same agent conversation: start the next turn with text (a follow-up instruction or the answer to the seller's needs_input question). Works only when the awarded claim advertised sessions (get_job.session.supported) and the previous turn is settled — otherwise it refuses before anything is signed or reserved ('turn n is still settling …; retry reply shortly' while the daemon settles it, 'turn n could not settle automatically (<reason>); run collect for turn n' when it cannot, 'seller does not support sessions; post a new job'). Each turn costs the job's price, is reserved against the per-job cap AND the session cap (max_session_sats, default 10x the price), and is paid when the turn is settled. deadline_secs bounds the turn (default 3600). close: true (no text) ends the session and pays nothing. Retrying after an error re-sends the same signed follow-up; it never starts a second turn. Then wait with get_job wait_for=result: the daemon settles the delivered turn on its own (get_job.settlement for that turn goes settling → settled, files under results/<job_id>-t<n>), so the next reply can follow; collect turn=<n> is only the explicit retry of a failed settle, and it is your call, not the human's (the reply already reserved its price).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -516,7 +520,7 @@ fn tools_for(sessions: bool) -> Value {
                 "text": { "type": "string", "description": "The next instruction or the answer to the seller's question" },
                 "deadline_secs": { "type": "integer", "minimum": 60, "description": "This turn's deadline from now (default 3600)" },
                 "max_session_sats": { "type": "integer", "minimum": 0, "description": "Session spend cap across all turns (default 10x the job price)" },
-                "close": { "type": "boolean", "description": "Close the session instead of starting a turn" }
+                "close": { "type": "boolean", "description": "Close the session instead of starting a turn. This is the one way to close a session, and it is optional: a parked session expires on its own at get_job.session.expires_hint, and closing early only frees the seller's parked agent and pays nothing." }
             },
             "required": ["job_id"],
             "additionalProperties": false
@@ -1070,6 +1074,106 @@ mod tests {
         }
     }
 
+    // Petar's buyer agent (2026-11-08) asked its human "collect and close the job?" about a job the
+    // daemon had already settled. The descriptions must not teach collect as a required step: the
+    // flow is post_job then get_job, collect is optional and idempotent, and asking the human is
+    // ruled out. Red-on-revert: restore "post_job then collect (two calls)" and this fails.
+    #[test]
+    fn descriptions_teach_auto_settle_and_keep_collect_optional() {
+        let post = listed_description("post_job");
+        assert!(!post.contains("two calls"), "{post}");
+        assert!(!post.contains("post_job then collect"), "{post}");
+        assert!(post.contains("auto-settles it on its own"), "{post}");
+        assert!(post.contains("collect is optional"), "{post}");
+        assert!(
+            post.contains("Do not ask the human whether to collect"),
+            "{post}"
+        );
+
+        let collect = listed_description("collect");
+        let shown: String = collect.chars().take(400).collect();
+        assert!(
+            shown.contains("usually NOT needed"),
+            "said early, before truncation: {shown}"
+        );
+        assert!(collect.contains("never pays twice"), "{collect}");
+        assert!(
+            collect.contains("Never ask the human whether to collect"),
+            "{collect}"
+        );
+
+        let get = listed_description("get_job");
+        for state in ["settling", "settled", "failed", "collect_required"] {
+            assert!(
+                get.contains(state),
+                "get_job documents settlement.state {state}: {get}"
+            );
+        }
+        assert!(listed_description("award_claim").contains("settles the job on its own"));
+
+        let on = tools_for(true);
+        let find = |name: &str| {
+            on.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        let close = find("reply")["inputSchema"]["properties"]["close"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(close.contains("expires on its own"), "{close}");
+        assert!(close.contains("the one way to close"), "{close}");
+        let reply = find("reply")["description"].as_str().unwrap().to_owned();
+        assert!(
+            reply.contains("the daemon settles the delivered turn on its own"),
+            "{reply}"
+        );
+        // Turns ≥ 2 are auto-settled now: no description may still say they need collect.
+        for (name, text) in [("reply", &reply), ("get_job", &get), ("collect", &collect)] {
+            for stale in ["does not settle turns 2", "settled only by collect", "a session turn 2 or later, or an award"] {
+                assert!(!text.contains(stale), "{name} still says {stale:?}: {text}");
+            }
+        }
+    }
+
+    // Closing a session is separate from collect (Petar, 2026-11-09): no tool list, sessions on or
+    // off, advertises collect.close_session any more, and collect's description says when to call
+    // it (failed / review did not finish / collect_required), that it is a manual trigger of the
+    // daemon's settle, and that it cannot override a review refusal. Red-on-revert: restore the
+    // close_session property, or the old "reading back the paths" reason, and this fails.
+    #[test]
+    fn collect_is_a_manual_settle_trigger_and_does_not_close_sessions() {
+        for sessions in [false, true] {
+            let listed = serde_json::to_string(&tools_for(sessions)).unwrap();
+            assert!(
+                !listed.contains("close_session"),
+                "sessions={sessions}: close_session is no longer advertised"
+            );
+        }
+        let collect = listed_description("collect");
+        for phrase in [
+            "manual trigger of the buyer daemon's own settle",
+            "settlement.state is failed",
+            "fix the cause first",
+            "review did not finish",
+            "collect_required",
+            "never overrides a review that refused the delivery",
+            "use reply close: true",
+        ] {
+            assert!(
+                collect.contains(phrase),
+                "collect must say {phrase:?}: {collect}"
+            );
+        }
+        assert!(
+            !collect.contains("reading back the paths"),
+            "read-back moved to get_job.settlement: {collect}"
+        );
+    }
+
     // The handshake keeps the orientation pointer and names both specific skills.
     #[test]
     fn instruction_guides_keep_orientation_and_name_both_specific_skills() {
@@ -1276,7 +1380,7 @@ mod tests {
         assert_eq!(names, vec!["post_job", "get_job", "collect", "award_claim", "reply"]);
         let collect = on.as_array().unwrap().iter().find(|t| t["name"] == "collect").unwrap();
         assert!(collect["inputSchema"]["properties"]["turn"].is_object());
-        assert!(collect["inputSchema"]["properties"]["close_session"].is_object());
+        assert!(collect["inputSchema"]["properties"].get("close_session").is_none());
         let off = tools();
         let collect = off
             .as_array()
@@ -1316,6 +1420,28 @@ mod tests {
             .unwrap()
             .remove("max_session_sats");
         assert_eq!(on_post, post(&off));
+    }
+
+    #[test]
+    fn collect_review_verdict_schema_is_hex_and_optional() {
+        let tools = tools();
+        let collect = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "collect")
+            .unwrap();
+        let schema = &collect["inputSchema"];
+        let threshold = &schema["properties"]["accept_review_verdict"];
+        assert_eq!(threshold["type"], "string");
+        assert_eq!(threshold["pattern"], "^[0-9a-f]{64}$");
+        assert_eq!(schema["required"], json!(["job_id"]));
+        assert!(
+            threshold["description"]
+                .as_str()
+                .unwrap()
+                .contains("operator decision, not a retry")
+        );
     }
 
     #[test]

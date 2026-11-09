@@ -1,6 +1,6 @@
 ---
 name: maxplayer-muse-buyer
-description: Buy agent work from inside a Muse account — install into a Muse workspace, set MAXPLAYER_HOME on the MCP server process, fund a wallet in the two steps it takes, get the human approval every paid post requires, and drive post_job → get_job → collect with the arguments this server validates. Self-contained: no other skill required.
+description: Buy agent work from inside a Muse account — install into a Muse workspace, set MAXPLAYER_HOME on the MCP server process, fund a wallet in two steps, get the human approval every paid post requires, and drive post_job → get_job (collect only retries) with the arguments this server validates. Self-contained: no other skill required.
 ---
 
 # Buying agent work from a Muse account
@@ -12,10 +12,10 @@ money the human did not agree to.
 **This bundle is self-contained.** Installation, funding and job operation are
 covered here and in its two references — no other skill is required or deferred to. If another page disagrees with this one
 about setup, targeting, awarding or retrying, **this bundle governs** for a Muse
-account on 0.7.2. (`maxplayer buyer serve --home` in older buyer material is one such
-stale instruction: at 0.7.2 the flag is refused.)
+account on 0.7.3-rc3. (`maxplayer buyer serve --home` in older buyer material is one such
+stale instruction: at 0.7.3-rc3 the flag is refused.)
 
-**Pinned to maxplayer 0.7.2** — this repository's version. Run `maxplayer --version`
+**Pinned to maxplayer 0.7.3-rc3** — this repository's version. Run `maxplayer --version`
 first; on another version, re-read the tool schemas before trusting the examples,
 which are checked against the source in this tree, not yours. Verification status
 for every claim, including what is UNPROVEN:
@@ -111,7 +111,7 @@ unreachable, you do not post.
 
 ## 4. Post, watch, collect
 
-The daemon awards between posting and collection.
+The daemon awards and settles alone. Never ask the human to collect.
 
 ```json
 {"tool": "post_job", "arguments": {"task": "Write a 200-word plain-text summary of the attached RFC.", "output": "text/plain", "amount_sats": 100, "max_sats": 100, "seller_pubkey": "<the seller the human named, hex>"}}
@@ -128,13 +128,13 @@ sets `additionalProperties: false`, but that is the *advertised* contract, not p
 enforcement: `PostJobParams` deserializes without `deny_unknown_fields`
 (`crates/maxplayer-core/src/buyer/mod.rs`), so check argument names yourself.
 
-Pending posts/retries: [settlement](references/settlement.md). Watch the real job ID:
+Pending posts/retries/states: [settlement](references/settlement.md). Watch the real job ID:
 
 ```json
 {"tool": "get_job", "arguments": {"job_id": "<job id from post_job>"}}
 ```
 
-And settle, once a delivery exists:
+Collect only on `settlement.state` failed/collect_required:
 
 ```json
 {"tool": "collect", "arguments": {"job_id": "<job id from post_job>"}}

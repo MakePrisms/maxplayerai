@@ -3,7 +3,7 @@
 //! Every entry point is inert unless `[sessions] enabled = true`.
 use super::store::BuyerTurn;
 use super::*;
-use crate::session::{FollowUp, FollowUpStatus, ReplyPreflight};
+use crate::session::{FollowUp, FollowUpStatus, ReplyPreflight, UncollectedTurn};
 use nostr_sdk::JsonUtil;
 
 /// A turn the seller may still answer or the buyer still owes a decision on.
@@ -21,6 +21,9 @@ pub(super) struct Facts {
     pub turns: Vec<BuyerTurn>,
     /// Follow-up id → the result that answers it (relay view, awarded seller only).
     pub delivered: BTreeMap<String, String>,
+    /// How the delivered, uncollected turn (if any) will settle: [`uncollected_settle`], filled in
+    /// by `reply` only. Never a money input; it picks the refusal's wording.
+    pub uncollected_settle: Option<UncollectedTurn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +118,12 @@ where
     crate::session::reply_preflight(&ReplyPreflight {
         claim_supports_sessions: facts.claim_session,
         session_live: money.live,
-        uncollected_turn: p.uncollected,
+        uncollected_turn: p.uncollected.map(|turn| {
+            let settle = facts.uncollected_settle.clone().unwrap_or_else(|| {
+                UncollectedTurn::CollectRequired("its settlement state was not read".into())
+            });
+            (turn, settle)
+        }),
         turn_in_flight: p.in_flight,
         // A re-send is already counted in `committed`; it adds nothing.
         price_sats: if resend { 0 } else { money.price },
@@ -237,7 +245,46 @@ pub(super) fn facts(
         turn1_result: bind.map(|b| b.result_id),
         turns,
         delivered,
+        uncollected_settle: None,
     })
+}
+
+/// How the delivered, uncollected turn `turn` of `job_id` will settle, read off the very object
+/// `get_job` returns as `settlement` ([`settlement::facts`] + [`settlement::hint`]: the reservation,
+/// the recorded settle refusal ([`settlement::note_refusal`]), the review hold
+/// ([`settlement::turn_review_hold`] / [`settlement::auto_settle_review_hold`]) and whether the
+/// turn's funds are held), so `reply` and `get_job.settlement` can never disagree. Read-only.
+pub(super) fn uncollected_settle(
+    context: &BuyerContext,
+    job_id: &str,
+    turn: u32,
+) -> UncollectedTurn {
+    // `reply` runs only on an awarded job, and the turn is delivered (that is why it is uncollected).
+    match settlement::facts(context, job_id, true, true) {
+        Ok(facts) => classify_settlement(&settlement::hint(&facts), turn),
+        Err(error) => UncollectedTurn::CollectRequired(format!(
+            "its settlement state could not be read: {error}"
+        )),
+    }
+}
+
+/// `settling` (the delivery watcher is on it, review in flight included) means wait; `settled`
+/// means the watcher won the race and a retry goes through. Anything else (`failed`,
+/// `collect_required`, a different turn) is not going to settle on its own: say why.
+fn classify_settlement(hint: &Value, turn: u32) -> UncollectedTurn {
+    let state = hint["state"].as_str().unwrap_or("unknown");
+    let ours = hint["turn"].as_u64() == Some(u64::from(turn));
+    if ours && hint["mode"] == settlement::MODE_AUTO && matches!(state, "settling" | "settled") {
+        return UncollectedTurn::Settling;
+    }
+    let reason = match (state, hint["error"].as_str()) {
+        (_, Some(error)) => format!("{state}: {error}"),
+        ("collect_required", None) => {
+            "collect_required: the daemon holds no reservation for it".to_owned()
+        }
+        _ => state.to_owned(),
+    };
+    UncollectedTurn::CollectRequired(reason)
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,7 +374,10 @@ async fn reply_inner(context: &Arc<BuyerContext>, params: ReplyParams) -> Result
     let offer = view.offer.as_ref().ok_or("offer not found on the relay")?;
     let facts = facts(context, job_id, &award, &view)?;
     sweep_no_response(&context.store, &facts, now, &guard);
-    let facts = self::facts(context, job_id, &award, &view)?;
+    let mut facts = self::facts(context, job_id, &award, &view)?;
+    if let Some(turn) = progress(&facts).uncollected {
+        facts.uncollected_settle = Some(uncollected_settle(context, job_id, turn));
+    }
     if params.close {
         drop(guard);
         send_close(context, job_id, &award.seller_pubkey).await?;
@@ -727,13 +777,75 @@ pub(super) async fn collect_target(
         .max_by_key(|t| t.turn))
 }
 
+/// What a [`TurnPay`] returns: the sealed collect's own result type.
+pub(super) type TurnPayFuture<'a> = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<collect::CollectOutcome, collect::CollectError>>
+            + Send
+            + 'a,
+    >,
+>;
+
+/// The pay step of a turn settle, behind a seam so the ordering, lock and review-hold guards can be
+/// driven without a mint. Production is [`SealedTurnPay`]: the sealed `collect_turn_async` (accept,
+/// verify, budget gate, wallet send, materialize), and nothing else.
+pub(super) trait TurnPay: Send + Sync {
+    fn pay<'a>(
+        &'a self,
+        home: &'a MaxplayerHome,
+        gate: Option<&'a mut BudgetGate>,
+        row: &'a BuyerTurn,
+        earlier: &'a [String],
+    ) -> TurnPayFuture<'a>;
+}
+
+/// The only production [`TurnPay`]: `collect_turn_async`, the path `collect turn=<n>` has always run.
+pub(super) struct SealedTurnPay;
+
+impl TurnPay for SealedTurnPay {
+    fn pay<'a>(
+        &'a self,
+        home: &'a MaxplayerHome,
+        gate: Option<&'a mut BudgetGate>,
+        row: &'a BuyerTurn,
+        earlier: &'a [String],
+    ) -> TurnPayFuture<'a> {
+        Box::pin(collect::collect_turn_async(
+            home,
+            gate,
+            &row.job_id,
+            &row.followup_id,
+            row.turn,
+            earlier,
+        ))
+    }
+}
+
 /// Settle one turn ≥ 2 under the money lock: pay-then-flip on the follow-up's reservation, exactly
-/// as turn 1 (`settle_after_pay`), then mark it collected.
+/// as turn 1 (`settle_after_pay`), then mark it collected. The `collect` RPC's turn path.
 pub(super) async fn settle_turn(
     context: &BuyerContext,
     row: &BuyerTurn,
 ) -> Result<collect::CollectOutcome, String> {
-    let _guard = context.money_lock.lock().await;
+    settle_turn_with(context, row, &SealedTurnPay).await
+}
+
+pub(super) async fn settle_turn_with(
+    context: &BuyerContext,
+    row: &BuyerTurn,
+    pay: &dyn TurnPay,
+) -> Result<collect::CollectOutcome, String> {
+    let guard = context.money_lock.lock().await;
+    settle_turn_locked(context, row, &guard, pay).await
+}
+
+/// [`settle_turn`]'s body; the caller holds the money lock (the guard is the proof).
+async fn settle_turn_locked(
+    context: &BuyerContext,
+    row: &BuyerTurn,
+    _money_lock: &tokio::sync::MutexGuard<'_, ()>,
+    pay: &dyn TurnPay,
+) -> Result<collect::CollectOutcome, String> {
     let earlier: Vec<BuyerTurn> = context
         .store
         .session_turns(&row.job_id)
@@ -754,16 +866,7 @@ pub(super) async fn settle_turn(
         &context.store,
         &row.followup_id,
         now_unix(),
-        || {
-            collect::collect_turn_async(
-                &context.home,
-                gate.as_mut(),
-                &row.job_id,
-                &row.followup_id,
-                row.turn,
-                &earlier,
-            )
-        },
+        || pay.pay(&context.home, gate.as_mut(), row, &earlier),
         |outcome| outcome.pay.amount_sats(),
     )
     .await
@@ -781,6 +884,217 @@ pub(super) async fn settle_turn(
         .map_err(|e| e.to_string())?;
     invalidate_reconcile_snapshot(context).await;
     Ok(outcome)
+}
+
+/// Turn 1 of `job_id` is settled: its reservation is `spent`, or its free collect record exists
+/// (the same two facts [`facts`] reads as `turn1_collected`). No turn ≥ 2 settles before it.
+fn turn_one_settled(context: &BuyerContext, job_id: &str) -> bool {
+    matches!(
+        context.store.reservation(job_id),
+        Ok(Some((reservations::ReservationState::Spent, _)))
+    ) || collect::free_collect_record_path(&context.home, job_id).exists()
+}
+
+/// The turn's price is still held, so the watcher may settle it: its follow-up reservation is
+/// `reserved`, or it is a free turn that reserved nothing (no row until it settles). The per-row
+/// form of [`store::BuyerStore::unsettled_turn_job_ids`]. An unreadable ledger is "not held": the
+/// watcher then leaves the turn to `collect` rather than act on a guess.
+pub(super) fn turn_funds_held(context: &BuyerContext, turn: &BuyerTurn) -> bool {
+    match context.store.reservation(&turn.followup_id) {
+        Ok(Some((reservations::ReservationState::Reserved, _))) => true,
+        Ok(None) => turn.amount_sats == 0,
+        _ => false,
+    }
+}
+
+/// The lowest live turn that is not settled yet. Settling strictly in turn order is the rule
+/// (`settle_turn_locked` also refuses out of order): the watcher only ever looks at this one turn
+/// per job, so turn n is never paid while turn n − 1 is outstanding.
+fn next_unsettled_turn(turns: &[BuyerTurn]) -> Option<&BuyerTurn> {
+    turns
+        .iter()
+        .filter(|t| live(t) && t.state != "collected")
+        .min_by_key(|t| t.turn)
+}
+
+/// The event carries `["e", followup_id, "", "reply"]`: a result answering that follow-up.
+fn replies_to(event: &nostr_sdk::Event, followup_id: &str) -> bool {
+    event.tags.iter().any(|tag| {
+        let p = tag.as_slice();
+        p.first().map(String::as_str) == Some("e")
+            && p.get(1).map(String::as_str) == Some(followup_id)
+            && p.get(3).map(String::as_str) == Some("reply")
+    })
+}
+
+/// How long after a turn's deadline the periodic sweep still reads the relay for its result. A
+/// result event that names the job, and `get_job` (which records deliveries on the turn rows),
+/// still reach a turn past this; only the blind once-a-minute relay read stops.
+const SENT_TURN_REFRESH_GRACE_SECS: i64 = 600;
+
+/// Record relay-seen deliveries on the job's `sent` turn rows ([`facts`] flips them to
+/// `delivered`). `false` when the relay or the award could not be read; the next pass retries.
+async fn refresh_deliveries(context: &BuyerContext, job_id: &str) -> bool {
+    let Ok(Some(award)) = context.store.award_record(job_id) else {
+        return false;
+    };
+    let Ok(keys) = buyer_keys(&context.home) else {
+        return false;
+    };
+    match job_lifecycle::fetch_job_view_async(
+        &context.home,
+        &keys,
+        job_id,
+        RELAY_TIMEOUT,
+        now_unix() as u64,
+    )
+    .await
+    {
+        Ok(view) => facts(context, job_id, &award, &view).is_ok(),
+        Err(error) => {
+            crate::opline!("buyer: delivery watcher could not read session {job_id} ({error})");
+            false
+        }
+    }
+}
+
+/// The delivery watcher's session pass (docs/specs/session-jobs.md §8.4): settle delivered turns
+/// ≥ 2 through [`settle_turn`]'s body, the same pay-then-flip `collect turn=<n>` runs, with no new
+/// pay path. Called from `settle_awarded` on a result event (narrowed to the jobs it references),
+/// the periodic sweep and the boot sweep. It never closes a session.
+pub(super) async fn settle_delivered_turns(
+    context: &BuyerContext,
+    wake: Option<&nostr_sdk::Event>,
+    pay: &dyn TurnPay,
+) {
+    if !context.home.config.sessions.enabled {
+        return;
+    }
+    let jobs = match context.store.unsettled_turn_job_ids() {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            crate::opline!(
+                "buyer: delivery watcher could not read session turns ({error}); will retry"
+            );
+            return;
+        }
+    };
+    for job_id in jobs {
+        if wake.is_some_and(|event| !job_lifecycle::event_references_job(event, &job_id)) {
+            continue;
+        }
+        settle_job_turns(context, &job_id, wake, pay).await;
+    }
+}
+
+/// Settle `job_id`'s delivered turns in order, stopping at the first one that is not delivered,
+/// held by review, outside the watcher's authority, or refused.
+async fn settle_job_turns(
+    context: &BuyerContext,
+    job_id: &str,
+    wake: Option<&nostr_sdk::Event>,
+    pay: &dyn TurnPay,
+) {
+    if !turn_one_settled(context, job_id) {
+        return; // Turn 1 settles first (`settle_awarded`'s job pass); then the next pass gets here.
+    }
+    let mut refreshed = false;
+    loop {
+        let turns = match context.store.session_turns(job_id) {
+            Ok(turns) => turns,
+            Err(error) => {
+                crate::opline!("buyer: delivery watcher could not read session {job_id} ({error})");
+                return;
+            }
+        };
+        let Some(next) = next_unsettled_turn(&turns).cloned() else {
+            return;
+        };
+        if next.state == "sent" && !refreshed {
+            refreshed = true;
+            // In flight: read the relay only on a result naming this job, or while the turn's
+            // deadline (plus grace) has not long passed, so an abandoned turn costs no relay read
+            // every minute forever.
+            if wake.is_none()
+                && now_unix() > next.deadline_unix as i64 + SENT_TURN_REFRESH_GRACE_SECS
+            {
+                return;
+            }
+            if refresh_deliveries(context, job_id).await {
+                continue;
+            }
+            return;
+        }
+        if next.state != "delivered" || !turn_funds_held(context, &next) {
+            return;
+        }
+        // A failed or timed-out turn review is not retried from this background sweep (no unbounded
+        // paid reviewer calls); `collect turn=<n>` retries it explicitly. A newer result from the
+        // awarded seller for this follow-up replaces the held one, exactly as on turn 1.
+        match settlement::turn_review_hold(context, job_id, &next.followup_id) {
+            Ok(Some(status)) => {
+                let replacement = wake.is_some_and(|event| {
+                    event.kind == nostr_sdk::Kind::Custom(crate::kinds::JOB_RESULT_KIND)
+                        && event.id.to_hex() != status.subject.event
+                        && replies_to(event, &next.followup_id)
+                        && context
+                            .store
+                            .award_record(job_id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|award| award.seller_pubkey == event.pubkey.to_hex())
+                });
+                if !replacement {
+                    return;
+                }
+            }
+            Err(error) => {
+                crate::opline!("buyer: {job_id} turn {}: {error}", next.turn);
+                return;
+            }
+            Ok(None) => {}
+        }
+        // Serialize with `collect`, `reply`, award and reconcile, then re-read: a `collect` that
+        // won the lock may already have settled this turn, and it must not be paid again.
+        let guard = context.money_lock.lock().await;
+        let current = match context.store.turn(&next.followup_id) {
+            Ok(Some(current)) => current,
+            _ => return,
+        };
+        if current.state == "collected" {
+            drop(guard);
+            continue;
+        }
+        if current.state != "delivered" || !turn_funds_held(context, &current) {
+            return;
+        }
+        let settled = settle_turn_locked(context, &current, &guard, pay).await;
+        drop(guard);
+        // `get_job.settlement` reads this per follow-up: a refusal shows `failed`, success clears it.
+        settlement::note_refusal(
+            context,
+            &current.followup_id,
+            settled.as_ref().err().cloned(),
+        );
+        match settled {
+            Ok(outcome) => crate::opline!(
+                "buyer: delivery watcher settled session {job_id} turn {} — {} for commit {} ({} \
+                 file(s); agent={})",
+                current.turn,
+                settled_payment_line(&outcome.pay),
+                outcome.commit_oid,
+                outcome.files.len(),
+                log_safe_agent(outcome.agent_used.as_deref())
+            ),
+            Err(error) => {
+                crate::opline!(
+                    "buyer: delivery watcher could not settle session {job_id} turn {}: {error}",
+                    current.turn
+                );
+                return;
+            }
+        }
+    }
 }
 
 /// A seller FEEDBACK that names one of our turns (`["e", followup, "", "reply"]`): a refused or
@@ -884,7 +1198,7 @@ mod tests {
                 },
                 "per-job cap",
             ),
-            (uncollected, MONEY, "collect first"),
+            (uncollected, MONEY, "could not settle automatically"),
             (no_session, MONEY, "does not support sessions"),
             (
                 ready(),

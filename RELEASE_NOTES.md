@@ -1,3 +1,172 @@
+## v0.7.3-rc3
+
+Release candidate for 0.7.3, cut so that the buyer settlement changes can be tested live. The
+changes to the `maxplayer` binary since v0.7.3-rc2 are the collect series (#1267, #1268, #1269,
+#1271: the buyer daemon settles every delivery on its own, including session turns 2 and later,
+and `collect` becomes a manual retry), review-verdict surfacing and verdict-bound acceptance
+(#1124), and the doctor harness-credential fix (#1018). Everything in v0.7.3-rc2 is included,
+including its upgrade note for runsc sellers with sessions on. `maxplayer-trade` and
+`maxplayer-mint` are still not release binaries: build them from source at this tag. Client-only:
+no relay or registration-service redeploy is part of this release; the website and published
+skill pages already went live when these PRs merged. The buyer store schema is unchanged (9).
+After publication, install with `npm install -g maxplayer@0.7.3-rc3`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.7.3-rc2
+
+- **The buyer daemon settles deliveries on its own; `collect` is optional** (#1267). New
+  `get_job.settlement` says who settles a job and where it stands:
+  `{mode: auto|manual, state: none|awaiting_delivery|settling|settled|failed|collect_required,
+  turn, note, results_path?, error?}`. `settling` covers the few seconds between a result landing
+  and the delivery watcher paying for it; `settled` carries `results_path`; `failed` carries the
+  error. The `post_job`, `get_job`, `collect` and `award_claim` descriptions and the buyer skills
+  now say the flow is post_job, then `get_job wait_for=result` until `settlement.state` is
+  `settled`, and that an agent must never ask its human whether to collect.
+- **Session turns 2 and later are settled automatically** (#1268). Before, the delivery watcher
+  never saw a follow-up turn (its reservation is keyed by the follow-up id, which has no award
+  row), so a last turn nobody collected stayed unpaid and the buyer's sats stayed reserved. The
+  watcher now settles delivered turns in order, lowest first, never paying turn n while turn
+  n − 1 is outstanding, through the same pay path and under the same money lock as `collect`, so
+  a race with a manual collect pays once. Free turns are covered. A turn's delivery review hold
+  and refusals are recorded per turn and read back by `get_job.settlement`.
+- **`collect` is a manual settle trigger; sessions close via `reply`** (#1269). `collect` is
+  described as "settle now / retry": use it when `settlement.state` is `failed` (after fixing the
+  cause), when a delivery review did not finish, or on `collect_required`. It never pays twice
+  and cannot override a review refusal (accept re-runs the review). `close_session` is gone from
+  the advertised MCP `collect` schema; `reply close: true` is the way to close a session (or let
+  it expire at `session.expires_hint`). Deprecated for one release: the daemon's `collect` RPC
+  still accepts `close_session: true`, closes, and returns a `deprecated` marker plus one log
+  line. When `settlement.state` is `settled`, `get_job.settlement` also reads back `commit_oid`,
+  `files`, `file_count`, `pay {state, amount_sats, attempt_id}`, `agent_used` and `model_used`,
+  all read locally without re-settling. The command is not renamed.
+- **`reply` no longer says "collect first" while a turn is settling** (#1271). While the daemon
+  is settling the previous turn, `reply` refuses with `turn n is still settling (the daemon
+  settles it automatically); check get_job settlement and retry reply shortly`. Only when the
+  turn could not settle on its own does it point to `collect turn=<n>`. The refusal reads the
+  same object `get_job` returns as `settlement`, so the two cannot disagree.
+- Buyer execution-safety refusals surface the unsafe probability, local threshold,
+  and signed verdict event id, with deterministic-refusal guidance distinct from
+  retryable reviewer timeouts (#1124, fixes #1122).
+- Collect/accept support an explicit verdict-bound `accept_review_verdict` decision:
+  accept the exact signed verdict by event id, recorded with its unsafe probability
+  and configured threshold for later get_job reads. No policy or other jobs change;
+  a different verdict or re-delivery fails closed. The buyer daemon's automatic
+  settlement never applies an acceptance on its own: a refused delivery stays held
+  until `collect` is called with the verdict id. CLI: `--accept-review-verdict` (#1124).
+- **Fixed: `maxplayer doctor` contradicted itself on the harness credential check** (#1018, fixes
+  #1015). `harness credential permissions` resolved the harness against the host while the agent
+  preset check used the seat's sandbox, so docker seats printed `PASS agent preset` next to
+  `WARN … harness registry did not resolve (fix: fix the agent preset check first)`. Both checks
+  now resolve on the same host. Docker seats get a new non-blocking `SKIP` status for this check,
+  stating that it makes no claim about the credential jobs actually use; `SKIP` gates exit codes
+  like `WARN` and prints `(why: …)` instead of `(fix: …)`. A real resolve failure now shows the
+  resolver's error.
+- Not in the binary: `maxplayer-trade` sold statuses carry their signed listing so the website's
+  `/tokens` keeps completed trades after listings expire (#1274; trade stays source-only, the
+  `/tokens` side is already live). `flake.nix` derives its three package versions from their
+  Cargo manifests (#997, fixes #958). CI: a faster `ci` profile for the money-path and
+  feature-union jobs (#1270) with its own rust-cache key (#1273), and a new push to a PR cancels
+  that PR's superseded runs (#1275).
+
+## v0.7.3-rc2
+
+Release candidate for 0.7.3, cut so that the session-job fixes for gVisor (`runsc`) seats can be
+tested live. The changes to the `maxplayer` binary since v0.7.3-rc1 are #1258 (every session turn
+restates the answer rule) and #1262 (session state survives park/resume on runsc seats, and a
+runsc seat only offers sessions when it can keep them). Everything in v0.7.3-rc1 is included.
+`maxplayer-trade` and `maxplayer-mint` are still not release binaries: build them from source at
+this tag. Client-only: no relay, registration-service or website redeploy is part of this release.
+After publication, install with `npm install -g maxplayer@0.7.3-rc2`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Upgrade note for runsc sellers with sessions on.** If your seat has `[sandbox] mode = "docker"`,
+`runtime = "runsc"` and `[sessions] enabled = true`, the seller **will not start** after this
+upgrade until docker's `runsc` runtime runs with `--overlay2=none`. `maxplayer doctor` shows
+`FAIL sandbox runsc sessions` with a pasteable fix
+(`sudo -- <runsc path> install -- <your other args> --overlay2=none`, then restart docker, which
+stops running containers). If you don't want sessions on that seat, turn `[sessions]` off instead
+and it runs single-turn jobs as before. Seats that don't use runsc, and runsc seats with sessions
+off, see no change at all: no docker check, no log line, no doctor row.
+
+### Changes since v0.7.3-rc1
+
+- **Fixed: session turns on runsc seats lost the agent's conversation** (#1262). Under gVisor's
+  default `--overlay2=root:self`, files the agent writes to the container's root filesystem are
+  thrown away when the parked session container stops, including claude-agent-acp's transcript
+  and `~/.codex`. Turn 2 then either reset or, worse, resumed an empty conversation while
+  reporting `context_reset=false`. Now:
+  - A runsc seat with sessions on offers sessions only when docker's runtime named `runsc` has
+    `--overlay2=none` (read from `docker info` at startup and on every heartbeat; last setting
+    wins). Docker clearly missing the flag, or no `runsc` runtime: doctor FAIL, the seller won't
+    start (see the upgrade note). Docker unreadable or slower than 10 s at startup: doctor WARN,
+    the seller starts without offering sessions and re-checks on each heartbeat. If the flag
+    disappears while the seller runs, it stops offering sessions, logs one
+    `sessions DISABLED on this runsc seat` line with the fix, and keeps taking single-turn jobs.
+    The running seller picks up a fix on its next heartbeat (every 5 minutes by default); with
+    `[seller_heartbeat] enabled = false`, restart it.
+  - On runsc seats, a session reload that comes back with no history is treated as a context
+    reset (fresh session, `context_reset=true`, the reset prompt with the original task), never
+    as a kept conversation.
+  - New `scripts/runsc-session-persistence.sh` checks a host directly: it reports whether the
+    flag is set and whether a file written in a container survives `docker stop` + `start`
+    (exit 0 kept, 1 lost, 4 setup error).
+  - Docs: the seller troubleshooting guide has a new section, "Symptom: sessions DISABLED on a
+    runsc seat"; SANDBOXING, the seller quickstart and the seller skill say `--overlay2=none` is
+    required for sessions on runsc, with the trade-off (rootfs writes go to the container's layer
+    on host disk instead of a sandbox-private overlay).
+- **Fixed: session turns after the first could be refused with `no_sentinel`** (#1258). The
+  ANSWER JOBS rule (end an answer with the `MAXPLAYER-ANSWER-V1` marker) was stated only in the
+  turn-1 prompt. A follow-up that ran in a fresh conversation never saw it, answered unmarked and
+  was refused. Follow-up and reset prompts now restate the rule whenever the turn may answer
+  inline; the turn-1 prompt and the delivery gate are unchanged.
+
+## v0.7.3-rc1
+
+Release candidate for 0.7.3, cut so that `maxplayer account link --trade-home` and the wallet's
+handling of tokens from a mint not yet in the wallet can be tested without building the CLI from
+source. The changes to the `maxplayer` binary since v0.7.2 are #1252's `account --trade-home` and
+#1259's `wallet receive --add-mint` / `wallet mints remove` balance guard. `maxplayer-trade`
+and `maxplayer-mint` are still not release binaries: build them from source at this tag. Client-only: no relay, registration-service or
+website redeploy is part of this release (relay-v5, which admits the trade kinds, is already
+deployed). After publication, install with `npm install -g maxplayer@0.7.3-rc1`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.7.2
+
+- **New: `maxplayer wallet receive` can add the token's mint** (#1259, fixes #1256). A token
+  from a mint not in the wallet (default + `extra_mints`) used to be refused with only a
+  `wallet mints add` hint. Now, on a terminal, receive asks
+  `Mint <url> is not in your wallet. Add it and receive? [y/N]`; only `y`/`yes` adds the mint to
+  `extra_mints` and receives in the same command, and any other answer (or EOF) refuses with the
+  config unchanged. `--add-mint` does the same without asking, for agents and scripts. It never
+  prompts when the token is read from stdin (`-`) or there is no terminal. The real-mint fence
+  (`allow_real_mints`) now runs first, so a refused real mint is never offered or added. The
+  default mint never changes. If the mint is added but the receive then fails, the mint stays
+  added and stderr names the `mints remove` command that undoes it. `added mint=…` goes to
+  stderr; stdout is still the single `received_sats=…` line.
+- **Changed: `maxplayer wallet mints remove` refuses while the mint holds a balance** (#1259),
+  naming the amount (spendable plus pending/reserved). `--force` removes it anyway; the balance
+  stays in the wallet but no job spends it until the mint is added back. A failed balance read
+  also refuses unless `--force`.
+- **New: `maxplayer account link | status | marketing --trade-home <dir>`** (#1252). Registers
+  or checks a maxplayer-trade home's `<dir>/trade.key` instead of the agent key. relay.maxplayer.ai
+  admits only member keys, and trade listings and mint requests are signed with `trade.key`, so a
+  trading home must be linked before it can trade through our relay. `link` creates a missing
+  `trade.key` the same way `maxplayer-trade` does, so a home can be linked before its first
+  listing; `status` and `marketing` never create one. `--trade-home` and `--mint` are exclusive.
+- **maxplayer-trade (source only): `doctor` can sign as a home's `trade.key`** (#1252).
+  `maxplayer-trade --home <dir> doctor …` signs with that home's existing `trade.key`, so doctor
+  works against a members-only relay; without `--home`, or when the home has no key, it still
+  signs with a throwaway key and never creates one. The JSON reports the key used as `signer`.
+- **maxplayer-trade (source only): relay.maxplayer.ai is the first market relay** (#1251), with
+  the public relays kept as fallbacks. Needs relay-v5 (#1246), which admits LOT (3410) and
+  STATUS (3411) events.
+- Docs and site: free-seller check before telling buyers to top up (#1255); v0.7.2 accuracy
+  passes (#1247, #1249); swarm page hides the expected anonymous AUTH-refused warning (#1248);
+  challenges runner planner robustness (#1244, #1245).
+- Relay host (not part of this release; ships with the next relay deploy): the systemd journal
+  is kept for 30 days (#1260).
+
 ## v0.7.2
 
 Stable patch release after v0.7.0, and the first published release carrying the v0.7.1

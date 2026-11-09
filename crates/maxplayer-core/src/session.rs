@@ -6,7 +6,7 @@
 //! is the only place a `session` tag can enter a claim, and it is a no-op when disabled, which is
 //! what keeps every claim/offer/result/accept byte identical to today's (failure test 13).
 use crate::gateway::{EventDraft, TagSpec};
-use crate::home::SessionsConfig;
+use crate::home::{SandboxConfig, SandboxMode, SessionsConfig};
 use crate::kinds::{JOB_ACCEPT_KIND, JOB_CLAIM_KIND, JOB_RESULT_KIND, SESSION_FOLLOWUP_KIND};
 use sha2::{Digest, Sha256};
 
@@ -258,14 +258,20 @@ pub fn admit_followup(
 
 // ───────────────────────────── §2.2–§2.4 tags ─────────────────────────────
 
-/// Append `["session","1"]` to a claim draft — ONLY when sessions are enabled and the seat runs
-/// docker with container delivery (§2.2, §5.1). With `enabled = false` the draft is untouched.
+/// Append `["session","1"]` to a claim draft — ONLY when sessions are enabled, the seat runs
+/// docker with container delivery (§2.2, §5.1), and the runsc overlay gate is not closed (§5.6).
+/// With `enabled = false` the draft is untouched.
 pub fn advertise_on_claim(
     draft: &mut EventDraft,
     cfg: &SessionsConfig,
     docker_container_seat: bool,
+    runsc_gate: &RunscOverlayGate,
 ) {
-    if draft.kind != JOB_CLAIM_KIND || !cfg.enabled || !docker_container_seat {
+    if draft.kind != JOB_CLAIM_KIND
+        || !cfg.enabled
+        || !docker_container_seat
+        || !runsc_gate.allows_sessions()
+    {
         return;
     }
     if claim_supports_sessions(&draft.tags) {
@@ -778,8 +784,16 @@ pub fn payment_gate(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyRefusal {
     NoSessionSupport,
+    /// The previous turn is delivered and the buyer daemon's delivery watcher settles it on its own
+    /// (`get_job.settlement` reads `auto`/`settling` for it): wait, do not collect.
+    TurnSettling {
+        turn: u32,
+    },
+    /// The previous turn is delivered but will not settle on its own (review hold, a recorded settle
+    /// refusal, no funds held): an explicit `collect` is needed. `reason` says which.
     CollectFirst {
         turn: u32,
+        reason: String,
     },
     SessionEnded,
     TurnInFlight,
@@ -797,9 +811,15 @@ impl std::fmt::Display for ReplyRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoSessionSupport => write!(f, "seller does not support sessions; post a new job"),
-            Self::CollectFirst { turn } => write!(
+            Self::TurnSettling { turn } => write!(
                 f,
-                "collect first: turn {turn} is delivered but not collected"
+                "turn {turn} is still settling (the daemon settles it automatically); check \
+                 get_job settlement and retry reply shortly"
+            ),
+            Self::CollectFirst { turn, reason } => write!(
+                f,
+                "turn {turn} could not settle automatically ({reason}); run collect for turn \
+                 {turn}, then retry reply"
             ),
             Self::SessionEnded => write!(f, "session is closed or expired; post a new job"),
             Self::TurnInFlight => write!(f, "a turn is already in flight; wait for its result"),
@@ -819,13 +839,22 @@ impl std::fmt::Display for ReplyRefusal {
     }
 }
 
+/// How a delivered, uncollected turn will settle, as `get_job.settlement` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UncollectedTurn {
+    /// The delivery watcher settles it on its own.
+    Settling,
+    /// It does not settle on its own; the reason (review hold, settle refusal, no funds held).
+    CollectRequired(String),
+}
+
 /// Buyer-side session view the preflight reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyPreflight {
     pub claim_supports_sessions: bool,
     pub session_live: bool,
-    /// Newest delivered turn not yet collected, if any.
-    pub uncollected_turn: Option<u32>,
+    /// Newest delivered turn not yet collected, if any, and how it will settle.
+    pub uncollected_turn: Option<(u32, UncollectedTurn)>,
     pub turn_in_flight: bool,
     /// Turn price (= job price). 0 on a free job.
     pub price_sats: u64,
@@ -841,8 +870,15 @@ pub fn reply_preflight(p: &ReplyPreflight) -> Result<(), ReplyRefusal> {
     if !p.session_live {
         return Err(ReplyRefusal::SessionEnded);
     }
-    if let Some(turn) = p.uncollected_turn {
-        return Err(ReplyRefusal::CollectFirst { turn });
+    if let Some((turn, settle)) = &p.uncollected_turn {
+        let turn = *turn;
+        return Err(match settle {
+            UncollectedTurn::Settling => ReplyRefusal::TurnSettling { turn },
+            UncollectedTurn::CollectRequired(reason) => ReplyRefusal::CollectFirst {
+                turn,
+                reason: reason.clone(),
+            },
+        });
     }
     if p.turn_in_flight {
         return Err(ReplyRefusal::TurnInFlight);
@@ -955,6 +991,318 @@ pub fn prompt_session_section() -> String {
          answer from the buyer before you can continue, end your final message with a line that \
          begins `{NEEDS_INPUT_MARKER}` followed by your question; the turn then ends and the buyer \
          replies in the next turn."
+    )
+}
+
+// ───────────────────────────── §5.6 runsc overlay gate ─────────────────────────────
+
+/// The docker runtime name a gVisor seat uses. Seat code keys gVisor handling (the resolver file,
+/// containment) on exactly this name, so the fix keeps it.
+pub const RUNSC_RUNTIME: &str = "runsc";
+
+/// The runsc flag a session seat needs: rootfs writes go to the container's own writable layer on
+/// the host, which docker keeps across stop/start, instead of a sandbox-private overlay that is
+/// discarded when the container stops.
+pub const RUNSC_OVERLAY_NONE: &str = "--overlay2=none";
+
+/// Whether this seat may advertise sessions as far as the gVisor rootfs overlay is concerned (§5.6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunscOverlayGate {
+    /// Not a docker + runsc seat with sessions on: nothing to check, nothing gated.
+    NotApplicable,
+    /// The docker runtime named `runsc` runs with `--overlay2=none`.
+    Open,
+    /// Fail closed: no session is advertised. `reason` says why; `fix` is the daemon.json change.
+    /// `misconfigured` is `true` when docker ANSWERED and shows the seat cannot keep a session (no
+    /// `runsc` registered, or `runsc` without `--overlay2=none`) — `maxplayer doctor` FAILs that,
+    /// which blocks the seller boot — and `false` when docker could not confirm either way
+    /// (unreadable, timed out, unparseable): doctor WARNs, the seat runs single-turn, and the
+    /// heartbeat re-probes.
+    Closed {
+        reason: String,
+        fix: String,
+        misconfigured: bool,
+    },
+}
+
+impl RunscOverlayGate {
+    pub fn allows_sessions(&self) -> bool {
+        !matches!(self, Self::Closed { .. })
+    }
+}
+
+/// Whether an awarded job runs as a SESSION (parks after turn 1): sessions enabled, the gate not
+/// closed NOW, and this seat's claim advertised `["session","1"]`. A gate that closed after the
+/// claim runs the job single-turn rather than parking a container whose rootfs would not survive.
+pub fn runs_as_session(
+    cfg: &SessionsConfig,
+    runsc_gate: &RunscOverlayGate,
+    claim_advertised: bool,
+) -> bool {
+    cfg.enabled && runsc_gate.allows_sessions() && claim_advertised
+}
+
+/// Whether the gate applies: `[sessions] enabled`, `mode = "docker"` and `runtime = "runsc"`
+/// (trimmed, as the seat resolves it). Every other seat is [`RunscOverlayGate::NotApplicable`] and
+/// never asks docker anything.
+pub fn runsc_overlay_gate_applies(
+    sandbox: Option<&SandboxConfig>,
+    sessions: &SessionsConfig,
+) -> bool {
+    sessions.enabled && seat_runs_runsc(sandbox)
+}
+
+/// Whether this seat's jobs run under gVisor: `[sandbox] mode = "docker"` and `runtime` trims to
+/// EXACTLY `runsc` (case-sensitive, as docker matches runtime names). Unset (docker's default runc),
+/// any other name, launcher mode and no sandbox are all `false`, and every bug-2 behaviour keyed on
+/// this — the overlay gate, its probe and log line, the doctor row, and the empty-reload reset —
+/// is then absent: a non-runsc seat behaves exactly as before.
+pub fn seat_runs_runsc(sandbox: Option<&SandboxConfig>) -> bool {
+    sandbox.is_some_and(|sandbox| {
+        sandbox.mode == SandboxMode::Docker
+            && sandbox.runtime.as_deref().map(str::trim) == Some(RUNSC_RUNTIME)
+    })
+}
+
+/// The §5.6 verdict for a seat. `read_runtimes` performs the `docker info` read and is awaited ONLY
+/// when the gate applies ([`runsc_overlay_gate_applies`]); any other seat gets
+/// [`RunscOverlayGate::NotApplicable`] without docker being asked anything.
+pub async fn resolve_runsc_gate<F, Fut>(
+    sandbox: Option<&SandboxConfig>,
+    sessions: &SessionsConfig,
+    read_runtimes: F,
+) -> RunscOverlayGate
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<String, String>>,
+{
+    if !runsc_overlay_gate_applies(sandbox, sessions) {
+        return RunscOverlayGate::NotApplicable;
+    }
+    let probed = read_runtimes().await;
+    runsc_overlay_gate(true, probed.as_deref().map_err(String::as_str))
+}
+
+/// The one operator line for a §5.6 verdict; `None` for [`RunscOverlayGate::NotApplicable`], so a
+/// non-runsc seat logs nothing new.
+pub fn runsc_gate_log_line(gate: &RunscOverlayGate) -> Option<String> {
+    match gate {
+        RunscOverlayGate::NotApplicable => None,
+        RunscOverlayGate::Open => Some(
+            "seller node sessions: runsc runs with --overlay2=none; session jobs are advertised"
+                .to_owned(),
+        ),
+        RunscOverlayGate::Closed { reason, fix, .. } => Some(format!(
+            "seller node sessions DISABLED on this runsc seat (single-turn jobs continue): {reason}. Fix: {fix}"
+        )),
+    }
+}
+
+/// How one runtime arg sets runsc's `--overlay2`, read as runsc's flag parser (Go's `flag`) reads
+/// it: one or two leading dashes, then `overlay2=<value>`, or `overlay2` with the value in the next
+/// arg. A word without a leading dash is never the flag (it is some other flag's value). The gate
+/// and the fix text both read args through this, so they cannot disagree about which arg is which.
+enum OverlayArg<'a> {
+    /// `--overlay2=<value>`.
+    Inline(&'a str),
+    /// `--overlay2`: the value is the next arg.
+    NextArg,
+}
+
+fn overlay_arg(arg: &str) -> Option<OverlayArg<'_>> {
+    let flag = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-'))?;
+    if let Some(value) = flag.strip_prefix("overlay2=") {
+        Some(OverlayArg::Inline(value))
+    } else if flag == "overlay2" {
+        Some(OverlayArg::NextArg)
+    } else {
+        None
+    }
+}
+
+/// Whether a runtime's argv leaves `--overlay2` at `none`: `--overlay2=none`, `--overlay2 none`,
+/// or one leading dash (Go's flag package accepts both). The LAST setting wins, as in runsc.
+pub fn runtime_args_disable_overlay(args: &[String]) -> bool {
+    let mut value: Option<&str> = None;
+    let mut iter = args.iter().map(String::as_str);
+    while let Some(arg) = iter.next() {
+        match overlay_arg(arg) {
+            Some(OverlayArg::Inline(inline)) => value = Some(inline),
+            Some(OverlayArg::NextArg) => value = iter.next(),
+            None => {}
+        }
+    }
+    value.map(str::trim) == Some("none")
+}
+
+/// The heading of the seller troubleshooting guide's section on a closed gate. The GitHub anchor in
+/// [`RUNSC_GUIDE_GITHUB_URL`] is this heading's slug; a test pins both against the guide file.
+pub const RUNSC_GUIDE_HEADING: &str = "Symptom: sessions DISABLED on a runsc seat";
+
+/// The guide as the site serves it (raw markdown, for agents). Printed by name, not by anchor: a raw
+/// page cannot jump to a section.
+pub const RUNSC_GUIDE_URL: &str =
+    "https://www.maxplayer.ai/.well-known/skills/debug-selling/skill.md";
+
+/// The same guide rendered on GitHub (for people), on `main`, anchored at the section.
+pub const RUNSC_GUIDE_GITHUB_URL: &str = "https://github.com/MakePrisms/maxplayerai/blob/main/web/app/.well-known/skills/debug-selling/skill.md#symptom-sessions-disabled-on-a-runsc-seat";
+
+/// One shell word: left bare when it holds only flag-safe characters, single-quoted otherwise (a `'`
+/// inside becomes `'\''`). Never starts a comment or an expansion: `#`, `$`, backtick, quotes and
+/// whitespace are all outside the bare set.
+fn shell_word(word: &str) -> String {
+    let safe = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_=./:,+@%".contains(c));
+    if safe {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// The fix for a closed gate, keeping the runtime NAMED `runsc`, its `path`, and any other args it
+/// already has (any `--overlay2` setting is replaced, read by [`overlay_arg`] exactly as the gate
+/// reads it). The text STARTS with the command and everything after it is a shell comment, so the
+/// whole line pastes safely: `sudo -- <path> install -- <kept args> --overlay2=none # ...`. `sudo
+/// --` keeps a path that begins with `-` from being read as a sudo option, and the path and args are
+/// shell-quoted. `runsc install` rewrites the whole entry, which is why the kept args are in it. The
+/// comment carries the daemon.json member for a hand edit (exactly `"runsc": {"path": "<path>",
+/// "runtimeArgs": ["--overlay2=none"]}` with no other args), the docker restart, the heartbeat
+/// re-check and the troubleshooting guide.
+pub fn runsc_daemon_json_fix(path: Option<&str>, args: &[String]) -> String {
+    let quote = |value: &str| serde_json::Value::from(value).to_string();
+    let known_path = path.map(str::trim).filter(|path| !path.is_empty());
+    let mut keep: Vec<String> = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match overlay_arg(arg) {
+            Some(OverlayArg::Inline(_)) => {}
+            Some(OverlayArg::NextArg) => {
+                iter.next();
+            }
+            None => keep.push(arg.clone()),
+        }
+    }
+    keep.push(RUNSC_OVERLAY_NONE.to_owned());
+    let json_args = keep
+        .iter()
+        .map(|arg| quote(arg))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shell_args = keep
+        .iter()
+        .map(|arg| shell_word(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let binary = known_path.map_or_else(|| RUNSC_RUNTIME.to_owned(), shell_word);
+    format!(
+        "sudo -- {binary} install -- {shell_args} # this rewrites the whole \"runsc\" entry in \
+         /etc/docker/daemon.json, other args included; or by hand, under \"runtimes\" set {}: \
+         {{\"path\": {}, \"runtimeArgs\": [{json_args}]}}. Then restart docker (this stops running \
+         containers). The running seller re-checks on its next heartbeat (every 5 minutes by \
+         default); if the seller heartbeat is turned off, restart the seller. Confirm with maxplayer \
+         doctor. Guide, section \"{RUNSC_GUIDE_HEADING}\": {RUNSC_GUIDE_GITHUB_URL} (raw: \
+         {RUNSC_GUIDE_URL})",
+        quote(RUNSC_RUNTIME),
+        quote(known_path.unwrap_or("<runsc path>")),
+    )
+}
+
+/// The gate's verdict from what `docker info --format '{{json .Runtimes}}'` returned (`Err` = the
+/// daemon could not be asked). Pure: the seller's claim path and `maxplayer doctor` both fold the
+/// same probe through here. Fails CLOSED on everything but a registered `runsc` whose args leave
+/// `--overlay2=none`: unreadable, unparseable, unregistered, and default args all close it.
+///
+/// ⛔ Why: a parked session container is resumed with `docker start`, and gVisor's default
+/// `--overlay2=root:self` discards every rootfs write at stop — the agent's transcript under
+/// `~/.claude`/`~/.codex`, tools it installed, its caches (bug 2; runsc 20261102.0). A seat that
+/// cannot show the flag is set does not advertise sessions; it keeps taking single-turn jobs.
+pub fn runsc_overlay_gate(applies: bool, probe: Result<&str, &str>) -> RunscOverlayGate {
+    if !applies {
+        return RunscOverlayGate::NotApplicable;
+    }
+    const WHY: &str = "parked session containers are stopped and restarted, and gVisor's default \
+        rootfs overlay discards their writes at stop";
+    let closed = |reason: String, misconfigured: bool, path: Option<&str>, args: &[String]| {
+        RunscOverlayGate::Closed {
+            reason,
+            fix: runsc_daemon_json_fix(path, args),
+            misconfigured,
+        }
+    };
+    let raw = match probe {
+        Ok(raw) => raw,
+        Err(error) => {
+            return closed(
+                format!(
+                    "could not read the docker runtimes ({error}), so `--overlay2=none` on the \
+                     runtime \"runsc\" is unconfirmed; {WHY}"
+                ),
+                false,
+                None,
+                &[],
+            );
+        }
+    };
+    let runtimes: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(runtimes) => runtimes,
+        Err(error) => {
+            return closed(
+                format!("unparseable docker runtimes ({error}); {WHY}"),
+                false,
+                None,
+                &[],
+            );
+        }
+    };
+    if !runtimes.is_object() {
+        return closed(
+            format!("unexpected docker runtimes (not a JSON object: {runtimes}); {WHY}"),
+            false,
+            None,
+            &[],
+        );
+    }
+    let Some(runsc) = runtimes.get(RUNSC_RUNTIME) else {
+        return closed(
+            "the docker daemon registers no runtime named \"runsc\"".to_owned(),
+            true,
+            None,
+            &[],
+        );
+    };
+    if !runsc.is_object() {
+        return closed(
+            format!(
+                "unexpected docker runtime entry for \"runsc\" (not a JSON object: {runsc}); {WHY}"
+            ),
+            false,
+            None,
+            &[],
+        );
+    }
+    let path = runsc.get("path").and_then(serde_json::Value::as_str);
+    let args: Vec<String> = runsc
+        .get("runtimeArgs")
+        .and_then(serde_json::Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if runtime_args_disable_overlay(&args) {
+        return RunscOverlayGate::Open;
+    }
+    closed(
+        format!(
+            "the docker runtime \"runsc\" runs without {RUNSC_OVERLAY_NONE} (runtimeArgs {args:?}); {WHY}"
+        ),
+        true,
+        path,
+        &args,
     )
 }
 

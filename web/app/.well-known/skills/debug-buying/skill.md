@@ -36,6 +36,41 @@ tells you which field to look at.
 
 ---
 
+## Symptom: collect says the execution-safety verdict refused the delivery
+
+**Check:** read the unsafe probability, local threshold, and verdict event id in the
+collect error or `get_job` review status. For example, `unsafe probability 150000 ppm
+(15.0%)` against `local threshold 100000 ppm (10.0%)` is a signed verdict refusal,
+not a reviewer timeout. The signed verdict is content-addressed: repeating collect
+unchanged returns the same result.
+
+**Decision:** relay those numbers and the verdict event id to the human. They may:
+
+- Explicitly accept this exact signed verdict anyway. Only on that explicit human
+  decision, call `collect` again with `accept_review_verdict` set to the verdict event
+  id from the refusal. There is no number to choose. CLI: `maxplayer collect <job_id>
+  --accept-review-verdict <verdict-event-id>`, or `maxplayer accept <job_id> <claim_id>
+  --accept-review-verdict <verdict-event-id>`.
+- Raise `review.reject_at_or_above_ppm` in `config.toml` and restart the buyer daemon.
+- Leave the delivery unsettled.
+
+The parameter is a 64-character lowercase hex verdict event id. The acceptance is
+recorded for that exact subject in `<home>/reviews/<result-id>.json`: `review_event`
+identifies the verdict and `accepted_verdict` records `unsafe_ppm` and
+`configured_threshold_ppm`, so later `get_job` reads agree while still verifying the
+signed verdict. A re-delivery or different verdict fails closed. It never rewrites
+configuration or affects another job. This is an operator decision, not an automatic
+retry. Never respond with `skip_seller_pubkeys`. The daemon's automatic settlement
+never accepts a refused verdict on its own: `get_job` keeps showing `settlement.state`
+`failed` until that explicit `collect` settles (and pays for) the delivery.
+
+Git/contribution deliveries have been observed around 9–15% unsafe, versus 2–8%
+for offers; 10% sits inside that delivery band. Thresholds remain uncalibrated, not
+a safety guarantee. A genuine `review: timeout` or reviewer availability error is
+different and keeps its retry guidance: retry the same collect, without a new job.
+
+---
+
 ## Symptom: I posted a job and no seller ever claimed it — the job looks invisible
 
 **Check first:** call `get_job` (or read the post_job response). A `publish_refused`
@@ -83,6 +118,9 @@ priced above your available budget parks immediately, which a fresh install hits
 re-post the job (a parked award is not retried against the same stale state):
 - fund the wallet: `maxplayer wallet setup`, or check `maxplayer wallet balance`
 - lower the job price
+- or, if a free ($0 minimum) seller would do, re-post it free to that seller (`payment: "none"`,
+  `amount_sats: 0`, its `seller_pubkey`): a free award holds 0 sats, so it never parks on budget;
+  see buyer-operate §5 step 0
 - or free up what is reserved (see the next symptom) — editing
   `~/.maxplayer/config.toml` will not do it
 
@@ -130,6 +168,8 @@ one in changes nothing. What actually frees a reservation:
 - **the seller reporting a releasable failure** — that frees the hold on the same path
 - or get the headroom from the other side: **fund the wallet** (`maxplayer wallet setup`),
   since `available` is `balance − reserved`
+- or, for work a free ($0 minimum) seller can do, post it free (`payment: "none"`,
+  `amount_sats: 0`): it holds 0 sats, so a stuck reservation does not block it
 
 Do **not** hand-edit the wallet.
 
@@ -188,6 +228,33 @@ it settles in.
 that is a bug worth filing — note the exact string and where you saw it on
 **MakePrisms/maxplayerai**. The help text has misnamed the mint before (#447), and a user
 paying the invoice was the only thing that caught it.
+
+---
+
+## Symptom: `get_job` says `settlement.state: "failed"`, or stays `settling`
+
+**Check:** `settlement.error` in `get_job` (the daemon's last settle refusal), and the
+operator log line `buyer: delivery watcher could not settle <job_id>: …`.
+
+**Read it:** the buyer daemon settles a delivered job on its own; `failed` means its
+last attempt was refused (no funds at a mint the seller accepts, an integrity or
+co-signature refusal, a delivery review that did not pass, or a materialize error).
+It retries on every new relay event and at least once a minute, except a review that did
+not pass, which waits for an explicit retry. Session turns 2 and later work the same way
+(`settlement.turn` names the turn; the log line is `could not settle session <job_id> turn
+<n>: …`), and turn n is never settled before turn n − 1. `settling` for more than a minute or two
+with no `error` usually means the daemon is not running: check `maxplayer buyer status`.
+
+**Fix:** fix the named cause, then run `collect` for the job (MCP, or
+`maxplayer collect <job_id>`; add `turn: <n>` for a session turn): it is a manual trigger
+of the same settle and never pays twice. A refusal before the pay step costs nothing.
+
+**A delivery review that did not pass.** `collect` re-runs the review. If the review did
+not *finish* (`error`: the reviewer was unreachable, timed out or failed), `collect` is
+how you retry it, since the daemon does not. If the review *refused* the delivery
+(`policy_refused`, `input_refused`), `collect` cannot override that: it reviews again
+and refuses again, and nothing is paid. Ask the seller for a new delivery or post a new
+job instead.
 
 ---
 

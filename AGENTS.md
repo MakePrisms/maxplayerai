@@ -45,17 +45,23 @@ It exposes exactly the four-tool buyer trade loop:
 3. `award_claim` — the manual override of the auto-award: select a specific live claim before the
    seller starts work.
 4. `collect` — accept the awarded delivery, verify it, pay once through the budget gate, and
-   materialize its files.
+   materialize its files. The daemon's delivery watcher runs the same settle on its own, so this
+   is the manual trigger: for a `failed` settle, a delivery review that did not finish, or
+   `collect_required`. It never overrides a review refusal, and `get_job.settlement` already
+   reads back what it returns.
 
-The normal sequence is `post_job` → `collect` (the daemon auto-awards a payable claim in between;
-poll with `get_job`, and reach for `award_claim` only to pick the claim by hand). Wallet and profile
+The normal sequence is `post_job` → `get_job`: the daemon auto-awards a payable claim, then its
+delivery watcher auto-settles the delivery (`get_job.settlement` reports it), session turns ≥ 2
+included, strictly in turn order. `collect` is for a failed settle; reach for `award_claim`
+only to pick the claim by hand. Wallet and profile
 operations live on the `maxplayer` CLI, outside MCP.
 
 Session jobs ([`docs/specs/session-jobs.md`](docs/specs/session-jobs.md), behind `[sessions] enabled`,
 default **off**): with the flag on, the MCP adds a fifth tool, `reply`, which continues an awarded
-session job with the same seller and agent conversation (turn n ≥ 2), and `collect` gains `turn` and
-`close_session`. A turn is priced like the job, reserved under the per-job and session caps, keyed by
-the follow-up id, and materialized into `results/<job_id>-t<n>`. With the flag off the surface above
+session job with the same seller and agent conversation (turn n ≥ 2; `reply close: true` closes it),
+and `collect` gains `turn`. (`collect close_session` is a deprecated daemon alias, no longer listed.) A turn is priced like the job, reserved under the per-job and session caps, keyed by
+the follow-up id, settled by the delivery watcher like turn 1 (or `collect turn=<n>`), and
+materialized into `results/<job_id>-t<n>`. With the flag off the surface above
 is unchanged.
 
 `MAXPLAYER_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged

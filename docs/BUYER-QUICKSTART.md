@@ -127,7 +127,8 @@ offer without claiming it learns not to claim it.
 
 #### Running one
 
-Two calls, the same two a priced job takes — `post_job` then `collect`:
+The same flow a priced job takes — `post_job`, then watch with `get_job` while the daemon
+awards and settles it (it pays nothing):
 
 ```json
 {"name": "post_job", "arguments": {
@@ -204,7 +205,9 @@ adds a fifth, `reply` — see *Session jobs* below):
 1. **`post_job`** — publish an offer with the task, output type, and amount. Target a seller with
    `seller_pubkey`, or set `untargeted: true` for an open offer. Once a payable claim appears, the
    buyer daemon **auto-awards** it under the hood (bounded by `max_sats`, which defaults to
-   `amount_sats`), so the normal flow is just `post_job` then `collect`.
+   `amount_sats`), and once the awarded seller delivers the daemon **auto-settles** it (accept,
+   verify, pay, materialize). So the normal flow is `post_job`, then `get_job` until
+   `settlement.state` is `settled`.
 2. **`get_job`** — read the offer, claims, and results. Use `wait_for: "claim"` or
    `wait_for: "result"` for a bounded long-poll.
 3. **`award_claim`** — the manual override of the daemon's auto-award: select a specific live claim
@@ -214,9 +217,18 @@ adds a fifth, `reply` — see *Session jobs* below):
    the delivered branch tips at the accepted commit, verifies the seller's co-signature, applies
    the budget gate, pays once, and writes the paid files below
    `$MAXPLAYER_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
+   Usually not needed: it is a manual trigger of the daemon's own settle, for retrying a
+   `failed` one (fix the cause first), a delivery review that did not finish, or a delivery
+   outside the automatic settle (`settlement.state: "collect_required"`: an award or session
+   turn the daemon holds no reservation for). It never overrides a review refusal: it re-runs
+   the review. You never need it to read a result back: a `settled` `get_job.settlement`
+   carries `results_path`, `commit_oid`, `files` and `pay`.
 
-In practice: `post_job`, then `collect` once the delivery lands — the daemon auto-awards a payable
-claim in between (use `get_job` to watch, and `award_claim` only to pick the claim by hand). Wallet
+In practice: `post_job`, then `get_job` (`wait_for: "result"`) — the daemon auto-awards a payable
+claim and auto-settles the delivery on its own. `get_job` → `settlement` says where it stands
+(`settling` → `settled`, with `results_path`); call `collect` only when it says `failed` or
+`collect_required`, and use `award_claim` only to pick the claim by hand. Agents should never ask
+the human whether to collect: paying was decided at award. Wallet
 and profile operations remain CLI commands and are not part of the MCP tool list.
 
 **Session jobs (opt-in, `[sessions] enabled = true`).** When the awarded claim advertised
@@ -226,9 +238,11 @@ seller instead of posting a new one: `collect` the delivered turn, then call **`
 `get_job` → `session.question`). Each turn costs the job's price and must fit both the per-job cap and
 the session cap (`max_session_sats` on `post_job` or `reply`; `reply`'s value wins; default 10× the
 price; it is never sent to the seller); `reply` refuses before signing anything
-when the previous turn is not collected yet. Collect turn n into `results/<job_id>-t<n>` with
-`collect` (the newest delivered turn is chosen automatically, or pass `turn`), and end the session
-with `reply` `close: true` or `collect` `close_session: true`. With the flag off (the default) none
+when the previous turn is not collected yet. The daemon settles every turn on its own, turn 1 and
+turns 2 and later alike, strictly in turn order, into `results/<job_id>-t<n>` for turn n ≥ 2;
+`collect` (the newest delivered turn is chosen automatically, or pass `turn`) is the explicit retry. Ending the session is optional — it expires at
+`session.expires_hint` — or end it early with `reply` `close: true`. (`collect`
+`close_session: true` still works for one release as a deprecated alias.) With the flag off (the default) none
 of this appears.
 
 ## 5. The buyer daemon

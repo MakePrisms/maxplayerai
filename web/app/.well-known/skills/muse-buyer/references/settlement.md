@@ -1,7 +1,7 @@
 # Settlement: when money actually moves, and what to do when it half-works
 
 Read this before telling a human where their sats went. Every statement here is
-checked against maxplayer 0.7.2 source in this repository; the file paths are named
+checked against maxplayer 0.7.3-rc3 source in this repository; the file paths are named
 so you can check them yourself.
 
 ## Pending preparation and safe retries
@@ -26,7 +26,25 @@ the real-money instruction constant).
 
 Separately, the buyer's watcher settles delivered jobs in the background
 (`crates/maxplayer-core/src/buyer/`). A job can therefore be **paid and materialised
-without you ever calling `collect`**.
+without you ever calling `collect`** — that is the normal case, and `get_job` →
+`settlement.state: "settled"` reports it. Session turns 2 and later settle the same way,
+strictly in turn order (`settlement.turn` names the turn).
+
+`get_job` → `settlement.state` values:
+
+- `settling` — delivered; the daemon is paying and materialising it now. Re-check
+  shortly; do not call `collect`.
+- `settled` — done; the files are under `results_path`, and the same object carries
+  `commit_oid`, `files`, `file_count` and `pay` (`state`, `amount_sats`, `attempt_id`).
+  A `collect` would only repeat them, without paying again.
+- `failed` — the daemon's settle was refused; `error` says why. Fix it (funds at a
+  mint the seller accepts, for example), then `collect` to retry. A delivery review
+  that did not finish (reviewer down, timed out, errored) is retried only by
+  `collect`; a review that refused the delivery cannot be overridden, because
+  `collect` re-runs the review.
+- `collect_required` — outside the automatic settle (an award or session turn with no
+  reservation): call `collect` yourself.
+- `awaiting_delivery`, `none` — nothing to settle yet, or nothing at all.
 
 Consequences for what you say to a human:
 
@@ -78,7 +96,7 @@ one.
 
 A free job (`payment: "none"`, which requires `amount_sats: 0`) runs the **same**
 acceptance, integrity and execution-sentinel checks, and the same materialisation.
-What it does not run is the payment leg: at 0.7.2 a free bind is routed straight
+What it does not run is the payment leg: at 0.7.3-rc3 a free bind is routed straight
 through verification and materialisation (`collect.rs`), and the response reports
 
 - `state: "none"`,

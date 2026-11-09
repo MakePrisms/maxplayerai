@@ -113,6 +113,24 @@ impl Display for DriverError {
 
 impl Error for DriverError {}
 
+/// What a successful `session/load` reports (docs/specs/session-jobs.md §6.3).
+///
+/// The count is what makes "loaded" mean "the conversation came back". ACP requires an agent to
+/// replay the whole earlier conversation before it answers a load, so a reload of a session that had
+/// a turn always replays at least that turn's user message. An agent whose transcript is gone (a
+/// parked container restarted under gVisor's default rootfs overlay, which discards writes outside
+/// the mounts) can still answer the load — claude-agent-acp keeps the id and reads an empty
+/// history — and the next prompt then runs in an EMPTY conversation. Zero here is that case, and the
+/// caller treats it exactly like a failed load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedSession {
+    pub session_id: SessionId,
+    /// Conversation-history notifications (user/agent messages, thoughts, tool calls) replayed
+    /// before the load answered. Housekeeping notifications (available commands, usage, modes) are
+    /// not history and are not counted.
+    pub replayed_history: usize,
+}
+
 /// Fires a session's cancel from OUTSIDE the driver while a prompt is in flight (session jobs, §4
 /// wrap-up). `prompt` holds `&mut self` until the turn answers, so the cancel cannot be a method
 /// call on the driver; it is a handle cloned before the prompt starts.
@@ -129,13 +147,14 @@ pub trait Driver {
         false
     }
     /// Reload a session the agent saved earlier (ACP `session/load`, docs/specs/session-jobs.md
-    /// §6.3). Called only when [`Self::supports_load_session`] is true; any error makes the caller
-    /// fall back to [`Self::start_session`] and mark the turn `context_reset`. Default: unsupported.
+    /// §6.3). Called only when [`Self::supports_load_session`] is true; any error, or a load that
+    /// replayed no history ([`LoadedSession::replayed_history`] = 0), makes the caller fall back to
+    /// [`Self::start_session`] and mark the turn `context_reset`. Default: unsupported.
     async fn load_session(
         &mut self,
         cfg: SessionConfig,
         session_id: &SessionId,
-    ) -> Result<SessionId, DriverError> {
+    ) -> Result<LoadedSession, DriverError> {
         let _ = (cfg, session_id);
         Err(DriverError::Other(
             "session/load is not supported by this driver".into(),

@@ -389,6 +389,78 @@ backlog full (cap 32)` line and a count of `claimed` rows past their deadline
 
 ---
 
+## Symptom: sessions DISABLED on a runsc seat
+
+Only a seat with `[sandbox] mode = "docker"`, `runtime = "runsc"` and `[sessions] enabled` can see
+this. Any other seat (no runtime set, runc, any other runtime name, launcher mode) never runs this
+check and never logs this line.
+
+**At startup, a missing flag stops the seller.** When docker shows the runtime named `runsc` without
+`--overlay2=none` (or no `runsc` at all), `maxplayer doctor` reports `FAIL sandbox runsc sessions`,
+and the seller refuses to start with that row and the fix below. Either set the flag (below) or turn
+`[sessions]` off to run single-turn only. If docker cannot be read at startup (timeout, bad output),
+the row is a WARN instead: the seller starts without offering sessions and re-checks on each
+heartbeat. While running, the seller logs this line when the verdict changes (for example if the flag
+disappears after a docker reconfigure); it then stops offering sessions but keeps running:
+
+```
+seller node sessions DISABLED on this runsc seat (single-turn jobs continue): the docker runtime "runsc" runs without --overlay2=none (runtimeArgs []); ...
+```
+
+`maxplayer doctor` reports the same verdict as `sandbox runsc sessions` (FAIL for a missing flag,
+WARN when docker could not be read), with the same fix.
+
+**Read it:** a session job's container is stopped between turns and started again for the next one.
+gVisor's default (`--overlay2=root:self`) keeps every file the agent writes outside the job's work
+folder in a sandbox-private layer that is thrown away when the container stops. That includes the
+agent's own conversation under `~/.claude` or `~/.codex`, so turn 2 would start with nothing. The
+seat therefore offers session jobs only when docker's runtime named `runsc` has `--overlay2=none`.
+A seller that is already running when this happens keeps taking single-turn jobs; a seller that
+starts with sessions on and no flag refuses to start until the flag is set or `[sessions]` is off.
+
+**Fix:**
+
+1. Add the flag to the runtime named `runsc`. Keep the name `runsc`: the seller recognises gVisor by
+   that name only. The one-liner:
+
+   ```
+   sudo -- runsc install -- --overlay2=none
+   ```
+
+   `runsc install` rewrites the whole `runsc` entry in `/etc/docker/daemon.json`, so if the entry
+   already has other `runtimeArgs`, list them too (`sudo -- runsc install -- --platform=systrap
+   --overlay2=none`). The seller's log line and `doctor` print the exact command for your seat, with
+   your args. To edit by hand instead, merge this into `/etc/docker/daemon.json`, using the `path`
+   that `docker info --format '{{json .Runtimes}}'` shows and keeping any other args:
+
+   ```json
+   { "runtimes": { "runsc": { "path": "/usr/bin/runsc", "runtimeArgs": ["--overlay2=none"] } } }
+   ```
+
+2. Restart docker: `sudo systemctl restart docker`. **This stops every running container**,
+   including running jobs and parked sessions, so do it between jobs.
+
+3. Check: `docker info --format '{{json .Runtimes}}'` shows `"runtimeArgs":["--overlay2=none"]` on
+   `runsc`, and `maxplayer doctor` shows `PASS sandbox runsc sessions`. The running seller re-checks
+   on its next heartbeat (every 5 minutes by default) and logs `sessions: runsc runs with
+   --overlay2=none; session jobs are advertised`. If the heartbeat is off (`[seller_heartbeat]
+   enabled = false`, or `MAXPLAYER_HEARTBEAT_ENABLED=0`) or its interval is long, restart the seller
+   instead: the gate is otherwise only checked at startup.
+
+**To test the box itself**, `scripts/runsc-session-persistence.sh` in the repository writes a file
+inside a container, stops and starts it, and reports whether the file survived (exit 0) or was lost
+(exit 1). Run it with `sudo` on the seller box.
+
+**Know the trade-offs:**
+
+- With the flag, files the agent writes go to the container's writable layer on the host disk instead
+  of a sandbox-private overlay that is discarded at stop. gVisor still handles every file access; rootfs-heavy work is somewhat slower.
+- `/tmp` is still lost between turns on runsc, even with the flag (runsc mounts its own `/tmp`). The
+  agent's conversation and the work folder are not under `/tmp`.
+- A docker or host restart still ends parked sessions, on any runtime.
+
+---
+
 ## When in doubt
 
 - `maxplayer doctor` — the one self-check; run it first for any won't-start / can't-settle

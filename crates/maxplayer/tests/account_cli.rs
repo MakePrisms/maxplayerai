@@ -923,3 +923,103 @@ fn link_with_a_label_flag_says_the_name_is_public_before_sending() {
     let sent = out.find("Check you@example.com").expect("code sent line");
     assert!(notice < sent, "the notice comes before the request: {out}");
 }
+
+/// `--trade-home <dir>` links a `maxplayer-trade` home's `trade.key` (it signs listings and mint
+/// requests). `link` creates a missing key the way the trade CLI does (64 hex, 0600) and touches
+/// nothing else there; `status` never creates one; a missing directory or `--mint` with it is
+/// refused before any request.
+#[test]
+fn trade_home_links_the_trading_key_and_creates_it_only_for_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let fake = FakeRegistration::start();
+    let home = new_home();
+    let trade = home.root.join("trade-a");
+    std::fs::create_dir(&trade).unwrap();
+    let trade_arg = trade.to_str().unwrap().to_owned();
+
+    // status on a home without trade.key: refused, nothing created, nothing sent.
+    let (code, _, err) = run(
+        &home,
+        &fake.base_url(),
+        &["status", "--trade-home", &trade_arg],
+    );
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("no trade key at"), "{err}");
+    assert!(names_in(&trade).is_empty());
+    assert!(fake.requests().is_empty());
+
+    for args in [
+        &["status", "--trade-home", "/definitely/not/here"][..],
+        &["status", "--mint", "--trade-home", trade_arg.as_str()],
+    ] {
+        let (code, _, err) = run(&home, &fake.base_url(), args);
+        assert_ne!(code, 0, "{args:?}: {err}");
+        assert!(fake.requests().is_empty(), "{args:?}");
+    }
+
+    fake.set_next_code("482913");
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &[
+            "link",
+            "--trade-home",
+            &trade_arg,
+            "--email",
+            "ops@example.com",
+            "--label",
+            "trader-1",
+        ],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(err.contains("Created a new trade key"), "{err}");
+    assert!(out.contains("this trading home's key"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "maxplayer account link --trade-home {trade_arg} --code"
+        )),
+        "{out}"
+    );
+    assert_eq!(names_in(&trade), ["trade.key"]);
+    let key_path = trade.join("trade.key");
+    assert_eq!(
+        std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let secret = std::fs::read_to_string(&key_path).unwrap();
+    assert_eq!(secret.len(), 64);
+    let trade_hex = nostr_sdk::prelude::Keys::parse(&secret)
+        .unwrap()
+        .public_key()
+        .to_hex();
+    assert!(fake.pending(&trade_hex).is_some());
+    assert!(
+        fake.pending(&home.pubkey).is_none(),
+        "the agent key is not linked"
+    );
+
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &["link", "--trade-home", &trade_arg, "--code", "482913"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        fake.registration(&trade_hex).unwrap().email,
+        "ops@example.com"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&key_path).unwrap(),
+        secret,
+        "key kept"
+    );
+    let (code, out, _) = run(
+        &home,
+        &fake.base_url(),
+        &["status", "--json", "--trade-home", &trade_arg],
+    );
+    assert_eq!(code, 0);
+    let status: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(status["registered"], true);
+    assert_eq!(status["pubkey"], trade_hex);
+}

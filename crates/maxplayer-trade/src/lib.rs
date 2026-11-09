@@ -234,6 +234,12 @@ pub struct Revision {
     pub seq: u64,
     pub prev: String,
     pub status: Status,
+    /// `sold` only: the signed listing itself, byte-for-byte as an object. Relays delete a listing
+    /// at its NIP-40 expiry (24h) but keep statuses, so without this a completed trade loses its
+    /// amounts and mints. Must equal the listing exactly; absent (or null) on every other status,
+    /// so `available` and `cancelled` serialize as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lot: Option<serde_json::Value>,
 }
 pub fn lifecycle(lot: &Event, events: &[Event]) -> Result<Status> {
     ensure!(events.len() <= 256, "status history exceeds bound");
@@ -250,6 +256,12 @@ pub fn lifecycle(lot: &Event, events: &[Event]) -> Result<Status> {
             r.trade_v == 1 && r.lot_id == lot.id.to_hex() && tag(e, "e")? == r.lot_id,
             "wrong status binding"
         );
+        if let Some(carried) = &r.lot {
+            ensure!(
+                r.status == Status::Sold && *carried == serde_json::to_value(lot)?,
+                "status lot does not match the listing"
+            );
+        }
         ensure!(
             revisions.insert(r.seq, (e, r)).is_none(),
             "forked status history"
@@ -602,16 +614,36 @@ pub fn status_event(
         seq,
         prev: prev.to_hex(),
         status,
+        lot: None,
     };
-    Ok(
-        EventBuilder::new(Kind::Custom(STATUS), serde_json::to_string(&r)?)
-            .tags([
-                Tag::hashtag("maxplayer"),
-                Tag::parse(["v", "1"])?,
-                Tag::event(lot),
-            ])
-            .sign_with_keys(keys)?,
-    )
+    revision_event(keys, lot, serde_json::to_string(&r)?)
+}
+/// The terminal `sold` revision, carrying the signed listing (see [`Revision::lot`]) so the trade
+/// stays readable after relays drop the listing. A listing too large to fit the 8 KiB status bound
+/// (none `lot_event` builds) gets the bare revision instead.
+pub fn sold_event(keys: &Keys, lot: &Event, seq: u64, prev: EventId) -> Result<Event> {
+    let r = Revision {
+        trade_v: 1,
+        lot_id: lot.id.to_hex(),
+        seq,
+        prev: prev.to_hex(),
+        status: Status::Sold,
+        lot: Some(serde_json::to_value(lot)?),
+    };
+    let content = serde_json::to_string(&r)?;
+    if content.len() > 8192 {
+        return status_event(keys, lot.id, seq, prev, Status::Sold);
+    }
+    revision_event(keys, lot.id, content)
+}
+fn revision_event(keys: &Keys, lot: EventId, content: String) -> Result<Event> {
+    Ok(EventBuilder::new(Kind::Custom(STATUS), content)
+        .tags([
+            Tag::hashtag("maxplayer"),
+            Tag::parse(["v", "1"])?,
+            Tag::event(lot),
+        ])
+        .sign_with_keys(keys)?)
 }
 #[cfg(test)]
 mod listing_tests {
@@ -693,6 +725,74 @@ mod listing_tests {
         let k = Keys::generate();
         let a = status_event(&k, l.id, 2, s.id, Status::Sold).unwrap();
         assert!(lifecycle(&l, &[s, a]).is_err());
+    }
+    #[test]
+    fn sold_carries_listing() {
+        let (k, l, s) = fixture();
+        let end = sold_event(&k, &l, 2, s.id).unwrap();
+        let r: Revision = serde_json::from_str(&end.content).unwrap();
+        let carried: Event = serde_json::from_value(r.lot.unwrap()).unwrap();
+        assert_eq!(carried, l);
+        carried.verify().unwrap();
+        assert_eq!(lifecycle(&l, &[s, end]).unwrap(), Status::Sold);
+    }
+    #[test]
+    fn other_statuses_stay_bare() {
+        let (k, l, s) = fixture();
+        let end = status_event(&k, l.id, 2, s.id, Status::Cancelled).unwrap();
+        assert!(!s.content.contains("\"lot\"") && !end.content.contains("\"lot\""));
+        assert_eq!(
+            s.content,
+            format!(
+                r#"{{"trade_v":1,"lot_id":"{0}","seq":1,"prev":"{0}","status":"available"}}"#,
+                l.id
+            )
+        );
+    }
+    #[test]
+    fn carried_listing_must_be_this_listing_on_sold() {
+        let (k, l, s) = fixture();
+        let (_, other, _) = fixture();
+        let revise = |status: Status, carried: Option<serde_json::Value>| {
+            let r = Revision {
+                trade_v: 1,
+                lot_id: l.id.to_hex(),
+                seq: 2,
+                prev: s.id.to_hex(),
+                status,
+                lot: carried,
+            };
+            revision_event(&k, l.id, serde_json::to_string(&r).unwrap()).unwrap()
+        };
+        let mine = serde_json::to_value(&l).unwrap();
+        let mut tampered = mine.clone();
+        tampered["content"] = serde_json::json!("{}");
+        for (status, carried) in [
+            (Status::Sold, serde_json::to_value(&other).unwrap()),
+            (Status::Sold, tampered),
+            (Status::Sold, serde_json::json!(l.as_json())),
+            (Status::Cancelled, mine.clone()),
+        ] {
+            assert!(lifecycle(&l, &[s.clone(), revise(status, Some(carried))]).is_err());
+        }
+        let first = revision_event(
+            &k,
+            l.id,
+            serde_json::to_string(&Revision {
+                trade_v: 1,
+                lot_id: l.id.to_hex(),
+                seq: 1,
+                prev: l.id.to_hex(),
+                status: Status::Available,
+                lot: Some(mine),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(lifecycle(&l, &[first]).is_err());
+        // A sold status without the listing (every CLI before this change) is still valid.
+        let bare = revise(Status::Sold, None);
+        assert_eq!(lifecycle(&l, &[s, bare]).unwrap(), Status::Sold);
     }
     #[test]
     fn duplicate_event_idempotent() {

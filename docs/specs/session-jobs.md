@@ -58,7 +58,8 @@ Final stakeholder summary: 21 Oct 2026 12:38 UTC.
     Josip, 22 Oct 12:43 UTC); parked disk budget = 20 GiB per seat (revisited after the
     test-env size measurement); no automatic close of abandoned private session repos in v1
     (seller-only, create-only, 5 GiB quota); `reply` with an uncollected previous turn is refused with
-    "collect first".
+    "collect first" (since the delivery watcher settles turns ≥ 2: "turn n is still settling" while it
+    does, "turn n could not settle automatically (<reason>); run collect for turn n" when it cannot).
 
 ---
 
@@ -338,6 +339,48 @@ Turn 1 has no `session_turns` row; it is the existing `jobs` row.
   carrying its `session_protocol`) as the proof: no block ⇒ remove, never park. A newer protocol than
   the orchestrator speaks is refused before the agent runs.
 
+### 5.6 runsc seats: `--overlay2=none` gate (bug 2)
+
+A parked container is resumed with `docker start` (§5.2). Under gVisor's default
+`--overlay2=root:self` the rootfs overlay is sandbox-private and discarded at stop, so the agent's
+transcript (`~/.claude`, `~/.codex` under `HOME=/home/agent`), its installed tools and caches are gone
+at the next turn. On a seat with `[sessions] enabled`, `[sandbox] mode = "docker"` and
+`runtime = "runsc"`, session support is therefore gated on docker's runtime named `runsc` carrying
+`--overlay2=none` in `runtimeArgs` (last setting wins; `--overlay2 none` and one leading dash accepted).
+
+- **Probe.** `docker info --format '{{json .Runtimes}}'`, bounded at 10 s, at seat boot and on every
+  heartbeat tick (`refresh_runsc_gate`) — never per claim. The verdict is held in memory.
+- **Non-runsc seats are untouched.** The gate applies only when `[sandbox] mode = "docker"` and `runtime`
+  trims to exactly `runsc` (`session::seat_runs_runsc`). Unset runtime (docker's default runc), any
+  other name, launcher mode and no sandbox get `NotApplicable`: no `docker info`, no log line, no doctor
+  row, claims and session parking exactly as before.
+- **Verdict** (`session::runsc_overlay_gate`, pure, shared with `maxplayer doctor`): `Open` only for a
+  registered `runsc` whose args leave `--overlay2=none`; `Closed { reason, fix }` for a missing flag,
+  other args only, an unreadable daemon, unparseable output, or no `runsc` registered. Fails closed.
+- **Closed means:** `advertise_on_claim` adds no `["session","1"]`, and a job claimed while the gate was
+  open but executed after it closed runs single-turn (not parked). The seat logs one
+  `sessions DISABLED` line (on boot and on each change, not every beat) with the reason and the fix
+  (`session::runsc_daemon_json_fix`): first the command `sudo -- <runsc path> install -- <kept args>
+  --overlay2=none` (shell-quoted; everything after it is a `#` comment, so the line pastes safely;
+  overlay args are stripped by the same reader the gate uses), the daemon.json member `"runsc": {"path": "<runsc path>", "runtimeArgs": [..., "--overlay2=none"]}`,
+  "restart docker (this stops running containers)", the heartbeat re-check (next heartbeat, default 5 minutes; with the heartbeat off, restart the
+  seller), and the guide section
+  `debug-selling` "Symptom: sessions DISABLED on a runsc seat" (GitHub-rendered on `main`, plus the site's
+  raw copy). A test pins the heading against the guide file, so a rename cannot ship a dead link. Single-turn jobs are unaffected. Already-parked sessions are not touched.
+- **Doctor** reports the same verdict as `sandbox runsc sessions`: PASS when open; **FAIL** with the fix
+  when docker answered and shows the seat cannot keep a session (`runsc` without the flag, another
+  overlay value, or no `runsc` registered: `Closed { misconfigured: true }`); WARN when docker could not
+  confirm (unreadable, timed out, unparseable: `misconfigured: false`). FAIL is part of the seller boot
+  gate, so a runsc seat with `[sessions] enabled` and no flag **does not start** until the operator sets
+  the flag (and restarts docker) or turns `[sessions]` off — operator intent the seat cannot honour is
+  surfaced, not silently degraded (Petar, 2026-11-07). WARN keeps a daemon hiccup at boot from blocking
+  the seat; it starts single-turn and the heartbeat re-probes. A gate that closes at runtime (heartbeat)
+  only stops advertising and logs; it never stops a running seller. Non-runsc seats get no row at all.
+- **`/tmp` is not covered.** Measured 2026-11-06 (runsc 20261102.0, arm64): with `--overlay2=none` a
+  rootfs file survives stop/start but a `/tmp` file does not, under either setting. The transcript lives
+  under `HOME`, so the gate is sufficient for conversation continuity; state a turn leaves in `/tmp` is
+  lost on runsc seats.
+
 ---
 
 ## 6. Resume
@@ -377,6 +420,22 @@ advertised `agentCapabilities.loadSession` (next to `start_session`,
 `acp_session_id` was recorded, the orchestrator runs `session/new` in the same container: files and
 installed tools stay, and the result carries `["context","reset"]`. The prompt then also states the
 original task and the follow-ups so far (buyer messages only, newest last, cut at 64 KiB).
+
+**An empty reload is a failed reload (bug 2).** A recorded `acp_session_id` means turn 1 ran, and ACP
+requires an agent to replay the whole conversation as `session/update` notifications before answering
+`session/load`, so a real reload replays at least turn 1's user message. An agent whose transcript is
+gone can still answer the load — claude-agent-acp keeps the id and reads an empty history — and the
+follow-up then ran in an empty conversation with no `["context","reset"]`. `Driver::load_session`
+therefore returns the number of replayed history notifications (`LoadedSession::replayed_history`:
+user/agent messages, thoughts, tool calls, plans; not `available_commands_update`, usage or mode
+updates), and a successful load with zero is treated exactly like a failed one: `session/new`, the reset
+prompt, `["context","reset"]`. **runsc seats only:** the host sets `SessionInputs.reset_on_empty_reload`
+from `session::seat_runs_runsc` (serde default `false`, not serialized when `false`). Every other seat
+keeps the earlier rule — any successful load keeps the conversation — because an ACP adapter that does
+not replay history on `session/load` would otherwise turn every follow-up into a reset. Whether to widen
+this depends on each shipped adapter replaying history (claude-agent-acp 0.85.0 and codex-acp 2.1.1 do,
+from source; Cursor's `cursor-agent acp` is closed source and unverified). §5.6 is what keeps the
+transcript there on runsc in the first place.
 
 ### 6.4 Credentials across turns — answers
 
@@ -431,8 +490,17 @@ for the job's lifetime (`core/credential_proxy.rs:210`, `:1228 @e0262420`), whic
 ### 7.2 Inline turns and questions
 
 The agent marks a question by beginning its final message with `MAXPLAYER-NEEDS-INPUT-V1` (the §8.3
-pattern, `docs/protocol-v1.md:870 @e0262420`); the composed prompt (`compose_agent_prompt`,
-`core/seller_exec.rs:2328`) gains a session section saying so.
+pattern, `docs/protocol-v1.md:870 @e0262420`); the turn-1 prompt of a session job gains a session
+section saying so (`session::prompt_session_section`, appended after the composed job prompt in
+`core/seller_node/run.rs:9785`).
+
+Every turn n ≥ 2 prompt — the follow-up and the context-reset prompt — restates that session section
+**and**, when the turn's delivery gate allows inline (buyer reads inline, not a contribution), the
+ANSWER JOBS rule, from the same source turn 1 uses (`seller_exec::inline_answer_rule`,
+`core/seller_exec.rs:2294`). A turn must
+not depend on the agent remembering turn 1: a context reset (or a resume that silently reads back an
+empty conversation) starts a new conversation, and an unmarked, file-less answer is refused
+`no_sentinel`. The marker gate itself is unchanged.
 
 - Tree changed ⇒ git delivery; the question (if any) is the result content.
 - Tree unchanged since the session base ⇒ inline delivery, content = the marked message
@@ -458,7 +526,10 @@ pattern, `docs/protocol-v1.md:870 @e0262420`); the composed prompt (`compose_age
 
 `reply(job_id, text)` refuses locally, before anything is signed, when:
 - the claim had no `session` tag ("seller does not support sessions; post a new job");
-- the previous turn is delivered but not collected ("collect turn n first");
+- the previous turn is delivered but not collected: "turn n is still settling (the daemon settles it
+  automatically); check get_job settlement and retry reply shortly" while `get_job.settlement` reads
+  `auto`/`settling` for it, else "turn n could not settle automatically (<reason>); run collect for
+  turn n, then retry reply" (review hold, recorded settle refusal, no funds held — the same facts);
 - the session is closed/expired, or a turn is already in flight;
 - the per-job cap refuses the price (`BudgetGate::check`, `core/budget.rs:191 @e0262420` — still the
   sole spend gate, `:51`);
@@ -513,6 +584,7 @@ pays leaves the session parked until it expires; the seller's exposure is one tu
 `collect(job_id)` settles the newest delivered, uncollected turn (optional `turn`). Turn 1 materializes
 to `results/<job_id>` as today (`core/collect.rs:458 @e0262420`); turn n to `results/<job_id>-t<n>`.
 Verification additionally checks the commit's single parent is the previous git turn's accepted commit.
+Closing is not part of collect: `reply close: true` (§10) is the one way to close a session.
 
 *Found while implementing:* "previous git turn" skips inline turns (an inline turn keeps the base,
 §7.2), down to turn 1. When every earlier turn was inline, the seller's base is its own provisioning
@@ -520,6 +592,23 @@ commit, which the buyer never saw, so the parent check is skipped and only the t
 sentinel run. The check runs on the fetched delivery before any spend. Turn 1's own selectors (auto
 accept, "awarded seller delivered", pay window) must ignore results that carry `reply`, or a turn-2
 result could be bound as turn 1.
+
+*Auto-settle (follow-up to #1267):* the buyer daemon's delivery watcher settles turns ≥ 2 on its
+own, as it does turn 1, so `collect` is the explicit retry rather than the only settle. Its job
+work set (`awards` JOIN `reservations`) cannot see a turn (the reservation is keyed by the
+follow-up id, which has no award row), so it has a second one: `session_turns` in `sent` or
+`delivered` whose follow-up reservation is still `reserved` (a free turn reserves nothing and
+qualifies with no row). It wakes on a result event (narrowed to the job it names), the periodic
+sweep and the boot sweep; a `sent` turn makes it read the relay, bounded to the turn's deadline
+plus ten minutes on the timer. Per job it settles only the lowest unsettled live turn, and only
+once turn 1 is settled, so turn n is never paid while n − 1 is outstanding (`settle_turn` refuses
+out-of-order turns too). It settles through `settle_turn`'s body (no second pay path) under the
+money lock, re-reading the turn under the lock, so a racing `collect` pays once. The turn's
+delivery review files its status under the offer like turn 1's, and the watcher skips a turn
+whose review is pending or did not pass, except for a newer result from the awarded seller
+answering that follow-up; a status naming turn 1's or an earlier settled turn's result is
+history. A refusal is recorded per follow-up and shown as `get_job.settlement` `failed`; success
+clears it. It never closes a session.
 
 ---
 
@@ -579,7 +668,9 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
   no result reports `pending`, `refused` (seller feedback refused or failed it) or `no_response`,
   never `done` (rc2). `no_response`: the follow-up's deadline passed with no result; the reservation is released
   (as feedback-driven releases do today, `core/buyer/mod.rs:2934 @e0262420`) and `reply` may retry.
-- **`collect`** gains `turn?` and `close_session?` (collect, then send close).
+- **`collect`** gains `turn?`. *Changed 9 Nov 2026 (Petar):* it also gained `close_session?`
+  (collect, then send close); that is now a deprecated daemon alias kept for one release. The MCP
+  schema no longer lists it, and `reply close: true` is the one documented way to close.
 
 *Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed) only
 when the buyer runs with `[sessions] enabled = true`; with the flag off the tool list is

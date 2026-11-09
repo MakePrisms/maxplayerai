@@ -207,6 +207,16 @@
     443
   ];
 
+  # Time-bound the systemd journal so server logs have a real retention period (privacy policy). Left on
+  # defaults it is persistent and only size-capped (10% of the filesystem, max 4G): on 4 Nov 2026 the live
+  # box held 3.2G going back to its first boot on 3 Aug, including nginx error lines with `client: <ip>`.
+  # MaxRetentionSec drops journal files whose entries are all older than this, so entries can outlive it by
+  # up to one journal file's span; MaxFileSec bounds that span to a day.
+  services.journald.extraConfig = ''
+    MaxRetentionSec=30day
+    MaxFileSec=1day
+  '';
+
   # Prebuilt relay systems from CI (.github/workflows/relay-build.yml pushes each `relay-v*` tag's closure).
   # Merged with the NixOS default cache.nixos.org entry, not replacing it. Public key only; the push token
   # lives in the repo's Actions secrets. A path missing from the cache still builds locally.

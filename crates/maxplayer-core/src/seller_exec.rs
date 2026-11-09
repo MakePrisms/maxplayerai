@@ -582,10 +582,14 @@ impl SandboxPolicy {
                     .clone()
                     .filter(|image| !image.trim().is_empty())
                     .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string());
+                // Trimmed ONCE here, so `--runtime` gets the same name the §5.6 runsc gate
+                // (`session::seat_runs_runsc`, which trims) keyed on: `" runsc "` is runsc for both.
                 let runtime = config
                     .runtime
-                    .clone()
-                    .filter(|runtime| !runtime.trim().is_empty());
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|runtime| !runtime.is_empty())
+                    .map(str::to_owned);
                 let network = config
                     .network
                     .clone()
@@ -2285,6 +2289,28 @@ where
     }
 }
 
+/// The ANSWER JOBS delivery rule: how the hired agent marks an answer-only reply so the seller can
+/// deliver it inline (§6.1). The ONE source of this wording — the turn-1 prompt
+/// ([`compose_agent_prompt`]) and every later session turn (follow-up and context-reset prompts,
+/// `seller_node::session_run`) state it from here, so the turns cannot drift apart. Callers state
+/// it ONLY when the buyer declared it can read an inline answer; the marker gate that reads the
+/// reply is unchanged and strict.
+pub fn inline_answer_rule() -> String {
+    format!(
+        "ANSWER JOBS: when the task asks you for information and you leave NO files on disk, \
+         put this exact line first in your final message, alone on its line:\n\
+         {marker}\n\
+         and put your answer on the lines after it, as plain text with no code fence around \
+         the whole reply. Keep the answer under {answer_limit} bytes; a longer one cannot be \
+         delivered, so write a longer one to a file and leave it on disk instead. The daemon \
+         then delivers that answer to the buyer as the deliverable. Without that first line, \
+         only files on disk are delivered.",
+        marker = crate::engine::INLINE_ANSWER_MARKER,
+        // The cap the seller enforces, which already allows for the marker line above.
+        answer_limit = crate::seller_node::run::INLINE_ANSWER_MAX_BYTES,
+    )
+}
+
 /// Daemon/node-owned delivery, plus the job agent's PROMPT PREAMBLE — identity, job context,
 /// boundaries (#685, #731), and the buyer's declared output type (#686).
 ///
@@ -2358,22 +2384,10 @@ pub fn compose_agent_prompt(
     // caused. An offer from a build that never heard of inline delivery declares nothing, so it
     // never sees this and behaves exactly as it does today.
     let answer_section = if accepts_inline {
-        format!(
-            // Leads with its OWN newline. The prompt must end where its last sentence ends when
-            // this section is absent — `seller_memory_read_on_start` anchors the memory invariant
-            // on exactly that, and a separator left behind by an empty section breaks it.
-            "\nANSWER JOBS: when the task asks you for information and you leave NO files on disk, \
-             put this exact line first in your final message, alone on its line:\n\
-             {marker}\n\
-             and put your answer on the lines after it, as plain text with no code fence around \
-             the whole reply. Keep the answer under {answer_limit} bytes; a longer one cannot be \
-             delivered, so write a longer one to a file and leave it on disk instead. The daemon \
-             then delivers that answer to the buyer as the deliverable. Without that first line, \
-             only files on disk are delivered.",
-            marker = crate::engine::INLINE_ANSWER_MARKER,
-            // The cap the seller enforces, which already allows for the marker line above.
-            answer_limit = crate::seller_node::run::INLINE_ANSWER_MAX_BYTES,
-        )
+        // Leads with its OWN newline. The prompt must end where its last sentence ends when
+        // this section is absent — `seller_memory_read_on_start` anchors the memory invariant
+        // on exactly that, and a separator left behind by an empty section breaks it.
+        format!("\n{}", inline_answer_rule())
     } else {
         String::new()
     };
@@ -2915,6 +2929,7 @@ pub async fn run_session_agent_in_env(
     attachments: JobAttachments,
     resume: Option<String>,
     wrap_up_at: Option<std::time::SystemTime>,
+    reset_on_empty_reload: bool,
     release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
 ) -> Result<SessionAgentReport, ExecError> {
     use crate::driver::{AcpDriver, AgentCommand, ContentBlock, PromptTurn, SessionConfig};
@@ -2964,6 +2979,7 @@ pub async fn run_session_agent_in_env(
         },
         resume,
         wrap_up_at,
+        reset_on_empty_reload,
     };
     let mut capture = crate::engine::AgentMessageCapture::default();
     let ended = run_session_job(
@@ -4402,6 +4418,7 @@ pub async fn run_session_agent_in_env(
     _attachments: JobAttachments,
     _resume: Option<String>,
     _wrap_up_at: Option<std::time::SystemTime>,
+    _reset_on_empty_reload: bool,
     _release: Box<dyn FnOnce(bool) -> Option<String> + '_>,
 ) -> Result<SessionAgentReport, ExecError> {
     Err(ExecError::AcpRequired)
@@ -6879,6 +6896,30 @@ mod tests {
     // argv carries no `--runtime` (the daemon default, `runc`); set ⇒ `docker run --runtime <name>`,
     // and it must precede the image or docker reads it as the agent command. A Mac seat is the unset
     // case — the platform VM is its boundary, so no runtime override is named.
+    // A padded `runtime` is runsc for the §5.6 gate (which trims), so `--runtime` must be the
+    // trimmed name too, or the gate would vouch for a runtime docker is never asked to run.
+    #[test]
+    fn a_padded_runtime_is_trimmed_once_for_the_gate_and_the_argv() {
+        let config =
+            crate::home::parse_config_toml("[sandbox]\nmode='docker'\nruntime=' runsc '\n")
+                .unwrap();
+        assert!(crate::session::seat_runs_runsc(config.sandbox.as_ref()));
+        let policy = SandboxPolicy::from_config(config.sandbox.as_ref()).unwrap();
+        let launch = policy
+            .launch(&argv(&["claude-agent-acp"]), &job(Path::new("/w"), &[]))
+            .expect("command");
+        assert!(
+            windowed(&launch.args, &["--runtime", "runsc"]),
+            "{:?}",
+            launch.args
+        );
+        assert!(
+            !launch.args.iter().any(|a| a == " runsc "),
+            "{:?}",
+            launch.args
+        );
+    }
+
     #[test]
     fn docker_runtime_is_named_only_when_configured_and_precedes_the_image() {
         // Unset: no --runtime anywhere.
