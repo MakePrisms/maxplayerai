@@ -48,7 +48,9 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   (`used_by_operation`: a cdk saga id for the buyer, trade's journal operation id for trade);
   recovery on either side releases only its own, and a credit never overwrites a row another
   operation owns. The buyer never runs a full-wallet NUT-13 restore (it would hand every owner's
-  reservation back as spendable); a stranded buyer swap recovers only its own outputs. `maxplayer wallet balance` shows reserved sats
+  reservation back as spendable); a stranded buyer swap recovers only its own stored outputs and
+  is kept, not finished, until every one is accounted for. A trade credit drops a spent input only
+  while this operation (or nobody) owns it. `maxplayer wallet balance` shows reserved sats
   as `reserved_sats=` on the mint's line, never in `balance_sats`.
 - **Legacy standalone homes** (a directory with `wallet.seed`, `trade.key`, or a root
   `trade.sqlite`/`owner.lock`, given with `--home`) are deprecated. Every command there prints a

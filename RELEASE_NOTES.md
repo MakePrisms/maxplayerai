@@ -33,7 +33,12 @@ the merge, Vercel).
   swap whose reply was lost, `maxplayer wallet reconcile` and the pay path re-derive that swap's
   outputs (its stored counter range) and add only those, instead of running cdk's full-wallet
   NUT-13 restore, which marked every seed proof the mint still calls unspent as spendable and
-  could hand another operation's reserved proofs to a second spender.
+  could hand another operation's reserved proofs to a second spender. It restores only the
+  swap's stored outputs, on their own keyset, and finishes only when every one is accounted for
+  (returned, already in the wallet, or spent at the mint). A swap with no stored outputs, or an
+  empty or partial `/restore`, is kept and retried: `reconcile` prints `swap_held=<n>` and a
+  remediation line naming the saga, and payments are no longer refused because of it (its
+  reserved inputs stay unspendable).
 - **Changed: `maxplayer wallet balance`** prints `reserved_sats=<n>` on a mint line when proofs
   there are reserved by an in-flight operation (job payment, send, melt or a trade); they were
   never in `balance_sats`. Lines with nothing reserved are unchanged.
