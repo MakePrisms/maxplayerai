@@ -3139,7 +3139,11 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
                             .award_record(&job_id)
                             .ok()
                             .flatten()
-                            .is_some_and(|award| award.seller_pubkey == event.pubkey.to_hex())
+                            .is_some_and(|award| {
+                                // RC3-02: a replacement result counts only from a VERIFIED author.
+                                job_lifecycle::verified_author_hex(event)
+                                    .is_some_and(|author| author == award.seller_pubkey)
+                            })
                 });
                 if !replacement {
                     continue;
@@ -3313,7 +3317,11 @@ fn release_reservation_on_failure_feedback(
     if !is_releasable_failure_feedback(event) {
         return Ok(None);
     }
-    let author = event.pubkey.to_hex();
+    // RC3-02: authorize on a VERIFIED author only — an event whose id or signature does not verify
+    // is treated exactly like a stranger's (a strict no-op), whatever the SDK did at ingest.
+    let Some(author) = job_lifecycle::verified_author_hex(event) else {
+        return Ok(None);
+    };
     // Scope is the awarded-AND-unsettled set (the JOIN in `awarded_unsettled_job_ids`), so a feedback
     // for a job we never awarded, or one already spent/released, matches nothing here.
     for job_id in store.awarded_unsettled_job_ids()? {
@@ -5499,6 +5507,69 @@ mod tests {
             store.reserved_in_flight().expect("reserved"),
             0,
             "the freed funds must leave the reserved term — released, never spent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Rewrite `event` through its JSON (which `Event::from_json` reparses WITHOUT verifying): `edit`
+    /// mutates the JSON object, while the claimed `id`/`sig` are kept unless `edit` changes them.
+    fn tampered(event: &nostr_sdk::Event, edit: impl FnOnce(&mut serde_json::Value)) -> nostr_sdk::Event {
+        use nostr_sdk::JsonUtil;
+        let mut value = serde_json::to_value(event).expect("event json");
+        edit(&mut value);
+        nostr_sdk::Event::from_json(value.to_string()).expect("reparse (no verify)")
+    }
+
+    // RC3-02 (v0.7.3-rc3 external review) — the release gate must authorize on a VERIFIED author, not
+    // on whatever `pubkey` an event claims. Two forgeries that both claim the awarded seller:
+    // (1) a flipped signature, and (2) a SAME-ID redelivery — the seller's genuine feedback for some
+    // other job, retargeted at ours while keeping its real id and signature (the shape a relay-pool
+    // verification cache keyed by id lets through). Neither may release.
+    // Red-on-revert: read the author from `event.pubkey` again and BOTH release, failing here.
+    #[test]
+    fn a_forged_or_same_id_redelivered_failure_from_the_awarded_seller_does_not_release() {
+        let root = temp_home("df-forged");
+        let seller = nostr_sdk::Keys::generate();
+        let job = "a".repeat(64);
+        let store = awarded_unsettled(&root, &job, &seller, 100);
+
+        let genuine = failure_feedback(&job, &seller, "delivery_failed");
+        let bad_sig = tampered(&genuine, |v| {
+            let sig = v["sig"].as_str().unwrap().to_owned();
+            let flipped = if sig.starts_with('0') { "1" } else { "0" };
+            v["sig"] = serde_json::Value::String(format!("{flipped}{}", &sig[1..]));
+        });
+        assert_eq!(bad_sig.pubkey, seller.public_key(), "the forgery claims the awarded seller");
+
+        let other_job = "b".repeat(64);
+        let elsewhere = failure_feedback(&other_job, &seller, "delivery_failed");
+        let same_id = tampered(&elsewhere, |v| {
+            let tags = v["tags"].as_array_mut().unwrap();
+            for tag in tags.iter_mut() {
+                if tag[0] == "e" {
+                    tag[1] = serde_json::Value::String(job.clone());
+                }
+            }
+        });
+        assert_eq!(same_id.id, elsewhere.id, "the redelivery keeps the genuine id and signature");
+        assert!(job_lifecycle::event_references_job(&same_id, &job), "and now names OUR job");
+
+        for (label, event) in [("flipped signature", &bad_sig), ("same-id redelivery", &same_id)] {
+            assert!(event.verify().is_err(), "{label}: the forgery must not verify");
+            let outcome = release_reservation_on_failure_feedback(&store, event, now_unix())
+                .expect("no store error");
+            assert_eq!(outcome, None, "{label}: an unverifiable event must never release");
+            assert_eq!(
+                store.reservation(&job).expect("read").map(|(state, _)| state),
+                Some(reservations::ReservationState::Reserved),
+                "{label}: the reservation must stay held"
+            );
+        }
+
+        // Non-vacuity: the genuine event from the same seller still releases.
+        assert_eq!(
+            release_reservation_on_failure_feedback(&store, &genuine, now_unix()).expect("no error"),
+            Some((job.clone(), 100))
         );
         let _ = std::fs::remove_dir_all(&root);
     }

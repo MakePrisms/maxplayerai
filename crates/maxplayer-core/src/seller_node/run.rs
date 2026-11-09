@@ -8075,9 +8075,10 @@ impl SellerNodeRunner {
                 return;
             }
         };
-        if event.pubkey.to_hex() != buyer {
+        // RC3-02: the author must be PROVEN (id + signature verify), not just claimed.
+        if crate::job_lifecycle::verified_author_hex(event).as_deref() != Some(buyer.as_str()) {
             opline!(
-                "seller node accept ignore job_id={job_id}: author is not the offer's buyer"
+                "seller node accept ignore job_id={job_id}: author is not the offer's buyer (or the event does not verify)"
             );
             return;
         }
@@ -8343,6 +8344,12 @@ impl SellerNodeRunner {
             return;
         };
         let job_id = award.offer_id.clone();
+        // RC3-02: an award whose id or signature does not verify has no author at all. Checked
+        // FIRST, before the suppression and execute/release branches, so it can drive none of them.
+        let Some(award_author) = crate::job_lifecycle::verified_author_hex(event) else {
+            opline!("seller node award ignore job_id={job_id}: award event does not verify");
+            return;
+        };
 
         // Only an offer we recorded can be awarded to us; its buyer is the sole authorized awarder.
         let buyer = match self.node.store().offer_facts(&job_id) {
@@ -8380,7 +8387,6 @@ impl SellerNodeRunner {
             Ok(Some((_, _, published))) => published,
             _ => None,
         };
-        let award_author = event.pubkey.to_hex();
         match match_award(&award.claim_id, our_claim_id.as_deref(), &award_author, &buyer) {
             AwardMatch::Execute => {
                 let private = async {
@@ -8703,11 +8709,15 @@ impl SellerNodeRunner {
         // POSITIVE presence only. Our result is authored by THIS seller; a buyer receipt is authored by
         // the offer's buyer (the #541 buyer-binding — a forged receipt with a foreign author never
         // counts). Absence of BOTH ⇒ false ⇒ RunAgent.
+        // RC3-02: only a VERIFIED event counts — a forged result/receipt must never make the seller
+        // skip a live award's run.
         let settled = events.iter().any(|event| {
             let kind = event.kind.as_u16();
-            (kind == JOB_RESULT_KIND && event.pubkey == self.seller_pubkey)
-                || (kind == JOB_RECEIPT_KIND
-                    && buyer_pubkey.is_some_and(|buyer| event.pubkey.to_hex() == buyer))
+            let Some(author) = crate::job_lifecycle::verified_author_hex(event) else {
+                return false;
+            };
+            (kind == JOB_RESULT_KIND && author == self.seller_pubkey.to_hex())
+                || (kind == JOB_RECEIPT_KIND && buyer_pubkey.is_some_and(|buyer| author == buyer))
         });
         if settled {
             // arm-after-the-event: the settlement event is in hand — persist the durable marker so a
@@ -11368,6 +11378,18 @@ impl SellerNodeRunner {
     }
 
     async fn dispatch_event(self: &Arc<Self>, event: &nostr_sdk::Event) {
+        // RC3-02: one verify at the work-lane choke point, for live AND backfilled events alike, so
+        // no handler below ever acts on an event whose id or signature does not verify — whatever the
+        // SDK's ingest or verification cache did. `on_award`/`on_accept` re-check on their own (they
+        // are also driven directly), and so do the relay-fetch gates that bypass this lane.
+        if crate::job_lifecycle::verified_author_hex(event).is_none() {
+            opline!(
+                "seller node drop id={} kind={}: event does not verify (id or signature)",
+                event.id,
+                event.kind.as_u16()
+            );
+            return;
+        }
         match event.kind {
             k if k.as_u16() == JOB_OFFER_KIND => self.on_offer(event).await,
             k if k.as_u16() == JOB_AWARD_KIND => self.on_award(event).await,
@@ -15348,6 +15370,26 @@ mod tests {
                 assert!(
                     runner.node.store().job_award_time(&skipped_id).expect("award time").is_none(),
                     "a forged award must not even be PERSISTED — the author gate runs before the write"
+                );
+
+                // LEG 1b (RC3-02) — an award that CLAIMS the real buyer but does not verify (flipped
+                // signature). Before the verify gate this passed `author == buyer` and suppressed.
+                let genuine = award_event(&skipped_id, "any-claim", &buyer, &other_seller, &buyer);
+                let unverifiable = {
+                    use nostr_sdk::JsonUtil;
+                    let mut value = serde_json::to_value(&genuine).expect("award json");
+                    let sig = value["sig"].as_str().unwrap().to_owned();
+                    let flipped = if sig.starts_with('0') { "1" } else { "0" };
+                    value["sig"] = serde_json::Value::String(format!("{flipped}{}", &sig[1..]));
+                    nostr_sdk::Event::from_json(value.to_string()).expect("reparse (no verify)")
+                };
+                assert_eq!(unverifiable.pubkey, buyer.public_key(), "the forgery claims the buyer");
+                assert!(unverifiable.verify().is_err(), "and does not verify");
+                runner.on_award(&unverifiable).await;
+                runner.dispatch_event(&unverifiable).await;
+                assert!(
+                    runner.node.store().job_award_time(&skipped_id).expect("award time").is_none(),
+                    "an unverifiable award claiming the buyer must not be persisted"
                 );
 
                 // LEG 2 — the REAL buyer, but the award roots on a different offer. It can only ever

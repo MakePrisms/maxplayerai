@@ -1374,6 +1374,21 @@ async fn await_job_event(
     .await;
 }
 
+/// RC3-02 (v0.7.3-rc3 external review): the author of `event`, as hex, ONLY when the event proves
+/// it — its id recomputes from its content AND its signature verifies under that pubkey.
+///
+/// Every money gate authorizes on `event.pubkey` (the buyer's release-on-failure author gate, the
+/// seller's award/accept author gate, the pinned-seller delivery probe, the seller's
+/// settled-elsewhere skip). Until now all of them relied on nostr-relay-pool verifying at ingest;
+/// `nostr-relay-pool` 0.44.1 showed that reliance can break (a redelivered id was not re-verified),
+/// and fetched/stored events reach these gates through more than one SDK path. Verifying again at
+/// the gate costs one Schnorr check per gated event and makes each gate correct on its own,
+/// independent of the SDK version or ingest path. Callers treat `None` exactly like a wrong author:
+/// a strict no-op.
+pub(crate) fn verified_author_hex(event: &nostr_sdk::Event) -> Option<String> {
+    event.verify().ok().map(|()| event.pubkey.to_hex())
+}
+
 /// True when `event` carries an `e` tag naming this job's offer — the tag every claim, result and
 /// feedback roots itself on.
 pub(crate) fn event_references_job(event: &nostr_sdk::Event, job_id: &str) -> bool {
@@ -3290,10 +3305,15 @@ async fn presence_of_filter(
         .map_err(|error| JobLifecycleError::Relay(format!("relay handle: {error}")))?;
     relay.wait_for_connection(RELAY_CONNECT_WAIT).await;
 
-    let mut events = relay
-        .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
-        .await
-        .map_err(|error| JobLifecycleError::Relay(format!("fetch: {error}")))?;
+    // RC3-02: only events that verify count as presence. A forged event under the filtered author
+    // must never make a probe answer `Present` (which HOLDS a refund), so unverifiable events are
+    // dropped before the emptiness discipline below ever sees them.
+    let mut events = authentic_events(
+        relay
+            .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+            .await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch: {error}")))?,
+    );
     if events.is_empty() {
         let confirmed =
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
@@ -3302,10 +3322,12 @@ async fn presence_of_filter(
             client.disconnect().await;
             return Ok(PresenceRead::Unverified);
         }
-        events = relay
-            .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
-            .await
-            .map_err(|error| JobLifecycleError::Relay(format!("fetch (recheck): {error}")))?;
+        events = authentic_events(
+            relay
+                .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                .await
+                .map_err(|error| JobLifecycleError::Relay(format!("fetch (recheck): {error}")))?,
+        );
     }
 
     let read = if events.is_empty() {
@@ -3315,6 +3337,16 @@ async fn presence_of_filter(
     };
     client.disconnect().await;
     Ok(read)
+}
+
+/// Keep only the events whose id and signature verify ([`verified_author_hex`]).
+fn authentic_events(
+    events: impl IntoIterator<Item = nostr_sdk::Event>,
+) -> Vec<nostr_sdk::Event> {
+    events
+        .into_iter()
+        .filter(|event| verified_author_hex(event).is_some())
+        .collect()
 }
 
 /// Reduce a job's parsed awards — **oldest first** — to a single presence.
@@ -4305,6 +4337,40 @@ fn result_attribution(tags: &[TagSpec]) -> (Option<String>, Option<String>) {
 mod tests {
     use super::*;
     use crate::home;
+
+    // RC3-02: `verified_author_hex` returns the author only for an event whose id AND signature
+    // verify, and `authentic_events` drops everything else — so a presence probe can never answer
+    // `Present` (and hold a refund) on a forgery. Covers a flipped signature, a same-id redelivery
+    // with altered content, and the genuine event (non-vacuity).
+    #[test]
+    fn only_verified_events_have_an_author_or_count_as_present() {
+        use nostr_sdk::{EventBuilder, JsonUtil, Keys, Kind};
+        let seller = Keys::generate();
+        let genuine = EventBuilder::new(Kind::Custom(JOB_RESULT_KIND), "result")
+            .sign_with_keys(&seller)
+            .expect("sign");
+        let edit = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = serde_json::to_value(&genuine).expect("json");
+            f(&mut value);
+            nostr_sdk::Event::from_json(value.to_string()).expect("reparse (no verify)")
+        };
+        let bad_sig = edit(&|v| {
+            let sig = v["sig"].as_str().unwrap().to_owned();
+            let flipped = if sig.starts_with('0') { "1" } else { "0" };
+            v["sig"] = serde_json::Value::String(format!("{flipped}{}", &sig[1..]));
+        });
+        let same_id = edit(&|v| v["content"] = serde_json::Value::String("forged".into()));
+        assert_eq!(same_id.id, genuine.id, "the redelivery keeps the claimed id");
+
+        assert_eq!(verified_author_hex(&genuine), Some(seller.public_key().to_hex()));
+        assert_eq!(verified_author_hex(&bad_sig), None, "a flipped signature has no author");
+        assert_eq!(verified_author_hex(&same_id), None, "a same-id content swap has no author");
+
+        let kept = authentic_events(vec![bad_sig, same_id.clone(), genuine.clone()]);
+        assert_eq!(kept.len(), 1, "only the genuine event survives");
+        assert_eq!(kept[0].content, "result");
+        assert!(authentic_events(vec![same_id]).is_empty(), "forgeries alone read as absent");
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn credits_first_same_result_reaccept_keeps_mints_and_attempt_id() {
