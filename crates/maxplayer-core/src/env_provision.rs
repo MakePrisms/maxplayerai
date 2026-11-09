@@ -150,6 +150,16 @@ pub enum ProvisionOutcomeClass {
 
 pub const ENV_UNPROVISIONABLE: &str = "env_unprovisionable";
 
+/// RC3-01 (worker-fable M-2): the `reason_detail` for a base that declares a checks environment on a
+/// host-delivery seller. Distinct from `env_unprovisionable` because nothing was attempted: the seller
+/// refused by policy, and the buyer can fix it (drop the declaration or pick a container seller).
+pub const HOST_CHECKS_ENV_REFUSED: &str = "checks_env_refused_on_host";
+
+/// The buyer-facing sentence for a host-delivery refusal of a declared checks environment.
+pub const HOST_CHECKS_ENV_REFUSED_FEEDBACK: &str = "seller refused the job: the base declares a checks \
+     environment in .maxplayer/checks.toml (nix-flake or container-image), which this seller will not \
+     provision on its host; remove the declaration or hire a container-delivery seller";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProvisionRefusal {
     DeclarationUnparsable { detail: String },
@@ -242,10 +252,21 @@ pub fn refusal_feedback(refusal: &ProvisionRefusal) -> (gateway::ReasonCode, &'s
         ProvisionRefusal::DeclarationUnparsable { .. }
         | ProvisionRefusal::ReservedPath { .. }
         | ProvisionRefusal::EnvLockMissing { .. }
-        | ProvisionRefusal::Unprovisionable(_)
-        | ProvisionRefusal::HostDeliveryRefused { .. } => {
+        | ProvisionRefusal::Unprovisionable(_) => {
             (gateway::ReasonCode::ExecutionFailed, ENV_UNPROVISIONABLE)
         }
+        // Same reason CODE (the buyer's release path keys on it), its own detail.
+        ProvisionRefusal::HostDeliveryRefused { .. } => {
+            (gateway::ReasonCode::ExecutionFailed, HOST_CHECKS_ENV_REFUSED)
+        }
+    }
+}
+
+/// The human-readable feedback for a refusal, when it says more than the generic execution failure.
+pub fn refusal_reason(refusal: &ProvisionRefusal) -> Option<&'static str> {
+    match refusal {
+        ProvisionRefusal::HostDeliveryRefused { .. } => Some(HOST_CHECKS_ENV_REFUSED_FEEDBACK),
+        _ => None,
     }
 }
 
@@ -589,18 +610,23 @@ mod tests {
             ProvisionRefusal::Unprovisionable(EnvProvisionError::BackendUnavailable {
                 backend: "container".to_owned(),
             }),
-            ProvisionRefusal::HostDeliveryRefused {
-                env_kind: EnvKind::NixFlake,
-            },
-            ProvisionRefusal::HostDeliveryRefused {
-                env_kind: EnvKind::ContainerImage,
-            },
         ];
         for refusal in refusals {
             assert_eq!(
                 refusal_feedback(&refusal),
                 (gateway::ReasonCode::ExecutionFailed, ENV_UNPROVISIONABLE)
             );
+            assert_eq!(refusal_reason(&refusal), None);
+        }
+        // RC3-01: the host refusal keeps the execution_failed CODE but says what happened and how to
+        // fix it, naming the declaration file.
+        for env_kind in [EnvKind::NixFlake, EnvKind::ContainerImage] {
+            let refusal = ProvisionRefusal::HostDeliveryRefused { env_kind };
+            assert_eq!(
+                refusal_feedback(&refusal),
+                (gateway::ReasonCode::ExecutionFailed, HOST_CHECKS_ENV_REFUSED)
+            );
+            assert!(refusal_reason(&refusal).is_some_and(|text| text.contains(".maxplayer/checks.toml")));
         }
     }
 

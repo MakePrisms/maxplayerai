@@ -9147,7 +9147,7 @@ impl SellerNodeRunner {
                         job_id,
                         &offer.buyer_pubkey,
                         reason_code,
-                        EXEC_FAILURE_FEEDBACK,
+                        env_provision::refusal_reason(&refusal).unwrap_or(EXEC_FAILURE_FEEDBACK),
                         Some(reason_detail),
                     )
                     .await;
@@ -17468,6 +17468,77 @@ mod tests {
         }
     }
 
+    const RC3_01_SHIM_LEG: &str = "MAXPLAYER_TEST_RC3_01_SHIM_LEG";
+
+    /// Child leg of `host_delivery_spawns_no_nix_or_container_runtime`: runs ONLY when re-executed by
+    /// it, with recording `nix`/`docker`/`podman` stand-ins first on PATH. Drives both declared env
+    /// kinds through the real checkout + post-checkout seam and requires the refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rc3_01_path_shim_child_leg() {
+        use crate::checks::{EnvKind, DECLARATION_PATH};
+        use git2::FileMode::Blob;
+        let Some(root) = std::env::var_os(RC3_01_SHIM_LEG) else { return };
+        let root = std::path::PathBuf::from(root);
+        let nix_decl: &[u8] = b"schema = 1\n[env]\nkind = \"nix-flake\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n";
+        let flake: &[u8] = b"{ outputs = { self }: { }; }";
+        let lock: &[u8] = b"{\"nodes\":{\"root\":{}},\"root\":\"root\",\"version\":7}";
+        let image_decl = format!(
+            "schema = 1\n[env]\nkind = \"container-image\"\nimage = \"docker.io/library/alpine@sha256:{}\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n",
+            "a".repeat(64)
+        );
+        let r = checkout_then_finish(&root, "nix", &[(DECLARATION_PATH, nix_decl, Blob), ("flake.nix", flake, Blob), ("flake.lock", lock, Blob)]).await;
+        assert_eq!(refused_as(&r), Some(ProvisionRefusal::HostDeliveryRefused { env_kind: EnvKind::NixFlake }), "{r:?}");
+        let r = checkout_then_finish(&root, "image", &[(DECLARATION_PATH, image_decl.as_bytes(), Blob)]).await;
+        assert_eq!(refused_as(&r), Some(ProvisionRefusal::HostDeliveryRefused { env_kind: EnvKind::ContainerImage }), "{r:?}");
+    }
+
+    // RC3-01 (worker-fable M-1) TOOTH — the host delivery seam spawns NO `nix`, `docker` or `podman`
+    // at all, whatever it then returns. The earlier canary relied on `nix develop` actually building
+    // the buyer's flake, which it never did, so "provision, ignore the result, refuse anyway" stayed
+    // green. Here every spawn of those names is recorded by a stand-in first on PATH. The child runs
+    // in its own process, so PATH is never mutated under sibling tests. Positive control first: the
+    // stand-in really does record when spawned by name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_delivery_spawns_no_nix_or_container_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_dir("rc3-01-shim");
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).expect("mk bin");
+        let marker = root.join("SPAWNED");
+        for name in ["nix", "docker", "podman"] {
+            let path = bin.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho \"{name} $*\" >> '{}'\nexit 0\n", marker.display()))
+                .expect("write stand-in");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+
+        let control = std::process::Command::new("nix")
+            .arg("develop")
+            .env("PATH", &path)
+            .status()
+            .expect("spawn stand-in");
+        assert!(control.success() && marker.exists(), "positive control: the tripwire records a spawn");
+        std::fs::remove_file(&marker).expect("reset marker");
+
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "seller_node::run::tests::rc3_01_path_shim_child_leg", "--nocapture", "--test-threads=1"])
+            .env("PATH", &path)
+            .env(RC3_01_SHIM_LEG, root.join("cases"))
+            .output()
+            .expect("spawn child leg");
+        let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(output.status.success() && combined.contains("1 passed"), "child leg: {combined}");
+        assert!(
+            !marker.exists(),
+            "host delivery spawned a checks runtime: {}",
+            std::fs::read_to_string(&marker).unwrap_or_default()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // RC3-01 (v0.7.3-rc3 external review) TOOTH — a buyer base that declares a checks environment is
     // REFUSED on the host delivery path, for BOTH backends, and every malformed or odd declaration
     // stays fail-closed. Driven through the real private-input checkout + the real post-checkout
@@ -17511,7 +17582,7 @@ mod tests {
         assert_eq!(refusal, ProvisionRefusal::HostDeliveryRefused { env_kind: EnvKind::ContainerImage });
         assert_eq!(
             env_provision::refusal_feedback(&refusal),
-            (ReasonCode::ExecutionFailed, env_provision::ENV_UNPROVISIONABLE)
+            (ReasonCode::ExecutionFailed, env_provision::HOST_CHECKS_ENV_REFUSED)
         );
 
         // 3. Fail-closed edge cases: refused with a specific refusal, never skipped.
