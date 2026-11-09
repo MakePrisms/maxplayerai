@@ -172,12 +172,17 @@ export function string(j: Json | undefined): string {
  * deserializes from an array of exactly its field count — which the CLI
  * accepts, so refusing it here would hide a listing the CLI trades. A struct
  * holding a `#[serde(flatten)]` field (Leg) has no positional form.
+ * `optional` names trailing `#[serde(default)]` fields (Revision.lot): absent
+ * from the map, or left off the end of the positional form, they are simply missing.
  */
-export function struct(j: Json | undefined, fields: readonly string[], seq: boolean): Record<string, Json> {
+export function struct(j: Json | undefined, fields: readonly string[], seq: boolean, optional: readonly string[] = []): Record<string, Json> {
   const out: Record<string, Json> = Object.create(null);
+  // `optional` = trailing `#[serde(default)]` fields: they may be absent from the map, and the
+  // positional form may stop before them.
+  const required = fields.length - optional.length;
   if (j?.t === "arr" && seq) {
-    if (j.v.length !== fields.length) throw new JsonError("invalid length");
-    fields.forEach((f, n) => { out[f] = j.v[n] as Json; });
+    if (j.v.length < required || j.v.length > fields.length) throw new JsonError("invalid length");
+    j.v.forEach((v, n) => { out[fields[n] as string] = v; });
     return out;
   }
   if (j?.t !== "obj") throw new JsonError("expected struct");
@@ -186,7 +191,7 @@ export function struct(j: Json | undefined, fields: readonly string[], seq: bool
     if (k in out) throw new JsonError(`duplicate field ${k}`);
     out[k] = v;
   }
-  for (const f of fields) if (!(f in out)) throw new JsonError(`missing field ${f}`);
+  for (const f of fields.slice(0, required)) if (!(f in out)) throw new JsonError(`missing field ${f}`);
   return out;
 }
 
@@ -201,4 +206,52 @@ export function unitEnum<T extends string>(j: Json | undefined, variants: readon
     if ((variants as readonly string[]).includes(k) && v.t === "null") return k as T;
   }
   throw new JsonError("unknown variant");
+}
+
+/* ---------------- structural equality with serde_json::Value ---------------- */
+
+/** serde_json's map: duplicate keys collapse, the last one wins. */
+function lastWins(entries: [string, Json][]): Map<string, Json> {
+  const m = new Map<string, Json>();
+  for (const [k, v] of entries) m.set(k, v);
+  return m;
+}
+
+/**
+ * `serde_json::Value == serde_json::to_value(v)` for a plain value built from
+ * strings, safe non-negative integers and arrays/objects of those (a signed
+ * Nostr event): key order is irrelevant, numbers must be integer lexemes
+ * (`1.0` and `1e0` are floats to serde and never equal an integer).
+ */
+export function sameJson(j: Json, v: unknown): boolean {
+  if (typeof v === "string") return j.t === "str" && j.v === v;
+  if (typeof v === "number") {
+    // serde_json reads `-0` as the float -0.0, which never equals an integer.
+    if (j.t !== "num" || !Number.isSafeInteger(v) || v < 0) return false;
+    return /^(?:0|[1-9]\d*)$/.test(j.raw) && BigInt(j.raw) === BigInt(v);
+  }
+  if (Array.isArray(v)) return j.t === "arr" && j.v.length === v.length && v.every((x, i) => sameJson(j.v[i] as Json, x));
+  if (v && typeof v === "object") {
+    if (j.t !== "obj") return false;
+    const m = lastWins(j.v);
+    const keys = Object.keys(v);
+    return m.size === keys.length && keys.every((k) => m.has(k) && sameJson(m.get(k) as Json, (v as Record<string, unknown>)[k]));
+  }
+  return false;
+}
+
+/** A plain JS value for strict JSON (last duplicate key wins); null when a number is not a safe integer. */
+export function toPlain(j: Json): unknown {
+  switch (j.t) {
+    case "null": return null;
+    case "bool": return j.v;
+    case "str": return j.v;
+    case "num": return /^(?:0|[1-9]\d*)$/.test(j.raw) && Number.isSafeInteger(Number(j.raw)) ? Number(j.raw) : null;
+    case "arr": return j.v.map(toPlain);
+    case "obj": {
+      const out: Record<string, unknown> = Object.create(null);
+      for (const [k, v] of lastWins(j.v)) out[k] = toPlain(v);
+      return out;
+    }
+  }
 }

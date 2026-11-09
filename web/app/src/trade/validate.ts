@@ -18,7 +18,7 @@ import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import { TRADE_LOT, TRADE_STATUS } from "../model/kinds.js";
-import { JsonError, parseJson, string, struct, u8, uint, unitEnum, type Json } from "./json.js";
+import { JsonError, parseJson, sameJson, string, struct, toPlain, u8, uint, unitEnum, type Json } from "./json.js";
 import { decodeNpub } from "./nip19.js";
 
 /** A raw NIP-01 event from a relay. Untrusted. */
@@ -222,9 +222,11 @@ export function parseLot(e: NostrEvent, now: number): LotVerdict {
 
 /* ---------------- status chains (lifecycle) ---------------- */
 
-const REVISION_FIELDS = ["trade_v", "lot_id", "seq", "prev", "status"] as const;
+const REVISION_FIELDS = ["trade_v", "lot_id", "seq", "prev", "status", "lot"] as const;
+/** Revision.lot is `#[serde(default)]`: absent or null on every status the CLI wrote before it. */
+const REVISION_OPTIONAL = ["lot"] as const;
 
-interface Revision { seq: bigint; prev: string; status: Status; event: NostrEvent }
+interface Revision { seq: bigint; prev: string; status: Status; event: NostrEvent; lot?: Json }
 
 export type ChainVerdict =
   | { ok: true; status: Status; events: NostrEvent[] }
@@ -253,15 +255,18 @@ export function lifecycle(lot: NostrEvent, events: readonly NostrEvent[]): Chain
       let lotId: string;
       let tradeV: bigint;
       try {
-        const f = struct(parseJson(e.content), REVISION_FIELDS, true);
+        const f = struct(parseJson(e.content), REVISION_FIELDS, true, REVISION_OPTIONAL);
         tradeV = u8(f.trade_v);
         lotId = string(f.lot_id);
         r = { seq: uint(f.seq), prev: string(f.prev), status: unitEnum(f.status, STATUSES), event: e };
+        if (f.lot && f.lot.t !== "null") r.lot = f.lot;
       } catch (err) {
         if (err instanceof JsonError) throw new TradeError(`malformed status: ${err.message}`);
         throw err;
       }
       ensure(tradeV === 1n && lotId === lot.id && tag(e, "e") === lotId, "wrong status binding");
+      // lib.rs: a carried listing is allowed on `sold` only, and must be this listing exactly.
+      if (r.lot) ensure(r.status === "sold" && sameJson(r.lot, lot), "status lot does not match the listing");
       ensure(!revisions.has(r.seq), "forked status history");
       revisions.set(r.seq, r);
     }
@@ -283,5 +288,23 @@ export function lifecycle(lot: NostrEvent, events: readonly NostrEvent[]): Chain
     return { ok: true, status, events: chain };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+/**
+ * The signed listing a `sold` status carries (lib.rs `sold_event`), or null.
+ * Relays delete listings at their 24h expiry but keep statuses, so this is how
+ * a completed trade stays readable. Unverified: the caller hands it to
+ * checkLot like any listing, and lifecycle() still requires it to be the
+ * exact listing the chain belongs to.
+ */
+export function carriedLot(status: NostrEvent): NostrEvent | null {
+  try {
+    if (status.kind !== TRADE_STATUS || typeof status.content !== "string") return null;
+    const f = struct(parseJson(status.content), REVISION_FIELDS, true, REVISION_OPTIONAL);
+    if (!f.lot || f.lot.t !== "obj") return null;
+    return toPlain(f.lot) as NostrEvent;
+  } catch {
+    return null;
   }
 }
