@@ -2442,6 +2442,24 @@ mod serialized_bounded_push_tests {
 }
 
 /// Reconstruct only requests we actually retained. Legacy rows are unknown, not unconstrained.
+/// #1057: the operator line for a blocked pre-claim review, with the way out that actually works
+/// for its class (review round 1): `review retry` for a permanent input error or an availability
+/// error; for a policy refusal, which `review retry` refuses, expiry or a restart.
+fn review_blocked_line(job_id: &str, error: &str) -> String {
+    let next = match crate::review::state::failure_state(error) {
+        "policy_refused" => crate::review::state::SELLER_POLICY_REFUSAL_NEXT.to_owned(),
+        "input_refused" => format!(
+            "retry: maxplayer review retry {job_id}; not reconsidered until an explicit retry or the offer expires"
+        ),
+        _ => format!("retry: maxplayer review retry {job_id}"),
+    };
+    format!("seller node review blocked id={job_id}: {error}; inspect: maxplayer review status {job_id}; {next}")
+}
+
+/// #1057 review round 1: how often the drain tick may sweep review state of gone offers. The sweep
+/// reads the store; tickets of offers missing from a reconsider pass are dropped by the pass itself.
+const REVIEW_STATE_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
 fn capacity_retry_offer(row: &super::store::Offer, seller_pubkey: &str) -> Option<ParsedOffer> {
     let request = row.capability_request.as_ref()?;
     Some(ParsedOffer {
@@ -4727,8 +4745,17 @@ pub struct SellerNodeRunner {
     // Bounded off-loop review work; None is pending, Some is terminal until restart.
     review_checks: Arc<std::sync::Mutex<std::collections::BTreeMap<String, Option<Result<Option<String>, String>>>>>,
     /// #1057: the review failure already logged per offer, so a re-drive of the same outcome stays
-    /// quiet. Cleared with the cached check by an explicit `review retry`; pruned to `review_checks`.
+    /// quiet. Cleared with the cached check by an explicit `review retry`; pruned to `review_checks`
+    /// and swept against live offers on the drain tick ([`Self::prune_review_state`]).
     review_blocked_logged: std::sync::Mutex<std::collections::BTreeMap<String, String>>,
+    /// When [`Self::prune_review_state`] last ran from the drain tick (`None` = not yet).
+    review_state_swept_at: std::sync::Mutex<Option<Instant>>,
+    /// Test hook: how many times [`Self::claim_offer`] was entered (#1057 reconsider-skip tests).
+    #[cfg(test)]
+    claim_offer_entries: std::sync::atomic::AtomicUsize,
+    /// Test hook: normal-level `review blocked` lines logged (#1057 log-once tests).
+    #[cfg(test)]
+    review_blocked_lines: std::sync::atomic::AtomicUsize,
     /// Pre-claim private input staging, off the event loop (#1096 review B2): a large base
     /// can take minutes for the relay to pack. Finished offers are re-driven on the drain tick.
     private_preflight: super::preflight::PreflightGate<nostr_sdk::Event>,
@@ -5229,6 +5256,11 @@ impl SellerNodeRunner {
             capacity_skip_pending: std::sync::atomic::AtomicBool::new(false),
             review_checks: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             review_blocked_logged: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            review_state_swept_at: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            claim_offer_entries: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            review_blocked_lines: std::sync::atomic::AtomicUsize::new(0),
             private_preflight: super::preflight::PreflightGate::new(),
             delivery_push_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             session_rt: session_run::SessionRuntime::default(),
@@ -5649,7 +5681,13 @@ impl SellerNodeRunner {
     /// re-driven: re-requesting it reproduces the same answer. Its explicit `review retry` ticket is
     /// what brings it back, so a queued ticket for such an offer arms the tick by itself. The return
     /// value counts only offers that actually reached a claim, not ones stopped at the review gate.
+    ///
+    /// #1057 review round 1: a ticket never outlives its use. Review state (tickets included) of an
+    /// offer that is gone (expired, claimed) is swept first, so it cannot arm the tick; a ticket this
+    /// pass does not hand to the review gate (unreconstructable row, `Skip`, or declined inside
+    /// `claim_offer` before the gate) is dropped with one log line. Only a slot shortage keeps it.
     async fn reconsider_capacity_skips(&self) -> usize {
+        self.sweep_review_state_if_due();
         let retries = self.terminal_review_retries();
         if !retries.is_empty() {
             self.capacity_skip_pending
@@ -5675,6 +5713,19 @@ impl SellerNodeRunner {
                 return 0;
             }
         };
+        let review_root = self.node.home().root.clone();
+        // A retry ticket this pass did not deliver to the review gate (which consumes it) would arm
+        // this tick every drain until the offer expires. Drop it, once, and say why.
+        let drop_retry = |id: &str, why: &str| {
+            if retries.contains(id) && crate::review::state::take_retry(&review_root, id) {
+                opline!("seller node review retry dropped id={id}: {why}; the earlier review outcome stands (inspect: maxplayer review status {id})");
+            }
+        };
+        for id in &retries {
+            if !pending.iter().any(|row| &row.offer_id == id) {
+                drop_retry(id, "the offer is no longer awaiting a claim (deadline passed or claimed)");
+            }
+        }
         if pending.is_empty() {
             return 0;
         }
@@ -5697,6 +5748,7 @@ impl SellerNodeRunner {
             }
             let Some(offer) = capacity_retry_offer(&row, &seller_pubkey) else {
                 opline!("seller node offer skip id={}: stored capability request unknown; awaiting relay re-ingest", row.offer_id);
+                drop_retry(&row.offer_id, "the stored offer cannot be rebuilt for a re-drive");
                 continue;
             };
             match classify_offer(
@@ -5726,6 +5778,9 @@ impl SellerNodeRunner {
                         None,
                     )
                     .await;
+                    // The review gate consumes the ticket; one still queued means `claim_offer`
+                    // declined the offer before the gate (suppressed, already awarded, backlog full).
+                    drop_retry(&row.offer_id, "the offer was declined before its review (see the offer skip line)");
                     // Count a re-drive only if it reached a claim: one stopped at the review gate
                     // (pending or blocked) is not a `re-drove` (#1057).
                     if matches!(self.node.store().claim_row_state(&row.offer_id), Ok(Some(_))) {
@@ -5738,6 +5793,7 @@ impl SellerNodeRunner {
                         row.offer_id,
                         skip.reason()
                     );
+                    drop_retry(&row.offer_id, skip.reason());
                 }
             }
         }
@@ -7700,12 +7756,65 @@ impl SellerNodeRunner {
             logged.retain(|id, _| live.contains(id));
         }
         logged.insert(job_id.to_owned(), error.to_owned());
-        let parked = if crate::review::state::terminal(error) {
-            "; not reconsidered until an explicit retry or the offer expires"
-        } else {
-            ""
-        };
-        opline!("seller node review blocked id={job_id}: {error}; inspect: maxplayer review status {job_id}; retry: maxplayer review retry {job_id}{parked}");
+        #[cfg(test)]
+        self.review_blocked_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        opline!("{}", review_blocked_line(job_id, error));
+    }
+
+    /// Run [`Self::prune_review_state`] at most once per [`REVIEW_STATE_SWEEP_INTERVAL`].
+    fn sweep_review_state_if_due(&self) {
+        let Ok(mut swept_at) = self.review_state_swept_at.lock() else { return };
+        if swept_at.is_some_and(|at| at.elapsed() < REVIEW_STATE_SWEEP_INTERVAL) {
+            return;
+        }
+        *swept_at = Some(Instant::now());
+        drop(swept_at);
+        self.prune_review_state();
+    }
+
+    /// #1057 review round 1: forget the review state of offers that are gone (deadline passed, or
+    /// claimed): cached failed checks, the logged-once entries, and `review-retry/` tickets. Runs from
+    /// the drain tick at most once a minute ([`Self::sweep_review_state_if_due`]) and reads the store
+    /// only when there is something to sweep. `None` = nothing to sweep (or the store read failed); otherwise
+    /// the number of entries removed. Cached passes stay with the 256-entry prune in
+    /// [`Self::offer_review_ready`]; in-flight checks are never touched.
+    fn prune_review_state(&self) -> Option<usize> {
+        let root = &self.node.home().root;
+        let tickets = crate::review::state::queued_retries(root);
+        let failed = self
+            .review_checks
+            .lock()
+            .is_ok_and(|checks| checks.values().any(|value| matches!(value, Some(Err(_)))));
+        let logged = self.review_blocked_logged.lock().is_ok_and(|logged| !logged.is_empty());
+        if tickets.is_empty() && !failed && !logged {
+            return None;
+        }
+        let live: std::collections::BTreeSet<String> =
+            match self.node.store().offers_awaiting_claim(now_unix()) {
+                Ok(rows) => rows.into_iter().map(|row| row.offer_id).collect(),
+                Err(error) => {
+                    opline_verbose!("seller node review state sweep: store read failed ({error}); next tick");
+                    return None;
+                }
+            };
+        let mut removed = 0usize;
+        // Lock order: `review_checks` is released before `review_blocked_logged` is taken.
+        if let Ok(mut checks) = self.review_checks.lock() {
+            let before = checks.len();
+            checks.retain(|id, value| !matches!(value, Some(Err(_))) || live.contains(id));
+            removed += before - checks.len();
+        }
+        if let Ok(mut logged) = self.review_blocked_logged.lock() {
+            let before = logged.len();
+            logged.retain(|id, _| live.contains(id));
+            removed += before - logged.len();
+        }
+        for id in tickets {
+            if !live.contains(&id) && crate::review::state::take_retry(root, &id) {
+                removed += 1;
+            }
+        }
+        Some(removed)
     }
 
     fn offer_review_ready(&self, job_id: &str, buyer: &str) -> Result<bool, String> {
@@ -7733,7 +7842,12 @@ impl SellerNodeRunner {
             .review_checks
             .lock()
             .map_err(|_| "review: state lock failed")?;
-        if crate::review::state::take_retry(&home.root, job_id) {
+        // #1057 review round 1: only a check with an outcome consumes a retry ticket. The spawned
+        // review writes its status file BEFORE it stores the result, so `review retry` can queue a
+        // ticket while this entry is still `None`; consuming it here would lose the retry once the
+        // late `Err` lands. Left queued, the tick serves it as soon as the outcome is stored.
+        let in_flight = matches!(checks.get(job_id), Some(None));
+        if !in_flight && crate::review::state::take_retry(&home.root, job_id) {
             if matches!(checks.get(job_id), Some(Some(Err(_)))) {
                 checks.remove(job_id);
                 if let Ok(mut logged) = self.review_blocked_logged.lock() {
@@ -7834,6 +7948,8 @@ impl SellerNodeRunner {
         now: i64,
         contribution: Option<&ContributionOffer>,
     ) {
+        #[cfg(test)]
+        self.claim_offer_entries.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // #541/#814: refuse an offer that is no longer ours to claim, before any work. Two
         // buyer-authenticated signals land here (see [`Suppression`]): a co-signed kind-3400 receipt
         // means the offer was awarded + settled (to us or another seat) and is terminal; a kind-3405
@@ -14997,6 +15113,293 @@ mod tests {
         runner.client.disconnect().await;
         let _ = std::fs::remove_dir_all(root);
     }
+
+    // BEGIN #1057 review round 1 tests
+    const R1057_REFUSED: &str = "review: execution-safety verdict refused this offer: unsafe probability 900000 ppm (90.0%) is at or above the local threshold 500000 ppm (50.0%)";
+    const R1057_PERMANENT: &str = "review: permanent input error (invalid_subject); retrying unchanged input cannot help; correct the input or update the reviewer before explicitly retrying";
+    const R1057_TIMEOUT: &str = "review: timeout; next step blocked; retry available";
+
+    /// A 1-slot open-pool seller at `rate_sats` 200 (so a 100-sat offer classifies `Skip`) with a
+    /// reviewer that never answers: a re-requested review stays in flight for 2 s, then times out.
+    async fn review_1057_seller(
+        label: &str,
+    ) -> (nostr_relay_builder::prelude::LocalRelay, SellerNodeRunner, std::path::PathBuf, Keys) {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.unwrap();
+        let url = relay.url().await.to_string();
+        let root = temp_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).unwrap();
+        home.config.relay_url = url.clone();
+        home.config.seller = Some(seller_cfg(200, true));
+        home.config.review.reviewers.insert(url, Keys::generate().public_key().to_hex());
+        home.config.review.timeout_seconds = 2;
+        let runner = SellerNodeRunner::boot(home).await.unwrap();
+        (relay, runner, root, Keys::generate())
+    }
+
+    fn offer_1057(buyer: &Keys, task: &str, amount: u64, deadline_unix: u64) -> (String, crate::gateway::ParsedOffer) {
+        let draft = crate::gateway::OfferDraft::untargeted(task, "", amount, deadline_unix).to_event_draft();
+        let event = crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(buyer).unwrap();
+        (event.id.to_hex(), crate::gateway::parse_offer(&draft).unwrap())
+    }
+
+    /// A finished review, written exactly as the spawned task writes it: status file, then result.
+    fn settle_1057(runner: &SellerNodeRunner, id: &str, error: &str) {
+        let subject = crate::review::Subject { offer: id.into(), event: id.into(), kind: JOB_OFFER_KIND, commit: None };
+        let result: Result<Option<String>, String> = Err(error.to_owned());
+        crate::review::state::completed(&runner.node.home().root, &subject, &result).unwrap();
+        runner.review_checks.lock().unwrap().insert(id.to_owned(), Some(result));
+    }
+
+    /// Drive `id` through `claim_offer`: the offer is recorded and the cached review blocks it.
+    async fn block_1057(runner: &SellerNodeRunner, buyer: &Keys, id: &str, offer: &crate::gateway::ParsedOffer) {
+        runner
+            .claim_offer(id, &buyer.public_key().to_hex(), offer, &runner.seller_pubkey.to_hex(), offer.deadline_unix, now_unix(), None)
+            .await;
+        assert!(runner.node.store().claim_row_state(id).unwrap().is_none(), "a blocked review never claims");
+    }
+
+    fn entries_1057(runner: &SellerNodeRunner) -> usize {
+        runner.claim_offer_entries.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn ticket_1057(runner: &SellerNodeRunner, id: &str) -> bool {
+        crate::review::state::queued_retries(&runner.node.home().root).iter().any(|t| t == id)
+    }
+    fn cached_1057(runner: &SellerNodeRunner, id: &str) -> Option<Option<Result<Option<String>, String>>> {
+        runner.review_checks.lock().unwrap().get(id).cloned()
+    }
+
+    /// #1057 review round 1 (Nit): the reconsider tick never hands a terminal offer to `claim_offer`,
+    /// while an availability outcome is still re-driven on every armed tick.
+    /// RED ON REVERT: drop the `terminal_review_outcome && !retries` skip in
+    /// `reconsider_capacity_skips` and the terminal offer is re-driven too (two entries per round).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_review_offer_is_not_handed_to_claim_offer_by_the_reconsider_tick() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1057-skip").await;
+        let deadline = now_unix() as u64 + 600;
+        let (terminal, terminal_offer) = offer_1057(&buyer, "#1057 skip terminal", 300, deadline);
+        let (timeout, timeout_offer) = offer_1057(&buyer, "#1057 skip availability", 300, deadline);
+        settle_1057(&runner, &terminal, R1057_PERMANENT);
+        block_1057(&runner, &buyer, &terminal, &terminal_offer).await;
+        settle_1057(&runner, &timeout, R1057_TIMEOUT);
+        block_1057(&runner, &buyer, &timeout, &timeout_offer).await;
+        assert_eq!(entries_1057(&runner), 2);
+        for round in 1..=3 {
+            // Another capacity skip (or the availability outcome) armed the tick.
+            runner.capacity_skip_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(runner.reconsider_capacity_skips().await, 0);
+            assert_eq!(
+                entries_1057(&runner),
+                2 + round,
+                "round {round}: only the availability offer is re-driven; the terminal one stays parked"
+            );
+        }
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1057 review round 1 (Nit): one normal-level `review blocked` line per offer and outcome.
+    /// RED ON REVERT: drop the `previous == error` guard in `log_review_blocked` and every re-drive
+    /// logs again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_blocked_is_logged_once_per_offer_and_outcome() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1057-log-once").await;
+        let lines = || runner.review_blocked_lines.load(std::sync::atomic::Ordering::Relaxed);
+        let deadline = now_unix() as u64 + 600;
+        let (blocked, offer) = offer_1057(&buyer, "#1057 log once", 300, deadline);
+        settle_1057(&runner, &blocked, R1057_PERMANENT);
+        for _ in 0..3 {
+            block_1057(&runner, &buyer, &blocked, &offer).await;
+        }
+        assert_eq!(lines(), 1, "a repeated outcome is logged once");
+        assert_eq!(runner.review_blocked_logged.lock().unwrap().get(&blocked).map(String::as_str), Some(R1057_PERMANENT));
+        settle_1057(&runner, &blocked, R1057_REFUSED);
+        block_1057(&runner, &buyer, &blocked, &offer).await;
+        block_1057(&runner, &buyer, &blocked, &offer).await;
+        assert_eq!(lines(), 2, "a changed outcome is logged once more");
+        let (timeout, timeout_offer) = offer_1057(&buyer, "#1057 log once availability", 300, deadline);
+        settle_1057(&runner, &timeout, R1057_TIMEOUT);
+        block_1057(&runner, &buyer, &timeout, &timeout_offer).await;
+        block_1057(&runner, &buyer, &timeout, &timeout_offer).await;
+        assert_eq!(lines(), 3, "availability outcomes are logged once per outcome too");
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1057 review round 1 (Low, policy log): the parked line names the way out that works.
+    /// `review retry` refuses a policy refusal, so its line must not suggest it.
+    #[test]
+    fn review_blocked_line_names_the_way_out_for_each_class() {
+        let id = "a".repeat(64);
+        let retry = format!("maxplayer review retry {id}");
+        for policy in [R1057_REFUSED, crate::review::CONFLICTING_RESULTS] {
+            let line = review_blocked_line(&id, policy);
+            assert!(!line.contains(&retry), "{line}");
+            assert!(line.contains("restart the seller") && line.contains("expires"), "{line}");
+            assert!(line.contains(&format!("maxplayer review status {id}")), "{line}");
+        }
+        let permanent = review_blocked_line(&id, R1057_PERMANENT);
+        assert!(permanent.contains(&retry) && permanent.contains("not reconsidered until an explicit retry"), "{permanent}");
+        let availability = review_blocked_line(&id, R1057_TIMEOUT);
+        assert!(availability.contains(&retry) && !availability.contains("not reconsidered"), "{availability}");
+    }
+
+    /// #1057 review round 1 (Medium): a retry ticket the tick cannot hand to the review gate is
+    /// dropped, so it cannot arm the tick every drain until the offer expires. One offer per way the
+    /// pass can fail to deliver it: expired (absent from `offers_awaiting_claim`), `Skip`, a row that
+    /// cannot be rebuilt, and an offer `claim_offer` declines before its review. The periodic sweep
+    /// is held off so only the pass itself can remove the tickets.
+    /// RED ON REVERT: drop any one `drop_retry` call and that offer's ticket survives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_retry_ticket_the_tick_cannot_serve_is_dropped_not_rearmed() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1057-stranded").await;
+        let review_root = runner.node.home().root.clone();
+        let buyer_hex = buyer.public_key().to_hex();
+        let pending = || runner.capacity_skip_pending.load(std::sync::atomic::Ordering::Relaxed);
+        *runner.review_state_swept_at.lock().unwrap() = Some(Instant::now());
+        let now = now_unix() as u64;
+        let (expired, expired_offer) = offer_1057(&buyer, "#1057 expired", 300, now - 1);
+        let (skipped, skipped_offer) = offer_1057(&buyer, "#1057 below rate", 100, now + 600);
+        let (legacy, legacy_offer) = offer_1057(&buyer, "#1057 legacy row", 300, now + 600);
+        let (declined, declined_offer) = offer_1057(&buyer, "#1057 settled elsewhere", 300, now + 600);
+        for (id, offer) in [(&expired, &expired_offer), (&skipped, &skipped_offer), (&declined, &declined_offer)] {
+            settle_1057(&runner, id, R1057_PERMANENT);
+            block_1057(&runner, &buyer, id, offer).await;
+        }
+        // A row journaled before the capability column existed cannot be rebuilt for a re-drive.
+        let mut row = offer_row(&legacy, &buyer_hex, &legacy_offer);
+        row.capability_request = None;
+        runner.node.store().record_offer(&row, now as i64).unwrap();
+        settle_1057(&runner, &legacy, R1057_PERMANENT);
+        // A co-signed receipt: `claim_offer` refuses the offer before its review gate.
+        runner.terminal_offers.record_receipt(&declined, &buyer_hex);
+        for id in [&expired, &skipped, &legacy, &declined] {
+            crate::review::state::retry(&review_root, id).unwrap();
+        }
+        assert_eq!(runner.terminal_review_retries().len(), 4);
+        let entries = entries_1057(&runner);
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        for (id, why) in [(&expired, "expired"), (&skipped, "Skip"), (&legacy, "unreconstructable row"), (&declined, "declined before review")] {
+            assert!(!ticket_1057(&runner, id), "{why}: a ticket the tick cannot serve must be dropped");
+            assert!(
+                matches!(cached_1057(&runner, id), Some(Some(Err(e))) if e == R1057_PERMANENT),
+                "{why}: the earlier outcome stands and no review is re-requested"
+            );
+        }
+        assert_eq!(entries_1057(&runner), entries + 1, "only the declined offer reached claim_offer");
+        assert!(runner.terminal_review_retries().is_empty(), "nothing is left to arm the next tick");
+        assert!(!pending());
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        assert!(!pending(), "the tick stays disarmed");
+        assert_eq!(entries_1057(&runner), entries + 1);
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1057 review round 1 (Medium): with every slot busy the pass stops before the review gate,
+    /// so the ticket is kept and served once a slot frees.
+    /// RED ON REVERT: drop tickets before the slot check and the retry is lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_retry_ticket_waits_for_a_free_slot() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1057-no-slot").await;
+        let review_root = runner.node.home().root.clone();
+        let pending = || runner.capacity_skip_pending.load(std::sync::atomic::Ordering::Relaxed);
+        let (id, offer) = offer_1057(&buyer, "#1057 no slot", 300, now_unix() as u64 + 600);
+        settle_1057(&runner, &id, R1057_PERMANENT);
+        block_1057(&runner, &buyer, &id, &offer).await;
+        crate::review::state::retry(&review_root, &id).unwrap();
+        let busy = "f".repeat(64);
+        assert_eq!(runner.slots.try_reserve(&busy), Reserve::Reserved);
+        let entries = entries_1057(&runner);
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        assert!(ticket_1057(&runner, &id), "no free slot: the ticket waits");
+        assert!(pending(), "and the tick stays armed for the slot");
+        assert_eq!(entries_1057(&runner), entries);
+        runner.slots.release(&busy);
+        assert_eq!(runner.reconsider_capacity_skips().await, 0, "a re-requested review is not a claim");
+        assert!(!ticket_1057(&runner, &id), "a free slot serves the ticket");
+        assert!(matches!(cached_1057(&runner, &id), Some(None)), "the review is requested again");
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1057 review round 1 (Low, race): the spawned review writes its status file before it stores
+    /// the result. A `review retry` in that window must survive until the result lands.
+    /// RED ON REVERT: let `offer_review_ready` consume a ticket while the entry is in flight and the
+    /// ticket is gone before the late `Err` is stored, leaving the offer parked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_retry_queued_while_the_review_is_in_flight_is_not_lost() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1057-race").await;
+        let review_root = runner.node.home().root.clone();
+        let (id, offer) = offer_1057(&buyer, "#1057 race", 300, now_unix() as u64 + 600);
+        settle_1057(&runner, &id, R1057_PERMANENT);
+        block_1057(&runner, &buyer, &id, &offer).await;
+        // The window: status file already says input_refused, the cache still says in flight.
+        runner.review_checks.lock().unwrap().insert(id.clone(), None);
+        crate::review::state::retry(&review_root, &id).unwrap();
+        assert!(!runner.offer_review_ready(&id, &buyer.public_key().to_hex()).unwrap(), "still in flight");
+        assert!(ticket_1057(&runner, &id), "a ticket queued while the review is in flight is kept");
+        // The late result lands.
+        runner.review_checks.lock().unwrap().insert(id.clone(), Some(Err(R1057_PERMANENT.into())));
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        assert!(!ticket_1057(&runner, &id), "the tick serves it once the outcome is stored");
+        assert!(matches!(cached_1057(&runner, &id), Some(None)), "the review is requested again");
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1057 review round 1 (Low, pruning): review state of offers that are gone (deadline passed)
+    /// is swept from `review_checks` (failed checks only), `review_blocked_logged` and `review-retry/`;
+    /// live offers, cached passes and in-flight checks stay. The sweep reads the store only when there
+    /// is something to sweep, and runs from the drain tick at most once per interval.
+    /// RED ON REVERT: drop any of the three removals, or the drain-tick call, or the throttle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_state_of_gone_offers_is_swept_on_the_drain_tick() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1057-prune").await;
+        let review_root = runner.node.home().root.clone();
+        let now = now_unix() as u64;
+        let (live, live_offer) = offer_1057(&buyer, "#1057 prune live", 300, now + 600);
+        let (gone, gone_offer) = offer_1057(&buyer, "#1057 prune gone", 300, now - 1);
+        for (id, offer) in [(&live, &live_offer), (&gone, &gone_offer)] {
+            settle_1057(&runner, id, R1057_PERMANENT);
+            block_1057(&runner, &buyer, id, offer).await;
+        }
+        crate::review::state::retry(&review_root, &gone).unwrap();
+        let (passed, flight) = ("e".repeat(64), "d".repeat(64));
+        runner.review_checks.lock().unwrap().insert(passed.clone(), Some(Ok(None)));
+        runner.review_checks.lock().unwrap().insert(flight.clone(), None);
+        let logged = |id: &str| runner.review_blocked_logged.lock().unwrap().contains_key(id);
+        assert!(logged(&live) && logged(&gone));
+
+        assert_eq!(runner.prune_review_state(), Some(3), "the gone offer's failed check, logged entry and ticket");
+        assert!(cached_1057(&runner, &gone).is_none(), "a gone offer's failed check is swept");
+        assert!(!logged(&gone), "a gone offer's logged-once entry is swept");
+        assert!(!ticket_1057(&runner, &gone), "a gone offer's retry ticket is swept");
+        assert!(cached_1057(&runner, &live).is_some() && logged(&live), "a live offer keeps its state");
+        assert!(cached_1057(&runner, &passed).is_some(), "cached passes are left to the 256-entry prune");
+        assert!(cached_1057(&runner, &flight).is_some(), "an in-flight check is never touched");
+
+        runner.review_checks.lock().unwrap().remove(&live);
+        runner.review_blocked_logged.lock().unwrap().remove(&live);
+        assert_eq!(runner.prune_review_state(), None, "nothing to sweep: no store read");
+
+        let regone = || {
+            settle_1057(&runner, &gone, R1057_PERMANENT);
+            runner.review_blocked_logged.lock().unwrap().insert(gone.clone(), R1057_PERMANENT.into());
+        };
+        regone();
+        *runner.review_state_swept_at.lock().unwrap() = None;
+        runner.reconsider_capacity_skips().await;
+        assert!(cached_1057(&runner, &gone).is_none() && !logged(&gone), "the drain tick sweeps");
+        regone();
+        runner.reconsider_capacity_skips().await;
+        assert!(cached_1057(&runner, &gone).is_some() && logged(&gone), "at most once per interval");
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+    // END #1057 review round 1 tests
 
     // The review before the agent runs must route a private offer like the claim-time review
     // does. Before the fix it always sent a public kind-3409 request, which the reviewer never

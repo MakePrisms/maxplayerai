@@ -22,6 +22,8 @@ pub fn write(root: &Path, subject: &Subject, state: &str, detail: &str) -> Resul
         detail: detail.into(),
         retry: if state == "input_refused" {
             "Retrying unchanged input cannot help. Correct the input or update the reviewer, then explicitly retry.".into()
+        } else if subject.kind == JOB_OFFER_KIND && state == "policy_refused" {
+            SELLER_POLICY_REFUSAL_NEXT.into()
         } else if subject.kind == JOB_OFFER_KIND {
             format!("maxplayer review retry {}", subject.event)
         } else if state == "policy_refused" {
@@ -121,31 +123,37 @@ pub fn completed(
             "disabled",
             "explicit local configuration or counterparty public-key skip",
         ),
-        Err(e) => write(
-            root,
-            subject,
-            if permanent_error(e) {
-                "input_refused"
-            } else if policy_refusal(e) {
-                "policy_refused"
-            } else {
-                "error"
-            },
-            e,
-        ),
+        Err(e) => write(root, subject, failure_state(e), e),
     }
 }
+/// What a seller does about an offer whose review was refused by policy. `retry` refuses
+/// `policy_refused`, so this never points at `maxplayer review retry` (#1057 review round 1).
+pub const SELLER_POLICY_REFUSAL_NEXT: &str = "a policy refusal is not retryable (`review retry` refuses it): the offer stays parked until it expires; to review it again after changing review.reject_at_or_above_ppm, restart the seller so the local threshold is re-read";
+/// Exactly the policy refusals this crate builds: the signed-verdict refusal and the conflicting
+/// results refusal. Matched by prefix and by the exact text, never by loose words, so an
+/// availability error that merely mentions "threshold" or "conflicting" (a relay's refusal
+/// reason, the config validation message) stays retryable (#1057 review round 1).
 fn policy_refusal(error: &str) -> bool {
-    error.starts_with(VERDICT_REFUSED_PREFIX)
-        || error.contains("threshold")
-        || error.contains("conflicting")
+    error.starts_with(VERDICT_REFUSED_PREFIX) || error == CONFLICTING_RESULTS
+}
+/// The status-file state for a failed review: `input_refused` (permanent input error),
+/// `policy_refused` (verdict or conflict refusal) or `error` (availability: timeouts, reviewer
+/// unreachable, relay refusals, configuration).
+pub fn failure_state(error: &str) -> &'static str {
+    if permanent_error(error) {
+        "input_refused"
+    } else if policy_refusal(error) {
+        "policy_refused"
+    } else {
+        "error"
+    }
 }
 /// #1057: a review failure that cannot change by waiting (`input_refused` or `policy_refused`).
 /// Re-requesting it reproduces the same answer, so the seller stops re-driving the offer until an
 /// explicit `review retry` (permanent input errors only) or a restart (a changed local threshold).
-/// Everything else (`error`: timeouts, reviewer unreachable, relay refusals) is availability.
+/// Everything else (`error`) is availability.
 pub fn terminal(error: &str) -> bool {
-    permanent_error(error) || policy_refusal(error)
+    failure_state(error) != "error"
 }
 /// Offer ids with an explicit retry ticket waiting to be consumed by the seller's reconsider tick.
 pub fn queued_retries(root: &Path) -> Vec<String> {
@@ -179,20 +187,60 @@ mod tests {
         assert!(read(&root, "../../elsewhere").is_err());
     }
 
+    /// #1057 review round 1: classification of the strings this crate actually builds, through
+    /// the real constructors (`reviewer_error`, `CONFLICTING_RESULTS`, config validation). The
+    /// verdict, conflict, timeout and relay-refusal strings built by `wire::check` itself are
+    /// covered in `review::tests::built_review_errors_classify_as_parked_or_retryable`.
     #[test]
     fn terminal_outcomes_are_refusals_and_permanent_input_errors_only() {
-        assert!(terminal("review: execution-safety probability exceeds local threshold"));
-        assert!(terminal(&format!("{VERDICT_REFUSED_PREFIX} this offer: unsafe probability 900000 ppm")));
-        assert!(terminal("review: conflicting results"));
-        assert!(terminal("review: permanent input error (invalid_subject); retrying unchanged input cannot help"));
-        for availability in [
-            "review: timeout; next step blocked; retry available",
-            "review: timeout; last reviewer error (rate_limited); next step blocked; retry available",
-            "review: reviewer error (queue_full); next step blocked; explicit retry available",
-            "review: relay refused the review request: rate-limited",
-            "review: configure a reviewer key for this relay, or explicitly skip review",
+        for code in [
+            "input_too_large",
+            "unsupported_input",
+            "input_integrity",
+            "invalid_subject",
+            "invalid_input",
+            "invalid_request",
+            "unauthorized_request",
         ] {
-            assert!(!terminal(availability), "{availability}");
+            assert_eq!(failure_state(&reviewer_error(code)), "input_refused", "{code}");
+        }
+        assert_eq!(failure_state(CONFLICTING_RESULTS), "policy_refused");
+        for code in [
+            "rate_limited",
+            "queue_full",
+            "stale_request",
+            "provider_unavailable",
+            "provider_timeout",
+            "input_unavailable",
+            "private_transport_unavailable",
+            "secret_file_unavailable",
+        ] {
+            let error = reviewer_error(code);
+            assert_eq!(failure_state(&error), "error", "{error}");
+            assert!(!terminal(&error), "{error}");
+        }
+        // The config validation message mentions "threshold" and is not a policy refusal.
+        let config = ReviewConfig { timeout_seconds: 0, ..Default::default() }.validate().unwrap_err();
+        assert!(config.contains("threshold"), "{config}");
+        assert!(!terminal(&config), "{config}");
+        // What `review status` shows and what `review retry` accepts, per class, for an offer.
+        let root = tempfile::tempdir().unwrap();
+        for (n, (error, state, retryable)) in [
+            (reviewer_error("invalid_subject"), "input_refused", true),
+            (CONFLICTING_RESULTS.to_owned(), "policy_refused", false),
+            (reviewer_error("rate_limited"), "error", true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = Subject { offer: format!("{:064x}", n + 1), event: format!("{:064x}", n + 1), kind: JOB_OFFER_KIND, commit: None };
+            completed(root.path(), &s, &Err(error.clone())).unwrap();
+            let status = read(root.path(), &s.event).unwrap();
+            assert_eq!(status.state, state, "{error}");
+            assert_eq!(retry(root.path(), &s.event).is_ok(), retryable, "{error}");
+            if state == "policy_refused" {
+                assert_eq!(status.retry, SELLER_POLICY_REFUSAL_NEXT, "a policy refusal must not advise `review retry`");
+            }
         }
         let root = tempfile::tempdir().unwrap();
         assert!(queued_retries(root.path()).is_empty());
