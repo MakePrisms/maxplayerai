@@ -1413,6 +1413,10 @@ pub async fn send_async(
             "insufficient funds: balance={before} need={amount_sats}"
         )));
     }
+    // Review r3 H1: in flight from before the send saga exists until `confirm` returns.
+    let _operation = crate::shared_wallet::operation_guard(Some(&home.wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     let prepared = crate::shared_wallet::prepare_send_locked(
         &wallet,
         Some(&home.wallet_dir),
@@ -1641,6 +1645,10 @@ async fn pay_quote_on_wallet(
             "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
         )));
     }
+    // Review r3 H1: in flight from before the melt saga exists until `confirm` returns.
+    let _operation = crate::shared_wallet::operation_guard(Some(wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     let prepared = crate::shared_wallet::prepare_melt_locked(wallet, Some(wallet_dir), &quote.id)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
@@ -1883,6 +1891,17 @@ fn prepared_melt_thread(
         Ok(wallet) => wallet,
         Err(error) => {
             let _ = prepared_tx.send(Err(error));
+            return;
+        }
+    };
+    // Review r3 H1: this thread's melt is in flight from before its saga exists until the verdict's
+    // `confirm`/`cancel` returns; the guard lives on this thread's stack until it exits.
+    let _operation = match runtime.block_on(crate::shared_wallet::operation_guard(Some(
+        &home.wallet_dir,
+    ))) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = prepared_tx.send(Err(WalletOpsError::Wallet(error.to_string())));
             return;
         }
     };
@@ -2359,6 +2378,34 @@ pub async fn remove_mint_async(
             .retain(|entry| normalize_mint_url(entry).ok().as_deref() != Some(to_remove.as_str()));
     })?;
     Ok(removed)
+}
+
+/// The sagas the last wallet pass kept (review r3 L2): held swap sagas (outputs not all accounted
+/// for yet) and held sends/melts, with the mint, id and remediation. Read from the wallet database
+/// only (no mint request, no seed); a home without a wallet database has none.
+pub async fn held_sagas_async(
+    home: &MaxplayerHome,
+) -> Result<Vec<crate::payment_wallet::HeldSwap>, WalletOpsError> {
+    if !sqlite_path(&home.wallet_dir).exists() {
+        return Ok(Vec::new());
+    }
+    let store = open_balance_store(home).await?;
+    crate::payment_wallet::load_held_sagas(&store)
+        .await
+        .map_err(WalletOpsError::Wallet)
+}
+
+/// Blocking [`held_sagas_async`].
+pub fn held_sagas_blocking(
+    home: &MaxplayerHome,
+) -> Result<Vec<crate::payment_wallet::HeldSwap>, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("held_sagas_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(held_sagas_async(home))
 }
 
 pub fn balances_blocking(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsError> {

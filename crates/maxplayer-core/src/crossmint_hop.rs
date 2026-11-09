@@ -1145,6 +1145,10 @@ impl HopEffects for CdkHopEffects {
             )
             .await
             .unwrap_or_default();
+            // Review r3 H1: in flight from before the melt saga exists until `confirm` returns.
+            let _operation = crate::shared_wallet::operation_guard(wallet_dir.as_deref())
+                .await
+                .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
             let select = crate::shared_wallet::select_guard(wallet_dir.as_deref())
                 .await
                 .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
@@ -1273,7 +1277,10 @@ async fn sweep_one(
         let outcome = bounded(
             &format!("{label} saga recovery"),
             HOP_LEG_TIMEOUT,
-            crate::payment_wallet::recover_incomplete_sagas_guarded(wallet),
+            crate::payment_wallet::recover_incomplete_sagas_guarded(
+                wallet,
+                Some(home.wallet_dir.as_path()),
+            ),
         )
         .await?;
         if let crate::payment_wallet::GuardedRecovery::Held(reason) = outcome {

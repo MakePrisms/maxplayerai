@@ -39,6 +39,21 @@ the merge, Vercel).
   empty or partial `/restore`, is kept and retried: `reconcile` prints `swap_held=<n>` and a
   remediation line naming the saga, and payments are no longer refused because of it (its
   reserved inputs stay unspendable).
+- **Fixed: a send's or melt's swap is no longer deleted when its reply was lost.** The swap a
+  job payment, `wallet send` or melt runs first stores its outputs before it is sent; recovery
+  used to delete that record as an orphan on `https://` mints (also while another process on the
+  same home was still waiting for the reply), losing the change. It is now kept while its send or
+  melt is running or incomplete, its change is recovered from the mint once the swap is known to
+  have executed, and only then is the send or melt retired with its inputs recorded spent. A send
+  whose inputs were already spent no longer blocks every later payment. Sends and melts take a
+  shared `<home>/wallet/operation.lock` while they run so recovery in any process can tell a
+  running one from a crashed one.
+- **Changed: `maxplayer wallet balance` and `maxplayer doctor` show held sagas.** When the last
+  wallet pass kept a swap (outputs not all back yet) or a send/melt (waiting for its swap),
+  `balance` prints `swap_held=<n> saga_ids=…` / `send_held=<n> saga_ids=…` and a remediation line
+  per saga on stderr, and `doctor` adds a `wallet held sagas` WARN row. `wallet reconcile` also
+  prints `send_held=<n> retired_spent=<n>` when either is non-zero. Output is unchanged when
+  nothing is held.
 - **Changed: `maxplayer wallet balance`** prints `reserved_sats=<n>` on a mint line when proofs
   there are reserved by an in-flight operation (job payment, send, melt or a trade); they were
   never in `balance_sats`. Lines with nothing reserved are unchanged.

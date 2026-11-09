@@ -96,7 +96,11 @@ impl std::fmt::Display for SelectLockError {
 impl std::error::Error for SelectLockError {}
 
 fn open_lock_file(wallet_dir: &Path) -> Result<(PathBuf, File), SelectLockError> {
-    let path = wallet_dir.join(SELECT_LOCK_FILE);
+    open_named_lock_file(wallet_dir, SELECT_LOCK_FILE)
+}
+
+fn open_named_lock_file(wallet_dir: &Path, name: &str) -> Result<(PathBuf, File), SelectLockError> {
+    let path = wallet_dir.join(name);
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -109,8 +113,12 @@ fn open_lock_file(wallet_dir: &Path) -> Result<(PathBuf, File), SelectLockError>
 }
 
 fn try_flock(file: &File) -> Result<bool, SelectLockError> {
+    try_flock_mode(file, libc::LOCK_EX)
+}
+
+fn try_flock_mode(file: &File, mode: libc::c_int) -> Result<bool, SelectLockError> {
     // Safety: plain libc call on a valid descriptor owned by `file`, which outlives the call.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0 {
         return Ok(true);
     }
     let error = std::io::Error::last_os_error();
@@ -160,6 +168,68 @@ pub async fn select_guard(
         Some(dir) => acquire(dir, SELECT_LOCK_TIMEOUT).await.map(Some),
         None => Ok(None),
     }
+}
+
+// ---- Operation lock: evidence that a send or melt is still running ----------------------------
+//
+// cdk 0.17.2 sagas say nothing about whether the process that wrote them is alive. A send's or
+// melt's `confirm` swaps with `ProofReservation::Skip`, so for the whole time its swap request is
+// out, the parent saga owns the inputs and the child swap saga owns nothing but its stored blinded
+// messages. To another process on this home, a live operation and a crashed one look identical in
+// the database. The operation lock is the evidence the code can check instead: every core send and
+// melt takes it SHARED before cdk's `prepare_*` creates the parent saga and holds it until
+// `confirm`/`cancel` returns (or its future is dropped), and recovery asks for it EXCLUSIVE without
+// waiting ([`operation_in_flight`]). The kernel drops a `flock` when its descriptor closes, so a
+// killed process (even `kill -9`) never leaves an operation looking alive.
+
+/// The operation lock file inside the home's `wallet/` directory.
+pub const OPERATION_LOCK_FILE: &str = "operation.lock";
+
+/// A held (shared) operation lock: one cdk send or melt of this process is between `prepare` and
+/// the end of its `confirm`/`cancel`. Dropping it ends that.
+#[derive(Debug)]
+pub struct OperationGuard {
+    _file: File,
+}
+
+/// Take the operation lock SHARED for one send or melt on the wallet in `wallet_dir`. Take it BEFORE
+/// cdk's `prepare_send`/`prepare_melt` (so the parent saga never exists without it) and keep it until
+/// `confirm`/`cancel` has returned. Any number of operations hold it at once; it only waits while a
+/// recovery pass is probing ([`operation_in_flight`] holds it exclusive for one system call), and
+/// that wait is bounded ([`SELECT_LOCK_TIMEOUT`], a retryable refusal before anything is prepared).
+/// `None` takes nothing (wallets no other process opens: in-memory tests).
+pub async fn operation_guard(
+    wallet_dir: Option<&Path>,
+) -> Result<Option<OperationGuard>, SelectLockError> {
+    let Some(dir) = wallet_dir else {
+        return Ok(None);
+    };
+    let (path, file) = open_named_lock_file(dir, OPERATION_LOCK_FILE)?;
+    let started = tokio::time::Instant::now();
+    loop {
+        if try_flock_mode(&file, libc::LOCK_SH)? {
+            return Ok(Some(OperationGuard { _file: file }));
+        }
+        let waited = started.elapsed();
+        if waited >= SELECT_LOCK_TIMEOUT {
+            return Err(SelectLockError::Busy { path, waited });
+        }
+        tokio::time::sleep(POLL.min(SELECT_LOCK_TIMEOUT - waited)).await;
+    }
+}
+
+/// Whether any process (this one included) holds an [`OperationGuard`] on the wallet in
+/// `wallet_dir` right now: a send or melt there is between `prepare` and the end of `confirm`.
+/// Never waits. `false` means every operation whose saga the caller read BEFORE this call has ended
+/// in its process (returned, failed, was dropped, or the process died) and will write nothing more.
+/// `None` (a wallet no other process opens) is never in flight.
+pub fn operation_in_flight(wallet_dir: Option<&Path>) -> Result<bool, SelectLockError> {
+    let Some(dir) = wallet_dir else {
+        return Ok(false);
+    };
+    let (_, file) = open_named_lock_file(dir, OPERATION_LOCK_FILE)?;
+    // Acquired ⇒ nobody holds it; closing `file` releases it at once.
+    Ok(!try_flock_mode(&file, libc::LOCK_EX)?)
 }
 
 /// Open this home's shared wallet at `mint_url` for another local process (`maxplayer-trade`):
@@ -594,6 +664,104 @@ mod tests {
             seen, 5,
             "select_guard call sites (prepare_send/melt_locked, pay, hop, swap apply)"
         );
+    }
+
+    /// Review r3 H1: every production cdk send/melt (`prepare_send`, `prepare_melt`, their locked
+    /// wrappers, `revoke_send`) takes the operation lock (`operation_guard(`) first, so recovery in
+    /// any process can tell a running send from a crashed one. `shared_wallet.rs` defines the
+    /// wrappers; their callers are what is checked.
+    #[test]
+    fn every_cdk_send_and_melt_holds_the_operation_lock() {
+        let mut seen = 0;
+        for (name, source) in [
+            ("payment_wallet.rs", include_str!("payment_wallet.rs")),
+            ("crossmint_hop.rs", include_str!("crossmint_hop.rs")),
+            ("wallet_ops.rs", include_str!("wallet_ops.rs")),
+            ("buyer_fund.rs", include_str!("buyer_fund.rs")),
+            // fee_remit.rs only calls its `RemitEffects` trait; the live melt is
+            // `wallet_ops::prepare_melt_payment_blocking`'s thread, checked in wallet_ops.rs.
+            ("authorize_pay.rs", include_str!("authorize_pay.rs")),
+        ] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let lines: Vec<&str> = production.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || code.contains("fn ") {
+                    continue;
+                }
+                let calls = [
+                    "prepare_send_locked(",
+                    "prepare_melt_locked(",
+                    ".prepare_send(",
+                    ".prepare_melt(",
+                    ".revoke_send(",
+                ];
+                if !calls.iter().any(|call| code.contains(call)) {
+                    continue;
+                }
+                seen += 1;
+                let before = lines[i.saturating_sub(60)..i].join("\n");
+                assert!(
+                    before.contains(&format!("{}(", "operation_guard")),
+                    "{name}:{}: a cdk send/melt without the operation lock taken before it",
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(
+            seen, 6,
+            "pay send, revoke, wallet send, two melt paths, hop melt"
+        );
+    }
+
+    #[test]
+    fn operation_lock_is_shared_between_operations_and_seen_by_recovery() {
+        let wallet = dir("operation");
+        assert!(!operation_in_flight(Some(&wallet)).unwrap());
+        assert!(!operation_in_flight(None).unwrap());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let first = runtime.block_on(operation_guard(Some(&wallet))).unwrap();
+        let second = runtime.block_on(operation_guard(Some(&wallet))).unwrap();
+        assert!(first.is_some() && second.is_some(), "operations share it");
+        assert!(operation_in_flight(Some(&wallet)).unwrap());
+        drop(first);
+        assert!(operation_in_flight(Some(&wallet)).unwrap(), "one still runs");
+        drop(second);
+        assert!(!operation_in_flight(Some(&wallet)).unwrap(), "released on drop");
+        // A killed holder (another process) never looks alive: the kernel releases the flock. The
+        // holder is `flock` plus the `sleep` it forks (which inherits the descriptor), in their own
+        // process group, killed together.
+        use std::os::unix::process::CommandExt;
+        let mut holder = std::process::Command::new("flock")
+            .arg("-s")
+            .arg(wallet.join(OPERATION_LOCK_FILE))
+            .args(["sleep", "600"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = holder.id() as libc::pid_t;
+        let started = std::time::Instant::now();
+        while !operation_in_flight(Some(&wallet)).unwrap() {
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Safety: signals only the process group this test created.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        holder.wait().unwrap();
+        let started = std::time::Instant::now();
+        while operation_in_flight(Some(&wallet)).unwrap() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "a killed holder must release the operation lock"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Rust sources under `dir`, recursively (relative path, contents).
