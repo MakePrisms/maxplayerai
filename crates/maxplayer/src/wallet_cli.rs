@@ -539,13 +539,8 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
                 report.swap_recovered,
                 report.swap_held.len()
             );
-            if !report.send_held.is_empty() || report.retired_spent > 0 {
-                let _ = writeln!(
-                    out,
-                    "send_held={} retired_spent={}",
-                    report.send_held.len(),
-                    report.retired_spent
-                );
+            if !report.send_held.is_empty() {
+                let _ = writeln!(out, "send_held={}", report.send_held.len());
             }
             for held in report.swap_held.iter().chain(&report.send_held) {
                 let _ = writeln!(err, "{}", held.remediation());
@@ -554,6 +549,8 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         }
         Err(error) => {
             let _ = writeln!(err, "{error}");
+            // Review r4 L4: a refused pass still recorded what it keeps and why; show it here too.
+            write_held_sagas(&home, None, out, err);
             RUNTIME_ERROR
         }
     }
@@ -1872,6 +1869,7 @@ mod tests {
                 kind: "swap".into(),
                 reason: "its outputs are not all back".into(),
                 mint_url: "https://held-mint.example".into(),
+                blocks_payments: false,
                 transient: false,
             },
             HeldSwap {
@@ -1879,6 +1877,7 @@ mod tests {
                 kind: "send".into(),
                 reason: "its swap is not resolved".into(),
                 mint_url: "https://held-mint.example".into(),
+                blocks_payments: true,
                 transient: false,
             },
         ];
@@ -1928,6 +1927,10 @@ mod tests {
             "{err}"
         );
         assert!(err.contains("send saga 019a0000-send kept"), "{err}");
+        assert!(
+            err.contains("Payments on this mint are refused"),
+            "review r4 L4: a refusing hold says payments stop: {err}"
+        );
         let (_, out, _) = balance(&["--mint", "https://held-mint.example"]);
         assert!(out.contains("swap_held=1"), "{out}");
         let (_, out, _) = balance(&["--mint", DEFAULT_MINT_URL]);

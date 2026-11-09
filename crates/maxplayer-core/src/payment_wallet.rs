@@ -145,11 +145,10 @@ pub(crate) async fn recover_incomplete_sagas_guarded(
     {
         return Ok(GuardedRecovery::Held(reason));
     }
-    // Review r3 H1, every scheme. cdk's resume compensates `Send(ProofsReserved)` with no NUT-07
-    // check and deletes a child swap whose `/restore` comes back empty: both wrong while a send or
-    // melt (this process or another on the home) is mid-`confirm`, and the child's stored messages
-    // are the only record of its seed outputs. Held while one runs, or while a child swap exists
-    // (the saga-scoped retire pass, `retire_eligible_incomplete_sagas_in`, resolves those).
+    // Review r3 H1, every scheme. A send or melt running on this home (this process or another)
+    // owns sagas that look exactly like a crashed one's, and cdk would compensate its parent in the
+    // middle of `confirm`. This is the one wallet-wide hold left: it lasts only while an operation
+    // holds the flock (a kernel lock, dropped when that process exits), never on stored state.
     if crate::shared_wallet::operation_in_flight(wallet_dir)
         .map_err(|error| cdk::Error::Custom(error.to_string()))?
     {
@@ -158,16 +157,15 @@ pub(crate) async fn recover_incomplete_sagas_guarded(
                 .into(),
         ));
     }
-    if let Some(child) = any_child_swap(wallet)
+    // Review r4 M3: a held child swap no longer holds cdk recovery for the whole wallet (it stalled
+    // the hop sweep). cdk runs over a view without the sagas maxplayer keeps itself
+    // ([`sagas_hidden_from_cdk`]); every other saga on this mint is recovered by cdk as before.
+    let hidden = sagas_hidden_from_cdk(wallet)
         .await
-        .map_err(|error| cdk::Error::Custom(error.to_string()))?
-    {
-        return Ok(GuardedRecovery::Held(format!(
-            "cdk saga recovery held: swap saga {child} is a send's or melt's swap (outputs stored, \
-             nothing reserved); cdk would delete it on an empty /restore"
-        )));
-    }
-    wallet.recover_incomplete_sagas().await?;
+        .map_err(|error| cdk::Error::Custom(error.to_string()))?;
+    crate::saga_recovery_view::without_sagas(wallet, hidden)
+        .recover_incomplete_sagas()
+        .await?;
     Ok(GuardedRecovery::Ran)
 }
 
@@ -223,20 +221,21 @@ pub struct RetireReport {
     /// empty/partial `/restore`). Kept untouched and retried every pass; NOT a pay refusal (see
     /// `recover_unmapped_sagas`).
     ///
-    /// Also the child swap of a send or melt (`swap_no_reserve`: stored blinded messages, no
-    /// reserved inputs; review r3 H1) that is not resolved yet: a send or melt may still be running
-    /// it (operation lock held), its send or melt is still incomplete, or its outputs are not all
-    /// accounted for. A child owns no proof row, so keeping it can never make anything selectable.
+    /// Also every child swap of a send or melt (`swap_no_reserve`: stored blinded messages, nothing
+    /// reserved; review r3 H1, r4). It is never deleted and never restored: its outputs, if the mint
+    /// executed it, stay at the mint until automatic recovery exists (MakePrisms/maxplayerai#1272).
+    /// A child owns no proof row, so keeping it can never make anything selectable.
     pub swap_held: Vec<HeldSwap>,
-    /// `Send(ProofsReserved)` sagas kept without wedging payments: a send or melt is running (it may
-    /// be this one), the mint reads an input PENDING, or the mint reads inputs SPENT and the child
-    /// swap that spent them is not resolved yet. Their inputs stay RESERVED under them (never
-    /// selectable) and are never released as Unspent.
+    /// `Send(ProofsReserved)` sagas (and melts) this pass kept, each with why. Three kinds:
+    /// * transient: a send or melt is running (operation lock held) and may own it;
+    /// * waiting: its inputs read UNSPENT but a kept child swap may be its swap and could still
+    ///   commit, so they are not released ([`HeldSwap::blocks_payments`] false; payments continue,
+    ///   its inputs stay reserved under it);
+    /// * refused: main's fail-closed refusal (an input SPENT or PENDING, an empty reservation, an
+    ///   incomplete NUT-07 answer, or a melt). Payments on this mint are refused
+    ///   ([`HeldSwap::blocks_payments`] true); recorded so `wallet balance` / `doctor` show it even
+    ///   though the pass returns `Err` (review r4 L4).
     pub send_held: Vec<HeldSwap>,
-    /// `Send(ProofsReserved)` sagas retired after the mint read inputs SPENT (their child swap
-    /// executed; no token was ever created) and that child swap was resolved: SPENT inputs are
-    /// recorded Spent, inputs the mint still reads UNSPENT (never sent anywhere) are released.
-    pub retired_spent: usize,
     /// Stranded `Send(TokenCreated)` sagas completed after mint-truth said the
     /// reserved inputs were all SPENT — the send executed, so the inputs are
     /// recorded Spent and the saga dropped. The token's outputs are deliberately
@@ -254,7 +253,7 @@ pub struct RetireReport {
 pub struct HeldSwap {
     /// The cdk saga id.
     pub saga_id: String,
-    /// `swap` or `send`.
+    /// `swap`, `send` or `melt`.
     #[serde(default = "held_kind_swap")]
     pub kind: String,
     /// Why it is kept.
@@ -262,6 +261,10 @@ pub struct HeldSwap {
     /// The mint the saga is on.
     #[serde(default)]
     pub mint_url: String,
+    /// Payments on this mint are refused while it is kept (fail-closed, so the same payment can
+    /// never be sent twice). `false`: payments continue, nothing it keeps is selectable.
+    #[serde(default)]
+    pub blocks_payments: bool,
     /// Transient (a send or melt is running right now): not recorded for `wallet balance` /
     /// `doctor`, which show only holds that need attention.
     #[serde(skip)]
@@ -272,6 +275,12 @@ fn held_kind_swap() -> String {
     "swap".to_owned()
 }
 
+/// Why a child swap is kept (review r3 H1, r4 H1/M3; deferred recovery: #1272).
+const CHILD_SWAP_HELD: &str = "it is the swap of a send or melt (its outputs are stored, nothing is \
+     reserved under it) and the mint may have executed it; those stored outputs are the only local \
+     record of its change, and automatic recovery of them is not implemented yet \
+     (MakePrisms/maxplayerai#1272), so it is never deleted and never restored automatically";
+
 impl HeldSwap {
     fn new(kind: &str, saga: &cdk::wallet::types::WalletSaga, reason: String) -> Self {
         Self {
@@ -279,7 +288,16 @@ impl HeldSwap {
             kind: kind.to_owned(),
             reason,
             mint_url: saga.mint_url.to_string(),
+            blocks_payments: false,
             transient: false,
+        }
+    }
+
+    /// A refusal: kept AND payments on this mint are refused (main's fail-closed behaviour).
+    fn refusing(kind: &str, saga: &cdk::wallet::types::WalletSaga, reason: String) -> Self {
+        Self {
+            blocks_payments: true,
+            ..Self::new(kind, saga, reason)
         }
     }
 
@@ -296,13 +314,18 @@ impl HeldSwap {
         }
     }
 
-    /// The operator line: what is kept, why, and what to do.
+    /// The operator line: what is kept, why, what it does to payments, and what to do.
     pub fn remediation(&self) -> String {
+        let effect = if self.blocks_payments {
+            "Payments on this mint are refused until it is resolved, so this payment can never be \
+             sent twice"
+        } else {
+            "Payments continue: nothing it keeps can be selected by another payment"
+        };
         format!(
-            "{} saga {} kept: {}. Payments continue: its reserved inputs stay unspendable and its \
-             outputs' counters are never reused. Every wallet pass retries it (or run `maxplayer \
-             wallet reconcile`). If it never clears, its outputs exist only at the mint: keep \
-             this home's `key` and `wallet/cdk-wallet.sqlite` and report the saga id.",
+            "{} saga {} kept: {}. {effect}. Every wallet pass looks at it again (or run `maxplayer \
+             wallet reconcile`). Never delete it by hand: keep this home's `key` and \
+             `wallet/cdk-wallet.sqlite`, and report the saga id with this line.",
             self.kind, self.saga_id, self.reason
         )
     }
@@ -831,13 +854,15 @@ impl<'a> CdkBuyerMint<'a> {
             return Ok(());
         }
         for saga in &incomplete {
-            // Review r3 H1: a send or melt kept by this pass (one is running and may own it, or its
-            // child swap is not resolved yet). Its inputs stay reserved under it, so no payment can
-            // select them; refusing payments for it would wedge on another process's live send.
+            // Review r3 H1 / r4: a send or melt this pass kept WITHOUT refusing (one is running and
+            // may own it, or its release waits out a recently posted child swap). Its inputs stay
+            // reserved under it, so no payment can select them. A refusing hold falls through to
+            // the refusal below, exactly as on main.
             if let Some(held) = report
                 .send_held
                 .iter()
                 .find(|held| held.saga_id == saga.id.to_string())
+                && !held.blocks_payments
                 && matches!(
                     saga.state,
                     WalletSagaState::Send(
@@ -1178,13 +1203,10 @@ async fn retire_eligible(
     // still holding the lock now, or has ended and will write nothing more.
     let in_flight = crate::shared_wallet::operation_in_flight(wallet_dir)
         .map_err(|error| PaymentWalletError::Wallet(error.to_string()))?;
+    // The first send refusal: returned after the pass, once every hold is recorded (review r4 L4).
+    let mut parent_refusal: Option<PaymentWalletError> = None;
 
-    // Child swaps first, so a send or melt whose swap is resolved this pass can retire in it too.
-    let (swaps, others): (Vec<_>, Vec<_>) = incomplete
-        .iter()
-        .cloned()
-        .partition(|saga| matches!(saga.state, WalletSagaState::Swap(_)));
-    for saga in swaps.into_iter().chain(others) {
+    for saga in incomplete {
         // A nostr:// request stays executable on the relays until its `exp`: leave the sagas whose
         // inputs it could still spend (ProofsReserved send, any swap) until it cannot. The NUT-07
         // check below then runs after that point, so "all Unspent" is final.
@@ -1213,35 +1235,58 @@ async fn retire_eligible(
         }
         match &saga.state {
             WalletSagaState::Send(SendSagaState::ProofsReserved) => {
-                if saga_has_confirmed_outgoing_tx(wallet, &saga).await? {
-                    return Err(PaymentWalletError::Reconcile(
+                let retired = match saga_has_confirmed_outgoing_tx(wallet, &saga).await {
+                    Ok(false) => retire_one_proofs_reserved(wallet, &saga).await,
+                    Ok(true) => Err(PaymentWalletError::Reconcile(
                         "ProofsReserved saga unexpectedly has a confirmed outgoing tx; refuse retire".into(),
-                    ));
-                }
-                match retire_one_proofs_reserved(wallet, &saga).await? {
-                    ParentRetire::Released => report.retired += 1,
-                    ParentRetire::Spent => report.retired_spent += 1,
-                    ParentRetire::Held(reason) => {
+                    )),
+                    Err(error) => Err(error),
+                };
+                match retired {
+                    Ok(ParentRetire::Released) => report.retired += 1,
+                    Ok(ParentRetire::Waiting(reason)) => {
                         report.send_held.push(HeldSwap::new("send", &saga, reason))
                     }
-                    ParentRetire::Untouched => {}
-                }
-            }
-            // Review r3 H1: a melt whose pre-melt swap executed (inputs SPENT) and that never sent its
-            // melt request (still ProofsReserved) retires once that swap is resolved. Any other melt
-            // is left exactly as before for `recover_unmapped_sagas` to refuse. Never on nostr://.
-            WalletSagaState::Melt(cdk::wallet::types::MeltSagaState::ProofsReserved)
-                if !crate::mint_wire::is_nostr_scheme(&wallet.mint_url.to_string()) =>
-            {
-                match retire_spent_melt(wallet, &saga).await {
-                    Ok(ParentRetire::Spent) => report.retired_spent += 1,
-                    Ok(ParentRetire::Held(reason)) => {
-                        report.send_held.push(HeldSwap::new("melt", &saga, reason))
+                    // Main's fail-closed refusal is kept: an input SPENT or PENDING (its swap may have
+                    // executed, the send never recorded a token), an empty reservation, an incomplete
+                    // NUT-07 answer. Review r4 L4: it is recorded first, so `wallet balance` and
+                    // `doctor` name the saga even though this pass returns `Err` and payments stop.
+                    Err(refusal) => {
+                        report.send_held.push(HeldSwap::refusing(
+                            "send",
+                            &saga,
+                            format!(
+                                "it could not be retired safely ({refusal}); a send whose input the \
+                                 mint reads SPENT or PENDING may have had its swap executed without \
+                                 recording a token, so it is never released or retired \
+                                 automatically (MakePrisms/maxplayerai#1272)"
+                            ),
+                        ));
+                        parent_refusal.get_or_insert(refusal);
                     }
-                    Ok(ParentRetire::Released | ParentRetire::Untouched) => {}
-                    Err(refusal) => report.unresolved.push(format!("{}: {refusal}", saga.id)),
                 }
             }
+            // Main refuses an in-flight revoke (`recover_unmapped_sagas`); shown where the balance is.
+            WalletSagaState::Send(SendSagaState::RollingBack) => {
+                report.send_held.push(HeldSwap::refusing(
+                    "send",
+                    &saga,
+                    "a revoke of its token was interrupted (RollingBack); it is never retired \
+                     automatically"
+                        .into(),
+                ))
+            }
+            // Melts are never resolved by this pass (main: `recover_unmapped_sagas` refuses them).
+            // Review r4 L4: say which one, and why, where the balance is read.
+            WalletSagaState::Melt(_) => report.send_held.push(HeldSwap::refusing(
+                "melt",
+                &saga,
+                format!(
+                    "a melt in state {} is never resolved by payment recovery (the hop sweep's cdk \
+                     recovery resolves one unless a kept swap may be its swap)",
+                    saga.state.state_str()
+                ),
+            )),
             // A `TokenCreated` send WITH a confirmed outgoing transaction is a send that
             // demonstrably completed. Counting it and moving on is what left this table growing by
             // exactly one row per payment, forever (#293) — so the row is dropped here.
@@ -1291,6 +1336,9 @@ async fn retire_eligible(
         }
     }
     record_held_sagas(wallet, &report).await;
+    if let Some(refusal) = parent_refusal {
+        return Err(refusal);
+    }
     Ok(report)
 }
 
@@ -1582,54 +1630,13 @@ fn refuse_if_not_all_unspent(
     Ok(())
 }
 
-/// What [`retire_one_proofs_reserved`] / [`retire_spent_melt`] did with a parent saga.
+/// What [`retire_one_proofs_reserved`] did with a `Send(ProofsReserved)` saga that it did not refuse.
 enum ParentRetire {
-    /// Every input UNSPENT at the mint: released, saga deleted (the pre-r3 retire).
+    /// Every input UNSPENT at the mint: released, saga deleted (main's retire).
     Released,
-    /// Inputs SPENT at the mint and the child swap resolved: retired (see [`retire_spent_parent`]).
-    Spent,
-    /// Kept, inputs untouched (reserved under it, unselectable); not a payment refusal.
-    Held(String),
-    /// Not a case this pass handles; left exactly as before.
-    Untouched,
-}
-
-/// A parent's reserved inputs read at the mint. A complete answer is required; PENDING refuses.
-enum ParentInputs {
-    AllUnspent,
-    /// At least one SPENT, the rest UNSPENT.
-    SomeSpent,
-}
-
-fn classify_parent_inputs(
-    requested_ys: &[CashuPublicKey],
-    states: &[cashu::ProofState],
-) -> Result<ParentInputs, PaymentWalletError> {
-    let requested: HashSet<_> = requested_ys.iter().copied().collect();
-    let reported: HashSet<_> = states.iter().map(|proof_state| proof_state.y).collect();
-    if requested.is_empty() || requested != reported {
-        return Err(PaymentWalletError::Reconcile(
-            "retire refused: NUT-07 response Y set incomplete or mismatched (empty/partial/wrong-y; per-saga fail-closed)"
-                .into(),
-        ));
-    }
-    if states
-        .iter()
-        .any(|proof_state| !matches!(proof_state.state, State::Spent | State::Unspent))
-    {
-        return Err(PaymentWalletError::Reconcile(
-            "retire refused: reserved proof mint state is Pending (Spent or Pending inputs are never released; per-saga fail-closed)"
-                .into(),
-        ));
-    }
-    if states
-        .iter()
-        .all(|proof_state| proof_state.state == State::Unspent)
-    {
-        Ok(ParentInputs::AllUnspent)
-    } else {
-        Ok(ParentInputs::SomeSpent)
-    }
+    /// Every input UNSPENT, but a kept child swap may be its swap and could still commit at the
+    /// mint: kept, inputs reserved under it, not a payment refusal.
+    Waiting(String),
 }
 
 async fn retire_one_proofs_reserved(
@@ -1655,10 +1662,22 @@ async fn retire_one_proofs_reserved(
     let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
     // Never use check_proofs_spent — it deletes mint-Spent ys from localstore.
     let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
-    // Review r3 H1: SPENT inputs mean this send's swap (`swap_no_reserve`) executed. They are never
-    // released; the send retires once that swap's own saga is resolved (its change recovered).
-    if let ParentInputs::SomeSpent = classify_parent_inputs(&ys, &states)? {
-        return retire_spent_parent(wallet, saga).await;
+    refuse_if_not_all_unspent(&ys, &states)?;
+
+    // Review r4 H1 (PR body, "Unspent parent release"): every input reads UNSPENT and no operation
+    // holds the lock, but a kept child swap created no earlier than this send may be its swap. A
+    // request the mint received before the process died (or before a timed-out `confirm` future was
+    // dropped) carries no expiry on `https://` and can still commit after this read; releasing then
+    // would put inputs the mint has spent back in the spendable set. Nothing here can prove it will
+    // not, so the inputs stay reserved under this send (fail-closed, shown in balance/doctor, NOT a
+    // payment refusal) until the child is resolved (MakePrisms/maxplayerai#1272).
+    if let Some(child) = child_swap_for(wallet, saga).await? {
+        return Ok(ParentRetire::Waiting(format!(
+            "the mint reads its inputs UNSPENT, but swap saga {child} (outputs stored, nothing \
+             reserved) may be its swap and the mint could still commit it, so its inputs are not \
+             released; they stay reserved (not spendable) until that swap is resolved \
+             (MakePrisms/maxplayerai#1272)"
+        )));
     }
 
     // Pre-mutate TOCTOU: re-fetch ProofsReserved ∧ no confirmed tx ∧ Unspent
@@ -1705,117 +1724,6 @@ async fn retire_one_proofs_reserved(
 
     revert_reserved_and_delete_saga(wallet, saga).await?;
     Ok(ParentRetire::Released)
-}
-
-/// A `Melt(ProofsReserved)` whose pre-melt swap executed (an input SPENT) but whose melt request was
-/// never sent (cdk moves to `MeltRequested` before sending it): retired like a send
-/// ([`retire_spent_parent`]), its quote released. Every other melt is [`ParentRetire::Untouched`].
-async fn retire_spent_melt(
-    wallet: &Wallet,
-    saga: &cdk::wallet::types::WalletSaga,
-) -> Result<ParentRetire, PaymentWalletError> {
-    let reserved = wallet
-        .localstore
-        .get_reserved_proofs(&saga.id)
-        .await
-        .map_err(wallet_error)?;
-    if reserved.is_empty() {
-        return Ok(ParentRetire::Untouched);
-    }
-    let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
-    let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
-    match classify_parent_inputs(&ys, &states)? {
-        ParentInputs::AllUnspent => Ok(ParentRetire::Untouched),
-        ParentInputs::SomeSpent => retire_spent_parent(wallet, saga).await,
-    }
-}
-
-/// Retire a send or melt that never got past `ProofsReserved` but whose child swap executed (review r3
-/// H1). Called only when no send or melt is running ([`crate::shared_wallet::operation_in_flight`]
-/// read after the saga read), so nothing will write this saga again.
-///
-/// * While a child swap that may be this one's is unresolved: [`ParentRetire::Held`]. Its change is
-///   recovered from the child's stored messages first; the inputs stay reserved meanwhile.
-/// * Then, in ONE `update_proofs`: inputs the mint reads SPENT are recorded Spent (never released;
-///   P2PK payee outputs were never ours, the seed change is already back), inputs it reads UNSPENT are
-///   released (no token was ever created: the saga never reached `TokenCreated` and no transaction
-///   names it, so nothing holds them). A melt's quote is released. Then the saga is deleted.
-async fn retire_spent_parent(
-    wallet: &Wallet,
-    saga: &cdk::wallet::types::WalletSaga,
-) -> Result<ParentRetire, PaymentWalletError> {
-    if let Some(child) = unresolved_child_swap_for(wallet, saga).await? {
-        return Ok(ParentRetire::Held(format!(
-            "the mint reads its inputs SPENT (its swap executed) and swap saga {child}, which may be \
-             that swap, is not resolved yet; it retires once that swap's outputs are recovered"
-        )));
-    }
-    let refuse = |why: &str| {
-        PaymentWalletError::Reconcile(format!("spent-parent retire refused: {why} (TOCTOU)"))
-    };
-    let fresh = wallet
-        .localstore
-        .get_saga(&saga.id)
-        .await
-        .map_err(wallet_error)?
-        .ok_or_else(|| refuse("saga disappeared before mutate"))?;
-    if fresh.state != saga.state || fresh.version != saga.version {
-        return Err(refuse("saga changed before mutate"));
-    }
-    if saga_has_referencing_transaction(wallet, &fresh).await? {
-        return Err(refuse("a transaction references this saga"));
-    }
-    let reserved = wallet
-        .localstore
-        .get_reserved_proofs(&saga.id)
-        .await
-        .map_err(wallet_error)?;
-    if reserved.is_empty() {
-        return Err(refuse("reserved emptied before mutate"));
-    }
-    let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
-    let states = nut07_check_state_non_mutating(wallet, ys.clone()).await?;
-    if !matches!(
-        classify_parent_inputs(&ys, &states)?,
-        ParentInputs::SomeSpent
-    ) {
-        return Err(refuse("inputs no longer read SPENT"));
-    }
-    let spent: HashSet<CashuPublicKey> = states
-        .iter()
-        .filter(|s| s.state == State::Spent)
-        .map(|s| s.y)
-        .collect();
-    let rows = reserved
-        .into_iter()
-        .map(|mut row| {
-            row.state = if spent.contains(&row.y) {
-                State::Spent
-            } else {
-                State::Unspent
-            };
-            row.used_by_operation = None;
-            row
-        })
-        .collect::<Vec<_>>();
-    wallet
-        .localstore
-        .update_proofs(rows, vec![])
-        .await
-        .map_err(|error| refuse(&format!("writing inputs: {error}")))?;
-    if matches!(saga.state, WalletSagaState::Melt(_)) {
-        wallet
-            .localstore
-            .release_melt_quote(&saga.id)
-            .await
-            .map_err(|error| refuse(&format!("releasing the melt quote: {error}")))?;
-    }
-    wallet
-        .localstore
-        .delete_saga(&saga.id)
-        .await
-        .map_err(|error| refuse(&format!("deleting saga: {error}")))?;
-    Ok(ParentRetire::Spent)
 }
 
 /// Revert a saga's reserved proofs to spendable and delete the saga, matching CDK
@@ -1978,12 +1886,17 @@ async fn resolve_one_swap_saga(
                     .into(),
             ));
         }
-        // Review r3 H1: stored blinded messages with nothing reserved is the child swap of a send
-        // or melt (`swap_no_reserve`, ProofReservation::Skip). cdk stores the messages just before
-        // it posts, so the mint may have executed it; the messages are then the only local record
-        // of its seed outputs. Never dropped here.
+        // Review r3 H1, r4 H1/M3: stored blinded messages with nothing reserved is the child swap
+        // of a send or melt (`swap_no_reserve`, ProofReservation::Skip). cdk stores the messages
+        // just before it posts, so the mint may have executed it; the messages are then the only
+        // local record of its seed outputs. Held: never dropped, never restored (no `/restore`, no
+        // credit), never a payment refusal (it owns no proof row). Recovering it is #1272.
         if has_stored_blinded_messages(saga) {
-            resolve_child_swap(wallet, wallet_dir, seed, in_flight, saga, report).await;
+            report.swap_held.push(if in_flight {
+                HeldSwap::in_flight("swap", saga)
+            } else {
+                HeldSwap::new("swap", saga, CHILD_SWAP_HELD.into())
+            });
             return Ok(());
         }
         // nostr://: a send's `confirm` swaps with ProofReservation::Skip, so ITS swap row binds no
@@ -2039,143 +1952,27 @@ fn has_stored_blinded_messages(saga: &cdk::wallet::types::WalletSaga) -> bool {
     )
 }
 
-/// A child swap (stored blinded messages, nothing reserved: the swap a send or melt `confirm` runs
-/// with `ProofReservation::Skip`; review r3 H1). Never dropped on its own say-so, never a payment
-/// refusal:
-///
-/// * A send or melt holds the operation lock ([`crate::shared_wallet::operation_in_flight`]): this
-///   may be its swap, between `post_swap` and the `update_proofs` that writes the outputs and
-///   deletes the row, in this process or another one. Left untouched for that operation.
-/// * Otherwise the operation that started it has ended and writes nothing more. Its outputs are
-///   recovered exactly as a spent reserved swap's are ([`complete_spent_swap_saga`]: the stored
-///   seed messages only, `/restore`, every one accounted for, insert-if-absent under the selection
-///   lock), and the row is deleted only then. Anything less keeps it, held.
-///
-/// Why holding it never wedges payments safely: a child owns no proof row (`used_by_operation` is
-/// never its id), so keeping it can make nothing selectable or unselectable, and its outputs'
-/// counters lie below the keyset counter, which only grows. Its parent's inputs stay reserved
-/// under the parent until [`retire_one_proofs_reserved`] / [`retire_spent_melt`] see this child
-/// resolved.
-async fn resolve_child_swap(
+/// A child swap: a Swap saga with stored blinded messages and nothing reserved under it (the swap a
+/// send's or melt's `confirm` runs with `ProofReservation::Skip`).
+async fn is_child_swap(
     wallet: &Wallet,
-    wallet_dir: Option<&std::path::Path>,
-    seed: Option<&[u8; 64]>,
-    in_flight: bool,
     saga: &cdk::wallet::types::WalletSaga,
-    report: &mut RetireReport,
-) {
-    if in_flight {
-        report.swap_held.push(HeldSwap::in_flight("swap", saga));
-        return;
-    }
-    let held = |reason: String| {
-        HeldSwap::new(
-            "swap",
-            saga,
-            format!(
-                "it is a send's or melt's swap (outputs stored, nothing reserved) and {reason}"
-            ),
-        )
-    };
-    match incomplete_unspent_parent(wallet, saga).await {
-        Ok(None) => {}
-        Ok(Some(reason)) | Err(PaymentWalletError::Reconcile(reason)) => {
-            report.swap_held.push(held(reason));
-            return;
-        }
-        Err(error) => {
-            report.swap_held.push(held(error.to_string()));
-            return;
-        }
-    }
-    match complete_spent_swap_saga(wallet, wallet_dir, seed, saga).await {
-        Ok(SwapCompletion::Recovered) => report.swap_recovered += 1,
-        Ok(SwapCompletion::Held(reason)) => report.swap_held.push(held(reason)),
-        Err(error) => report.swap_held.push(held(format!(
-            "its outputs could not be checked this pass ({error})"
-        ))),
-    }
-}
-
-/// `Some(reason)` while a send or melt that may have started `child` (created no later than it) is
-/// still incomplete and the mint reads none of its inputs SPENT: its swap may not have executed yet,
-/// so the child is kept for it. `None` once every such parent is gone or reads an input SPENT.
-async fn incomplete_unspent_parent(
-    wallet: &Wallet,
-    child: &cdk::wallet::types::WalletSaga,
-) -> Result<Option<String>, PaymentWalletError> {
-    for parent in wallet
-        .localstore
-        .get_incomplete_sagas()
-        .await
-        .map_err(wallet_error)?
-    {
-        if parent.mint_url != wallet.mint_url
-            || parent.unit != wallet.unit
-            || parent.created_at > child.created_at
-            || !matches!(
-                parent.state,
-                WalletSagaState::Send(SendSagaState::ProofsReserved | SendSagaState::RollingBack)
-                    | WalletSagaState::Melt(_)
-            )
-        {
-            continue;
-        }
-        let keep = |why: &str| {
-            Some(format!(
-                "{} saga {} ({}), which may have started it, is still incomplete and {why}",
-                parent_kind(&parent),
-                parent.id,
-                parent.state.state_str()
-            ))
-        };
-        let reserved = wallet
+) -> Result<bool, PaymentWalletError> {
+    Ok(matches!(saga.state, WalletSagaState::Swap(_))
+        && has_stored_blinded_messages(saga)
+        && wallet
             .localstore
-            .get_reserved_proofs(&parent.id)
+            .get_reserved_proofs(&saga.id)
             .await
-            .map_err(wallet_error)?;
-        if reserved.is_empty() {
-            return Ok(keep("reserves no inputs"));
-        }
-        let ys = reserved.iter().map(|info| info.y).collect::<Vec<_>>();
-        let states = match nut07_check_state_non_mutating(wallet, ys).await {
-            Ok(states) => states,
-            Err(error) => return Ok(keep(&format!("its inputs could not be read ({error})"))),
-        };
-        if !states.iter().any(|s| s.state == State::Spent) {
-            return Ok(keep("the mint reads none of its inputs SPENT"));
-        }
-    }
-    Ok(None)
+            .map_err(wallet_error)?
+            .is_empty())
 }
 
-/// Any child swap (stored blinded messages, nothing reserved) on this wallet's mint.
-async fn any_child_swap(wallet: &Wallet) -> Result<Option<String>, PaymentWalletError> {
-    for saga in wallet
-        .localstore
-        .get_incomplete_sagas()
-        .await
-        .map_err(wallet_error)?
-    {
-        if saga.mint_url == wallet.mint_url
-            && matches!(saga.state, WalletSagaState::Swap(_))
-            && has_stored_blinded_messages(&saga)
-            && wallet
-                .localstore
-                .get_reserved_proofs(&saga.id)
-                .await
-                .map_err(wallet_error)?
-                .is_empty()
-        {
-            return Ok(Some(saga.id.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-/// Is a child swap that may belong to `parent` still in the wallet? A child is created during its
-/// parent's `confirm`, so never before the parent; seconds granularity makes this conservative.
-async fn unresolved_child_swap_for(
+/// A kept child swap ([`is_child_swap`]) on this mint created no earlier than `parent` (a child is
+/// created during its parent's `confirm`; whole-second timestamps make `>=` conservative, so it may
+/// match a child that is not this parent's). Used only to KEEP `parent`'s UNSPENT inputs reserved,
+/// never to credit or delete anything.
+async fn child_swap_for(
     wallet: &Wallet,
     parent: &cdk::wallet::types::WalletSaga,
 ) -> Result<Option<String>, PaymentWalletError> {
@@ -2185,24 +1982,64 @@ async fn unresolved_child_swap_for(
         .await
         .map_err(wallet_error)?
     {
-        if saga.mint_url != wallet.mint_url
-            || saga.created_at < parent.created_at
-            || !matches!(saga.state, WalletSagaState::Swap(_))
-            || !has_stored_blinded_messages(&saga)
-        {
-            continue;
-        }
-        if wallet
-            .localstore
-            .get_reserved_proofs(&saga.id)
-            .await
-            .map_err(wallet_error)?
-            .is_empty()
+        if saga.mint_url == wallet.mint_url
+            && saga.unit == wallet.unit
+            && saga.created_at >= parent.created_at
+            && is_child_swap(wallet, &saga).await?
         {
             return Ok(Some(saga.id.to_string()));
         }
     }
     Ok(None)
+}
+
+/// The sagas cdk's own recovery must not see (review r3 H1, r4 H1/M3):
+/// * every child swap ([`is_child_swap`]): cdk deletes it on an empty `/restore` and otherwise
+///   credits its outputs whether or not its parent's inputs were already given back;
+/// * every `Send`/`Melt` still in `ProofsReserved` on this mint created no later than some child
+///   swap: it may be that child's parent (a child is created during its parent's `confirm`; nothing
+///   else in the database links them), and cdk compensates those with no NUT-07 check, returning
+///   inputs the executed swap spent. maxplayer's retire pass resolves such a send on a complete
+///   NUT-07 answer instead, and keeps a melt refused.
+///
+/// Every other saga (receive, issue, a swap that reserves its own inputs, a send or melt past
+/// `ProofsReserved`, and any send or melt created after every kept child) goes to cdk, so an old
+/// held child never stops the recovery of a later, unrelated operation (review r4 M3).
+async fn sagas_hidden_from_cdk(wallet: &Wallet) -> Result<HashSet<uuid::Uuid>, PaymentWalletError> {
+    let sagas: Vec<_> = wallet
+        .localstore
+        .get_incomplete_sagas()
+        .await
+        .map_err(wallet_error)?
+        .into_iter()
+        .filter(|saga| saga.mint_url == wallet.mint_url && saga.unit == wallet.unit)
+        .collect();
+    let mut hidden = HashSet::new();
+    let mut newest_child: Option<u64> = None;
+    for saga in &sagas {
+        if is_child_swap(wallet, saga).await? {
+            hidden.insert(saga.id);
+            newest_child = newest_child.max(Some(saga.created_at));
+        }
+    }
+    if let Some(newest_child) = newest_child {
+        hidden.extend(
+            sagas
+                .iter()
+                .filter(|saga| {
+                    saga.created_at <= newest_child
+                        && matches!(
+                            saga.state,
+                            WalletSagaState::Send(SendSagaState::ProofsReserved)
+                                | WalletSagaState::Melt(
+                                    cdk::wallet::types::MeltSagaState::ProofsReserved
+                                )
+                        )
+                })
+                .map(|saga| saga.id),
+        );
+    }
+    Ok(hidden)
 }
 
 async fn wallet_has_incomplete_proofs_reserved_send(
@@ -3792,11 +3629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn proofs_reserved_with_spent_input_and_no_child_swap_retires_recording_it_spent() {
-        // Review r3 H1 (was `…_refuses_retire`, which pinned the wedge): a send whose input the mint
-        // reads SPENT, with no child swap left (resolved, or dropped by an older binary) and no
-        // transaction, never created a token. Retire it, recording the input Spent: never released
-        // as Unspent, never a payment wedge.
+    async fn proofs_reserved_with_spent_mint_state_refuses_retire() {
         let seller = secret_key(1).public_key();
         let proof = p2pk_proof(7, seller);
         let proof_y = proof.y().unwrap();
@@ -3841,16 +3674,52 @@ mod tests {
             .build()
             .unwrap();
 
-        let report = retire_eligible_incomplete_sagas(&wallet).await.unwrap();
-        assert_eq!(report.retired_spent, 1, "{report:?}");
-        assert_eq!(report.retired, 0, "{report:?}");
-        assert!(
+        let err = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("spent must refuse");
+        match &err {
+            PaymentWalletError::Reconcile(message) if message.contains("Spent or Pending") => {}
+            other => panic!("expected Spent/Pending refuse, got: {other}"),
+        }
+        assert_eq!(
             wallet
                 .localstore
-                .get_saga(&saga_id)
+                .get_incomplete_sagas()
                 .await
                 .unwrap()
-                .is_none()
+                .len(),
+            1,
+            "saga must remain when retire refused"
+        );
+        // Non-mutating NUT-07: reserved proofs must still be present after Spent refuse.
+        assert_eq!(
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "check_proofs_spent must not be used (would delete Spent ys)"
+        );
+
+        // Stickiness RED triad: 2nd Err ∧ saga len==1 ∧ no phantom Unspent credit.
+        let err2 = retire_eligible_incomplete_sagas(&wallet)
+            .await
+            .expect_err("spent refuse must be sticky on second retire");
+        match &err2 {
+            PaymentWalletError::Reconcile(message) if message.contains("Spent or Pending") => {}
+            other => panic!("expected sticky Spent/Pending refuse, got: {other}"),
+        }
+        assert_eq!(
+            wallet
+                .localstore
+                .get_incomplete_sagas()
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "saga must remain after second spent refuse"
         );
         let unspent = wallet
             .localstore
@@ -3859,18 +3728,24 @@ mod tests {
             .unwrap();
         assert!(
             unspent.iter().all(|info| info.y != proof_y),
-            "SAFETY: a Spent input must never be credited back as Unspent/spendable"
+            "Spent refuse must not phantom-credit proof as Unspent/spendable"
         );
-        let spent = wallet
-            .localstore
-            .get_proofs_by_ys(vec![proof_y])
-            .await
-            .unwrap();
-        assert_eq!(spent.len(), 1, "check_proofs_spent must not delete it");
         assert_eq!(
-            (spent[0].state, spent[0].used_by_operation),
-            (State::Spent, None)
+            wallet
+                .localstore
+                .get_reserved_proofs(&saga_id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "Spent proof must remain reserved (not returned to spendable)"
         );
+        // Review r4 L4: the refusal is recorded for `wallet balance` / `doctor` although the pass
+        // returned `Err`, and it says payments are refused.
+        let held = load_held_sagas(&*wallet.localstore).await.unwrap();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].saga_id, saga_id.to_string());
+        assert!(held[0].blocks_payments, "{held:?}");
     }
 
     #[tokio::test]
@@ -8210,40 +8085,73 @@ mod tests {
         wallet.localstore.get_saga(&id).await.unwrap().is_some()
     }
 
-    /// (1) A child swap whose send is still incomplete is kept, never dropped, and never asked about at
-    /// the mint while that send's inputs read UNSPENT (its swap may not have executed yet). Once the
-    /// send is gone and the mint's `/restore` still has nothing, it stays held. Payments continue.
+    /// (a) Review r4 H1/M3 + scope: a message-bearing child swap with nothing reserved is HELD.
+    /// Never dropped, never restored (zero `/restore` even though this mint would sign it), never
+    /// credited, never a payment refusal, recorded for `wallet balance` / `doctor`. While its send is
+    /// incomplete with UNSPENT inputs, the send is not released either (item 4, fail-closed), and
+    /// payments continue. Once the send is gone the child stays held, and cdk's guarded recovery
+    /// runs without touching it.
     #[tokio::test]
-    async fn child_swap_with_stored_messages_is_kept_while_its_send_is_incomplete() {
+    async fn message_bearing_child_swap_is_held_never_restored_and_payments_continue() {
         let (_home, wallet_dir, wallet, parent, child, input_y, outputs, mint_fake) =
             child_swap_scene(51, State::Unspent).await;
         mint_fake.unknown_unspent.store(true, Ordering::SeqCst);
+        mint_fake.restore_signs.store(true, Ordering::SeqCst);
+
         let report = retire_in(&wallet, &wallet_dir).await;
         assert!(
             saga_exists(&wallet, child).await,
             "SAFETY: a child swap's stored messages are the only record of its outputs: {report:?}"
         );
         assert_eq!(report.swap_held.len(), 1, "{report:?}");
+        assert_eq!(report.swap_held[0].saga_id, child.to_string());
+        assert!(!report.swap_held[0].blocks_payments);
+        assert!(report.swap_held[0].remediation().contains("#1272"));
+        assert_eq!(
+            report.retired, 0,
+            "SAFETY (item 4): UNSPENT inputs are not released while a kept child may be their swap"
+        );
+        assert_eq!(report.send_held.len(), 1, "{report:?}");
+        assert_eq!(report.send_held[0].saga_id, parent.to_string());
+        assert!(!report.send_held[0].blocks_payments, "{report:?}");
+        assert_eq!(
+            row(&wallet, input_y).await,
+            Some((State::Reserved, Some(parent))),
+            "SAFETY: the inputs stay reserved under the send, never spendable"
+        );
+        pay_recovery(&wallet, &wallet_dir)
+            .await
+            .expect("a held child swap (and its waiting send) must not wedge payments");
+
+        // The send is gone (cdk compensated it after a definitive refusal, which releases its inputs
+        // and leaves the child): the child is still held, and still never restored.
+        wallet.localstore.release_proofs(&parent).await.unwrap();
+        wallet.localstore.delete_saga(&parent).await.unwrap();
+        let report = retire_in(&wallet, &wallet_dir).await;
+        assert!(saga_exists(&wallet, child).await, "{report:?}");
+        assert_eq!(report.swap_held.len(), 1, "{report:?}");
+        assert!(report.send_held.is_empty(), "{report:?}");
+        pay_recovery(&wallet, &wallet_dir)
+            .await
+            .expect("payments continue past a held child");
+        assert_eq!(
+            recover_incomplete_sagas_guarded(&wallet, Some(&wallet_dir))
+                .await
+                .unwrap(),
+            GuardedRecovery::Ran,
+            "a held child no longer holds cdk recovery for the whole wallet (r4 M3)"
+        );
         assert!(
-            report.swap_held[0].reason.contains("still incomplete"),
-            "{}",
-            report.swap_held[0].reason
+            saga_exists(&wallet, child).await,
+            "SAFETY: cdk's recovery never sees it"
         );
         assert_eq!(
             mint_fake.restores.load(Ordering::SeqCst),
             0,
-            "no /restore while its send's inputs read UNSPENT"
+            "SAFETY: never restored automatically"
         );
-        // The send never spent anything: released exactly as before r3.
-        assert_eq!(report.retired, 1, "{report:?}");
-        assert_eq!(row(&wallet, input_y).await, Some((State::Unspent, None)));
-        pay_recovery(&wallet, &wallet_dir)
-            .await
-            .expect("a kept child swap must not wedge payments");
-        assert!(saga_exists(&wallet, child).await, "still kept");
-        assert!(!saga_exists(&wallet, parent).await);
         for y in &outputs {
-            assert_eq!(row(&wallet, *y).await, None, "nothing credited");
+            assert_eq!(row(&wallet, *y).await, None, "SAFETY: nothing credited");
         }
         let held = load_held_sagas(&*wallet.localstore).await.unwrap();
         assert_eq!(
@@ -8254,68 +8162,89 @@ mod tests {
         assert_eq!(held[0].saga_id, child.to_string());
     }
 
-    /// (2) The send's input is SPENT (its swap executed) and the mint's `/restore` has the change:
-    /// first held (empty restore) without wedging payments, then the change is inserted Unspent, the
-    /// child deleted, the send retired with its input recorded Spent (never released).
+    /// (c) Review r4 H2/L4: a send whose input the mint reads SPENT keeps main's fail-closed refusal
+    /// (never retired, never released, payments refused so the same attempt cannot pay twice), and
+    /// that refusal is RECORDED as a payment-blocking `send_held` although the pass returns `Err`.
+    /// Its child swap is held beside it, never restored.
     #[tokio::test]
-    async fn spent_send_retires_after_its_child_swap_change_is_recovered() {
+    async fn spent_send_is_refused_and_recorded_as_held_despite_the_error() {
         let (_home, wallet_dir, wallet, parent, child, input_y, outputs, mint_fake) =
             child_swap_scene(52, State::Spent).await;
         mint_fake.unknown_unspent.store(true, Ordering::SeqCst);
+        mint_fake.restore_signs.store(true, Ordering::SeqCst);
+        for pass in 0..2 {
+            let refusal = retire_eligible_incomplete_sagas_in(&wallet, Some(&wallet_dir))
+                .await
+                .expect_err("main's fail-closed refusal");
+            assert!(
+                refusal.to_string().contains("Spent or Pending"),
+                "{refusal}"
+            );
+            assert!(saga_exists(&wallet, parent).await && saga_exists(&wallet, child).await);
+            assert_eq!(
+                row(&wallet, input_y).await,
+                Some((State::Reserved, Some(parent))),
+                "SAFETY: a SPENT input is never released or retired (pass {pass})"
+            );
+            let held = load_held_sagas(&*wallet.localstore).await.unwrap();
+            let send = held
+                .iter()
+                .find(|h| h.saga_id == parent.to_string())
+                .unwrap_or_else(|| {
+                    panic!("SAFETY (r4 L4): the refused send is recorded: {held:?}")
+                });
+            assert_eq!(send.kind, "send");
+            assert!(send.blocks_payments);
+            assert!(
+                send.remediation()
+                    .contains("Payments on this mint are refused"),
+                "{}",
+                send.remediation()
+            );
+            assert!(
+                held.iter().any(|h| h.saga_id == child.to_string()),
+                "{held:?}"
+            );
+            assert!(
+                pay_recovery(&wallet, &wallet_dir).await.is_err(),
+                "payments refused, exactly as on main"
+            );
+        }
+        assert_eq!(mint_fake.restores.load(Ordering::SeqCst), 0);
+        for y in &outputs {
+            assert_eq!(row(&wallet, *y).await, None, "SAFETY: nothing credited");
+        }
+    }
 
-        // The mint's restore lags: both kept, nothing written, payments continue.
+    /// (d) A dead-looking send whose operation lock another process still holds is never released;
+    /// once that process is gone (kernel drops the flock) and no kept child may be its swap, its
+    /// UNSPENT inputs are released exactly as on main.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unspent_send_is_not_released_while_another_process_holds_the_operation_lock() {
+        let (_home, wallet_dir, wallet, parent, child, input_y, _outputs, mint_fake) =
+            child_swap_scene(55, State::Unspent).await;
+        mint_fake.unknown_unspent.store(true, Ordering::SeqCst);
+        wallet.localstore.delete_saga(&child).await.unwrap();
+        let other = OtherProcessOperation::start(&wallet_dir);
         let report = retire_in(&wallet, &wallet_dir).await;
-        assert_eq!(report.swap_recovered, 0, "{report:?}");
-        assert_eq!(report.retired_spent, 0, "{report:?}");
-        assert_eq!(report.swap_held.len(), 1, "{report:?}");
-        assert_eq!(report.send_held.len(), 1, "{report:?}");
-        assert!(report.send_held[0].reason.contains(&child.to_string()));
-        assert!(saga_exists(&wallet, child).await && saga_exists(&wallet, parent).await);
+        assert_eq!(report.retired, 0, "{report:?}");
+        assert!(
+            report.send_held.iter().all(|h| h.transient) && report.send_held.len() == 1,
+            "{report:?}"
+        );
         assert_eq!(
             row(&wallet, input_y).await,
             Some((State::Reserved, Some(parent))),
-            "SAFETY: a SPENT input is never released"
+            "SAFETY: a send another process is running is never released"
         );
         pay_recovery(&wallet, &wallet_dir)
             .await
-            .expect("a held send/child pair must not wedge payments");
-        assert_eq!(load_held_sagas(&*wallet.localstore).await.unwrap().len(), 2);
-
-        mint_fake.restore_signs.store(true, Ordering::SeqCst);
+            .expect("a running send in another process must not wedge payments");
+        drop(other);
         let report = retire_in(&wallet, &wallet_dir).await;
-        assert_eq!(report.swap_recovered, 1, "{report:?}");
-        assert_eq!(report.retired_spent, 1, "{report:?}");
-        assert!(report.swap_held.is_empty() && report.send_held.is_empty());
-        assert!(!saga_exists(&wallet, child).await && !saga_exists(&wallet, parent).await);
-        for y in &outputs {
-            assert_eq!(
-                row(&wallet, *y).await,
-                Some((State::Unspent, None)),
-                "the change is back and spendable"
-            );
-        }
-        assert_eq!(
-            row(&wallet, input_y).await,
-            Some((State::Spent, None)),
-            "SAFETY: the spent input is recorded Spent, never Unspent"
-        );
-        assert!(
-            mint_fake
-                .restore_keysets
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|k| *k == test_keyset().id)
-        );
-        assert!(
-            load_held_sagas(&*wallet.localstore)
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        pay_recovery(&wallet, &wallet_dir)
-            .await
-            .expect("payments continue");
+        assert_eq!(report.retired, 1, "{report:?}");
+        assert_eq!(row(&wallet, input_y).await, Some((State::Unspent, None)));
+        assert!(!saga_exists(&wallet, parent).await);
     }
 
     /// Holds `<wallet_dir>/operation.lock` SHARED from a separate `flock` process, the way a send or
@@ -8466,20 +8395,81 @@ mod tests {
         assert_eq!(row(&wallet, input_y).await, Some((State::Spent, None)));
     }
 
-    /// cdk's own recovery deletes a child swap on an empty `/restore` and compensates a running
-    /// send: held while a send or melt runs and while any child swap exists, on every scheme.
-    #[tokio::test]
-    async fn cdk_recovery_is_held_while_a_child_swap_exists_or_an_operation_runs() {
-        let (_home, wallet_dir, wallet, _parent, child, ..) =
+    /// (e) Review r4 M3: a held child swap no longer holds cdk recovery (and so the hop sweep) for the
+    /// whole wallet. cdk runs over a view without the child and without the sends that may be its
+    /// parent; an unrelated swap that reserves its own inputs, and a send created after the child,
+    /// are recovered by cdk as before. Only a running operation still holds cdk recovery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_child_swap_does_not_stop_cdk_recovery_of_unrelated_sagas() {
+        let (_home, wallet_dir, wallet, parent, child, input_y, _outputs, mint_fake) =
             child_swap_scene(54, State::Spent).await;
-        let GuardedRecovery::Held(reason) =
-            recover_incomplete_sagas_guarded(&wallet, Some(&wallet_dir))
+        let child_saga = wallet.localstore.get_saga(&child).await.unwrap().unwrap();
+        // An unrelated stranded swap that reserved its own input before posting (cdk compensates it
+        // without asking the mint), and a later send that reserved one.
+        let mut unrelated = Vec::new();
+        for (amount, later_send) in [(8_u64, false), (16, true)] {
+            let proof = p2pk_proof(amount, secret_key(1).public_key());
+            let y = proof.y().unwrap();
+            wallet
+                .localstore
+                .update_proofs(
+                    vec![
+                        ProofInfo::new(proof, mint(MINT), State::Unspent, CurrencyUnit::Sat)
+                            .unwrap(),
+                    ],
+                    vec![],
+                )
                 .await
-                .unwrap()
-        else {
-            panic!("cdk recovery ran with a child swap present");
-        };
-        assert!(reason.contains(&child.to_string()), "{reason}");
+                .unwrap();
+            let id = uuid::Uuid::now_v7();
+            wallet
+                .localstore
+                .reserve_proofs(vec![y], &id)
+                .await
+                .unwrap();
+            let mut saga = if later_send {
+                WalletSaga::new(
+                    id,
+                    WalletSagaState::Send(SendSagaState::ProofsReserved),
+                    Amount::from(amount),
+                    mint(MINT),
+                    CurrencyUnit::Sat,
+                    cdk::wallet::types::OperationData::Send(
+                        cdk::wallet::types::SendOperationData {
+                            amount: Amount::from(amount),
+                            memo: None,
+                            counter_start: None,
+                            counter_end: None,
+                            token: None,
+                            proofs: None,
+                        },
+                    ),
+                )
+            } else {
+                WalletSaga::new(
+                    id,
+                    WalletSagaState::Swap(cdk::wallet::types::SwapSagaState::ProofsReserved),
+                    Amount::from(amount),
+                    mint(MINT),
+                    CurrencyUnit::Sat,
+                    cdk::wallet::types::OperationData::Swap(
+                        cdk::wallet::types::SwapOperationData {
+                            input_amount: Amount::from(amount),
+                            output_amount: Amount::from(amount),
+                            counter_start: None,
+                            counter_end: None,
+                            blinded_messages: None,
+                        },
+                    ),
+                )
+            };
+            if later_send {
+                saga.created_at = child_saga.created_at + 1;
+            }
+            wallet.localstore.add_saga(saga).await.unwrap();
+            unrelated.push((id, y));
+        }
+
         let _op = OtherProcessOperation::start(&wallet_dir);
         let GuardedRecovery::Held(reason) =
             recover_incomplete_sagas_guarded(&wallet, Some(&wallet_dir))
@@ -8489,7 +8479,32 @@ mod tests {
             panic!("cdk recovery ran while a send was in flight");
         };
         assert!(reason.contains("operation lock"), "{reason}");
-        assert!(saga_exists(&wallet, child).await);
+        drop(_op);
+
+        assert_eq!(
+            recover_incomplete_sagas_guarded(&wallet, Some(&wallet_dir))
+                .await
+                .unwrap(),
+            GuardedRecovery::Ran,
+            "a held child must not stall recovery (hop sweep) of unrelated sagas"
+        );
+        for (id, y) in unrelated {
+            assert!(
+                !saga_exists(&wallet, id).await,
+                "unrelated saga {id} recovered"
+            );
+            assert_eq!(row(&wallet, y).await, Some((State::Unspent, None)));
+        }
+        assert!(
+            saga_exists(&wallet, child).await,
+            "SAFETY: the child is never touched"
+        );
+        assert_eq!(
+            row(&wallet, input_y).await,
+            Some((State::Reserved, Some(parent))),
+            "SAFETY: a send that may be the child's parent is never compensated by cdk"
+        );
+        assert_eq!(mint_fake.restores.load(Ordering::SeqCst), 0);
     }
 
     // #748. A Swap saga with no bound proofs and no referencing transaction is a

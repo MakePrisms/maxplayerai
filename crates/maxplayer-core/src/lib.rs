@@ -84,6 +84,9 @@ pub mod payment;
 pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
+/// cdk saga recovery over a database view without the sagas maxplayer keeps.
+#[cfg(feature = "wallet")]
+mod saga_recovery_view;
 #[cfg(feature = "wallet")]
 pub mod nostr_mint;
 /// Seller-side platform fee: the product-set rate in basis points, the fee arithmetic, and the

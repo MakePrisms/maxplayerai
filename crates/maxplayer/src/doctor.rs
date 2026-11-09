@@ -2087,10 +2087,21 @@ mod checks {
                     .map(|held| format!("{} {} at {}", held.kind, held.saga_id, held.mint_url))
                     .collect();
                 let swaps = held.iter().filter(|held| held.kind == "swap").count();
+                // Review r4 L4: a refused send/melt stops payments on its mint; say so up front.
+                let refusing: Vec<&str> = held
+                    .iter()
+                    .filter(|held| held.blocks_payments)
+                    .map(|held| held.mint_url.as_str())
+                    .collect();
+                let refused = if refusing.is_empty() {
+                    String::new()
+                } else {
+                    format!("; payments refused at {}", refusing.join(", "))
+                };
                 Some(Check::warn(
                     HELD_SAGAS_CHECK,
                     format!(
-                        "swap_held={swaps} send_held={} ({})",
+                        "swap_held={swaps} send_held={} ({}){refused}",
                         held.len() - swaps,
                         ids.join("; ")
                     ),
@@ -2978,6 +2989,7 @@ mod tests {
             kind: kind.into(),
             reason: "its outputs are not all back".into(),
             mint_url: "https://mint.example".into(),
+            blocks_payments: kind == "send",
             transient: false,
         };
         let check = checks::held_sagas_check(Ok(vec![held("swap", "s-1"), held("send", "p-1")]))
@@ -2985,6 +2997,10 @@ mod tests {
         assert_eq!(check.status, Status::Warn);
         let line = check.render();
         assert!(line.contains("swap_held=1 send_held=1"), "{line}");
+        assert!(
+            line.contains("payments refused at https://mint.example"),
+            "{line}"
+        );
         assert!(line.contains("swap s-1 at https://mint.example"), "{line}");
         assert!(line.contains("swap saga s-1 kept"), "{line}");
         assert!(line.contains("maxplayer wallet reconcile"), "{line}");

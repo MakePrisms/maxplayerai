@@ -40,20 +40,27 @@ the merge, Vercel).
   remediation line naming the saga, and payments are no longer refused because of it (its
   reserved inputs stay unspendable).
 - **Fixed: a send's or melt's swap is no longer deleted when its reply was lost.** The swap a
-  job payment, `wallet send` or melt runs first stores its outputs before it is sent; recovery
-  used to delete that record as an orphan on `https://` mints (also while another process on the
-  same home was still waiting for the reply), losing the change. It is now kept while its send or
-  melt is running or incomplete, its change is recovered from the mint once the swap is known to
-  have executed, and only then is the send or melt retired with its inputs recorded spent. A send
-  whose inputs were already spent no longer blocks every later payment. Sends and melts take a
-  shared `<home>/wallet/operation.lock` while they run so recovery in any process can tell a
-  running one from a crashed one.
+  job payment, `wallet send` or melt runs first stores its outputs just before it is sent;
+  recovery used to delete that record as an orphan on `https://` mints (also while another
+  process on the same home was still waiting for the reply), losing the change. It is now kept
+  and never deleted or restored automatically: `wallet reconcile`, `wallet balance` and `doctor`
+  report it as `swap_held` with its saga id, and payments continue (it holds nothing a payment
+  could select). Its change stays at the mint until automatic recovery lands
+  (MakePrisms/maxplayerai#1272); keep the home's `key` and `wallet/cdk-wallet.sqlite` and report the
+  saga id. While such a swap exists, a send whose inputs the mint still reads unspent is not
+  released (shown as `send_held`; payments continue), and cdk's own recovery skips the swap and
+  any send or melt that may have started it but still recovers every other operation (including
+  during the cross-mint hop sweep). Sends and melts take a shared `<home>/wallet/operation.lock`
+  while they run so recovery in any process can tell a running one from a crashed one.
 - **Changed: `maxplayer wallet balance` and `maxplayer doctor` show held sagas.** When the last
-  wallet pass kept a swap (outputs not all back yet) or a send/melt (waiting for its swap),
-  `balance` prints `swap_held=<n> saga_ids=…` / `send_held=<n> saga_ids=…` and a remediation line
-  per saga on stderr, and `doctor` adds a `wallet held sagas` WARN row. `wallet reconcile` also
-  prints `send_held=<n> retired_spent=<n>` when either is non-zero. Output is unchanged when
-  nothing is held.
+  wallet pass kept a swap or a send/melt, `balance` prints `swap_held=<n> saga_ids=…` /
+  `send_held=<n> saga_ids=…` and a remediation line per saga on stderr, and `doctor` adds a
+  `wallet held sagas` WARN row. A send that is refused as before (an input the mint reads spent or
+  pending: it may have paid without recording a token, so payments on that mint stop rather than
+  risk paying twice) is now shown there too, with `Payments on this mint are refused` in its line
+  and `payments refused at <mint>` in the doctor row; `wallet reconcile` prints the same lines
+  when it fails. `wallet reconcile` prints `send_held=<n>` when it is non-zero. Output is unchanged
+  when nothing is held.
 - **Changed: `maxplayer wallet balance`** prints `reserved_sats=<n>` on a mint line when proofs
   there are reserved by an in-flight operation (job payment, send, melt or a trade); they were
   never in `balance_sats`. Lines with nothing reserved are unchanged.
