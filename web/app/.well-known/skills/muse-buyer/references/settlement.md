@@ -27,8 +27,8 @@ the real-money instruction constant).
 Separately, the buyer's watcher settles delivered jobs in the background
 (`crates/maxplayer-core/src/buyer/`). A job can therefore be **paid and materialised
 without you ever calling `collect`** — that is the normal case, and `get_job` →
-`settlement.state: "settled"` reports it. Session turns 2 and later are the exception:
-only `collect` settles them (`settlement.state: "collect_required"`).
+`settlement.state: "settled"` reports it. Session turns 2 and later settle the same way,
+strictly in turn order (`settlement.turn` names the turn).
 
 `get_job` → `settlement.state` values:
 
@@ -38,8 +38,8 @@ only `collect` settles them (`settlement.state: "collect_required"`).
   the same paths and pay summary, without paying again.
 - `failed` — the daemon's settle was refused; `error` says why. Fix it, then `collect`
   to retry.
-- `collect_required` — outside the automatic settle (a session turn 2 or later, or an
-  award with no reservation): call `collect` yourself.
+- `collect_required` — outside the automatic settle (an award or session turn with no
+  reservation): call `collect` yourself.
 - `awaiting_delivery`, `none` — nothing to settle yet, or nothing at all.
 
 Consequences for what you say to a human:

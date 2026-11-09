@@ -49,8 +49,8 @@ It exposes exactly the four-tool buyer trade loop:
    is the explicit retry.
 
 The normal sequence is `post_job` → `get_job`: the daemon auto-awards a payable claim, then its
-delivery watcher auto-settles the delivery (`get_job.settlement` reports it). `collect` is for a
-failed settle or a session turn ≥ 2, which the watcher does not settle; reach for `award_claim`
+delivery watcher auto-settles the delivery (`get_job.settlement` reports it), session turns ≥ 2
+included, strictly in turn order. `collect` is for a failed settle; reach for `award_claim`
 only to pick the claim by hand. Wallet and profile
 operations live on the `maxplayer` CLI, outside MCP.
 
@@ -58,7 +58,8 @@ Session jobs ([`docs/specs/session-jobs.md`](docs/specs/session-jobs.md), behind
 default **off**): with the flag on, the MCP adds a fifth tool, `reply`, which continues an awarded
 session job with the same seller and agent conversation (turn n ≥ 2), and `collect` gains `turn` and
 `close_session`. A turn is priced like the job, reserved under the per-job and session caps, keyed by
-the follow-up id, and materialized into `results/<job_id>-t<n>`. With the flag off the surface above
+the follow-up id, settled by the delivery watcher like turn 1 (or `collect turn=<n>`), and
+materialized into `results/<job_id>-t<n>`. With the flag off the surface above
 is unchanged.
 
 `MAXPLAYER_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged

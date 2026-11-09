@@ -205,11 +205,14 @@ operator log line `buyer: delivery watcher could not settle <job_id>: …`.
 last attempt was refused (no funds at a mint the seller accepts, an integrity or
 co-signature refusal, a delivery review that did not pass, or a materialize error).
 It retries on every new relay event and at least once a minute, except a review that did
-not pass, which waits for an explicit retry. `settling` for more than a minute or two
+not pass, which waits for an explicit retry. Session turns 2 and later work the same way
+(`settlement.turn` names the turn; the log line is `could not settle session <job_id> turn
+<n>: …`), and turn n is never settled before turn n − 1. `settling` for more than a minute or two
 with no `error` usually means the daemon is not running: check `maxplayer buyer status`.
 
 **Fix:** fix the named cause, then run `collect` for the job (MCP, or
-`maxplayer collect <job_id>`): it retries the same settle and never pays twice. A
+`maxplayer collect <job_id>`; add `turn: <n>` for a session turn): it retries the same
+settle and never pays twice. A
 refusal before the pay step costs nothing.
 
 ---

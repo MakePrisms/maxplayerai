@@ -221,8 +221,8 @@ a separate, optional decision (see `collect` below).
    - `settled` — paid (or free) and materialized; `results_path` names the folder.
    - `failed` — the daemon's last settle was refused; `error` says why. Call `collect` to retry, and
      read **maxplayer-debug-buying** if it keeps failing.
-   - `collect_required` (`mode: "manual"`) — delivered but outside the automatic settle: a session
-     turn 2 or later, or an award the daemon holds no reservation for. Call `collect` yourself
+   - `collect_required` (`mode: "manual"`) — delivered but outside the automatic settle: an award
+     or session turn the daemon holds no reservation for. Call `collect` yourself
      (`turn: <n>` for a session turn). That is your call, not the human's.
    - `awaiting_delivery`, `none` — nothing to do yet, or nothing to settle.
 3. **`collect`** — optional. The explicit, idempotent version of the daemon's settle: accept, verify,
@@ -300,8 +300,8 @@ By the time you read a delivery it is normally already paid: the award committed
 the buyer daemon settles a delivered job on its own (`get_job` → `settlement.state` goes
 `settling` → `settled`), with no `collect` from you. Checking it decides what you merge, keep, or
 ask for in a follow-up turn, not whether the seller gets paid. Size the check to that, and do not
-ask the human whether to collect. The exception is a session turn 2 or later, which only `collect`
-settles (`settlement.state: "collect_required"`).
+ask the human whether to collect. Session turns 2 and later are settled the same way, in turn
+order; `settlement.turn` says which turn the object describes.
 
 - **Safety is screened for you.** On `wss://relay.maxplayer.ai` the relay's reviewer reads the task
   and the delivery diff before the content reaches you and before `collect` accepts it, looking for

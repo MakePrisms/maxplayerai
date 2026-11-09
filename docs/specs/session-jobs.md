@@ -588,6 +588,23 @@ sentinel run. The check runs on the fetched delivery before any spend. Turn 1's 
 accept, "awarded seller delivered", pay window) must ignore results that carry `reply`, or a turn-2
 result could be bound as turn 1.
 
+*Auto-settle (follow-up to #1267):* the buyer daemon's delivery watcher settles turns ≥ 2 on its
+own, as it does turn 1, so `collect` is the explicit retry rather than the only settle. Its job
+work set (`awards` JOIN `reservations`) cannot see a turn (the reservation is keyed by the
+follow-up id, which has no award row), so it has a second one: `session_turns` in `sent` or
+`delivered` whose follow-up reservation is still `reserved` (a free turn reserves nothing and
+qualifies with no row). It wakes on a result event (narrowed to the job it names), the periodic
+sweep and the boot sweep; a `sent` turn makes it read the relay, bounded to the turn's deadline
+plus ten minutes on the timer. Per job it settles only the lowest unsettled live turn, and only
+once turn 1 is settled, so turn n is never paid while n − 1 is outstanding (`settle_turn` refuses
+out-of-order turns too). It settles through `settle_turn`'s body (no second pay path) under the
+money lock, re-reading the turn under the lock, so a racing `collect` pays once. The turn's
+delivery review files its status under the offer like turn 1's, and the watcher skips a turn
+whose review is pending or did not pass, except for a newer result from the awarded seller
+answering that follow-up; a status naming turn 1's or an earlier settled turn's result is
+history. A refusal is recorded per follow-up and shown as `get_job.settlement` `failed`; success
+clears it. It never closes a session.
+
 ---
 
 ## 9. Reviews
