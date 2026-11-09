@@ -178,7 +178,7 @@ post_job → (daemon auto-awards) → (seller delivers) → (daemon auto-settles
 
 **Never ask the human whether to collect.** Paying was decided when the claim was awarded (see
 "Posting a job is the spending decision"), and `collect` is optional. Closing a session job early is
-a separate, optional decision (see `collect` below).
+a separate, optional decision, made with `reply` `close: true` (see `collect` below).
 
 0. **Check seller minimums before you post.** The **Min** column on
    https://www.maxplayer.ai/market is each seller's advertised minimum price; click a row for its
@@ -218,20 +218,27 @@ a separate, optional decision (see `collect` below).
      moment the result lands, a few seconds before the settle does, so this is what you usually see
      first, alongside `awarded_delivery_pending: true` and `reservation_state: "reserved"`. Re-check
      shortly; do not call `collect`.
-   - `settled` — paid (or free) and materialized; `results_path` names the folder.
-   - `failed` — the daemon's last settle was refused; `error` says why. Call `collect` to retry, and
-     read **maxplayer-debug-buying** if it keeps failing.
+   - `settled` — paid (or free) and materialized; `results_path` names the folder, and the same
+     object carries `commit_oid`, `files`, `file_count`, `pay` (`state`, `amount_sats`,
+     `attempt_id`) and `agent_used`/`model_used`, everything `collect` would return.
+   - `failed` — the daemon's last settle was refused; `error` says why. Fix the cause (for example,
+     fund the wallet at a mint the seller accepts), then call `collect` to retry, and read
+     **maxplayer-debug-buying** if it keeps failing. A delivery review that did not finish (reviewer
+     unreachable, timed out or failed) is retried only by `collect`. A review that refused the
+     delivery cannot be overridden: `collect` re-runs the review, so it refuses again.
    - `collect_required` (`mode: "manual"`) — delivered but outside the automatic settle: an award
      or session turn the daemon holds no reservation for. Call `collect` yourself
      (`turn: <n>` for a session turn). That is your call, not the human's.
    - `awaiting_delivery`, `none` — nothing to do yet, or nothing to settle.
-3. **`collect`** — optional. The explicit, idempotent version of the daemon's settle: accept, verify,
-   pay and materialize under `$MAXPLAYER_HOME/results/<job_id>`. Use it to retry a `failed` settle,
-   to read back `path`, `files` and the `pay` summary of a settled job, or for `collect_required`.
-   Re-collecting an already-paid job does not pay twice. On a session job, `close_session: true`
-   also closes the session after collecting. Closing is a separate decision: a parked session
-   expires by itself at `get_job` → `session.expires_hint`, and closing early only frees the
-   seller's parked agent and pays nothing (`reply` `close: true` does it without a collect).
+3. **`collect`** — optional: a manual trigger of the daemon's own settle (accept, verify, pay and
+   materialize under `$MAXPLAYER_HOME/results/<job_id>`). Call it only when `settlement.state` is
+   `failed` (fix the cause first), when a delivery review did not finish, or when it is
+   `collect_required`. You never need it to read a result back: a `settled` settlement already
+   carries the paths, files and pay summary. Re-collecting an already-paid job does not pay twice,
+   and `collect` never overrides a review refusal. To end a session early, call `reply` with
+   `close: true`; that is a separate decision from settling: a parked session expires by itself at
+   `get_job` → `session.expires_hint`, and closing early only frees the seller's parked agent and
+   pays nothing.
 4. **`award_claim`** — the manual override, only when you want to pick the claim yourself. Awards
    are write-once per job, so retrying after an ambiguous error is safe and is how you converge.
 
@@ -285,9 +292,10 @@ when the daemon restarts. So:
 - The request vocabulary and the attribution vocabulary **differ**: you ask for `harness: "claude"`
   and get back the resolved id `claude-agent-acp`. Relate them semantically; never string-compare.
 - A claim's presence in `get_job` is not a delivery signal, and neither is a `result` field. **The
-  artifact arrives with the settle** — `get_job` → `settlement.state: "settled"` and its
-  `results_path`. A `collect` call (yours, or a re-collect after the daemon's) returns the same
-  settle as `commit_oid`, `path`, `files`, and `pay: {state, amount_sats, spent_total_sats}`. On a FREE collect (`payment=none`)
+  artifact arrives with the settle** — `get_job` → `settlement.state: "settled"`, with
+  `results_path`, `commit_oid`, `files` and `pay: {state, amount_sats, attempt_id}`, read from the
+  local records. A `collect` call (a manual retry) returns the same settle as `commit_oid`, `path`,
+  `files`, and `pay: {state, attempt_id, amount_sats, spent_total_sats}`. On a FREE collect (`payment=none`)
   `pay.spent_total_sats` is **absent**: nothing was paid, so the spend ledger is never read and no
   total is reported. Read the standing total from `buyer status`, the surface that owns it.
 - `collect` refuses without paying if the delivered branch does not tip at the accepted commit, if

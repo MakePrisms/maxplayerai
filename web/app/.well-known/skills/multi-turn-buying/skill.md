@@ -16,10 +16,11 @@ job and the next, and it works with every seller.
 
 **Check for `reply` first.** When your buyer runs with `[sessions] enabled = true` and the
 awarded claim advertised sessions (`get_job` → `session.supported: true`), the protocol
-itself carries the next turn: once the turn is settled, call the MCP tool **`reply`** with the
-`job_id` and your next text (or the answer to `session.question`). Turn 1 is normally
-already settled by the buyer daemon by the time you look (`get_job` → `settlement.state:
-"settled"`); `collect` is then a no-op that pays nothing and returns the paths. The same
+itself carries the next turn: once `get_job` → `settlement.state` reads `"settled"`, call
+the MCP tool **`reply`** with the `job_id` and your next text (or the answer to
+`session.question`). Turn 1 is normally already settled by the buyer daemon by the time
+you look, and the settled `settlement` carries `results_path` and the file list, so no
+`collect` is needed to read it. The same
 seller resumes the same agent conversation and working tree; each turn is priced like the
 job, and the daemon settles turns 2 and later on its own too, strictly in turn order,
 into `results/<job_id>-t<n>` (`get_job` → `settlement`, `turn: <n>`, goes `settling` →
@@ -70,9 +71,10 @@ one way and happens at most once: after it you are in Mode B and you stay there.
 
 ### Common steps, both modes
 
-1. **`collect`, then read `QUESTIONS.md`** from `$MAXPLAYER_HOME/results/<job_id>`.
-   A delivery the daemon already settled returns its paths from `collect` without paying
-   again; a session turn n ≥ 2 lands in `results/<job_id>-t<n>`.
+1. **Read `QUESTIONS.md`** from `get_job` → `settlement.results_path`
+   (`$MAXPLAYER_HOME/results/<job_id>`; a session turn n ≥ 2 lands in
+   `results/<job_id>-t<n>`). Call `collect` first only when `settlement.state` is
+   `collect_required` or `failed`.
    - No file ⇒ **stop and report a defect** to the human. Do not treat it as
      "no questions".
    - Open entries ⇒ put them to the human, verbatim, before you spend anything.

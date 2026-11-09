@@ -34,6 +34,8 @@ mod auto_award_retry;
 mod session_reply;
 /// `get_job.settlement`: whether the daemon settles a delivery on its own, and where it stands.
 mod settlement;
+/// What a settled `get_job.settlement` reads back (commit, files, pay), so collect is not a read.
+mod settled_view;
 
 /// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
 #[cfg(test)]
@@ -880,7 +882,16 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
             let delivered = awarded_delivery_pending || view.accepted.is_some();
             let settlement_hint =
                 settlement::facts(context, &view.job_id, awarded.is_some(), delivered)
-                    .map(|facts| settlement::hint(&facts))
+                    .map(|facts| {
+                        let mut hint = settlement::hint(&facts);
+                        settled_view::enrich(
+                            &context.home,
+                            &context.store,
+                            &view.job_id,
+                            &mut hint,
+                        );
+                        hint
+                    })
                     .unwrap_or(Value::Null);
             let review_status = crate::review::protect_job_view(&context.home, &mut view, awarded.as_ref().map(|a| a.seller_pubkey.as_str())).await;
             // Read-only planner hints. Parsing stays with the existing Cashu parser;
@@ -1298,9 +1309,25 @@ struct CollectParams {
     /// turn once turn 1 is collected, else turn 1.
     #[serde(default)]
     turn: Option<u32>,
-    /// Session jobs (§10): collect, then send the `close` follow-up.
+    /// DEPRECATED alias (kept for one release): collect, then send the `close` follow-up. No longer
+    /// advertised on the MCP schema; `reply close: true` is the one documented way to close. Still
+    /// honoured, with `deprecated` on the response and one operator line per call.
     #[serde(default)]
     close_session: bool,
+}
+
+/// The `deprecated` value a `collect close_session=true` response carries.
+const CLOSE_SESSION_DEPRECATED: &str = "collect close_session is deprecated and will be removed in a \
+     future release: close a session with reply close: true (closing is separate from settling)";
+
+fn close_session_deprecation_line(job_id: &str) -> String {
+    format!("buyer: collect close_session is deprecated (job {job_id}); use reply close: true")
+}
+
+/// Mark a `collect close_session=true` response deprecated.
+fn with_close_deprecation(mut body: Value) -> Value {
+    body["deprecated"] = json!(CLOSE_SESSION_DEPRECATED);
+    body
 }
 
 /// Collect a delivered job: run the sealed pay path ([`collect::collect_async`] — accept-if-needed,
@@ -1514,6 +1541,9 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
         Err(error) => return Response::err(id, CODE_METHOD_NOT_FOUND, format!("collect params: {error}")),
     };
 
+    if params.close_session {
+        crate::opline!("{}", close_session_deprecation_line(&params.job_id));
+    }
     let sessions = context.home.config.sessions.enabled;
     if !sessions && (params.turn.is_some_and(|t| t > 1) || params.close_session) {
         return Response::err(id, CODE_REFUSED, session_reply::disabled());
@@ -1532,18 +1562,23 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                     } else {
                         None
                     };
+                    let body = json!({
+                        "pay": collect_pay_response(&outcome.pay),
+                        "commit_oid": outcome.commit_oid,
+                        "path": outcome.path,
+                        "files": outcome.files,
+                        "agent_used": outcome.agent_used,
+                        "model_used": outcome.model_used,
+                        "turn": row.turn,
+                        "session_closed": closed,
+                    });
                     Response::ok(
                         id,
-                        json!({
-                            "pay": collect_pay_response(&outcome.pay),
-                            "commit_oid": outcome.commit_oid,
-                            "path": outcome.path,
-                            "files": outcome.files,
-                            "agent_used": outcome.agent_used,
-                            "model_used": outcome.model_used,
-                            "turn": row.turn,
-                            "session_closed": closed,
-                        }),
+                        if params.close_session {
+                            with_close_deprecation(body)
+                        } else {
+                            body
+                        },
                     )
                 }
                 Err(error) => {
@@ -1570,7 +1605,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
             let closed = collect_close(context, &params.job_id).await;
             Response::ok(
                 id,
-                json!({
+                with_close_deprecation(json!({
                     "pay": collect_pay_response(&outcome.pay),
                     "commit_oid": outcome.commit_oid,
                     "path": outcome.path,
@@ -1578,7 +1613,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                     "agent_used": outcome.agent_used,
                     "model_used": outcome.model_used,
                     "session_closed": closed,
-                }),
+                })),
             )
         }
         Ok(outcome) => Response::ok(
@@ -1604,7 +1639,8 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
     }
 }
 
-/// `collect close_session=true`: the collect already settled; a close failure is reported, not raised.
+/// Deprecated `collect close_session=true`: the collect already settled; a close failure is
+/// reported, not raised. `reply close: true` reaches the same [`session_reply::send_close`].
 async fn collect_close(context: &BuyerContext, job_id: &str) -> Value {
     let Some(award) = context.store.award_record(job_id).ok().flatten() else {
         return json!(false);
@@ -6561,6 +6597,185 @@ mod tests {
             json!(results.display().to_string())
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // Shared fixture for the close/read-back handler tests: a buyer with `[sessions] enabled`, the
+    // buyer-signed offer on a local relay, a recorded award, and a FREE INLINE accept-bind, so the
+    // real `collect` handler settles end to end (no wallet, no mint) and `send_close` really publishes.
+    async fn free_session_job(
+        label: &str,
+    ) -> (
+        nostr_relay_builder::prelude::LocalRelay,
+        HomeLock,
+        Arc<BuyerContext>,
+        String,
+        PathBuf,
+    ) {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::{Client, EventBuilder, Keys, Kind, Tag};
+        let root = temp_home(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap_home(&root).expect("bootstrap home");
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        home.config.relay_url = relay.url().await.to_string();
+        home.config.sessions.enabled = true;
+        let (lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
+        let keys = buyer_keys(&context.home).expect("buyer keys");
+        let offer = EventBuilder::new(Kind::Custom(crate::kinds::JOB_OFFER_KIND), "")
+            .tag(
+                Tag::parse(vec![
+                    "t".to_owned(),
+                    crate::gateway::MAXPLAYER_TAG.to_owned(),
+                ])
+                .expect("t tag"),
+            )
+            .sign_with_keys(&keys)
+            .expect("sign offer");
+        let job = offer.id.to_hex();
+        let publisher = Client::new(keys.clone());
+        publisher
+            .add_relay(&context.home.config.relay_url)
+            .await
+            .expect("add relay");
+        publisher.connect().await;
+        publisher
+            .send_event(&offer)
+            .await
+            .expect("relay stores the offer");
+        publisher.disconnect().await;
+        let seller = Keys::generate().public_key().to_hex();
+        context
+            .store
+            .record_award(&job, &"c".repeat(64), &"e".repeat(64), &seller, 0, 7)
+            .expect("record award");
+        let bind = job_lifecycle::AcceptedBind {
+            followup_id: None,
+            private_evidence: None,
+            delivery_kind: Some("inline".to_owned()),
+            inline_answer: Some("the answer".to_owned()),
+            payment_mode: crate::gateway::PaymentMode::None,
+            job_id: job.clone(),
+            claim_id: "c".repeat(64),
+            result_id: "r".repeat(64),
+            seller_pubkey: seller,
+            commit_oid: "d".repeat(64),
+            repo: String::new(),
+            branch: String::new(),
+            job_hash: "h".repeat(64),
+            amount_sats: 0,
+            accept_event_id: "b".repeat(64),
+            accepted_at: 3,
+            seller_signature: String::new(),
+            creq_hash: None,
+            accepted_mints: vec![],
+            funding_mint: None,
+            delivery_mint: None,
+            agent_used: Some("claude-agent-acp".to_owned()),
+            model_used: None,
+            contribution: None,
+        };
+        let jobs = context.home.root.join("jobs");
+        std::fs::create_dir_all(&jobs).expect("jobs dir");
+        std::fs::write(
+            jobs.join(format!("{job}.json")),
+            serde_json::to_string(&bind).unwrap(),
+        )
+        .expect("write bind");
+        (relay, lock, context, job, root)
+    }
+
+    fn session_state(context: &BuyerContext, job: &str) -> Option<String> {
+        context
+            .store
+            .session_row(job)
+            .expect("session row")
+            .map(|(_, state)| state)
+    }
+
+    // The deprecated `collect close_session: true` alias still works for one release: it settles,
+    // closes the session (the seller's close follow-up is published and the local row reads
+    // closed), and the response says it is deprecated. Red-on-revert: drop the alias's close and
+    // `session_closed`/the closed row fail; drop `with_close_deprecation` and `deprecated` fails.
+    #[tokio::test]
+    async fn the_deprecated_close_session_alias_still_closes_and_says_deprecated() {
+        let (relay, _lock, context, job, root) = free_session_job("close-alias").await;
+        let body = collect(
+            &context,
+            json!(1),
+            json!({"job_id": job, "close_session": true}),
+        )
+        .await
+        .result
+        .expect("collect settles the free inline delivery");
+        assert_eq!(body["session_closed"], json!(true), "{body}");
+        assert_eq!(session_state(&context, &job).as_deref(), Some("closed"));
+        let deprecated = body["deprecated"].as_str().expect("deprecated marker");
+        assert!(deprecated.contains("reply close: true"), "{deprecated}");
+        assert_eq!(body["pay"]["state"], json!("none"));
+        assert!(close_session_deprecation_line(&job).contains("deprecated"));
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // `reply close: true` is THE way to close: it closes with no collect and no deprecation, and a
+    // plain collect neither closes nor carries the deprecation marker.
+    #[tokio::test]
+    async fn reply_close_closes_and_a_plain_collect_does_not() {
+        let (relay, _lock, context, job, root) = free_session_job("reply-close").await;
+        let body = collect(&context, json!(1), json!({"job_id": job}))
+            .await
+            .result
+            .expect("collect settles");
+        assert!(body.get("deprecated").is_none(), "{body}");
+        assert!(body.get("session_closed").is_none(), "{body}");
+        assert_eq!(
+            session_state(&context, &job),
+            None,
+            "a plain collect never closes"
+        );
+
+        let closed =
+            session_reply::reply(&context, json!(2), json!({"job_id": job, "close": true}))
+                .await
+                .result
+                .expect("reply close succeeds");
+        assert_eq!(closed["session"], json!("closed"), "{closed}");
+        assert!(closed.get("deprecated").is_none(), "{closed}");
+        assert_eq!(session_state(&context, &job).as_deref(), Some("closed"));
+        let _ = std::fs::remove_dir_all(&root);
+        drop(relay);
+    }
+
+    // get_job.settlement makes collect unnecessary for read-back: after the settle, the REAL
+    // get_job handler's settled settlement carries results_path plus what collect returned
+    // (commit_oid, files, file_count, pay, agent_used), read from the bind and records. Red-on-revert:
+    // drop the `settled_view::enrich` call from get_job and every read-back assertion fails.
+    #[tokio::test]
+    async fn get_job_settlement_reads_back_what_collect_returned() {
+        let (relay, _lock, context, job, root) = free_session_job("settled-readback").await;
+        let collected = collect(&context, json!(1), json!({"job_id": job}))
+            .await
+            .result
+            .expect("collect settles");
+        let settlement = get_job(&context, json!(2), json!({"job_id": job}))
+            .await
+            .result
+            .expect("get_job returns a view")["settlement"]
+            .clone();
+        assert_eq!(settlement["state"], json!("settled"), "{settlement}");
+        assert_eq!(settlement["results_path"], collected["path"]);
+        assert_eq!(settlement["commit_oid"], collected["commit_oid"]);
+        assert_eq!(settlement["files"], collected["files"]);
+        assert_eq!(settlement["file_count"], json!(1));
+        assert_eq!(settlement["pay"]["state"], collected["pay"]["state"]);
+        assert_eq!(
+            settlement["pay"]["amount_sats"],
+            collected["pay"]["amount_sats"]
+        );
+        assert_eq!(settlement["agent_used"], collected["agent_used"]);
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
     }

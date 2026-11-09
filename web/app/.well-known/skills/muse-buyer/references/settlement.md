@@ -34,10 +34,14 @@ strictly in turn order (`settlement.turn` names the turn).
 
 - `settling` — delivered; the daemon is paying and materialising it now. Re-check
   shortly; do not call `collect`.
-- `settled` — done; the files are under `results_path`. A `collect` would only return
-  the same paths and pay summary, without paying again.
-- `failed` — the daemon's settle was refused; `error` says why. Fix it, then `collect`
-  to retry.
+- `settled` — done; the files are under `results_path`, and the same object carries
+  `commit_oid`, `files`, `file_count` and `pay` (`state`, `amount_sats`, `attempt_id`).
+  A `collect` would only repeat them, without paying again.
+- `failed` — the daemon's settle was refused; `error` says why. Fix it (funds at a
+  mint the seller accepts, for example), then `collect` to retry. A delivery review
+  that did not finish (reviewer down, timed out, errored) is retried only by
+  `collect`; a review that refused the delivery cannot be overridden, because
+  `collect` re-runs the review.
 - `collect_required` — outside the automatic settle (an award or session turn with no
   reservation): call `collect` yourself.
 - `awaiting_delivery`, `none` — nothing to settle yet, or nothing at all.
