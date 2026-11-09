@@ -1640,6 +1640,83 @@ async fn trade_credit_never_overwrites_or_drops_another_owners_rows() {
     p.cancel().await.unwrap();
 }
 
+/// M3 (advisor r2): a journal without a recorded input owner (`InputOwner::NotACdkSaga`) drops a
+/// spent input only while NOBODY owns it. A row another trade operation holds (not a cdk saga) is
+/// left exactly as it is; an unowned one is dropped.
+#[tokio::test]
+async fn trade_credit_without_an_input_owner_leaves_another_trade_operations_row() {
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path();
+    fund(home, &m.url, 7).await;
+    let db = wallet::database(home, &m.url).await.unwrap();
+    let mut ys: Vec<_> = rows(home, &m.url, vec![State::Unspent])
+        .await
+        .into_iter()
+        .map(|p| p.y)
+        .collect();
+    ys.sort();
+    assert!(ys.len() >= 2);
+    let (held, free) = (ys[0], ys[1]);
+    let trade_op = uuid::Uuid::new_v4();
+    wallet::reserve(home, &m.url, &[held], &trade_op)
+        .await
+        .unwrap();
+    assert!(
+        db.get_saga(&trade_op).await.unwrap().is_none(),
+        "not a cdk saga"
+    );
+    wallet::credit(
+        home,
+        &m.url,
+        vec![],
+        &[held, free],
+        wallet::InputOwner::NotACdkSaga,
+    )
+    .await
+    .unwrap();
+    let state = |y| {
+        let db = db.clone();
+        async move {
+            db.get_proofs_by_ys(vec![y])
+                .await
+                .unwrap()
+                .first()
+                .map(|r| (r.state, r.used_by_operation))
+        }
+    };
+    assert_eq!(
+        state(held).await,
+        Some((State::Reserved, Some(trade_op))),
+        "SAFETY: another trade operation's row survives an owner-less credit"
+    );
+    assert_eq!(state(free).await, None, "an unowned spent input is dropped");
+}
+
+/// H1 (advisor r2): the mint executed the swap but its `/restore` answers empty (a lagging or
+/// lost restore). The saga is KEPT (held, retryable), nothing is written, trade's and the melt
+/// saga's reservations keep their owners, and the next pass with an answering mint recovers it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_recovery_with_an_empty_restore_keeps_the_saga_until_the_mint_answers() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let m = MintFixture::start(0).await;
+    let s = spent_swap_scene(&m).await;
+    m.faults.blank_restores.store(1, SeqCst);
+    let report = retire(&m, &s.home).await;
+    assert_eq!(report.swap_recovered, 0, "{report:?}");
+    assert_eq!(report.swap_held.len(), 1, "{report:?}");
+    assert_eq!(report.swap_held[0].saga_id, s.swap_saga.to_string());
+    assert_eq!(
+        m.faults.blank_restores.load(SeqCst),
+        0,
+        "the blank restore was used"
+    );
+    assert_owners_kept(&m, &s, false).await;
+    let report = retire(&m, &s.home).await;
+    assert_eq!(report.swap_recovered, 1, "{report:?}");
+    assert_owners_kept(&m, &s, true).await;
+}
+
 /// L5: every proof-row write in trade goes through `wallet::{credit, reserve, release}` (selection
 /// lock, owner checked); no other module writes the shared wallet's proof table directly.
 #[test]

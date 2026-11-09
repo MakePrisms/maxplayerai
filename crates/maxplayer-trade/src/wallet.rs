@@ -663,8 +663,9 @@ pub enum InputOwner {
     /// Rows `used_by_operation = op`, or unowned (a consumed input nobody holds; leaving it would be
     /// a phantom balance). A row another operation owns is never dropped.
     Op(uuid::Uuid),
-    /// A journal written before attempts named their reservation: rows that are unowned or owned
-    /// by an operation that is not a cdk saga of this wallet (never a buyer saga's row).
+    /// A journal written before attempts named their reservation (or an attempt whose inputs were
+    /// never wallet rows): only unowned rows. A row with ANY owner (a cdk saga, another trade
+    /// operation, or this one under a journal that did not record it) is left alone (review r2 M3).
     NotACdkSaga,
 }
 /// Credit newly issued proofs and drop spent inputs, under the selection lock, in one SQLite
@@ -704,8 +705,7 @@ pub async fn credit(
         for row in db.get_proofs_by_ys(spent.to_vec()).await? {
             let ours = match (owner, row.used_by_operation) {
                 (InputOwner::Op(op), held) => held.is_none() || held == Some(op),
-                (InputOwner::NotACdkSaga, None) => true,
-                (InputOwner::NotACdkSaga, Some(id)) => db.get_saga(&id).await?.is_none(),
+                (InputOwner::NotACdkSaga, held) => held.is_none(),
             };
             if ours {
                 remove.push(row.y);

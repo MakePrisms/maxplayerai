@@ -49,7 +49,7 @@ pub struct Attempt {
     /// The operation that held `inputs` reserved in the wallet when this attempt was created (a
     /// lock's plan reservation). Settlement drops a spent input only while that operation still
     /// owns it. `None`: inputs not in the wallet (HTLC claims/refunds) or a journal written before
-    /// this field (then only rows no cdk saga owns are dropped).
+    /// this field (then only unowned rows are dropped).
     #[serde(default)]
     pub input_owner: Option<uuid::Uuid>,
 }
