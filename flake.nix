@@ -175,7 +175,10 @@
           # Its integration tests need Postgres (CI runs them), hence doCheck = false here.
           maxplayer-registration = pkgs.rustPlatform.buildRustPackage {
             pname = "maxplayer-registration";
-            version = "0.1.0";
+            # From crates/maxplayer-registration/Cargo.toml: its own workspace, so it pins [package].version.
+            version = let m = builtins.fromTOML (builtins.readFile ./crates/maxplayer-registration/Cargo.toml); in
+              if builtins.isString m.package.version then m.package.version
+              else m.workspace.package.version;
             src = ./crates/maxplayer-registration;
             cargoLock.lockFile = ./crates/maxplayer-registration/Cargo.lock;
             doCheck = false;
