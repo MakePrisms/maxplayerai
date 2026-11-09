@@ -1162,7 +1162,10 @@ mod tests {
             "never overrides a review that refused the delivery",
             "use reply close: true",
         ] {
-            assert!(collect.contains(phrase), "collect must say {phrase:?}: {collect}");
+            assert!(
+                collect.contains(phrase),
+                "collect must say {phrase:?}: {collect}"
+            );
         }
         assert!(
             !collect.contains("reading back the paths"),

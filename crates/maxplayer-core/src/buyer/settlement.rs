@@ -161,7 +161,14 @@ pub(super) fn hint(f: &Facts) -> Value {
                         ),
                     );
                 }
-                return body(MODE_AUTO, "failed", 1, None, Some(detail), review_note(state));
+                return body(
+                    MODE_AUTO,
+                    "failed",
+                    1,
+                    None,
+                    Some(detail),
+                    review_note(state),
+                );
             }
             if f.delivered {
                 return body(
@@ -647,7 +654,10 @@ mod tests {
             note(&held).contains("does not retry that on its own"),
             "{held}"
         );
-        assert!(note(&held).contains("Call collect to retry the review"), "{held}");
+        assert!(
+            note(&held).contains("Call collect to retry the review"),
+            "{held}"
+        );
 
         // A refusal is not retryable by collect: it re-runs the review, it does not override it.
         for refused in ["policy_refused", "input_refused"] {

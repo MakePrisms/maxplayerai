@@ -884,7 +884,12 @@ async fn get_job(context: &BuyerContext, id: Value, params: Value) -> Response {
                 settlement::facts(context, &view.job_id, awarded.is_some(), delivered)
                     .map(|facts| {
                         let mut hint = settlement::hint(&facts);
-                        settled_view::enrich(&context.home, &context.store, &view.job_id, &mut hint);
+                        settled_view::enrich(
+                            &context.home,
+                            &context.store,
+                            &view.job_id,
+                            &mut hint,
+                        );
                         hint
                     })
                     .unwrap_or(Value::Null);
@@ -1569,7 +1574,11 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                     });
                     Response::ok(
                         id,
-                        if params.close_session { with_close_deprecation(body) } else { body },
+                        if params.close_session {
+                            with_close_deprecation(body)
+                        } else {
+                            body
+                        },
                     )
                 }
                 Err(error) => {
@@ -6616,14 +6625,26 @@ mod tests {
         let (lock, context, _socket) = bootstrap(home).await.expect("buyer bootstrap");
         let keys = buyer_keys(&context.home).expect("buyer keys");
         let offer = EventBuilder::new(Kind::Custom(crate::kinds::JOB_OFFER_KIND), "")
-            .tag(Tag::parse(vec!["t".to_owned(), crate::gateway::MAXPLAYER_TAG.to_owned()]).expect("t tag"))
+            .tag(
+                Tag::parse(vec![
+                    "t".to_owned(),
+                    crate::gateway::MAXPLAYER_TAG.to_owned(),
+                ])
+                .expect("t tag"),
+            )
             .sign_with_keys(&keys)
             .expect("sign offer");
         let job = offer.id.to_hex();
         let publisher = Client::new(keys.clone());
-        publisher.add_relay(&context.home.config.relay_url).await.expect("add relay");
+        publisher
+            .add_relay(&context.home.config.relay_url)
+            .await
+            .expect("add relay");
         publisher.connect().await;
-        publisher.send_event(&offer).await.expect("relay stores the offer");
+        publisher
+            .send_event(&offer)
+            .await
+            .expect("relay stores the offer");
         publisher.disconnect().await;
         let seller = Keys::generate().public_key().to_hex();
         context
@@ -6658,13 +6679,20 @@ mod tests {
         };
         let jobs = context.home.root.join("jobs");
         std::fs::create_dir_all(&jobs).expect("jobs dir");
-        std::fs::write(jobs.join(format!("{job}.json")), serde_json::to_string(&bind).unwrap())
-            .expect("write bind");
+        std::fs::write(
+            jobs.join(format!("{job}.json")),
+            serde_json::to_string(&bind).unwrap(),
+        )
+        .expect("write bind");
         (relay, lock, context, job, root)
     }
 
     fn session_state(context: &BuyerContext, job: &str) -> Option<String> {
-        context.store.session_row(job).expect("session row").map(|(_, state)| state)
+        context
+            .store
+            .session_row(job)
+            .expect("session row")
+            .map(|(_, state)| state)
     }
 
     // The deprecated `collect close_session: true` alias still works for one release: it settles,
@@ -6674,10 +6702,14 @@ mod tests {
     #[tokio::test]
     async fn the_deprecated_close_session_alias_still_closes_and_says_deprecated() {
         let (relay, _lock, context, job, root) = free_session_job("close-alias").await;
-        let body = collect(&context, json!(1), json!({"job_id": job, "close_session": true}))
-            .await
-            .result
-            .expect("collect settles the free inline delivery");
+        let body = collect(
+            &context,
+            json!(1),
+            json!({"job_id": job, "close_session": true}),
+        )
+        .await
+        .result
+        .expect("collect settles the free inline delivery");
         assert_eq!(body["session_closed"], json!(true), "{body}");
         assert_eq!(session_state(&context, &job).as_deref(), Some("closed"));
         let deprecated = body["deprecated"].as_str().expect("deprecated marker");
@@ -6699,12 +6731,17 @@ mod tests {
             .expect("collect settles");
         assert!(body.get("deprecated").is_none(), "{body}");
         assert!(body.get("session_closed").is_none(), "{body}");
-        assert_eq!(session_state(&context, &job), None, "a plain collect never closes");
+        assert_eq!(
+            session_state(&context, &job),
+            None,
+            "a plain collect never closes"
+        );
 
-        let closed = session_reply::reply(&context, json!(2), json!({"job_id": job, "close": true}))
-            .await
-            .result
-            .expect("reply close succeeds");
+        let closed =
+            session_reply::reply(&context, json!(2), json!({"job_id": job, "close": true}))
+                .await
+                .result
+                .expect("reply close succeeds");
         assert_eq!(closed["session"], json!("closed"), "{closed}");
         assert!(closed.get("deprecated").is_none(), "{closed}");
         assert_eq!(session_state(&context, &job).as_deref(), Some("closed"));
@@ -6734,7 +6771,10 @@ mod tests {
         assert_eq!(settlement["files"], collected["files"]);
         assert_eq!(settlement["file_count"], json!(1));
         assert_eq!(settlement["pay"]["state"], collected["pay"]["state"]);
-        assert_eq!(settlement["pay"]["amount_sats"], collected["pay"]["amount_sats"]);
+        assert_eq!(
+            settlement["pay"]["amount_sats"],
+            collected["pay"]["amount_sats"]
+        );
         assert_eq!(settlement["agent_used"], collected["agent_used"]);
         let _ = std::fs::remove_dir_all(&root);
         drop(relay);
