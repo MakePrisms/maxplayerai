@@ -137,17 +137,18 @@ jobs:
   # `live-mints` is deliberately absent here. It stays exclusive to money-path (#720), the only row
   # permitted to reach a live third-party mint, so this row adds NO network money reach.
   #
-  # Release, so the git-delivery suite runs the way money-path runs it: that job documents a
-  # debug-only transport-lifecycle bug (#152) as its reason for release-only, and this row inherits
-  # the constraint rather than re-litigating it.
+  # Profile `ci` (Cargo.toml), the same as money-path: dev-speed compile of our crates, optimised
+  # third-party crates, debug assertions on. Both rows used to run in release because of a debug-only
+  # transport-lifecycle bug (#152); that was fixed in 20965f2, and release spent ~21 minutes of this
+  # job compiling maxplayer-core.
   #
   # Its OWN job, for the reason money-path has its own: this row carries money teeth, because
   # `wallet` composes `git-delivery`. A step queued behind a failed step is reported `skipped` inside
   # a job whose conclusion is `failure`, which cannot distinguish a suite that failed from a suite
   # that never ran — the one ambiguity a row like this must not have.
   #
-  # build-acp's build step stays. It compiles this combo in DEBUG and this row is release, so neither
-  # covers the other's profile.
+  # build-acp's build step stays: it builds the shipped `maxplayer` binary in release, which is the
+  # only release-profile compile of the seller surface left in this file.
   feature-union:
     name: Test the full shipped feature combo (acp + wallet)
     runs-on: ubuntu-latest
@@ -156,7 +157,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test maxplayer-core (acp + gateway + git-delivery + wallet)
-        run: cargo test -p maxplayer-core --release --features acp,gateway,git-delivery,wallet --locked
+        run: cargo test -p maxplayer-core --profile ci --features acp,gateway,git-delivery,wallet --locked
 
   # The bare feature set — `wallet` off, so `acp` and the seller surface are off with it. NO other
   # job compiles it: build-default builds `--workspace` with default features (wallet ON) and
@@ -218,7 +219,7 @@ jobs:
   # buries its result inside another job's conclusion. A separate runner also gives the suite its own
   # resource budget, which matters while the acp test's subprocess peak is the leading suspect.
   # Co-locating them bought nothing to trade away, either: this suite compiles its own feature set
-  # (no acp, release) and so reuses none of the acp job's build output. The default-feature job
+  # (no acp, profile ci) and so reuses none of the acp job's build output. The default-feature job
   # carries zero money teeth (it compiles the gateway/git-delivery/wallet tests out entirely), which
   # makes this the only job in CI that runs them.
   money-path:
@@ -228,17 +229,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Release build: the money-path suite is run in release (as the local money gate is), which
-      # also sidesteps a debug-only latent bug in the git-delivery HTTP transport
-      # (git_transport::client_short builds a nested tokio runtime inside the async collect path and
-      # panics on drop under debug). Interim: release-only until that transport-lifecycle bug is
-      # fixed (#152); the money assertions here (tip-match refusal, zero-burn, no
-      # journal/materialization) hold in release.
+      # Profile `ci` (Cargo.toml): our crates at dev speed with debug assertions and overflow checks
+      # on, third-party crates optimised. This used to be `--release` because of a debug-only panic
+      # in the git-delivery HTTP transport (#152); that was fixed in 20965f2 (verify-fetch runs off
+      # the async runtime, with a regression test), and release spent ~21 minutes of this job
+      # compiling maxplayer-core.
       # Keep the live job_lifecycle pre-publish fee-floor check enabled here (#720).
       # The payment_wallet worker-send tests now run offline with plain `wallet`;
       # their keyset fixture no longer depends on testnut's HTTP availability.
       - name: Test maxplayer-core (money-path suite)
-        run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
+        run: cargo test -p maxplayer-core --profile ci --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
 
   # The seller-credits mint sidecar (docs/specs/seller-credits.md stage 2). It is its OWN cargo
   # workspace with its own Cargo.lock, so cdk's `mint` feature, and the `protoc` its signatory's
