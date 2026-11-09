@@ -41,7 +41,7 @@ pub(super) struct Facts {
 }
 
 /// A session turn ≥ 2 as the hint needs it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct Turn {
     pub turn: u32,
     /// The `session_turns.state`: pending | sent | delivered | collected | refused | no_response.
@@ -49,6 +49,11 @@ pub(super) struct Turn {
     pub failure: Option<String>,
     /// `results/<job_id>-t<n>` when that directory exists.
     pub results_path: Option<String>,
+    /// The turn's price is still held (reserved, or a free turn): inside the watcher's work set
+    /// (`BuyerStore::unsettled_turn_job_ids`, per row `session_reply::turn_funds_held`).
+    pub funds_held: bool,
+    /// The review hold the watcher's turn pass skips on ([`turn_review_hold`]).
+    pub review_hold: Option<(String, String)>,
 }
 
 fn body(
@@ -228,52 +233,97 @@ fn released() -> Value {
     )
 }
 
-/// A session turn ≥ 2. The watcher's work set joins `awards` on the job id, and a turn's
-/// reservation is keyed by its FOLLOW-UP id, which has no award row, so no turn ≥ 2 is ever in it:
-/// only `collect` settles those (`session_reply::settle_turn`).
+/// A session turn ≥ 2. The delivery watcher settles these too (`session_reply::settle_delivered_turns`,
+/// strictly in turn order, same `settle_turn` path as `collect turn=<n>`), so the mode is `auto`
+/// unless the turn's price is not held (then nothing the daemon holds can pay it: `manual`).
 fn turn_hint(turn: &Turn) -> Value {
     let n = turn.turn;
+    let retry = DELIVERY_RECHECK_INTERVAL.as_secs();
     match turn.state.as_str() {
         "collected" => body(
-            MODE_MANUAL,
+            MODE_AUTO,
             "settled",
             n,
             turn.results_path.as_deref(),
             None,
             format!(
-                "Turn {n} is settled (collected) and its files are under results_path. collect \
-                 is not needed again: it never pays twice."
+                "Turn {n} is settled: accepted, verified, paid (a free job pays nothing) and \
+                 materialized; its files are under results_path. collect is not needed: it never \
+                 pays twice."
             ),
         ),
-        "delivered" => match turn.failure.as_deref() {
-            Some(error) => body(
-                MODE_MANUAL,
-                "failed",
-                n,
-                None,
-                Some(error),
-                format!(
-                    "collect for turn {n} was refused (see error). Retry collect with turn={n}; it \
-                     never pays twice. If it keeps failing, read the maxplayer-debug-buying skill."
-                ),
-            ),
-            None => body(
-                MODE_MANUAL,
-                "collect_required",
-                n,
-                None,
-                None,
-                format!(
-                    "Turn {n} was delivered. The daemon does NOT settle session turns 2 and later \
-                     on its own: call collect with turn={n} to pay this turn's reserved price \
-                     (nothing on a free job) and materialize results/<job_id>-t{n}. That call is \
-                     yours, not the human's: the reply already reserved the price. Do not ask the \
-                     human whether to collect."
-                ),
-            ),
-        },
-        "refused" | "no_response" => body(
+        "delivered" if !turn.funds_held => body(
             MODE_MANUAL,
+            "collect_required",
+            n,
+            None,
+            turn.failure.as_deref(),
+            format!(
+                "Turn {n} was delivered, but the daemon holds no reservation for it, so its \
+                 delivery watcher does not settle it. Call collect with turn={n} yourself. \
+                 {NOT_A_HUMAN_DECISION}"
+            ),
+        ),
+        "delivered" => {
+            if let Some(error) = turn.failure.as_deref() {
+                return body(
+                    MODE_AUTO,
+                    "failed",
+                    n,
+                    None,
+                    Some(error),
+                    format!(
+                        "The daemon's last attempt to settle turn {n} was refused (see error). It \
+                         retries on each new relay event and at least every {retry}s. Call collect \
+                         with turn={n} to retry now and read the full refusal; collect never pays \
+                         twice. If it keeps failing, read the maxplayer-debug-buying skill."
+                    ),
+                );
+            }
+            if let Some((state, detail)) = turn.review_hold.as_ref() {
+                if state == "pending" {
+                    return body(
+                        MODE_AUTO,
+                        "settling",
+                        n,
+                        None,
+                        None,
+                        format!(
+                            "Turn {n} was delivered; its delivery review is in flight. The daemon \
+                             settles it on its own once the review passes (within {retry}s). \
+                             Re-check with get_job shortly. {NOT_A_HUMAN_DECISION}"
+                        ),
+                    );
+                }
+                return body(
+                    MODE_AUTO,
+                    "failed",
+                    n,
+                    None,
+                    Some(detail),
+                    format!(
+                        "The delivery review of turn {n} did not pass ({state}; see error), and the \
+                         daemon does not retry that on its own. Fix the cause, then call collect \
+                         with turn={n} to retry explicitly; see the maxplayer-debug-buying skill."
+                    ),
+                );
+            }
+            body(
+                MODE_AUTO,
+                "settling",
+                n,
+                None,
+                None,
+                format!(
+                    "Turn {n} was delivered. The buyer daemon is settling it on its own (accept, \
+                     verify, pay this turn's reserved price, materialize into \
+                     results/<job_id>-t{n}), normally within seconds. Re-check with get_job \
+                     shortly; collect is not needed. {NOT_A_HUMAN_DECISION}"
+                ),
+            )
+        }
+        "refused" | "no_response" => body(
+            MODE_AUTO,
             "none",
             n,
             None,
@@ -285,14 +335,14 @@ fn turn_hint(turn: &Turn) -> Value {
             ),
         ),
         _ => body(
-            MODE_MANUAL,
+            MODE_AUTO,
             "awaiting_delivery",
             n,
             None,
             None,
             format!(
-                "Turn {n} is in flight; poll get_job wait_for=result. Once it is delivered, settle \
-                 it with collect turn={n}: the daemon does not settle turns 2 and later on its own."
+                "Turn {n} is in flight; poll get_job wait_for=result. The daemon settles it on its \
+                 own when it lands; collect is not needed."
             ),
         ),
     }
@@ -329,6 +379,65 @@ pub(super) fn auto_settle_review_hold(
         return Ok(None);
     }
     crate::review::state::blocked_job(&context.home.root, job_id)
+}
+
+/// The review hold on session turn `followup_id` of `job_id`: the turn-≥ 2 twin of
+/// [`auto_settle_review_hold`], shared by the watcher's turn pass and [`facts`].
+///
+/// Keying: a turn's buyer delivery review runs in `accept_turn_async` with subject `{offer: job_id,
+/// event: <turn result id>}`, and `review::state::write` files every RESULT-kind status under the
+/// OFFER (`review-job-status/<job_id>.json`), the same file turn 1 uses. So the hold is read off the
+/// job's file, then attributed: a status whose subject is turn 1's or an already settled turn's
+/// result is history, not this turn's hold. Any other blocking status is this turn's, because
+/// `reply` refuses to start turn n + 1 while turn n is unsettled, so at most one turn is ever
+/// delivered and unsettled per job. No hold once the turn's accept-bind exists (its review passed:
+/// the pass is recorded before the bind is written), or when delivery review is off for the seller.
+pub(super) fn turn_review_hold(
+    context: &BuyerContext,
+    job_id: &str,
+    followup_id: &str,
+) -> Result<Option<crate::review::state::Status>, String> {
+    let review_enabled = context
+        .store
+        .award_record(job_id)
+        .ok()
+        .flatten()
+        .map(|award| {
+            context
+                .home
+                .config
+                .review
+                .enabled(crate::kinds::JOB_RESULT_KIND, &award.seller_pubkey)
+                .unwrap_or(true)
+        })
+        .unwrap_or(context.home.config.review.buyer_delivery);
+    if !review_enabled
+        || !matches!(
+            job_lifecycle::load_accepted_bind(&context.home, followup_id),
+            Ok(None)
+        )
+    {
+        return Ok(None);
+    }
+    let Some(status) = crate::review::state::blocked_job(&context.home.root, job_id)? else {
+        return Ok(None);
+    };
+    let turn_one = job_lifecycle::load_accepted_bind(&context.home, job_id)
+        .ok()
+        .flatten()
+        .map(|bind| bind.result_id);
+    let settled = context
+        .store
+        .session_turns(job_id)
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|t| t.state == "collected" && t.followup_id != followup_id)
+        .filter_map(|t| t.result_id);
+    let history = turn_one
+        .into_iter()
+        .chain(settled)
+        .any(|result| result == status.subject.event);
+    Ok((!history).then_some(status))
 }
 
 /// Record (`Some`) or clear (`None`) the last refused settle under `key` — the job id, or a turn's
@@ -400,6 +509,14 @@ pub(super) fn facts(
                     &context.home,
                     &crate::session::collect_dir_name(job_id, t.turn),
                 ),
+                funds_held: session_reply::turn_funds_held(context, &t),
+                review_hold: (t.state == "delivered")
+                    .then(|| match turn_review_hold(context, job_id, &t.followup_id) {
+                        Ok(status) => status.map(|s| (s.state, s.detail)),
+                        // The watcher skips a turn whose hold it cannot read: report it as held.
+                        Err(error) => Some(("error".to_owned(), error)),
+                    })
+                    .flatten(),
                 state: t.state,
             })
     } else {
@@ -564,50 +681,81 @@ mod tests {
         assert_eq!(state(&delivered), ("manual", "collect_required", 1));
     }
 
-    // Turns ≥ 2 are never auto-settled; the hint must say collect is required, and still not a
-    // human decision.
+    // Turns ≥ 2 are auto-settled by the delivery watcher, exactly like turn 1: the hint says so,
+    // still forbids asking the human, and falls back to manual only when no price is held.
     #[test]
-    fn session_turns_two_and_later_are_manual() {
+    fn session_turns_two_and_later_are_auto() {
         let base = Facts {
             awarded: true,
             reservation: Some(ReservationState::Spent),
             ..Default::default()
         };
-        let with = |state: &str, failure: Option<&str>, path: Option<&str>| {
+        let with = |turn: Turn| {
             hint(&Facts {
-                latest_turn: Some(Turn {
-                    turn: 2,
-                    state: state.into(),
-                    failure: failure.map(Into::into),
-                    results_path: path.map(Into::into),
-                }),
+                latest_turn: Some(Turn { turn: 2, ..turn }),
                 ..base.clone()
             })
         };
-        let due = with("delivered", None, None);
-        assert_eq!(state(&due), ("manual", "collect_required", 2));
-        assert!(
-            note(&due).contains("does NOT settle session turns 2 and later"),
-            "{due}"
-        );
-        assert!(note(&due).contains("collect with turn=2"), "{due}");
+        let held = |state: &str| Turn {
+            state: state.into(),
+            funds_held: true,
+            ..Default::default()
+        };
+        let due = with(held("delivered"));
+        assert_eq!(state(&due), ("auto", "settling", 2));
+        assert!(note(&due).contains("settling it on its own"), "{due}");
+        assert!(note(&due).contains("collect is not needed"), "{due}");
         assert!(note(&due).contains("Do not ask the human"), "{due}");
+        assert!(!note(&due).contains("does NOT settle"), "{due}");
 
-        let refused = with("delivered", Some("integrity"), None);
-        assert_eq!(state(&refused), ("manual", "failed", 2));
+        let refused = with(Turn {
+            failure: Some("integrity".into()),
+            ..held("delivered")
+        });
+        assert_eq!(state(&refused), ("auto", "failed", 2));
         assert_eq!(refused["error"], json!("integrity"));
+        assert!(note(&refused).contains("collect with turn=2"), "{refused}");
 
-        let done = with("collected", None, Some("/h/results/j-t2"));
-        assert_eq!(state(&done), ("manual", "settled", 2));
+        let review_failed = with(Turn {
+            review_hold: Some(("error".into(), "review timed out".into())),
+            ..held("delivered")
+        });
+        assert_eq!(state(&review_failed), ("auto", "failed", 2));
+        assert_eq!(review_failed["error"], json!("review timed out"));
+        assert!(
+            note(&review_failed).contains("does not retry that on its own"),
+            "{review_failed}"
+        );
+        let review_pending = with(Turn {
+            review_hold: Some(("pending".into(), "Waiting".into())),
+            ..held("delivered")
+        });
+        assert_eq!(state(&review_pending), ("auto", "settling", 2));
+
+        let done = with(Turn {
+            results_path: Some("/h/results/j-t2".into()),
+            ..held("collected")
+        });
+        assert_eq!(state(&done), ("auto", "settled", 2));
         assert_eq!(done["results_path"], json!("/h/results/j-t2"));
 
+        assert_eq!(state(&with(held("sent"))), ("auto", "awaiting_delivery", 2));
         assert_eq!(
-            state(&with("sent", None, None)),
-            ("manual", "awaiting_delivery", 2)
+            state(&with(Turn {
+                state: "no_response".into(),
+                ..Default::default()
+            })),
+            ("auto", "none", 2)
         );
-        assert_eq!(
-            state(&with("no_response", None, None)),
-            ("manual", "none", 2)
-        );
+
+        // No price held (outside the watcher's work set): collect is required, still not a human
+        // decision.
+        let unheld = with(Turn {
+            state: "delivered".into(),
+            ..Default::default()
+        });
+        assert_eq!(state(&unheld), ("manual", "collect_required", 2));
+        assert!(note(&unheld).contains("collect with turn=2"), "{unheld}");
+        assert!(note(&unheld).contains("Do not ask the human"), "{unheld}");
     }
 }

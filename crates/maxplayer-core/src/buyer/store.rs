@@ -1089,6 +1089,29 @@ impl BuyerStore {
         Ok(jobs)
     }
 
+    /// Session jobs with a turn ≥ 2 the delivery watcher may have to settle — its turn work set
+    /// (docs/specs/session-jobs.md §8.4). A turn's reservation is keyed by its FOLLOW-UP id, which
+    /// has no `awards` row, so [`Self::awarded_unsettled_job_ids`] can never see one.
+    ///
+    /// A turn qualifies while it is `sent` (in flight: the watcher reads the relay to learn whether
+    /// it was delivered) or `delivered`, AND its price is still held: its follow-up reservation is
+    /// `reserved`, or it is a free turn (amount 0), which reserves nothing and so has no row until
+    /// it settles. A settled turn (`spent`), a released one, and every `collected`, `refused` or
+    /// `no_response` turn drop out. Which turn of a job settles next, and whether it may, is the
+    /// caller's decision (strict turn order); this only says which jobs to look at.
+    pub fn unsettled_turn_job_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT t.job_id FROM session_turns t
+             LEFT JOIN reservations r ON r.job_id = t.followup_id
+             WHERE t.state IN ('sent','delivered')
+               AND (r.state = 'reserved' OR (r.job_id IS NULL AND t.amount_sats = 0))
+             ORDER BY t.job_id",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Jobs whose award SETTLED (reservation `spent`) but whose attribution never landed — the
     /// boot heal's work set (#261). The settle-time attribution write is advisory and post-flip,
     /// so a crash after `convert_to_spent`, or a pay whose flip failed and was later converged by
@@ -1733,6 +1756,52 @@ mod tests {
         assert_eq!(store.session_committed_sats("job").unwrap(), 200);
         store.close_session("job", 9).unwrap();
         assert_eq!(store.open_session("job", 500, 10).unwrap(), (500, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The delivery watcher's turn work set: in-flight or delivered turns whose price is still
+    /// held (priced: follow-up reservation `reserved`; free: no row yet). Settled, released and
+    /// finished turns drop out, and a job is listed once however many turns qualify.
+    #[test]
+    fn unsettled_turn_job_ids_holds_live_turns_with_held_funds_only() {
+        let dir = std::env::temp_dir().join(format!("mx-buyer-turn-workset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = BuyerStore::open(dir.join("buyer.sqlite")).unwrap();
+        let turn = |id: &str, job: &str, n: u32, amount: u64, state: &str| {
+            store.put_turn(id, job, n, "{}", amount, 50, 1).unwrap();
+            store.set_turn_state(id, state, None, 2).unwrap();
+        };
+        // Priced, delivered, reserved: in.
+        turn("p-del", "job-a", 2, 100, "delivered");
+        store.reserve("p-del", 100, 1_000, 3).unwrap();
+        // Priced, sent, reserved, on the same job: the job is listed once.
+        turn("p-sent", "job-a", 3, 100, "sent");
+        store.reserve("p-sent", 100, 1_000, 3).unwrap();
+        // Free, sent, no reservation row: in.
+        turn("f-sent", "job-b", 2, 0, "sent");
+        // Priced, delivered, but released: out.
+        turn("p-rel", "job-c", 2, 100, "delivered");
+        store.reserve("p-rel", 100, 1_000, 3).unwrap();
+        store.release("p-rel", 4).unwrap();
+        // Priced, delivered, already spent (settled, row not yet flipped): out.
+        turn("p-spent", "job-d", 2, 100, "delivered");
+        store.reserve("p-spent", 100, 1_000, 3).unwrap();
+        store.convert_to_spent("p-spent", 100, 4).unwrap();
+        // Priced, delivered, no reservation row at all: outside the watcher's authority.
+        turn("p-none", "job-e", 2, 100, "delivered");
+        // Free, already settled (a spent zero row): out.
+        turn("f-spent", "job-f", 2, 0, "delivered");
+        store.convert_to_spent("f-spent", 0, 4).unwrap();
+        // Finished states: out, whatever the ledger says.
+        turn("f-col", "job-g", 2, 0, "collected");
+        turn("f-ref", "job-h", 2, 0, "refused");
+        turn("f-nr", "job-i", 2, 0, "no_response");
+        turn("f-pend", "job-j", 2, 0, "pending");
+        assert_eq!(
+            store.unsettled_turn_job_ids().unwrap(),
+            vec!["job-a".to_owned(), "job-b".to_owned()]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     use super::*;
