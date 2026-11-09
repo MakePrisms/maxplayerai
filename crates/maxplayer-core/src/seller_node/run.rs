@@ -7482,6 +7482,15 @@ impl SellerNodeRunner {
     }
 
     async fn on_offer(&self, event: &nostr_sdk::Event) {
+        // RC3-02: offer BACKFILL (`run_offer_backfill` -> `read_stored`), the preflight redrive and the
+        // private-content path all call this directly, NOT through `dispatch_event`, and
+        // `read_stored` reads the raw Message stream where relay-pool 0.44.3 re-emits a same-id,
+        // content-swapped event. `record_offer` is first-write-wins, so the buyer/price recorded here
+        // must come from an event that verifies.
+        let Some(verified_buyer) = crate::job_lifecycle::verified_author_hex(event) else {
+            opline!("seller node offer ignore id={}: event does not verify (id or signature)", event.id);
+            return;
+        };
         let Some(seller) = self.node.home().config.seller.clone() else {
             opline!("seller node offer skipped: no [seller] config");
             return;
@@ -7585,7 +7594,7 @@ impl SellerNodeRunner {
         let seller_pubkey = self.seller_pubkey.to_hex();
         // The buyer is the offer's author. Resolved here — ahead of the classify call — so the
         // allowlist fence can test it and the skip log can name the declined pubkey.
-        let buyer_pubkey = event.pubkey.to_hex();
+        let buyer_pubkey = verified_buyer;
         let now = now_unix();
         let deadline_unix = match classify_offer(&offer, &seller, &self.agents, &seller_pubkey, &buyer_pubkey, now as u64, event.created_at.as_secs())
         {
@@ -8123,7 +8132,8 @@ impl SellerNodeRunner {
                     Ok(Some((_, _, published))) => published,
                     _ => None,
                 };
-                let accept_author = event.pubkey.to_hex();
+                // Verified at the top of `on_accept`; re-derive from the verified value, never the claim.
+                let accept_author = crate::job_lifecycle::verified_author_hex(event).unwrap_or_default();
                 match match_award(
                     &accept.claim_id,
                     our_claim_id.as_deref(),
@@ -8218,7 +8228,8 @@ impl SellerNodeRunner {
         event: &nostr_sdk::Event,
         signal: &str,
     ) {
-        let author = event.pubkey.to_hex();
+        // RC3-02: a decision that does not verify has no author; it can never suppress.
+        let author = crate::job_lifecycle::verified_author_hex(event).unwrap_or_default();
         if author != buyer {
             opline_verbose!(
                 "seller node {signal} job_id={job_id}: author={author} is not the offer's buyer; \
@@ -10725,6 +10736,12 @@ impl SellerNodeRunner {
     /// collection from the breadcrumb), and only then record the receipt (deduped by the wrap id, so
     /// a replayed wrap credits the job at most once). Every refusal is logged with a named reason.
     async fn on_gift_wrap(&self, event: &nostr_sdk::Event) {
+        // RC3-02: wrap backfill calls this directly (not via `dispatch_event`); verify the outer 1059
+        // (signed by its ephemeral key) here so both entry points share one check.
+        if crate::job_lifecycle::verified_author_hex(event).is_none() {
+            opline!("seller node wrap ignore id={}: event does not verify", event.id);
+            return;
+        }
         if self.node.home().config.privacy.private_content_v2 {
             if let Ok(Ok(content)) = self.node.signer().unwrap_private_content(event.clone()).await {
                 let received = (|| {
@@ -11378,10 +11395,10 @@ impl SellerNodeRunner {
     }
 
     async fn dispatch_event(self: &Arc<Self>, event: &nostr_sdk::Event) {
-        // RC3-02: one verify at the work-lane choke point, for live AND backfilled events alike, so
-        // no handler below ever acts on an event whose id or signature does not verify — whatever the
-        // SDK's ingest or verification cache did. `on_award`/`on_accept` re-check on their own (they
-        // are also driven directly), and so do the relay-fetch gates that bypass this lane.
+        // RC3-02: one verify at the work-lane choke point for LIVE events, so no handler below acts on
+        // an event whose id or signature does not verify. Backfill and redrive call `on_offer` /
+        // `on_gift_wrap` directly, so those handlers (and `on_award` / `on_accept`, which are also
+        // driven directly) verify on their own; so do the relay-fetch gates that bypass this lane.
         if crate::job_lifecycle::verified_author_hex(event).is_none() {
             opline!(
                 "seller node drop id={} kind={}: event does not verify (id or signature)",
@@ -15410,6 +15427,58 @@ mod tests {
                     Some("claimed".to_owned()),
                     "neither a forged nor a misbound decision may take an offer off this seller"
                 );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// RC3-02 (advisor r1 High) — offer BACKFILL and redrive call `on_offer` directly, not through
+    /// `dispatch_event`, and `record_offer` is first-write-wins. A same-id redelivery of a genuine
+    /// offer with a swapped buyer and price (what relay-pool 0.44.3 can hand `read_stored`) must not
+    /// be recorded or claimed; the genuine offer afterwards is.
+    /// RED ON REVERT: drop the verify at the top of `on_offer` and the swap is recorded first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_same_id_swapped_offer_is_never_recorded_even_off_the_backfill_path() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::JsonUtil;
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("rc3-02-offer", &relay_url, true, 0, Some(0)).await;
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let buyer = Keys::generate();
+                let attacker = Keys::generate();
+                let draft = crate::gateway::OfferDraft::untargeted("genuine task", "", 100, now_unix() as u64 + 600)
+                    .to_event_draft();
+                let genuine = crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&buyer).unwrap();
+                let id = genuine.id.to_hex();
+                let swapped = {
+                    let mut value = serde_json::to_value(&genuine).expect("json");
+                    value["pubkey"] = serde_json::Value::String(attacker.public_key().to_hex());
+                    value["content"] = serde_json::Value::String("swapped task".into());
+                    nostr_sdk::Event::from_json(value.to_string()).expect("reparse (no verify)")
+                };
+                assert_eq!(swapped.id, genuine.id, "the swap keeps the genuine id");
+                assert!(swapped.verify().is_err());
+
+                runner.on_offer(&swapped).await;
+                assert!(
+                    runner.node.store().offer_facts(&id).expect("read").is_none(),
+                    "an unverifiable offer must not be recorded"
+                );
+                assert!(runner.node.store().claim_row_state(&id).expect("read").is_none());
+
+                runner.on_offer(&genuine).await;
+                let (recorded_buyer, _, _) = runner
+                    .node
+                    .store()
+                    .offer_facts(&id)
+                    .expect("read")
+                    .expect("the genuine offer is recorded afterwards");
+                assert_eq!(recorded_buyer, buyer.public_key().to_hex());
             })
             .await;
         let _ = std::fs::remove_dir_all(&root);

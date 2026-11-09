@@ -3159,10 +3159,15 @@ pub(crate) async fn award_presence_async(
     // would read as emptiness. Here a refusal surfaces as `Err` → the caller's Unverified — a
     // refused read is not an answered one.
     use nostr_sdk::pool::relay::ReqExitPolicy;
-    let mut events = relay
-        .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
-        .await
-        .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?;
+    // RC3-02: only awards that verify are evidence of what the relay holds; an unverifiable award
+    // (e.g. a same-id content swap the SDK's id-keyed verification cache let through) must never
+    // be parsed into a money row. Filtered BEFORE the emptiness discipline.
+    let mut events = authentic_events(
+        relay
+            .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+            .await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?,
+    );
 
     if events.is_empty() {
         // Emptiness means nothing until the relay shows it is answering us at all — and the
@@ -3177,10 +3182,12 @@ pub(crate) async fn award_presence_async(
             client.disconnect().await;
             return Ok(PresenceRead::Unverified);
         }
-        events = relay
-            .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
-            .await
-            .map_err(|error| JobLifecycleError::Relay(format!("fetch award (recheck): {error}")))?;
+        events = authentic_events(
+            relay
+                .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                .await
+                .map_err(|error| JobLifecycleError::Relay(format!("fetch award (recheck): {error}")))?,
+        );
         if events.is_empty() {
             client.disconnect().await;
             return Ok(PresenceRead::ConfirmedAbsent);
@@ -3609,10 +3616,16 @@ pub(crate) async fn fetch_job_view_async(
     // read as unknown — the discipline `award_presence_async` already relies on.
     use nostr_sdk::pool::relay::ReqExitPolicy;
     let offer_read_started = tokio::time::Instant::now();
-    let mut offer_events = relay
-        .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
-        .await
-        .map_err(|error| JobLifecycleError::Relay(format!("fetch offer: {error}")))?;
+    // RC3-02: every event this view is built from must verify. The legacy public claim/result
+    // lists below carry `event.pubkey` straight into the seller/invoice that `prepare_award_async`
+    // and `accept_claim_async` pay from, and relay-pool 0.44.3 can hand a fetch a same-id,
+    // content-swapped event. (v2 and private events are additionally validated downstream.)
+    let mut offer_events = authentic_events(
+        relay
+            .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
+            .await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch offer: {error}")))?,
+    );
 
     // `read_confirmed` is derived from the OFFER read ALONE. A claim or result event is the relay
     // answering a DIFFERENT filter — it proves the session is alive but says NOTHING about whether
@@ -3637,12 +3650,14 @@ pub(crate) async fn fetch_job_view_async(
             crate::buyer::relay::probe_relay_serves_our_reqs(&client, keys.public_key(), timeout)
                 .await;
         if confirmed {
-            offer_events = relay
-                .fetch_events(offer_filter, timeout, ReqExitPolicy::ExitOnEOSE)
-                .await
-                .map_err(|error| {
-                    JobLifecycleError::Relay(format!("fetch offer (recheck): {error}"))
-                })?;
+            offer_events = authentic_events(
+                relay
+                    .fetch_events(offer_filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                    .await
+                    .map_err(|error| {
+                        JobLifecycleError::Relay(format!("fetch offer (recheck): {error}"))
+                    })?,
+            );
         }
         // Make the why-empty question observable next time (the report the tree lacked): whether
         // the relay answered our REQ, whether the recheck found the offer, and how long it took.
@@ -3674,10 +3689,10 @@ pub(crate) async fn fetch_job_view_async(
         if read.is_err() { client.disconnect().await; }
         read?
     } else {
-        (client.fetch_events(feedback_filter, timeout).await
-            .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?.into_iter().collect(),
-         client.fetch_events(result_filter, timeout).await
-            .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?.into_iter().collect(),
+        (authentic_events(client.fetch_events(feedback_filter, timeout).await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?),
+         authentic_events(client.fetch_events(result_filter, timeout).await
+            .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?),
          Vec::new())
     };
 

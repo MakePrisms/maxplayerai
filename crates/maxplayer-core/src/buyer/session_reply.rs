@@ -1042,7 +1042,11 @@ async fn settle_job_turns(
                             .award_record(job_id)
                             .ok()
                             .flatten()
-                            .is_some_and(|award| award.seller_pubkey == event.pubkey.to_hex())
+                            .is_some_and(|award| {
+                                // RC3-02: a replacement counts only from a VERIFIED author.
+                                job_lifecycle::verified_author_hex(event)
+                                    .is_some_and(|author| author == award.seller_pubkey)
+                            })
                 });
                 if !replacement {
                     return;
@@ -1124,7 +1128,12 @@ pub(super) async fn on_turn_feedback(context: &BuyerContext, event: &nostr_sdk::
     let Ok(Some(turn)) = context.store.turn(&followup) else {
         return false;
     };
-    let seller_ok = matches!(context.store.award_record(&turn.job_id), Ok(Some(a)) if a.seller_pubkey == event.pubkey.to_hex());
+    // RC3-02: authorize the turn release on a VERIFIED author only (`None` never releases).
+    let verified = job_lifecycle::verified_author_hex(event);
+    let seller_ok = matches!(
+        (context.store.award_record(&turn.job_id), verified.as_deref()),
+        (Ok(Some(a)), Some(author)) if a.seller_pubkey == author
+    );
     let failure = matches!(tag("status").as_deref(), Some("error" | "refusal"));
     if !seller_ok
         || !failure
