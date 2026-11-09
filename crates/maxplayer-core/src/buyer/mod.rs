@@ -77,6 +77,9 @@ const RELAY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
 mod lifecycle_history_tests;
+/// The delivery watcher settling session turns ≥ 2 (docs/specs/session-jobs.md §8.4).
+#[cfg(test)]
+mod session_turn_settle_tests;
 /// How often the background auto-award task re-checks the relay for a payable claim, until one
 /// appears or the offer deadline passes. Bounded polling (no tight spin on a live-but-unpayable claim).
 const AUTO_AWARD_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -3035,7 +3038,8 @@ async fn resolve_award_attempts(context: &BuyerContext) {
     }
 }
 
-/// Settle awarded-but-unsettled jobs through the daemon's single spend path.
+/// Settle awarded-but-unsettled jobs through the daemon's single spend path, then their delivered
+/// session turns ≥ 2 ([`session_reply::settle_delivered_turns`]).
 ///
 /// `wake` narrows the sweep to the jobs a just-arrived result references (the fast path); `None`
 /// sweeps the whole set (boot, the backstop tick, and after a `Lagged` gap).
@@ -3113,6 +3117,9 @@ async fn settle_awarded(context: &Arc<BuyerContext>, wake: Option<&nostr_sdk::Ev
             Err(error) => crate::opline!("buyer: delivery watcher could not settle {job_id}: {error}"),
         }
     }
+    // Session turns ≥ 2 (§8.4): their reservations are keyed by follow-up ids, which have no award
+    // row, so the pass above never sees them. Same wake, same narrowing, same settle path.
+    session_reply::settle_delivered_turns(context, wake, &session_reply::SealedTurnPay).await;
 }
 
 /// Consume a seller's post-award FEEDBACK (kind-3404) and, when it reports a POST-AWARD FAILURE

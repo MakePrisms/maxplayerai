@@ -218,8 +218,8 @@ adds a fifth, `reply` — see *Session jobs* below):
    the budget gate, pays once, and writes the paid files below
    `$MAXPLAYER_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
    Usually not needed: it is the explicit version of the daemon's own settle, for retrying a
-   `failed` one or for a delivery outside it (`settlement.state: "collect_required"`, e.g. a
-   session turn 2 or later).
+   `failed` one or for a delivery outside it (`settlement.state: "collect_required"`: an award
+   or session turn the daemon holds no reservation for).
 
 In practice: `post_job`, then `get_job` (`wait_for: "result"`) — the daemon auto-awards a payable
 claim and auto-settles the delivery on its own. `get_job` → `settlement` says where it stands
@@ -235,9 +235,9 @@ seller instead of posting a new one: `collect` the delivered turn, then call **`
 `get_job` → `session.question`). Each turn costs the job's price and must fit both the per-job cap and
 the session cap (`max_session_sats` on `post_job` or `reply`; `reply`'s value wins; default 10× the
 price; it is never sent to the seller); `reply` refuses before signing anything
-when the previous turn is not collected yet. The daemon settles turn 1 on its own; turns 2 and
-later are settled only by `collect` (the newest delivered turn is chosen automatically, or pass
-`turn`) into `results/<job_id>-t<n>`. Ending the session is optional — it expires at
+when the previous turn is not collected yet. The daemon settles every turn on its own, turn 1 and
+turns 2 and later alike, strictly in turn order, into `results/<job_id>-t<n>` for turn n ≥ 2;
+`collect` (the newest delivered turn is chosen automatically, or pass `turn`) is the explicit retry. Ending the session is optional — it expires at
 `session.expires_hint` — or end it early with `reply` `close: true` or `collect`
 `close_session: true`. With the flag off (the default) none
 of this appears.

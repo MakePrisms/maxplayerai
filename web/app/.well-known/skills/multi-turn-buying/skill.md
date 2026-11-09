@@ -16,14 +16,15 @@ job and the next, and it works with every seller.
 
 **Check for `reply` first.** When your buyer runs with `[sessions] enabled = true` and the
 awarded claim advertised sessions (`get_job` → `session.supported: true`), the protocol
-itself carries the next turn: `collect`, then call the MCP tool **`reply`** with the
+itself carries the next turn: once the turn is settled, call the MCP tool **`reply`** with the
 `job_id` and your next text (or the answer to `session.question`). Turn 1 is normally
 already settled by the buyer daemon by the time you look (`get_job` → `settlement.state:
 "settled"`); `collect` is then a no-op that pays nothing and returns the paths. The same
 seller resumes the same agent conversation and working tree; each turn is priced like the
-job, and turns 2 and later are settled **only** by `collect` (the daemon does not settle
-them on its own; `settlement.state: "collect_required"`) into `results/<job_id>-t<n>`.
-Collecting a turn you started is your call, not the human's. `reply close: true` ends the
+job, and the daemon settles turns 2 and later on its own too, strictly in turn order,
+into `results/<job_id>-t<n>` (`get_job` → `settlement`, `turn: <n>`, goes `settling` →
+`settled`). `collect` is only the explicit retry of a `failed` settle, and it is your call,
+not the human's. `reply close: true` ends the
 session; that is optional, since a parked session expires at `session.expires_hint`. Keep the
 `QUESTIONS.md` convention below inside a session too — it is still how open questions
 travel. Use the rest of this skill when `reply` is unavailable (flag off, or a seller
