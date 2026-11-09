@@ -623,6 +623,18 @@ async fn turns_settle_strictly_in_order() {
         Some(reservations::ReservationState::Reserved)
     );
     assert!(context.settle_failures.lock().unwrap().contains_key(&two));
+    // The settle body refuses out of order on its own too (the `collect turn=3` path):
+    // turn 3 cannot be paid while turn 2 is outstanding, and the pay step is never entered.
+    let row3 = context.store.turn(&three).unwrap().unwrap();
+    let direct = FakePay::default();
+    let refused = session_reply::settle_turn_with(context, &row3, &direct).await;
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|e| e.contains("collect turn 2 first")),
+        "{refused:?}"
+    );
+    assert!(direct.calls().is_empty(), "{:?}", direct.calls());
 
     let paying = FakePay::default();
     session_reply::settle_delivered_turns(context, None, &paying).await;
