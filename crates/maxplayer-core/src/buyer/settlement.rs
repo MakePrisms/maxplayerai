@@ -161,18 +161,7 @@ pub(super) fn hint(f: &Facts) -> Value {
                         ),
                     );
                 }
-                return body(
-                    MODE_AUTO,
-                    "failed",
-                    1,
-                    None,
-                    Some(detail),
-                    format!(
-                        "The delivery review did not pass ({state}; see error), and the daemon \
-                         does not retry that on its own. Fix the cause, then call collect to retry \
-                         explicitly; see the maxplayer-debug-buying skill."
-                    ),
-                );
+                return body(MODE_AUTO, "failed", 1, None, Some(detail), review_note(state));
             }
             if f.delivered {
                 return body(
@@ -203,6 +192,25 @@ pub(super) fn hint(f: &Facts) -> Value {
     }
 }
 
+/// The note for a turn-1 delivery whose review did not pass. `collect` re-runs the review (accept
+/// reviews a delivery that has no bind yet), so it retries a review that did not FINISH (`error`:
+/// reviewer down, timed out, failed) but can never override one that refused the delivery.
+fn review_note(state: &str) -> String {
+    match state {
+        "error" => format!(
+            "The delivery review did not finish ({state}: the reviewer was unreachable, timed out \
+             or failed; see error), and the daemon does not retry that on its own. Call collect to \
+             retry the review and the settle now; it never pays twice. If it keeps failing, see the \
+             maxplayer-debug-buying skill. {NOT_A_HUMAN_DECISION}"
+        ),
+        _ => format!(
+            "The delivery review refused this delivery ({state}; see error). collect re-runs the \
+             review, so it cannot override a refusal; nothing is paid unless a review passes. See \
+             the maxplayer-debug-buying skill."
+        ),
+    }
+}
+
 fn settled_turn_one(f: &Facts) -> Value {
     let mode = if f.awarded { MODE_AUTO } else { MODE_MANUAL };
     body(
@@ -213,8 +221,8 @@ fn settled_turn_one(f: &Facts) -> Value {
         None,
         "Settled: the delivery was accepted, verified, paid (a free job pays nothing) and \
          materialized; the files are under results_path (absent only when an earlier collect used \
-         out=). collect is not needed: it is idempotent and would only return the same paths and \
-         pay summary, without paying again."
+         out=). commit_oid, files and pay here are what collect would return, so collect is not \
+         needed: it is idempotent and would only repeat them, without paying again."
             .to_owned(),
     )
 }
@@ -639,6 +647,19 @@ mod tests {
             note(&held).contains("does not retry that on its own"),
             "{held}"
         );
+        assert!(note(&held).contains("Call collect to retry the review"), "{held}");
+
+        // A refusal is not retryable by collect: it re-runs the review, it does not override it.
+        for refused in ["policy_refused", "input_refused"] {
+            let hint = hint(&Facts {
+                delivered: true,
+                review_hold: Some((refused.into(), "threshold".into())),
+                ..reserved_award()
+            });
+            assert_eq!(state(&hint), ("auto", "failed", 1));
+            assert!(note(&hint).contains("cannot override a refusal"), "{hint}");
+            assert!(!note(&hint).contains("Call collect to retry"), "{hint}");
+        }
 
         let pending = hint(&Facts {
             delivered: true,

@@ -580,6 +580,7 @@ pays leaves the session parked until it expires; the seller's exposure is one tu
 `collect(job_id)` settles the newest delivered, uncollected turn (optional `turn`). Turn 1 materializes
 to `results/<job_id>` as today (`core/collect.rs:458 @e0262420`); turn n to `results/<job_id>-t<n>`.
 Verification additionally checks the commit's single parent is the previous git turn's accepted commit.
+Closing is not part of collect: `reply close: true` (§10) is the one way to close a session.
 
 *Found while implementing:* "previous git turn" skips inline turns (an inline turn keeps the base,
 §7.2), down to turn 1. When every earlier turn was inline, the seller's base is its own provisioning
@@ -663,7 +664,9 @@ routing `:422 @e0262420`; `AGENTS.md:41` says "exactly the four-tool buyer trade
   no result reports `pending`, `refused` (seller feedback refused or failed it) or `no_response`,
   never `done` (rc2). `no_response`: the follow-up's deadline passed with no result; the reservation is released
   (as feedback-driven releases do today, `core/buyer/mod.rs:2934 @e0262420`) and `reply` may retry.
-- **`collect`** gains `turn?` and `close_session?` (collect, then send close).
+- **`collect`** gains `turn?`. *Changed 9 Nov 2026 (Petar):* it also gained `close_session?`
+  (collect, then send close); that is now a deprecated daemon alias kept for one release. The MCP
+  schema no longer lists it, and `reply close: true` is the one documented way to close.
 
 *Found while implementing:* `reply` and the `collect` params are listed (and `reply` routed) only
 when the buyer runs with `[sessions] enabled = true`; with the flag off the tool list is

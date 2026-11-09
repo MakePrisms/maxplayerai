@@ -56,7 +56,8 @@ fn usage(err: &mut dyn Write) {
          offer and the claim agreed on, then materializes the files under <home>/results/<job_id>.\n\
          A priced job (payment=sat) pays the seller through the sealed money path; a free job\n\
          (payment=none) pays nothing and opens no wallet. Idempotent: re-collecting\n\
-         re-materializes without a second payment.\n\
+         re-materializes without a second payment. The buyer daemon runs this settle on its own;\n\
+         this command is the manual trigger (a failed settle, an unfinished delivery review).\n\
          Exit codes: 0 success, 1 usage error, 2 runtime error"
     );
 }

@@ -211,9 +211,15 @@ not pass, which waits for an explicit retry. Session turns 2 and later work the 
 with no `error` usually means the daemon is not running: check `maxplayer buyer status`.
 
 **Fix:** fix the named cause, then run `collect` for the job (MCP, or
-`maxplayer collect <job_id>`; add `turn: <n>` for a session turn): it retries the same
-settle and never pays twice. A
-refusal before the pay step costs nothing.
+`maxplayer collect <job_id>`; add `turn: <n>` for a session turn): it is a manual trigger
+of the same settle and never pays twice. A refusal before the pay step costs nothing.
+
+**A delivery review that did not pass.** `collect` re-runs the review. If the review did
+not *finish* (`error`: the reviewer was unreachable, timed out or failed), `collect` is
+how you retry it, since the daemon does not. If the review *refused* the delivery
+(`policy_refused`, `input_refused`), `collect` cannot override that: it reviews again
+and refuses again, and nothing is paid. Ask the seller for a new delivery or post a new
+job instead.
 
 ---
 
