@@ -520,6 +520,7 @@ fn private_contribution_reads_only_the_relay_job_repo_after_posting() {
             &home_a,
             Some(&mut gate),
             CollectRequest {
+                accept_review_verdict: None,
                 job_id: outcome.job_id.clone(),
                 out: None,
             },
@@ -599,6 +600,7 @@ fn private_contribution_reads_only_the_relay_job_repo_after_posting() {
             &home_b,
             None,
             CollectRequest {
+                accept_review_verdict: None,
                 job_id: offer_id_b.clone(),
                 out: None,
             },

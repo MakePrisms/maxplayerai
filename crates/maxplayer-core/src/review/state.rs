@@ -24,6 +24,10 @@ pub fn write(root: &Path, subject: &Subject, state: &str, detail: &str) -> Resul
             "Retrying unchanged input cannot help. Correct the input or update the reviewer, then explicitly retry.".into()
         } else if subject.kind == JOB_OFFER_KIND {
             format!("maxplayer review retry {}", subject.event)
+        } else if state == "policy_refused" {
+            format!(
+                "Deterministic verdict: repeating collect or accept unchanged returns the same refusal; {VERDICT_DECISION_GUIDANCE}."
+            )
         } else {
             "Retry the same collect or accept operation; no new job or delivery is needed.".into()
         },
@@ -122,7 +126,10 @@ pub fn completed(
             subject,
             if permanent_error(e) {
                 "input_refused"
-            } else if e.contains("threshold") || e.contains("conflicting") {
+            } else if e.starts_with(VERDICT_REFUSED_PREFIX)
+                || e.contains("threshold")
+                || e.contains("conflicting")
+            {
                 "policy_refused"
             } else {
                 "error"
@@ -193,6 +200,19 @@ mod buyer_hold_tests {
         assert!(blocked_job(&root, &s.offer).unwrap().is_none());
         write(&root, &s, "error", "timeout").unwrap();
         assert!(blocked_job(&root, &s.offer).unwrap().is_some());
+        completed(&root, &s, &Err(format!("{VERDICT_REFUSED_PREFIX} this delivery: unsafe probability 900000 ppm; threshold 500000 ppm"))).unwrap();
+        let status = read(&root, &s.event).unwrap();
+        assert_eq!(status.state, "policy_refused");
+        assert!(status.retry.starts_with("Deterministic verdict:"));
+        assert!(status.retry.contains("accept_review_verdict"));
+        assert!(blocked_job(&root, &s.offer).unwrap().is_some());
+        completed(&root, &s, &Err("review: timeout; retry available".into())).unwrap();
+        let status = read(&root, &s.event).unwrap();
+        assert_eq!(status.state, "error");
+        assert_eq!(
+            status.retry,
+            "Retry the same collect or accept operation; no new job or delivery is needed."
+        );
         write(&root, &s, "pending", "explicit retry").unwrap();
         assert!(blocked_job(&root, &s.offer).unwrap().is_some());
         write(&root, &s, "passed", "signed result").unwrap();

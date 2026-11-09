@@ -73,6 +73,7 @@ pub async fn accept_turn_async(
         &review_subject,
         &first.seller_pubkey,
         result.private_evidence.as_ref(),
+        None,
     )
     .await
     .map_err(JobLifecycleError::Input)?;
@@ -102,7 +103,8 @@ pub async fn accept_turn_async(
         return finish_existing(home, &keys, bind, job_id, followup_id).await;
     }
     if let Some(id) = review_id {
-        crate::review::record_pass(home, &review_subject, &id).map_err(JobLifecycleError::Input)?;
+        crate::review::record_pass(home, &review_subject, &id, None)
+            .map_err(JobLifecycleError::Input)?;
     }
     let seller_signature = require_seller_signature(&result.seller_signature)?;
     let contribution_offer = offer.contribution.is_some()
