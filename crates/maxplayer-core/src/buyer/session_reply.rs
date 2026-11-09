@@ -3,7 +3,7 @@
 //! Every entry point is inert unless `[sessions] enabled = true`.
 use super::store::BuyerTurn;
 use super::*;
-use crate::session::{FollowUp, FollowUpStatus, ReplyPreflight};
+use crate::session::{FollowUp, FollowUpStatus, ReplyPreflight, UncollectedTurn};
 use nostr_sdk::JsonUtil;
 
 /// A turn the seller may still answer or the buyer still owes a decision on.
@@ -21,6 +21,9 @@ pub(super) struct Facts {
     pub turns: Vec<BuyerTurn>,
     /// Follow-up id → the result that answers it (relay view, awarded seller only).
     pub delivered: BTreeMap<String, String>,
+    /// How the delivered, uncollected turn (if any) will settle: [`uncollected_settle`], filled in
+    /// by `reply` only. Never a money input; it picks the refusal's wording.
+    pub uncollected_settle: Option<UncollectedTurn>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +118,12 @@ where
     crate::session::reply_preflight(&ReplyPreflight {
         claim_supports_sessions: facts.claim_session,
         session_live: money.live,
-        uncollected_turn: p.uncollected,
+        uncollected_turn: p.uncollected.map(|turn| {
+            let settle = facts.uncollected_settle.clone().unwrap_or_else(|| {
+                UncollectedTurn::CollectRequired("its settlement state was not read".into())
+            });
+            (turn, settle)
+        }),
         turn_in_flight: p.in_flight,
         // A re-send is already counted in `committed`; it adds nothing.
         price_sats: if resend { 0 } else { money.price },
@@ -237,7 +245,46 @@ pub(super) fn facts(
         turn1_result: bind.map(|b| b.result_id),
         turns,
         delivered,
+        uncollected_settle: None,
     })
+}
+
+/// How the delivered, uncollected turn `turn` of `job_id` will settle, read off the very object
+/// `get_job` returns as `settlement` ([`settlement::facts`] + [`settlement::hint`]: the reservation,
+/// the recorded settle refusal ([`settlement::note_refusal`]), the review hold
+/// ([`settlement::turn_review_hold`] / [`settlement::auto_settle_review_hold`]) and whether the
+/// turn's funds are held), so `reply` and `get_job.settlement` can never disagree. Read-only.
+pub(super) fn uncollected_settle(
+    context: &BuyerContext,
+    job_id: &str,
+    turn: u32,
+) -> UncollectedTurn {
+    // `reply` runs only on an awarded job, and the turn is delivered (that is why it is uncollected).
+    match settlement::facts(context, job_id, true, true) {
+        Ok(facts) => classify_settlement(&settlement::hint(&facts), turn),
+        Err(error) => UncollectedTurn::CollectRequired(format!(
+            "its settlement state could not be read: {error}"
+        )),
+    }
+}
+
+/// `settling` (the delivery watcher is on it, review in flight included) means wait; `settled`
+/// means the watcher won the race and a retry goes through. Anything else (`failed`,
+/// `collect_required`, a different turn) is not going to settle on its own: say why.
+fn classify_settlement(hint: &Value, turn: u32) -> UncollectedTurn {
+    let state = hint["state"].as_str().unwrap_or("unknown");
+    let ours = hint["turn"].as_u64() == Some(u64::from(turn));
+    if ours && hint["mode"] == settlement::MODE_AUTO && matches!(state, "settling" | "settled") {
+        return UncollectedTurn::Settling;
+    }
+    let reason = match (state, hint["error"].as_str()) {
+        (_, Some(error)) => format!("{state}: {error}"),
+        ("collect_required", None) => {
+            "collect_required: the daemon holds no reservation for it".to_owned()
+        }
+        _ => state.to_owned(),
+    };
+    UncollectedTurn::CollectRequired(reason)
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,7 +374,10 @@ async fn reply_inner(context: &Arc<BuyerContext>, params: ReplyParams) -> Result
     let offer = view.offer.as_ref().ok_or("offer not found on the relay")?;
     let facts = facts(context, job_id, &award, &view)?;
     sweep_no_response(&context.store, &facts, now, &guard);
-    let facts = self::facts(context, job_id, &award, &view)?;
+    let mut facts = self::facts(context, job_id, &award, &view)?;
+    if let Some(turn) = progress(&facts).uncollected {
+        facts.uncollected_settle = Some(uncollected_settle(context, job_id, turn));
+    }
     if params.close {
         drop(guard);
         send_close(context, job_id, &award.seller_pubkey).await?;
@@ -1148,7 +1198,7 @@ mod tests {
                 },
                 "per-job cap",
             ),
-            (uncollected, MONEY, "collect first"),
+            (uncollected, MONEY, "could not settle automatically"),
             (no_session, MONEY, "does not support sessions"),
             (
                 ready(),

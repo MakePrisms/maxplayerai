@@ -845,3 +845,141 @@ async fn a_review_held_turn_is_not_retried_in_the_background() {
         "collected"
     );
 }
+
+/// `reply` on `session.job_id`; `Err` carries the refusal text.
+async fn reply_to(context: &Arc<BuyerContext>, job_id: &str) -> Result<Value, String> {
+    let response = session_reply::reply(
+        context,
+        json!(1),
+        json!({ "job_id": job_id, "text": "and one more thing" }),
+    )
+    .await;
+    match (response.result, response.error) {
+        (Some(result), None) => Ok(result),
+        (_, Some(error)) => Err(error.message),
+        (None, None) => Err("empty response".into()),
+    }
+}
+
+/// `reply` refused locally: still exactly one turn row, nothing new signed or reserved.
+fn assert_nothing_started(context: &BuyerContext, session: &Session) {
+    let turns = context.store.session_turns(&session.job_id).unwrap();
+    assert_eq!(
+        turns.len(),
+        1,
+        "a refused reply stores no new turn: {turns:?}"
+    );
+    assert_eq!(turns[0].followup_id, session.followup_id);
+}
+
+// ★ REPLY WHILE TURN 2 SETTLES. Turn 2 is delivered and the delivery watcher has not run yet (the
+// few seconds #1268 leaves). `reply` refuses, but must NOT tell the agent to collect: the daemon is
+// about to settle it, and get_job.settlement says `auto`/`settling` for the same turn. Once the
+// settle is refused (recorded by the watcher) or the turn's funds are no longer held, the daemon
+// will not settle it, and `reply` points at `collect` for that turn with the reason get_job shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_says_settling_until_the_daemon_cannot_settle_the_turn() {
+    let daemon = Daemon::start(false).await;
+    let context = &daemon.context;
+    let session = session_on_relay(&daemon, 2).await;
+    deliver_turn_two(&daemon, &session, "turn two answer", None).await;
+
+    let refused = reply_to(context, &session.job_id).await.unwrap_err();
+    assert_eq!(
+        refused,
+        "turn 2 is still settling (the daemon settles it automatically); check get_job \
+         settlement and retry reply shortly"
+    );
+    let settlement = settlement_of(context, &session.job_id).await;
+    assert_eq!(
+        (
+            &settlement["mode"],
+            &settlement["state"],
+            &settlement["turn"]
+        ),
+        (&json!("auto"), &json!("settling"), &json!(2)),
+        "reply and get_job.settlement agree: {settlement}"
+    );
+    assert_nothing_started(context, &session);
+
+    // The watcher's settle was refused: it is recorded per follow-up, get_job reads `failed`.
+    settlement::note_refusal(
+        context,
+        &session.followup_id,
+        Some("payment request mint not accepted".into()),
+    );
+    let refused = reply_to(context, &session.job_id).await.unwrap_err();
+    assert_eq!(
+        refused,
+        "turn 2 could not settle automatically (failed: payment request mint not accepted); run \
+         collect for turn 2, then retry reply"
+    );
+    assert_eq!(
+        settlement_of(context, &session.job_id).await["state"],
+        json!("failed")
+    );
+    assert_nothing_started(context, &session);
+
+    // No funds held for the turn: outside the watcher's work set, get_job reads `collect_required`.
+    settlement::note_refusal(context, &session.followup_id, None);
+    context
+        .store
+        .release(&session.followup_id, now_unix())
+        .expect("release");
+    let refused = reply_to(context, &session.job_id).await.unwrap_err();
+    assert!(
+        refused.starts_with("turn 2 could not settle automatically (collect_required")
+            && refused.ends_with("run collect for turn 2, then retry reply"),
+        "{refused}"
+    );
+    assert_eq!(
+        settlement_of(context, &session.job_id).await["state"],
+        json!("collect_required")
+    );
+    assert_nothing_started(context, &session);
+}
+
+// ★ REPLY ON A REVIEW-HELD TURN. A turn whose delivery review is still running is settled by the
+// daemon once it passes: `reply` says settling. One whose review timed out is never retried in the
+// background: `reply` points at `collect` with the review's detail, as get_job.settlement does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reply_on_a_review_held_turn_points_at_collect_with_the_reason() {
+    let daemon = Daemon::start(true).await;
+    let context = &daemon.context;
+    let session = session_on_relay(&daemon, 2).await;
+    let result = deliver_turn_two(&daemon, &session, "turn two answer", None).await;
+    let held = |state: &str, detail: &str| {
+        crate::review::state::write(
+            &context.home.root,
+            &crate::review::Subject {
+                offer: session.job_id.clone(),
+                event: result.id.to_hex(),
+                kind: crate::kinds::JOB_RESULT_KIND,
+                commit: None,
+            },
+            state,
+            detail,
+        )
+        .expect("review status");
+    };
+
+    held("pending", "reviewing");
+    let refused = reply_to(context, &session.job_id).await.unwrap_err();
+    assert!(refused.starts_with("turn 2 is still settling"), "{refused}");
+    assert_nothing_started(context, &session);
+
+    held("error", "review timed out");
+    let refused = reply_to(context, &session.job_id).await.unwrap_err();
+    assert_eq!(
+        refused,
+        "turn 2 could not settle automatically (failed: review timed out); run collect for turn \
+         2, then retry reply"
+    );
+    let settlement = settlement_of(context, &session.job_id).await;
+    assert_eq!(
+        (&settlement["state"], &settlement["error"]),
+        (&json!("failed"), &json!("review timed out")),
+        "{settlement}"
+    );
+    assert_nothing_started(context, &session);
+}
