@@ -1,34 +1,48 @@
 //! Environment-backend resolution and effect-injected provisioning.
+//!
+//! RC3-01 (v0.7.3-rc3 external review): production NEVER provisions a buyer-declared checks
+//! environment. The seller's host delivery path refuses any `.maxplayer/checks.toml` declaration
+//! (`ProvisionRefusal::HostDeliveryRefused`) and container delivery never reads it. Everything that
+//! could build an exec argv or spawn a process (`HostEnvRunner`, `EnvEffects`, `provision`,
+//! `resolve_backend`, ...) is therefore compiled for tests ONLY, so production code cannot call it.
+//! A future sandboxed checks runner must re-introduce these deliberately. Live here: declaration
+//! capture, the refusal type and its buyer feedback.
 
 use std::fmt;
+#[cfg(test)]
 use std::path::PathBuf;
 
 use crate::checks::{self, ChecksDeclaration, ChecksError, EnvKind};
 use crate::gateway;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnvBackend {
     NixFlake { workdir: PathBuf, devshell: String },
     ContainerImage { digest: String },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnvPosture {
     Provision,
     Checks,
 }
 
+#[cfg(test)]
 pub trait EnvRunner {
     fn argv_prefix(&self, backend: &EnvBackend, posture: EnvPosture) -> Vec<String>;
     fn container_runtime(&self) -> Option<&str>;
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostEnvRunner {
     pub container_runtime: Option<String>,
     pub mount_dir: PathBuf,
 }
 
+#[cfg(test)]
 impl EnvRunner for HostEnvRunner {
     fn argv_prefix(&self, backend: &EnvBackend, posture: EnvPosture) -> Vec<String> {
         match backend {
@@ -65,16 +79,19 @@ impl EnvRunner for HostEnvRunner {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectOutput {
     pub status: i32,
     pub stdout: String,
 }
 
+#[cfg(test)]
 pub trait EnvEffects {
     fn run(&self, argv: &[String]) -> Result<EffectOutput, EnvProvisionError>;
 }
 
+#[cfg(test)]
 pub fn compose(
     policy_wrap: &dyn Fn(Vec<String>) -> Vec<String>,
     mut prefix: Vec<String>,
@@ -116,6 +133,7 @@ impl fmt::Display for EnvProvisionError {
 
 impl std::error::Error for EnvProvisionError {}
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionedEnv {
     pub backend: EnvBackend,
@@ -123,6 +141,7 @@ pub struct ProvisionedEnv {
     pub warmed: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProvisionOutcomeClass {
     Infra,
@@ -142,6 +161,7 @@ pub enum ProvisionRefusal {
     HostDeliveryRefused { env_kind: EnvKind },
 }
 
+#[cfg(test)]
 pub fn provision(
     effects: &dyn EnvEffects,
     runner: &dyn EnvRunner,
@@ -192,6 +212,7 @@ pub fn provision(
     })
 }
 
+#[cfg(test)]
 fn require_success(
     effects: &dyn EnvEffects,
     argv: Vec<String>,
@@ -206,6 +227,7 @@ fn require_success(
     Ok(output)
 }
 
+#[cfg(test)]
 pub fn classify_provision_failure(error: &EnvProvisionError) -> ProvisionOutcomeClass {
     match error {
         EnvProvisionError::BackendUnavailable { .. }
@@ -239,6 +261,7 @@ pub fn capture_job_checks(
     Ok((bytes, declaration))
 }
 
+#[cfg(test)]
 pub fn resolve_backend(declaration: &ChecksDeclaration) -> Result<EnvBackend, EnvProvisionError> {
     match declaration.env_kind {
         EnvKind::NixFlake => Ok(EnvBackend::NixFlake {

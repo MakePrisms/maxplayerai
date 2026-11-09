@@ -2664,9 +2664,10 @@ fn plan_delivery_workdir(
 
 /// Provision a job's delivery workdir from its STORED contribution pin — the single routing seam
 /// `execute_job` uses on BOTH the fresh-award and restart/resume paths. Reads the pin, plans, and
-/// initializes: a recorded pin clones the pinned base at `base_oid` onto the per-job fork branch,
-/// captures any checks declaration from that commit's tree, provisions its environment, and persists
-/// the exact declaration bytes plus resolved environment reference. No pin gives the empty-workdir
+/// initializes: a recorded pin clones the pinned base at `base_oid` onto the per-job fork branch, then
+/// parses `.maxplayer/checks.toml` from that commit and REFUSES any declaration
+/// (`HostDeliveryRefused`, RC3-01); a base without a declaration is left as checked out. No pin
+/// gives the empty-workdir
 /// default (a from-scratch job, unchanged). A pin READ error is mapped to an init error so the caller
 /// fails the job rather than silently degrading a served contribution to an empty workdir.
 ///
@@ -2717,16 +2718,24 @@ async fn provision_delivery_workdir(
         }
     } };
 
-    let checks_workdir = workdir.clone();
+    finish_checked_out_workdir(workdir, base_oid).await.map(Some)
+}
+
+/// Everything `provision_delivery_workdir` does AFTER the base is checked out (private input
+/// baseline or contribution clone), split out only so tests can drive it behind the REAL checkout
+/// functions without a network base. Today that is exactly one step: the RC3-01 refusal of a
+/// buyer-declared checks environment. Returns the base oid the delivery must descend from.
+async fn finish_checked_out_workdir(
+    workdir: std::path::PathBuf,
+    base_oid: String,
+) -> Result<String, DeliveryWorkdirError> {
     let checks_base_oid = base_oid.clone();
-    tokio::task::spawn_blocking(move || {
-        refuse_host_checks_declaration(&checks_workdir, &checks_base_oid)
-    })
-    .await
-    .map_err(|error| {
-        seller_git::SellerGitError::Io(format!("checks provisioning task failed: {error}"))
-    })??;
-    Ok(Some(base_oid))
+    tokio::task::spawn_blocking(move || refuse_host_checks_declaration(&workdir, &checks_base_oid))
+        .await
+        .map_err(|error| {
+            seller_git::SellerGitError::Io(format!("checks provisioning task failed: {error}"))
+        })??;
+    Ok(base_oid)
 }
 
 /// RC3-01 (v0.7.3-rc3 external review): the host delivery path must never provision a BUYER-declared
@@ -2737,7 +2746,10 @@ async fn provision_delivery_workdir(
 /// `Command::new(..).output()` — no env_clear, no sandbox, no timeout. There is no sandboxed checks
 /// runner yet (nothing executes the declared commands or writes an attestation), so the only safe
 /// behaviour on this path is to REFUSE: a base that declares checks fails the job with
-/// `env_unprovisionable` before any process is spawned and before anything is persisted.
+/// `env_unprovisionable` before any checks-env process could be spawned, before any checks state is
+/// recorded, and before the agent runs. (By this point `execute_job` has already marked the job
+/// executing and the base has been fetched and checked out; libgit2 checkout runs no buyer hooks or
+/// filters, and nothing evaluates the checked-out flake.)
 ///
 /// The declaration is still parsed first (pure git reads, no exec) so a malformed or reserved-path
 /// declaration keeps its specific refusal. A base without a declaration is unaffected.
@@ -17397,37 +17409,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Commit `files` as the only commit of a fresh repo at `dir`; returns the commit oid.
-    fn commit_base_tree(dir: &std::path::Path, files: &[(&str, &[u8])]) -> String {
-        let repo = git2::Repository::init(dir).expect("init base repo");
+    /// A bare private-input cache (the shape `privacy::execution` hands `provision_delivery_workdir`)
+    /// whose `refs/heads/input-baseline` is a single commit of `entries`; returns `(cache, oid)`.
+    /// `entries` are `(path, bytes, mode)`; a `FileMode::Commit` entry's bytes are the gitlink oid hex.
+    fn baseline_cache(
+        dir: &std::path::Path,
+        entries: &[(&str, &[u8], git2::FileMode)],
+    ) -> (std::path::PathBuf, String) {
+        let cache = dir.join("input-cache.git");
+        let repo = git2::Repository::init_bare(&cache).expect("init bare cache");
         let mut builder = git2::build::TreeUpdateBuilder::new();
-        for (path, bytes) in files {
-            let blob = repo.blob(bytes).expect("write blob");
-            builder.upsert(*path, blob, git2::FileMode::Blob);
+        for (path, bytes, mode) in entries {
+            let oid = if *mode == git2::FileMode::Commit {
+                git2::Oid::from_str(std::str::from_utf8(bytes).unwrap()).unwrap()
+            } else {
+                repo.blob(bytes).expect("write blob")
+            };
+            builder.upsert(*path, oid, *mode);
         }
         let empty_oid = repo.treebuilder(None).unwrap().write().unwrap();
         let empty = repo.find_tree(empty_oid).unwrap();
-        let tree_oid = builder.create_updated(&repo, &empty).expect("build tree");
-        let tree = repo.find_tree(tree_oid).unwrap();
-        let sig = git2::Signature::now("base", "base@example.invalid").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
-            .expect("commit base")
-            .to_string()
+        let tree = repo.find_tree(builder.create_updated(&repo, &empty).expect("tree")).unwrap();
+        let sig = git2::Signature::now("buyer", "buyer@example.invalid").unwrap();
+        let oid = repo
+            .commit(Some("refs/heads/input-baseline"), &sig, &sig, "base", &tree, &[])
+            .expect("commit base");
+        (cache, oid.to_string())
     }
 
-    // RC3-01 (v0.7.3-rc3 external review) TOOTH — a buyer base that declares a checks environment
-    // must be REFUSED on the host delivery path, for BOTH backends, before anything runs. Before the
-    // fix `provision_delivery_workdir` ran `nix develop <buyer-flake>#default --command true` (or
-    // `docker pull <buyer-image>`) on the seller host via a bare `Command::new(..).output()`. The
-    // nix-flake case here would therefore have spawned `nix` against a buyer-authored `flake.nix`
-    // whose devshell writes a marker file; the marker staying absent is direct proof that no buyer
-    // code executed. A base WITHOUT a declaration still provisions (unchanged), and a malformed
-    // declaration keeps its specific `DeclarationUnparsable` refusal.
-    #[test]
-    fn host_delivery_refuses_declared_checks_env_without_executing() {
+    /// Drive the host delivery seam behind the REAL private-input checkout: `init_verified_input_workdir`
+    /// (what `provision_delivery_workdir` runs for a private baseline) and then
+    /// `finish_checked_out_workdir` (everything it runs after any checkout). Only the
+    /// `privacy::execution` lookup that supplies `(cache, oid)` is bypassed.
+    async fn checkout_then_finish(
+        root: &std::path::Path,
+        label: &str,
+        entries: &[(&str, &[u8], git2::FileMode)],
+    ) -> Result<String, DeliveryWorkdirError> {
+        let dir = root.join(label);
+        std::fs::create_dir_all(&dir).expect("mk case dir");
+        let (cache, oid) = baseline_cache(&dir, entries);
+        let workdir = dir.join("workdir");
+        let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
+        let (w, c, o) = (workdir.clone(), cache.clone(), oid.clone());
+        tokio::task::spawn_blocking(move || {
+            seller_git::init_verified_input_workdir(&w, &identity, &c, &o, "refs/heads/delivery/rc3-01")
+        })
+        .await
+        .expect("checkout task")
+        .map_err(DeliveryWorkdirError::Git)?;
+        finish_checked_out_workdir(workdir, oid).await
+    }
+
+    fn refused_as(result: &Result<String, DeliveryWorkdirError>) -> Option<ProvisionRefusal> {
+        match result {
+            Err(DeliveryWorkdirError::Refused(refusal)) => Some(refusal.clone()),
+            _ => None,
+        }
+    }
+
+    // RC3-01 (v0.7.3-rc3 external review) TOOTH — a buyer base that declares a checks environment is
+    // REFUSED on the host delivery path, for BOTH backends, and every malformed or odd declaration
+    // stays fail-closed. Driven through the real private-input checkout + the real post-checkout
+    // phase of `provision_delivery_workdir`. Before the fix that phase ran
+    // `nix develop <workdir>#default --command true` / `docker pull <image>` through a bare
+    // `Command::new(..).output()`; it now returns `HostDeliveryRefused` (feedback
+    // `execution_failed`/`env_unprovisionable`). The exec-capable provisioner itself is compiled for
+    // tests only (`env_provision`), so production cannot call it at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_delivery_refuses_declared_checks_env_without_executing() {
+        use crate::checks::{EnvKind, DECLARATION_PATH};
+        use git2::FileMode::{Blob, Commit, Link};
         let root = temp_dir("rc3-01");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("mk root");
+
         let marker = root.join("BUYER_CODE_RAN");
         let flake = format!(
             r#"{{ outputs = {{ self }}: {{ devShells.x86_64-linux.default = builtins.derivation {{
@@ -17435,73 +17491,71 @@ mod tests {
   args = [ "-c" "touch {marker}; mkdir $out" ]; }}; }}; }}"#,
             marker = marker.display()
         );
+        let lock: &[u8] = b"{\"nodes\":{\"root\":{}},\"root\":\"root\",\"version\":7}";
         let nix_decl: &[u8] = b"schema = 1\n[env]\nkind = \"nix-flake\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n";
-        let image = format!("docker.io/library/alpine@sha256:{}", "a".repeat(64));
         let image_decl = format!(
-            "schema = 1\n[env]\nkind = \"container-image\"\nimage = \"{image}\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n"
+            "schema = 1\n[env]\nkind = \"container-image\"\nimage = \"docker.io/library/alpine@sha256:{}\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n",
+            "a".repeat(64)
         );
+        let unpinned_decl: &[u8] = b"schema = 1\n[env]\nkind = \"container-image\"\nimage = \"alpine:latest\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n";
+        let huge = vec![b'#'; crate::checks::DECLARATION_SIZE_LIMIT + 1];
 
-        let nix_dir = root.join("nix");
-        let nix_oid = commit_base_tree(
-            &nix_dir,
-            &[
-                (crate::checks::DECLARATION_PATH, nix_decl),
-                ("flake.nix", flake.as_bytes()),
-                ("flake.lock", b"{\"nodes\":{\"root\":{}},\"root\":\"root\",\"version\":7}"),
-            ],
-        );
-        let err = refuse_host_checks_declaration(&nix_dir, &nix_oid)
-            .expect_err("a nix-flake declaration must be refused on host delivery");
-        assert!(
-            matches!(
-                err,
-                DeliveryWorkdirError::Refused(ProvisionRefusal::HostDeliveryRefused {
-                    env_kind: crate::checks::EnvKind::NixFlake
-                })
-            ),
-            "nix-flake refused before provisioning, got {err:?}"
-        );
+        // 1. nix-flake: refused, and the buyer flake never ran.
+        let r = checkout_then_finish(&root, "nix", &[(DECLARATION_PATH, nix_decl, Blob), ("flake.nix", flake.as_bytes(), Blob), ("flake.lock", lock, Blob)]).await;
+        assert_eq!(refused_as(&r), Some(ProvisionRefusal::HostDeliveryRefused { env_kind: EnvKind::NixFlake }), "nix-flake: {r:?}");
         assert!(!marker.exists(), "buyer flake code must never execute on the seller host");
 
-        let img_dir = root.join("image");
-        let img_oid = commit_base_tree(
-            &img_dir,
-            &[(crate::checks::DECLARATION_PATH, image_decl.as_bytes())],
-        );
-        let err = refuse_host_checks_declaration(&img_dir, &img_oid)
-            .expect_err("a container-image declaration must be refused on host delivery");
-        assert!(
-            matches!(
-                err,
-                DeliveryWorkdirError::Refused(ProvisionRefusal::HostDeliveryRefused {
-                    env_kind: crate::checks::EnvKind::ContainerImage
-                })
-            ),
-            "container-image refused before any pull, got {err:?}"
-        );
-        if let DeliveryWorkdirError::Refused(refusal) = &err {
-            assert_eq!(
-                env_provision::refusal_feedback(refusal),
-                (ReasonCode::ExecutionFailed, env_provision::ENV_UNPROVISIONABLE)
-            );
-        }
-
-        let bad_dir = root.join("bad");
-        let bad_oid =
-            commit_base_tree(&bad_dir, &[(crate::checks::DECLARATION_PATH, b"not toml [")]);
-        let err = refuse_host_checks_declaration(&bad_dir, &bad_oid).expect_err("malformed");
-        assert!(
-            matches!(
-                err,
-                DeliveryWorkdirError::Refused(ProvisionRefusal::DeclarationUnparsable { .. })
-            ),
-            "malformed declaration keeps its specific refusal, got {err:?}"
+        // 2. container-image: refused before any pull, with the documented buyer feedback.
+        let r = checkout_then_finish(&root, "image", &[(DECLARATION_PATH, image_decl.as_bytes(), Blob)]).await;
+        let refusal = refused_as(&r).expect("container-image refused");
+        assert_eq!(refusal, ProvisionRefusal::HostDeliveryRefused { env_kind: EnvKind::ContainerImage });
+        assert_eq!(
+            env_provision::refusal_feedback(&refusal),
+            (ReasonCode::ExecutionFailed, env_provision::ENV_UNPROVISIONABLE)
         );
 
-        let plain_dir = root.join("plain");
-        let plain_oid = commit_base_tree(&plain_dir, &[("README.md", b"hello")]);
-        refuse_host_checks_declaration(&plain_dir, &plain_oid)
-            .expect("a base without a checks declaration is unaffected");
+        // 3. Fail-closed edge cases: refused with a specific refusal, never skipped.
+        let unparsable = |r: &Result<String, DeliveryWorkdirError>| {
+            matches!(refused_as(r), Some(ProvisionRefusal::DeclarationUnparsable { .. }))
+        };
+        let r = checkout_then_finish(&root, "empty", &[(DECLARATION_PATH, b"", Blob)]).await;
+        assert!(unparsable(&r), "empty declaration: {r:?}");
+        let r = checkout_then_finish(&root, "huge", &[(DECLARATION_PATH, &huge, Blob)]).await;
+        assert!(unparsable(&r), "oversized declaration: {r:?}");
+        let r = checkout_then_finish(&root, "toml", &[(DECLARATION_PATH, b"not toml [", Blob)]).await;
+        assert!(unparsable(&r), "malformed declaration: {r:?}");
+        let r = checkout_then_finish(&root, "unpinned", &[(DECLARATION_PATH, unpinned_decl, Blob)]).await;
+        assert!(unparsable(&r), "unpinned image: {r:?}");
+        let r = checkout_then_finish(&root, "nolock", &[(DECLARATION_PATH, nix_decl, Blob), ("flake.nix", flake.as_bytes(), Blob)]).await;
+        assert!(matches!(refused_as(&r), Some(ProvisionRefusal::EnvLockMissing { .. })), "missing flake.lock: {r:?}");
+        assert!(!marker.exists());
+
+        // 4. Symlink AT the declaration path: git stores the link text as a blob; it is parsed, never
+        //    followed. Either the private-input object policy refuses the checkout, or the link text
+        //    is refused as a declaration — never `Ok`.
+        let r = checkout_then_finish(&root, "symlink", &[(DECLARATION_PATH, b"../flake.nix", Link)]).await;
+        assert!(r.is_err(), "a symlinked declaration must fail closed: {r:?}");
+
+        // 5. Shapes that are NOT a declaration (observed policy, pinned so a change is deliberate):
+        //    a tree or gitlink at the path, or a differently-cased path, reads as absent. Nothing
+        //    executes either way: the host path has no provisioner to fall back to.
+        let r = checkout_then_finish(&root, "tree", &[(".maxplayer/checks.toml/inner", nix_decl, Blob)]).await;
+        assert!(r.is_ok(), "a tree at the declaration path reads as no declaration: {r:?}");
+        let gitlink = "b".repeat(40);
+        let r = checkout_then_finish(&root, "gitlink", &[(DECLARATION_PATH, gitlink.as_bytes(), Commit)]).await;
+        assert!(!matches!(r, Err(DeliveryWorkdirError::Refused(ProvisionRefusal::HostDeliveryRefused { .. }))), "gitlink: {r:?}");
+        let r = checkout_then_finish(&root, "case", &[(".Maxplayer/checks.toml", nix_decl, Blob)]).await;
+        assert!(r.is_ok(), "the declaration path is exact: {r:?}");
+
+        // 6. A base without a declaration is unaffected: Ok(base_oid), workdir checked out.
+        let r = checkout_then_finish(&root, "plain", &[("README.md", b"hello", Blob)]).await;
+        let oid = r.expect("a base without a checks declaration is unaffected");
+        assert!(root.join("plain/workdir/README.md").exists());
+
+        // 7. A base oid that is not in the checked-out repo fails the job (Git), never Ok.
+        let r = finish_checked_out_workdir(root.join("plain/workdir"), "c".repeat(40)).await;
+        assert!(matches!(r, Err(DeliveryWorkdirError::Git(_))), "unknown base oid: {r:?}");
+        assert_eq!(oid.len(), 40);
 
         let _ = std::fs::remove_dir_all(&root);
     }
