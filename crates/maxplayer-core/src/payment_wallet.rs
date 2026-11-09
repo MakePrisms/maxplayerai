@@ -8248,8 +8248,9 @@ mod tests {
     }
 
     /// Holds `<wallet_dir>/operation.lock` SHARED from a separate `flock` process, the way a send or
-    /// melt in another process does; killed on drop.
-    struct OtherProcessOperation(std::process::Child);
+    /// melt in another process does; killed on drop, and drop returns only once the kernel has
+    /// released the lock.
+    struct OtherProcessOperation(std::process::Child, std::path::PathBuf);
 
     impl OtherProcessOperation {
         fn start(wallet_dir: &std::path::Path) -> Self {
@@ -8266,7 +8267,7 @@ mod tests {
                 .process_group(0)
                 .spawn()
                 .expect("spawn flock");
-            let guard = Self(child);
+            let guard = Self(child, wallet_dir.to_path_buf());
             let started = std::time::Instant::now();
             while !crate::shared_wallet::operation_in_flight(Some(wallet_dir)).unwrap() {
                 assert!(
@@ -8284,6 +8285,16 @@ mod tests {
             // Safety: signals only the process group `start` created.
             unsafe { libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL) };
             let _ = self.0.wait();
+            // `wait` reaps only `flock`; the `sleep` it forked holds the descriptor until it has
+            // exited too, so the lock can outlive `wait` by a moment (seen under a loaded host).
+            let started = std::time::Instant::now();
+            while crate::shared_wallet::operation_in_flight(Some(&self.1)).unwrap_or(false) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "a killed holder must release the operation lock"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
     }
 
