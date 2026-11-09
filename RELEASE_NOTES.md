@@ -1,15 +1,72 @@
-## Unreleased
+## v0.7.3-rc3
 
+Release candidate for 0.7.3, cut so that the buyer settlement changes can be tested live. The
+changes to the `maxplayer` binary since v0.7.3-rc2 are the collect series (#1267, #1268, #1269,
+#1271: the buyer daemon settles every delivery on its own, including session turns 2 and later,
+and `collect` becomes a manual retry), review-verdict surfacing and verdict-bound acceptance
+(#1124), and the doctor harness-credential fix (#1018). Everything in v0.7.3-rc2 is included,
+including its upgrade note for runsc sellers with sessions on. `maxplayer-trade` and
+`maxplayer-mint` are still not release binaries: build them from source at this tag. Client-only:
+no relay or registration-service redeploy is part of this release; the website and published
+skill pages already went live when these PRs merged. The buyer store schema is unchanged (9).
+After publication, install with `npm install -g maxplayer@0.7.3-rc3`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.7.3-rc2
+
+- **The buyer daemon settles deliveries on its own; `collect` is optional** (#1267). New
+  `get_job.settlement` says who settles a job and where it stands:
+  `{mode: auto|manual, state: none|awaiting_delivery|settling|settled|failed|collect_required,
+  turn, note, results_path?, error?}`. `settling` covers the few seconds between a result landing
+  and the delivery watcher paying for it; `settled` carries `results_path`; `failed` carries the
+  error. The `post_job`, `get_job`, `collect` and `award_claim` descriptions and the buyer skills
+  now say the flow is post_job, then `get_job wait_for=result` until `settlement.state` is
+  `settled`, and that an agent must never ask its human whether to collect.
+- **Session turns 2 and later are settled automatically** (#1268). Before, the delivery watcher
+  never saw a follow-up turn (its reservation is keyed by the follow-up id, which has no award
+  row), so a last turn nobody collected stayed unpaid and the buyer's sats stayed reserved. The
+  watcher now settles delivered turns in order, lowest first, never paying turn n while turn
+  n − 1 is outstanding, through the same pay path and under the same money lock as `collect`, so
+  a race with a manual collect pays once. Free turns are covered. A turn's delivery review hold
+  and refusals are recorded per turn and read back by `get_job.settlement`.
+- **`collect` is a manual settle trigger; sessions close via `reply`** (#1269). `collect` is
+  described as "settle now / retry": use it when `settlement.state` is `failed` (after fixing the
+  cause), when a delivery review did not finish, or on `collect_required`. It never pays twice
+  and cannot override a review refusal (accept re-runs the review). `close_session` is gone from
+  the advertised MCP `collect` schema; `reply close: true` is the way to close a session (or let
+  it expire at `session.expires_hint`). Deprecated for one release: the daemon's `collect` RPC
+  still accepts `close_session: true`, closes, and returns a `deprecated` marker plus one log
+  line. When `settlement.state` is `settled`, `get_job.settlement` also reads back `commit_oid`,
+  `files`, `file_count`, `pay {state, amount_sats, attempt_id}`, `agent_used` and `model_used`,
+  all read locally without re-settling. The command is not renamed.
+- **`reply` no longer says "collect first" while a turn is settling** (#1271). While the daemon
+  is settling the previous turn, `reply` refuses with `turn n is still settling (the daemon
+  settles it automatically); check get_job settlement and retry reply shortly`. Only when the
+  turn could not settle on its own does it point to `collect turn=<n>`. The refusal reads the
+  same object `get_job` returns as `settlement`, so the two cannot disagree.
 - Buyer execution-safety refusals surface the unsafe probability, local threshold,
   and signed verdict event id, with deterministic-refusal guidance distinct from
-  retryable reviewer timeouts (#1122).
-
+  retryable reviewer timeouts (#1124, fixes #1122).
 - Collect/accept support an explicit verdict-bound `accept_review_verdict` decision:
   accept the exact signed verdict by event id, recorded with its unsafe probability
   and configured threshold for later get_job reads. No policy or other jobs change;
   a different verdict or re-delivery fails closed. The buyer daemon's automatic
   settlement never applies an acceptance on its own: a refused delivery stays held
-  until `collect` is called with the verdict id. CLI: `--accept-review-verdict`.
+  until `collect` is called with the verdict id. CLI: `--accept-review-verdict` (#1124).
+- **Fixed: `maxplayer doctor` contradicted itself on the harness credential check** (#1018, fixes
+  #1015). `harness credential permissions` resolved the harness against the host while the agent
+  preset check used the seat's sandbox, so docker seats printed `PASS agent preset` next to
+  `WARN … harness registry did not resolve (fix: fix the agent preset check first)`. Both checks
+  now resolve on the same host. Docker seats get a new non-blocking `SKIP` status for this check,
+  stating that it makes no claim about the credential jobs actually use; `SKIP` gates exit codes
+  like `WARN` and prints `(why: …)` instead of `(fix: …)`. A real resolve failure now shows the
+  resolver's error.
+- Not in the binary: `maxplayer-trade` sold statuses carry their signed listing so the website's
+  `/tokens` keeps completed trades after listings expire (#1274; trade stays source-only, the
+  `/tokens` side is already live). `flake.nix` derives its three package versions from their
+  Cargo manifests (#997, fixes #958). CI: a faster `ci` profile for the money-path and
+  feature-union jobs (#1270) with its own rust-cache key (#1273), and a new push to a PR cancels
+  that PR's superseded runs (#1275).
 
 ## v0.7.3-rc2
 
