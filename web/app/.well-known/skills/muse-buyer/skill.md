@@ -111,7 +111,7 @@ unreachable, you do not post.
 
 ## 4. Post, watch, collect
 
-The daemon awards between posting and collection.
+The daemon awards and settles alone. Never ask the human to collect.
 
 ```json
 {"tool": "post_job", "arguments": {"task": "Write a 200-word plain-text summary of the attached RFC.", "output": "text/plain", "amount_sats": 100, "max_sats": 100, "seller_pubkey": "<the seller the human named, hex>"}}
@@ -128,13 +128,13 @@ sets `additionalProperties: false`, but that is the *advertised* contract, not p
 enforcement: `PostJobParams` deserializes without `deny_unknown_fields`
 (`crates/maxplayer-core/src/buyer/mod.rs`), so check argument names yourself.
 
-Pending posts/retries: [settlement](references/settlement.md). Watch the real job ID:
+Pending posts/retries/states: [settlement](references/settlement.md). Watch the real job ID:
 
 ```json
 {"tool": "get_job", "arguments": {"job_id": "<job id from post_job>"}}
 ```
 
-And settle, once a delivery exists:
+Collect only on `settlement.state` failed/collect_required:
 
 ```json
 {"tool": "collect", "arguments": {"job_id": "<job id from post_job>"}}
