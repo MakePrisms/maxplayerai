@@ -2,7 +2,11 @@
  * Read-only reader for the token-trade market: listings (TRADE_LOT) and their
  * hash-chained statuses (TRADE_STATUS), from the public relays the trade CLI publishes to.
  *
- * Mirrors `Market::discover` in crates/maxplayer-trade/src/market.rs:
+ * Mirrors `Market::discover` in crates/maxplayer-trade/src/market.rs, plus one
+ * read the CLI does not need: every status under the protocol tag, because a
+ * `sold` status carries its listing after relays have deleted the listing
+ * itself (24h NIP-40 expiry), and that is the only record of an older trade.
+ *
  *   - every configured relay is queried and the results are UNIONED by id;
  *   - listings: `{kinds:[TRADE_LOT], #t:[maxplayer], since}`;
  *   - statuses: `{kinds:[TRADE_STATUS], #e:[lot], authors:[maker]}` — by lot AND
@@ -92,6 +96,13 @@ export function allowedRelay(url: string): boolean {
 
 export function lotFilter(since: number, until?: number): Filter {
   const f: Filter = { kinds: [TRADE_LOT], "#t": [MAXPLAYER_TAG], since, limit: PAGE_LIMIT };
+  if (until != null) f.until = until;
+  return f;
+}
+
+/** Every status under the protocol tag: finds sold statuses whose listing relays have already deleted. */
+export function soldHistoryFilter(since: number, until?: number): Filter {
+  const f: Filter = { kinds: [TRADE_STATUS], "#t": [MAXPLAYER_TAG], since, limit: PAGE_LIMIT };
   if (until != null) f.until = until;
   return f;
 }
@@ -314,6 +325,7 @@ export function createTradeReader(opts: TradeReaderOptions, cb: TradeReaderCallb
         const emit = (e: NostrEvent) => cb.onEvent(e, url);
         const lotSince = lastRound == null ? HISTORY_FLOOR : lastRound - OVERLAP_SECONDS;
         await drain(req, lotFilter(lotSince), emit);
+        await drain(req, soldHistoryFilter(lotSince), emit);
 
         const known = opts.knownLots();
         const fresh = known.filter((l) => !fullyRead.has(l.id));

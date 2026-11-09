@@ -288,14 +288,17 @@ async fn live_maker_swap(j: &Journal, id: &str) -> Result<bool> {
 }
 async fn finish_listing(j: &Journal, m: &Market, l: &mut Listing, status: Status) -> Result<()> {
     if lifecycle(&l.event, &l.statuses)? == Status::Available {
-        let prev = l.statuses.last().context("listing has no status history")?;
-        l.statuses.push(status_event(
-            &m.keys,
-            l.event.id,
-            l.statuses.len() as u64 + 1,
-            prev.id,
-            status,
-        )?);
+        let prev = l
+            .statuses
+            .last()
+            .context("listing has no status history")?
+            .id;
+        let seq = l.statuses.len() as u64 + 1;
+        l.statuses.push(if status == Status::Sold {
+            sold_event(&m.keys, &l.event, seq, prev)?
+        } else {
+            status_event(&m.keys, l.event.id, seq, prev, status)?
+        });
         j.put("listing", &l.event.id.to_hex(), l).await?;
     }
     if l.published == l.statuses.len() {

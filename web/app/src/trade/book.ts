@@ -14,9 +14,15 @@
  * Status events are kept only when they are signed by the lot's maker and
  * e-tag it, as the CLI's discover() queries them; anything else is ignored
  * rather than allowed to quarantine somebody else's listing.
+ *
+ * A `sold` status may carry its signed listing (lib.rs `sold_event`). Relays
+ * delete listings at their 24h expiry but keep statuses, so that copy is the
+ * only way a completed trade stays on the page. It is ingested exactly like a
+ * listing from a relay (same signature and parse rules), only when the maker
+ * signed both, and lifecycle() still requires it to be that very listing.
  */
 import { TRADE_LOT, TRADE_STATUS } from "../model/kinds.js";
-import { MAX_STATUS_EVENTS, checkLot, lifecycle, type Lot, type NostrEvent, type Status } from "./validate.js";
+import { MAX_STATUS_EVENTS, carriedLot, checkLot, lifecycle, type Lot, type NostrEvent, type Status } from "./validate.js";
 
 export type LotState = Status | "expired" | "quarantined" | "pending";
 
@@ -80,6 +86,11 @@ export function createBook() {
   function ingest(raw: unknown): boolean {
     const e = raw as NostrEvent;
     if (!e || typeof e !== "object" || typeof e.id !== "string") return false;
+    if (e.kind === TRADE_STATUS) {
+      const carried = carriedLot(e);
+      const added = carried != null && carried.pubkey === e.pubkey && carried.kind === TRADE_LOT && ingest(carried);
+      return ingestStatus(e) || added;
+    }
     if (e.kind === TRADE_LOT) {
       if (judged.has(e.id)) return false;
       judged.add(e.id);
@@ -93,7 +104,11 @@ export function createBook() {
       }
       return true;
     }
-    if (e.kind === TRADE_STATUS && Array.isArray(e.tags)) {
+    return false;
+  }
+
+  function ingestStatus(e: NostrEvent): boolean {
+    if (Array.isArray(e.tags)) {
       // Route by the e tag(s); lifecycle() decides whether the binding is valid.
       const targets = e.tags.filter((t) => Array.isArray(t) && t[0] === "e" && typeof t[1] === "string").map((t) => t[1] as string);
       let changed = false;

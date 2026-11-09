@@ -10,7 +10,7 @@
 use anyhow::Result;
 use maxplayer_trade::{
     Asset, DeadlinePolicy, LOT, Leg, Lot, STATUS, Status, lifecycle, lot_event, parse_lot,
-    status_event,
+    sold_event, status_event,
 };
 use nostr_sdk::prelude::*;
 use serde_json::{Value, json};
@@ -292,6 +292,51 @@ fn main() -> Result<()> {
     chains.push(chain_verdict("status with listing kind", &lot, &[kind_mix.clone()]));
     // The 256-event bound is exercised in the web test with this same test key
     // (0x11 repeated); 257 signed events would make this file half a megabyte.
+
+    // A sold status carrying its signed listing (sold_event): relays delete listings at expiry,
+    // statuses stay, so this is how a completed trade remains readable.
+    let carried = sold_event(&maker, &lot, 2, s1.id)?;
+    chains.push(chain_verdict("sold carrying its listing", &lot, &[s1.clone(), carried.clone()]));
+    let lot_value = serde_json::to_value(&lot)?;
+    let carry = |status: &str, seq: u64, prev: &str, v: Value| {
+        let mut r = rev(&lot, seq, prev, status);
+        r["lot"] = v;
+        status_raw(&maker, T0 + seq, status_tags(&lot), r)
+    };
+    let s1id = s1.id.to_hex();
+    let other_lot = lot_case(&maker, T0 + 7, |_, _| None);
+    chains.push(chain_verdict("sold carrying another listing", &lot, &[s1.clone(), carry("sold", 2, &s1id, serde_json::to_value(&other_lot)?)]));
+    let mut tampered_lot = lot_value.clone();
+    tampered_lot["content"] = json!(tampered_lot["content"].as_str().unwrap().replace("\"net\":64", "\"net\":65"));
+    chains.push(chain_verdict("sold carrying a tampered listing", &lot, &[s1.clone(), carry("sold", 2, &s1id, tampered_lot)]));
+    chains.push(chain_verdict("sold carrying the listing as a string", &lot, &[s1.clone(), carry("sold", 2, &s1id, json!(lot.as_json()))]));
+    chains.push(chain_verdict("sold with lot null", &lot, &[s1.clone(), carry("sold", 2, &s1id, Value::Null)]));
+    chains.push(chain_verdict("cancelled carrying its listing", &lot, &[s1.clone(), carry("cancelled", 2, &s1id, lot_value.clone())]));
+    chains.push(chain_verdict("available carrying its listing", &lot, &[carry("available", 1, &lid, lot_value.clone())]));
+    let mut reordered = serde_json::Map::new();
+    for (k, v) in lot_value.as_object().unwrap().iter().rev() {
+        reordered.insert(k.clone(), v.clone());
+    }
+    let reordered_raw = {
+        let mut r = rev(&lot, 2, &s1id, "sold").to_string();
+        let keys = ["sig", "content", "tags", "kind", "created_at", "pubkey", "id"];
+        let body = keys.iter().map(|k| format!("{:?}:{}", k, lot_value[*k])).collect::<Vec<_>>().join(",");
+        r.pop();
+        format!("{r},\"lot\":{{{body}}}}}")
+    };
+    chains.push(chain_verdict("sold carrying its listing, keys reordered", &lot, &[s1.clone(), sign(&maker, STATUS, T0 + 2, status_tags(&lot), reordered_raw)]));
+    let float_raw = carried.content.replace(&format!("\"created_at\":{}", lot.created_at.as_secs()), &format!("\"created_at\":{}.0", lot.created_at.as_secs()));
+    assert_ne!(float_raw, carried.content);
+    chains.push(chain_verdict("sold carrying its listing, created_at as float", &lot, &[s1.clone(), sign(&maker, STATUS, T0 + 2, status_tags(&lot), float_raw)]));
+    let neg0_raw = carried.content.replace(&format!("\"kind\":{LOT}"), "\"kind\":-0");
+    chains.push(chain_verdict("sold carrying its listing, kind -0", &lot, &[s1.clone(), sign(&maker, STATUS, T0 + 2, status_tags(&lot), neg0_raw)]));
+    let dup_raw = carried.content.replacen("\"lot\":{", &format!("\"lot\":{{\"kind\":1,"), 1);
+    chains.push(chain_verdict("sold carrying its listing, duplicate key last wins", &lot, &[s1.clone(), sign(&maker, STATUS, T0 + 2, status_tags(&lot), dup_raw)]));
+    let dup_lot_raw = carried.content.replacen("\"status\":\"sold\"", "\"status\":\"sold\",\"lot\":null", 1);
+    chains.push(chain_verdict("sold with lot given twice", &lot, &[s1.clone(), sign(&maker, STATUS, T0 + 2, status_tags(&lot), dup_lot_raw)]));
+    let arr6 = json!([1, lid, 2, s1id, "sold", lot_value]).to_string();
+    chains.push(chain_verdict("revision as array with listing", &lot, &[s1.clone(), sign(&maker, STATUS, T0 + 2, status_tags(&lot), arr6)]));
+    let _ = reordered;
 
     // A chain for the crate-built listing too, so the builder is covered end to end.
     let rs1 = status_event(&maker, real.id, 1, real.id, Status::Available)?;

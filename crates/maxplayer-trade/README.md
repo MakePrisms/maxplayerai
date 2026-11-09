@@ -78,7 +78,9 @@ sections below describe their dated runs, not current coverage totals.
   the taker's encrypted notice supplements this. Without the notice, maker safety
   relies on the chosen mint reporting the HTLC witness. Mint choice is the buyer’s/seller’s
   responsibility; there is no witness-verification/rating gate. Maker publishes sold after claiming
-  the incoming leg. Locked proofs are never counted as ordinary wallet balance.
+  the incoming leg. The sold status carries the signed listing in a `lot` field, because relays
+  delete listings at their 24h NIP-40 expiry but keep statuses; `lifecycle` accepts `lot` only on
+  sold and only when it equals the listing exactly. Sold statuses without it stay valid. Locked proofs are never counted as ordinary wallet balance.
 - Private SQLite journal using CDK's KV API; exact inputs, blinded outputs, secrets/blinding
   factors, signed witnesses, results and send deadlines are persisted before mint effects.
   Recovery restores the same outputs and never creates a replacement swap on a timeout alone.

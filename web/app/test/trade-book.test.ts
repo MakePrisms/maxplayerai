@@ -11,7 +11,7 @@ import { bytesToHex } from "@noble/hashes/utils";
 import { TRADE_LOT, TRADE_STATUS } from "../src/model/kinds.js";
 import { WINDOWS, completedStats, createBook } from "../src/trade/book.js";
 import { lifecycle, parseLot, type NostrEvent } from "../src/trade/validate.js";
-import { allowedRelay, createTradeReader, drain, liveFilters, lotFilter, NUDGE_MS, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
+import { allowedRelay, createTradeReader, drain, liveFilters, lotFilter, NUDGE_MS, soldHistoryFilter, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
 import { dockSide, mintLabel, rate, timeLeft } from "../src/trade/format.js";
 
 /** The fixture generator's test keys: bytes 0x11… (maker) and 0x22… (other). */
@@ -49,6 +49,12 @@ function status(l: NostrEvent, seq: number, prev: string, s: string, secret = MA
 }
 
 const NOW = T0 + 600;
+
+/** A sold status carrying `carried` (lib.rs sold_event) — by default its own listing. */
+function soldWithLot(l: NostrEvent, seq: number, prev: string, carried: unknown = l, s = "sold", secret = MAKER, at = l.created_at + seq): NostrEvent {
+  return sign(secret, TRADE_STATUS, at, [["t", "maxplayer"], ["v", "1"], ["e", l.id]],
+    JSON.stringify({ trade_v: 1, lot_id: l.id, seq, prev, status: s, lot: carried }));
+}
 
 test("the TS signer produces listings the validator accepts (sanity for the cases below)", () => {
   const l = lot();
@@ -434,4 +440,100 @@ test("the static period buttons match the windows the stats use", () => {
   const html = readFileSync(new URL("../public/tokens.html", import.meta.url), "utf8");
   const buttons = [...html.matchAll(/data-w="([^"]+)"[^>]*>([^<]+)</g)].map((m) => [m[1], m[2]]);
   assert.deepEqual(buttons, WINDOWS.map((w) => [w.key, w.label]));
+});
+
+/* ---------------- sold statuses that carry their listing ---------------- */
+
+test("book: a sold status carrying its listing keeps the trade after relays deleted the listing", () => {
+  const t = T0 + 30 * 86400;
+  const l = lot(MAKER, T0, 100, 90);
+  const s1 = status(l, 1, l.id, "available");
+  const book = createBook();
+  // What a public relay still holds a month later: the statuses, not the listing.
+  book.ingest(s1);
+  book.ingest(soldWithLot(l, 2, s1.id));
+  const v = book.view(t);
+  assert.deepEqual(v.closed.map((r) => [r.id, r.state]), [[l.id, "sold"]]);
+  const all = completedStats(v, t, null);
+  assert.equal(all.trades, 1);
+  assert.equal(all.giveSats, 100);
+  assert.equal(all.wantSats, 90);
+  assert.equal(all.medianFill, 2);
+  // Without the carried listing the same statuses show nothing (the bug).
+  const bare = createBook();
+  bare.ingest(s1);
+  bare.ingest(status(l, 2, s1.id, "sold"));
+  assert.equal(completedStats(bare.view(t), t, null).trades, 0);
+});
+
+test("book: a carried listing is only trusted when it is the maker's own, untampered listing", () => {
+  const t = T0 + 30 * 86400;
+  const l = lot(MAKER, T0, 100, 90);
+  const s1 = status(l, 1, l.id, "available");
+  const theirs = lot(OTHER, T0, 1, 1);
+  const tampered = { ...l, content: l.content.replace('"net":100', '"net":999') };
+  const mine2 = lot(MAKER, T0 + 5, 7, 7);
+  for (const [name, carried] of [["someone else's listing", theirs], ["tampered", tampered], ["another listing of mine", mine2]] as const) {
+    const book = createBook();
+    book.ingest(s1);
+    book.ingest(soldWithLot(l, 2, s1.id, carried));
+    const v = book.view(t);
+    assert.equal(completedStats(v, t, null).trades, 0, name);
+    assert.ok(!v.closed.some((r) => r.state === "sold"), name);
+  }
+  // With the listing present, a sold status carrying the wrong one quarantines the chain.
+  const book = createBook();
+  book.ingest(l); book.ingest(s1);
+  book.ingest(soldWithLot(l, 2, s1.id, mine2));
+  assert.equal(book.view(NOW).quarantined.find((r) => r.id === l.id)?.detail, "status lot does not match the listing");
+  // A stranger's sold status carrying a real listing cannot close it.
+  const stranger = createBook();
+  stranger.ingest(s1);
+  stranger.ingest(soldWithLot(l, 2, s1.id, l, "sold", OTHER));
+  assert.equal(completedStats(stranger.view(t), t, null).trades, 0);
+});
+
+test("lifecycle: only sold may carry a listing; key order is irrelevant, floats are not", () => {
+  const l = lot();
+  const s1 = status(l, 1, l.id, "available");
+  const ok = lifecycle(l, [s1, soldWithLot(l, 2, s1.id)]);
+  assert.ok(ok.ok && ok.status === "sold");
+  assert.equal(lifecycle(l, [s1, soldWithLot(l, 2, s1.id, l, "cancelled")]).ok, false);
+  assert.equal(lifecycle(l, [soldWithLot(l, 1, l.id, l, "available")]).ok, false);
+  const reordered = Object.fromEntries(Object.entries(l).reverse());
+  assert.equal(lifecycle(l, [s1, soldWithLot(l, 2, s1.id, reordered)]).ok, true);
+  assert.equal(lifecycle(l, [s1, soldWithLot(l, 2, s1.id, null)]).ok, true, "null is serde's None");
+  assert.equal(lifecycle(l, [s1, soldWithLot(l, 2, s1.id, JSON.stringify(l))]).ok, false, "a string is not the listing");
+  const asFloat = sign(MAKER, TRADE_STATUS, l.created_at + 2, [["t", "maxplayer"], ["v", "1"], ["e", l.id]],
+    JSON.stringify({ trade_v: 1, lot_id: l.id, seq: 2, prev: s1.id, status: "sold", lot: l })
+      .replace(`"created_at":${l.created_at}`, `"created_at":${l.created_at}.0`));
+  assert.equal(lifecycle(l, [s1, asFloat]).ok, false);
+});
+
+test("reader: reads every status under the tag, so a sold trade whose listing is gone still shows", async () => {
+  const l = lot(MAKER, T0, 64, 48);
+  const s1 = status(l, 1, l.id, "available");
+  const sold = soldWithLot(l, 2, s1.id);
+  const store = [s1, sold]; // the listing itself expired off the relay
+  const book = createBook();
+  const sockets: FakeSocket[] = [];
+  let wake!: () => void;
+  const done = new Promise<void>((r) => { wake = r; });
+  const reader = createTradeReader(
+    {
+      relays: ["wss://a.example"],
+      openSocket: (u) => { const s = new FakeSocket(u, store); sockets.push(s); return s as unknown as WebSocket; },
+      now: () => NOW,
+      setTimer: () => 0,
+      clearTimer: () => {},
+      knownLots: () => book.known(),
+    },
+    { onEvent: (e) => { book.ingest(e); }, onStatusesRead: (ids, r) => book.markHistoryRead(ids, r), onRelayState() {}, onRound: () => wake() },
+  );
+  reader.start();
+  await done;
+  reader.stop();
+  const reqs = sockets[0]!.sent.filter((f) => f[0] === "REQ").map((f) => f[2]);
+  assert.deepEqual(reqs[1], soldHistoryFilter(0));
+  assert.deepEqual(book.view(NOW + 30 * 86400).closed.map((r) => [r.id, r.state]), [[l.id, "sold"]]);
 });
