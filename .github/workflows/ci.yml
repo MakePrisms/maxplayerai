@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # release/** too: backport tags are cut from release branches, and the release-profile jobs
+    # (feature-union-release, money-path-release) run on pushes only.
+    branches: [main, 'release/**']
   pull_request:
   # Manual full run. The maxplayer-trade jobs always run on push and dispatch; only pull requests
   # are filtered (see trade-changes).
@@ -147,8 +149,8 @@ jobs:
   # a job whose conclusion is `failure`, which cannot distinguish a suite that failed from a suite
   # that never ran — the one ambiguity a row like this must not have.
   #
-  # build-acp's build step stays: it builds the shipped `maxplayer` binary in release, which is the
-  # only release-profile compile of the seller surface left in this file.
+  # build-acp's build step stays: it builds the shipped `maxplayer` binary in release on every pull
+  # request. This row's release-profile run is feature-union-release, on pushes only.
   feature-union:
     name: Test the full shipped feature combo (acp + wallet)
     runs-on: ubuntu-latest
@@ -239,6 +241,34 @@ jobs:
       # their keyset fixture no longer depends on testnut's HTTP availability.
       - name: Test maxplayer-core (money-path suite)
         run: cargo test -p maxplayer-core --profile ci --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
+
+  # Release-profile twins of feature-union and money-path: same commands with `--release`, on pushes
+  # (main, release/**) and manual runs only. Pull requests run profile `ci`; these keep what ships
+  # (opt-level 3 + thin LTO) under test after every merge, so an optimiser-exposed defect (UB in an
+  # `unsafe` block, a timing race) goes red on the merge commit that introduced it, not at tag time.
+  # Nobody waits on them: they run after merge. Separate jobs rather than a matrix, so the PR check
+  # names and the rust-cache keys of the ci-profile jobs stay as they are.
+  feature-union-release:
+    name: Test the full shipped feature combo (acp + wallet, release)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test maxplayer-core (acp + gateway + git-delivery + wallet, release)
+        run: cargo test -p maxplayer-core --release --features acp,gateway,git-delivery,wallet --locked
+
+  money-path-release:
+    name: Money-path tests (release)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test maxplayer-core (money-path suite, release)
+        run: cargo test -p maxplayer-core --release --no-default-features --features gateway,git-delivery,wallet,live-mints --locked
 
   # The seller-credits mint sidecar (docs/specs/seller-credits.md stage 2). It is its OWN cargo
   # workspace with its own Cargo.lock, so cdk's `mint` feature, and the `protoc` its signatory's
