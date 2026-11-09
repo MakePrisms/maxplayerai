@@ -137,6 +137,9 @@ pub enum ProvisionRefusal {
     ReservedPath { path: String },
     EnvLockMissing { detail: String },
     Unprovisionable(EnvProvisionError),
+    /// RC3-01: a buyer-declared checks environment reached the HOST delivery path, which has no
+    /// sandboxed provisioner. Refused before any process is spawned.
+    HostDeliveryRefused { env_kind: EnvKind },
 }
 
 pub fn provision(
@@ -217,7 +220,8 @@ pub fn refusal_feedback(refusal: &ProvisionRefusal) -> (gateway::ReasonCode, &'s
         ProvisionRefusal::DeclarationUnparsable { .. }
         | ProvisionRefusal::ReservedPath { .. }
         | ProvisionRefusal::EnvLockMissing { .. }
-        | ProvisionRefusal::Unprovisionable(_) => {
+        | ProvisionRefusal::Unprovisionable(_)
+        | ProvisionRefusal::HostDeliveryRefused { .. } => {
             (gateway::ReasonCode::ExecutionFailed, ENV_UNPROVISIONABLE)
         }
     }
@@ -562,6 +566,12 @@ mod tests {
             ProvisionRefusal::Unprovisionable(EnvProvisionError::BackendUnavailable {
                 backend: "container".to_owned(),
             }),
+            ProvisionRefusal::HostDeliveryRefused {
+                env_kind: EnvKind::NixFlake,
+            },
+            ProvisionRefusal::HostDeliveryRefused {
+                env_kind: EnvKind::ContainerImage,
+            },
         ];
         for refusal in refusals {
             assert_eq!(
