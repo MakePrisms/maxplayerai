@@ -3162,14 +3162,17 @@ pub(crate) async fn award_presence_async(
     // RC3-02: only awards that verify are evidence of what the relay holds; an unverifiable award
     // (e.g. a same-id content swap the SDK's id-keyed verification cache let through) must never
     // be parsed into a money row. Filtered BEFORE the emptiness discipline.
-    let (mut events, mut poisoned) = authentic_split(
+    let (mut events, poisoned) = authentic_split(
         relay
             .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| JobLifecycleError::Relay(format!("fetch award: {error}")))?,
+        &filter,
     );
 
-    if events.is_empty() && poisoned {
+    // A poisoned award read is unanswered even when something else verified: the frame we could
+    // not trust may be the award that disagrees, and this read writes money rows (worker-fable M1).
+    if poisoned {
         client.disconnect().await;
         return Ok(PresenceRead::Unverified);
     }
@@ -3186,15 +3189,21 @@ pub(crate) async fn award_presence_async(
             client.disconnect().await;
             return Ok(PresenceRead::Unverified);
         }
-        (events, poisoned) = authentic_split(
+        let (rechecked, poisoned) = authentic_split(
             relay
-                .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
                 .await
                 .map_err(|error| JobLifecycleError::Relay(format!("fetch award (recheck): {error}")))?,
+            &filter,
         );
+        if poisoned {
+            client.disconnect().await;
+            return Ok(PresenceRead::Unverified);
+        }
+        events = rechecked;
         if events.is_empty() {
             client.disconnect().await;
-            return Ok(if poisoned { PresenceRead::Unverified } else { PresenceRead::ConfirmedAbsent });
+            return Ok(PresenceRead::ConfirmedAbsent);
         }
     }
 
@@ -3324,6 +3333,7 @@ async fn presence_of_filter(
             .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| JobLifecycleError::Relay(format!("fetch: {error}")))?,
+        &filter,
     );
     if events.is_empty() && !poisoned {
         let confirmed =
@@ -3335,20 +3345,14 @@ async fn presence_of_filter(
         }
         (events, poisoned) = authentic_split(
             relay
-                .fetch_events(filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                .fetch_events(filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
                 .await
                 .map_err(|error| JobLifecycleError::Relay(format!("fetch (recheck): {error}")))?,
+            &filter,
         );
     }
 
-    let read = if events.is_empty() && poisoned {
-        // Only unverifiable frames matched: the relay's answer is untrustworthy, not empty.
-        PresenceRead::Unverified
-    } else if events.is_empty() {
-        PresenceRead::ConfirmedAbsent
-    } else {
-        PresenceRead::Present(())
-    };
+    let read = filter_presence_verdict(&events, poisoned);
     client.disconnect().await;
     Ok(read)
 }
@@ -3358,14 +3362,21 @@ async fn presence_of_filter(
 /// re-emits a same-id swap on the raw Message stream, and `fetch_events`' set keeps whichever frame
 /// arrived first) must NOT read as "the relay holds nothing": callers that would conclude absence
 /// treat a poisoned empty read as unanswered instead.
+///
+/// worker-fable M1: a frame that verifies but does NOT match the filter we asked for is the relay
+/// answering a different question (another author's "award", another job's result). The SDK does
+/// not enforce filters client-side, so such a frame is dropped and also poisons the read: it is
+/// never evidence of presence, and its arrival means the relay's answer cannot certify absence.
 fn authentic_split(
     events: impl IntoIterator<Item = nostr_sdk::Event>,
+    filter: &nostr_sdk::Filter,
 ) -> (Vec<nostr_sdk::Event>, bool) {
     let mut poisoned = false;
     let kept = events
         .into_iter()
         .filter(|event| {
-            let ok = verified_author_hex(event).is_some();
+            let ok = verified_author_hex(event).is_some()
+                && filter.match_event(event, Default::default());
             poisoned |= !ok;
             ok
         })
@@ -3373,14 +3384,35 @@ fn authentic_split(
     (kept, poisoned)
 }
 
-/// Keep only the events whose id and signature verify ([`verified_author_hex`]).
-fn authentic_events(
+/// The verdict of a single-filter presence read once [`authentic_split`] has run. Anything that
+/// verified and matched is presence (holding funds is the safe direction); otherwise a poisoned read
+/// is unanswered, never absence.
+fn filter_presence_verdict(kept: &[nostr_sdk::Event], poisoned: bool) -> PresenceRead<()> {
+    if !kept.is_empty() {
+        PresenceRead::Present(())
+    } else if poisoned {
+        PresenceRead::Unverified
+    } else {
+        PresenceRead::ConfirmedAbsent
+    }
+}
+
+/// The legacy claim/result lists of a job view (advisor r3 M1 / worker-fable M2). These feed claim
+/// liveness and delivery, and reconcile releases a reservation whose claim reads dead — so a read
+/// that dropped ANY frame is an error (reconcile's `Err` arm keeps the funds), never a shorter list.
+fn authentic_list(
     events: impl IntoIterator<Item = nostr_sdk::Event>,
-) -> Vec<nostr_sdk::Event> {
-    events
-        .into_iter()
-        .filter(|event| verified_author_hex(event).is_some())
-        .collect()
+    filter: &nostr_sdk::Filter,
+    what: &str,
+) -> Result<Vec<nostr_sdk::Event>, JobLifecycleError> {
+    let (kept, poisoned) = authentic_split(events, filter);
+    if poisoned {
+        return Err(JobLifecycleError::Relay(format!(
+            "fetch {what}: the relay returned an event that does not verify or does not match the \
+             request; the read is not trusted"
+        )));
+    }
+    Ok(kept)
 }
 
 /// Reduce a job's parsed awards — **oldest first** — to a single presence.
@@ -3424,6 +3456,17 @@ fn parse_relayed_award(
     buyer_pubkey_hex: &str,
     job_id: &str,
 ) -> Result<RelayedAward, String> {
+    // worker-fable M1: only an award THIS buyer signed is a selection. The relay decides what a
+    // fetch returns, so a verifying kind-3405 signed by anyone else (a colluding seller naming its
+    // own claim) must never become the claim collect pays or the row a repair writes.
+    if event.kind != nostr_sdk::Kind::Custom(JOB_AWARD_KIND) {
+        return Err(format!("event is kind {}, not an award", event.kind.as_u16()));
+    }
+    match verified_author_hex(event) {
+        Some(author) if author.eq_ignore_ascii_case(buyer_pubkey_hex) => {}
+        Some(author) => return Err(format!("award is signed by {author}, not this buyer")),
+        None => return Err("award does not verify".to_owned()),
+    }
     let draft = event_to_draft(event);
     let parsed = gateway::parse_award(&draft)
         .ok_or_else(|| "award has no root `e` (offer) and non-root `e` (claim) tag pair".to_owned())?;
@@ -3652,6 +3695,7 @@ pub(crate) async fn fetch_job_view_async(
             .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
             .await
             .map_err(|error| JobLifecycleError::Relay(format!("fetch offer: {error}")))?,
+        &offer_filter,
     );
 
     // `read_confirmed` is derived from the OFFER read ALONE. A claim or result event is the relay
@@ -3684,11 +3728,12 @@ pub(crate) async fn fetch_job_view_async(
         if confirmed {
             (offer_events, offer_poisoned) = authentic_split(
                 relay
-                    .fetch_events(offer_filter, timeout, ReqExitPolicy::ExitOnEOSE)
+                    .fetch_events(offer_filter.clone(), timeout, ReqExitPolicy::ExitOnEOSE)
                     .await
                     .map_err(|error| {
                         JobLifecycleError::Relay(format!("fetch offer (recheck): {error}"))
                     })?,
+                &offer_filter,
             );
         }
         // Make the why-empty question observable next time (the report the tree lacked): whether
@@ -3722,11 +3767,18 @@ pub(crate) async fn fetch_job_view_async(
         if read.is_err() { client.disconnect().await; }
         read?
     } else {
-        (authentic_events(client.fetch_events(feedback_filter, timeout).await
-            .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?),
-         authentic_events(client.fetch_events(result_filter, timeout).await
-            .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?),
-         Vec::new())
+        let lists: Result<_, JobLifecycleError> = async {
+            let feedback = client.fetch_events(feedback_filter.clone(), timeout).await
+                .map_err(|error| JobLifecycleError::Relay(format!("fetch feedback: {error}")))?;
+            let feedback = authentic_list(feedback, &feedback_filter, "feedback")?;
+            let results = client.fetch_events(result_filter.clone(), timeout).await
+                .map_err(|error| JobLifecycleError::Relay(format!("fetch results: {error}")))?;
+            let results = authentic_list(results, &result_filter, "results")?;
+            Ok((feedback, results))
+        }.await;
+        if lists.is_err() { client.disconnect().await; }
+        let (feedback, results) = lists?;
+        (feedback, results, Vec::new())
     };
 
     if let Some(event) = offer_events.iter().find(|e| e.id == offer_id) {
@@ -4414,18 +4466,77 @@ mod tests {
         assert_eq!(verified_author_hex(&bad_sig), None, "a flipped signature has no author");
         assert_eq!(verified_author_hex(&same_id), None, "a same-id content swap has no author");
 
-        let kept = authentic_events(vec![bad_sig, same_id.clone(), genuine.clone()]);
+        let any = nostr_sdk::Filter::new();
+        let (kept, _) = authentic_split(vec![bad_sig, same_id.clone(), genuine.clone()], &any);
         assert_eq!(kept.len(), 1, "only the genuine event survives");
         assert_eq!(kept[0].content, "result");
-        assert!(authentic_events(vec![same_id.clone()]).is_empty());
         // advisor r2: a read whose only frame is an unverifiable twin is POISONED, not empty — the
         // presence probes and the offer read then answer Unverified / unconfirmed, never absence.
-        let (kept, poisoned) = authentic_split(vec![same_id.clone()]);
+        let (kept, poisoned) = authentic_split(vec![same_id.clone()], &any);
         assert!(kept.is_empty() && poisoned, "a twin-only read is poisoned, not empty");
-        let (kept, poisoned) = authentic_split(Vec::<nostr_sdk::Event>::new());
+        let (kept, poisoned) = authentic_split(Vec::<nostr_sdk::Event>::new(), &any);
         assert!(kept.is_empty() && !poisoned, "a truly empty read is not poisoned");
-        let (kept, poisoned) = authentic_split(vec![genuine.clone(), same_id]);
+        let (kept, poisoned) = authentic_split(vec![genuine.clone(), same_id.clone()], &any);
         assert!(kept.len() == 1 && poisoned, "a verifying frame is kept alongside a twin");
+
+        // advisor r3: the three absence decisions themselves. Twin-only is never absence; mixed is
+        // presence; truly empty is absence.
+        assert!(matches!(filter_presence_verdict(&[], true), PresenceRead::Unverified));
+        assert!(matches!(filter_presence_verdict(&[], false), PresenceRead::ConfirmedAbsent));
+        assert!(matches!(
+            filter_presence_verdict(std::slice::from_ref(&genuine), true),
+            PresenceRead::Present(())
+        ));
+        // The legacy claim/result lists refuse a poisoned read outright (reconcile's Err arm keeps
+        // the funds) instead of returning a shorter list.
+        assert!(authentic_list(vec![same_id.clone()], &any, "results").is_err());
+        assert!(authentic_list(vec![genuine.clone(), same_id], &any, "results").is_err());
+        assert_eq!(authentic_list(vec![genuine.clone()], &any, "results").expect("clean").len(), 1);
+
+        // worker-fable M1: a verifying event that does not match the filter asked for (another
+        // author) is dropped AND poisons the read — never presence, never certified absence.
+        let other = Keys::generate();
+        let foreign = EventBuilder::new(Kind::Custom(JOB_RESULT_KIND), "result")
+            .sign_with_keys(&other)
+            .expect("sign");
+        let by_seller = nostr_sdk::Filter::new().author(seller.public_key());
+        let (kept, poisoned) = authentic_split(vec![foreign.clone()], &by_seller);
+        assert!(kept.is_empty() && poisoned, "an off-filter author is not presence");
+        assert!(matches!(filter_presence_verdict(&kept, poisoned), PresenceRead::Unverified));
+        let (kept, poisoned) = authentic_split(vec![genuine.clone()], &by_seller);
+        assert!(kept.len() == 1 && !poisoned, "the filtered author's own event is presence");
+    }
+
+    // worker-fable M1: only an award THIS buyer signed is a selection. A verifying kind-3405 that a
+    // colluding seller signed (naming its own claim, with the buyer's `p`) must never parse into the
+    // claim collect pays or the row a repair writes. Red on revert of the signer check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_award_signed_by_anyone_but_the_buyer_refuses_to_parse() {
+        let buyer = nostr_sdk::Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let seller = nostr_sdk::Keys::generate();
+        let seller_hex = seller.public_key().to_hex();
+        let offer = "a".repeat(64);
+        let claim = "c".repeat(64);
+        let tags = || vec![
+            vec!["e", offer.as_str(), "", "root"],
+            vec!["e", claim.as_str()],
+            vec!["p", buyer_hex.as_str()],
+            vec!["p", seller_hex.as_str()],
+        ];
+        let forged = award_event_with(&seller, tags()).await;
+        let error = parse_relayed_award(&forged, &buyer_hex, &offer)
+            .expect_err("a seller-signed award must not parse");
+        assert!(error.contains("not this buyer"), "unexpected: {error}");
+        let genuine = award_event_with(&buyer, tags()).await;
+        assert!(parse_relayed_award(&genuine, &buyer_hex, &offer).is_ok(), "non-vacuity");
+        // Wrong kind, buyer-signed: still not an award.
+        let mut builder = nostr_sdk::EventBuilder::new(nostr_sdk::Kind::Custom(JOB_RESULT_KIND), "x");
+        for tag in tags() {
+            builder = builder.tag(nostr_sdk::Tag::parse(tag).expect("tag"));
+        }
+        let wrong_kind = builder.sign(&buyer).await.expect("sign");
+        assert!(parse_relayed_award(&wrong_kind, &buyer_hex, &offer).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread")]

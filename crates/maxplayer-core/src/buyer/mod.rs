@@ -2787,15 +2787,50 @@ async fn resolve_expired_attempt(
             }
         }
         Ok(job_lifecycle::PresenceRead::Unverified) => {
-            crate::opline!(
-                "buyer: pending award attempt for {job_id} unresolved (relay did not confirm \
-                 presence or absence); will retry next pass"
-            );
+            if past_pay_window(now_unix(), attempt.offer_deadline_unix) {
+                // RC3-02 (advisor r3 M2): past the pay window an unverified probe never resolves
+                // on its own if the relay keeps answering with an unverifiable frame. Releasing
+                // here would reintroduce the false absence, so the funds stay HELD — but the hold
+                // is surfaced (status → parked_awards) instead of only logged every pass. A later
+                // Present still heals it (`mark_award_awarded` clears the park).
+                park_unverified_expired_attempt(&context.store, job_id, now_unix());
+            } else {
+                crate::opline!(
+                    "buyer: pending award attempt for {job_id} unresolved (relay did not confirm \
+                     presence or absence); will retry next pass"
+                );
+            }
         }
         Err(error) => {
             crate::opline!("buyer: pending award attempt for {job_id} probe failed: {error}");
         }
     }
+}
+
+/// The surfaced reason for an expired attempt whose award the relay will not answer for.
+pub(crate) const PARK_REASON_EXPIRED_UNVERIFIED: &str =
+    "award attempt is past its pay window and the relay keeps answering with events that do not \
+     verify; funds stay held (never released on an unverified read) — check the relay, then \
+     settle with `collect` or release manually";
+
+/// Park (once) the intent of an expired attempt the relay will not answer for, keeping its
+/// reservation held. Idempotent: an intent already parked with this reason is left alone, so the
+/// 600s sweep does not rewrite it or re-log.
+fn park_unverified_expired_attempt(store: &store::BuyerStore, job_id: &str, now: i64) {
+    let already = store
+        .pending_award_state(job_id)
+        .ok()
+        .flatten()
+        .is_some_and(|(state, reason)| {
+            state == "parked" && reason.as_deref() == Some(PARK_REASON_EXPIRED_UNVERIFIED)
+        });
+    if already {
+        return;
+    }
+    crate::opline!(
+        "buyer: ⚠ pending award attempt for {job_id}: {PARK_REASON_EXPIRED_UNVERIFIED}"
+    );
+    let _ = store.mark_award_parked(job_id, PARK_REASON_EXPIRED_UNVERIFIED, now);
 }
 
 /// Resolve award attempts a prior run left open (#322) — runs as the first act of the reconcile
@@ -4695,6 +4730,42 @@ mod tests {
             state: store::AttemptState::Pending,
             detail: None,
         }
+    }
+
+    // RC3-02 (advisor r3 M2): an expired attempt whose probe stays Unverified is parked with a
+    // surfaced reason while its reservation stays HELD and the attempt stays pending (a later
+    // Present still heals it). Parking is idempotent across sweeps.
+    #[test]
+    fn an_unverified_expired_attempt_parks_but_keeps_its_funds() {
+        let root = temp_home("expired-unverified");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let store = store::BuyerStore::open(root.join("buyer.sqlite")).expect("store");
+        let job = "d".repeat(64);
+        store.reserve(&job, 4, 1_000, now_unix()).expect("reserve");
+        store.put_pending_award(&job, 4, None, None, now_unix()).expect("intent");
+        let mut pinned = attempt_fixture(&job, "ws://127.0.0.1:1");
+        pinned.offer_deadline_unix = now_unix() - 9 * 24 * 3_600;
+        store.begin_award_attempt(&pinned, now_unix()).expect("pin");
+
+        park_unverified_expired_attempt(&store, &job, now_unix());
+        park_unverified_expired_attempt(&store, &job, now_unix() + 600);
+
+        assert_eq!(
+            store.pending_award_state(&job).expect("read"),
+            Some(("parked".to_owned(), Some(PARK_REASON_EXPIRED_UNVERIFIED.to_owned())))
+        );
+        assert_eq!(
+            store.award_attempt(&job).expect("read").expect("row").state,
+            store::AttemptState::Pending,
+            "the attempt is not refused on an unverified read"
+        );
+        assert_eq!(
+            store.reservation(&job).expect("read").map(|(state, _)| state),
+            Some(reservations::ReservationState::Reserved),
+            "and the funds stay held"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // #322 round 2: the pay-window boundary is the ONE comparison the terminalize decision rests

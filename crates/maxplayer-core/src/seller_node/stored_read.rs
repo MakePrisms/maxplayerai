@@ -61,12 +61,24 @@ pub(crate) async fn read_stored(relay: &Relay, filters: Vec<Filter>, wait: Durat
         };
     }
     let mut events = BTreeMap::new();
-    let verdict =
-        tokio::time::timeout(wait, collect(&mut notifications, &id, &filters, &mut events)).await;
+    let mut unverifiable = 0usize;
+    let verdict = tokio::time::timeout(
+        wait,
+        collect(&mut notifications, &id, &filters, &mut events, &mut unverifiable),
+    )
+    .await;
     // Newest first, the order `fetch_events` handed its callers.
     let mut events: Vec<Event> = events.into_values().collect();
     events.sort();
     match verdict {
+        // RC3-02 (advisor r3 Low): a read that dropped a matching frame because it did not verify
+        // is not a complete answer. A caller that acts on emptiness (kind-0 merge-then-publish)
+        // would otherwise publish over a profile it never saw; backfills retry, as on any
+        // incomplete read.
+        Ok(Ok(())) if unverifiable > 0 => StoredRead::Incomplete {
+            events,
+            reason: format!("the relay returned {unverifiable} matching event(s) that do not verify"),
+        },
         Ok(Ok(())) => StoredRead::Complete(events),
         Ok(Err(reason)) => StoredRead::Incomplete { events, reason },
         Err(_) => StoredRead::Incomplete {
@@ -81,6 +93,7 @@ async fn collect(
     id: &SubscriptionId,
     filters: &[Filter],
     events: &mut BTreeMap<EventId, Event>,
+    unverifiable: &mut usize,
 ) -> Result<(), String> {
     loop {
         let notification = match notifications.recv().await {
@@ -104,12 +117,15 @@ async fn collect(
                 // cache is keyed by id; inserting it would REPLACE the genuine frame and the handler
                 // would then (correctly) reject the survivor, silently dropping a valid offer or
                 // payment wrap. Two different bodies cannot both verify under one id.
-                if event.verify().is_ok()
-                    && filters
-                        .iter()
-                        .any(|filter| filter.match_event(&event, Default::default()))
+                if filters
+                    .iter()
+                    .any(|filter| filter.match_event(&event, Default::default()))
                 {
-                    events.insert(event.id, event.into_owned());
+                    if event.verify().is_ok() {
+                        events.insert(event.id, event.into_owned());
+                    } else {
+                        *unverifiable += 1;
+                    }
                 }
             }
             RelayNotification::Message {
@@ -186,10 +202,21 @@ mod tests {
             }
             tx.send(eose.clone()).unwrap();
             let mut events = BTreeMap::new();
-            collect(&mut rx, &id, &filters, &mut events).await.expect("complete");
+            let mut unverifiable = 0;
+            collect(&mut rx, &id, &filters, &mut events, &mut unverifiable).await.expect("complete");
             assert_eq!(events.len(), 1);
             assert_eq!(events[&genuine.id].content, "genuine", "the genuine frame survives either order");
+            assert_eq!(unverifiable, 1, "the twin is counted, so read_stored reports Incomplete");
         }
+        // Twin only: nothing occupies the id, and the read is flagged (never a clean empty).
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        tx.send(frame(&twin)).unwrap();
+        tx.send(eose.clone()).unwrap();
+        let mut events = BTreeMap::new();
+        let mut unverifiable = 0;
+        collect(&mut rx, &id, &filters, &mut events, &mut unverifiable).await.expect("eose");
+        assert!(events.is_empty());
+        assert_eq!(unverifiable, 1);
     }
 
     async fn connected(url: &str) -> (Client, Relay) {
