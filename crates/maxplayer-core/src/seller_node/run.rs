@@ -7876,12 +7876,15 @@ impl SellerNodeRunner {
         // ticket while this entry is still `None`; consuming it here would lose the retry once the
         // late `Err` lands. Left queued, the tick serves it as soon as the outcome is stored.
         let in_flight = matches!(checks.get(job_id), Some(None));
-        if !in_flight && crate::review::state::take_retry(&home.root, job_id) {
-            if matches!(checks.get(job_id), Some(Some(Err(_)))) {
-                checks.remove(job_id);
-                if let Ok(mut logged) = self.review_blocked_logged.lock() {
-                    logged.remove(job_id);
-                }
+        // `take_retry` runs (consuming the ticket) whenever the check is not in flight; only a
+        // failed outcome is then cleared so the review is requested again.
+        if !in_flight
+            && crate::review::state::take_retry(&home.root, job_id)
+            && matches!(checks.get(job_id), Some(Some(Err(_))))
+        {
+            checks.remove(job_id);
+            if let Ok(mut logged) = self.review_blocked_logged.lock() {
+                logged.remove(job_id);
             }
         }
         if let Some(value) = checks.get(job_id) {
