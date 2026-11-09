@@ -157,7 +157,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # `key: ci-profile`: without it this job's cache key is the one the old release-profile run
+      # saved. An exact-match restore never saves, so the ci-profile dependencies were recompiled on
+      # every run (~4-7 min). A distinct key lets main save them once.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-profile
       - name: Test maxplayer-core (acp + gateway + git-delivery + wallet)
         run: cargo test -p maxplayer-core --profile ci --features acp,gateway,git-delivery,wallet --locked
 
@@ -230,7 +235,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Distinct cache key for the ci profile: see feature-union.
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-profile
       # Profile `ci` (Cargo.toml): our crates at dev speed with debug assertions and overflow checks
       # on, third-party crates optimised. This used to be `--release` because of a debug-only panic
       # in the git-delivery HTTP transport (#152); that was fixed in 20965f2 (verify-fetch runs off
