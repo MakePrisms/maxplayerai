@@ -198,6 +198,34 @@ pub enum HopError {
         /// Invoice amount in msat, `None` for an amountless or undecodable invoice.
         invoice_msat: Option<u64>,
     },
+    /// The target invoice had already expired when the hop was planned. Refused before the source
+    /// is asked to price it: an expired invoice cannot be paid, so planning it only strands a quote.
+    InvoiceExpired {
+        /// Target mint that raised the invoice.
+        mint: String,
+    },
+    /// The source mint priced the hop invoice at an amount other than the pinned delivery.
+    SourceQuoteMismatch {
+        /// Source mint that raised the melt quote.
+        mint: String,
+        /// Amount pinned by the buyer-signed offer.
+        expected_sats: u64,
+        /// Amount the source melt quote would melt.
+        quoted_sats: u64,
+    },
+    /// The invoice a melt is about to pay is not the one the hop planned: wrong amount, a different
+    /// payment hash, or undecodable (REPORT1110 F1, review r1). Checked before EVERY melt, including
+    /// a recovered or superseding one and a pairing journalled before the plan-time check existed.
+    UnpinnedInvoice {
+        /// Attempt the refused melt belongs to.
+        attempt_id: String,
+        /// Amount pinned by the buyer-signed offer.
+        expected_sats: u64,
+        /// Amount of the invoice about to be paid in msat, `None` if amountless or undecodable.
+        invoice_msat: Option<u64>,
+        /// Whether its payment hash matched the planned one; `None` when the plan predates the pin.
+        hash_matches: Option<bool>,
+    },
 }
 
 impl fmt::Display for HopError {
@@ -301,6 +329,27 @@ impl fmt::Display for HopError {
                  offer pins delivery at {expected_sats} sats; refusing the hop with zero spend",
                 invoice_msat.map_or_else(|| "no amount".to_owned(), |msat| format!("{msat} msat"))
             ),
+            Self::InvoiceExpired { mint } => write!(
+                formatter,
+                "cross-mint hop: target mint {mint} returned an already-expired invoice; refusing \
+                 the hop with zero spend"
+            ),
+            Self::SourceQuoteMismatch { mint, expected_sats, quoted_sats } => write!(
+                formatter,
+                "cross-mint hop: source mint {mint} priced the hop invoice at {quoted_sats} sats, not \
+                 the pinned delivery of {expected_sats} sats; refusing before the melt"
+            ),
+            Self::UnpinnedInvoice { attempt_id, expected_sats, invoice_msat, hash_matches } => write!(
+                formatter,
+                "cross-mint hop: attempt {attempt_id} would pay an invoice for {} {} but the plan \
+                 pins {expected_sats} sats to one invoice; refusing before the melt",
+                invoice_msat.map_or_else(|| "no amount".to_owned(), |msat| format!("{msat} msat")),
+                match hash_matches {
+                    Some(true) => "(same payment hash)",
+                    Some(false) => "(a different payment hash than planned)",
+                    None => "(the plan predates the payment-hash pin)",
+                }
+            ),
         }
     }
 }
@@ -322,6 +371,11 @@ pub(crate) trait HopEffects {
 
     /// Ask the target mint for a mint quote's state and exact invoice in one response.
     fn target_invoice(&mut self, mint_quote_id: &str) -> Result<(MintLeg, String), HopError>;
+
+    /// The bolt11 a source melt quote will pay and the amount it will melt, as the buyer's wallet
+    /// stored them when the quote was raised. Read before every melt so the hop pays only the
+    /// invoice it planned (REPORT1110 F1).
+    fn melt_invoice(&mut self, melt_quote_id: &str) -> Result<(String, u64), HopError>;
 
     /// Raise, but do not pay, a fresh source-mint melt quote against `bolt11`.
     fn supersede_melt_quote(&mut self, bolt11: &str) -> Result<(String, u64), HopError>;
@@ -688,6 +742,9 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
     let melted_earlier = loop {
         break match effects.melt_leg(&active_melt_quote_id)? {
             MeltLeg::Unpaid => {
+                // Also the gate for a pairing journalled before the plan-time check: it is reused
+                // as-is (authorize_pay), so this is the first place its invoice is ever checked.
+                require_melt_pinned(effects, &pairing, &active_melt_quote_id)?;
                 actual_fee_this_run = Some(effects.melt(&active_melt_quote_id)?);
                 false
             }
@@ -709,6 +766,8 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
                     }
                     MintLeg::Unpaid => {}
                 }
+                // Never raise a replacement quote against an invoice the plan did not pin.
+                require_pinned_invoice(&pairing, &bolt11)?;
                 if supersessions >= MAX_MELT_SUPERSESSIONS {
                     eprintln!(
                         "{}",
@@ -728,6 +787,9 @@ pub(crate) fn run_hop<S: HopJournalStore, E: HopEffects>(
                         replacement_cost: planned_cost,
                     });
                 }
+                // The replacement quote must melt exactly the delivery, against the same invoice:
+                // `planned_cost` bounds fees, it is not an amount pin.
+                require_melt_pinned(effects, &pairing, &new_melt_quote_id)?;
                 store.append_sync(&HopRecord::MeltSuperseded {
                     attempt_id: pairing.attempt_id.clone(),
                     superseded_melt_quote_id: active_melt_quote_id.clone(),
@@ -809,20 +871,90 @@ fn authorized_hop_cost(
     })
 }
 
-/// Refuse a target-mint bolt11 whose amount is not exactly `delivered_sats` (REPORT1110 F1).
-/// Undecodable and amountless invoices are refused too: either would let the payer side decide the
-/// amount, and the payer side here is the seller's own mint.
-fn require_invoice_amount(bolt11: &str, mint: &str, delivered_sats: u64) -> Result<(), HopError> {
+/// What the hop pins about a bolt11: amount in msat (`None` if amountless), payment hash (hex),
+/// and whether it has expired. `None` for an undecodable string.
+///
+/// `amount_milli_satoshis` floors a sub-msat (pico-BTC) remainder, so an invoice up to 0.9 msat
+/// above the pin compares equal. `lightning-invoice` 0.34 keeps the pico amount private, so that
+/// floor is accepted and documented rather than closed: it is below one millisatoshi.
+fn invoice_facts(bolt11: &str) -> Option<(Option<u64>, String, bool)> {
     use std::str::FromStr as _;
-    let invoice_msat = cdk::Bolt11Invoice::from_str(bolt11.trim())
-        .ok()
-        .and_then(|invoice| invoice.amount_milli_satoshis());
+    let invoice = cdk::Bolt11Invoice::from_str(bolt11.trim()).ok()?;
+    Some((
+        invoice.amount_milli_satoshis(),
+        invoice.payment_hash().to_string(),
+        invoice.is_expired(),
+    ))
+}
+
+/// Plan-time half of the F1 pin: refuse a target-mint bolt11 whose amount is not exactly
+/// `delivered_sats`, and refuse an expired one. Undecodable and amountless invoices are refused
+/// too: either would let the payer side decide the amount, and the payer side here is the seller's
+/// own mint. Returns the payment hash the hop journals.
+fn require_invoice_amount(
+    bolt11: &str,
+    mint: &str,
+    delivered_sats: u64,
+) -> Result<String, HopError> {
+    let facts = invoice_facts(bolt11);
+    let invoice_msat = facts.as_ref().and_then(|(msat, _, _)| *msat);
     let expected_msat = delivered_sats.checked_mul(1000);
-    if invoice_msat.is_none() || invoice_msat != expected_msat {
+    let Some((_, payment_hash, expired)) =
+        facts.filter(|_| invoice_msat.is_some() && invoice_msat == expected_msat)
+    else {
         return Err(HopError::InvoiceAmountMismatch {
             mint: mint.to_owned(),
             expected_sats: delivered_sats,
             invoice_msat,
+        });
+    };
+    if expired {
+        return Err(HopError::InvoiceExpired {
+            mint: mint.to_owned(),
+        });
+    }
+    Ok(payment_hash)
+}
+
+/// Run-time half of the F1 pin: the invoice a melt is about to pay must be for exactly the pinned
+/// delivery and, when the plan journalled one, carry the planned payment hash. A pre-pin pairing
+/// (no hash) is held to the amount alone, which is what closes F1 for hops an rc7 buyer planned.
+fn require_pinned_invoice(pairing: &HopJournal, bolt11: &str) -> Result<(), HopError> {
+    let facts = invoice_facts(bolt11);
+    let invoice_msat = facts.as_ref().and_then(|(msat, _, _)| *msat);
+    let hash_matches = match (&pairing.invoice_payment_hash, &facts) {
+        (Some(pinned), Some((_, hash, _))) => Some(pinned.eq_ignore_ascii_case(hash)),
+        (Some(_), None) => Some(false),
+        (None, _) => None,
+    };
+    let expected_msat = pairing.delivered_sats.checked_mul(1000);
+    let pinned_msat_differs =
+        matches!(pairing.invoice_msat, Some(pinned) if Some(pinned) != invoice_msat);
+    let amount_ok = invoice_msat.is_some() && invoice_msat == expected_msat && !pinned_msat_differs;
+    if !amount_ok || hash_matches == Some(false) {
+        return Err(HopError::UnpinnedInvoice {
+            attempt_id: pairing.attempt_id.clone(),
+            expected_sats: pairing.delivered_sats,
+            invoice_msat,
+            hash_matches,
+        });
+    }
+    Ok(())
+}
+
+/// Gate one melt: the source quote must pay the pinned invoice and melt exactly the delivery.
+fn require_melt_pinned<E: HopEffects>(
+    effects: &mut E,
+    pairing: &HopJournal,
+    melt_quote_id: &str,
+) -> Result<(), HopError> {
+    let (bolt11, melt_sats) = effects.melt_invoice(melt_quote_id)?;
+    require_pinned_invoice(pairing, &bolt11)?;
+    if melt_sats != pairing.delivered_sats {
+        return Err(HopError::SourceQuoteMismatch {
+            mint: pairing.source_mint.clone(),
+            expected_sats: pairing.delivered_sats,
+            quoted_sats: melt_sats,
         });
     }
     Ok(())
@@ -979,17 +1111,23 @@ impl CdkHopEffects {
         }
         // REPORT1110 F1: the target mint is the SELLER's choice, so the invoice it returns is
         // untrusted. It must be for exactly the pinned delivery amount — checked BEFORE the source
-        // is even asked to price it, so an inflated invoice can never reach the budget gate.
-        require_invoice_amount(&mint_quote.request, &self.target.mint_url.to_string(), delivered_sats)?;
+        // is even asked to price it, so an inflated invoice can never reach the budget gate. Its
+        // payment hash is journalled so every later melt can prove it pays this same invoice.
+        let payment_hash = require_invoice_amount(
+            &mint_quote.request,
+            &self.target.mint_url.to_string(),
+            delivered_sats,
+        )?;
         let (melt_quote_id, quoted_cost, cost) = self.raise_melt_quote(&mint_quote.request).await?;
-        // The source melts exactly what the invoice asks (cdk checks quote vs invoice); pin it to
-        // the delivery amount too, so the planned cost is delivery + the source's own fees only.
+        // cdk 0.17.2 compares a melt quote to its invoice only for sat/msat wallets, only after the
+        // quote is raised, and truncates msat to sat; the decode above is the control that binds
+        // the offer. This also pins the source's priced amount to the delivery (defence in depth).
         if cost.melt_amount != delivered_sats {
-            return Err(HopError::Mint(format!(
-                "source mint {} priced the hop invoice at {} sats, not the pinned delivery of \
-                 {delivered_sats} sats; refusing the hop with zero spend",
-                self.source.mint_url, cost.melt_amount
-            )));
+            return Err(HopError::SourceQuoteMismatch {
+                mint: self.source.mint_url.to_string(),
+                expected_sats: delivered_sats,
+                quoted_sats: cost.melt_amount,
+            });
         }
         self.require_source_covers(quoted_cost).await?;
         let planned_cost = authorized_hop_cost(
@@ -1007,6 +1145,8 @@ impl CdkHopEffects {
             planned_cost,
             fee_reserve: cost.fee_reserve,
             input_fee: cost.input_fee,
+            invoice_payment_hash: Some(payment_hash),
+            invoice_msat: delivered_sats.checked_mul(1000),
         })
     }
 
@@ -1151,6 +1291,24 @@ impl HopEffects for CdkHopEffects {
             MintQuoteState::Issued => MintLeg::Issued,
         };
         Ok((state, quote.request))
+    }
+
+    fn melt_invoice(&mut self, melt_quote_id: &str) -> Result<(String, u64), HopError> {
+        let wallet = self.source.clone();
+        let quote_id = melt_quote_id.to_owned();
+        block_on_leg("melt invoice", async move {
+            let quote = wallet
+                .localstore
+                .get_melt_quote(&quote_id)
+                .await
+                .map_err(|error| HopError::Mint(format!("melt invoice: {error}")))?
+                .ok_or_else(|| {
+                    HopError::Mint(format!(
+                        "melt invoice: source melt quote {quote_id} is not in the wallet store"
+                    ))
+                })?;
+            Ok::<_, HopError>((quote.request, quote.amount.to_u64()))
+        })?
     }
 
     fn supersede_melt_quote(&mut self, bolt11: &str) -> Result<(String, u64), HopError> {
@@ -1377,7 +1535,127 @@ mod tests {
             // reserved_ln_fee_sats() == 7.
             fee_reserve: 7,
             input_fee: 2,
+            // Pre-pin shape (as an rc7 buyer journalled it): held to the amount check only.
+            invoice_payment_hash: None,
+            invoice_msat: None,
         }
+    }
+
+    /// The one invoice the fake hop is planned against: signed, 100 sats.
+    fn honest_invoice() -> String {
+        crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"fake-planned-target", Duration::ZERO)
+    }
+
+    fn honest_hash() -> String {
+        crate::lnurl_pay::test_support::payment_hash_hex(b"fake-planned-target")
+    }
+
+    fn pinned_journal(attempt: &str) -> HopJournal {
+        HopJournal {
+            invoice_payment_hash: Some(honest_hash()),
+            invoice_msat: Some(100_000),
+            ..journal(attempt)
+        }
+    }
+
+    fn inflated_invoice(seed: &[u8]) -> String {
+        crate::lnurl_pay::test_support::signed_bolt11(Some(29_000_000), seed, Duration::ZERO)
+    }
+
+    // ── REPORT1110 F1 review r1: the pin holds at EVERY melt, not only at plan time ──────────
+
+    #[test]
+    fn a_pre_pin_pairing_whose_melt_pays_an_inflated_invoice_refuses_before_the_melt() {
+        // An rc7 buyer journalled this hop with no invoice check; authorize_pay reuses it as-is.
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().planned_melt_invoice = (inflated_invoice(b"pre-pin-inflated"), 29_000);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let error = run_hop(&store, &mut effects, &journal("attempt-1"))
+            .expect_err("an inflated pre-pin hop must refuse");
+        assert!(
+            matches!(
+                error,
+                HopError::UnpinnedInvoice {
+                    expected_sats: 100,
+                    invoice_msat: Some(29_000_000),
+                    hash_matches: None,
+                    ..
+                }
+            ),
+            "got: {error}"
+        );
+        assert!(world.borrow().melts.is_empty(), "nothing may be melted");
+        assert!(world.borrow().mints.is_empty());
+    }
+
+    #[test]
+    fn a_pinned_pairing_refuses_a_melt_for_a_different_invoice_of_the_same_amount() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        let swapped = crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"swapped", Duration::ZERO);
+        world.borrow_mut().planned_melt_invoice = (swapped, 100);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let error = run_hop(&store, &mut effects, &pinned_journal("attempt-1"))
+            .expect_err("a different payment hash must refuse");
+        assert!(
+            matches!(error, HopError::UnpinnedInvoice { hash_matches: Some(false), .. }),
+            "got: {error}"
+        );
+        assert!(world.borrow().melts.is_empty());
+    }
+
+    #[test]
+    fn a_pinned_pairing_paying_its_own_invoice_settles() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let settled = run_hop(&store, &mut effects, &pinned_journal("attempt-1"))
+            .expect("the planned invoice pays");
+        assert_eq!(settled.minted_sats, 100);
+        assert_eq!(world.borrow().melts, vec!["melt-1"]);
+    }
+
+    #[test]
+    fn recovery_refuses_a_target_invoice_that_changed_since_the_plan() {
+        // cdk 0.17.2 happens to keep the stored request on a status check; the hop must not rely
+        // on that. A failed melt whose target now reports a larger invoice raises no new quote.
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().target_bolt11 = inflated_invoice(b"recovery-inflated");
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let error = run_hop(&store, &mut effects, &pinned_journal("attempt-1"))
+            .expect_err("a changed invoice must refuse");
+        assert!(
+            matches!(error, HopError::UnpinnedInvoice { invoice_msat: Some(29_000_000), .. }),
+            "got: {error}"
+        );
+        assert!(world.borrow().superseding_quotes.is_empty(), "no replacement quote may be raised");
+        assert!(world.borrow().melts.is_empty());
+    }
+
+    #[test]
+    fn a_superseding_quote_that_melts_more_than_the_delivery_refuses_before_it_is_journalled() {
+        let store = MemJournal::default();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().superseding_melt_sats = Some(105);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let error = run_hop(&store, &mut effects, &journal("attempt-1"))
+            .expect_err("a replacement melting more than the delivery must refuse");
+        assert!(
+            matches!(
+                error,
+                HopError::SourceQuoteMismatch { expected_sats: 100, quoted_sats: 105, .. }
+            ),
+            "got: {error}"
+        );
+        assert!(world.borrow().melts.is_empty());
+        assert!(
+            matches!(store.replay("attempt-1").unwrap().as_slice(), [HopRecord::Planned(_)]),
+            "the refused replacement must not be journalled"
+        );
     }
 
     /// What the fake mints did, shared with the test so a restart can inspect it.
@@ -1400,6 +1678,12 @@ mod tests {
         fail_all_melts: bool,
         /// Actual Lightning fee the melt effect reports as paid (#186 reconciliation input).
         melt_fee: u64,
+        /// Bolt11 the target reports for the hop's mint quote (recovery reads it).
+        target_bolt11: String,
+        /// What the planned melt quote pays: (bolt11, melt amount).
+        planned_melt_invoice: (String, u64),
+        /// Override for the melt amount of a superseding quote (default: its invoice's amount).
+        superseding_melt_sats: Option<u64>,
         /// Shared with the journal so a test can assert write-before-effect order.
         ops: Rc<RefCell<Vec<String>>>,
     }
@@ -1411,6 +1695,8 @@ mod tests {
                 mint_leg: Some(MintLeg::Unpaid),
                 superseding_planned_cost: 109,
                 source_coverage: u64::MAX,
+                target_bolt11: honest_invoice(),
+                planned_melt_invoice: (honest_invoice(), 100),
                 ..Self::default()
             }))
         }
@@ -1445,7 +1731,7 @@ mod tests {
             let state = world
                 .mint_leg
                 .ok_or_else(|| HopError::Mint("target mint unreachable".into()))?;
-            Ok((state, "lnbc-same-target-invoice".to_owned()))
+            Ok((state, world.target_bolt11.clone()))
         }
 
         fn supersede_melt_quote(&mut self, bolt11: &str) -> Result<(String, u64), HopError> {
@@ -1461,6 +1747,23 @@ mod tests {
                 .superseding_quotes
                 .push((id.clone(), bolt11.to_owned(), planned_cost));
             Ok((id, planned_cost))
+        }
+
+        fn melt_invoice(&mut self, melt_quote_id: &str) -> Result<(String, u64), HopError> {
+            let world = self.world.borrow();
+            if let Some((_, bolt11, _)) = world
+                .superseding_quotes
+                .iter()
+                .find(|(id, _, _)| id == melt_quote_id)
+            {
+                let sats = world.superseding_melt_sats.unwrap_or_else(|| {
+                    invoice_facts(bolt11)
+                        .and_then(|(msat, _, _)| msat)
+                        .map_or(0, |msat| msat / 1000)
+                });
+                return Ok((bolt11.clone(), sats));
+            }
+            Ok(world.planned_melt_invoice.clone())
         }
 
         fn require_source_covers(&mut self, planned_cost: u64) -> Result<(), HopError> {
@@ -1877,6 +2180,9 @@ mod tests {
             fn require_source_covers(&mut self, _: u64) -> Result<(), HopError> {
                 unreachable!()
             }
+            fn melt_invoice(&mut self, _: &str) -> Result<(String, u64), HopError> {
+                Ok((honest_invoice(), 100))
+            }
             fn melt(&mut self, _: &str) -> Result<u64, HopError> {
                 Ok(0)
             }
@@ -2190,9 +2496,50 @@ mod tests {
         let pairing = effects.plan_quotes("attempt-f1-honest", 100).await.expect("honest hop plans");
         assert_eq!(pairing.delivered_sats, 100);
         assert_eq!(pairing.fee_reserve, 290);
+        assert_eq!(
+            pairing.invoice_payment_hash.as_deref(),
+            Some(crate::lnurl_pay::test_support::payment_hash_hex(b"f1-honest").as_str()),
+            "the planned invoice's payment hash is journalled"
+        );
+        assert_eq!(pairing.invoice_msat, Some(100_000));
         let multiplier = default_hop_fee_buffer_multiplier();
         assert_eq!(pairing.planned_cost, 100 + 290 + 290 * multiplier, "melt + reserve + buffer");
         assert_eq!(melt_quotes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn plan_quotes_refuses_an_expired_target_invoice() {
+        let expired = crate::lnurl_pay::test_support::signed_bolt11(
+            Some(100_000),
+            b"f1-expired",
+            Duration::from_secs(7200),
+        );
+        let (effects, melt_quotes) = scripted_hop(expired, 100).await;
+        let error = effects
+            .plan_quotes("attempt-f1-expired", 100)
+            .await
+            .expect_err("an expired invoice must refuse");
+        assert!(matches!(error, HopError::InvoiceExpired { .. }), "got: {error}");
+        assert_eq!(melt_quotes.load(std::sync::atomic::Ordering::SeqCst), 0, "source never quoted");
+    }
+
+    #[tokio::test]
+    async fn cdk_melt_invoice_reads_the_planned_quote_from_the_wallet_store() {
+        let honest =
+            crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"f1-store", Duration::ZERO);
+        let (effects, _) = scripted_hop(honest.clone(), 100).await;
+        let pairing = effects.plan_quotes("attempt-f1-store", 100).await.expect("honest hop plans");
+        let quote_id = pairing.melt_quote_id.clone();
+        let (bolt11, melt_sats) = tokio::task::spawn_blocking(move || {
+            let mut effects = effects;
+            effects.melt_invoice(&quote_id)
+        })
+        .await
+        .expect("join")
+        .expect("the planned melt quote is in the store");
+        assert_eq!(bolt11, honest);
+        assert_eq!(melt_sats, 100);
+        require_pinned_invoice(&pairing, &bolt11).expect("the planned quote pays the pinned invoice");
     }
 
     #[tokio::test]
@@ -2526,7 +2873,7 @@ mod tests {
         assert_eq!(world.borrow().melts, vec!["melt-2"]);
         assert_eq!(
             world.borrow().superseding_quotes[0].1,
-            "lnbc-same-target-invoice"
+            honest_invoice()
         );
         let records = store.replay("attempt-1").unwrap();
         assert!(matches!(

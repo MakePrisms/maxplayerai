@@ -1870,6 +1870,8 @@ mod tests {
             planned_cost: 109,
             fee_reserve: 7,
             input_fee: 2,
+            invoice_payment_hash: None,
+            invoice_msat: None,
         };
         // Direct path with no input fee is the amount, exactly as before.
         assert_eq!(cap_charge(None, 100, 0), 100, "zero-fee direct is the amount");
