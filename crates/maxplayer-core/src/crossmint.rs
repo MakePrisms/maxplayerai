@@ -284,14 +284,12 @@ pub struct HopJournal {
     /// reserve portion of `planned_cost` — the only part that reconciles against the actual fee.
     #[serde(default)]
     pub input_fee: u64,
-    /// Payment hash (hex) of the target invoice this hop was planned against (REPORT1110 F1). Every
-    /// melt re-decodes the invoice it is about to pay and refuses a different hash. `None` on a
+    /// SHA-256 (hex) of the exact target bolt11 this hop was planned against, trimmed and
+    /// lowercased (REPORT1110 F1). Every melt refuses an invoice string with a different digest,
+    /// which pins payee, route hints and expiry as well as amount and payment hash. `None` on a
     /// pairing journalled before the pin; such a pairing is still held to the amount check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invoice_payment_hash: Option<String>,
-    /// Amount of that invoice in msat (`delivered_sats * 1000`); `None` on a pre-pin pairing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub invoice_msat: Option<u64>,
+    pub invoice_sha256: Option<String>,
 }
 
 impl HopJournal {
@@ -565,8 +563,7 @@ mod tests {
             planned_cost: 109,
             fee_reserve: 7,
             input_fee: 2,
-            invoice_payment_hash: Some("ab".repeat(32)),
-            invoice_msat: Some(100_000),
+            invoice_sha256: Some("ab".repeat(32)),
         };
         let encoded = serde_json::to_string(&journal).expect("journal serializes");
         let decoded: HopJournal = serde_json::from_str(&encoded).expect("journal deserializes");
@@ -575,13 +572,11 @@ mod tests {
         // A pre-pin pairing (written by rc7) has neither field: the row keeps its old shape and
         // still loads, as `None`.
         let legacy = HopJournal {
-            invoice_payment_hash: None,
-            invoice_msat: None,
+            invoice_sha256: None,
             ..journal.clone()
         };
         let legacy_json = serde_json::to_string(&legacy).expect("legacy serializes");
-        assert!(!legacy_json.contains("invoice_payment_hash"), "absent pin keeps the rc7 row shape");
-        assert!(!legacy_json.contains("invoice_msat"));
+        assert!(!legacy_json.contains("invoice_sha256"), "absent pin keeps the rc7 row shape");
         let reloaded: HopJournal = serde_json::from_str(&legacy_json).expect("rc7 row deserializes");
         assert_eq!(reloaded, legacy);
         assert_eq!(decoded.mint_quote_id, "mint-quote-1");
