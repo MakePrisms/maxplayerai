@@ -47,8 +47,10 @@ the merge, Vercel).
   report it as `swap_held` with its saga id, and payments continue (it holds nothing a payment
   could select). Its change stays at the mint until automatic recovery lands
   (MakePrisms/maxplayerai#1272); keep the home's `key` and `wallet/cdk-wallet.sqlite` and report the
-  saga id. While such a swap exists, a send whose inputs the mint still reads unspent is not
-  released (shown as `send_held`; payments continue), and cdk's own recovery skips the swap and
+  saga id. While such a swap exists, a crashed send whose inputs the mint still reads unspent is
+  not released and payments on that mint are refused (shown as `send_held` with `Payments on this
+  mint are refused`): the swap may still commit at the mint, and a retry would otherwise pay the
+  same attempt twice with other proofs. cdk's own recovery skips the swap and
   any send or melt that may have started it but still recovers every other operation (including
   during the cross-mint hop sweep). Sends and melts take a shared `<home>/wallet/operation.lock`
   while they run so recovery in any process can tell a running one from a crashed one.
