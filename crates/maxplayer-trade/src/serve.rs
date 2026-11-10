@@ -288,6 +288,7 @@ struct SocketPath {
     _dir: Option<std::fs::File>,
 }
 fn socket_path(home: &Path) -> Result<SocketPath> {
+    let home = &crate::wallet::state_dir(home);
     let direct = home.join(SOCKET);
     if direct.as_os_str().len() < 100 {
         return Ok(SocketPath {
@@ -312,7 +313,7 @@ pub fn bind(home: &Path, relays: Vec<String>) -> Result<mpsc::Receiver<Job>> {
 /// another uid to prove the real socket drops a foreign peer before reading anything.
 #[doc(hidden)]
 pub fn bind_expecting(home: &Path, relays: Vec<String>, owner: u32) -> Result<mpsc::Receiver<Job>> {
-    let file = home.join(SOCKET);
+    let file = crate::wallet::state_dir(home).join(SOCKET);
     match std::fs::symlink_metadata(&file) {
         Ok(meta) => {
             ensure!(
@@ -775,6 +776,23 @@ pub async fn execute(home: &Path, j: &Journal, m: &Market, job: Job) {
     let _ = job.reply.send(result);
 }
 async fn run_command(home: &Path, j: &Journal, m: &Market, c: &Command) -> Result<Outcome> {
+    // The CLI checks these before handing off; refuse here too, whatever the client was.
+    if crate::wallet::is_legacy_dir(home)
+        && matches!(
+            c,
+            Command::List { .. }
+                | Command::Take { .. }
+                | Command::Fund { .. }
+                | Command::Receive { .. }
+        )
+    {
+        anyhow::bail!("{}", crate::wallet::legacy_refusal(home));
+    }
+    if let Command::Receive { mint, .. } | Command::Send { mint, .. } | Command::Fund { mint, .. } =
+        c
+    {
+        crate::wallet::check_mint(home, &Asset::from_cli(mint)?.mint_url)?;
+    }
     match c {
         Command::List {
             give_mint,
@@ -1101,7 +1119,7 @@ pub async fn forward_expecting(home: &Path, request: &Request, me: u32) -> Resul
     // socket another uid planted in the home.
     trusted_serve(
         stream.peer_cred()?.uid(),
-        std::fs::symlink_metadata(home.join(SOCKET))
+        std::fs::symlink_metadata(crate::wallet::state_dir(home).join(SOCKET))
             .context("serve socket vanished during hand-off; nothing was sent")?
             .uid(),
         me,

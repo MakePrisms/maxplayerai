@@ -46,6 +46,39 @@ pub struct Attempt {
     pub quarantined: bool,
     #[serde(default)]
     pub observed_preimage: Option<String>,
+    /// The operation that held `inputs` reserved in the wallet when this attempt was created (a
+    /// lock's plan reservation). Settlement drops a spent input only while that operation still
+    /// owns it. `None`: inputs not in the wallet (HTLC claims/refunds) or a journal written before
+    /// this field (then only unowned rows are dropped).
+    #[serde(default)]
+    pub input_owner: Option<uuid::Uuid>,
+}
+impl Attempt {
+    fn input_owner(&self) -> crate::wallet::InputOwner {
+        match self.input_owner {
+            Some(op) => crate::wallet::InputOwner::Op(op),
+            None => crate::wallet::InputOwner::NotACdkSaga,
+        }
+    }
+}
+/// The single operation that holds every one of `ys` reserved, if there is one.
+async fn reservation_owner(
+    home: &Path,
+    mint: &str,
+    ys: Vec<PublicKey>,
+) -> Result<Option<uuid::Uuid>> {
+    if ys.is_empty() {
+        return Ok(None);
+    }
+    let rows = database(home, mint)
+        .await?
+        .get_proofs_by_ys(ys.clone())
+        .await?;
+    let owners: HashSet<_> = rows.iter().map(|r| r.used_by_operation).collect();
+    Ok(match owners.into_iter().collect::<Vec<_>>().as_slice() {
+        [Some(op)] if rows.len() == ys.len() => Some(*op),
+        _ => None,
+    })
 }
 /// HTTP per-request timeout (unchanged). A `nostr://` request is bounded by the connector window
 /// instead; see `crate::transport`.
@@ -202,6 +235,8 @@ pub async fn plan_excluding(
     max_fee: u64,
     exclude: &HashSet<cashu::nuts::PublicKey>,
 ) -> Result<Plan> {
+    // Review r6 H1: the shared mint payment gate, before any proof is chosen.
+    crate::wallet::payment_gate(home, mint).await?;
     let w = wallet(home, mint).await?;
     crate::wallet::bounded_for(mint, w.refresh_keysets())
         .await
@@ -241,7 +276,10 @@ pub async fn plan_excluding(
         if total >= gross + lock_fee {
             ensure!(inputs.len() <= 128, "too many inputs");
             ensure!(claim_fee + lock_fee <= max_fee, "fee cap exceeded");
-            unspent(mint, &inputs).await?;
+            if let Err(error) = unspent(mint, &inputs).await {
+                crate::wallet::refuse_if_taken(home, mint, &inputs.ys()?).await?;
+                return Err(error);
+            }
             return Ok(Plan {
                 mint: mint.into(),
                 inputs,
@@ -257,29 +295,29 @@ pub async fn plan_excluding(
     }
     bail!("insufficient unreserved balance (overlisting refused)")
 }
+/// Re-apply a journaled reservation (recovery): owner-checked, under the wallet selection lock.
 pub async fn reserve(home: &Path, p: &Plan, op: &str) -> Result<()> {
-    let db = database(home, &p.mint).await?;
-    let id = uuid::Uuid::parse_str(op)?;
-    let existing = db.get_reserved_proofs(&id).await?;
-    let intended: HashSet<_> = p.inputs.ys()?.into_iter().collect();
-    ensure!(
-        existing.iter().all(|p| intended.contains(&p.y)),
-        "reservation conflict"
-    );
-    let reserved: HashSet<_> = existing.iter().map(|p| p.y).collect();
-    let missing = intended.difference(&reserved).copied().collect::<Vec<_>>();
-    if !missing.is_empty() {
-        db.reserve_proofs(missing, &id).await?;
-    }
-    Ok(())
+    crate::wallet::reserve(home, &p.mint, &p.inputs.ys()?, &uuid::Uuid::parse_str(op)?).await
+}
+/// First reservation of a freshly planned lot/take: under ONE selection lock, check the planned
+/// inputs are still free (another process on a shared home may have taken one since `plan`),
+/// journal the intent with `journal`, then reserve. Nothing is journaled if a proof was taken.
+pub async fn reserve_new<F, Fut>(home: &Path, p: &Plan, op: &str, journal: F) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let ys = p.inputs.ys()?;
+    // Review r6 H1: gated again here (a plan may predate a crash); before the lock, local only.
+    crate::wallet::payment_gate(home, &p.mint).await?;
+    let sel = crate::wallet::select(home, &p.mint).await?;
+    sel.verify_free(&ys).await?;
+    journal().await?;
+    sel.reserve(&ys, &uuid::Uuid::parse_str(op)?).await
 }
 pub async fn release(home: &Path, p: &Plan, op: &str) -> Result<()> {
     unspent(&p.mint, &p.inputs).await?;
-    database(home, &p.mint)
-        .await?
-        .release_proofs(&uuid::Uuid::parse_str(op)?)
-        .await?;
-    Ok(())
+    crate::wallet::release(home, &p.mint, &uuid::Uuid::parse_str(op)?).await
 }
 pub fn conditions(
     hash: &str,
@@ -391,6 +429,7 @@ pub async fn lock(
             })
             .collect();
         crate::transport::check_claim_fits(&p.mint, &locked, claim_outputs(p.net))?;
+        let input_owner = reservation_owner(home, &p.mint, p.inputs.ys()?).await?;
         j.put(
             "attempt",
             id,
@@ -404,6 +443,7 @@ pub async fn lock(
                 unforwardable: false,
                 quarantined: false,
                 observed_preimage: None,
+                input_owner,
                 send_before: Some(send_before),
             },
         )
@@ -520,6 +560,7 @@ async fn redeem_inner(
                 unforwardable: false,
                 quarantined: false,
                 observed_preimage: None,
+                input_owner: None,
                 send_before,
             },
         )
@@ -702,10 +743,7 @@ pub async fn execute(home: &Path, j: &Journal, id: &str) -> Result<Proofs> {
                 )?)
             })
             .collect::<Result<Vec<_>>>()?;
-        database(home, &a.mint)
-            .await?
-            .update_proofs(owned, a.inputs.ys()?)
-            .await?;
+        crate::wallet::credit(home, &a.mint, owned, &a.inputs.ys()?, a.input_owner()).await?;
         if !result
             .iter()
             .zip(&a.outputs)
@@ -1095,16 +1133,17 @@ pub async fn settle_unforwardable(home: &Path, j: &Journal, id: &str) -> Result<
         "lock output identity changed"
     );
     let mint_url = a.mint.parse::<cdk::mint_url::MintUrl>()?;
-    database(home, &a.mint)
-        .await?
-        .update_proofs(
-            owned
-                .into_iter()
-                .map(|p| ProofInfo::new(p, mint_url.clone(), State::Unspent, CurrencyUnit::Sat))
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-            a.inputs.ys()?,
-        )
-        .await?;
+    crate::wallet::credit(
+        home,
+        &a.mint,
+        owned
+            .into_iter()
+            .map(|p| ProofInfo::new(p, mint_url.clone(), State::Unspent, CurrencyUnit::Sat))
+            .collect::<std::result::Result<Vec<_>, _>>()?,
+        &a.inputs.ys()?,
+        a.input_owner(),
+    )
+    .await?;
     a.result = Some(result);
     a.done = true;
     j.put("attempt", id, &a).await

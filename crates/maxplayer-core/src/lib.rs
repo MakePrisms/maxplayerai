@@ -68,6 +68,9 @@ pub mod long_poll;
 pub mod oplog;
 #[cfg(feature = "wallet")]
 pub mod buyer_fund;
+/// The buyer wallet shared with `maxplayer-trade` on the same home: selection lock, shared open.
+#[cfg(feature = "wallet")]
+pub mod shared_wallet;
 /// Persistent per-home buyer daemon (exclusive lock, unix-socket RPC, wallet/identity
 /// behind serialized actors, durable state DB). See [`buyer`].
 // NOTE: the wallet/buyer feature-flag structure is under review in issue #133 —
@@ -81,6 +84,9 @@ pub mod payment;
 pub mod payment_send;
 #[cfg(feature = "wallet")]
 pub mod payment_wallet;
+/// cdk saga recovery over a database view without the sagas maxplayer keeps.
+#[cfg(feature = "wallet")]
+mod saga_recovery_view;
 #[cfg(feature = "wallet")]
 pub mod nostr_mint;
 /// Seller-side platform fee: the product-set rate in basis points, the fee arithmetic, and the

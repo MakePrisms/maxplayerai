@@ -111,6 +111,7 @@ pub async fn open_wallet_at_mint_async(
         nostr_sdk::Keys::parse(&secret)
             .map_err(|error| FundError::Wallet(format!("wallet key: {error}")))?,
     )
+    .map(crate::shared_wallet::scoped)
     .map_err(|error| FundError::Wallet(error.to_string()))
 }
 

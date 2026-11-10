@@ -83,6 +83,18 @@ pub fn is_nostr(mint: &str) -> bool {
     mint_wire::is_nostr_scheme(mint)
 }
 
+/// The refusal for every plain-HTTP mint in a user build (Petar, 2026-11-06: no http:// mints in
+/// anything users install, localhost included). Same rule as core's `home::mint_allowed`.
+pub const HTTP_MINT_REFUSED: &str = "http:// mints are not supported; use https:// or nostr://";
+/// The refusal for a `ws://` mint relay in a user build (same reasoning: usable on one machine only).
+pub const WS_MINT_RELAY_REFUSED: &str = "ws:// mint relays are not supported; use wss://";
+
+/// Whether this build admits `u` as a plain-HTTP mint: a loopback host, and only when built with
+/// the test-only `local-test-mints` feature (test fixtures). Never true in a user build.
+pub fn local_test_http_mint(u: &url::Url) -> bool {
+    cfg!(feature = "local-test-mints") && u.scheme() == "http" && u.host_str().is_some_and(loopback)
+}
+
 fn loopback(host: &str) -> bool {
     host == "localhost"
         || host
@@ -128,7 +140,8 @@ pub fn same_mint_relays(a: &[String], b: &[String]) -> bool {
     set(a) == set(b)
 }
 
-/// One mint relay: `wss://`, or `ws://` on loopback (tests), no credentials/query/fragment.
+/// One mint relay: `wss://` (`ws://` on loopback only in `local-test-mints` test builds), no
+/// credentials/query/fragment.
 pub fn check_mint_relay(relay: &str) -> Result<()> {
     let u = url::Url::parse(relay).with_context(|| format!("invalid mint relay {relay}"))?;
     let host = u.host_str().context("mint relay without host")?;
@@ -140,8 +153,9 @@ pub fn check_mint_relay(relay: &str) -> Result<()> {
         "ambiguous mint relay URL {relay}"
     );
     ensure!(
-        u.scheme() == "wss" || (u.scheme() == "ws" && loopback(host)),
-        "mint relay must be wss:// (ws:// only on loopback): {relay}"
+        u.scheme() == "wss"
+            || (cfg!(feature = "local-test-mints") && u.scheme() == "ws" && loopback(host)),
+        "{WS_MINT_RELAY_REFUSED}: {relay}"
     );
     Ok(())
 }
@@ -190,8 +204,13 @@ pub fn mint_relays() -> Vec<String> {
 }
 
 /// Whether every hop to `mint` is loopback (lab-timing fence): the host for HTTP, every
-/// configured mint relay for `nostr://`.
+/// configured mint relay for `nostr://`. Always false in a user build (no `local-test-mints`):
+/// loopback fixtures exist only in tests, so production never shortens a poll, exempts a mint
+/// from backoff or applies lab timing because a host happens to be 127.0.0.1.
 pub fn loopback_only(mint: &str) -> bool {
+    if !cfg!(feature = "local-test-mints") {
+        return false;
+    }
     if is_nostr(mint) {
         return mint_relays().iter().all(|r| {
             url::Url::parse(r)

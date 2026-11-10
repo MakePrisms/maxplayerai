@@ -2613,6 +2613,7 @@ dependencies = [
  "async-trait",
  "async-wsocket",
  "base64 0.22.1",
+ "bitcoin",
  "bytes",
  "cashu",
  "cdk",

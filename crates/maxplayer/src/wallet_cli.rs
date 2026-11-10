@@ -265,7 +265,57 @@ fn cmd_balance(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
         let _ = writeln!(out, "configured_total_sats={configured_total}");
     }
     let _ = writeln!(out, "total_sats={total}");
+    write_held_sagas(&home, filter.as_deref(), out, err);
     SUCCESS
+}
+
+/// Review r3 L2: the sagas the last wallet pass kept (as `reconcile` reports them), so a held swap's
+/// missing outputs and a held send's reserved inputs are explained where the balance is read. Only
+/// when there are any (the common output keeps its exact grammar); count on stdout, one remediation
+/// line per saga on stderr. A failed read is reported and does not change the exit code.
+#[cfg(feature = "wallet")]
+fn write_held_sagas(
+    home: &maxplayer_core::home::MaxplayerHome,
+    mint_filter: Option<&str>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) {
+    let held = match wallet_ops::held_sagas_blocking(home) {
+        Ok(held) => held,
+        Err(error) => {
+            let _ = writeln!(err, "held sagas: could not read ({error})");
+            return;
+        }
+    };
+    let held: Vec<_> = held
+        .into_iter()
+        .filter(|held| {
+            mint_filter.is_none_or(|filter| {
+                wallet_ops::normalize_mint_url(&held.mint_url)
+                    .ok()
+                    .as_deref()
+                    == Some(filter)
+            })
+        })
+        .collect();
+    if held.is_empty() {
+        return;
+    }
+    // Same counters as `wallet reconcile`: swaps whose outputs are not all back, then sends/melts
+    // kept while their swap is resolved.
+    for (label, swaps) in [("swap_held", true), ("send_held", false)] {
+        let ids: Vec<&str> = held
+            .iter()
+            .filter(|held| (held.kind == "swap") == swaps)
+            .map(|held| held.saga_id.as_str())
+            .collect();
+        if !ids.is_empty() {
+            let _ = writeln!(out, "{label}={} saga_ids={}", ids.len(), ids.join(","));
+        }
+    }
+    for held in &held {
+        let _ = writeln!(err, "{}", held.remediation());
+    }
 }
 
 #[cfg(feature = "wallet")]
@@ -408,8 +458,14 @@ fn setup_needs_payment_summary(quote: &wallet_ops::MintQuote) -> String {
 /// dev play mint; ordinary mints carry no class label — the URL is the mint's identity (#577).
 #[cfg(feature = "wallet")]
 fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
+    // `reserved_sats` only when something is held, so the common line keeps its exact grammar.
+    let reserved = if row.reserved_sats > 0 {
+        format!(" reserved_sats={}", row.reserved_sats)
+    } else {
+        String::new()
+    };
     format!(
-        "mint={} role={} balance_sats={}{}",
+        "mint={} role={} balance_sats={}{reserved}{}",
         row.mint_url,
         if !row.configured {
             "unconfigured"
@@ -468,7 +524,7 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         let wallet = buyer_fund::open_wallet_async(&home)
             .await
             .map_err(|error| error.to_string())?;
-        payment_wallet::retire_eligible_incomplete_sagas(&wallet)
+        payment_wallet::retire_eligible_incomplete_sagas_in(&wallet, Some(&home.wallet_dir))
             .await
             .map_err(|error| error.to_string())
     });
@@ -476,16 +532,25 @@ fn cmd_reconcile(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i
         Ok(report) => {
             let _ = writeln!(
                 out,
-                "retired={} mapped_token_created={} swap_rolled_back={} swap_recovered={}",
+                "retired={} mapped_token_created={} swap_rolled_back={} swap_recovered={} swap_held={}",
                 report.retired,
                 report.mapped_token_created,
                 report.swap_rolled_back,
-                report.swap_recovered
+                report.swap_recovered,
+                report.swap_held.len()
             );
+            if !report.send_held.is_empty() {
+                let _ = writeln!(out, "send_held={}", report.send_held.len());
+            }
+            for held in report.swap_held.iter().chain(&report.send_held) {
+                let _ = writeln!(err, "{}", held.remediation());
+            }
             SUCCESS
         }
         Err(error) => {
             let _ = writeln!(err, "{error}");
+            // Review r4 L4: a refused pass still recorded what it keeps and why; show it here too.
+            write_held_sagas(&home, None, out, err);
             RUNTIME_ERROR
         }
     }
@@ -1785,6 +1850,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Review r3 L2: `wallet balance` prints the held sagas the last wallet pass recorded (count and
+    /// saga ids on stdout, remediation on stderr, like `wallet reconcile`), honours `--mint`, and
+    /// prints nothing extra once the record is cleared.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_surfaces_held_sagas_with_ids_and_remediation() {
+        use cdk_sqlite::wallet::WalletSqliteDatabase;
+        use maxplayer_core::payment_wallet::{HeldSwap, store_held_sagas};
+        let root = ux_test_home("balance-held");
+        let _ = std::fs::remove_dir_all(&root);
+        seed_testnut_default_home(&root);
+        seed_mint_balance(&root, "https://held-mint.example/", 5);
+        let home = home::bootstrap(&root).expect("home");
+        let held = vec![
+            HeldSwap {
+                saga_id: "019a0000-swap".into(),
+                kind: "swap".into(),
+                reason: "its outputs are not all back".into(),
+                mint_url: "https://held-mint.example".into(),
+                blocks_payments: false,
+                transient: false,
+            },
+            HeldSwap {
+                saga_id: "019a0000-send".into(),
+                kind: "send".into(),
+                reason: "its swap is not resolved".into(),
+                mint_url: "https://held-mint.example".into(),
+                blocks_payments: true,
+                transient: false,
+            },
+        ];
+        let write = |held: Vec<HeldSwap>| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let store =
+                        WalletSqliteDatabase::new(home.wallet_dir.join("cdk-wallet.sqlite"))
+                            .await
+                            .unwrap();
+                    store_held_sagas(&store, "https://held-mint.example", &held)
+                        .await
+                        .unwrap();
+                })
+        };
+        write(held);
+        let balance = |extra: &[&str]| {
+            let mut args = vec![
+                "balance".to_owned(),
+                "--home".to_owned(),
+                root.to_string_lossy().into_owned(),
+            ];
+            args.extend(extra.iter().map(|a| (*a).to_owned()));
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = run(&args, &mut out, &mut err);
+            (
+                code,
+                String::from_utf8(out).unwrap(),
+                String::from_utf8(err).unwrap(),
+            )
+        };
+        let (code, out, err) = balance(&[]);
+        assert_eq!(code, SUCCESS, "{err}");
+        assert!(
+            out.contains("swap_held=1 saga_ids=019a0000-swap\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("send_held=1 saga_ids=019a0000-send\n"),
+            "{out}"
+        );
+        assert!(
+            err.contains("swap saga 019a0000-swap kept: its outputs"),
+            "{err}"
+        );
+        assert!(err.contains("send saga 019a0000-send kept"), "{err}");
+        assert!(
+            err.contains("Payments on this mint are refused"),
+            "review r4 L4: a refusing hold says payments stop: {err}"
+        );
+        let (_, out, _) = balance(&["--mint", "https://held-mint.example"]);
+        assert!(out.contains("swap_held=1"), "{out}");
+        let (_, out, _) = balance(&["--mint", DEFAULT_MINT_URL]);
+        assert!(
+            !out.contains("_held="),
+            "other mints' holds are filtered: {out}"
+        );
+        write(Vec::new());
+        let (code, out, err) = balance(&[]);
+        assert_eq!(code, SUCCESS);
+        assert!(
+            !out.contains("_held=") && !err.contains("kept"),
+            "{out}{err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[cfg(feature = "wallet")]
     #[test]
     fn balance_mint_filter_distinguishes_discovered_from_never_seen() {
@@ -2195,6 +2358,30 @@ mod tests {
         );
     }
 
+    // Shared home with maxplayer-trade: sats a trade (or any in-flight operation) holds RESERVED are
+    // shown as `reserved_sats=`, never inside `balance_sats`; a row with nothing held keeps the
+    // exact old grammar (scripts parse it).
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_row_shows_reserved_sats_apart_from_spendable() {
+        use maxplayer_core::wallet_ops::MintBalance;
+        let row = |reserved_sats| MintBalance {
+            mint_url: "https://real-mint.example".to_owned(),
+            balance_sats: 3,
+            is_default: true,
+            configured: true,
+            reserved_sats,
+        };
+        assert_eq!(
+            balance_row_line(&row(4)),
+            "mint=https://real-mint.example role=default balance_sats=3 reserved_sats=4"
+        );
+        assert_eq!(
+            balance_row_line(&row(0)),
+            "mint=https://real-mint.example role=default balance_sats=3"
+        );
+    }
+
     // #577: `wallet balance` and `wallet mints list` rows mark play money ONLY on a testnut (play)
     // row; an ordinary/real row carries no money-class label. Pure row formatters, asserted for a
     // play (testnut) and a real row. The absence asserts red-on-revert if the class fork returns.
@@ -2207,12 +2394,14 @@ mod tests {
             balance_sats: 5,
             is_default: true,
             configured: true,
+            reserved_sats: 0,
         };
         let real_extra = MintBalance {
             mint_url: "https://real-mint.example".to_owned(),
             balance_sats: 0,
             is_default: false,
             configured: true,
+            reserved_sats: 0,
         };
         let balance = balance_row_line(&testnut_default);
         assert!(

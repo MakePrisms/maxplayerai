@@ -41,7 +41,7 @@ fn text(o: &std::process::Output) -> (String, String) {
 type KvRow = (String, String, Vec<u8>, i64, i64);
 /// Every journal row including its timestamps: any write shows up here.
 fn kv_dump(home: &Path) -> Vec<KvRow> {
-    let path = home.join("trade.sqlite");
+    let path = maxplayer_trade::wallet::state_dir(home).join("trade.sqlite");
     if !path.exists() {
         return vec![];
     }
@@ -188,7 +188,7 @@ async fn discover_is_lock_free_and_never_touches_the_journal() {
     s.created = coordinator::now() - 120;
     f.jt.put("swap", &id, &s).await.unwrap();
     let relay_before = relay_events(&f.relay_url).await;
-    std::fs::File::create(f.taker.join("owner.lock")).unwrap();
+    std::fs::File::create(maxplayer_trade::wallet::state_dir(&f.taker).join("owner.lock")).unwrap();
     let before = snapshot(&f.taker);
     {
         use fs2::FileExt;
@@ -196,7 +196,7 @@ async fn discover_is_lock_free_and_never_touches_the_journal() {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(f.taker.join("owner.lock"))
+            .open(maxplayer_trade::wallet::state_dir(&f.taker).join("owner.lock"))
             .unwrap();
         held.lock_exclusive().unwrap();
         let before = snapshot(&f.taker);
@@ -434,8 +434,17 @@ async fn stale_socket_and_bounded_protocol() {
     let f = Fixture::new(0).await;
     let lot = f.list(false).await;
     // Stale: a bound-then-dropped listener leaves a socket file nobody serves.
-    drop(std::os::unix::net::UnixListener::bind(f.maker.join("serve.sock")).unwrap());
-    assert!(f.maker.join("serve.sock").exists());
+    drop(
+        std::os::unix::net::UnixListener::bind(
+            maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        )
+        .unwrap(),
+    );
+    assert!(
+        maxplayer_trade::wallet::state_dir(&f.maker)
+            .join("serve.sock")
+            .exists()
+    );
     let out = run(&f.maker, &f.relay_url, &["cancel", &lot]).await;
     let (stdout, stderr) = text(&out);
     assert!(
@@ -447,7 +456,7 @@ async fn stale_socket_and_bounded_protocol() {
     let log = f.root.path().join("serve.log");
     let mut serve = start_serve(&f.maker, &f.relay_url, &log, &[]).await;
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(f.maker.join("serve.sock"))
+    let mode = std::fs::metadata(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"))
         .unwrap()
         .permissions()
         .mode();
@@ -455,15 +464,19 @@ async fn stale_socket_and_bounded_protocol() {
     // Oversized request: refused, connection closed, serve alive and still serving.
     {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let mut s = tokio::net::UnixStream::connect(f.maker.join("serve.sock"))
-            .await
-            .unwrap();
+        let mut s = tokio::net::UnixStream::connect(
+            maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        )
+        .await
+        .unwrap();
         let _ = s.write_all(&vec![b'x'; 64 * 1024]).await;
         let mut buf = vec![];
         let _ = tokio::time::timeout(Duration::from_secs(15), s.read_to_end(&mut buf)).await;
-        let mut s = tokio::net::UnixStream::connect(f.maker.join("serve.sock"))
-            .await
-            .unwrap();
+        let mut s = tokio::net::UnixStream::connect(
+            maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        )
+        .await
+        .unwrap();
         s.write_all(
             b"{\"v\":1,\"relays\":[],\"command\":{\"cancel\":{\"lot\":\"x\",\"extra\":1}}}\n",
         )
@@ -497,13 +510,17 @@ async fn stale_socket_and_bounded_protocol() {
     serve.kill().await.unwrap();
     serve.wait().await.unwrap();
     // A non-socket file at the socket path is never removed.
-    std::fs::remove_file(f.maker.join("serve.sock")).unwrap();
-    std::fs::write(f.maker.join("serve.sock"), b"not a socket").unwrap();
+    std::fs::remove_file(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock")).unwrap();
+    std::fs::write(
+        maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock"),
+        b"not a socket",
+    )
+    .unwrap();
     let out = run(&f.maker, &f.relay_url, &["serve"]).await;
     assert!(!out.status.success());
     assert!(text(&out).1.contains("not a socket"));
     assert_eq!(
-        std::fs::read(f.maker.join("serve.sock")).unwrap(),
+        std::fs::read(maxplayer_trade::wallet::state_dir(&f.maker).join("serve.sock")).unwrap(),
         b"not a socket"
     );
 }
@@ -884,7 +901,7 @@ async fn dry_run_refusals_and_unsolvable_amounts_are_reported() {
 
 /// `status` before this change, verbatim from 7d8cd74 `wallet::read_status` — the golden.
 fn status_golden(home: &Path) -> String {
-    let path = home.join("trade.sqlite");
+    let path = maxplayer_trade::wallet::state_dir(home).join("trade.sqlite");
     if !path.exists() {
         return format!("{}\n", serde_json::json!({"records":[]}));
     }

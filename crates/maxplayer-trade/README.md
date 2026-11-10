@@ -1,6 +1,7 @@
-# maxplayer-trade — standalone real-money Cashu trades
+# maxplayer-trade — real-money Cashu trades from your maxplayer home
 
-A fixed-lot CLI, independent of jobs and the maxplayer daemon. Market traffic goes first to
+A fixed-lot CLI, independent of jobs (still a separate binary from `maxplayer`). It trades from
+the **maxplayer home** (see [Home and wallet](#home-and-wallet)). Market traffic goes first to
 `relay.maxplayer.ai`, which stores lots and statuses from relay members since relay-v5 (#1246),
 with public relays as fallbacks; `nostr://` mint traffic (kinds 23410/23411) uses it too.
 **A live 32-for-24 trade completed on 2026-10-08**, including both claims, NUT-07 witness
@@ -8,6 +9,63 @@ recovery, fee-inclusive net delivery, and a signed `sold` status. Real-money tra
 or an unconditional atomicity guarantee.
 
 Current operating policy is in [Round 5](#round-5-final-review-policy).
+
+## Home and wallet
+
+- **Home.** `--home <dir>` names a maxplayer home (a directory with `key` and/or `config.toml`);
+  without `--home` it is the buyer's home, `$MAXPLAYER_HOME` else `~/.maxplayer` (resolved by
+  `maxplayer_core::home`). Create one with `maxplayer wallet setup --home <dir>` (or
+  `maxplayer whoami --home <dir>`). A directory that is neither a maxplayer home nor a legacy
+  trading home runs read-only commands only (`balance`, `status`, `discover`, `preflight`, dry
+  runs); writing commands refuse and create nothing.
+- **Identity.** Lots, statuses and `nostr://` mint requests are signed with the home's `key`,
+  the key `maxplayer account link --home <dir>` registers. There is no `trade.key` in a
+  maxplayer home. `maxplayer account … --trade-home <dir>` is deprecated: it still parses,
+  prints a warning on stderr, is ignored, and acts on the home key (or on the mint key with
+  `--mint`); it never creates a `trade.key`.
+- **Wallet.** Trading spends and receives in the buyer's wallet: the same database
+  (`<home>/wallet/cdk-wallet.sqlite`) and the same seed (derived from the home key), so sats a
+  trade brings in show in `maxplayer wallet balance`. Only the home's mints may be traded: the
+  default, `extra_mints` (`maxplayer wallet mints add`) and the seller's `accepted_mints`
+  (`config.toml`), each still admitted by the real-mint fence (`allow_real_mints`) and https:// or
+  nostr:// only; any other mint is refused before anything is journaled. A seller can trade: its
+  job payments land in this same wallet at every accepted mint, and it can trade each of them.
+  The seller node's only proof-selecting step (the platform-fee remittance melt) takes the same
+  selection lock, and its recovery releases only its own reservations. Trades are not recorded in the buyer's spend ledger, do not count against
+  `per_job_budget_sats`, and pay no platform fee. Trade's own per-mint caps still apply.
+- **Trade state.** The journal (`trade.sqlite`), `owner.lock` and `serve.sock` live in
+  `<home>/trade/` (0700).
+- **Two writers, one wallet.** The buyer daemon / `maxplayer wallet` and `maxplayer-trade` may run
+  at once. Every step that picks unspent proofs and reserves them holds an exclusive OS advisory
+  lock (`flock`) on `<home>/wallet/select.lock`, in both programs: core's `prepare_send` /
+  `prepare_melt` (job payments, `wallet send`/`melt`, the cross-mint hop) and trade's
+  verify-journal-reserve for lots, takes, sends and withdrawals, plus trade's credit of new proofs
+  and the local apply of a recovered buyer swap. It is held only across that local database
+  work, never across a mint request: mint info and keysets are fetched before it is taken, and a
+  mint call inside it is refused. A caller waits at most 5 s, then refuses with "the wallet is
+  busy … nothing was reserved, retry". The kernel releases a `flock` when its holder exits,
+  including `kill -9`, so a crash never leaves it held. Every reservation names its owner
+  (`used_by_operation`: a cdk saga id for the buyer, trade's journal operation id for trade);
+  recovery on either side releases only its own, and a credit never overwrites a row another
+  operation owns. The buyer never runs a full-wallet NUT-13 restore (it would hand every owner's
+  reservation back as spendable); a stranded buyer swap recovers only its own stored outputs and
+  is kept, not finished, until every one is accounted for. A trade credit drops a spent input only
+  while this operation (or nobody) owns it. `maxplayer wallet balance` shows reserved sats
+  as `reserved_sats=` on the mint's line, never in `balance_sats`.
+- **Legacy standalone homes** (a directory with `wallet.seed`, `trade.key`, or a root
+  `trade.sqlite`/`owner.lock`, given with `--home`) are deprecated. Every command there prints a
+  warning. Draining and finishing still work: `balance`, `status`, `recover`, `send`
+  (incl. `--reclaim`), `withdraw`, `preflight`, `doctor`, and `serve`/`cancel` for lots and
+  swaps already in flight. New `list`, `take`, `fund` and `receive` are refused. Move the money
+  with `maxplayer-trade --home <legacy> send <mint> --amount <n> --out <file>`, then
+  `maxplayer wallet receive "$(cat <file>)"` on the maxplayer home; never delete a legacy home
+  that still holds funds or unfinished records.
+- **A maxplayer home with legacy files at its top level** (`key` or `config.toml` next to
+  `wallet.seed`, `trade.key`, a root `trade.sqlite` or `owner.lock`, as an older
+  `maxplayer-trade --home ~/.maxplayer` left them): every command refuses, names the stray files
+  and creates nothing (never a `wallet.seed` or `trade.key`). A lone `owner.lock`/`serve.sock`
+  holds no money: delete it once no older `maxplayer-trade` runs there. Otherwise move exactly
+  the named files into their own directory and finish and drain that legacy home from there.
 Earlier dated verification sections are historical snapshots, not current coverage totals.
 
 ## Round 5 final-review policy
@@ -98,8 +156,12 @@ sections below describe their dated runs, not current coverage totals.
 Any canonical HTTPS mint (or a `nostr://<npub>` mint, see below) can be used if automatic preflight passes: advertised NUT-07/09/11/12/14,
 an active sat keyset, and clock skew at most 60 seconds. Preflight runs before each `list`,
 `take`, funding quotes and lock submission; successful earlier preflight is not cached
-as permission for a later lock. Test mints and loopback HTTP(S) fixtures remain supported.
-HTTP is refused except on loopback, and redirects are disabled. There is no real-money
+as permission for a later lock. Plain `http://` mints are refused everywhere, localhost
+included ("http:// mints are not supported; use https:// or nostr://"), the same rule as the
+buyer wallet's real-mint fence; redirects are disabled. Loopback HTTP fixture mints exist only in
+test builds (the `local-test-mints` feature, below), never in a `cargo build`/`cargo install`
+binary. A lot advertising an `http://` mint is skipped by `discover` and refused by `take` before
+anything is journaled. There is no real-money
 opt-in environment variable or allow-list flag. Each lock's gross amount is capped at
 **100,000 sats**. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home, including pending/lost funding intents.
 Each withdrawal invoice is also capped at **100,000 sats**, plus at most max(32 sats, ceil(invoice amount × 2%)) of
@@ -117,8 +179,8 @@ a guarantee for other deployments or versions.
 Default market relays: `wss://relay.maxplayer.ai`, then `wss://nos.lol`,
 `wss://relay.primal.net`, `wss://offchain.pub` as fallbacks; repeat `--relay URL` before the
 command to configure alternatives. `relay.maxplayer.ai` accepts writes only from signed-in relay
-members (`maxplayer account link --trade-home <home>` links a home's `trade.key`, creating it if
-needed); a non-member's lot is refused there and still reaches the
+members (`maxplayer account link --home <home>` links the home key that trading signs with);
+a non-member's lot is refused there and still reaches the
 public relays, so listing, discovery and trading work either way. Reads there need no sign-in.
 The dated live tests below ran before relay-v5 and made no production relay writes.
 
@@ -132,7 +194,7 @@ through one dispatch (`src/transport.rs`): HTTP(S) mints keep the raw requests u
 request / 23411 reply per call, identical re-send on a lost reply, request `exp` enforced by
 the mint). CDK wallets for such mints are built with that connector and poll subscriptions.
 
-- Relays: repeat `--mint-relay URL` (max 8, `wss://`, `ws://` only on loopback) before the
+- Relays: repeat `--mint-relay URL` (max 8, `wss://` only; `ws://` is refused) before the
   command; default `wss://relay.maxplayer.ai`, `wss://relay.ditto.pub`,
   `wss://nostr-pub.wellorder.net` (`transport::default_mint_relays`), the same list and order a
   default credits sidecar listens on. They carry only kinds 23410/23411; market relays never carry
@@ -231,6 +293,17 @@ cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bin max
 Long runs should be backgrounded once, redirected to a log and awaited through that process;
 do not pipe a build through tail/grep or start duplicate watchers. If cargo is unavailable,
 wrap the command with `nix develop --extra-experimental-features 'nix-command flakes' --command`.
+
+`local-test-mints` is a test-only feature: it admits plain-HTTP loopback mints and `ws://`
+loopback mint relays (the fake CDK mints and local relays in `tests/`). Every `cargo test`,
+`--examples` and `clippy --all-targets` build gets it through a self dev-dependency in
+`Cargo.toml`; `lab` implies it. `cargo build`/`cargo install` never resolve dev-dependencies, so
+the binary users install refuses both. CI checks that with
+`scripts/check-user-build-mint-fence.sh` (builds without features, then checks `preflight`,
+`balance`, `fund`, `withdraw`, `receive`, `send`, `list`, `doctor` and `--mint-relay` refuse
+`http://127.0.0.1:<port>` and `ws://127.0.0.1:<port>` before any connection or home write).
+Without that feature `transport::loopback_only` is always false, so no production timing ever
+depends on a host being loopback.
 
 `lab` is compile-time-only test instrumentation. `TRADE_LAB_SECONDS=1` uses 48/16-second locks,
 2-second claim cutoff and 1-second refund margin, **only for 127.0.0.1 mints**. Production builds
@@ -970,7 +1043,8 @@ The skill documents these states and the CLI help regression includes `withdraw 
 `maxplayer-trade doctor nostr://<npub> --mint-relay ws://127.0.0.1:<port> --json`
 uses exactly one logical **info** request to the explicit relay, re-sending the identical
 event every 5 s like trade admission does. It needs no `--home`, wallet, seed or journal; with
-`--home` before the command it signs as that home's existing `trade.key` (never created),
+`--home` before the command it signs as that home's `key` (a legacy home: its existing
+`trade.key`; neither is ever created),
 otherwise with an ephemeral key, which `relay.maxplayer.ai` refuses unless it is a relay member. `--timeout-seconds` changes only this
 read-only probe's budget; silence within that budget does not prove the mint is offline.
 Doctor exits 0 for usable info (unknown compatibility warns), 1 for proven incompatibility,

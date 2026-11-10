@@ -485,10 +485,7 @@ async fn release(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
     if let Ok(text) = std::env::var("TRADE_LAB_RECEIVE_RELEASE_ERROR") {
         anyhow::bail!("lab fault: release failed: {text}");
     }
-    database(home, &r.mint)
-        .await?
-        .release_proofs(&operation(r)?)
-        .await?;
+    crate::wallet::release(home, &r.mint, &operation(r)?).await?;
     let mut next = r.clone();
     next.released = true;
     j.put("receive", &next.id, &next).await?;
@@ -656,8 +653,12 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
         let url = MintUrl::from_str(&r.mint)?;
         let op = operation(r)?;
         // RESERVED under this receipt until `done` is journaled: withdraw/send select
-        // only unreserved UNSPENT rows, so nothing can spend them before that.
-        db.update_proofs(
+        // only unreserved UNSPENT rows, so nothing can spend them before that. Under the
+        // selection lock; a row that appeared meanwhile (same token redeemed by another
+        // process) keeps its owner.
+        crate::wallet::credit(
+            home,
+            &r.mint,
             missing
                 .into_iter()
                 .map(|p| {
@@ -671,7 +672,8 @@ pub async fn resume(home: &Path, j: &Journal, r: &mut Receipt) -> Result<()> {
                     )
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?,
-            vec![],
+            &[],
+            crate::wallet::InputOwner::Op(op),
         )
         .await?;
     }

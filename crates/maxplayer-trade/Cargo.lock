@@ -2133,6 +2133,7 @@ dependencies = [
  "async-trait",
  "async-wsocket",
  "base64 0.22.1",
+ "bitcoin",
  "bytes",
  "cashu",
  "cdk",
@@ -2157,6 +2158,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "uuid",
 ]
 
 [[package]]
@@ -2211,6 +2213,7 @@ dependencies = [
  "httpdate",
  "maxplayer-core",
  "maxplayer-mint",
+ "maxplayer-trade",
  "nostr-relay-builder",
  "nostr-sdk",
  "reqwest",

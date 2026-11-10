@@ -1,6 +1,6 @@
 ---
 name: maxplayer-trade
-description: Trade Cashu tokens for a human with the standalone maxplayer-trade CLI, including real money. Use for “sell/list X of mint A for Y of mint B”, “buy that lot”, “find listings”, “fund my trade wallet”, “receive this token”, “send a token”, “withdraw”, “check balance”, or “something got interrupted”.
+description: Trade Cashu tokens for a human with the maxplayer-trade CLI from their maxplayer home, including real money. Use for “sell/list X of mint A for Y of mint B”, “buy that lot”, “find listings”, “fund my trade wallet”, “receive this token”, “send a token”, “withdraw”, “check balance”, or “something got interrupted”.
 ---
 
 # Trade Cashu for the human
@@ -9,12 +9,12 @@ description: Trade Cashu tokens for a human with the standalone maxplayer-trade 
 
 ## 1. Establish custody and scope
 
-Use the standalone binary, not Maxplayer jobs or wallet/daemon. Read
+Use the trade binary, not Maxplayer jobs. Read
 [commands](references/commands.md) before a command and
 [recovery](references/recovery.md) for any interruption.
 
-Choose **one private, persistent absolute home** for this human. Put
-`--home <home>` before every command but `doctor`. Preserve that home, keys, databases and
+Trade from the human's **maxplayer home** (`--home <home>`, default `$MAXPLAYER_HOME`/`~/.maxplayer`):
+its key signs, its wallet pays (sellers too), only its mints trade. A legacy trade home only drains. Preserve that home, keys, databases and
 journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; keep it afterward for recovery.
 Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,

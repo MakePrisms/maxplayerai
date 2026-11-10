@@ -1,6 +1,6 @@
 ---
 name: maxplayer-mint-and-trade
-description: Set up a seller's own token mint and standalone token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs both binaries, connects the mint and trading home, and prepares an approved issuance and listing.
+description: Set up a seller's own token mint and token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs both binaries, connects the mint and the maxplayer home, and prepares an approved issuance and listing.
 ---
 
 # Set up a mint and token trading
@@ -26,10 +26,13 @@ database or start a second writer to fix a setup failure. Record the chosen
 revision and paths without displaying secrets.
 
 The mint lives under `<MAXPLAYER_HOME>/mint` (default `~/.maxplayer/mint`).
-Use a **separate, private, persistent absolute trading home**, passed with
-`maxplayer-trade --home <path>`. It is not the seller's ordinary Maxplayer wallet.
-Do not invent a trading-home environment variable. Preserve all state across
-restarts; do not move an existing funded home without a recovery plan.
+Trading uses the **same maxplayer home**: `maxplayer-trade` signs with its `key`, pays from
+its wallet, and keeps its journal in `<MAXPLAYER_HOME>/trade` (pass `--home <path>` only to
+pick a home other than `$MAXPLAYER_HOME`/`~/.maxplayer`). Only the home's mints can be traded: the
+default, `extra_mints` (`maxplayer wallet mints add`) and, on a seller, `accepted_mints`. A seller
+can trade from its own home: job payments land in the same wallet. An older standalone trading
+home (with `wallet.seed`/`trade.key`) is drain-only: move its funds with its `send`, then
+`maxplayer wallet receive`. Preserve all state across restarts.
 
 ## 2. Install and connect both tools
 
@@ -65,8 +68,9 @@ usage and exits 2 for `--help`; that alone is not an installation failure.
   These are distinct from **market relays**, which carry lots and trade messages.
   Follow the trading references. `relay.maxplayer.ai` is the first default market relay
   (it stores lots only from relay members); public relays are the fallbacks. To use it, link
-  the mint key (`maxplayer account link --mint`) and the trading home's key
-  (`maxplayer account link --trade-home <home>`), and run `doctor` with `--home <home>`.
+  the mint key (`maxplayer account link --mint`) and the home key (`maxplayer account link`;
+  trading signs with it, so no separate trading key exists), and run `doctor` with
+  `--home <home>`. Add the mint to the wallet: `maxplayer wallet mints add nostr://<npub>`.
 - Run the trading skill's read-only readiness checks against the mint's public
   `nostr://` URL. Verify an actual mint reply, not just a running process or relay
   acceptance. Record the trading home and relay settings for future commands.
@@ -116,8 +120,8 @@ Do not invent a price or assume that “set up” authorizes issuance or trading
    README. Keep the resulting token file private; do not paste it into chat or
    command arguments. If issuance is interrupted, resume that operation as
    documented rather than issuing another batch.
-2. Import that file into the **trading home**, using the trading skill's `receive`
-   workflow, not the ordinary seller wallet. Verify the receive state and balance.
+2. Import that file into the home's wallet, using the trading skill's `receive`
+   workflow (it lands in the same wallet `maxplayer wallet balance` shows). Verify the receive state and balance.
    An ambiguous result needs recovery of the existing attempt, not new issuance.
 3. Show the listing's `--dry-run` using the agreed mint pair, amounts and fee cap.
    Explain the debits, receipts and lock/recovery obligations from the trading

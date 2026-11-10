@@ -6,7 +6,12 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [features]
-lab = []
+# Plain-`http://` loopback mints and `ws://` loopback mint relays, for local test fixtures ONLY.
+# A user build (`cargo install --locked --path crates/maxplayer-trade`, `cargo build`) never
+# enables it and accepts only `https://`/`nostr://` mints and `wss://` mint relays (Petar,
+# 2026-11-06). Every test build gets it through the self dev-dependency below; `lab` implies it.
+local-test-mints = []
+lab = ["local-test-mints"]
 
 [workspace]
 
@@ -41,6 +46,10 @@ bitcoin = "0.32"
 maxplayer-core = { path = "../maxplayer-core", features = ["wallet"] }
 
 [dev-dependencies]
+# Tests, examples and `clippy --all-targets` run against local fake mints: enable
+# `local-test-mints` for them only. Dev-dependencies never reach `cargo build`/`cargo install`, so
+# the shipped binary keeps the feature off (checked in CI by scripts/check-user-build-mint-fence.sh).
+maxplayer-trade = { path = ".", features = ["local-test-mints"] }
 cdk = { version = "=0.17.2", default-features = false, features = ["mint", "wallet"] }
 cdk-sqlite = { version = "=0.17.2", features = ["mint", "wallet"] }
 cdk-fake-wallet = "=0.17.2"

@@ -325,6 +325,7 @@ mod tests {
             balance_sats: price,
             is_default: true,
             configured: true,
+            reserved_sats: 0,
         }];
         let source = select_source_mint(configured, &listed, true, &balances, price);
         let plan = plan_payment(&source, &listed, true).unwrap();
@@ -588,6 +589,7 @@ mod tests {
             balance_sats: sats,
             is_default: false,
             configured: true,
+            reserved_sats: 0,
         }
     }
 

@@ -41,7 +41,7 @@ git-delivery = ["gateway", "dep:git2", "dep:reqwest", "dep:base64", "dep:libc"]
 # calls, and a reqwest async client (with `stream`, for SSE responses) forwarding to the real upstream.
 # It lives under `wallet` because `seller_exec` — the only caller — already does, so reqwest and
 # `tokio/net` are guaranteed present here.
-wallet = ["dep:async-wsocket", "dep:tempfile", "dep:ciborium", "git-delivery", "gateway", "dep:async-trait", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "dep:bytes", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
+wallet = ["dep:async-wsocket", "dep:tempfile", "dep:ciborium", "git-delivery", "gateway", "dep:async-trait", "dep:cashu", "dep:cdk", "dep:cdk-sqlite", "dep:bitcoin", "dep:uuid", "dep:nostr-sdk", "dep:rusqlite", "dep:libc", "dep:bytes", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:futures-util", "tokio/sync", "tokio/time", "tokio/net", "tokio/io-util", "tokio/signal"]
 # TESTS ONLY, opt-in, OFF by default (issue #720). The job_lifecycle pre-publish
 # fee-floor test resolves the home's shipped minibits default over the internet.
 # The two payment_wallet worker-send tests now use cached keysets and an in-process
@@ -84,6 +84,10 @@ cdk = { version = "=0.17.2", default-features = false, features = ["wallet"], op
 # The `nostr://` mint connector (`nostr_mint`) implements cdk's async `MintConnector` trait. Gated to `wallet`.
 async-trait = { version = "0.1.89", optional = true }
 cdk-sqlite = { version = "=0.17.2", optional = true }
+# `saga_recovery_view` implements cdk's `WalletDatabase` trait, whose signatures name these types
+# (`bitcoin::bip32::DerivationPath`, `uuid::Uuid`); both are already in the graph through cdk.
+bitcoin = { version = "0.32", optional = true }
+uuid = { version = "1.23.5", optional = true }
 getrandom = "0.3"
 hex = "0.4.3"
 # Exclusive home lock (flock) for the buyer daemon, and the exchange-file open flags and the process

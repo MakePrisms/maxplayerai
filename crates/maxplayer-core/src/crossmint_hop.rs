@@ -860,6 +860,9 @@ pub(crate) struct CdkHopEffects {
     target: Wallet,
     /// `[buyer] hop_fee_buffer_multiplier`. Applied only when writing the Planned record.
     hop_fee_buffer_multiplier: u64,
+    /// The home's `wallet/` dir: the melt's proof selection holds its selection lock
+    /// ([`crate::shared_wallet`]). `None` only for in-memory test wallets.
+    wallet_dir: Option<PathBuf>,
 }
 
 impl CdkHopEffects {
@@ -892,6 +895,7 @@ impl CdkHopEffects {
             source,
             target,
             hop_fee_buffer_multiplier: home.config.buyer.hop_fee_buffer_multiplier,
+            wallet_dir: Some(home.wallet_dir.clone()),
         })
     }
 
@@ -1105,6 +1109,7 @@ impl HopEffects for CdkHopEffects {
             source: self.source.clone(),
             target: self.target.clone(),
             hop_fee_buffer_multiplier: self.hop_fee_buffer_multiplier,
+            wallet_dir: self.wallet_dir.clone(),
         };
         let bolt11 = bolt11.to_owned();
         block_on_leg("source melt quote", async move {
@@ -1120,6 +1125,7 @@ impl HopEffects for CdkHopEffects {
             source: self.source.clone(),
             target: self.target.clone(),
             hop_fee_buffer_multiplier: self.hop_fee_buffer_multiplier,
+            wallet_dir: self.wallet_dir.clone(),
         };
         block_on_leg("source coverage", async move {
             effects.require_source_covers(planned_cost).await
@@ -1129,13 +1135,37 @@ impl HopEffects for CdkHopEffects {
     fn melt(&mut self, melt_quote_id: &str) -> Result<u64, HopError> {
         let wallet = self.source.clone();
         let quote_id = melt_quote_id.to_owned();
+        let wallet_dir = self.wallet_dir.clone();
         block_on_leg("melt", async move {
+            // Review r6 H1: the one mint payment gate, before this melt's own operation lock.
+            crate::payment_wallet::payment_gate(&wallet, wallet_dir.as_deref())
+                .await
+                .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
+            // Mint metadata first, outside the lock; the lock is then held only across prepare_melt's
+            // local selection + reservation (no mint request inside it), outside the mint bound.
+            let metadata = tokio::time::timeout(
+                MINT_TOUCH_TIMEOUT,
+                crate::shared_wallet::warm_metadata(&wallet),
+            )
+            .await
+            .unwrap_or_default();
+            // Review r3 H1: in flight from before the melt saga exists until `confirm` returns.
+            let _operation = crate::shared_wallet::operation_guard(wallet_dir.as_deref())
+                .await
+                .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
+            let select = crate::shared_wallet::select_guard(wallet_dir.as_deref())
+                .await
+                .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
             let prepared = bounded(
                 "prepare melt",
                 MINT_TOUCH_TIMEOUT,
-                wallet.prepare_melt(&quote_id, HashMap::new()),
+                crate::shared_wallet::local_only(
+                    metadata,
+                    wallet.prepare_melt(&quote_id, HashMap::new()),
+                ),
             )
             .await?;
+            drop(select);
             let melted = bounded("melt confirm", HOP_LEG_TIMEOUT, prepared.confirm()).await?;
             // `confirm` is the effect boundary — the melt has settled and the fee actually paid is
             // known here. The mint returned the unused reserve as change; reporting the real fee lets
@@ -1251,7 +1281,10 @@ async fn sweep_one(
         let outcome = bounded(
             &format!("{label} saga recovery"),
             HOP_LEG_TIMEOUT,
-            crate::payment_wallet::recover_incomplete_sagas_guarded(wallet),
+            crate::payment_wallet::recover_incomplete_sagas_guarded(
+                wallet,
+                Some(home.wallet_dir.as_path()),
+            ),
         )
         .await?;
         if let crate::payment_wallet::GuardedRecovery::Held(reason) = outcome {
@@ -1852,9 +1885,34 @@ mod tests {
             )
             .unwrap(),
             hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
+            wallet_dir: None,
         }
     }
 
+    /// Review r6 H1: the hop melt runs the mint payment gate before it selects anything.
+    #[test]
+    fn hop_melt_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut effects, scene) = runtime.block_on(async {
+            let mut effects = cdk_hop_with_source("https://127.0.0.1:1").await;
+            effects.wallet_dir = Some(dir.path().to_path_buf());
+            let scene =
+                crate::payment_wallet::gate_scene::crashed_send(&effects.source, true).await;
+            (effects, scene)
+        });
+        let error = effects
+            .melt("r6-quote")
+            .expect_err("SAFETY (r6 H1): the hop must not melt other proofs");
+        crate::payment_wallet::gate_scene::assert_refusal(&error.to_string(), &scene);
+        runtime.block_on(crate::payment_wallet::gate_scene::assert_nothing_selected(
+            &effects.source,
+            &scene,
+        ));
+    }
     async fn cdk_hop_with_target(target_mint: &str) -> CdkHopEffects {
         let source_store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
         let target_store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
@@ -1876,6 +1934,7 @@ mod tests {
             )
             .unwrap(),
             hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
+            wallet_dir: None,
         }
     }
 

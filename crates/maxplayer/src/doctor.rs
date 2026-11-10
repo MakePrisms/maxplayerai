@@ -2068,6 +2068,57 @@ mod checks {
     /// named buyers can reach (single-user boxes are common, and there the exposure is nil) and a FAIL
     /// for one strangers can reach, whose higher exposure warrants the stricter posture. A no-op PASS
     /// where there is no POSIX mode to read (non-unix): the `too_open` list simply stays empty.
+    pub(super) const HELD_SAGAS_CHECK: &str = "wallet held sagas";
+
+    /// Review r3 L2: the held sagas the last wallet pass recorded, as `maxplayer wallet reconcile`
+    /// reports them (count, saga ids, remediation). `None` when there are none. Never a FAIL: payments
+    /// continue past a held saga, so it must not block a seller boot.
+    pub(super) fn held_sagas_check(
+        held: Result<
+            Vec<maxplayer_core::payment_wallet::HeldSwap>,
+            maxplayer_core::wallet_ops::WalletOpsError,
+        >,
+    ) -> Option<Check> {
+        match held {
+            Ok(held) if held.is_empty() => None,
+            Ok(held) => {
+                let ids: Vec<String> = held
+                    .iter()
+                    .map(|held| format!("{} {} at {}", held.kind, held.saga_id, held.mint_url))
+                    .collect();
+                let swaps = held.iter().filter(|held| held.kind == "swap").count();
+                // Review r4 L4: a refused send/melt stops payments on its mint; say so up front.
+                let refusing: Vec<&str> = held
+                    .iter()
+                    .filter(|held| held.blocks_payments)
+                    .map(|held| held.mint_url.as_str())
+                    .collect();
+                let refused = if refusing.is_empty() {
+                    String::new()
+                } else {
+                    format!("; payments refused at {}", refusing.join(", "))
+                };
+                Some(Check::warn(
+                    HELD_SAGAS_CHECK,
+                    format!(
+                        "swap_held={swaps} send_held={} ({}){refused}",
+                        held.len() - swaps,
+                        ids.join("; ")
+                    ),
+                    held.iter()
+                        .map(|held| held.remediation())
+                        .collect::<Vec<_>>()
+                        .join(" | "),
+                ))
+            }
+            Err(error) => Some(Check::warn(
+                HELD_SAGAS_CHECK,
+                format!("could not read the held-saga record: {error}"),
+                "run `maxplayer wallet reconcile` to see what the wallet keeps",
+            )),
+        }
+    }
+
     pub(super) fn check_home_permissions(
         home_root: std::path::PathBuf,
         wallet_dir: std::path::PathBuf,
@@ -2603,6 +2654,7 @@ fn build_checks(
     // Home/wallet perms are verified against the SAME resolved home the rest of the gate inspects.
     let perms_home_root = home.root.clone();
     let perms_wallet_dir = home.wallet_dir.clone();
+    let held_sagas = maxplayer_core::wallet_ops::held_sagas_blocking(home);
     // Harness credentials live under the operator $HOME, not the seat home. Empty HOME is
     // carried as None — never guessed as a relative `.claude`.
     let user_home = user_home_dir();
@@ -2687,6 +2739,11 @@ fn build_checks(
     checks.push(Box::new(move || {
         checks::check_home_permissions(perms_home_root, perms_wallet_dir, serves_strangers)
     }));
+    // Review r3 L2: sagas the last wallet pass kept. Advisory WARN, only when there are any (or the
+    // record cannot be read); every other seat's output is unchanged.
+    if let Some(check) = checks::held_sagas_check(held_sagas) {
+        checks.push(Box::new(move || check));
+    }
     // #715: inspect the configured harness's credential directory. Advisory WARN; never blocks
     // boot (group-write is inert on a single-account host).
     checks.push(Box::new(move || {
@@ -2918,6 +2975,40 @@ mod tests {
         assert_eq!(ran.get(), 3, "an early FAIL must not short-circuit later checks");
         assert_eq!(results.len(), 3);
         assert_eq!(exit_code(&results), FAILURE, "any FAIL ⇒ exit 1");
+    }
+
+    /// Review r3 L2: held sagas are a WARN row naming the count, kind, saga id and remediation; no
+    /// held saga adds no row; an unreadable record is a WARN, never a FAIL.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn held_sagas_row_names_each_held_saga_and_never_fails() {
+        use maxplayer_core::payment_wallet::HeldSwap;
+        assert!(checks::held_sagas_check(Ok(Vec::new())).is_none());
+        let held = |kind: &str, id: &str| HeldSwap {
+            saga_id: id.into(),
+            kind: kind.into(),
+            reason: "its outputs are not all back".into(),
+            mint_url: "https://mint.example".into(),
+            blocks_payments: kind == "send",
+            transient: false,
+        };
+        let check = checks::held_sagas_check(Ok(vec![held("swap", "s-1"), held("send", "p-1")]))
+            .expect("a row");
+        assert_eq!(check.status, Status::Warn);
+        let line = check.render();
+        assert!(line.contains("swap_held=1 send_held=1"), "{line}");
+        assert!(
+            line.contains("payments refused at https://mint.example"),
+            "{line}"
+        );
+        assert!(line.contains("swap s-1 at https://mint.example"), "{line}");
+        assert!(line.contains("swap saga s-1 kept"), "{line}");
+        assert!(line.contains("maxplayer wallet reconcile"), "{line}");
+        let unread = checks::held_sagas_check(Err(
+            maxplayer_core::wallet_ops::WalletOpsError::Wallet("db".into()),
+        ))
+        .expect("a row");
+        assert_eq!(unread.status, Status::Warn);
     }
 
     #[test]

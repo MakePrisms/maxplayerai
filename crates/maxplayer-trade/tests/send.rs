@@ -13,7 +13,9 @@ use std::{os::unix::fs::PermissionsExt, path::Path, str::FromStr, sync::atomic::
 use support::*;
 
 async fn home() -> (tempfile::TempDir, Journal) {
-    let h = tempfile::tempdir().unwrap();
+    // A maxplayer home BEFORE the journal opens: a journal opened on a bare directory lands at its
+    // root (legacy layout), which then makes it a mixed home the CLI refuses.
+    let h = maxplayer_home();
     let j = Journal::open(h.path()).await.unwrap();
     (h, j)
 }

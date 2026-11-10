@@ -7,7 +7,7 @@
 //! FakeWallet-auto-pays mint quotes. For other configured mints, [`begin_mint_async`]
 //! returns the bolt11 and callers must pay it, then [`complete_mint_async`].
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -290,6 +290,10 @@ pub struct MintBalance {
     /// for a mint the config no longer (or never) names. Display surfaces them (#266); accept-time
     /// source selection deliberately ignores them (see `crossmint::holds_at_least`).
     pub configured: bool,
+    /// Sats in `Pending`, `Reserved` and `PendingSpent` proofs at the mint: held by an in-flight
+    /// operation (a job payment, send or melt, or a local `maxplayer-trade` lot/swap/send on this
+    /// home). Never part of `balance_sats` and never spendable until the owner releases them.
+    pub reserved_sats: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -864,6 +868,23 @@ pub fn configured_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsEr
     Ok(out)
 }
 
+/// Mints `maxplayer-trade` may trade from this home: [`configured_mints`] (default + `extra_mints`),
+/// then every seller `accepted_mints` entry, normalized and deduplicated. A seller on this home is
+/// paid at each accepted mint into this same wallet, so it must be able to trade every one of them.
+/// Membership only: the caller still applies the real-mint fence ([`home::mint_allowed`]) and its
+/// own scheme rules to the mint it admits. Buyer paths keep [`configured_mints`]; adding
+/// `accepted_mints` there would change which balances pay for jobs.
+pub fn tradeable_mints(home: &MaxplayerHome) -> Result<Vec<String>, WalletOpsError> {
+    let mut out = configured_mints(home)?;
+    for accepted in &home.config.accepted_mints {
+        let normalized = normalize_mint_url(accepted)?;
+        if !out.contains(&normalized) {
+            out.push(normalized);
+        }
+    }
+    Ok(out)
+}
+
 /// Refuse every melt-side call on a `nostr://` mint: raising a melt quote, preparing or confirming a
 /// melt, and asking a melt quote's status.
 ///
@@ -1050,6 +1071,7 @@ pub async fn open_wallet_async(
         nostr_sdk::Keys::parse(&secret)
             .map_err(|error| WalletOpsError::Wallet(format!("wallet key: {error}")))?,
     )
+    .map(crate::shared_wallet::scoped)
     .map_err(|error| WalletOpsError::Wallet(error.to_string()))
 }
 
@@ -1159,7 +1181,22 @@ pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, Wa
             )
             .await
             .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let reserved = store
+            .get_balance(
+                Some(MintUrl::from_str(&mint_url).map_err(|error| {
+                    WalletOpsError::Wallet(format!("invalid normalized mint URL: {error}"))
+                })?),
+                Some(CurrencyUnit::Sat),
+                Some(vec![
+                    cashu::State::Pending,
+                    cashu::State::Reserved,
+                    cashu::State::PendingSpent,
+                ]),
+            )
+            .await
+            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
         rows.push(MintBalance {
+            reserved_sats: reserved,
             is_default: mint_url == default,
             configured: configured.iter().any(|entry| entry == &mint_url),
             mint_url,
@@ -1376,10 +1413,23 @@ pub async fn send_async(
             "insufficient funds: balance={before} need={amount_sats}"
         )));
     }
-    let prepared = wallet
-        .prepare_send(Amount::from(amount_sats), SendOptions::default())
+    // Review r6 H1: the one mint payment gate, BEFORE this send's own operation lock (which would
+    // make a dead parent look in flight). Local reads only.
+    crate::payment_wallet::payment_gate(&wallet, Some(&home.wallet_dir))
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    // Review r3 H1: in flight from before the send saga exists until `confirm` returns.
+    let _operation = crate::shared_wallet::operation_guard(Some(&home.wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    let prepared = crate::shared_wallet::prepare_send_locked(
+        &wallet,
+        Some(&home.wallet_dir),
+        Amount::from(amount_sats),
+        SendOptions::default(),
+    )
+    .await
+    .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // `confirm` is the effect boundary: it consumes the input proofs and mints the outgoing token, so
     // past this point the ecash has left the spendable balance and the caller MUST receive the token.
     // The post-confirm balance read is observational; a read failure must never discard the token
@@ -1512,7 +1562,7 @@ pub async fn melt_within_async(
     // [`PreparedMeltPayment::confirm`] (since addendum 8; [`pay_melt_quote_async`] is retained but
     // no longer called on that path, removal owed) — with its store fence in between, so that it
     // only ever pays the quote its admission bound (addendum 5 §1, rule 1).
-    pay_quote_on_wallet(&wallet, mint_url, &quote, ceiling).await
+    pay_quote_on_wallet(&wallet, &home.wallet_dir, mint_url, &quote, ceiling).await
 }
 
 /// **Pay a melt quote the wallet already holds, by id, and never raise another.** The seller fee
@@ -1557,7 +1607,7 @@ pub async fn pay_melt_quote_async(
                 "melt quote {quote_id} is not in this wallet; refusing to pay a quote this wallet did not raise"
             ))
         })?;
-    pay_quote_on_wallet(&wallet, mint_url, &quote, Some(ceiling)).await
+    pay_quote_on_wallet(&wallet, &home.wallet_dir, mint_url, &quote, Some(ceiling)).await
 }
 
 /// The pay step shared by [`melt_within_async`] (quote raised a moment ago) and
@@ -1565,6 +1615,7 @@ pub async fn pay_melt_quote_async(
 /// reserve, balance check, `prepare_melt` on this quote's id, `confirm`.
 async fn pay_quote_on_wallet(
     wallet: &Wallet,
+    wallet_dir: &Path,
     mint_url: String,
     quote: &cdk::wallet::MeltQuote,
     ceiling: Option<&MeltCeiling>,
@@ -1599,8 +1650,15 @@ async fn pay_quote_on_wallet(
             "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
         )));
     }
-    let prepared = wallet
-        .prepare_melt(&quote.id, HashMap::new())
+    // Review r6 H1: the one mint payment gate, before this melt's own operation lock.
+    crate::payment_wallet::payment_gate(wallet, Some(wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    // Review r3 H1: in flight from before the melt saga exists until `confirm` returns.
+    let _operation = crate::shared_wallet::operation_guard(Some(wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    let prepared = crate::shared_wallet::prepare_melt_locked(wallet, Some(wallet_dir), &quote.id)
         .await
         .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // Reported, not bounded: this operator path keeps its reserve-only ceiling (addendum 8 §6); the
@@ -1845,6 +1903,26 @@ fn prepared_melt_thread(
             return;
         }
     };
+    // Review r6 H1: the one mint payment gate (seller fee remittance), before this thread's own
+    // operation lock.
+    if let Err(error) = runtime.block_on(crate::payment_wallet::payment_gate(
+        &wallet,
+        Some(&home.wallet_dir),
+    )) {
+        let _ = prepared_tx.send(Err(WalletOpsError::Wallet(error.to_string())));
+        return;
+    }
+    // Review r3 H1: this thread's melt is in flight from before its saga exists until the verdict's
+    // `confirm`/`cancel` returns; the guard lives on this thread's stack until it exits.
+    let _operation = match runtime.block_on(crate::shared_wallet::operation_guard(Some(
+        &home.wallet_dir,
+    ))) {
+        Ok(guard) => guard,
+        Err(error) => {
+            let _ = prepared_tx.send(Err(WalletOpsError::Wallet(error.to_string())));
+            return;
+        }
+    };
     // Steps 1–3 as one future so an early refusal is one `Err` and the prepared melt (which borrows
     // the wallet) stays on this thread's stack for the verdict.
     let staged = runtime.block_on(async {
@@ -1881,10 +1959,10 @@ fn prepared_melt_thread(
                 "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
             )));
         }
-        let prepared = wallet
-            .prepare_melt(&quote.id, HashMap::new())
-            .await
-            .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let prepared =
+            crate::shared_wallet::prepare_melt_locked(&wallet, Some(&home.wallet_dir), &quote.id)
+                .await
+                .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
         let input_fee_sats = prepared.input_fee().to_u64();
         let swap_fee_sats = prepared.swap_fee().to_u64();
         let requires_swap = prepared.requires_swap();
@@ -2225,6 +2303,7 @@ pub fn list_mints(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsErr
             configured: true,
             mint_url,
             balance_sats: 0,
+            reserved_sats: 0,
         })
         .collect())
 }
@@ -2317,6 +2396,34 @@ pub async fn remove_mint_async(
             .retain(|entry| normalize_mint_url(entry).ok().as_deref() != Some(to_remove.as_str()));
     })?;
     Ok(removed)
+}
+
+/// The sagas the last wallet pass kept (review r3 L2): held swap sagas (outputs not all accounted
+/// for yet) and held sends/melts, with the mint, id and remediation. Read from the wallet database
+/// only (no mint request, no seed); a home without a wallet database has none.
+pub async fn held_sagas_async(
+    home: &MaxplayerHome,
+) -> Result<Vec<crate::payment_wallet::HeldSwap>, WalletOpsError> {
+    if !sqlite_path(&home.wallet_dir).exists() {
+        return Ok(Vec::new());
+    }
+    let store = open_balance_store(home).await?;
+    crate::payment_wallet::load_held_sagas(&store)
+        .await
+        .map_err(WalletOpsError::Wallet)
+}
+
+/// Blocking [`held_sagas_async`].
+pub fn held_sagas_blocking(
+    home: &MaxplayerHome,
+) -> Result<Vec<crate::payment_wallet::HeldSwap>, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("held_sagas_blocking")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(held_sagas_async(home))
 }
 
 pub fn balances_blocking(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsError> {
@@ -3153,6 +3260,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Trade's admission set is configured mints + every seller accepted mint; the buyer's
+    // configured set is unchanged by it.
+    #[test]
+    fn tradeable_mints_adds_every_accepted_mint_and_leaves_configured_mints_alone() {
+        let root = temp_home("tradeable");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        home.config.accepted_mints = vec![
+            "https://a.example/".into(),
+            "https://b.example".into(),
+            " https://c.example ".into(),
+        ];
+        home.config.extra_mints = vec!["https://d.example".into(), "https://b.example/".into()];
+        assert_eq!(
+            configured_mints(&home).expect("configured"),
+            [
+                "https://a.example",
+                "https://d.example",
+                "https://b.example"
+            ]
+        );
+        assert_eq!(
+            tradeable_mints(&home).expect("tradeable"),
+            [
+                "https://a.example",
+                "https://d.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
+        home.config.extra_mints.clear();
+        assert_eq!(
+            configured_mints(&home).expect("configured"),
+            ["https://a.example"]
+        );
+        assert_eq!(
+            tradeable_mints(&home).expect("tradeable"),
+            [
+                "https://a.example",
+                "https://b.example",
+                "https://c.example"
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn normalize_mint_url_trims_and_strips_trailing_slash() {
         let normalized =
@@ -3487,4 +3640,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     // END #1256 tests
+
+    // BEGIN r6 gate tests (review r6 H1: `wallet send` and both melt paths run the payment gate)
+    const GATED_MINT: &str = "https://127.0.0.1:1";
+
+    async fn gated_home(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        MaxplayerHome,
+        crate::payment_wallet::gate_scene::Scene,
+        Wallet,
+    ) {
+        let root = temp_home(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        add_mint(&mut home, GATED_MINT).expect("add");
+        let wallet = open_wallet_async(&home, GATED_MINT).await.expect("wallet");
+        let scene = crate::payment_wallet::gate_scene::crashed_send(&wallet, true).await;
+        (root, home, scene, wallet)
+    }
+
+    fn gated_quote() -> cdk::wallet::MeltQuote {
+        cdk::wallet::MeltQuote {
+            id: "r6-quote".into(),
+            mint_url: Some(MintUrl::from_str(GATED_MINT).unwrap()),
+            unit: CurrencyUnit::Sat,
+            amount: Amount::from(4),
+            request: "lnbc-r6".into(),
+            fee_reserve: Amount::from(0),
+            state: MeltQuoteState::Unpaid,
+            expiry: cashu::util::unix_time() + 3600,
+            payment_proof: None,
+            estimated_blocks: None,
+            fee_index: None,
+            payment_method: PaymentMethod::BOLT11,
+            used_by_operation: None,
+            version: 0,
+        }
+    }
+
+    fn gated_ceiling() -> MeltCeiling {
+        MeltCeiling {
+            max_debit_sats: 10,
+            invoice_sats: 4,
+            planned_quote_id: None,
+        }
+    }
+
+    /// Review r6 H1: `wallet send` is refused, before any selection, while a crashed send on this
+    /// mint waits on its child swap (inputs UNSPENT; its swap may still commit).
+    #[tokio::test]
+    async fn wallet_send_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let (root, home, scene, wallet) = gated_home("r6-send").await;
+        let error = send_async(&home, 4, Some(GATED_MINT))
+            .await
+            .expect_err("SAFETY (r6 H1): a second send could pay twice");
+        crate::payment_wallet::gate_scene::assert_refusal(&error.to_string(), &scene);
+        crate::payment_wallet::gate_scene::assert_nothing_selected(&wallet, &scene).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review r6 H1: the operator melt (`pay_quote_on_wallet`) is refused the same way.
+    #[tokio::test]
+    async fn melt_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let (root, home, scene, wallet) = gated_home("r6-melt").await;
+        wallet
+            .localstore
+            .add_melt_quote(gated_quote())
+            .await
+            .unwrap();
+        let error = pay_melt_quote_async(&home, "r6-quote", Some(GATED_MINT), &gated_ceiling())
+            .await
+            .expect_err("SAFETY (r6 H1)");
+        crate::payment_wallet::gate_scene::assert_refusal(&error.to_string(), &scene);
+        crate::payment_wallet::gate_scene::assert_nothing_selected(&wallet, &scene).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review r6 H1: the seller fee-remittance melt (`prepare_melt_payment_blocking`) too.
+    #[test]
+    fn seller_fee_melt_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (root, home, scene, wallet) = runtime.block_on(gated_home("r6-fee"));
+        runtime
+            .block_on(wallet.localstore.add_melt_quote(gated_quote()))
+            .unwrap();
+        let error = match prepare_melt_payment_blocking(
+            &home,
+            "r6-quote",
+            Some(GATED_MINT),
+            &gated_ceiling(),
+        ) {
+            Ok(_) => panic!("SAFETY (r6 H1): the fee melt must be refused"),
+            Err(error) => error.to_string(),
+        };
+        crate::payment_wallet::gate_scene::assert_refusal(&error, &scene);
+        runtime.block_on(crate::payment_wallet::gate_scene::assert_nothing_selected(
+            &wallet, &scene,
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END r6 gate tests
 }

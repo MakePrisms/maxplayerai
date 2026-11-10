@@ -20,9 +20,11 @@ async fn serve_drops_a_peer_of_another_uid_before_reading() {
         me() + 1,
     )
     .unwrap();
-    let mut s = tokio::net::UnixStream::connect(home.path().join("serve.sock"))
-        .await
-        .unwrap();
+    let mut s = tokio::net::UnixStream::connect(
+        maxplayer_trade::wallet::state_dir(home.path()).join("serve.sock"),
+    )
+    .await
+    .unwrap();
     let _ = s
         .write_all(
             b"{\"v\":3,\"relays\":[\"ws://127.0.0.1:1\"],\"mint_relays\":[],\"command\":{\"cancel\":{\"lot\":\"x\"}}}\n",
@@ -41,7 +43,10 @@ async fn serve_drops_a_peer_of_another_uid_before_reading() {
 #[tokio::test]
 async fn client_writes_nothing_to_a_serve_of_another_uid() {
     let home = tempfile::tempdir().unwrap();
-    let l = tokio::net::UnixListener::bind(home.path().join("serve.sock")).unwrap();
+    let l = tokio::net::UnixListener::bind(
+        maxplayer_trade::wallet::state_dir(home.path()).join("serve.sock"),
+    )
+    .unwrap();
     let req = Request {
         v: PROTOCOL_V,
         relays: vec![],

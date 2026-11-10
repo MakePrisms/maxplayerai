@@ -1,3 +1,88 @@
+## Unreleased
+
+Not yet released. `maxplayer-trade` stays a separate binary built from source; this changes the
+`maxplayer` binary (account, wallet) and `maxplayer-core` (shared wallet lock), and is client-only:
+no relay, registration-service or website redeploy (the mint-and-trade skill page goes live with
+the merge, Vercel).
+
+- **Changed: `maxplayer-trade` trades from the maxplayer home.** Default home is
+  `$MAXPLAYER_HOME`, else `~/.maxplayer`; `--home <dir>` picks another maxplayer home. Lots,
+  statuses and `nostr://` mint requests are signed with the home `key` (the one
+  `maxplayer account link` registers); no `trade.key` is created. Trading spends and receives in
+  the buyer wallet (`wallet/cdk-wallet.sqlite`, same seed), so received sats show in
+  `maxplayer wallet balance`. Only the home's mints (the default, `extra_mints` and a seller's
+  `accepted_mints`) that pass the real-mint fence can be traded, so a seller can trade every mint
+  it accepts payment at (its payments land in the same wallet). Trades are not in the buyer
+  spend ledger, do not count against `per_job_budget_sats`, and pay no platform fee. Trade state lives in `<home>/trade/`.
+- **Changed: `maxplayer-trade` refuses plain `http://` mints, localhost included**, with
+  `http:// mints are not supported; use https:// or nostr://`, and refuses `ws://` mint relays
+  (`--mint-relay`), the same rule as the buyer wallet's real-mint fence. This covers every command
+  (`preflight`, `balance`, `fund`, `withdraw`, `receive`, `send`, `list`, `take`, `doctor`), serve
+  hand-offs and lots from the market: `discover` skips a lot naming an `http://` mint and `take`
+  refuses it before anything is journaled. Loopback HTTP fake mints remain only in test builds
+  (test-only cargo feature `local-test-mints`); `cargo install --locked --path
+  crates/maxplayer-trade` never enables it.
+- **New: wallet selection lock.** The buyer (job payments, `wallet send`/`melt`, the cross-mint
+  hop, swap recovery) and `maxplayer-trade` (lot, take, send and withdraw reservations, credits)
+  take an exclusive `flock` on `<home>/wallet/select.lock` only for local database work (picking
+  and reserving proofs, writing recovered ones), never across a mint request; a caller waits at
+  most 5 s, then refuses retryably with nothing reserved. The kernel releases it if the holder
+  dies, including `kill -9`. Reservations are owner-named (`used_by_operation`) and recovery
+  releases only its own.
+- **Changed: a stranded buyer swap is recovered from its own outputs.** When the mint executed a
+  swap whose reply was lost, `maxplayer wallet reconcile` and the pay path re-derive that swap's
+  outputs (its stored counter range) and add only those, instead of running cdk's full-wallet
+  NUT-13 restore, which marked every seed proof the mint still calls unspent as spendable and
+  could hand another operation's reserved proofs to a second spender. It restores only the
+  swap's stored outputs, on their own keyset, and finishes only when every one is accounted for
+  (returned, already in the wallet, or spent at the mint). A swap with no stored outputs, or an
+  empty or partial `/restore`, is kept and retried: `reconcile` prints `swap_held=<n>` and a
+  remediation line naming the saga, and payments are no longer refused because of it (its
+  reserved inputs stay unspendable).
+- **Fixed: a send's or melt's swap is no longer deleted when its reply was lost.** The swap a
+  job payment, `wallet send` or melt runs first stores its outputs just before it is sent;
+  recovery used to delete that record as an orphan on `https://` mints (also while another
+  process on the same home was still waiting for the reply), losing the change. It is now kept
+  and never deleted or restored automatically: `wallet reconcile`, `wallet balance` and `doctor`
+  report it as `swap_held` with its saga id; it does not itself refuse payments (it holds
+  nothing a payment could select). Its change stays at the mint until automatic recovery lands
+  (MakePrisms/maxplayerai#1272); keep the home's `key` and `wallet/cdk-wallet.sqlite` and report the
+  saga id. While such a swap exists, a crashed send whose inputs the mint still reads unspent is
+  not released and payments on that mint are refused (shown as `send_held` with `Payments on this
+  mint are refused`): the swap may still commit at the mint, and a retry would otherwise pay the
+  same attempt twice with other proofs. The same refusal applies to every spend on that mint:
+  job payments, `maxplayer wallet send`, `wallet melt`, the seller fee remittance, the cross-mint
+  hop and `maxplayer-trade` (list, take, send, withdraw) all stop before choosing a proof, with
+  `payments on this mint are refused (<mint>): send saga <id> is kept: …` naming `wallet
+  balance`/`doctor` and MakePrisms/maxplayerai#1272. A send or melt another process is running
+  never causes it. cdk's own recovery skips the swap and
+  any send or melt that may have started it but still recovers every other operation (including
+  during the cross-mint hop sweep). Sends and melts take a shared `<home>/wallet/operation.lock`
+  while they run so recovery in any process can tell a running one from a crashed one.
+- **Changed: `maxplayer wallet balance` and `maxplayer doctor` show held sagas.** When the last
+  wallet pass kept a swap or a send/melt, `balance` prints `swap_held=<n> saga_ids=…` /
+  `send_held=<n> saga_ids=…` and a remediation line per saga on stderr, and `doctor` adds a
+  `wallet held sagas` WARN row. A send that is refused as before (an input the mint reads spent or
+  pending: it may have paid without recording a token, so payments on that mint stop rather than
+  risk paying twice) is now shown there too, with `Payments on this mint are refused` in its line
+  and `payments refused at <mint>` in the doctor row; `wallet reconcile` prints the same lines
+  when it fails. `wallet reconcile` prints `send_held=<n>` when it is non-zero. Output is unchanged
+  when nothing is held.
+- **Changed: `maxplayer wallet balance`** prints `reserved_sats=<n>` on a mint line when proofs
+  there are reserved by an in-flight operation (job payment, send, melt or a trade); they were
+  never in `balance_sats`. Lines with nothing reserved are unchanged.
+- **Deprecated: `maxplayer account link|status|marketing --trade-home <dir>`.** Still parses,
+  prints `--trade-home is deprecated and ignored: trading now uses this home's key; it will be
+  removed in a future release` on stderr, and acts on the home key (or on the mint key with
+  `--mint`). It never creates a `trade.key`.
+- **Deprecated: standalone trading homes** (`maxplayer-trade --home <dir>` with `wallet.seed`
+  or `trade.key`). Every command warns; `balance`, `status`, `recover`, `send`, `withdraw`,
+  `doctor`, `serve` and `cancel` still run so funds can be drained and in-flight trades finished;
+  new `list`, `take`, `fund` and `receive` are refused with the drain steps
+  (`send … --out <file>`, then `maxplayer wallet receive "$(cat <file>)"`). A maxplayer home
+  that also has such files at its top level is refused by every command, which names the files
+  and what to do; nothing is created there.
+
 ## v0.7.3-rc5
 
 Release candidate for 0.7.3, cut to ship the checks-env pre-claim tag (#1285, fixes #707). The
@@ -32,6 +117,7 @@ npm `rc`; leave stable `latest` unchanged.
   redeployed. Buyers on older clients keep posting untagged offers, which host seats still refuse
   after the award, exactly as in v0.7.3-rc4.
 
+||||||| parent of 425111e9 (docs: trade uses the maxplayer home; release notes; MintBalance reserved_sats in tests; clippy)
 ## v0.7.3-rc4
 
 Release candidate for 0.7.3, cut to ship the security follow-ups from the v0.7.3-rc3 external
