@@ -983,3 +983,82 @@ async fn reply_on_a_review_held_turn_points_at_collect_with_the_reason() {
     );
     assert_nothing_started(context, &session);
 }
+
+// RC3-02 (v0.7.3-rc3 external review, advisor r1 Medium): the SESSION turn-failure release runs
+// before the job-level gate (`release_on_failure_feedback` returns on `on_turn_feedback`), so it must
+// authorize on a VERIFIED author itself. A same-id redelivery (the awarded seller's genuine feedback
+// for one turn, retargeted at another and keeping its id + signature) and a flipped-signature copy
+// must not release the turn; the genuine event still does.
+// Red-on-revert: compare `event.pubkey` again in `on_turn_feedback` and the turn is released.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unverifiable_turn_failure_does_not_release_the_turn() {
+    use crate::gateway::{EventDraft, TagSpec};
+    use nostr_sdk::JsonUtil;
+    let daemon = Daemon::start(false).await;
+    let context = &daemon.context;
+    let seller = Keys::generate();
+    let job = hex(0x5e55);
+    let now = now_unix();
+    context
+        .store
+        .record_award(&job, &hex(0xc1a1), &hex(0xa3a2), &seller.public_key().to_hex(), 100, now)
+        .expect("award");
+    let victim = seed_turn(context, &job, 2, "pending");
+    let other = seed_turn(context, &job, 3, "pending");
+    let failure_for = |followup: &str| {
+        crate::gateway::nostr::event_builder(&EventDraft::new(
+            crate::kinds::JOB_FEEDBACK_KIND,
+            vec![
+                TagSpec::new(["e", job.as_str(), "", "root"]),
+                TagSpec::new(["e", followup, "", "reply"]),
+                TagSpec::new(["status", "error"]),
+                TagSpec::new(["reason_code", "execution_failed"]),
+            ],
+            "turn failed",
+        ))
+        .expect("builder")
+        .sign_with_keys(&seller)
+        .expect("sign")
+    };
+    let edit = |event: &nostr_sdk::Event, f: &dyn Fn(&mut serde_json::Value)| {
+        let mut value = serde_json::to_value(event).expect("json");
+        f(&mut value);
+        nostr_sdk::Event::from_json(value.to_string()).expect("reparse (no verify)")
+    };
+
+    // The seller's genuine failure for turn 3, retargeted at turn 2 (same id + signature).
+    let elsewhere = failure_for(&other);
+    let same_id = edit(&elsewhere, &|v| {
+        for tag in v["tags"].as_array_mut().unwrap() {
+            if tag[3] == "reply" {
+                tag[1] = serde_json::Value::String(victim.clone());
+            }
+        }
+    });
+    assert_eq!(same_id.id, elsewhere.id);
+    let genuine = failure_for(&victim);
+    let bad_sig = edit(&genuine, &|v| {
+        let sig = v["sig"].as_str().unwrap().to_owned();
+        let flipped = if sig.starts_with('0') { "1" } else { "0" };
+        v["sig"] = serde_json::Value::String(format!("{flipped}{}", &sig[1..]));
+    });
+
+    for (label, event) in [("same-id redelivery", &same_id), ("flipped signature", &bad_sig)] {
+        assert!(event.verify().is_err(), "{label} must not verify");
+        session_reply::on_turn_feedback(context, event).await;
+        assert_eq!(
+            reservation_state(context, &victim),
+            Some(reservations::ReservationState::Reserved),
+            "{label}: the turn's reservation must stay held"
+        );
+        assert_eq!(context.store.turn(&victim).unwrap().unwrap().state, "pending", "{label}");
+    }
+
+    // Non-vacuity: the genuine failure from the awarded seller releases the turn.
+    session_reply::on_turn_feedback(context, &genuine).await;
+    assert_eq!(
+        reservation_state(context, &victim),
+        Some(reservations::ReservationState::Released)
+    );
+    assert_eq!(context.store.turn(&victim).unwrap().unwrap().state, "refused");
+}
