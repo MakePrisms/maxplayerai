@@ -23199,7 +23199,7 @@ mod tests {
         let body = format!(
             "#!/bin/sh\n\
              read -r _init\n\
-             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":2}}}}'\n\
+             printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":1}}}}'\n\
              read -r new\n\
              printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"stub\"{models}}}}}'\n\
              read -r turn\n\

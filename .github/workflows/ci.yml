@@ -102,6 +102,15 @@ jobs:
       # (env-gated real agent), so it is reported ignored here, not run.
       - name: Test maxplayer (CLI crate, acp)
         run: cargo test -p maxplayer --features acp,wallet --locked
+      # #1289: drive THIS client's real `initialize` (AcpDriver::ready) against the adapter versions
+      # the sandbox Dockerfile pins (read from the Dockerfile, so a pin bump is checked here in the
+      # same PR), the previous pins seats still run, and the pinned cursor-agent. v0.7.3-rc7's image
+      # shipped adapters that refused our params because only a generic client was checked.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4 # the sandbox image's node (docker/maxplayer-sandbox/Dockerfile)
+      - name: ACP initialize against the pinned adapters
+        run: ./scripts/check-acp-initialize.sh
       # Paired with the racer check in the default-feature job: the two scripts must reach opposite
       # verdicts on the two builds, which is what shows each one moves with the feature rather than
       # with something incidental to the binary it happens to be handed.

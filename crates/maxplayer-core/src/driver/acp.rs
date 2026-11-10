@@ -14,13 +14,50 @@ use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The ACP protocol version this client speaks: **v1**, the stable protocol.
+///
+/// It was `2` (#1289), but nothing in this driver speaks v2. ACP v2 is the SDK's experimental
+/// DRAFT (`@agentclientprotocol/sdk` 2.x, `v2/unstable`), with its own wire: `initialize` requires
+/// `info` (not `clientInfo`) and answers `info`/`capabilities` (not `agentInfo`/`agentCapabilities`),
+/// and it has no `session/load`. Every adapter-detection read in `acp_driver.rs` (`agentInfo.name`,
+/// `agentCapabilities.loadSession`) and the session-job reload path are v1 shapes.
+///
+/// Requesting `2` was harmless while the adapters were v1-only — claude-agent-acp 0.85.0,
+/// codex-acp 2.1.1, cursor-agent, opencode and gemini all negotiate a `2` request down to `1`. The
+/// v2-capable adapters the v0.7.3-rc7 image bakes (claude-agent-acp 0.104.1 on sdk 2.5.0,
+/// codex-acp 2.6.0 on sdk 2.4.0) route a request of `>= 2` to their v2 draft implementation, whose
+/// schema rejected our params (`invalid initialize params … path ["info"]`), and every stock-image
+/// claude/codex seat restart-looped. Sending `info` would have passed the handshake but landed the
+/// seat on the draft wire, where the detection reads above silently stop matching. Asking for `1`
+/// gets the v1 implementation from every adapter, old and new.
+pub const PROTOCOL_VERSION: u32 = 1;
 pub type SessionId = String;
 
+/// ACP v1 `Implementation`: who is on this end of the connection (`initialize.clientInfo`).
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Implementation {
+    pub name: String,
+    pub version: String,
+}
+
+impl Implementation {
+    /// This client: `maxplayer` at the version of the crate that built it.
+    pub fn maxplayer() -> Self {
+        Self {
+            name: "maxplayer".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+        }
+    }
+}
+
+/// ACP v1 `initialize` params. `clientInfo` is optional in v1 and sent anyway: it is what a v1
+/// `initialize` names the client with, and the v2 draft's REQUIRED field is its renamed successor
+/// (`info`), so a client that names itself is the shape both generations expect.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Initialize {
     pub protocol_version: u32,
+    pub client_info: Implementation,
     pub client_capabilities: Caps,
 }
 
@@ -28,6 +65,7 @@ impl Initialize {
     pub fn new(client_capabilities: Caps) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            client_info: Implementation::maxplayer(),
             client_capabilities,
         }
     }

@@ -2187,10 +2187,19 @@ mod tests {
     fn request_side_wire_uses_real_acp_camel_case() {
         let initialize =
             serde_json::to_value(Initialize::new(Caps::default())).expect("serialize initialize");
+        // ACP v1 (#1289): `protocolVersion: 1` keeps every adapter — including the v2-capable
+        // claude-agent-acp 0.104.1 / codex-acp 2.6.0 — on its v1 implementation, whose answer is the
+        // `agentInfo`/`agentCapabilities` shape `ready` reads. `clientInfo` is v1's (optional) name for
+        // the client. A `2` here routes those adapters to the v2 draft schema, which refused these
+        // params on every stock rc7 claude/codex seat.
         assert_eq!(
             initialize,
             json!({
-                "protocolVersion": 2,
+                "protocolVersion": 1,
+                "clientInfo": {
+                    "name": "maxplayer",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
                 "clientCapabilities": {
                     "methods": []
                 }
@@ -2227,6 +2236,77 @@ mod tests {
                 ]
             })
         );
+    }
+
+    /// #1289: THIS client's real `initialize` — `AcpDriver::ready`, not a hand-built payload — against
+    /// real adapter binaries. The rc7 release check drove `initialize` with a generic client, so a
+    /// params shape every v2-capable adapter refuses shipped green.
+    ///
+    /// Ignored because it needs the binaries; `scripts/check-acp-initialize.sh` installs the adapter
+    /// versions the sandbox Dockerfile pins (read from the Dockerfile, so a pin bump re-runs this),
+    /// the previous pins seats still run on derived images, and the pinned cursor-agent, then runs
+    /// this test with `MAXPLAYER_ACP_ADAPTERS` set. CI runs it in the `build-acp` job.
+    ///
+    /// `MAXPLAYER_ACP_ADAPTERS` is `;`-separated `label|kind|program|arg…`, kind one of
+    /// `claude`/`codex`/`generic`. It must name at least one adapter: an empty run proves nothing.
+    #[tokio::test]
+    #[ignore = "needs real ACP adapter binaries; run via scripts/check-acp-initialize.sh"]
+    async fn real_adapters_accept_this_clients_initialize() {
+        let spec = std::env::var("MAXPLAYER_ACP_ADAPTERS")
+            .expect("MAXPLAYER_ACP_ADAPTERS must list the adapters to check");
+        let home = std::env::temp_dir().join(format!("maxplayer-acp-1289-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("scratch HOME");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut checked = Vec::new();
+        for entry in spec
+            .split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let mut parts = entry.split('|');
+            let label = parts.next().expect("label").to_owned();
+            let kind = parts
+                .next()
+                .unwrap_or_else(|| panic!("{label}: missing kind"));
+            let program = parts
+                .next()
+                .unwrap_or_else(|| panic!("{label}: missing program"));
+            let args = parts.map(str::to_owned).collect();
+            // A scratch HOME: the handshake must not read or write any real harness login.
+            let command = AgentCommand::new(program.to_owned(), args).with_env(vec![
+                ("PATH".into(), path.clone()),
+                ("HOME".into(), home.display().to_string()),
+            ]);
+            let mut driver =
+                AcpDriver::new(command, PermissionOutcome::Allow, Duration::from_secs(60));
+            let ready = driver.ready().await.unwrap_or_else(|error| {
+                panic!("{label}: refused this client's initialize: {error:?}")
+            });
+            assert_eq!(ready.protocol_version, 1, "{label}: must negotiate ACP v1");
+            // The v1 answer is what every adapter-specific path reads. A v2-draft answer (`info`,
+            // `capabilities`) would pass the handshake and fail these silently.
+            match kind {
+                "claude" => assert!(driver.is_claude_adapter, "{label}: agentInfo.name not read"),
+                "codex" => assert!(driver.is_codex_adapter, "{label}: agentInfo.name not read"),
+                "generic" => assert!(
+                    !driver.is_claude_adapter && !driver.is_codex_adapter,
+                    "{label}: misdetected as claude/codex"
+                ),
+                other => panic!("{label}: unknown kind {other:?}"),
+            }
+            assert!(
+                driver.supports_load_session(),
+                "{label}: agentCapabilities.loadSession not read (session jobs would lose reloads)"
+            );
+            driver.shutdown().await.expect("shutdown");
+            checked.push(label);
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(
+            !checked.is_empty(),
+            "MAXPLAYER_ACP_ADAPTERS named no adapter"
+        );
+        eprintln!("initialize accepted by: {}", checked.join(", "));
     }
 
     #[test]
