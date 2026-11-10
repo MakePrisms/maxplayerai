@@ -250,10 +250,10 @@ jobs:
           ref: ${{ needs.plan.outputs.commit }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -267,7 +267,7 @@ jobs:
       # overwrite each other's manifest, and the arm64 leg would import amd64 layers it cannot use.
       - name: Build and push the sandbox image by digest
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           file: docker/maxplayer-sandbox/Dockerfile
@@ -282,7 +282,7 @@ jobs:
       # so it runs wherever the job runs, including an arm64 Mac's linux VM.
       - name: Build and push the containment sidecar by digest
         id: build_netfilter
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: docker/maxplayer-netfilter
           platforms: ${{ matrix.platform }}
@@ -356,12 +356,12 @@ jobs:
       # buildx v0.32.0 and is absent in v0.31.0. Leaving the version to whatever the runner image
       # happens to carry would make the identity binding below depend on the runner image.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           version: v0.37.1
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
