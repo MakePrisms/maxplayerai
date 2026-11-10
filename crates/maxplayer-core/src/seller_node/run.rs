@@ -2818,6 +2818,16 @@ fn refuse_host_checks_declaration(
     ))
 }
 
+/// #707: the pre-claim skip for an offer whose base declares a checks environment. A host-delivery
+/// seat refuses such a base after the award (RC3-01), so it must not claim it; a container-delivery
+/// seat never reads the declaration and is unaffected. Returns the declared kind to log.
+fn checks_env_claim_skip(tags: &[gateway::TagSpec], container_delivery: bool) -> Option<String> {
+    if container_delivery {
+        return None;
+    }
+    gateway::checks_env_param(tags)
+}
+
 /// #613 — the seller EMIT dual of the buyer's contribution parse. If `job_id` is a served
 /// contribution (a recorded pin), build the contribution result envelope tags to APPEND to the
 /// standard git result: the offer echo (`job-class`/`target-repo`/`base`/`accepts`) + the
@@ -7586,6 +7596,18 @@ impl SellerNodeRunner {
         }
     }
 
+    /// Whether this seat delivers inside the job container. `container_delivery_enabled` carries the
+    /// default, the mode and the root posture together; `execute_job` routes on this and the #707
+    /// pre-claim checks-env skip reads the same answer.
+    fn container_delivery(&self) -> bool {
+        self.node
+            .home()
+            .config
+            .sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.container_delivery_enabled(job_identity().0))
+    }
+
     async fn on_offer(&self, event: &nostr_sdk::Event) {
         // RC3-02: offer BACKFILL (`run_offer_backfill` -> `read_stored`), the preflight redrive and the
         // private-content path all call this directly, NOT through `dispatch_event`, and
@@ -7621,6 +7643,40 @@ impl SellerNodeRunner {
             if let Err(e)=self.node.store().mark_public_v2_offer(&event.id.to_hex()) {
                 opline!("seller public protocol marker failed id={}: {e}",event.id);return;
             }
+        }
+        // #707: a base that declares a checks environment cannot be served on the host delivery
+        // path (RC3-01 refuses it after the award). Skip it BEFORE claiming, and before staging
+        // fetches the base, so the buyer never waits out an award this seat would only refuse. The
+        // tag is the buyer daemon's statement; a missing or wrong one still ends in that refusal.
+        if let Some(env_kind) = checks_env_claim_skip(&draft.tags, self.container_delivery()) {
+            opline!(
+                "seller node offer skip id={}: the base declares a checks environment ({env_kind}) \
+                 and this seat delivers on the host",
+                event.id
+            );
+            let me = self.seller_pubkey.to_hex();
+            let targeted_to_self = draft.tags.iter().any(|tag| {
+                tag.first() == Some("p") && tag.0.get(1).map(String::as_str) == Some(me.as_str())
+            });
+            // Targeted buyers hear why once per offer (the backfill re-feeds stored offers). An
+            // offer only ever takes one of the two first-sight feedback skips, so the under-rate
+            // dedup set is shared rather than duplicated.
+            let offer_id = event.id.to_hex();
+            if targeted_to_self
+                && !self.fed_under_rate_offers.contains(&offer_id)
+                && self
+                    .publish_buyer_feedback(
+                        &offer_id,
+                        &verified_buyer,
+                        ReasonCode::CapabilityMissing,
+                        env_provision::HOST_CHECKS_ENV_REFUSED_FEEDBACK,
+                        Some(env_provision::HOST_CHECKS_ENV_REFUSED),
+                    )
+                    .await
+            {
+                self.fed_under_rate_offers.record(&offer_id);
+            }
+            return;
         }
         // Input staging is pre-claim. A missing input never becomes an empty job. It runs
         // off-loop: a large base can take minutes to pack, and this loop also serves awards,
@@ -9337,13 +9393,7 @@ impl SellerNodeRunner {
         // Reading the field raw would answer "host path" for the commonest docker seat there is: one
         // that never wrote the key. The uid is the one the container runs as (`docker run --user`):
         // under root the absent key resolves to the host path.
-        let container_delivery = self
-            .node
-            .home()
-            .config
-            .sandbox
-            .as_ref()
-            .is_some_and(|sandbox| sandbox.container_delivery_enabled(job_identity().0));
+        let container_delivery = self.container_delivery();
         let (commit, branch, usage, wall_time_ms, turn_session) = if container_delivery {
             let deadline = offer.deadline_unix.max(0) as u64;
             let memory_section = job_memory_section(
@@ -16277,6 +16327,66 @@ mod tests {
     ///
     /// RED ON REVERT: drop the `terminal_offers.settled_by` guard at the top of `claim_offer` and the
     /// settled offer is recorded and reserves the slot, failing the first assertion block.
+    /// #707: the pure gate. Host delivery skips a declared checks env; container delivery and an
+    /// undeclared base do not.
+    #[test]
+    fn checks_env_claim_skip_only_on_host_delivery_with_a_declaration() {
+        let tagged = crate::gateway::OfferDraft::untargeted("t", "", 100, 1_800_000_000)
+            .declaring_checks_env(Some(crate::checks::EnvKind::ContainerImage))
+            .to_event_draft();
+        let plain = crate::gateway::OfferDraft::untargeted("t", "", 100, 1_800_000_000).to_event_draft();
+        assert_eq!(checks_env_claim_skip(&tagged.tags, false).as_deref(), Some("container-image"));
+        assert_eq!(checks_env_claim_skip(&tagged.tags, true), None);
+        assert_eq!(checks_env_claim_skip(&plain.tags, false), None);
+    }
+
+    /// #707 through the real `on_offer`: a host-delivery seat (no `[sandbox]`) parks no claim on an
+    /// offer whose base declares a checks env, and still claims the same offer without the tag.
+    ///
+    /// RED ON REVERT: drop the `checks_env_claim_skip` block in `on_offer` and the tagged offer is
+    /// claimed, failing the first assertion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_seat_does_not_claim_an_offer_declaring_a_checks_env() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("checks-env-skip", &relay_url, true, 0, Some(0)).await;
+        assert!(!runner.container_delivery(), "precondition: a host-delivery seat");
+        let buyer = Keys::generate();
+        let deadline_unix = now_unix() as u64 + 3_600;
+        let sign = |draft: crate::gateway::EventDraft| {
+            crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&buyer).unwrap()
+        };
+        let tagged = sign(
+            crate::gateway::OfferDraft::untargeted("checked job", "", 100, deadline_unix)
+                .declaring_checks_env(Some(crate::checks::EnvKind::NixFlake))
+                .to_event_draft(),
+        );
+        let plain = sign(
+            crate::gateway::OfferDraft::untargeted("plain job", "", 100, deadline_unix).to_event_draft(),
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_offer(&tagged).await;
+                assert!(
+                    runner.node.store().claim_row_state(&tagged.id.to_hex()).unwrap().is_none(),
+                    "a host seat must not claim a base that declares a checks env"
+                );
+                assert_eq!(runner.slots.available(), 1, "no slot reserved for the skipped offer");
+                runner.on_offer(&plain).await;
+                assert!(
+                    runner.node.store().claim_row_state(&plain.id.to_hex()).unwrap().is_some(),
+                    "control: the same seat still claims an offer without the tag"
+                );
+            })
+            .await;
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_offer_won_by_another_seat_is_not_claimed() {
         use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};

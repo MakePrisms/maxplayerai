@@ -779,6 +779,9 @@ pub async fn post_job_async(
     // A base only the buyer can read makes such a job unservable: it would burn the
     // posting work and the deadline with no claim, or strand the selected seller.
     // Refuse it here, before the wallet opens and before any slow preparation.
+    // #707: the checks environment the pinned base declares, read by the public validation fetch
+    // below and stated on the offer. (Private posts read it from their own base import.)
+    let mut checks_env = None;
     if let Some(contribution) = &contribution {
         let public = visibility == crate::private_content::wire::Visibility::Public;
         if request.untargeted || public {
@@ -790,7 +793,7 @@ pub async fn post_job_async(
         // fetched objects seed the delivery store for the later verify fetch.
         // (Private posts validate all of this in their own base import.)
         if public {
-            validate_public_contribution_base(home, contribution).await?;
+            checks_env = validate_public_contribution_base(home, contribution).await?;
         }
     }
     let deadline_unix = resolve_post_deadline(request.deadline_unix, now_unix_secs()?)?;
@@ -842,7 +845,10 @@ pub async fn post_job_async(
         .map_err(|error| JobLifecycleError::Input(error.to_string()))?;
     }
 
-    let draft = build_offer_draft(&request, deadline_unix, contribution.as_ref())?;
+    let mut draft = build_offer_draft(&request, deadline_unix, contribution.as_ref())?;
+    if let Some(env_kind) = checks_env {
+        draft.tags.push(TagSpec::new(["param", gateway::CHECKS_ENV_PARAM, env_kind.as_str()]));
+    }
 
     let keys = buyer_keys(home)?;
     if visibility == crate::private_content::wire::Visibility::Private {
@@ -941,7 +947,7 @@ async fn assert_base_readable_by_sellers(
 async fn validate_public_contribution_base(
     home: &MaxplayerHome,
     contribution: &crate::contribution::ContributionOffer,
-) -> Result<(), JobLifecycleError> {
+) -> Result<Option<crate::checks::EnvKind>, JobLifecycleError> {
     let url = contribution.target.clone_url().to_owned();
     let oid = contribution.base.oid().to_owned();
     // Sign only for the configured relay host, where sellers are members too.
@@ -1006,7 +1012,7 @@ fn finish_public_base_validation(
     repo: &git2::Repository,
     oid: &str,
     store: &std::path::Path,
-) -> Result<(), JobLifecycleError> {
+) -> Result<Option<crate::checks::EnvKind>, JobLifecycleError> {
     crate::private_content::repositories::check_object_quotas(repo).map_err(|error| {
         JobLifecycleError::Input(format!(
             "contribution base exceeds the relay repository quotas ({error}); a seller could \
@@ -1017,7 +1023,14 @@ fn finish_public_base_validation(
     if let Err(error) = crate::store_seed::write(store, repo.path(), oid) {
         crate::opline!("public base seed not kept ({error}); collect fetches unseeded");
     }
-    Ok(())
+    // #707: pure git reads of the base just fetched. An invalid declaration refuses the post here,
+    // before a seller is awarded a job it could only refuse.
+    crate::checks::declared_env_kind(repo, oid).map_err(|error| {
+        JobLifecycleError::Input(format!(
+            "the pinned contribution base has an invalid .maxplayer/checks.toml ({error}); fix or \
+             remove it — the job was not posted"
+        ))
+    })
 }
 
 fn now_unix_secs() -> Result<u64, JobLifecycleError> {
@@ -6694,7 +6707,37 @@ mod tests {
         // The seed write is advisory and copies PACK files; this loose-object
         // fixture has none, so validation must still pass (a real network fetch
         // always lands a pack, and `store_seed` has its own coverage).
-        finish_public_base_validation(&repo, &commit, &store).unwrap();
+        assert_eq!(finish_public_base_validation(&repo, &commit, &store).unwrap(), None);
+
+        // #707: a declared checks env is read off the fetched base for the offer tag, and an
+        // invalid declaration refuses the post.
+        let decl = repo
+            .blob(b"schema = 1\n[env]\nkind = \"nix-flake\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n")
+            .unwrap();
+        let empty = repo.blob(b"{}").unwrap();
+        let mut dot = repo.treebuilder(None).unwrap();
+        dot.insert("checks.toml", decl, 0o100644).unwrap();
+        let dot = dot.write().unwrap();
+        let mut root_tree = repo.treebuilder(None).unwrap();
+        root_tree.insert(".maxplayer", dot, 0o040000).unwrap();
+        root_tree.insert("flake.nix", empty, 0o100644).unwrap();
+        root_tree.insert("flake.lock", empty, 0o100644).unwrap();
+        let declared = repo.find_tree(root_tree.write().unwrap()).unwrap();
+        let declared = repo.commit(None, &sig, &sig, "declared", &declared, &[]).unwrap().to_string();
+        assert_eq!(
+            finish_public_base_validation(&repo, &declared, &store).unwrap(),
+            Some(crate::checks::EnvKind::NixFlake)
+        );
+        let bad = repo.blob(b"schema = 7").unwrap();
+        let mut dot = repo.treebuilder(None).unwrap();
+        dot.insert("checks.toml", bad, 0o100644).unwrap();
+        let dot = dot.write().unwrap();
+        let mut root_tree = repo.treebuilder(None).unwrap();
+        root_tree.insert(".maxplayer", dot, 0o040000).unwrap();
+        let bad = repo.find_tree(root_tree.write().unwrap()).unwrap();
+        let bad = repo.commit(None, &sig, &sig, "bad", &bad, &[]).unwrap().to_string();
+        let error = finish_public_base_validation(&repo, &bad, &store).unwrap_err().to_string();
+        assert!(error.contains("checks.toml") && error.contains("not posted"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -102,6 +102,14 @@ pub fn prepare_offer(
     if options.contribution.is_some() {
         tags.push(TagSpec::new(["job-class", "contribution"]));
     }
+    // #707: a public field, so a seat that cannot serve a declared checks environment skips the
+    // offer before claiming, without decrypting anything. Contribution offers only.
+    if let Some(checks_env) = &request.checks_env {
+        if options.contribution.is_none() {
+            return Err(Error("checks-env requires a contribution offer"));
+        }
+        tags.push(TagSpec::new(["param", crate::gateway::CHECKS_ENV_PARAM, checks_env]));
+    }
     let task = if let Some(seller) = &request.seller_pubkey {
         tags.push(TagSpec::new(["p", seller]));
         let mut recipients = vec![

@@ -23,7 +23,7 @@ pub async fn post(
     contribution: Option<&crate::contribution::ContributionOffer>,
 ) -> Result<PostJobOutcome> {
     let parsed = gateway::parse_offer(validated).map_err(|_| Error("invalid posting request"))?;
-    let offer = gateway::OfferDraft {
+    let mut offer = gateway::OfferDraft {
         task: parsed.task,
         output: parsed.output,
         amount_sats: parsed.amount,
@@ -35,6 +35,7 @@ pub async fn post(
         required_capabilities: parsed.required_capabilities,
         payment_mode: parsed.payment_mode,
         accepts_delivery: parsed.accepts_delivery,
+        checks_env: None,
     };
     let mut ctx = ContentContext::open(home, &keys.public_key().to_hex())?;
     let job = super::random_id()?;
@@ -59,6 +60,8 @@ pub async fn post(
         ),
         None => None,
     };
+    // #707: the checks environment the fetched base declares, stated on the offer below.
+    let mut declared_env = None;
     let imported_ref =
         if let (Some((source, oid)), Some(base_staging)) = (&imported_base, &base_staging) {
             let base_repo = git2::Repository::init_bare(base_staging.path())
@@ -94,7 +97,7 @@ pub async fn post(
                 crate::job_lifecycle::JobKind::FromScratch => None,
             };
             let inputs_path = snapshot.as_ref().map(|_| staging.path().to_owned());
-            let base_repo = tokio::task::spawn_blocking(move || {
+            let (base_repo, declared) = tokio::task::spawn_blocking(move || {
                 crate::git_transport::prepare_private_input_base(
                     &base_repo,
                     local_path.as_deref(),
@@ -121,10 +124,19 @@ pub async fn post(
                         .map_err(|_| Error("input staging unavailable"))?;
                     repositories::check_objects_after(&inputs, used)?;
                 }
-                Ok::<_, Error>(base_repo)
+                // #707: pure git reads of the pinned base. An invalid declaration refuses the post
+                // here, not after a seller's award.
+                let declared = crate::checks::declared_env_kind(&base_repo, &oid).map_err(|_| {
+                    Error(
+                        "the pinned contribution base has an invalid .maxplayer/checks.toml; fix or \
+                         remove it — the job was not posted",
+                    )
+                })?;
+                Ok::<_, Error>((base_repo, declared))
             })
             .await
             .map_err(|_| Error("base input worker unavailable"))??;
+            declared_env = declared;
             let reference = format!("refs/heads/input/{}", super::random_id()?);
             base_repo
                 .reference(
@@ -161,6 +173,7 @@ pub async fn post(
         accepts: c.accepts.clone(),
         input: None,
     });
+    offer = offer.declaring_checks_env(declared_env);
     let prepared = builders::prepare_offer(
         keys,
         &offer,
