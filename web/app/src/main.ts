@@ -111,7 +111,7 @@ function wireVideo(video: HTMLVideoElement | null): void {
 async function boot(): Promise<void> {
   if (location.hash === "#market") { location.replace("/market"); return; }
   const video = document.querySelector<HTMLVideoElement>(".h-video video");
-  if (video && matchMedia("(max-width: 760px) and (orientation: portrait)").matches) video.poster = "/media/first-job-vertical-poster.jpg?v=2";
+  if (video && matchMedia("(max-width: 760px) and (orientation: portrait)").matches) video.poster = "/media/first-job-vertical-poster.jpg?v=3";
   wireVideo(video);
   wireNav();
   wirePicker();
