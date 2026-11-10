@@ -9091,3 +9091,313 @@ mod private_flow_tests {
         assert!(!home.wallet_dir.join("wallet.sqlite").exists());
     }
 }
+
+/// RC3-02 (worker-fable M3): the REAL relay reads, driven against a raw-websocket relay that serves
+/// scripted frames. `LocalRelay` verifies and filters what it stores, so it can never hand a read a
+/// same-id twin or an off-filter event; this fixture can. Each scenario is paired with a control
+/// that reads `Present` / `ConfirmedAbsent` against the same relay, so an `Unverified` here is the
+/// gate at work and never a relay that did not answer.
+///
+/// A twin reaches the app only once the client has verified and cached the genuine id
+/// (relay-pool 0.44.3 `verify_and_cache`), so a twin-only answer first sends the genuine event on
+/// another subscription ([`ScriptedFrame::prime`]); the read's own subscription carries only the
+/// twin. `fetch_events` keeps whichever of two same-id frames arrived first.
+#[cfg(all(test, feature = "wallet"))]
+mod verify_site_teeth {
+    use super::*;
+    use crate::seller_node::p_gate_relay_fixture::{
+        asks_id, asks_kind, PGateRelay, ScriptedFrame,
+    };
+    use nostr_sdk::prelude::{Event, JsonUtil, Keys, Timestamp};
+
+    const READ: Duration = Duration::from_secs(3);
+    /// No NIP-42 challenge while a test runs. None of these filters pins `#p`, so the fixture serves
+    /// them unauthenticated; a mid-read AUTH would make the SDK re-send a REQ and spend a scripted
+    /// answer meant for the recheck.
+    const NO_AUTH: Duration = Duration::from_secs(3_600);
+
+    fn sign(draft: &EventDraft, keys: &Keys) -> Event {
+        gateway::nostr::event_builder(draft)
+            .expect("builder")
+            .sign_with_keys(keys)
+            .expect("sign")
+    }
+
+    /// `event` re-serialized with `edit` applied, claimed id and signature kept. Asserted to be a
+    /// real twin: same id, does not verify.
+    fn twin(event: &Event, edit: impl FnOnce(&mut serde_json::Value)) -> Event {
+        let mut value = serde_json::to_value(event).expect("json");
+        edit(&mut value);
+        let forged = Event::from_json(value.to_string()).expect("reparse (no verify)");
+        assert_eq!(forged.id, event.id, "a twin keeps the genuine id");
+        assert!(forged.verify().is_err(), "a twin does not verify");
+        forged
+    }
+
+    fn set_tag(value: &mut serde_json::Value, name: &str, to: &str) {
+        for tag in value["tags"].as_array_mut().expect("tags") {
+            if tag[0] == name {
+                tag[1] = serde_json::Value::String(to.to_owned());
+            }
+        }
+    }
+
+    async fn buyer_home(relay: &PGateRelay) -> (tempfile::TempDir, MaxplayerHome) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut home = home::bootstrap(dir.path()).expect("bootstrap");
+        home.config.relay_url = relay.url();
+        (dir, home)
+    }
+
+    // ── award_presence_async ───────────────────────────────────────────────────────────────────
+    // Sites: the verify in `authentic_split` (first read and recheck), the first-read `poisoned`
+    // branch, the recheck `poisoned` branch, and the filter binding (a seller-signed 3405).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn award_presence_never_answers_from_a_twin_or_an_off_filter_award() {
+        let relay = PGateRelay::start(NO_AUTH).await;
+        let (_dir, home) = buyer_home(&relay).await;
+        let buyer = Keys::generate();
+        let seller = Keys::generate();
+        let (buyer_hex, seller_hex) = (buyer.public_key().to_hex(), seller.public_key().to_hex());
+        let job = "a".repeat(64);
+        let (claim, other_claim) = ("c".repeat(64), "d".repeat(64));
+        let genuine = sign(&award_draft(&job, &claim, &buyer_hex, &seller_hex), &buyer);
+        // Same id, retargeted at another claim: what collect would pay if it were parsed.
+        let forged = twin(&genuine, |v| {
+            for tag in v["tags"].as_array_mut().expect("tags") {
+                if tag[0] == "e" && tag.as_array().map(Vec::len) == Some(2) {
+                    tag[1] = serde_json::Value::String(other_claim.clone());
+                }
+            }
+        });
+        // Validly signed, well-formed, names our job and the buyer's `p` - but not by the buyer.
+        let seller_signed = sign(&award_draft(&job, &other_claim, &buyer_hex, &seller_hex), &seller);
+        let read = || award_presence_async(&home, &buyer, &job, READ);
+        let serve = |answers: Vec<Vec<ScriptedFrame>>| {
+            relay.clear_scripts();
+            relay.script(asks_kind(JOB_AWARD_KIND), answers);
+        };
+        let repairable = |presence: PresenceRead<AwardPresence>| match presence {
+            PresenceRead::Present(AwardPresence::Repairable(award)) => award.claim_id,
+            other => panic!("expected a repairable award, got {other:?}"),
+        };
+
+        // Controls: the relay answers, so emptiness is certified and the genuine award is read.
+        serve(vec![]);
+        assert_eq!(read().await.expect("read"), PresenceRead::ConfirmedAbsent, "control: empty");
+        serve(vec![vec![ScriptedFrame::event(&genuine)]]);
+        assert_eq!(repairable(read().await.expect("read")), claim, "control: genuine award");
+
+        // Twin-only on the first read.
+        serve(vec![vec![ScriptedFrame::prime(&genuine), ScriptedFrame::event(&forged)]]);
+        assert_eq!(read().await.expect("read"), PresenceRead::Unverified, "twin-only first read");
+        // Empty first read, twin-only recheck.
+        serve(vec![vec![], vec![ScriptedFrame::prime(&genuine), ScriptedFrame::event(&forged)]]);
+        assert_eq!(read().await.expect("read"), PresenceRead::Unverified, "twin-only recheck");
+        // [twin, genuine]: the twin arrives first and wins the id; never absence, never parsed.
+        serve(vec![vec![
+            ScriptedFrame::prime(&genuine),
+            ScriptedFrame::event(&forged),
+            ScriptedFrame::event(&genuine),
+        ]]);
+        assert_eq!(read().await.expect("read"), PresenceRead::Unverified, "[twin, genuine]");
+        // [genuine, twin]: the genuine award is read, never the twin's claim.
+        serve(vec![vec![ScriptedFrame::event(&genuine), ScriptedFrame::event(&forged)]]);
+        assert_eq!(repairable(read().await.expect("read")), claim, "[genuine, twin]");
+        // A verifying award signed by the seller is off the `author=<buyer>` filter.
+        serve(vec![vec![ScriptedFrame::event(&seller_signed)]]);
+        assert_eq!(read().await.expect("read"), PresenceRead::Unverified, "seller-signed award");
+    }
+
+    // ── presence_of_filter, via event_present_async and job_has_results_async ─────────────────
+    // Sites: the verify in `authentic_split`, the first-read `!poisoned` gate, the recheck's
+    // `poisoned`, `filter_presence_verdict`'s poisoned arm, and the filter binding (by id, and by
+    // the pinned-seller author).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn presence_probes_never_answer_from_a_twin_or_an_off_filter_event() {
+        let relay = PGateRelay::start(NO_AUTH).await;
+        let url = relay.url();
+        let buyer = Keys::generate();
+        let seller = Keys::generate();
+        let seller_hex = seller.public_key().to_hex();
+        let job = "a".repeat(64);
+        let result = |author: &Keys, content: &str| {
+            sign(
+                &EventDraft::new(
+                    JOB_RESULT_KIND,
+                    vec![
+                        TagSpec::new(["e", &job, "", "root"]),
+                        TagSpec::new(["t", gateway::MAXPLAYER_TAG]),
+                    ],
+                    content,
+                ),
+                author,
+            )
+        };
+        let genuine = result(&seller, "delivered");
+        let forged = twin(&genuine, |v| v["content"] = "forged".into());
+        let unrelated = result(&seller, "a different event");
+        let stranger = result(&Keys::generate(), "junk result");
+        let id = genuine.id.to_hex();
+
+        let by_id = || event_present_async(&buyer, &url, &id, READ);
+        let serve_id = |answers: Vec<Vec<ScriptedFrame>>| {
+            relay.clear_scripts();
+            relay.script(asks_id(id.clone()), answers);
+        };
+        serve_id(vec![]);
+        assert_eq!(by_id().await.expect("read"), PresenceRead::ConfirmedAbsent, "control: empty");
+        serve_id(vec![vec![ScriptedFrame::event(&genuine)]]);
+        assert_eq!(by_id().await.expect("read"), PresenceRead::Present(()), "control: genuine");
+        serve_id(vec![vec![ScriptedFrame::prime(&genuine), ScriptedFrame::event(&forged)]]);
+        assert_eq!(by_id().await.expect("read"), PresenceRead::Unverified, "twin-only first read");
+        serve_id(vec![vec![], vec![ScriptedFrame::prime(&genuine), ScriptedFrame::event(&forged)]]);
+        assert_eq!(by_id().await.expect("read"), PresenceRead::Unverified, "twin-only recheck");
+        serve_id(vec![vec![
+            ScriptedFrame::prime(&genuine),
+            ScriptedFrame::event(&forged),
+            ScriptedFrame::event(&genuine),
+        ]]);
+        assert_eq!(by_id().await.expect("read"), PresenceRead::Unverified, "[twin, genuine]");
+        serve_id(vec![vec![ScriptedFrame::event(&genuine), ScriptedFrame::event(&forged)]]);
+        assert_eq!(by_id().await.expect("read"), PresenceRead::Present(()), "[genuine, twin]");
+        // A verifying event with another id answering a by-id REQ is not this event.
+        serve_id(vec![vec![ScriptedFrame::event(&unrelated)]]);
+        assert_eq!(by_id().await.expect("read"), PresenceRead::Unverified, "off-filter id");
+
+        let results = || job_has_results_async(&buyer, &url, &job, &seller_hex, READ);
+        let serve_results = |answers: Vec<Vec<ScriptedFrame>>| {
+            relay.clear_scripts();
+            relay.script(asks_kind(JOB_RESULT_KIND), answers);
+        };
+        serve_results(vec![vec![ScriptedFrame::event(&genuine)]]);
+        assert_eq!(results().await.expect("read"), PresenceRead::Present(()), "control: seller's result");
+        // The griefing vector the author filter exists for: anyone's 3403 must not hold a refund.
+        serve_results(vec![vec![ScriptedFrame::event(&stranger)]]);
+        assert_eq!(results().await.expect("read"), PresenceRead::Unverified, "a stranger's result");
+        serve_results(vec![vec![ScriptedFrame::prime(&genuine), ScriptedFrame::event(&forged)]]);
+        assert_eq!(results().await.expect("read"), PresenceRead::Unverified, "twin-only result");
+    }
+
+    fn view_offer(buyer: &Keys, seller: &Keys) -> Event {
+        let draft = OfferDraft::new(
+            "rc3-02 view",
+            "text/plain",
+            10,
+            Timestamp::now().as_secs() + 600,
+            seller.public_key().to_hex(),
+        )
+        .to_event_draft();
+        sign(&draft, buyer)
+    }
+
+    // ── fetch_job_view_async: the offer read ─────────────────────────────────────────────────
+    // Sites: the verify in `authentic_split` (offer read and recheck), the `offer_poisoned` branch,
+    // the recheck guard, and the filter binding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_job_view_never_certifies_or_reads_an_offer_from_a_twin_or_an_off_filter_offer() {
+        let relay = PGateRelay::start(NO_AUTH).await;
+        let (_dir, home) = buyer_home(&relay).await;
+        let buyer = Keys::generate();
+        let seller = Keys::generate();
+        let genuine = view_offer(&buyer, &seller);
+        let job = genuine.id.to_hex();
+        let forged = twin(&genuine, |v| set_tag(v, "amount", "1"));
+        let unrelated = view_offer(&buyer, &Keys::generate());
+        let now = Timestamp::now().as_secs();
+        let view = || fetch_job_view_async(&home, &buyer, &job, READ, now);
+        let serve = |answers: Vec<Vec<ScriptedFrame>>| {
+            relay.clear_scripts();
+            relay.script(asks_id(job.clone()), answers);
+        };
+
+        serve(vec![]);
+        let read = view().await.expect("view");
+        assert!(read.read_confirmed && read.offer.is_none(), "control: answered absence is certified");
+        serve(vec![vec![ScriptedFrame::event(&genuine)]]);
+        let read = view().await.expect("view");
+        assert!(read.read_confirmed, "control: genuine offer");
+        assert_eq!(read.offer.expect("offer").amount_sats, 10);
+
+        for (leg, answers) in [
+            ("twin-only offer read", vec![vec![ScriptedFrame::prime(&genuine), ScriptedFrame::event(&forged)]]),
+            ("twin-only recheck", vec![vec![], vec![ScriptedFrame::prime(&genuine), ScriptedFrame::event(&forged)]]),
+            (
+                "[twin, genuine]",
+                vec![vec![
+                    ScriptedFrame::prime(&genuine),
+                    ScriptedFrame::event(&forged),
+                    ScriptedFrame::event(&genuine),
+                ]],
+            ),
+            ("off-filter offer", vec![vec![ScriptedFrame::event(&unrelated)]]),
+        ] {
+            serve(answers);
+            let read = view().await.expect("view");
+            assert!(!read.read_confirmed, "{leg}: must not certify the offer's absence");
+            assert!(read.offer.is_none(), "{leg}: no offer may be read from it");
+        }
+        serve(vec![vec![ScriptedFrame::event(&genuine), ScriptedFrame::event(&forged)]]);
+        let read = view().await.expect("view");
+        assert_eq!(read.offer.expect("[genuine, twin]").amount_sats, 10, "[genuine, twin] reads the genuine offer");
+    }
+
+    // ── fetch_job_view_async: the legacy claim and result lists ──────────────────────────────
+    // Sites: `authentic_list` at the feedback read and at the results read (verify + filter).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_job_view_refuses_a_twin_or_off_filter_claim_or_result_instead_of_a_shorter_list() {
+        let relay = PGateRelay::start(NO_AUTH).await;
+        let (_dir, home) = buyer_home(&relay).await;
+        let buyer = Keys::generate();
+        let seller = Keys::generate();
+        let (buyer_hex, seller_hex) = (buyer.public_key().to_hex(), seller.public_key().to_hex());
+        let offer = view_offer(&buyer, &seller);
+        let job = offer.id.to_hex();
+        let other_job = "b".repeat(64);
+        let claim_for = |job: &str| {
+            sign(
+                &gateway::claim_draft(job, &buyer_hex, &seller_hex, gateway::ClaimPayment::None, &[], &Default::default()),
+                &seller,
+            )
+        };
+        let result_for = |job: &str| {
+            sign(
+                &gateway::inline_result_draft(job, &buyer_hex, "text/plain", 10, "job-hash", "sig", "answer", &[]),
+                &seller,
+            )
+        };
+        let claim = claim_for(&job);
+        // The money attack: same id, the seller the buyer would pay swapped for an attacker.
+        let attacker = Keys::generate().public_key().to_hex();
+        let forged_claim = twin(&claim, |v| v["pubkey"] = attacker.clone().into());
+        let result = result_for(&job);
+        let forged_result = twin(&result, |v| v["content"] = "forged answer".into());
+        let now = Timestamp::now().as_secs();
+        let view = || fetch_job_view_async(&home, &buyer, &job, READ, now);
+        let serve = |kind: u16, frames: Vec<ScriptedFrame>| {
+            relay.clear_scripts();
+            relay.script(asks_id(job.clone()), vec![vec![ScriptedFrame::event(&offer)]]);
+            relay.script(asks_kind(kind), vec![frames]);
+        };
+        let refused = |read: Result<JobView, JobLifecycleError>, leg: &str| match read {
+            Err(JobLifecycleError::Relay(message)) if message.contains("the read is not trusted") => {}
+            other => panic!("{leg}: expected the untrusted-read refusal, got {other:?}"),
+        };
+
+        serve(JOB_CLAIM_KIND, vec![ScriptedFrame::event(&claim)]);
+        let read = view().await.expect("control: genuine claim");
+        assert_eq!(read.claims.len(), 1);
+        assert_eq!(read.claims[0].seller_pubkey, seller_hex);
+        serve(JOB_RESULT_KIND, vec![ScriptedFrame::event(&result)]);
+        assert_eq!(view().await.expect("control: genuine result").results.len(), 1);
+
+        serve(JOB_CLAIM_KIND, vec![ScriptedFrame::prime(&claim), ScriptedFrame::event(&forged_claim)]);
+        refused(view().await, "twin-only claim");
+        serve(JOB_CLAIM_KIND, vec![ScriptedFrame::event(&claim_for(&other_job))]);
+        refused(view().await, "another job's claim");
+        serve(JOB_RESULT_KIND, vec![ScriptedFrame::prime(&result), ScriptedFrame::event(&forged_result)]);
+        refused(view().await, "twin-only result");
+        serve(JOB_RESULT_KIND, vec![ScriptedFrame::event(&result_for(&other_job))]);
+        refused(view().await, "another job's result");
+    }
+}

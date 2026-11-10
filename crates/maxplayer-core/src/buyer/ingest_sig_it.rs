@@ -301,12 +301,17 @@ async fn a_same_id_redelivery_with_altered_content_never_surfaces_as_an_event_no
         !has_content(&events, &swapped.content),
         "a same-id redelivery must never surface as a new Event notification"
     );
-    // The raw `Message` stream (what `fetch_events` and backfills read) MAY carry it — that is the
-    // residual SDK behaviour this PR's app-side gates exist for. Whatever surfaces there must fail
+    // The raw `Message` stream (what `fetch_events` and backfills read) DOES carry it: relay-pool
+    // 0.44.3 treats a cached id as verified and re-emits the frame. That is the residual SDK
+    // behaviour the app-side gates exist for, pinned here (worker-fable M3) so an SDK change that
+    // stops re-emitting it is visible — at which point those gates become defence in depth rather
+    // than the only defence, and this test is where to say so. Whatever surfaces there must fail
     // our gate's author check, so no money decision can be taken on it.
-    if has_content(&messages, &swapped.content) {
-        eprintln!("note: SDK re-emitted the same-id redelivery on the raw Message stream (cached id)");
-    }
+    assert!(
+        has_content(&messages, &swapped.content),
+        "relay-pool re-emits a same-id redelivery on the raw Message stream (cached id); if this \
+         fails, the SDK changed and the RC3-02 premise must be re-examined"
+    );
     assert_eq!(
         crate::job_lifecycle::verified_author_hex(&swapped),
         None,
