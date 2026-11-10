@@ -1,3 +1,32 @@
+## v0.7.3-rc7
+
+Release candidate for 0.7.3. It carries exactly what v0.7.3-rc6 was cut for; rc6 was tagged and
+its binaries and sandbox image were built, but its GitHub Release was refused
+(`body is too long (maximum is 125000 characters)`: the release job sent the whole of
+RELEASE_NOTES.md), so npm publish never ran and rc6 cannot be installed. Do not use the
+`maxplayer-sandbox:v0.7.3-rc6` image tag; no released binary asks for it. The only change since
+rc6 is the release job fix below. Everything in v0.7.3-rc5 is included, and its upgrade order still
+applies to anyone coming from v0.7.3-rc4 or older. No new wire field: no relay, reviewer or
+registration-service redeploy. `maxplayer-trade` and `maxplayer-mint` are still not release
+binaries: build them from source at this tag. After publication, install with
+`npm install -g maxplayer@0.7.3-rc7`. Publish as a GitHub prerelease on npm `rc`; leave stable
+`latest` unchanged. Full details of the rc6 changes are in the `## v0.7.3-rc6` section of
+[RELEASE_NOTES.md](https://github.com/MakePrisms/maxplayerai/blob/v0.7.3-rc7/RELEASE_NOTES.md).
+
+- **Changed: sandbox image agent CLIs, for Claude Fable 5.2** (needs Claude Code >= 2.1.321).
+  `ghcr.io/makeprisms/maxplayer-sandbox:v0.7.3-rc7` bakes `@agentclientprotocol/claude-agent-acp`
+  0.104.1 (was 0.85.0), whose bundled `claude-agent-sdk` 0.3.322 runs Claude Code 2.1.322 (was
+  2.1.286), plus standalone `@anthropic-ai/claude-code` 2.1.322; `@agentclientprotocol/codex-acp`
+  2.6.0 (was 2.1.1; Codex 0.166.0) and cursor-agent `2026.11.05-86047df` (was
+  `2026.08.11-e8db854`). Docker seats get it by upgrading to this version; host-mode seats must
+  upgrade the adapters on their own PATH. No authenticated Fable 5.2 job has been run through the
+  image yet; prove it on your own seat (`ANTHROPIC_MODEL` plus
+  `[sandbox] forward_env = ["ANTHROPIC_MODEL"]`) before taking paid work on it.
+- **Changed: `maxplayer-trade` trades from the maxplayer home, with a shared wallet selection
+  lock and held-saga recovery/reporting in the buyer wallet** (#1263), as described under v0.7.3-rc6.
+- **Fixed: the release job sends only this version's notes section** as the GitHub Release body,
+  and fails before creating anything unless RELEASE_NOTES.md starts with `## v<version>`.
+
 ## v0.7.3-rc6
 
 Release candidate for 0.7.3, cut to ship a sandbox image whose Claude Code can run Claude Fable 5.2

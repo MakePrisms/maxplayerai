@@ -361,7 +361,20 @@ jobs:
           # lead and the generated changelog follows. The path is hardcoded and unguarded on
           # purpose: a `[ -f … ]` test would publish the release without the notes and say nothing,
           # and a release cannot be un-published. Missing file ⇒ gh fails ⇒ the release fails closed.
-          flags=(--title "maxplayer $VERSION" --generate-notes --notes-file RELEASE_NOTES.md)
+          #
+          # Only THIS version's section is sent, not the whole file: GitHub refuses a release body
+          # over 125000 characters (HTTP 422 "body is too long"), and RELEASE_NOTES.md keeps every
+          # shipped section, so it crossed that at v0.7.3-rc6 (125611 B) and the release failed after
+          # its images were already published. The section is the top `## ` heading up to the next
+          # one; it must be headed by this exact version or the job fails closed before creating
+          # anything.
+          awk 'NR==1 && !/^## /{exit 1} /^## /{n++} n==1' RELEASE_NOTES.md > release-body.md
+          head -n1 release-body.md | grep -qxF "## v$VERSION" || {
+            echo "RELEASE_NOTES.md must start with '## v$VERSION'; got: $(head -n1 RELEASE_NOTES.md)" >&2
+            exit 1
+          }
+          wc -c release-body.md
+          flags=(--title "maxplayer $VERSION" --generate-notes --notes-file release-body.md)
           if [ "$PRERELEASE" = true ]; then
             flags+=(--prerelease)
           fi
