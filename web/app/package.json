@@ -13,7 +13,8 @@
     "serve": "python3 -m http.server 490 --directory dist",
     "typecheck": "tsc --noEmit",
     "bake": "node scripts/bake-snapshot.mjs",
-    "test": "npm run typecheck && node --import tsx --test test/*.test.ts test/*.test.mjs"
+    "test": "npm run typecheck && node --import tsx --test test/*.test.ts test/*.test.mjs",
+    "og": "node scripts/render-og.mjs"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
