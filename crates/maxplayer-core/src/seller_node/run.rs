@@ -16001,8 +16001,12 @@ mod tests {
         );
 
         // `record_offer` fails (health() still answers).
-        let (written, written_offer) =
-            offer_1057(&buyer, "#1057 record offer fails", 300, now_unix() as u64 + 600);
+        let (written, written_offer) = offer_1057(
+            &buyer,
+            "#1057 record offer fails",
+            300,
+            now_unix() as u64 + 600,
+        );
         settle_1057(&runner, &written, R1057_PERMANENT);
         block_1057(&runner, &buyer, &written, &written_offer).await;
         crate::review::state::retry(&review_root, &written).unwrap();
