@@ -35,6 +35,21 @@ pub(crate) fn without_sagas(wallet: &Wallet, hidden: HashSet<uuid::Uuid>) -> Wal
     view.localstore = Arc::new(HidingStore {
         inner: wallet.localstore.clone(),
         hidden,
+        #[cfg(test)]
+        list_transactions_ok: None,
+    });
+    view
+}
+
+/// Test only: `wallet` whose `list_transactions` answers the first `ok_calls` calls and then fails
+/// (a database read error), with nothing hidden.
+#[cfg(test)]
+pub(crate) fn failing_list_transactions_after(wallet: &Wallet, ok_calls: usize) -> Wallet {
+    let mut view = wallet.clone();
+    view.localstore = Arc::new(HidingStore {
+        inner: wallet.localstore.clone(),
+        hidden: HashSet::new(),
+        list_transactions_ok: Some(Arc::new(std::sync::atomic::AtomicUsize::new(ok_calls))),
     });
     view
 }
@@ -43,6 +58,9 @@ pub(crate) fn without_sagas(wallet: &Wallet, hidden: HashSet<uuid::Uuid>) -> Wal
 struct HidingStore {
     inner: Store,
     hidden: HashSet<uuid::Uuid>,
+    /// Test only: calls of `list_transactions` left before it fails.
+    #[cfg(test)]
+    list_transactions_ok: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 #[async_trait]
@@ -123,6 +141,14 @@ impl WalletDatabase<Error> for HidingStore {
         direction: Option<TransactionDirection>,
         unit: Option<CurrencyUnit>,
     ) -> Result<Vec<Transaction>, Error> {
+        #[cfg(test)]
+        if let Some(left) = &self.list_transactions_ok {
+            use std::sync::atomic::Ordering::SeqCst;
+            if left.load(SeqCst) == 0 {
+                return Err(Error::Database("test: list_transactions fails".into()));
+            }
+            left.fetch_sub(1, SeqCst);
+        }
         self.inner
             .list_transactions(mint_url, direction, unit)
             .await

@@ -229,8 +229,9 @@ pub struct RetireReport {
     /// `Send(ProofsReserved)` sagas (and melts) this pass kept, each with why. Three kinds:
     /// * transient: a send or melt is running (operation lock held) and may own it;
     /// * waiting: its inputs read UNSPENT but a kept child swap may be its swap and could still
-    ///   commit, so they are not released ([`HeldSwap::blocks_payments`] false; payments continue,
-    ///   its inputs stay reserved under it);
+    ///   commit, so they are not released and payments on this mint are refused
+    ///   ([`HeldSwap::blocks_payments`] true, review r5 H1: a crashed payment whose swap the mint
+    ///   may still commit must not be paid again with other proofs); its inputs stay reserved;
     /// * refused: main's fail-closed refusal (an input SPENT or PENDING, an empty reservation, an
     ///   incomplete NUT-07 answer, or a melt). Payments on this mint are refused
     ///   ([`HeldSwap::blocks_payments`] true); recorded so `wallet balance` / `doctor` show it even
@@ -619,9 +620,14 @@ impl<'a> CdkBuyerMint<'a> {
             )));
         }
         // Same bound: confirm settles the swap over mint HTTP cdk leaves un-timed. On timeout we fail
-        // closed and return NO token, so no money reaches the seller this run. A ProofsReserved left
-        // mid-swap is compensated exactly as a definitive confirm failure is — the ATTEMPT_METADATA tag
-        // lets the next recover/reconcile map it, so a later retry never double-spends.
+        // closed and return NO token, so no money reaches the seller this run. Dropping the confirm
+        // future does NOT compensate: the send stays ProofsReserved with its inputs reserved, and no
+        // ATTEMPT_METADATA transaction exists yet (cdk writes it only after the swap returns), so
+        // `reconcile` cannot map it. A later retry cannot double-spend because recovery
+        // (`retire_eligible`) never releases those inputs while the swap may still commit, and
+        // refuses payments on this mint meanwhile: an input the mint reads SPENT or PENDING, or an
+        // all-UNSPENT send beside a kept child swap (its outputs are stored just before the post;
+        // review r5 H1). Only an all-UNSPENT send with no stored swap (none was posted) is released.
         // For a nostr:// mint the bound outlasts ONE connector window, but confirm makes more than one
         // call (fetch_active_keyset before the swap), so this arm CAN fire while the swap request is
         // still live. What makes that safe is recovery's REQUEST_SETTLE hold, not this bound.
@@ -855,9 +861,9 @@ impl<'a> CdkBuyerMint<'a> {
         }
         for saga in &incomplete {
             // Review r3 H1 / r4: a send or melt this pass kept WITHOUT refusing (one is running and
-            // may own it, or its release waits out a recently posted child swap). Its inputs stay
-            // reserved under it, so no payment can select them. A refusing hold falls through to
-            // the refusal below, exactly as on main.
+            // may own it). Its inputs stay reserved under it, so no payment can select them. A
+            // refusing hold (including a send whose release waits on a kept child swap, review r5
+            // H1) falls through to the refusal below, exactly as on main.
             if let Some(held) = report
                 .send_held
                 .iter()
@@ -1244,8 +1250,19 @@ async fn retire_eligible(
                 };
                 match retired {
                     Ok(ParentRetire::Released) => report.retired += 1,
+                    // Review r5 H1 (option A, Petar): its swap may still commit at the mint, and a
+                    // pay retry would select OTHER proofs and pay the same attempt twice, so payments
+                    // on this mint are refused while it waits. Recorded first; the pass then returns
+                    // `Err` exactly as for a SPENT parent. Its inputs stay reserved under it.
                     Ok(ParentRetire::Waiting(reason)) => {
-                        report.send_held.push(HeldSwap::new("send", &saga, reason))
+                        let refusal = PaymentWalletError::Reconcile(format!(
+                            "send saga {} kept: {reason}",
+                            saga.id
+                        ));
+                        report
+                            .send_held
+                            .push(HeldSwap::refusing("send", &saga, reason));
+                        parent_refusal.get_or_insert(refusal);
                     }
                     // Main's fail-closed refusal is kept: an input SPENT or PENDING (its swap may have
                     // executed, the send never recorded a token), an empty reservation, an incomplete
@@ -1290,26 +1307,38 @@ async fn retire_eligible(
             // A `TokenCreated` send WITH a confirmed outgoing transaction is a send that
             // demonstrably completed. Counting it and moving on is what left this table growing by
             // exactly one row per payment, forever (#293) — so the row is dropped here.
-            WalletSagaState::Send(SendSagaState::TokenCreated)
-                if saga_has_confirmed_outgoing_tx(wallet, &saga).await? =>
-            {
-                report.mapped_token_created += 1;
-                // A refusal is recorded and the pass continues: one saga that cannot be retired
-                // must not stop the others from being, and leaving the row is always the safe
-                // outcome here (it is inert, not a wedge — `recover_unmapped_sagas` tolerates it).
-                match retire_one_mapped_send(wallet, &saga).await {
-                    Ok(()) => report.retired_mapped += 1,
-                    Err(refusal) => report.unresolved.push(format!("{}: {refusal}", saga.id)),
-                }
-            }
-            // Unmapped `Send(TokenCreated)`: resolve on mint truth. Left unresolved these
-            // wedge the wallet permanently — `recover_unmapped_sagas` refuses them
-            // wallet-wide, so one stuck saga blocks every outbound payment regardless of
-            // amount. Send interprets the mint answer more conservatively than Swap does;
-            // see [`resolve_one_send_saga`].
             WalletSagaState::Send(SendSagaState::TokenCreated) => {
-                if let Err(refusal) = resolve_one_send_saga(wallet, &saga, &mut report).await {
-                    report.unresolved.push(format!("{}: {refusal}", saga.id));
+                match saga_has_confirmed_outgoing_tx(wallet, &saga).await {
+                    Ok(true) => {
+                        report.mapped_token_created += 1;
+                        // A refusal is recorded and the pass continues: one saga that cannot be
+                        // retired must not stop the others from being, and leaving the row is
+                        // always the safe outcome here (it is inert, not a wedge —
+                        // `recover_unmapped_sagas` tolerates it).
+                        match retire_one_mapped_send(wallet, &saga).await {
+                            Ok(()) => report.retired_mapped += 1,
+                            Err(refusal) => {
+                                report.unresolved.push(format!("{}: {refusal}", saga.id))
+                            }
+                        }
+                    }
+                    // Unmapped `Send(TokenCreated)`: resolve on mint truth. Left unresolved these
+                    // wedge the wallet permanently — `recover_unmapped_sagas` refuses them
+                    // wallet-wide, so one stuck saga blocks every outbound payment regardless of
+                    // amount. Send interprets the mint answer more conservatively than Swap does;
+                    // see [`resolve_one_send_saga`].
+                    Ok(false) => {
+                        if let Err(refusal) =
+                            resolve_one_send_saga(wallet, &saga, &mut report).await
+                        {
+                            report.unresolved.push(format!("{}: {refusal}", saga.id));
+                        }
+                    }
+                    // Review r5 L2: a failed transaction lookup is folded in like any other
+                    // refusal, never `?`: an early return would skip `record_held_sagas` for the
+                    // holds already found (e.g. a refused SPENT send). The row is left;
+                    // `recover_unmapped_sagas` still refuses while the lookup fails.
+                    Err(refusal) => report.unresolved.push(format!("{}: {refusal}", saga.id)),
                 }
             }
             // Swap-family sagas (proofs_reserved / swap_requested): resolve on mint
@@ -1635,7 +1664,7 @@ enum ParentRetire {
     /// Every input UNSPENT at the mint: released, saga deleted (main's retire).
     Released,
     /// Every input UNSPENT, but a kept child swap may be its swap and could still commit at the
-    /// mint: kept, inputs reserved under it, not a payment refusal.
+    /// mint: kept, inputs reserved under it, and payments on this mint refused (review r5 H1).
     Waiting(String),
 }
 
@@ -1669,14 +1698,17 @@ async fn retire_one_proofs_reserved(
     // request the mint received before the process died (or before a timed-out `confirm` future was
     // dropped) carries no expiry on `https://` and can still commit after this read; releasing then
     // would put inputs the mint has spent back in the spendable set. Nothing here can prove it will
-    // not, so the inputs stay reserved under this send (fail-closed, shown in balance/doctor, NOT a
-    // payment refusal) until the child is resolved (MakePrisms/maxplayerai#1272).
+    // not, so the inputs stay reserved under this send (fail-closed, shown in balance/doctor) until
+    // the child is resolved (MakePrisms/maxplayerai#1272). The caller also refuses payments on this
+    // mint meanwhile (review r5 H1): a pay retry would otherwise spend other proofs while this
+    // send's swap can still commit, paying the same attempt twice.
     if let Some(child) = child_swap_for(wallet, saga).await? {
         return Ok(ParentRetire::Waiting(format!(
             "the mint reads its inputs UNSPENT, but swap saga {child} (outputs stored, nothing \
-             reserved) may be its swap and the mint could still commit it, so its inputs are not \
-             released; they stay reserved (not spendable) until that swap is resolved \
-             (MakePrisms/maxplayerai#1272)"
+             reserved) may be its swap and the mint could still commit it, so its inputs stay \
+             reserved (not spendable) and payments on this mint are refused until that swap is \
+             resolved (automatically once MakePrisms/maxplayerai#1272 lands, or by hand): \
+             otherwise a crashed payment could be paid twice with other proofs"
         )));
     }
 
@@ -8085,18 +8117,86 @@ mod tests {
         wallet.localstore.get_saga(&id).await.unwrap().is_some()
     }
 
-    /// (a) Review r4 H1/M3 + scope: a message-bearing child swap with nothing reserved is HELD.
-    /// Never dropped, never restored (zero `/restore` even though this mint would sign it), never
-    /// credited, never a payment refusal, recorded for `wallet balance` / `doctor`. While its send is
-    /// incomplete with UNSPENT inputs, the send is not released either (item 4, fail-closed), and
-    /// payments continue. Once the send is gone the child stays held, and cdk's guarded recovery
-    /// runs without touching it.
+    /// (a) Review r4 H1/M3 + r5 H1 (option A): a message-bearing child swap with nothing reserved is
+    /// HELD (never dropped, never restored, never credited, never a payment refusal by itself), and a
+    /// dead send whose inputs all read UNSPENT beside it is kept with its inputs reserved AND refuses
+    /// payments on this mint: its swap may still commit, and a retry would pay the same attempt again
+    /// with other proofs. Both are recorded for `wallet balance` / `doctor` although the pass fails.
     #[tokio::test]
-    async fn message_bearing_child_swap_is_held_never_restored_and_payments_continue() {
+    async fn unspent_send_beside_a_held_child_swap_refuses_payments_and_is_never_released() {
         let (_home, wallet_dir, wallet, parent, child, input_y, outputs, mint_fake) =
             child_swap_scene(51, State::Unspent).await;
         mint_fake.unknown_unspent.store(true, Ordering::SeqCst);
         mint_fake.restore_signs.store(true, Ordering::SeqCst);
+
+        for pass in 0..2 {
+            let refusal = retire_eligible_incomplete_sagas_in(&wallet, Some(&wallet_dir))
+                .await
+                .expect_err("SAFETY (r5 H1): a send whose swap may still commit refuses the pass");
+            assert!(
+                refusal.to_string().contains(&parent.to_string()),
+                "{refusal}"
+            );
+            let error = pay_recovery(&wallet, &wallet_dir)
+                .await
+                .expect_err("SAFETY (r5 H1): payments on this mint are refused (no double pay)");
+            assert!(error.to_string().contains(&parent.to_string()), "{error}");
+            assert!(
+                saga_exists(&wallet, child).await && saga_exists(&wallet, parent).await,
+                "SAFETY: both kept (pass {pass})"
+            );
+            assert_eq!(
+                row(&wallet, input_y).await,
+                Some((State::Reserved, Some(parent))),
+                "SAFETY (item 4): the inputs stay reserved under the send, never spendable (pass {pass})"
+            );
+            let held = load_held_sagas(&*wallet.localstore).await.unwrap();
+            assert_eq!(held.len(), 2, "{held:?}");
+            let send = held
+                .iter()
+                .find(|h| h.saga_id == parent.to_string())
+                .unwrap_or_else(|| panic!("the waiting send is recorded: {held:?}"));
+            assert_eq!(send.kind, "send");
+            assert!(send.blocks_payments, "{held:?}");
+            let line = send.remediation();
+            assert!(
+                line.contains("Payments on this mint are refused")
+                    && line.contains("#1272")
+                    && line.contains("paid twice"),
+                "{line}"
+            );
+            let swap = held
+                .iter()
+                .find(|h| h.saga_id == child.to_string())
+                .unwrap_or_else(|| panic!("the child is recorded: {held:?}"));
+            assert!(
+                !swap.blocks_payments,
+                "a child alone never refuses: {held:?}"
+            );
+            assert!(swap.remediation().contains("#1272"));
+        }
+        assert_eq!(
+            mint_fake.restores.load(Ordering::SeqCst),
+            0,
+            "SAFETY: never restored automatically"
+        );
+        for y in &outputs {
+            assert_eq!(row(&wallet, *y).await, None, "SAFETY: nothing credited");
+        }
+    }
+
+    /// (b) Review r4 H1/M3 + r5 H1: once the send is gone (cdk compensated it after a definitive
+    /// refusal, which releases its inputs and leaves the child), the child is still held and never
+    /// restored, but it does not refuse payments by itself, and cdk's guarded recovery runs without
+    /// touching it.
+    #[tokio::test]
+    async fn held_child_swap_without_its_send_is_never_restored_and_payments_continue() {
+        let (_home, wallet_dir, wallet, parent, child, _input_y, outputs, mint_fake) =
+            child_swap_scene(56, State::Unspent).await;
+        mint_fake.unknown_unspent.store(true, Ordering::SeqCst);
+        mint_fake.restore_signs.store(true, Ordering::SeqCst);
+        wallet.localstore.release_proofs(&parent).await.unwrap();
+        wallet.localstore.delete_saga(&parent).await.unwrap();
 
         let report = retire_in(&wallet, &wallet_dir).await;
         assert!(
@@ -8107,33 +8207,10 @@ mod tests {
         assert_eq!(report.swap_held[0].saga_id, child.to_string());
         assert!(!report.swap_held[0].blocks_payments);
         assert!(report.swap_held[0].remediation().contains("#1272"));
-        assert_eq!(
-            report.retired, 0,
-            "SAFETY (item 4): UNSPENT inputs are not released while a kept child may be their swap"
-        );
-        assert_eq!(report.send_held.len(), 1, "{report:?}");
-        assert_eq!(report.send_held[0].saga_id, parent.to_string());
-        assert!(!report.send_held[0].blocks_payments, "{report:?}");
-        assert_eq!(
-            row(&wallet, input_y).await,
-            Some((State::Reserved, Some(parent))),
-            "SAFETY: the inputs stay reserved under the send, never spendable"
-        );
-        pay_recovery(&wallet, &wallet_dir)
-            .await
-            .expect("a held child swap (and its waiting send) must not wedge payments");
-
-        // The send is gone (cdk compensated it after a definitive refusal, which releases its inputs
-        // and leaves the child): the child is still held, and still never restored.
-        wallet.localstore.release_proofs(&parent).await.unwrap();
-        wallet.localstore.delete_saga(&parent).await.unwrap();
-        let report = retire_in(&wallet, &wallet_dir).await;
-        assert!(saga_exists(&wallet, child).await, "{report:?}");
-        assert_eq!(report.swap_held.len(), 1, "{report:?}");
         assert!(report.send_held.is_empty(), "{report:?}");
         pay_recovery(&wallet, &wallet_dir)
             .await
-            .expect("payments continue past a held child");
+            .expect("payments continue past a held child whose send is gone");
         assert_eq!(
             recover_incomplete_sagas_guarded(&wallet, Some(&wallet_dir))
                 .await
@@ -8160,6 +8237,71 @@ mod tests {
             "recorded for `wallet balance` / `doctor`: {held:?}"
         );
         assert_eq!(held[0].saga_id, child.to_string());
+        assert!(!held[0].blocks_payments);
+    }
+
+    /// Review r5 L2: a refused SPENT send followed (in saga order) by a `Send(TokenCreated)` whose
+    /// transaction lookup fails. The failed lookup is folded into the pass like any other refusal,
+    /// so the refused send is still recorded for `wallet balance` / `doctor`, and the pass returns
+    /// the send's refusal. (The lookup failure is a test-only database view whose
+    /// `list_transactions` fails after its first call, the send's own lookup.)
+    #[tokio::test]
+    async fn a_failed_transaction_lookup_later_in_the_pass_still_records_the_refused_send() {
+        let (_home, wallet_dir, wallet, parent, child, input_y, _outputs, mint_fake) =
+            child_swap_scene(57, State::Spent).await;
+        mint_fake.unknown_unspent.store(true, Ordering::SeqCst);
+        wallet.localstore.delete_saga(&child).await.unwrap();
+        let parent_created = wallet
+            .localstore
+            .get_saga(&parent)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at;
+        let mut later = WalletSaga::new(
+            uuid::Uuid::now_v7(),
+            WalletSagaState::Send(SendSagaState::TokenCreated),
+            Amount::from(4),
+            mint(MINT),
+            CurrencyUnit::Sat,
+            cdk::wallet::types::OperationData::Send(cdk::wallet::types::SendOperationData {
+                amount: Amount::from(4),
+                memo: None,
+                counter_start: None,
+                counter_end: None,
+                token: None,
+                proofs: None,
+            }),
+        );
+        later.created_at = parent_created + 1;
+        let later_id = later.id;
+        wallet.localstore.add_saga(later).await.unwrap();
+        let failing = crate::saga_recovery_view::failing_list_transactions_after(&wallet, 1);
+
+        let refusal = retire_eligible_incomplete_sagas_in(&failing, Some(&wallet_dir))
+            .await
+            .expect_err("the SPENT send still refuses the pass");
+        assert!(
+            refusal.to_string().contains("Spent or Pending"),
+            "the send's refusal, not the lookup error: {refusal}"
+        );
+        let held = load_held_sagas(&*wallet.localstore).await.unwrap();
+        let send = held
+            .iter()
+            .find(|h| h.saga_id == parent.to_string())
+            .unwrap_or_else(|| {
+                panic!("SAFETY (r5 L2): the refused send is recorded despite the lookup error: {held:?}")
+            });
+        assert!(send.blocks_payments, "{held:?}");
+        assert!(
+            saga_exists(&wallet, later_id).await,
+            "the unmapped row is left"
+        );
+        assert_eq!(
+            row(&wallet, input_y).await,
+            Some((State::Reserved, Some(parent))),
+            "SAFETY: a SPENT input is never released"
+        );
     }
 
     /// (c) Review r4 H2/L4: a send whose input the mint reads SPENT keeps main's fail-closed refusal
