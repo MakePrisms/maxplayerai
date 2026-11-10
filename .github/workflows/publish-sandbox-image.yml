@@ -120,11 +120,13 @@ jobs:
       NETFILTER_IMAGE_NAME: makeprisms/maxplayer-netfilter
     steps:
       # Check out the ref being released so the Dockerfile (and its pinned adapters) is exactly the one
-      # that tag names — not whatever main happens to be at publish time.
+      # that tag names — not whatever main happens to be at publish time. `inputs.tag` (not
+      # `github.event.inputs.tag`) so the workflow_call path checks out the same tag the version step
+      # below reads; under workflow_call `github.event` is the caller's push payload, which has none.
       - name: Checkout the released ref
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
 
       # Resolve the version tag and decide whether :latest moves. A prerelease (or any manual dispatch)
       # publishes the version tag ALONE, leaving :latest pointing at the last stable image — mirroring
