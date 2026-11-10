@@ -94,8 +94,78 @@ struct ForcedClose {
     reason: String,
 }
 
+/// One frame a [`PGateRelay::script`] sends in answer to a matching `REQ`, before its `EOSE`.
+///
+/// RC3-02 (worker-fable M3): the relay decides what a fetch returns, and nostr-relay-pool 0.44.3
+/// verifies an event only the FIRST time it sees its id (`verify_and_cache`). A raw-websocket double
+/// is the only way to hand the real read paths a same-id twin, a flipped signature, or a validly
+/// signed event the REQ never asked for — `LocalRelay` verifies and filters what it stores.
+#[derive(Debug, Clone)]
+pub(crate) enum ScriptedFrame {
+    /// An `EVENT` on the REQ's own subscription.
+    Event(Value),
+    /// An `EVENT` on ANOTHER subscription id. Sent with the genuine event first, it primes the
+    /// client's id-keyed verification cache, so a same-id twin that follows on the REQ's own
+    /// subscription is admitted without re-verification and reaches the app (the RC3-02 hole).
+    Elsewhere(String, Value),
+}
+
+impl ScriptedFrame {
+    /// `event` on the REQ's own subscription, serialized exactly as it is (a twin keeps its
+    /// claimed id and signature).
+    pub(crate) fn event(event: &nostr_sdk::Event) -> Self {
+        Self::Event(serde_json::to_value(event).expect("event to json"))
+    }
+
+    /// `event` on an unrelated subscription — the cache primer.
+    pub(crate) fn prime(event: &nostr_sdk::Event) -> Self {
+        Self::Elsewhere(
+            "rc3-02-prime".to_owned(),
+            serde_json::to_value(event).expect("event to json"),
+        )
+    }
+}
+
+/// Which REQs a script answers: true when ANY filter of the REQ satisfies it.
+type ReqMatcher = Box<dyn Fn(&Value) -> bool + Send + Sync>;
+
+/// A queue of scripted answers, one consumed per matching REQ. Once it is empty the relay answers
+/// that REQ with a bare `EOSE`, so a test can script "first read X, recheck Y".
+struct Script {
+    matches: ReqMatcher,
+    answers: VecDeque<Vec<ScriptedFrame>>,
+}
+
+impl std::fmt::Debug for Script {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Script").field("answers", &self.answers).finish_non_exhaustive()
+    }
+}
+
+/// A filter asking for `kind`.
+pub(crate) fn asks_kind(kind: u16) -> impl Fn(&Value) -> bool + Send + Sync + 'static {
+    move |filter: &Value| {
+        filter
+            .get("kinds")
+            .and_then(Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|k| k.as_u64() == Some(u64::from(kind))))
+    }
+}
+
+/// A filter asking for the event `id_hex` by id.
+pub(crate) fn asks_id(id_hex: String) -> impl Fn(&Value) -> bool + Send + Sync + 'static {
+    move |filter: &Value| {
+        filter
+            .get("ids")
+            .and_then(Value::as_array)
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(id_hex.as_str())))
+    }
+}
+
 #[derive(Debug, Default)]
 struct Controls {
+    /// Scripted EVENT frames served ahead of a matching REQ's `EOSE` (RC3-02 teeth).
+    scripts: std::sync::Mutex<Vec<Script>>,
     /// Refusals queued by the test, consumed one per matching `REQ`.
     forced: Mutex<VecDeque<ForcedClose>>,
     /// Writer for the most recently accepted socket, so a test can push an UNSOLICITED `CLOSED` —
@@ -124,6 +194,20 @@ struct Controls {
 }
 
 impl Controls {
+    /// The next scripted answer for a REQ carrying `filters`, consumed; empty when no script
+    /// matches or the matching script's queue is spent.
+    fn scripted_answer(&self, filters: &[&Value]) -> Vec<ScriptedFrame> {
+        let mut scripts = self
+            .scripts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        scripts
+            .iter_mut()
+            .find(|script| filters.iter().any(|filter| (script.matches)(filter)))
+            .and_then(|script| script.answers.pop_front())
+            .unwrap_or_default()
+    }
+
     fn auth_refused(&self) -> bool {
         self.refuse_auth.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -289,6 +373,33 @@ impl PGateRelay {
             .withheld_eose_kinds
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = kinds.to_vec();
+    }
+
+    /// Answer the next REQs matching `matches` with `answers`, one answer per REQ in order, each
+    /// followed by the `EOSE`; once spent, a matching REQ gets a bare `EOSE`. Scripts are tried in
+    /// the order they were added.
+    pub(crate) fn script(
+        &self,
+        matches: impl Fn(&Value) -> bool + Send + Sync + 'static,
+        answers: Vec<Vec<ScriptedFrame>>,
+    ) {
+        self.controls
+            .scripts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(Script {
+                matches: Box::new(matches),
+                answers: answers.into(),
+            });
+    }
+
+    /// Drop every script, so the next leg of a test starts from a relay that holds nothing.
+    pub(crate) fn clear_scripts(&self) {
+        self.controls
+            .scripts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clear();
     }
 
     /// Refuse every later AUTH the way buzz refuses an unregistered key (#1228): `OK false`
@@ -576,6 +687,13 @@ async fn serve_connection(
 
                 match verdict {
                     Verdict::Eose => {
+                        for frame in controls.scripted_answer(&filters) {
+                            let (sub, event) = match frame {
+                                ScriptedFrame::Event(event) => (subscription_id.clone(), event),
+                                ScriptedFrame::Elsewhere(sub, event) => (sub, event),
+                            };
+                            send(&writer, json!(["EVENT", sub, event])).await?;
+                        }
                         send(&writer, json!(["EOSE", subscription_id])).await?;
                     }
                     Verdict::Closed(reason) => {

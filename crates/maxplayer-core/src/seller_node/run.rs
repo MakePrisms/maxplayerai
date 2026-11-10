@@ -15484,6 +15484,305 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ── RC3-02 (worker-fable M3): one test per seller verify site ─────────────────────────────
+    //
+    // LEG 1b above kills no single mutant: its award is for a capacity-skipped offer, so every
+    // verify masks the others. Each test below reaches exactly one site with a flipped-signature
+    // event claiming the real buyer, so removing that one verify turns that one test red.
+
+    /// `event` with a flipped signature: same id, content and claimed author; does not verify.
+    fn rc3_02_flipped(event: &nostr_sdk::Event) -> nostr_sdk::Event {
+        use nostr_sdk::JsonUtil;
+        let mut value = serde_json::to_value(event).expect("event json");
+        let sig = value["sig"].as_str().expect("sig").to_owned();
+        let flipped = if sig.starts_with('0') { "1" } else { "0" };
+        value["sig"] = serde_json::Value::String(format!("{flipped}{}", &sig[1..]));
+        let forged = nostr_sdk::Event::from_json(value.to_string()).expect("reparse (no verify)");
+        assert_eq!((forged.id, forged.pubkey), (event.id, event.pubkey), "the forgery claims the signer");
+        assert!(forged.verify().is_err(), "and does not verify");
+        forged
+    }
+
+    /// A one-slot open-pool seller holding a parked, PUBLISHED claim on one fresh untargeted offer.
+    /// Returns `(runner, root, buyer, job_id, our_claim_id)`. Call inside a `LocalSet`.
+    async fn rc3_02_holding_a_claim(
+        label: &str,
+        relay_url: &str,
+    ) -> (Arc<SellerNodeRunner>, std::path::PathBuf, Keys, String, String) {
+        let (runner, root) = boot_capacity_skip_seller(label, relay_url, true, 0, Some(3_600)).await;
+        let runner = Arc::new(runner);
+        let buyer = Keys::generate();
+        let draft = crate::gateway::OfferDraft::untargeted(label, "", 100, now_unix() as u64 + 3_600)
+            .to_event_draft();
+        let offer = crate::gateway::nostr::event_builder(&draft)
+            .expect("offer builder")
+            .sign_with_keys(&buyer)
+            .expect("sign offer");
+        let job_id = offer.id.to_hex();
+        runner.on_offer(&offer).await;
+        runner.publish_now(&format!("claim:{job_id}")).await;
+        let our_claim = match runner.node.store().outbox_row(&format!("claim:{job_id}")) {
+            Ok(Some((_, _, Some(id)))) => id,
+            other => panic!("precondition: our claim is published with an id; got {other:?}"),
+        };
+        assert_eq!(
+            runner.node.store().claim_row_state(&job_id).expect("claim row"),
+            Some("claimed".to_owned()),
+            "precondition: we hold a parked claim"
+        );
+        assert_eq!(runner.slots.available(), 0, "precondition: the claim holds the only slot");
+        (runner, root, buyer, job_id, our_claim)
+    }
+
+    /// Site: the verify at the top of `on_award`, Execute arm. An unverifiable award claiming the
+    /// buyer and naming OUR claim must not bind or run the job.
+    /// RED ON REVERT: make that verify return `event.pubkey` and the award is recorded and executed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unverifiable_award_naming_our_claim_never_runs_the_agent() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (runner, root, buyer, job_id, our_claim) =
+                    rc3_02_holding_a_claim("rc3-02-award-ours", &relay_url).await;
+                let seller_hex = runner.seller_pubkey.to_hex();
+                let forged = rc3_02_flipped(&award_event(&job_id, &our_claim, &buyer, &seller_hex, &buyer));
+                runner.on_award(&forged).await;
+                tokio::task::yield_now().await;
+                assert!(
+                    runner.node.store().job_award_time(&job_id).expect("award time").is_none(),
+                    "an unverifiable award naming our claim must not be recorded"
+                );
+                assert_eq!(
+                    runner.node.store().claim_row_state(&job_id).expect("claim row"),
+                    Some("claimed".to_owned()),
+                    "the claim stays parked: nothing is executing"
+                );
+                assert_eq!(runner.slots.available(), 0, "the parked slot was not handed to a run");
+                let _ = std::fs::remove_dir_all(&root);
+            })
+            .await;
+    }
+
+    /// Site: the verify at the top of `on_award`, Release arm. An unverifiable award naming ANOTHER
+    /// claim must not release ours; the genuine award afterwards does (control).
+    /// RED ON REVERT: same mutation as above; the forgery releases our claim and slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unverifiable_award_naming_another_claim_never_releases_ours() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (runner, root, buyer, job_id, _our_claim) =
+                    rc3_02_holding_a_claim("rc3-02-award-other", &relay_url).await;
+                let other_seller = Keys::generate().public_key().to_hex();
+                let genuine = award_event(&job_id, &"e".repeat(64), &buyer, &other_seller, &buyer);
+                runner.on_award(&rc3_02_flipped(&genuine)).await;
+                assert_eq!(
+                    runner.node.store().claim_row_state(&job_id).expect("claim row"),
+                    Some("claimed".to_owned()),
+                    "an unverifiable award for another seat must not release our claim"
+                );
+                assert_eq!(runner.slots.available(), 0, "nor our slot");
+                runner.on_award(&genuine).await;
+                assert_eq!(
+                    runner.node.store().claim_row_state(&job_id).expect("claim row"),
+                    Some("released".to_owned()),
+                    "control: the genuine award releases it"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            })
+            .await;
+    }
+
+    /// Site: the verify in `suppress_taken_elsewhere`, driven directly (both handlers verify before
+    /// calling it, so it is unreachable through them with an unverifiable event).
+    /// RED ON REVERT: read the author from `event.pubkey` and the forgery suppresses the offer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unverifiable_decision_never_suppresses_even_called_directly() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root, buyer, skipped_id) =
+            boot_at_capacity_with_a_skipped_offer("rc3-02-suppress", &relay_url).await;
+        let buyer_hex = buyer.public_key().to_hex();
+        let other_seller = Keys::generate().public_key().to_hex();
+        let genuine = award_event(&skipped_id, "another-seats-claim", &buyer, &other_seller, &buyer);
+        runner.suppress_taken_elsewhere(&skipped_id, &buyer_hex, &rc3_02_flipped(&genuine), "award");
+        assert!(
+            runner.terminal_offers.suppressed_by(&skipped_id, &buyer_hex, now_unix() as u64).is_none(),
+            "an unverifiable decision must not suppress"
+        );
+        runner.suppress_taken_elsewhere(&skipped_id, &buyer_hex, &genuine, "award");
+        assert!(
+            runner.terminal_offers.suppressed_by(&skipped_id, &buyer_hex, now_unix() as u64).is_some(),
+            "control: the genuine decision suppresses"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Site: the verify at the top of `on_accept`, on the FREE-TURN path (`on_turn_accept` runs
+    /// right after it and does not verify on its own).
+    /// RED ON REVERT: make that check compare `event.pubkey` and the forgery marks the turn paid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unverifiable_turn_accept_never_settles_a_free_turn() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use crate::session::TurnState;
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let root = temp_dir("rc3-02-turn-accept");
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = crate::home::bootstrap(&root).expect("bootstrap home");
+        home.config.relay_url = relay_url;
+        home.config.review.seller_offer = false;
+        home.config.sessions.enabled = true;
+        let mut seller = seller_cfg(1, true);
+        seller.claim_award_timeout_secs = Some(3_600);
+        home.config.seller = Some(seller);
+        let runner = Arc::new(SellerNodeRunner::boot(home).await.expect("boot"));
+
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let (job_id, followup, result_id) = ("a".repeat(64), "1".repeat(64), "2".repeat(64));
+        let now = now_unix() as u64;
+        let store = runner.node.store();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    offer_id: job_id.clone(),
+                    buyer_pubkey: buyer_hex.clone(),
+                    amount_sats: 0,
+                    unit: "sat".to_owned(),
+                    task: "free session".to_owned(),
+                    deadline_unix: (now + 3_600) as i64,
+                    targeted: false,
+                    requested_agent: None,
+                    capability_request: None,
+                    output: Some("text/plain".to_owned()),
+                    payment_mode: crate::gateway::PaymentMode::None,
+                    accepts_delivery: Vec::new(),
+                },
+                now as i64,
+            )
+            .expect("record offer");
+        assert!(store.record_turn(&followup, &job_id, 2, now + 3_600, TurnState::Delivered, now).expect("turn"));
+        store
+            .set_turn_state(&followup, TurnState::Delivered, Some(&result_id), None, now)
+            .expect("bind result");
+
+        let seller_hex = runner.seller_pubkey.to_hex();
+        let mut draft = crate::gateway::accept_draft(&job_id, &"c".repeat(64), &buyer_hex, &seller_hex);
+        crate::session::bind_accept_to_result(&mut draft, &result_id);
+        let genuine = crate::gateway::nostr::event_builder(&draft)
+            .expect("accept builder")
+            .sign_with_keys(&buyer)
+            .expect("sign accept");
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_accept(&rc3_02_flipped(&genuine)).await;
+                assert_eq!(
+                    runner.node.store().turn(&followup).expect("turn").expect("row").state,
+                    TurnState::Delivered,
+                    "an unverifiable accept must not settle the turn"
+                );
+                runner.on_accept(&genuine).await;
+                assert_eq!(
+                    runner.node.store().turn(&followup).expect("turn").expect("row").state,
+                    TurnState::Paid,
+                    "control: the genuine accept settles it"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Sites: the verify at the top of `on_accept` AND the re-derived `accept_author` on the bind
+    /// path (no award yet). Each alone keeps this green, by construction: the second is reached only
+    /// after the first passed. Red only with both reverted (recorded on the PR).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unverifiable_accept_naming_our_claim_never_binds() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (runner, root, buyer, job_id, our_claim) =
+                    rc3_02_holding_a_claim("rc3-02-accept-bind", &relay_url).await;
+                let seller_hex = runner.seller_pubkey.to_hex();
+                let genuine = accept_event(&job_id, &our_claim, &buyer, &seller_hex, &buyer);
+                runner.on_accept(&rc3_02_flipped(&genuine)).await;
+                assert!(
+                    runner.node.store().job_award_time(&job_id).expect("award time").is_none(),
+                    "an unverifiable accept must not bind the job"
+                );
+                runner.on_accept(&genuine).await;
+                assert!(
+                    runner.node.store().job_award_time(&job_id).expect("award time").is_some(),
+                    "control: the genuine accept binds it (and does not execute)"
+                );
+                let _ = std::fs::remove_dir_all(&root);
+            })
+            .await;
+    }
+
+    /// Site: the verify in `dispatch_event`, the only gate in front of `on_receipt` (which reads
+    /// `event.pubkey` unverified, fable L3). A forged buyer receipt must not make an offer terminal.
+    /// RED ON REVERT: drop that verify and the forgery suppresses the offer forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unverifiable_receipt_never_makes_an_offer_terminal() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("rc3-02-receipt", &relay_url, true, 0, Some(0)).await;
+        let runner = Arc::new(runner);
+        let buyer = Keys::generate();
+        let buyer_hex = buyer.public_key().to_hex();
+        let offer_id = "a".repeat(64);
+        let draft = crate::gateway::receipt_draft(
+            &offer_id,
+            "result-id",
+            &buyer_hex,
+            &Keys::generate().public_key().to_hex(),
+            "https://mint.invalid",
+            100,
+            "job-hash",
+            "seller-sig",
+            "buyer-sig",
+            None,
+            None,
+            &[],
+        );
+        let genuine = crate::gateway::nostr::event_builder(&draft)
+            .expect("receipt builder")
+            .sign_with_keys(&buyer)
+            .expect("sign receipt");
+        runner.dispatch_event(&rc3_02_flipped(&genuine)).await;
+        assert!(
+            runner.terminal_offers.suppressed_by(&offer_id, &buyer_hex, now_unix() as u64).is_none(),
+            "an unverifiable receipt must not make the offer terminal"
+        );
+        runner.dispatch_event(&genuine).await;
+        assert_eq!(
+            runner.terminal_offers.suppressed_by(&offer_id, &buyer_hex, now_unix() as u64),
+            Some(Suppression::Settled),
+            "control: the genuine receipt does"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// #814 REGRESSION 4 — the RECEIPT stays terminal, including out-of-order against an award.
     ///
     /// Both orders asserted, because `combine` must be order-independent: an award landing after a
