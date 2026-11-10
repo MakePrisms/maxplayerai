@@ -165,7 +165,7 @@ test("/skill.md sends only link-preview bots to its preview page; agents and bro
   const html = readFileSync(join(dist, "skill-preview.html"), "utf8");
   assert.match(html, /<meta name="robots" content="noindex, nofollow" \/>/, "the preview page is noindex");
   assert.ok(html.includes('<a href="/skill.md">'), "a person who lands there can reach the skill");
-  assert.equal(one(html, "property", "og:image", "skill-preview.html"), `${ORIGIN}/og/maxplayer-skill-card.png`, "its own card");
+  assert.equal(one(html, "property", "og:image", "skill-preview.html"), `${ORIGIN}/og/maxplayer-card.png`, "the same card as every page (bob)");
   // og:url must not be /skill.md: crawlers that re-fetch og:url would hit the redirect again.
   assert.equal(one(html, "property", "og:url", "skill-preview.html"), `${ORIGIN}/skill-preview`);
   for (const page of readdirSync(dist).filter((f) => f.endsWith(".html") && f !== "skill-preview.html")) {
