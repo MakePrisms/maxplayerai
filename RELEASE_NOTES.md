@@ -1,4 +1,15 @@
-## Unreleased
+## v0.7.3-rc5
+
+Release candidate for 0.7.3, cut to ship the checks-env pre-claim tag (#1285, fixes #707). The
+only change to the `maxplayer` binary since v0.7.3-rc4 is that change; everything in
+v0.7.3-rc4 is included. **This is a breaking release: read the upgrade order below before
+upgrading buyers.** The relay's `maxplayer-private-protocol` copy (`crates/buzz`) learns the new
+public field, so the relay and the reviewer must be redeployed before buyers on this version post
+private contribution jobs. The sandbox image needs no change. The buyer store schema is
+unchanged (9) and the seller store schema is unchanged (15). `maxplayer-trade` and
+`maxplayer-mint` are still not release binaries: build them from source at this tag. After
+publication, install with `npm install -g maxplayer@0.7.3-rc5`. Publish as a GitHub prerelease on
+npm `rc`; leave stable `latest` unchanged.
 
 ### ⚠️ Breaking: every party must upgrade (#707)
 
