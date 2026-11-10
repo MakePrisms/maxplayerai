@@ -145,6 +145,9 @@ pub struct Review {
     pub error_code: Option<String>,
 }
 pub const VERDICT_REFUSED_PREFIX: &str = "review: execution-safety verdict refused";
+/// The refusal [`wire::check_detailed`] returns when the trusted reviewer signed two different
+/// answers for one subject. A policy refusal like the verdict above: waiting cannot change it.
+pub const CONFLICTING_RESULTS: &str = "review: conflicting results";
 /// Appended to a buyer verdict refusal: a deterministic verdict needs a decision, not a retry.
 pub const VERDICT_DECISION_GUIDANCE: &str = "decide what to do (a human decision: the buyer daemon never settles a refused delivery on its own): accept this delivery anyway by calling collect (or accept) with accept_review_verdict set to the verdict event id above (this result only, recorded locally), raise review.reject_at_or_above_ppm in config.toml and restart the buyer daemon, or leave the delivery unsettled; calling collect unchanged returns this same verdict";
 
@@ -536,7 +539,7 @@ pub mod wire {
                     }
                     if let Some((previous, _)) = &accepted {
                         if previous != &r {
-                            return Err("review: conflicting results".into());
+                            return Err(CONFLICTING_RESULTS.into());
                         }
                     } else {
                         accepted = Some((r, event.id.to_hex()));
@@ -1290,6 +1293,73 @@ mod tests {
             vec![],
         );
         assert!(check(&m, &cfg).await.unwrap_err().contains("conflicting"));
+    }
+    /// #1057 review round 1: the strings `wire::check` actually builds, classified for the seller's
+    /// park/re-drive decision and the status file. A relay refusal whose reason happens to say
+    /// "threshold" or "conflicting" stays retryable; only the verdict prefix and the exact conflict
+    /// text are policy refusals.
+    #[cfg(feature = "wallet")]
+    #[tokio::test(start_paused = true)]
+    async fn built_review_errors_classify_as_parked_or_retryable() {
+        use super::state::{failure_state, terminal};
+        let keys = Keys::generate();
+        let cfg = config(&keys);
+        let refused = check(&mock(vec![signed(&answer(0.9), &keys)], vec![]), &cfg)
+            .await
+            .unwrap_err();
+        assert!(refused.starts_with(VERDICT_REFUSED_PREFIX), "{refused}");
+        assert_eq!(failure_state(&refused), "policy_refused");
+        let conflict = check(
+            &mock(
+                vec![signed(&answer(0.1), &keys), signed(&answer(0.9), &keys)],
+                vec![],
+            ),
+            &cfg,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(conflict, CONFLICTING_RESULTS);
+        assert_eq!(failure_state(&conflict), "policy_refused");
+        let mut error = answer(0.1);
+        error.status = "error".into();
+        error.results.clear();
+        error.error_code = Some("invalid_subject".into());
+        let permanent = check(&mock(vec![], vec![signed(&error, &keys)]), &cfg)
+            .await
+            .unwrap_err();
+        assert_eq!(failure_state(&permanent), "input_refused", "{permanent}");
+        error.error_code = Some("rate_limited".into());
+        let busy = check(&mock(vec![], vec![signed(&error, &keys)]), &cfg)
+            .await
+            .unwrap_err();
+        assert_eq!(failure_state(&busy), "error", "{busy}");
+        let timeout = check(&mock(vec![], vec![]), &cfg).await.unwrap_err();
+        assert_eq!(failure_state(&timeout), "error", "{timeout}");
+        let unconfigured = ReviewConfig {
+            reviewers: BTreeMap::new(),
+            timeout_seconds: 1,
+            ..Default::default()
+        };
+        let unconfigured = check(&mock(vec![], vec![]), &unconfigured)
+            .await
+            .unwrap_err();
+        assert_eq!(failure_state(&unconfigured), "error", "{unconfigured}");
+        let mut output = nostr_sdk::prelude::Output {
+            val: (),
+            success: std::collections::HashSet::new(),
+            failed: std::collections::HashMap::new(),
+        };
+        output.failed.insert(
+            nostr_sdk::prelude::RelayUrl::parse("wss://relay.test").unwrap(),
+            "blocked: conflicting writes above the rate threshold".into(),
+        );
+        let relay = wire::request_refused(&output).unwrap_err();
+        assert!(
+            relay.contains("threshold") && relay.contains("conflicting"),
+            "{relay}"
+        );
+        assert_eq!(failure_state(&relay), "error", "{relay}");
+        assert!(!terminal(&relay), "{relay}");
     }
     #[test]
     fn threshold_boundary_is_inclusive() {
