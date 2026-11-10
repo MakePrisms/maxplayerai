@@ -131,6 +131,12 @@ jobs:
       # the npm job, which keeps `latest` stable and ships prereleases under `rc`.
       - name: Determine image tags
         id: meta
+        # Untrusted-by-construction values reach the script through env, never `${{ }}` expansion
+        # inside `run:` (expression injection hardening, security report REPORT1110 S3).
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           # Three trigger shapes, and they do not agree on where the version lives or on whether
@@ -139,16 +145,16 @@ jobs:
           # is the default, rather than the other way round.
           case "$GITHUB_EVENT_NAME" in
             release)
-              version="${{ github.event.release.tag_name }}"
-              prerelease="${{ github.event.release.prerelease }}"
+              version="$RELEASE_TAG"
+              prerelease="$RELEASE_PRERELEASE"
               ;;
             workflow_dispatch)
-              version="${{ inputs.tag }}"
+              version="$INPUT_TAG"
               # A manual build is not a release; never let it move the stable pointer.
               prerelease=true
               ;;
             *)
-              version="${{ inputs.tag }}"
+              version="$INPUT_TAG"
               # Called from release.yml for a real tag, so `:latest` moves for a stable version. The
               # semver-suffix rule is release.yml's own (plan job): match the suffix rather than the
               # literal "rc", so `-beta` is not published as latest either.
