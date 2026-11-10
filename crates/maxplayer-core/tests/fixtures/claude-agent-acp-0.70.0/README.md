@@ -108,6 +108,6 @@ The `tools/fold:108` references in the original model-reporting commits refer to
 capture operator's launcher selecting `/Users/forge/forge/npm/bin/claude-agent-acp`.
 There is no `tools/fold` file in this repository or its available Git path history;
 its implementation cannot be audited here. It is not the sandbox's adapter pin.
-The Dockerfile now pins 0.85.0. This 0.70.0 capture, version strings, hashes and
+The Dockerfile now pins 0.104.1. This 0.70.0 capture, version strings, hashes and
 measured notification counts stay unchanged as historical evidence; source checks
-of 0.85.0 are not a new authenticated wire capture.
+of 0.85.0 and 0.104.1 are not a new authenticated wire capture.

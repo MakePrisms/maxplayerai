@@ -1040,12 +1040,12 @@ fn is_claude_agent_acp(initialize_result: &Value) -> bool {
 /// else reliably. The historical 0.70.0 wire capture below documents the picker alias and
 /// differing model surfaces; do not relabel that capture as a newer adapter measurement.
 ///
-/// Source-checked against the sandbox's 0.85.0 adapter (`dist/acp-agent.js`): `agentInfo.name`
+/// Source-checked against the sandbox's 0.104.1 adapter (`dist/v1/acp-agent.js`; earlier 0.85.0): `agentInfo.name`
 /// comes from packageJson.name, newSession preserves this opt-in and defaults it to false,
 /// and the notification gate calls shouldEmitRawMessage before sending `_claude/sdkMessage`.
 /// The filter matches type and optional subtype/origin, so only system/init is requested here.
 /// The original 0.70.0 live measurement was 15 frames unfiltered versus one filtered frame;
-/// it is historical evidence, not a live 0.85.0 count. Other harnesses get unchanged params.
+/// it is historical evidence, not a live 0.104.1 count. Other harnesses get unchanged params.
 /// `agentCapabilities.loadSession == true` in an `initialize` result (either key casing).
 fn advertises_load_session(initialize: &Value) -> bool {
     initialize
@@ -1207,7 +1207,7 @@ fn permission_option_id(option: &Value) -> Option<String> {
 
 /// ACP `sessionUpdate` kinds that carry conversation history when an agent replays a session on
 /// `session/load`: user and agent messages, thoughts, tool calls and plans (claude-agent-acp
-/// 0.85.0 `replaySessionHistory`, codex-acp 2.1.1 `streamThreadHistory`). Everything else an agent
+/// 0.104.1 `replaySessionHistory`, codex-acp 2.6.0 `streamThreadHistory`). Everything else an agent
 /// may send around a load — `available_commands_update`, `usage_update`, `current_mode_update`,
 /// `config_option_update`, `session_info_update` — describes the session, not what was said in it.
 const HISTORY_UPDATE_KINDS: &[&str] = &[
@@ -3314,7 +3314,7 @@ mod tests {
     /// A `/bin/sh` agent that advertises `loadSession` and, like every ACP agent must (ACP "Session
     /// Setup → Loading sessions": "The Agent MUST replay the entire conversation to the Client in
     /// the form of `session/update` notifications"), streams `replay` BEFORE it answers
-    /// `session/load`. claude-agent-acp 0.85.0 does exactly this: `loadSession` awaits
+    /// `session/load`. claude-agent-acp 0.104.1 (as 0.85.0 did) does exactly this: `loadSession` awaits
     /// `replaySessionHistory`, which sends prior user turns as `user_message_chunk` and prior
     /// answers as `agent_message_chunk`. `session/prompt` streams `answer`, then ends the turn.
     fn replaying_stub(replay: &[Value], answer: &[Value]) -> AgentCommand {
