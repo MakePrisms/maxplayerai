@@ -397,6 +397,11 @@ async fn collect_window(
                 }
                 // Application shape/domain/signatures are checked by unwrap_content.
                 // Keep foreign matches in the page count so the limit is not hidden.
+                // RC3-02: an unverifiable same-id twin (relay-pool 0.44.3 re-emits one on this
+                // message lane) must never evict the genuine wrap; it never occupies the id.
+                if event.verify().is_err() {
+                    continue;
+                }
                 events.insert(event.id, event.into_owned());
                 if events.len() > WINDOW_LIMIT {
                     return Err(Error("content query overflow"));
@@ -657,6 +662,45 @@ mod tests {
             super::super::transport::receive_since(now)
         );
         relay.disconnect().await;
+    }
+
+    // RC3-02 (advisor r3 nit): the inbox window collector keys wraps by id. A same-id,
+    // content-swapped twin must neither evict the genuine wrap (twin second) nor occupy its id
+    // (twin first). Red on revert of the verify in `collect_window`.
+    #[tokio::test]
+    async fn an_unverifiable_twin_never_evicts_or_occupies_a_wrap_id() {
+        use nostr_sdk::JsonUtil;
+        let recipient = Keys::generate().public_key();
+        let genuine = EventBuilder::new(Kind::GiftWrap, "genuine")
+            .tags([Tag::public_key(recipient)])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let twin = {
+            let mut value = serde_json::to_value(&genuine).unwrap();
+            value["content"] = serde_json::Value::String("swapped".into());
+            Event::from_json(value.to_string()).unwrap()
+        };
+        assert_eq!(twin.id, genuine.id);
+        let id = SubscriptionId::new("twin");
+        for order in [[&genuine, &twin], [&twin, &genuine]] {
+            let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+            for event in order {
+                tx.send(RelayNotification::Message {
+                    message: RelayMessage::Event {
+                        subscription_id: Cow::Owned(id.clone()),
+                        event: Cow::Owned(event.clone()),
+                    },
+                })
+                .unwrap();
+            }
+            tx.send(RelayNotification::Message {
+                message: RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone())),
+            })
+            .unwrap();
+            let page = collect_window(&mut rx, &id, recipient, 0, u64::MAX).await.unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].content, "genuine", "the genuine wrap survives either order");
+        }
     }
 
     #[tokio::test]

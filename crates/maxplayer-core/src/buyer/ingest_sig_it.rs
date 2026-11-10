@@ -184,3 +184,176 @@ async fn a_signature_invalid_event_is_dropped_at_client_ingest_before_any_consum
     client.disconnect().await;
     drop(relay);
 }
+
+// ── RC3-02 (v0.7.3-rc3 external review): SAME-ID redelivery ─────────────────────────────────────
+//
+// The test above gives every forgery a DISTINCT id, so it cannot see the hole the review named: the
+// SDK's verification cache is keyed by event id, and nostr-relay-pool 0.44.1 skipped verification
+// for an id it had already saved. 0.44.3 (pinned by #1253) verifies before the admit policy and
+// never caches a failure, but still treats a CACHED id as verified — so a redelivery that reuses a
+// genuine event's id with altered content passes `verify_and_cache`, and is then re-emitted on the
+// pool's raw `Message` stream (never as a new `Event`, because the id is already saved). The tests
+// below pin the two SDK properties our live consumers rely on, and the app-side gates
+// (`job_lifecycle::verified_author_hex`) are what close the raw-message / fetch path.
+
+/// Re-serialize `event` with `edit` applied to its JSON; the claimed id and sig are kept unless the
+/// edit changes them. `Event::from_json` does not verify.
+fn tampered(event: &Event, edit: impl FnOnce(&mut serde_json::Value)) -> Event {
+    let mut value = serde_json::to_value(event).expect("event to json");
+    edit(&mut value);
+    Event::from_json(value.to_string()).expect("reparse tampered event (from_json does not verify)")
+}
+
+/// Every FEEDBACK the client surfaces, split by stream: `(events, raw_messages)`, each as
+/// `(id_hex, content)` so a same-id content swap is distinguishable from the genuine event.
+type Seen = Arc<Mutex<Vec<(String, String)>>>;
+fn spawn_split_collector(client: &Client) -> (Seen, Seen) {
+    let (events, messages): (Seen, Seen) = Default::default();
+    let (ev, msg) = (Arc::clone(&events), Arc::clone(&messages));
+    let mut notifications = client.notifications();
+    tokio::spawn(async move {
+        while let Ok(n) = notifications.recv().await {
+            match n {
+                RelayPoolNotification::Event { event, .. }
+                    if event.kind == Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND) =>
+                {
+                    ev.lock().unwrap_or_else(|e| e.into_inner()).push((event.id.to_hex(), event.content.clone()));
+                }
+                RelayPoolNotification::Message {
+                    message: nostr_sdk::RelayMessage::Event { event, .. },
+                    ..
+                } if event.kind == Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND) => {
+                    msg.lock().unwrap_or_else(|e| e.into_inner()).push((event.id.to_hex(), event.content.to_string()));
+                }
+                _ => {}
+            }
+        }
+    });
+    (events, messages)
+}
+
+fn has_content(seen: &Seen, content: &str) -> bool {
+    seen.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(_, c)| c == content)
+}
+
+async fn wait_content(seen: &Seen, content: &str) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline {
+        if has_content(seen, content) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+async fn prod_client(url: &str, author: &Keys) -> Client {
+    let client = Client::new(Keys::generate());
+    client.automatic_authentication(true);
+    client
+        .pool()
+        .add_relay(url, RelayOptions::default().reconnect(true))
+        .await
+        .expect("add relay");
+    client.connect().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client
+        .subscribe(
+            Filter::new().kind(Kind::Custom(crate::kinds::JOB_FEEDBACK_KIND)).author(author.public_key()),
+            None,
+        )
+        .await
+        .expect("subscribe");
+    client
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_id_redelivery_with_altered_content_never_surfaces_as_an_event_nor_authorizes() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.expect("relay run");
+    let url = relay.url().await.to_string();
+    let author = Keys::generate();
+    let client = prod_client(&url, &author).await;
+    let (events, messages) = spawn_split_collector(&client);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The genuine event: verified and cached by id on first sight.
+    let genuine = signed_feedback("genuine-offer", &author);
+    assert!(relay.notify_event(genuine.clone()));
+    assert!(wait_content(&events, &genuine.content).await, "control: the genuine event surfaces");
+
+    // The redelivery: SAME claimed id + signature, different content (retargeted at a victim job).
+    let swapped = tampered(&genuine, |v| {
+        v["content"] = serde_json::Value::String("forged: release the victim job".into());
+    });
+    assert_eq!(swapped.id, genuine.id, "the forgery reuses the genuine, already-verified id");
+    assert!(swapped.verify().is_err(), "it does not verify on its own");
+    assert!(relay.notify_event(swapped.clone()));
+
+    // Ordering barrier: once a later event surfaces, the redelivery is fully processed.
+    let tracer = signed_feedback("tracer-offer", &author);
+    assert!(relay.notify_event(tracer.clone()));
+    assert!(wait_content(&events, &tracer.content).await, "the tracer must arrive");
+
+    // SDK property our LIVE loops rely on (buyer `forward_job_events`, seller work lane): the
+    // de-duplicated `Event` stream never carries the swapped content.
+    assert!(
+        !has_content(&events, &swapped.content),
+        "a same-id redelivery must never surface as a new Event notification"
+    );
+    // The raw `Message` stream (what `fetch_events` and backfills read) MAY carry it — that is the
+    // residual SDK behaviour this PR's app-side gates exist for. Whatever surfaces there must fail
+    // our gate's author check, so no money decision can be taken on it.
+    if has_content(&messages, &swapped.content) {
+        eprintln!("note: SDK re-emitted the same-id redelivery on the raw Message stream (cached id)");
+    }
+    assert_eq!(
+        crate::job_lifecycle::verified_author_hex(&swapped),
+        None,
+        "the app-side gate refuses the same-id redelivery"
+    );
+    assert_eq!(
+        crate::job_lifecycle::verified_author_hex(&genuine),
+        Some(author.public_key().to_hex()),
+        "and still accepts the genuine event"
+    );
+
+    client.disconnect().await;
+    drop(relay);
+}
+
+// The poisoning direction, which 0.44.1 got wrong: a forgery that ARRIVES FIRST under an id must not
+// make the genuine event with that id unreceivable (a failed verification must never be cached or
+// saved). Red on nostr-relay-pool 0.44.1's "save before verify" ordering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forgery_arriving_first_does_not_block_the_genuine_event_with_its_id() {
+    let relay = LocalRelay::new(RelayBuilder::default());
+    relay.run().await.expect("relay run");
+    let url = relay.url().await.to_string();
+    let author = Keys::generate();
+    let client = prod_client(&url, &author).await;
+    let (events, _messages) = spawn_split_collector(&client);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let genuine = signed_feedback("first-forged-offer", &author);
+    let forged_first = with_forged_signature(&genuine);
+    assert_eq!(forged_first.id, genuine.id);
+    assert!(relay.notify_event(forged_first));
+
+    let tracer = signed_feedback("poison-tracer", &author);
+    assert!(relay.notify_event(tracer.clone()));
+    assert!(wait_content(&events, &tracer.content).await, "the tracer must arrive");
+    assert!(
+        !events.lock().unwrap().iter().any(|(id, _)| *id == genuine.id.to_hex()),
+        "the forgery itself never surfaces"
+    );
+
+    assert!(relay.notify_event(genuine.clone()));
+    assert!(
+        wait_content(&events, &genuine.content).await,
+        "the genuine event must still surface after a same-id forgery was dropped"
+    );
+
+    client.disconnect().await;
+    drop(relay);
+}
