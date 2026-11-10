@@ -2232,6 +2232,15 @@ async fn finalize_auto_award(
             | AwardError::Presence(_)
             | AwardError::Unresolved { .. }),
         ) => Err(error.to_string()),
+        // PREPARE re-reads the job view, and that read can fail for the same transient reasons the
+        // driver's own read can: a relay quota (`rate-limited:` CLOSED when several jobs are polled
+        // at once), a timeout, a dropped socket. Nothing was signed onto the wire and the
+        // reservation was already released, so this is retry-safe; parking it stranded a claimed
+        // job for good (2026-11-03 canary: `PARKED — award failed: job lifecycle relay: lifecycle
+        // subscription refused`). Validation failures (input, not-found, targeting) still park.
+        Err(AwardError::Publish(error @ job_lifecycle::JobLifecycleError::Relay(_))) => {
+            Err(format!("award not prepared: {error}"))
+        }
         Err(error) => {
             crate::opline!("{}", auto_award_park_line(job_id, &format!("award failed: {error}")));
             let _ = context
@@ -5165,6 +5174,69 @@ mod tests {
         let after = context.store.award_attempt(&job).unwrap().unwrap();
         assert_eq!(after.event_json, before.event_json);
         assert_eq!(after.send_count, before.send_count);
+        let awards = publisher.fetch_events(Filter::new().kind(Kind::Custom(crate::kinds::JOB_AWARD_KIND)).event(e.offer.id), Duration::from_secs(2)).await.unwrap();
+        assert_eq!(awards.len(), 1);
+        publisher.disconnect().await;
+    }
+
+    /// Serves the driver's first claim read, then refuses the NEXT one (the re-read inside
+    /// `prepare_award_async`) the way buzz refuses a REQ over its per-pubkey WS quota.
+    #[derive(Debug)]
+    struct QuotaRefusesPrepareRead(Arc<std::sync::atomic::AtomicUsize>);
+    impl nostr_relay_builder::prelude::QueryPolicy for QuotaRefusesPrepareRead {
+        fn admit_query<'a>(&'a self, query: &'a nostr_sdk::Filter, _: &'a std::net::SocketAddr)
+            -> nostr_relay_builder::prelude::BoxedFuture<'a, nostr_relay_builder::prelude::PolicyResult> {
+            Box::pin(async move {
+                if query.kinds.as_ref().is_some_and(|k|
+                    k.contains(&nostr_sdk::Kind::Custom(crate::kinds::JOB_CLAIM_KIND)))
+                    && self.0.fetch_add(1, Ordering::SeqCst) == 1 {
+                    nostr_relay_builder::prelude::PolicyResult::Reject("rate-limited: quota exceeded; retry in 5s".into())
+                } else { nostr_relay_builder::prelude::PolicyResult::Accept }
+            })
+        }
+    }
+
+    // 2026-11-03 canary: with several private jobs polled at once the relay refused the award
+    // PREPARE read (`rate-limited:` CLOSED) and the auto-award PARKED the job for good — "award
+    // failed: job lifecycle relay: lifecycle subscription refused" — although nothing was signed
+    // and a retry seconds later would have awarded it. A relay read failure is transient: the
+    // intent must stay pending and the next drive must award it.
+    #[tokio::test]
+    async fn a_refused_prepare_read_leaves_the_auto_award_pending_not_parked() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        use nostr_sdk::prelude::*;
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let relay = LocalRelay::new(RelayBuilder::default().query_policy(QuotaRefusesPrepareRead(reads.clone())));
+        relay.run().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut home = bootstrap_home(root.path()).unwrap();
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).unwrap();
+        home.config.relay_url = relay.url().await.to_string();
+        let deadline = now_unix() as u64 + 120;
+        let (e, keys) = crate::private_content::public_v2::tests::fixture_deadline(false, false, deadline);
+        crate::private_content::public_v2::Context::open(&home).unwrap().remember(&e.offer, &e.offer).unwrap();
+        let publisher = Client::new(keys);
+        publisher.add_relay(&home.config.relay_url).await.unwrap();
+        publisher.connect().await;
+        for event in [&e.offer, &e.claim] {
+            assert!(!publisher.send_event(event).await.unwrap().success.is_empty());
+        }
+        let job = e.offer.id.to_hex();
+        let (_lock, context, _socket) = bootstrap(home).await.unwrap();
+        context.store.put_pending_award(&job, 0, None, None, now_unix()).unwrap();
+
+        let error = drive_auto_award(&context, &job, 0).await
+            .expect_err("a refused prepare read is a transient failure, not an outcome");
+        assert!(error.contains("lifecycle subscription refused"), "{error}");
+        assert!(reads.load(Ordering::SeqCst) >= 2, "the prepare read must have been the refused one");
+        let parked = context.store.parked_awards().unwrap();
+        assert!(!parked.iter().any(|(parked_job, _)| parked_job == &job),
+            "a refused relay read must never terminally park a claimed job: {parked:?}");
+        assert_eq!(context.store.pending_award_state(&job).unwrap().map(|(state, _)| state).as_deref(), Some("pending"));
+
+        // The retry the driver now gets awards it.
+        drive_auto_award(&context, &job, 0).await.unwrap();
+        assert_eq!(context.store.pending_award_state(&job).unwrap().map(|(state, _)| state).as_deref(), Some("awarded"));
         let awards = publisher.fetch_events(Filter::new().kind(Kind::Custom(crate::kinds::JOB_AWARD_KIND)).event(e.offer.id), Duration::from_secs(2)).await.unwrap();
         assert_eq!(awards.len(), 1);
         publisher.disconnect().await;

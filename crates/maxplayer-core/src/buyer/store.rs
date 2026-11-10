@@ -665,6 +665,26 @@ impl BuyerStore {
         })
     }
 
+    /// Undo a reservation THIS award call just created, when its prepare failed before anything
+    /// was signed, pinned or sent. Deletes the row (rather than marking it `released`) so the job
+    /// is exactly as it was before the call: a `released` row with no pinned attempt is what a
+    /// pre-attempt-ledger binary leaves behind, and `award_step` answers it with the legacy probe,
+    /// whose confirmed-absent arm terminally refuses the job (2026-11-03 canary). Only a `reserved`
+    /// row with no award row and no pinned attempt is deleted; anything else is left untouched and
+    /// reported as not discarded.
+    pub fn discard_unpinned_reservation(&self, job_id: &str) -> Result<bool, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM reservations WHERE job_id = ?1 AND state = 'reserved'
+               AND NOT EXISTS (SELECT 1 FROM awards WHERE job_id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM award_attempts WHERE job_id = ?1)",
+            params![job_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted == 1)
+    }
+
     /// Release `job_id`'s reservation so its funds become available again. Idempotent: only a
     /// `Reserved` row is freed; `Released`/`Spent`/absent are no-ops (never frees twice, never frees
     /// a paid reservation).

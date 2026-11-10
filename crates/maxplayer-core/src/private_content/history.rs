@@ -101,6 +101,22 @@ async fn fetch_page(wire: &WireHistory, relay: &Relay, filter: Filter, timeout: 
     result?
 }
 
+/// The static error for a relay `CLOSED` on a lifecycle read, keyed by its NIP-01 prefix. Every
+/// variant starts with the old `lifecycle subscription refused` text, so existing log greps still
+/// match; the suffix says whether retrying can help (a quota or relay error) or not (restricted).
+/// The raw reason is relay-authored text and goes only to the operator log, never into [`Error`].
+pub(crate) fn lifecycle_refusal(message: &str) -> &'static str {
+    if message.starts_with("rate-limited:") {
+        "lifecycle subscription refused: rate-limited by the relay"
+    } else if message.starts_with("restricted:") {
+        "lifecycle subscription refused: restricted by the relay"
+    } else if message.starts_with("error:") {
+        "lifecycle subscription refused: relay error"
+    } else {
+        "lifecycle subscription refused"
+    }
+}
+
 async fn collect(
     notifications: &mut tokio::sync::broadcast::Receiver<RelayNotification>,
     id: &SubscriptionId,
@@ -143,7 +159,11 @@ async fn collect(
             } if subscription_id.as_ref() == id => {
                 // The SDK automatically reissues the same REQ after NIP-42 auth.
                 if !message.starts_with("auth-required:") {
-                    return Err(Error("lifecycle subscription refused"));
+                    crate::opline!(
+                        "lifecycle relay closed a history read: {}",
+                        crate::gateway::log_safe_text(&message)
+                    );
+                    return Err(Error(lifecycle_refusal(&message)));
                 }
             }
             RelayNotification::AuthenticationFailed
@@ -314,6 +334,25 @@ mod tests {
             async { Ok(frames) }
         }).await;
         assert!(matches!(result, Err(Error("lifecycle history timestamp saturated"))));
+    }
+
+    /// 2026-11-03 canary: a buzz per-pubkey quota CLOSED (`rate-limited:`) read as a bare
+    /// "subscription refused", indistinguishable from a policy refusal. The class must survive.
+    #[tokio::test]
+    async fn a_closed_lifecycle_read_names_the_relay_refusal_class() {
+        for (reason, expected) in [
+            ("rate-limited: quota exceeded; retry in 5s", "lifecycle subscription refused: rate-limited by the relay"),
+            ("restricted: p-gated events require #p matching your pubkey", "lifecycle subscription refused: restricted by the relay"),
+            ("error: historical query failed", "lifecycle subscription refused: relay error"),
+            ("unprefixed words", "lifecycle subscription refused"),
+        ] {
+            let id = SubscriptionId::new("closed");
+            let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+            tx.send(RelayNotification::Message { message: RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()), message: Cow::Owned(reason.to_owned()),
+            }}).unwrap();
+            assert_eq!(collect(&mut rx, &id, &Filter::new()).await, Err(Error(expected)), "{reason}");
+        }
     }
 
     #[tokio::test]
