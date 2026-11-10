@@ -31,6 +31,8 @@ const ROUTES = {
   "terms-20261029.html": "/terms/20261029",
   "privacy-20261029.html": "/privacy/20261029",
   "fees-20261029.html": "/fees/20261029",
+  // The link-preview page bots get for /skill.md (vercel.json); not linked, noindex.
+  "skill-preview.html": "/skill-preview",
 };
 
 const decode = (s) => s.replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
@@ -89,6 +91,7 @@ test("every page has canonical, og:* and twitter:* tags with its own title and d
     assert.equal(one(head, "name", "twitter:image", page), image, `${page}: twitter:image matches og:image`);
     assert.ok(existsSync(local(image)), `${page}: ${image} exists in public/`);
     const [w, h] = pngSize(local(image));
+    assert.deepEqual([w, h], [1200, 630], `${page}: ${image} is 1200×630`);
     assert.equal(one(head, "property", "og:image:width", page), String(w), `${page}: og:image:width is the real width`);
     assert.equal(one(head, "property", "og:image:height", page), String(h), `${page}: og:image:height is the real height`);
     assert.equal(one(head, "property", "og:image:type", page), "image/png");
@@ -114,4 +117,58 @@ test("the preview image is 1200×630, small enough for every unfurler, and rende
   assert.match(template, /width: 1200px; height: 630px/, "the template renders at 1200×630");
   const render = readFileSync(join(root, "scripts", "render-og.mjs"), "utf8");
   assert.match(render, /"og\/card\.html", "public\/og\/maxplayer-card\.png", 1200, 630/, "npm run og writes the shipped card");
+});
+
+// bob (2026-11-10): https://www.maxplayer.ai/skill.md must unfurl too. It is markdown, which no
+// unfurler reads, so vercel.json sends link-preview bots (only them) to /skill-preview.
+const BOTS = [
+  "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)",
+  "Twitterbot/1.0",
+  "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)",
+  "Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)",
+  "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)",
+  "WhatsApp/2.23.20.0",
+  "TelegramBot (like TwitterBot)",
+];
+// Everything an agent or a person fetches the skill with must still get the markdown.
+const READERS = [
+  "curl/8.5.0",
+  "python-requests/2.32.3",
+  "node",
+  "Claude-User (claude-code/2.0; +https://www.anthropic.com/)",
+  "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ChatGPT-User/1.0; +https://openai.com/bot)",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+  "",
+];
+
+test("/skill.md sends only link-preview bots to its preview page; agents and browsers get the markdown", () => {
+  const { redirects } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  const rules = redirects.filter((r) => r.source === "/skill.md");
+  assert.equal(rules.length, 1, "one /skill.md rule");
+  const [rule] = rules;
+  assert.equal(rule.destination, "/skill-preview");
+  assert.equal(rule.permanent, false, "temporary: /skill.md itself stays the canonical markdown URL");
+  assert.equal(rule.has?.length, 1);
+  const [cond] = rule.has;
+  assert.equal(cond.type, "header");
+  assert.equal(cond.key.toLowerCase(), "user-agent");
+  const re = new RegExp(cond.value.re);
+  for (const ua of BOTS) assert.ok(re.test(ua), `bot gets the preview: ${ua}`);
+  for (const ua of READERS) assert.ok(!re.test(ua), `reader keeps the markdown: ${ua || "(no UA)"}`);
+  // No other rule may catch /skill.md for everyone.
+  for (const r of [...redirects, ...(JSON.parse(readFileSync(join(root, "vercel.json"), "utf8")).rewrites ?? [])]) {
+    if (r === rule) continue;
+    assert.notEqual(r.source, "/skill.md", `only the bot rule touches /skill.md (${r.destination})`);
+  }
+
+  const html = readFileSync(join(dist, "skill-preview.html"), "utf8");
+  assert.match(html, /<meta name="robots" content="noindex, nofollow" \/>/, "the preview page is noindex");
+  assert.ok(html.includes('<a href="/skill.md">'), "a person who lands there can reach the skill");
+  assert.equal(one(html, "property", "og:image", "skill-preview.html"), `${ORIGIN}/og/maxplayer-skill-card.png`, "its own card");
+  // og:url must not be /skill.md: crawlers that re-fetch og:url would hit the redirect again.
+  assert.equal(one(html, "property", "og:url", "skill-preview.html"), `${ORIGIN}/skill-preview`);
+  for (const page of readdirSync(dist).filter((f) => f.endsWith(".html") && f !== "skill-preview.html")) {
+    assert.ok(!readFileSync(join(dist, page), "utf8").includes("/skill-preview"), `${page} does not link /skill-preview`);
+  }
 });

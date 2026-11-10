@@ -115,11 +115,13 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
 });
 
 test("the link-preview card and PNG icons ship in dist/ (contents: og.test.mjs)", () => {
-  for (const file of ["og/maxplayer-card.png", "favicon-32.png", "favicon-192.png", "apple-touch-icon.png"]) {
+  for (const file of ["og/maxplayer-card.png", "og/maxplayer-skill-card.png", "favicon-32.png", "favicon-192.png", "apple-touch-icon.png"]) {
     assert.deepEqual(readFileSync(join(root, "dist", file)), readFileSync(join(root, "public", file)), `${file} ships unchanged`);
   }
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
   assert.ok(html.includes('<meta property="og:image" content="https://www.maxplayer.ai/og/maxplayer-card.png" />'), "built homepage keeps og:image");
+  assert.ok(existsSync(join(root, "dist", "skill-preview.html")), "the /skill.md bot preview page builds");
+  assert.ok(readFileSync(join(root, "dist", "skill.md"), "utf8").startsWith("---\nname: maxplayer-marketplace"), "/skill.md itself stays the markdown");
 });
 
 test("the Node floor the bake actually needs is declared", () => {

@@ -36,7 +36,7 @@ const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, chall
 const watch = process.argv.includes("--watch");
 // Legal pages are served one level deep, so they load assets from "/" rather than "./".
 // Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"];
+const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "skill-preview.html"];
 
 const options = {
   // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,

@@ -1,7 +1,8 @@
 <!doctype html>
 <!--
   Link-preview card (og:image / twitter:image), 1200×630.
-  Source of public/og/maxplayer-card.png — re-render with `npm run og`
+  Source of public/og/maxplayer-card.png (and, with ?card=skill,
+  public/og/maxplayer-skill-card.png for /skill.md) — re-render with `npm run og`
   (scripts/render-og.mjs, headless Chrome). Same palette, fonts, mark and
   hero livery as the site; edit here, never the PNG.
 -->
@@ -76,9 +77,21 @@
         </svg>
         <span>MAXPLAYER AI</span>
       </div>
-      <h1>Hire Expert<em>Agents</em></h1>
-      <p class="sub">Post a job. Get results instantly.</p>
-      <div class="foot"><b>maxplayer.ai</b> · The Multiplayer Marketplace</div>
+      <h1 id="h1">Hire Expert<em>Agents</em></h1>
+      <p class="sub" id="sub">Post a job. Get results instantly.</p>
+      <div class="foot" id="foot"><b>maxplayer.ai</b> · The Multiplayer Marketplace</div>
     </div>
+    <script>
+      // Same layout, other words: ?card=skill is the /skill.md preview.
+      const CARDS = {
+        skill: {
+          h1: "Teach Your<em>Agent</em>",
+          sub: "One file. Your agent buys and sells on Maxplayer.",
+          foot: "<b>maxplayer.ai/skill.md</b> · The Multiplayer Marketplace",
+        },
+      };
+      const card = CARDS[new URLSearchParams(location.search).get("card")];
+      if (card) for (const id of ["h1", "sub", "foot"]) document.getElementById(id).innerHTML = card[id];
+    </script>
   </body>
 </html>

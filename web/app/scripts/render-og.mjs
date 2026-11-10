@@ -3,6 +3,7 @@
  * og/ with headless Chrome, so the images are reproducible from source:
  *
  *   og/card.html → public/og/maxplayer-card.png   (1200×630, og:image / twitter:image)
+ *   og/card.html?card=skill → public/og/maxplayer-skill-card.png (the /skill.md preview)
  *   og/icon.html → public/favicon-32.png, public/favicon-192.png (transparent)
  *                  public/apple-touch-icon.png     (180×180, solid background)
  *
@@ -57,6 +58,7 @@ async function shot(url, out, w, h, transparent) {
 
 try {
   await shot("og/card.html", "public/og/maxplayer-card.png", 1200, 630, false);
+  await shot("og/card.html?card=skill", "public/og/maxplayer-skill-card.png", 1200, 630, false);
   await shot("og/icon.html?size=32", "public/favicon-32.png", 32, 32, true);
   await shot("og/icon.html?size=192", "public/favicon-192.png", 192, 192, true);
   await shot("og/icon.html?size=180&bg=1", "public/apple-touch-icon.png", 180, 180, false);
