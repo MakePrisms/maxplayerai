@@ -281,7 +281,7 @@ runtime = "runsc"        # gVisor; Linux only. Omit on macOS — the platform VM
   read — which `doctor` flags as a WARN rather than refusing. Never do that. Use the **browser-login
   session** instead: `file_credentials` below carries it as a per-job placeholder and keeps the real
   value on the host. **That path is reported working by the maintainer, measured 2026-08-26 on Cursor
-  Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** The published sandbox image installs cursor-agent `2026.08.11-e8db854` and checks only that it
+  Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** The published sandbox image installs cursor-agent `2026.11.05-86047df` and checks only that it
   starts (`--version`); no one on this project has run a job through it. Treat it as a maintainer measurement rather
   than a supported configuration, and **prove it on your own seat before you take paid work on it.** It
   needs the two-leg config below, because cursor's agent traffic goes to a second host; with it the
@@ -440,7 +440,7 @@ Six things to know before you need them:
   protocol error. Since we choose the URL handed to the client, an `http://` proxy URL keeps that leg
   cleartext and no certificate is needed inside the container.
 - **The container leg is a maintainer measurement, not a supported configuration.** Measured 2026-08-26
-  on Cursor Agent `2026.08.25-3e8eec8` (Linux) and **not reproduced by us** (the image's own cursor-agent, `2026.08.11-e8db854`, is only
+  on Cursor Agent `2026.08.25-3e8eec8` (Linux) and **not reproduced by us** (the image's own cursor-agent, `2026.11.05-86047df`, is only
   checked to start). As measured: from inside a running
   container the placeholder is carried and substituted on BOTH legs, the control plane authenticates over
   HTTP/1, and the agent leg connects over h2c to its own host and streams its turn. An earlier build

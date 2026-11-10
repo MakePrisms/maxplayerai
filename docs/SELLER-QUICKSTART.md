@@ -677,7 +677,7 @@ Use the browser-login **session** instead. `[[sandbox.file_credentials]]` reads 
 the session file on the host, once per job, and gives the container a placeholder plus a redirect flag;
 the real value never crosses. **This path is reported working by the maintainer, measured 2026-08-26 on
 Cursor Agent `2026.08.25-3e8eec8` (Linux), and not reproduced by us.** The published sandbox image
-installs cursor-agent `2026.08.11-e8db854` and checks only that it starts (`--version`); no one on this
+installs cursor-agent `2026.11.05-86047df` and checks only that it starts (`--version`); no one on this
 project has run a job through it. Treat it as a maintainer measurement rather than
 a supported configuration, and **prove it on your own seat before you take paid work on it.** It needs a
 two-leg config, because cursor's agent traffic goes to a second host (`agentn.global.api5.cursor.sh`) —

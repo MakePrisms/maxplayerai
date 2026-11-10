@@ -79,12 +79,12 @@ RUN apt-get update \
 # The ACP adapters the built-in harness presets resolve on PATH (`claude-agent-acp`, `codex-acp` —
 # see crates/maxplayer-core/src/agent_presets.rs). Baking them in means the job container does not fetch
 # them at run time, so a job's first turn is not spent installing its own harness. codex-acp
-# 2.1.1 launches its @openai/codex dependency (currently 0.159.3, range ^0.159.1).
-# claude-agent-acp 0.85.0 resolves the native CLI bundled by claude-agent-sdk
-# 0.3.286 (Claude Code 2.1.286), NOT `claude` on PATH, unless CLAUDE_CODE_EXECUTABLE overrides it.
+# 2.6.0 launches its @openai/codex dependency (currently 0.166.0, range ^0.166.0).
+# claude-agent-acp 0.104.1 resolves the native CLI bundled by claude-agent-sdk
+# 0.3.322 (Claude Code 2.1.322), NOT `claude` on PATH, unless CLAUDE_CODE_EXECUTABLE overrides it.
 # Keep the standalone `claude` CLI available for direct CLI use / explicit overrides, aligned with
 # that SDK's claudeCodeVersion. Raising only this global package does not upgrade ACP turns.
-# Both Claude pins clear Opus 5.5's Claude Code >=2.1.280 floor. Credentials are forwarded at run
+# Both Claude pins clear Fable 5.2's Claude Code >=2.1.321 floor (and Opus 5.5's >=2.1.280). Credentials are forwarded at run
 # time; no token is baked. NixOS executable overrides remain operator-specific (see the quickstart).
 #
 # Versions are PINNED to exact releases. An unpinned `npm install -g` resolves to whatever is latest at
@@ -93,9 +93,9 @@ RUN apt-get update \
 # digest correspond to a known adapter/CLI set, closing the gap called out in #792 (babu's F6 from the #221
 # security review). Bump these deliberately alongside a release.
 RUN npm install -g \
-    @agentclientprotocol/claude-agent-acp@0.85.0 \
-    @agentclientprotocol/codex-acp@2.1.1 \
-    @anthropic-ai/claude-code@2.1.286 \
+    @agentclientprotocol/claude-agent-acp@0.104.1 \
+    @agentclientprotocol/codex-acp@2.6.0 \
+    @anthropic-ai/claude-code@2.1.322 \
     && npm cache clean --force
 
 # cursor. Deliberately NOT on the line above: `npm i -g cursor-agent` installs an unrelated third
@@ -124,12 +124,12 @@ RUN npm install -g \
 ARG TARGETARCH
 RUN set -eu; \
     case "$TARGETARCH" in \
-      amd64) arch=x64;   sha=bfff4bf6f4e9dd30c1d0ef0a70b6077b074015dd2948e4c50685d53afdcfce5a ;; \
-      arm64) arch=arm64; sha=ea13f92e295f523a99ce8d8f57d6894d21e5d1e2d030ffad718ccd5955ca2eed ;; \
+      amd64) arch=x64;   sha=170b77786cbf4c93064d64fff12b71a178b968730561c64afc2e8e752535442e ;; \
+      arm64) arch=arm64; sha=131554bfdbf683d8ebfef83a2bb46ac4e5d060f198711040b07ed063c2471871 ;; \
       *) echo "cursor: unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
     node -e 'const fs=require("fs"),c=require("crypto");const[u,want,out]=process.argv.slice(1);(async()=>{const r=await fetch(u);if(!r.ok)throw new Error(`GET ${u} -> HTTP ${r.status}`);const b=Buffer.from(await r.arrayBuffer());const got=c.createHash("sha256").update(b).digest("hex");if(got!==want)throw new Error(`digest mismatch: got ${got} over ${b.length} B, want ${want}`);fs.writeFileSync(out,b);console.log(`cursor package: ${b.length} B sha256 ${got}`);})().catch(e=>{console.error(String(e));process.exit(1);});' \
-      "https://downloads.cursor.com/lab/2026.08.11-e8db854/linux/${arch}/agent-cli-package.tar.gz" \
+      "https://downloads.cursor.com/lab/2026.11.05-86047df/linux/${arch}/agent-cli-package.tar.gz" \
       "$sha" /tmp/cursor.tar.gz; \
     mkdir -p /usr/local/lib/cursor-agent; \
     tar -xzf /tmp/cursor.tar.gz -C /usr/local/lib/cursor-agent; \
