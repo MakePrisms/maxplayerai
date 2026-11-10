@@ -5806,17 +5806,18 @@ impl SellerNodeRunner {
                 ClaimDecision::Claim { deadline_unix } => {
                     let outcome = self
                         .claim_offer(
-                        &row.offer_id,
-                        &row.buyer_pubkey,
-                        &offer,
-                        &seller_pubkey,
-                        deadline_unix,
-                        now,
-                        // A recorded offer re-driven from the store carries no tags; its pin (if any)
-                        // was already written at the original claim (INSERT OR IGNORE — idempotent).
-                        None,
-                    )
-                    .await;
+                            &row.offer_id,
+                            &row.buyer_pubkey,
+                            &offer,
+                            &seller_pubkey,
+                            deadline_unix,
+                            now,
+                            // A recorded offer re-driven from the store carries no tags; its pin
+                            // (if any) was already written at the original claim (INSERT OR
+                            // IGNORE — idempotent).
+                            None,
+                        )
+                        .await;
                     // The review gate consumes the ticket. A decline before the gate that can clear
                     // (backlog full, store failure) keeps it and the tick armed, like a busy slot; a
                     // durable one (suppressed, already awarded) leaves nothing for it to serve.
@@ -8111,7 +8112,9 @@ impl SellerNodeRunner {
             Err(error) => {
                 self.log_offer_deferred(
                     job_id,
-                    format!("seller node offer skip id={job_id}: store health read failed ({error})"),
+                    format!(
+                        "seller node offer skip id={job_id}: store health read failed ({error})"
+                    ),
                 );
                 return ClaimOutcome::Deferred;
             }
@@ -8180,7 +8183,9 @@ impl SellerNodeRunner {
             }
         }
         // Review may have consumed time since the offer was received.
-        if deadline_unix <= now_unix() as u64 { return ClaimOutcome::ReachedReview; }
+        if deadline_unix <= now_unix() as u64 {
+            return ClaimOutcome::ReachedReview;
+        }
 
         // §2.2 — in FREE mode NO creq is built and none is emitted. `build_seller_creq` would
         // happily encode `amount = 0`, but every consumer of that request is a payment gate that
@@ -15923,13 +15928,20 @@ mod tests {
             0,
             "a re-requested review is not a claim"
         );
-        assert!(!ticket_1057(&runner, &id), "the next pass serves the ticket");
+        assert!(
+            !ticket_1057(&runner, &id),
+            "the next pass serves the ticket"
+        );
         assert!(
             matches!(cached_1057(&runner, &id), Some(None)),
             "the review is requested again"
         );
         assert!(
-            !runner.offer_deferred_logged.lock().unwrap().contains_key(&id),
+            !runner
+                .offer_deferred_logged
+                .lock()
+                .unwrap()
+                .contains_key(&id),
             "reaching the review forgets the logged decline"
         );
         runner.client.disconnect().await;
@@ -15952,7 +15964,10 @@ mod tests {
         let db = rusqlite::Connection::open(root.join(crate::seller_node::STATE_DB_FILE)).unwrap();
         db.execute_batch("ALTER TABLE jobs RENAME TO jobs_hidden_1057")
             .unwrap();
-        assert!(runner.node.store().health().is_err(), "fixture: health() fails");
+        assert!(
+            runner.node.store().health().is_err(),
+            "fixture: health() fails"
+        );
         assert_eq!(runner.reconsider_capacity_skips().await, 0);
         assert_eq!(runner.reconsider_capacity_skips().await, 0);
         assert!(
@@ -15974,7 +15989,10 @@ mod tests {
         db.execute_batch("ALTER TABLE jobs_hidden_1057 RENAME TO jobs")
             .unwrap();
         assert_eq!(runner.reconsider_capacity_skips().await, 0);
-        assert!(!ticket_1057(&runner, &id), "the store answers: ticket served");
+        assert!(
+            !ticket_1057(&runner, &id),
+            "the store answers: ticket served"
+        );
         assert!(
             matches!(cached_1057(&runner, &id), Some(None)),
             "the review is requested again"
@@ -16002,7 +16020,15 @@ mod tests {
             .record_offer(&offer_row(&awarded, &buyer_hex, &awarded_offer), now)
             .unwrap();
         store
-            .claim_and_enqueue(&awarded, &awarded, Some("creq"), &draft, now, now + 3_600, now)
+            .claim_and_enqueue(
+                &awarded,
+                &awarded,
+                Some("creq"),
+                &draft,
+                now,
+                now + 3_600,
+                now,
+            )
             .unwrap();
         store
             .record_award(&"a".repeat(64), &awarded, &buyer_hex, now)
