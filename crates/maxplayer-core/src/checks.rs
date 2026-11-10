@@ -263,6 +263,32 @@ pub trait BaseTree {
     fn blob_at(&self, path: &str) -> Result<Option<Vec<u8>>, ChecksError>;
 }
 
+/// The checks environment `.maxplayer/checks.toml` declares at `base_oid` in `repo`, read with pure
+/// git object reads (nothing is executed). `Ok(None)` when the base declares nothing. A declaration
+/// that is present but invalid is an error, the same fail-closed reading a seller applies (§9.1).
+///
+/// The buyer daemon calls this at post time on the base it already fetched, and states the result
+/// on the offer as `["param","checks-env", …]` (#707), so the person posting never tags anything.
+#[cfg(feature = "git-delivery")]
+pub fn declared_env_kind(
+    repo: &git2::Repository,
+    base_oid: &str,
+) -> Result<Option<EnvKind>, ChecksError> {
+    let tree = git2::Oid::from_str(base_oid)
+        .and_then(|oid| repo.find_commit(oid))
+        .and_then(|commit| commit.tree())
+        .map_err(|e| ChecksError::TreeRead(e.to_string()))?;
+    let base = (repo, &tree);
+    let Some(bytes) = base.blob_at(DECLARATION_PATH)? else {
+        return Ok(None);
+    };
+    let Some(declaration) = parse_declaration(&bytes)? else {
+        return Ok(None);
+    };
+    validate_against_base(&declaration, &base)?;
+    Ok(Some(declaration.env_kind))
+}
+
 #[cfg(feature = "git-delivery")]
 impl BaseTree for (&git2::Repository, &git2::Tree<'_>) {
     fn blob_at(&self, path: &str) -> Result<Option<Vec<u8>>, ChecksError> {
@@ -458,6 +484,49 @@ timeout_secs = 1200
         fn blob_at(&self, path: &str) -> Result<Option<Vec<u8>>, ChecksError> {
             Ok(self.0.get(path).cloned())
         }
+    }
+
+    /// #707: the buyer's post-time read of a real git base. Absent ⇒ None, each kind ⇒ that kind,
+    /// an invalid declaration ⇒ error (the post is refused rather than tagged wrong).
+    #[cfg(feature = "git-delivery")]
+    #[test]
+    fn declared_env_kind_reads_the_pinned_base() {
+        let dir = std::env::temp_dir().join(format!("maxplayer-707-declared-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = git2::Repository::init_bare(&dir).unwrap();
+        let commit = |files: &[(&str, &[u8])]| -> String {
+            let mut index = git2::Index::new().unwrap();
+            for (path, bytes) in files {
+                let oid = repo.blob(bytes).unwrap();
+                let mut entry = git2::IndexEntry {
+                    ctime: git2::IndexTime::new(0, 0), mtime: git2::IndexTime::new(0, 0),
+                    dev: 0, ino: 0, mode: 0o100644, uid: 0, gid: 0,
+                    file_size: bytes.len() as u32, id: oid, flags: 0, flags_extended: 0,
+                    path: path.as_bytes().to_vec(),
+                };
+                entry.flags = (path.len() as u16) & 0xfff;
+                index.add(&entry).unwrap();
+            }
+            let tree = repo.find_tree(index.write_tree_to(&repo).unwrap()).unwrap();
+            let sig = git2::Signature::now("t", "t@example.test").unwrap();
+            repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap().to_string()
+        };
+        let image = format!(
+            "schema = 1\n[env]\nkind = \"container-image\"\nimage = \"docker.io/library/alpine@sha256:{}\"\n[checks]\nprepare = []\ncommands = [[\"true\"]]\ntimeout_secs = 60\n",
+            "a".repeat(64)
+        );
+        let none = commit(&[("README", b"x")]);
+        let nix = commit(&[(DECLARATION_PATH, NIX.as_bytes()), ("flake.nix", b"{}"), ("flake.lock", b"{}")]);
+        let img = commit(&[(DECLARATION_PATH, image.as_bytes())]);
+        let bad = commit(&[(DECLARATION_PATH, b"not toml [[[")]);
+        let no_lock = commit(&[(DECLARATION_PATH, NIX.as_bytes()), ("flake.nix", b"{}")]);
+        assert_eq!(declared_env_kind(&repo, &none).unwrap(), None);
+        assert_eq!(declared_env_kind(&repo, &nix).unwrap(), Some(EnvKind::NixFlake));
+        assert_eq!(declared_env_kind(&repo, &img).unwrap(), Some(EnvKind::ContainerImage));
+        assert!(declared_env_kind(&repo, &bad).is_err());
+        assert!(declared_env_kind(&repo, &no_lock).is_err());
+        assert!(declared_env_kind(&repo, &"00".repeat(20)).is_err(), "unknown base oid");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

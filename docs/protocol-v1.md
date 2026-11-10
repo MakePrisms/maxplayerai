@@ -488,12 +488,18 @@ reject a lifecycle event that lacks it.
 | `["param","capability", token, ...]` | 0..1 | no | Requires every listed capability token |
 | `["param","payment","none"]` | 0..1 | no | This job has NO payment leg. Absent means `sat` |
 | `["param","accepts-delivery", mode, ...]` | 0..1 | no | Delivery modes this buyer can READ. Absent means `git` only |
+| `["param","checks-env", kind]` | 0..1 | no | Contribution only: the checks environment (`nix-flake` or `container-image`) the pinned base declares in `.maxplayer/checks.toml` (§9.1). Absent means none declared |
 | `["delivery","git"]` | 0..1 | no | Delivery binding mode |
 | `["repo", locator]` | 0..1 | no | Bound delivery remote |
 | `["branch", name]` | 0..1 | no | Bound delivery branch |
 
 The `delivery`, `repo`, and `branch` tags bind delivery as one group. If the offer uses any of them,
 it MUST carry all three. A reader MUST reject a partial group.
+
+`["param","checks-env", …]` is set by the buyer's client from the pinned base it fetches at post
+time, never typed by the poster; an invalid declaration refuses the post. A seat that cannot serve a
+declared checks environment SHOULD skip the offer before claiming. The tag is advisory: a seat MUST
+still read the declaration from the base itself after checkout and refuse what it cannot serve.
 
 `["param","accepts-delivery", …]` states which delivery modes the buyer can READ. **Absent MUST be
 read as `git` only.** A buyer that never heard of another mode emits no tag, so an offer posted

@@ -1896,3 +1896,33 @@ async fn permanently_refused_carrier_stops_retrying_and_keeps_the_relay_reason()
             .is_none()
     );
 }
+
+/// #707: `param:checks-env` is an allowed public field with a closed vocabulary, and the builder
+/// emits it only on a contribution offer.
+#[test]
+fn private_offer_carries_checks_env_only_on_contribution_with_closed_values() {
+    let p = PreparedContent::new(body()).unwrap();
+    for (value, ok) in [("nix-flake", true), ("container-image", true), ("docker", false)] {
+        let mut tags = offer_tags(&p);
+        tags.push(vec!["param".into(), "checks-env".into(), value.into()]);
+        assert_eq!(wire::validate_private(&sign(3401, tags, 1), &host()).is_ok(), ok, "{value}");
+    }
+    let service = keys(3).public_key().to_hex();
+    let job = "44".repeat(32);
+    let request = crate::gateway::OfferDraft::new("t", "text/plain", 100, 2000000000, keys(2).public_key().to_hex())
+        .declaring_checks_env(Some(crate::checks::EnvKind::NixFlake));
+    let refused = builders::prepare_offer(
+        &keys(1),
+        &request,
+        builders::OfferOptions {
+            visibility: wire::Visibility::Private,
+            category: wire::Output::Code,
+            service: &service,
+            job_id: &job,
+            attachments: vec![],
+            contribution: None,
+        },
+        &host(),
+    );
+    assert!(refused.is_err(), "checks-env without a contribution must be refused");
+}

@@ -192,6 +192,21 @@ impl EventDraft {
 /// sends inline only where the buyer said, on the signed offer, that it can read one.
 pub const ACCEPTS_DELIVERY_PARAM: &str = "accepts-delivery";
 
+/// Param name for the checks environment a contribution base declares (#707), emitted as
+/// `["param", "checks-env", <nix-flake|container-image>]` on the OFFER.
+///
+/// The buyer daemon sets it itself, from `.maxplayer/checks.toml` at the pinned base it already
+/// fetches at post time; nobody types it. A seat that cannot serve a declared checks environment
+/// (every host-delivery seat since RC3-01) skips the offer BEFORE claiming instead of refusing it
+/// after the award. Absent means no declaration. The tag only saves a wasted award: a missing or
+/// wrong tag still ends in the seat's post-award refusal, never in provisioning.
+pub const CHECKS_ENV_PARAM: &str = "checks-env";
+
+/// The declared checks environment an offer states, if any (`["param","checks-env", …]`).
+pub fn checks_env_param(tags: &[TagSpec]) -> Option<String> {
+    stated(param_value(tags, CHECKS_ENV_PARAM))
+}
+
 /// Wire label for git delivery — a tree pushed to a remote, named by repo/branch/commit.
 pub const DELIVERY_MODE_GIT: &str = "git";
 
@@ -225,6 +240,10 @@ pub struct OfferDraft {
     /// Delivery modes this buyer can READ, as `["param", "accepts-delivery", …]`. Empty ⇒ no tag,
     /// which every reader must treat as git-only — see [`ACCEPTS_DELIVERY_PARAM`].
     pub accepts_delivery: Vec<String>,
+    /// The checks environment the pinned contribution base declares (#707), as
+    /// `["param", "checks-env", …]`. `None` ⇒ no tag. Set by the posting path from the base it
+    /// fetched, never by the caller.
+    pub checks_env: Option<String>,
 }
 
 impl OfferDraft {
@@ -247,6 +266,7 @@ impl OfferDraft {
             required_capabilities: Vec::new(),
             payment_mode: PaymentMode::Sat,
             accepts_delivery: Vec::new(),
+            checks_env: None,
         }
     }
 
@@ -268,6 +288,7 @@ impl OfferDraft {
             required_capabilities: Vec::new(),
             payment_mode: PaymentMode::Sat,
             accepts_delivery: Vec::new(),
+            checks_env: None,
         }
     }
 
@@ -332,6 +353,12 @@ impl OfferDraft {
             tokens.push(stated.to_owned());
         }
         self.required_capabilities = tokens;
+        self
+    }
+
+    /// State the checks environment the pinned contribution base declares (#707).
+    pub fn declaring_checks_env(mut self, env_kind: Option<crate::checks::EnvKind>) -> Self {
+        self.checks_env = env_kind.map(|kind| kind.as_str().to_owned());
         self
     }
 
@@ -406,6 +433,11 @@ impl OfferDraft {
         // byte-identical to one posted before this existed, so the free lane is opt-in on the wire.
         if self.payment_mode.is_free() {
             tags.push(TagSpec::new(["param", PAYMENT_PARAM, PAYMENT_NONE]));
+        }
+        // #707 — emitted only when the base declares checks, so every other offer stays
+        // byte-identical to one posted before the tag existed.
+        if let Some(checks_env) = &self.checks_env {
+            tags.push(TagSpec::new(["param", CHECKS_ENV_PARAM, checks_env]));
         }
         if let Some(seller_pubkey) = &self.seller_pubkey {
             tags.push(TagSpec::new(["p", seller_pubkey]));
@@ -2467,6 +2499,22 @@ mod free_lane_tests {
 #[cfg(test)]
 mod inline_delivery_tests {
     use super::*;
+
+    // ── #707 checks-env declaration ────────────────────────────────────────────────────────────
+
+    /// The tag is emitted only when the base declares checks, and reads back as the declared kind.
+    #[test]
+    fn checks_env_param_is_emitted_only_when_declared_and_reads_back() {
+        let plain = OfferDraft::untargeted("t", "text/plain", 2, 1_800_000_000).to_event_draft();
+        assert_eq!(checks_env_param(&plain.tags), None);
+        assert!(!plain.tags.iter().any(|t| t.0.get(1).map(String::as_str) == Some(CHECKS_ENV_PARAM)));
+        for kind in [crate::checks::EnvKind::NixFlake, crate::checks::EnvKind::ContainerImage] {
+            let draft = OfferDraft::untargeted("t", "text/plain", 2, 1_800_000_000)
+                .declaring_checks_env(Some(kind))
+                .to_event_draft();
+            assert_eq!(checks_env_param(&draft.tags).as_deref(), Some(kind.as_str()));
+        }
+    }
 
     // ── Inline delivery (answer jobs) ──────────────────────────────────────────────────────────
 

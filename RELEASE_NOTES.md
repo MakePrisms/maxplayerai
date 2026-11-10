@@ -1,3 +1,26 @@
+## Unreleased
+
+### ⚠️ Breaking: every party must upgrade (#707)
+
+- **Host seats no longer claim contribution jobs they would refuse.** A contribution offer now
+  carries `["param","checks-env",<nix-flake|container-image>]` when its pinned base declares a
+  checks environment in `.maxplayer/checks.toml`. The buyer daemon adds it itself from the base it
+  already fetches at post time; nobody tags anything by hand, and an invalid declaration now refuses
+  the post instead of failing after an award. A host-delivery seat (launcher, host mode, root
+  docker, or `container_delivery = false`) skips such an offer before claiming, and tells a
+  targeted buyer why (`capability_missing` / `checks_env_refused_on_host`), instead of being awarded
+  and then refusing it with `env_unprovisionable` (#1278). Container-delivery seats are unchanged.
+- **Why it is breaking:** private offers are validated against a closed list of public fields, and
+  `param:checks-env` is new to it. Until they upgrade, the relay refuses to provision a private
+  contribution job whose base declares checks, and older sellers and the reviewer reject that
+  offer. Public offers are unaffected on old clients (they ignore the tag and keep the post-award
+  refusal).
+- **Upgrade order:** redeploy the relay (its `maxplayer-private-protocol` copy) and the reviewer
+  first, then sellers, then buyers. A buyer on this version posting a private contribution job
+  against a base with a `checks.toml` fails at provisioning on a relay that has not been
+  redeployed. Buyers on older clients keep posting untagged offers, which host seats still refuse
+  after the award, exactly as in v0.7.3-rc4.
+
 ## v0.7.3-rc4
 
 Release candidate for 0.7.3, cut to ship the security follow-ups from the v0.7.3-rc3 external
