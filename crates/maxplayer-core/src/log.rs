@@ -136,6 +136,48 @@ impl EventLog {
         })
     }
 
+    /// Open a run log that lives in a directory the BUYER controls (the job workdir, checked out
+    /// from a buyer-chosen base). worker-fable H-1 on #1278: `OpenOptions::open` follows a symlink,
+    /// so a base that ships `seller-run.jsonl` as a link made the seller daemon create/append to any
+    /// file the buyer named (e.g. a shell rc file). Here a symlink (or other non-regular, non-dir
+    /// entry) at `path` is unlinked first — the run log is node bookkeeping, never part of the
+    /// buyer's tree or the delivery — a directory there is refused, and the open itself uses
+    /// `O_NOFOLLOW`, so a link planted between the check and the open fails the open (ELOOP)
+    /// instead of being followed.
+    #[cfg(all(unix, feature = "git-delivery"))]
+    pub fn open_in_untrusted_dir(path: impl AsRef<Path>) -> Result<Self, LogError> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = path.as_ref().to_path_buf();
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_file() => {}
+            Ok(meta) if meta.file_type().is_dir() => {
+                return Err(LogError::Io(io::Error::other(format!(
+                    "refusing run log {}: a directory occupies the path",
+                    path.display()
+                ))));
+            }
+            Ok(_) => std::fs::remove_file(&path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(LogError::Io(error)),
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        // Read only after the no-follow open proved `path` is a regular file of ours.
+        let replay = read_log(&path, 0);
+        let next_seq = replay
+            .envelopes
+            .last()
+            .map_or(0, |envelope| envelope.seq.saturating_add(1));
+        Ok(Self {
+            path,
+            file,
+            next_seq,
+        })
+    }
+
     pub fn append(&mut self, payload: Event) -> Result<Envelope, LogError> {
         let envelope = Envelope {
             v: CURRENT_ENVELOPE_VERSION,
@@ -264,6 +306,36 @@ mod tests {
     use super::{EventLog, ReadError};
 
     static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    // worker-fable H-1 (#1278): a buyer-planted symlink at the run-log path is never followed.
+    // Red on revert: with `EventLog::open` the append lands in the outside file.
+    #[cfg(all(unix, feature = "git-delivery"))]
+    #[test]
+    fn a_run_log_symlink_in_an_untrusted_dir_is_never_followed() {
+        let dir = test_log_path("untrusted-dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("mk dir");
+        let outside = dir.with_extension("outside");
+        fs::write(&outside, "export PS1=untouched\n").expect("outside file");
+        let link = dir.join("seller-run.jsonl");
+        std::os::unix::fs::symlink(&outside, &link).expect("plant symlink");
+
+        let mut log = EventLog::open_in_untrusted_dir(&link).expect("open");
+        log.append(Event::GatewayStatusChanged { status: GatewayStatus::Online })
+            .expect("append");
+
+        assert_eq!(fs::read_to_string(&outside).expect("read outside"), "export PS1=untouched\n");
+        let meta = fs::symlink_metadata(&link).expect("meta");
+        assert!(meta.file_type().is_file(), "the link was replaced by our own regular file");
+        assert_eq!(log.replay(0).envelopes.len(), 1);
+
+        // A directory at the path is refused, never written through.
+        let dir_case = dir.join("dir-case");
+        fs::create_dir_all(&dir_case).expect("mk dir case");
+        assert!(EventLog::open_in_untrusted_dir(&dir_case).is_err());
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_file(&outside);
+    }
 
     #[test]
     fn round_trip_mixed_events_replays_in_sequence() {

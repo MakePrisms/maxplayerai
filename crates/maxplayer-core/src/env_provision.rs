@@ -1,34 +1,48 @@
 //! Environment-backend resolution and effect-injected provisioning.
+//!
+//! RC3-01 (v0.7.3-rc3 external review): production NEVER provisions a buyer-declared checks
+//! environment. The seller's host delivery path refuses any `.maxplayer/checks.toml` declaration
+//! (`ProvisionRefusal::HostDeliveryRefused`) and container delivery never reads it. Everything that
+//! could build an exec argv or spawn a process (`HostEnvRunner`, `EnvEffects`, `provision`,
+//! `resolve_backend`, ...) is therefore compiled for tests ONLY, so production code cannot call it.
+//! A future sandboxed checks runner must re-introduce these deliberately. Live here: declaration
+//! capture, the refusal type and its buyer feedback.
 
 use std::fmt;
+#[cfg(test)]
 use std::path::PathBuf;
 
 use crate::checks::{self, ChecksDeclaration, ChecksError, EnvKind};
 use crate::gateway;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EnvBackend {
     NixFlake { workdir: PathBuf, devshell: String },
     ContainerImage { digest: String },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnvPosture {
     Provision,
     Checks,
 }
 
+#[cfg(test)]
 pub trait EnvRunner {
     fn argv_prefix(&self, backend: &EnvBackend, posture: EnvPosture) -> Vec<String>;
     fn container_runtime(&self) -> Option<&str>;
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostEnvRunner {
     pub container_runtime: Option<String>,
     pub mount_dir: PathBuf,
 }
 
+#[cfg(test)]
 impl EnvRunner for HostEnvRunner {
     fn argv_prefix(&self, backend: &EnvBackend, posture: EnvPosture) -> Vec<String> {
         match backend {
@@ -65,16 +79,19 @@ impl EnvRunner for HostEnvRunner {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectOutput {
     pub status: i32,
     pub stdout: String,
 }
 
+#[cfg(test)]
 pub trait EnvEffects {
     fn run(&self, argv: &[String]) -> Result<EffectOutput, EnvProvisionError>;
 }
 
+#[cfg(test)]
 pub fn compose(
     policy_wrap: &dyn Fn(Vec<String>) -> Vec<String>,
     mut prefix: Vec<String>,
@@ -116,6 +133,7 @@ impl fmt::Display for EnvProvisionError {
 
 impl std::error::Error for EnvProvisionError {}
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProvisionedEnv {
     pub backend: EnvBackend,
@@ -123,6 +141,7 @@ pub struct ProvisionedEnv {
     pub warmed: bool,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProvisionOutcomeClass {
     Infra,
@@ -131,14 +150,28 @@ pub enum ProvisionOutcomeClass {
 
 pub const ENV_UNPROVISIONABLE: &str = "env_unprovisionable";
 
+/// RC3-01 (worker-fable M-2): the `reason_detail` for a base that declares a checks environment on a
+/// host-delivery seller. Distinct from `env_unprovisionable` because nothing was attempted: the seller
+/// refused by policy, and the buyer can fix it (drop the declaration or pick a container seller).
+pub const HOST_CHECKS_ENV_REFUSED: &str = "checks_env_refused_on_host";
+
+/// The buyer-facing sentence for a host-delivery refusal of a declared checks environment.
+pub const HOST_CHECKS_ENV_REFUSED_FEEDBACK: &str = "seller refused the job: the base declares a checks \
+     environment in .maxplayer/checks.toml (nix-flake or container-image), which this seller will not \
+     provision on its host; remove the declaration or hire a container-delivery seller";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProvisionRefusal {
     DeclarationUnparsable { detail: String },
     ReservedPath { path: String },
     EnvLockMissing { detail: String },
     Unprovisionable(EnvProvisionError),
+    /// RC3-01: a buyer-declared checks environment reached the HOST delivery path, which has no
+    /// sandboxed provisioner. Refused before any process is spawned.
+    HostDeliveryRefused { env_kind: EnvKind },
 }
 
+#[cfg(test)]
 pub fn provision(
     effects: &dyn EnvEffects,
     runner: &dyn EnvRunner,
@@ -189,6 +222,7 @@ pub fn provision(
     })
 }
 
+#[cfg(test)]
 fn require_success(
     effects: &dyn EnvEffects,
     argv: Vec<String>,
@@ -203,6 +237,7 @@ fn require_success(
     Ok(output)
 }
 
+#[cfg(test)]
 pub fn classify_provision_failure(error: &EnvProvisionError) -> ProvisionOutcomeClass {
     match error {
         EnvProvisionError::BackendUnavailable { .. }
@@ -220,6 +255,18 @@ pub fn refusal_feedback(refusal: &ProvisionRefusal) -> (gateway::ReasonCode, &'s
         | ProvisionRefusal::Unprovisionable(_) => {
             (gateway::ReasonCode::ExecutionFailed, ENV_UNPROVISIONABLE)
         }
+        // Same reason CODE (the buyer's release path keys on it), its own detail.
+        ProvisionRefusal::HostDeliveryRefused { .. } => {
+            (gateway::ReasonCode::ExecutionFailed, HOST_CHECKS_ENV_REFUSED)
+        }
+    }
+}
+
+/// The human-readable feedback for a refusal, when it says more than the generic execution failure.
+pub fn refusal_reason(refusal: &ProvisionRefusal) -> Option<&'static str> {
+    match refusal {
+        ProvisionRefusal::HostDeliveryRefused { .. } => Some(HOST_CHECKS_ENV_REFUSED_FEEDBACK),
+        _ => None,
     }
 }
 
@@ -235,6 +282,7 @@ pub fn capture_job_checks(
     Ok((bytes, declaration))
 }
 
+#[cfg(test)]
 pub fn resolve_backend(declaration: &ChecksDeclaration) -> Result<EnvBackend, EnvProvisionError> {
     match declaration.env_kind {
         EnvKind::NixFlake => Ok(EnvBackend::NixFlake {
@@ -568,6 +616,17 @@ mod tests {
                 refusal_feedback(&refusal),
                 (gateway::ReasonCode::ExecutionFailed, ENV_UNPROVISIONABLE)
             );
+            assert_eq!(refusal_reason(&refusal), None);
+        }
+        // RC3-01: the host refusal keeps the execution_failed CODE but says what happened and how to
+        // fix it, naming the declaration file.
+        for env_kind in [EnvKind::NixFlake, EnvKind::ContainerImage] {
+            let refusal = ProvisionRefusal::HostDeliveryRefused { env_kind };
+            assert_eq!(
+                refusal_feedback(&refusal),
+                (gateway::ReasonCode::ExecutionFailed, HOST_CHECKS_ENV_REFUSED)
+            );
+            assert!(refusal_reason(&refusal).is_some_and(|text| text.contains(".maxplayer/checks.toml")));
         }
     }
 

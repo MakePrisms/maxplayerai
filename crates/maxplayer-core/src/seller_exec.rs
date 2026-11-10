@@ -2843,7 +2843,9 @@ pub async fn run_agent_job_in_env(
     )
     .with_codex_session(prepared.codex_session.clone());
     let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
-    let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
+    // The workdir is the buyer's checked-out tree: never follow a link planted at the log path.
+    let mut log = EventLog::open_in_untrusted_dir(&log_path)
+        .map_err(|error| ExecError::Agent(error.to_string()))?;
     let params = RunParams {
         session_config: SessionConfig {
             cwd: launch.cwd,
@@ -2970,7 +2972,9 @@ pub async fn run_session_agent_in_env(
     )
     .with_codex_session(prepared.codex_session.clone());
     let log_path = workdir.join(crate::seller_git::SELLER_RUN_LOG);
-    let mut log = EventLog::open(&log_path).map_err(|error| ExecError::Agent(error.to_string()))?;
+    // The workdir is the buyer's checked-out tree: never follow a link planted at the log path.
+    let mut log = EventLog::open_in_untrusted_dir(&log_path)
+        .map_err(|error| ExecError::Agent(error.to_string()))?;
     let params = SessionTurnParams {
         session_config: SessionConfig {
             cwd: launch.cwd,
