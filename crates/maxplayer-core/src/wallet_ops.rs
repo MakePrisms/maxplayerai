@@ -1413,6 +1413,11 @@ pub async fn send_async(
             "insufficient funds: balance={before} need={amount_sats}"
         )));
     }
+    // Review r6 H1: the one mint payment gate, BEFORE this send's own operation lock (which would
+    // make a dead parent look in flight). Local reads only.
+    crate::payment_wallet::payment_gate(&wallet, Some(&home.wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // Review r3 H1: in flight from before the send saga exists until `confirm` returns.
     let _operation = crate::shared_wallet::operation_guard(Some(&home.wallet_dir))
         .await
@@ -1645,6 +1650,10 @@ async fn pay_quote_on_wallet(
             "insufficient funds for melt: balance={before} need={need} (amount+fee_reserve)"
         )));
     }
+    // Review r6 H1: the one mint payment gate, before this melt's own operation lock.
+    crate::payment_wallet::payment_gate(wallet, Some(wallet_dir))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
     // Review r3 H1: in flight from before the melt saga exists until `confirm` returns.
     let _operation = crate::shared_wallet::operation_guard(Some(wallet_dir))
         .await
@@ -1894,6 +1903,15 @@ fn prepared_melt_thread(
             return;
         }
     };
+    // Review r6 H1: the one mint payment gate (seller fee remittance), before this thread's own
+    // operation lock.
+    if let Err(error) = runtime.block_on(crate::payment_wallet::payment_gate(
+        &wallet,
+        Some(&home.wallet_dir),
+    )) {
+        let _ = prepared_tx.send(Err(WalletOpsError::Wallet(error.to_string())));
+        return;
+    }
     // Review r3 H1: this thread's melt is in flight from before its saga exists until the verdict's
     // `confirm`/`cancel` returns; the guard lives on this thread's stack until it exits.
     let _operation = match runtime.block_on(crate::shared_wallet::operation_guard(Some(
@@ -3622,4 +3640,109 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     // END #1256 tests
+
+    // BEGIN r6 gate tests (review r6 H1: `wallet send` and both melt paths run the payment gate)
+    const GATED_MINT: &str = "https://127.0.0.1:1";
+
+    async fn gated_home(
+        label: &str,
+    ) -> (
+        std::path::PathBuf,
+        MaxplayerHome,
+        crate::payment_wallet::gate_scene::Scene,
+        Wallet,
+    ) {
+        let root = temp_home(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let mut home = bootstrap(&root).expect("bootstrap");
+        add_mint(&mut home, GATED_MINT).expect("add");
+        let wallet = open_wallet_async(&home, GATED_MINT).await.expect("wallet");
+        let scene = crate::payment_wallet::gate_scene::crashed_send(&wallet, true).await;
+        (root, home, scene, wallet)
+    }
+
+    fn gated_quote() -> cdk::wallet::MeltQuote {
+        cdk::wallet::MeltQuote {
+            id: "r6-quote".into(),
+            mint_url: Some(MintUrl::from_str(GATED_MINT).unwrap()),
+            unit: CurrencyUnit::Sat,
+            amount: Amount::from(4),
+            request: "lnbc-r6".into(),
+            fee_reserve: Amount::from(0),
+            state: MeltQuoteState::Unpaid,
+            expiry: cashu::util::unix_time() + 3600,
+            payment_proof: None,
+            estimated_blocks: None,
+            fee_index: None,
+            payment_method: PaymentMethod::BOLT11,
+            used_by_operation: None,
+            version: 0,
+        }
+    }
+
+    fn gated_ceiling() -> MeltCeiling {
+        MeltCeiling {
+            max_debit_sats: 10,
+            invoice_sats: 4,
+            planned_quote_id: None,
+        }
+    }
+
+    /// Review r6 H1: `wallet send` is refused, before any selection, while a crashed send on this
+    /// mint waits on its child swap (inputs UNSPENT; its swap may still commit).
+    #[tokio::test]
+    async fn wallet_send_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let (root, home, scene, wallet) = gated_home("r6-send").await;
+        let error = send_async(&home, 4, Some(GATED_MINT))
+            .await
+            .expect_err("SAFETY (r6 H1): a second send could pay twice");
+        crate::payment_wallet::gate_scene::assert_refusal(&error.to_string(), &scene);
+        crate::payment_wallet::gate_scene::assert_nothing_selected(&wallet, &scene).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review r6 H1: the operator melt (`pay_quote_on_wallet`) is refused the same way.
+    #[tokio::test]
+    async fn melt_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let (root, home, scene, wallet) = gated_home("r6-melt").await;
+        wallet
+            .localstore
+            .add_melt_quote(gated_quote())
+            .await
+            .unwrap();
+        let error = pay_melt_quote_async(&home, "r6-quote", Some(GATED_MINT), &gated_ceiling())
+            .await
+            .expect_err("SAFETY (r6 H1)");
+        crate::payment_wallet::gate_scene::assert_refusal(&error.to_string(), &scene);
+        crate::payment_wallet::gate_scene::assert_nothing_selected(&wallet, &scene).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Review r6 H1: the seller fee-remittance melt (`prepare_melt_payment_blocking`) too.
+    #[test]
+    fn seller_fee_melt_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (root, home, scene, wallet) = runtime.block_on(gated_home("r6-fee"));
+        runtime
+            .block_on(wallet.localstore.add_melt_quote(gated_quote()))
+            .unwrap();
+        let error = match prepare_melt_payment_blocking(
+            &home,
+            "r6-quote",
+            Some(GATED_MINT),
+            &gated_ceiling(),
+        ) {
+            Ok(_) => panic!("SAFETY (r6 H1): the fee melt must be refused"),
+            Err(error) => error.to_string(),
+        };
+        crate::payment_wallet::gate_scene::assert_refusal(&error, &scene);
+        runtime.block_on(crate::payment_wallet::gate_scene::assert_nothing_selected(
+            &wallet, &scene,
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END r6 gate tests
 }

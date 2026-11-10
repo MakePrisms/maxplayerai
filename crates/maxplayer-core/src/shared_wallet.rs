@@ -714,6 +714,43 @@ mod tests {
         );
     }
 
+    /// Review r6 H1: every core spend path runs the one mint payment gate
+    /// (`payment_wallet::payment_gate`) and takes its operation lock only AFTER it (the caller's own
+    /// lock would hide a dead parent from the gate).
+    #[test]
+    fn every_core_spend_runs_the_payment_gate_before_its_operation_lock() {
+        for (name, source, expected) in [
+            ("payment_wallet.rs", include_str!("payment_wallet.rs"), 1),
+            ("wallet_ops.rs", include_str!("wallet_ops.rs"), 3),
+            ("crossmint_hop.rs", include_str!("crossmint_hop.rs"), 1),
+        ] {
+            let production = source.split("#[cfg(test)]\nmod tests").next().unwrap();
+            let lines: Vec<&str> = production.lines().collect();
+            let mut seen = 0;
+            for (i, line) in lines.iter().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || code.contains("fn ") || !code.contains("payment_gate(")
+                {
+                    continue;
+                }
+                seen += 1;
+                let before = lines[i.saturating_sub(40)..i].join("\n");
+                let after = lines[i..(i + 40).min(lines.len())].join("\n");
+                assert!(
+                    !before.contains("operation_guard("),
+                    "{name}:{}: the operation lock is taken before the payment gate",
+                    i + 1
+                );
+                assert!(
+                    after.contains("operation_guard("),
+                    "{name}:{}: payment gate not followed by the operation lock",
+                    i + 1
+                );
+            }
+            assert_eq!(seen, expected, "{name}: payment_gate call sites");
+        }
+    }
+
     #[test]
     fn operation_lock_is_shared_between_operations_and_seen_by_recovery() {
         let wallet = dir("operation");

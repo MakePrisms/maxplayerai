@@ -651,6 +651,8 @@ async fn prepare_withdraw(home: &Path, j: &Journal, a: &mut Withdrawal) -> Resul
         q.expiry > cdk::util::unix_time().saturating_add(60),
         "melt quote expired before submission"
     );
+    // Review r6 H1: the shared mint payment gate, before any proof is chosen.
+    crate::wallet::payment_gate(home, &a.mint).await?;
     let w = wallet(home, &a.mint).await?;
     crate::wallet::bounded_for(&a.mint, w.refresh_keysets())
         .await

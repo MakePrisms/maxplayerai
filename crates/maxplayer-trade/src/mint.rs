@@ -235,6 +235,8 @@ pub async fn plan_excluding(
     max_fee: u64,
     exclude: &HashSet<cashu::nuts::PublicKey>,
 ) -> Result<Plan> {
+    // Review r6 H1: the shared mint payment gate, before any proof is chosen.
+    crate::wallet::payment_gate(home, mint).await?;
     let w = wallet(home, mint).await?;
     crate::wallet::bounded_for(mint, w.refresh_keysets())
         .await
@@ -306,6 +308,8 @@ where
     Fut: std::future::Future<Output = Result<()>>,
 {
     let ys = p.inputs.ys()?;
+    // Review r6 H1: gated again here (a plan may predate a crash); before the lock, local only.
+    crate::wallet::payment_gate(home, &p.mint).await?;
     let sel = crate::wallet::select(home, &p.mint).await?;
     sel.verify_free(&ys).await?;
     journal().await?;

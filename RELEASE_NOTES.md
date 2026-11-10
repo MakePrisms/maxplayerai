@@ -44,13 +44,18 @@ the merge, Vercel).
   recovery used to delete that record as an orphan on `https://` mints (also while another
   process on the same home was still waiting for the reply), losing the change. It is now kept
   and never deleted or restored automatically: `wallet reconcile`, `wallet balance` and `doctor`
-  report it as `swap_held` with its saga id, and payments continue (it holds nothing a payment
-  could select). Its change stays at the mint until automatic recovery lands
+  report it as `swap_held` with its saga id; it does not itself refuse payments (it holds
+  nothing a payment could select). Its change stays at the mint until automatic recovery lands
   (MakePrisms/maxplayerai#1272); keep the home's `key` and `wallet/cdk-wallet.sqlite` and report the
   saga id. While such a swap exists, a crashed send whose inputs the mint still reads unspent is
   not released and payments on that mint are refused (shown as `send_held` with `Payments on this
   mint are refused`): the swap may still commit at the mint, and a retry would otherwise pay the
-  same attempt twice with other proofs. cdk's own recovery skips the swap and
+  same attempt twice with other proofs. The same refusal applies to every spend on that mint:
+  job payments, `maxplayer wallet send`, `wallet melt`, the seller fee remittance, the cross-mint
+  hop and `maxplayer-trade` (list, take, send, withdraw) all stop before choosing a proof, with
+  `payments on this mint are refused (<mint>): send saga <id> is kept: …` naming `wallet
+  balance`/`doctor` and MakePrisms/maxplayerai#1272. A send or melt another process is running
+  never causes it. cdk's own recovery skips the swap and
   any send or melt that may have started it but still recovers every other operation (including
   during the cross-mint hop sweep). Sends and melts take a shared `<home>/wallet/operation.lock`
   while they run so recovery in any process can tell a running one from a crashed one.

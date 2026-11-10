@@ -757,6 +757,22 @@ pub fn legacy_refusal(home: &Path) -> String {
 pub const INPUTS_CHANGED: &str = "the wallet's spendable proofs changed while this operation chose \
      its inputs (another process on this home spent or reserved one); nothing was journaled or \
      reserved; retry";
+/// Review r6 H1: core's one mint payment gate (`maxplayer_core::payment_wallet::payment_gate`), run
+/// before every NEW selection of UNSPENT proofs on a shared home (plan, reserve_new, send, withdraw).
+/// It refuses while a crashed buyer send or melt on this mint may still have its swap commit at the
+/// mint, or while a stored payment-blocking hold's saga is incomplete. Local database reads only, no
+/// mint request; trade holds no operation lock, so it never hides a dead parent from the gate. A
+/// legacy home has no buyer sagas and is never refused. Re-applying an already-journaled
+/// reservation (recovery) selects nothing new and is not gated.
+pub async fn payment_gate(home: &Path, mint: &str) -> Result<()> {
+    let Layout::Shared { root } = layout(home) else {
+        return Ok(());
+    };
+    let w = wallet(home, mint).await?;
+    maxplayer_core::payment_wallet::payment_gate(&w, Some(&root.join("wallet")))
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+}
 /// `Err(INPUTS_CHANGED)` unless every proof in `ys` is still UNSPENT, unowned and unlocked in the
 /// wallet database. Proofs are chosen from a snapshot without the selection lock; on a shared home
 /// the buyer may reserve or spend one before the choice is checked (NUT-07) or reserved.

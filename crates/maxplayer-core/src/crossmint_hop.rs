@@ -1137,6 +1137,10 @@ impl HopEffects for CdkHopEffects {
         let quote_id = melt_quote_id.to_owned();
         let wallet_dir = self.wallet_dir.clone();
         block_on_leg("melt", async move {
+            // Review r6 H1: the one mint payment gate, before this melt's own operation lock.
+            crate::payment_wallet::payment_gate(&wallet, wallet_dir.as_deref())
+                .await
+                .map_err(|error| HopError::Mint(format!("melt: {error}")))?;
             // Mint metadata first, outside the lock; the lock is then held only across prepare_melt's
             // local selection + reservation (no mint request inside it), outside the mint bound.
             let metadata = tokio::time::timeout(
@@ -1885,6 +1889,30 @@ mod tests {
         }
     }
 
+    /// Review r6 H1: the hop melt runs the mint payment gate before it selects anything.
+    #[test]
+    fn hop_melt_is_refused_while_a_crashed_send_waits_on_its_swap() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut effects, scene) = runtime.block_on(async {
+            let mut effects = cdk_hop_with_source("https://127.0.0.1:1").await;
+            effects.wallet_dir = Some(dir.path().to_path_buf());
+            let scene =
+                crate::payment_wallet::gate_scene::crashed_send(&effects.source, true).await;
+            (effects, scene)
+        });
+        let error = effects
+            .melt("r6-quote")
+            .expect_err("SAFETY (r6 H1): the hop must not melt other proofs");
+        crate::payment_wallet::gate_scene::assert_refusal(&error.to_string(), &scene);
+        runtime.block_on(crate::payment_wallet::gate_scene::assert_nothing_selected(
+            &effects.source,
+            &scene,
+        ));
+    }
     async fn cdk_hop_with_target(target_mint: &str) -> CdkHopEffects {
         let source_store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
         let target_store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());

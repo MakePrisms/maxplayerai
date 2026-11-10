@@ -416,6 +416,8 @@ pub async fn send(
         holds(&out, "")?.is_none(),
         "--out path already exists; refusing to overwrite"
     );
+    // Review r6 H1: the shared mint payment gate, before any proof is chosen.
+    crate::wallet::payment_gate(home, mint).await?;
     let db = database(home, mint).await?;
     let mut available = db
         .get_proofs(

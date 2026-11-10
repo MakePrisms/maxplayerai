@@ -68,6 +68,10 @@ async fn concurrent_core_and_trade_selection_never_double_reserves_or_loses_proo
     for round in 0..8 {
         let out = h.path().join(format!("token-{round}"));
         let core = async {
+            // Like every production core send: the operation lock, held until confirm returns.
+            let _op = shared_wallet::operation_guard(Some(&wallet_dir))
+                .await
+                .unwrap();
             match shared_wallet::prepare_send_locked(
                 &w,
                 Some(&wallet_dir),
@@ -642,6 +646,10 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
     let core = async {
         let mut sent = 0u64;
         for _ in 0..12 {
+            // Like every production core send: the operation lock, held until confirm returns.
+            let _op = shared_wallet::operation_guard(Some(&wallet_dir))
+                .await
+                .unwrap();
             match shared_wallet::prepare_send_locked(
                 &w,
                 Some(&wallet_dir),
@@ -922,6 +930,10 @@ async fn seller_fee_melt_and_trade_selection_never_double_reserve_or_lose_proofs
             .unwrap();
         let out = home.join(format!("token-{round}"));
         let seller = async {
+            // Like the production fee melt: the operation lock, held until confirm returns.
+            let _op = shared_wallet::operation_guard(Some(&wallet_dir))
+                .await
+                .unwrap();
             match shared_wallet::prepare_melt_locked(&w, Some(&wallet_dir), &q.id).await {
                 Ok(prepared) => {
                     let done = prepared.confirm().await.unwrap();
@@ -1224,7 +1236,13 @@ async fn assert_owners_kept(m: &MintFixture, s: &SwapScene, recovered: bool) {
         .await
         .err()
         .expect("SAFETY: trade cannot plan over another owner's proofs");
-    assert!(format!("{e:#}").contains("insufficient"), "{e:#}");
+    // Either the plan finds too little unowned balance, or (review r6 H1) the payment gate already
+    // refuses because recovery recorded the dead melt as payment-blocking.
+    let e = format!("{e:#}");
+    assert!(
+        e.contains("insufficient") || e.contains(maxplayer_core::payment_wallet::PAYMENTS_REFUSED),
+        "{e}"
+    );
 }
 async fn retire(m: &MintFixture, home: &Path) -> maxplayer_core::payment_wallet::RetireReport {
     let w = core_wallet(home, &m.url).await;
@@ -1743,4 +1761,142 @@ fn trade_writes_proof_rows_only_through_the_locked_wallet_helpers() {
             );
         }
     }
+}
+
+/// Review r6 H1: a buyer send on this shared home crashed after posting its swap: the send saga is
+/// `ProofsReserved` (no process holds the operation lock) and its child swap (blinded messages
+/// stored, nothing reserved) exists. Returns (send saga, child swap saga).
+async fn crashed_core_send(home: &Path, mint: &str) -> (uuid::Uuid, uuid::Uuid) {
+    use cdk::wallet::types::{
+        OperationData, SwapOperationData, SwapSagaState, WalletSaga, WalletSagaState,
+    };
+    let keyset = rows(home, mint, vec![State::Unspent]).await[0]
+        .proof
+        .keyset_id;
+    let w = core_wallet(home, mint).await;
+    let p = shared_wallet::prepare_send_locked(
+        &w,
+        Some(&home.join("wallet")),
+        Amount::from(3),
+        SendOptions::default(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("core send selection: {e}"));
+    let parent = p.operation_id();
+    drop(p); // its process died: the send stays ProofsReserved, its inputs reserved
+    let child = uuid::Uuid::new_v4();
+    wallet::database(home, mint)
+        .await
+        .unwrap()
+        .add_saga(WalletSaga::new(
+            child,
+            WalletSagaState::Swap(SwapSagaState::SwapRequested),
+            Amount::from(3),
+            mint.parse().unwrap(),
+            cdk::nuts::CurrencyUnit::Sat,
+            OperationData::Swap(SwapOperationData {
+                input_amount: Amount::from(3),
+                output_amount: Amount::from(3),
+                counter_start: Some(0),
+                counter_end: Some(1),
+                blinded_messages: Some(vec![cashu::BlindedMessage::new(
+                    Amount::from(1),
+                    keyset,
+                    cashu::SecretKey::generate().public_key(),
+                )]),
+            }),
+        ))
+        .await
+        .unwrap();
+    (parent, child)
+}
+
+/// Review r6 H1: while a crashed buyer send on this mint waits on its child swap (its inputs
+/// UNSPENT at the mint, its swap may still commit), every trade selection on the mint is refused by
+/// core's payment gate before choosing a proof: `plan`, `reserve_new` of a plan made before the
+/// crash, `send` and `withdraw`. Nothing is journaled or reserved. Once the send is gone (only the
+/// child is left), trading continues.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trade_selection_is_refused_while_a_crashed_buyer_send_waits_on_its_swap() {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let m = MintFixture::start(0).await;
+    let h = maxplayer_home();
+    let home = h.path();
+    fund(home, &m.url, 64).await;
+    let j = Journal::open(home).await.unwrap();
+    let early = maxplayer_trade::mint::plan(home, &m.url, 5, 10)
+        .await
+        .unwrap();
+    let (parent, _child) = crashed_core_send(home, &m.url).await;
+    let refused = |what: &str, e: anyhow::Error| {
+        let e = format!("{e:#}");
+        assert!(
+            e.contains(maxplayer_core::payment_wallet::PAYMENTS_REFUSED)
+                && e.contains(&parent.to_string())
+                && e.contains("#1272"),
+            "SAFETY (r6 H1): {what} must be refused by the payment gate: {e}"
+        );
+    };
+    refused(
+        "plan",
+        maxplayer_trade::mint::plan(home, &m.url, 5, 10)
+            .await
+            .err()
+            .expect("plan refused"),
+    );
+    let journaled = AtomicBool::new(false);
+    refused(
+        "reserve_new",
+        maxplayer_trade::mint::reserve_new(
+            home,
+            &early,
+            &uuid::Uuid::new_v4().to_string(),
+            || async {
+                journaled.store(true, SeqCst);
+                Ok::<(), anyhow::Error>(())
+            },
+        )
+        .await
+        .err()
+        .expect("reserve_new refused"),
+    );
+    assert!(!journaled.load(SeqCst), "SAFETY: nothing journaled");
+    refused(
+        "send",
+        send::send(home, &j, &m.url, 5, &home.join("token"), None)
+            .await
+            .err()
+            .expect("send refused"),
+    );
+    assert!(j.all::<send::SendAttempt>("send").await.unwrap().is_empty());
+    refused(
+        "withdraw",
+        money::withdraw(home, &j, &m.url, &invoice(2))
+            .await
+            .err()
+            .expect("withdraw refused"),
+    );
+    assert!(
+        m.faults.melt_requests.lock().unwrap().is_empty(),
+        "SAFETY: no melt posted"
+    );
+    let reserved = rows(home, &m.url, IN_FLIGHT.to_vec()).await;
+    assert!(
+        !reserved.is_empty() && reserved.iter().all(|r| r.used_by_operation == Some(parent)),
+        "SAFETY: only the crashed send's inputs are reserved: {reserved:?}"
+    );
+
+    // The send is gone (cdk compensated it after a definitive refusal); the child alone never
+    // refuses, so trading continues.
+    let db = wallet::database(home, &m.url).await.unwrap();
+    db.release_proofs(&parent).await.unwrap();
+    db.delete_saga(&parent).await.unwrap();
+    let plan = maxplayer_trade::mint::plan(home, &m.url, 5, 10)
+        .await
+        .unwrap_or_else(|e| panic!("a child alone must not stop trading: {e:#}"));
+    maxplayer_trade::mint::reserve_new(home, &plan, &uuid::Uuid::new_v4().to_string(), || async {
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .unwrap();
 }
