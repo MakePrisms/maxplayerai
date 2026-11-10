@@ -15558,7 +15558,8 @@ mod tests {
     /// #1057 review round 1 (Medium): a retry ticket the tick cannot hand to the review gate is
     /// dropped, so it cannot arm the tick every drain until the offer expires. One offer per way the
     /// pass can fail to deliver it: expired (absent from `offers_awaiting_claim`), `Skip`, a row that
-    /// cannot be rebuilt, and an offer `claim_offer` declines before its review. The periodic sweep
+    /// cannot be rebuilt, and an offer `claim_offer` declines for good before its review (a co-signed
+    /// receipt; round 2 keeps the ticket only for declines that can clear). The periodic sweep
     /// is held off so only the pass itself can remove the tickets.
     /// RED ON REVERT: drop any one `drop_retry` call and that offer's ticket survives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -15948,10 +15949,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// #1057 review round 2 (Low): a store read failure before the review (here `health()`, made to
-    /// fail by hiding a table it counts) keeps the ticket like a full backlog; once the store
-    /// answers again the ticket is served. A durable decline still reports `Declined`.
-    /// RED ON REVERT: report a store failure as `Declined` and the ticket is dropped.
+    /// #1057 review round 2 (Low): a store failure before the review keeps the ticket like a full
+    /// backlog: a `health()` read failure (a table it counts is hidden) and a `record_offer` write
+    /// failure (a trigger refuses inserts into `offers`). Once the store answers again the ticket is
+    /// served. A durable decline (receipt, already awarded) still reports `Declined`.
+    /// RED ON REVERT: report either store failure as `Declined` and the ticket is dropped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn review_retry_ticket_survives_a_store_failure_before_review() {
         let (_relay, runner, root, buyer) = review_1057_seller("review-1057-store-error").await;
@@ -15997,6 +15999,45 @@ mod tests {
             matches!(cached_1057(&runner, &id), Some(None)),
             "the review is requested again"
         );
+
+        // `record_offer` fails (health() still answers).
+        let (written, written_offer) =
+            offer_1057(&buyer, "#1057 record offer fails", 300, now_unix() as u64 + 600);
+        settle_1057(&runner, &written, R1057_PERMANENT);
+        block_1057(&runner, &buyer, &written, &written_offer).await;
+        crate::review::state::retry(&review_root, &written).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refuse_offers_1057 BEFORE INSERT ON offers \
+             BEGIN SELECT RAISE(ABORT, 'offers refused (test)'); END",
+        )
+        .unwrap();
+        runner
+            .capacity_skip_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        assert!(
+            ticket_1057(&runner, &written),
+            "a record_offer failure can clear, so the ticket is kept"
+        );
+        assert!(
+            runner
+                .offer_deferred_logged
+                .lock()
+                .unwrap()
+                .get(&written)
+                .is_some_and(|line| line.contains("record offer failed")),
+            "fixture: the pass stopped at record_offer"
+        );
+        db.execute_batch("DROP TRIGGER refuse_offers_1057").unwrap();
+        runner
+            .capacity_skip_pending
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        assert!(
+            !ticket_1057(&runner, &written),
+            "the store answers: ticket served"
+        );
+        assert!(matches!(cached_1057(&runner, &written), Some(None)));
 
         // Durable declines are `Declined`: a co-signed receipt, and a claim already awarded.
         let buyer_hex = buyer.public_key().to_hex();
