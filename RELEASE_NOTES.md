@@ -1,3 +1,79 @@
+## v0.7.3-rc4
+
+Release candidate for 0.7.3, cut to ship the security follow-ups from the v0.7.3-rc3 external
+review and two buyer/seller reliability fixes. The changes to the `maxplayer` binary since
+v0.7.3-rc3 are the nostr 0.44.8 / relay-pool 0.44.3 bump that stops a stranger's gift wrap from
+killing a seller's signer (#1253), event id + signature verification at every money gate (#1280,
+with red-on-revert tests in #1283), host delivery refusing buyer-declared checks environments
+(#1278), the git2 0.21 and rustls-webpki 0.103.16 dependency fixes (#1281, #1279), terminal
+pre-claim review outcomes no longer re-driven every tick (#1222, fixes #1057), and a refused relay
+read during award prepare no longer stranding the job (#1254). Everything in v0.7.3-rc3 is
+included. **Sellers should upgrade and restart:** every published seller up to v0.7.3-rc3 can
+have its signer disabled by any stranger (#1253); the sandbox image needs no change.
+`maxplayer-trade` and `maxplayer-mint` are still not release binaries: build them from source at
+this tag. Client-only: no relay or registration-service redeploy is part of this release (the
+`crates/buzz` lockfile bumps in #1279 reach the relay only on its own deploy); the website and
+published skill pages already went live when these PRs merged. The buyer store schema is
+unchanged (9). After publication, install with `npm install -g maxplayer@0.7.3-rc4`.
+Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+### Changes since v0.7.3-rc3
+
+- **Fixed: a stranger's gift wrap could disable a seller's signer** (#1253, RUSTSEC-2026-0216 /
+  GHSA-hrqp-8w79-gwgw). nostr 0.44.4 panicked in NIP-44 v2 decrypt on an empty ciphertext with a
+  valid HMAC, which anyone can build for a wrap p-tagged to the seller. The panic killed the
+  signer actor: the process stayed up but every later claim, heartbeat, delivery and fee
+  signature failed with `SignerActorGone` until a restart, and the wrap backfill could re-trigger
+  it after the restart. `nostr` 0.44.4 → 0.44.8 and `nostr-relay-pool` 0.44.1 → 0.44.3 (both old
+  pins were yanked), which also pick up the other 0.44.x advisories (NIP-04/NIP-44 panics and
+  exhaustion, signature-verification cache poisoning, events processed before verification,
+  unbounded AUTH-challenge queue). Root `Cargo.lock` only; no API change.
+- **Money gates verify the event id and signature themselves** (#1280, RC3-02). relay-pool
+  0.44.3 still treats any cached event id as verified, so a redelivery reusing a genuine event's
+  id with altered content or tags skipped verification and was re-emitted on the raw message
+  stream that `fetch_events` and the backfills read. Every buyer and seller author gate now
+  authorizes on `verified_author_hex`, which recomputes the id and checks the signature; an event
+  that fails is treated exactly like one from the wrong author. #1283 adds a scripted relay double
+  and red-on-revert tests for the verification sites (tests only).
+- **Host delivery refuses buyer-declared checks environments** (#1278, RC3-01). The host delivery
+  path read `.maxplayer/checks.toml` from the buyer's base tree and provisioned it on the seller
+  host (`nix develop` on the buyer's flake, or `docker|podman pull` of the buyer's image) with no
+  sandbox. Nothing runs declared checks yet, so a base that declares a checks environment now
+  fails at provisioning with `execution_failed` / `env_unprovisionable` on host delivery, before
+  anything is spawned; malformed declarations keep their specific refusals and bases without a
+  declaration behave as before. Container delivery never reached this path.
+- **Dependency security bumps** (#1279, #1281). rustls-webpki → 0.103.16 (RUSTSEC-2026-0382,
+  distrusted emSign intermediates), plus semver-compatible lockfile bumps of rustls, h2,
+  quinn-proto, tokio, zstd, libz-sys, negentropy, pulldown-cmark, webbrowser, event-listener and
+  others for their advisories, across the root, mint, trade, challenges and buzz lockfiles (no
+  `Cargo.toml` or code change; `flake.nix` buzz `cargoHash` updated). git2 0.19 → 0.21
+  (RUSTSEC-2026-0183): `Remote::list()` was undefined behaviour on an empty ref advertisement,
+  which is normal for a seed probe or an unpushed job repo and is reached by the seller push
+  preflight, `maxplayer sell`'s seed probe, the lifecycle ls-remote and the buyer's
+  private-repository verify. Call sites keep their old semantics under the new `Result` APIs.
+- **Seller: terminal pre-claim review outcomes are not re-driven every tick** (#1222, fixes
+  #1057). A policy refusal or permanent reviewer input error (`invalid_subject`) used to re-arm
+  the capacity reconsider tick, which re-drove the offer every ~5 s and logged `review blocked`
+  each time until the offer expired. Terminal outcomes now stay parked and log once per offer and
+  outcome (`…; not reconsidered until an explicit retry or the offer expires`; repeats go to a
+  verbose-only `review still blocked`). `maxplayer review retry` still works without a restart,
+  availability outcomes (timeouts, unreachable reviewer) are still retried, and `re-drove N` now
+  counts only offers that reached a claim row.
+- **Buyer: a refused relay read during award prepare no longer strands the job** (#1254). With
+  many private jobs in flight, the relay's per-pubkey admission quota answers
+  `CLOSED rate-limited: …`; an auto-award whose prepare re-read hit that was parked, and the
+  reservation it had just taken was released into a shape the next attempt read as a
+  pre-attempt-ledger job and refused terminally. Now a relay read failure in prepare leaves the
+  auto-award pending and retried with backoff until the deadline, the unpinned reservation is
+  discarded so the job plans afresh, and the lifecycle and content reads name the relay's refusal
+  class (`…: rate-limited by the relay` / `restricted by the relay` / `relay error`; the old text
+  is still a prefix). Jobs already stranded on an older binary stay refused after upgrading and
+  need a new offer. The buyer can still exceed the quota with many jobs in flight; pacing is a
+  follow-up.
+- Not in the binary: the `grok-bot-operate` skill gains docker + gVisor, upgrade and keep-alive
+  sections and a verified tool list (#1277); the homepage "Just ask" first-job video is re-cut
+  (38.5 s, was 50.5 s) with its recording sources under `web/app/video/` (#1282).
+
 ## v0.7.3-rc3
 
 Release candidate for 0.7.3, cut so that the buyer settlement changes can be tested live. The
