@@ -1857,8 +1857,7 @@ async fn trade_selection_is_refused_while_a_crashed_buyer_send_waits_on_its_swap
             },
         )
         .await
-        .err()
-        .expect("reserve_new refused"),
+        .expect_err("reserve_new refused"),
     );
     assert!(!journaled.load(SeqCst), "SAFETY: nothing journaled");
     refused(
