@@ -643,7 +643,10 @@ pub fn materialize_delivery(
         .map_err(|error| error.to_string())?;
     let tree = commit.tree().map_err(|error| error.to_string())?;
 
-    std::fs::create_dir_all(dest).map_err(|error| error.to_string())?;
+    // REPORT1110 F2: every entry name is seller-authored. Validate the WHOLE tree before the first
+    // write, so an unsafe name refuses the delivery with nothing on disk (never a partial tree).
+    validate_tree_paths(&tree)?;
+    ensure_real_dir(dest)?;
     let mut files: Vec<String> = Vec::new();
     let mut walk_err: Option<String> = None;
     tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
@@ -669,15 +672,13 @@ pub fn materialize_delivery(
         let Some(blob) = object.as_blob() else {
             return git2::TreeWalkResult::Ok;
         };
-        let path = dest.join(&rel);
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                walk_err = Some(error.to_string());
-                return git2::TreeWalkResult::Abort;
-            }
+        // Re-checked per entry (defence in depth: `validate_tree_paths` already refused the tree).
+        if let Err(error) = validate_delivery_path(&rel) {
+            walk_err = Some(error);
+            return git2::TreeWalkResult::Abort;
         }
-        if let Err(error) = std::fs::write(&path, blob.content()) {
-            walk_err = Some(error.to_string());
+        if let Err(error) = write_under(dest, &rel, blob.content()) {
+            walk_err = Some(error);
             return git2::TreeWalkResult::Abort;
         }
         files.push(rel);
@@ -694,6 +695,112 @@ pub fn materialize_delivery(
     }
     files.sort();
     Ok(files)
+}
+
+/// Refuse a seller-authored delivery path that is not a plain relative path under the results
+/// directory: empty, absolute, `.`/`..`/empty components, `.git` (any case), backslashes, colons
+/// or control characters. The same rule the reviewer applies to the same trees
+/// (`private_content::validate_path`), plus a length bound.
+pub fn validate_delivery_path(rel: &str) -> Result<(), String> {
+    if rel.len() > 4096 || crate::private_content::validate_path(rel).is_err() {
+        return Err(format!("unsafe delivery path {rel:?}; refusing the delivery"));
+    }
+    Ok(())
+}
+
+/// Walk `tree` and refuse it if ANY entry (blob, subtree, symlink or submodule) has an unsafe
+/// path. Reads objects only, writes nothing — so the pay path runs it before any spend.
+pub fn validate_tree_paths(tree: &git2::Tree<'_>) -> Result<(), String> {
+    let mut failure: Option<String> = None;
+    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        let Ok(name) = entry.name() else {
+            failure = Some("non-UTF-8 tree entry name".into());
+            return git2::TreeWalkResult::Abort;
+        };
+        if let Err(error) = validate_delivery_path(&format!("{root}{name}")) {
+            failure = Some(error);
+            return git2::TreeWalkResult::Abort;
+        }
+        git2::TreeWalkResult::Ok
+    })
+    .map_err(|error| match failure.take() {
+        Some(reason) => format!("failed: {reason}"),
+        None => error.to_string(),
+    })?;
+    match failure {
+        Some(reason) => Err(format!("failed: {reason}")),
+        None => Ok(()),
+    }
+}
+
+/// [`validate_tree_paths`] for the delivery `commit_oid` retained in the buyer store: the pre-pay
+/// form, so a delivery collect would refuse to materialize is never paid for.
+pub(crate) fn validate_delivery_tree_in_store(
+    store: &Path,
+    store_ref: &str,
+    commit_oid: &str,
+) -> Result<(), String> {
+    let repo = git2::Repository::open_bare(store)
+        .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
+    let commit = repo
+        .revparse_single(store_ref)
+        .or_else(|_| repo.revparse_single(commit_oid))
+        .map_err(|error| format!("delivery {commit_oid} not found in buyer store: {error}"))?
+        .peel_to_commit()
+        .map_err(|error| error.to_string())?;
+    let tree = commit.tree().map_err(|error| error.to_string())?;
+    validate_tree_paths(&tree)
+}
+
+/// Create `dir` if absent; refuse if it (the final component) is a symlink or not a directory.
+fn ensure_real_dir(dir: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            Err(format!("refusing to materialize through symlink {}", dir.display()))
+        }
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} exists and is not a directory", dir.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(dir)
+            .map_err(|error| format!("create {}: {error}", dir.display())),
+        Err(error) => Err(format!("inspect {}: {error}", dir.display())),
+    }
+}
+
+/// Write `content` to `dest/rel` without following a symlink at any component under `dest`:
+/// intermediate directories are checked one by one, and the file is opened `O_NOFOLLOW`, so a
+/// symlink already in the results folder cannot redirect the write. Existing regular files are
+/// overwritten (re-collect is idempotent). `rel` must already have passed [`validate_delivery_path`].
+fn write_under(dest: &Path, rel: &str, content: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    let file_name = parts.pop().ok_or_else(|| format!("unsafe delivery path {rel:?}"))?;
+    let mut dir = dest.to_path_buf();
+    for part in parts {
+        dir.push(part);
+        ensure_real_dir(&dir)?;
+    }
+    let path = dir.join(file_name);
+    if let Ok(meta) = std::fs::symlink_metadata(&path)
+        && meta.file_type().is_symlink()
+    {
+        return Err(format!("refusing to write through symlink {}", path.display()));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&path).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return format!("refusing to write through symlink {}", path.display());
+        }
+        format!("write {}: {error}", path.display())
+    })?;
+    file.write_all(content)
+        .map_err(|error| format!("write {}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -871,6 +978,87 @@ mod tests {
         let error = materialize_delivery(&store, &store_ref, &commit_hex, &root.join("out"))
             .expect_err("a non-UTF-8 entry name must refuse");
         assert_eq!(error, "failed: non-UTF-8 tree entry name");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Store a delivery whose tree is written as a RAW tree object, the way a seller-hosted repo
+    /// reaches the buyer store through fetch/indexer: libgit2's treebuilder refuses unsafe names,
+    /// but the tree parser and the indexer accept any NUL-free name. Returns the commit hex.
+    fn seed_raw_tree_store(store: &Path, names: &[&[u8]]) -> String {
+        let repo = git2::Repository::init_bare(store).expect("init store");
+        let blob = repo.blob(b"seller-controlled bytes\n").expect("blob");
+        let mut raw = Vec::new();
+        for name in names {
+            raw.extend_from_slice(b"100644 ");
+            raw.extend_from_slice(name);
+            raw.push(0);
+            raw.extend_from_slice(blob.as_bytes());
+        }
+        let odb = repo.odb().expect("odb");
+        let tree_oid = odb.write(git2::ObjectType::Tree, &raw).expect("write raw tree");
+        let tree = repo.find_tree(tree_oid).expect("find raw tree");
+        let sig = git2::Signature::now("t", "t@e").expect("sig");
+        let commit_oid = repo.commit(None, &sig, &sig, "delivery", &tree, &[]).expect("commit");
+        let commit_hex = commit_oid.to_string();
+        repo.reference(&PayPathDeliveryVerifier::store_ref_for(&commit_hex), commit_oid, true, "retain")
+            .expect("retain ref");
+        commit_hex
+    }
+
+    // Security report REPORT1110 F2: a seller-authored tree entry name is a path, not a file name.
+    // `..` components or an absolute name must never write outside `dest`, and the whole delivery
+    // must refuse (fail-closed: no file at all, never a partial materialization).
+    #[test]
+    fn materialize_delivery_refuses_tree_entries_that_escape_dest() {
+        let root = temp_root("escape");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let absolute = root.join("ABSOLUTE_WRITE.txt");
+        let absolute_name = absolute.to_str().expect("utf8 temp path").to_owned();
+        let cases: Vec<(&str, Vec<u8>, PathBuf)> = vec![
+            ("dotdot", b"../../ESCAPED.txt".to_vec(), root.join("ESCAPED.txt")),
+            ("absolute", absolute_name.clone().into_bytes(), absolute.clone()),
+            ("dotgit", b".git/config".to_vec(), root.join("results").join("dotgit").join(".git/config")),
+            ("backslash", b"..\\x.txt".to_vec(), root.join("results").join("dotdot-bs")),
+        ];
+        for (label, bad, escaped) in cases {
+            let store = root.join(format!("store-{label}"));
+            // `ok.txt` sorts after the bad entry for every case: a walker that writes before it
+            // validates would leave a partial tree behind.
+            let commit_hex = seed_raw_tree_store(&store, &[&bad, b"ok.txt"]);
+            let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+            let dest = root.join("results").join(label);
+            let result = materialize_delivery(&store, &store_ref, &commit_hex, &dest);
+            assert!(!escaped.exists(), "{label}: wrote outside dest at {}", escaped.display());
+            let error = result.expect_err(&format!("{label}: an unsafe entry name must refuse"));
+            assert!(error.contains("unsafe delivery path"), "{label}: unexpected error {error}");
+            assert!(!dest.join("ok.txt").exists(), "{label}: partial materialization");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // F2 hardening: a symlink already sitting in `dest` (e.g. planted by an earlier collect into the
+    // same named `out` folder) must not redirect a delivered file's write.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_delivery_does_not_follow_a_symlink_in_dest() {
+        let root = temp_root("symlink");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let commit_hex = seed_store(&store);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&dest).expect("dest");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("README.md"), "victim\n").expect("victim");
+        std::os::unix::fs::symlink(outside.join("README.md"), dest.join("README.md")).expect("file link");
+        std::os::unix::fs::symlink(&outside, dest.join("src")).expect("dir link");
+        let error = materialize_delivery(&store, &store_ref, &commit_hex, &dest)
+            .expect_err("a symlink in dest must refuse");
+        assert!(error.contains("symlink"), "unexpected error {error}");
+        assert_eq!(std::fs::read_to_string(outside.join("README.md")).expect("victim"), "victim\n");
+        assert!(!outside.join("lib.rs").exists(), "wrote through a directory symlink");
         let _ = std::fs::remove_dir_all(&root);
     }
 

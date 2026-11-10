@@ -520,6 +520,18 @@ pub async fn authorize_pay_async(
     if let Some(delivery) = delivery.as_ref() {
         crate::payment::verify_pay_path_delivery(&mut verifier, delivery, &key)
             .map_err(AuthorizePayError::Payment)?;
+        // REPORT1110 F2: a delivered tree with an unsafe entry path (`..`, absolute, `.git`, ...)
+        // is one collect refuses to materialize. Refuse it HERE, before the budget gate, so the
+        // buyer never pays for a delivery it will not write to disk. Zero spend, no journal.
+        let commit_hex = delivery.commit_oid().as_str();
+        crate::collect::validate_delivery_tree_in_store(
+            verifier.repository(),
+            &PayPathDeliveryVerifier::store_ref_for(commit_hex),
+            commit_hex,
+        )
+        .map_err(|reason| AuthorizePayError::Delivery(DeliveryError::ContentRefused(format!(
+            "{reason}; zero spend"
+        ))))?;
     }
 
     // THE §19 EXECUTION-SENTINEL TOOTH (from-scratch money path). The delivery the buyer just fetched
