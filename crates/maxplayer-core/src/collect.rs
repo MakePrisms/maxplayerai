@@ -1019,7 +1019,9 @@ mod tests {
             ("dotdot", b"../../ESCAPED.txt".to_vec(), root.join("ESCAPED.txt")),
             ("absolute", absolute_name.clone().into_bytes(), absolute.clone()),
             ("dotgit", b".git/config".to_vec(), root.join("results").join("dotgit").join(".git/config")),
-            ("backslash", b"..\\x.txt".to_vec(), root.join("results").join("dotdot-bs")),
+            // On Unix `\` is an ordinary byte, so an accepted `..\x.txt` would land as one file
+            // of that name inside dest: that is where to look for the bytes.
+            ("backslash", b"..\\x.txt".to_vec(), root.join("results").join("backslash").join("..\\x.txt")),
         ];
         for (label, bad, escaped) in cases {
             let store = root.join(format!("store-{label}"));

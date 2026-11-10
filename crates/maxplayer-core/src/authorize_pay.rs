@@ -529,7 +529,7 @@ pub async fn authorize_pay_async(
             &PayPathDeliveryVerifier::store_ref_for(commit_hex),
             commit_hex,
         )
-        .map_err(|reason| AuthorizePayError::Delivery(DeliveryError::ContentRefused(format!(
+        .map_err(|reason| AuthorizePayError::Delivery(DeliveryError::UnsafeTree(format!(
             "{reason}; zero spend"
         ))))?;
     }
