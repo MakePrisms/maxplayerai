@@ -61,7 +61,7 @@ fn inspect_objects(repo: &Repository, private: bool, used: Usage) -> Result<Usag
         if private && kind == ObjectType::Tree {
             let tree = repo.find_tree(id).map_err(|_| Error("invalid input tree"))?;
             for entry in tree.iter() {
-                let name = entry.name().ok_or(Error("invalid input path"))?;
+                let name = entry.name().map_err(|_| Error("invalid input path"))?;
                 super::validate_path(name)?;
                 if !matches!(entry.filemode(), 0o040000 | 0o100644 | 0o100755) {
                     return Err(Error(

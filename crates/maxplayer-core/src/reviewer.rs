@@ -350,7 +350,7 @@ pub fn git_files(path: &Path, commit: &str) -> Result<Vec<(String, Arc<ReviewBlo
     tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         let mut read = || -> Result<Option<(String, Arc<ReviewBlob>)>, String> {
             if std::time::Instant::now() >= deadline { return Err("input_unavailable".into()); }
-            let name = entry.name().ok_or("unsupported_input")?;
+            let name = entry.name().map_err(|_| "unsupported_input")?;
             let path = format!("{root}{name}");
             if path.len() > 4096 { return Err("unsupported_input".into()); }
             crate::private_content::validate_path(&path).map_err(|_| "unsupported_input")?;

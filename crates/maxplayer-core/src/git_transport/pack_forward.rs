@@ -187,7 +187,7 @@ pub(super) fn candidate(repo: &Repository) -> Result<Option<File>, TransportErro
 fn command(reference: &str, oid: Oid) -> Vec<u8> {
     let line = format!(
         "{} {oid} {reference}\0report-status ofs-delta\n",
-        Oid::zero()
+        Oid::ZERO_SHA1
     );
     format!("{:04x}{line}0000", line.len() + 4).into_bytes()
 }
@@ -291,7 +291,7 @@ mod tests {
             ("report-status ofs-delta", false, false),
         ] {
             let oid = if empty {
-                Oid::zero()
+                Oid::ZERO_SHA1
             } else {
                 Oid::from_str(&"ab".repeat(20)).unwrap()
             };

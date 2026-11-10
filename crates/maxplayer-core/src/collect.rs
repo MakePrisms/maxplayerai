@@ -650,7 +650,8 @@ pub fn materialize_delivery(
         if entry.kind() != Some(git2::ObjectType::Blob) {
             return git2::TreeWalkResult::Ok;
         }
-        let name = match entry.name() {
+        // git2 0.21: `name()` is `Result` (non-UTF-8 is an error, as `None` was before).
+        let name = match entry.name().ok() {
             Some(name) => name,
             None => {
                 walk_err = Some("non-UTF-8 tree entry name".into());
@@ -682,7 +683,12 @@ pub fn materialize_delivery(
         files.push(rel);
         git2::TreeWalkResult::Ok
     })
-    .map_err(|error| error.to_string())?;
+    // git2 >= 0.20: an aborting callback makes `walk` itself return `Err` (GIT_EUSER), so the
+    // specific reason recorded in `walk_err` must win over libgit2's generic "callback returned".
+    .map_err(|error| match walk_err.take() {
+        Some(reason) => format!("failed: {reason}"),
+        None => error.to_string(),
+    })?;
     if let Some(error) = walk_err {
         return Err(format!("failed: {error}"));
     }
@@ -837,6 +843,34 @@ mod tests {
         // Idempotent re-materialize (what re-collect does after a reconciled pay): same result.
         let again = materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("re-materialize");
         assert_eq!(again, files);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // git2 >= 0.20 makes an aborted `Tree::walk` return `Err` itself, which used to pre-empt the
+    // specific reason the callback recorded. A non-UTF-8 entry name must still refuse with THAT
+    // reason, not libgit2's generic "callback returned" (worker-fable review of #1281).
+    #[cfg(unix)]
+    #[test]
+    fn materialize_delivery_reports_a_non_utf8_entry_name_specifically() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = temp_root("non-utf8");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let repo = git2::Repository::init_bare(&store).expect("init store");
+        let blob = repo.blob(b"x\n").expect("blob");
+        let mut top = repo.treebuilder(None).expect("tree");
+        top.insert(std::path::Path::new(std::ffi::OsStr::from_bytes(b"bad\xff")), blob, 0o100644)
+            .expect("insert non-utf8 name");
+        let tree = repo.find_tree(top.write().expect("write tree")).expect("find tree");
+        let sig = git2::Signature::now("t", "t@e").expect("sig");
+        let commit_oid = repo.commit(None, &sig, &sig, "delivery", &tree, &[]).expect("commit");
+        let commit_hex = commit_oid.to_string();
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        repo.reference(&store_ref, commit_oid, true, "retain").expect("retain ref");
+
+        let error = materialize_delivery(&store, &store_ref, &commit_hex, &root.join("out"))
+            .expect_err("a non-UTF-8 entry name must refuse");
+        assert_eq!(error, "failed: non-UTF-8 tree entry name");
         let _ = std::fs::remove_dir_all(&root);
     }
 

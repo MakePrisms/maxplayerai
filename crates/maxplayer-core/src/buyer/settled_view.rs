@@ -109,7 +109,7 @@ fn delivery_files(home: &MaxplayerHome, commit_oid: &str) -> Result<Vec<String>,
     let mut files = Vec::new();
     tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         if entry.kind() == Some(git2::ObjectType::Blob)
-            && let Some(name) = entry.name()
+            && let Ok(name) = entry.name()
         {
             files.push(format!("{root}{name}"));
         }
