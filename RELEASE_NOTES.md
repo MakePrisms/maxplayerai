@@ -1,10 +1,29 @@
-## Unreleased
+## v0.7.3-rc6
 
-Not yet released. `maxplayer-trade` stays a separate binary built from source; this changes the
-`maxplayer` binary (account, wallet) and `maxplayer-core` (shared wallet lock), and is client-only:
-no relay, registration-service or website redeploy (the mint-and-trade skill page goes live with
-the merge, Vercel).
+Release candidate for 0.7.3, cut to ship a sandbox image whose Claude Code can run Claude Fable 5.2
+(it needs Claude Code >= 2.1.321), plus the trade/shared-home wallet work merged since v0.7.3-rc5
+(#1263). Everything in v0.7.3-rc5 is included, and its upgrade order still applies to anyone
+coming from v0.7.3-rc4 or older. This release adds no new wire field: no relay, reviewer or
+registration-service redeploy (the mint-and-trade skill page went live with #1263's merge, Vercel).
+`maxplayer-trade` and `maxplayer-mint` are still not release binaries: build them from source at
+this tag. After publication, install with `npm install -g maxplayer@0.7.3-rc6`. Publish as a
+GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
 
+- **Changed: sandbox image agent CLIs.** `ghcr.io/makeprisms/maxplayer-sandbox:v0.7.3-rc6` bakes
+  `@agentclientprotocol/claude-agent-acp` 0.104.1 (was 0.85.0), whose bundled
+  `claude-agent-sdk` 0.3.322 runs Claude Code 2.1.322 (was 2.1.286) — the executable ACP turns
+  actually use; the standalone `@anthropic-ai/claude-code` is 2.1.322 to match.
+  `@agentclientprotocol/codex-acp` is 2.6.0 (was 2.1.1; Codex 0.166.0, was 0.159.3) and
+  cursor-agent is `2026.11.05-86047df` (was `2026.08.11-e8db854`, tarball digests updated). A
+  docker seat picks the new image up by upgrading to this version; a host-mode seat uses whatever
+  adapters are on its own PATH and must upgrade them itself (`npm i -g
+  @agentclientprotocol/claude-agent-acp@0.104.1`). Checked: all three adapters answer ACP
+  `initialize`; claude-agent-acp still names itself `@agentclientprotocol/claude-agent-acp`, keeps
+  the opt-in `_meta.claudeCode.emitRawSDKMessages` filter and the `_claude/sdkMessage`
+  notification the driver reads the model from, and still maps untyped `mcpServers` entries as
+  stdio; both claude and codex still advertise `loadSession` and replay history. No authenticated
+  Fable 5.2 job has been run through the image yet; prove it on your own seat (`ANTHROPIC_MODEL`
+  plus `[sandbox] forward_env = ["ANTHROPIC_MODEL"]`) before taking paid work on it.
 - **Changed: `maxplayer-trade` trades from the maxplayer home.** Default home is
   `$MAXPLAYER_HOME`, else `~/.maxplayer`; `--home <dir>` picks another maxplayer home. Lots,
   statuses and `nostr://` mint requests are signed with the home `key` (the one
@@ -117,7 +136,6 @@ npm `rc`; leave stable `latest` unchanged.
   redeployed. Buyers on older clients keep posting untagged offers, which host seats still refuse
   after the award, exactly as in v0.7.3-rc4.
 
-||||||| parent of 425111e9 (docs: trade uses the maxplayer home; release notes; MintBalance reserved_sats in tests; clippy)
 ## v0.7.3-rc4
 
 Release candidate for 0.7.3, cut to ship the security follow-ups from the v0.7.3-rc3 external
