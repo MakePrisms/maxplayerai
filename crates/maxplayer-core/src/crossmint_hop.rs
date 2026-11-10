@@ -187,6 +187,17 @@ pub enum HopError {
         /// Amount the target mint actually issued.
         minted: u64,
     },
+    /// The target mint (seller-chosen) returned a bolt11 whose amount is not the pinned delivery
+    /// amount, or no amount at all (REPORT1110 F1). Refused while planning, before any melt quote is
+    /// raised, so the buyer never pays an invoice larger than the offer.
+    InvoiceAmountMismatch {
+        /// Target mint that raised the invoice.
+        mint: String,
+        /// Amount pinned by the buyer-signed offer.
+        expected_sats: u64,
+        /// Invoice amount in msat, `None` for an amountless or undecodable invoice.
+        invoice_msat: Option<u64>,
+    },
 }
 
 impl fmt::Display for HopError {
@@ -283,6 +294,12 @@ impl fmt::Display for HopError {
                 formatter,
                 "cross-mint hop: target mint issued {minted} sats but the buyer-signed offer pins \
                  delivery at {expected} sats"
+            ),
+            Self::InvoiceAmountMismatch { mint, expected_sats, invoice_msat } => write!(
+                formatter,
+                "cross-mint hop: target mint {mint} returned an invoice for {} but the buyer-signed \
+                 offer pins delivery at {expected_sats} sats; refusing the hop with zero spend",
+                invoice_msat.map_or_else(|| "no amount".to_owned(), |msat| format!("{msat} msat"))
             ),
         }
     }
@@ -792,6 +809,25 @@ fn authorized_hop_cost(
     })
 }
 
+/// Refuse a target-mint bolt11 whose amount is not exactly `delivered_sats` (REPORT1110 F1).
+/// Undecodable and amountless invoices are refused too: either would let the payer side decide the
+/// amount, and the payer side here is the seller's own mint.
+fn require_invoice_amount(bolt11: &str, mint: &str, delivered_sats: u64) -> Result<(), HopError> {
+    use std::str::FromStr as _;
+    let invoice_msat = cdk::Bolt11Invoice::from_str(bolt11.trim())
+        .ok()
+        .and_then(|invoice| invoice.amount_milli_satoshis());
+    let expected_msat = delivered_sats.checked_mul(1000);
+    if invoice_msat.is_none() || invoice_msat != expected_msat {
+        return Err(HopError::InvoiceAmountMismatch {
+            mint: mint.to_owned(),
+            expected_sats: delivered_sats,
+            invoice_msat,
+        });
+    }
+    Ok(())
+}
+
 /// Bound on one hop leg that moves money.
 ///
 /// Longer than [`MINT_TOUCH_TIMEOUT`], which bounds mint *reads*: a melt is a Lightning payment
@@ -941,7 +977,20 @@ impl CdkHopEffects {
                 self.target.mint_url, mint_quote.id
             )));
         }
+        // REPORT1110 F1: the target mint is the SELLER's choice, so the invoice it returns is
+        // untrusted. It must be for exactly the pinned delivery amount — checked BEFORE the source
+        // is even asked to price it, so an inflated invoice can never reach the budget gate.
+        require_invoice_amount(&mint_quote.request, &self.target.mint_url.to_string(), delivered_sats)?;
         let (melt_quote_id, quoted_cost, cost) = self.raise_melt_quote(&mint_quote.request).await?;
+        // The source melts exactly what the invoice asks (cdk checks quote vs invoice); pin it to
+        // the delivery amount too, so the planned cost is delivery + the source's own fees only.
+        if cost.melt_amount != delivered_sats {
+            return Err(HopError::Mint(format!(
+                "source mint {} priced the hop invoice at {} sats, not the pinned delivery of \
+                 {delivered_sats} sats; refusing the hop with zero spend",
+                self.source.mint_url, cost.melt_amount
+            )));
+        }
         self.require_source_covers(quoted_cost).await?;
         let planned_cost = authorized_hop_cost(
             quoted_cost,
@@ -1936,6 +1985,214 @@ mod tests {
             hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
             wallet_dir: None,
         }
+    }
+
+    // ── REPORT1110 F1: the target mint is SELLER-chosen, so its invoice is untrusted ──────────────
+    //
+    // A scripted mint over cdk's own HTTP client: `/v1/info`, `/v1/keysets`, `/v1/keys`, the bolt11
+    // mint quote (target) and melt quote (source). The target answers a quote request for `n` sats
+    // with a REAL signed bolt11 for whatever the test chooses; the source prices whatever invoice it
+    // is shown and counts how often it was asked.
+    #[derive(Clone, Debug, Default)]
+    struct ScriptedMint {
+        keyset: Option<cashu::KeySet>,
+        invoice: String,
+        melt_amount: u64,
+        fee_reserve: u64,
+        melt_quotes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl cdk::wallet::HttpTransport for ScriptedMint {
+        fn with_proxy(&mut self, _: url::Url, _: Option<&str>, _: bool) -> Result<(), cdk::Error> {
+            Ok(())
+        }
+
+        async fn http_get<R>(&self, url: url::Url, _: Option<cashu::nuts::AuthToken>) -> Result<R, cdk::Error>
+        where
+            R: serde::de::DeserializeOwned,
+        {
+            let keyset = self.keyset.clone().expect("scripted keyset");
+            let path = url.path().to_owned();
+            let value = if path.ends_with("/v1/keysets") {
+                serde_json::to_value(cashu::KeysetResponse {
+                    keysets: vec![cashu::KeySetInfo {
+                        id: keyset.id,
+                        unit: keyset.unit.clone(),
+                        active: true,
+                        input_fee_ppk: 0,
+                        final_expiry: None,
+                    }],
+                })
+            } else if path.contains("/v1/keys") {
+                serde_json::to_value(cashu::KeysResponse { keysets: vec![keyset] })
+            } else if path.ends_with("/v1/info") {
+                serde_json::to_value(cashu::MintInfo::new())
+            } else {
+                return Err(cdk::Error::Custom(format!("unexpected GET {path}")));
+            };
+            serde_json::from_value(value.map_err(|e| cdk::Error::Custom(e.to_string()))?)
+                .map_err(|e| cdk::Error::Custom(e.to_string()))
+        }
+
+        async fn http_post<P, R>(&self, url: url::Url, _: Option<cashu::nuts::AuthToken>, _: &P) -> Result<R, cdk::Error>
+        where
+            P: serde::Serialize + ?Sized + Send + Sync,
+            R: serde::de::DeserializeOwned,
+        {
+            let path = url.path().to_owned();
+            let value = if path.ends_with("/v1/mint/quote/bolt11") {
+                serde_json::json!({
+                    "quote": "target-quote-1",
+                    "request": self.invoice,
+                    "amount": null,
+                    "unit": "sat",
+                    "state": "UNPAID",
+                    "expiry": 4_000_000_000u64,
+                })
+            } else if path.ends_with("/v1/melt/quote/bolt11") {
+                self.melt_quotes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                serde_json::json!({
+                    "quote": "source-melt-1",
+                    "amount": self.melt_amount,
+                    "fee_reserve": self.fee_reserve,
+                    "state": "UNPAID",
+                    "expiry": 4_000_000_000u64,
+                })
+            } else {
+                return Err(cdk::Error::Custom(format!("unexpected POST {path}")));
+            };
+            serde_json::from_value(value).map_err(|e| cdk::Error::Custom(e.to_string()))
+        }
+    }
+
+    fn scripted_keyset(seed: u8) -> cashu::KeySet {
+        let keys = (0..16u32)
+            .map(|bit| {
+                let amount = cashu::Amount::from(1u64 << bit);
+                let key = cashu::SecretKey::from_slice(&[seed.wrapping_add(bit as u8 + 1); 32]).unwrap();
+                (amount, key.public_key())
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let keys = cashu::Keys::new(keys);
+        cashu::KeySet {
+            id: cashu::Id::v2_from_data(&keys, &cashu::CurrencyUnit::Sat, 0, None),
+            unit: cashu::CurrencyUnit::Sat,
+            active: Some(true),
+            keys,
+            input_fee_ppk: 0,
+            final_expiry: None,
+        }
+    }
+
+    /// A wallet at `mint_url` speaking to `transport`, holding `balance` (power-of-two proofs).
+    async fn scripted_wallet(mint_url: &str, transport: ScriptedMint, balance: u64, seed: u8) -> Wallet {
+        use cdk::cdk_database::WalletDatabase as _;
+        let url: cdk::mint_url::MintUrl = mint_url.parse().unwrap();
+        let store = Arc::new(cdk_sqlite::wallet::memory::empty().await.unwrap());
+        store.add_mint(url.clone(), Some(cashu::MintInfo::new())).await.unwrap();
+        let keyset_id = transport.keyset.as_ref().unwrap().id;
+        let proofs = (0..16u32)
+            .filter(|bit| balance & (1u64 << bit) != 0)
+            .map(|bit| {
+                let proof = cashu::Proof::new(
+                    cashu::Amount::from(1u64 << bit),
+                    keyset_id,
+                    cashu::secret::Secret::generate(),
+                    cashu::SecretKey::from_slice(&[9; 32]).unwrap().public_key(),
+                );
+                cdk::wallet::types::ProofInfo::new(proof, url.clone(), cashu::State::Unspent, cashu::CurrencyUnit::Sat).unwrap()
+            })
+            .collect::<Vec<_>>();
+        store.update_proofs(proofs, vec![]).await.unwrap();
+        let connector = Arc::new(cdk::wallet::BaseHttpClient::with_transport(url.clone(), transport, None));
+        cdk::wallet::WalletBuilder::new()
+            .mint_url(url)
+            .unit(cashu::CurrencyUnit::Sat)
+            .localstore(store)
+            .seed([seed; 64])
+            .shared_client(connector)
+            .build()
+            .unwrap()
+    }
+
+    /// Hop effects whose target mint answers every quote with `invoice`, and whose source (the
+    /// buyer's own mint, funded with 30 000 sats) prices it at `melt_amount` + a 290-sat reserve.
+    async fn scripted_hop(invoice: String, melt_amount: u64) -> (CdkHopEffects, Arc<std::sync::atomic::AtomicUsize>) {
+        let melt_quotes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let source = ScriptedMint {
+            keyset: Some(scripted_keyset(40)),
+            melt_amount,
+            fee_reserve: 290,
+            melt_quotes: melt_quotes.clone(),
+            ..Default::default()
+        };
+        let target = ScriptedMint { keyset: Some(scripted_keyset(80)), invoice, ..Default::default() };
+        let effects = CdkHopEffects {
+            source: scripted_wallet("https://buyer-mint.test", source, 30_000, 11).await,
+            target: scripted_wallet("https://seller-chosen-mint.test", target, 0, 12).await,
+            hop_fee_buffer_multiplier: default_hop_fee_buffer_multiplier(),
+            wallet_dir: None,
+        };
+        (effects, melt_quotes)
+    }
+
+    #[tokio::test]
+    async fn plan_quotes_refuses_a_target_invoice_above_the_offer_amount() {
+        // Asked for 100 sats, the seller-chosen mint returns a signed invoice for 29 000.
+        let inflated = crate::lnurl_pay::test_support::signed_bolt11(
+            Some(29_000_000),
+            b"f1-inflated",
+            Duration::ZERO,
+        );
+        let (effects, melt_quotes) = scripted_hop(inflated, 29_000).await;
+        let error = effects
+            .plan_quotes("attempt-f1-inflated", 100)
+            .await
+            .expect_err("an invoice above the offer amount must refuse the hop");
+        assert!(
+            matches!(
+                error,
+                HopError::InvoiceAmountMismatch { expected_sats: 100, invoice_msat: Some(29_000_000), .. }
+            ),
+            "got: {error:?}"
+        );
+        assert_eq!(
+            melt_quotes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the source mint must never be asked to price the inflated invoice"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_quotes_refuses_an_amountless_target_invoice() {
+        let amountless =
+            crate::lnurl_pay::test_support::signed_bolt11(None, b"f1-amountless", Duration::ZERO);
+        let (effects, melt_quotes) = scripted_hop(amountless, 100).await;
+        let error = effects
+            .plan_quotes("attempt-f1-amountless", 100)
+            .await
+            .expect_err("an amountless invoice must refuse the hop");
+        assert!(
+            matches!(error, HopError::InvoiceAmountMismatch { invoice_msat: None, .. }),
+            "got: {error:?}"
+        );
+        assert_eq!(melt_quotes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    // Positive control: an honest target (invoice == offer amount) still plans, and the planned
+    // cost stays offer + fee allowance, nowhere near the per-job cap.
+    #[tokio::test]
+    async fn plan_quotes_accepts_a_target_invoice_for_exactly_the_offer_amount() {
+        let honest =
+            crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"f1-honest", Duration::ZERO);
+        let (effects, melt_quotes) = scripted_hop(honest, 100).await;
+        let pairing = effects.plan_quotes("attempt-f1-honest", 100).await.expect("honest hop plans");
+        assert_eq!(pairing.delivered_sats, 100);
+        assert_eq!(pairing.fee_reserve, 290);
+        let multiplier = default_hop_fee_buffer_multiplier();
+        assert_eq!(pairing.planned_cost, 100 + 290 + 290 * multiplier, "melt + reserve + buffer");
+        assert_eq!(melt_quotes.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
