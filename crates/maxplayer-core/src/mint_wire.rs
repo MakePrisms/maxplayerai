@@ -52,8 +52,9 @@ pub const MAX_PLAINTEXT_BYTES: usize = 65_535;
 /// URL scheme of a Nostr-transported mint: `nostr://<npub>`.
 pub const NOSTR_MINT_SCHEME: &str = "nostr://";
 
-/// NUT-06 `name` a `maxplayer-mint` advertises until its operator names it. Wallets show no name
-/// for it: every unnamed credit mint reports it, so it identifies none of them.
+/// NUT-06 `name` every `maxplayer-mint` advertised before mints could be named (and that an
+/// un-upgraded one still does). Wallets show no name for it: it identifies none of them. An
+/// upgraded unnamed mint advertises `maxplayer-mint-<8 hex>` instead, which wallets do show.
 pub const DEFAULT_MINT_NAME: &str = "Maxplayer credits";
 
 /// Longest mint name, in characters, a `maxplayer-mint` accepts and a wallet displays.

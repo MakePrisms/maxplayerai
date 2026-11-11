@@ -905,7 +905,7 @@ async fn issue_on_unstarted_mint_survives_recovery_and_restores() {
 
 /// Petar, 2026-11-11: the operator names the mint and wallets read it from NUT-06 info. cdk keeps
 /// the info it first stored and ignores the builder on later starts, so a rename must still reach
-/// the info a wallet fetches; an unnamed mint keeps the shared default (which wallets hide).
+/// the info a wallet fetches, including a legacy mint whose stored info says "Maxplayer credits".
 #[tokio::test(flavor = "multi_thread")]
 async fn mint_name_is_served_and_a_rename_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -943,7 +943,8 @@ fn mint_name_is_kept_in_mint_toml_and_validated() {
     let dir = tempfile::tempdir().unwrap();
     let home = MintHome::at(dir.path());
     home.init_named(Some("io-seller".into())).unwrap();
-    assert_eq!(home.load().unwrap().config.effective_name(), "io-seller");
+    let secrets = home.load().unwrap();
+    assert_eq!(secrets.config.effective_name(&secrets.keys), "io-seller");
     home.set_name("renamed").unwrap();
     let config = home.load().unwrap().config;
     assert_eq!(config.name.as_deref(), Some("renamed"));
@@ -951,14 +952,26 @@ fn mint_name_is_kept_in_mint_toml_and_validated() {
     for bad in ["", " padded", "x mint=https://a.test", "quote\"d"] {
         assert!(home.set_name(bad).is_err(), "{bad:?}");
     }
-    assert_eq!(home.load().unwrap().config.effective_name(), "renamed");
+    let secrets = home.load().unwrap();
+    assert_eq!(secrets.config.effective_name(&secrets.keys), "renamed");
 
     let unnamed = tempfile::tempdir().unwrap();
     let home = MintHome::at(unnamed.path());
     home.init().unwrap();
+    // Unnamed: `maxplayer-mint-<8 hex>`, like an unnamed seller's `maxplayer-seller-<8 hex>`, and
+    // shown by wallets (the old shared default was not).
+    let secrets = home.load().unwrap();
+    let default = secrets.config.effective_name(&secrets.keys);
     assert_eq!(
-        home.load().unwrap().config.effective_name(),
-        backend::MINT_NAME
+        default,
+        format!(
+            "maxplayer-mint-{}",
+            &secrets.keys.public_key().to_hex()[..8]
+        )
+    );
+    assert_eq!(
+        maxplayer_core::mint_wire::display_mint_name(Some(&default)),
+        Some(default.as_str())
     );
     assert!(
         !std::fs::read_to_string(unnamed.path().join("mint/mint.toml"))

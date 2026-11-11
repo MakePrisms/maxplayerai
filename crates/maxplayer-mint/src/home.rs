@@ -25,7 +25,7 @@ pub struct MintConfig {
     pub rate_limit: u32,
     /// Name advertised in NUT-06 info and shown by wallets next to the mint URL. Self-chosen,
     /// like a seller's kind-0 name: the `nostr://` npub stays the mint's identity.
-    /// Unset ⇒ [`crate::backend::MINT_NAME`].
+    /// Unset ⇒ [`default_name`] (`maxplayer-mint-<8 hex>`, like a seller's `maxplayer-seller-<8 hex>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -50,10 +50,17 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The name of a mint whose operator chose none: `maxplayer-mint-` + the first 8 hex characters of
+/// its key, the same shape as an unnamed seller's `maxplayer-seller-<8 hex>`. Unique per mint, so
+/// wallets show it (unlike the old shared "Maxplayer credits").
+pub fn default_name(keys: &Keys) -> String {
+    format!("maxplayer-mint-{}", &keys.public_key().to_hex()[..8])
+}
+
 impl MintConfig {
-    /// The name `run` advertises.
-    pub fn effective_name(&self) -> &str {
-        self.name.as_deref().unwrap_or(crate::backend::MINT_NAME)
+    /// The name `run` advertises: `name`, else [`default_name`].
+    pub fn effective_name(&self, keys: &Keys) -> String {
+        self.name.clone().unwrap_or_else(|| default_name(keys))
     }
 
     pub fn effective_relays(&self) -> Vec<String> {

@@ -57,16 +57,17 @@ async fn init(home: &MintHome, name: Option<String>) -> Result<()> {
     let keys = home.init_named(name)?;
     let url = mint_url(&keys)?;
     let secrets = home.load()?;
+    let name = secrets.config.effective_name(&secrets.keys);
     // Creates mint.sqlite and the first keyset.
-    backend::open_named(
-        &home.db_path(),
-        &secrets.seed,
-        &url,
-        secrets.config.effective_name(),
-    )
-    .await?;
+    backend::open_named(&home.db_path(), &secrets.seed, &url, &name).await?;
     println!("Created {}", home.dir().display());
     println!("Mint URL: {url}");
+    println!("Mint name: {name}");
+    if secrets.config.name.is_none() {
+        println!(
+            "Wallets show this name next to the mint URL. Give it one people know you by (e.g. your seller name):  maxplayer-mint name <name>"
+        );
+    }
     println!("Add it to accepted_mints in config.toml:  \"{url}\"");
     println!("Then let your wallet spend what it earns there:  maxplayer wallet mints add {url}");
     println!();
@@ -123,17 +124,17 @@ async fn run(home: &MintHome) -> Result<()> {
     // Before `open`: its startup saga recovery must not run under a listener that is serving.
     let _lock = home.lock_run()?;
     let url = mint_url(&secrets.keys)?;
-    let mint = backend::open_named(
-        &home.db_path(),
-        &secrets.seed,
-        &url,
-        secrets.config.effective_name(),
-    )
-    .await?;
+    let name = secrets.config.effective_name(&secrets.keys);
+    let mint = backend::open_named(&home.db_path(), &secrets.seed, &url, &name).await?;
+    if secrets.config.name.is_none() {
+        eprintln!(
+            "maxplayer-mint: no name set, serving the default {name:?}; set one with `maxplayer-mint name <name>`"
+        );
+    }
     let relays = secrets.config.effective_relays();
     let server =
         server::Server::connect(mint, secrets.keys, &relays, secrets.config.rate_limit).await?;
-    eprintln!("maxplayer-mint: serving {url} on {relays:?}");
+    eprintln!("maxplayer-mint: serving {url} ({name:?}) on {relays:?}");
     tokio::select! {
         result = server.serve() => result,
         _ = tokio::signal::ctrl_c() => Ok(()),

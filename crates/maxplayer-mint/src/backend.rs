@@ -13,7 +13,8 @@ use cdk_sqlite::MintSqliteDatabase;
 
 use crate::dispatch::MAX_IO;
 
-/// Name the mint advertises in NUT-06 info until the operator sets `name` in `mint.toml`.
+/// cdk's builder name, and the name of a mint opened through [`open`] (tests, embedders). The
+/// binary always passes a name: `mint.toml`'s, else `maxplayer-mint-<8 hex>` ([`crate::home::default_name`]).
 pub const MINT_NAME: &str = maxplayer_core::mint_wire::DEFAULT_MINT_NAME;
 
 /// Open (creating on first use) and start the mint in `db_path`, keyed from `seed`, advertising
