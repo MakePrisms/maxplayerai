@@ -614,10 +614,10 @@ pub const INLINE_ANSWER_FILENAME: &str = "answer.txt";
 /// there is no store to open, no ref to resolve and no tree to walk — the answer arrived inside the
 /// result event and was recorded on the bind at accept, under the digest the seller co-signed.
 pub fn materialize_inline_delivery(answer: &str, dest: &Path) -> Result<Vec<String>, String> {
-    std::fs::create_dir_all(dest)
-        .map_err(|error| format!("create {}: {error}", dest.display()))?;
-    let path = dest.join(INLINE_ANSWER_FILENAME);
-    std::fs::write(&path, answer).map_err(|error| format!("write {}: {error}", path.display()))?;
+    // Same writer as the git path: a symlink already at `dest` or at `dest/answer.txt` (reused
+    // `out`, a folder the operator filled) must not redirect the write (#1290 review).
+    ensure_real_dir(dest)?;
+    write_under(dest, INLINE_ANSWER_FILENAME, answer.as_bytes())?;
     Ok(vec![INLINE_ANSWER_FILENAME.to_owned()])
 }
 
@@ -702,23 +702,67 @@ pub fn materialize_delivery(
 /// or control characters. The same rule the reviewer applies to the same trees
 /// (`private_content::validate_path`), plus a length bound.
 pub fn validate_delivery_path(rel: &str) -> Result<(), String> {
-    if rel.len() > 4096 || crate::private_content::validate_path(rel).is_err() {
+    if rel.len() > 4096
+        || crate::private_content::validate_path(rel).is_err()
+        || !rel.split('/').all(portable_component)
+    {
         return Err(format!("unsafe delivery path {rel:?}; refusing the delivery"));
     }
     Ok(())
+}
+
+/// Longest single path component the buyer's filesystem stores (`NAME_MAX` on Linux and APFS).
+/// Refused here, on the pay path too, so a name that could only fail at write time is never paid.
+const MAX_COMPONENT_BYTES: usize = 255;
+
+/// A component no filesystem the buyer could run on reads as `.git` or `..` — git's
+/// `core.protectNTFS` / `core.protectHFS` set (#1290 review): Win32 strips trailing dots and
+/// spaces (`.git.`, `...`), NTFS has the 8.3 short name `GIT~1`, and HFS+ ignores some code points
+/// when it compares names (`.gi\u{200C}t`). Not an escape on Linux/APFS, but the `.git` rule above
+/// must hold on every volume a buyer might use.
+fn portable_component(component: &str) -> bool {
+    if component.len() > MAX_COMPONENT_BYTES
+        || component.ends_with('.')
+        || component.ends_with(' ')
+        || component.eq_ignore_ascii_case("git~1")
+    {
+        return false;
+    }
+    if component.chars().any(is_hfs_ignorable) {
+        let folded: String = component.chars().filter(|c| !is_hfs_ignorable(*c)).collect();
+        if folded.is_empty() || folded == "." || folded == ".." || folded.eq_ignore_ascii_case(".git")
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Code points HFS+ skips when comparing names (git `is_hfs_dotgit`).
+fn is_hfs_ignorable(c: char) -> bool {
+    matches!(c, '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}')
 }
 
 /// Walk `tree` and refuse it if ANY entry (blob, subtree, symlink or submodule) has an unsafe
 /// path. Reads objects only, writes nothing — so the pay path runs it before any spend.
 pub fn validate_tree_paths(tree: &git2::Tree<'_>) -> Result<(), String> {
     let mut failure: Option<String> = None;
+    // A raw tree can repeat a name, or name a blob and a subtree alike. Both stay inside dest, but
+    // the second write fails (or silently replaces the first) AFTER a paid collect has spent, so
+    // refuse it here, before the budget gate (#1290 review).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         let Ok(name) = entry.name() else {
             failure = Some("non-UTF-8 tree entry name".into());
             return git2::TreeWalkResult::Abort;
         };
-        if let Err(error) = validate_delivery_path(&format!("{root}{name}")) {
+        let path = format!("{root}{name}");
+        if let Err(error) = validate_delivery_path(&path) {
             failure = Some(error);
+            return git2::TreeWalkResult::Abort;
+        }
+        if !seen.insert(path.clone()) {
+            failure = Some(format!("duplicate delivery path {path:?}; refusing the delivery"));
             return git2::TreeWalkResult::Abort;
         }
         git2::TreeWalkResult::Ok
@@ -1019,6 +1063,7 @@ mod tests {
             ("dotdot", b"../../ESCAPED.txt".to_vec(), root.join("ESCAPED.txt")),
             ("absolute", absolute_name.clone().into_bytes(), absolute.clone()),
             ("dotgit", b".git/config".to_vec(), root.join("results").join("dotgit").join(".git/config")),
+            ("dotgit-upper", b".GIT/config".to_vec(), root.join("results").join("dotgit-upper").join(".GIT/config")),
             // On Unix `\` is an ordinary byte, so an accepted `..\x.txt` would land as one file
             // of that name inside dest: that is where to look for the bytes.
             ("backslash", b"..\\x.txt".to_vec(), root.join("results").join("backslash").join("..\\x.txt")),
@@ -1061,6 +1106,122 @@ mod tests {
         assert!(error.contains("symlink"), "unexpected error {error}");
         assert_eq!(std::fs::read_to_string(outside.join("README.md")).expect("victim"), "victim\n");
         assert!(!outside.join("lib.rs").exists(), "wrote through a directory symlink");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1290 review (Medium): every fixture above puts the bad name FIRST, so the per-entry check
+    // alone would also pass them. Here a safe name comes first: only the whole-tree pre-pass keeps
+    // it off disk, so dropping that pre-pass turns this red.
+    #[test]
+    fn materialize_delivery_writes_nothing_when_a_later_entry_is_unsafe() {
+        let root = temp_root("late-unsafe");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("root");
+        let store = root.join("store");
+        let commit_hex = seed_raw_tree_store(&store, &[b"0-ok.txt", b"../../LATE_ESCAPE.txt"]);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        let error = materialize_delivery(&store, &store_ref, &commit_hex, &dest)
+            .expect_err("a later unsafe entry must refuse the whole tree");
+        assert!(error.contains("unsafe delivery path"), "unexpected error {error}");
+        assert!(!dest.join("0-ok.txt").exists(), "a safe entry was written before the refusal");
+        assert!(!dest.exists(), "dest must not be created for a refused tree");
+        assert!(!root.join("LATE_ESCAPE.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_delivery_refuses_a_duplicate_entry_before_writing() {
+        let root = temp_root("dup");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let commit_hex = seed_raw_tree_store(&store, &[b"dup.txt", b"dup.txt"]);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        let error = materialize_delivery(&store, &store_ref, &commit_hex, &dest)
+            .expect_err("a repeated name must refuse");
+        assert!(error.contains("duplicate delivery path"), "unexpected error {error}");
+        assert!(!dest.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1290 review (Medium): the earlier symlink test aborts on README.md before `src/` is ever
+    // used. This tree has ONLY `src/lib.rs`, so the intermediate-directory check is what refuses.
+    #[cfg(unix)]
+    #[test]
+    fn materialize_delivery_does_not_follow_a_symlinked_intermediate_directory() {
+        let root = temp_root("dir-symlink");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let repo = git2::Repository::init_bare(&store).expect("init store");
+        let lib = repo.blob(b"pub fn delivered() {}\n").expect("blob");
+        let mut sub = repo.treebuilder(None).expect("subtree");
+        sub.insert("lib.rs", lib, 0o100644).expect("insert lib");
+        let sub_oid = sub.write().expect("write subtree");
+        let mut top = repo.treebuilder(None).expect("tree");
+        top.insert("src", sub_oid, 0o040000).expect("insert src");
+        let tree = repo.find_tree(top.write().expect("write tree")).expect("tree");
+        let sig = git2::Signature::now("t", "t@e").expect("sig");
+        let commit_oid = repo.commit(None, &sig, &sig, "delivery", &tree, &[]).expect("commit");
+        let commit_hex = commit_oid.to_string();
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        repo.reference(&store_ref, commit_oid, true, "retain").expect("retain ref");
+        let dest = root.join("results").join("job");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&dest).expect("dest");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, dest.join("src")).expect("dir link");
+        let error = materialize_delivery(&store, &store_ref, &commit_hex, &dest)
+            .expect_err("a symlinked directory in dest must refuse");
+        assert!(error.contains("symlink"), "unexpected error {error}");
+        assert!(!outside.join("lib.rs").exists(), "wrote through a directory symlink");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delivery_paths_that_alias_dotgit_or_dotdot_on_other_filesystems_are_refused() {
+        let long = "a".repeat(256);
+        let too_long = "a/".repeat(2100);
+        for bad in [
+            ".git.", ".git ", "x/.git./config", "GIT~1", "git~1/config", "...", ".. ", "a/b.",
+            ".gi\u{200C}t/config", "\u{FEFF}.git", "x/.\u{200D}./y", "\u{200E}", long.as_str(),
+            "a:b", "a\u{7}b", too_long.as_str(), ".GiT/x",
+        ] {
+            assert!(validate_delivery_path(bad).is_err(), "{bad:?} must be refused");
+        }
+        let longest_ok = "a".repeat(255);
+        for good in [
+            "file.txt", "src/lib.rs", "v1.2.3/notes.md", "日本語.txt", ".gitignore", ".github/x.yml",
+            "git~2", "a\u{200C}b", longest_ok.as_str(),
+        ] {
+            assert!(validate_delivery_path(good).is_ok(), "{good:?} must be accepted");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_inline_delivery_does_not_follow_a_symlink() {
+        let root = temp_root("inline-symlink");
+        let _ = std::fs::remove_dir_all(&root);
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("victim"), "victim\n").expect("victim");
+        // A symlink at dest/answer.txt.
+        let dest = root.join("results").join("job");
+        std::fs::create_dir_all(&dest).expect("dest");
+        std::os::unix::fs::symlink(outside.join("victim"), dest.join(INLINE_ANSWER_FILENAME))
+            .expect("file link");
+        let error = materialize_inline_delivery("seller text", &dest)
+            .expect_err("a symlinked answer.txt must refuse");
+        assert!(error.contains("symlink"), "unexpected error {error}");
+        assert_eq!(std::fs::read_to_string(outside.join("victim")).expect("victim"), "victim\n");
+        // dest itself a symlink.
+        let linked = root.join("results").join("linked");
+        std::os::unix::fs::symlink(&outside, &linked).expect("dir link");
+        let error = materialize_inline_delivery("seller text", &linked)
+            .expect_err("a symlinked dest must refuse");
+        assert!(error.contains("symlink"), "unexpected error {error}");
+        assert!(!outside.join(INLINE_ANSWER_FILENAME).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 
