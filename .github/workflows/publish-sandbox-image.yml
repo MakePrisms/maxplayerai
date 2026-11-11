@@ -119,18 +119,30 @@ jobs:
       # but bricks the seat. Publishing them together is what makes that pair impossible to break.
       NETFILTER_IMAGE_NAME: makeprisms/maxplayer-netfilter
     steps:
-      # Check out the ref being released so the Dockerfile (and its pinned adapters) is exactly the one
-      # that tag names — not whatever main happens to be at publish time.
-      - name: Checkout the released ref
+      # Check out the commit being released so the Dockerfile (and its pinned adapters) is exactly the
+      # one that release names — not whatever main happens to be at publish time.
+      # - release / workflow_call: the event's own commit (`github.sha`: the tagged release's commit,
+      #   or the caller's tag push). It cannot move, and no branch can shadow it.
+      # - workflow_dispatch: the tag the operator named, fully qualified, so a branch with the same
+      #   name is never built in its place (#1293 review M1). An empty input fails the checkout.
+      # No credentials persist: nothing in this job talks to git over the network.
+      - name: Checkout the released commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || github.event.inputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
 
       # Resolve the version tag and decide whether :latest moves. A prerelease (or any manual dispatch)
       # publishes the version tag ALONE, leaving :latest pointing at the last stable image — mirroring
       # the npm job, which keeps `latest` stable and ships prereleases under `rc`.
       - name: Determine image tags
         id: meta
+        # Untrusted-by-construction values reach the script through env, never `${{ }}` expansion
+        # inside `run:` (expression injection hardening, security report REPORT1110 S3).
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           # Three trigger shapes, and they do not agree on where the version lives or on whether
@@ -139,16 +151,16 @@ jobs:
           # is the default, rather than the other way round.
           case "$GITHUB_EVENT_NAME" in
             release)
-              version="${{ github.event.release.tag_name }}"
-              prerelease="${{ github.event.release.prerelease }}"
+              version="$RELEASE_TAG"
+              prerelease="$RELEASE_PRERELEASE"
               ;;
             workflow_dispatch)
-              version="${{ inputs.tag }}"
+              version="$INPUT_TAG"
               # A manual build is not a release; never let it move the stable pointer.
               prerelease=true
               ;;
             *)
-              version="${{ inputs.tag }}"
+              version="$INPUT_TAG"
               # Called from release.yml for a real tag, so `:latest` moves for a stable version. The
               # semver-suffix rule is release.yml's own (plan job): match the suffix rather than the
               # literal "rc", so `-beta` is not published as latest either.
@@ -163,11 +175,14 @@ jobs:
           # here. A tag missing its `v` would publish images no seller ever asks for, and the pull
           # failure would surface much later, on the first contained job. release.yml's
           # verify-release-version.sh already holds the tag to the crate version; this holds the
-          # image tag to the shape that ref is built from.
-          case "$version" in
-            v*) ;;
-            *) echo "image version '$version' does not start with 'v' — the binary asks for :v<version>, so these images would be unreachable" >&2; exit 1 ;;
-          esac
+          # image tag to the shape that ref is built from. The shape is checked exactly, not just the
+          # leading `v`: the tag list below is comma-joined and split again at push time, so a
+          # version carrying `,` (or `:`/`/`) would add an image ref of its own — e.g. move `:latest`
+          # from a manual dispatch that must never touch it (#1293 review).
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "image version '$version' is not v<MAJOR>.<MINOR>.<PATCH>[-<pre>] — the binary asks for :v<CARGO_PKG_VERSION>, and anything else is either unreachable or splits into extra image refs" >&2
+            exit 1
+          fi
 
           tags="${REGISTRY}/${IMAGE_NAME}:${version}"
           netfilter_tags="${REGISTRY}/${NETFILTER_IMAGE_NAME}:${version}"
@@ -181,6 +196,12 @@ jobs:
           # states the commit. After the checkout, `git rev-parse HEAD` is the released ref in all
           # three trigger shapes. Resolved ONCE here so both architecture legs stamp the same commit.
           commit="$(git rev-parse HEAD)"
+          # Outside a manual dispatch the checkout above is pinned to the event's commit; prove it,
+          # so an edit to that `ref:` cannot silently go back to resolving a name.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] && [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "checked out $commit, but this run is for $GITHUB_SHA" >&2
+            exit 1
+          fi
 
           echo "version=$version"               >> "$GITHUB_OUTPUT"
           echo "tags=$tags"                     >> "$GITHUB_OUTPUT"
@@ -259,12 +280,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.plan.outputs.commit }}
+          # This job holds `packages: write`; keep the token out of .git/config (#1293 review L3).
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -278,7 +301,7 @@ jobs:
       # overwrite each other's manifest, and the arm64 leg would import amd64 layers it cannot use.
       - name: Build and push the sandbox image by digest
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: .
           file: docker/maxplayer-sandbox/Dockerfile
@@ -293,7 +316,7 @@ jobs:
       # so it runs wherever the job runs, including an arm64 Mac's linux VM.
       - name: Build and push the containment sidecar by digest
         id: build_netfilter
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5.4.0
         with:
           context: docker/maxplayer-netfilter
           platforms: ${{ matrix.platform }}
@@ -306,6 +329,7 @@ jobs:
       # reference and fail with a much less obvious message, one job later.
       - name: Write the digests out
         env:
+          PLATFORM: ${{ matrix.platform }}
           SANDBOX_DIGEST: ${{ steps.build.outputs.digest }}
           NETFILTER_DIGEST: ${{ steps.build_netfilter.outputs.digest }}
         run: |
@@ -317,8 +341,8 @@ jobs:
           mkdir -p /tmp/digests/sandbox /tmp/digests/netfilter
           echo "$SANDBOX_DIGEST"   > /tmp/digests/sandbox/digest
           echo "$NETFILTER_DIGEST" > /tmp/digests/netfilter/digest
-          echo "sandbox ${{ matrix.platform }} -> $SANDBOX_DIGEST"
-          echo "netfilter ${{ matrix.platform }} -> $NETFILTER_DIGEST"
+          echo "sandbox $PLATFORM -> $SANDBOX_DIGEST"
+          echo "netfilter $PLATFORM -> $NETFILTER_DIGEST"
 
       # `retention-days: 1`: these are a handoff between two jobs of one run, not an artifact anyone
       # downloads later. The durable handles are the manifest-list digests in the run summary.
@@ -367,12 +391,12 @@ jobs:
       # buildx v0.32.0 and is absent in v0.31.0. Leaving the version to whatever the runner image
       # happens to carry would make the identity binding below depend on the runner image.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
         with:
           version: v0.37.1
 
       - name: Login to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

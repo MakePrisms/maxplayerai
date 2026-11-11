@@ -128,11 +128,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Third-party actions in the job whose output ships to npm and the GitHub Release are pinned to
+      # a commit (#1293 review L4). dtolnay is pinned to a `master` commit, never a `stable`-branch
+      # head: upstream garbage-collects commits outside master's history (#1293 fable r2 R1). At
+      # master `toolchain` is a required input; the toolchain is still `stable`, resolved by rustup.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: release-${{ matrix.target }}
 
@@ -175,9 +180,14 @@ jobs:
       # folds its newline to a space, so `\` + newline reaches the shell as `\ ` — an escaped space,
       # which joins onto the next word instead of continuing the line. The argument then carries a
       # leading space and no path matches it. `verify-release-workflow.sh` fails on the shape.
+      #
+      # The version reaches every script below through env, never `${{ }}` inside `run:`: on a tag
+      # push it is the tag name, and a ref name may contain `'` (REPORT1110 S3 class, #1293 review).
       - name: Verify the version matches the release
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          ./scripts/verify-release-version.sh '${{ needs.plan.outputs.version }}' \
+          ./scripts/verify-release-version.sh "$VERSION" \
             "target/${{ matrix.target }}/release/maxplayer"
 
       # Which features were compiled in. `version` succeeds in every build, so nothing else here can
@@ -220,10 +230,12 @@ jobs:
       # the name of the binary inside it and the name it answers to. One asset stem is now the whole
       # of the release, so naming it here would only add a second place for it to drift.
       - name: Package the asset
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           ./scripts/package-release-asset.sh \
             "target/${{ matrix.target }}/release/maxplayer" \
-            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist
+            '${{ matrix.platform }}' "$VERSION" dist
 
       # Determinism is the property those fixed uid/gid/mtime flags exist to provide, so it is proved
       # on the artifact rather than inferred from the flags being present — the same reason
@@ -234,11 +246,13 @@ jobs:
       # `cmp` rather than a hash: choosing between `sha256sum` and `shasum -a 256` is the very GNU/BSD
       # split this commit removes, and byte-equality is the property anyway.
       - name: Verify the archive is deterministic
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
         run: |
           ./scripts/package-release-asset.sh \
             "target/${{ matrix.target }}/release/maxplayer" \
-            '${{ matrix.platform }}' '${{ needs.plan.outputs.version }}' dist-recheck
-          ASSET="maxplayer-${{ needs.plan.outputs.version }}-${{ matrix.platform }}.tar.gz"
+            '${{ matrix.platform }}' "$VERSION" dist-recheck
+          ASSET="maxplayer-${VERSION}-${{ matrix.platform }}.tar.gz"
           cmp "dist/$ASSET" "dist-recheck/$ASSET" || {
             echo "the archive is not a function of its contents: two runs over identical inputs differ" >&2
             # Say WHERE, because this check runs on platforms nobody here can reproduce, and "they
