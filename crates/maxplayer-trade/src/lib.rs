@@ -142,6 +142,30 @@ pub struct Lot {
     pub deadline_policy: DeadlinePolicy,
     pub fee_policy: String,
 }
+/// `discover --give-mint/--want-mint`: keep lots whose maker gives `give` and wants `want`
+/// (either filter optional). With both, one pair remains and lots are ordered cheapest first for
+/// a taker: fewest wanted sats per given sat, then the larger lot. Otherwise relay order is kept.
+pub fn select_lots<T>(
+    lots: Vec<(Lot, T)>,
+    give: Option<&Asset>,
+    want: Option<&Asset>,
+) -> Vec<(Lot, T)> {
+    let mut out: Vec<_> = lots
+        .into_iter()
+        .filter(|(l, _)| {
+            give.is_none_or(|a| l.give.asset == *a) && want.is_none_or(|a| l.want.asset == *a)
+        })
+        .collect();
+    if give.is_some() && want.is_some() {
+        out.sort_by(|(a, _), (b, _)| {
+            let cross = |x: &Lot, y: &Lot| x.want.net as u128 * y.give.net as u128;
+            cross(a, b)
+                .cmp(&cross(b, a))
+                .then(b.give.net.cmp(&a.give.net))
+        });
+    }
+    out
+}
 fn tag(event: &Event, name: &str) -> Result<String> {
     let tags: Vec<_> = event
         .tags
@@ -716,6 +740,60 @@ mod listing_tests {
         .unwrap();
         let s = status_event(&k, l.id, 1, l.id, Status::Available).unwrap();
         (k, l, s)
+    }
+    #[test]
+    fn select_lots_filters_by_mint_and_sorts_cheapest_first() {
+        let (a, b, c) = (
+            Asset::new("http://127.0.0.1:1").unwrap(),
+            Asset::new("http://127.0.0.1:2").unwrap(),
+            Asset::new("http://127.0.0.1:3").unwrap(),
+        );
+        let lot = |g: &Asset, give: u64, w: &Asset, want: u64| Lot {
+            trade_v: 1,
+            give: Leg {
+                asset: g.clone(),
+                net: give,
+            },
+            want: Leg {
+                asset: w.clone(),
+                net: want,
+            },
+            maker_trade_pubkey: String::new(),
+            expires_at: 0,
+            deadline_policy: DeadlinePolicy::default(),
+            fee_policy: String::new(),
+        };
+        let lots = vec![
+            (lot(&a, 100, &b, 110), "a->b 1.10"),
+            (lot(&b, 100, &a, 90), "b->a"),
+            (lot(&a, 50, &b, 45), "a->b 0.90 small"),
+            (lot(&a, 200, &b, 180), "a->b 0.90 big"),
+            (lot(&a, 100, &c, 1), "a->c"),
+            (lot(&a, 10, &b, 10), "a->b 1.00"),
+        ];
+        let names = |v: Vec<(Lot, &'static str)>| v.into_iter().map(|(_, n)| n).collect::<Vec<_>>();
+        assert_eq!(
+            names(select_lots(lots.clone(), Some(&a), Some(&b))),
+            ["a->b 0.90 big", "a->b 0.90 small", "a->b 1.00", "a->b 1.10"]
+        );
+        assert_eq!(
+            names(select_lots(lots.clone(), Some(&b), Some(&a))),
+            ["b->a"]
+        );
+        // One filter: every pair on that side, relay order kept.
+        assert_eq!(
+            names(select_lots(lots.clone(), Some(&a), None)),
+            [
+                "a->b 1.10",
+                "a->b 0.90 small",
+                "a->b 0.90 big",
+                "a->c",
+                "a->b 1.00"
+            ]
+        );
+        assert_eq!(names(select_lots(lots.clone(), None, Some(&a))), ["b->a"]);
+        assert_eq!(select_lots(lots.clone(), None, None).len(), lots.len());
+        assert!(select_lots(lots, Some(&c), Some(&a)).is_empty());
     }
     #[test]
     fn signed_listing_roundtrip() {

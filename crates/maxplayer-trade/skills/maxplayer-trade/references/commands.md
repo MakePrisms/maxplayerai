@@ -39,7 +39,7 @@ fund <mint> --amount <sats> [--quote <quote-id>] [--id <funding-id>]
 receive <mint> [--token-file <path>]
 send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats> [--dry-run]
-discover
+discover [--give-mint <mint>] [--want-mint <mint>]
 serve
 cancel <lot>
 take <lot> --max-give <total-sats> --min-receive <net-sats> --max-fees <sats> [--dry-run]
@@ -51,7 +51,7 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` defaults to the maxplayer home; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--timeout-seconds` (doctor: default 30 seconds), `--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`, `--check-sends`,
+`--timeout-seconds` (doctor: default 30 seconds), `--give-mint`/`--want-mint` on discover, `--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`, `--check-sends`,
 and `--max-fees` (default 16 on list/take; on send it is required unless the mint's input fee is 0). `send` takes either `<mint> --amount --out` or `--reclaim <send-id>`. Positional mint arguments are
 canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
 canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
@@ -140,6 +140,15 @@ carries `expected_fees` per leg (`net`, `ppk`, `gross`, `claim_fee`) from the
 mints' published keysets, or `"unknown"` when a mint did not answer within ~5 s
 (discover never blocks on a mint). The taker's own lock fee depends on its inputs:
 use `take --dry-run`. Relay union, EOSE and `timeout_or_partial` reporting are unchanged.
+
+`discover --give-mint <mint> --want-mint <mint>` keeps only lots whose maker gives the
+first mint and wants the second (same direction as `list`); either filter alone is allowed.
+With both, listings are sorted cheapest first for a taker (fewest wanted sats per given
+sat, then the larger lot), so the first entry is the market's best price on that pair.
+Before listing A→B, `discover --give-mint A --want-mint B` shows the lots you would
+compete with and `discover --give-mint B --want-mint A` shows lots you could take
+instead. Mints are canonicalized like positional mints; a malformed or identical pair is
+refused before any relay traffic.
 
 ## Fee preview: `--dry-run`
 
