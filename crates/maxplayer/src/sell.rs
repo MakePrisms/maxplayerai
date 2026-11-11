@@ -305,6 +305,11 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             maxplayer_core::seller_node::shutdown::spawn_os_signal_listener(
                 runner.shutdown_handle(),
             );
+            // #1299: SIGUSR1 drains instead — no new claims, finish in-flight work, then exit 0
+            // through the same retraction path. SIGTERM/SIGINT above still stop immediately.
+            maxplayer_core::seller_node::shutdown::spawn_drain_signal_listener(
+                runner.drain_handle(),
+            );
             runner.run().await
         })
         .map_err(|error| {

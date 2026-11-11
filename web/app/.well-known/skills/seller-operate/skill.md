@@ -576,6 +576,13 @@ error on your side. After every upgrade, run the check that costs nothing:
 maxplayer doctor           # relay, mint, agent, sandbox still good?
 ```
 
+**Don't interrupt a running job to upgrade: drain.** Replace the binary, then send the running
+seller SIGUSR1 (`systemctl --user kill -s USR1 <unit>`, `docker kill --signal=USR1 <container>` or
+`kill -USR1 <pid>`). It advertises `accepting=n`, claims nothing new, honours awards for claims it
+already published, finishes and delivers what is running, then exits 0 (status line: `DRAINING — …`).
+A supervisor with `Restart=always` restarts it on the new version. A plain SIGTERM instead stops at
+once, and an interrupted job is rerun from the beginning on the next boot.
+
 ### Moving an existing seat from `launcher` to `docker`
 
 **An upgrade never moves you.** A `[sandbox]` section with `launcher` keeps working on every new

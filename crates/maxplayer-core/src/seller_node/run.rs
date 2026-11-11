@@ -134,6 +134,27 @@ struct SlotGate {
     /// Configured ceiling, clamped as `new` clamps it. Held so a report can carry its denominator: a
     /// count of resumed jobs means nothing without the capacity they are being bounded to.
     capacity: usize,
+    /// #1299: execution tasks spawned by [`spawn_bounded_execution`] that have not returned yet,
+    /// INCLUDING ones still waiting for a permit (which hold no slot). A drain waits for this to
+    /// reach zero; a store row count could not serve, because a resumed row skipped as already
+    /// settled can keep its non-terminal state and would hold a drain open forever.
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// #1299: decrements [`SlotGate::executions`] when an execution task ends, unwind included.
+struct ExecutionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ExecutionGuard {
+    fn enter(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// A reserved slot held for a claim that is awaiting its award. `reserved_at` bounds how long the
@@ -166,6 +187,7 @@ impl SlotGate {
             parked: Mutex::new(HashMap::new()),
             lapse_after,
             capacity: capacity.max(1),
+            executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -269,6 +291,11 @@ impl SlotGate {
     fn available(&self) -> usize {
         self.permits.available_permits()
     }
+
+    /// #1299: execution tasks not yet returned (running or waiting for a permit).
+    fn executions(&self) -> usize {
+        self.executions.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Spawn ONE execution task for `job_id`, bounded by a real slot permit no matter which path
@@ -324,7 +351,11 @@ where
         );
     }
     let slots = Arc::clone(slots);
+    // Counted from BEFORE the spawn, so a drain tick can never see the gap between the award and the
+    // task's first poll as "nothing in flight".
+    let running = ExecutionGuard::enter(&slots.executions);
     tokio::task::spawn_local(async move {
+        let _running = running;
         let slot = match parked {
             Some(permit) => Some(permit),
             None => {
@@ -4822,6 +4853,10 @@ pub struct SellerNodeRunner {
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
+    /// #1299: the drain latch (SIGUSR1). Once set the node claims nothing new, advertises
+    /// `accepting=n`, still executes awards for claims it already published, and leaves through the
+    /// ordinary exit path when no slot is held and no awarded/executing row remains.
+    drain: shutdown::DrainSignal,
     /// Backfill cadence, resolved once at boot (tests shorten it per runner, never via the env).
     wrap_backfill_interval_secs: u64,
     /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
@@ -5303,6 +5338,7 @@ impl SellerNodeRunner {
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
+            drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
             redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
@@ -5623,6 +5659,39 @@ impl SellerNodeRunner {
     /// via [`shutdown::spawn_os_signal_listener`]; an embedder can drive it directly.
     pub fn shutdown_handle(&self) -> shutdown::ShutdownHandle {
         self.shutdown.handle()
+    }
+
+    /// #1299: a handle asking this node to DRAIN — stop claiming, finish in-flight work, then leave
+    /// through the same exit path as a shutdown (terminal `accepting=n`, [`Self::run`] returns
+    /// `Ok(())`). The daemon wires it to SIGUSR1 via [`shutdown::spawn_drain_signal_listener`]. A
+    /// shutdown request during a drain still stops the node immediately.
+    pub fn drain_handle(&self) -> shutdown::DrainSignal {
+        self.drain.clone()
+    }
+
+    /// #1299: what a drain is still waiting for, or `None` when the node may leave. Counts held
+    /// slots (executing jobs, running follow-up turns, and claims parked for an award we promised to
+    /// honour) AND live execution tasks (an award whose task is still waiting for a permit holds no
+    /// slot). Durable rows are deliberately NOT counted: a resumed row skipped as settled elsewhere
+    /// keeps its state, and would hold a drain open forever. A store read failure is never "idle".
+    ///
+    /// Also waits for the unexpired outbox to empty: a delivery is enqueued, then published by the
+    /// lane's next drain pass, and a drain that left in between would make the buyer wait for the
+    /// next boot to see a result that was already finished.
+    fn drain_remaining(&self) -> Option<String> {
+        let held = self.slots.capacity.saturating_sub(self.slots.available());
+        let tasks = self.slots.executions();
+        let outbox = match self.node.store().pending_outbox(now_unix()) {
+            Ok(items) => items.len().to_string(),
+            Err(error) => format!("unknown ({error})"),
+        };
+        if held == 0 && tasks == 0 && outbox == "0" {
+            None
+        } else {
+            Some(format!(
+                "{held} slot(s) held, {tasks} job execution(s) running or queued, {outbox} unpublished event(s)"
+            ))
+        }
     }
 
     /// Subscribe (or re-subscribe) the offer REQ. `open_pool` false forces the targeted-only shape —
@@ -6264,6 +6333,8 @@ impl SellerNodeRunner {
         // [`shutdown::spawn_os_signal_listener`], or an embedder's handle). Taken once — a second
         // loop on the same node would get `None` and simply never see a request.
         let mut shutdown_rx = self.shutdown.take_receiver();
+        // #1299: set once the drain has been noticed on a drain tick (log + immediate beat once).
+        let mut drain_noticed = false;
         // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
         // pause until it drains); ticks and backfills coalesce to one pending pass each and take
         // turns with events.
@@ -6340,6 +6411,30 @@ impl SellerNodeRunner {
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
                 // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
+                    // #1299: a requested drain. First tick: say so and re-announce now
+                    // (`accepting=n`) rather than an interval later. Every tick: leave through the
+                    // ordinary exit path once nothing is held — same retraction, same lane settle,
+                    // same remittance drain as a SIGTERM, minus the interrupted jobs.
+                    if self.drain.is_requested() {
+                        if !drain_noticed {
+                            drain_noticed = true;
+                            opline!(
+                                "seller node: drain requested ({}); claiming nothing new, finishing \
+                                 in-flight work",
+                                self.drain.reason().unwrap_or("unknown")
+                            );
+                            if heartbeat_enabled && supervision.is_none() {
+                                heartbeat_tick.reset_immediately();
+                            }
+                        }
+                        match self.drain_remaining() {
+                            None => {
+                                opline!("seller node: drain complete (nothing in flight); retracting the seat and ending the loop");
+                                break;
+                            }
+                            Some(left) => opline_verbose!("seller node draining: {left}"),
+                        }
+                    }
                     queue.request_tick();
                     // R3-2: a harness dropped or came back since the last beat. Fire the heartbeat
                     // supervision NOW (its single-flight arm below) rather than an interval later, so
@@ -7081,9 +7176,19 @@ impl SellerNodeRunner {
         } else {
             roster.names.join(", ")
         };
+        // #1299: a draining seat says so first — it is not advertising, and the operator waiting to
+        // upgrade wants to know what it is still waiting for.
+        let state = if self.drain.is_requested() {
+            format!(
+                "DRAINING — {}",
+                self.drain_remaining()
+                    .unwrap_or_else(|| "idle, exiting".to_owned())
+            )
+        } else {
+            advertising_state(self.sign_in.refusal().is_some(), roster.serving).to_owned()
+        };
         opline!(
-            "seller node status: {} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
-            advertising_state(self.sign_in.refusal().is_some(), roster.serving),
+            "seller node status: {state} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
             self.slots.capacity
         );
     }
@@ -7287,7 +7392,10 @@ impl SellerNodeRunner {
         // snapshot, both reads.
         let draft = crate::heartbeat::heartbeat_for_state(
             in_flight,
-            roster.serving,
+            // #1299: a draining seat advertises `accepting=n` from the first beat after the request,
+            // so buyers stop targeting it while it finishes. The serving count is unchanged (the
+            // harnesses still work), which is how a reader tells a drain from a broken seat.
+            roster.serving && !self.drain.is_requested(),
             seller.rate_sats,
             // §4.1 — derived from the SAME `SellerConfig` `classify_offer` reads, in the same call,
             // for the same reason the admission policy below is: the ad cannot drift from its gate.
@@ -8114,6 +8222,14 @@ impl SellerNodeRunner {
         #[cfg(test)]
         self.claim_offer_entries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // #1299: a draining node takes no new work. THE SINGLE CHOKE POINT for the same reason the
+        // suppression check below lives here: both the wire path (`on_offer`) and the capacity-skip
+        // re-drive (`reconsider_capacity_skips`) claim through this function. Awards for claims
+        // already published do not come through here, so they are still honoured.
+        if self.drain.is_requested() {
+            opline_verbose!("seller node offer skip id={job_id}: draining (no new claims)");
+            return ClaimOutcome::Declined;
+        }
         // #541/#814: refuse an offer that is no longer ours to claim, before any work. Two
         // buyer-authenticated signals land here (see [`Suppression`]): a co-signed kind-3400 receipt
         // means the offer was awarded + settled (to us or another seat) and is terminal; a kind-3405
@@ -21002,6 +21118,127 @@ mod tests {
         loop_handle.abort();
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // BEGIN #1299 drain tests
+    /// Boot a 1-slot seller against the fixture with a 1 s heartbeat, for the drain teeth.
+    async fn drain_runner(label: &str, fixture: &PGateRelay) -> (SellerNodeRunner, std::path::PathBuf) {
+        let root = throwaway_root(label);
+        let home = lane_home(&root, fixture);
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        (runner, root)
+    }
+
+    /// #1299 — a draining node claims nothing new, on the shared choke point both claim paths use.
+    ///
+    /// RED ON REVERT: drop the drain check at the top of `claim_offer` and the offer goes on to its
+    /// review gate (`ReachedReview`) instead of being declined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_draining_node_declines_new_offers() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-declines", &fixture).await;
+        let buyer = Keys::generate();
+        let (id, offer) = offer_1057(&buyer, "#1299 drain", 300, now_unix() as u64 + 600);
+        assert!(runner.drain_handle().request("test drain"));
+        let outcome = runner
+            .claim_offer(
+                &id,
+                &buyer.public_key().to_hex(),
+                &offer,
+                &runner.seller_pubkey.to_hex(),
+                offer.deadline_unix,
+                now_unix(),
+                None,
+            )
+            .await;
+        assert_eq!(outcome, ClaimOutcome::Declined, "a draining node must not claim");
+        assert!(runner.node.store().claim_row_state(&id).unwrap().is_none());
+        assert_eq!(runner.slots.available(), 1, "nothing was reserved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 — a drain advertises `accepting=n` while it waits, does NOT leave while a slot is held
+    /// (an executing job, or a claim whose award it promised to honour), and leaves through the
+    /// ordinary exit path — clean return, terminal `accepting=n` — once the slot is released.
+    ///
+    /// RED ON REVERT: drop the drain arm on the drain tick and the loop never returns; make
+    /// `drain_remaining` ignore held slots and the loop returns while the slot is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_1299_a_drain_waits_for_held_work_then_leaves_cleanly() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-waits", &fixture).await;
+        let slots = Arc::clone(&runner.slots);
+        assert_eq!(slots.try_reserve("job-in-flight"), Reserve::Reserved);
+        let drain = runner.drain_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| seat_announcements(events)
+                            .iter()
+                            .any(|beat| beat.tag_value("accepting") == Some("y")))
+                        .await,
+                    "harness check: the seat advertises itself open first"
+                );
+                let before = seat_announcements(&fixture.events().await).len();
+                assert!(drain.request("test drain"));
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| {
+                            let beats = seat_announcements(events);
+                            beats.len() > before
+                                && beats.last().unwrap().tag_value("accepting") == Some("n")
+                        })
+                        .await,
+                    "a draining seat must advertise accepting=n while it finishes"
+                );
+                // Two drain ticks (5 s each) with the slot still held: the loop must stay up.
+                tokio::time::sleep(DRAIN_INTERVAL * 2 + Duration::from_millis(500)).await;
+                assert!(
+                    !loop_handle.is_finished(),
+                    "a drain must not leave while a slot is still held"
+                );
+                slots.release("job-in-flight");
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("an idle drain must RETURN, not have to be killed")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "a completed drain is a clean exit: {outcome:?}");
+        let events = fixture.events().await;
+        let terminal = *seat_announcements(&events).last().expect("a beat");
+        assert_eq!(terminal.tag_value("accepting"), Some("n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 — SIGTERM during a drain still means stop now: the loop returns although a slot is
+    /// held, exactly as an ordinary shutdown leaves in-flight rows to the boot resume path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_1299_a_shutdown_aborts_a_drain() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-abort", &fixture).await;
+        assert_eq!(runner.slots.try_reserve("job-in-flight"), Reserve::Reserved);
+        let drain = runner.drain_handle();
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                assert!(drain.request("test drain"));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(shutdown.request("SIGTERM"));
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("a shutdown during a drain must return promptly")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END #1299 drain tests
 
     // BEGIN R3-2 run-loop tests
     /// R3-2 — a seat whose harness drops republishes its beat promptly with `serving=0/1` and

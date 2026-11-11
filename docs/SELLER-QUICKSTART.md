@@ -1714,6 +1714,23 @@ announcement is a replaceable event, so nothing supersedes it until you next sta
 judge a seat announcement by its age rather than trust it outright, and why the retraction narrows
 the window rather than closing it.
 
+**Upgrading without interrupting a job: drain first.** A stop leaves running jobs to the next boot,
+which reruns an interrupted agent from the beginning. To upgrade with nothing in flight, install the
+new binary, then send the running seller **SIGUSR1** instead of SIGTERM:
+
+```bash
+systemctl --user kill -s USR1 maxplayer-seller   # systemd unit
+docker kill --signal=USR1 <container>            # docker
+kill -USR1 <pid>                                 # bare process
+```
+
+The seller then advertises `accepting=n`, claims nothing new, still honours an award for a claim it
+already published, finishes and delivers what is running, publishes its terminal `accepting=n` and
+exits 0. The status line reads `DRAINING — …` with what it is still waiting for. A unit with
+`Restart=always` comes straight back on the new binary (`Restart=on-failure` does not: exit 0 is not
+a failure). A SIGTERM during the drain still stops it at once. Parked session jobs and
+delivered-but-unpaid jobs are not waited for; both survive a restart.
+
 Restarting is the bare relaunch — config is already written:
 
 ```bash
