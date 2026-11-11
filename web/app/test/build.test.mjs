@@ -102,6 +102,12 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
       assert.ok(!pageHtml.includes(`"./${asset}"`) && !pageHtml.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
     }
   }
+  // The /skill.md bot preview page loads no script, but its stylesheets ship stamped too (advisor r1, PR #1294).
+  const preview = readFileSync(join(root, "dist", "skill-preview.html"), "utf8");
+  for (const asset of ["styles.css", "fonts.css"]) {
+    assert.ok(preview.includes(`"/${asset}?v=${stamp}"`), `${asset} is stamped in skill-preview.html`);
+    assert.ok(!preview.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in skill-preview.html`);
+  }
   // Font preload URLs must match fonts.css URLs byte-for-byte or the browser
   // fetches every preloaded font twice.
   const fontsCss = readFileSync(join(root, "dist", "fonts.css"), "utf8");

@@ -129,10 +129,19 @@ const BOTS = [
   "LinkedInBot/1.0 (compatible; Mozilla/5.0; Apache-HttpClient +http://www.linkedin.com)",
   "WhatsApp/2.23.20.0",
   "TelegramBot (like TwitterBot)",
+  "TwitterBot/1.0",
 ];
 // Everything an agent or a person fetches the skill with must still get the markdown.
 const READERS = [
   "curl/8.5.0",
+  "Wget/1.21.4",
+  "Go-http-client/1.1",
+  "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)",
+  "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GPTBot/1.2; +https://openai.com/gptbot)",
+  "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)",
+  // WhatsApp's in-app browser: only the crawler's UA *starts* with WhatsApp/ (advisor r1, PR #1294).
+  // If this matched, the preview page's only link (/skill.md) would bounce it straight back.
+  "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 WhatsApp/2.23.20.0",
   "python-requests/2.32.3",
   "node",
   "Claude-User (claude-code/2.0; +https://www.anthropic.com/)",

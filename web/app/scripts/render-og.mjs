@@ -52,6 +52,10 @@ async function shot(url, out, w, h, transparent) {
     ...(transparent ? ["--default-background-color=00000000"] : []),
     `--screenshot=${join(root, out)}`, `${base}/${url}`,
   ], { timeout: 60_000 });
+  // Fail here, not later in the tests, if Chrome wrote the wrong size (PNG IHDR: width, height at 16/20).
+  const png = readFileSync(join(root, out));
+  const [pw, ph] = [png.readUInt32BE(16), png.readUInt32BE(20)];
+  if (pw !== w || ph !== h) throw Error(`${out} is ${pw}×${ph}, expected ${w}×${h}`);
   console.log(`${out} ${w}×${h}`);
 }
 
