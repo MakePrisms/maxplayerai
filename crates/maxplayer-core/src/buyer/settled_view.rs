@@ -94,8 +94,9 @@ fn read_free_record(home: &MaxplayerHome, key: &str) -> Option<Value> {
     serde_json::from_slice(&raw).ok()
 }
 
-/// The sorted blob paths of the delivered commit's tree in the buyer store: the list
-/// `collect::materialize_delivery` writes, read without writing anything.
+/// The sorted paths `collect::materialize_delivery` writes for the delivered commit's tree in the
+/// buyer store (agent-control names already carry `collect::INERT_SUFFIX`), read without writing
+/// anything.
 fn delivery_files(home: &MaxplayerHome, commit_oid: &str) -> Result<Vec<String>, String> {
     let repo = git2::Repository::open_bare(collect::delivery_store_path(home))
         .map_err(|e| e.to_string())?;
@@ -119,7 +120,7 @@ fn delivery_files(home: &MaxplayerHome, commit_oid: &str) -> Result<Vec<String>,
         if entry.kind() == Some(git2::ObjectType::Blob)
             && let Ok(name) = entry.name()
         {
-            files.push(format!("{root}{name}"));
+            files.push(collect::materialized_path(&format!("{root}{name}")));
         }
         git2::TreeWalkResult::Ok
     });
@@ -240,7 +241,8 @@ mod tests {
         .unwrap();
     }
 
-    /// A bare buyer store holding a two-file commit under its retention ref; returns its oid.
+    /// A bare buyer store holding a three-file commit (one an agent-control name, P1) under its
+    /// retention ref; returns its oid.
     fn seed_store(home: &MaxplayerHome) -> String {
         let repo = git2::Repository::init_bare(collect::delivery_store_path(home)).unwrap();
         let readme = repo.blob(b"# delivered\n").unwrap();
@@ -250,6 +252,7 @@ mod tests {
         let sub = sub.write().unwrap();
         let mut top = repo.treebuilder(None).unwrap();
         top.insert("README.md", readme, 0o100644).unwrap();
+        top.insert("AGENTS.md", readme, 0o100644).unwrap();
         top.insert("src", sub, 0o040000).unwrap();
         let tree = repo.find_tree(top.write().unwrap()).unwrap();
         let sig = git2::Signature::now("t", "t@e").unwrap();
@@ -354,8 +357,12 @@ mod tests {
         let mut hint = settled(1);
         enrich(&home, &store, &job, &mut hint);
         assert_eq!(hint["commit_oid"], json!(paid.commit_oid));
-        assert_eq!(hint["files"], json!(["README.md", "src/lib.rs"]));
-        assert_eq!(hint["file_count"], json!(2));
+        // P1: the list names what materialize writes, so an agent-control file reads back inert.
+        assert_eq!(
+            hint["files"],
+            json!(["AGENTS.md.delivered", "README.md", "src/lib.rs"])
+        );
+        assert_eq!(hint["file_count"], json!(3));
         assert_eq!(
             hint["pay"],
             json!({"state": "closed", "amount_sats": 100, "attempt_id": attempt})

@@ -684,11 +684,13 @@ pub fn materialize_delivery(
             walk_err = Some(error);
             return git2::TreeWalkResult::Abort;
         }
-        if let Err(error) = write_under(target, &rel, blob.content()) {
+        // P1 (rc8 review): agent-instruction and harness-config names are written inert.
+        let written = materialized_path(&rel);
+        if let Err(error) = write_under(target, &written, blob.content()) {
             walk_err = Some(error);
             return git2::TreeWalkResult::Abort;
         }
-        files.push(rel);
+        files.push(written);
         git2::TreeWalkResult::Ok
     });
     // git2 >= 0.20: an aborting callback makes `walk` itself return `Err` (GIT_EUSER), so the
@@ -785,6 +787,88 @@ pub(crate) fn check_dest(dest: &Path) -> Result<(), String> {
 const PORTABLE_PATH_MAX: usize = 1024;
 /// Upper bound on a [`temp_name`] (`.maxplayer-tmp-stage-<pid>-<n>` is at most 52 bytes).
 const TEMP_NAME_MAX: usize = 64;
+
+/// Suffix materialize appends to a delivered path component an agent harness or editor would load
+/// on its own (see [`AGENT_CONTROL_NAMES`]). The bytes are kept; only the name changes, and the
+/// delivered commit in the buyer store still holds the original path.
+pub const INERT_SUFFIX: &str = ".delivered";
+
+/// P1 (v0.7.3-rc8 security review): file and directory names that agent harnesses and editors load
+/// without being asked, as project instructions (`AGENTS.md`, `CLAUDE.md`, rules files), settings
+/// and hooks (`.claude/`, `.cursor/`, `.vscode/`), MCP/tool servers (`.mcp.json`,
+/// `opencode.json`) or shell code (`.envrc`, run by direnv on `cd`). A delivery is seller-authored
+/// data, but a harness gives these names the authority of the buyer's own project rules, and some
+/// load them from any directory an agent reads in (Codex/Claude nested `AGENTS.md`/`CLAUDE.md`).
+/// Matched per path component, after the same case/Unicode folding [`collision_key`] uses, so
+/// `Agents.MD` or `.Claude` on a case-insensitive volume is caught too. Lowercase.
+///
+/// A deny-list lags new harnesses; extend it when one adds an auto-loaded name. Not covered:
+/// names only loaded under a parent (e.g. `.github/instructions/`), and a buyer who opens a
+/// results folder as a workspace with tools that read every file.
+const AGENT_CONTROL_NAMES: &[&str] = &[
+    // Instruction files.
+    "agents.md",
+    "agent.md",
+    "claude.md",
+    "claude.local.md",
+    "gemini.md",
+    "crush.md",
+    "copilot-instructions.md",
+    ".cursorrules",
+    ".windsurfrules",
+    ".clinerules",
+    ".roorules",
+    ".goosehints",
+    ".rules",
+    // Tool, MCP and execution config.
+    ".mcp.json",
+    "opencode.json",
+    "opencode.jsonc",
+    ".aider.conf.yml",
+    ".envrc",
+    // Harness and editor directories (settings, hooks, rules, skills, tasks).
+    ".agents",
+    ".amazonq",
+    ".claude",
+    ".codex",
+    ".continue",
+    ".cursor",
+    ".gemini",
+    ".goose",
+    ".junie",
+    ".kiro",
+    ".opencode",
+    ".roo",
+    ".vscode",
+    ".windsurf",
+    ".zed",
+];
+
+/// True when `component` is an [`AGENT_CONTROL_NAMES`] entry on any volume the buyer may use.
+fn is_agent_control_name(component: &str) -> bool {
+    let key = collision_key(component);
+    AGENT_CONTROL_NAMES.contains(&key.as_str())
+}
+
+/// The path materialize writes a validated delivered path at: every component that is an agent-
+/// control name gets [`INERT_SUFFIX`] (`AGENTS.md` → `AGENTS.md.delivered`, `.claude/settings.json`
+/// → `.claude.delivered/settings.json`); every other component is unchanged. The pre-pay check,
+/// the write and `get_job`'s file list all use this one mapping.
+pub fn materialized_path(rel: &str) -> String {
+    if !rel.split('/').any(is_agent_control_name) {
+        return rel.to_owned();
+    }
+    rel.split('/')
+        .map(|component| {
+            if is_agent_control_name(component) {
+                format!("{component}{INERT_SUFFIX}")
+            } else {
+                component.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
 
 /// Refuse a seller-authored delivery path that is not a plain relative path under the results
 /// directory: empty, absolute, `.`/`..`/empty components, `.git` (any case), backslashes, colons
@@ -915,6 +999,13 @@ pub fn validate_tree_paths(repo: &git2::Repository, tree: &git2::Tree<'_>) -> Re
             ));
         }
         let path = format!("{root}{name}");
+        if let Err(error) = validate_delivery_path(&path) {
+            return refuse(error);
+        }
+        // P1: materialize writes agent-control names with INERT_SUFFIX, so the written path is
+        // the one that must fit the length bounds and must not collide (`AGENTS.md` next to a
+        // delivered `AGENTS.md.delivered` would be one file on disk).
+        let path = materialized_path(&path);
         if let Err(error) = validate_delivery_path(&path) {
             return refuse(error);
         }
@@ -1197,6 +1288,146 @@ mod tests {
         let again = materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("re-materialize");
         assert_eq!(again, files);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Build a buyer store whose delivered tree holds `files` (slash paths, nested trees built as
+    /// needed), each blob's content being its own path. Returns the commit hex.
+    fn seed_paths_store(store: &Path, files: &[&str]) -> String {
+        fn build(repo: &git2::Repository, files: &[(Vec<&str>, &str)]) -> git2::Oid {
+            let mut top = repo.treebuilder(None).expect("tree");
+            let mut subdirs: std::collections::BTreeMap<&str, Vec<(Vec<&str>, &str)>> =
+                Default::default();
+            for (parts, full) in files {
+                if parts.len() == 1 {
+                    let blob = repo.blob(full.as_bytes()).expect("blob");
+                    top.insert(parts[0], blob, 0o100644).expect("insert blob");
+                } else {
+                    subdirs.entry(parts[0]).or_default().push((parts[1..].to_vec(), full));
+                }
+            }
+            for (name, children) in subdirs {
+                let oid = build(repo, &children);
+                top.insert(name, oid, 0o040000).expect("insert subtree");
+            }
+            top.write().expect("write tree")
+        }
+        let repo = git2::Repository::init_bare(store).expect("init store");
+        let split: Vec<(Vec<&str>, &str)> =
+            files.iter().map(|path| (path.split('/').collect(), *path)).collect();
+        let tree = repo.find_tree(build(&repo, &split)).expect("find tree");
+        let sig = git2::Signature::now("t", "t@e").expect("sig");
+        let commit_oid = repo.commit(None, &sig, &sig, "delivery", &tree, &[]).expect("commit");
+        let commit_hex = commit_oid.to_string();
+        repo.reference(&PayPathDeliveryVerifier::store_ref_for(&commit_hex), commit_oid, true, "retain")
+            .expect("retain ref");
+        commit_hex
+    }
+
+    // P1 (v0.7.3-rc8 security review): a delivery carrying agent-instruction or harness-config
+    // files must not land under the names a harness auto-loads. Each is written with
+    // INERT_SUFFIX, bytes unchanged; ordinary files keep their names.
+    #[test]
+    fn materialize_delivery_writes_agent_control_files_inert() {
+        let root = temp_root("agent-control");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let delivered = [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "docs/Agents.MD",
+            ".cursorrules",
+            ".mcp.json",
+            ".envrc",
+            ".claude/settings.json",
+            ".vscode/tasks.json",
+            ".cursor/rules/x.mdc",
+            "README.md",
+            "src/agents.rs",
+            "my.claude/notes.txt",
+        ];
+        let commit_hex = seed_paths_store(&store, &delivered);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+
+        let files = materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("materialize");
+        let mut expected = vec![
+            "AGENTS.md.delivered",
+            "CLAUDE.md.delivered",
+            "docs/Agents.MD.delivered",
+            ".cursorrules.delivered",
+            ".mcp.json.delivered",
+            ".envrc.delivered",
+            ".claude.delivered/settings.json",
+            ".vscode.delivered/tasks.json",
+            ".cursor.delivered/rules/x.mdc",
+            "README.md",
+            "src/agents.rs",
+            "my.claude/notes.txt",
+        ];
+        expected.sort();
+        assert_eq!(files, expected);
+        for (original, written) in delivered.iter().zip(
+            delivered.iter().map(|path| materialized_path(path)),
+        ) {
+            assert_eq!(
+                std::fs::read_to_string(dest.join(&written)).expect("written file"),
+                *original,
+                "{original} must keep its bytes under {written}"
+            );
+        }
+        for loaded in [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "docs/Agents.MD",
+            ".cursorrules",
+            ".mcp.json",
+            ".envrc",
+            ".claude",
+            ".vscode",
+            ".cursor",
+        ] {
+            assert!(
+                std::fs::symlink_metadata(dest.join(loaded)).is_err(),
+                "{loaded} must not exist under the results folder"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // P1: the inert name is checked before pay like any other written path. A seller delivering
+    // both `AGENTS.md` and `AGENTS.md.delivered` names one file twice: refused, nothing written.
+    #[test]
+    fn a_delivered_name_that_collides_with_an_inert_rename_is_refused_before_pay() {
+        let root = temp_root("inert-collision");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let commit_hex = seed_paths_store(&store, &["AGENTS.md", "agents.md.DELIVERED"]);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let error = validate_delivery_tree_in_store(&store, &store_ref, &commit_hex)
+            .expect_err("the pre-pay check must refuse the collision");
+        assert!(error.contains("appears twice"), "{error}");
+        let dest = root.join("out");
+        assert!(materialize_delivery(&store, &store_ref, &commit_hex, &dest).is_err());
+        assert!(!dest.exists(), "a refused delivery writes nothing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialized_path_maps_only_agent_control_components() {
+        for (delivered, written) in [
+            ("README.md", "README.md"),
+            ("AGENTS.md", "AGENTS.md.delivered"),
+            ("a/b/CLAUDE.md", "a/b/CLAUDE.md.delivered"),
+            (".claude/agents/x.md", ".claude.delivered/agents/x.md"),
+            (".Claude/CLAUDE.md", ".Claude.delivered/CLAUDE.md.delivered"),
+            ("AGENTS.md.delivered", "AGENTS.md.delivered"),
+            ("notAGENTS.md", "notAGENTS.md"),
+            ("agents", "agents"),
+            // HFS+ ignores U+200C when it compares names, so this IS `.claude` there.
+            (".cla\u{200C}ude/x", ".cla\u{200C}ude.delivered/x"),
+        ] {
+            assert_eq!(materialized_path(delivered), written, "{delivered:?}");
+        }
     }
 
     // git2 >= 0.20 makes an aborted `Tree::walk` return `Err` itself, which used to pre-empt the
