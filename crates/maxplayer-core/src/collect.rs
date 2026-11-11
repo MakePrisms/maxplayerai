@@ -859,8 +859,15 @@ fn portable_component(component: &str) -> bool {
 /// store, never accept a pair macOS cannot.
 fn collision_key(path: &str) -> String {
     use unicode_normalization::UnicodeNormalization as _;
+    // ASCII has no decomposition, no ignorables and a 1:1 case map: the same key, cheaply. Nearly
+    // every honest tree takes this path (#1290 fable r3 L2).
+    if path.is_ascii() {
+        return path.to_ascii_lowercase();
+    }
     let stripped: String = path.nfd().filter(|c| !is_hfs_ignorable(*c)).collect();
-    stripped.to_uppercase().to_lowercase().nfd().collect()
+    // lower→upper→lower: the leading lowercase sends `ẞ` (already uppercase) to `ß`, which then
+    // folds with `ß` and `ss` (#1290 fable r3 L1).
+    stripped.to_lowercase().to_uppercase().to_lowercase().nfd().collect()
 }
 
 /// Code points HFS+ skips when comparing names (git `is_hfs_dotgit`).
@@ -914,7 +921,7 @@ pub fn validate_tree_paths(repo: &git2::Repository, tree: &git2::Tree<'_>) -> Re
         // Names APFS/HFS+ would store as one file collide: case, Unicode form, ignorables.
         if !seen.insert(collision_key(&path)) {
             return refuse(format!(
-                "delivery path {} appears twice (or twice up to letter case); refusing the delivery",
+                "delivery path {} appears twice (up to letter case or Unicode form); refusing the delivery",
                 shown(&path)
             ));
         }
@@ -1475,6 +1482,8 @@ mod tests {
             ("\u{212a}ey", "key"),
             ("a\u{200c}b", "ab"),
             ("Dir/X.md", "dir/x.md"),
+            ("\u{1e9e}", "\u{df}"),
+            ("\u{1e9e}x", "ssx"),
         ] {
             assert_eq!(collision_key(a), collision_key(b), "{a:?} vs {b:?}");
         }
@@ -1505,6 +1514,11 @@ mod tests {
         let error = check_dest(&deep).expect_err("no room left for the longest delivery");
         assert!(error.contains("nothing was paid"), "got: {error}");
         assert!(validate_delivery_path(&"a".repeat(513)).is_err(), "over the path bound");
+        // fable r3 L3: legal components, so only the 512-byte bound can refuse it.
+        let at = |tail: usize| format!("{}/{}", vec!["a".repeat(200); 2].join("/"), "b".repeat(tail));
+        assert_eq!(at(110).len(), 512);
+        validate_delivery_path(&at(110)).expect("512 bytes is the bound");
+        assert!(validate_delivery_path(&at(111)).is_err(), "513 bytes must refuse");
         assert!(validate_delivery_path(&"a/".repeat(200)[..399]).is_ok(), "a 399-byte path is fine");
     }
 
@@ -1563,7 +1577,9 @@ mod tests {
         let error = validate_delivery_tree_in_store(&store, &PayPathDeliveryVerifier::store_ref_for(&bomb), &bomb)
             .expect_err("a 2^20-path tree must refuse");
         assert!(error.contains("more than"), "got: {error}");
-        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+        // The entry-cap message above proves the walk was cut short; the clock only catches a
+        // pathological regression, with room for slow unoptimised builds (fable r3 L2).
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "took {:?}", started.elapsed());
         let _ = std::fs::remove_dir_all(&root);
     }
 
