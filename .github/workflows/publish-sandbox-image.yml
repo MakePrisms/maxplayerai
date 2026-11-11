@@ -119,14 +119,18 @@ jobs:
       # but bricks the seat. Publishing them together is what makes that pair impossible to break.
       NETFILTER_IMAGE_NAME: makeprisms/maxplayer-netfilter
     steps:
-      # Check out the ref being released so the Dockerfile (and its pinned adapters) is exactly the one
-      # that tag names — not whatever main happens to be at publish time. `inputs.tag` (not
-      # `github.event.inputs.tag`) so the workflow_call path checks out the same tag the version step
-      # below reads; under workflow_call `github.event` is the caller's push payload, which has none.
-      - name: Checkout the released ref
+      # Check out the commit being released so the Dockerfile (and its pinned adapters) is exactly the
+      # one that release names — not whatever main happens to be at publish time.
+      # - release / workflow_call: the event's own commit (`github.sha`: the tagged release's commit,
+      #   or the caller's tag push). It cannot move, and no branch can shadow it.
+      # - workflow_dispatch: the tag the operator named, fully qualified, so a branch with the same
+      #   name is never built in its place (#1293 review M1). An empty input fails the checkout.
+      # No credentials persist: nothing in this job talks to git over the network.
+      - name: Checkout the released commit
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.sha }}
+          persist-credentials: false
 
       # Resolve the version tag and decide whether :latest moves. A prerelease (or any manual dispatch)
       # publishes the version tag ALONE, leaving :latest pointing at the last stable image — mirroring
@@ -192,6 +196,12 @@ jobs:
           # states the commit. After the checkout, `git rev-parse HEAD` is the released ref in all
           # three trigger shapes. Resolved ONCE here so both architecture legs stamp the same commit.
           commit="$(git rev-parse HEAD)"
+          # Outside a manual dispatch the checkout above is pinned to the event's commit; prove it,
+          # so an edit to that `ref:` cannot silently go back to resolving a name.
+          if [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] && [ "$commit" != "$GITHUB_SHA" ]; then
+            echo "checked out $commit, but this run is for $GITHUB_SHA" >&2
+            exit 1
+          fi
 
           echo "version=$version"               >> "$GITHUB_OUTPUT"
           echo "tags=$tags"                     >> "$GITHUB_OUTPUT"
@@ -251,6 +261,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.plan.outputs.commit }}
+          # This job holds `packages: write`; keep the token out of .git/config (#1293 review L3).
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -298,6 +310,7 @@ jobs:
       # reference and fail with a much less obvious message, one job later.
       - name: Write the digests out
         env:
+          PLATFORM: ${{ matrix.platform }}
           SANDBOX_DIGEST: ${{ steps.build.outputs.digest }}
           NETFILTER_DIGEST: ${{ steps.build_netfilter.outputs.digest }}
         run: |
@@ -309,8 +322,8 @@ jobs:
           mkdir -p /tmp/digests/sandbox /tmp/digests/netfilter
           echo "$SANDBOX_DIGEST"   > /tmp/digests/sandbox/digest
           echo "$NETFILTER_DIGEST" > /tmp/digests/netfilter/digest
-          echo "sandbox ${{ matrix.platform }} -> $SANDBOX_DIGEST"
-          echo "netfilter ${{ matrix.platform }} -> $NETFILTER_DIGEST"
+          echo "sandbox $PLATFORM -> $SANDBOX_DIGEST"
+          echo "netfilter $PLATFORM -> $NETFILTER_DIGEST"
 
       # `retention-days: 1`: these are a handoff between two jobs of one run, not an artifact anyone
       # downloads later. The durable handles are the manifest-list digests in the run summary.
