@@ -14,9 +14,31 @@ use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The ACP protocol version this client speaks: **v1**, the stable protocol.
+///
+/// It was `2` (#1289), but nothing in this driver speaks v2. ACP v2 is the SDK's experimental
+/// DRAFT (`@agentclientprotocol/sdk` 2.x, `v2/unstable`), with its own wire: `initialize` requires
+/// `info` (not `clientInfo`) and answers `info`/`capabilities` (not `agentInfo`/`agentCapabilities`),
+/// and it has no `session/load`. Every adapter-detection read in `acp_driver.rs` (`agentInfo.name`,
+/// `agentCapabilities.loadSession`) and the session-job reload path are v1 shapes.
+///
+/// Requesting `2` was harmless while the adapters were v1-only — claude-agent-acp 0.85.0,
+/// codex-acp 2.1.1, cursor-agent, opencode and gemini all negotiate a `2` request down to `1`. The
+/// v2-capable adapters the v0.7.3-rc7 image bakes (claude-agent-acp 0.104.1 on sdk 2.5.0,
+/// codex-acp 2.6.0 on sdk 2.4.0) route a request of `>= 2` to their v2 draft implementation, whose
+/// schema rejected our params (`invalid initialize params … path ["info"]`), and every stock-image
+/// claude/codex seat restart-looped. Sending `info` would have passed the handshake but landed the
+/// seat on the draft wire, where the detection reads above silently stop matching. Asking for `1`
+/// gets the v1 implementation from every adapter, old and new.
+pub const PROTOCOL_VERSION: u32 = 1;
 pub type SessionId = String;
 
+/// ACP v1 `initialize` params.
+///
+/// No `clientInfo`, deliberately (#1291 review M1): v1 makes it optional, the fix for #1289 does not
+/// need it, and it is not neutral — codex-acp forwards `clientInfo.name` to Codex as the session's
+/// originator, so sending it would change how every codex seat identifies itself upstream. Add it
+/// on its own, with an authenticated codex turn behind it, if it is ever wanted.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Initialize {

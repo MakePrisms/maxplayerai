@@ -21,7 +21,7 @@ rl.on("line", async (line) => {
   const params = req.params || {};
   switch (req.method) {
     case "initialize":
-      send({ id: req.id, result: { protocolVersion: 2, agentCapabilities: {}, agentInfo: { name: "stub-challenge-agent", version: "0.1.0" } } });
+      send({ id: req.id, result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: "stub-challenge-agent", version: "0.1.0" } } });
       break;
     case "session/new": {
       const id = `stub-${sessions.size + 1}`;

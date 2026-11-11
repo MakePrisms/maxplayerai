@@ -43,7 +43,7 @@ fn write_stub_agent(dir: &std::path::Path) -> std::path::PathBuf {
     let body = format!(
         "#!/bin/sh\n\
          read _req\n\
-         printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":2}}}}'\n\
+         printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"protocolVersion\":1}}}}'\n\
          read _req\n\
          printf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{{\"sessionId\":\"stub\"}}}}'\n\
          read _req\n\

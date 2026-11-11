@@ -88,6 +88,9 @@ pub struct AcpDriver {
     is_codex_adapter: bool,
     /// `initialize` advertised `agentCapabilities.loadSession` (session jobs, §6.3).
     load_session_supported: bool,
+    /// The `protocolVersion` the agent's `initialize` result carried, verbatim; `None` when absent
+    /// or not an unsigned integer. Kept apart from the negotiated version, which falls back to ours.
+    answered_protocol_version: Option<u64>,
     codex_session: Option<crate::home::CodexSessionSettings>,
 }
 
@@ -113,6 +116,7 @@ impl AcpDriver {
             is_claude_adapter: false,
             is_codex_adapter: false,
             load_session_supported: false,
+            answered_protocol_version: None,
             codex_session: None,
         }
     }
@@ -406,17 +410,11 @@ impl Driver for AcpDriver {
         self.is_codex_adapter = result.pointer("/agentInfo/name").and_then(Value::as_str)
             == Some("@agentclientprotocol/codex-acp");
         self.load_session_supported = advertises_load_session(&result);
-        let protocol_version = result
+        self.answered_protocol_version = result
             .get("protocol_version")
             .or_else(|| result.get("protocolVersion"))
-            .and_then(Value::as_u64)
-            .map(|value| value as u32)
-            .unwrap_or(PROTOCOL_VERSION);
-        if !supports_negotiated_protocol(protocol_version) {
-            return Err(DriverError::Other(format!(
-                "unsupported ACP protocol version {protocol_version}"
-            )));
-        }
+            .and_then(Value::as_u64);
+        let protocol_version = negotiate_protocol(self.answered_protocol_version, &result)?;
         Ok(Readiness {
             runtime_id: self.command.runtime_id(),
             protocol_version,
@@ -1309,8 +1307,40 @@ fn stop_reason_from_params(params: &Value) -> StopReason {
         .unwrap_or(StopReason::Failed)
 }
 
-fn supports_negotiated_protocol(protocol_version: u32) -> bool {
-    (1..=PROTOCOL_VERSION).contains(&protocol_version)
+/// The protocol version to run with, given what the agent's `initialize` answered.
+///
+/// An absent version is taken as ours (pre-existing leniency). `1` is v1. An answer ABOVE ours is
+/// tolerated when the result is still v1-shaped (`agentCapabilities` or `agentInfo`): until #1291
+/// this client asked for `2` and accepted `1..=2`, so an agent that echoes a hard-coded `2` while
+/// speaking v1 — which this repo's own stubs did — worked yesterday, and refusing it would
+/// restart-loop its seat exactly the way #1289 did (#1291 review M2). It is warned about, and run
+/// as v1, because v1 is all this driver speaks. A higher answer WITHOUT v1 shapes is a different
+/// protocol and is refused with an error that says what to change; `0` is refused.
+fn negotiate_protocol(
+    answered: Option<u64>,
+    initialize_result: &Value,
+) -> Result<u32, DriverError> {
+    let Some(answered) = answered else {
+        return Ok(PROTOCOL_VERSION);
+    };
+    if answered == u64::from(PROTOCOL_VERSION) {
+        return Ok(PROTOCOL_VERSION);
+    }
+    let v1_shaped = initialize_result.get("agentCapabilities").is_some()
+        || initialize_result.get("agentInfo").is_some();
+    if answered > u64::from(PROTOCOL_VERSION) && v1_shaped {
+        eprintln!(
+            "acp: initialize: the agent answered ACP protocol version {answered} to a v{PROTOCOL_VERSION} \
+             request but replied with v1 fields; running it as v{PROTOCOL_VERSION}. Have the agent \
+             answer protocolVersion {PROTOCOL_VERSION}."
+        );
+        return Ok(PROTOCOL_VERSION);
+    }
+    Err(DriverError::Other(format!(
+        "unsupported ACP protocol version {answered}: maxplayer speaks ACP v{PROTOCOL_VERSION} \
+         only and requested it; the agent must answer protocolVersion {PROTOCOL_VERSION} with a v1 \
+         initialize result (agentCapabilities/agentInfo)"
+    )))
 }
 
 #[cfg(test)]
@@ -2187,10 +2217,15 @@ mod tests {
     fn request_side_wire_uses_real_acp_camel_case() {
         let initialize =
             serde_json::to_value(Initialize::new(Caps::default())).expect("serialize initialize");
+        // ACP v1 (#1289): `protocolVersion: 1` keeps every adapter — including the v2-capable
+        // claude-agent-acp 0.104.1 / codex-acp 2.6.0 — on its v1 implementation, whose answer is the
+        // `agentInfo`/`agentCapabilities` shape `ready` reads. A `2` here routes those adapters to the
+        // v2 draft schema, which refused these params on every stock rc7 claude/codex seat. No
+        // `clientInfo`: codex-acp forwards it to Codex as the originator (see `Initialize`).
         assert_eq!(
             initialize,
             json!({
-                "protocolVersion": 2,
+                "protocolVersion": 1,
                 "clientCapabilities": {
                     "methods": []
                 }
@@ -2229,12 +2264,155 @@ mod tests {
         );
     }
 
+    /// #1289: THIS client's real `initialize` — `AcpDriver::ready`, not a hand-built payload — against
+    /// real adapter binaries. The rc7 release check drove `initialize` with a generic client, so a
+    /// params shape every v2-capable adapter refuses shipped green.
+    ///
+    /// Ignored because it needs the binaries; `scripts/check-acp-initialize.sh` installs the adapter
+    /// versions the sandbox Dockerfile pins (read from the Dockerfile, so a pin bump re-runs this),
+    /// the previous pins seats still run on derived images, and the pinned cursor-agent, then runs
+    /// this test with `MAXPLAYER_ACP_ADAPTERS` set. CI runs it in `build-acp` and before every
+    /// sandbox image publish.
+    ///
+    /// `MAXPLAYER_ACP_ADAPTERS` is `;`-separated `label|kind|program|arg…`, kind one of
+    /// `claude`/`codex`/`generic`. It must name at least one adapter: an empty run proves nothing.
+    /// Claude rows also open a real `session/new` with the driver's params (claude-agent-acp answers
+    /// it without credentials); codex needs auth there, so its rows stop at `initialize`.
+    ///
+    /// Every adapter runs to the end and is shut down whatever happened, then all failures are
+    /// reported together: a mid-loop panic would skip `shutdown()` and leak an agent that does not
+    /// exit on stdin EOF (#1291 review L2).
+    #[tokio::test]
+    #[ignore = "needs real ACP adapter binaries; run via scripts/check-acp-initialize.sh"]
+    async fn real_adapters_accept_this_clients_initialize() {
+        let spec = std::env::var("MAXPLAYER_ACP_ADAPTERS")
+            .expect("MAXPLAYER_ACP_ADAPTERS must list the adapters to check");
+        let path = std::env::var("PATH").unwrap_or_default();
+        let mut passed = Vec::new();
+        let mut failed = Vec::new();
+        for entry in spec
+            .split(';')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+        {
+            let mut parts = entry.split('|');
+            let label = parts.next().unwrap_or_default().to_owned();
+            let (Some(kind), Some(program)) = (parts.next(), parts.next()) else {
+                failed.push(format!("{label}: malformed entry {entry:?}"));
+                continue;
+            };
+            let args = parts.map(str::to_owned).collect();
+            // A fresh, private scratch HOME per adapter, removed on every path (#1291 review L3):
+            // the handshake must not read or write any real harness login, nor see the last row's.
+            let home = tempfile::tempdir().expect("scratch HOME");
+            let cwd = tempfile::tempdir().expect("scratch cwd");
+            let command = AgentCommand::new(program.to_owned(), args).with_env(vec![
+                ("PATH".into(), path.clone()),
+                ("HOME".into(), home.path().display().to_string()),
+            ]);
+            let mut driver =
+                AcpDriver::new(command, PermissionOutcome::Allow, Duration::from_secs(60));
+            let outcome = check_real_adapter(&mut driver, kind, cwd.path()).await;
+            let _ = driver.shutdown().await;
+            match outcome {
+                Ok(()) => passed.push(label),
+                Err(reason) => failed.push(format!("{label}: {reason}")),
+            }
+        }
+        eprintln!("initialize accepted by: {}", passed.join(", "));
+        assert!(
+            failed.is_empty(),
+            "adapters that refused this client:\n{}",
+            failed.join("\n")
+        );
+        assert!(
+            !passed.is_empty(),
+            "MAXPLAYER_ACP_ADAPTERS named no adapter"
+        );
+    }
+
+    async fn check_real_adapter(
+        driver: &mut AcpDriver,
+        kind: &str,
+        cwd: &std::path::Path,
+    ) -> Result<(), String> {
+        let ready = driver
+            .ready()
+            .await
+            .map_err(|error| format!("refused this client's initialize: {error:?}"))?;
+        // The answer itself, not the negotiated value: `ready` falls back to ours when the agent
+        // names no version, which would make a bare `== 1` vacuous (#1291 review L4).
+        if driver.answered_protocol_version != Some(1) || ready.protocol_version != 1 {
+            return Err(format!(
+                "answered protocolVersion {:?}, negotiated {}; must answer 1",
+                driver.answered_protocol_version, ready.protocol_version
+            ));
+        }
+        // The v1 answer is what every adapter-specific path reads. A v2-draft answer (`info`,
+        // `capabilities`) would pass the handshake and fail these silently.
+        let detected = match kind {
+            "claude" => driver.is_claude_adapter,
+            "codex" => driver.is_codex_adapter,
+            "generic" => !driver.is_claude_adapter && !driver.is_codex_adapter,
+            other => return Err(format!("unknown kind {other:?}")),
+        };
+        if !detected {
+            return Err(format!("agentInfo.name not read as {kind}"));
+        }
+        // Every row we run today advertises it; a future generic row that does not is a product
+        // question, not necessarily a bug — drop this check for that row rather than the row.
+        if !driver.supports_load_session() {
+            return Err(
+                "agentCapabilities.loadSession not read (session jobs lose reloads)".into(),
+            );
+        }
+        if kind == "claude" {
+            let session = driver
+                .start_session(SessionConfig {
+                    cwd: cwd.to_path_buf(),
+                    mcp_servers: Vec::new(),
+                    env: Vec::new(),
+                })
+                .await
+                .map_err(|error| format!("refused this client's session/new: {error:?}"))?;
+            if session.is_empty() {
+                return Err("session/new returned an empty session id".into());
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn negotiated_protocol_accepts_real_acp_v1() {
-        assert!(supports_negotiated_protocol(1));
-        assert!(supports_negotiated_protocol(PROTOCOL_VERSION));
-        assert!(!supports_negotiated_protocol(0));
-        assert!(!supports_negotiated_protocol(PROTOCOL_VERSION + 1));
+        let v1 = json!({"agentCapabilities": {"loadSession": true}, "agentInfo": {"name": "x"}});
+        assert_eq!(negotiate_protocol(Some(1), &v1).unwrap(), 1);
+        // Absent stays lenient: an agent that names no version is taken at ours.
+        assert_eq!(negotiate_protocol(None, &json!({})).unwrap(), 1);
+        assert!(negotiate_protocol(Some(0), &v1).is_err());
+    }
+
+    /// #1291 review M2: the literal `2` an agent hard-coded while this client still asked for it.
+    /// v1-shaped, it keeps working (as v1); without v1 shapes it is refused, and says what to fix.
+    #[test]
+    fn a_v1_shaped_answer_of_2_still_runs_as_v1() {
+        let v1_caps = json!({"protocolVersion": 2, "agentCapabilities": {}});
+        let v1_info = json!({"protocolVersion": 2, "agentInfo": {"name": "stub"}});
+        assert_eq!(negotiate_protocol(Some(2), &v1_caps).unwrap(), 1);
+        assert_eq!(negotiate_protocol(Some(2), &v1_info).unwrap(), 1);
+
+        let draft = json!({"protocolVersion": 2, "info": {"name": "x", "version": "1"}, "capabilities": {}});
+        let error = negotiate_protocol(Some(2), &draft).unwrap_err();
+        let DriverError::Other(message) = error else {
+            panic!("unexpected error kind");
+        };
+        assert!(
+            message.contains("unsupported ACP protocol version 2"),
+            "{message}"
+        );
+        assert!(
+            message.contains("must answer protocolVersion 1"),
+            "{message}"
+        );
     }
 
     #[test]

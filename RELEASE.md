@@ -243,6 +243,13 @@ release ships. That line is only the request, though — `scripts/verify-seller-
 artifact. `flake.nix` still relies on `default` for `buyer-static`; making it explicit there too is a
 loose end.
 
+**Sandbox adapter pins are checked against this client's real `initialize`.** Bumping
+`@agentclientprotocol/claude-agent-acp`, `@agentclientprotocol/codex-acp` or the cursor tarball in
+`docker/maxplayer-sandbox/Dockerfile` re-runs `scripts/check-acp-initialize.sh` in CI's `build-acp` job
+and again before `publish-sandbox-image.yml` pushes anything (#1289: v0.7.3-rc7 shipped adapters that
+refused the client). Keep each pin exact and on one line outside comments, or the script fails. When
+the fleet no longer runs the previous adapters, move `claude_prev` / `codex_prev` in the script.
+
 ## Reproducibility cross-check (darwin, optional)
 
 A darwin binary built on a different machine will not hash the same as CI's even when the code is
