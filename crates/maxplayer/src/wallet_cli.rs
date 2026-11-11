@@ -6,7 +6,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use maxplayer_core::home::{self, MaxplayerHome, DEFAULT_MINIBITS_MINT_URL, DEFAULT_MINT_URL};
+use maxplayer_core::home::{self, DEFAULT_MINIBITS_MINT_URL, DEFAULT_MINT_URL, MaxplayerHome};
 #[cfg(feature = "wallet")]
 use maxplayer_core::wallet_ops;
 
@@ -351,7 +351,8 @@ fn cmd_setup(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     // #445 (Option 1, fail-closed): never SILENTLY auto-fund play money from invisible home state.
     // If setup resolves to the testnut play mint without the user naming it via `--mint`, refuse and
     // force the money-type decision into the open — a money act must be affirmed, not defaulted.
-    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint()) {
+    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint())
+    {
         let _ = writeln!(err, "{reason}");
         return RUNTIME_ERROR;
     }
@@ -456,6 +457,8 @@ fn setup_needs_payment_summary(quote: &wallet_ops::MintQuote) -> String {
 
 /// One `wallet balance` row: mint URL, role, balance. A play-money marker trails the row only for a
 /// dev play mint; ordinary mints carry no class label — the URL is the mint's identity (#577).
+/// `name="…"` follows the URL only when the mint named itself (self-chosen, like a seller's kind-0
+/// name; `display_mint_name` keeps it from forging another field), so unnamed rows keep the old grammar.
 #[cfg(feature = "wallet")]
 fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
     // `reserved_sats` only when something is held, so the common line keeps its exact grammar.
@@ -464,8 +467,14 @@ fn balance_row_line(row: &wallet_ops::MintBalance) -> String {
     } else {
         String::new()
     };
+    let name = row
+        .name
+        .as_deref()
+        .and_then(|name| maxplayer_core::mint_wire::display_mint_name(Some(name)))
+        .map(|name| format!(" name=\"{name}\""))
+        .unwrap_or_default();
     format!(
-        "mint={} role={} balance_sats={}{reserved}{}",
+        "mint={}{name} role={} balance_sats={}{reserved}{}",
         row.mint_url,
         if !row.configured {
             "unconfigured"
@@ -696,7 +705,13 @@ fn required(value: Option<String>, flag: &str) -> Result<String, String> {
 #[cfg(feature = "wallet")]
 fn parse_complete_locked(
     args: &[String],
-) -> Result<(Option<PathBuf>, maxplayer_core::authorize_pay::CompleteLockedRequest), String> {
+) -> Result<
+    (
+        Option<PathBuf>,
+        maxplayer_core::authorize_pay::CompleteLockedRequest,
+    ),
+    String,
+> {
     use maxplayer_core::authorize_pay::CompleteLockedRequest;
 
     let mut home: Option<PathBuf> = None;
@@ -826,7 +841,8 @@ fn cmd_mint(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     // #445 (Option 1, fail-closed): `wallet mint` tops up via the same auto-funding mint_blocking
     // path as `setup`, so a SILENT testnut auto-fund is refused identically — a money act is affirmed
     // with `--mint`, never defaulted from invisible home state. Same predicate, same placement.
-    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint()) {
+    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint())
+    {
         let _ = writeln!(err, "{reason}");
         return RUNTIME_ERROR;
     }
@@ -877,8 +893,12 @@ fn cmd_mint_complete(args: &[String], out: &mut dyn Write, err: &mut dyn Write) 
         Ok(home) => home,
         Err(code) => return code,
     };
-    match wallet_ops::complete_mint_by_id_blocking(&home, quote_id, opts.amount, opts.mint.as_deref())
-    {
+    match wallet_ops::complete_mint_by_id_blocking(
+        &home,
+        quote_id,
+        opts.amount,
+        opts.mint.as_deref(),
+    ) {
         Ok(outcome) => {
             let _ = writeln!(
                 out,
@@ -1357,7 +1377,8 @@ fn cmd_invoice(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32
     // #445 (Option 1, fail-closed): `wallet invoice` auto-funds via invoice_blocking (the testnut
     // dev mint self-settles), so a SILENT testnut auto-fund is refused identically to `setup`/`mint` —
     // the money-type decision is forced open with `--mint`, never defaulted. Same predicate, same placement.
-    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint()) {
+    if let Some(reason) = refuse_silent_play_money(opts.mint.as_deref(), home.config.default_mint())
+    {
         let _ = writeln!(err, "{reason}");
         return RUNTIME_ERROR;
     }
@@ -1448,6 +1469,18 @@ fn cmd_mints(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                     let _ = writeln!(out, "added mint={normalized}");
                     if let Some(hint) = seller_mint_hint(&home, &normalized) {
                         let _ = writeln!(out, "{hint}");
+                    }
+                    // Re-adding a mint the wallet already uses refreshes the name `balance` shows.
+                    // Best effort: the add itself already succeeded.
+                    match wallet_ops::refresh_mint_name(&home, &normalized) {
+                        Ok(Some(name)) => {
+                            let _ = writeln!(out, "name=\"{name}\"");
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            let _ =
+                                writeln!(err, "note: could not refresh the mint's name: {error}");
+                        }
                     }
                     SUCCESS
                 }
@@ -1582,24 +1615,55 @@ mod tests {
     fn parse_complete_locked_requires_the_identity_flags() {
         // Missing --amount (a required identity flag) refuses at parse — before any home/gate/wallet.
         let args: Vec<String> = [
-            "--job-id", "j", "--result-id", "r", "--delivery-integrity-hash", "aa",
-            "--job-hash", "bb", "--seller-pubkey", "cc", "--seller-signature", "dd",
+            "--job-id",
+            "j",
+            "--result-id",
+            "r",
+            "--delivery-integrity-hash",
+            "aa",
+            "--job-hash",
+            "bb",
+            "--seller-pubkey",
+            "cc",
+            "--seller-signature",
+            "dd",
         ]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
         let err = parse_complete_locked(&args).expect_err("must refuse without --amount");
-        assert!(err.contains("--amount"), "error should name the missing flag, got: {err}");
+        assert!(
+            err.contains("--amount"),
+            "error should name the missing flag, got: {err}"
+        );
     }
 
     #[cfg(feature = "wallet")]
     #[test]
     fn parse_complete_locked_collects_repeated_accepted_mints() {
         let args: Vec<String> = [
-            "--job-id", "job1", "--result-id", "res1", "--delivery-integrity-hash", "11",
-            "--job-hash", "22", "--seller-pubkey", "ab", "--amount", "100",
-            "--seller-signature", "ff", "--accepted-mint", "https://m1", "--accepted-mint",
-            "https://m2", "--realized-mint", "https://m1", "--home", "/tmp/x",
+            "--job-id",
+            "job1",
+            "--result-id",
+            "res1",
+            "--delivery-integrity-hash",
+            "11",
+            "--job-hash",
+            "22",
+            "--seller-pubkey",
+            "ab",
+            "--amount",
+            "100",
+            "--seller-signature",
+            "ff",
+            "--accepted-mint",
+            "https://m1",
+            "--accepted-mint",
+            "https://m2",
+            "--realized-mint",
+            "https://m1",
+            "--home",
+            "/tmp/x",
         ]
         .iter()
         .map(|s| (*s).to_owned())
@@ -1609,7 +1673,10 @@ mod tests {
         assert_eq!(request.job_id, "job1");
         assert_eq!(request.amount_sats, 100);
         assert_eq!(request.seller_signature, "ff");
-        assert_eq!(request.accepted_mints, vec!["https://m1".to_owned(), "https://m2".to_owned()]);
+        assert_eq!(
+            request.accepted_mints,
+            vec!["https://m1".to_owned(), "https://m2".to_owned()]
+        );
         assert_eq!(request.realized_mint, Some("https://m1".to_owned()));
     }
 
@@ -1636,8 +1703,14 @@ mod tests {
             "spent must return the distinct alarm exit code, not the generic runtime error"
         );
         let err_text = String::from_utf8(err).expect("utf8");
-        assert!(err_text.starts_with("ALARM"), "must lead with a greppable ALARM, got: {err_text}");
-        assert!(err_text.contains("NOT resending"), "alarm must state it is not resending");
+        assert!(
+            err_text.starts_with("ALARM"),
+            "must lead with a greppable ALARM, got: {err_text}"
+        );
+        assert!(
+            err_text.contains("NOT resending"),
+            "alarm must state it is not resending"
+        );
         assert!(err_text.contains("Journal left unchanged"));
         assert!(out.is_empty(), "no success output on the alarm path");
     }
@@ -1651,15 +1724,21 @@ mod tests {
         let mut out = Vec::new();
         let mut err = Vec::new();
         let code = report_complete_locked(
-            Err(AuthorizePayError::Payment(PaymentError::LockedTokenMissing(
-                "no confirmed send transaction".into(),
-            ))),
+            Err(AuthorizePayError::Payment(
+                PaymentError::LockedTokenMissing("no confirmed send transaction".into()),
+            )),
             &mut out,
             &mut err,
         );
-        assert_eq!(code, RUNTIME_ERROR, "missing is a refuse, not the spent alarm");
+        assert_eq!(
+            code, RUNTIME_ERROR,
+            "missing is a refuse, not the spent alarm"
+        );
         let err_text = String::from_utf8(err).expect("utf8");
-        assert!(!err_text.starts_with("ALARM"), "missing must NOT masquerade as the accounting-gap alarm");
+        assert!(
+            !err_text.starts_with("ALARM"),
+            "missing must NOT masquerade as the accounting-gap alarm"
+        );
         assert!(err_text.contains("refusing to remint"), "got: {err_text}");
     }
 
@@ -2371,6 +2450,7 @@ mod tests {
             is_default: true,
             configured: true,
             reserved_sats,
+            name: None,
         };
         assert_eq!(
             balance_row_line(&row(4)),
@@ -2379,6 +2459,35 @@ mod tests {
         assert_eq!(
             balance_row_line(&row(0)),
             "mint=https://real-mint.example role=default balance_sats=3"
+        );
+    }
+
+    // Petar, 2026-11-11: a credit mint that named itself shows the name right after its URL; the
+    // `mint=<url> ` prefix and every other field keep their place (crossmint-smoke.sh greps them).
+    // A name that could forge a field is never printed.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn balance_row_shows_a_self_chosen_mint_name() {
+        use maxplayer_core::wallet_ops::MintBalance;
+        let row = |name: Option<&str>| MintBalance {
+            mint_url: "nostr://npub1example".to_owned(),
+            balance_sats: 1400,
+            is_default: false,
+            configured: true,
+            reserved_sats: 0,
+            name: name.map(str::to_owned),
+        };
+        assert_eq!(
+            balance_row_line(&row(Some("io-seller"))),
+            "mint=nostr://npub1example name=\"io-seller\" role=extra balance_sats=1400"
+        );
+        assert_eq!(
+            balance_row_line(&row(None)),
+            "mint=nostr://npub1example role=extra balance_sats=1400"
+        );
+        assert_eq!(
+            balance_row_line(&row(Some("x mint=https://a.test balance_sats=9"))),
+            "mint=nostr://npub1example role=extra balance_sats=1400"
         );
     }
 
@@ -2395,6 +2504,7 @@ mod tests {
             is_default: true,
             configured: true,
             reserved_sats: 0,
+            name: None,
         };
         let real_extra = MintBalance {
             mint_url: "https://real-mint.example".to_owned(),
@@ -2402,6 +2512,7 @@ mod tests {
             is_default: false,
             configured: true,
             reserved_sats: 0,
+            name: None,
         };
         let balance = balance_row_line(&testnut_default);
         assert!(
@@ -2455,7 +2566,12 @@ mod tests {
             &mut out,
             &mut err,
         );
-        assert_eq!(add, SUCCESS, "add extra mint: {}", String::from_utf8_lossy(&err));
+        assert_eq!(
+            add,
+            SUCCESS,
+            "add extra mint: {}",
+            String::from_utf8_lossy(&err)
+        );
 
         let mut out = Vec::new();
         let mut err = Vec::new();

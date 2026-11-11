@@ -4,20 +4,38 @@ use anyhow::{Context, Result, bail};
 use maxplayer_mint::home::{MintHome, mint_url};
 use maxplayer_mint::{backend, issue, server};
 
-const USAGE: &str = "usage: maxplayer-mint <init|run|issue [amount]>
+const USAGE: &str = "usage: maxplayer-mint <init [--name <name>]|name <name>|run|issue [amount]>
   init            create <home>/mint/ and print the nostr:// mint URL
+  name <name>     set the name wallets show next to the mint URL (restart `run` to serve it)
   run             serve the mint over its relays until interrupted
   issue [amount]  finish any interrupted issue, then issue <amount> sat into a token file
 <home> is $MAXPLAYER_HOME, or ~/.maxplayer";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let command = std::env::args().nth(1);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let home = MintHome::at(&home_dir()?);
-    match command.as_deref() {
-        Some("init") => init(&home).await,
-        Some("run") => run(&home).await,
-        Some("issue") => issue_cmd(&home, std::env::args().nth(2)).await,
+    match args.as_slice() {
+        ["init"] => init(&home, None).await,
+        ["init", "--name", name] => init(&home, Some(name.to_string())).await,
+        ["name", name] => {
+            home.set_name(name)?;
+            println!(
+                "Mint name set to {name:?} in {}",
+                home.dir().join("mint.toml").display()
+            );
+            println!(
+                "Restart `maxplayer-mint run` to serve it (systemctl --user restart maxplayer-mint)."
+            );
+            println!(
+                "Wallets show it after they next talk to the mint, or re-run `maxplayer wallet mints add <url>`."
+            );
+            Ok(())
+        }
+        ["run"] => run(&home).await,
+        ["issue"] => issue_cmd(&home, None).await,
+        ["issue", amount] => issue_cmd(&home, Some(amount.to_string())).await,
         _ => {
             eprintln!("{USAGE}");
             std::process::exit(2);
@@ -35,12 +53,18 @@ fn home_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(user).join(".maxplayer"))
 }
 
-async fn init(home: &MintHome) -> Result<()> {
-    let keys = home.init()?;
+async fn init(home: &MintHome, name: Option<String>) -> Result<()> {
+    let keys = home.init_named(name)?;
     let url = mint_url(&keys)?;
     let secrets = home.load()?;
     // Creates mint.sqlite and the first keyset.
-    backend::open(&home.db_path(), &secrets.seed, &url).await?;
+    backend::open_named(
+        &home.db_path(),
+        &secrets.seed,
+        &url,
+        secrets.config.effective_name(),
+    )
+    .await?;
     println!("Created {}", home.dir().display());
     println!("Mint URL: {url}");
     println!("Add it to accepted_mints in config.toml:  \"{url}\"");
@@ -99,7 +123,13 @@ async fn run(home: &MintHome) -> Result<()> {
     // Before `open`: its startup saga recovery must not run under a listener that is serving.
     let _lock = home.lock_run()?;
     let url = mint_url(&secrets.keys)?;
-    let mint = backend::open(&home.db_path(), &secrets.seed, &url).await?;
+    let mint = backend::open_named(
+        &home.db_path(),
+        &secrets.seed,
+        &url,
+        secrets.config.effective_name(),
+    )
+    .await?;
     let relays = secrets.config.effective_relays();
     let server =
         server::Server::connect(mint, secrets.keys, &relays, secrets.config.rate_limit).await?;

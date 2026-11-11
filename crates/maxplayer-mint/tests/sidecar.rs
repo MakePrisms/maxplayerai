@@ -903,6 +903,71 @@ async fn issue_on_unstarted_mint_survives_recovery_and_restores() {
     mint.stop().await.unwrap();
 }
 
+/// Petar, 2026-11-11: the operator names the mint and wallets read it from NUT-06 info. cdk keeps
+/// the info it first stored and ignores the builder on later starts, so a rename must still reach
+/// the info a wallet fetches; an unnamed mint keeps the shared default (which wallets hide).
+#[tokio::test(flavor = "multi_thread")]
+async fn mint_name_is_served_and_a_rename_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("mint.sqlite");
+    let keys = Keys::generate();
+    let url = mint_url(&keys).unwrap();
+    let seed = seed();
+    let name_of = |info: cdk::nuts::MintInfo| info.name.unwrap_or_default();
+
+    let mint = backend::open(&db, &seed, &url).await.unwrap();
+    assert_eq!(name_of(mint.mint_info().await.unwrap()), backend::MINT_NAME);
+    mint.stop().await.unwrap();
+
+    let mint = backend::open_named(&db, &seed, &url, "io-seller")
+        .await
+        .unwrap();
+    assert_eq!(name_of(mint.mint_info().await.unwrap()), "io-seller");
+    // What a wallet receives for `info`.
+    let served = match maxplayer_mint::dispatch::execute(&mint, op::INFO, json!({})).await {
+        Outcome::Ok(value) => value,
+        Outcome::Err(error) => panic!("info refused: {error:?}"),
+    };
+    assert_eq!(served["name"], "io-seller");
+    mint.stop().await.unwrap();
+
+    let mint = backend::open_named(&db, &seed, &url, "io-seller 2")
+        .await
+        .unwrap();
+    assert_eq!(name_of(mint.mint_info().await.unwrap()), "io-seller 2");
+    mint.stop().await.unwrap();
+}
+
+#[test]
+fn mint_name_is_kept_in_mint_toml_and_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = MintHome::at(dir.path());
+    home.init_named(Some("io-seller".into())).unwrap();
+    assert_eq!(home.load().unwrap().config.effective_name(), "io-seller");
+    home.set_name("renamed").unwrap();
+    let config = home.load().unwrap().config;
+    assert_eq!(config.name.as_deref(), Some("renamed"));
+    assert_eq!(config.rate_limit, 20, "other settings kept");
+    for bad in ["", " padded", "x mint=https://a.test", "quote\"d"] {
+        assert!(home.set_name(bad).is_err(), "{bad:?}");
+    }
+    assert_eq!(home.load().unwrap().config.effective_name(), "renamed");
+
+    let unnamed = tempfile::tempdir().unwrap();
+    let home = MintHome::at(unnamed.path());
+    home.init().unwrap();
+    assert_eq!(
+        home.load().unwrap().config.effective_name(),
+        backend::MINT_NAME
+    );
+    assert!(
+        !std::fs::read_to_string(unnamed.path().join("mint/mint.toml"))
+            .unwrap()
+            .contains("name"),
+        "an unnamed mint.toml stays as before"
+    );
+}
+
 #[test]
 fn second_run_on_the_same_mint_is_refused() {
     let dir = tempfile::tempdir().unwrap();
@@ -1374,10 +1439,7 @@ async fn live_info_overlay_survives_restart_preserving_metadata_and_keyset() {
             info["version"],
             format!("maxplayer-mint/{}", env!("CARGO_PKG_VERSION"))
         );
-        assert_eq!(
-            info["maxplayer_mint"]["build"],
-            env!("MINT_SIDECAR_BUILD")
-        );
+        assert_eq!(info["maxplayer_mint"]["build"], env!("MINT_SIDECAR_BUILD"));
         assert_eq!(info["maxplayer_mint"]["durable_replay"], true);
         assert_eq!(active_keyset(&h.mint), keyset);
         let _: cdk::nuts::MintInfo = serde_json::from_value(info.clone()).unwrap();

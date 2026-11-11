@@ -52,6 +52,34 @@ pub const MAX_PLAINTEXT_BYTES: usize = 65_535;
 /// URL scheme of a Nostr-transported mint: `nostr://<npub>`.
 pub const NOSTR_MINT_SCHEME: &str = "nostr://";
 
+/// NUT-06 `name` a `maxplayer-mint` advertises until its operator names it. Wallets show no name
+/// for it: every unnamed credit mint reports it, so it identifies none of them.
+pub const DEFAULT_MINT_NAME: &str = "Maxplayer credits";
+
+/// Longest mint name, in characters, a `maxplayer-mint` accepts and a wallet displays.
+pub const MAX_MINT_NAME_CHARS: usize = 64;
+
+/// A mint name a wallet may print inside a `key=value` line: 1–[`MAX_MINT_NAME_CHARS`]
+/// characters, no surrounding whitespace, no control characters and none of `=` `"` `\`. The
+/// last rule keeps a hostile name from forging another field (`name="x mint=https://… balance_sats=…"`
+/// would fool a `grep 'mint=<url> '` parser).
+pub fn valid_mint_name(name: &str) -> bool {
+    let count = name.chars().count();
+    count > 0
+        && count <= MAX_MINT_NAME_CHARS
+        && name.trim() == name
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '=' | '"' | '\\'))
+}
+
+/// The NUT-06 name a wallet shows for a mint: `None` for no name, an invalid one, or
+/// [`DEFAULT_MINT_NAME`] (shared by every unnamed credit mint). Self-chosen like a seller's
+/// kind-0 name; the mint URL stays its identity.
+pub fn display_mint_name(name: Option<&str>) -> Option<&str> {
+    name.filter(|name| *name != DEFAULT_MINT_NAME && valid_mint_name(name))
+}
+
 /// Public relays a `nostr://` mint and its wallets use IN ADDITION to the home's own `relay_url`
 /// (spec decision 15). Each was checked live on 23 Sep 2026 with fresh throwaway keys: it accepts
 /// and delivers kinds 23410/23411 from a NIP-42-enabled client, carries a 51 KB plaintext, stores
@@ -208,6 +236,32 @@ pub use maxplayer_private_protocol::mint::decode_npub;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mint_names_display_only_when_set_and_field_safe() {
+        use super::{DEFAULT_MINT_NAME, display_mint_name, valid_mint_name};
+        assert_eq!(display_mint_name(Some("io-seller")), Some("io-seller"));
+        assert_eq!(
+            display_mint_name(Some("Minibits mint")),
+            Some("Minibits mint")
+        );
+        assert_eq!(display_mint_name(Some(DEFAULT_MINT_NAME)), None);
+        assert_eq!(display_mint_name(None), None);
+        for bad in [
+            "",
+            " io",
+            "io ",
+            "a\nb",
+            "x mint=https://a.test balance_sats=9",
+            "say \"hi\"",
+            "back\\slash",
+            &"n".repeat(65),
+        ] {
+            assert!(!valid_mint_name(bad), "{bad:?}");
+            assert_eq!(display_mint_name(Some(bad)), None, "{bad:?}");
+        }
+        assert!(valid_mint_name(&"n".repeat(64)));
+    }
+
     use super::*;
 
     #[test]

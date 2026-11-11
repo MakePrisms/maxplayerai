@@ -36,8 +36,15 @@ install -m 0755 crates/maxplayer-mint/target/release/maxplayer-mint ~/.local/bin
 ## 1. Create the mint
 
 ```bash
-maxplayer-mint init
+maxplayer-mint init --name <name>
 ```
+
+`<name>` is what wallets show next to your mint's URL (`maxplayer wallet balance` prints
+`name="<name>"`), so holders can tell your credits apart. Pick something people know you by, like
+your seller name. It is self-chosen, like a seller's profile name: the `nostr://` URL stays the
+mint's identity. Rename later with `maxplayer-mint name <name>` and restart `run`. Without a name
+the mint reports "Maxplayer credits", which wallets don't show. Names are up to 64 characters,
+without `=`, `"` or `\`.
 
 This creates `<home>/mint/`, where `<home>` is `$MAXPLAYER_HOME` or `~/.maxplayer` (the same home
 your `maxplayer` seller uses). It prints the mint's `nostr://` URL and the two setup lines from
@@ -73,6 +80,7 @@ never loosen the directory mode.
 ```toml
 relays = []       # empty = wss://relay.maxplayer.ai + wss://relay.ditto.pub + wss://nostr-pub.wellorder.net
 rate_limit = 20   # new requests per second, across all clients (replays of old requests don't count)
+name = "io-seller" # shown by wallets next to the mint URL; omit for none
 ```
 
 Wallets use the same default and fallback relays, so leave `relays` empty unless you know why.

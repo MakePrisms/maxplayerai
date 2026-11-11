@@ -13,15 +13,33 @@ use cdk_sqlite::MintSqliteDatabase;
 
 use crate::dispatch::MAX_IO;
 
-/// Name the mint advertises in NUT-06 info.
-pub const MINT_NAME: &str = "Maxplayer credits";
+/// Name the mint advertises in NUT-06 info until the operator sets `name` in `mint.toml`.
+pub const MINT_NAME: &str = maxplayer_core::mint_wire::DEFAULT_MINT_NAME;
 
 /// Open (creating on first use) and start the mint in `db_path`, keyed from `seed`, advertising
-/// `url`. Starting runs cdk's saga recovery; only `run` (and `init`) may do that.
+/// `url` and the default name. Starting runs cdk's saga recovery; only `run` (and `init`) may do that.
 pub async fn open(db_path: &Path, seed: &[u8; 64], url: &str) -> Result<Mint> {
+    open_named(db_path, seed, url, MINT_NAME).await
+}
+
+/// [`open`], advertising `name` in NUT-06 info.
+pub async fn open_named(db_path: &Path, seed: &[u8; 64], url: &str, name: &str) -> Result<Mint> {
     let mint = build(db_path, seed, url).await?;
+    set_name(&mint, name).await?;
     mint.start().await.context("start mint")?;
     Ok(mint)
+}
+
+/// Make `name` the advertised NUT-06 name. cdk keeps the info it first stored in `mint.sqlite`
+/// and ignores the builder's name on every later start, so a rename has to be written here.
+pub async fn set_name(mint: &Mint, name: &str) -> Result<()> {
+    let info = mint.mint_info().await.context("read mint info")?;
+    if info.name.as_deref() != Some(name) {
+        mint.set_mint_info(info.name(name))
+            .await
+            .context("save mint name")?;
+    }
+    Ok(())
 }
 
 /// The mint without its background services (no saga recovery): safe next to a running `run`.

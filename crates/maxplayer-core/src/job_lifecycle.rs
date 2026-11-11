@@ -4732,6 +4732,7 @@ mod tests {
             is_default,
             configured: true,
             reserved_sats: 0,
+            name: None,
         }
     }
 

@@ -4314,6 +4314,7 @@ mod tests {
             is_default,
             configured,
             reserved_sats: 0,
+            name: None,
         }
     }
 

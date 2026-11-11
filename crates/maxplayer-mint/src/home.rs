@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bip39::Mnemonic;
-use maxplayer_core::mint_wire::FALLBACK_RELAYS;
+use maxplayer_core::mint_wire::{FALLBACK_RELAYS, MAX_MINT_NAME_CHARS, valid_mint_name};
 use nostr_sdk::prelude::{Keys, ToBech32};
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +23,11 @@ pub struct MintConfig {
     pub relays: Vec<String>,
     /// New requests per second, across all clients.
     pub rate_limit: u32,
+    /// Name advertised in NUT-06 info and shown by wallets next to the mint URL. Self-chosen,
+    /// like a seller's kind-0 name: the `nostr://` npub stays the mint's identity.
+    /// Unset ⇒ [`crate::backend::MINT_NAME`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 impl Default for MintConfig {
@@ -30,11 +35,27 @@ impl Default for MintConfig {
         Self {
             relays: Vec::new(),
             rate_limit: 20,
+            name: None,
         }
     }
 }
 
+/// A name wallets will display ([`valid_mint_name`]).
+pub fn validate_name(name: &str) -> Result<()> {
+    if !valid_mint_name(name) {
+        bail!(
+            "mint name {name:?} must be 1-{MAX_MINT_NAME_CHARS} characters, with no leading or trailing spaces, control characters, '=', '\"' or '\\'"
+        );
+    }
+    Ok(())
+}
+
 impl MintConfig {
+    /// The name `run` advertises.
+    pub fn effective_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(crate::backend::MINT_NAME)
+    }
+
     pub fn effective_relays(&self) -> Vec<String> {
         if !self.relays.is_empty() {
             return self.relays.clone();
@@ -111,6 +132,14 @@ impl MintHome {
     /// Create a new mint. Refuses if `<home>/mint/` exists in any form: overwriting a mint, or
     /// mixing a new key with an old database, is how credits get lost or double-spent.
     pub fn init(&self) -> Result<Keys> {
+        self.init_named(None)
+    }
+
+    /// [`Self::init`], writing `name` into the new `mint.toml`.
+    pub fn init_named(&self, name: Option<String>) -> Result<Keys> {
+        if let Some(name) = &name {
+            validate_name(name)?;
+        }
         if fs::symlink_metadata(&self.dir).is_ok() {
             bail!(
                 "{} already exists; refusing to create a mint over it",
@@ -132,9 +161,25 @@ impl MintHome {
         write_private(&self.seed_path(), &mnemonic.to_string())?;
         write_private(
             &self.config_path(),
-            &toml::to_string(&MintConfig::default())?,
+            &toml::to_string(&MintConfig {
+                name,
+                ..MintConfig::default()
+            })?,
         )?;
         Ok(keys)
+    }
+
+    /// Set `name` in an existing mint's `mint.toml` (other settings kept). A running `run`
+    /// advertises it after a restart.
+    pub fn set_name(&self, name: &str) -> Result<()> {
+        validate_name(name)?;
+        let mut config = self.load()?.config;
+        config.name = Some(name.to_owned());
+        let tmp = self.dir.join("mint.toml.tmp");
+        let _ = fs::remove_file(&tmp);
+        write_private(&tmp, &toml::to_string(&config)?)?;
+        fs::rename(&tmp, self.config_path()).context("replace mint.toml")?;
+        Ok(())
     }
 
     pub fn load(&self) -> Result<Secrets> {
@@ -147,6 +192,9 @@ impl MintHome {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => MintConfig::default(),
             Err(error) => return Err(error).context("read mint.toml"),
         };
+        if let Some(name) = &config.name {
+            validate_name(name).context("mint.toml")?;
+        }
         Ok(Secrets {
             keys,
             seed: mnemonic.to_seed_normalized(""),
