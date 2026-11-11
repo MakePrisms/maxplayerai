@@ -26,6 +26,8 @@ use std::sync::Once;
 
 use git_http_fixture::GitHttpAuthServer;
 use maxplayer_core::budget::BudgetGate;
+use maxplayer_core::authorize_pay::AuthorizePayError;
+use maxplayer_core::delivery::DeliveryError;
 use maxplayer_core::collect::{collect_async, CollectError, CollectRequest};
 use maxplayer_core::home;
 use maxplayer_core::job_lifecycle::AcceptedBind;
@@ -861,8 +863,14 @@ async fn a_paid_collect_refuses_a_path_escaping_delivery_before_any_spend() {
     let (result, gate, root) =
         collect_hostile("escape-paid", &"e1".repeat(32), false, "../../ESCAPED_PAID.txt").await;
     let error = result.expect_err("a path-escaping delivery must refuse");
-    assert!(matches!(error, CollectError::Pay(_)), "must refuse in the pay path: {error}");
-    assert!(error.to_string().contains("unsafe delivery path"), "got: {error}");
+    assert!(
+        matches!(
+            error,
+            CollectError::Pay(AuthorizePayError::Delivery(DeliveryError::UnsafeTree(_)))
+        ),
+        "must refuse in the pay path as an unsafe tree: {error}"
+    );
+    assert!(error.to_string().contains("refusing the delivery"), "got: {error}");
     assert!(!root.join("ESCAPED_PAID.txt").exists(), "wrote outside the results directory");
     assert_eq!(gate.spent(), 0, "an unsafe delivery must burn ZERO spend");
     assert!(!root.join("payment-journal").exists(), "no payment journal on a pre-pay refusal");
@@ -875,7 +883,7 @@ async fn a_free_collect_refuses_a_path_escaping_delivery_and_writes_nothing() {
     let (result, gate, root) =
         collect_hostile("escape-free", &"e2".repeat(32), true, "../../ESCAPED_FREE.txt").await;
     let error = result.expect_err("a path-escaping free delivery must refuse");
-    assert!(error.to_string().contains("unsafe delivery path"), "got: {error}");
+    assert!(error.to_string().contains("refusing the delivery"), "got: {error}");
     assert!(!root.join("ESCAPED_FREE.txt").exists(), "wrote outside the results directory");
     assert!(
         !root.join("results").join("a".repeat(64)).join("ok.txt").exists(),

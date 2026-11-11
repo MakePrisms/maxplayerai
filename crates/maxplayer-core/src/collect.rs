@@ -180,6 +180,7 @@ pub async fn collect_async(
     // Resolve + validate the destination BEFORE spending, so a bad `out` name never pays then fails.
     let dest = results_dest(home, &request.job_id, request.out.as_deref())
         .map_err(CollectError::Input)?;
+    check_dest(&dest).map_err(CollectError::Input)?;
 
     // 2/3. THE MODE BRANCH. `bind.payment_mode` is the agreement of the buyer-signed OFFER and the
     // seller-signed CLAIM, decided and frozen at accept by `verify_free_accept` — never re-derived
@@ -284,6 +285,7 @@ pub async fn collect_turn_async(
         .map_err(CollectError::Lifecycle)?;
     let dest = results_dest(home, &crate::session::collect_dir_name(job_id, turn), None)
         .map_err(CollectError::Input)?;
+    check_dest(&dest).map_err(CollectError::Input)?;
     if !bind_is_inline(&bind)
         && let Some(parent) = job_lifecycle::turn_parent_commit(home, job_id, earlier)
             .map_err(CollectError::Lifecycle)?
@@ -644,12 +646,17 @@ pub fn materialize_delivery(
     let tree = commit.tree().map_err(|error| error.to_string())?;
 
     // REPORT1110 F2: every entry name is seller-authored. Validate the WHOLE tree before the first
-    // write, so an unsafe name refuses the delivery with nothing on disk (never a partial tree).
-    validate_tree_paths(&tree)?;
-    ensure_real_dir(dest)?;
+    // write (names, duplicates, depth, size, and that every file is in the store), so a delivery
+    // that would fail below is refused with nothing on disk and, on the pay path, before payment.
+    validate_tree_paths(&repo, &tree)?;
+    // A first collect writes into a fresh staging directory and renames it into place, so a failure
+    // part-way leaves nothing behind (#1290 fable M1). A re-collect into an existing folder writes in
+    // place; each file is still replaced by rename, never written through.
+    let staged = stage_for(dest)?;
+    let target: &Path = staged.as_deref().unwrap_or(dest);
     let mut files: Vec<String> = Vec::new();
     let mut walk_err: Option<String> = None;
-    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         if entry.kind() != Some(git2::ObjectType::Blob) {
             return git2::TreeWalkResult::Ok;
         }
@@ -677,24 +684,87 @@ pub fn materialize_delivery(
             walk_err = Some(error);
             return git2::TreeWalkResult::Abort;
         }
-        if let Err(error) = write_under(dest, &rel, blob.content()) {
+        if let Err(error) = write_under(target, &rel, blob.content()) {
             walk_err = Some(error);
             return git2::TreeWalkResult::Abort;
         }
         files.push(rel);
         git2::TreeWalkResult::Ok
-    })
+    });
     // git2 >= 0.20: an aborting callback makes `walk` itself return `Err` (GIT_EUSER), so the
-    // specific reason recorded in `walk_err` must win over libgit2's generic "callback returned".
-    .map_err(|error| match walk_err.take() {
-        Some(reason) => format!("failed: {reason}"),
-        None => error.to_string(),
-    })?;
-    if let Some(error) = walk_err {
-        return Err(format!("failed: {error}"));
+    // specific reason recorded in `walk_err` wins over libgit2's generic "callback returned".
+    let outcome = match (walked, walk_err) {
+        (_, Some(reason)) => Err(format!("failed: {reason}")),
+        (Err(error), None) => Err(error.to_string()),
+        (Ok(()), None) => Ok(()),
+    };
+    if let Err(error) = outcome {
+        if let Some(staging) = &staged {
+            let _ = std::fs::remove_dir_all(staging);
+        }
+        return Err(error);
+    }
+    if let Some(staging) = staged {
+        std::fs::rename(&staging, dest).map_err(|error| {
+            let _ = std::fs::remove_dir_all(&staging);
+            format!("move {} into place at {}: {error}", staging.display(), dest.display())
+        })?;
     }
     files.sort();
     Ok(files)
+}
+
+/// Prefix of the staging directories and temporary files collect creates. Refused as a delivered
+/// name, so a seller cannot collide with one.
+const TMP_PREFIX: &str = ".maxplayer-tmp-";
+
+fn temp_name(kind: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    format!("{TMP_PREFIX}{kind}-{}-{n}", std::process::id())
+}
+
+/// `Some(staging dir)` when `dest` does not exist yet (written there, then renamed to `dest`);
+/// `None` when `dest` is an existing real directory (written in place).
+fn stage_for(dest: &Path) -> Result<Option<std::path::PathBuf>, String> {
+    match std::fs::symlink_metadata(dest) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = dest
+                .parent()
+                .ok_or_else(|| format!("{} has no parent directory", dest.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create {}: {error}", parent.display()))?;
+            let staging = parent.join(temp_name("stage"));
+            std::fs::create_dir(&staging)
+                .map_err(|error| format!("create {}: {error}", staging.display()))?;
+            Ok(Some(staging))
+        }
+        Err(error) => Err(format!("inspect {}: {error}", dest.display())),
+        Ok(_) => {
+            ensure_real_dir(dest)?;
+            Ok(None)
+        }
+    }
+}
+
+/// The results folder must be absent or a real directory. Checked BEFORE payment (#1290 fable
+/// L1): materialize refuses a symlinked or non-directory `dest`, and that refusal must not come
+/// after the buyer has paid.
+pub(crate) fn check_dest(dest: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dest) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "results folder {} is a symlink; collect does not write through symlinks. Remove it \
+             (or pick another out name) and collect again — nothing was paid",
+            dest.display()
+        )),
+        Ok(meta) if !meta.is_dir() => Err(format!(
+            "{} exists and is not a directory — nothing was paid",
+            dest.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect {}: {error}", dest.display())),
+    }
 }
 
 /// Refuse a seller-authored delivery path that is not a plain relative path under the results
@@ -702,13 +772,36 @@ pub fn materialize_delivery(
 /// or control characters. The same rule the reviewer applies to the same trees
 /// (`private_content::validate_path`), plus a length bound.
 pub fn validate_delivery_path(rel: &str) -> Result<(), String> {
-    if rel.len() > 4096
+    if rel.len() > MAX_DELIVERY_PATH_BYTES
         || crate::private_content::validate_path(rel).is_err()
         || !rel.split('/').all(portable_component)
     {
-        return Err(format!("unsafe delivery path {rel:?}; refusing the delivery"));
+        return Err(format!("unsafe delivery path {}; refusing the delivery", shown(rel)));
     }
     Ok(())
+}
+
+/// Longest delivered path, so `results/<job>/` + path stays well under `PATH_MAX` (#1290 fable M1).
+const MAX_DELIVERY_PATH_BYTES: usize = 1024;
+/// Deepest directory nesting in one delivery.
+const MAX_DELIVERY_DEPTH: usize = 64;
+/// Most tree entries (files, directories, symlinks, submodules) one delivery may hold. Also bounds
+/// the walk itself: a tree is a DAG, so a few shared subtrees can name 2^N paths (#1290 fable M2).
+const MAX_DELIVERY_ENTRIES: usize = 100_000;
+/// Largest single delivered file.
+const MAX_DELIVERY_FILE_BYTES: u64 = 100 * 1024 * 1024;
+/// Most bytes one delivery may write to disk.
+const MAX_DELIVERY_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// A seller-chosen name as it appears in an error: Debug-escaped and cut to 120 characters, since
+/// one entry name can be 64 KiB and the error reaches logs and agent tool results (#1290 fable L5).
+fn shown(text: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    if text.chars().count() <= MAX_CHARS {
+        return format!("{text:?}");
+    }
+    let head: String = text.chars().take(MAX_CHARS).collect();
+    format!("{head:?}… ({} bytes)", text.len())
 }
 
 /// Longest single path component the buyer's filesystem stores (`NAME_MAX` on Linux and APFS).
@@ -722,6 +815,7 @@ const MAX_COMPONENT_BYTES: usize = 255;
 /// must hold on every volume a buyer might use.
 fn portable_component(component: &str) -> bool {
     if component.len() > MAX_COMPONENT_BYTES
+        || component.to_ascii_lowercase().starts_with(TMP_PREFIX)
         || component.ends_with('.')
         || component.ends_with(' ')
         || component.eq_ignore_ascii_case("git~1")
@@ -743,37 +837,96 @@ fn is_hfs_ignorable(c: char) -> bool {
     matches!(c, '\u{200C}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{206A}'..='\u{206F}' | '\u{FEFF}')
 }
 
-/// Walk `tree` and refuse it if ANY entry (blob, subtree, symlink or submodule) has an unsafe
-/// path. Reads objects only, writes nothing — so the pay path runs it before any spend.
-pub fn validate_tree_paths(tree: &git2::Tree<'_>) -> Result<(), String> {
+/// Walk `tree` and refuse it unless materialize could write ALL of it: every path safe (see
+/// [`validate_delivery_path`]), no entry name containing `/`, no two paths that collide on a
+/// case-insensitive volume (which also catches a blob and a subtree of the same name), nesting,
+/// entry count, per-file and total size within bounds, and every file present in the store as a
+/// blob. Reads object headers only and writes nothing, so the pay path runs it before any spend;
+/// the entry cap bounds the walk itself.
+pub fn validate_tree_paths(repo: &git2::Repository, tree: &git2::Tree<'_>) -> Result<(), String> {
+    let odb = repo
+        .odb()
+        .map_err(|error| format!("open buyer store objects: {error}"))?;
     let mut failure: Option<String> = None;
-    // A raw tree can repeat a name, or name a blob and a subtree alike. Both stay inside dest, but
-    // the second write fails (or silently replaces the first) AFTER a paid collect has spent, so
-    // refuse it here, before the budget gate (#1290 review).
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        let Ok(name) = entry.name() else {
-            failure = Some("non-UTF-8 tree entry name".into());
-            return git2::TreeWalkResult::Abort;
+    let mut entries = 0usize;
+    let mut total_bytes = 0u64;
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        let mut refuse = |reason: String| {
+            failure = Some(reason);
+            git2::TreeWalkResult::Abort
         };
+        entries += 1;
+        if entries > MAX_DELIVERY_ENTRIES {
+            return refuse(format!(
+                "delivery has more than {MAX_DELIVERY_ENTRIES} entries; refusing the delivery"
+            ));
+        }
+        let Ok(name) = entry.name() else {
+            return refuse("non-UTF-8 tree entry name".into());
+        };
+        if name.contains('/') {
+            return refuse(format!(
+                "tree entry name {} contains '/'; refusing the delivery",
+                shown(name)
+            ));
+        }
+        if root.matches('/').count() >= MAX_DELIVERY_DEPTH {
+            return refuse(format!(
+                "delivery is nested deeper than {MAX_DELIVERY_DEPTH} directories; refusing the delivery"
+            ));
+        }
         let path = format!("{root}{name}");
         if let Err(error) = validate_delivery_path(&path) {
-            failure = Some(error);
-            return git2::TreeWalkResult::Abort;
+            return refuse(error);
         }
-        if !seen.insert(path.clone()) {
-            failure = Some(format!("duplicate delivery path {path:?}; refusing the delivery"));
-            return git2::TreeWalkResult::Abort;
+        // Lowercased: names that differ only in case are one file on macOS's default volume.
+        if !seen.insert(path.to_lowercase()) {
+            return refuse(format!(
+                "delivery path {} appears twice (or twice up to letter case); refusing the delivery",
+                shown(&path)
+            ));
+        }
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            match odb.read_header(entry.id()) {
+                Ok((size, git2::ObjectType::Blob)) => {
+                    let size = size as u64;
+                    total_bytes = total_bytes.saturating_add(size);
+                    if size > MAX_DELIVERY_FILE_BYTES {
+                        return refuse(format!(
+                            "delivered file {} is {size} bytes, over {MAX_DELIVERY_FILE_BYTES}; \
+                             refusing the delivery",
+                            shown(&path)
+                        ));
+                    }
+                    if total_bytes > MAX_DELIVERY_TOTAL_BYTES {
+                        return refuse(format!(
+                            "delivery is over {MAX_DELIVERY_TOTAL_BYTES} bytes; refusing the delivery"
+                        ));
+                    }
+                }
+                Ok((_, kind)) => {
+                    return refuse(format!(
+                        "delivered file {} is a {kind} object, not a file; refusing the delivery",
+                        shown(&path)
+                    ));
+                }
+                // libgit2's fetch does not check connectivity, so a seller's server can omit blobs
+                // from the pack. Refuse here, before pay, not at write time after it (fable M1).
+                Err(_) => {
+                    return refuse(format!(
+                        "delivered file {} is missing from the buyer store; refusing the delivery",
+                        shown(&path)
+                    ));
+                }
+            }
         }
         git2::TreeWalkResult::Ok
-    })
-    .map_err(|error| match failure.take() {
-        Some(reason) => format!("failed: {reason}"),
-        None => error.to_string(),
-    })?;
-    match failure {
-        Some(reason) => Err(format!("failed: {reason}")),
-        None => Ok(()),
+    });
+    match (walked, failure) {
+        (_, Some(reason)) => Err(reason),
+        (Err(error), None) => Err(error.to_string()),
+        (Ok(()), None) => Ok(()),
     }
 }
 
@@ -793,7 +946,7 @@ pub(crate) fn validate_delivery_tree_in_store(
         .peel_to_commit()
         .map_err(|error| error.to_string())?;
     let tree = commit.tree().map_err(|error| error.to_string())?;
-    validate_tree_paths(&tree)
+    validate_tree_paths(&repo, &tree)
 }
 
 /// Create `dir` if absent; refuse if it (the final component) is a symlink or not a directory.
@@ -811,40 +964,51 @@ fn ensure_real_dir(dir: &Path) -> Result<(), String> {
 }
 
 /// Write `content` to `dest/rel` without following a symlink at any component under `dest`:
-/// intermediate directories are checked one by one, and the file is opened `O_NOFOLLOW`, so a
-/// symlink already in the results folder cannot redirect the write. Existing regular files are
-/// overwritten (re-collect is idempotent). `rel` must already have passed [`validate_delivery_path`].
+/// intermediate directories are checked one by one, and a symlink already at the target refuses.
+/// The bytes go to a fresh temporary file (`O_CREAT|O_EXCL|O_NOFOLLOW`) renamed over the target,
+/// so an existing hard link, FIFO or racing symlink there is replaced, never written through or
+/// blocked on (#1290 fable L2). Re-collect stays idempotent. `rel` must already have passed
+/// [`validate_delivery_path`].
 fn write_under(dest: &Path, rel: &str, content: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
     let mut parts: Vec<&str> = rel.split('/').collect();
-    let file_name = parts.pop().ok_or_else(|| format!("unsafe delivery path {rel:?}"))?;
+    let file_name = parts.pop().ok_or_else(|| format!("unsafe delivery path {}", shown(rel)))?;
     let mut dir = dest.to_path_buf();
     for part in parts {
         dir.push(part);
         ensure_real_dir(&dir)?;
     }
     let path = dir.join(file_name);
-    if let Ok(meta) = std::fs::symlink_metadata(&path)
-        && meta.file_type().is_symlink()
-    {
-        return Err(format!("refusing to write through symlink {}", path.display()));
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!("refusing to write through symlink {}", path.display()));
+        }
+        Ok(meta) if meta.is_dir() => {
+            return Err(format!("{} exists and is a directory", path.display()));
+        }
+        _ => {}
     }
+    let temp = dir.join(temp_name("file"));
     let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(&path).map_err(|error| {
-        #[cfg(unix)]
-        if error.raw_os_error() == Some(libc::ELOOP) {
-            return format!("refusing to write through symlink {}", path.display());
-        }
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| format!("write {}: {error}", temp.display()))?;
+    if let Err(error) = file.write_all(content) {
+        drop(file);
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("write {}: {error}", path.display()));
+    }
+    drop(file);
+    std::fs::rename(&temp, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&temp);
         format!("write {}: {error}", path.display())
-    })?;
-    file.write_all(content)
-        .map_err(|error| format!("write {}: {error}", path.display()))
+    })
 }
 
 #[cfg(test)]
@@ -1021,7 +1185,7 @@ mod tests {
 
         let error = materialize_delivery(&store, &store_ref, &commit_hex, &root.join("out"))
             .expect_err("a non-UTF-8 entry name must refuse");
-        assert_eq!(error, "failed: non-UTF-8 tree entry name");
+        assert_eq!(error, "non-UTF-8 tree entry name");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1078,7 +1242,8 @@ mod tests {
             let result = materialize_delivery(&store, &store_ref, &commit_hex, &dest);
             assert!(!escaped.exists(), "{label}: wrote outside dest at {}", escaped.display());
             let error = result.expect_err(&format!("{label}: an unsafe entry name must refuse"));
-            assert!(error.contains("unsafe delivery path"), "{label}: unexpected error {error}");
+            // A raw entry name holding `/` is now refused as such, before its components are read.
+            assert!(error.contains("refusing the delivery"), "{label}: unexpected error {error}");
             assert!(!dest.join("ok.txt").exists(), "{label}: partial materialization");
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -1123,7 +1288,7 @@ mod tests {
         let dest = root.join("results").join("job");
         let error = materialize_delivery(&store, &store_ref, &commit_hex, &dest)
             .expect_err("a later unsafe entry must refuse the whole tree");
-        assert!(error.contains("unsafe delivery path"), "unexpected error {error}");
+        assert!(error.contains("refusing the delivery"), "unexpected error {error}");
         assert!(!dest.join("0-ok.txt").exists(), "a safe entry was written before the refusal");
         assert!(!dest.exists(), "dest must not be created for a refused tree");
         assert!(!root.join("LATE_ESCAPE.txt").exists());
@@ -1140,7 +1305,7 @@ mod tests {
         let dest = root.join("results").join("job");
         let error = materialize_delivery(&store, &store_ref, &commit_hex, &dest)
             .expect_err("a repeated name must refuse");
-        assert!(error.contains("duplicate delivery path"), "unexpected error {error}");
+        assert!(error.contains("appears twice"), "unexpected error {error}");
         assert!(!dest.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1223,6 +1388,203 @@ mod tests {
         assert!(error.contains("symlink"), "unexpected error {error}");
         assert!(!outside.join(INLINE_ANSWER_FILENAME).exists());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn raw_tree(repo: &git2::Repository, entries: &[(&str, &[u8], git2::Oid)]) -> git2::Oid {
+        let mut raw = Vec::new();
+        for (mode, name, oid) in entries {
+            raw.extend_from_slice(mode.as_bytes());
+            raw.push(b' ');
+            raw.extend_from_slice(name);
+            raw.push(0);
+            raw.extend_from_slice(oid.as_bytes());
+        }
+        repo.odb().expect("odb").write(git2::ObjectType::Tree, &raw).expect("write raw tree")
+    }
+
+    fn retain_tree(repo: &git2::Repository, tree_oid: git2::Oid) -> String {
+        let tree = repo.find_tree(tree_oid).expect("find tree");
+        let sig = git2::Signature::now("t", "t@e").expect("sig");
+        let commit_oid = repo.commit(None, &sig, &sig, "delivery", &tree, &[]).expect("commit");
+        let commit_hex = commit_oid.to_string();
+        repo.reference(&PayPathDeliveryVerifier::store_ref_for(&commit_hex), commit_oid, true, "retain")
+            .expect("retain ref");
+        commit_hex
+    }
+
+    // #1290 fable M1: anything materialize would refuse, the pre-pay check refuses too, so a paid
+    // collect never ends in a refused (partial) write.
+    #[test]
+    fn prepay_check_and_materialize_agree() {
+        let root = temp_root("agree");
+        let _ = std::fs::remove_dir_all(&root);
+        let check = |label: &str, names: &[&[u8]]| {
+            let store = root.join(format!("store-{label}"));
+            let commit_hex = seed_raw_tree_store(&store, names);
+            let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+            let dest = root.join("results").join(label);
+            let prepay = validate_delivery_tree_in_store(&store, &store_ref, &commit_hex);
+            let written = materialize_delivery(&store, &store_ref, &commit_hex, &dest);
+            assert!(prepay.is_err(), "{label}: the pre-pay check must refuse");
+            assert_eq!(prepay.is_ok(), written.is_ok(), "{label}: pay path and materialize disagree");
+            assert!(!dest.exists(), "{label}: partial tree");
+        };
+        check("slash-collision", &[b"0-first.txt", b"a", b"a/b"]);
+        check("name-max", &[b"0-first.txt", &[b'x'; 300]]);
+        check("case-collision", &[b"0-first.txt", b"README.md", b"readme.md"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tree_naming_a_missing_or_non_blob_object_is_refused_before_pay() {
+        let root = temp_root("missing-blob");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let repo = git2::Repository::init_bare(&store).expect("init store");
+        let present = repo.blob(b"x\n").expect("blob");
+        let absent = git2::Oid::from_bytes(&[0xab; 20]).expect("oid");
+        let missing = retain_tree(
+            &repo,
+            raw_tree(&repo, &[("100644", b"0-first.txt", present), ("100644", b"gone.txt", absent)]),
+        );
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&missing);
+        let error = validate_delivery_tree_in_store(&store, &store_ref, &missing).expect_err("missing blob");
+        assert!(error.contains("missing from the buyer store"), "got: {error}");
+        let dest = root.join("results").join("job");
+        assert!(materialize_delivery(&store, &store_ref, &missing, &dest).is_err());
+        assert!(!dest.exists(), "nothing may be written");
+        let leaf = raw_tree(&repo, &[("100644", b"f", present)]);
+        let not_blob = retain_tree(&repo, raw_tree(&repo, &[("100644", b"x", leaf)]));
+        let error = validate_delivery_tree_in_store(
+            &store,
+            &PayPathDeliveryVerifier::store_ref_for(&not_blob),
+            &not_blob,
+        )
+        .expect_err("a blob-mode entry naming a tree");
+        assert!(error.contains("not a file"), "got: {error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn deep_and_exponential_trees_are_refused_quickly() {
+        let root = temp_root("bomb");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let repo = git2::Repository::init_bare(&store).expect("init store");
+        let blob = repo.blob(b"x\n").expect("blob");
+        let mut deep = raw_tree(&repo, &[("100644", b"f", blob)]);
+        for _ in 0..70 {
+            deep = raw_tree(&repo, &[("40000", b"d", deep)]);
+        }
+        let deep = retain_tree(&repo, deep);
+        let error = validate_delivery_tree_in_store(&store, &PayPathDeliveryVerifier::store_ref_for(&deep), &deep)
+            .expect_err("70 levels must refuse");
+        assert!(error.contains("nested deeper"), "got: {error}");
+        // 23 objects, 2^20 paths: the entry cap stops the walk long before it finishes.
+        let mut bomb = raw_tree(&repo, &[("100644", b"f", blob)]);
+        for _ in 0..20 {
+            bomb = raw_tree(&repo, &[("40000", b"a", bomb), ("40000", b"b", bomb)]);
+        }
+        let bomb = retain_tree(&repo, bomb);
+        let started = std::time::Instant::now();
+        let error = validate_delivery_tree_in_store(&store, &PayPathDeliveryVerifier::store_ref_for(&bomb), &bomb)
+            .expect_err("a 2^20-path tree must refuse");
+        assert!(error.contains("more than"), "got: {error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "took {:?}", started.elapsed());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_delivery_replaces_a_hard_link_in_dest_instead_of_writing_through_it() {
+        let root = temp_root("hardlink");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let commit_hex = seed_store(&store);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&dest).expect("dest");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("victim"), "victim\n").expect("victim");
+        std::fs::hard_link(outside.join("victim"), dest.join("README.md")).expect("hard link");
+        materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("materializes");
+        assert_eq!(std::fs::read_to_string(outside.join("victim")).expect("victim"), "victim\n");
+        assert_eq!(std::fs::read_to_string(dest.join("README.md")).expect("readme"), "# delivered\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn materialize_delivery_does_not_block_on_a_fifo_in_dest() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = temp_root("fifo");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let commit_hex = seed_store(&store);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        std::fs::create_dir_all(&dest).expect("dest");
+        let fifo = dest.join("README.md");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("c path");
+        // SAFETY: `mkfifo` reads a NUL-terminated path and a mode, and touches no memory of ours.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0, "mkfifo");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (s, r, c, d) = (store.clone(), store_ref.clone(), commit_hex.clone(), dest.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(materialize_delivery(&s, &r, &c, &d));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20))
+            .expect("materialize must not block on a FIFO")
+            .expect("materializes");
+        assert_eq!(std::fs::read_to_string(&fifo).expect("readme"), "# delivered\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_first_collect_is_staged_and_leaves_no_temporary_entries() {
+        let root = temp_root("staged");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let commit_hex = seed_store(&store);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("materializes");
+        materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("re-materializes");
+        for dir in [root.join("results"), dest.clone(), dest.join("src")] {
+            for entry in std::fs::read_dir(&dir).expect("read dir") {
+                let name = entry.expect("entry").file_name();
+                assert!(!name.to_string_lossy().starts_with(TMP_PREFIX), "left behind {name:?} in {}", dir.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_results_folder_is_refused_before_pay() {
+        let root = temp_root("dest-check");
+        let _ = std::fs::remove_dir_all(&root);
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+        std::fs::create_dir_all(root.join("results")).expect("results");
+        let dest = root.join("results").join("job");
+        std::os::unix::fs::symlink(&elsewhere, &dest).expect("link");
+        let error = check_dest(&dest).expect_err("a symlinked results folder must refuse");
+        assert!(error.contains("symlink") && error.contains("nothing was paid"), "got: {error}");
+        assert!(check_dest(&root.join("results").join("absent")).is_ok());
+        assert!(check_dest(&elsewhere).is_ok());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_refused_path_is_echoed_truncated_and_temp_names_are_reserved() {
+        let long = "a".repeat(70_000);
+        let error = validate_delivery_path(&long).expect_err("too long");
+        assert!(error.len() < 400, "echoed {} bytes", error.len());
+        assert!(error.contains("70000 bytes"), "got: {error}");
+        assert!(validate_delivery_path(".maxplayer-tmp-stage-1-1/x").is_err());
+        assert!(validate_delivery_path(&"a/".repeat(600)).is_err(), "over the path bound");
     }
 
     // A bind that pins a commit absent from the store fails closed with a precise reason (never a

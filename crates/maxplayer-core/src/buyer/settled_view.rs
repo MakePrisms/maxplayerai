@@ -106,16 +106,27 @@ fn delivery_files(home: &MaxplayerHome, commit_oid: &str) -> Result<Vec<String>,
         .and_then(|object| object.peel_to_commit())
         .and_then(|commit| commit.tree())
         .map_err(|e| e.to_string())?;
+    // Bounded: a tree is a DAG, and a few shared subtrees can name 2^N paths (#1290 fable M2).
+    // Same cap as collect's pre-pay check, which refuses such a delivery outright.
+    const MAX_LISTED_ENTRIES: usize = 100_000;
     let mut files = Vec::new();
-    tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+    let mut visited = 0usize;
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        visited += 1;
+        if visited > MAX_LISTED_ENTRIES {
+            return git2::TreeWalkResult::Abort;
+        }
         if entry.kind() == Some(git2::ObjectType::Blob)
             && let Ok(name) = entry.name()
         {
             files.push(format!("{root}{name}"));
         }
         git2::TreeWalkResult::Ok
-    })
-    .map_err(|e| e.to_string())?;
+    });
+    if visited > MAX_LISTED_ENTRIES {
+        return Err(format!("delivery has more than {MAX_LISTED_ENTRIES} entries; not listed"));
+    }
+    walked.map_err(|e| e.to_string())?;
     files.sort();
     Ok(files)
 }
