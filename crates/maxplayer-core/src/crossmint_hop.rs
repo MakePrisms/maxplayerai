@@ -271,6 +271,15 @@ pub enum HopError {
         /// What the prepared melt would have taken, and from what.
         reason: String,
     },
+    /// The recovery sweep could not re-check an attempt recorded as refused (a mint unreachable,
+    /// a held saga recovery, ...). Its last known state is "nothing melted", so this is reported
+    /// apart from a strand and the next sweep checks again (#1292 fable r5 L2).
+    RefusedRecheckIncomplete {
+        /// Attempt that was refused earlier.
+        attempt_id: String,
+        /// Why the re-check stopped.
+        detail: String,
+    },
 }
 
 impl fmt::Display for HopError {
@@ -435,6 +444,11 @@ impl fmt::Display for HopError {
                 "cross-mint hop: attempt {attempt_id}: {reason}; the prepared melt was cancelled \
                  before it reached the mint, and the next run prices it again"
             ),
+            Self::RefusedRecheckIncomplete { attempt_id, detail } => write!(
+                formatter,
+                "cross-mint hop: attempt {attempt_id} was refused earlier and could not be \
+                 re-checked: {detail}"
+            ),
         }
     }
 }
@@ -532,8 +546,9 @@ pub enum HopRecord {
         /// Ecash issued at the target mint.
         minted_sats: u64,
     },
-    /// A pin guard refused the hop before anything was melted (#1292 review L2). Terminal: later
-    /// runs and the recovery sweep do not retry it, and no money left the source for it.
+    /// A pin guard refused the hop before anything was melted (#1292 review L2). The pay path never
+    /// retries it. The recovery sweep only re-checks the source, and completes the hop only if a
+    /// melt landed after all (fable r4 L1); it raises, melts and re-quotes nothing for it.
     Refused {
         /// Attempt that was refused.
         attempt_id: String,
@@ -899,7 +914,10 @@ fn run_hop_with<S: HopJournalStore, E: HopEffects>(
     // a no-op on the recovery path (#186).
     let mut actual_fee_this_run: Option<u64> = None;
     let melted_earlier = loop {
-        break match effects.melt_leg(&active_melt_quote_id)? {
+        break match effects
+            .melt_leg(&active_melt_quote_id)
+            .map_err(|error| recheck_failed(refused.as_deref(), &pairing, error))?
+        {
             MeltLeg::Unpaid => {
                 if let Some(reason) = &refused {
                     return Err(HopError::HopRefused {
@@ -929,7 +947,9 @@ fn run_hop_with<S: HopJournalStore, E: HopEffects>(
                 });
             }
             MeltLeg::Failed => {
-                let (invoice_state, bolt11) = effects.target_invoice(&pairing.mint_quote_id)?;
+                let (invoice_state, bolt11) = effects
+                    .target_invoice(&pairing.mint_quote_id)
+                    .map_err(|error| recheck_failed(refused.as_deref(), &pairing, error))?;
                 match invoice_state {
                     MintLeg::Paid | MintLeg::Issued => break true,
                     MintLeg::Pending => {
@@ -1049,6 +1069,18 @@ fn run_hop_with<S: HopJournalStore, E: HopEffects>(
         recovered_strand,
         unused_fee_reserve_sats,
     })
+}
+
+/// On a refused attempt, a status read that fails is a failed re-check, not a strand: the last
+/// known state is that nothing was melted (#1292 fable r5 L2).
+fn recheck_failed(refused: Option<&str>, pairing: &HopJournal, error: HopError) -> HopError {
+    match refused {
+        Some(_) => HopError::RefusedRecheckIncomplete {
+            attempt_id: pairing.attempt_id.clone(),
+            detail: error.to_string(),
+        },
+        None => error,
+    }
 }
 
 /// Plan-time hop authorization: quoted cost plus a fee-market buffer.
@@ -1241,7 +1273,8 @@ fn refuse_terminally<S: HopJournalStore, T>(
 /// The melt cdk prepared, checked against the pairing right before `confirm` (#1292 review L1):
 /// the invoice and amount pins, the source mint, and everything it takes from the wallet
 /// (`amount + fee_reserve + input fee + swap fee`, fable r4 L2) against the authorized
-/// `planned_cost`. Plan prices the input fee as a ceiling that covers both fees.
+/// `planned_cost`. Plan prices `input_fee` to cover both fees as cdk 0.17.2 selects proofs
+/// (`source_input_fee_ceiling`); this check is what holds the cap if that pricing is ever low.
 #[allow(clippy::too_many_arguments)]
 fn require_prepared_within_pin(
     pin: &HopJournal,
@@ -1668,14 +1701,17 @@ impl CdkHopEffects {
         Ok(())
     }
 
-    /// Upper bound on every fee the source wallet pays for this melt besides the Lightning reserve.
-    ///
-    /// cdk may swap before it melts, and then charges two fees: the swap fee on the proofs fed to
-    /// the swap (at most every unspent proof) and the melt's input fee on the split of
-    /// `amount + fee_reserve` (at most one proof per bit of it, plus one). Each is priced at that
-    /// worst case and summed, so the prepared melt's `input_fee + swap_fee` never exceeds it
-    /// (#1292 fable r4 L2). Over-stating costs cap headroom; under-stating would put a fee on the
-    /// wire the cap never saw.
+    /// Upper bound on every fee the source wallet pays for this melt besides the Lightning reserve,
+    /// priced with the calls cdk 0.17.2's `prepare_melt` uses (#1292 fable r5 L1):
+    /// - swap fee: cdk swaps a subset of the unspent proofs and charges each proof at its OWN
+    ///   keyset's rate (`get_proofs_fee`), so the fee of every unspent proof bounds it, whatever
+    ///   mix of keysets and rates the wallet holds. On cdk's exact-match path (no swap) the melt's
+    ///   input fee is the fee of the selected proofs, which this term bounds as well.
+    /// - melt input fee (swap path): the active keyset's rate on `split(amount + fee_reserve)`
+    ///   outputs, the same estimate cdk charges.
+    /// The two are summed. This bounds cdk 0.17.2's selection; it is not a proof about any cdk.
+    /// `require_prepared_within_pin` stays the backstop: a melt that would take more is cancelled
+    /// before it reaches the mint, so the cap holds even if this is ever low.
     async fn source_input_fee_ceiling(&self, melt_total: u64) -> Result<u64, HopError> {
         let proofs = bounded(
             "source proof count",
@@ -1683,17 +1719,22 @@ impl CdkHopEffects {
             self.source.get_unspent_proofs(),
         )
         .await?;
-        let inputs = u64::try_from(proofs.len()).unwrap_or(u64::MAX).max(1);
-        let split = u64::from(u64::BITS - melt_total.leading_zeros()) + 1;
-        let mut total = 0u64;
-        for count in [inputs, split] {
-            let fee = crate::payment_wallet::bounded_input_fee(&self.source, count)
-                .await
-                .map(|fee| fee.to_u64())
-                .map_err(|error| HopError::Mint(format!("source input fee: {error}")))?;
-            total = total.saturating_add(fee);
-        }
-        Ok(total)
+        let swap_ceiling = bounded("source swap fee", MINT_TOUCH_TIMEOUT, async {
+            Ok::<_, cdk::Error>(self.source.get_proofs_fee(&proofs).await?.total)
+        })
+        .await?;
+        let melt_ceiling = bounded("source melt input fee", MINT_TOUCH_TIMEOUT, async {
+            let active = self.source.get_active_keyset().await?;
+            let amounts = self
+                .source
+                .get_keyset_fees_and_amounts_by_id(active.id)
+                .await?;
+            let outputs = u64::try_from(cdk::Amount::from(melt_total).split(&amounts)?.len())
+                .unwrap_or(u64::MAX);
+            self.source.get_keyset_count_fee(&active.id, outputs).await
+        })
+        .await?;
+        Ok(swap_ceiling.to_u64().saturating_add(melt_ceiling.to_u64()))
     }
 }
 
@@ -1942,6 +1983,19 @@ pub fn hop_journal_dir(home: &MaxplayerHome) -> PathBuf {
 /// which is stuck by design but must not be stuck in silence.
 pub async fn sweep_hops(home: &MaxplayerHome) -> Result<Vec<SweptHop>, HopError> {
     let store = FsHopJournal::new(hop_journal_dir(home));
+    sweep_journal(&store, |pairing, honor_refusal| {
+        sweep_one(home, &store, pairing, honor_refusal)
+    })
+    .await
+}
+
+/// [`sweep_hops`] over one journal, with the per-attempt resume injected so the sweep's own
+/// decisions are testable without live mints (#1292 fable r5 L3).
+async fn sweep_journal<F, Fut>(store: &FsHopJournal, mut resume: F) -> Result<Vec<SweptHop>, HopError>
+where
+    F: FnMut(HopJournal, bool) -> Fut,
+    Fut: Future<Output = Result<HopSettled, HopError>>,
+{
     let mut swept = Vec::new();
     for attempt_id in store.attempt_ids()? {
         let records = store.replay(&attempt_id)?;
@@ -1958,9 +2012,28 @@ pub async fn sweep_hops(home: &MaxplayerHome) -> Result<Vec<SweptHop>, HopError>
         let active_melt_quote_id = active_melt(&records)
             .map(|(id, _)| id)
             .unwrap_or_else(|| pairing.melt_quote_id.clone());
-        let result = sweep_one(home, &store, pairing.clone(), !refused).await;
-        if refused && matches!(result, Err(HopError::HopRefused { .. })) {
-            continue;
+        let result = resume(pairing.clone(), !refused).await;
+        if refused {
+            match &result {
+                // Still nothing melted: nothing to report.
+                Err(HopError::HopRefused { .. }) => continue,
+                // No verdict this time. Never printed as a strand, never counted as unfinished:
+                // the last known state is that nothing left the source (fable r5 L2).
+                Err(error @ HopError::RefusedRecheckIncomplete { .. }) => {
+                    eprintln!(
+                        "CROSSMINT REFUSED-RECHECK attempt={} could not be re-checked (source {} \
+                         melt quote {}, target {}): {error}; it was refused before a melt was sent \
+                         and nothing is known to have been melted since; the next sweep checks again",
+                        pairing.attempt_id,
+                        pairing.source_mint,
+                        active_melt_quote_id,
+                        pairing.target_mint,
+                    );
+                    continue;
+                }
+                // A melt that landed or is in flight after all: reported like any other hop.
+                _ => {}
+            }
         }
         if let Err(error) = &result
             && error.is_pin_refusal()
@@ -2013,7 +2086,29 @@ async fn sweep_one(
     pairing: HopJournal,
     honor_refusal: bool,
 ) -> Result<HopSettled, HopError> {
-    let mut effects = CdkHopEffects::open(home, &pairing.source_mint, &pairing.target_mint).await?;
+    let mut effects = match open_for_sweep(home, &pairing).await {
+        Ok(effects) => effects,
+        // Opening the wallets or recovering their sagas failed: for a refused attempt that is a
+        // failed re-check, not a strand (#1292 fable r5 L2).
+        Err(error) if !honor_refusal => {
+            return Err(HopError::RefusedRecheckIncomplete {
+                attempt_id: pairing.attempt_id.clone(),
+                detail: error.to_string(),
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    // `run_hop` blocks (it bridges each leg onto its own runtime), so it may not run on the
+    // caller's async thread.
+    let store = store.clone();
+    tokio::task::spawn_blocking(move || run_hop_with(&store, &mut effects, &pairing, honor_refusal))
+        .await
+        .map_err(|error| HopError::Mint(format!("hop sweep task: {error}")))?
+}
+
+/// Both wallets of a hop, opened and with their sagas recovered, for the sweep.
+async fn open_for_sweep(home: &MaxplayerHome, pairing: &HopJournal) -> Result<CdkHopEffects, HopError> {
+    let effects = CdkHopEffects::open(home, &pairing.source_mint, &pairing.target_mint).await?;
     let mut recovered = Vec::new();
     for (label, wallet) in [("source", &effects.source), ("target", &effects.target)] {
         // Never plain cdk recovery: on a nostr:// mint it would unspend inputs and drop swap rows
@@ -2036,13 +2131,8 @@ async fn sweep_one(
         }
         recovered.push(wallet.mint_url.to_string());
     }
-    require_both_mints_recovered(&recovered, &pairing)?;
-    // `run_hop` blocks (it bridges each leg onto its own runtime), so it may not run on the
-    // caller's async thread.
-    let store = store.clone();
-    tokio::task::spawn_blocking(move || run_hop_with(&store, &mut effects, &pairing, honor_refusal))
-        .await
-        .map_err(|error| HopError::Mint(format!("hop sweep task: {error}")))?
+    require_both_mints_recovered(&recovered, pairing)?;
+    Ok(effects)
 }
 
 #[cfg(test)]
@@ -2324,6 +2414,84 @@ mod tests {
             assert!(world.borrow().superseding_quotes.is_empty(), "no re-quote");
             assert!(settled_of(&store.replay("attempt-1").unwrap()).is_none());
         }
+    }
+
+    // fable r5 L3: the sweep's own decisions, over a real journal file.
+    async fn sweep_fake(store: &FsHopJournal, world: &Rc<RefCell<MintWorld>>) -> Vec<SweptHop> {
+        sweep_journal(store, |pairing, honor_refusal| {
+            let store = store.clone();
+            let world = Rc::clone(world);
+            async move {
+                let mut effects = FakeMints { world };
+                run_hop_with(&store, &mut effects, &pairing, honor_refusal)
+            }
+        })
+        .await
+        .expect("journal readable")
+    }
+
+    #[tokio::test]
+    async fn the_sweep_rechecks_a_refused_attempt_and_completes_only_a_landed_melt() {
+        let dir = scratch_dir("sweep-refused");
+        let store = FsHopJournal::new(&dir);
+        store.append_sync(&HopRecord::Planned(journal("attempt-1"))).unwrap();
+        store
+            .append_sync(&HopRecord::Refused { attempt_id: "attempt-1".into(), reason: "test".into() })
+            .unwrap();
+        let world = MintWorld::shared();
+        assert!(sweep_fake(&store, &world).await.is_empty(), "unpaid: nothing to report");
+        world.borrow_mut().melt_leg = None;
+        assert!(
+            sweep_fake(&store, &world).await.is_empty(),
+            "an unreachable source is a failed re-check, not a strand"
+        );
+        world.borrow_mut().melt_leg = Some(MeltLeg::Paid);
+        world.borrow_mut().mint_leg = Some(MintLeg::Paid);
+        let swept = sweep_fake(&store, &world).await;
+        assert_eq!(swept.len(), 1, "a melt that landed is resumed");
+        assert_eq!(swept[0].result.as_ref().expect("completed").minted_sats, 100);
+        assert!(world.borrow().melts.is_empty(), "nothing melted again");
+        assert!(settled_of(&store.replay("attempt-1").unwrap()).is_some());
+        assert!(sweep_fake(&store, &world).await.is_empty(), "settled: skipped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_still_reports_an_unreachable_source_on_an_unrefused_attempt() {
+        let dir = scratch_dir("sweep-unrefused");
+        let store = FsHopJournal::new(&dir);
+        store.append_sync(&HopRecord::Planned(journal("attempt-1"))).unwrap();
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = None;
+        let swept = sweep_fake(&store, &world).await;
+        assert_eq!(swept.len(), 1);
+        assert!(matches!(swept[0].result, Err(HopError::Mint(_))), "got: {:?}", swept[0].result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_attempt_in_flight_or_paid_at_the_target_is_handled_on_recheck() {
+        let store = refused_store("attempt-1");
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Pending);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let error = run_hop_with(&store, &mut effects, &journal("attempt-1"), false)
+            .expect_err("in flight");
+        assert!(matches!(error, HopError::MeltInFlight { .. }), "got: {error}");
+        assert!(world.borrow().melts.is_empty() && world.borrow().mints.is_empty());
+        assert!(settled_of(&store.replay("attempt-1").unwrap()).is_none());
+
+        let store = refused_store("attempt-1");
+        let world = MintWorld::shared();
+        world.borrow_mut().melt_leg = Some(MeltLeg::Failed);
+        world.borrow_mut().mint_leg = Some(MintLeg::Paid);
+        let mut effects = FakeMints { world: Rc::clone(&world) };
+        let settled = run_hop_with(&store, &mut effects, &journal("attempt-1"), false)
+            .expect("the target invoice was paid: completed");
+        assert_eq!(settled.minted_sats, 100);
+        assert!(world.borrow().melts.is_empty(), "no melt");
+        assert!(world.borrow().superseding_quotes.is_empty(), "no re-quote");
+        assert!(settled_of(&store.replay("attempt-1").unwrap()).is_some());
     }
 
     // fable r4 L3: plan asks for one more leg of lifetime than the melt does.
@@ -3170,7 +3338,7 @@ mod tests {
                         id: keyset.id,
                         unit: keyset.unit.clone(),
                         active: true,
-                        input_fee_ppk: 0,
+                        input_fee_ppk: keyset.input_fee_ppk,
                         final_expiry: None,
                     }],
                 })
@@ -3217,6 +3385,10 @@ mod tests {
     }
 
     fn scripted_keyset(seed: u8) -> cashu::KeySet {
+        scripted_keyset_with_fee(seed, 0)
+    }
+
+    fn scripted_keyset_with_fee(seed: u8, input_fee_ppk: u64) -> cashu::KeySet {
         let keys = (0..16u32)
             .map(|bit| {
                 let amount = cashu::Amount::from(1u64 << bit);
@@ -3226,11 +3398,11 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         let keys = cashu::Keys::new(keys);
         cashu::KeySet {
-            id: cashu::Id::v2_from_data(&keys, &cashu::CurrencyUnit::Sat, 0, None),
+            id: cashu::Id::v2_from_data(&keys, &cashu::CurrencyUnit::Sat, input_fee_ppk, None),
             unit: cashu::CurrencyUnit::Sat,
             active: Some(true),
             keys,
-            input_fee_ppk: 0,
+            input_fee_ppk,
             final_expiry: None,
         }
     }
@@ -3507,6 +3679,41 @@ mod tests {
     // #1292 review L1/L5: the real effect re-checks the prepared quote before confirm. A store row
     // tampered after planning (fee reserve raised past the authorized cost) is cancelled before any
     // melt request: the scripted source would answer a POST /v1/melt/bolt11 with a different error.
+    // fable r5 L1: what cdk actually prepares at a fee-charging keyset, through its swap path,
+    // stays within the fee the plan priced.
+    #[tokio::test]
+    async fn the_fee_ceiling_covers_what_cdk_prepares_at_a_fee_charging_keyset() {
+        let honest =
+            crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"f1-fee-keyset", Duration::ZERO);
+        let source = ScriptedMint {
+            keyset: Some(scripted_keyset_with_fee(40, 1000)),
+            melt_amount: 100,
+            fee_reserve: 290,
+            ..Default::default()
+        };
+        let target = ScriptedMint { keyset: Some(scripted_keyset(80)), invoice: honest, ..Default::default() };
+        let effects = CdkHopEffects {
+            source: scripted_wallet("https://buyer-mint.test", source, 30_000, 11).await,
+            target: scripted_wallet("https://seller-chosen-mint.test", target, 0, 12).await,
+            hop_fee_buffer_multiplier: 0,
+            wallet_dir: None,
+        };
+        let pairing = effects.plan_quotes("attempt-fee-keyset", 100).await.expect("plans");
+        let prepared = effects
+            .source
+            .prepare_melt(&pairing.melt_quote_id, HashMap::new())
+            .await
+            .expect("prepares");
+        let charged = prepared.input_fee().to_u64() + prepared.swap_fee().to_u64();
+        assert!(charged > 0, "the fee-charging keyset must be exercised");
+        assert!(
+            charged <= pairing.input_fee,
+            "cdk charges {charged} sats of input/swap fee; the plan priced {}",
+            pairing.input_fee
+        );
+        prepared.cancel().await.expect("cancel");
+    }
+
     #[tokio::test]
     async fn cdk_melt_cancels_a_prepared_melt_outside_the_authorized_cost() {
         let honest =
