@@ -1,3 +1,36 @@
+## v0.7.3-rc8
+
+Release candidate for 0.7.3. **v0.7.3-rc7 cannot run claude or codex seats; upgrade to this one.**
+rc7's sandbox image baked claude-agent-acp 0.104.1 and codex-acp 2.6.0, and both refuse the
+`initialize` request the rc7 seller sends (`invalid initialize params … path: ["info"]`), so every
+stock-image claude/codex seat failed its pre-advertise probe and never advertised (#1289). The fix
+is in the maxplayer binary, not the image: the adapter pins are unchanged from rc7 (claude-agent-acp
+0.104.1 / Claude Code 2.1.322, which Claude Fable 5.2 needs; codex-acp 2.6.0; cursor-agent
+2026.11.05-86047df). No new wire field: no relay, reviewer or registration-service redeploy.
+`maxplayer-trade` and `maxplayer-mint` are still not release binaries: build them from source at
+this tag. After publication, install with `npm install -g maxplayer@0.7.3-rc8`. Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` unchanged.
+
+- **Fixed: the seller's ACP `initialize` is accepted by the rc7-image adapters** (#1291, fixes
+  #1289). The driver now requests ACP protocol v1. It used to request 2, which the SDK 2.x adapters
+  route to the experimental v2 draft that requires `info`. No `clientInfo` is sent. An agent that
+  answers above 1 but still carries v1 fields runs as v1 with a warning. A new release gate,
+  `scripts/check-acp-initialize.sh`, runs the real `AcpDriver::ready` against the Dockerfile's
+  adapter pins, the previous pins (claude-agent-acp 0.85.0, codex-acp 2.1.1) and the pinned
+  cursor-agent; CI `build-acp` and `publish-sandbox-image.yml` both run it, so no image is pushed
+  whose adapters refuse this client. Host-mode seats on claude-agent-acp 0.104.x or codex-acp 2.6.x
+  need this binary too.
+- **Fixed (security): `collect` refuses delivered tree paths that escape the results directory**
+  (#1290). Every entry is validated before anything is written, symlinks under the results folder
+  are not followed, and a paid collect refuses before any spend.
+- **Fixed (security): a cross-mint hop refuses a target invoice that is not for the offer amount**
+  (#1292). The seller-chosen target mint's bolt11 must equal the offer amount, and amountless or
+  undecodable invoices are refused, before the source mint prices it.
+- **Changed: `publish-sandbox-image.yml` reads release tag/inputs through `env:`** (#1293), not
+  `${{ }}` expansion inside `run:`.
+- Site: link previews (og/twitter/canonical tags, preview card, PNG favicons; #1294, #1295) and
+  quieter product-news wording in the skills (#1296).
+
 ## v0.7.3-rc7
 
 Release candidate for 0.7.3. It carries exactly what v0.7.3-rc6 was cut for; rc6 was tagged and
