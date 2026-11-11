@@ -42,10 +42,15 @@ function req(method, params) {
 
 const out = {};
 try {
-  out.initialize = (await req("initialize", { protocolVersion: 2,
-    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false } })).result;
+  // ACP v1, as the driver sends it (#1289): a `2` routes claude-agent-acp >= 0.104 to the SDK's v2
+  // draft, which refuses these params. A refused initialize stops here with the adapter's error.
+  const init = await req("initialize", { protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false } });
+  if (init.error) throw new Error(`initialize refused: ${JSON.stringify(init.error)}`);
+  out.initialize = init.result;
   const sn = await req("session/new", { cwd: CWD, mcpServers: [],
     _meta: { claudeCode: { emitRawSDKMessages: [{ type: "system", subtype: "init" }] } } });
+  if (sn.error) throw new Error(`session/new refused: ${JSON.stringify(sn.error)}`);
   out.sessionNew = sn.result;
   const sid = sn.result.sessionId;
   out.prompt = await req("session/prompt", { sessionId: sid,

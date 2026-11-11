@@ -195,9 +195,28 @@ jobs:
   # Each leg pushes BOTH images by digest only — no tag is written here. Tags are applied once, by
   # the merge job, to the manifest list: a tag must never point at a single-architecture image, not
   # even briefly, or a seat on the other architecture would pull something it cannot run.
+  # #1289 / #1291 review M4: the image is what ships the adapters, so the adapters it pins must accept
+  # THIS client's real `initialize` before anything is pushed. CI runs the same check on every pull
+  # request; this covers a publish of a commit whose CI was skipped or red, and workflow_dispatch.
+  check-adapters:
+    name: ACP initialize against the pinned adapters
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.4 # the sandbox image's node (docker/maxplayer-sandbox/Dockerfile)
+      - run: ./scripts/check-acp-initialize.sh
+
   build:
     name: Build ${{ matrix.platform }}
-    needs: plan
+    needs: [plan, check-adapters]
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read

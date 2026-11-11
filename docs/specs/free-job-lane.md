@@ -578,7 +578,7 @@ No caps, rate limits, or quotas are specified. These are the exposures the opera
 
 **Not touched, and deliberately:** `crossmint.rs` (`plan_payment :94`) — the free path never calls
 it; `budget.rs` — a free job writes no spend record (§3.1); `seller.rs`'s `SellerJournal` — dead code
-at this head (§3.3); `driver/acp.rs:17` — a different `PROTOCOL_VERSION` (§1.2).
+at this head (§3.3); `driver/acp.rs:17` at `8c3bc9b` — a different `PROTOCOL_VERSION` (§1.2; ACP, `1` since #1289).
 
 ---
 
@@ -592,7 +592,7 @@ the brief's §4 all reproduce; these are additions and two errors.
    five** — `:1606`, `:1611`, `:1616`, `:1622`, `:1628`, `:1634`. Its own doc lists the same six as
    bullets at `:1593-1598`.
 2. **Reproduces exactly.** Two `PROTOCOL_VERSION` constants, `gateway.rs:10` (wire, `&str`) and
-   `driver/acp.rs:17` (ACP, `u32`); `git grep -n "const PROTOCOL_VERSION" -- crates` returns those
+   `driver/acp.rs:17` (ACP, `u32`, `2` at `8c3bc9b`; `1` since #1289); `git grep -n "const PROTOCOL_VERSION" -- crates` returns those
    two lines and no others.
 3. **Reproduces.** `gateway.rs:401` compares by equality with no range;
    `buzz-relay/src/audio/handler.rs:417` accepts `1..=CURRENT_PROTOCOL_VERSION` (`:124`). Adding to

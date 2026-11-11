@@ -81,6 +81,9 @@ jobs:
   build-acp:
     name: Build & test (acp)
     runs-on: ubuntu-latest
+    # Read-only: this job runs freshly downloaded adapter code (scripts/check-acp-initialize.sh).
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

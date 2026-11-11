@@ -33,31 +33,16 @@ use serde_json::Value;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub type SessionId = String;
 
-/// ACP v1 `Implementation`: who is on this end of the connection (`initialize.clientInfo`).
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub struct Implementation {
-    pub name: String,
-    pub version: String,
-}
-
-impl Implementation {
-    /// This client: `maxplayer` at the version of the crate that built it.
-    pub fn maxplayer() -> Self {
-        Self {
-            name: "maxplayer".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
-        }
-    }
-}
-
-/// ACP v1 `initialize` params. `clientInfo` is optional in v1 and sent anyway: it is what a v1
-/// `initialize` names the client with, and the v2 draft's REQUIRED field is its renamed successor
-/// (`info`), so a client that names itself is the shape both generations expect.
+/// ACP v1 `initialize` params.
+///
+/// No `clientInfo`, deliberately (#1291 review M1): v1 makes it optional, the fix for #1289 does not
+/// need it, and it is not neutral — codex-acp forwards `clientInfo.name` to Codex as the session's
+/// originator, so sending it would change how every codex seat identifies itself upstream. Add it
+/// on its own, with an authenticated codex turn behind it, if it is ever wanted.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Initialize {
     pub protocol_version: u32,
-    pub client_info: Implementation,
     pub client_capabilities: Caps,
 }
 
@@ -65,7 +50,6 @@ impl Initialize {
     pub fn new(client_capabilities: Caps) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
-            client_info: Implementation::maxplayer(),
             client_capabilities,
         }
     }
