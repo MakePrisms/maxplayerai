@@ -2645,6 +2645,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "toml",
+ "unicode-normalization",
  "url",
  "uuid",
 ]

@@ -52,6 +52,8 @@ live-mints = []
 test-support = []
 
 [dependencies]
+# Collision key for delivered paths on APFS/HFS+ (collect.rs, #1290).
+unicode-normalization = "0.1"
 # Same transport crate as the pinned SDK; observe raw row counts before SDK filtering.
 async-wsocket = { version = "0.13.2", optional = true }
 tempfile = { version = "3", optional = true }

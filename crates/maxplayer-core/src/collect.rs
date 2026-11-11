@@ -764,8 +764,27 @@ pub(crate) fn check_dest(dest: &Path) -> Result<(), String> {
         Ok(_) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("inspect {}: {error}", dest.display())),
+    }?;
+    // #1290 fable r2 R1: the longest path the pre-pay check accepts must still be writable here.
+    // Worst case: a staging dir in dest's place, the deepest delivered path, and a temporary file
+    // name in place of its last component, under macOS's PATH_MAX (a release target).
+    let worst = dest.as_os_str().len() + TEMP_NAME_MAX + 1 + MAX_DELIVERY_PATH_BYTES + TEMP_NAME_MAX + 1;
+    if worst > PORTABLE_PATH_MAX {
+        return Err(format!(
+            "results folder {} is {} bytes long; with the longest delivery path collect accepts \
+             ({MAX_DELIVERY_PATH_BYTES} bytes) a write could exceed the {PORTABLE_PATH_MAX}-byte \
+             path limit. Use a shorter maxplayer home path — nothing was paid",
+            dest.display(),
+            dest.as_os_str().len()
+        ));
     }
+    Ok(())
 }
+
+/// `PATH_MAX` on macOS, including the terminating NUL: the smallest of the release targets.
+const PORTABLE_PATH_MAX: usize = 1024;
+/// Upper bound on a [`temp_name`] (`.maxplayer-tmp-stage-<pid>-<n>` is at most 52 bytes).
+const TEMP_NAME_MAX: usize = 64;
 
 /// Refuse a seller-authored delivery path that is not a plain relative path under the results
 /// directory: empty, absolute, `.`/`..`/empty components, `.git` (any case), backslashes, colons
@@ -781,8 +800,9 @@ pub fn validate_delivery_path(rel: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Longest delivered path, so `results/<job>/` + path stays well under `PATH_MAX` (#1290 fable M1).
-const MAX_DELIVERY_PATH_BYTES: usize = 1024;
+/// Longest delivered path. [`check_dest`] refuses, before pay, a results folder whose own path
+/// leaves no room for it under [`PORTABLE_PATH_MAX`] (#1290 fable M1, r2 R1).
+const MAX_DELIVERY_PATH_BYTES: usize = 512;
 /// Deepest directory nesting in one delivery.
 const MAX_DELIVERY_DEPTH: usize = 64;
 /// Most tree entries (files, directories, symlinks, submodules) one delivery may hold. Also bounds
@@ -830,6 +850,17 @@ fn portable_component(component: &str) -> bool {
         }
     }
     true
+}
+
+/// The key two delivered paths collide under on a case-insensitive APFS/HFS+ volume (#1290 fable
+/// r2 R1): canonical decomposition (NFC `café` and NFD `café` are one name there), HFS-ignorable
+/// code points dropped, and a full upper→lower round trip, which folds `ſ`→`s` and the Kelvin sign
+/// →`k` where plain `to_lowercase` does not. Deliberately broad: it may refuse a pair Linux could
+/// store, never accept a pair macOS cannot.
+fn collision_key(path: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    let stripped: String = path.nfd().filter(|c| !is_hfs_ignorable(*c)).collect();
+    stripped.to_uppercase().to_lowercase().nfd().collect()
 }
 
 /// Code points HFS+ skips when comparing names (git `is_hfs_dotgit`).
@@ -880,8 +911,8 @@ pub fn validate_tree_paths(repo: &git2::Repository, tree: &git2::Tree<'_>) -> Re
         if let Err(error) = validate_delivery_path(&path) {
             return refuse(error);
         }
-        // Lowercased: names that differ only in case are one file on macOS's default volume.
-        if !seen.insert(path.to_lowercase()) {
+        // Names APFS/HFS+ would store as one file collide: case, Unicode form, ignorables.
+        if !seen.insert(collision_key(&path)) {
             return refuse(format!(
                 "delivery path {} appears twice (or twice up to letter case); refusing the delivery",
                 shown(&path)
@@ -1432,7 +1463,49 @@ mod tests {
         check("slash-collision", &[b"0-first.txt", b"a", b"a/b"]);
         check("name-max", &[b"0-first.txt", &[b'x'; 300]]);
         check("case-collision", &[b"0-first.txt", b"README.md", b"readme.md"]);
+        check("long-path", &[b"0-first.txt", "a/".repeat(260).as_bytes()]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn paths_macos_would_store_as_one_file_collide() {
+        for (a, b) in [
+            ("caf\u{e9}", "cafe\u{301}"),
+            ("\u{17f}rc", "src"),
+            ("\u{212a}ey", "key"),
+            ("a\u{200c}b", "ab"),
+            ("Dir/X.md", "dir/x.md"),
+        ] {
+            assert_eq!(collision_key(a), collision_key(b), "{a:?} vs {b:?}");
+        }
+        assert_ne!(collision_key("a.txt"), collision_key("b.txt"));
+        // A blob `café` (NFC) beside a subtree `café` (NFD) is refused before pay.
+        let root = temp_root("nfd");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let repo = git2::Repository::init_bare(&store).expect("init store");
+        let blob = repo.blob(b"x\n").expect("blob");
+        let sub = raw_tree(&repo, &[("100644", b"f", blob)]);
+        let commit = retain_tree(
+            &repo,
+            raw_tree(&repo, &[("100644", "caf\u{e9}".as_bytes(), blob), ("40000", "cafe\u{301}".as_bytes(), sub)]),
+        );
+        let error = validate_delivery_tree_in_store(&store, &PayPathDeliveryVerifier::store_ref_for(&commit), &commit)
+            .expect_err("NFC/NFD pair must refuse");
+        assert!(error.contains("appears twice"), "got: {error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_results_folder_too_long_for_the_longest_delivery_is_refused_before_pay() {
+        let root = temp_root("long-dest");
+        let ok = root.join("results").join("a".repeat(64));
+        assert!(check_dest(&ok).is_ok(), "an ordinary home fits");
+        let deep = root.join("x".repeat(200)).join("y".repeat(200)).join("results").join("a".repeat(64));
+        let error = check_dest(&deep).expect_err("no room left for the longest delivery");
+        assert!(error.contains("nothing was paid"), "got: {error}");
+        assert!(validate_delivery_path(&"a".repeat(513)).is_err(), "over the path bound");
+        assert!(validate_delivery_path(&"a/".repeat(200)[..399]).is_ok(), "a 399-byte path is fine");
     }
 
     #[test]
