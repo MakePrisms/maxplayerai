@@ -26,6 +26,8 @@ use std::sync::Once;
 
 use git_http_fixture::GitHttpAuthServer;
 use maxplayer_core::budget::BudgetGate;
+use maxplayer_core::authorize_pay::AuthorizePayError;
+use maxplayer_core::delivery::DeliveryError;
 use maxplayer_core::collect::{collect_async, CollectError, CollectRequest};
 use maxplayer_core::home;
 use maxplayer_core::job_lifecycle::AcceptedBind;
@@ -776,6 +778,122 @@ async fn a_free_collect_refuses_a_delivery_with_no_execution_sentinel() {
 
     drop(server);
     let _ = fs::remove_dir_all(&upstream);
+    let _ = fs::remove_dir_all(&root);
+}
+
+// ── REPORT1110 F2 — a seller-authored tree entry that escapes the results dir, over the REAL fetch ──
+//
+// libgit2's treebuilder refuses `..`/absolute names, but the tree PARSER and the fetch indexer accept
+// any NUL-free name, so a seller-hosted repo can deliver one. Built here as a raw tree object served
+// by the same HTTPS fixture. The paid collect must refuse BEFORE the budget gate (zero spend, no
+// journal) and the free collect must refuse in materialize; neither may write outside `results/`.
+fn make_hostile_upstream(label: &str, job_hash: &str, escape_name: &[u8]) -> (PathBuf, String) {
+    let dir = temp(label);
+    fs::create_dir_all(&dir).expect("upstream dir");
+    let repo = git2::Repository::init(&dir).expect("init upstream");
+    let manifest = maxplayer_core::delivery_sentinel::render_manifest(
+        job_hash,
+        maxplayer_core::delivery_sentinel::DeliveryMode::FromScratch,
+        1,
+        12,
+    );
+    let sentinel = repo.blob(manifest.as_bytes()).expect("sentinel blob");
+    let payload = repo.blob(b"seller-controlled bytes\n").expect("payload blob");
+    // Raw tree entries must be sorted by name; `..`, `/` and the sentinel's capitals all sort first.
+    let mut entries: Vec<(Vec<u8>, git2::Oid)> = vec![
+        (escape_name.to_vec(), payload),
+        (maxplayer_core::delivery_sentinel::SENTINEL_FILE.as_bytes().to_vec(), sentinel),
+        (b"ok.txt".to_vec(), payload),
+    ];
+    entries.sort();
+    let mut raw = Vec::new();
+    for (name, oid) in &entries {
+        raw.extend_from_slice(b"100644 ");
+        raw.extend_from_slice(name);
+        raw.push(0);
+        raw.extend_from_slice(oid.as_bytes());
+    }
+    let tree_oid = repo.odb().expect("odb").write(git2::ObjectType::Tree, &raw).expect("raw tree");
+    let tree = repo.find_tree(tree_oid).expect("tree");
+    let sig = git2::Signature::now("Seller", "seller@example.invalid").expect("sig");
+    let commit = repo
+        .commit(Some("refs/heads/main"), &sig, &sig, "delivery", &tree, &[])
+        .expect("commit");
+    repo.set_head("refs/heads/main").expect("head");
+    (dir, commit.to_string())
+}
+
+async fn collect_hostile(label: &str, mount_seed: &str, free: bool, escape: &str) -> (Result<maxplayer_core::collect::CollectOutcome, CollectError>, BudgetGate, PathBuf) {
+    init_test_env();
+    let job_hash = "5e".repeat(32);
+    let (upstream, tip_oid) = make_hostile_upstream(label, &job_hash, escape.as_bytes());
+    let mount = format!("/git/{mount_seed}/repo.git");
+    let server = GitHttpAuthServer::spawn(&upstream, &mount);
+    let repo_url = server.repo_url();
+
+    let root = temp(&format!("home-{label}"));
+    let _ = fs::remove_dir_all(&root);
+    let home = home::bootstrap(&root).expect("home");
+    let secret_hex = home::read_secret_key_hex(&home).expect("secret");
+    let pubkey_hex = home::public_key_hex(&home).expect("pubkey");
+    let job_id = "a".repeat(64);
+    let bind = if free {
+        free_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, &job_hash)
+    } else {
+        let mut bind = from_scratch_bind(&job_id, &pubkey_hex, &tip_oid, &repo_url, &job_hash);
+        bind.seller_signature = seller_cosig(&secret_hex, &pubkey_hex, &bind);
+        bind
+    };
+    write_bind(&home, &bind);
+    let mut gate = BudgetGate::from_home(&home).expect("gate");
+    let result = collect_async(
+        &home,
+        Some(&mut gate),
+        CollectRequest { accept_review_verdict: None, job_id, out: None },
+    )
+    .await;
+    drop(server);
+    let _ = fs::remove_dir_all(&upstream);
+    (result, gate, root)
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_paid_collect_refuses_a_path_escaping_delivery_before_any_spend() {
+    // `results/<job>/../../ESCAPED_PAID.txt` is `<home>/ESCAPED_PAID.txt`.
+    let (result, gate, root) =
+        collect_hostile("escape-paid", &"e1".repeat(32), false, "../../ESCAPED_PAID.txt").await;
+    let error = result.expect_err("a path-escaping delivery must refuse");
+    assert!(
+        matches!(
+            error,
+            CollectError::Pay(AuthorizePayError::Delivery(DeliveryError::UnsafeTree(_)))
+        ),
+        "must refuse in the pay path as an unsafe tree: {error}"
+    );
+    assert!(error.to_string().contains("refusing the delivery"), "got: {error}");
+    assert!(!root.join("ESCAPED_PAID.txt").exists(), "wrote outside the results directory");
+    assert_eq!(gate.spent(), 0, "an unsafe delivery must burn ZERO spend");
+    assert!(!root.join("payment-journal").exists(), "no payment journal on a pre-pay refusal");
+    assert!(!root.join("results").join("a".repeat(64)).exists(), "nothing materialized");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_free_collect_refuses_a_path_escaping_delivery_and_writes_nothing() {
+    let (result, gate, root) =
+        collect_hostile("escape-free", &"e2".repeat(32), true, "../../ESCAPED_FREE.txt").await;
+    let error = result.expect_err("a path-escaping free delivery must refuse");
+    assert!(error.to_string().contains("refusing the delivery"), "got: {error}");
+    assert!(!root.join("ESCAPED_FREE.txt").exists(), "wrote outside the results directory");
+    assert!(
+        !root.join("results").join("a".repeat(64)).join("ok.txt").exists(),
+        "no partial materialization"
+    );
+    assert!(
+        !root.join("collects").join(format!("{}.json", "a".repeat(64))).exists(),
+        "no collect record for a refused collect"
+    );
+    assert_eq!(gate.spent(), 0);
     let _ = fs::remove_dir_all(&root);
 }
 

@@ -2147,6 +2147,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "unicode-normalization",
  "uuid",
 ]
 

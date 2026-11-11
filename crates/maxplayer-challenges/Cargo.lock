@@ -811,6 +811,7 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "toml",
+ "unicode-normalization",
 ]
 
 [[package]]

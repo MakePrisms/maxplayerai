@@ -161,6 +161,10 @@ pub enum DeliveryError {
     },
     /// Contribution: the content gate refused (empty / out-of-scope / forbidden / too-large).
     ContentRefused(String),
+    /// The delivered tree names an entry collect will not write — `..`, absolute, `.git`, ...
+    /// (REPORT1110 F2). Refused on the pay path before the budget gate. Distinct from
+    /// [`Self::ContentRefused`], which is the contribution diff gate.
+    UnsafeTree(String),
     /// Contribution: merging the retained local `commit_oid` into the target failed.
     MergeFailed(&'static str),
 }
@@ -204,6 +208,7 @@ impl fmt::Display for DeliveryError {
                 "delivered commit {commit_oid} does not descend from base {base_oid}"
             ),
             Self::ContentRefused(reason) => write!(formatter, "content gate refused: {reason}"),
+            Self::UnsafeTree(reason) => write!(formatter, "delivered tree refused: {reason}"),
             Self::MergeFailed(operation) => {
                 write!(formatter, "retained merge {operation} failed")
             }
