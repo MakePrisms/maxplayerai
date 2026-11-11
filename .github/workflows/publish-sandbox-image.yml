@@ -171,11 +171,14 @@ jobs:
           # here. A tag missing its `v` would publish images no seller ever asks for, and the pull
           # failure would surface much later, on the first contained job. release.yml's
           # verify-release-version.sh already holds the tag to the crate version; this holds the
-          # image tag to the shape that ref is built from.
-          case "$version" in
-            v*) ;;
-            *) echo "image version '$version' does not start with 'v' — the binary asks for :v<version>, so these images would be unreachable" >&2; exit 1 ;;
-          esac
+          # image tag to the shape that ref is built from. The shape is checked exactly, not just the
+          # leading `v`: the tag list below is comma-joined and split again at push time, so a
+          # version carrying `,` (or `:`/`/`) would add an image ref of its own — e.g. move `:latest`
+          # from a manual dispatch that must never touch it (#1293 review).
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+            echo "image version '$version' is not v<MAJOR>.<MINOR>.<PATCH>[-<pre>] — the binary asks for :v<CARGO_PKG_VERSION>, and anything else is either unreachable or splits into extra image refs" >&2
+            exit 1
+          fi
 
           tags="${REGISTRY}/${IMAGE_NAME}:${version}"
           netfilter_tags="${REGISTRY}/${NETFILTER_IMAGE_NAME}:${version}"
