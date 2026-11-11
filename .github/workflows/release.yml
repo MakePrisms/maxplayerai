@@ -129,10 +129,12 @@ jobs:
       - uses: actions/checkout@v4
 
       # Third-party actions in the job whose output ships to npm and the GitHub Release are pinned to
-      # a commit (#1293 review L4). The toolchain itself is still `stable`, resolved by rustup at
-      # run time; the pin only freezes the action's own code.
-      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # a commit (#1293 review L4). dtolnay is pinned to a `master` commit, never a `stable`-branch
+      # head: upstream garbage-collects commits outside master's history (#1293 fable r2 R1). At
+      # master `toolchain` is a required input; the toolchain is still `stable`, resolved by rustup.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
