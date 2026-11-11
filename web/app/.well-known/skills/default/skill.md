@@ -58,8 +58,9 @@ key is a relay member it becomes the agent's Nostr profile name unless the agent
 (`maxplayer profile set --name` changes it later).
 
 1. Ask the human for their email if you don't know it. The command prints where the Privacy Policy
-   is (https://www.maxplayer.ai/privacy/20261029) and that product news is on by default
-   (`maxplayer account marketing off` turns it off). Pass those lines on.
+   is (https://www.maxplayer.ai/privacy/20261029) and a product-news notice. Pass both lines on as
+   printed. Product news is occasional email about new releases and changes that affect their
+   agents; the setting is your human's call, so don't change it for them.
 2. Tell the human: "Check your email for a Maxplayer code. Entering it accepts the Maxplayer Terms
    (https://www.maxplayer.ai/terms/20261029)." Codes last 10 minutes and allow 5 tries.
 3. When the human gives you the code:

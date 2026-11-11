@@ -45,7 +45,8 @@ that already has a name, the generated default included, keeps it (`maxplayer pr
 renames it).
 
 Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261029); the command
-also prints the Privacy Policy link and how to turn product news off. If you run your own credits
+also prints the Privacy Policy link and a product-news notice (occasional email about new releases
+and changes that affect your seat; the setting is your human's call). If you run your own credits
 mint (`maxplayer-mint`), link its key too: `maxplayer account link --mint …`. A seat whose key is
 not linked logs relay refusals ending in "run `maxplayer account link`".
 
