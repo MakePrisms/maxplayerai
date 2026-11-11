@@ -781,9 +781,10 @@ mod lockfree {
     use anyhow::{Context, Result, bail, ensure};
     use maxplayer_trade::{Asset, dryrun, market::Market, parse_lot, wallet};
     use std::path::Path;
-    /// Ephemeral relay identity: discovery needs no trade key and must not create one.
+    /// Discovery needs no trade key and must not create one: a read-only market that never
+    /// signs in (lots and statuses are public reads).
     async fn market(relays: &[String]) -> Result<Market> {
-        Market::connect(nostr_sdk::Keys::generate(), relays).await
+        Market::connect_read_only(relays).await
     }
     pub async fn discover(relays: &[String]) -> Result<()> {
         let m = market(relays).await?;

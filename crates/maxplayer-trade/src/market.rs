@@ -86,13 +86,23 @@ pub struct Envelope {
 }
 impl Market {
     pub async fn connect(keys: Keys, urls: &[String]) -> Result<Self> {
+        Self::connect_with(keys, urls, true).await
+    }
+    /// Read-only market for lock-free discovery (`discover`, `take --dry-run`): a throwaway key
+    /// that never answers a NIP-42 challenge and opens no TRADE inbox. Lots and statuses are
+    /// public reads; signing in with an unregistered throwaway key only gets it refused (and, on
+    /// buzz, the socket closed under the query) plus a misleading `account link` hint.
+    pub async fn connect_read_only(urls: &[String]) -> Result<Self> {
+        Self::connect_with(Keys::generate(), urls, false).await
+    }
+    async fn connect_with(keys: Keys, urls: &[String], sign_in: bool) -> Result<Self> {
         ensure!(!urls.is_empty() && urls.len() <= 8, "relay count");
         let (tx, inbox) = tokio::sync::mpsc::unbounded_channel();
         let mut clients = vec![];
         for url in urls {
             check_market_relay(url)?;
             let c = Client::new(keys.clone());
-            c.automatic_authentication(true);
+            c.automatic_authentication(sign_in);
             c.add_relay(url).await?;
             let mut rx = c.notifications();
             let tx = tx.clone();
@@ -126,8 +136,13 @@ impl Market {
             // Before connecting, so the first sign-in is not missed. A sign-in-required relay
             // never delivers live TRADE messages to a REQ it saw before sign-in, so the REQ is
             // re-sent after every sign-in (reconnects included). Open relays are unaffected.
-            for relay in c.relays().await.into_values() {
-                maxplayer_core::relay_auth::resubscribe_on_auth(relay, "maxplayer-trade market");
+            if sign_in {
+                for relay in c.relays().await.into_values() {
+                    maxplayer_core::relay_auth::resubscribe_on_auth(
+                        relay,
+                        "maxplayer-trade market",
+                    );
+                }
             }
             c.connect().await;
             clients.push(c);
@@ -138,16 +153,17 @@ impl Market {
             let pk = keys.public_key();
             tasks.spawn(async move {
                 c.wait_for_connection(Duration::from_secs(10)).await;
-                c.subscribe(
-                    Filter::new()
-                        .kind(Kind::Custom(TRADE))
-                        .pubkey(pk)
-                        .since(Timestamp::from(
-                            crate::coordinator::now().saturating_sub(3600),
-                        )),
-                    None,
-                )
-                .await
+                // The TRADE inbox is a trading identity's; a read-only market has none.
+                if sign_in {
+                    let _ = c
+                        .subscribe(
+                            Filter::new().kind(Kind::Custom(TRADE)).pubkey(pk).since(
+                                Timestamp::from(crate::coordinator::now().saturating_sub(3600)),
+                            ),
+                            None,
+                        )
+                        .await;
+                }
             });
         }
         while tasks.join_next().await.is_some() {}
