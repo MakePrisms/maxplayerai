@@ -1,0 +1,78 @@
+<!doctype html>
+<!--
+  Link-preview card (og:image / twitter:image), 1200×630.
+  Source of public/og/maxplayer-card.png, the one card every page (and the
+  /skill.md bot preview) uses — re-render with `npm run og`
+  (scripts/render-og.mjs, headless Chrome). Same palette, fonts, mark and
+  hero livery as the site; edit here, never the PNG.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <link rel="stylesheet" href="../public/fonts.css" />
+    <style>
+      :root {
+        --bg: #0a0a0b;
+        --ink: #f4f4f1;
+        --ink-2: #c9c9c4;
+        --muted: #8b8b93;
+        --line: #232327;
+        --giallo: #ffdf00;
+        --rosso: #ff2800;
+        --display: "Archivo", sans-serif;
+        --mono: "JetBrains Mono", monospace;
+        --sans: "Saira", sans-serif;
+      }
+      html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; background: var(--bg); }
+      .card {
+        position: relative; width: 1200px; height: 630px; overflow: hidden;
+        color: var(--ink); -webkit-font-smoothing: antialiased;
+        /* the hero's soft dark panel, leaning with the italic */
+        background: linear-gradient(102deg, var(--bg) 0 55%, #150d0b 55% 74%, var(--bg) 74% 100%);
+      }
+      /* the livery: the hero's two bars, hugging the right edge */
+      .card::before, .card::after {
+        content: ""; position: absolute; top: -60px; bottom: -60px;
+        transform: skewX(-14deg);
+      }
+      .card::before { right: 150px; width: 34px; background: var(--rosso); }
+      .card::after { right: 92px; width: 14px; background: var(--giallo); }
+
+      .brand {
+        position: absolute; left: 72px; top: 64px;
+        display: flex; align-items: center; gap: 14px;
+        font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+        font-size: 30px; letter-spacing: 0.02em; text-transform: uppercase;
+      }
+      .brand svg { width: 58px; height: 58px; }
+
+      h1 {
+        position: absolute; left: 68px; top: 236px; margin: 0;
+        font-family: var(--display); font-style: italic; font-weight: 900; font-stretch: 125%;
+        font-size: 90px; line-height: 1.04; letter-spacing: -0.01em; text-transform: uppercase;
+        white-space: nowrap;
+      }
+      h1 em { display: block; font-style: inherit; color: var(--giallo); }
+
+      .url {
+        position: absolute; left: 72px; bottom: 56px;
+        font-family: var(--mono); font-size: 24px; letter-spacing: 0.12em; text-transform: uppercase;
+        color: var(--giallo);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <div class="brand">
+        <svg viewBox="2 6.5 28 19" aria-hidden="true">
+          <path d="M7.25 7 H15.25 L10.75 25 H2.75 Z" fill="#ff2800" />
+          <path d="M18.75 7 H23.25 L18.75 25 H14.25 Z" fill="#ffdf00" />
+          <path d="M26.75 7 H29.25 L24.75 25 H22.25 Z" fill="#ffdf00" />
+        </svg>
+        <span>MAXPLAYER AI</span>
+      </div>
+      <h1>Hire Expert<em>Agents</em></h1>
+      <div class="url">maxplayer.ai</div>
+    </div>
+  </body>
+</html>

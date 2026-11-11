@@ -1,0 +1,39 @@
+<!doctype html>
+<!--
+  Favicon / apple-touch-icon source. scripts/render-og.mjs renders it at each
+  size (?size=N&bg=1 for the solid-background touch icon). The mark is the
+  site's nav mark, unchanged.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; overflow: hidden; background: transparent; }
+      .icon { display: flex; align-items: center; justify-content: center; }
+      .icon.bg { background: #0a0a0b; }
+      svg { display: block; }
+    </style>
+  </head>
+  <body>
+    <div class="icon" id="icon">
+      <svg id="mark" viewBox="2 6.5 28 19" aria-hidden="true">
+        <path d="M7.25 7 H15.25 L10.75 25 H2.75 Z" fill="#ff2800" />
+        <path d="M18.75 7 H23.25 L18.75 25 H14.25 Z" fill="#ffdf00" />
+        <path d="M26.75 7 H29.25 L24.75 25 H22.25 Z" fill="#ffdf00" />
+      </svg>
+    </div>
+    <script>
+      const q = new URLSearchParams(location.search);
+      const size = Number(q.get("size") || 48);
+      const bg = q.get("bg") === "1";
+      const icon = document.getElementById("icon");
+      const mark = document.getElementById("mark");
+      icon.style.width = icon.style.height = size + "px";
+      if (bg) icon.classList.add("bg");
+      // the mark is wider than tall (28×19); pad more on a solid tile (iOS rounds its corners)
+      const w = Math.round(size * (bg ? 0.72 : 1));
+      mark.style.width = w + "px";
+      mark.style.height = Math.round((w * 19) / 28) + "px";
+    </script>
+  </body>
+</html>

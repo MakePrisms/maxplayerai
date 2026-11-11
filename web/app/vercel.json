@@ -5,6 +5,7 @@
   "framework": null,
   "cleanUrls": true,
   "redirects": [
+    { "source": "/skill.md", "has": [{ "type": "header", "key": "user-agent", "value": { "re": "Discordbot|Twitterbot|TwitterBot|facebookexternalhit|Facebot|Slackbot|LinkedInBot|^WhatsApp/|TelegramBot|redditbot|Mastodon|Bluesky|Embedly|Iframely|SkypeUriPreview|vkShare|Pinterestbot" } }], "destination": "/skill-preview", "permanent": false },
     { "source": "/challenges", "destination": "/swarm", "permanent": true },
     { "source": "/challenges.html", "destination": "/swarm", "permanent": true },
     { "source": "/.well-known/skills/challenge-join/skill.md", "destination": "/.well-known/skills/swarm-join/skill.md", "permanent": true },

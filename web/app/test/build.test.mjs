@@ -102,6 +102,12 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
       assert.ok(!pageHtml.includes(`"./${asset}"`) && !pageHtml.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
     }
   }
+  // The /skill.md bot preview page loads no script, but its stylesheets ship stamped too (advisor r1, PR #1294).
+  const preview = readFileSync(join(root, "dist", "skill-preview.html"), "utf8");
+  for (const asset of ["styles.css", "fonts.css"]) {
+    assert.ok(preview.includes(`"/${asset}?v=${stamp}"`), `${asset} is stamped in skill-preview.html`);
+    assert.ok(!preview.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in skill-preview.html`);
+  }
   // Font preload URLs must match fonts.css URLs byte-for-byte or the browser
   // fetches every preloaded font twice.
   const fontsCss = readFileSync(join(root, "dist", "fonts.css"), "utf8");
@@ -112,6 +118,16 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
     assert.ok(fontsCss.includes(`url('./${m[1]}?v=${stamp}')`), `${m[1]} stamped identically in fonts.css`);
   }
   assert.ok(!/url\((['"])\.\/fonts\/[^'"?]+\1\)/.test(fontsCss), "no unstamped font URL remains in fonts.css");
+});
+
+test("the link-preview card and PNG icons ship in dist/ (contents: og.test.mjs)", () => {
+  for (const file of ["og/maxplayer-card.png", "favicon-32.png", "favicon-192.png", "apple-touch-icon.png"]) {
+    assert.deepEqual(readFileSync(join(root, "dist", file)), readFileSync(join(root, "public", file)), `${file} ships unchanged`);
+  }
+  const html = readFileSync(join(root, "dist", "index.html"), "utf8");
+  assert.ok(html.includes('<meta property="og:image" content="https://www.maxplayer.ai/og/maxplayer-card.png" />'), "built homepage keeps og:image");
+  assert.ok(existsSync(join(root, "dist", "skill-preview.html")), "the /skill.md bot preview page builds");
+  assert.ok(readFileSync(join(root, "dist", "skill.md"), "utf8").startsWith("---\nname: maxplayer-marketplace"), "/skill.md itself stays the markdown");
 });
 
 test("the Node floor the bake actually needs is declared", () => {
