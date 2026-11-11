@@ -1229,7 +1229,7 @@ async fn landed_reclaim_refused_with_outputs_hidden_twice_is_never_redeemed() {
     }
 }
 
-// ---- readable `status` lists sends (a non-terminal send must never read "UNRESOLVED: none") ----
+// ---- readable `status` lists sends (a non-terminal send must never read "Nothing unresolved") ----
 
 /// (unresolved count, manual count) as `status --json` states them, for comparison with the text.
 fn json_counts(out: &std::process::Output) -> (usize, usize) {
@@ -1345,16 +1345,25 @@ async fn readable_status_lists_unresolved_and_settled_sends_with_json_matching_c
             .unwrap()
             .contains("reclaimed 8")
     );
-    assert!(!text.contains("UNRESOLVED: none"), "{text}");
+    assert!(!text.contains("Nothing unresolved"), "{text}");
 
     let json = cli(a.path(), &["status", "--json"], None).await;
     let (unresolved, manual_n) = json_counts(&json);
     assert_eq!((unresolved, manual_n), (4, 1));
     assert!(
-        text.contains(&format!(
-            "summary: {unresolved} unresolved ({manual_n} of them need manual recovery)"
+        text.starts_with(&format!(
+            "UNRESOLVED ({unresolved}), {manual_n} needs manual recovery:\n"
         )),
-        "summary must match status --json:\n{text}"
+        "header must match status --json:\n{text}"
+    );
+    // The readable view is not a help page: no exit-code text, one next step.
+    assert!(
+        !text.contains("Exit codes") && !text.contains("summary:"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\nNext: keep `serve` running, or run `recover`.\n"),
+        "{text}"
     );
     // The readable view never prints the journaled token.
     assert_secret_free(&human, &read(&a.path().join("s1")));

@@ -249,9 +249,10 @@ pub fn render(home: &Path) -> Result<String> {
         out.push('\n');
     }
     if unresolved.is_empty() {
-        out.push_str("UNRESOLVED: none\n");
+        out.push_str("Nothing unresolved: everything is settled.\n");
     } else {
-        out.push_str(&format!("UNRESOLVED ({}):\n", unresolved.len()));
+        out.push_str(&unresolved_header(unresolved.len(), manual));
+        out.push('\n');
         for l in &unresolved {
             out.push_str(&format!("  {l}\n"));
         }
@@ -259,17 +260,65 @@ pub fn render(home: &Path) -> Result<String> {
     for l in &settled {
         out.push_str(&format!("{l}\n"));
     }
-    out.push_str(&format!(
-        "summary: {} unresolved ({} of them need manual recovery). Exit codes: recover/take exit 3 while unresolved items remain (keep serve running or rerun recover), 4 when manual recovery is needed, 0 when everything is settled. status itself always exits 0; use status --json for machine-readable records.",
-        unresolved.len(),
-        manual
-    ));
-    Ok(out)
+    out.push_str(&next_steps(unresolved.len(), manual));
+    // `println!` adds the final newline.
+    Ok(out.trim_end_matches('\n').to_string())
+}
+
+/// `UNRESOLVED (n):`, naming the manual-recovery share only when there is one. Exit codes live
+/// in `status --help` / `recover --help`, not in every run's output (Petar, 2026-11-11).
+fn unresolved_header(unresolved: usize, manual: usize) -> String {
+    match manual {
+        0 => format!("UNRESOLVED ({unresolved}):"),
+        1 => format!("UNRESOLVED ({unresolved}), 1 needs manual recovery:"),
+        n => format!("UNRESOLVED ({unresolved}), {n} need manual recovery:"),
+    }
+}
+
+/// What the operator can do next; empty when everything is settled.
+fn next_steps(unresolved: usize, manual: usize) -> String {
+    let mut out = String::new();
+    if unresolved > manual {
+        out.push_str("Next: keep `serve` running, or run `recover`.\n");
+    }
+    if manual > 0 {
+        out.push_str("Lines marked MANUAL RECOVERY will not settle on their own; their journaled data is retained.\n");
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The readable summary carries no exit-code help, and a next step only when one applies.
+    #[test]
+    fn header_and_next_steps_read_plainly() {
+        assert_eq!(unresolved_header(2, 0), "UNRESOLVED (2):");
+        assert_eq!(
+            unresolved_header(2, 1),
+            "UNRESOLVED (2), 1 needs manual recovery:"
+        );
+        assert_eq!(
+            unresolved_header(4, 2),
+            "UNRESOLVED (4), 2 need manual recovery:"
+        );
+        assert_eq!(next_steps(0, 0), "");
+        assert_eq!(
+            next_steps(1, 0),
+            "Next: keep `serve` running, or run `recover`.\n"
+        );
+        let manual_only = next_steps(1, 1);
+        assert!(!manual_only.contains("Next:"), "{manual_only}");
+        assert!(manual_only.contains("MANUAL RECOVERY"), "{manual_only}");
+        assert!(next_steps(3, 1).starts_with("Next: "));
+        for text in [next_steps(3, 1), unresolved_header(3, 1)] {
+            assert!(
+                !text.contains("Exit codes") && !text.contains("exit 3"),
+                "{text}"
+            );
+        }
+    }
 
     fn attempt(state: &str) -> SendAttempt {
         serde_json::from_value(serde_json::json!({

@@ -1004,7 +1004,11 @@ async fn status_json_matches_golden_and_summary_is_readable_and_secret_free() {
                 h.contains(&format!("+24 {} / -32 {}; fees 0", f.b.url, f.a.url)),
                 "{h}"
             );
-            assert!(h.contains("UNRESOLVED: none"), "{h}");
+            assert!(
+                h.starts_with("Nothing unresolved: everything is settled.\n"),
+                "{h}"
+            );
+            assert!(!h.contains("Exit codes") && !h.contains("Next:"), "{h}");
         }
     }
 }
