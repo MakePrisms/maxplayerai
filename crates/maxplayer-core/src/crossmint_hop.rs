@@ -207,6 +207,8 @@ pub enum HopError {
     InvoiceExpired {
         /// Target mint that raised the invoice.
         mint: String,
+        /// Lifetime it had left, by the buyer's clock (0 if expired or unreadable).
+        remaining_secs: u64,
     },
     /// The source mint priced the hop invoice at an amount other than the pinned delivery.
     SourceQuoteMismatch {
@@ -248,6 +250,15 @@ pub enum HopError {
         attempt_id: String,
         /// The refusal recorded when it happened.
         reason: String,
+    },
+    /// The seller's target mint answered a new quote request with a quote id the buyer's wallet
+    /// already holds (#1292 fable r3 L4). cdk keys rows on id alone, so the earlier row has been
+    /// overwritten; it is left in place (not deleted) and the hop refuses.
+    TargetQuoteIdReused {
+        /// Target mint that reused the id.
+        mint: String,
+        /// The reused quote id.
+        quote_id: String,
     },
 }
 
@@ -357,10 +368,14 @@ impl fmt::Display for HopError {
                  delivery at {expected_sats} sats; refusing the hop with zero spend",
                 describe_invoice(*invoice_msat, *undecodable)
             ),
-            Self::InvoiceExpired { mint } => write!(
+            Self::InvoiceExpired {
+                mint,
+                remaining_secs,
+            } => write!(
                 formatter,
-                "cross-mint hop: target mint {mint} returned an invoice that has expired or expires \
-                 within {MIN_INVOICE_LIFETIME:?}; refusing before any melt quote is raised"
+                "cross-mint hop: the invoice from target mint {mint} has {remaining_secs}s of \
+                 lifetime left by this machine's clock, under the {MIN_INVOICE_LIFETIME:?} a payment \
+                 needs; refusing before it is paid or re-quoted"
             ),
             Self::SourceQuoteMismatch {
                 mint,
@@ -397,6 +412,11 @@ impl fmt::Display for HopError {
                 formatter,
                 "cross-mint hop: attempt {attempt_id} was refused on an earlier run with nothing \
                  melted and is not retried ({reason})"
+            ),
+            Self::TargetQuoteIdReused { mint, quote_id } => write!(
+                formatter,
+                "cross-mint hop: target mint {mint} returned quote id {quote_id}, which this wallet \
+                 already held; refusing the hop and leaving that row in place"
             ),
         }
     }
@@ -1004,6 +1024,7 @@ fn authorized_hop_cost(
 /// `None` for an undecodable string. `Bolt11Invoice::from_str` rejects an amount that is not a
 /// whole number of msat (`ImpreciseAmount`), so a sub-msat invoice is undecodable and refused:
 /// there is no rounding floor.
+#[derive(Debug)]
 struct InvoiceFacts {
     msat: Option<u64>,
     remaining: Duration,
@@ -1025,14 +1046,18 @@ fn invoice_digest(bolt11: &str) -> String {
     sha256::Hash::hash(bolt11.trim().to_ascii_lowercase().as_bytes()).to_string()
 }
 
-/// Least lifetime a target invoice must have left to be planned or re-quoted: one money-moving
-/// leg. An invoice that expires inside it can only strand a quote.
-const MIN_INVOICE_LIFETIME: Duration = HOP_LEG_TIMEOUT;
+/// Least lifetime a target invoice must have left to be planned, melted or re-quoted. Its own
+/// value (#1292 fable r3 N6), held at least one money-moving leg by the assertion below: raising
+/// `HOP_LEG_TIMEOUT` past it fails the build rather than silently shutting out mints whose
+/// invoices are short-lived.
+const MIN_INVOICE_LIFETIME: Duration = Duration::from_secs(90);
+const _: () = assert!(MIN_INVOICE_LIFETIME.as_secs() >= HOP_LEG_TIMEOUT.as_secs());
 
 fn require_lifetime(facts: &InvoiceFacts, mint: &str) -> Result<(), HopError> {
     if facts.remaining < MIN_INVOICE_LIFETIME {
         return Err(HopError::InvoiceExpired {
             mint: mint.to_owned(),
+            remaining_secs: facts.remaining.as_secs(),
         });
     }
     Ok(())
@@ -1047,7 +1072,13 @@ fn require_invoice_amount(
     mint: &str,
     delivered_sats: u64,
 ) -> Result<String, HopError> {
-    let facts = invoice_facts(bolt11);
+    // cdk parses the request untrimmed: refuse padding here so the hop and cdk agree on what
+    // decodes (#1292 fable r3 L1), instead of passing the pin and failing at the melt quote.
+    let facts = if bolt11 == bolt11.trim() {
+        invoice_facts(bolt11)
+    } else {
+        None
+    };
     let undecodable = facts.is_none();
     let invoice_msat = facts.as_ref().and_then(|facts| facts.msat);
     let expected_msat = delivered_sats.checked_mul(1000);
@@ -1067,36 +1098,34 @@ fn require_invoice_amount(
 /// Run-time half of the F1 pin: the invoice a melt is about to pay must be for exactly the pinned
 /// delivery and, when the plan journalled one, be the planned invoice. A pre-pin pairing (no
 /// digest) is held to the amount alone, which is what closes F1 for hops an rc7 buyer planned.
-fn require_pinned_invoice(pairing: &HopJournal, bolt11: &str) -> Result<(), HopError> {
+fn require_pinned_invoice(pairing: &HopJournal, bolt11: &str) -> Result<InvoiceFacts, HopError> {
     let facts = invoice_facts(bolt11);
     let invoice_msat = facts.as_ref().and_then(|facts| facts.msat);
+    let undecodable = facts.is_none();
     let invoice_matches = pairing
         .invoice_sha256
         .as_ref()
         .map(|pinned| pinned.eq_ignore_ascii_case(&invoice_digest(bolt11)));
     let amount_ok =
         invoice_msat.is_some() && invoice_msat == pairing.delivered_sats.checked_mul(1000);
-    if !amount_ok || invoice_matches == Some(false) {
-        return Err(HopError::UnpinnedInvoice {
+    match facts {
+        Some(facts) if amount_ok && invoice_matches != Some(false) => Ok(facts),
+        _ => Err(HopError::UnpinnedInvoice {
             attempt_id: pairing.attempt_id.clone(),
             expected_sats: pairing.delivered_sats,
             invoice_msat,
-            undecodable: facts.is_none(),
+            undecodable,
             invoice_matches,
-        });
+        }),
     }
-    Ok(())
 }
 
 /// Before raising a replacement melt quote: the target invoice must still be the pinned one and
-/// have one leg of lifetime left, or the re-quote can only fail again (up to
+/// have [`MIN_INVOICE_LIFETIME`] left, or the re-quote can only fail again (up to
 /// `MAX_MELT_SUPERSESSIONS` times) without saying why.
 fn require_requotable(pairing: &HopJournal, bolt11: &str) -> Result<(), HopError> {
-    require_pinned_invoice(pairing, bolt11)?;
-    if let Some(facts) = invoice_facts(bolt11) {
-        require_lifetime(&facts, &pairing.target_mint)?;
-    }
-    Ok(())
+    let facts = require_pinned_invoice(pairing, bolt11)?;
+    require_lifetime(&facts, &pairing.target_mint)
 }
 
 /// Gate one melt: the source quote must pay the pinned invoice and melt exactly the delivery.
@@ -1106,7 +1135,7 @@ fn require_melt_pinned<E: HopEffects>(
     melt_quote_id: &str,
 ) -> Result<(), HopError> {
     let (bolt11, melt_sats) = effects.melt_invoice(melt_quote_id)?;
-    require_pinned_invoice(pairing, &bolt11)?;
+    let facts = require_pinned_invoice(pairing, &bolt11)?;
     if melt_sats != pairing.delivered_sats {
         return Err(HopError::SourceQuoteMismatch {
             mint: pairing.source_mint.clone(),
@@ -1114,7 +1143,9 @@ fn require_melt_pinned<E: HopEffects>(
             quoted_sats: melt_sats,
         });
     }
-    Ok(())
+    // A resumed pairing whose invoice has run out gets no futile melt (#1292 fable r3 L3); the
+    // caller records the refusal as terminal, so the sweep stops reporting it as a strand.
+    require_lifetime(&facts, &pairing.target_mint)
 }
 
 /// Record a pin refusal as terminal before returning it (#1292 review L2). Every caller runs while
@@ -1351,6 +1382,21 @@ impl CdkHopEffects {
                     .into(),
             ));
         }
+        // #1292 fable r3 L4: the quote id is the seller mint's choice and cdk keys rows on id alone.
+        // Read what the wallet already holds, so a reused id is refused rather than deleted below.
+        let known_ids: std::collections::HashSet<String> = tokio::time::timeout(
+            MINT_TOUCH_TIMEOUT,
+            self.target.localstore.get_mint_quotes(),
+        )
+        .await
+        .map_err(|_elapsed| HopError::MintUnreachable {
+            label: "target quote ids (wallet store)".to_owned(),
+            detail: format!("store read exceeded {MINT_TOUCH_TIMEOUT:?}"),
+        })?
+        .map_err(|error| HopError::Mint(format!("target quote ids: {error}")))?
+        .into_iter()
+        .map(|quote| quote.id)
+        .collect();
         let mint_quote = bounded(
             "target mint quote",
             MINT_TOUCH_TIMEOUT,
@@ -1362,36 +1408,62 @@ impl CdkHopEffects {
             ),
         )
         .await?;
-        if mint_quote.request.trim().is_empty() {
+        let target_quote_id = mint_quote_id(&mint_quote.id);
+        if known_ids.contains(&target_quote_id) {
+            eprintln!(
+                "cross-mint hop: target mint {} reused quote id {target_quote_id}; the earlier row \
+                 was overwritten by the wallet library and is left in place",
+                self.target.mint_url
+            );
+            return Err(HopError::TargetQuoteIdReused {
+                mint: self.target.mint_url.to_string(),
+                quote_id: target_quote_id,
+            });
+        }
+        // Any refusal from here on leaves neither the target quote nor a raised source quote in
+        // the buyer's stores (#1292 fable r3 L1): nothing will ever pay them.
+        let mut raised_melt: Option<String> = None;
+        let planned = self
+            .plan_against(
+                attempt_id,
+                delivered_sats,
+                &target_quote_id,
+                &mint_quote.request,
+                &mut raised_melt,
+            )
+            .await;
+        if planned.is_err() {
+            self.discard_planning_quotes(&target_quote_id, raised_melt.as_deref())
+                .await;
+        }
+        planned
+    }
+
+    /// The body of [`Self::plan_quotes`] once the target quote exists. `raised_melt` is set as soon
+    /// as a source melt quote is stored, so the caller can drop it on refusal.
+    async fn plan_against(
+        &self,
+        attempt_id: &str,
+        delivered_sats: u64,
+        target_quote_id: &str,
+        request: &str,
+        raised_melt: &mut Option<String>,
+    ) -> Result<HopJournal, HopError> {
+        if request.trim().is_empty() {
             return Err(HopError::Mint(format!(
-                "target mint {} returned an empty bolt11 for quote {} (refusing a hop with nothing \
-                 to pay)",
-                self.target.mint_url, mint_quote.id
+                "target mint {} returned an empty bolt11 for quote {target_quote_id} (refusing a \
+                 hop with nothing to pay)",
+                self.target.mint_url
             )));
         }
         // REPORT1110 F1: the target mint is the SELLER's choice, so the invoice it returns is
         // untrusted. It must be for exactly the pinned delivery amount — checked BEFORE the source
         // is even asked to price it, so an inflated invoice can never reach the budget gate. Its
         // digest is journalled so every later melt can prove it pays this same invoice.
-        let invoice_sha256 = match require_invoice_amount(
-            &mint_quote.request,
-            &self.target.mint_url.to_string(),
-            delivered_sats,
-        ) {
-            Ok(digest) => digest,
-            Err(refusal) => {
-                // Nothing will ever pay this quote: drop it so a hostile seller cannot leave an
-                // unissued row with its inflated invoice in the buyer's store once per job. Best
-                // effort; the refusal stands whether or not the delete lands.
-                let _ = tokio::time::timeout(
-                    MINT_TOUCH_TIMEOUT,
-                    self.target.localstore.remove_mint_quote(&mint_quote.id),
-                )
-                .await;
-                return Err(refusal);
-            }
-        };
-        let (melt_quote_id, quoted_cost, cost) = self.raise_melt_quote(&mint_quote.request).await?;
+        let invoice_sha256 =
+            require_invoice_amount(request, &self.target.mint_url.to_string(), delivered_sats)?;
+        let (melt_quote_id, quoted_cost, cost) = self.raise_melt_quote(request).await?;
+        *raised_melt = Some(melt_quote_id.clone());
         // cdk 0.17.2 compares a melt quote to its invoice only for sat/msat wallets, only after the
         // quote is raised, and truncates msat to sat; the decode above is the control that binds
         // the offer. For the sat wallet the hop uses, cdk already refuses a mismatched quote with
@@ -1415,13 +1487,52 @@ impl CdkHopEffects {
             source_mint: self.source.mint_url.to_string(),
             melt_quote_id,
             target_mint: self.target.mint_url.to_string(),
-            mint_quote_id: mint_quote_id(&mint_quote.id),
+            mint_quote_id: target_quote_id.to_owned(),
             delivered_sats,
             planned_cost,
             fee_reserve: cost.fee_reserve,
             input_fee: cost.input_fee,
             invoice_sha256: Some(invoice_sha256),
         })
+    }
+
+    /// Drop the quotes a refused plan raised. Best effort: the refusal stands either way, but a
+    /// failed delete is said on stderr so accumulating rows are visible (#1292 fable r3 N5).
+    async fn discard_planning_quotes(&self, target_quote_id: &str, melt_quote_id: Option<&str>) {
+        match tokio::time::timeout(
+            MINT_TOUCH_TIMEOUT,
+            self.target.localstore.remove_mint_quote(target_quote_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "cross-mint hop: could not drop refused target quote {target_quote_id}: {error}"
+            ),
+            Err(_elapsed) => eprintln!(
+                "cross-mint hop: dropping refused target quote {target_quote_id} timed out"
+            ),
+        }
+        if let Some(id) = melt_quote_id {
+            self.discard_melt_quote(id).await;
+        }
+    }
+
+    async fn discard_melt_quote(&self, melt_quote_id: &str) {
+        match tokio::time::timeout(
+            MINT_TOUCH_TIMEOUT,
+            self.source.localstore.remove_melt_quote(melt_quote_id),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => eprintln!(
+                "cross-mint hop: could not drop unused source quote {melt_quote_id}: {error}"
+            ),
+            Err(_elapsed) => eprintln!(
+                "cross-mint hop: dropping unused source quote {melt_quote_id} timed out"
+            ),
+        }
     }
 
     /// Raise and price one source-mint melt quote without moving money.
@@ -1439,10 +1550,17 @@ impl CdkHopEffects {
                 .melt_quote(PaymentMethod::BOLT11, bolt11.to_owned(), None, None),
         )
         .await?;
+        let input_fee = match self.source_input_fee_ceiling().await {
+            Ok(fee) => fee,
+            Err(error) => {
+                self.discard_melt_quote(&mint_quote_id(&melt_quote.id)).await;
+                return Err(error);
+            }
+        };
         let cost = HopCost {
             melt_amount: melt_quote.amount.to_u64(),
             fee_reserve: melt_quote.fee_reserve.to_u64(),
-            input_fee: self.source_input_fee_ceiling().await?,
+            input_fee,
         };
         let quoted_cost = cost
             .planned_cost()
@@ -1894,6 +2012,46 @@ mod tests {
 
     fn inflated_invoice(seed: &[u8]) -> String {
         crate::lnurl_pay::test_support::signed_bolt11(Some(29_000_000), seed, Duration::ZERO)
+    }
+
+    // ── #1292 fable r3 ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_digest_pin_accepts_case_and_padding_and_refuses_other_forms() {
+        let pin = pinned_journal("attempt-1");
+        let honest = honest_invoice();
+        require_pinned_invoice(&pin, &honest.to_ascii_uppercase()).expect("all-uppercase is the same invoice");
+        require_pinned_invoice(&pin, &format!(" {honest}\n")).expect("padding is the same invoice at melt time");
+        let mixed = format!("{}{}", honest[..1].to_ascii_uppercase(), &honest[1..]);
+        for other in [mixed, format!("lightning:{honest}")] {
+            let error = require_pinned_invoice(&pin, &other).expect_err("must refuse");
+            assert!(matches!(error, HopError::UnpinnedInvoice { undecodable: true, .. }), "got: {error}");
+        }
+        // At plan the hop refuses padding outright: cdk would not decode it.
+        let error = require_invoice_amount(&format!("{honest}\n"), "https://b.example", 100)
+            .expect_err("a padded invoice must refuse at plan");
+        assert!(matches!(error, HopError::InvoiceAmountMismatch { undecodable: true, .. }), "got: {error}");
+    }
+
+    #[test]
+    fn a_pinned_pairing_whose_invoice_is_about_to_expire_is_refused_terminally() {
+        // 3600 s expiry, issued 3570 s ago: 30 s left, inside the window the old is_expired() missed.
+        let dying = crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"dying-pinned", Duration::from_secs(3570));
+        let pin = HopJournal { invoice_sha256: Some(invoice_digest(&dying)), ..journal("attempt-1") };
+        for leg in [MeltLeg::Failed, MeltLeg::Unpaid] {
+            let store = MemJournal::default();
+            let world = MintWorld::shared();
+            world.borrow_mut().melt_leg = Some(leg);
+            world.borrow_mut().target_bolt11 = dying.clone();
+            world.borrow_mut().planned_melt_invoice = (dying.clone(), 100);
+            let mut effects = FakeMints { world: Rc::clone(&world) };
+            let error = run_hop(&store, &mut effects, &pin).expect_err("must refuse");
+            assert!(matches!(error, HopError::InvoiceExpired { remaining_secs, .. } if remaining_secs <= 30), "got: {error}");
+            assert!(error.to_string().contains("s of lifetime left"), "{error}");
+            assert!(world.borrow().superseding_quotes.is_empty(), "no re-quote");
+            assert!(world.borrow().melts.is_empty(), "no futile melt");
+            assert!(refused_of(&store.replay("attempt-1").unwrap()).is_some(), "recorded as terminal");
+        }
     }
 
     // ── #1292 review r2 (fable L1–L5) ─────────────────────────────────────────────────────
@@ -3034,22 +3192,27 @@ mod tests {
         use cdk::secp256k1::hashes::{Hash as _, sha256};
         use cdk::secp256k1::{Secp256k1, SecretKey};
         let key = SecretKey::from_slice(&[0x42; 32]).expect("32 bytes is a key");
-        let mut raw = InvoiceBuilder::new(Currency::Bitcoin)
-            .description("sub-msat".into())
-            .payment_hash(sha256::Hash::hash(b"f1-sub-msat"))
-            .payment_secret(PaymentSecret([7u8; 32]))
-            .current_timestamp()
-            .min_final_cltv_expiry_delta(144)
-            .amount_milli_satoshis(100_000)
-            .build_raw()
-            .expect("raw invoice");
+        let build = |pico: u64| {
+            let mut raw = InvoiceBuilder::new(Currency::Bitcoin)
+                .description("sub-msat".into())
+                .payment_hash(sha256::Hash::hash(b"f1-sub-msat"))
+                .payment_secret(PaymentSecret([7u8; 32]))
+                .current_timestamp()
+                .min_final_cltv_expiry_delta(144)
+                .amount_milli_satoshis(100_000)
+                .build_raw()
+                .expect("raw invoice");
+            raw.hrp.raw_amount = Some(pico);
+            raw.hrp.si_prefix = Some(SiPrefix::Pico);
+            raw.sign::<_, ()>(|hash| Ok(Secp256k1::new().sign_ecdsa_recoverable(hash, &key)))
+                .expect("signs")
+                .to_string()
+        };
+        // Control (#1292 fable r3 N3): the same construction with whole millisatoshis decodes.
+        assert_eq!(invoice_facts(&build(1_000_000)).and_then(|facts| facts.msat), Some(100_000));
+        assert_eq!(invoice_facts(&build(1_000_010)).and_then(|facts| facts.msat), Some(100_001));
         // 1 000 001 pico-BTC = 100 000.1 msat: not a whole millisatoshi.
-        raw.hrp.raw_amount = Some(1_000_001);
-        raw.hrp.si_prefix = Some(SiPrefix::Pico);
-        let bolt11 = raw
-            .sign::<_, ()>(|hash| Ok(Secp256k1::new().sign_ecdsa_recoverable(hash, &key)))
-            .expect("signs")
-            .to_string();
+        let bolt11 = build(1_000_001);
         assert!(invoice_facts(&bolt11).is_none(), "an imprecise amount must not decode");
         let error = require_invoice_amount(&bolt11, "https://seller-chosen-mint.test", 100)
             .expect_err("a sub-msat amount must refuse");
@@ -3150,6 +3313,31 @@ mod tests {
         assert_eq!(bolt11, honest);
         assert_eq!(melt_sats, 100);
         require_pinned_invoice(&pairing, &bolt11).expect("the planned quote pays the pinned invoice");
+    }
+
+    #[tokio::test]
+    async fn every_plan_refusal_leaves_no_quote_in_the_buyer_stores() {
+        let honest = crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"f1-cleanup", Duration::ZERO);
+        // Padded invoice: refused at the pin, before the source is asked.
+        let (effects, melt_quotes) = scripted_hop(format!("{honest}\n"), 100).await;
+        effects.plan_quotes("attempt-padded", 100).await.expect_err("padding refuses");
+        assert_eq!(melt_quotes.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(effects.target.localstore.get_mint_quotes().await.unwrap().is_empty());
+        // Source prices the hop wrong: refused after the target quote exists.
+        let (effects, _) = scripted_hop(honest, 101).await;
+        effects.plan_quotes("attempt-mismatch", 100).await.expect_err("mismatch refuses");
+        assert!(effects.target.localstore.get_mint_quotes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reused_target_quote_id_is_refused_and_the_earlier_row_kept() {
+        let honest = crate::lnurl_pay::test_support::signed_bolt11(Some(100_000), b"f1-reuse", Duration::ZERO);
+        // The scripted mint always answers with id `target-quote-1`.
+        let (effects, _) = scripted_hop(honest, 100).await;
+        effects.plan_quotes("attempt-first", 100).await.expect("first plan");
+        let error = effects.plan_quotes("attempt-second", 100).await.expect_err("reused id refuses");
+        assert!(matches!(error, HopError::TargetQuoteIdReused { .. }), "got: {error}");
+        assert_eq!(effects.target.localstore.get_mint_quotes().await.unwrap().len(), 1, "earlier row kept");
     }
 
     #[tokio::test]

@@ -287,7 +287,9 @@ pub struct HopJournal {
     /// SHA-256 (hex) of the exact target bolt11 this hop was planned against, trimmed and
     /// lowercased (REPORT1110 F1). Every melt refuses an invoice string with a different digest,
     /// which pins payee, route hints and expiry as well as amount and payment hash. `None` on a
-    /// pairing journalled before the pin; such a pairing is still held to the amount check.
+    /// pairing journalled before the pin (rc7), and also on a row from an unreleased `f01e39d7`
+    /// build, whose `invoice_payment_hash`/`invoice_msat` keys are ignored on load. Either is still
+    /// held to the exact-amount check, which keeps F1 closed for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invoice_sha256: Option<String>,
 }
