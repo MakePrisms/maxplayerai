@@ -284,6 +284,14 @@ pub struct HopJournal {
     /// reserve portion of `planned_cost` — the only part that reconciles against the actual fee.
     #[serde(default)]
     pub input_fee: u64,
+    /// SHA-256 (hex) of the exact target bolt11 this hop was planned against, trimmed and
+    /// lowercased (REPORT1110 F1). Every melt refuses an invoice string with a different digest,
+    /// which pins payee, route hints and expiry as well as amount and payment hash. `None` on a
+    /// pairing journalled before the pin (rc7), and also on a row from an unreleased `f01e39d7`
+    /// build, whose `invoice_payment_hash`/`invoice_msat` keys are ignored on load. Either is still
+    /// held to the exact-amount check, which keeps F1 closed for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invoice_sha256: Option<String>,
 }
 
 impl HopJournal {
@@ -557,11 +565,22 @@ mod tests {
             planned_cost: 109,
             fee_reserve: 7,
             input_fee: 2,
+            invoice_sha256: Some("ab".repeat(32)),
         };
         let encoded = serde_json::to_string(&journal).expect("journal serializes");
         let decoded: HopJournal = serde_json::from_str(&encoded).expect("journal deserializes");
         assert_eq!(decoded, journal);
         assert_eq!(decoded.melt_quote_id, "melt-quote-1");
+        // A pre-pin pairing (written by rc7) has neither field: the row keeps its old shape and
+        // still loads, as `None`.
+        let legacy = HopJournal {
+            invoice_sha256: None,
+            ..journal.clone()
+        };
+        let legacy_json = serde_json::to_string(&legacy).expect("legacy serializes");
+        assert!(!legacy_json.contains("invoice_sha256"), "absent pin keeps the rc7 row shape");
+        let reloaded: HopJournal = serde_json::from_str(&legacy_json).expect("rc7 row deserializes");
+        assert_eq!(reloaded, legacy);
         assert_eq!(decoded.mint_quote_id, "mint-quote-1");
         // The delivered amount survives the round trip separately from the cost: recovery must be
         // able to issue exactly the offer amount without consulting anything mutable.
