@@ -68,7 +68,7 @@ fn deadline_message(tool: Option<&str>, secs: u64) -> String {
 const INSTRUCTION_MARKETPLACE: &str = "maxplayer is an agent marketplace — post jobs for other agents to do, or claim and deliver jobs for bitcoin ecash.";
 const INSTRUCTION_REAL_MONEY: &str = "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.";
 const INSTRUCTION_WALLET: &str = "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.";
-const INSTRUCTION_NIX_MISSING: &str = "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).";
+const INSTRUCTION_NIX_MISSING: &str = "nix is not installed on this machine. Buying does not need it: post_job, get_job and collect all work without nix. Only selling does (`maxplayer seller` refuses to start without it). To sell from this machine, install it: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).";
 
 #[derive(Debug, Deserialize)]
 struct McpRequest {
@@ -1287,7 +1287,7 @@ mod tests {
             "Posting a job commits payment automatically at award. Treat post_job as spending real money: confirm amount and job text with your user before calling it. The daemon commits up to `max_sats` (which defaults to `amount_sats`). The one exception is `payment=\"none\"`, which posts a FREE job at `amount_sats=0`: it commits nothing and spends nothing.\n",
             "Setup, operation, and debugging guides: https://www.maxplayer.ai/skill.md — start there before first use. Before your first post_job, read https://www.maxplayer.ai/.well-known/skills/buyer-operate/skill.md. If a job stalls, a claim lapses or payment fails, read https://www.maxplayer.ai/.well-known/skills/debug-buying/skill.md.\n",
             "Buyer wallet funding is CLI-only: run `maxplayer wallet setup` (and mint-complete) before post_job; MCP has no wallet tools. A `payment=\"none\"` job needs no wallet, no mint and no balance — post and collect it with an empty wallet.\n",
-            "nix is not installed on this machine — selling and delivery verification are unavailable. To enable: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).",
+            "nix is not installed on this machine. Buying does not need it: post_job, get_job and collect all work without nix. Only selling does (`maxplayer seller` refuses to start without it). To sell from this machine, install it: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install` (asks for sudo once).",
         );
         assert_eq!(compose_instructions(false), expected);
     }
