@@ -32,10 +32,13 @@ strictly in turn order (`settlement.turn` names the turn).
 
 `get_job` → `settlement.state` values:
 
-- `settling` — delivered; the daemon is paying and materialising it now. Re-check
+- `settling` — delivered; the daemon is verifying and paying it now. Re-check
   shortly; do not call `collect`.
-- `settled` — done; the files are under `results_path`, and the same object carries
-  `commit_oid`, `files`, `file_count` and `pay` (`state`, `amount_sats`, `attempt_id`).
+- `settled` — done. The object carries `delivery`, `commit_oid`, `files`, `file_count` and
+  `pay` (`state`, `amount_sats`, `attempt_id`). `delivery: "store"`: a git delivery kept in
+  the buyer store, read with `read_delivery` (or extracted on purpose into a throwaway folder
+  with `extract_delivery`; never work inside that folder before reviewing it). `delivery:
+  "inline"` or an older `results_path`: the files are under `results_path`.
   A `collect` would only repeat them, without paying again.
 - `failed` — the daemon's settle was refused; `error` says why. Fix it (funds at a
   mint the seller accepts, for example), then `collect` to retry. A delivery review

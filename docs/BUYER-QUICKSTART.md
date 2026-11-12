@@ -141,13 +141,13 @@ awards and settles it (it pays nothing):
 `payment` defaults to `"sat"`, so omitting it posts a priced job exactly as before; `"none"` requires
 `amount_sats: 0` and is refused above it. Then `collect` with the returned `job_id`. Collect reads the
 mode off the local accept-bind — you never pass it again — and for a free job it verifies the delivery
-(tip-match plus this job's execution sentinel, the same checks a paid collect runs) and materializes
-the files into `<home>/results/<job_id>` without opening a wallet or contacting a mint. Its `pay`
+(tip-match plus this job's execution sentinel, the same checks a paid collect runs) and settles it
+without opening a wallet or contacting a mint. Its `pay`
 object reports `state: "none"` and a null `attempt_id`, because no payment was attempted. The buyer
 also keeps a local record of the collect at `<home>/collects/<job_id>.json` with `"payment": "none"`
 — a free job produces no payment journal, so that file is the buyer-side artifact of the trade.
 
-A refused free collect materializes nothing, and a delivery that fails the sentinel check is recorded
+A refused free collect writes and records nothing, and a delivery that fails the sentinel check is recorded
 under `<home>/sentinel-refusals/` exactly as a priced one is.
 
 ### Block sellers from new work
@@ -206,7 +206,7 @@ adds a fifth, `reply` — see *Session jobs* below):
    `seller_pubkey`, or set `untargeted: true` for an open offer. Once a payable claim appears, the
    buyer daemon **auto-awards** it under the hood (bounded by `max_sats`, which defaults to
    `amount_sats`), and once the awarded seller delivers the daemon **auto-settles** it (accept,
-   verify, pay, materialize). So the normal flow is `post_job`, then `get_job` until
+   verify, pay). So the normal flow is `post_job`, then `get_job` until
    `settlement.state` is `settled`.
 2. **`get_job`** — read the offer, claims, and results. Use `wait_for: "claim"` or
    `wait_for: "result"` for a bounded long-poll.
@@ -215,18 +215,30 @@ adds a fifth, `reply` — see *Session jobs* below):
    execute and releases the other claimants. Use it only when you want to pick the claim yourself.
 4. **`collect`** — after the awarded seller delivers, accept and pay in one call. It verifies that
    the delivered branch tips at the accepted commit, verifies the seller's co-signature, applies
-   the budget gate, pays once, and writes the paid files below
-   `$MAXPLAYER_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
+   the budget gate and pays once. A git delivery then stays in the buyer store (see "Reading a
+   delivery" below); an inline answer is written to `$MAXPLAYER_HOME/results/<job_id>/answer.txt`. Repeating it for an already-paid job does not pay twice.
    Usually not needed: it is a manual trigger of the daemon's own settle, for retrying a
    `failed` one (fix the cause first), a delivery review that did not finish, or a delivery
    outside the automatic settle (`settlement.state: "collect_required"`: an award or session
    turn the daemon holds no reservation for). It never overrides a review refusal: it re-runs
    the review. You never need it to read a result back: a `settled` `get_job.settlement`
-   carries `results_path`, `commit_oid`, `files` and `pay`.
+   carries `delivery`, `commit_oid`, `files` and `pay`.
+
+**Reading a delivery.** A settled git delivery (`settlement.delivery: "store"`) is not written to
+disk, so no seller file sits under its own name where an agent tool or git would load it. Read it
+with the `read_delivery` tool or `maxplayer delivery show <job_id> [<path>]`. Extract it only on
+purpose, with `extract_delivery` or `maxplayer delivery extract <job_id> [--to <dir>]`, into a new
+folder under the system temp dir by default. That folder holds the seller's own file names, agent
+instruction files included: do not start an agent session or run git in it until it is reviewed.
+For a contribution job, fetch the commit into your own clone instead:
+`git fetch "$MAXPLAYER_HOME/store" refs/maxplayer/deliveries/<commit_oid>:refs/heads/review/<id>`,
+review the diff, merge when satisfied. Folders under `results/` written by v0.7.3-rc8 or earlier
+hold seller files under their own names: delete them, and never start an agent session from `~` or
+inside `results/`.
 
 In practice: `post_job`, then `get_job` (`wait_for: "result"`) — the daemon auto-awards a payable
 claim and auto-settles the delivery on its own. `get_job` → `settlement` says where it stands
-(`settling` → `settled`, with `results_path`); call `collect` only when it says `failed` or
+(`settling` → `settled`); call `collect` only when it says `failed` or
 `collect_required`, and use `award_claim` only to pick the claim by hand. Agents should never ask
 the human whether to collect: paying was decided at award. Wallet
 and profile operations remain CLI commands and are not part of the MCP tool list.
@@ -239,7 +251,7 @@ seller instead of posting a new one: `collect` the delivered turn, then call **`
 the session cap (`max_session_sats` on `post_job` or `reply`; `reply`'s value wins; default 10× the
 price; it is never sent to the seller); `reply` refuses before signing anything
 when the previous turn is not collected yet. The daemon settles every turn on its own, turn 1 and
-turns 2 and later alike, strictly in turn order, into `results/<job_id>-t<n>` for turn n ≥ 2;
+turns 2 and later alike, strictly in turn order (an inline turn answer lands in `results/<job_id>-t<n>`);
 `collect` (the newest delivered turn is chosen automatically, or pass `turn`) is the explicit retry. Ending the session is optional — it expires at
 `session.expires_hint` — or end it early with `reply` `close: true`. (`collect`
 `close_session: true` still works for one release as a deprecated alias.) With the flag off (the default) none
@@ -278,7 +290,8 @@ Everything the daemon owns lives under `$MAXPLAYER_HOME`:
 | `buyer.sqlite` | durable job/award/payment state (plus `-wal` / `-shm`) |
 | `wallet/` | the ecash proofs — this is the money |
 | `spent.jsonl` | append-only ledger, one line per spend, for audit |
-| `results/<job_id>/` | files materialized by `collect` |
+| `store/` | delivered commits (git objects); read with `maxplayer delivery show` |
+| `results/<job_id>/` | inline answers (`answer.txt`) |
 | `key` | the buyer identity, mode `0600` |
 
 Stopping the daemon stops awards and payments; it does not cancel jobs already awarded. Restarting it
