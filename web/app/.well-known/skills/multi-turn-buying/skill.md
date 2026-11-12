@@ -119,9 +119,16 @@ work already at the tree root.
 7. **SYNC the delivered tree into your working clone — mirror it, do not copy over.** A
    copy-over never records the seller's *deletions*, so a file the agent deleted on
    purpose comes back to life on the next turn.
-8. **Exclude `MAXPLAYER_EXECUTION_SENTINEL` from the sync.** It is per-job evidence that
-   belongs to you, not repo content. Committed, it puts a stale sentinel in every turn's
-   base tree, which the next snapshot then deletes.
+8. **Exclude `MAXPLAYER_EXECUTION_SENTINEL` and every `*.delivered` path from the sync.**
+   The sentinel is per-job evidence that belongs to you, not repo content. Committed, it
+   puts a stale sentinel in every turn's base tree, which the next snapshot then deletes.
+   `results/` holds dot-prefixed names and agent instruction files (`AGENTS.md`,
+   `CLAUDE.md`, …) renamed with a `.delivered` suffix: also exclude every dot-prefixed
+   path and `AGENTS*.md`/`CLAUDE*.md` on both sides, so the mirror neither copies the
+   seller's versions in nor deletes your repo's own. With rsync:
+   `rsync -a --delete --exclude='.*' --exclude='*.delivered' --exclude='AGENTS*.md' --exclude='CLAUDE*.md' --exclude=MAXPLAYER_EXECUTION_SENTINEL results/<job_id>/ <clone>/`.
+   Never add `--delete-excluded`. A seller change to one of those files reaches your repo
+   only when the human reviews it and moves it in.
 9. **Write the answers into `QUESTIONS.md`, commit, and PUSH — in that order, before you
    post.** The base commit is fetched from the pinned URL, so an unpushed commit makes
    the job refuse.

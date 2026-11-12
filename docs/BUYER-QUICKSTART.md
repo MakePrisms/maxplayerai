@@ -217,9 +217,11 @@ adds a fifth, `reply` — see *Session jobs* below):
    the delivered branch tips at the accepted commit, verifies the seller's co-signature, applies
    the budget gate, pays once, and writes the paid files below
    `$MAXPLAYER_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
-   Names agent harnesses load on their own (`AGENTS.md`, `CLAUDE.md`, `.mcp.json`, `.envrc`,
-   `.claude/`, `.vscode/` and similar) are written with a `.delivered` suffix, so a delivery cannot
-   pass itself off as your project's instructions; the delivered commit keeps the original names.
+   Settling (by the daemon or by `collect`) writes every dot-prefixed name (`.claude/`,
+   `.mcp.json`, `.env`, …) and the few undotted agent instruction files (`AGENTS.md`, `CLAUDE.md`
+   and similar) with a `.delivered` suffix, so the names harnesses load today do not load from
+   `results/`. The delivered commit keeps the original names. Treat a delivery like a stranger's
+   pull request, and run your agent from a project folder, not your home directory.
    Usually not needed: it is a manual trigger of the daemon's own settle, for retrying a
    `failed` one (fix the cause first), a delivery review that did not finish, or a delivery
    outside the automatic settle (`settlement.state: "collect_required"`: an award or session

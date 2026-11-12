@@ -655,6 +655,9 @@ pub fn materialize_delivery(
     let staged = stage_for(dest)?;
     let target: &Path = staged.as_deref().unwrap_or(dest);
     let mut files: Vec<String> = Vec::new();
+    // Delivered paths written under an inert name; on a re-collect into an existing folder their
+    // original names are removed afterwards (an older build wrote them there).
+    let mut renamed: Vec<(String, git2::Oid)> = Vec::new();
     let mut walk_err: Option<String> = None;
     let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
         if entry.kind() != Some(git2::ObjectType::Blob) {
@@ -686,9 +689,16 @@ pub fn materialize_delivery(
         }
         // P1 (rc8 review): agent-instruction and harness-config names are written inert.
         let written = materialized_path(&rel);
+        if let Err(error) = validate_delivery_path(&written) {
+            walk_err = Some(error);
+            return git2::TreeWalkResult::Abort;
+        }
         if let Err(error) = write_under(target, &written, blob.content()) {
             walk_err = Some(error);
             return git2::TreeWalkResult::Abort;
+        }
+        if written != rel {
+            renamed.push((rel, blob.id()));
         }
         files.push(written);
         git2::TreeWalkResult::Ok
@@ -711,9 +721,56 @@ pub fn materialize_delivery(
             let _ = std::fs::remove_dir_all(&staging);
             format!("move {} into place at {}: {error}", staging.display(), dest.display())
         })?;
+    } else {
+        for (rel, blob) in &renamed {
+            if let Ok(blob) = repo.find_blob(*blob) {
+                remove_stale_original(dest, rel, blob.content());
+            }
+        }
     }
     files.sort();
     Ok(files)
+}
+
+/// P1 re-collect: a results folder an older build materialized holds this delivery's agent-control
+/// files under their ORIGINAL names, which a re-collect would otherwise leave live beside the inert
+/// copies. Remove the regular file at `dest/rel` only when it holds exactly the delivered bytes (so
+/// a file of the buyer's own, or another job's in a reused `out` folder, is kept), then each
+/// original-named directory on its way that is now empty. Never follows a symlink (a symlinked or
+/// non-directory parent stops it), never removes a directory with anything left in it. No path
+/// removed here is one materialize wrote: written paths are fixed points of [`materialized_path`]
+/// and `rel` is not one.
+fn remove_stale_original(dest: &Path, rel: &str, delivered: &[u8]) {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let Some((file_name, parents)) = parts.split_last() else {
+        return;
+    };
+    let mut dir = dest.to_path_buf();
+    let mut dirs: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    let mut renamed_above = false;
+    for part in parents {
+        dir.push(part);
+        match std::fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => return,
+        }
+        renamed_above |= is_agent_control_name(part);
+        dirs.push((dir.clone(), renamed_above));
+    }
+    let file = dir.join(file_name);
+    let same = matches!(std::fs::symlink_metadata(&file), Ok(meta) if meta.is_file()
+        && meta.len() == delivered.len() as u64)
+        && std::fs::read(&file).is_ok_and(|bytes| bytes == delivered);
+    if !same {
+        return;
+    }
+    let _ = std::fs::remove_file(&file);
+    for (dir, renamed) in dirs.iter().rev() {
+        if *renamed {
+            // `remove_dir` refuses a directory that is not empty.
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
 }
 
 /// Prefix of the staging directories and temporary files collect creates. Refused as a delivered
@@ -793,67 +850,53 @@ const TEMP_NAME_MAX: usize = 64;
 /// delivered commit in the buyer store still holds the original path.
 pub const INERT_SUFFIX: &str = ".delivered";
 
-/// P1 (v0.7.3-rc8 security review): file and directory names that agent harnesses and editors load
-/// without being asked, as project instructions (`AGENTS.md`, `CLAUDE.md`, rules files), settings
-/// and hooks (`.claude/`, `.cursor/`, `.vscode/`), MCP/tool servers (`.mcp.json`,
-/// `opencode.json`) or shell code (`.envrc`, run by direnv on `cd`). A delivery is seller-authored
-/// data, but a harness gives these names the authority of the buyer's own project rules, and some
-/// load them from any directory an agent reads in (Codex/Claude nested `AGENTS.md`/`CLAUDE.md`).
-/// Matched per path component, after the same case/Unicode folding [`collision_key`] uses, so
-/// `Agents.MD` or `.Claude` on a case-insensitive volume is caught too. Lowercase.
+/// P1 (v0.7.3-rc8 security review): agent harnesses and editors load some files without being
+/// asked, as project instructions, settings and hooks, MCP/tool servers or shell code, and some
+/// load them from any directory under their working directory that the agent reads in (Claude Code
+/// nested `CLAUDE.md`/`AGENTS.md`). A delivery is seller-authored data, so materialize writes none
+/// of those names. Two rules, so new harnesses need no list entry:
 ///
-/// A deny-list lags new harnesses; extend it when one adds an auto-loaded name. Not covered:
-/// names only loaded under a parent (e.g. `.github/instructions/`), and a buyer who opens a
-/// results folder as a workspace with tools that read every file.
-const AGENT_CONTROL_NAMES: &[&str] = &[
-    // Instruction files.
+/// - every DOT-PREFIXED component (`.claude/`, `.cursor/`, `.codex/`, `.github/`, `.vscode/`,
+///   `.mcp.json`, `.envrc`, `.env`, `.cursorrules`, `.cargo/`, …): nearly every harness keeps its
+///   config, hooks, rules and skills under a dot name;
+/// - the few UNDOTTED instruction/config files in [`AGENT_CONTROL_FILES`].
+///
+/// Matched after the same case/Unicode folding [`collision_key`] uses, so `Agents.MD` or `.Claude`
+/// on a case-insensitive volume is caught too. The same classifier is meant for any later path that
+/// moves a delivery into a project. Not covered: a buyer who opens the results folder itself as a
+/// workspace with tools that read every file, or copies the delivered commit into a project.
+/// Lowercase.
+const AGENT_CONTROL_FILES: &[&str] = &[
     "agents.md",
+    "agents.override.md",
     "agent.md",
     "claude.md",
     "claude.local.md",
     "gemini.md",
     "crush.md",
-    "copilot-instructions.md",
-    ".cursorrules",
-    ".windsurfrules",
-    ".clinerules",
-    ".roorules",
-    ".goosehints",
-    ".rules",
-    // Tool, MCP and execution config.
-    ".mcp.json",
+    "crush.json",
+    "warp.md",
     "opencode.json",
     "opencode.jsonc",
-    ".aider.conf.yml",
-    ".envrc",
-    // Harness and editor directories (settings, hooks, rules, skills, tasks).
-    ".agents",
-    ".amazonq",
-    ".claude",
-    ".codex",
-    ".continue",
-    ".cursor",
-    ".gemini",
-    ".goose",
-    ".junie",
-    ".kiro",
-    ".opencode",
-    ".roo",
-    ".vscode",
-    ".windsurf",
-    ".zed",
 ];
 
-/// True when `component` is an [`AGENT_CONTROL_NAMES`] entry on any volume the buyer may use.
+/// True when materialize must write `component` inert: a dot-prefixed name or an
+/// [`AGENT_CONTROL_FILES`] entry, on any volume the buyer may use. A dot-prefixed name that
+/// already ends in [`INERT_SUFFIX`] is left alone, so the mapping is idempotent (a recorded file
+/// list maps to itself) and `.claude` next to `.claude.delivered` is a collision the pre-pay check
+/// refuses.
 fn is_agent_control_name(component: &str) -> bool {
     let key = collision_key(component);
-    AGENT_CONTROL_NAMES.contains(&key.as_str())
+    if key.starts_with('.') {
+        return !key.ends_with(INERT_SUFFIX);
+    }
+    AGENT_CONTROL_FILES.contains(&key.as_str())
 }
 
 /// The path materialize writes a validated delivered path at: every component that is an agent-
 /// control name gets [`INERT_SUFFIX`] (`AGENTS.md` → `AGENTS.md.delivered`, `.claude/settings.json`
 /// → `.claude.delivered/settings.json`); every other component is unchanged. The pre-pay check,
-/// the write and `get_job`'s file list all use this one mapping.
+/// the write and `get_job`'s file list all use this one mapping. Idempotent.
 pub fn materialized_path(rel: &str) -> String {
     if !rel.split('/').any(is_agent_control_name) {
         return rel.to_owned();
@@ -1341,6 +1384,10 @@ mod tests {
             ".claude/settings.json",
             ".vscode/tasks.json",
             ".cursor/rules/x.mdc",
+            "AGENTS.override.md",
+            ".env",
+            ".github/instructions/x.instructions.md",
+            ".newharness/hooks.json",
             "README.md",
             "src/agents.rs",
             "my.claude/notes.txt",
@@ -1360,6 +1407,10 @@ mod tests {
             ".claude.delivered/settings.json",
             ".vscode.delivered/tasks.json",
             ".cursor.delivered/rules/x.mdc",
+            "AGENTS.override.md.delivered",
+            ".env.delivered",
+            ".github.delivered/instructions/x.instructions.md",
+            ".newharness.delivered/hooks.json",
             "README.md",
             "src/agents.rs",
             "my.claude/notes.txt",
@@ -1385,6 +1436,10 @@ mod tests {
             ".claude",
             ".vscode",
             ".cursor",
+            "AGENTS.override.md",
+            ".env",
+            ".github",
+            ".newharness",
         ] {
             assert!(
                 std::fs::symlink_metadata(dest.join(loaded)).is_err(),
@@ -1421,6 +1476,14 @@ mod tests {
             (".claude/agents/x.md", ".claude.delivered/agents/x.md"),
             (".Claude/CLAUDE.md", ".Claude.delivered/CLAUDE.md.delivered"),
             ("AGENTS.md.delivered", "AGENTS.md.delivered"),
+            ("AGENTS.override.md", "AGENTS.override.md.delivered"),
+            // Every dot-prefixed component, known harness or not.
+            (".gitignore", ".gitignore.delivered"),
+            (".github/workflows/ci.yml", ".github.delivered/workflows/ci.yml"),
+            ("src/.hidden/x", "src/.hidden.delivered/x"),
+            // Idempotent: an already-inert dot name maps to itself.
+            (".claude.delivered/x", ".claude.delivered/x"),
+            (".Claude.DELIVERED/x", ".Claude.DELIVERED/x"),
             ("notAGENTS.md", "notAGENTS.md"),
             ("agents", "agents"),
             // HFS+ ignores U+200C when it compares names, so this IS `.claude` there.
@@ -1428,6 +1491,112 @@ mod tests {
         ] {
             assert_eq!(materialized_path(delivered), written, "{delivered:?}");
         }
+    }
+
+    // The undotted list is matched against `collision_key`, so an entry that is not already its own
+    // key (uppercase, say) would never match anything. Dotted names need no entry.
+    #[test]
+    fn agent_control_files_are_folded_keys_and_undotted() {
+        for name in AGENT_CONTROL_FILES {
+            assert_eq!(*name, collision_key(name), "{name} must be lowercase/folded");
+            assert!(!name.starts_with('.'), "{name} is covered by the dot rule");
+            assert_eq!(materialized_path(name), format!("{name}{INERT_SUFFIX}"));
+        }
+    }
+
+    // P1: the pre-pay check bounds the INERT path. A component or path that fits only before the
+    // suffix is refused before pay, never at write time after it (advisor r1 Low 4).
+    #[test]
+    fn a_path_too_long_only_after_the_inert_suffix_is_refused_before_pay() {
+        let long_component = format!(".{}", "a".repeat(250)); // 251 bytes; 261 with the suffix
+        // 506 bytes; 516 with the suffix (the bound is 512).
+        let long_path = format!("{}/{}/AGENTS.md", "a".repeat(245), "b".repeat(250));
+        for delivered in [long_component.as_str(), long_path.as_str()] {
+            assert!(validate_delivery_path(delivered).is_ok(), "fits before the suffix");
+            let root = temp_root("inert-length");
+            let _ = std::fs::remove_dir_all(&root);
+            let store = root.join("store");
+            let commit_hex = seed_paths_store(&store, &[delivered]);
+            let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+            let error = validate_delivery_tree_in_store(&store, &store_ref, &commit_hex)
+                .expect_err("the inert path is over the bound");
+            assert!(error.contains("unsafe delivery path"), "{error}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // P1: a renamed DIRECTORY collides with a delivered directory of the inert name; refused
+    // before pay like the file case.
+    #[test]
+    fn a_renamed_directory_colliding_with_a_delivered_one_is_refused_before_pay() {
+        for delivered in [
+            &[".claude/a.json", ".claude.delivered/b.json"][..],
+            &[".claude/a.json", ".CLAUDE.delivered"][..],
+        ] {
+            let root = temp_root("inert-dir-collision");
+            let _ = std::fs::remove_dir_all(&root);
+            let store = root.join("store");
+            let commit_hex = seed_paths_store(&store, delivered);
+            let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+            let error = validate_delivery_tree_in_store(&store, &store_ref, &commit_hex)
+                .expect_err("the inert directory names one path twice");
+            assert!(error.contains("appears twice"), "{delivered:?}: {error}");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    // P1: a results folder an older build materialized holds the agent-control files under their
+    // original names. A re-collect removes exactly those (and directories it emptied), never
+    // anything else, and never through a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn a_re_collect_removes_original_names_an_older_build_wrote() {
+        let root = temp_root("inert-recollect");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let delivered = [
+            "AGENTS.md",
+            "CLAUDE.md",
+            ".claude/settings.json",
+            ".cursor/rules/x.mdc",
+            ".vscode/tasks.json",
+            "README.md",
+        ];
+        let commit_hex = seed_paths_store(&store, &delivered);
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        // What an older build wrote (the delivered bytes under the original names)...
+        for path in ["AGENTS.md", ".claude/settings.json", ".cursor/rules/x.mdc", "README.md"] {
+            let file = dest.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, path).unwrap();
+        }
+        // ...beside files that are not this delivery's: kept.
+        std::fs::write(dest.join(".claude/mine.json"), "keep").unwrap();
+        std::fs::write(dest.join("CLAUDE.md"), "not the delivered bytes").unwrap();
+        // A symlinked original-named directory is never followed.
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("tasks.json"), "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join(".vscode")).unwrap();
+
+        let files = materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("re-collect");
+        assert!(files.contains(&".vscode.delivered/tasks.json".to_owned()));
+        for gone in ["AGENTS.md", ".claude/settings.json", ".cursor"] {
+            assert!(
+                std::fs::symlink_metadata(dest.join(gone)).is_err(),
+                "{gone} must be removed on re-collect"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(dest.join(".claude/mine.json")).unwrap(), "keep");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("CLAUDE.md")).unwrap(),
+            "not the delivered bytes"
+        );
+        assert_eq!(std::fs::read_to_string(dest.join("README.md")).unwrap(), "README.md");
+        assert_eq!(std::fs::read_to_string(dest.join("AGENTS.md.delivered")).unwrap(), "AGENTS.md");
+        assert_eq!(std::fs::read_to_string(outside.join("tasks.json")).unwrap(), "outside");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // git2 >= 0.20 makes an aborted `Tree::walk` return `Err` itself, which used to pre-empt the

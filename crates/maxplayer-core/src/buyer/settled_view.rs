@@ -49,12 +49,15 @@ pub(super) fn details(home: &MaxplayerHome, key: &str) -> Option<Value> {
         .as_ref()
         .and_then(|record| record["files"].as_array().cloned())
     {
-        Some(
-            files
-                .iter()
-                .filter_map(|f| f.as_str().map(str::to_owned))
-                .collect::<Vec<_>>(),
-        )
+        // A record an older build wrote names agent-control files as delivered; report them under
+        // the inert names materialize now writes (the mapping is idempotent for newer records).
+        let mut files = files
+            .iter()
+            .filter_map(|f| f.as_str().map(collect::materialized_path))
+            .collect::<Vec<_>>();
+        files.sort();
+        files.dedup();
+        Some(files)
     } else if collect::bind_is_inline(&bind) {
         Some(vec![collect::INLINE_ANSWER_FILENAME.to_owned()])
     } else {
@@ -129,6 +132,9 @@ fn delivery_files(home: &MaxplayerHome, commit_oid: &str) -> Result<Vec<String>,
     }
     walked.map_err(|e| e.to_string())?;
     files.sort();
+    // A delivery settled by an older build may hold both `AGENTS.md` and `AGENTS.md.delivered`;
+    // both map to one written name.
+    files.dedup();
     Ok(files)
 }
 
@@ -402,6 +408,35 @@ mod tests {
             hint["pay"],
             json!({"state": "none", "amount_sats": 0, "attempt_id": null})
         );
+    }
+
+    // P1: a free record written by an older build lists agent-control files under their original
+    // names; the read-back reports the inert names materialize writes now, once each.
+    #[test]
+    fn a_free_record_from_an_older_build_reads_back_inert_names() {
+        let (_dir, home) = home();
+        let store = BuyerStore::open(home.root.join("buyer.sqlite")).unwrap();
+        let job = "d".repeat(64);
+        write_bind(&home, &bind(&job, None, false, true));
+        let record = collect::free_collect_record_path(&home, &job);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(
+            &record,
+            json!({
+                "files": ["README.md", "AGENTS.md", "AGENTS.md.delivered", ".claude/settings.json"],
+                "payment": "none",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut hint = settled(1);
+        enrich(&home, &store, &job, &mut hint);
+        assert_eq!(
+            hint["files"],
+            json!([".claude.delivered/settings.json", "AGENTS.md.delivered", "README.md"])
+        );
+        assert_eq!(hint["file_count"], json!(3));
     }
 
     // A session turn ≥ 2 is read under its follow-up id (bind, journal), never turn 1's.
