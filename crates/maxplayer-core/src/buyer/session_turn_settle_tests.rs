@@ -528,7 +528,7 @@ impl TurnPay for FakePay {
                 Ok(collect::CollectOutcome {
                     pay: collect::CollectPayment::Free,
                     commit_oid: "c".repeat(40),
-                    path: String::new(),
+                    path: None,
                     files: Vec::new(),
                     agent_used: None,
                     model_used: None,

@@ -540,13 +540,15 @@ async fn a_free_collect_settles_without_authorize_pay_and_a_paid_one_still_enter
     assert_eq!(outcome.commit_oid, tip_oid, "the delivered tip is what was collected");
     assert!(
         outcome.files.contains(&"README.md".to_string()),
-        "the delivered files must be materialized: {:?}",
+        "the delivered files must be listed: {:?}",
         outcome.files
     );
-    assert_eq!(
-        fs::read_to_string(root.join("results").join(&job_id).join("README.md")).expect("readme"),
-        "delivered\n",
-        "the materialized file must be the delivered content, read back off disk"
+    // P1 (settle-without-unpacking): a git delivery stays in the buyer store. Nothing is written
+    // under results/, and the outcome names no folder.
+    assert!(outcome.path.is_none(), "a git delivery has no results folder");
+    assert!(
+        !root.join("results").join(&job_id).exists(),
+        "settle must not write a git delivery to disk"
     );
 
     // The negative gate, AFTER: still no wallet store. A run that quietly created one would have
@@ -595,7 +597,7 @@ async fn a_free_collect_settles_without_authorize_pay_and_a_paid_one_still_enter
     .expect("re-collecting a free job must succeed");
     assert_eq!(
         again.files, outcome.files,
-        "a re-collect materializes the same files"
+        "a re-collect lists the same files"
     );
     assert!(again.pay.is_free());
     let reread: serde_json::Value =

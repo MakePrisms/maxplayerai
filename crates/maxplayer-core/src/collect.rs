@@ -18,11 +18,15 @@
 //!        that oid) runs inside `authorize_pay` BEFORE any spend, so a delivered-oid ≠ bound-oid
 //!        mismatch — and the pre-pay seller co-signature check — refuse with ZERO spend and NO
 //!        materialize;
-//!   4. materialize: only after the pay above succeeds (or idempotently reconciles) are the
-//!      delivered files checked out.
+//!   4. settle: a git delivery STAYS in the buyer store (P1, v0.7.3-rc8 security review; spec
+//!      `docs/specs/settle-without-unpacking.md`). No seller-named file is written to disk, so no
+//!      agent harness or git can load one on its own. The outcome lists the delivered files; the
+//!      buyer reads them with `read_delivery` or extracts them on purpose with `extract_delivery`
+//!      ([`crate::delivery_read`]). Only an inline answer is written, as the fixed name
+//!      [`INLINE_ANSWER_FILENAME`].
 //!
-//! Idempotent by attempt id: re-collecting an already-paid job loads the existing bind, reconciles
-//! the payment without a second spend, and re-materializes the files.
+//! Idempotent by attempt id: re-collecting an already-paid job loads the existing bind and
+//! reconciles the payment without a second spend.
 //!
 //! # Two modes
 //!
@@ -54,7 +58,8 @@ pub struct CollectRequest {
     /// Offer event id (hex). A prior accept_claim bind is used when present; otherwise collect
     /// accepts the delivered claim itself.
     pub job_id: String,
-    /// Optional output folder NAME (no path separators) under `<home>/results`. `None` ⇒ the job id.
+    /// Optional output folder NAME (no path separators) under `<home>/results` for an INLINE answer.
+    /// `None` ⇒ the job id. Refused for a git delivery, which is never written under `results/`.
     pub out: Option<String>,
 }
 
@@ -102,9 +107,10 @@ impl CollectPayment {
 pub struct CollectOutcome {
     pub pay: CollectPayment,
     pub commit_oid: String,
-    /// Absolute path the delivery files were checked out to.
-    pub path: String,
-    /// Sorted relative file list written under `path`.
+    /// Absolute folder an INLINE answer was written to. `None` for a git delivery: it stays in the
+    /// buyer store and nothing is written ([`crate::delivery_read`] reads or extracts it).
+    pub path: Option<String>,
+    /// Sorted relative file list of the delivery (written under `path` only for an inline answer).
     pub files: Vec<String>,
     /// Seller-claimed harness that RAN the paid result, from the accept-bind (#261). An
     /// attribution captured off the delivered result's exec-metadata — never the requested
@@ -112,6 +118,15 @@ pub struct CollectOutcome {
     pub agent_used: Option<String>,
     /// Model the harness self-reported for the run; same trust class as `agent_used`.
     pub model_used: Option<String>,
+}
+
+impl CollectOutcome {
+    /// `"inline"` when an answer was written to `path`, `"store"` for a git delivery kept in the
+    /// buyer store. The settled view derives the same value from the bind's kind; an inline settle
+    /// always writes its answer, so the two agree.
+    pub fn delivery_kind(&self) -> &'static str {
+        if self.path.is_some() { "inline" } else { "store" }
+    }
 }
 
 #[derive(Debug)]
@@ -177,10 +192,21 @@ pub async fn collect_async(
         .map_err(CollectError::Lifecycle)?,
     };
 
-    // Resolve + validate the destination BEFORE spending, so a bad `out` name never pays then fails.
-    let dest = results_dest(home, &request.job_id, request.out.as_deref())
-        .map_err(CollectError::Input)?;
-    check_dest(&dest).map_err(CollectError::Input)?;
+    // Only an inline answer is written to disk. Resolve + validate its destination BEFORE spending,
+    // so a bad `out` name never pays then fails.
+    let inline_answer = inline_answer_of(&bind);
+    if inline_answer.is_none() && request.out.is_some() {
+        return Err(CollectError::Input(GIT_OUT_REFUSAL.to_owned()));
+    }
+    let dest = match inline_answer {
+        Some(_) => {
+            let dest = results_dest(home, &request.job_id, request.out.as_deref())
+                .map_err(CollectError::Input)?;
+            check_dest(&dest).map_err(CollectError::Input)?;
+            Some(dest)
+        }
+        None => None,
+    };
 
     // 2/3. THE MODE BRANCH. `bind.payment_mode` is the agreement of the buyer-signed OFFER and the
     // seller-signed CLAIM, decided and frozen at accept by `verify_free_accept` — never re-derived
@@ -194,24 +220,25 @@ pub async fn collect_async(
     // uncollectable. Nothing on this branch may reintroduce that window.
     if bind.payment_mode.is_free() {
         job_lifecycle::validate_private_bind(home, &bind).map_err(CollectError::Lifecycle)?;
-        let files = match bind.inline_answer.as_deref() {
+        let (path, files) = match (inline_answer, dest.as_deref()) {
             // An inline delivery has nothing to fetch: the answer is on the bind.
-            Some(answer) if bind_is_inline(&bind) => {
-                let files = materialize_inline_delivery(answer, &dest)
+            (Some(answer), Some(dest)) => {
+                let files = materialize_inline_delivery(answer, dest)
                     .map_err(CollectError::Materialize)?;
                 // §7.0 — the record is the artifact, never the silence. `collect_free` writes it
                 // on the git arm, and this arm does not go through `collect_free`, so it writes
                 // its own. Without it a completed free inline trade leaves no buyer-side trace
                 // that it ever happened.
-                write_free_collect_record(home, &bind, &dest, &files)?;
-                files
+                let path = dest.display().to_string();
+                write_free_collect_record(home, &bind, &path, &files)?;
+                (Some(path), files)
             }
-            _ => collect_free(home, &bind, &dest)?,
+            _ => (None, collect_free(home, &bind)?),
         };
         return Ok(CollectOutcome {
             pay: CollectPayment::Free,
             commit_oid: bind.commit_oid,
-            path: dest.display().to_string(),
+            path,
             files,
             agent_used: bind.agent_used,
             model_used: bind.model_used,
@@ -238,27 +265,23 @@ pub async fn collect_async(
         .await
         .map_err(CollectError::Pay)?;
 
-    // 4. Materialize the paid delivery's files (read-only checkout from the buyer store). Reached
-    // only after the pay above succeeded or reconciled — never on an integrity refusal.
-    let files = match bind.inline_answer.as_deref() {
-        // Reached only after the pay above succeeded, exactly like the git arm below. The answer
-        // was bound at accept under the digest `authorize_pay` just verified the co-signature over,
-        // so writing it here materializes the artifact that was paid for.
-        Some(answer) if bind_is_inline(&bind) => {
-            materialize_inline_delivery(answer, &dest).map_err(CollectError::Materialize)?
-        }
-        _ => {
-            let store = delivery_store_path(home);
-            let store_ref = PayPathDeliveryVerifier::store_ref_for(&bind.commit_oid);
-            materialize_delivery(&store, &store_ref, &bind.commit_oid, &dest)
-                .map_err(CollectError::Materialize)?
-        }
+    // 4. Settle the paid delivery. Reached only after the pay above succeeded or reconciled — never
+    // on an integrity refusal. A git delivery stays in the buyer store (P1): list its files, write
+    // nothing.
+    let (path, files) = match (inline_answer, dest.as_deref()) {
+        // The answer was bound at accept under the digest `authorize_pay` just verified the
+        // co-signature over, so writing it here writes the artifact that was paid for.
+        (Some(answer), Some(dest)) => (
+            Some(dest.display().to_string()),
+            materialize_inline_delivery(answer, dest).map_err(CollectError::Materialize)?,
+        ),
+        _ => (None, settled_delivery_files(home, &bind.commit_oid)?),
     };
 
     Ok(CollectOutcome {
         pay: CollectPayment::Sat(pay),
         commit_oid: bind.commit_oid,
-        path: dest.display().to_string(),
+        path,
         files,
         // Attribution recorded at accept from the delivered result's seller-claimed
         // exec-metadata; the settle path persists it onto the awards row (#261).
@@ -270,7 +293,8 @@ pub async fn collect_async(
 /// Session jobs (§8.4): settle ONE turn ≥ 2 — accept its result if needed (per-turn bind at
 /// `jobs/<followup_id>.json`, ACCEPT with `reply`), refuse a git turn whose commit does not have the
 /// previous git turn's commit as its single parent (before any spend), then pay (NUT-18 payload id
-/// = the follow-up id) or settle free, and materialize into `results/<job_id>-t<n>`.
+/// = the follow-up id) or settle free. A git turn stays in the buyer store; an inline answer is
+/// written into `results/<job_id>-t<n>`.
 /// `earlier` lists the follow-up ids of turns 2..n-1, oldest first.
 pub async fn collect_turn_async(
     home: &MaxplayerHome,
@@ -283,9 +307,16 @@ pub async fn collect_turn_async(
     let bind = job_lifecycle::accept_turn_async(home, job_id, followup_id)
         .await
         .map_err(CollectError::Lifecycle)?;
-    let dest = results_dest(home, &crate::session::collect_dir_name(job_id, turn), None)
-        .map_err(CollectError::Input)?;
-    check_dest(&dest).map_err(CollectError::Input)?;
+    let inline_answer = inline_answer_of(&bind);
+    let dest = match inline_answer {
+        Some(_) => {
+            let dest = results_dest(home, &crate::session::collect_dir_name(job_id, turn), None)
+                .map_err(CollectError::Input)?;
+            check_dest(&dest).map_err(CollectError::Input)?;
+            Some(dest)
+        }
+        None => None,
+    };
     if !bind_is_inline(&bind)
         && let Some(parent) = job_lifecycle::turn_parent_commit(home, job_id, earlier)
             .map_err(CollectError::Lifecycle)?
@@ -294,19 +325,20 @@ pub async fn collect_turn_async(
     }
     if bind.payment_mode.is_free() {
         job_lifecycle::validate_private_bind(home, &bind).map_err(CollectError::Lifecycle)?;
-        let files = match bind.inline_answer.as_deref() {
-            Some(answer) if bind_is_inline(&bind) => {
-                let files = materialize_inline_delivery(answer, &dest)
+        let (path, files) = match (inline_answer, dest.as_deref()) {
+            (Some(answer), Some(dest)) => {
+                let files = materialize_inline_delivery(answer, dest)
                     .map_err(CollectError::Materialize)?;
-                write_free_collect_record(home, &bind, &dest, &files)?;
-                files
+                let path = dest.display().to_string();
+                write_free_collect_record(home, &bind, &path, &files)?;
+                (Some(path), files)
             }
-            _ => collect_free(home, &bind, &dest)?,
+            _ => (None, collect_free(home, &bind)?),
         };
         return Ok(CollectOutcome {
             pay: CollectPayment::Free,
             commit_oid: bind.commit_oid,
-            path: dest.display().to_string(),
+            path,
             files,
             agent_used: bind.agent_used,
             model_used: bind.model_used,
@@ -321,22 +353,17 @@ pub async fn collect_turn_async(
     let pay = authorize_pay::authorize_pay_async(home, gate, pay_request)
         .await
         .map_err(CollectError::Pay)?;
-    let files = match bind.inline_answer.as_deref() {
-        Some(answer) if bind_is_inline(&bind) => {
-            materialize_inline_delivery(answer, &dest).map_err(CollectError::Materialize)?
-        }
-        _ => materialize_delivery(
-            &delivery_store_path(home),
-            &PayPathDeliveryVerifier::store_ref_for(&bind.commit_oid),
-            &bind.commit_oid,
-            &dest,
-        )
-        .map_err(CollectError::Materialize)?,
+    let (path, files) = match (inline_answer, dest.as_deref()) {
+        (Some(answer), Some(dest)) => (
+            Some(dest.display().to_string()),
+            materialize_inline_delivery(answer, dest).map_err(CollectError::Materialize)?,
+        ),
+        _ => (None, settled_delivery_files(home, &bind.commit_oid)?),
     };
     Ok(CollectOutcome {
         pay: CollectPayment::Sat(pay),
         commit_oid: bind.commit_oid,
-        path: dest.display().to_string(),
+        path,
         files,
         agent_used: bind.agent_used,
         model_used: bind.model_used,
@@ -393,8 +420,9 @@ pub fn collect_blocking(
     runtime.block_on(collect_async(home, gate, request))
 }
 
-/// The FREE collect path (`payment=none`): verify the delivery exactly as hard as the paid path
-/// does, materialize it, and record the collect. No payment leg exists, so none is run.
+/// The FREE collect path (`payment=none`) for a git delivery: verify the delivery exactly as hard
+/// as the paid path does, check its tree, and record the collect. No payment leg exists, so none
+/// is run. The delivery stays in the buyer store; nothing is written under `results/`.
 ///
 /// What this deliberately does NOT do — the list is the point of the function:
 ///
@@ -421,11 +449,7 @@ pub fn collect_blocking(
 /// signature over the payment RECEIPT preimage (mint, amount, unit, attempt id), which does not
 /// exist for a trade with no payment. The seller's co-signature over the delivered RESULT is
 /// verified at accept, which has already run by the time we are here.
-fn collect_free(
-    home: &MaxplayerHome,
-    bind: &AcceptedBind,
-    dest: &Path,
-) -> Result<Vec<String>, CollectError> {
+fn collect_free(home: &MaxplayerHome, bind: &AcceptedBind) -> Result<Vec<String>, CollectError> {
     let commit_oid = CommitOid::parse(bind.commit_oid.clone())
         .map_err(|error| CollectError::Integrity(format!("accepted commit_oid: {error}")))?;
     let delivery = GitDelivery::new(bind.repo.clone(), bind.branch.clone(), commit_oid)
@@ -516,17 +540,18 @@ fn collect_free(
         }
     }
 
-    // 3. Materialize — the SAME read-only checkout the paid path performs, reached only after both
-    // verifications above passed.
-    let files = materialize_delivery(&store, &store_ref, &bind.commit_oid, dest)
-        .map_err(CollectError::Materialize)?;
+    // 3. The same tree check the paid path runs before payment (names, size, depth, every blob
+    // present), then the file list. Nothing is written: the delivery stays in the buyer store.
+    validate_delivery_tree_in_store(&store, &store_ref, &bind.commit_oid)
+        .map_err(|error| CollectError::Integrity(format!("delivery tree refused: {error}")))?;
+    let files = delivery_file_list(&store, &bind.commit_oid).map_err(CollectError::Materialize)?;
 
     // 4. Record the collect. A free job produces no payment-journal entry (there is no payment to
     // journal), so without this a completed free trade would leave the buyer no durable local
     // artifact at all — and §7.0 is that the record is the artifact, never the silence. Written
     // ONLY on the free path: the paid path's durable record is its payment journal, and adding a
     // second one there would change paid behaviour.
-    write_free_collect_record(home, bind, dest, &files)?;
+    write_free_collect_record(home, bind, &store_ref, &files)?;
     Ok(files)
 }
 
@@ -536,13 +561,13 @@ pub fn free_collect_record_path(home: &MaxplayerHome, job_id: &str) -> PathBuf {
 }
 
 /// Write the free collect record, `payment = "none"` — the buyer-side fact that this job completed
-/// with no payment leg. WRITE-ONCE: a re-collect re-materializes the files (idempotent) and leaves
-/// the first record's `collected_at` standing, so the record dates the collect rather than the last
-/// re-read of it.
+/// with no payment leg. WRITE-ONCE: a re-collect leaves the first record's `collected_at` standing,
+/// so the record dates the collect rather than the last re-read of it. `location` is the folder an
+/// inline answer was written to, or the buyer-store ref a git delivery stays under.
 fn write_free_collect_record(
     home: &MaxplayerHome,
     bind: &AcceptedBind,
-    dest: &Path,
+    location: &str,
     files: &[String],
 ) -> Result<(), CollectError> {
     // A session turn's record is keyed by its follow-up, so it never collides with turn 1's.
@@ -564,7 +589,7 @@ fn write_free_collect_record(
         // The fact this record exists to state. Mirrors the seller store's `deliveries.payment`.
         "payment": crate::gateway::PaymentMode::None.as_wire(),
         "amount_sats": 0,
-        "path": dest.display().to_string(),
+        "path": location,
         "files": files,
         "collected_at": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -579,6 +604,65 @@ fn write_free_collect_record(
 /// Mirrors the path [`authorize_pay`](crate::authorize_pay) opens the verifier against.
 pub fn delivery_store_path(home: &MaxplayerHome) -> PathBuf {
     home.root.join("store")
+}
+
+/// Why `out` is refused for a git delivery: it named a `results/` folder, and a git delivery is no
+/// longer written there.
+pub const GIT_OUT_REFUSAL: &str = "'out' names a results folder for an inline answer only; a git \
+     delivery stays in the buyer store and is not written to disk. Read it with read_delivery, or \
+     extract it on purpose with `maxplayer delivery extract <job_id> --to <dir>`. Nothing was paid; \
+     the delivery is accepted and settles on its own (or collect again without out)";
+
+/// The inline answer this bind settles, if it is an inline delivery (§6.4).
+fn inline_answer_of(bind: &AcceptedBind) -> Option<&str> {
+    bind.inline_answer.as_deref().filter(|_| bind_is_inline(bind))
+}
+
+/// The file list of a settled git delivery, read from the buyer store without writing anything.
+fn settled_delivery_files(home: &MaxplayerHome, commit_oid: &str) -> Result<Vec<String>, CollectError> {
+    delivery_file_list(&delivery_store_path(home), commit_oid).map_err(CollectError::Materialize)
+}
+
+/// The tree of `commit_oid` in the buyer store: its retention ref first, then the raw oid.
+pub(crate) fn delivery_tree<'r>(
+    repo: &'r git2::Repository,
+    commit_oid: &str,
+) -> Result<git2::Tree<'r>, String> {
+    let store_ref = PayPathDeliveryVerifier::store_ref_for(commit_oid);
+    repo.revparse_single(&store_ref)
+        .or_else(|_| repo.revparse_single(commit_oid))
+        .and_then(|object| object.peel_to_commit())
+        .and_then(|commit| commit.tree())
+        .map_err(|error| format!("delivery {commit_oid} not found in buyer store: {error}"))
+}
+
+/// The sorted blob paths of the delivered commit's tree in the buyer store, read without writing
+/// anything. Bounded: a tree is a DAG, and a few shared subtrees can name 2^N paths (#1290 fable
+/// M2); same cap as the pre-pay check, which refuses such a delivery outright.
+pub fn delivery_file_list(store: &Path, commit_oid: &str) -> Result<Vec<String>, String> {
+    let repo = git2::Repository::open_bare(store)
+        .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
+    let tree = delivery_tree(&repo, commit_oid)?;
+    let mut files = Vec::new();
+    let mut visited = 0usize;
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        visited += 1;
+        if visited > MAX_DELIVERY_ENTRIES {
+            return git2::TreeWalkResult::Abort;
+        }
+        if entry.kind() == Some(git2::ObjectType::Blob)
+            && let Ok(name) = entry.name()
+        {
+            files.push(format!("{root}{name}"));
+        }
+        git2::TreeWalkResult::Ok
+    });
+    if visited > MAX_DELIVERY_ENTRIES {
+        return Err(format!("delivery has more than {MAX_DELIVERY_ENTRIES} entries; not listed"));
+    }
+    walked.map_err(|error| error.to_string())?;
+    files.sort();
+    Ok(files)
 }
 
 /// Resolve a delivery output folder under `<home>/results`. `out` is an optional simple folder NAME
@@ -807,7 +891,7 @@ const MAX_DELIVERY_PATH_BYTES: usize = 512;
 const MAX_DELIVERY_DEPTH: usize = 64;
 /// Most tree entries (files, directories, symlinks, submodules) one delivery may hold. Also bounds
 /// the walk itself: a tree is a DAG, so a few shared subtrees can name 2^N paths (#1290 fable M2).
-const MAX_DELIVERY_ENTRIES: usize = 100_000;
+pub(crate) const MAX_DELIVERY_ENTRIES: usize = 100_000;
 /// Largest single delivered file.
 const MAX_DELIVERY_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// Most bytes one delivery may write to disk.
@@ -857,7 +941,7 @@ fn portable_component(component: &str) -> bool {
 /// code points dropped, and a full upper→lower round trip, which folds `ſ`→`s` and the Kelvin sign
 /// →`k` where plain `to_lowercase` does not. Deliberately broad: it may refuse a pair Linux could
 /// store, never accept a pair macOS cannot.
-fn collision_key(path: &str) -> String {
+pub(crate) fn collision_key(path: &str) -> String {
     use unicode_normalization::UnicodeNormalization as _;
     // ASCII has no decomposition, no ignorables and a 1:1 case map: the same key, cheaply. Nearly
     // every honest tree takes this path (#1290 fable r3 L2).
@@ -1716,6 +1800,41 @@ mod tests {
         assert!(bind_is_inline(&bind));
         bind.delivery_kind = Some("fork".to_owned());
         assert!(!bind_is_inline(&bind));
+    }
+
+    // P1 (settle-without-unpacking): no settle path writes a git delivery to disk. Paid, free and
+    // session-turn settles all go through this file; the only writer of delivered files is
+    // `delivery_read::extract`. Red-on-revert: restoring `materialize_delivery` in any settle arm.
+    #[test]
+    fn no_settle_path_calls_the_delivery_writer() {
+        let source = include_str!("collect.rs");
+        let body = &source[..source.find("#[cfg(test)]\nmod tests {").expect("tests module")];
+        let calls: Vec<&str> = body
+            .lines()
+            .filter(|line| line.contains("materialize_delivery(") && !line.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(calls, vec!["pub fn materialize_delivery("], "{calls:?}");
+    }
+
+    // `out` names a results folder, and a git delivery has none: refused before any pay (no gate is
+    // even supplied, so reaching the pay path would fail differently).
+    #[tokio::test(flavor = "current_thread")]
+    async fn collect_refuses_out_for_a_git_delivery_before_pay() {
+        let root = std::env::temp_dir().join(format!("maxplayer-gitout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let job = "9a".repeat(32);
+        write_bind(&home, &bind_for(&job, &"5".repeat(64), &"d".repeat(40)));
+        let error = collect_async(
+            &home,
+            None,
+            CollectRequest { accept_review_verdict: None, job_id: job.clone(), out: Some("x".into()) },
+        )
+        .await
+        .expect_err("refused");
+        assert!(error.to_string().contains("inline answer only"), "{error}");
+        assert!(!root.join("results").exists() && !root.join("payment-journal").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Helper: a from-scratch accept-bind pinning `commit_oid` (used by refuse-path tests).

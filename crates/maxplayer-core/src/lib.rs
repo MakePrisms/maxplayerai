@@ -12,6 +12,8 @@ pub mod checks;
 pub mod challenge;
 #[cfg(feature = "wallet")]
 pub mod collect;
+#[cfg(feature = "wallet")]
+pub mod delivery_read;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
 pub mod job_lifecycle;
 #[cfg(all(feature = "wallet", feature = "gateway"))]

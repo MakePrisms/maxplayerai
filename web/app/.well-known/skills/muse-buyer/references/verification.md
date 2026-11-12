@@ -22,8 +22,8 @@ Read from the code, not from anyone's report.
 | `max_sats` is a per-job ceiling for the background auto-award, defaulting to `amount_sats` | same, and `crates/maxplayer-core/src/buyer/mod.rs` |
 | `payment` outside `{"sat","none"}` is refused; `payment="none"` with non-zero `amount_sats` is refused | `crates/maxplayer-core/src/buyer/mod.rs` |
 | `get_job` requires `job_id`; `wait_for`/`timeout_secs` are optional and the timeout is capped | `crates/maxplayer/src/mcp.rs` |
-| `collect` requires `job_id`. **On a paid job** (`payment: "sat"`) its order is accept → verify → **pay** → materialise, and it is idempotent by attempt id | `crates/maxplayer-core/src/collect.rs` |
-| **On a free job** (`payment: "none"`) there is no payment leg and no attempt id: the free bind is verified and materialised, and the response reports `state: "none"`, `attempt_id: null`, `amount_sats: 0` and **no** `spent_total_sats` | `crates/maxplayer-core/src/collect.rs`, `crates/maxplayer-core/src/buyer/mod.rs` |
+| `collect` requires `job_id`. **On a paid job** (`payment: "sat"`) its order is accept → verify → **pay** → settle (a git delivery stays in the buyer store), and it is idempotent by attempt id | `crates/maxplayer-core/src/collect.rs` |
+| **On a free job** (`payment: "none"`) there is no payment leg and no attempt id: the free bind is verified and settled, and the response reports `state: "none"`, `attempt_id: null`, `amount_sats: 0` and **no** `spent_total_sats` | `crates/maxplayer-core/src/collect.rs`, `crates/maxplayer-core/src/buyer/mod.rs` |
 | A retry preserves the pinned award rather than re-transmitting it; an **expired** pending attempt is only probed, so the outcome can stay unresolved or come back refused — retrying is not a convergence guarantee | `crates/maxplayer-core/src/buyer/mod.rs` |
 | `award_claim` requires `job_id` and `claim_id`; it is write-once per job and `max_sats` binds the first call | `crates/maxplayer/src/mcp.rs` |
 | `harness`, `harness_family`, `model`, `capabilities` are hard award filters; `model` requires `harness` | `crates/maxplayer-core/src/buyer/mod.rs` |

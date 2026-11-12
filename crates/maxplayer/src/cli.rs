@@ -53,6 +53,7 @@ where
         Some("reviewer") => crate::reviewer_cli::run(&args[2..], out, err),
         Some("accept") => crate::accept_cli::run(&args[2..], out, err),
         Some("collect") => crate::collect_cli::run(&args[2..], out, err),
+        Some("delivery") => crate::delivery_cli::run(&args[2..], out, err),
         Some("doctor") => crate::doctor::run(&args[2..], out, err),
         // INTERNAL (Track B): container-side delivery orchestrator. Not advertised in usage.
         Some("__deliver") => crate::deliver_cli::run(&args[2..], out, err),
@@ -359,7 +360,7 @@ fn write_usage(out: &mut dyn Write) {
     );
     let _ = writeln!(
         out,
-        "  maxplayer review status|retry <subject-id> [--home <path>]\n  maxplayer reviewer serve <config.json>   # relay-owner reviewer\n  maxplayer accept <job_id> <claim_id> [--result-id <id>] [--accept-review-verdict <verdict-event-id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>] [--accept-review-verdict <verdict-event-id>]   # buyer: accept-if-needed + verify + pay + materialize\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error\n{}",
+        "  maxplayer review status|retry <subject-id> [--home <path>]\n  maxplayer reviewer serve <config.json>   # relay-owner reviewer\n  maxplayer accept <job_id> <claim_id> [--result-id <id>] [--accept-review-verdict <verdict-event-id>]   # buyer: bind a delivered result (collect folds this in)\n  maxplayer collect <job_id> [--out <folder>] [--accept-review-verdict <verdict-event-id>]   # buyer: accept-if-needed + verify + pay (a git delivery stays in the store)\n  maxplayer delivery show <job_id> [<path>] | delivery extract <job_id> [--to <dir>]   # buyer: read a settled delivery, or extract it into a throwaway folder\n  maxplayer log replay <path>\n  maxplayer mock run --script <path> --log <path> [--job-id <id>] [--permission-policy allow|deny]\n  maxplayer run --agent-command <cmd> --task <text> --log <path> [--cwd <dir>] [--job-id <id>] [--permission-policy allow|allow-always|deny] [--idle-timeout <secs>]\n\nExit codes: 0 success, 1 usage error, 2 runtime error\n{}",
         crate::skill::docs_pointer_line()
     );
 }
@@ -767,6 +768,7 @@ mod tests {
             ("skill --help", "maxplayer skill"),
             ("accept --help", "maxplayer accept"),
             ("collect --help", "maxplayer collect"),
+            ("delivery --help", "maxplayer delivery"),
             ("mcp --help", "maxplayer mcp"),
             ("log --help", "maxplayer log replay"),
             ("log replay --help", "maxplayer log replay"),

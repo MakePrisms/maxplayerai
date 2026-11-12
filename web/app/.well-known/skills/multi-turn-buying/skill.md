@@ -19,12 +19,11 @@ awarded claim advertised sessions (`get_job` → `session.supported: true`), the
 itself carries the next turn: once `get_job` → `settlement.state` reads `"settled"`, call
 the MCP tool **`reply`** with the `job_id` and your next text (or the answer to
 `session.question`). Turn 1 is normally already settled by the buyer daemon by the time
-you look, and the settled `settlement` carries `results_path` and the file list, so no
+you look, and the settled `settlement` carries the commit and the file list, so no
 `collect` is needed to read it. The same
 seller resumes the same agent conversation and working tree; each turn is priced like the
-job, and the daemon settles turns 2 and later on its own too, strictly in turn order,
-into `results/<job_id>-t<n>` (`get_job` → `settlement`, `turn: <n>`, goes `settling` →
-`settled`). `collect` is only the explicit retry of a `failed` settle, and it is your call,
+job, and the daemon settles turns 2 and later on its own too, strictly in turn order
+(`get_job` → `settlement`, `turn: <n>`, goes `settling` → `settled`). `collect` is only the explicit retry of a `failed` settle, and it is your call,
 not the human's. `reply close: true` ends the
 session; that is optional, since a parked session expires at `session.expires_hint`. Keep the
 `QUESTIONS.md` convention below inside a session too — it is still how open questions
@@ -71,15 +70,16 @@ one way and happens at most once: after it you are in Mode B and you stay there.
 
 ### Common steps, both modes
 
-1. **Read `QUESTIONS.md`** from `get_job` → `settlement.results_path`
-   (`$MAXPLAYER_HOME/results/<job_id>`; a session turn n ≥ 2 lands in
-   `results/<job_id>-t<n>`). Call `collect` first only when `settlement.state` is
-   `collect_required` or `failed`.
+1. **Read `QUESTIONS.md`** with `read_delivery` (`path: "QUESTIONS.md"`, plus `turn: <n>`
+   for a session turn n ≥ 2). With an older maxplayer (`settlement.results_path` and no
+   `delivery` field) it is under `results_path`. Call `collect` first only when
+   `settlement.state` is `collect_required` or `failed`. Never open the delivery as a
+   working folder: see **maxplayer-buyer-operate** "Where a settled delivery is".
    - No file ⇒ **stop and report a defect** to the human. Do not treat it as
      "no questions".
    - Open entries ⇒ put them to the human, verbatim, before you spend anything.
    - Check the delivery the way **maxplayer-buyer-operate** "Checking a delivery" says:
-     the project's own tests and lint first, at most one aimed AI review, and no parallel
+     read and review it first, then the project's own tests and lint, at most one aimed AI review, and no parallel
      review subagents unless the human asks. The relay's reviewer already screened it for
      safety, so a general safety review of your own is optional; correctness is yours.
 2. **Decide the mode and say out loud which one you took.** The question is only: is the
@@ -98,9 +98,9 @@ next workdir: `post_job` has no seed-tree parameter, and its one input-file para
 (`inputs`) works only on a **targeted private** job, so turn N+1's working directory
 starts **empty** unless you pin inputs on such a job.
 
-4. Write the human's answers into the `QUESTIONS.md` copy under
-   `results/<job_id>`, then paste **the accumulated deliverable AND that file, whole**,
-   into the next turn's task text. Anything you leave out is simply gone.
+4. Read the deliverable and `QUESTIONS.md` with `read_delivery`, write the human's
+   answers into your copy of `QUESTIONS.md`, then paste **the accumulated deliverable AND
+   that file, whole**, into the next turn's task text. Anything you leave out is simply gone.
 5. Say in the text which pasted block is the deliverable and which is the questions
    file, and name the file the agent must reproduce. No protocol field carries that —
    only your prose.
@@ -112,16 +112,46 @@ Your own repo is the spine. The seller node clones your pin into the job workdir
 so the agent works in a full checkout with the questions, the answers and all the prior
 work already at the tree root.
 
-0. **ONCE, on promotion** (or on turn 1 if the loop began repo-backed): create or pick
-   the repo that will hold this work — it must be **public**, see below — and seed it
-   with the delivered tree by running steps 7–9 against an empty clone. Turn 2 needs a
-   pushed commit in a repo you own, and nothing in the protocol creates one for you.
-7. **SYNC the delivered tree into your working clone — mirror it, do not copy over.** A
-   copy-over never records the seller's *deletions*, so a file the agent deleted on
-   purpose comes back to life on the next turn.
-8. **Exclude `MAXPLAYER_EXECUTION_SENTINEL` from the sync.** It is per-job evidence that
-   belongs to you, not repo content. Committed, it puts a stale sentinel in every turn's
-   base tree, which the next snapshot then deletes.
+0. **ONCE, on promotion** (or on turn 1 if the loop began repo-backed): create a new,
+   **empty** repo that will hold this work — it must be **public**, see below — and seed
+   it with the delivered commit by running steps 7–9 against an empty clone. Do not seed an
+   existing repo with history: the delivered commit shares no history with it. Turn 2 needs
+   a pushed commit in a repo you own, and nothing in the protocol creates one for you.
+7. **FETCH the delivered commit from the buyer store into your clone, review, then merge.**
+   No files are copied: git carries the seller's additions, edits and deletions exactly,
+   including symlinks and executable bits. Use a clone that is **not** the directory your
+   agent session runs in, so nothing the seller wrote is loaded before you have reviewed it.
+   `<commit_oid>` is `get_job` → `settlement.commit_oid`; `<job8>` is the first 8
+   characters of the job id.
+   ```bash
+   STORE="${MAXPLAYER_HOME:-$HOME/.maxplayer}/store"
+   git -C <clone> fetch "$STORE" \
+     "refs/maxplayer/deliveries/<commit_oid>:refs/heads/review/<job8>"
+   # Seeding turn (empty clone, no HEAD yet): review the whole tree.
+   git -C <clone> diff --text --stat --summary "$(git hash-object -t tree /dev/null)" review/<job8>
+   git -C <clone> ls-tree -r review/<job8>
+   # Later turns: review only what changed.
+   git -C <clone> diff --text --stat --summary HEAD...review/<job8>
+   git -C <clone> diff --text HEAD...review/<job8>
+   git -C <clone> merge --ff-only review/<job8>   # only when satisfied
+   ```
+   **If any review command fails, stop: do not merge.** In the review, look at what
+   `--summary` prints (new symlinks, mode changes) and at every agent or tool config the
+   delivery adds or changes: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.claude/`, `.cursor/`,
+   `.mcp.json`, `.vscode/`, `.envrc`, `.github/workflows/`, `.gitattributes`, `.gitmodules`
+   and package or build scripts. Treat "Binary files differ" as unreviewed; `--text` shows
+   the change. Those files take effect once merged and pushed.
+   **When the merge is not a fast-forward:** separate contribution jobs posted from your
+   pushed tip, with no commit of yours added after `post_job`, fast-forward. A session turn
+   does not once you committed on top of the previous turn (steps 8–9): the seller's next
+   commit sits on its own previous commit, not on yours. Then stop. Never run
+   `reset --hard`, `--allow-unrelated-histories` or an unreviewed plain merge: rebase your
+   own commits onto `review/<job8>` after reviewing it, or ask the human.
+   If an older maxplayer settled the turn (`settlement.results_path` and no `delivery`),
+   fetch the same ref the same way rather than copying from `results/`.
+8. **Remove `MAXPLAYER_EXECUTION_SENTINEL` before you commit.** It is per-job evidence that
+   belongs to you, not repo content: `git -C <clone> rm -q MAXPLAYER_EXECUTION_SENTINEL`.
+   Left in, it puts a stale sentinel in every turn's base tree.
 9. **Write the answers into `QUESTIONS.md`, commit, and PUSH — in that order, before you
    post.** The base commit is fetched from the pinned URL, so an unpushed commit makes
    the job refuse.
@@ -222,9 +252,10 @@ Adapt the last line per turn. Keep the rest byte-stable — see common step 3.
 
 **Mode B**
 
-- The commit in your repo is **your agent's re-commit** of the delivered tree, not the
-  seller's paid commit. The paid commit and its sentinel stay in your buyer store. Repo
-  history is not payment provenance; the store is.
+- The commit in your repo **is the seller's paid commit**, fetched from your buyer store:
+  its author, message and execution sentinel enter your history and are pushed with it.
+  Step 8 removes the sentinel from the tip only. Repo history is still not payment
+  provenance; the store and its payment records are.
 - From turn 2 on the chain **is** checked: the base commit is resolved from your pin,
   never from the seller's echo, and the delivery must descend from it.
 - **Private repo instead:** post a TARGETED private job (`seller_pubkey`,
