@@ -1027,7 +1027,8 @@ async fn status_json_matches_golden_and_summary_is_readable_and_secret_free() {
             }
         }
         assert!(h.contains(&format!("swap {id} complete")), "{h}");
-        assert!(h.contains("Exit codes:"), "{h}");
+        // Exit codes live in `status --help` / `recover --help`, not in readable status.
+        assert!(!h.contains("Exit codes"), "{h}");
         if home == &f.taker {
             assert!(
                 h.contains(&format!("+32 {} / -24 {}; fees 0", f.a.url, f.b.url)),
@@ -1048,7 +1049,11 @@ async fn status_json_matches_golden_and_summary_is_readable_and_secret_free() {
                 h.contains(&format!("+24 {} / -32 {}; fees 0", f.b.url, f.a.url)),
                 "{h}"
             );
-            assert!(h.contains("UNRESOLVED: none"), "{h}");
+            assert!(
+                h.starts_with("Nothing unresolved: everything is settled.\n"),
+                "{h}"
+            );
+            assert!(!h.contains("Exit codes") && !h.contains("Next:"), "{h}");
         }
     }
 }

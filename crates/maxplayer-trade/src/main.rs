@@ -87,7 +87,7 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// One recovery pass; exit 3 if items remain pending. Does not wait for lock deadlines.
+    /// One recovery pass; does not wait for lock deadlines. Exits 0 when settled, 3 while items remain (keep serve running or rerun), 4 when manual recovery is needed.
     Recover,
     /// Check NUT-07/09/11/12/14, an active sat keyset, and clock skew <= 60 seconds.
     Preflight { mint: String },
@@ -135,7 +135,7 @@ enum Command {
         #[arg(long)]
         reclaim: Option<String>,
     },
-    /// Summarize lots, swaps and money records without locking the home or advancing payments.
+    /// Summarize lots, swaps and money records without locking the home or advancing payments; always exits 0.
     Status {
         /// Print the raw public records (machine-readable) instead of the summary.
         #[arg(long)]
