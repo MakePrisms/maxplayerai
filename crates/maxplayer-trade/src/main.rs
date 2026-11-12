@@ -58,7 +58,15 @@ enum Command {
         dry_run: bool,
     },
     /// Discover verified available lots (lock-free, read-only; works while serve runs).
-    Discover,
+    Discover {
+        /// Only lots whose maker gives this mint (same direction as on list).
+        #[arg(long)]
+        give_mint: Option<String>,
+        /// Only lots whose maker wants this mint. With both mints, lots are sorted cheapest
+        /// first for a taker (fewest wanted sats per given sat).
+        #[arg(long)]
+        want_mint: Option<String>,
+    },
     /// Cancel an inactive lot and release its reserved inputs.
     Cancel { lot: String },
     /// Keep running to accept trades and recover existing money authorizations.
@@ -291,7 +299,12 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     };
     // Lock-free, journal-free commands: they only read relays, mints and SQLite snapshots.
     match &cli.command {
-        Command::Discover => return lockfree::discover(&relays).await,
+        Command::Discover {
+            give_mint,
+            want_mint,
+        } => {
+            return lockfree::discover(&relays, give_mint.as_deref(), want_mint.as_deref()).await;
+        }
         Command::List {
             give_mint,
             give,
@@ -732,7 +745,7 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
         command,
         Command::Balance { .. }
             | Command::Status { .. }
-            | Command::Discover
+            | Command::Discover { .. }
             | Command::Preflight { .. }
             | Command::List { dry_run: true, .. }
             | Command::Take { dry_run: true, .. }
@@ -785,14 +798,25 @@ mod lockfree {
     async fn market(relays: &[String]) -> Result<Market> {
         Market::connect(nostr_sdk::Keys::generate(), relays).await
     }
-    pub async fn discover(relays: &[String]) -> Result<()> {
+    pub async fn discover(relays: &[String], give: Option<&str>, want: Option<&str>) -> Result<()> {
+        // Refuse a malformed filter before any relay traffic.
+        let give = give.map(Asset::from_cli).transpose()?;
+        let want = want.map(Asset::from_cli).transpose()?;
+        ensure!(
+            give.is_none() || give != want,
+            "same-asset swap: --give-mint and --want-mint are the same mint"
+        );
         let m = market(relays).await?;
         let lots = m.discover(None).await?;
         let now = maxplayer_trade::coordinator::now();
-        let terms = lots
-            .iter()
-            .map(|e| parse_lot(e, now))
+        let parsed = lots
+            .into_iter()
+            .map(|e| Ok((parse_lot(&e, now)?, e)))
             .collect::<Result<Vec<_>>>()?;
+        let (terms, lots): (Vec<_>, Vec<_>) =
+            maxplayer_trade::select_lots(parsed, give.as_ref(), want.as_ref())
+                .into_iter()
+                .unzip();
         let fees = dryrun::discover_fees(&terms).await;
         let listings = lots.iter().zip(fees).map(|(e, fees)| {
             Ok(serde_json::json!({"lot_id":e.id,"maker":e.pubkey,"terms":serde_json::from_str::<serde_json::Value>(&e.content)?,"expected_fees":fees}))

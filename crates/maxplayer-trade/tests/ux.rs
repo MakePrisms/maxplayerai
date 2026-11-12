@@ -233,6 +233,50 @@ async fn discover_is_lock_free_and_never_touches_the_journal() {
     assert!(!fresh.exists(), "SAFETY: discover created a home");
 }
 
+/// `discover --give-mint/--want-mint` keeps only that direction; a bad pair is refused offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discover_filters_by_mint_pair() {
+    let f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let home = f.root.path().join("x");
+    let ids = |out: &std::process::Output| -> Vec<String> {
+        let (stdout, stderr) = text(out);
+        assert!(out.status.success(), "{stderr}");
+        let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        v["listings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["lot_id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let (a, b) = (f.a.url.as_str(), f.b.url.as_str());
+    for (args, want) in [
+        (vec!["discover", "--give-mint", a, "--want-mint", b], true),
+        (vec!["discover", "--give-mint", a], true),
+        (vec!["discover", "--want-mint", b], true),
+        (vec!["discover", "--give-mint", b, "--want-mint", a], false),
+        (vec!["discover", "--give-mint", b], false),
+    ] {
+        let found = ids(&run(&home, &f.relay_url, &args).await);
+        assert_eq!(found == [lot.clone()], want, "{args:?}: {found:?}");
+        assert!(want || found.is_empty(), "{args:?}: {found:?}");
+    }
+    for bad in [
+        vec!["discover", "--give-mint", a, "--want-mint", a],
+        vec!["discover", "--give-mint", "not a mint"],
+    ] {
+        let out = run(&home, "ws://127.0.0.1:1", &bad).await;
+        assert!(!out.status.success(), "{bad:?} accepted");
+        assert!(
+            !text(&out).1.contains("relay"),
+            "{bad:?} reached a relay: {}",
+            text(&out).1
+        );
+    }
+    assert!(!home.exists(), "SAFETY: discover created a home");
+}
+
 /// Mint keysets unreachable or hanging: discover still answers, fees marked unknown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discover_marks_unreachable_mint_fees_unknown_without_blocking() {
