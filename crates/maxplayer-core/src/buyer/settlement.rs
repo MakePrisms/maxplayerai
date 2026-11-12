@@ -190,7 +190,7 @@ pub(super) fn hint(f: &Facts) -> Value {
                     None,
                     format!(
                         "Delivered. The buyer daemon is settling this on its own (accept, verify, \
-                         pay, materialize into results/<job_id>), normally within seconds of the \
+                         pay; a git delivery stays in the buyer store), normally within seconds of the \
                          delivery. Re-check with get_job shortly; collect is not needed. \
                          {NOT_A_HUMAN_DECISION}"
                     ),
@@ -251,8 +251,11 @@ fn settled_turn_one(f: &Facts) -> Value {
         f.results_path.as_deref(),
         None,
         "Settled: the delivery was accepted, verified, paid (a free job pays nothing) and \
-         materialized; the files are under results_path (absent only when an earlier collect used \
-         out=). commit_oid, files and pay here are what collect would return, so collect is not \
+         settled. An inline answer is written to results_path. A git delivery (delivery: \"store\") \
+         is NOT written to disk: it stays in the buyer store. Read its files with read_delivery, or \
+         extract it on purpose with `maxplayer delivery extract <job_id>` into a throwaway folder; \
+         never start an agent session or run git inside an extracted folder before reviewing it. \
+         commit_oid, files and pay here are what collect would return, so collect is not \
          needed: it is idempotent and would only repeat them, without paying again."
             .to_owned(),
     )
@@ -286,9 +289,10 @@ fn turn_hint(turn: &Turn) -> Value {
             turn.results_path.as_deref(),
             None,
             format!(
-                "Turn {n} is settled: accepted, verified, paid (a free job pays nothing) and \
-                 materialized; its files are under results_path. collect is not needed: it never \
-                 pays twice."
+                "Turn {n} is settled: accepted, verified and paid (a free job pays nothing). An \
+                 inline answer is under results_path; a git delivery stays in the buyer store \
+                 (read_delivery with turn={n}, or `maxplayer delivery extract <job_id> --turn {n}`). \
+                 collect is not needed: it never pays twice."
             ),
         ),
         "delivered" if !turn.funds_held => body(
@@ -355,8 +359,8 @@ fn turn_hint(turn: &Turn) -> Value {
                 None,
                 format!(
                     "Turn {n} was delivered. The buyer daemon is settling it on its own (accept, \
-                     verify, pay this turn's reserved price, materialize into \
-                     results/<job_id>-t{n}), normally within seconds. Re-check with get_job \
+                     verify, pay this turn's reserved price; a git delivery stays in the buyer \
+                     store), normally within seconds. Re-check with get_job \
                      shortly; collect is not needed. {NOT_A_HUMAN_DECISION}"
                 ),
             )

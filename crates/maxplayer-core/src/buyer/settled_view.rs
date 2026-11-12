@@ -77,6 +77,10 @@ pub(super) fn details(home: &MaxplayerHome, key: &str) -> Option<Value> {
         })
     };
     let mut value = json!({
+        // P1 (spec settle-without-unpacking §2.2): where the delivered files are. `inline` = the
+        // answer was written to `results_path`; `store` = a git delivery that stays in the buyer
+        // store and is read with `read_delivery` or extracted on purpose.
+        "delivery": if collect::bind_is_inline(&bind) { "inline" } else { "store" },
         "commit_oid": bind.commit_oid,
         "pay": pay,
         "agent_used": bind.agent_used,
@@ -94,41 +98,9 @@ fn read_free_record(home: &MaxplayerHome, key: &str) -> Option<Value> {
     serde_json::from_slice(&raw).ok()
 }
 
-/// The sorted blob paths of the delivered commit's tree in the buyer store: the list
-/// `collect::materialize_delivery` writes, read without writing anything.
+/// The sorted blob paths of the delivered commit's tree in the buyer store, read without writing.
 fn delivery_files(home: &MaxplayerHome, commit_oid: &str) -> Result<Vec<String>, String> {
-    let repo = git2::Repository::open_bare(collect::delivery_store_path(home))
-        .map_err(|e| e.to_string())?;
-    let store_ref = crate::delivery_git::PayPathDeliveryVerifier::store_ref_for(commit_oid);
-    let tree = repo
-        .revparse_single(&store_ref)
-        .or_else(|_| repo.revparse_single(commit_oid))
-        .and_then(|object| object.peel_to_commit())
-        .and_then(|commit| commit.tree())
-        .map_err(|e| e.to_string())?;
-    // Bounded: a tree is a DAG, and a few shared subtrees can name 2^N paths (#1290 fable M2).
-    // Same cap as collect's pre-pay check, which refuses such a delivery outright.
-    const MAX_LISTED_ENTRIES: usize = 100_000;
-    let mut files = Vec::new();
-    let mut visited = 0usize;
-    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
-        visited += 1;
-        if visited > MAX_LISTED_ENTRIES {
-            return git2::TreeWalkResult::Abort;
-        }
-        if entry.kind() == Some(git2::ObjectType::Blob)
-            && let Ok(name) = entry.name()
-        {
-            files.push(format!("{root}{name}"));
-        }
-        git2::TreeWalkResult::Ok
-    });
-    if visited > MAX_LISTED_ENTRIES {
-        return Err(format!("delivery has more than {MAX_LISTED_ENTRIES} entries; not listed"));
-    }
-    walked.map_err(|e| e.to_string())?;
-    files.sort();
-    Ok(files)
+    collect::delivery_file_list(&collect::delivery_store_path(home), commit_oid)
 }
 
 /// The most advanced folded payment state among the journals whose payload id is `key` (several
