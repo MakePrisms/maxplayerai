@@ -931,7 +931,7 @@ fn portable_component(component: &str) -> bool {
 /// code points dropped, and a full upper→lower round trip, which folds `ſ`→`s` and the Kelvin sign
 /// →`k` where plain `to_lowercase` does not. Deliberately broad: it may refuse a pair Linux could
 /// store, never accept a pair macOS cannot.
-fn collision_key(path: &str) -> String {
+pub(crate) fn collision_key(path: &str) -> String {
     use unicode_normalization::UnicodeNormalization as _;
     // ASCII has no decomposition, no ignorables and a 1:1 case map: the same key, cheaply. Nearly
     // every honest tree takes this path (#1290 fable r3 L2).
