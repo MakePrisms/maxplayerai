@@ -64,18 +64,21 @@ pub const MAX_MINT_RELAYS: usize = 8;
 pub const DEFAULT_MINT_RELAY: &str = "wss://relay.maxplayer.ai";
 
 static MINT_RELAYS: RwLock<Option<Vec<String>>> = RwLock::new(None);
-/// The home whose `trade.key` signs every `nostr://` mint request. The default mint relay only lets
-/// registered keys sign in (email signup option C, Bob 2026-10-22). `None` (no home, e.g.
-/// `doctor`): a fresh throwaway key per request.
-static MINT_IDENTITY_HOME: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
+/// The home whose key signs every `nostr://` mint request, and whether a missing legacy
+/// `trade.key` may be created for it. The default mint relay only lets registered keys sign in
+/// (email signup option C, Bob 2026-10-22). `None` (no home, e.g. `doctor`): a fresh throwaway key
+/// per request.
+static MINT_IDENTITY_HOME: RwLock<Option<(std::path::PathBuf, bool)>> = RwLock::new(None);
 
-/// Sign every later `nostr://` mint request, and the relay sign-in, as `home`'s `trade.key`. The
-/// key is read (or created) only when a mint request is built, so a command refused earlier never
-/// touches the home.
-pub fn configure_mint_identity(home: &std::path::Path) {
+/// Sign every later `nostr://` mint request, and the relay sign-in, as `home`'s key. The key is
+/// read only when a mint request is built, so a command refused earlier never touches the home.
+/// `read_only` (discover, status, balance, preflight, dry runs): an existing key is used, a missing
+/// legacy `trade.key` is never created (the request signs with a throwaway key instead); otherwise
+/// a legacy home's `trade.key` is created on first use.
+pub fn configure_mint_identity(home: &std::path::Path, read_only: bool) {
     *MINT_IDENTITY_HOME
         .write()
-        .unwrap_or_else(|e| e.into_inner()) = Some(home.to_owned());
+        .unwrap_or_else(|e| e.into_inner()) = Some((home.to_owned(), read_only));
 }
 
 /// Whether `mint` uses the `nostr://` scheme (case-insensitive: such a URL never reaches HTTP).
@@ -278,8 +281,13 @@ pub fn connector(mint: &str) -> Result<NostrMintConnector> {
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
-    let c = match home {
-        Some(home) => c.with_identity(crate::wallet::identity(&home)?),
+    let identity = match home {
+        Some((home, true)) => crate::wallet::existing_identity(&home)?,
+        Some((home, false)) => Some(crate::wallet::identity(&home)?),
+        None => None,
+    };
+    let c = match identity {
+        Some(keys) => c.with_identity(keys),
         None => c,
     };
     Ok(match lab_window(mint) {

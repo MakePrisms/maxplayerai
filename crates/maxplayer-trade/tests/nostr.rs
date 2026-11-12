@@ -2025,6 +2025,31 @@ async fn nostr_cli_dry_runs_and_discover_price_lots() {
     assert_eq!(listing["expected_fees"]["give"]["net"], 32, "{listing}");
     assert_eq!(listing["expected_fees"]["want"]["net"], 24, "{listing}");
 
+    // An existing but empty home (legacy layout: no key, no config.toml): discover still prices
+    // the nostr:// lot, and its mint requests never create a trade.key there.
+    let empty = e.root.path().join("empty-home");
+    std::fs::create_dir(&empty).unwrap();
+    let (code, out, err) = cli(&e, &empty, &["--relay", &market, "discover"]).await;
+    assert_eq!(code, 0, "discover on an empty home: {err}");
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(
+        v["listings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|l| l["lot_id"] == lot.as_str() && l["expected_fees"]["give"]["net"] == 32),
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&empty).unwrap().count(),
+        0,
+        "SAFETY: discover wrote into an empty home: {:?}",
+        std::fs::read_dir(&empty)
+            .unwrap()
+            .map(|d| d.unwrap().file_name())
+            .collect::<Vec<_>>()
+    );
+
     e.tap.reset();
     let (code, out, err) = cli(
         &e,

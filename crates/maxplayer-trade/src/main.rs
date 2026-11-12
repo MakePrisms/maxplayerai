@@ -268,7 +268,8 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         _ => {}
     }
     // Mint requests sign as this home's key: the default mint relay only admits registered keys.
-    maxplayer_trade::transport::configure_mint_identity(home);
+    // A read-only command never creates a key (`discover` on an empty or legacy home).
+    maxplayer_trade::transport::configure_mint_identity(home, is_read_only(&cli.command));
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
         let asset = Asset::from_cli(mint)?;
@@ -707,6 +708,19 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
 /// ~/.maxplayer) names either a maxplayer home (`key`/`config.toml`: shared mode) or a legacy
 /// standalone trading home (`wallet.seed`/`trade.key`/root `trade.sqlite`: drain-only, warned).
 /// A directory that is neither serves read-only commands only; nothing is created there.
+/// Commands that run without a home and must create nothing in one (no home, key or journal).
+fn is_read_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Balance { .. }
+            | Command::Status { .. }
+            | Command::Discover { .. }
+            | Command::Preflight { .. }
+            | Command::List { dry_run: true, .. }
+            | Command::Take { dry_run: true, .. }
+    )
+}
+
 fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
     use maxplayer_trade::wallet;
     let home = match arg {
@@ -741,17 +755,8 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
         );
         return Ok(home);
     }
-    let read_only = matches!(
-        command,
-        Command::Balance { .. }
-            | Command::Status { .. }
-            | Command::Discover { .. }
-            | Command::Preflight { .. }
-            | Command::List { dry_run: true, .. }
-            | Command::Take { dry_run: true, .. }
-    );
     ensure!(
-        read_only,
+        is_read_only(command),
         "no maxplayer home at {h} (no key or config.toml): trading uses a maxplayer home's key and \
          wallet. Create one with `maxplayer wallet setup --home {h}` (or `maxplayer whoami --home \
          {h}`), link its key with `maxplayer account link --home {h}`, then retry; nothing was \
