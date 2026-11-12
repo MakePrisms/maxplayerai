@@ -64,6 +64,8 @@ impl Default for AuthRelayOptions {
 pub struct Counters {
     pub connections: AtomicUsize,
     pub auths: AtomicUsize,
+    /// Every AUTH received, accepted or refused.
+    pub auth_attempts: AtomicUsize,
     pub pre_auth_reqs: AtomicUsize,
     pub post_auth_reqs: AtomicUsize,
     /// Live events withheld from a subscription that was opened before sign-in.
@@ -222,6 +224,7 @@ async fn connection(
                 }
                 match v[0].as_str() {
                     Some("AUTH") => {
+                        counters.auth_attempts.fetch_add(1, Ordering::SeqCst);
                         let ok = !options.refuse_auth
                             && serde_json::from_value::<Event>(v[1].clone()).is_ok_and(|e| {
                                 e.verify().is_ok()

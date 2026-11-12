@@ -156,3 +156,57 @@ async fn trade_inbox_on_an_open_relay_is_unchanged() {
     assert!(started.elapsed() < Duration::from_secs(1));
     assert_eq!(Counters::get(&relay.counters.auths), 0);
 }
+
+/// `discover` / `take --dry-run` read lots with a throwaway key. On a members-only relay that
+/// refuses sign-in the way buzz does (OK false + close), answering the challenge only gets the
+/// socket closed under the query and prints a `maxplayer account link` hint for a key nobody can
+/// link. The read-only market never signs in, still reads the stored lot, and opens no inbox.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_discovery_never_signs_in_on_a_members_only_relay() {
+    let member = Keys::generate();
+    let gated = AuthRelay::start(AuthRelayOptions {
+        members: Some([member.public_key(); 2]),
+        buzz_refusal: true,
+        ..Default::default()
+    })
+    .await;
+    let home = tempfile::tempdir().unwrap();
+    let j = Journal::open(home.path()).await.unwrap();
+    let m = Market::connect(member.clone(), &[gated.url.clone()])
+        .await
+        .unwrap();
+    let listed = lot(&member);
+    m.publish_durable(&j, &listed).await.unwrap();
+    let before = Counters::get(&gated.counters.auth_attempts);
+    let connections = Counters::get(&gated.counters.connections);
+
+    let reader = Market::connect_read_only(&[gated.url.clone()])
+        .await
+        .unwrap();
+    // Past the fixture's 150 ms challenge delay, so an auto-sign-in would have happened. With
+    // sign-in on (mutation-checked), the refusal closes the socket and this query finds no EOSE.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (lots, partial) = reader
+        .query(nostr_sdk::prelude::Filter::new().kind(Kind::Custom(LOT)))
+        .await
+        .unwrap();
+    assert_eq!(partial, 0, "{:?}", gated.counters);
+    assert!(
+        lots.iter().any(|e| e.id == listed.id),
+        "{:?}",
+        gated.counters
+    );
+    assert_eq!(
+        Counters::get(&gated.counters.auth_attempts),
+        before,
+        "read-only discovery answered the NIP-42 challenge: {:?}",
+        gated.counters
+    );
+    // One socket, never closed by a refusal and reopened.
+    assert_eq!(
+        Counters::get(&gated.counters.connections),
+        connections + 1,
+        "{:?}",
+        gated.counters
+    );
+}
