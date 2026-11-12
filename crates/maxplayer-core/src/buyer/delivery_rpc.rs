@@ -59,7 +59,11 @@ pub(super) async fn read(context: &BuyerContext, id: Value, params: Value) -> Re
     let params: ReadParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(error) => {
-            return Response::err(id, CODE_METHOD_NOT_FOUND, format!("read_delivery params: {error}"));
+            return Response::err(
+                id,
+                CODE_METHOD_NOT_FOUND,
+                format!("read_delivery params: {error}"),
+            );
         }
     };
     let result = settled_key(context, &params.job_id, params.turn).and_then(|key| {
@@ -136,8 +140,14 @@ mod tests {
             assert!(error.message.contains("not settled"), "{}", error.message);
         }
         context.store.reserve(&job, 0, 1_000, 1).expect("reserve");
-        let error = read(&context, json!(3), json!({"job_id": job})).await.error.expect("refused");
-        assert!(error.message.contains("not settled"), "a reserved job is not settled");
+        let error = read(&context, json!(3), json!({"job_id": job}))
+            .await
+            .error
+            .expect("refused");
+        assert!(
+            error.message.contains("not settled"),
+            "a reserved job is not settled"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -20,8 +20,14 @@ struct Opts {
 
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    Show { path: Option<String>, offset: Option<usize>, max_bytes: Option<usize> },
-    Extract { to: Option<String> },
+    Show {
+        path: Option<String>,
+        offset: Option<usize>,
+        max_bytes: Option<usize>,
+    },
+    Extract {
+        to: Option<String>,
+    },
 }
 
 fn usage(out: &mut dyn Write) {
@@ -43,18 +49,33 @@ fn usage(out: &mut dyn Write) {
 
 fn parse(args: &[String]) -> Result<Opts, String> {
     let mut iter = args.iter();
-    let action = iter.next().ok_or("delivery requires show or extract")?.clone();
+    let action = iter
+        .next()
+        .ok_or("delivery requires show or extract")?
+        .clone();
     let mut job_id = None;
     let mut path = None;
     let (mut offset, mut max_bytes, mut to, mut turn, mut home) = (None, None, None, None, None);
     while let Some(arg) = iter.next() {
         let mut value = |flag: &str| {
-            iter.next().cloned().ok_or_else(|| format!("{flag} requires a value"))
+            iter.next()
+                .cloned()
+                .ok_or_else(|| format!("{flag} requires a value"))
         };
         match arg.as_str() {
-            "--offset" => offset = Some(value("--offset")?.parse().map_err(|_| "--offset is a number")?),
+            "--offset" => {
+                offset = Some(
+                    value("--offset")?
+                        .parse()
+                        .map_err(|_| "--offset is a number")?,
+                )
+            }
             "--max-bytes" => {
-                max_bytes = Some(value("--max-bytes")?.parse().map_err(|_| "--max-bytes is a number")?)
+                max_bytes = Some(
+                    value("--max-bytes")?
+                        .parse()
+                        .map_err(|_| "--max-bytes is a number")?,
+                )
             }
             "--to" if action == "extract" => to = Some(value("--to")?),
             "--turn" => turn = Some(value("--turn")?.parse().map_err(|_| "--turn is a number")?),
@@ -66,12 +87,21 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         }
     }
     let action = match action.as_str() {
-        "show" => Action::Show { path, offset, max_bytes },
+        "show" => Action::Show {
+            path,
+            offset,
+            max_bytes,
+        },
         "extract" if offset.is_none() && max_bytes.is_none() => Action::Extract { to },
         "extract" => return Err("--offset/--max-bytes apply to show".into()),
         other => return Err(format!("unknown delivery action {other} (show or extract)")),
     };
-    Ok(Opts { action, job_id: job_id.ok_or("delivery requires <job_id>")?, turn, home })
+    Ok(Opts {
+        action,
+        job_id: job_id.ok_or("delivery requires <job_id>")?,
+        turn,
+        home,
+    })
 }
 
 #[cfg(feature = "wallet")]
@@ -107,7 +137,11 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
     let (method, params) = match opts.action {
-        Action::Show { path, offset, max_bytes } => (
+        Action::Show {
+            path,
+            offset,
+            max_bytes,
+        } => (
             "read_delivery",
             serde_json::json!({ "job_id": opts.job_id, "turn": opts.turn, "path": path, "offset": offset, "max_bytes": max_bytes }),
         ),
@@ -123,7 +157,10 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 },
                 other => other.map(|p| p.display().to_string()),
             };
-            ("extract_delivery", serde_json::json!({ "job_id": opts.job_id, "turn": opts.turn, "to": to }))
+            (
+                "extract_delivery",
+                serde_json::json!({ "job_id": opts.job_id, "turn": opts.turn, "to": to }),
+            )
         }
     };
     match crate::daemon::ensure_then_call(&home, method, params) {
@@ -173,14 +210,26 @@ mod tests {
 
     #[test]
     fn parses_show_and_extract() {
-        let show = parse(&args(&["show", "j", "src/a.rs", "--offset", "5", "--turn", "2"])).unwrap();
+        let show = parse(&args(&[
+            "show", "j", "src/a.rs", "--offset", "5", "--turn", "2",
+        ]))
+        .unwrap();
         assert_eq!(
             show.action,
-            Action::Show { path: Some("src/a.rs".into()), offset: Some(5), max_bytes: None }
+            Action::Show {
+                path: Some("src/a.rs".into()),
+                offset: Some(5),
+                max_bytes: None
+            }
         );
         assert_eq!(show.turn, Some(2));
         let extract = parse(&args(&["extract", "j", "--to", "/tmp/x"])).unwrap();
-        assert_eq!(extract.action, Action::Extract { to: Some("/tmp/x".into()) });
+        assert_eq!(
+            extract.action,
+            Action::Extract {
+                to: Some("/tmp/x".into())
+            }
+        );
         for bad in [
             &["extract", "j", "extra"][..],
             &["show"],

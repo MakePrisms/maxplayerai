@@ -44,7 +44,9 @@ pub fn read(
     offset: usize,
     max_bytes: Option<usize>,
 ) -> Result<Value, String> {
-    let max = max_bytes.unwrap_or(READ_DEFAULT_BYTES).clamp(1, READ_MAX_BYTES);
+    let max = max_bytes
+        .unwrap_or(READ_DEFAULT_BYTES)
+        .clamp(1, READ_MAX_BYTES);
     if collect::bind_is_inline(bind) {
         let answer = bind.inline_answer.as_deref().unwrap_or_default();
         return match path {
@@ -55,7 +57,9 @@ pub fn read(
                 offset,
                 max,
             )),
-            Some(other) => Err(format!("{other:?} is not in this delivery (an inline answer)")),
+            Some(other) => Err(format!(
+                "{other:?} is not in this delivery (an inline answer)"
+            )),
         };
     }
     let store = collect::delivery_store_path(home);
@@ -76,9 +80,13 @@ pub fn read(
         .get_path(Path::new(path))
         .map_err(|_| format!("{path:?} is not a file in this delivery"))?;
     if entry.kind() != Some(git2::ObjectType::Blob) {
-        return Err(format!("{path:?} is a directory; call without path to list the files"));
+        return Err(format!(
+            "{path:?} is a directory; call without path to list the files"
+        ));
     }
-    let blob = repo.find_blob(entry.id()).map_err(|error| error.to_string())?;
+    let blob = repo
+        .find_blob(entry.id())
+        .map_err(|error| error.to_string())?;
     Ok(text_slice(path, blob.content(), offset, max))
 }
 
@@ -144,7 +152,11 @@ pub fn extract(
                  with objects/ and refs/, or with commondir), so git would treat that folder as a \
                  repository and read the delivered config. Read those files with read_delivery \
                  instead. Nothing was written",
-                if dir.is_empty() { "the delivery's top folder".to_owned() } else { format!("{dir:?}") }
+                if dir.is_empty() {
+                    "the delivery's top folder".to_owned()
+                } else {
+                    format!("{dir:?}")
+                }
             ));
         }
     }
@@ -168,7 +180,10 @@ pub fn extract(
                     return Err(format!("{} is a symlink; refusing", absolute.display()));
                 }
                 Ok(meta) if !meta.is_dir() => {
-                    return Err(format!("{} exists and is not a directory", absolute.display()));
+                    return Err(format!(
+                        "{} exists and is not a directory",
+                        absolute.display()
+                    ));
                 }
                 Ok(_) => {
                     let mut entries = std::fs::read_dir(&absolute)
@@ -225,7 +240,9 @@ pub fn git_repository_layout(
         let (mut head, mut objects, mut refs, mut commondir) = (false, false, false, false);
         let mut subtrees = Vec::new();
         for entry in tree.iter() {
-            *budget = budget.checked_sub(1).ok_or("delivery has too many entries")?;
+            *budget = budget
+                .checked_sub(1)
+                .ok_or("delivery has too many entries")?;
             let Ok(name) = entry.name() else { continue };
             let key = collect::collision_key(name);
             match entry.kind() {
@@ -246,7 +263,11 @@ pub fn git_repository_layout(
         }
         for (name, id) in subtrees {
             let sub = repo.find_tree(id).map_err(|e| e.to_string())?;
-            let path = if dir.is_empty() { name } else { format!("{dir}/{name}") };
+            let path = if dir.is_empty() {
+                name
+            } else {
+                format!("{dir}/{name}")
+            };
             if let Some(found) = check(repo, &sub, &path, budget)? {
                 return Ok(Some(found));
             }
@@ -267,7 +288,10 @@ fn inside(path: &Path, root: &Path) -> bool {
     let mut existing = path.to_path_buf();
     let mut rest = Vec::new();
     while !existing.exists() {
-        match (existing.file_name().map(|n| n.to_owned()), existing.parent()) {
+        match (
+            existing.file_name().map(|n| n.to_owned()),
+            existing.parent(),
+        ) {
             (Some(name), Some(parent)) => {
                 rest.push(name);
                 existing = parent.to_path_buf();
@@ -292,8 +316,10 @@ mod tests {
 
     fn temp_root(label: &str) -> PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        let root = std::env::temp_dir()
-            .join(format!("maxplayer-dread-{label}-{}-{id}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "maxplayer-dread-{label}-{}-{id}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&root);
         root
     }
@@ -309,7 +335,10 @@ mod tests {
                     let blob = repo.blob(contents.as_bytes()).expect("blob");
                     top.insert(parts[0], blob, 0o100644).expect("insert");
                 } else {
-                    subdirs.entry(parts[0]).or_default().push((parts[1..].to_vec(), contents));
+                    subdirs
+                        .entry(parts[0])
+                        .or_default()
+                        .push((parts[1..].to_vec(), contents));
                 }
             }
             for (name, children) in subdirs {
@@ -322,13 +351,22 @@ mod tests {
         let root = temp_root(label);
         let home = home::bootstrap(root.join("home")).expect("home");
         let repo = git2::Repository::init_bare(collect::delivery_store_path(&home)).expect("store");
-        let split: Vec<(Vec<&str>, &str)> =
-            files.iter().map(|(p, c)| (p.split('/').collect(), *c)).collect();
+        let split: Vec<(Vec<&str>, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.split('/').collect(), *c))
+            .collect();
         let tree = repo.find_tree(build(&repo, &split)).expect("tree");
         let sig = git2::Signature::now("t", "t@e").expect("sig");
-        let oid = repo.commit(None, &sig, &sig, "delivery", &tree, &[]).expect("commit");
-        repo.reference(&PayPathDeliveryVerifier::store_ref_for(&oid.to_string()), oid, true, "r")
-            .expect("ref");
+        let oid = repo
+            .commit(None, &sig, &sig, "delivery", &tree, &[])
+            .expect("commit");
+        repo.reference(
+            &PayPathDeliveryVerifier::store_ref_for(&oid.to_string()),
+            oid,
+            true,
+            "r",
+        )
+        .expect("ref");
         let bind: AcceptedBind = serde_json::from_value(json!({
             "job_id": "ab".repeat(32),
             "claim_id": "c".repeat(64),
@@ -349,17 +387,32 @@ mod tests {
 
     #[test]
     fn read_lists_and_returns_files_without_writing_anything() {
-        let (root, home, bind) =
-            seeded("read", &[("README.md", "hello"), ("CLAUDE.md", "seller says"), ("src/a.rs", "fn a(){}")]);
+        let (root, home, bind) = seeded(
+            "read",
+            &[
+                ("README.md", "hello"),
+                ("CLAUDE.md", "seller says"),
+                ("src/a.rs", "fn a(){}"),
+            ],
+        );
         let listed = read(&home, &bind, None, 0, None).expect("list");
         assert_eq!(listed["delivery"], json!("store"));
-        assert_eq!(listed["files"], json!(["CLAUDE.md", "README.md", "src/a.rs"]));
+        assert_eq!(
+            listed["files"],
+            json!(["CLAUDE.md", "README.md", "src/a.rs"])
+        );
         let file = read(&home, &bind, Some("CLAUDE.md"), 0, None).expect("read");
         assert_eq!(file["content"], json!("seller says"));
         let part = read(&home, &bind, Some("README.md"), 1, Some(2)).expect("slice");
-        assert_eq!((part["content"].clone(), part["next_offset"].clone()), (json!("el"), json!(3)));
+        assert_eq!(
+            (part["content"].clone(), part["next_offset"].clone()),
+            (json!("el"), json!(3))
+        );
         for bad in ["../x", "/etc/passwd", "src", "missing.md", ""] {
-            assert!(read(&home, &bind, Some(bad), 0, None).is_err(), "{bad:?} must be refused");
+            assert!(
+                read(&home, &bind, Some(bad), 0, None).is_err(),
+                "{bad:?} must be refused"
+            );
         }
         assert!(!home.root.join("results").exists(), "a read writes nothing");
         let _ = std::fs::remove_dir_all(&root);
@@ -377,9 +430,17 @@ mod tests {
         let full = root.join("full");
         std::fs::create_dir_all(&full).unwrap();
         std::fs::write(full.join("mine"), "m").unwrap();
-        assert!(extract(&home, &bind, Some(&full)).unwrap_err().contains("not empty"));
+        assert!(
+            extract(&home, &bind, Some(&full))
+                .unwrap_err()
+                .contains("not empty")
+        );
         let in_home = home.root.join("x");
-        assert!(extract(&home, &bind, Some(&in_home)).unwrap_err().contains("inside the maxplayer home"));
+        assert!(
+            extract(&home, &bind, Some(&in_home))
+                .unwrap_err()
+                .contains("inside the maxplayer home")
+        );
         assert!(!in_home.exists());
         let fresh = root.join("fresh");
         let (dir, _) = extract(&home, &bind, Some(&fresh)).expect("fresh dir");
@@ -391,8 +452,17 @@ mod tests {
     #[test]
     fn extract_refuses_a_git_repository_layout_anywhere_and_writes_nothing() {
         for layout in [
-            vec![("HEAD", "ref: refs/heads/main\n"), ("objects/info/x", "x"), ("refs/x", "x"), ("config", "[core]\n")],
-            vec![("sub/HEAD", "ref: x\n"), ("sub/objects/x", "x"), ("sub/refs/x", "x")],
+            vec![
+                ("HEAD", "ref: refs/heads/main\n"),
+                ("objects/info/x", "x"),
+                ("refs/x", "x"),
+                ("config", "[core]\n"),
+            ],
+            vec![
+                ("sub/HEAD", "ref: x\n"),
+                ("sub/objects/x", "x"),
+                ("sub/refs/x", "x"),
+            ],
             vec![("a/b/head", "ref: x\n"), ("a/b/commondir", "../c\n")],
         ] {
             let (root, home, bind) = seeded("gitlayout", &layout);
@@ -400,7 +470,10 @@ mod tests {
             let error = extract(&home, &bind, Some(&to)).expect_err("git layout refused");
             assert!(error.contains("git repository"), "{error}");
             assert!(!to.exists(), "nothing written");
-            assert!(read(&home, &bind, Some(layout[0].0), 0, None).is_ok(), "still readable");
+            assert!(
+                read(&home, &bind, Some(layout[0].0), 0, None).is_ok(),
+                "still readable"
+            );
             let _ = std::fs::remove_dir_all(&root);
         }
         // Not a repository: no HEAD file, or HEAD as a directory, or HEAD without refs/.
