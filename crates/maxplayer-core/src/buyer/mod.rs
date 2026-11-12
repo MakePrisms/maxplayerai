@@ -36,6 +36,8 @@ mod session_reply;
 mod settlement;
 /// What a settled `get_job.settlement` reads back (commit, files, pay), so collect is not a read.
 mod settled_view;
+/// `read_delivery` / `extract_delivery`: the way into a settled git delivery kept in the store.
+mod delivery_rpc;
 
 /// #574 platform-contract test that the client drops signature-invalid events at relay ingest.
 #[cfg(test)]
@@ -456,6 +458,8 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
         "award" => award(context, id, request.params).await,
         "collect" => collect(context, id, request.params).await,
         "reply" => session_reply::reply(context, id, request.params).await,
+        "read_delivery" => delivery_rpc::read(context, id, request.params).await,
+        "extract_delivery" => delivery_rpc::extract(context, id, request.params).await,
         "accept_claim" | "authorize_pay" => Response::err(
             id,
             CODE_NOT_IMPLEMENTED,
@@ -1592,6 +1596,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                         "pay": collect_pay_response(&outcome.pay),
                         "commit_oid": outcome.commit_oid,
                         "path": outcome.path,
+                    "delivery": if outcome.path.is_some() { "inline" } else { "store" },
                         "files": outcome.files,
                         "agent_used": outcome.agent_used,
                         "model_used": outcome.model_used,
@@ -1641,6 +1646,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                     "pay": collect_pay_response(&outcome.pay),
                     "commit_oid": outcome.commit_oid,
                     "path": outcome.path,
+                    "delivery": if outcome.path.is_some() { "inline" } else { "store" },
                     "files": outcome.files,
                     "agent_used": outcome.agent_used,
                     "model_used": outcome.model_used,
@@ -1654,6 +1660,7 @@ async fn collect(context: &BuyerContext, id: Value, params: Value) -> Response {
                 "pay": collect_pay_response(&outcome.pay),
                 "commit_oid": outcome.commit_oid,
                 "path": outcome.path,
+                    "delivery": if outcome.path.is_some() { "inline" } else { "store" },
                 "files": outcome.files,
                 // Seller-claimed attribution of the settled delivery (#261); null = unreported.
                 "agent_used": outcome.agent_used,
