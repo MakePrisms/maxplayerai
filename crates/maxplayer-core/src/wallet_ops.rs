@@ -294,6 +294,10 @@ pub struct MintBalance {
     /// operation (a job payment, send or melt, or a local `maxplayer-trade` lot/swap/send on this
     /// home). Never part of `balance_sats` and never spendable until the owner releases them.
     pub reserved_sats: u64,
+    /// The mint's self-chosen NUT-06 name as the wallet database last stored it
+    /// ([`crate::mint_wire::display_mint_name`]); `None` when unnamed, default or unknown. Read
+    /// offline: the wallet stores it whenever it fetches the mint's info, and `mints add` refreshes it.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1195,12 +1199,21 @@ pub async fn balances_async(home: &MaxplayerHome) -> Result<Vec<MintBalance>, Wa
             )
             .await
             .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+        let name = registered
+            .iter()
+            .find(|(url, _)| {
+                normalize_mint_url(&url.to_string()).ok().as_deref() == Some(mint_url.as_str())
+            })
+            .and_then(|(_, info)| info.as_ref())
+            .and_then(|info| crate::mint_wire::display_mint_name(info.name.as_deref()))
+            .map(str::to_owned);
         rows.push(MintBalance {
             reserved_sats: reserved,
             is_default: mint_url == default,
             configured: configured.iter().any(|entry| entry == &mint_url),
             mint_url,
             balance_sats: balance,
+            name,
         });
     }
     Ok(rows)
@@ -2304,6 +2317,7 @@ pub fn list_mints(home: &MaxplayerHome) -> Result<Vec<MintBalance>, WalletOpsErr
             mint_url,
             balance_sats: 0,
             reserved_sats: 0,
+            name: None,
         })
         .collect())
 }
@@ -2328,6 +2342,58 @@ pub fn add_mint(home: &mut MaxplayerHome, mint_url: &str) -> Result<String, Wall
         config.extra_mints.push(to_add);
     })?;
     Ok(normalized)
+}
+
+/// Re-read a mint's NUT-06 info and store it, so `wallet balance` shows its current name. Only for
+/// a mint the wallet database already knows (it has talked to it): a first contact registers the
+/// mint and its name by itself, and registering here would leave a stray `role=unconfigured` row
+/// after `mints remove`. `Ok(None)` = not known yet (nothing fetched) or no displayable name.
+pub fn refresh_mint_name(
+    home: &MaxplayerHome,
+    mint_url: &str,
+) -> Result<Option<String>, WalletOpsError> {
+    crate::runtime_guard::refuse_nested_block_on("refresh_mint_name")
+        .map_err(WalletOpsError::Wallet)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    runtime.block_on(refresh_mint_name_async(home, mint_url))
+}
+
+/// Async form of [`refresh_mint_name`].
+pub async fn refresh_mint_name_async(
+    home: &MaxplayerHome,
+    mint_url: &str,
+) -> Result<Option<String>, WalletOpsError> {
+    let normalized = normalize_mint_url(mint_url)?;
+    let url = MintUrl::from_str(&normalized)
+        .map_err(|error| WalletOpsError::Wallet(format!("invalid normalized mint URL: {error}")))?;
+    let store = open_balance_store(home).await?;
+    let known = store
+        .get_mint(url.clone())
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    if known.is_none() {
+        return Ok(None);
+    }
+    let identity = home::read_secret_key_hex(home)
+        .ok()
+        .and_then(|hex| nostr_sdk::Keys::parse(&hex).ok());
+    let client = crate::nostr_mint::mint_connector_for(&url, &home.config.relay_url, identity)
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    let info = tokio::time::timeout(Duration::from_secs(15), client.get_mint_info())
+        .await
+        .map_err(|_| {
+            WalletOpsError::Wallet("mint did not answer its info request within 15s".into())
+        })?
+        .map_err(|error| WalletOpsError::Wallet(format!("mint info request failed: {error}")))?;
+    let name = crate::mint_wire::display_mint_name(info.name.as_deref()).map(str::to_owned);
+    store
+        .add_mint(url, Some(info))
+        .await
+        .map_err(|error| WalletOpsError::Wallet(error.to_string()))?;
+    Ok(name)
 }
 
 /// Remove an opt-in extra mint. Default mint is pinned and cannot be removed.
@@ -3026,6 +3092,53 @@ mod tests {
             .expect("whole database balance");
         assert_eq!(row_total, db_total, "per-mint rows cross-foot to DB truth");
         assert_eq!(row_total, 37);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Petar, 2026-11-11: `wallet balance` names a mint by the NUT-06 name the wallet database
+    // stored for it, offline; the shared default credit-mint name and an unregistered mint show none.
+    #[tokio::test(flavor = "current_thread")]
+    async fn balances_carry_the_stored_mint_name() {
+        use cashu::MintInfo;
+
+        let root = temp_home("mint-name");
+        let _ = std::fs::remove_dir_all(&root);
+        let home = bootstrap(&root).expect("bootstrap");
+        let store = WalletSqliteDatabase::new(sqlite_path(&home.wallet_dir))
+            .await
+            .expect("open on-disk wallet database");
+        for (url, name) in [
+            ("https://named-mint.example/", "io-seller"),
+            (
+                "https://default-named.example/",
+                crate::mint_wire::DEFAULT_MINT_NAME,
+            ),
+        ] {
+            store
+                .add_mint(
+                    MintUrl::from_str(url).unwrap(),
+                    Some(MintInfo::new().name(name)),
+                )
+                .await
+                .expect("register mint");
+        }
+        let rows = balances_async(&home).await.expect("balances");
+        let name_of = |url: &str| {
+            rows.iter()
+                .find(|row| row.mint_url == url)
+                .unwrap_or_else(|| panic!("{url} row missing: {rows:?}"))
+                .name
+                .clone()
+        };
+        assert_eq!(
+            name_of("https://named-mint.example"),
+            Some("io-seller".to_owned())
+        );
+        assert_eq!(name_of("https://default-named.example"), None);
+        assert_eq!(
+            name_of(&normalize_mint_url(home.config.default_mint()).unwrap()),
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

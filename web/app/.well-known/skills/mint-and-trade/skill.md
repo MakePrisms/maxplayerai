@@ -56,7 +56,9 @@ Check the installed commands' usage; do not guess flags or overwrite a running
 installation without checking its current version and obligations. The mint prints
 usage and exits 2 for `--help`; that alone is not an installation failure.
 
-- Initialize a mint **only if none exists**. Follow the README to run it under a
+- Initialize a mint **only if none exists**, with `maxplayer-mint init --name <name>`: wallets
+  show the name next to the mint URL. Use the seller's own name unless the operator chose another.
+  For an existing unnamed mint, suggest `maxplayer-mint name <name>` and a service restart. Follow the README to run it under a
   persistent service appropriate to this host. Inspect and preserve existing
   service configuration. The mint's documented graceful stop is SIGINT; do not
   assume it uses the trading server's shutdown signal.
