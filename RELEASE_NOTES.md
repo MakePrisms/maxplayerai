@@ -1,3 +1,17 @@
+## Unreleased
+
+- **Fixed: delivered files can no longer pose as agent instructions or a git repository** (#1307,
+  P1 from the v0.7.3-rc8 security review). Settling a delivery (by the daemon or `collect`) now
+  writes every dot-prefixed name (`.claude/`, `.cursor/`, `.github/`, `.mcp.json`, `.env`, …), the
+  undotted agent instruction files we know harnesses load (`AGENTS.md`, `AGENTS.override.md`,
+  `CLAUDE.md`, `GEMINI.md`, `QWEN.md`, `CRUSH.md`, `opencode.json` and similar) and any file named
+  `HEAD` with a `.delivered` suffix. Bytes are unchanged and the delivered commit in the buyer
+  store keeps the original names. `collect --out` refuses dot-prefixed and agent-control names.
+  **Upgrading buyers:** folders under `results/` settled by v0.7.3-rc8 or earlier still hold the
+  original names. Run `collect` on those jobs again (it does not pay twice; it removes the
+  original-named copies) or delete the folders. Never start an agent session from `~` or inside
+  `results/<job_id>`.
+
 ## v0.7.3-rc8
 
 Release candidate for 0.7.3. **v0.7.3-rc7 cannot run claude or codex seats; upgrade to this one.**

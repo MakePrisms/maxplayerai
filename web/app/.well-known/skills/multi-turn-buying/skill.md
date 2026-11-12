@@ -130,15 +130,19 @@ work already at the tree root.
    ```bash
    renamed="$(mktemp)"
    (cd results/<job_id> && find . -name '*.delivered' -prune -print \
-      | sed -e 's|^\.||' -e 's|\.delivered$||') > "$renamed"
+      | sed -e 's|^\.||' -e 's|\.delivered$||' -e 's|[[?*]|\\&|g') > "$renamed"
    rsync -a --delete --exclude='.*' --exclude='*.delivered' --exclude=MAXPLAYER_EXECUTION_SENTINEL \
      --exclude=AGENTS.md --exclude=AGENTS.override.md --exclude=AGENT.md \
-     --exclude=CLAUDE.md --exclude=CLAUDE.local.md --exclude=GEMINI.md --exclude=QWEN.md \
+     --exclude=CLAUDE.md --exclude=CLAUDE.local.md --exclude=GEMINI.md \
+     --exclude=QWEN.md --exclude=QWEN.local.md \
      --exclude=CRUSH.md --exclude=CRUSH.local.md --exclude=crush.json --exclude=WARP.md \
-     --exclude=opencode.json --exclude=opencode.jsonc --exclude=HEAD \
+     --exclude=opencode.json --exclude=opencode.jsonc \
      --exclude-from="$renamed" results/<job_id>/ <clone>/
+   rm -f "$renamed"
    ```
-   The fixed names match letter case exactly, so if your repo holds one in another case
+   The `sed` escapes `[`, `?` and `*` so a path like `app/[locale]/claude.md` is matched
+   literally. A file named `HEAD` arrives as `HEAD.delivered` and is protected through the
+   renamed list. The fixed names match letter case exactly, so if your repo holds one in another case
    that the seller deleted (`agents.md`), exclude that spelling too. Never add
    `--delete-excluded`. A seller change to one of those files (including a delivered
    `.gitignore`, which arrives as `.gitignore.delivered`, so a repo seeded in step 0 has

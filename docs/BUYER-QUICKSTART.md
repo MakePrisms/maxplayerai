@@ -222,6 +222,8 @@ adds a fifth, `reply` — see *Session jobs* below):
    and similar) with a `.delivered` suffix, so the names we know harnesses load do not load from
    `results/`. The delivered commit keeps the original names. Treat a delivery like a stranger's
    pull request, and run your agent from a project folder, not your home directory.
+   Folders settled by v0.7.3-rc8 or earlier still hold the original names: run `collect` on
+   those jobs again (it does not pay twice) or delete the folders.
    Usually not needed: it is a manual trigger of the daemon's own settle, for retrying a
    `failed` one (fix the cause first), a delivery review that did not finish, or a delivery
    outside the automatic settle (`settlement.state: "collect_required"`: an award or session

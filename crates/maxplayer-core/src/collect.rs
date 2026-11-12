@@ -599,7 +599,7 @@ pub fn results_dest(
             }
             // `.` is results/ itself; `.git`, `.claude`, `AGENTS.md`, `HEAD` would put a seller's
             // tree where git or a harness loads it from every other results folder.
-            if name.starts_with('.') || is_agent_control_name(name) {
+            if name.starts_with('.') || is_agent_control_name(name) || is_git_head_name(name) {
                 return Err(format!(
                     "'out' must not start with '.' or be a name agent tools or git load on their \
                      own ({name:?})"
@@ -867,10 +867,12 @@ pub const INERT_SUFFIX: &str = ".delivered";
 /// - every DOT-PREFIXED component (`.claude/`, `.cursor/`, `.codex/`, `.github/`, `.vscode/`,
 ///   `.mcp.json`, `.envrc`, `.env`, `.cursorrules`, `.cargo/`, …): nearly every harness keeps its
 ///   config, hooks, rules and skills under a dot name;
-/// - the few UNDOTTED instruction/config files in [`AGENT_CONTROL_FILES`], plus git's `HEAD`:
-///   plain files `HEAD`, `objects/` and `refs/` make a folder a git repository whose seller-written
-///   `config` git reads (`core.fsmonitor` runs a command on `git status`), and without `HEAD` git
-///   does not treat the folder as one (worker-fable r1 F1).
+/// - the few UNDOTTED instruction/config files in [`AGENT_CONTROL_FILES`];
+/// - a FILE named `HEAD` (any case), never a directory: plain files `HEAD`, `objects/` and `refs/`
+///   make a folder a git repository whose seller-written `config` git reads (`core.fsmonitor` runs
+///   a command on `git status`). git, libgit2 and gitoxide all require a `HEAD` file before they
+///   treat a folder as one, and a directory named `HEAD` never qualifies, so ordinary `head/` and
+///   `Head/` source directories keep their names (worker-fable r1 F1, advisor r5 L2).
 ///
 /// Matched after the same case/Unicode folding [`collision_key`] uses, so `Agents.MD` or `.Claude`
 /// on a case-insensitive volume is caught too. The same classifier is meant for any later path that
@@ -888,12 +890,17 @@ const AGENT_CONTROL_FILES: &[&str] = &[
     "crush.local.md",
     "crush.json",
     "qwen.md",
+    "qwen.local.md",
     "warp.md",
     "opencode.json",
     "opencode.jsonc",
-    // Not an instruction file: see the git-repository note above.
-    "head",
 ];
+
+/// True for a name git reads as a repository's `HEAD`. Inert only as the FILE (leaf) component of
+/// a path: see the git-repository note on [`AGENT_CONTROL_FILES`].
+fn is_git_head_name(component: &str) -> bool {
+    collision_key(component) == "head"
+}
 
 /// True when materialize must write `component` inert: a dot-prefixed name or an
 /// [`AGENT_CONTROL_FILES`] entry, on any volume the buyer may use. A dot-prefixed name that
@@ -916,12 +923,28 @@ fn is_agent_control_name(component: &str) -> bool {
 /// → `.claude.delivered/settings.json`); every other component is unchanged. The pre-pay check,
 /// the write and `get_job`'s file list all use this one mapping. Idempotent.
 pub fn materialized_path(rel: &str) -> String {
-    if !rel.split('/').any(is_agent_control_name) {
+    map_inert(rel, true)
+}
+
+/// [`materialized_path`] for a DIRECTORY path (a tree entry in the pre-pay walk): the same mapping,
+/// except that a last component named `HEAD` is a directory and keeps its name.
+fn materialized_dir_path(rel: &str) -> String {
+    map_inert(rel, false)
+}
+
+fn map_inert(rel: &str, leaf_is_file: bool) -> String {
+    let count = rel.split('/').count();
+    let inert = |index: usize, component: &str| {
+        is_agent_control_name(component)
+            || (leaf_is_file && index + 1 == count && is_git_head_name(component))
+    };
+    if !rel.split('/').enumerate().any(|(i, c)| inert(i, c)) {
         return rel.to_owned();
     }
     rel.split('/')
-        .map(|component| {
-            if is_agent_control_name(component) {
+        .enumerate()
+        .map(|(i, component)| {
+            if inert(i, component) {
                 format!("{component}{INERT_SUFFIX}")
             } else {
                 component.to_owned()
@@ -1066,7 +1089,11 @@ pub fn validate_tree_paths(repo: &git2::Repository, tree: &git2::Tree<'_>) -> Re
         // P1: materialize writes agent-control names with INERT_SUFFIX, so the written path is
         // the one that must fit the length bounds and must not collide (`AGENTS.md` next to a
         // delivered `AGENTS.md.delivered` would be one file on disk).
-        let path = materialized_path(&path);
+        let path = if entry.kind() == Some(git2::ObjectType::Tree) {
+            materialized_dir_path(&path)
+        } else {
+            materialized_path(&path)
+        };
         if let Err(error) = validate_delivery_path(&path) {
             return refuse(error);
         }
@@ -1506,6 +1533,11 @@ mod tests {
             ("HEAD", "HEAD.delivered"),
             ("vendor/repo.git/HEAD", "vendor/repo.git/HEAD.delivered"),
             ("HEADER.md", "HEADER.md"),
+            // Only a FILE named HEAD: directories named head/HEAD keep their names.
+            ("src/head/mod.rs", "src/head/mod.rs"),
+            ("components/Head/index.tsx", "components/Head/index.tsx"),
+            ("HEAD/x", "HEAD/x"),
+            ("QWEN.local.md", "QWEN.local.md.delivered"),
             // The undotted list is matched after folding, not just ASCII lowercase.
             ("AGENT\u{200C}S.md", "AGENT\u{200C}S.md.delivered"),
             ("AGENT\u{17F}.md", "AGENT\u{17F}.md.delivered"),
@@ -1578,11 +1610,19 @@ mod tests {
                 ("sub/config", config),
                 ("sub/objects/info/x", "x"),
                 ("sub/refs/x", "x"),
+                // An ordinary directory named head/HEAD is not git's HEAD and keeps its name.
+                ("src/head/mod.rs", "mod"),
+                ("HEAD.d/HEAD/x", "x"),
+                // The pre-pay check maps a directory HEAD as a directory: no clash with this file.
+                ("HEAD.d/HEAD.delivered", "y"),
             ],
         );
         let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
         let dest = root.join("results").join("job");
-        materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("materialize");
+        let files = materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("materialize");
+        assert_eq!(std::fs::read_to_string(dest.join("src/head/mod.rs")).unwrap(), "mod");
+        assert!(dest.join("HEAD.d/HEAD/x").is_file());
+        assert!(files.contains(&"src/head/mod.rs".to_owned()));
         for dir in [dest.clone(), dest.join("sub")] {
             assert!(!dir.join("HEAD").exists(), "{} must have no HEAD", dir.display());
             assert_eq!(std::fs::read_to_string(dir.join("HEAD.delivered")).unwrap(), head);
