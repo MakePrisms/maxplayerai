@@ -4,10 +4,10 @@
 #
 #   curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 #
-# What it does: probes for a working nix (#745) before touching the network; then resolves a release,
-# downloads that release's asset for THIS platform, verifies the download against the release's own
+# What it does: resolves a release, downloads that release's asset for THIS platform, verifies the download against the release's own
 # SHA256SUMS, proves the binary runs and reports the version it was supposed to be, and only then
-# puts it on PATH.
+# puts it on PATH. Nix is not required to install or to buy; only `maxplayer seller` needs it (#745),
+# and when it is missing the installer says so in one note after a successful install.
 #
 # Options (flags and environment are equivalent; the flag wins):
 #   --version <x.y.z>   MAXPLAYER_VERSION   install this exact version instead of the latest release
@@ -38,11 +38,9 @@
 # ── Three properties this script is judged on ───────────────────────────────────────────────────
 #
 # ★ It refuses rather than guessing. An unsupported OS or architecture, a missing tool it needs to
-#   verify with, a checksum that does not match, a binary that will not run, a missing nix whose
-#   operator declined or who has no controlling terminal — every one of those exits non-zero having
-#   installed nothing. There is no flag to turn verification off, because an installer that can be
-#   asked to skip it is an installer whose verification is decorative. The nix decline path is this
-#   property, not a courtesy: no skip flag, no warn-and-continue, no "install the CLI anyway".
+#   verify with, a checksum that does not match, a binary that will not run — every one of those
+#   exits non-zero having installed nothing. There is no flag to turn verification off, because an
+#   installer that can be asked to skip it is an installer whose verification is decorative.
 #
 # ★ Every refusal happens in THIS shell. `die` is never reached from inside a `$(command
 #   substitution)`, because `exit` there ends the subshell and the caller carries on with an empty
@@ -178,63 +176,29 @@ fetch() {
 }
 
 # ── Nix (#745) ──────────────────────────────────────────────────────────────────────────────────
-# Probe FIRST, before any download. An operator who declines — or who has no TTY to answer on —
-# must be left with nothing: no temp dir, no partial asset, no determinate wrapper on disk.
+# Nix is a SELLER requirement, not an install or buyer one: `maxplayer seller` refuses to start
+# without a working nix (its boot gate, #745), and `maxplayer doctor` reports it as a FAIL only on a
+# home configured to sell. Buying, `mcp` and `version` never use it.
 #
-# ★ Ruling, not a proposal. A paid review of #745 advised against chaining the Determinate
-#   installer into the default `curl | sh` (it breaks this script's no-elevation contract, taxes
-#   buyers who do not need nix, couples two failure domains, and the documented one-liner is a
-#   pipe whose operators include non-TTY/CI). gudnuf ruled the chaining stays. The disagreement
-#   is recorded here; the chaining is implemented anyway. Softening it would be a different
-#   decision than the one this file is carrying out.
+# ★ This reverses an earlier ruling. Until this change the installer probed nix before any
+#   download and, with no nix, either chained the Determinate installer (TTY) or refused and
+#   installed nothing (no TTY). #745's own acceptance said every buyer path must never require
+#   nix, the paid review of #745 advised against taxing buyers here, and operators who install via
+#   npm never ran this script anyway, so the boot gate was always the real enforcement. A buyer on a
+#   box without nix — a CI runner, a container, an agent sandbox — was turned away for something
+#   buying never uses. So the installer no longer probes, prompts or chains: it installs, and when
+#   nix is missing it prints one note naming what needs it and how to get it.
 #
-# Missing + a controlling terminal: the two lines below, then the Determinate installer.
-# Missing + no TTY: the same two lines, no prompt, no hang, non-zero.
-# Present: no-op.
-#
-# This function does not print a result. A `nix_ok=$(probe_nix)` shape would `die` inside a
-# subshell and the caller would continue — the second property this script is judged on.
-
-print_nix_required() {
-    printf '%s\n' "Nix is required to use maxplayer."
-    printf '%s\n' "Enter your password to install it from determinate.systems"
-}
-
-install_nix_from_determinate() {
-    pick_downloader
-    _nix_sh="$(mktemp "$(tmpl nix)")" || die "cannot create a temporary file"
-    # Cleared on the success path before returning so main's later EXIT trap is the one that
-    # fires. `rm -f` on a missing file is the whole handler — it must not `exit 1`.
-    trap 'rm -f "$_nix_sh"' EXIT HUP INT TERM
-    fetch "https://install.determinate.systems/nix" "$_nix_sh" \
-        || die "could not download the determinate.systems nix installer — nothing has been installed"
-    # `sh -s -- install` is Determinate's documented invocation. Stdin is the wrapper we just
-    # fetched, matching `curl | sh -s -- install`. Prompts go to /dev/tty, which we already
-    # required before calling this.
-    sh -s -- install < "$_nix_sh" \
-        || die "the determinate.systems nix installer failed — nothing has been installed"
-    rm -f "$_nix_sh"
-    trap - EXIT HUP INT TERM
-}
-
-ensure_nix() {
-    # On PATH *and* actually runnable. `command -v` alone would accept a broken shim.
+# Same probe the boot gate uses: on PATH *and* actually runnable, so a broken shim reads as missing.
+# The note is advice, never a refusal: it goes to stdout after the install has already succeeded.
+note_nix_for_sellers() {
     if command -v nix >/dev/null 2>&1 && nix --version >/dev/null 2>&1; then
         return 0
     fi
-
-    # Same discriminator the PATH prompt uses: `curl | sh` puts the script on stdin, so stdin
-    # is never a terminal. /dev/tty is the controlling terminal; stdout being a TTY is how we
-    # tell a watching operator from a piped/CI run that would hang on a read forever.
-    if [ -t 1 ] && [ -r /dev/tty ]; then
-        print_nix_required > /dev/tty \
-            || die "could not write to the controlling terminal — nothing has been installed"
-        install_nix_from_determinate
-        return 0
-    fi
-
-    print_nix_required >&2
-    exit 1
+    say ""
+    say "note: no working nix found. Buying does not need it. Selling does: \`maxplayer seller\` refuses"
+    say "to start without nix. Install it before you sell:"
+    say "  curl -fsSL https://install.determinate.systems/nix | sh -s -- install"
 }
 
 # ── Version ─────────────────────────────────────────────────────────────────────────────────────
@@ -399,10 +363,6 @@ main() {
         bin_dir="$HOME/.local/bin"
     fi
 
-    # Before detect_platform, before pick_downloader, before any fetch, before any temp dir.
-    # A decline (or a no-TTY refuse) must leave this machine as it was.
-    ensure_nix
-
     detect_platform
     pick_downloader
     pick_hasher
@@ -471,6 +431,7 @@ main() {
     staged=""
 
     say "installed $reported -> $bin_dir/$BIN_NAME"
+    note_nix_for_sellers
 
     # ── What the user's shell will actually run ─────────────────────────────────────────────────
     # The file being in place is not the same property as the name resolving to it. Reported

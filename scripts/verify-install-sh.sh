@@ -13,10 +13,11 @@
 #
 # ── Why containers, and why two ─────────────────────────────────────────────────────────────────
 # The claim is "installs on a machine that has never heard of nix", so it has to be tested somewhere
-# that has no nix, no rust and no prior maxplayer. Since #745 the installer probes nix first and
-# refuses (no TTY) or chains Determinate (TTY) when it is missing; the no-nix refusal is proven on
-# the image as-is, and a PATH stub is injected only after that so the download/verify legs still
-# run. The two images are not redundant:
+# that has no nix, no rust and no prior maxplayer. Nix is a seller requirement only (#745: the
+# `maxplayer seller` boot gate enforces it), so the installer must install here and print one note
+# naming what needs nix; leg 0 proves that on the image as-is. A PATH stub is injected only after
+# that, so the remaining legs also cover the nix-present path, where the note must be absent. The
+# two images are not redundant:
 #
 #   alpine:3              musl; busybox wget, NO curl   → exercises the wget branch, zero packages added
 #   debian:bookworm-slim  glibc; neither downloader     → curl installed, exercises the curl branch
@@ -136,44 +137,38 @@ else fail "no downloader in this image — the harness was supposed to provide o
 fi
 echo "  (downloader under test: $DL)"
 
-# ── Legs 0 — nix probe (#745), before any download ──────────────────────────────────────────────
-# These run BEFORE the stub nix is injected. The image has no nix (asserted above); docker did not
-# allocate a TTY, so this is the no-TTY path: print the two lines, do not prompt, do not hang,
-# install nothing. The decline path is the first property this installer is judged on.
+# ── Legs 0 — no nix: installs, and says only selling needs it (#745) ────────────────────────────
+# These run BEFORE the stub nix is injected. The image has no nix (asserted above) and docker did
+# not allocate a TTY: the path where the installer used to refuse and install nothing. It must now
+# install, exit 0, and print the seller note — never the old "Nix is required" refusal or a prompt.
 
-echo "leg 0: missing nix and no TTY refuses before any download"
+echo "leg 0: missing nix and no TTY installs, and notes that selling needs nix"
 BIN0="$(leg_dir nonix)"
-if MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN0" sh "$INSTALLER" >/legs/nonix.out 2>&1; then
-    fail "the installer exited 0 with no nix and no TTY — it must refuse, having installed nothing"
+MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN0" sh "$INSTALLER" >/legs/nonix.out 2>&1 \
+    || fail "the installer exited non-zero with no nix — buying never needs nix, so it must install. Output: $(cat /legs/nonix.out)"
+[ -x "$BIN0/maxplayer" ] || fail "leg 0: exit 0 but there is no executable at $BIN0/maxplayer"
+got="$("$BIN0/maxplayer" version)" || fail "leg 0: the installed maxplayer did not run"
+assert_version_line "$got" "leg 0 maxplayer version"
+grep -q 'no working nix found. Buying does not need it.' /legs/nonix.out \
+    || fail "leg 0: installed, but the seller note is missing. Output: $(cat /legs/nonix.out)"
+grep -q 'install.determinate.systems/nix' /legs/nonix.out \
+    || fail "leg 0: the seller note does not say how to install nix. Output: $(cat /legs/nonix.out)"
+if grep -q 'Nix is required' /legs/nonix.out; then
+    fail "leg 0: the installer still claims nix is required. Output: $(cat /legs/nonix.out)"
 fi
-grep -q 'Nix is required to use maxplayer.' /legs/nonix.out \
-    || fail "leg 0: refused, but the first required line is missing. Output: $(cat /legs/nonix.out)"
-grep -q 'Enter your password to install it from determinate.systems' /legs/nonix.out \
-    || fail "leg 0: refused, but the second required line is missing. Output: $(cat /legs/nonix.out)"
-# Refused at the probe, not after fetching something. `installing maxplayer` is the first thing a
-# run prints once it has committed to a platform/version, so its absence places the refusal before
-# that. `if`, not `grep … && fail`: under `set -e` an AND-list whose left side fails takes the
-# whole list non-zero and kills the driver.
-if grep -q 'installing maxplayer' /legs/nonix.out; then
-    fail "the nix refusal happened after the installer had already committed to a download"
-fi
-if grep -q 'latest release is' /legs/nonix.out; then
-    fail "the nix refusal happened after the installer had already asked GitHub for a release"
-fi
-assert_empty "$BIN0" "leg 0"
-ok "no nix, no TTY -> non-zero, the two required lines, nothing installed, no download"
+ok "no nix, no TTY -> rc=0, installed $got, seller note printed"
 
-echo "leg 0b: --help does not require nix"
+echo "leg 0b: --help works with no nix"
 BIN0B="$(leg_dir help-nonix)"
 if MAXPLAYER_BIN_DIR="$BIN0B" sh "$INSTALLER" --help >/legs/help-nonix.out 2>&1; then
     :
 else
-    fail "--help exited non-zero on a nix-less box, so the probe is running before flag parsing"
+    fail "--help exited non-zero on a nix-less box"
 fi
 grep -q 'usage:' /legs/help-nonix.out \
     || fail "--help on a nix-less box did not print usage. Output: $(cat /legs/help-nonix.out)"
 assert_empty "$BIN0B" "leg 0b"
-ok "--help -> rc=0 with no nix (flags before the probe)"
+ok "--help -> rc=0 with no nix"
 
 echo "leg 0c: an unknown option is refused by name even with no nix"
 BIN0C="$(leg_dir badopt-nonix)"
@@ -181,13 +176,13 @@ if MAXPLAYER_BIN_DIR="$BIN0C" sh "$INSTALLER" --not-a-flag >/legs/badopt-nonix.o
     fail "the installer accepted an unknown option"
 fi
 grep -q "unknown option" /legs/badopt-nonix.out \
-    || fail "refused with no nix, but not for the unknown option (probe-before-flags would print the nix lines instead). Output: $(cat /legs/badopt-nonix.out)"
+    || fail "refused with no nix, but not for the unknown option. Output: $(cat /legs/badopt-nonix.out)"
 assert_empty "$BIN0C" "leg 0c"
-ok "--not-a-flag with no nix -> unknown option, not the nix probe"
+ok "--not-a-flag with no nix -> unknown option"
 
-# Existing install/verify legs need `nix --version` to succeed so they still exercise the
-# download path. A stub, not a real nix: this image must remain a machine that has never heard
-# of nix (no /nix), and the stub must not leak into leg 0 above.
+# The remaining legs run with a working `nix --version`, so they also cover the nix-present path
+# (leg 1 asserts the seller note is absent there). A stub, not a real nix: this image must remain
+# a machine that has never heard of nix (no /nix), and the stub must not leak into leg 0 above.
 mkdir -p /shim
 cat > /shim/nix <<'EOF'
 #!/bin/sh
@@ -200,7 +195,7 @@ EOF
 chmod 755 /shim/nix
 PATH="/shim:$PATH"
 export PATH
-command -v nix >/dev/null 2>&1 || fail "the nix stub is not on PATH — later legs would hit the no-TTY refuse and prove nothing about the download"
+command -v nix >/dev/null 2>&1 || fail "the nix stub is not on PATH — leg 1 would not cover the nix-present path"
 nix --version >/dev/null 2>&1 || fail "the nix stub's --version does not succeed"
 
 # ── Leg 1 — install ─────────────────────────────────────────────────────────────────────────────
@@ -208,9 +203,12 @@ echo "leg 1: install $VERSION"
 BIN1="$(leg_dir install)"
 PATH="$BIN1:$PATH"
 export PATH
-MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN1" sh "$INSTALLER" \
-    || fail "installer exited non-zero"
+MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN1" sh "$INSTALLER" >/legs/install.out 2>&1 \
+    || fail "installer exited non-zero. Output: $(cat /legs/install.out)"
 [ -x "$BIN1/maxplayer" ] || fail "installer reported success but there is no executable at $BIN1/maxplayer"
+if grep -q 'no working nix found' /legs/install.out; then
+    fail "leg 1: nix works here, but the installer printed the missing-nix note anyway"
+fi
 
 got="$(maxplayer version)" || fail "maxplayer version exited non-zero"
 assert_version_line "$got" "maxplayer version"

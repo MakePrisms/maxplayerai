@@ -425,6 +425,27 @@ mod checks {
         }
     }
 
+    /// The nix verdict for a home with no `[seller]` section, as `maxplayer doctor` reports it. Nix
+    /// is a seller requirement (#745), so for a home that only buys a missing nix is NOT APPLICABLE:
+    /// a passing probe stays PASS (it is real evidence), and either failing variant becomes SKIP so
+    /// a buyer's doctor run does not exit 1 over something buying never uses. The note says what
+    /// changes the answer — configuring this home to sell — and how to install nix first. Only the
+    /// doctor report calls this; the boot gate keeps the FAIL (and its PATH-skew diagnosis, which a
+    /// seller home's doctor run still shows).
+    pub(super) fn nix_for_buyer_home(check: Check) -> Check {
+        if check.status == super::Status::Pass {
+            return check;
+        }
+        Check::skip(
+            NIX_CHECK,
+            "no working nix found — not needed to buy, and this home has no [seller] section",
+            format!(
+                "nix is a seller requirement (#745), and buying never uses it; `maxplayer seller` \
+                 refuses to start without it, so install it before selling: `{DETERMINATE_NIX_INSTALL}`"
+            ),
+        )
+    }
+
     /// A runnable nix at a well-known install prefix, probed only after the PATH leg failed. Each
     /// candidate is executed, not merely stat'ed — the point is a nix that would work if PATH
     /// carried it, and a broken shim at a known path proves nothing.
@@ -2495,7 +2516,7 @@ mod checks {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
+        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix — FAILs only on a home with a [seller] section, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
         crate::skill::docs_pointer_line()
     );
 }
@@ -2583,10 +2604,43 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 /// `maxplayer seller` boot-readiness gate (issue #107) so the two never drift and no check logic is
 /// duplicated. The seller key is read once only to probe NIP-42 relay auth; it is NEVER placed in
 /// any Check detail.
+///
+/// This is the GATE's registry: nix is always a blocking environment check here, whatever the
+/// home's role. `maxplayer doctor` reads [`build_report_checks`], which differs only in how it
+/// reports nix on a home with no `[seller]`.
 #[cfg(feature = "wallet")]
 fn build_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     unsafe_no_sandbox: bool,
+) -> Vec<Box<dyn FnOnce() -> Check>> {
+    build_checks_with_environment(home, unsafe_no_sandbox, build_environment_checks())
+}
+
+/// The registry `maxplayer doctor` reports. Nix is a SELLER requirement (#723/#745: "every buyer
+/// path must never require nix"), so on a home with no `[seller]` section a missing nix is reported
+/// as not applicable instead of failing the exit — a buyer running doctor must not be told the box
+/// is broken. A home that has a `[seller]` gets exactly the gate's registry. The boot gate never
+/// reads this: `maxplayer seller` writes `[seller]` before the gate runs, and the gate builds from
+/// [`build_checks`], so a nix-less seat is still refused at boot.
+#[cfg(feature = "wallet")]
+fn build_report_checks(home: &maxplayer_core::home::MaxplayerHome) -> Vec<Box<dyn FnOnce() -> Check>> {
+    let environment = if home.config.seller.is_some() {
+        build_environment_checks()
+    } else {
+        build_buyer_environment_checks()
+    };
+    // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
+    // waive. The containment check is read at its own severity.
+    build_checks_with_environment(home, false, environment)
+}
+
+/// [`build_checks`] with the environment head supplied by the caller — the one place the rest of
+/// the registry is assembled, so the gate and the report cannot drift.
+#[cfg(feature = "wallet")]
+fn build_checks_with_environment(
+    home: &maxplayer_core::home::MaxplayerHome,
+    unsafe_no_sandbox: bool,
+    environment: Vec<Box<dyn FnOnce() -> Check>>,
 ) -> Vec<Box<dyn FnOnce() -> Check>> {
     let relay_url = home.config.relay_url.clone();
     let relay_url_for_token_policy = home.config.relay_url.clone();
@@ -2661,7 +2715,7 @@ fn build_checks(
 
     // Environment requirements (#745) head the ONE registry — build_checks stays the single
     // source both `maxplayer doctor` and the boot gate run, never a second list to keep in sync.
-    let mut checks: Vec<Box<dyn FnOnce() -> Check>> = build_environment_checks();
+    let mut checks: Vec<Box<dyn FnOnce() -> Check>> = environment;
     checks.push(Box::new(checks::check_credential_helper));
     checks.push(Box::new(move || checks::check_seller_key(&key_path, key_present)));
     let secret_for_mints = secret.clone();
@@ -2774,6 +2828,15 @@ fn build_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
     vec![Box::new(move || checks::check_nix(user_home))]
 }
 
+/// The environment head `maxplayer doctor` reports for a home with no `[seller]`: the same nix
+/// probe, folded by [`checks::nix_for_buyer_home`] so a missing nix is SKIP, not FAIL. Never used
+/// by the boot gate.
+#[cfg(feature = "wallet")]
+fn build_buyer_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
+    let user_home = user_home_dir();
+    vec![Box::new(move || checks::nix_for_buyer_home(checks::check_nix(user_home)))]
+}
+
 /// The operator's `$HOME`, or `None` when unset or empty — never guessed as a relative path.
 #[cfg(feature = "wallet")]
 fn user_home_dir() -> Option<std::path::PathBuf> {
@@ -2818,9 +2881,7 @@ fn run_doctor(
 
     let _ = write!(out, "{}", report_preamble(&home.root));
 
-    // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
-    // waive. The containment check is read at its own severity.
-    let results = run_checks(build_checks(&home, false));
+    let results = run_checks(build_report_checks(&home));
     for result in &results {
         let _ = writeln!(out, "{}", result.render());
     }
@@ -6512,6 +6573,71 @@ mod tests {
             vec!["nix"],
             "the --skip-doctor gate runs the environment subset of the one registry — only nix today"
         );
+    }
+
+    // Nix is a seller requirement: on a home with no [seller] the doctor REPORT shows a missing nix
+    // as SKIP (both failure variants), never FAIL, and a working nix keeps its PASS. Pure, so it is
+    // red-provable on any box — drop the fold and the two failures stay FAIL.
+    #[test]
+    fn nix_for_buyer_home_skips_a_missing_nix_and_keeps_a_pass() {
+        let pass = checks::nix_for_buyer_home(checks::fold_nix(true, None));
+        assert_eq!(pass.status, Status::Pass, "{}", pass.render());
+
+        let skewed = std::path::PathBuf::from("/nix/var/nix/profiles/default/bin/nix");
+        for failed in [checks::fold_nix(false, None), checks::fold_nix(false, Some(skewed))] {
+            assert_eq!(failed.status, Status::Fail, "precondition: the gate's verdict is FAIL");
+            let reported = checks::nix_for_buyer_home(failed);
+            assert_eq!(reported.status, Status::Skip, "{}", reported.render());
+            assert_eq!(reported.name, "nix");
+            let rendered = reported.render();
+            assert!(rendered.contains("no [seller] section"), "{rendered}");
+            assert!(rendered.contains("`maxplayer seller`"), "names what needs nix: {rendered}");
+            assert!(
+                rendered.contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
+                "says how to install it before selling: {rendered}"
+            );
+            assert_eq!(exit_code(&[reported]), SUCCESS, "a buyer's missing nix must not fail the exit");
+        }
+    }
+
+    // Wiring: `maxplayer doctor` on a home with no [seller] never FAILs nix, while a home WITH a
+    // [seller] reports exactly what the boot gate's registry does. The nix probe is
+    // machine-dependent, so on a box with nix both read PASS; red-prove by running this test with
+    // nix off PATH (e.g. PATH=$HOME/.cargo/bin:/usr/bin:/bin) and making build_report_checks use
+    // build_environment_checks for every home — the buyer assertion goes red.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_report_scopes_the_nix_failure_to_seller_homes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-nix-buyer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the home");
+        // Network-free, as in nix_check_is_wired_into_the_shared_registry.
+        home.config.relay_url = "not-a-relay-url".into();
+        home.config.accepted_mints = Vec::new();
+        assert!(home.config.seller.is_none(), "precondition: a fresh home has no [seller]");
+
+        let nix_of = |results: Vec<Check>| {
+            results.into_iter().find(|c| c.name == "nix").expect("the registry carries nix")
+        };
+        let buyer = nix_of(run_checks(build_report_checks(&home)));
+        assert_ne!(buyer.status, Status::Fail, "buyer home: {}", buyer.render());
+
+        home.config.seller = Some(seller_for_agents(vec!["claude".into()], Vec::new()));
+        let seller_report = nix_of(run_checks(build_report_checks(&home)));
+        let gate = nix_of(run_checks(build_checks(&home, false)));
+        assert_eq!(
+            seller_report.render(),
+            gate.render(),
+            "a seller home's doctor report must match the boot gate's nix verdict"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     // #745's ruled-out bypass, pinned: the refusal for an environment failure must NOT advertise

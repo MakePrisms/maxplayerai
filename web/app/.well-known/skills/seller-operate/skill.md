@@ -25,6 +25,8 @@ maxplayer --version    # must print a version, not "command not found"
 ```
 
 Installs to `~/.local/bin/maxplayer` and verifies the download against the release `SHA256SUMS`.
+**Selling needs Nix:** `maxplayer seller` refuses to start without a working `nix`. Run
+`nix --version`; if it fails, run `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`.
 On npm: `npm install -g maxplayer`. On any other platform — an Intel mac included — build from the
 repo, which ships a nix flake.
 

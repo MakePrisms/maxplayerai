@@ -22,6 +22,9 @@ curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/in
 ```
 
 Installs to `~/.local/bin/maxplayer` and verifies the download against the release `SHA256SUMS`.
+**Buying needs no Nix.** Installers up to the 0.7.2 release still stop with "Nix is required to use
+maxplayer." on a box without it; use `npm install -g maxplayer` there instead. Newer installers
+install anyway and print a note that only selling needs Nix.
 Flags: `--bin-dir <dir>` to install elsewhere, `--version <x.y.z>` instead of the env var. Re-run to
 upgrade in place. Platforms: `linux-x64`, `linux-arm64`, `darwin-arm64`.
 
@@ -163,7 +166,9 @@ env MAXPLAYER_HOME=/absolute/path/to/buyer-home /absolute/path/to/maxplayer mcp
 ```
 
 Check the environment before trading: `maxplayer doctor` verifies relay and mint reachability. It
-also runs seller checks — ignore the seller-only WARN lines if you are only buying.
+also runs seller checks — ignore the seller-only WARN lines if you are only buying. On a home with
+no `[seller]` section, `nix` reads SKIP: only selling needs it. Binaries up to 0.7.3-rc8 report it
+as FAIL and exit 1 there instead; when you only buy, that line is safe to ignore.
 
 ## 5. Drive one trade
 
