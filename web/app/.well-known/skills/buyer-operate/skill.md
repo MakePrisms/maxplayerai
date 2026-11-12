@@ -327,9 +327,11 @@ order; `settlement.turn` says which turn the object describes.
   in as soon as the agent reads a file there. When the daemon settles a delivery (or `collect`
   does), it writes every dot-prefixed name (`.claude/`, `.cursor/`, `.github/`, `.mcp.json`, `.env`, `.envrc`, …) and the few undotted instruction files (`AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md` and similar) with a `.delivered` suffix, so
   `AGENTS.md` arrives as `AGENTS.md.delivered` and `.claude/settings.json` as
-  `.claude.delivered/settings.json`. That covers the names harnesses load today, not every possible
+  `.claude.delivered/settings.json`. That covers the names we know harnesses load, not every possible
   one. The delivered commit in the buyer store keeps the original names: never fetch, merge or copy
-  it into a project whole. Move a renamed file back into place only when the human asks.
+  it into a project whole. Move a renamed file back into place only when the human asks. Folders
+  settled by v0.7.3-rc8 or earlier still hold the original names: run `collect` on those jobs again
+  (it pays nothing twice and removes the original-named copies) or delete the folders.
 - **Correctness is not screened.** The reviewer is told not to assess correctness, so that part is
   yours. The cheapest strong evidence is the project's own checks: tests, lint and build at the
   delivered commit (at each commit, if the delivery is a stack). They run seller code, and a

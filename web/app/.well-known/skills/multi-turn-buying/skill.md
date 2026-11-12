@@ -125,17 +125,21 @@ work already at the tree root.
    `results/` holds dot-prefixed names and agent instruction files renamed with a
    `.delivered` suffix: also exclude every dot-prefixed path and each of those
    instruction files by name, on both sides, so the mirror neither copies the seller's
-   versions in nor deletes your repo's own. With rsync:
+   versions in nor deletes your repo's own. With rsync, protecting both the fixed names
+   and every path the settle actually renamed (that covers other letter cases):
    ```bash
+   renamed="$(mktemp)"
+   (cd results/<job_id> && find . -name '*.delivered' -prune -print \
+      | sed -e 's|^\.||' -e 's|\.delivered$||') > "$renamed"
    rsync -a --delete --exclude='.*' --exclude='*.delivered' --exclude=MAXPLAYER_EXECUTION_SENTINEL \
      --exclude=AGENTS.md --exclude=AGENTS.override.md --exclude=AGENT.md \
-     --exclude=CLAUDE.md --exclude=CLAUDE.local.md --exclude=GEMINI.md \
-     --exclude=CRUSH.md --exclude=crush.json --exclude=WARP.md \
-     --exclude=opencode.json --exclude=opencode.jsonc \
-     results/<job_id>/ <clone>/
+     --exclude=CLAUDE.md --exclude=CLAUDE.local.md --exclude=GEMINI.md --exclude=QWEN.md \
+     --exclude=CRUSH.md --exclude=CRUSH.local.md --exclude=crush.json --exclude=WARP.md \
+     --exclude=opencode.json --exclude=opencode.jsonc --exclude=HEAD \
+     --exclude-from="$renamed" results/<job_id>/ <clone>/
    ```
-   The renaming ignores letter case and these excludes do not, so if your repo has one of
-   those files in another case (`agents.md`), exclude that spelling too. Never add
+   The fixed names match letter case exactly, so if your repo holds one in another case
+   that the seller deleted (`agents.md`), exclude that spelling too. Never add
    `--delete-excluded`. A seller change to one of those files (including a delivered
    `.gitignore`, which arrives as `.gitignore.delivered`, so a repo seeded in step 0 has
    none until you move it in) reaches your repo only when the human reviews it and moves

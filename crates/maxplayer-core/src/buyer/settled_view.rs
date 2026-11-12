@@ -259,6 +259,8 @@ mod tests {
         let mut top = repo.treebuilder(None).unwrap();
         top.insert("README.md", readme, 0o100644).unwrap();
         top.insert("AGENTS.md", readme, 0o100644).unwrap();
+        // An older build could settle a tree holding both names; they list as one written path.
+        top.insert("AGENTS.md.delivered", readme, 0o100644).unwrap();
         top.insert("src", sub, 0o040000).unwrap();
         let tree = repo.find_tree(top.write().unwrap()).unwrap();
         let sig = git2::Signature::now("t", "t@e").unwrap();

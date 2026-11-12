@@ -219,7 +219,7 @@ adds a fifth, `reply` — see *Session jobs* below):
    `$MAXPLAYER_HOME/results/<job_id>`. Repeating it for an already-paid job does not pay twice.
    Settling (by the daemon or by `collect`) writes every dot-prefixed name (`.claude/`,
    `.mcp.json`, `.env`, …) and the few undotted agent instruction files (`AGENTS.md`, `CLAUDE.md`
-   and similar) with a `.delivered` suffix, so the names harnesses load today do not load from
+   and similar) with a `.delivered` suffix, so the names we know harnesses load do not load from
    `results/`. The delivered commit keeps the original names. Treat a delivery like a stranger's
    pull request, and run your agent from a project folder, not your home directory.
    Usually not needed: it is a manual trigger of the daemon's own settle, for retrying a

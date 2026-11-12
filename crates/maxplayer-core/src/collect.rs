@@ -597,6 +597,14 @@ pub fn results_dest(
                     "'out' must be a simple folder name (no path separators or '..')".into(),
                 );
             }
+            // `.` is results/ itself; `.git`, `.claude`, `AGENTS.md`, `HEAD` would put a seller's
+            // tree where git or a harness loads it from every other results folder.
+            if name.starts_with('.') || is_agent_control_name(name) {
+                return Err(format!(
+                    "'out' must not start with '.' or be a name agent tools or git load on their \
+                     own ({name:?})"
+                ));
+            }
             Ok(results.join(name))
         }
         None => Ok(results.join(job_id)),
@@ -859,7 +867,10 @@ pub const INERT_SUFFIX: &str = ".delivered";
 /// - every DOT-PREFIXED component (`.claude/`, `.cursor/`, `.codex/`, `.github/`, `.vscode/`,
 ///   `.mcp.json`, `.envrc`, `.env`, `.cursorrules`, `.cargo/`, …): nearly every harness keeps its
 ///   config, hooks, rules and skills under a dot name;
-/// - the few UNDOTTED instruction/config files in [`AGENT_CONTROL_FILES`].
+/// - the few UNDOTTED instruction/config files in [`AGENT_CONTROL_FILES`], plus git's `HEAD`:
+///   plain files `HEAD`, `objects/` and `refs/` make a folder a git repository whose seller-written
+///   `config` git reads (`core.fsmonitor` runs a command on `git status`), and without `HEAD` git
+///   does not treat the folder as one (worker-fable r1 F1).
 ///
 /// Matched after the same case/Unicode folding [`collision_key`] uses, so `Agents.MD` or `.Claude`
 /// on a case-insensitive volume is caught too. The same classifier is meant for any later path that
@@ -874,10 +885,14 @@ const AGENT_CONTROL_FILES: &[&str] = &[
     "claude.local.md",
     "gemini.md",
     "crush.md",
+    "crush.local.md",
     "crush.json",
+    "qwen.md",
     "warp.md",
     "opencode.json",
     "opencode.jsonc",
+    // Not an instruction file: see the git-repository note above.
+    "head",
 ];
 
 /// True when materialize must write `component` inert: a dot-prefixed name or an
@@ -1302,7 +1317,7 @@ mod tests {
             results_dest(&home, &job, Some("out-1")).expect("named"),
             home.root.join("results").join("out-1")
         );
-        for bad in ["../escape", "a/b", "a\\b", ".."] {
+        for bad in ["../escape", "a/b", "a\\b", "..", ".", ".git", ".claude", "AGENTS.md", "head"] {
             assert!(results_dest(&home, &job, Some(bad)).is_err(), "must refuse {bad:?}");
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -1339,6 +1354,12 @@ mod tests {
     /// Build a buyer store whose delivered tree holds `files` (slash paths, nested trees built as
     /// needed), each blob's content being its own path. Returns the commit hex.
     fn seed_paths_store(store: &Path, files: &[&str]) -> String {
+        let with_contents: Vec<(&str, &str)> = files.iter().map(|path| (*path, *path)).collect();
+        seed_contents_store(store, &with_contents)
+    }
+
+    /// [`seed_paths_store`] with each file's bytes given: `(path, contents)`.
+    fn seed_contents_store(store: &Path, files: &[(&str, &str)]) -> String {
         fn build(repo: &git2::Repository, files: &[(Vec<&str>, &str)]) -> git2::Oid {
             let mut top = repo.treebuilder(None).expect("tree");
             let mut subdirs: std::collections::BTreeMap<&str, Vec<(Vec<&str>, &str)>> =
@@ -1359,7 +1380,7 @@ mod tests {
         }
         let repo = git2::Repository::init_bare(store).expect("init store");
         let split: Vec<(Vec<&str>, &str)> =
-            files.iter().map(|path| (path.split('/').collect(), *path)).collect();
+            files.iter().map(|(path, contents)| (path.split('/').collect(), *contents)).collect();
         let tree = repo.find_tree(build(&repo, &split)).expect("find tree");
         let sig = git2::Signature::now("t", "t@e").expect("sig");
         let commit_oid = repo.commit(None, &sig, &sig, "delivery", &tree, &[]).expect("commit");
@@ -1480,6 +1501,14 @@ mod tests {
             (".Claude/CLAUDE.md", ".Claude.delivered/CLAUDE.md.delivered"),
             ("AGENTS.md.delivered", "AGENTS.md.delivered"),
             ("AGENTS.override.md", "AGENTS.override.md.delivered"),
+            ("QWEN.md", "QWEN.md.delivered"),
+            ("CRUSH.local.md", "CRUSH.local.md.delivered"),
+            ("HEAD", "HEAD.delivered"),
+            ("vendor/repo.git/HEAD", "vendor/repo.git/HEAD.delivered"),
+            ("HEADER.md", "HEADER.md"),
+            // The undotted list is matched after folding, not just ASCII lowercase.
+            ("AGENT\u{200C}S.md", "AGENT\u{200C}S.md.delivered"),
+            ("AGENT\u{17F}.md", "AGENT\u{17F}.md.delivered"),
             // Every dot-prefixed component, known harness or not.
             (".gitignore", ".gitignore.delivered"),
             (".github/workflows/ci.yml", ".github.delivered/workflows/ci.yml"),
@@ -1526,6 +1555,44 @@ mod tests {
             assert!(error.contains("unsafe delivery path"), "{error}");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // worker-fable r1 F1: plain files `HEAD`, `objects/`, `refs/` and a `config` would make the
+    // results folder (or a subfolder) a git repository whose seller-written config git reads.
+    // `HEAD` is written inert, so neither folder opens as a repository.
+    #[test]
+    fn a_delivered_git_directory_layout_is_not_a_repository_on_disk() {
+        let root = temp_root("git-layout");
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("store");
+        let config = "[core]\n\tbare = false\n";
+        let head = "ref: refs/heads/main\n";
+        let commit_hex = seed_contents_store(
+            &store,
+            &[
+                ("HEAD", head),
+                ("config", config),
+                ("objects/info/x", "x"),
+                ("refs/x", "x"),
+                ("sub/HEAD", head),
+                ("sub/config", config),
+                ("sub/objects/info/x", "x"),
+                ("sub/refs/x", "x"),
+            ],
+        );
+        let store_ref = PayPathDeliveryVerifier::store_ref_for(&commit_hex);
+        let dest = root.join("results").join("job");
+        materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("materialize");
+        for dir in [dest.clone(), dest.join("sub")] {
+            assert!(!dir.join("HEAD").exists(), "{} must have no HEAD", dir.display());
+            assert_eq!(std::fs::read_to_string(dir.join("HEAD.delivered")).unwrap(), head);
+            assert!(
+                git2::Repository::open(&dir).is_err(),
+                "{} must not open as a git repository",
+                dir.display()
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // P1: a renamed DIRECTORY collides with a delivered directory of the inert name; refused
@@ -1580,7 +1647,8 @@ mod tests {
         // A symlinked original-named directory is never followed.
         let outside = root.join("outside");
         std::fs::create_dir_all(&outside).unwrap();
-        std::fs::write(outside.join("tasks.json"), "outside").unwrap();
+        // Holding the delivered bytes, so only the no-follow check (not the byte check) keeps it.
+        std::fs::write(outside.join("tasks.json"), ".vscode/tasks.json").unwrap();
         std::os::unix::fs::symlink(&outside, dest.join(".vscode")).unwrap();
 
         let files = materialize_delivery(&store, &store_ref, &commit_hex, &dest).expect("re-collect");
@@ -1598,7 +1666,10 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(dest.join("README.md")).unwrap(), "README.md");
         assert_eq!(std::fs::read_to_string(dest.join("AGENTS.md.delivered")).unwrap(), "AGENTS.md");
-        assert_eq!(std::fs::read_to_string(outside.join("tasks.json")).unwrap(), "outside");
+        assert_eq!(
+            std::fs::read_to_string(outside.join("tasks.json")).unwrap(),
+            ".vscode/tasks.json"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
