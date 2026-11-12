@@ -192,7 +192,7 @@ fetch() {
 # Same probe the boot gate uses: on PATH *and* actually runnable, so a broken shim reads as missing.
 # The note is advice, never a refusal: it goes to stdout after the install has already succeeded.
 note_nix_for_sellers() {
-    if command -v nix >/dev/null 2>&1 && nix --version >/dev/null 2>&1; then
+    if command -v nix >/dev/null 2>&1 && nix --version </dev/null >/dev/null 2>&1; then
         return 0
     fi
     say ""

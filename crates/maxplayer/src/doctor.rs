@@ -428,20 +428,21 @@ mod checks {
     /// The nix verdict for a home with no `[seller]` section, as `maxplayer doctor` reports it. Nix
     /// is a seller requirement (#745), so for a home that only buys a missing nix is NOT APPLICABLE:
     /// a passing probe stays PASS (it is real evidence), and either failing variant becomes SKIP so
-    /// a buyer's doctor run does not exit 1 over something buying never uses. The note says what
-    /// changes the answer — configuring this home to sell — and how to install nix first. Only the
-    /// doctor report calls this; the boot gate keeps the FAIL (and its PATH-skew diagnosis, which a
-    /// seller home's doctor run still shows).
+    /// a buyer's doctor run does not exit 1 over something buying never uses. The gate's own detail
+    /// and remedy are kept verbatim, so the PATH-skew case still reads "nix IS installed … do NOT
+    /// reinstall" rather than being flattened into "install nix". Only the doctor report calls this;
+    /// the boot gate keeps the FAIL.
     pub(super) fn nix_for_buyer_home(check: Check) -> Check {
         if check.status == super::Status::Pass {
             return check;
         }
+        let remedy = check.hint.unwrap_or_default();
         Check::skip(
             NIX_CHECK,
-            "no working nix found — not needed to buy, and this home has no [seller] section",
+            format!("not needed to buy, and this home has no [seller] section — {}", check.detail),
             format!(
                 "nix is a seller requirement (#745), and buying never uses it; `maxplayer seller` \
-                 refuses to start without it, so install it before selling: `{DETERMINATE_NIX_INSTALL}`"
+                 refuses to start without it, so before selling: {remedy}"
             ),
         )
     }
@@ -6604,13 +6605,17 @@ mod tests {
         assert_eq!(pass.status, Status::Pass, "{}", pass.render());
 
         let skewed = std::path::PathBuf::from("/nix/var/nix/profiles/default/bin/nix");
-        for failed in [checks::fold_nix(false, None), checks::fold_nix(false, Some(skewed))] {
+        for (failed, skew) in [(checks::fold_nix(false, None), false), (checks::fold_nix(false, Some(skewed)), true)] {
             assert_eq!(failed.status, Status::Fail, "precondition: the gate's verdict is FAIL");
             let reported = checks::nix_for_buyer_home(failed);
             assert_eq!(reported.status, Status::Skip, "{}", reported.render());
             assert_eq!(reported.name, "nix");
             let rendered = reported.render();
             assert!(rendered.contains("no [seller] section"), "{rendered}");
+            // The PATH-skew diagnosis survives the fold: an installed-but-off-PATH nix is never
+            // reported to a buyer as "install it" (advisor r1, #1312).
+            assert_eq!(rendered.contains("do NOT reinstall"), skew, "{rendered}");
+            assert_eq!(rendered.contains("nix IS installed"), skew, "{rendered}");
             assert!(rendered.contains("`maxplayer seller`"), "names what needs nix: {rendered}");
             assert!(
                 rendered.contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
