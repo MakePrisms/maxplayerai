@@ -19,8 +19,12 @@ pub const MINT_NAME: &str = maxplayer_core::mint_wire::DEFAULT_MINT_NAME;
 
 /// Open (creating on first use) and start the mint in `db_path`, keyed from `seed`, advertising
 /// `url` and the default name. Starting runs cdk's saga recovery; only `run` (and `init`) may do that.
+/// Leaves the stored NUT-06 name alone: a new database gets [`MINT_NAME`] from the builder, an
+/// existing one keeps whatever name it already serves.
 pub async fn open(db_path: &Path, seed: &[u8; 64], url: &str) -> Result<Mint> {
-    open_named(db_path, seed, url, MINT_NAME).await
+    let mint = build(db_path, seed, url).await?;
+    mint.start().await.context("start mint")?;
+    Ok(mint)
 }
 
 /// [`open`], advertising `name` in NUT-06 info.
