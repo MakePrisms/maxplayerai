@@ -9,10 +9,10 @@
 //!   libgit2. Nothing is written.
 //! - [`extract`] writes the delivery into a throwaway folder (default: a new directory under the
 //!   system temp dir, never inside the maxplayer home) with the same checked writer collect used,
-//!   and refuses a tree that lays out a git repository (see [`git_repository_layout`]). It is the
-//!   only path in the binary that writes delivered files.
+//!   and refuses a tree that lays out a version-control repository (see [`extract_refusal`]). It is
+//!   the only path in the binary that writes delivered files.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -24,9 +24,33 @@ use crate::job_lifecycle::{self, AcceptedBind};
 /// Default and largest number of bytes [`read`] returns per call.
 pub const READ_DEFAULT_BYTES: usize = 64 * 1024;
 pub const READ_MAX_BYTES: usize = 256 * 1024;
+/// Largest file [`read`] returns text from. Each paged read loads the whole blob, so a bigger file
+/// is extracted instead (#1311 fable L6).
+pub const READ_TEXT_MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Most paths one listing returns; the rest are paged with `offset` (#1311 fable L6).
+pub const LIST_MAX_ENTRIES: usize = 2_000;
+
+/// Version-control metadata folders other than `.git` (refused by name before payment): a delivered
+/// one would make that VCS read seller config in the extracted folder, e.g. an `.hg/hgrc` hook that
+/// runs on `hg status` (#1311 fable M7). VCS names, not harness names. Compared folded.
+const VCS_METADATA_DIRS: &[&str] = &[".hg", ".jj", ".sl", ".svn", ".bzr"];
+
+/// A Nostr event id: 64 lowercase hex characters. Job ids and follow-up ids are joined into file
+/// paths under the home, so anything else is refused before it gets near one (#1311 fable M1).
+pub fn is_event_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// The accept-bind under `key` (a job id, or a session turn's follow-up id).
 pub fn bind_for(home: &MaxplayerHome, key: &str) -> Result<AcceptedBind, String> {
+    if !is_event_id(key) {
+        return Err(format!(
+            "{key:?} is not a job id (64 lowercase hex characters)"
+        ));
+    }
     job_lifecycle::load_accepted_bind(home, key)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| {
@@ -34,9 +58,9 @@ pub fn bind_for(home: &MaxplayerHome, key: &str) -> Result<AcceptedBind, String>
         })
 }
 
-/// List the delivery's files (`path` = `None`), or return one file's text from `offset`, at most
-/// `max_bytes` (capped at [`READ_MAX_BYTES`]). A file that is not UTF-8 text returns its size and
-/// no content. Writes nothing.
+/// List the delivery's files (`path` = `None`; `offset` pages the list), or return one file's text
+/// from byte `offset`, at most `max_bytes` (capped at [`READ_MAX_BYTES`]). A file that is not UTF-8
+/// text returns its size and no content. Writes nothing.
 pub fn read(
     home: &MaxplayerHome,
     bind: &AcceptedBind,
@@ -63,31 +87,93 @@ pub fn read(
         };
     }
     let store = collect::delivery_store_path(home);
-    let Some(path) = path else {
-        let files = collect::delivery_file_list(&store, &bind.commit_oid)?;
-        return Ok(json!({
-            "delivery": "store",
-            "commit_oid": bind.commit_oid,
-            "file_count": files.len(),
-            "files": files,
-        }));
-    };
-    collect::validate_delivery_path(path).map_err(|error| format!("path refused: {error}"))?;
     let repo = git2::Repository::open_bare(&store)
         .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
     let tree = collect::delivery_tree(&repo, &bind.commit_oid)?;
+    let Some(path) = path else {
+        return list(&tree, &bind.commit_oid, offset);
+    };
+    collect::validate_delivery_path(path).map_err(|error| format!("path refused: {error}"))?;
     let entry = tree
         .get_path(Path::new(path))
         .map_err(|_| format!("{path:?} is not a file in this delivery"))?;
     if entry.kind() != Some(git2::ObjectType::Blob) {
         return Err(format!(
-            "{path:?} is a directory; call without path to list the files"
+            "{path:?} is a directory or a submodule; call without path to list the files"
         ));
     }
     let blob = repo
         .find_blob(entry.id())
         .map_err(|error| error.to_string())?;
-    Ok(text_slice(path, blob.content(), offset, max))
+    if blob.size() > READ_TEXT_MAX_FILE_BYTES {
+        return Ok(json!({
+            "path": path,
+            "size": blob.size(),
+            "too_large": true,
+            "note": format!("larger than {READ_TEXT_MAX_FILE_BYTES} bytes; extract the delivery into a throwaway folder to inspect it"),
+        }));
+    }
+    let mut value = text_slice(path, blob.content(), offset, max);
+    if entry.filemode() == 0o120000 {
+        // The content is the link target. extract writes it as a plain text file; a git merge of
+        // the commit creates a real symlink.
+        value["symlink"] = json!(true);
+    }
+    Ok(value)
+}
+
+/// One page of the file list, plus every entry whose type the plain list hides (#1311 fable L8):
+/// symlinks, submodules (gitlinks, never extracted) and executable files.
+fn list(tree: &git2::Tree<'_>, commit_oid: &str, offset: usize) -> Result<Value, String> {
+    let mut files = Vec::new();
+    let mut special = Vec::new();
+    let mut visited = 0usize;
+    let walked = tree.walk(git2::TreeWalkMode::PreOrder, |root, entry| {
+        visited += 1;
+        if visited > collect::MAX_DELIVERY_ENTRIES {
+            return git2::TreeWalkResult::Abort;
+        }
+        let Ok(name) = entry.name() else {
+            return git2::TreeWalkResult::Ok;
+        };
+        let rel = format!("{root}{name}");
+        let kind = match entry.filemode() {
+            0o120000 => Some("symlink"),
+            0o160000 => Some("submodule"),
+            0o100755 => Some("executable"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            special.push(json!({ "path": rel, "kind": kind }));
+        }
+        if entry.kind() == Some(git2::ObjectType::Blob) {
+            files.push(rel);
+        }
+        git2::TreeWalkResult::Ok
+    });
+    if visited > collect::MAX_DELIVERY_ENTRIES {
+        return Err(format!(
+            "delivery has more than {} entries; not listed",
+            collect::MAX_DELIVERY_ENTRIES
+        ));
+    }
+    walked.map_err(|error| error.to_string())?;
+    files.sort();
+    let start = offset.min(files.len());
+    let end = start.saturating_add(LIST_MAX_ENTRIES).min(files.len());
+    special.truncate(LIST_MAX_ENTRIES);
+    let mut value = json!({
+        "delivery": "store",
+        "commit_oid": commit_oid,
+        "file_count": files.len(),
+        "offset": start,
+        "files": &files[start..end],
+        "special": special,
+    });
+    if end < files.len() {
+        value["next_offset"] = json!(end);
+    }
+    Ok(value)
 }
 
 fn text_slice(path: &str, bytes: &[u8], offset: usize, max: usize) -> Value {
@@ -111,6 +197,14 @@ fn text_slice(path: &str, bytes: &[u8], offset: usize, max: usize) -> Value {
     while !text.is_char_boundary(end) {
         end -= 1;
     }
+    // A max smaller than the character at `start` would return nothing and the same offset, and a
+    // pager would loop forever (#1311 fable L7): return that one whole character instead.
+    if end == start && start < size {
+        end = start + 1;
+        while !text.is_char_boundary(end) {
+            end += 1;
+        }
+    }
     let mut value = json!({
         "path": path,
         "size": size,
@@ -124,8 +218,10 @@ fn text_slice(path: &str, bytes: &[u8], offset: usize, max: usize) -> Value {
 }
 
 /// Extract the delivery into `to`, or into a new folder under the system temp dir when `to` is
-/// `None`. `to` must be absent or an empty directory, and neither it nor the default folder may be
-/// inside the maxplayer home. Returns the folder and the sorted file list.
+/// `None`. `to` must be an absolute path with no `.` or `..` component, absent or an empty
+/// directory, and neither it nor the default folder may be inside the maxplayer home (checked
+/// again once the folder exists). A failure removes what it wrote. Returns the folder and the
+/// sorted file list.
 pub fn extract(
     home: &MaxplayerHome,
     bind: &AcceptedBind,
@@ -146,60 +242,17 @@ pub fn extract(
         let repo = git2::Repository::open_bare(&store)
             .map_err(|error| format!("open buyer store {}: {error}", store.display()))?;
         let tree = collect::delivery_tree(&repo, &bind.commit_oid)?;
-        if let Some(dir) = git_repository_layout(&repo, &tree)? {
+        if let Some(reason) = extract_refusal(&repo, &tree)? {
             return Err(format!(
-                "refusing to extract: {} holds a git repository's internal files (a HEAD file \
-                 with objects/ and refs/, or with commondir), so git would treat that folder as a \
-                 repository and read the delivered config. Read those files with read_delivery \
-                 instead. Nothing was written",
-                if dir.is_empty() {
-                    "the delivery's top folder".to_owned()
-                } else {
-                    format!("{dir:?}")
-                }
+                "refusing to extract: {reason}. Read those files with read_delivery instead; for a \
+                 contribution job, fetch the commit into your own clone (the buyer-operate skill). \
+                 Nothing was written"
             ));
         }
     }
     let home_root = canonical_or_self(&home.root);
-    let dest = match to {
-        Some(to) => {
-            let absolute = if to.is_absolute() {
-                to.to_path_buf()
-            } else {
-                std::env::current_dir().map_err(|e| e.to_string())?.join(to)
-            };
-            if inside(&absolute, &home_root) {
-                return Err(format!(
-                    "{} is inside the maxplayer home ({}); extract somewhere outside it",
-                    absolute.display(),
-                    home_root.display()
-                ));
-            }
-            match std::fs::symlink_metadata(&absolute) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(format!("{} is a symlink; refusing", absolute.display()));
-                }
-                Ok(meta) if !meta.is_dir() => {
-                    return Err(format!(
-                        "{} exists and is not a directory",
-                        absolute.display()
-                    ));
-                }
-                Ok(_) => {
-                    let mut entries = std::fs::read_dir(&absolute)
-                        .map_err(|e| format!("read {}: {e}", absolute.display()))?;
-                    if entries.next().is_some() {
-                        return Err(format!(
-                            "{} is not empty; extract into a new or empty folder",
-                            absolute.display()
-                        ));
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(format!("inspect {}: {error}", absolute.display())),
-            }
-            absolute
-        }
+    let (dest, created) = match to {
+        Some(to) => prepare_target(to, &home_root)?,
         None => {
             let short = &bind.job_id[..bind.job_id.len().min(8)];
             let prefix = format!("maxplayer-{short}-");
@@ -208,26 +261,112 @@ pub fn extract(
                 .tempdir()
                 .map_err(|error| format!("create a temp folder: {error}"))?
                 .keep();
-            if inside(&canonical_or_self(&dir), &home_root) {
+            let real = canonical_or_self(&dir);
+            if real.starts_with(&home_root) {
                 let _ = std::fs::remove_dir(&dir);
                 return Err(format!(
                     "the system temp dir {} is inside the maxplayer home; pass --to",
                     dir.display()
                 ));
             }
-            dir
+            (real, true)
         }
     };
-    collect::check_dest(&dest)?;
-    let files = collect::materialize_delivery(&store, &store_ref, &bind.commit_oid, &dest)?;
-    Ok((dest, files))
+    match collect::materialize_delivery(&store, &store_ref, &bind.commit_oid, &dest) {
+        Ok(files) => Ok((dest, files)),
+        Err(error) => {
+            // The folder was new or empty: put it back the way it was.
+            let _ = std::fs::remove_dir_all(&dest);
+            if !created {
+                let _ = std::fs::create_dir(&dest);
+            }
+            Err(format!("extract failed and wrote nothing: {error}"))
+        }
+    }
 }
 
-/// The first directory (`""` = the top) whose entries make git treat it as a repository: a blob
-/// named `HEAD` (folded as collect folds names) with either `objects/` and `refs/` trees, or a
-/// `commondir` file. git, libgit2 and gitoxide all require the `HEAD` file. One structural rule
-/// about git, not a list of harness file names.
-pub fn git_repository_layout(
+/// Validate a caller-chosen `to`, create it when absent, and return its real path and whether it
+/// was created here. Checked twice: lexically before anything exists, and on the canonical path
+/// once the folder exists, so neither a `..` after a missing component nor an ancestor swapped for
+/// a symlink can land it inside the home (#1311 fable M2).
+fn prepare_target(to: &Path, home_root: &Path) -> Result<(PathBuf, bool), String> {
+    if !to.is_absolute() {
+        return Err(format!(
+            "{} is relative; pass an absolute folder (the buyer daemon's working directory is not \
+             yours)",
+            to.display()
+        ));
+    }
+    if to
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!(
+            "{} contains a . or .. component; refusing",
+            to.display()
+        ));
+    }
+    if inside(to, home_root) {
+        return Err(format!(
+            "{} is inside the maxplayer home ({}); extract somewhere outside it",
+            to.display(),
+            home_root.display()
+        ));
+    }
+    let created = match std::fs::symlink_metadata(to) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!("{} is a symlink; refusing", to.display()));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!("{} exists and is not a directory", to.display()));
+        }
+        Ok(_) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            }
+            std::fs::create_dir(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+            true
+        }
+        Err(error) => return Err(format!("inspect {}: {error}", to.display())),
+    };
+    let undo = |message: String| {
+        if created {
+            let _ = std::fs::remove_dir(to);
+        }
+        Err(message)
+    };
+    let real = match std::fs::canonicalize(to) {
+        Ok(real) => real,
+        Err(error) => return undo(format!("resolve {}: {error}", to.display())),
+    };
+    if real.starts_with(home_root) {
+        return undo(format!(
+            "{} resolves to {}, inside the maxplayer home; extract somewhere outside it",
+            to.display(),
+            real.display()
+        ));
+    }
+    match std::fs::read_dir(&real).map(|mut entries| entries.next().is_some()) {
+        Ok(false) => Ok((real, created)),
+        Ok(true) => undo(format!(
+            "{} is not empty; extract into a new or empty folder",
+            to.display()
+        )),
+        Err(error) => undo(format!("read {}: {error}", to.display())),
+    }
+}
+
+/// Why `extract` must not write this tree, or `None`. Two structural rules, checked in every
+/// folder with names folded as collect folds them:
+///
+/// - A git repository layout: a blob named `HEAD` with a `refs/` tree, or with a `commondir` blob.
+///   git, libgit2 and gitoxide all need the `HEAD` file. `objects/` is not required, because
+///   `GIT_OBJECT_DIRECTORY` in the environment stands in for it (#1311 fable L1). The rule relies
+///   on `extract` writing every entry as a plain non-executable file: no symlinks, no exec bits.
+/// - Another VCS's metadata folder ([`VCS_METADATA_DIRS`]); `.git` is refused by name before pay.
+pub fn extract_refusal(
     repo: &git2::Repository,
     tree: &git2::Tree<'_>,
 ) -> Result<Option<String>, String> {
@@ -237,7 +376,14 @@ pub fn git_repository_layout(
         dir: &str,
         budget: &mut usize,
     ) -> Result<Option<String>, String> {
-        let (mut head, mut objects, mut refs, mut commondir) = (false, false, false, false);
+        let shown = |dir: &str| {
+            if dir.is_empty() {
+                "the delivery's top folder".to_owned()
+            } else {
+                format!("{dir:?}")
+            }
+        };
+        let (mut head, mut refs, mut commondir) = (false, false, false);
         let mut subtrees = Vec::new();
         for entry in tree.iter() {
             *budget = budget
@@ -251,23 +397,33 @@ pub fn git_repository_layout(
                     commondir |= key == "commondir";
                 }
                 Some(git2::ObjectType::Tree) => {
-                    objects |= key == "objects";
                     refs |= key == "refs";
-                    subtrees.push((name.to_owned(), entry.id()));
+                    let path = if dir.is_empty() {
+                        name.to_owned()
+                    } else {
+                        format!("{dir}/{name}")
+                    };
+                    if VCS_METADATA_DIRS.iter().any(|vcs| key == *vcs) {
+                        return Ok(Some(format!(
+                            "{path:?} is a version-control metadata folder, so that tool would \
+                             read the delivered config in the extracted folder"
+                        )));
+                    }
+                    subtrees.push((path, entry.id()));
                 }
                 _ => {}
             }
         }
-        if head && ((objects && refs) || commondir) {
-            return Ok(Some(dir.to_owned()));
+        if head && (refs || commondir) {
+            return Ok(Some(format!(
+                "{} holds a git repository's internal files (a HEAD file with refs/, or with \
+                 commondir), so git would treat that folder as a repository and read the \
+                 delivered config",
+                shown(dir)
+            )));
         }
-        for (name, id) in subtrees {
+        for (path, id) in subtrees {
             let sub = repo.find_tree(id).map_err(|e| e.to_string())?;
-            let path = if dir.is_empty() {
-                name
-            } else {
-                format!("{dir}/{name}")
-            };
             if let Some(found) = check(repo, &sub, &path, budget)? {
                 return Ok(Some(found));
             }
@@ -275,7 +431,7 @@ pub fn git_repository_layout(
         Ok(None)
     }
     // Same bound as the pre-pay check, which has already refused anything larger.
-    let mut budget = 100_000usize;
+    let mut budget = collect::MAX_DELIVERY_ENTRIES;
     check(repo, tree, "", &mut budget)
 }
 
@@ -283,7 +439,9 @@ fn canonical_or_self(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// True when `path` (resolved through its nearest existing ancestor) is `root` or under it.
+/// True when `path` (resolved through its nearest existing ancestor) is `root` or under it. A
+/// first, lexical check: [`prepare_target`] refuses `..` before calling it and re-checks the real
+/// path once the folder exists.
 fn inside(path: &Path, root: &Path) -> bool {
     let mut existing = path.to_path_buf();
     let mut rest = Vec::new();
@@ -444,7 +602,7 @@ mod tests {
         assert!(!in_home.exists());
         let fresh = root.join("fresh");
         let (dir, _) = extract(&home, &bind, Some(&fresh)).expect("fresh dir");
-        assert_eq!(dir, fresh);
+        assert_eq!(dir, std::fs::canonicalize(&fresh).unwrap());
         assert!(fresh.join("AGENTS.md").is_file());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -464,11 +622,24 @@ mod tests {
                 ("sub/refs/x", "x"),
             ],
             vec![("a/b/head", "ref: x\n"), ("a/b/commondir", "../c\n")],
+            // #1311 fable L1: no objects/ — GIT_OBJECT_DIRECTORY can stand in for it.
+            vec![
+                ("HEAD", "ref: x\n"),
+                ("refs/x", "x"),
+                ("config", "[core]\n"),
+            ],
+            // #1311 fable M7: another VCS's metadata folder.
+            vec![(".hg/hgrc", "[hooks]\npre-status = touch PWNED\n")],
+            vec![("sub/.JJ/repo/x", "x")],
+            vec![(".svn/entries", "x")],
         ] {
             let (root, home, bind) = seeded("gitlayout", &layout);
             let to = root.join("out");
             let error = extract(&home, &bind, Some(&to)).expect_err("git layout refused");
-            assert!(error.contains("git repository"), "{error}");
+            assert!(
+                error.contains("git repository") || error.contains("version-control"),
+                "{error}"
+            );
             assert!(!to.exists(), "nothing written");
             assert!(
                 read(&home, &bind, Some(layout[0].0), 0, None).is_ok(),
@@ -481,11 +652,84 @@ mod tests {
             vec![("objects/x", "x"), ("refs/x", "x"), ("config", "c")],
             vec![("HEAD/x", "x"), ("objects/x", "x"), ("refs/x", "x")],
             vec![("HEAD", "x"), ("objects/x", "x"), ("HEADER.md", "h")],
+            vec![("hg/hgrc", "x"), ("docs/svn.md", "x")],
         ] {
             let (root, home, bind) = seeded("notrepo", &layout);
             let to = root.join("out");
             extract(&home, &bind, Some(&to)).expect("ordinary tree extracts");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    // #1311 fable M2/M6: `..`, `.` and relative targets are refused before anything is created, so
+    // a missing component followed by `..` cannot land the tree inside the home.
+    #[test]
+    fn a_dotdot_or_relative_to_cannot_land_inside_the_home() {
+        let (root, home, bind) = seeded("dotdot", &[("CLAUDE.md", "seller says")]);
+        let sneaky = root
+            .join("zzz")
+            .join("..")
+            .join("home")
+            .join("results")
+            .join("job1");
+        let error = extract(&home, &bind, Some(&sneaky)).expect_err("refused");
+        assert!(error.contains(".."), "{error}");
+        assert!(!home.root.join("results").join("job1").exists());
+        assert!(!root.join("zzz").exists(), "nothing created");
+        let error = extract(&home, &bind, Some(Path::new("rel/out"))).expect_err("relative");
+        assert!(error.contains("relative"), "{error}");
+        #[cfg(unix)]
+        {
+            // A symlinked ancestor that resolves into the home is refused, and nothing remains.
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&home.root, &link).unwrap();
+            let via = link.join("results").join("job2");
+            assert!(extract(&home, &bind, Some(&via)).is_err());
+            assert!(!home.root.join("results").join("job2").exists());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1311 fable M1: only an event id reaches the file system.
+    #[test]
+    fn bind_for_refuses_anything_but_an_event_id() {
+        let (root, home, _bind) = seeded("ids", &[("a", "a")]);
+        let abs = home.root.join("jobs").join("ab".repeat(32));
+        for bad in [
+            abs.to_str().unwrap(),
+            "../jobs/x",
+            "AB",
+            "",
+            &"g".repeat(64),
+        ] {
+            assert!(
+                bind_for(&home, bad).unwrap_err().contains("not a job id"),
+                "{bad:?}"
+            );
+        }
+        assert!(is_event_id(&"ab".repeat(32)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // #1311 fable L7: a max smaller than one character still advances; L6/L8: listings page and
+    // name symlinks.
+    #[test]
+    fn paging_always_advances_and_listings_page() {
+        let value = text_slice("f", "é!".as_bytes(), 0, 1);
+        assert_eq!(value["content"], json!("é"));
+        assert_eq!(value["next_offset"], json!(2));
+        let names: Vec<String> = (0..LIST_MAX_ENTRIES + 3)
+            .map(|i| format!("f{i:05}"))
+            .collect();
+        let files: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "x")).collect();
+        let (root, home, bind) = seeded("paging", &files);
+        let first = read(&home, &bind, None, 0, None).unwrap();
+        assert_eq!(first["file_count"], json!(LIST_MAX_ENTRIES + 3));
+        assert_eq!(first["files"].as_array().unwrap().len(), LIST_MAX_ENTRIES);
+        let next = first["next_offset"].as_u64().unwrap() as usize;
+        let rest = read(&home, &bind, None, next, None).unwrap();
+        assert_eq!(rest["files"].as_array().unwrap().len(), 3);
+        assert!(rest.get("next_offset").is_none());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

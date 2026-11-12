@@ -120,6 +120,15 @@ pub struct CollectOutcome {
     pub model_used: Option<String>,
 }
 
+impl CollectOutcome {
+    /// `"inline"` when an answer was written to `path`, `"store"` for a git delivery kept in the
+    /// buyer store. The settled view derives the same value from the bind's kind; an inline settle
+    /// always writes its answer, so the two agree.
+    pub fn delivery_kind(&self) -> &'static str {
+        if self.path.is_some() { "inline" } else { "store" }
+    }
+}
+
 #[derive(Debug)]
 pub enum CollectError {
     Input(String),
@@ -601,7 +610,8 @@ pub fn delivery_store_path(home: &MaxplayerHome) -> PathBuf {
 /// longer written there.
 pub const GIT_OUT_REFUSAL: &str = "'out' names a results folder for an inline answer only; a git \
      delivery stays in the buyer store and is not written to disk. Read it with read_delivery, or \
-     extract it on purpose with `maxplayer delivery extract <job_id> --to <dir>`. Nothing was paid";
+     extract it on purpose with `maxplayer delivery extract <job_id> --to <dir>`. Nothing was paid; \
+     the delivery is accepted and settles on its own (or collect again without out)";
 
 /// The inline answer this bind settles, if it is an inline delivery (§6.4).
 fn inline_answer_of(bind: &AcceptedBind) -> Option<&str> {
@@ -881,7 +891,7 @@ const MAX_DELIVERY_PATH_BYTES: usize = 512;
 const MAX_DELIVERY_DEPTH: usize = 64;
 /// Most tree entries (files, directories, symlinks, submodules) one delivery may hold. Also bounds
 /// the walk itself: a tree is a DAG, so a few shared subtrees can name 2^N paths (#1290 fable M2).
-const MAX_DELIVERY_ENTRIES: usize = 100_000;
+pub(crate) const MAX_DELIVERY_ENTRIES: usize = 100_000;
 /// Largest single delivered file.
 const MAX_DELIVERY_FILE_BYTES: u64 = 100 * 1024 * 1024;
 /// Most bytes one delivery may write to disk.
@@ -1790,6 +1800,41 @@ mod tests {
         assert!(bind_is_inline(&bind));
         bind.delivery_kind = Some("fork".to_owned());
         assert!(!bind_is_inline(&bind));
+    }
+
+    // P1 (settle-without-unpacking): no settle path writes a git delivery to disk. Paid, free and
+    // session-turn settles all go through this file; the only writer of delivered files is
+    // `delivery_read::extract`. Red-on-revert: restoring `materialize_delivery` in any settle arm.
+    #[test]
+    fn no_settle_path_calls_the_delivery_writer() {
+        let source = include_str!("collect.rs");
+        let body = &source[..source.find("#[cfg(test)]\nmod tests {").expect("tests module")];
+        let calls: Vec<&str> = body
+            .lines()
+            .filter(|line| line.contains("materialize_delivery(") && !line.trim_start().starts_with("//"))
+            .collect();
+        assert_eq!(calls, vec!["pub fn materialize_delivery("], "{calls:?}");
+    }
+
+    // `out` names a results folder, and a git delivery has none: refused before any pay (no gate is
+    // even supplied, so reaching the pay path would fail differently).
+    #[tokio::test(flavor = "current_thread")]
+    async fn collect_refuses_out_for_a_git_delivery_before_pay() {
+        let root = std::env::temp_dir().join(format!("maxplayer-gitout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = home::bootstrap(&root).expect("home");
+        let job = "9a".repeat(32);
+        write_bind(&home, &bind_for(&job, &"5".repeat(64), &"d".repeat(40)));
+        let error = collect_async(
+            &home,
+            None,
+            CollectRequest { accept_review_verdict: None, job_id: job.clone(), out: Some("x".into()) },
+        )
+        .await
+        .expect_err("refused");
+        assert!(error.to_string().contains("inline answer only"), "{error}");
+        assert!(!root.join("results").exists() && !root.join("payment-journal").exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Helper: a from-scratch accept-bind pinning `commit_oid` (used by refuse-path tests).

@@ -227,12 +227,12 @@ adds a fifth, `reply` — see *Session jobs* below):
 **Reading a delivery.** A settled git delivery (`settlement.delivery: "store"`) is not written to
 disk, so no seller file sits under its own name where an agent tool or git would load it. Read it
 with the `read_delivery` tool or `maxplayer delivery show <job_id> [<path>]`. Extract it only on
-purpose, with `extract_delivery` or `maxplayer delivery extract <job_id> [--to <dir>]`, into a new
-folder under the system temp dir by default. That folder holds the seller's own file names, agent
+purpose, with `extract_delivery` (always a new folder under the system temp dir) or
+`maxplayer delivery extract <job_id> [--to <dir>]`. That folder holds the seller's own file names, agent
 instruction files included: do not start an agent session or run git in it until it is reviewed.
 For a contribution job, fetch the commit into your own clone instead:
-`git fetch "$MAXPLAYER_HOME/store" refs/maxplayer/deliveries/<commit_oid>:refs/heads/review/<id>`,
-review the diff, merge when satisfied. Folders under `results/` written by v0.7.3-rc8 or earlier
+`git fetch "${MAXPLAYER_HOME:-$HOME/.maxplayer}/store" refs/maxplayer/deliveries/<commit_oid>:refs/heads/review/<id>`,
+review the diff (see the multi-turn-buying skill for the exact commands), merge when satisfied. Folders under `results/` written by v0.7.3-rc8 or earlier
 hold seller files under their own names: delete them, and never start an agent session from `~` or
 inside `results/`.
 

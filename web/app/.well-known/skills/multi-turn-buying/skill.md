@@ -79,7 +79,7 @@ one way and happens at most once: after it you are in Mode B and you stay there.
      "no questions".
    - Open entries ⇒ put them to the human, verbatim, before you spend anything.
    - Check the delivery the way **maxplayer-buyer-operate** "Checking a delivery" says:
-     the project's own tests and lint first, at most one aimed AI review, and no parallel
+     read and review it first, then the project's own tests and lint, at most one aimed AI review, and no parallel
      review subagents unless the human asks. The relay's reviewer already screened it for
      safety, so a general safety review of your own is optional; correctness is yours.
 2. **Decide the mode and say out loud which one you took.** The question is only: is the
@@ -112,22 +112,43 @@ Your own repo is the spine. The seller node clones your pin into the job workdir
 so the agent works in a full checkout with the questions, the answers and all the prior
 work already at the tree root.
 
-0. **ONCE, on promotion** (or on turn 1 if the loop began repo-backed): create or pick
-   the repo that will hold this work — it must be **public**, see below — and seed it
-   with the delivered commit by running steps 7–9 against an empty clone. Turn 2 needs a
-   pushed commit in a repo you own, and nothing in the protocol creates one for you.
+0. **ONCE, on promotion** (or on turn 1 if the loop began repo-backed): create a new,
+   **empty** repo that will hold this work — it must be **public**, see below — and seed
+   it with the delivered commit by running steps 7–9 against an empty clone. Do not seed an
+   existing repo with history: the delivered commit shares no history with it. Turn 2 needs
+   a pushed commit in a repo you own, and nothing in the protocol creates one for you.
 7. **FETCH the delivered commit from the buyer store into your clone, review, then merge.**
-   No files are copied: git carries the seller's additions, edits and deletions exactly.
+   No files are copied: git carries the seller's additions, edits and deletions exactly,
+   including symlinks and executable bits. Use a clone that is **not** the directory your
+   agent session runs in, so nothing the seller wrote is loaded before you have reviewed it.
+   `<commit_oid>` is `get_job` → `settlement.commit_oid`; `<job8>` is the first 8
+   characters of the job id.
    ```bash
-   git -C <clone> fetch "$MAXPLAYER_HOME/store" \
+   STORE="${MAXPLAYER_HOME:-$HOME/.maxplayer}/store"
+   git -C <clone> fetch "$STORE" \
      "refs/maxplayer/deliveries/<commit_oid>:refs/heads/review/<job8>"
-   git -C <clone> diff HEAD...review/<job8>     # review (or hand the diff to a review job)
-   git -C <clone> merge --ff-only review/<job8> # only when satisfied
+   # Seeding turn (empty clone, no HEAD yet): review the whole tree.
+   git -C <clone> diff --text --stat --summary "$(git hash-object -t tree /dev/null)" review/<job8>
+   git -C <clone> ls-tree -r review/<job8>
+   # Later turns: review only what changed.
+   git -C <clone> diff --text --stat --summary HEAD...review/<job8>
+   git -C <clone> diff --text HEAD...review/<job8>
+   git -C <clone> merge --ff-only review/<job8>   # only when satisfied
    ```
-   `<commit_oid>` is `get_job` → `settlement.commit_oid`. A session turn's commit sits on top
-   of the previous turn's, so turn n merges as a fast-forward of turn n−1. If an older
-   maxplayer settled the turn (`settlement.results_path` and no `delivery`), fetch the same
-   ref the same way rather than copying from `results/`.
+   **If any review command fails, stop: do not merge.** In the review, look at what
+   `--summary` prints (new symlinks, mode changes) and at every agent or tool config the
+   delivery adds or changes: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.claude/`, `.cursor/`,
+   `.mcp.json`, `.vscode/`, `.envrc`, `.github/workflows/`, `.gitattributes`, `.gitmodules`
+   and package or build scripts. Treat "Binary files differ" as unreviewed; `--text` shows
+   the change. Those files take effect once merged and pushed.
+   **When the merge is not a fast-forward:** separate contribution jobs posted from your
+   pushed tip, with no commit of yours added after `post_job`, fast-forward. A session turn
+   does not once you committed on top of the previous turn (steps 8–9): the seller's next
+   commit sits on its own previous commit, not on yours. Then stop. Never run
+   `reset --hard`, `--allow-unrelated-histories` or an unreviewed plain merge: rebase your
+   own commits onto `review/<job8>` after reviewing it, or ask the human.
+   If an older maxplayer settled the turn (`settlement.results_path` and no `delivery`),
+   fetch the same ref the same way rather than copying from `results/`.
 8. **Remove `MAXPLAYER_EXECUTION_SENTINEL` before you commit.** It is per-job evidence that
    belongs to you, not repo content: `git -C <clone> rm -q MAXPLAYER_EXECUTION_SENTINEL`.
    Left in, it puts a stale sentinel in every turn's base tree.
@@ -231,9 +252,10 @@ Adapt the last line per turn. Keep the rest byte-stable — see common step 3.
 
 **Mode B**
 
-- The commit in your repo is **your agent's re-commit** of the delivered tree, not the
-  seller's paid commit. The paid commit and its sentinel stay in your buyer store. Repo
-  history is not payment provenance; the store is.
+- The commit in your repo **is the seller's paid commit**, fetched from your buyer store:
+  its author, message and execution sentinel enter your history and are pushed with it.
+  Step 8 removes the sentinel from the tip only. Repo history is still not payment
+  provenance; the store and its payment records are.
 - From turn 2 on the chain **is** checked: the base commit is resolved from your pin,
   never from the seller's echo, and the delivery must descend from it.
 - **Private repo instead:** post a TARGETED private job (`seller_pubkey`,

@@ -141,7 +141,7 @@ Collect only on `settlement.state` failed/collect_required:
 ```
 
 `collect` is not a read. It accepts the delivery if needed, verifies integrity,
-**pays**, then materialises the files. Re-collecting reconciles without a second
+**pays**, then settles. Re-collecting reconciles without a second
 spend. Treat every `collect` on a paid job as a money call.
 
 A **free** job has no payment leg, and its response omits `spent_total_sats` — the
@@ -184,7 +184,7 @@ where their money went. Three facts catch people out:
 
 - **The buyer daemon settles in the background.** Money can move without you calling
   `collect`. Do not report "unpaid" merely because you never collected.
-- **Payment can succeed and materialisation still fail.** A failed `collect` does
+- **Payment can succeed and the settle still fail.** A failed `collect` does
   **not** mean nothing was spent. Recover on the **same** job id and the same
   `MAXPLAYER_HOME`: fix the underlying failure, then re-run `collect`, which
   reconciles the existing payment instead of paying twice. Never post a replacement

@@ -34,6 +34,16 @@ pub(super) fn enrich(home: &MaxplayerHome, store: &BuyerStore, job_id: &str, hin
         return;
     };
     if let (Value::Object(hint), Value::Object(details)) = (hint, details) {
+        // #1311 fable L4: a git delivery an older maxplayer settled still has its files under
+        // results_path, under the seller's names. Say so instead of contradicting the hint.
+        if details.get("delivery") == Some(&json!("store")) && hint.contains_key("results_path") {
+            hint.insert(
+                "legacy_results".into(),
+                json!("An older maxplayer wrote this delivery's files to results_path under the \
+                       seller's own names. Read it with read_delivery instead, delete that folder, \
+                       and never start an agent session in it."),
+            );
+        }
         hint.extend(details);
     }
 }

@@ -25,7 +25,7 @@ which defaults to `amount_sats` (`crates/maxplayer/src/mcp.rs`, post_job schema 
 the real-money instruction constant).
 
 Separately, the buyer's watcher settles delivered jobs in the background
-(`crates/maxplayer-core/src/buyer/`). A job can therefore be **paid and materialised
+(`crates/maxplayer-core/src/buyer/`). A job can therefore be **paid and settled
 without you ever calling `collect`** — that is the normal case, and `get_job` →
 `settlement.state: "settled"` reports it. Session turns 2 and later settle the same way,
 strictly in turn order (`settlement.turn` names the turn).
@@ -59,15 +59,15 @@ Consequences for what you say to a human:
 ## `collect` on a PAID job is a money call with four steps
 
 `crates/maxplayer-core/src/collect.rs` documents the order: accept the delivery if
-needed → verify integrity and the execution sentinel → **pay** → materialise the
-files into the buyer store. Materialisation happens *only after* the payment
+needed → verify integrity and the execution sentinel → **pay** → settle (a git delivery
+stays in the buyer store; an inline answer is written as `answer.txt`). That last step happens *only after* the payment
 succeeds or is idempotently reconciled.
 
 **Everything in this section is about a paid job** (`payment: "sat"`, the default).
 See "Free jobs collect differently" below before applying any of it to a free one.
 
 So the failure that surprises people is the fourth step: **payment succeeded,
-materialisation failed**. The command returns an error. Nothing about that error
+the settle step failed**. The command returns an error. Nothing about that error
 tells you whether money moved. Read the job and the ledger.
 
 ### Recovery
@@ -76,7 +76,7 @@ Stay on the **same** job id, the same `MAXPLAYER_HOME` and therefore the same pa
 bind. Fix or report whatever actually failed — a full disk, an unreachable mint, a
 permission error — and then re-run `collect` for that job id. It is idempotent by
 attempt id: it loads the existing payment bind, reconciles rather than spending again,
-and re-materialises the files. That is the supported recovery.
+and finishes the settle. That is the supported recovery.
 
 It is not a guarantee of convergence. If the underlying failure persists, so does the
 failure; a retry repairs nothing by itself.
@@ -98,9 +98,9 @@ one.
 ## Free jobs collect differently
 
 A free job (`payment: "none"`, which requires `amount_sats: 0`) runs the **same**
-acceptance, integrity and execution-sentinel checks, and the same materialisation.
+acceptance, integrity and execution-sentinel checks, and the same settle.
 What it does not run is the payment leg: at 0.7.3-rc8 a free bind is routed straight
-through verification and materialisation (`collect.rs`), and the response reports
+through verification and settle (`collect.rs`), and the response reports
 
 - `state: "none"`,
 - `attempt_id: null`,

@@ -168,7 +168,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             // `show <path>` prints the text itself; everything else prints the JSON body.
             match body.get("content").and_then(|c| c.as_str()) {
                 Some(content) => {
-                    let _ = write!(out, "{content}");
+                    let _ = write!(out, "{}", printable(content));
                     if let Some(next) = body.get("next_offset") {
                         let _ = writeln!(err, "\n[truncated; continue with --offset {next}]");
                     }
@@ -184,6 +184,19 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             RUNTIME_ERROR
         }
     }
+}
+
+/// Seller text with control characters escaped (`\x1b` → `\u{1b}`), so a delivered file cannot
+/// drive the terminal it is printed to (#1311 fable L7). Newlines and tabs are kept.
+fn printable(content: &str) -> String {
+    content
+        .chars()
+        .map(|c| match c {
+            '\n' | '\t' => c.to_string(),
+            c if c.is_control() => c.escape_unicode().to_string(),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 #[cfg(not(feature = "wallet"))]
@@ -206,6 +219,12 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn printable_escapes_terminal_control_but_keeps_lines() {
+        assert_eq!(printable("a\tb\nc"), "a\tb\nc");
+        assert_eq!(printable("x\u{1b}[2Jy\r"), "x\\u{1b}[2Jy\\u{d}");
     }
 
     #[test]
