@@ -122,13 +122,24 @@ work already at the tree root.
 8. **Exclude `MAXPLAYER_EXECUTION_SENTINEL` and every `*.delivered` path from the sync.**
    The sentinel is per-job evidence that belongs to you, not repo content. Committed, it
    puts a stale sentinel in every turn's base tree, which the next snapshot then deletes.
-   `results/` holds dot-prefixed names and agent instruction files (`AGENTS.md`,
-   `CLAUDE.md`, …) renamed with a `.delivered` suffix: also exclude every dot-prefixed
-   path and `AGENTS*.md`/`CLAUDE*.md` on both sides, so the mirror neither copies the
-   seller's versions in nor deletes your repo's own. With rsync:
-   `rsync -a --delete --exclude='.*' --exclude='*.delivered' --exclude='AGENTS*.md' --exclude='CLAUDE*.md' --exclude=MAXPLAYER_EXECUTION_SENTINEL results/<job_id>/ <clone>/`.
-   Never add `--delete-excluded`. A seller change to one of those files reaches your repo
-   only when the human reviews it and moves it in.
+   `results/` holds dot-prefixed names and agent instruction files renamed with a
+   `.delivered` suffix: also exclude every dot-prefixed path and each of those
+   instruction files by name, on both sides, so the mirror neither copies the seller's
+   versions in nor deletes your repo's own. With rsync:
+   ```bash
+   rsync -a --delete --exclude='.*' --exclude='*.delivered' --exclude=MAXPLAYER_EXECUTION_SENTINEL \
+     --exclude=AGENTS.md --exclude=AGENTS.override.md --exclude=AGENT.md \
+     --exclude=CLAUDE.md --exclude=CLAUDE.local.md --exclude=GEMINI.md \
+     --exclude=CRUSH.md --exclude=crush.json --exclude=WARP.md \
+     --exclude=opencode.json --exclude=opencode.jsonc \
+     results/<job_id>/ <clone>/
+   ```
+   The renaming ignores letter case and these excludes do not, so if your repo has one of
+   those files in another case (`agents.md`), exclude that spelling too. Never add
+   `--delete-excluded`. A seller change to one of those files (including a delivered
+   `.gitignore`, which arrives as `.gitignore.delivered`, so a repo seeded in step 0 has
+   none until you move it in) reaches your repo only when the human reviews it and moves
+   it in.
 9. **Write the answers into `QUESTIONS.md`, commit, and PUSH — in that order, before you
    post.** The base commit is fetched from the pinned URL, so an unpushed commit makes
    the job refuse.

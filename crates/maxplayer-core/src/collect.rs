@@ -846,7 +846,7 @@ const PORTABLE_PATH_MAX: usize = 1024;
 const TEMP_NAME_MAX: usize = 64;
 
 /// Suffix materialize appends to a delivered path component an agent harness or editor would load
-/// on its own (see [`AGENT_CONTROL_NAMES`]). The bytes are kept; only the name changes, and the
+/// on its own (see [`is_agent_control_name`]). The bytes are kept; only the name changes, and the
 /// delivered commit in the buyer store still holds the original path.
 pub const INERT_SUFFIX: &str = ".delivered";
 
@@ -888,6 +888,9 @@ const AGENT_CONTROL_FILES: &[&str] = &[
 fn is_agent_control_name(component: &str) -> bool {
     let key = collision_key(component);
     if key.starts_with('.') {
+        // The `.delivered` exemption is for materialize's idempotence only. A later path that
+        // moves a delivery into a project must gate every dot-prefixed name, including
+        // `.foo.delivered`, without it.
         return !key.ends_with(INERT_SUFFIX);
     }
     AGENT_CONTROL_FILES.contains(&key.as_str())

@@ -332,10 +332,12 @@ order; `settlement.turn` says which turn the object describes.
   it into a project whole. Move a renamed file back into place only when the human asks.
 - **Correctness is not screened.** The reviewer is told not to assess correctness, so that part is
   yours. The cheapest strong evidence is the project's own checks: tests, lint and build at the
-  delivered commit (at each commit, if the delivery is a stack). They run seller code, so first read
-  what the delivery changes in build scripts, dependencies and test setup (`build.rs`,
-  `package.json` scripts, `Makefile`, `conftest.py`), or run them where neither `$MAXPLAYER_HOME`
-  nor other keys are reachable. That costs CPU, not tokens.
+  delivered commit (at each commit, if the delivery is a stack). They run seller code, and a
+  checkout of the commit brings its dotfiles back under their original names, so check it out in a
+  throwaway directory, never your working repo. First read what it changes in build scripts,
+  dependencies, test setup and tool config (`build.rs`, `package.json` scripts, `Makefile`,
+  `conftest.py`, `.cargo/config.toml`, `.envrc`), or run the checks where neither
+  `$MAXPLAYER_HOME` nor other keys are reachable. That costs CPU, not tokens.
 - **AI code review: one pass, aimed.** If you still want a model to read the code, run one pass over
   the riskiest change (money, auth, migrations, deletions), not one reviewer per commit or PR.
 - **No parallel review subagents unless the human asks.** Several reviewers reading a
