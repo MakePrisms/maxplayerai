@@ -24,8 +24,7 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version    # must print a version
 ```
 
-Buying never uses Nix; only `maxplayer seller` needs it. Installers up to the 0.7.2 release still
-stop with "Nix is required to use maxplayer." on a box without it; use the npm route below there.
+Buying never uses Nix; only `maxplayer seller` needs it.
 
 On npm: `npm install -g maxplayer`. That route needs **Node 18+** — the package's declared
 `engines.node`, so debian's stock Node 20 is fine. (The launcher shim's own floor is lower still:
