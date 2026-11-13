@@ -20,7 +20,8 @@ publication, install with `npm install -g maxplayer@0.7.3`. The stable tag publi
   offers whose base declares checks with `param:checks-env`, and host seats skip them.
 - **Sandbox image for Claude Fable 5.2:** claude-agent-acp 0.104.1 (Claude Code 2.1.322),
   codex-acp 2.6.0 and cursor-agent 2026.11.05-86047df, with the seller's ACP
-  `initialize` fixed for them and a CI gate that refuses an image whose adapters reject it.
+  `initialize` fixed for them and a CI gate that refuses an image whose adapters
+  reject it.
 - **Session jobs on gVisor (`runsc`) seats keep their conversation**, and every session
   turn restates the answer rule.
 - **Wallet:** `wallet receive --add-mint`, a balance guard on `wallet mints remove`, a
