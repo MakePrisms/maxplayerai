@@ -49,9 +49,10 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
     independent verify task, no buyer confirmation; our buyer uses the `claude` preset; `codex`
     ships as a preset only after a live canary. (Josip, accepted defaults)
 16. **Private tasks are a setting.** A swarm can send its tasks as private offers. (Bob, 13 Nov 17:13)
-17. **The lead sets up its own coordination structure**, like the five tables in Anthropic's
-    Fermat run (Announce, Assign, Notes, Subtasks, Landed), and team-wide orders reach sellers inside
-    the task text. (Bob, 13 Nov 17:03–17:11)
+17. **The lead has the tools to set up its own coordination structure if it wants to**, e.g. the five
+    tables in Anthropic's Fermat run (Announce, Assign, Notes, Subtasks, Landed). Nothing is
+    prescribed: no default boards, no required structure. Team-wide orders reach sellers inside the
+    task text. (Bob, 13 Nov 17:03–17:18)
 18. **Everything passes through the lead.** Sellers never take orders from other sellers: only the
     lead writes boards and the queue; seller notes and proposed subtasks go to the lead, which
     decides what, if anything, other sellers see. (Bob, 13 Nov 17:17)
@@ -285,12 +286,14 @@ JSON back, plus the canaries in §10. Failure disables the planner and shows in
 Agent-queued tasks are dispatched; results wait for the agent's next `swarm_job_status`.
 `swarm_job_create` says so.
 
-### 9.5 Boards: lead-defined shared state
+### 9.5 Boards: optional primitives for the lead
 
-The lead (planner, or the buyer's agent) designs the team's coordination structure itself, with no
-tools: board operations are part of its JSON output. Mapping to the Fermat run's five tables:
+Boards are tools, not a structure. A swarm job starts with **no boards**; the planner prompt
+describes what the primitives can do and leaves it to the lead (planner, or the buyer's agent)
+whether to use them at all. Board operations are part of the lead's JSON output, so the lead still
+needs no tools. A lead that wants the Fermat run's setup can build it from these primitives:
 
-| Their table | Here |
+| Their table | How a lead could build it |
 |---|---|
 | Announce | a board the lead creates with `include: all` |
 | Assign | a board the lead writes, plus task pins and workstream owners |
@@ -391,7 +394,8 @@ Each behind a default-off flag where it changes running behaviour.
 5. **Planner** (§9, §10): presets, `planner_command`, `planner-test` with canaries, `analyze` +
    `step` with board operations, triggers, output filter, verify-before-solved. Tests: stub planner;
    rejected output fed back; canaries refuse a writing / reading command; idle ceiling; one call per
-   settled batch; a stub lead that creates the five Fermat-style boards drives a task tree.
+   settled batch; a swarm job with no boards works exactly like one without the feature; a stub
+   lead that chooses to build the five Fermat-style boards can drive a task tree with them.
 6. **Retire** `scripts/challenges/` and the old docs after one live swarm job on the new path.
 
 Bob's rule stands: no swarm merges while a swarm job is live; confirm the board deploy before telling
