@@ -1716,12 +1716,19 @@ the window rather than closing it.
 
 **Upgrading without interrupting a job: drain first.** A stop leaves running jobs to the next boot,
 which reruns an interrupted agent from the beginning. To upgrade with nothing in flight, install the
-new binary, then send the running seller **SIGUSR1** instead of SIGTERM:
+new binary, then drain the running seller:
 
 ```bash
-systemctl --user kill -s USR1 maxplayer-seller   # systemd unit
-docker kill --signal=USR1 <container>            # docker
-kill -USR1 <pid>                                 # bare process
+"$MAXPLAYER_BIN" seller drain --home "$MAXPLAYER_HOME"   # waits until it has exited; --no-wait returns at once
+```
+
+`seller drain` finds the seller through its home lock (`seller.lock` records the holder's pid) and
+sends it **SIGUSR1**. It exits 2 without sending anything when no seller runs on that home. A seller in
+a container is reached from inside it, or with the signal directly:
+
+```bash
+docker exec <container> maxplayer seller drain   # or: docker kill --signal=USR1 <container>
+systemctl --user kill -s USR1 maxplayer-seller   # systemd, equivalent to the command
 ```
 
 The seller then advertises `accepting=n`, claims nothing new, still honours an award for a claim it

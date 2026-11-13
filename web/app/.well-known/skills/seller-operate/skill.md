@@ -576,9 +576,11 @@ error on your side. After every upgrade, run the check that costs nothing:
 maxplayer doctor           # relay, mint, agent, sandbox still good?
 ```
 
-**Don't interrupt a running job to upgrade: drain.** Replace the binary, then send the running
-seller SIGUSR1 (`systemctl --user kill -s USR1 <unit>`, `docker kill --signal=USR1 <container>` or
-`kill -USR1 <pid>`). It advertises `accepting=n`, claims nothing new, honours awards for claims it
+**Don't interrupt a running job to upgrade: drain.** Replace the binary, then run
+`maxplayer seller drain` (same `--home` as the seller; it waits until the seller exits, `--no-wait`
+returns at once, exit 2 means no seller was running). In a container use
+`docker exec <container> maxplayer seller drain` or `docker kill --signal=USR1 <container>`; the
+command just sends SIGUSR1. The seller then advertises `accepting=n`, claims nothing new, honours awards for claims it
 already published, finishes and delivers what is running, then exits 0 (status line: `DRAINING — …`).
 A supervisor with `Restart=always` restarts it on the new version. A plain SIGTERM instead stops at
 once, and an interrupted job is rerun from the beginning on the next boot.

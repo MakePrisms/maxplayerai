@@ -28,6 +28,9 @@ mod sell;
 // `sell`: it is reached only through the `seller` arm and reads the seller node's store.
 #[cfg(feature = "acp")]
 mod seller_fees;
+// `maxplayer seller drain` (#1299): signals the seller holding this home's lock. Same gate as `sell`.
+#[cfg(feature = "acp")]
+mod seller_drain;
 // The containment probe is compiled on every build, not only the seller one: the payload half runs
 // INSIDE the launcher, and a seat may reasonably run the probe from a binary it already trusts.
 #[cfg(feature = "wallet")]

@@ -80,6 +80,17 @@ impl HomeLock {
             };
         }
 
+        // #1299: record the holder's pid so `maxplayer seller drain` can find this node. Written only
+        // once the lock is ours (never before the flock, which would clobber a live holder's pid),
+        // truncating first so a shorter pid leaves no stale tail. Best effort: a failed write costs
+        // the drain command its target (it then reports "no pid recorded"), never the node its home.
+        {
+            use std::io::Write;
+            let _ = file.set_len(0).and_then(|()| {
+                (&file).write_all(format!("{}\n", std::process::id()).as_bytes())
+            });
+        }
+
         Ok(Self { path, _file: file })
     }
 
@@ -87,6 +98,159 @@ impl HomeLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// #1299: who holds a seller home lock, as seen by another process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockHolder {
+    /// No lock file, or nothing holds it: no seller node is running on this home.
+    Free,
+    /// A process holds it and recorded this pid.
+    Pid(u32),
+    /// Held, but no pid recorded: a seller from before #1299 (which does not handle SIGUSR1 either),
+    /// or one in the instant between taking the lock and writing its pid.
+    Unrecorded,
+}
+
+/// #1299: probe a seller home lock without taking it for longer than the probe.
+///
+/// Opens the file read-only (never creates it) and tries a NON-blocking shared lock: success means
+/// nobody holds it (released again at once); `EWOULDBLOCK` means a node holds it, and the file's
+/// content is the pid that node recorded. The brief shared lock can make a node starting in that
+/// same instant fail its own acquire, which it reports as an ordinary "already owned" refusal.
+pub fn holder(path: impl AsRef<Path>) -> Result<LockHolder, LockError> {
+    use std::io::Read;
+    let mut file = match OpenOptions::new().read(true).open(path.as_ref()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(LockHolder::Free),
+        Err(error) => return Err(LockError::Open(error.to_string())),
+    };
+    // Safety: plain libc call on a valid descriptor owned by `file` for the whole call.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(LockHolder::Free); // our shared lock is released when `file` drops
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        return Err(LockError::Flock(error.to_string()));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .map_err(|error| LockError::Open(error.to_string()))?;
+    Ok(match content.trim().parse::<u32>() {
+        Ok(pid) if pid > 0 => LockHolder::Pid(pid),
+        _ => LockHolder::Unrecorded,
+    })
+}
+
+/// #1299: why a drain request was not sent.
+#[derive(Debug)]
+pub enum DrainRefusal {
+    /// Nothing holds the lock: no seller is running on this home.
+    NotRunning,
+    /// Held, but no pid recorded.
+    Unrecorded,
+    /// The recorded pid does not have this lock file open: the node runs in another pid namespace
+    /// (a container) or the pid is not the holder. Signalling it could hit an unrelated process.
+    NotHolder { pid: u32 },
+    /// The lock or the holder could not be inspected.
+    Inspect(String),
+    /// `kill(2)` failed.
+    Signal { pid: u32, error: String },
+}
+
+impl std::fmt::Display for DrainRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotRunning => write!(f, "no seller is running on this home (its lock is free)"),
+            Self::Unrecorded => write!(
+                f,
+                "a seller holds this home but recorded no pid: it is older than the drain feature \
+                 (SIGUSR1 would kill it outright, so nothing was sent) or still starting — retry \
+                 in a moment, or wait until it is idle and stop it normally"
+            ),
+            Self::NotHolder { pid } => write!(
+                f,
+                "the recorded seller pid {pid} does not hold this home's lock from here: the seller \
+                 probably runs in a container (use `docker exec <container> maxplayer seller drain` \
+                 or `docker kill --signal=USR1 <container>`); nothing was sent"
+            ),
+            Self::Inspect(error) => write!(f, "could not inspect the running seller: {error}"),
+            Self::Signal { pid, error } => write!(f, "could not signal seller pid {pid}: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DrainRefusal {}
+
+/// #1299: ask the seller node holding the lock at `path` to drain (SIGUSR1). Returns its pid.
+///
+/// Signals only a pid that (on Linux) is proven to have THIS lock file open, so a recorded pid that
+/// means something else here — a container's pid namespace, a reused pid — is refused, not hit.
+pub fn request_drain(path: impl AsRef<Path>) -> Result<u32, DrainRefusal> {
+    let path = path.as_ref();
+    let pid = match holder(path).map_err(|error| DrainRefusal::Inspect(error.to_string()))? {
+        LockHolder::Free => return Err(DrainRefusal::NotRunning),
+        LockHolder::Unrecorded => return Err(DrainRefusal::Unrecorded),
+        LockHolder::Pid(pid) => pid,
+    };
+    if !holds_file_open(pid, path).map_err(DrainRefusal::Inspect)? {
+        return Err(DrainRefusal::NotHolder { pid });
+    }
+    let raw = libc::pid_t::try_from(pid).map_err(|_| DrainRefusal::NotHolder { pid })?;
+    // Safety: plain libc call; `raw` is a positive pid verified above.
+    if unsafe { libc::kill(raw, libc::SIGUSR1) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Err(DrainRefusal::NotRunning); // exited between the check and the signal
+        }
+        return Err(DrainRefusal::Signal { pid, error: error.to_string() });
+    }
+    Ok(pid)
+}
+
+/// #1299: whether the node a drain was sent to is still up, for a caller waiting on the drain.
+///
+/// Read-only on purpose: it never touches the lock, so polling it cannot make a supervisor's
+/// immediate restart of the drained node fail its own acquire. On Linux "up" means the pid still has
+/// the lock file open (a reused pid does not); elsewhere, that the pid still exists.
+pub fn still_holding(pid: u32, path: impl AsRef<Path>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        holds_file_open(pid, path.as_ref()).unwrap_or(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        let Ok(raw) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // Safety: signal 0 only probes for existence.
+        unsafe { libc::kill(raw, 0) == 0 }
+    }
+}
+
+/// Whether `pid` has the file at `path` open, compared by device and inode through `/proc`.
+#[cfg(target_os = "linux")]
+fn holds_file_open(pid: u32, path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::MetadataExt;
+    let lock = std::fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let fds = std::path::PathBuf::from(format!("/proc/{pid}/fd"));
+    let entries = match std::fs::read_dir(&fds) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("{}: {error}", fds.display())),
+    };
+    Ok(entries.flatten().any(|entry| {
+        std::fs::metadata(entry.path())
+            .is_ok_and(|open| open.dev() == lock.dev() && open.ino() == lock.ino())
+    }))
+}
+
+/// Elsewhere there is no `/proc`: the held lock plus the pid its holder wrote is the evidence.
+#[cfg(not(target_os = "linux"))]
+fn holds_file_open(_pid: u32, _path: &Path) -> Result<bool, String> {
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -120,6 +284,96 @@ mod tests {
         drop(first);
         let third = HomeLock::acquire(&path).expect("acquire after release");
         drop(third);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1299: the holder records its pid, a probe reads it without disturbing the lock, and a
+    /// released (or never created) lock reads as free.
+    #[test]
+    fn the_holder_records_its_pid_and_a_probe_reads_it() {
+        let path = temp_lock("holder");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(holder(&path).unwrap(), LockHolder::Free, "no file: free");
+        let held = HomeLock::acquire(&path).expect("acquire");
+        assert_eq!(holder(&path).unwrap(), LockHolder::Pid(std::process::id()));
+        assert_eq!(holder(&path).unwrap(), LockHolder::Pid(std::process::id()), "probing twice");
+        drop(held);
+        assert_eq!(holder(&path).unwrap(), LockHolder::Free, "released: free");
+        // A pid file left behind is not a holder.
+        assert!(matches!(request_drain(&path), Err(DrainRefusal::NotRunning)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// #1299: a recorded pid that does not have the lock open (another pid namespace, a reused
+    /// pid) is refused, never signalled. RED ON REVERT: drop the `/proc` check and the `sleep`
+    /// child below is sent SIGUSR1, which kills it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_recorded_pid_that_does_not_hold_the_lock_is_not_signalled() {
+        let path = temp_lock("not-holder");
+        let _ = std::fs::remove_file(&path);
+        let mut stranger = std::process::Command::new("sleep").arg("30").spawn().expect("sleep");
+        let held = HomeLock::acquire(&path).expect("acquire");
+        std::fs::write(&path, format!("{}\n", stranger.id())).unwrap();
+        let refused = request_drain(&path);
+        assert!(
+            matches!(refused, Err(DrainRefusal::NotHolder { pid }) if pid == stranger.id()),
+            "{refused:?}"
+        );
+        assert!(stranger.try_wait().unwrap().is_none(), "the stranger must not have been signalled");
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        drop(held);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    const DRAIN_CHILD_ENV: &str = "MAXPLAYER_TEST_DRAIN_CHILD_LOCK";
+
+    /// Not a test on its own: the child half of the next test, re-executed in a separate process.
+    /// Without the env var it returns at once.
+    #[test]
+    fn drain_child_process() {
+        let Some(path) = std::env::var_os(DRAIN_CHILD_ENV) else {
+            return;
+        };
+        extern "C" fn on_usr1(_: libc::c_int) {
+            // Safety: `_exit` is async-signal-safe.
+            unsafe { libc::_exit(0) }
+        }
+        // Handler first, THEN the lock (which publishes the pid): the parent can only find us once
+        // a signal can no longer kill us by default.
+        let handler: extern "C" fn(libc::c_int) = on_usr1;
+        // Safety: installs a handler that only calls an async-signal-safe function.
+        unsafe { libc::signal(libc::SIGUSR1, handler as libc::sighandler_t) };
+        let _held = HomeLock::acquire(PathBuf::from(path)).expect("child acquire");
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::process::exit(7); // never signalled
+    }
+
+    /// #1299: `request_drain` finds the real holder in another process through the lock alone and
+    /// delivers SIGUSR1 to it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn request_drain_signals_the_process_holding_the_lock() {
+        let path = temp_lock("drain-child");
+        let _ = std::fs::remove_file(&path);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "seller_node::lock::tests::drain_child_process", "--test-threads=1"])
+            .env(DRAIN_CHILD_ENV, &path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while holder(&path).unwrap() != LockHolder::Pid(child.id()) {
+            assert!(std::time::Instant::now() < deadline, "the child never took the lock");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(request_drain(&path).expect("drain sent"), child.id());
+        let status = child.wait().unwrap();
+        assert!(!still_holding(child.id(), &path), "an exited holder is not still holding");
+        assert_eq!(status.code(), Some(0), "the child must exit through its SIGUSR1 handler");
+        assert_eq!(holder(&path).unwrap(), LockHolder::Free);
         let _ = std::fs::remove_file(&path);
     }
 }
