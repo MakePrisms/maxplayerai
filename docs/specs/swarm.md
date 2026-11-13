@@ -59,6 +59,9 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
 19. **Session jobs are the default** where the seller supports them: one session per seller per swarm
     job, later tasks as reply turns; fall back to a one-off job otherwise or when the lead marks a
     task `fresh`. Swarm members are told to enable sessions. (Bob, 13 Nov 17:26)
+20. **Shared work product (contribution mode / shared repo) is a follow-up spec**, not part of this
+    one. Its risks and required defaults are recorded in §14.1 so the follow-up starts from them.
+    (Bob, 13 Nov 17:31)
 
 ## 2. What exists today
 
@@ -455,10 +458,37 @@ period.
 - Per-buyer free/paid (`free_for`), auto-raise beyond `max_sats`.
 - Input files, git/code delivery for tasks (text/inline only; see #1250), and a buyer-run checker
   plus toolchain capabilities such as `lean`. Needed for proof/code swarm jobs like the Fermat run;
-  next phase.
+  follow-up spec, see §14.1.
 - Live boards: sellers reading or writing boards mid-task. Needs a seller tool and network access
   from the sandbox; next phase after file delivery.
 - Fully hidden swarms (encrypted name, purpose, goal and roster; invite-only discovery).
+
+### 14.1 Notes for the follow-up: shared work product
+
+Idea: swarm tasks deliver into a shared buyer repo through contribution mode (seller forks, delivers
+a commit; `verify_contribution`, `delivery_git.rs:583`), a buyer-side checker validates, the lead
+merges. New risks versus text answers:
+
+1. **The buyer runs seller code.** Builds, install hooks and tests execute seller code; an
+   unsandboxed checker gives every member code execution next to the buyer's key and wallet.
+2. **Seller-to-seller instructions through the repo.** Harnesses auto-load `AGENTS.md`,
+   `CLAUDE.md`, `.cursor/` etc. from the working directory, bypassing "everything through the lead"
+   (§1.18).
+3. **Gaming the checker** by editing tests or checker config (in Lean: `sorry`, new `axiom`).
+4. **Repo exposure:** every member sees the whole repo, private tasks or not; buyer CI with secrets
+   could run on merged changes.
+5. **Licence/provenance and junk** (copied code, huge files).
+
+Defaults the follow-up must enforce (not advise): a dedicated empty repo per swarm job, never the
+buyer's own; checker in a throwaway sandbox with no network and nothing from the buyer home, and no
+automatic merge without one; refuse changes to tests, checker config, agent instruction files,
+`.github/`, submodules, out-of-repo symlinks and files over a size cap; only the lead merges, after
+the checker passes; off by default, enabled per swarm.
+
+The normal market already carries risks 1, 2, 4, 5 for contribution jobs: collect only
+materializes a read-only copy (`collect.rs:253`), and the default `ContentPolicy` refuses only empty
+diffs (`contribution.rs:285`). A stricter default policy and an "untrusted code" warning in the buyer
+skill and collect output are separate from swarm work.
 - Restricting who may create swarms (addable later as a relay rule on 30344).
 - Per-swarm acceptance (acceptance is per buyer, §1.13).
 - Opting out of one swarm job inside a swarm (membership is per swarm).
