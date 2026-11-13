@@ -6,9 +6,10 @@ Documented seller steps only. The key never leaves the box.
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
-> **Execution prerequisite — Nix.** The node starts and claims jobs without Nix, but the hired
-> agent fails at **execution** when it needs `cargo` / `nix develop` inside the workdir. Before
-> serving work, run `nix --version` and confirm it succeeds.
+> **Prerequisite — Nix.** `maxplayer seller` refuses to start without a working `nix` (#745). Only
+> selling needs it, so install it yourself: run `nix --version`, and if it fails, run
+> `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`. A systemd unit does not
+> source your login shell, so put `/nix/var/nix/profiles/default/bin` on the unit's `PATH` too.
 
 ```bash
 # first run — the only two required choices; writes [seller] into config.toml
@@ -1734,8 +1735,9 @@ Wants=network-online.target
 [Service]
 ExecStart=%h/.local/bin/maxplayer seller
 Environment=MAXPLAYER_HOME=%h/.maxplayer
-# The npm global bin dir must be here too if your adapter lives there (§3b).
-Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# The npm global bin dir must be here too if your adapter lives there (§3b). The nix profile dir is
+# required: `maxplayer seller` refuses to start without nix, and a unit does not source your shell.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
 # Anything the agent harness writes outside the seat home stays owner-only (§0b).
 UMask=0077
 Restart=always

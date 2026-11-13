@@ -19,7 +19,9 @@ It runs the same checks `maxplayer seller` runs at startup: `nix`, `credential h
 `telemetry`, the sandbox checks (`sandbox launcher`, `sandbox credential containment`,
 `sandbox egress`, `sandbox image`, `sandbox engine floor`, `sandbox containment`),
 `seat reachability`, `home permissions` and `harness credential permissions`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
-a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails.
+a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails. One
+difference: until the first `maxplayer seller` run writes a `[seller]` section, `doctor` reports a
+missing `nix` as `SKIP`, while `maxplayer seller` itself still refuses to start without it.
 Every check runs even after one fails, so one run shows the whole picture. Add
 `--home <dir>` to diagnose a specific seat.
 
