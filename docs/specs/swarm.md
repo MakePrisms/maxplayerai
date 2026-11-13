@@ -52,6 +52,9 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
 17. **The lead sets up its own coordination structure**, like the five tables in Anthropic's
     Fermat run (Announce, Assign, Notes, Subtasks, Landed), and team-wide orders reach sellers inside
     the task text. (Bob, 13 Nov 17:03–17:11)
+18. **Everything passes through the lead.** Sellers never take orders from other sellers: only the
+    lead writes boards and the queue; seller notes and proposed subtasks go to the lead, which
+    decides what, if anything, other sellers see. (Bob, 13 Nov 17:17)
 
 ## 2. What exists today
 
@@ -291,32 +294,45 @@ tools: board operations are part of its JSON output. Mapping to the Fermat run's
 |---|---|
 | Announce | a board the lead creates with `include: all` |
 | Assign | a board the lead writes, plus task pins and workstream owners |
-| Notes | a board with `writers: members` |
-| Subtasks | the task queue; members may add tasks with a `parent` link (task tree) |
-| Landed | the results log, filled automatically |
+| Notes | seller reports go to the lead's inbox; the lead republishes what it chooses to a board |
+| Subtasks | the task queue; sellers *propose* subtasks with a `parent` link, the lead accepts them into the queue (task tree) |
+| Landed | the results log, filled automatically; only the lead decides what of it other sellers see |
 
+- **Rule: the lead is the only writer.** Nothing a seller writes reaches another seller unless the
+  lead itself writes it to a board or into a task. No board has member write access.
 - **Board** = named, ordered list of short text entries stored by the daemon per swarm job.
-  Fields set by the lead: `name`, `purpose`, `writers` (`lead` \| `members`), `include`
+  Fields set by the lead: `name`, `purpose`, `include`
   (`all` \| `workstream` \| `none`: which tasks get it pasted in), `cap_chars` (how much of the newest
   entries is pasted). The lead creates, renames, posts to, and removes entries from any board, and
   may define none or as many as it likes (limit 16 per swarm job).
 - **Into the task text.** The daemon builds each task as:
   `## Team orders` / boards selected by `include`, newest first, trimmed to `cap_chars` /
-  `## Your task` / `## Reporting` (how to post back). Board text from members is wrapped as
-  untrusted content. Ordinary job text, so sellers and the wire do not change.
-- **Back from sellers.** A seller may end its answer with one fenced JSON block:
-  `{"notes":[{"board","text"}],"subtasks":[{"text","parent","workstream","durationSeconds"}]}`.
-  The daemon strips it from the answer, checks writers, sizes (≤ 2 KB per note, ≤ 8 notes and
-  ≤ 8 subtasks per task) and that `parent` exists, then applies it. Member subtasks join the queue
-  like any other task: dispatch still enforces minutes, rate and budget, and the lead can drop them.
-- **Lead input.** `step` receives every board (trimmed) and the task tree. New notes count as a
-  change for the `step` trigger (§9.2).
+  `## Your task` / `## Reporting` (how to report back). Every entry was written by the lead.
+  Ordinary job text, so sellers and the wire do not change.
+- **Back from sellers: to the lead only.** A seller may end its answer with one fenced JSON block:
+  `{"notes":["text"],"proposed_subtasks":[{"text","parent","workstream","durationSeconds"}]}`.
+  The daemon strips it from the answer, checks sizes (≤ 2 KB per note, ≤ 8 notes and ≤ 8 proposals
+  per task) and that `parent` exists, and stores it in the **lead inbox**, marked untrusted with its
+  seller and task. Nothing from the inbox is pasted into any task or board automatically.
+- **Lead decides.** `step` receives the inbox, every board and the task tree, and returns board
+  writes and queue additions in its own words: accept a proposal (`accept: [proposal id]`, optionally
+  edited), reject it, or summarise several notes into one board entry. Accepted subtasks keep their
+  `parent`, so the tree still grows from sellers' splits. Dispatch then enforces minutes, rate and
+  budget as for any task. New inbox items count as a change for the `step` trigger (§9.2).
+- **Cost.** Every seller-to-team hop now waits for a lead call (seconds to a few minutes), and the
+  lead's input grows with the inbox (trimmed like results, newest first). With a few dozen members
+  this is fine; at Fermat scale (hundreds of helpers splitting work themselves) the lead becomes
+  the bottleneck. Accepted trade-off.
+- **No planner (check-in mode).** The inbox waits for the buyer's agent, which accepts or rejects
+  through `swarm_job_boards` / `swarm_job_tasks`.
 - **Timing.** Sellers see board updates when their next task starts. Tasks are 5–30 min, so that is
   the coordination delay. Mid-task reads/writes are a later phase (§14).
 - **Visibility.** In a public swarm, boards are public because the task text is. In a private swarm
   they travel only inside encrypted task text (§7.5).
-- **Injection between sellers.** Member notes reach other sellers' prompts. They are marked untrusted
-  and capped; the lead can remove entries. This is inherent to letting helpers coordinate.
+- **Injection.** A seller can still try to steer the lead through its notes, as it can through its
+  answer today. The prompt treats inbox items as untrusted data, the lead restates rather than
+  copies, and the output filter (§10.4) applies to board writes as to tasks. There is no direct
+  seller-to-seller path.
 
 ## 10. Security of the planner call
 
@@ -369,8 +385,9 @@ Each behind a default-off flag where it changes running behaviour.
    tasks over M members with a stub seller; budget never exceeded; restart resumes from the store;
    expired task frees its seller; a member of two swarms gets one task from each; vectors pass in
    Rust; a private swarm's offers carry no task text or swarm link in public events and its tally
-   matches the store; board text lands in the next task; a seller report adds notes and child
-   subtasks and is refused past the caps or for a lead-only board.
+   matches the store; board text lands in the next task; a seller report lands only in the lead
+   inbox, never in another seller's task text, until the lead accepts it; reports past the caps are
+   refused.
 5. **Planner** (§9, §10): presets, `planner_command`, `planner-test` with canaries, `analyze` +
    `step` with board operations, triggers, output filter, verify-before-solved. Tests: stub planner;
    rejected output fed back; canaries refuse a writing / reading command; idle ceiling; one call per
