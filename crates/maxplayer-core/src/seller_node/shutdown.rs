@@ -179,6 +179,87 @@ async fn wait_for_os_signal() -> &'static str {
     }
 }
 
+/// #1299: a request to DRAIN — stop taking new work, finish what is in flight, then leave.
+///
+/// Distinct from a [`ShutdownHandle`] request on purpose. SIGTERM means "stop now": supervisors
+/// follow it with SIGKILL after a short grace (systemd 90 s, `docker stop` 10 s), far shorter than a
+/// job, so it cannot also mean "wait for the job". A drain is asked for separately (SIGUSR1, see
+/// [`spawn_drain_signal_listener`]) and has no deadline of its own; a SIGTERM during a drain still
+/// stops the node immediately, which is the abort path.
+///
+/// A one-way latch: once requested it stays requested for the life of the node, and the first
+/// reason wins. Clones share the latch, so the node keeps one and hands clones out as handles.
+/// The run loop reads it on its drain tick rather than awaiting it, so there is no channel to close
+/// and nothing a dropped handle can be mistaken for.
+#[derive(Clone, Debug, Default)]
+pub struct DrainSignal {
+    reason: std::sync::Arc<std::sync::OnceLock<String>>,
+}
+
+impl DrainSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the node to drain. `true` the first time; `false` when a drain was already requested
+    /// (a repeated signal is redundant, not an error).
+    pub fn request(&self, reason: impl Into<String>) -> bool {
+        self.reason.set(reason.into()).is_ok()
+    }
+
+    /// Whether a drain has been requested.
+    pub fn is_requested(&self) -> bool {
+        self.reason.get().is_some()
+    }
+
+    /// The first request's reason, for the log.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.get().map(String::as_str)
+    }
+}
+
+/// Translate SIGUSR1 into a drain request (#1299), for as long as the returned task lives.
+///
+/// Installing the listener replaces SIGUSR1's default disposition (terminate) — intended: an
+/// operator who sends it wants the jobs to finish, not the process to die mid-job. The handler is
+/// registered SYNCHRONOUSLY, before this returns (call it inside the runtime): `Some` means SIGUSR1
+/// already drains, so the caller may now advertise the pid
+/// ([`crate::seller_node::run::SellerNodeRunner::enable_drain_command`]). `None` means registration
+/// failed (logged): the seat keeps selling without a drain path, exactly as before #1299, and must
+/// NOT advertise its pid.
+#[cfg(unix)]
+pub fn spawn_drain_signal_listener(drain: DrainSignal) -> Option<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut usr1 = match signal(SignalKind::user_defined1()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            crate::opline!(
+                "seller node WARN: SIGUSR1 listener unavailable ({error}); this seat has no \
+                 drain path — an upgrade will interrupt running jobs"
+            );
+            return None;
+        }
+    };
+    Some(tokio::spawn(async move {
+        while usr1.recv().await.is_some() {
+            if drain.request("SIGUSR1") {
+                crate::opline!(
+                    "seller node: SIGUSR1 received; draining — no new claims, finishing in-flight \
+                     work, then exiting (SIGTERM aborts the drain)"
+                );
+            } else {
+                crate::opline!("seller node: SIGUSR1 received; already draining");
+            }
+        }
+    }))
+}
+
+/// Non-unix: no SIGUSR1, so no drain trigger from the OS. An embedder can still use the handle.
+#[cfg(not(unix))]
+pub fn spawn_drain_signal_listener(_drain: DrainSignal) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
 /// Non-unix fallback: `Ctrl-C` only, which is all the platform offers as a deliverable stop.
 #[cfg(not(unix))]
 async fn wait_for_os_signal() -> &'static str {
@@ -195,6 +276,19 @@ async fn wait_for_os_signal() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1299: the drain latch is one-way, the first reason wins, and clones share it — the node
+    /// keeps one and the signal listener holds another.
+    #[test]
+    fn a_drain_request_latches_once_and_is_shared_by_clones() {
+        let node = DrainSignal::new();
+        let handle = node.clone();
+        assert!(!node.is_requested());
+        assert!(handle.request("SIGUSR1"));
+        assert!(node.is_requested(), "a clone's request must reach the node");
+        assert!(!handle.request("again"), "a repeated request is redundant");
+        assert_eq!(node.reason(), Some("SIGUSR1"));
+    }
 
     /// The seam the run loop is wired to: a request arrives, with the reason intact.
     #[tokio::test]

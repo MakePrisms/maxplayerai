@@ -1714,6 +1714,39 @@ announcement is a replaceable event, so nothing supersedes it until you next sta
 judge a seat announcement by its age rather than trust it outright, and why the retraction narrows
 the window rather than closing it.
 
+**Upgrading without interrupting a job: drain first.** A stop leaves running jobs to the next boot,
+which reruns an interrupted agent from the beginning. To upgrade with nothing in flight, install the
+new binary, then drain the running seller:
+
+```bash
+"$MAXPLAYER_BIN" seller drain --home "$MAXPLAYER_HOME"   # waits until it has exited; --no-wait returns at once
+```
+
+`seller drain` finds the seller through its home lock (`seller.lock` records the holder's pid once
+the seller can take SIGUSR1 as a drain) and sends it **SIGUSR1**. Exit codes: 0 drained (or sent,
+with `--no-wait`); 2 **nothing was sent** — read the message: no seller runs on that home, or it is
+still booting, or it is older than the drain feature (stop that one when idle instead), or it runs in
+a container or as another user; 3 `--timeout` passed and the drain is still running. A seller in a
+container is reached from inside it, or with the signal directly:
+
+```bash
+docker exec <container> maxplayer seller drain                    # or: docker kill --signal=USR1 <container>
+systemctl --user kill --kill-whom=main -s USR1 maxplayer-seller   # systemd: signal ONLY the seller
+```
+
+Always pass `--kill-whom=main` to `systemctl kill`: without it systemd signals every process in the
+unit, including the running job's agent, which SIGUSR1 kills. A Docker seat runs from an image, so a
+restart policy brings back the OLD version: after the drain exits, recreate the container from the new
+image (`docker compose pull && docker compose up -d`, or `docker run` again).
+
+The seller then advertises `accepting=n`, claims nothing new, still honours an award for a claim it
+already published, finishes and delivers what is running, publishes its terminal `accepting=n` and
+exits 0. New follow-up turns on parked session jobs are left on the relay for the restarted seller.
+The status line reads `DRAINING — …` with what it is still waiting for. A unit with
+`Restart=always` comes straight back on the new binary (`Restart=on-failure` does not: exit 0 is not
+a failure). A SIGTERM during the drain still stops it at once. Parked session jobs and
+delivered-but-unpaid jobs are not waited for; both survive a restart.
+
 Restarting is the bare relaunch — config is already written:
 
 ```bash

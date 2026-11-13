@@ -134,6 +134,27 @@ struct SlotGate {
     /// Configured ceiling, clamped as `new` clamps it. Held so a report can carry its denominator: a
     /// count of resumed jobs means nothing without the capacity they are being bounded to.
     capacity: usize,
+    /// #1299: execution tasks spawned by [`spawn_bounded_execution`] that have not returned yet,
+    /// INCLUDING ones still waiting for a permit (which hold no slot). A drain waits for this to
+    /// reach zero; a store row count could not serve, because a resumed row skipped as already
+    /// settled can keep its non-terminal state and would hold a drain open forever.
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// #1299: decrements [`SlotGate::executions`] when an execution task ends, unwind included.
+struct ExecutionGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ExecutionGuard {
+    fn enter(count: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// A reserved slot held for a claim that is awaiting its award. `reserved_at` bounds how long the
@@ -166,6 +187,7 @@ impl SlotGate {
             parked: Mutex::new(HashMap::new()),
             lapse_after,
             capacity: capacity.max(1),
+            executions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -269,6 +291,11 @@ impl SlotGate {
     fn available(&self) -> usize {
         self.permits.available_permits()
     }
+
+    /// #1299: execution tasks not yet returned (running or waiting for a permit).
+    fn executions(&self) -> usize {
+        self.executions.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// Spawn ONE execution task for `job_id`, bounded by a real slot permit no matter which path
@@ -324,7 +351,11 @@ where
         );
     }
     let slots = Arc::clone(slots);
+    // Counted from BEFORE the spawn, so a drain tick can never see the gap between the award and the
+    // task's first poll as "nothing in flight".
+    let running = ExecutionGuard::enter(&slots.executions);
     tokio::task::spawn_local(async move {
+        let _running = running;
         let slot = match parked {
             Some(permit) => Some(permit),
             None => {
@@ -4723,6 +4754,63 @@ const RETRACTION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cadence of the outbox drain / housekeeping tick.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// #1299: how long a drain waits once ONLY unsent private-content copies hold it. They are durable
+/// (`private-content.sqlite`) and re-sent by the next boot, and a copy the relay keeps refusing is
+/// retried indefinitely, so this bounds the wait instead of letting one copy pin the seat.
+const DRAIN_PRIVATE_GRACE: Duration = Duration::from_secs(600);
+
+/// #1299: what a drain is still waiting for. See [`SellerNodeRunner::drain_remaining`].
+#[derive(Debug)]
+struct DrainLeft {
+    held: usize,
+    executions: usize,
+    turns: usize,
+    lane_busy: bool,
+    queued: usize,
+    outbox: Result<usize, String>,
+    private: Result<usize, String>,
+}
+
+impl DrainLeft {
+    /// Everything but private-content copies is done.
+    fn only_private(&self) -> bool {
+        self.held == 0
+            && self.executions == 0
+            && self.turns == 0
+            && !self.lane_busy
+            && self.queued == 0
+            && matches!(self.outbox, Ok(0))
+    }
+
+    /// Nothing at all is owed: the node may leave.
+    fn idle(&self) -> bool {
+        self.only_private() && matches!(self.private, Ok(0))
+    }
+}
+
+impl std::fmt::Display for DrainLeft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = |value: &Result<usize, String>| match value {
+            Ok(n) => n.to_string(),
+            Err(error) => format!("unknown ({error})"),
+        };
+        write!(
+            f,
+            "{} slot(s) held, {} job execution(s) running or queued, {} session turn(s), {} \
+             unpublished event(s), {} private copy(ies) unsent",
+            self.held,
+            self.executions,
+            self.turns,
+            count(&self.outbox),
+            count(&self.private)
+        )?;
+        if self.lane_busy || self.queued > 0 {
+            write!(f, ", work lane busy={} queued={}", self.lane_busy, self.queued)?;
+        }
+        Ok(())
+    }
+}
+
 /// A booted seller node with its live relay surface.
 pub struct SellerNodeRunner {
     node: SellerNode,
@@ -4822,6 +4910,10 @@ pub struct SellerNodeRunner {
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
+    /// #1299: the drain latch (SIGUSR1). Once set the node claims nothing new, advertises
+    /// `accepting=n`, still executes awards for claims it already published, and leaves through the
+    /// ordinary exit path when no slot is held and no awarded/executing row remains.
+    drain: shutdown::DrainSignal,
     /// Backfill cadence, resolved once at boot (tests shorten it per runner, never via the env).
     wrap_backfill_interval_secs: u64,
     /// Mint redeems between the intent-to-receive breadcrumb and the receipt write. Graceful
@@ -5303,6 +5395,7 @@ impl SellerNodeRunner {
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
             shutdown: shutdown::ShutdownChannel::new(),
+            drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
             redeems_in_flight: std::sync::atomic::AtomicUsize::new(0),
             remit_flight: crate::fee_remit::RemitFlight::new(),
@@ -5625,6 +5718,68 @@ impl SellerNodeRunner {
         self.shutdown.handle()
     }
 
+    /// #1299: a handle asking this node to DRAIN — stop claiming, finish in-flight work, then leave
+    /// through the same exit path as a shutdown (terminal `accepting=n`, [`Self::run`] returns
+    /// `Ok(())`). The daemon wires it to SIGUSR1 via [`shutdown::spawn_drain_signal_listener`]. A
+    /// shutdown request during a drain still stops the node immediately.
+    pub fn drain_handle(&self) -> shutdown::DrainSignal {
+        self.drain.clone()
+    }
+
+    /// #1299: make this node findable by `maxplayer seller drain` (its pid goes into the home
+    /// lock). Call ONLY after SIGUSR1 is handled as a drain ([`shutdown::spawn_drain_signal_listener`]
+    /// returned `Some`): before that, SIGUSR1's default disposition would kill a node the command
+    /// meant to drain. A failure is logged; the seat keeps selling, only the command cannot find it.
+    pub fn enable_drain_command(&self) {
+        if let Err(error) = self.node.record_drain_pid() {
+            opline!(
+                "seller node WARN: could not record the pid for `maxplayer seller drain` ({error}); \
+                 drain this seat with SIGUSR1 directly"
+            );
+        }
+    }
+
+    /// #1299: what a drain is still waiting for. Counts held slots (executing jobs, running
+    /// follow-up turns, and claims parked for an award we promised to honour), live execution tasks
+    /// (an award whose task is still waiting for a permit holds no slot), session turns in flight (a
+    /// turn task holds no slot until it acquires one), the work lane (`lane_busy`: an award mid-
+    /// handler; `queued`: events not yet handled, e.g. a late award), the unexpired outbox (a
+    /// delivery enqueued but not yet on the wire), and unsent private-content copies (a private
+    /// result's encrypted copies go out after its carrier). Durable job rows are deliberately NOT
+    /// counted: a resumed row skipped as settled elsewhere keeps its state, and would hold a drain
+    /// open forever. A store read failure is never "idle".
+    fn drain_remaining(&self, lane_busy: bool, queued: usize) -> DrainLeft {
+        DrainLeft {
+            held: self.slots.capacity.saturating_sub(self.slots.available()),
+            executions: self.slots.executions(),
+            turns: self.session_rt.in_flight_turns(),
+            lane_busy,
+            queued,
+            outbox: self
+                .node
+                .store()
+                .pending_outbox(now_unix())
+                .map(|items| items.len())
+                .map_err(|error| error.to_string()),
+            private: self.private_content_unsent(),
+        }
+    }
+
+    /// #1299: unsent private-content copies and carriers (capped count), for the drain.
+    fn private_content_unsent(&self) -> Result<usize, String> {
+        if !self.node.home().config.privacy.private_content_v2 {
+            return Ok(0);
+        }
+        let path = self.node.home().root.join("private-content.sqlite");
+        if !path.exists() {
+            return Ok(0);
+        }
+        let me = self.seller_pubkey.to_hex();
+        crate::private_content::store::ContentStore::open(&path)
+            .and_then(|db| Ok(db.pending(&me, 256)?.len() + db.pending_carriers(&me, 256)?.len()))
+            .map_err(|error| error.to_string())
+    }
+
     /// Subscribe (or re-subscribe) the offer REQ. `open_pool` false forces the targeted-only shape —
     /// used by the boot/recovery path when the seller has not opted into the open pool, and by the
     /// `CLOSED` degrade, which keeps targeted claiming alive after the relay refuses the grouped REQ.
@@ -5727,6 +5882,11 @@ impl SellerNodeRunner {
     /// ticket stays queued and the tick armed, and the decline line is logged once per offer and
     /// condition ([`Self::log_offer_deferred`]).
     async fn reconsider_capacity_skips(&self) -> usize {
+        // #1299: a draining node re-drives nothing. Returning before the ticket loop also keeps every
+        // #1057 `review retry` ticket on disk for the restarted seller.
+        if self.drain.is_requested() {
+            return 0;
+        }
         self.sweep_review_state_if_due();
         let retries = self.terminal_review_retries();
         if !retries.is_empty() {
@@ -6264,6 +6424,12 @@ impl SellerNodeRunner {
         // [`shutdown::spawn_os_signal_listener`], or an embedder's handle). Taken once — a second
         // loop on the same node would get `None` and simply never see a request.
         let mut shutdown_rx = self.shutdown.take_receiver();
+        // #1299: the drain has been logged; its `accepting=n` beat has been fired (re-tried each tick
+        // while a heartbeat supervision is in flight, which may have built an `accepting=y` draft);
+        // and since when only private-content copies have held it (see DRAIN_PRIVATE_GRACE).
+        let mut drain_noticed = false;
+        let mut drain_beat_fired = false;
+        let mut drain_private_only_since: Option<tokio::time::Instant> = None;
         // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
         // pause until it drains); ticks and backfills coalesce to one pending pass each and take
         // turns with events.
@@ -6340,6 +6506,46 @@ impl SellerNodeRunner {
                 // Housekeeping runs on the lane; the loop only asks for it, and reports a lane that
                 // has stayed busy (30s, then 60s, 120s, ...).
                 _ = drain_tick.tick() => {
+                    // #1299: a requested drain. First tick: say so and re-announce now
+                    // (`accepting=n`) rather than an interval later. Every tick: leave through the
+                    // ordinary exit path once nothing is held — same retraction, same lane settle,
+                    // same remittance drain as a SIGTERM, minus the interrupted jobs.
+                    if self.drain.is_requested() {
+                        if !drain_noticed {
+                            drain_noticed = true;
+                            opline!(
+                                "seller node: drain requested ({}); claiming nothing new, finishing \
+                                 in-flight work",
+                                self.drain.reason().unwrap_or("unknown")
+                            );
+                        }
+                        if !drain_beat_fired && (!heartbeat_enabled || supervision.is_none()) {
+                            drain_beat_fired = true;
+                            if heartbeat_enabled {
+                                heartbeat_tick.reset_immediately();
+                            }
+                        }
+                        let left = self.drain_remaining(lane.is_some(), queue.queued_events());
+                        if left.idle() {
+                            opline!("seller node: drain complete (nothing in flight); retracting the seat and ending the loop");
+                            break;
+                        }
+                        if left.only_private() {
+                            let since = *drain_private_only_since
+                                .get_or_insert_with(tokio::time::Instant::now);
+                            if since.elapsed() >= DRAIN_PRIVATE_GRACE {
+                                opline!(
+                                    "seller node: drain leaving with private content still unsent \
+                                     ({left}) after {}s; it is stored and re-sent after the restart",
+                                    DRAIN_PRIVATE_GRACE.as_secs()
+                                );
+                                break;
+                            }
+                        } else {
+                            drain_private_only_since = None;
+                        }
+                        opline_verbose!("seller node draining: {left}");
+                    }
                     queue.request_tick();
                     // R3-2: a harness dropped or came back since the last beat. Fire the heartbeat
                     // supervision NOW (its single-flight arm below) rather than an interval later, so
@@ -7081,9 +7287,21 @@ impl SellerNodeRunner {
         } else {
             roster.names.join(", ")
         };
+        // #1299: a draining seat says so first — it is not advertising, and the operator waiting to
+        // upgrade wants to know what it is still waiting for.
+        let state = if self.drain.is_requested() {
+            // The lane is the loop's to see; the status line reports the rest.
+            let left = self.drain_remaining(false, 0);
+            if left.idle() {
+                "DRAINING — idle, exiting".to_owned()
+            } else {
+                format!("DRAINING — {left}")
+            }
+        } else {
+            advertising_state(self.sign_in.refusal().is_some(), roster.serving).to_owned()
+        };
         opline!(
-            "seller node status: {} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
-            advertising_state(self.sign_in.refusal().is_some(), roster.serving),
+            "seller node status: {state} · harness: {harnesses} · {busy}/{} job slot(s) busy{loop_health}",
             self.slots.capacity
         );
     }
@@ -7287,7 +7505,10 @@ impl SellerNodeRunner {
         // snapshot, both reads.
         let draft = crate::heartbeat::heartbeat_for_state(
             in_flight,
-            roster.serving,
+            // #1299: a draining seat advertises `accepting=n` from the first beat after the request,
+            // so buyers stop targeting it while it finishes. The serving count is unchanged (the
+            // harnesses still work), which is how a reader tells a drain from a broken seat.
+            roster.serving && !self.drain.is_requested(),
             seller.rate_sats,
             // §4.1 — derived from the SAME `SellerConfig` `classify_offer` reads, in the same call,
             // for the same reason the admission policy below is: the ad cannot drift from its gate.
@@ -7609,6 +7830,12 @@ impl SellerNodeRunner {
     }
 
     async fn on_offer(&self, event: &nostr_sdk::Event) {
+        // #1299: a draining node takes no new work, so it does none of the pre-claim work either
+        // (recording, input staging, buyer feedback). `claim_offer` checks again for its other callers.
+        if self.drain.is_requested() {
+            opline_verbose!("seller node offer skip id={}: draining (no new claims)", event.id);
+            return;
+        }
         // RC3-02: offer BACKFILL (`run_offer_backfill` -> `read_stored`), the preflight redrive and the
         // private-content path all call this directly, NOT through `dispatch_event`, and
         // `read_stored` reads the raw Message stream where relay-pool 0.44.3 re-emits a same-id,
@@ -8114,6 +8341,16 @@ impl SellerNodeRunner {
         #[cfg(test)]
         self.claim_offer_entries
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // #1299: a draining node takes no new work. Every claim goes through this function (the wire
+        // path, backfill, the preflight re-drive and the capacity-skip re-drive), so this is the
+        // backstop; `on_offer` and `reconsider_capacity_skips` also stop earlier. `Deferred`, not
+        // `Declined`: a drain is a condition that clears (on the restarted seller), so a #1057
+        // review-retry ticket must survive it. Awards for claims already published do not come
+        // through here, so they are still honoured.
+        if self.drain.is_requested() {
+            opline_verbose!("seller node offer skip id={job_id}: draining (no new claims)");
+            return ClaimOutcome::Deferred;
+        }
         // #541/#814: refuse an offer that is no longer ours to claim, before any work. Two
         // buyer-authenticated signals land here (see [`Suppression`]): a co-signed kind-3400 receipt
         // means the offer was awarded + settled (to us or another seat) and is terminal; a kind-3405
@@ -11995,6 +12232,36 @@ mod slot_gate_tests {
     use std::time::{Duration, Instant};
 
     const LONG: Duration = Duration::from_secs(3600);
+
+    /// #1299 advisor r1 — an execution is counted from BEFORE its task first runs, while it waits for
+    /// a permit (holding no slot), and uncounted once it returns.
+    /// RED ON REVERT: drop the `ExecutionGuard` and `executions()` reads 0 while the task waits.
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_1299_an_execution_waiting_for_a_permit_is_counted() {
+        let gate = Arc::new(SlotGate::new(1, LONG));
+        assert_eq!(gate.try_reserve("busy"), super::Reserve::Reserved);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let flag = Arc::clone(&ran);
+                spawn_bounded_execution(&gate, "late-award".into(), move |_, _| async move {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                assert_eq!(gate.executions(), 1, "counted before the task's first poll");
+                tokio::task::yield_now().await;
+                assert_eq!(gate.executions(), 1, "still counted while it waits for a permit");
+                assert_eq!(gate.available(), 0, "and it holds no slot of its own");
+                gate.release("busy");
+                for _ in 0..100 {
+                    if gate.executions() == 0 { break; }
+                    tokio::task::yield_now().await;
+                }
+                assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(gate.executions(), 0, "uncounted once it returns");
+            })
+            .await;
+    }
 
     #[test]
     fn one_slot_is_serial_admits_one_then_blocks() {
@@ -21002,6 +21269,187 @@ mod tests {
         loop_handle.abort();
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    // BEGIN #1299 drain tests
+    /// Boot a 1-slot seller against the fixture with a 1 s heartbeat, for the drain teeth.
+    async fn drain_runner(label: &str, fixture: &PGateRelay) -> (SellerNodeRunner, std::path::PathBuf) {
+        let root = throwaway_root(label);
+        let mut home = lane_home(&root, fixture);
+        // An hour: the only beats after the boot one are the drain's own, so a prompt `accepting=n`
+        // proves the drain fired it (advisor r1: a 1 s interval masked a missing reset).
+        home.config.seller_heartbeat.interval_secs = 3600;
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        (runner, root)
+    }
+
+    /// #1299 advisor r1 — the drain's exit condition counts the work lane (an award mid-handler) and
+    /// queued events (a late award not yet handled), session turns in flight, and private copies;
+    /// private copies alone are the only thing the grace bound may leave behind.
+    /// RED ON REVERT: drop any term from `only_private` and its case reads idle.
+    #[test]
+    fn issue_1299_drain_left_counts_every_kind_of_owed_work() {
+        let idle = || DrainLeft { held: 0, executions: 0, turns: 0, lane_busy: false, queued: 0, outbox: Ok(0), private: Ok(0) };
+        assert!(idle().idle());
+        for (what, left) in [
+            ("held slot", DrainLeft { held: 1, ..idle() }),
+            ("execution", DrainLeft { executions: 1, ..idle() }),
+            ("session turn", DrainLeft { turns: 1, ..idle() }),
+            ("lane busy", DrainLeft { lane_busy: true, ..idle() }),
+            ("queued event", DrainLeft { queued: 1, ..idle() }),
+            ("outbox", DrainLeft { outbox: Ok(1), ..idle() }),
+            ("outbox unreadable", DrainLeft { outbox: Err("x".into()), ..idle() }),
+        ] {
+            assert!(!left.idle() && !left.only_private(), "{what} must hold the drain");
+        }
+        for left in [DrainLeft { private: Ok(2), ..idle() }, DrainLeft { private: Err("x".into()), ..idle() }] {
+            assert!(!left.idle() && left.only_private(), "{left}");
+        }
+    }
+
+    /// #1299 advisor r1 — a session turn task holds no slot until it acquires one; the drain must
+    /// count it from the moment it is admitted.
+    /// RED ON REVERT: drop `turns` from `drain_remaining` and the runner reads idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_session_turn_in_flight_holds_the_drain() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-turn", &fixture).await;
+        assert!(runner.drain_remaining(false, 0).idle(), "harness check: idle at rest");
+        runner.session_rt.insert_in_flight_for_test(&"1".repeat(64));
+        let left = runner.drain_remaining(false, 0);
+        assert!(!left.idle(), "{left}");
+        assert_eq!(left.turns, 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 advisor r1 (Medium) — a drain must not consume a #1057 `review retry` ticket: the
+    /// restarted seller serves it. RED ON REVERT: drop the early return in
+    /// `reconsider_capacity_skips` AND return `Declined` from `claim_offer` and the ticket is deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_drain_keeps_review_retry_tickets() {
+        let (_relay, runner, root, buyer) = review_1057_seller("review-1299-drain").await;
+        let review_root = runner.node.home().root.clone();
+        let (id, offer) = offer_1057(&buyer, "#1299 drain ticket", 300, now_unix() as u64 + 600);
+        settle_1057(&runner, &id, R1057_PERMANENT);
+        block_1057(&runner, &buyer, &id, &offer).await;
+        crate::review::state::retry(&review_root, &id).unwrap();
+        assert!(runner.drain_handle().request("test drain"));
+        assert_eq!(runner.reconsider_capacity_skips().await, 0);
+        assert!(ticket_1057(&runner, &id), "the ticket survives the drain");
+        runner.client.disconnect().await;
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// #1299 — a draining node claims nothing new, on the shared choke point both claim paths use.
+    ///
+    /// RED ON REVERT: drop the drain check at the top of `claim_offer` and the offer goes on to its
+    /// review gate (`ReachedReview`) instead of being declined.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_draining_node_declines_new_offers() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-declines", &fixture).await;
+        let buyer = Keys::generate();
+        let (id, offer) = offer_1057(&buyer, "#1299 drain", 300, now_unix() as u64 + 600);
+        assert!(runner.drain_handle().request("test drain"));
+        let outcome = runner
+            .claim_offer(
+                &id,
+                &buyer.public_key().to_hex(),
+                &offer,
+                &runner.seller_pubkey.to_hex(),
+                offer.deadline_unix,
+                now_unix(),
+                None,
+            )
+            .await;
+        assert_eq!(outcome, ClaimOutcome::Deferred, "a draining node must not claim (and keeps #1057 tickets)");
+        assert!(runner.node.store().claim_row_state(&id).unwrap().is_none());
+        assert_eq!(runner.slots.available(), 1, "nothing was reserved");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 — a drain advertises `accepting=n` while it waits, does NOT leave while a slot is held
+    /// (an executing job, or a claim whose award it promised to honour), and leaves through the
+    /// ordinary exit path — clean return, terminal `accepting=n` — once the slot is released.
+    ///
+    /// RED ON REVERT: drop the drain arm on the drain tick and the loop never returns; make
+    /// `drain_remaining` ignore held slots and the loop returns while the slot is still held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_1299_a_drain_waits_for_held_work_then_leaves_cleanly() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-waits", &fixture).await;
+        let slots = Arc::clone(&runner.slots);
+        assert_eq!(slots.try_reserve("job-in-flight"), Reserve::Reserved);
+        let drain = runner.drain_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| seat_announcements(events)
+                            .iter()
+                            .any(|beat| beat.tag_value("accepting") == Some("y")))
+                        .await,
+                    "harness check: the seat advertises itself open first"
+                );
+                let before = seat_announcements(&fixture.events().await).len();
+                assert!(drain.request("test drain"));
+                assert!(
+                    fixture
+                        .wait_until_published(FIXTURE_WAIT, |events| {
+                            let beats = seat_announcements(events);
+                            beats.len() > before
+                                && beats.last().unwrap().tag_value("accepting") == Some("n")
+                        })
+                        .await,
+                    "a draining seat must advertise accepting=n while it finishes"
+                );
+                // Two drain ticks (5 s each) with the slot still held: the loop must stay up.
+                tokio::time::sleep(DRAIN_INTERVAL * 2 + Duration::from_millis(500)).await;
+                assert!(
+                    !loop_handle.is_finished(),
+                    "a drain must not leave while a slot is still held"
+                );
+                slots.release("job-in-flight");
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("an idle drain must RETURN, not have to be killed")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "a completed drain is a clean exit: {outcome:?}");
+        let events = fixture.events().await;
+        let terminal = *seat_announcements(&events).last().expect("a beat");
+        assert_eq!(terminal.tag_value("accepting"), Some("n"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 — SIGTERM during a drain still means stop now: the loop returns although a slot is
+    /// held, exactly as an ordinary shutdown leaves in-flight rows to the boot resume path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn issue_1299_a_shutdown_aborts_a_drain() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-abort", &fixture).await;
+        assert_eq!(runner.slots.try_reserve("job-in-flight"), Reserve::Reserved);
+        let drain = runner.drain_handle();
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let joined = local
+            .run_until(async {
+                assert!(drain.request("test drain"));
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                assert!(shutdown.request("SIGTERM"));
+                tokio::time::timeout(FIXTURE_WAIT, loop_handle).await
+            })
+            .await;
+        let outcome = joined
+            .expect("a shutdown during a drain must return promptly")
+            .expect("the loop task must not panic");
+        assert!(outcome.is_ok(), "{outcome:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END #1299 drain tests
 
     // BEGIN R3-2 run-loop tests
     /// R3-2 — a seat whose harness drops republishes its beat promptly with `serving=0/1` and
