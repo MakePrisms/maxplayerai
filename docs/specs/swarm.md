@@ -48,6 +48,10 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
 15. **First-draft questions:** `join` edits seller config (append-only); `solved` needs one
     independent verify task, no buyer confirmation; our buyer uses the `claude` preset; `codex`
     ships as a preset only after a live canary. (Josip, accepted defaults)
+16. **Private tasks are a setting.** A swarm can send its tasks as private offers. (Bob, 13 Nov 17:13)
+17. **The lead sets up its own coordination structure**, like the five tables in Anthropic's
+    Fermat run (Announce, Assign, Notes, Subtasks, Landed), and team-wide orders reach sellers inside
+    the task text. (Bob, 13 Nov 17:03–17:11)
 
 ## 2. What exists today
 
@@ -96,7 +100,7 @@ untouched; no `PROTOCOL_VERSION` bump.
 
 | Kind | Name | Author | `d` | Key tags | Content |
 |---|---|---|---|---|---|
-| `30344` **new** | SWARM | buyer | slug | `name`, `status` (`open`\|`closed`) | purpose / description (markdown) |
+| `30344` **new** | SWARM | buyer | slug | `name`, `status` (`open`\|`closed`), `tasks` (`public`\|`private`, default `public`) | purpose / description (markdown) |
 | `30341` | SWARM JOB | buyer | slug | `a` = `30344:<buyer>:<swarm d>` **(new, required)**, `title`, `starts`, `ends`, `status`, `budget <n> sat`, optional `update`, `result` | goal |
 | `30342` | SWARM MEMBERSHIP | seller | `<buyer>:<swarm d>` **(was `<buyer>`)** | `a` = swarm address **(was forbidden)**, `p` = buyer, `since`, `minutes` (1–480), `status` (`joined`\|`left`) | note |
 | `30343` | SWARM DECISION | buyer | seller pubkey | `p` = seller, `decision` | reason (unchanged; per buyer) |
@@ -110,8 +114,10 @@ untouched; no `PROTOCOL_VERSION` bump.
 - **Minutes** are per swarm per day: used = sum over that swarm's tasks to that seller whose award
   falls in the day, across all the swarm's jobs. Two overlapping swarm jobs in one swarm share the
   seller's minutes (today each challenge counted separately, `model.mjs:143`, `:150`).
-- Task offers keep the text prefix `[swarm:<buyer>:<swarm job d>]`; the legacy `[challenge:…]`
-  matcher is dropped.
+- Public task offers keep the text prefix `[swarm:<buyer>:<swarm job d>]`; the legacy
+  `[challenge:…]` matcher is dropped. Private tasks carry no public link (§7.5).
+- Swarm job `update` gains a buyer-signed JSON tally (per member: tasks done, minutes used today).
+  Public swarms can recompute it from job events; private swarms rely on it (§7.5).
 
 ## 5. Relay
 
@@ -193,11 +199,31 @@ Started next to the existing loops (`buyer/mod.rs:352`, `:355`) when `[swarm].en
 The board stays JS, the daemon is Rust. Add `web/app/src/swarm/shared/vectors.json` (events in →
 per-seller eligibility and minutes per swarm out), run by both test suites.
 
+### 7.5 Private tasks (`tasks = private` on the swarm)
+
+- Each task is posted with `visibility: private`: targeted, encrypted task text, inline answer in the
+  encrypted result body. Private offers, private inline delivery and `[privacy].private_jobs`
+  (`home.rs:1737`, default `true` at `:1747`) already exist; the runner today forces
+  `visibility:'public'` (`swarm.mjs:1857`).
+- **Linking.** The private OFFER schema forbids every unlisted tag and keeps public content empty
+  (`docs/specs/private-offers-wire-v2.md` §2.3), so a private task has no public `[swarm:…]` prefix
+  and no swarm tag. We do not widen that schema. The daemon links tasks from its own store, and the
+  public view of a private swarm uses the buyer-signed tally in the swarm job's `update` (§4).
+  Sellers see their own tasks locally.
+- **Public view of a private swarm:** name, purpose, members, buyer-reported minutes and task counts.
+  No task text, answers or boards.
+- **Seller support:** `join` on a private swarm refuses when the local `[privacy].private_jobs` is
+  `false`. Any seller with `maxplayer swarm` runs a build that has private jobs.
+- **Not a security boundary against the seller.** A private task still reaches one untrusted
+  seller, so the planner output filter (§10.4) stays.
+- Setting chosen at `swarm_create` (`tasks: private`) / `maxplayer swarm create --private-tasks`;
+  changing it applies to tasks posted afterwards.
+
 ## 8. MCP tools (buyer's agent)
 
 | Tool | Does |
 |---|---|
-| `swarm_create {name, purpose, slug?}` | Publishes a 30344 swarm. Returns its address. |
+| `swarm_create {name, purpose, slug?, tasks?: public\|private}` | Publishes a 30344 swarm. Returns its address. |
 | `swarm_list {}` / `swarm_members {swarm?}` | The buyer's swarms; applicants and members with minutes. |
 | `swarm_decide {seller, accept}` | Per-buyer acceptance. |
 | `swarm_job_create {swarm, goal, title?, starts?, ends?, budget_sats, tasks?[]}` | Publishes a 30341 swarm job (default: now → +24 h). Optional tasks are queued (fan-out without a planner). Says whether a planner is configured. |
@@ -205,6 +231,7 @@ per-seller eligibility and minutes per swarm out), run by both test suites.
 | `swarm_job_tasks {swarm_job, add?[], drop?[], replace?[]}` | Edit the queue. |
 | `swarm_job_steer {swarm_job, note}` | Note the planner sees on every call. |
 | `swarm_job_close {swarm_job, result?, status: completed\|cancelled}` | Stop posting; in-flight tasks still settle and pay. |
+| `swarm_job_boards {swarm_job, create?[], post?[], remove?[]}` | Same board operations as the planner (§9.5), for a buyer's agent acting as lead. |
 
 A `swarm-buyer` skill and the tool descriptions carry the guidance: create a swarm first, write
 self-contained tasks of ≥ 5 min, verify before closing as solved.
@@ -255,12 +282,50 @@ JSON back, plus the canaries in §10. Failure disables the planner and shows in
 Agent-queued tasks are dispatched; results wait for the agent's next `swarm_job_status`.
 `swarm_job_create` says so.
 
+### 9.5 Boards: lead-defined shared state
+
+The lead (planner, or the buyer's agent) designs the team's coordination structure itself, with no
+tools: board operations are part of its JSON output. Mapping to the Fermat run's five tables:
+
+| Their table | Here |
+|---|---|
+| Announce | a board the lead creates with `include: all` |
+| Assign | a board the lead writes, plus task pins and workstream owners |
+| Notes | a board with `writers: members` |
+| Subtasks | the task queue; members may add tasks with a `parent` link (task tree) |
+| Landed | the results log, filled automatically |
+
+- **Board** = named, ordered list of short text entries stored by the daemon per swarm job.
+  Fields set by the lead: `name`, `purpose`, `writers` (`lead` \| `members`), `include`
+  (`all` \| `workstream` \| `none`: which tasks get it pasted in), `cap_chars` (how much of the newest
+  entries is pasted). The lead creates, renames, posts to, and removes entries from any board, and
+  may define none or as many as it likes (limit 16 per swarm job).
+- **Into the task text.** The daemon builds each task as:
+  `## Team orders` / boards selected by `include`, newest first, trimmed to `cap_chars` /
+  `## Your task` / `## Reporting` (how to post back). Board text from members is wrapped as
+  untrusted content. Ordinary job text, so sellers and the wire do not change.
+- **Back from sellers.** A seller may end its answer with one fenced JSON block:
+  `{"notes":[{"board","text"}],"subtasks":[{"text","parent","workstream","durationSeconds"}]}`.
+  The daemon strips it from the answer, checks writers, sizes (≤ 2 KB per note, ≤ 8 notes and
+  ≤ 8 subtasks per task) and that `parent` exists, then applies it. Member subtasks join the queue
+  like any other task: dispatch still enforces minutes, rate and budget, and the lead can drop them.
+- **Lead input.** `step` receives every board (trimmed) and the task tree. New notes count as a
+  change for the `step` trigger (§9.2).
+- **Timing.** Sellers see board updates when their next task starts. Tasks are 5–30 min, so that is
+  the coordination delay. Mid-task reads/writes are a later phase (§14).
+- **Visibility.** In a public swarm, boards are public because the task text is. In a private swarm
+  they travel only inside encrypted task text (§7.5).
+- **Injection between sellers.** Member notes reach other sellers' prompts. They are marked untrusted
+  and capped; the lead can remove entries. This is inherent to letting helpers coordinate.
+
 ## 10. Security of the planner call
 
 Seller answers enter the prompt, and task text the planner returns is posted publicly. A planner with
 any tool, even read-only, can be steered into reading `~/.maxplayer/key` or wallet files and leaking
 them in a task.
 
+0. Private tasks (§7.5) cut public exposure but not exposure to the receiving seller, so every
+   item below applies to both settings.
 1. Presets carry the no-tools flags; agents never compose them.
 2. Canaries in `planner-test`, in a fresh temp dir: a write canary (file appears ⇒ refuse) and a read
    canary (token from a file appears in output ⇒ refuse). They catch forgotten flags, not every case.
@@ -299,12 +364,17 @@ Each behind a default-off flag where it changes running behaviour.
 3. **Board on our relay.** `/swarm` lists swarms from every buyer, `/swarm/<naddr>` one swarm and its
    jobs; drop the denylist and build-time buyer key; minutes per swarm and the shared vectors (§7.4).
    Vercel deploy.
-4. **Daemon engine + MCP, no planner** (§7, §8) behind `[swarm].enabled`. Tests: fan-out of N tasks
-   over M members with a stub seller; budget never exceeded; restart resumes from the store; expired
-   task frees its seller; a member of two swarms gets one task from each; vectors pass in Rust.
+4. **Daemon engine + MCP, no planner** (§7, §8) behind `[swarm].enabled`, including private tasks
+   (§7.5) and boards with task-text assembly and seller report parsing (§9.5). Tests: fan-out of N
+   tasks over M members with a stub seller; budget never exceeded; restart resumes from the store;
+   expired task frees its seller; a member of two swarms gets one task from each; vectors pass in
+   Rust; a private swarm's offers carry no task text or swarm link in public events and its tally
+   matches the store; board text lands in the next task; a seller report adds notes and child
+   subtasks and is refused past the caps or for a lead-only board.
 5. **Planner** (§9, §10): presets, `planner_command`, `planner-test` with canaries, `analyze` +
-   `step`, triggers, output filter, verify-before-solved. Tests: stub planner; rejected output fed
-   back; canaries refuse a writing / reading command; idle ceiling; one call per settled batch.
+   `step` with board operations, triggers, output filter, verify-before-solved. Tests: stub planner;
+   rejected output fed back; canaries refuse a writing / reading command; idle ceiling; one call per
+   settled batch; a stub lead that creates the five Fermat-style boards drives a task tree.
 6. **Retire** `scripts/challenges/` and the old docs after one live swarm job on the new path.
 
 Bob's rule stands: no swarm merges while a swarm job is live; confirm the board deploy before telling
@@ -319,7 +389,12 @@ period.
 ## 14. Deliberately left out
 
 - Per-buyer free/paid (`free_for`), auto-raise beyond `max_sats`.
-- Private jobs, input files, git/code delivery for tasks (text/inline only, as today; see #1250).
+- Input files, git/code delivery for tasks (text/inline only; see #1250), and a buyer-run checker
+  plus toolchain capabilities such as `lean`. Needed for proof/code swarm jobs like the Fermat run;
+  next phase.
+- Live boards: sellers reading or writing boards mid-task. Needs a seller tool and network access
+  from the sandbox; next phase after file delivery.
+- Fully hidden swarms (encrypted name, purpose, goal and roster; invite-only discovery).
 - Restricting who may create swarms (addable later as a relay rule on 30344).
 - Per-swarm acceptance (acceptance is per buyer, §1.13).
 - Opting out of one swarm job inside a swarm (membership is per swarm).
