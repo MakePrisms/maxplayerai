@@ -221,22 +221,26 @@ impl DrainSignal {
 /// Translate SIGUSR1 into a drain request (#1299), for as long as the returned task lives.
 ///
 /// Installing the listener replaces SIGUSR1's default disposition (terminate) — intended: an
-/// operator who sends it wants the jobs to finish, not the process to die mid-job. Registration
-/// failure is logged and the seat keeps selling without a drain path, exactly as before #1299.
+/// operator who sends it wants the jobs to finish, not the process to die mid-job. The handler is
+/// registered SYNCHRONOUSLY, before this returns (call it inside the runtime): `Some` means SIGUSR1
+/// already drains, so the caller may now advertise the pid
+/// ([`crate::seller_node::run::SellerNodeRunner::enable_drain_command`]). `None` means registration
+/// failed (logged): the seat keeps selling without a drain path, exactly as before #1299, and must
+/// NOT advertise its pid.
 #[cfg(unix)]
-pub fn spawn_drain_signal_listener(drain: DrainSignal) -> tokio::task::JoinHandle<()> {
+pub fn spawn_drain_signal_listener(drain: DrainSignal) -> Option<tokio::task::JoinHandle<()>> {
     use tokio::signal::unix::{signal, SignalKind};
-    tokio::spawn(async move {
-        let mut usr1 = match signal(SignalKind::user_defined1()) {
-            Ok(stream) => stream,
-            Err(error) => {
-                crate::opline!(
-                    "seller node WARN: SIGUSR1 listener unavailable ({error}); this seat has no \
-                     drain path — an upgrade will interrupt running jobs"
-                );
-                return;
-            }
-        };
+    let mut usr1 = match signal(SignalKind::user_defined1()) {
+        Ok(stream) => stream,
+        Err(error) => {
+            crate::opline!(
+                "seller node WARN: SIGUSR1 listener unavailable ({error}); this seat has no \
+                 drain path — an upgrade will interrupt running jobs"
+            );
+            return None;
+        }
+    };
+    Some(tokio::spawn(async move {
         while usr1.recv().await.is_some() {
             if drain.request("SIGUSR1") {
                 crate::opline!(
@@ -247,13 +251,13 @@ pub fn spawn_drain_signal_listener(drain: DrainSignal) -> tokio::task::JoinHandl
                 crate::opline!("seller node: SIGUSR1 received; already draining");
             }
         }
-    })
+    }))
 }
 
 /// Non-unix: no SIGUSR1, so no drain trigger from the OS. An embedder can still use the handle.
 #[cfg(not(unix))]
-pub fn spawn_drain_signal_listener(_drain: DrainSignal) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async {})
+pub fn spawn_drain_signal_listener(_drain: DrainSignal) -> Option<tokio::task::JoinHandle<()>> {
+    None
 }
 
 /// Non-unix fallback: `Ctrl-C` only, which is all the platform offers as a deliverable stop.

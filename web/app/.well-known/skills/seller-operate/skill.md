@@ -578,9 +578,13 @@ maxplayer doctor           # relay, mint, agent, sandbox still good?
 
 **Don't interrupt a running job to upgrade: drain.** Replace the binary, then run
 `maxplayer seller drain` (same `--home` as the seller; it waits until the seller exits, `--no-wait`
-returns at once, exit 2 means no seller was running). In a container use
-`docker exec <container> maxplayer seller drain` or `docker kill --signal=USR1 <container>`; the
-command just sends SIGUSR1. The seller then advertises `accepting=n`, claims nothing new, honours awards for claims it
+returns at once). Exit 2 means NOTHING WAS SENT, not that it is safe to restart: read the message (no
+seller running, still booting, older than the drain feature, in a container or another user's). Exit
+3 means `--timeout` passed while it still drains. In a container use
+`docker exec <container> maxplayer seller drain` or `docker kill --signal=USR1 <container>`, then
+recreate the container from the new image (a restart policy reuses the old one). Under systemd use
+`systemctl kill --kill-whom=main -s USR1 <unit>`: without `--kill-whom=main` the signal also hits the
+running job's agent and kills it. The seller then advertises `accepting=n`, claims nothing new, honours awards for claims it
 already published, finishes and delivers what is running, then exits 0 (status line: `DRAINING — …`).
 A supervisor with `Restart=always` restarts it on the new version. A plain SIGTERM instead stops at
 once, and an interrupted job is rerun from the beginning on the next boot.

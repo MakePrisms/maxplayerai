@@ -163,6 +163,75 @@ mod tests {
         assert!(parse(&args(&["--bogus"])).is_err());
     }
 
+    /// A stand-in seller: `flock(1)` holds `seller.lock` exclusively and its child (which inherits
+    /// the locked descriptor) records its own pid, then becomes `sleep`. `ignore_usr1` makes it
+    /// survive the signal, like a seller still draining. `None` when `flock(1)` is not installed.
+    fn stand_in_seller(root: &std::path::Path, ignore_usr1: bool) -> Option<std::process::Child> {
+        let lock = root.join(maxplayer_core::seller_node::LOCK_FILE);
+        let trap = if ignore_usr1 { "trap '' USR1; " } else { "" };
+        let script = format!("{trap}echo $$ > '{}'; exec sleep 30", lock.display());
+        let child = std::process::Command::new("flock")
+            .arg(&lock)
+            .args(["sh", "-c", &script])
+            .spawn()
+            .ok()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            maxplayer_core::seller_node::lock::holder(&lock),
+            Ok(maxplayer_core::seller_node::lock::LockHolder::Pid(_))
+        ) {
+            assert!(Instant::now() < deadline, "the stand-in never recorded its pid");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Some(child)
+    }
+
+    fn temp_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("maxplayer-drain-cli-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// #1299 advisor r1: exit 0 once the holder has exited after the signal.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seller_that_exits_on_the_signal_is_reported_drained() {
+        let root = temp_root("exit0");
+        let Some(mut child) = stand_in_seller(&root, false) else {
+            eprintln!("skipped: flock(1) not installed");
+            return;
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(&args(&["--home", root.to_str().unwrap(), "--timeout", "20"]), &mut out, &mut err);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(code, SUCCESS, "{}", String::from_utf8_lossy(&err));
+        assert!(String::from_utf8_lossy(&out).contains("has exited"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 advisor r1: exit 3 when `--timeout` passes while the seller is still draining, and the
+    /// seller is left running (the drain continues).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_seller_still_draining_at_the_timeout_exits_still_draining() {
+        let root = temp_root("exit3");
+        let Some(mut child) = stand_in_seller(&root, true) else {
+            eprintln!("skipped: flock(1) not installed");
+            return;
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run(&args(&["--home", root.to_str().unwrap(), "--timeout", "1"]), &mut out, &mut err);
+        let alive = child.try_wait().unwrap().is_none();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(code, STILL_DRAINING, "{}", String::from_utf8_lossy(&err));
+        assert!(alive, "the timeout stops the WAIT, not the seller");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// No seller on the home: nothing is sent and the exit says so.
     #[test]
     fn no_running_seller_exits_not_sent() {

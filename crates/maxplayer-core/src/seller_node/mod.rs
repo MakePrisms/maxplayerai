@@ -201,6 +201,12 @@ impl SellerNode {
         })
     }
 
+    /// #1299: record this process's pid in the home lock so `maxplayer seller drain` can find it.
+    /// Call only once SIGUSR1 is handled as a drain.
+    pub fn record_drain_pid(&self) -> std::io::Result<()> {
+        self._lock.record_pid()
+    }
+
     /// The seller public key (hex).
     pub fn seller_pubkey(&self) -> &str {
         self.signer.public_key_hex()

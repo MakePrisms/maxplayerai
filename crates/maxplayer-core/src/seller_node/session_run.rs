@@ -34,6 +34,20 @@ pub(super) struct SessionRuntime {
     pending: Mutex<HashMap<String, nostr_sdk::Event>>,
 }
 
+impl SessionRuntime {
+    /// #1299: turn tasks started and not yet returned. Counted from `spawn_turn`'s insert, which
+    /// runs BEFORE the task is spawned, so a drain never sees a just-admitted turn as idle (a turn
+    /// holds no slot until `run_turn` acquires one).
+    pub(super) fn in_flight_turns(&self) -> usize {
+        self.in_flight.lock().expect("session state").len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn insert_in_flight_for_test(&self, fid: &str) {
+        self.in_flight.lock().expect("session state").insert(fid.to_owned());
+    }
+}
+
 /// The host's verdict on a follow-up (§6.1 step 3).
 pub(super) enum Release {
     Prompt(orch::SessionPrompt),
@@ -228,6 +242,13 @@ impl SellerNodeRunner {
         }
         if followup.status == FollowUpStatus::Close {
             self.close_session(record).await;
+            return;
+        }
+        // #1299: a draining node starts no new turn. Nothing is journaled, so the follow-up stays on
+        // the relay and the restarted seller reads it from history (the award REQ, which carries
+        // kind 3412, is re-issued unbounded at boot) and runs it then. `close` above is still honoured.
+        if self.drain.is_requested() {
+            opline!("seller node follow-up deferred id={fid} job_id={job_id}: draining; the restarted seller runs it");
             return;
         }
         let text = if crate::seller_node::privacy::is_private(&draft) {
@@ -1243,6 +1264,9 @@ impl SellerNodeRunner {
             .map_err(|error| delivery_failed(error.to_string()))?;
         let key = format!("result:{}", r.fid);
         self.publish_now(&key).await;
+        // #1299 advisor r1: a PRIVATE turn's encrypted copies go out on the content flush, not with
+        // the carrier above. Flush now, as `execute_job` does, rather than on a later paced pass.
+        self.drain(DrainMode::Routine, true).await;
         if let Ok(Some((_, _, Some(result_id)))) = store.outbox_row(&key) {
             let _ = store.set_turn_result(r.fid, &result_id);
         }

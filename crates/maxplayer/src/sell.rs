@@ -311,10 +311,16 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
                 runner.shutdown_handle(),
             );
             // #1299: SIGUSR1 drains instead — no new claims, finish in-flight work, then exit 0
-            // through the same retraction path. SIGTERM/SIGINT above still stop immediately.
-            maxplayer_core::seller_node::shutdown::spawn_drain_signal_listener(
+            // through the same retraction path. SIGTERM/SIGINT above still stop immediately. The
+            // pid goes into seller.lock only once the handler is registered: until then SIGUSR1
+            // would kill this node, so `maxplayer seller drain` must not be able to find it.
+            if maxplayer_core::seller_node::shutdown::spawn_drain_signal_listener(
                 runner.drain_handle(),
-            );
+            )
+            .is_some()
+            {
+                runner.enable_drain_command();
+            }
             runner.run().await
         })
         .map_err(|error| {
