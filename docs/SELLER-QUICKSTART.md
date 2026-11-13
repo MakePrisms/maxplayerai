@@ -1735,8 +1735,9 @@ Wants=network-online.target
 [Service]
 ExecStart=%h/.local/bin/maxplayer seller
 Environment=MAXPLAYER_HOME=%h/.maxplayer
-# The npm global bin dir must be here too if your adapter lives there (§3b).
-Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# The npm global bin dir must be here too if your adapter lives there (§3b). The nix profile dir is
+# required: `maxplayer seller` refuses to start without nix, and a unit does not source your shell.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
 # Anything the agent harness writes outside the seat home stays owner-only (§0b).
 UMask=0077
 Restart=always

@@ -136,6 +136,9 @@ elif command -v wget >/dev/null 2>&1; then DL=wget
 else fail "no downloader in this image — the harness was supposed to provide one"
 fi
 echo "  (downloader under test: $DL)"
+# Resolved ONCE, before /shim goes on PATH: shim_downloader writes /shim/$DL, so resolving the real
+# downloader later would find the shim itself and the shim would exec itself forever (leg 7).
+REAL_DL="$(command -v "$DL")"
 
 # ── Legs 0 — no nix: installs, and says only selling needs it (#745) ────────────────────────────
 # These run BEFORE the stub nix is injected. The image has no nix (asserted above) and docker did
@@ -412,7 +415,7 @@ rm -f /shim/uname
 # bytes the release published. install.sh itself is untouched.
 shim_downloader() {
     mkdir -p /shim
-    real="$(command -v "$DL")"
+    real="$REAL_DL"
     {
         echo '#!/bin/sh'
         echo "mode='$1'"

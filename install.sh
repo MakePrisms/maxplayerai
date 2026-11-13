@@ -4,8 +4,8 @@
 #
 #   curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh
 #
-# What it does: resolves a release, downloads that release's asset for THIS platform, verifies the download against the release's own
-# SHA256SUMS, proves the binary runs and reports the version it was supposed to be, and only then
+# What it does: resolves a release, downloads that release's asset for THIS platform, verifies the
+# download against the release's own SHA256SUMS, proves the binary runs and reports the version it was supposed to be, and only then
 # puts it on PATH. Nix is not required to install or to buy; only `maxplayer seller` needs it (#745),
 # and when it is missing the installer says so in one note after a successful install.
 #
@@ -189,7 +189,9 @@ fetch() {
 #   buying never uses. So the installer no longer probes, prompts or chains: it installs, and when
 #   nix is missing it prints one note naming what needs it and how to get it.
 #
-# Same probe the boot gate uses: on PATH *and* actually runnable, so a broken shim reads as missing.
+# Probes PATH only: nix must be on PATH *and* actually run, so a broken shim reads as missing. The
+# boot gate also probes the well-known install locations; this note cannot, so it says what to do
+# when nix is installed but off this PATH rather than telling such a box to reinstall.
 # The note is advice, never a refusal: it goes to stdout after the install has already succeeded.
 note_nix_for_sellers() {
     if command -v nix >/dev/null 2>&1 && nix --version </dev/null >/dev/null 2>&1; then
@@ -199,6 +201,7 @@ note_nix_for_sellers() {
     say "note: no working nix found. Buying does not need it. Selling does: \`maxplayer seller\` refuses"
     say "to start without nix. Install it before you sell:"
     say "  curl -fsSL https://install.determinate.systems/nix | sh -s -- install"
+    say "If \`nix --version\` works in another shell, nix is installed but not on this PATH: do not reinstall."
 }
 
 # ── Version ─────────────────────────────────────────────────────────────────────────────────────

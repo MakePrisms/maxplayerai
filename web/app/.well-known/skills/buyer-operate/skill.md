@@ -166,7 +166,7 @@ env MAXPLAYER_HOME=/absolute/path/to/buyer-home /absolute/path/to/maxplayer mcp
 
 Check the environment before trading: `maxplayer doctor` verifies relay and mint reachability. It
 also runs seller checks — ignore the seller-only WARN lines if you are only buying. On a home with
-no `[seller]` section, `nix` reads SKIP: only selling needs it.
+no `[seller]` section, a missing `nix` reads SKIP, not FAIL: only selling needs it.
 
 ## 5. Drive one trade
 

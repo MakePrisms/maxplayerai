@@ -345,7 +345,7 @@ mod checks {
     const NIX_CHECK: &str = "nix";
 
     /// Determinate Systems' documented install one-liner — the fix for a box where nix truly is
-    /// not installed. The same installer `install.sh` chains (#745's shell half).
+    /// not installed. `install.sh` prints it in its seller note when nix is missing.
     const DETERMINATE_NIX_INSTALL: &str =
         "curl -fsSL https://install.determinate.systems/nix | sh -s -- install";
 
@@ -2609,7 +2609,9 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
 /// This is the GATE's registry: nix is always a blocking environment check here, whatever the
 /// home's role. `maxplayer doctor` reads [`build_report_checks`], which differs only in how it
 /// reports nix on a home with no `[seller]`.
-#[cfg(feature = "wallet")]
+// Gate-only (plus tests): `maxplayer doctor` reads `build_report_checks`, so a buyer-only build
+// (wallet, no acp) has no caller.
+#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
 fn build_checks(
     home: &maxplayer_core::home::MaxplayerHome,
     unsafe_no_sandbox: bool,
@@ -2824,23 +2826,23 @@ fn build_checks_with_environment(
 }
 
 /// The ENVIRONMENT requirements — checks that ask "can this box EVER do the work" rather than "is
-/// it ready right now" — currently just nix (#745). These head [`build_checks`], so `maxplayer
-/// doctor` and the full boot gate run them from the one shared registry; they are ALSO the entire
+/// it ready right now" — currently just nix (#745). These head [`build_checks`], the boot gate's
+/// registry; `maxplayer doctor` runs the same probe through [`build_report_checks`], which reports
+/// it as SKIP on a home with no `[seller]`. They are ALSO the entire
 /// registry the boot gate still runs under `--skip-doctor`, because #745 rules out any escape
 /// hatch for them — the blanket bypass narrows the gate to this subset, it never skips it. A
 /// second gate beside [`sell_readiness_gate`] was the rejected alternative: that is the #728
 /// keep-two-things-in-sync defect, committed prospectively.
-#[cfg(feature = "wallet")]
+#[cfg(all(feature = "wallet", any(feature = "acp", test)))]
 fn build_environment_checks() -> Vec<Box<dyn FnOnce() -> Check>> {
-    // The single-user nix profile lives under the operator $HOME (`~/.nix-profile`).
-    let user_home = user_home_dir();
-    vec![Box::new(move || checks::check_nix(user_home))]
+    vec![Box::new(real_nix_probe())]
 }
 
-/// The production nix probe [`build_environment_checks`] runs, for [`run_doctor`] to hand to
-/// [`build_report_checks`].
+/// The production nix probe: the one [`build_environment_checks`] runs for the gate and
+/// [`run_doctor`] hands to [`build_report_checks`], so the two cannot drift.
 #[cfg(feature = "wallet")]
 fn real_nix_probe() -> impl FnOnce() -> Check + 'static {
+    // The single-user nix profile lives under the operator $HOME (`~/.nix-profile`).
     let user_home = user_home_dir();
     move || checks::check_nix(user_home)
 }
@@ -2919,7 +2921,8 @@ fn run_doctor_with_nix_probe(
 }
 
 /// `maxplayer seller` startup readiness gate (issue #107 — auto-doctor, NOT a first-run wizard). Runs the
-/// SAME registry as `maxplayer doctor` via [`build_checks`] and REFUSES to boot when any BLOCKING check
+/// same registry as `maxplayer doctor` via [`build_checks`] (doctor differs only in reporting a
+/// missing nix as SKIP on a home with no `[seller]`, see [`build_report_checks`]) and REFUSES to boot when any BLOCKING check
 /// (`Status::Fail`) fails, echoing each failure's one-line fix hint. WARN checks are advisory: they
 /// print but never block. Returns `Ok(())` when the box can sell, `Err(())` when it must not start.
 ///
