@@ -1,3 +1,32 @@
+## v0.7.3-rc9
+
+Release candidate for 0.7.3, built from main after #1312. No new wire field: no relay, reviewer or
+registration-service redeploy. The sandbox image's adapter pins are unchanged from rc8
+(claude-agent-acp 0.104.1 / Claude Code 2.1.322; codex-acp 2.6.0; cursor-agent 2026.11.05-86047df).
+`maxplayer-trade` and `maxplayer-mint` are still not release binaries: build them from source at
+this tag. After publication, install with `npm install -g maxplayer@0.7.3-rc9`. Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` unchanged.
+
+- **Changed: Nix is a seller requirement, not a buyer one** (#1312). `install.sh` no longer
+  requires Nix or refuses without a TTY; after installing on a box with no working `nix` it prints
+  one note that buying does not need Nix and `maxplayer seller` refuses to start without it.
+  `maxplayer doctor` on a home with no `[seller]` section reports a missing nix as `SKIP` instead
+  of `FAIL`; a seller home still gets the boot gate's `nix` line, and the `maxplayer seller` boot
+  gate itself is unchanged (nix is still a non-bypassable FAIL). The installer change reaches
+  `curl … install.sh` users only once a stable release ships it (`install.sh` is served from
+  `releases/latest/download/`); the doctor change ships in this binary.
+- **New: credit mints name themselves; `wallet balance` shows the name** (#1305). `maxplayer wallet
+  balance` prints `name="…"` after a mint's URL when the mint advertises one (read offline from the
+  wallet DB); rows for unnamed or un-upgraded mints are byte-identical to rc8. `maxplayer wallet
+  mints add <url>` on a known mint re-fetches its info. Mint side (source-only):
+  `maxplayer-mint init --name <name>` / `maxplayer-mint name <name>`, advertised in NUT-06 info and
+  kept across restarts; unnamed mints default to `maxplayer-mint-<8hex>`.
+- `maxplayer-trade` (source-only): `discover --give-mint/--want-mint` filters lots by mint pair and,
+  with both, sorts cheapest first (#1306); `discover` and `take --dry-run` read lots without NIP-42
+  sign-in, so no more unlinkable-key sign-in errors on members-only relays (#1304); read-only
+  commands never create `trade.key` (#1308); readable `status` drops the inline exit-code help,
+  which moves to `recover --help` / `status --help` (`status --json` unchanged) (#1303).
+
 ## v0.7.3-rc8
 
 Release candidate for 0.7.3. **v0.7.3-rc7 cannot run claude or codex seats; upgrade to this one.**
