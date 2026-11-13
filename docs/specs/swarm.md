@@ -56,6 +56,9 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
 18. **Everything passes through the lead.** Sellers never take orders from other sellers: only the
     lead writes boards and the queue; seller notes and proposed subtasks go to the lead, which
     decides what, if anything, other sellers see. (Bob, 13 Nov 17:17)
+19. **Session jobs are the default** where the seller supports them: one session per seller per swarm
+    job, later tasks as reply turns; fall back to a one-off job otherwise or when the lead marks a
+    task `fresh`. Swarm members are told to enable sessions. (Bob, 13 Nov 17:26)
 
 ## 2. What exists today
 
@@ -118,6 +121,10 @@ untouched; no `PROTOCOL_VERSION` bump.
 - **Minutes** are per swarm per day: used = sum over that swarm's tasks to that seller whose award
   falls in the day, across all the swarm's jobs. Two overlapping swarm jobs in one swarm share the
   seller's minutes (today each challenge counted separately, `model.mjs:143`, `:150`).
+- **Session turns count too** (§7.6). A turn's minutes run from its FOLLOW-UP (`3412`, buyer-signed,
+  `root` = the task's offer) to its result, capped at the turn's `deadline`; the turn belongs to the
+  same swarm job as the offer it continues. The minutes model gains this rule (today it counts
+  offers only).
 - Public task offers keep the text prefix `[swarm:<buyer>:<swarm job d>]`; the legacy
   `[challenge:…]` matcher is dropped. Private tasks carry no public link (§7.5).
 - Swarm job `update` gains a buyer-signed JSON tally (per member: tasks done, minutes used today).
@@ -156,7 +163,8 @@ untouched; no `PROTOCOL_VERSION` bump.
 - `join` while one of the swarm's jobs is running: membership counts from the swarm's next job; `join`
   says so. A minutes change for a swarm with a running job that counts the seller is refused (it
   would forfeit the day), as the sidecar does today.
-- Delete `crates/maxplayer-challenges/` and its CI job; rewrite the `swarm-join` skill.
+- Delete `crates/maxplayer-challenges/` and its CI job; rewrite the `swarm-join` skill. The skill
+  tells members to enable `[sessions]` (docker seat), and `join` prints a hint when it is off.
 
 ## 7. Swarm engine in the buyer daemon
 
@@ -170,7 +178,10 @@ Started next to the existing loops (`buyer/mod.rs:352`, `:355`) when `[swarm].en
   result, steering notes, planner counters, last-planned fingerprint.
 - `swarm_tasks`: id, swarm job `d`, workstream, text, duration_secs, max_sats, optional seller pin,
   state (`queued | posted | collected | failed | dropped`), job_id, outcome, answer excerpt, `quotes`
-  (earlier task ids whose answers are appended), created_by (`agent | planner`).
+  (earlier task ids whose answers are appended), created_by (`agent | planner`), `fresh` (bool),
+  session job id and turn number when sent as a turn.
+- `swarm_sessions`: swarm job `d`, seller, job id of turn 1, last turn, state
+  (`open | context_reset | dead | closed`).
 - Replaces the runner's journal file and lock.
 
 ### 7.2 Tick (every 5 s)
@@ -222,6 +233,36 @@ per-seller eligibility and minutes per swarm out), run by both test suites.
   seller, so the planner output filter (§10.4) stays.
 - Setting chosen at `swarm_create` (`tasks: private`) / `maxplayer swarm create --private-tasks`;
   changing it applies to tasks posted afterwards.
+
+### 7.6 Session jobs by default
+
+Uses the existing session jobs (`docs/specs/session-jobs.md`): FOLLOW-UP `3412`, MCP/daemon `reply`,
+claims advertise `["session","1"]`; sellers need `[sessions] enabled = true` (default `false`,
+`home.rs:1790`) on a docker seat with container delivery.
+
+- **One session per seller per swarm job.** The seller's first task in that swarm job is an ordinary
+  task job. If its claim advertised sessions, the daemon records a session; the seller's next task
+  from that swarm job goes as a `reply` turn on it (same agent conversation), with the same task
+  text assembly (§9.5), so the turn stands on its own if memory is lost.
+- **Falls back to a new one-off task** when: the claim did not advertise sessions; the task is
+  `fresh`; the session is `dead` (reply refused, or the turn never started before its deadline —
+  parked sessions expire after 6 h or a seller host/Docker restart, and can be evicted for disk);
+  or the seller is not the pinned/selected seller for that task anyway. A turn that reports
+  `["context","reset"]` is still a valid result; the session continues without memory and the lead
+  sees `context_reset`.
+- **`fresh`.** The lead or the buyer's agent may mark any task `fresh` (new agent, no history). The
+  independent verify task before `solved` (§10.6) is always fresh and goes to a different seller.
+- **Dispatch rules unchanged.** A turn is a task like any other: same minutes, rate, budget and
+  one-task-per-seller-per-swarm checks; the previous turn is collected before the next is sent (as
+  `reply` requires). Each turn is paid on collect at the seller's rate.
+- **Cap.** Each session is opened with `max_session_sats` = the swarm job's budget, so the session cap
+  never binds before the swarm job budget, which the daemon enforces per turn.
+- **Close.** Sessions are closed (`reply close`) when the swarm job closes; otherwise they expire on the
+  seller's lifetime.
+- **Cost.** Every turn runs both reviews again (session-jobs §0.8), adding latency per task.
+- **Private tasks.** Follow-ups on private jobs are encrypted like the offer (session-jobs §2.1).
+  Whether the anchor's implementation covers private follow-ups end to end is checked in PR 4; if not,
+  private swarms fall back to one-off tasks until it does.
 
 ## 8. MCP tools (buyer's agent)
 
@@ -390,7 +431,9 @@ Each behind a default-off flag where it changes running behaviour.
    Rust; a private swarm's offers carry no task text or swarm link in public events and its tally
    matches the store; board text lands in the next task; a seller report lands only in the lead
    inbox, never in another seller's task text, until the lead accepts it; reports past the caps are
-   refused.
+   refused; with a session-capable stub seller, the second task to it in one swarm job is a `reply`
+   turn and its minutes are counted from the follow-up; a `fresh` task, a non-session claim and a dead
+   session each produce a new one-off job; closing the swarm job closes its sessions.
 5. **Planner** (§9, §10): presets, `planner_command`, `planner-test` with canaries, `analyze` +
    `step` with board operations, triggers, output filter, verify-before-solved. Tests: stub planner;
    rejected output fed back; canaries refuse a writing / reading command; idle ceiling; one call per
