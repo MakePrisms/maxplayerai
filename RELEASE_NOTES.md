@@ -1,3 +1,58 @@
+## v0.7.3
+
+Stable release following v0.7.3-rc9, incorporating the 0.7.3 release-candidate series.
+The code is exactly v0.7.3-rc9; only version strings and these notes changed. After
+publication, install with `npm install -g maxplayer@0.7.3`. The stable tag publishes npm
+`latest`; the `rc` dist-tag remains on its existing release candidate.
+
+### Highlights since stable v0.7.2
+
+- **The buyer daemon settles deliveries on its own**, including session turns 2 and
+  later. `get_job.settlement` reports where a job stands and `collect` becomes a manual
+  retry. Delivery-review refusals name the signed verdict, which can be accepted
+  explicitly with `--accept-review-verdict`.
+- **Security fixes:** a stranger's gift wrap could disable a seller's signer (nostr
+  0.44.8, RUSTSEC-2026-0216); money gates verify event ids and signatures themselves;
+  `collect` refuses delivered paths that escape the results folder; a cross-mint hop
+  refuses a target invoice that is not for the offer amount; host delivery refuses
+  buyer-declared checks environments; git2 and rustls-webpki advisory bumps.
+- **Host seats no longer claim contribution jobs they would refuse:** the buyer tags
+  offers whose base declares checks with `param:checks-env`, and host seats skip them.
+- **Sandbox image for Claude Fable 5.2:** claude-agent-acp 0.104.1 (Claude Code 2.1.322),
+  codex-acp 2.6.0 and cursor-agent 2026.11.05-86047df, with the seller's ACP
+  `initialize` fixed for them and a CI gate that refuses an image whose adapters
+  reject it.
+- **Session jobs on gVisor (`runsc`) seats keep their conversation**, and every session
+  turn restates the answer rule.
+- **Wallet:** `wallet receive --add-mint`, a balance guard on `wallet mints remove`, a
+  shared wallet selection lock, held swap/send sagas shown in `wallet balance` and
+  `doctor`, and mint names in `wallet balance`.
+- **Nix is a seller requirement only:** `install.sh` no longer needs Nix or a TTY, and
+  `doctor` on a buyer-only home skips the nix check.
+- `maxplayer-trade` trades from the maxplayer home with its key and wallet and uses
+  relay.maxplayer.ai first; `--trade-home` is deprecated. Trade and mint sidecars remain
+  source-built.
+
+The RC sections below keep the detailed changes and rollout notes for each stage; they
+are not new release announcements.
+
+### Upgrade and release scope
+
+- **Relay and reviewer: nothing to deploy.** The `param:checks-env` allowlist entry
+  (#1285) is in `relay-v7`, which is already live.
+- **Upgrade sellers before buyers.** v0.7.2 sellers reject private contribution offers
+  carrying `param:checks-env`, which v0.7.3 buyers send when the base declares
+  `.maxplayer/checks.toml`.
+- **runsc seats with sessions on** will not start until docker's `runsc` runtime runs
+  with `--overlay2=none`; `maxplayer doctor` prints the fix. Turn `[sessions]` off to
+  keep the old behaviour.
+- Restart buyer daemons, MCP servers and sellers after upgrading, keeping their homes,
+  keys, wallets and state. Match Docker sandbox image overrides to
+  `ghcr.io/makeprisms/maxplayer-sandbox:v0.7.3`; host-mode seats upgrade the adapters on
+  their own PATH. Buyer (9) and seller (15) store schemas are unchanged.
+- The release workflow packages the `maxplayer` client and sandbox image. The relay,
+  reviewer, website and mint/trade/challenge sidecars are deployed or built separately.
+
 ## v0.7.3-rc9
 
 Release candidate for 0.7.3, built from main after #1312. No new wire field: no relay, reviewer or
