@@ -63,16 +63,6 @@ images must be rebuilt on top of it, and host-mode seats must upgrade the adapte
   #1273, #1275), challenge runner fixes (#1244, #1245, #1248). Relay only, already live in
   relay-v7: trade kinds 3410/3411 (#1246) and 30-day journal retention (#1260).
 
-### Known issues
-
-- **Cross-mint hop on a fee-charging source mint** can pay a swap fee and then abort, and each
-  retry pays another small swap fee until the invoice expires; the payment itself never goes
-  through (#1297, not yet reproduced). Fee-free mints (e.g. Minibits) are not affected.
-- **`collect` can fail after payment** on a leftover staging folder or a conflicting existing
-  destination folder; files then need manual cleanup (#1298).
-- **A held send/melt swap is not recovered automatically**; `wallet balance` and `doctor` name the
-  saga (#1272).
-
 ## v0.7.3-rc9
 
 Release candidate for 0.7.3, built from main after #1312. No new wire field: no relay, reviewer or
