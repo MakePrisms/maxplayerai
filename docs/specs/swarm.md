@@ -25,6 +25,10 @@ Josip, #swarm-production, 11–13 Nov 2026:
    built-in presets for known CLIs and a raw command as the escape hatch.
 8. **A small task queue** per run in the daemon.
 9. **One planner call per change** (today's `assign` and `assess` merged).
+10. **Many buyers.** Any buyer can create swarm runs; a buyer is identified by its pubkey. Sellers
+    discover runs on our relay and join a run's buyer. No buyer key is built into the client.
+11. **Open questions 2–5 of the first draft accepted with their defaults** (Josip, 13 Nov 15:29);
+    question 1 is superseded by input 10. See §12.
 
 ## 1. What exists today
 
@@ -71,9 +75,10 @@ Three roles, cleanly split:
 
 1. Add 30341, 30342, 30343 to the maxplayer list in `required_scope_for_kind` (`ingest.rs:671-682`)
    as `Scope::MessagesWrite`. Writes stay member-gated (sellers and our buyer are already members).
-2. No per-kind author allowlist on the relay. Readers trust only the configured swarm buyer key
-   (`[swarm].buyer`, §5.3); runs from other keys are ignored by `swarm status`, the board and
-   sellers. Spam is bounded by the membership gate. (Open question 1.)
+2. No per-kind author allowlist on the relay and no buyer filter in clients: any relay member may
+   publish a run, and `swarm list`, the board and sellers show runs from every buyer. Spam is bounded
+   by the membership gate. If it becomes a problem, restrict who may publish 30341 with a relay rule,
+   never with a key hardcoded in the client.
 3. Reads: the board reads anonymously (open read) with its existing polling fallback. No new read
    service.
 4. Deploy: relay deploy before PR 2 is released (§9).
@@ -82,19 +87,31 @@ Three roles, cleanly split:
 
 | Command | Who | Replaces |
 |---|---|---|
-| `maxplayer swarm status [--run <d>] [--json]` | both | sidecar `status` |
-| `maxplayer swarm join --minutes N [--note …]` | seller | sidecar `join` |
-| `maxplayer swarm leave` | seller | sidecar `leave` |
+| `maxplayer swarm list [--all] [--json]` | seller | new: open runs on our relay from every buyer |
+| `maxplayer swarm status (<run> \| --buyer <npub>) [--json]` | both | sidecar `status` |
+| `maxplayer swarm join (<run> \| --buyer <npub>) --minutes N [--note …]` | seller | sidecar `join` |
+| `maxplayer swarm leave (<run> \| --buyer <npub>)` | seller | sidecar `leave` |
 | `maxplayer swarm decide --seller <hex> --accept\|--deny` | buyer | sidecar `decide` |
 | `maxplayer swarm members [--json]` | buyer | sidecar `members` |
 
 - Dispatch from `crates/maxplayer/src/cli.rs` next to `buyer`/`seller` (`cli.rs:47`).
 - One relay: the home's `relay_url`. The quorum, outbox and multi-relay paging go away; validation
   stays in `maxplayer-core/src/challenge.rs`.
-- `--buyer` defaults to `[swarm].buyer` (our key, shipped as the default), so a seller just runs
-  `maxplayer swarm join --minutes 60`.
+- **Identifying the buyer.** A buyer is its pubkey. A run is addressed `30341:<buyer pubkey>:<d>`
+  and printed by `list` as an `naddr`, so two buyers' runs never clash. `<run>` accepts that `naddr`;
+  the buyer is read from the run event. `--buyer <npub|hex>` is the alternative. There is no default.
+- **`list`** shows, per run: title, buyer (npub + kind-0 name if any), status, starts/ends, budget,
+  number of accepted members, and whether this seller is already a member of that buyer. Default:
+  `scheduled` and `in_progress` runs; `--all` adds closed ones.
+- **Membership stays per buyer**, as on the wire today: the 30342 event has `d = <buyer pubkey>`
+  (`challenge.rs`). Joining via a run makes the seller a member of that run's buyer, so it also
+  covers that buyer's later runs until `leave`. A seller joins several buyers with several
+  memberships, each with its own daily minutes. The existing eligibility rule stays: a membership
+  counts for a run only if published at or before its `starts`, so joining a run that has already
+  started counts from the buyer's next run; `join` says so.
 - `join` appends the buyer to `[seller].accept_offers_only_from` itself (preserving entries) and
   prints that the seller must be restarted. Today this is a manual step and the most common miss.
+  `leave` does not remove it (the seller may still want that buyer's market jobs).
 - Run creation (`publish`) is **not** a CLI command for humans; it is the MCP tool `swarm_create` (§6).
   A thin `maxplayer swarm create --goal-file …` wrapper over the same daemon request is fine for ops.
 - Keep the existing safety rule: `join` refuses a minutes change while a run that counts the seller is
@@ -140,6 +157,13 @@ Every 5 s (same cadence as today):
   are out of scope (§0.2).
 
 ### 5.4 Minutes: one formula, two implementations
+
+**Scope change: minutes are counted per buyer per day, across all of that buyer's runs.** Today a
+run counts only its own jobs (`model.mjs:143` takes the selected run's job facts; `:150` sums them),
+so two overlapping runs from one buyer could each use a seller's full daily minutes. With many runs
+per buyer this matters: the membership offers minutes to a buyer, not to a run. Used minutes for a
+seller = sum over that buyer's jobs to that seller whose award falls in the run day, whichever run
+posted them. One job at a time per seller per buyer, across runs.
 
 The board stays JS, the daemon becomes Rust. Both must compute identical minutes and eligibility.
 Add `web/app/src/challenge/shared/vectors.json` (events in → per-seller minutes/eligibility out),
@@ -242,11 +266,14 @@ Each behind a default-off flag where it changes running behaviour.
 
 1. **Relay admits 30341–30343** (`ingest.rs`). Test: member write of each kind accepted; non-member
    refused. Relay deploy.
-2. **`maxplayer swarm` CLI** (§4) + `[swarm].buyer` default + `swarm-join` skill update; delete
+2. **`maxplayer swarm` CLI** (§4) + `swarm-join` skill update; delete
    `crates/maxplayer-challenges` and its CI job. Tests: port the sidecar's event/eligibility tests;
-   `join` edits `accept_offers_only_from` without dropping entries; refuses minutes change mid-run.
-3. **Board on our relay**: drop the denylist, read our relay with polling, buyer key from
-   `[swarm].buyer` default; minutes vectors (§5.4). Vercel deploy.
+   `list` shows runs from two different buyers; `join <naddr>` publishes a membership with
+   `d = <that run's buyer>`; `join` edits `accept_offers_only_from` without dropping entries; refuses
+   a minutes change mid-run; joining a started run reports next-run eligibility.
+3. **Board on our relay**: drop the denylist, read our relay with polling, drop the build-time
+   `CHALLENGE_BUYER_PUBKEY`; `/swarm` lists open runs from every buyer and `/swarm/<naddr>` shows
+   one run. Minutes vectors and the per-buyer minutes scope (§5.4). Vercel deploy.
 4. **Daemon engine + MCP, no planner** (§5, §6) behind `[swarm].enabled`. Tests: fan-out of N tasks over
    M sellers with a stub seller; budget never exceeded; restart mid-run resumes from the store;
    expired job frees its seller; minutes vectors pass in Rust.
@@ -261,21 +288,26 @@ telling anyone to switch.
 ## 10. Migration
 
 Members are few. Existing memberships/decisions live on the public relays; after PR 2 each seller
-runs `maxplayer swarm join --minutes N` once and we re-`decide` them. No dual-relay period.
+runs `maxplayer swarm join --buyer <our npub> --minutes N` once and we re-`decide` them. No
+dual-relay period.
 
 ## 11. Deliberately left out
 
 - Per-buyer free/paid (`free_for`), auto-raise to rate beyond `max_sats`.
 - Private jobs, input files, git/code delivery for swarm tasks (text/inline only, as today; see #1250).
 - Multiple concurrent jobs per seller.
-- Our relay restricting who may publish runs (readers filter by key instead).
+- Restricting who may publish runs. Addable later as a relay rule on 30341, with no client change.
+- Run-specific memberships (join one run of a buyer but not another). Needs a wire change; nobody has
+  asked for it.
 - MCP sampling as a planner backend.
 
-## 12. Open questions (proposed default in bold)
+## 12. Decided questions (Josip, #swarm-production, 13 Nov 2026)
 
-1. Who may publish runs? **Readers trust only `[swarm].buyer`; no relay rule.** Alternative: relay
-   allowlist for 30341 authors.
+1. Who may publish runs? **Any relay member; clients show every buyer (§3.2).** Replaces the first
+   draft's "readers trust only our buyer key", superseded by §0.10.
 2. Should `join` edit the seller config itself? **Yes, append-only, and print the restart step.**
 3. Should `solved` require buyer confirmation? **No; one independent verify task, agent can override.**
 4. Which preset for our own buyer? **`claude`**, since its flags are already proven in production.
 5. Ship `codex` as a preset in PR 5? **Only after a live canary run with the flags above.**
+
+No open questions remain.
