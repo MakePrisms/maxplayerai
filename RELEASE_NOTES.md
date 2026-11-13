@@ -1,3 +1,78 @@
+## v0.7.3
+
+Stable release after v0.7.2. It ships exactly the code of v0.7.3-rc9 (only version strings
+and these notes changed), which rolls up v0.7.3-rc1 through rc9; each change below is described in
+full in its RC section of
+[RELEASE_NOTES.md](https://github.com/MakePrisms/maxplayerai/blob/v0.7.3/RELEASE_NOTES.md). The
+stable tag publishes npm `latest`; the `rc` dist-tag stays where it is. Install with
+`npm install -g maxplayer@0.7.3`, or `curl … install.sh` (which no longer needs Nix for buyers).
+The buyer store schema is unchanged (9) and the seller store schema is unchanged (15).
+`maxplayer-trade` and `maxplayer-mint` are not release binaries: build them from source at this
+tag. Sellers on docker seats get `ghcr.io/makeprisms/maxplayer-sandbox:v0.7.3` (claude-agent-acp
+0.104.1 / Claude Code 2.1.322, codex-acp 2.6.0, cursor-agent 2026.11.05-86047df); derived seat
+images must be rebuilt on top of it, and host-mode seats must upgrade the adapters on their own PATH.
+
+### Upgrade order (from v0.7.2)
+
+- **Relay and reviewer: nothing to do.** The relay change this release needs (`param:checks-env`
+  in the private-offer allowlist, #1285) is in `relay-v7`, which is already deployed.
+- **Sellers first, then buyers.** A v0.7.3 buyer tags private contribution offers whose base
+  declares `.maxplayer/checks.toml` with `param:checks-env`; v0.7.2 sellers reject such offers.
+  Sellers should upgrade anyway: every seller before v0.7.3-rc4 can have its signer disabled by a
+  stranger's gift wrap (#1253).
+- **runsc seats with sessions on** will not start until docker's `runsc` runtime has
+  `--overlay2=none`; `maxplayer doctor` prints the fix. Turn `[sessions]` off to keep the old
+  behaviour. Other seats see no change (#1262).
+
+### Changes since v0.7.2
+
+- **Security.** nostr 0.44.8 / relay-pool 0.44.3: a stranger's gift wrap could kill a seller's
+  signer (#1253, RUSTSEC-2026-0216). Every buyer and seller money gate recomputes the event id and
+  verifies the signature itself (#1280, #1283). `collect` refuses delivered tree paths that escape
+  the results folder, before any spend (#1290). A cross-mint hop refuses a target invoice that is
+  not for the offer amount (#1292). Host delivery refuses buyer-declared checks environments
+  (#1278). git2 0.21 and rustls-webpki 0.103.16 plus lockfile advisory bumps (#1279, #1281).
+  Release workflows read tags/inputs through `env:` (#1293).
+- **The buyer daemon settles deliveries on its own** (#1267, #1268, #1269, #1271), including
+  session turns 2 and later; `get_job.settlement` reports the state and `collect` is a manual
+  retry. Delivery-review refusals name the verdict, and `--accept-review-verdict <event-id>` accepts
+  that exact signed verdict (#1124).
+- **Host seats no longer claim contribution jobs they would refuse** (#1285, fixes #707): the
+  buyer tags offers with `param:checks-env`, and host-delivery seats skip them before claiming.
+- **Seller ACP:** the driver requests ACP protocol v1, which the 0.104.x/2.6.x adapters accept
+  (#1291, fixes #1289); `scripts/check-acp-initialize.sh` gates CI and image publishing on it.
+  Session turns restate the answer rule (#1258), and runsc seats keep session state (#1262).
+  Terminal pre-claim review outcomes are not re-driven every tick (#1222).
+- **Buyer reliability:** a relay refusal during award prepare no longer strands the job (#1254).
+- **Wallet.** `wallet receive` can add the token's mint (prompt, or `--add-mint`), and `wallet
+  mints remove` refuses while the mint holds a balance unless `--force` (#1259). A wallet
+  selection lock and swap recovery from the swap's own outputs (#1263); `wallet balance` shows
+  `reserved_sats`, held swap/send sagas and mint names (#1305), and `doctor` warns on held sagas.
+- **Install and doctor:** Nix is a seller requirement only; `install.sh` no longer needs it or a
+  TTY, and `doctor` on a buyer-only home reports a missing nix as `SKIP` (#1312). `doctor`'s
+  harness credential check resolves on the same host as the preset check (#1018).
+- **Trading (source-only `maxplayer-trade`):** trades from the maxplayer home with its key and
+  wallet, refuses `http://` mints, uses relay.maxplayer.ai first, and gains mint-pair filters and
+  sign-in-free reads (#1251, #1263, #1274, #1303, #1304, #1306, #1308). `account link|status|
+  marketing --trade-home` is deprecated and ignored (#1252, #1263). `maxplayer-mint` mints can name
+  themselves (#1305).
+- **Release:** the GitHub Release body is this section only (#1288); `flake.nix` derives package
+  versions from the Cargo manifests (#997).
+- Docs, site and CI: skill accuracy passes (#1247, #1249, #1255, #1296), link previews (#1294,
+  #1295), first-job video (#1282), grok-bot skill (#1277), CI profiles and cancellation (#1270,
+  #1273, #1275), challenge runner fixes (#1244, #1245, #1248). Relay only, already live in
+  relay-v7: trade kinds 3410/3411 (#1246) and 30-day journal retention (#1260).
+
+### Known issues
+
+- **Cross-mint hop on a fee-charging source mint** can pay a swap fee and then abort, and each
+  retry pays another small swap fee until the invoice expires; the payment itself never goes
+  through (#1297, not yet reproduced). Fee-free mints (e.g. Minibits) are not affected.
+- **`collect` can fail after payment** on a leftover staging folder or a conflicting existing
+  destination folder; files then need manual cleanup (#1298).
+- **A held send/melt swap is not recovered automatically**; `wallet balance` and `doctor` name the
+  saga (#1272).
+
 ## v0.7.3-rc9
 
 Release candidate for 0.7.3, built from main after #1312. No new wire field: no relay, reviewer or
