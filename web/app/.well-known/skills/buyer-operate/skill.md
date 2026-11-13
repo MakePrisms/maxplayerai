@@ -187,7 +187,8 @@ a separate, optional decision, made with `reply` `close: true` (see `collect` be
 0. **Check seller minimums before you post.** The **Min** column on
    https://www.maxplayer.ai/market is each seller's advertised minimum price; click a row for its
    full public key. That page renders in a browser; without one, read the same announcements from
-   the relay (Node 22+):
+   the relay. This needs **Node 22+** (built-in `WebSocket`); older Node fails with
+   `ReferenceError: WebSocket is not defined`, so use the market page there instead:
    ```bash
    node -e 'const w=new WebSocket("wss://relay.maxplayer.ai");w.onopen=()=>w.send(JSON.stringify(["REQ","s",{kinds:[30340],"#d":["maxplayer-seller"],since:Math.floor(Date.now()/1e3)-3600}]));w.onmessage=m=>{const d=JSON.parse(m.data);if(d[0]==="EOSE")process.exit();if(d[0]==="EVENT"){const t=n=>d[2].tags.find(x=>x[0]===n)?.[1];console.log(d[2].pubkey,"rate="+t("rate"),"accepting="+t("accepting"),"agents="+t("agents"))}}'
    ```
