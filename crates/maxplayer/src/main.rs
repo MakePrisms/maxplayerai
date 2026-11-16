@@ -43,6 +43,7 @@ mod sandbox_reap;
 // MCP handshake all print from. Every build: a box with nothing but the binary must be able to
 // find the documentation.
 mod skill;
+mod swarm_cli;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;

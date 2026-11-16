@@ -93,7 +93,10 @@ impl SwarmRelay {
     ) -> Result<Vec<Event>, String> {
         let mut out = Vec::new();
         for chunk in authors.chunks(AUTHOR_CHUNK) {
-            out.extend(self.fetch(vec![filter().authors(chunk.iter().copied())]).await?);
+            out.extend(
+                self.fetch(vec![filter().authors(chunk.iter().copied())])
+                    .await?,
+            );
         }
         Ok(out)
     }
@@ -157,7 +160,10 @@ pub fn reject_secret_in_draft(home: &MaxplayerHome, draft: &EventDraft) -> Resul
     let secret = home::read_secret_key_hex(home).map_err(|_| "could not read home key")?;
     if !secret.is_empty()
         && (draft.content.contains(&secret)
-            || draft.tags.iter().any(|tag| tag.0.iter().any(|v| v.contains(&secret))))
+            || draft
+                .tags
+                .iter()
+                .any(|tag| tag.0.iter().any(|v| v.contains(&secret))))
     {
         return Err("event would publish secret key".into());
     }
@@ -206,11 +212,23 @@ mod tests {
     fn replacement_timestamp_beats_the_stored_version() {
         let k = Keys::generate();
         let me = k.public_key().to_hex();
-        let stored = [event(&k, 30342, "x", 1000), event(&Keys::generate(), 30342, "x", 5000)];
-        assert_eq!(replacement_timestamp(900, &stored, &me, 30342, "x"), Ok(1001));
-        assert_eq!(replacement_timestamp(2000, &stored, &me, 30342, "x"), Ok(2000));
+        let stored = [
+            event(&k, 30342, "x", 1000),
+            event(&Keys::generate(), 30342, "x", 5000),
+        ];
+        assert_eq!(
+            replacement_timestamp(900, &stored, &me, 30342, "x"),
+            Ok(1001)
+        );
+        assert_eq!(
+            replacement_timestamp(2000, &stored, &me, 30342, "x"),
+            Ok(2000)
+        );
         // Another author's or another `d`'s event does not move it.
-        assert_eq!(replacement_timestamp(900, &stored, &me, 30342, "y"), Ok(900));
+        assert_eq!(
+            replacement_timestamp(900, &stored, &me, 30342, "y"),
+            Ok(900)
+        );
         let ahead = [event(&k, 30342, "x", 900 + 901)];
         assert!(replacement_timestamp(900, &ahead, &me, 30342, "x").is_err());
     }

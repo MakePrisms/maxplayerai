@@ -69,7 +69,9 @@ pub fn valid_slug(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 pub fn valid_hex(s: &str) -> bool {
-    s.len() == 64 && s.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    s.len() == 64
+        && s.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 fn base(d: &EventDraft, kind: u16) -> Result<()> {
     require(d.kind == kind, "wrong kind")?;
@@ -98,7 +100,10 @@ pub fn parse_swarm_address(a: &str) -> Result<(&str, &str)> {
         return Err(SwarmError("invalid swarm address"));
     };
     require(kind == SWARM_KIND.to_string(), "address names another kind")?;
-    require(valid_hex(buyer) && valid_slug(swarm), "invalid swarm address")?;
+    require(
+        valid_hex(buyer) && valid_slug(swarm),
+        "invalid swarm address",
+    )?;
     Ok((buyer, swarm))
 }
 
@@ -184,7 +189,11 @@ impl SwarmJob {
         add(&mut t, "starts", self.starts);
         add(&mut t, "ends", self.ends);
         add(&mut t, "status", &self.status);
-        t.push(TagSpec::new(["budget", &self.budget_sats.to_string(), "sat"]));
+        t.push(TagSpec::new([
+            "budget",
+            &self.budget_sats.to_string(),
+            "sat",
+        ]));
         if let Some(v) = &self.update {
             add(&mut t, "update", v);
         }
@@ -211,7 +220,10 @@ fn parse_swarm_job_draft(d: &EventDraft, author: &str) -> Result<SwarmJob> {
     let budget_sats = number(&b[1])?;
     let status = value(d, "status")?;
     require(
-        matches!(status, "scheduled" | "in_progress" | "completed" | "cancelled"),
+        matches!(
+            status,
+            "scheduled" | "in_progress" | "completed" | "cancelled"
+        ),
         "unknown swarm job status",
     )?;
     let title = value(d, "title")?;
@@ -262,12 +274,21 @@ fn parse_membership_draft(d: &EventDraft, author: &str) -> Result<Membership> {
     require(valid_hex(author), "invalid seller key")?;
     let (buyer, swarm) = parse_swarm_address(value(d, "a")?)?;
     require(value(d, "p")? == buyer, "membership p and a disagree")?;
-    require(value(d, "d")? == format!("{buyer}:{swarm}"), "bad membership d")?;
+    require(
+        value(d, "d")? == format!("{buyer}:{swarm}"),
+        "bad membership d",
+    )?;
     let since = number(value(d, "since")?)?;
     let minutes = number(value(d, "minutes")?)?;
-    require((1..=MINUTES_MAX).contains(&minutes), "minutes must be 1..=480")?;
+    require(
+        (1..=MINUTES_MAX).contains(&minutes),
+        "minutes must be 1..=480",
+    )?;
     let status = value(d, "status")?;
-    require(matches!(status, "joined" | "left"), "unknown membership status")?;
+    require(
+        matches!(status, "joined" | "left"),
+        "unknown membership status",
+    )?;
     let oversized = d.content.encode_utf16().count() > NOTE_MAX
         || serde_json::to_string(&d.tags.iter().map(|t| &t.0).collect::<Vec<_>>())
             .expect("string tags")
@@ -281,7 +302,11 @@ fn parse_membership_draft(d: &EventDraft, author: &str) -> Result<Membership> {
         since,
         minutes,
         status: status.into(),
-        note: if oversized { String::new() } else { d.content.clone() },
+        note: if oversized {
+            String::new()
+        } else {
+            d.content.clone()
+        },
     })
 }
 
@@ -326,7 +351,10 @@ fn parse_decision_draft(d: &EventDraft, author: &str) -> Result<Decision> {
         Some(a) => {
             let (buyer, swarm) = parse_swarm_address(a)?;
             require(buyer == author, "decision names another buyer's swarm")?;
-            require(value(d, "d")? == format!("{seller}:{swarm}"), "bad decision d")?;
+            require(
+                value(d, "d")? == format!("{seller}:{swarm}"),
+                "bad decision d",
+            )?;
             Some(swarm.to_owned())
         }
         None => {
@@ -335,7 +363,10 @@ fn parse_decision_draft(d: &EventDraft, author: &str) -> Result<Decision> {
         }
     };
     let decision = value(d, "decision")?;
-    require(matches!(decision, "accepted" | "denied"), "unknown decision")?;
+    require(
+        matches!(decision, "accepted" | "denied"),
+        "unknown decision",
+    )?;
     let membership_event_id = optional(d, "e")?.map(str::to_owned);
     require(
         membership_event_id.as_deref().is_none_or(valid_hex),
@@ -368,7 +399,10 @@ mod signed {
             .map_err(|_| SwarmError("invalid event id or signature"))?;
         Ok(EventDraft::new(
             e.kind.as_u16(),
-            e.tags.iter().map(|t| TagSpec(t.as_slice().to_vec())).collect(),
+            e.tags
+                .iter()
+                .map(|t| TagSpec(t.as_slice().to_vec()))
+                .collect(),
             &e.content,
         ))
     }
@@ -387,7 +421,9 @@ mod signed {
     /// Verify before replacement: the newest event per `(author, kind, d)`; a `created_at` tie
     /// goes to the lower id. Callers drop invalid payloads first (the ignore-invalid rule), so an
     /// invalid newer event never hides a valid older one.
-    pub fn latest_per_coordinate<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<&'a Event> {
+    pub fn latest_per_coordinate<'a>(
+        events: impl IntoIterator<Item = &'a Event>,
+    ) -> Vec<&'a Event> {
         let mut latest: BTreeMap<(String, u16, String), &Event> = BTreeMap::new();
         for e in events {
             let Ok(draft) = verified(e) else { continue };
@@ -403,7 +439,9 @@ mod signed {
         latest.into_values().collect()
     }
     /// Latest valid swarms (any buyer), as `(event, swarm)`.
-    pub fn latest_swarms<'a>(events: impl IntoIterator<Item = &'a Event>) -> Vec<(&'a Event, Swarm)> {
+    pub fn latest_swarms<'a>(
+        events: impl IntoIterator<Item = &'a Event>,
+    ) -> Vec<(&'a Event, Swarm)> {
         latest_per_coordinate(events.into_iter().filter(|e| parse_swarm(e).is_ok()))
             .into_iter()
             .filter_map(|e| parse_swarm(e).ok().map(|s| (e, s)))
@@ -600,7 +638,10 @@ mod tests {
     #[test]
     fn drafts_roundtrip() {
         let s = swarm();
-        assert_eq!(parse_swarm_draft(&s.to_event_draft().unwrap(), BUYER).unwrap(), s);
+        assert_eq!(
+            parse_swarm_draft(&s.to_event_draft().unwrap(), BUYER).unwrap(),
+            s
+        );
         let mut private = s.clone();
         private.tasks = "private".into();
         assert_eq!(
@@ -608,12 +649,21 @@ mod tests {
             private
         );
         let j = job();
-        assert_eq!(parse_swarm_job_draft(&j.to_event_draft().unwrap(), BUYER).unwrap(), j);
+        assert_eq!(
+            parse_swarm_job_draft(&j.to_event_draft().unwrap(), BUYER).unwrap(),
+            j
+        );
         let m = membership();
-        assert_eq!(parse_membership_draft(&m.to_event_draft().unwrap(), SELLER).unwrap(), m);
+        assert_eq!(
+            parse_membership_draft(&m.to_event_draft().unwrap(), SELLER).unwrap(),
+            m
+        );
         for scope in [None, Some("math")] {
             let d = decision(scope);
-            assert_eq!(parse_decision_draft(&d.to_event_draft().unwrap(), BUYER).unwrap(), d);
+            assert_eq!(
+                parse_decision_draft(&d.to_event_draft().unwrap(), BUYER).unwrap(),
+                d
+            );
         }
     }
     #[test]
@@ -666,7 +716,11 @@ mod tests {
                 }
                 let mut d = original.clone();
                 d.tags.push(d.tags[i].clone());
-                assert!(parse(&d).is_err(), "kind {} duplicate {name}", original.kind);
+                assert!(
+                    parse(&d).is_err(),
+                    "kind {} duplicate {name}",
+                    original.kind
+                );
             }
             for (k, v) in [("t", "other"), ("v", "2")] {
                 let mut d = original.clone();
@@ -767,7 +821,11 @@ mod tests {
             assert!(parse_swarm_job_draft(&d, BUYER).is_err(), "{k}: {v}");
         }
         let mut d = job().to_event_draft().unwrap();
-        d.tags.iter_mut().find(|t| t.first() == Some("budget")).unwrap().0[2] = "usd".into();
+        d.tags
+            .iter_mut()
+            .find(|t| t.first() == Some("budget"))
+            .unwrap()
+            .0[2] = "usd".into();
         assert!(parse_swarm_job_draft(&d, BUYER).is_err());
         for (k, v) in [
             ("name", " "),
@@ -831,7 +889,12 @@ mod tests {
             let mut m = membership();
             m.buyer = j.buyer.clone();
             m.seller = seller.public_key().to_hex();
-            World { buyer, seller, job: j, m }
+            World {
+                buyer,
+                seller,
+                job: j,
+                m,
+            }
         }
         impl World {
             fn decide(&self, swarm: Option<&str>, decision: &str, t: u64) -> Event {
@@ -928,7 +991,11 @@ mod tests {
             m.minutes = 20;
             for padded_tags in [false, true] {
                 let mut draft = m.to_event_draft().unwrap();
-                draft.content = if padded_tags { "short".into() } else { "x".repeat(4097) };
+                draft.content = if padded_tags {
+                    "short".into()
+                } else {
+                    "x".repeat(4097)
+                };
                 if padded_tags {
                     draft.tags.push(TagSpec::new(["extra", &"x".repeat(16385)]));
                 }
@@ -1003,7 +1070,10 @@ mod tests {
             day2.starts += 86400;
             day2.ends += 86400;
             for day in [&w.job, &day2] {
-                assert_eq!(eligible_sellers(day, [&joined, &accepted]), vec![w.m.clone()]);
+                assert_eq!(
+                    eligible_sellers(day, [&joined, &accepted]),
+                    vec![w.m.clone()]
+                );
             }
             // A late replacement cannot borrow an earlier seller-chosen epoch.
             let mut m = w.m.clone();
@@ -1022,14 +1092,21 @@ mod tests {
             assert!(eligible_sellers(&day2, [&late, &left, &accepted]).is_empty());
             let mut invalid = left.clone();
             invalid.content.push('x');
-            assert_eq!(eligible_sellers(&day2, [&late, &invalid, &accepted]).len(), 1);
+            assert_eq!(
+                eligible_sellers(&day2, [&late, &invalid, &accepted]).len(),
+                1
+            );
         }
         #[test]
         fn latest_tie_break() {
             let w = world();
             let accepted = w.decide(None, "accepted", 100);
             let tied = w.decide(None, "denied", 100);
-            let winner = if tied.id < accepted.id { &tied } else { &accepted };
+            let winner = if tied.id < accepted.id {
+                &tied
+            } else {
+                &accepted
+            };
             assert_eq!(latest_per_coordinate([&tied, &accepted]), vec![winner]);
             assert_eq!(latest_per_coordinate([&accepted, &tied]), vec![winner]);
         }
@@ -1045,7 +1122,10 @@ mod tests {
             let jobs = vec![running.clone(), other_swarm];
             let now = running.starts + 10;
             // Counted in the running job: a republish now would forfeit it.
-            assert_eq!(blocking_job(&jobs, &joined, &w.m, now, now), Some(running.clone()));
+            assert_eq!(
+                blocking_job(&jobs, &joined, &w.m, now, now),
+                Some(running.clone())
+            );
             // After ends + tolerance it no longer blocks.
             let late = running.ends + CREATED_AT_TOLERANCE + 1;
             assert_eq!(blocking_job(&jobs, &joined, &w.m, late, late), None);
@@ -1056,8 +1136,14 @@ mod tests {
             let mut closed = running.clone();
             closed.status = "completed".into();
             assert_eq!(blocking_job(&[closed], &joined, &w.m, now, now), None);
-            assert_eq!(running_job(&jobs, &w.job.buyer, "math", now), Some(running.clone()));
-            assert_eq!(running_job(&jobs, &w.job.buyer, "math", running.starts - 1), None);
+            assert_eq!(
+                running_job(&jobs, &w.job.buyer, "math", now),
+                Some(running.clone())
+            );
+            assert_eq!(
+                running_job(&jobs, &w.job.buyer, "math", running.starts - 1),
+                None
+            );
             assert_eq!(running_job(&jobs, &w.job.buyer, "chem", now), None);
         }
     }
