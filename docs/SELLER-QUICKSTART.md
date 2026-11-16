@@ -1732,21 +1732,23 @@ container is reached from inside it, or with the signal directly:
 
 ```bash
 docker exec <container> maxplayer seller drain                    # or: docker kill --signal=USR1 <container>
-systemctl --user kill --kill-whom=main -s USR1 maxplayer-seller   # systemd: signal ONLY the seller
+systemctl --user kill --kill-who=main -s USR1 maxplayer-seller   # systemd: signal ONLY the seller
 ```
 
-Always pass `--kill-whom=main` to `systemctl kill`: without it systemd signals every process in the
+Always pass `--kill-who=main` to `systemctl kill`: without it systemd signals every process in the
 unit, including the running job's agent, which SIGUSR1 kills. A Docker seat runs from an image, so a
 restart policy brings back the OLD version: after the drain exits, recreate the container from the new
 image (`docker compose pull && docker compose up -d`, or `docker run` again).
 
 The seller then advertises `accepting=n`, claims nothing new, still honours an award for a claim it
 already published, finishes and delivers what is running, publishes its terminal `accepting=n` and
-exits 0. New follow-up turns on parked session jobs are left on the relay for the restarted seller.
+exits 0. A new follow-up turn on a parked session job is journaled, not started, and the restarted
+seller runs it.
 The status line reads `DRAINING — …` with what it is still waiting for. A unit with
 `Restart=always` comes straight back on the new binary (`Restart=on-failure` does not: exit 0 is not
-a failure). A SIGTERM during the drain still stops it at once. Parked session jobs and
-delivered-but-unpaid jobs are not waited for; both survive a restart.
+a failure). A SIGTERM during the drain still stops it at once. Parked session jobs,
+delivered-but-unpaid jobs and follow-up turns waiting for the previous turn's payment are not
+waited for; all survive a restart.
 
 Restarting is the bare relaunch — config is already written:
 
