@@ -62,10 +62,17 @@ usage and exits 2 for `--help`; that alone is not an installation failure.
   persistent service appropriate to this host. Inspect and preserve existing
   service configuration. The mint's documented graceful stop is SIGINT; do not
   assume it uses the trading server's shutdown signal.
-- Keep exactly one live mint. Establish a protected backup of the whole mint
-  directory while the mint is stopped, and a procedure to keep that backup
-  current. An old database is not a safe substitute for the latest spent-proof
-  record. Never print seeds, keys, proofs, token contents or raw databases.
+- Keep exactly one live mint. **Backups are automatic:** `maxplayer-mint run`
+  snapshots the database online after every change and keeps the key, seed,
+  config and issued token files in its backup directory (`<home>/mint/backups/`,
+  or `backup_dir` in `mint.toml`). The only backup step is **one-time, at setup**:
+  ask the human to get that directory off this machine, either by pointing
+  `backup_dir` at off-box storage (then restart the mint) or by adding it to an
+  existing off-box backup or sync. Record which. **Never ask the human to back up
+  or stop the mint after a trade, issue or receive**, and never stop it to copy
+  files: the backups are already current. Restore only with `maxplayer-mint
+  restore` (newest backup only, mint stopped). Never print seeds, keys, proofs,
+  token contents or raw databases.
 - Configure the trading client to reach the mint using compatible **mint relays**.
   These are distinct from **market relays**, which carry lots and trade messages.
   Follow the trading references. `relay.maxplayer.ai` is the first default market relay
@@ -84,8 +91,8 @@ usage and exits 2 for `--help`; that alone is not an installation failure.
   human also wants to set one up; do not start an unconfigured seller.
 
 **Setup is complete** when both binaries are usable, the mint service is running,
-the trading client can reach it, and the persistent homes and backup procedure
-are recorded. Report any host limitation instead of claiming a temporary process
+the trading client can reach it, and the persistent homes and the backup
+directory's off-box location are recorded. Report any host limitation instead of claiming a temporary process
 will survive logout or reboot.
 
 ## 3. Prepare the first issuance and sale

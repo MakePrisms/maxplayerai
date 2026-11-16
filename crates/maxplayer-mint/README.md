@@ -60,24 +60,53 @@ step 4. It refuses if `<home>/mint/` already exists.
 
 - `nostr.key` and `seed`: the mint itself. Whoever holds them can issue credits under your mint.
 - `mint.sqlite`: the keysets and every proof already spent.
-- `mint.toml`: relays and rate limit.
+- `mint.toml`: relays, rate limit, name and `backup_dir`.
 - `issued/`: one token file per `issue`. A file nobody has received yet is spendable credits.
+- `backups/`: the automatic backups `run` keeps (below).
 
 The directory is created `0700`, and that mode is what keeps it private. `nostr.key`, `seed`,
 `mint.toml` and the token files are `0600`, but cdk creates `mint.sqlite` under your umask, so
 never loosen the directory mode.
 
-**Back it up now, and keep exactly one live copy.**
+**Backups are automatic.** While `run` serves, it keeps the backup directory
+(`<home>/mint/backups/`, or `backup_dir` in `mint.toml`) current by itself:
+
+- A consistent snapshot of `mint.sqlite`, taken online with SQLite `VACUUM INTO` (no stopping
+  the mint): once at start, within about 30 seconds of any change (every trade, receive and
+  `issue`), and once more on a clean stop. The newest 10 are kept as
+  `mint-<sequence>-<UTC time>.sqlite`, each written atomically and `0600` in a `0700` directory.
+- Copies of `nostr.key`, `seed`, `mint.toml` and every `issued/*.token`, so the backup directory
+  alone is a complete restore set.
+- A snapshot that fails is logged as `maxplayer-mint: BACKUP FAILED …` and retried; the mint keeps
+  serving.
+
+**The one manual step, once at setup: get the backup directory off this machine.** A backup on
+the same disk does not survive losing that disk. Either set `backup_dir` in `mint.toml` to a
+mounted off-box location (network share, a second disk, a synced folder) and restart `run`, or
+have your existing backup or sync tool copy `<home>/mint/backups/` off the box on its own
+schedule. Nothing else is needed after trades: never stop the mint to back it up.
 
 - Losing `nostr.key` or `seed` makes every credit the mint issued worthless. There is no
   platform backup.
 - An **old or missing** `mint.sqlite` can let credits that were already spent be spent again:
   with the seed still there, the mint comes back with the same keys and no record of what was
-  spent. Restore only the latest copy, never delete `mint.sqlite` to fix a problem, and never
-  run two copies.
-- Stop the service before you copy the directory (`systemctl --user stop maxplayer-mint`, then
-  `start` again). A copy taken while `run` is serving can be torn.
-- Protect the backup like the mint: it can issue credits and holds every unreceived token.
+  spent. Never delete `mint.sqlite` to fix a problem, and never run two copies. `run` refuses to
+  start when `mint.sqlite` is missing or older than the newest backup.
+- Protect the backup directory like the mint: it can issue credits and holds every unreceived
+  token.
+
+**Restore** only the NEWEST backup, with the service stopped:
+
+```bash
+systemctl --user stop maxplayer-mint
+maxplayer-mint restore                 # from backup_dir; or: maxplayer-mint restore --from <dir>
+systemctl --user start maxplayer-mint
+```
+
+`restore` takes the newest snapshot and nothing older, moves the replaced `mint.sqlite` aside
+(`<home>/mint/replaced-<time>/`, never deleted), and recreates `<home>/mint/` from the backup
+directory if it is gone. It refuses another mint's backups and a database that already holds
+everything in the newest snapshot.
 
 ## 2. Configure (optional)
 
@@ -87,6 +116,7 @@ never loosen the directory mode.
 relays = []       # empty = wss://relay.maxplayer.ai + wss://relay.ditto.pub + wss://nostr-pub.wellorder.net
 rate_limit = 20   # new requests per second, across all clients (replays of old requests don't count)
 name = "io-seller" # shown by wallets next to the mint URL; unset = maxplayer-mint-<8 hex>
+backup_dir = "/mnt/offbox/maxplayer-mint"  # automatic backups; unset = <home>/mint/backups (relative = from <home>/mint)
 ```
 
 Wallets use the same default and fallback relays, so leave `relays` empty unless you know why.
