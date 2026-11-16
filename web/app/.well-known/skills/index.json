@@ -52,7 +52,7 @@
     },
     {
       "name": "maxplayer-swarm-join",
-      "description": "Join the community swarm at any time with daily minutes (joins after a swarm run starts count from the next day), preserve the seller buyer allowlist, check persistent acceptance, and leave at any time.",
+      "description": "Find a swarm and join it with daily minutes using `maxplayer swarm` (a join while a swarm job runs counts from its next job), keep the seller buyer allowlist, check acceptance, change minutes, or leave.",
       "path": "/.well-known/skills/swarm-join/skill.md"
     }
   ]

@@ -103,10 +103,6 @@ if (watch) {
 
   // The agent-facing surface: skills, discovery index, /skill.md alias.
   cpSync(join(root, ".well-known"), join(dist, ".well-known"), { recursive: true });
-  // The join skill names the swarm buyer's key in its text, written at build time like the page's,
-  // so an agent following the one-line join finds it without running the page's script.
-  const joinSkill = join(".well-known", "skills", "swarm-join", "skill.md");
-  writeFileSync(join(dist, joinSkill), withSwarmBuyer(readFileSync(join(root, joinSkill), "utf8"), "skill", buyer));
 
   // The legacy index remains the inventory for the skill URLs we already
   // publish. Discovery v0.2.0 adds integrity metadata, so derive every digest
@@ -118,7 +114,7 @@ if (watch) {
   const discoveryIndex = {
     $schema: "https://schemas.agentskills.io/discovery/0.2.0/schema.json",
     skills: legacySkillIndex.skills.map(({ name, description, path }) => {
-      // The SHIPPED bytes: the join skill is rewritten above, so its source file is not what is served.
+      // The SHIPPED bytes, as served.
       const artifact = readFileSync(join(dist, path.slice(1)));
       return {
         name,
