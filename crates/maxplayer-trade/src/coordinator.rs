@@ -83,6 +83,22 @@ pub struct Listing {
     pub reservation: String,
     pub active: Option<String>,
     pub cancelled: bool,
+    /// Recovery found the lot past its expiry (plus [`EXPIRED_LOT_GRACE_SECONDS`]) with no live
+    /// maker swap: it is never served or reserved again. Journaled before the release.
+    #[serde(default)]
+    pub expired: bool,
+    /// The expired lot's reservation is released (set after the release succeeded).
+    #[serde(default)]
+    pub expired_released: bool,
+}
+/// How long past a lot's `expires_at` recovery waits before it releases the reservation of a lot
+/// nobody traded. A request admitted just before expiry holds the lot's `lot:<id>` unit key until
+/// its swap row is saved, so this is a margin, not the guard; the live-swap check is the guard.
+pub const EXPIRED_LOT_GRACE_SECONDS: u64 = QUOTE_SECONDS;
+/// Whether `l` is past its signed expiry plus [`EXPIRED_LOT_GRACE_SECONDS`] at `at`.
+fn lot_past_expiry(l: &Listing, at: u64) -> bool {
+    serde_json::from_str::<Lot>(&l.event.content)
+        .is_ok_and(|lot| at >= lot.expires_at.saturating_add(EXPIRED_LOT_GRACE_SECONDS))
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Swap {
@@ -254,6 +270,8 @@ pub async fn list(
         reservation: uuid::Uuid::new_v4().to_string(),
         active: None,
         cancelled: false,
+        expired: false,
+        expired_released: false,
     };
     // Persist reservation intent first; recovery completes it before any new wallet operation.
     mint::reserve_new(home, &row.plan, &row.reservation, || {
@@ -275,6 +293,10 @@ pub async fn cancel(home: &Path, j: &Journal, m: &Market, id: &str) -> Result<()
     ensure!(
         lifecycle(&l.event, &l.statuses)? == Status::Available,
         "lot is terminal"
+    );
+    ensure!(
+        !l.expired,
+        "lot expired; recovery releases its reservation on its own (nothing to cancel)"
     );
     ensure!(l.active.is_none(), "cannot cancel active swap");
     // The swap rows are authoritative (`active` may lag them after a crash or timeout).
@@ -606,6 +628,7 @@ async fn handle_message(home: &Path, j: &Journal, m: &Market, e: &Event) -> Resu
             .context("unknown lot")?;
         ensure!(
             !l.cancelled
+                && !l.expired
                 && l.published > 0
                 && lifecycle(&l.event, &l.statuses)? == Status::Available
                 && l.active.is_none(),
@@ -1349,8 +1372,31 @@ async fn recover_listing(
             l.active = Some(s.id.clone());
             j.put("listing", &l.event.id.to_hex(), &l).await?;
         }
+        // An expired lot nobody is trading: no new request can be admitted (`parse_lot` refuses
+        // it), so release its reservation instead of waiting for a manual `cancel`. A live maker
+        // swap (from the swap rows, as `cancel` checks) keeps it reserved until that swap ends.
+        // Nothing is published: relays already drop the listing at its NIP-40 expiration.
+        if !l.expired
+            && !l.cancelled
+            && lifecycle(&l.event, &l.statuses)? == Status::Available
+            && lot_past_expiry(&l, now())
+            && !live_maker_swap(j, &l.event.id.to_hex()).await?
+        {
+            l.expired = true;
+            j.put("listing", &l.event.id.to_hex(), &l).await?;
+        }
+        if l.expired && !l.expired_released {
+            mint::release(home, &l.plan, &l.reservation).await?;
+            l.expired_released = true;
+            j.put("listing", &l.event.id.to_hex(), &l).await?;
+            eprintln!(
+                "{}",
+                serde_json::json!({"lot_id":l.event.id,"status":"expired","released_debit":l.plan.debit,"mint":l.plan.mint})
+            );
+        }
         if l.active.is_none()
             && !l.cancelled
+            && !l.expired
             && lifecycle(&l.event, &l.statuses)? == Status::Available
         {
             mint::reserve(home, &l.plan, &l.reservation).await?;
@@ -2193,6 +2239,8 @@ mod t7_review_regressions {
                 reservation: uuid::Uuid::new_v4().to_string(),
                 active: None,
                 cancelled: false,
+                expired: false,
+                expired_released: false,
             },
         )
         .await
@@ -2272,6 +2320,8 @@ mod review_r2 {
                 reservation: uuid::Uuid::new_v4().to_string(),
                 active: None,
                 cancelled,
+                expired: false,
+                expired_released: false,
             },
         )
     }

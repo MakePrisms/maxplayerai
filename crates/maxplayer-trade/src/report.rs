@@ -131,13 +131,20 @@ pub fn render(home: &Path) -> Result<String> {
         if l.cancelled && status == "available" {
             line.push_str(" (cancel pending publication)");
         }
+        if l.expired && status == "available" {
+            line.push_str(if l.expired_released {
+                " (expired; reservation released)"
+            } else {
+                " (expired; reservation release pending)"
+            });
+        }
         if let Some(t) = lot_terms(&l.event) {
             line.push_str(&format!(
                 "; gives {} {} for {} {}",
                 t.give.net, t.give.asset.mint_url, t.want.net, t.want.asset.mint_url
             ));
         }
-        if status == "available" && !l.cancelled {
+        if status == "available" && !l.cancelled && !l.expired {
             line.push_str(&format!(
                 "; reserves debit {} {}",
                 l.plan.debit, l.plan.mint

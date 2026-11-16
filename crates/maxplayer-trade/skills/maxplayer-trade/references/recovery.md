@@ -172,6 +172,10 @@ wallet credit. Recover or resume that exact quote, never pay a second invoice to
 resolve missing credit. A historical CDK orphan-quote reservation problem needs a
 human; never clear it from the database yourself.
 
+An expired lot (24 h) with no live maker swap needs no `cancel`: `serve`/`recover`
+release its reservation one minute after expiry and publish nothing; `status` shows
+`(expired; reservation released)`. A swap still live at expiry keeps it reserved until it ends.
+
 Published listing statuses (`available`, `sold`, `cancelled`) are not wallet
 settlement states. Reservations/active quotes and lot expiry are separate conditions. Relay absence, a publication ACK, or a stale listing is
 not permission to duplicate a trade. A listing quarantined by discovery validation

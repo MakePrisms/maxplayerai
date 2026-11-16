@@ -547,7 +547,7 @@ pub async fn send(
 }
 
 /// Ys named by unfinished journaled intents on `mint`: sends, withdrawals, listings
-/// (not cancelled) and coordinator swaps. Coin selection never takes them.
+/// (not cancelled or expired) and coordinator swaps. Coin selection never takes them.
 pub(crate) async fn journaled_inputs(j: &Journal, mint: &str) -> Result<HashSet<PublicKey>> {
     let mut ys = HashSet::new();
     for r in j.all::<SendAttempt>("send").await? {
@@ -561,7 +561,7 @@ pub(crate) async fn journaled_inputs(j: &Journal, mint: &str) -> Result<HashSet<
         }
     }
     for l in j.all::<crate::coordinator::Listing>("listing").await? {
-        if l.plan.mint == mint && !l.cancelled {
+        if l.plan.mint == mint && !l.cancelled && !l.expired {
             ys.extend(l.plan.inputs.ys()?);
         }
     }

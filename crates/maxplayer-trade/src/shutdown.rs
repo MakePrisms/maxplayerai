@@ -236,6 +236,7 @@ pub fn unfinished(home: &Path, now: u64) -> serde_json::Value {
     for (id, v, _) in rows("listing") {
         if let Ok(l) = serde_json::from_slice::<Listing>(&v) {
             if !l.cancelled
+                && !l.expired
                 && l.active.is_none()
                 && crate::lifecycle(&l.event, &l.statuses)
                     .is_ok_and(|s| s == crate::Status::Available)
