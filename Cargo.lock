@@ -2775,6 +2775,7 @@ dependencies = [
  "git2",
  "libc",
  "maxplayer-core",
+ "maxplayer-trade",
  "nostr-relay-builder",
  "nostr-sdk",
  "rcgen",

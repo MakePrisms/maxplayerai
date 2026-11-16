@@ -78,7 +78,7 @@ default = ["wallet"]
 # there is no acp-without-wallet build, so the `#[cfg(feature = "acp")]` gates on the seller surface
 # are sound (they can rely on the wallet-gated code being present). #360.
 acp = ["wallet", "maxplayer-core/acp"]
-wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk"]
+wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk", "dep:maxplayer-trade"]
 # Dev-only: exposes `maxplayer stub-pay` (budget-gate exercise). Not on the settlement
 # path and not part of the default user CLI surface.
 stub-pay = []
@@ -96,6 +96,9 @@ git2 = { workspace = true, optional = true }
 # already resolves under `wallet`, so no new resolution — gated by `wallet` because the public key
 # it encodes comes from `maxplayer-core::home::public_key_hex`, itself `wallet`-gated.
 nostr-sdk = { version = "0.44.1", optional = true }
+# `maxplayer trade ...` (token trading on this home's key and wallet). Never with `local-test-mints`:
+# a user build refuses http:// mints and ws:// mint relays (scripts/check-user-build-mint-fence.sh).
+maxplayer-trade = { path = "../maxplayer-trade", optional = true }
 
 # #905: the retired-seat reaper's `--dry-run` must remove nothing. Drives the shipped binary against
 # a recording stand-in `docker` on PATH, so it needs the subcommand compiled in (`acp`); a buyer-only
