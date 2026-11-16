@@ -28,6 +28,11 @@ pub struct MintConfig {
     /// Unset ⇒ [`default_name`] (`maxplayer-mint-<8 hex>`, like a seller's `maxplayer-seller-<8 hex>`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Where `run` writes its automatic backups. Unset ⇒ `<home>/mint/backups`. Point it at
+    /// storage on another machine or disk so a lost disk doesn't take the backups with it.
+    /// A relative path is taken from `<home>/mint/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_dir: Option<PathBuf>,
 }
 
 impl Default for MintConfig {
@@ -36,6 +41,7 @@ impl Default for MintConfig {
             relays: Vec::new(),
             rate_limit: 20,
             name: None,
+            backup_dir: None,
         }
     }
 }
@@ -61,6 +67,14 @@ impl MintConfig {
     /// The name `run` advertises: `name`, else [`default_name`].
     pub fn effective_name(&self, keys: &Keys) -> String {
         self.name.clone().unwrap_or_else(|| default_name(keys))
+    }
+
+    /// The backup directory of the mint in `mint_dir`.
+    pub fn backup_dir_in(&self, mint_dir: &Path) -> PathBuf {
+        match &self.backup_dir {
+            Some(dir) => mint_dir.join(dir),
+            None => mint_dir.join("backups"),
+        }
     }
 
     pub fn effective_relays(&self) -> Vec<String> {
@@ -189,12 +203,9 @@ impl MintHome {
         Ok(())
     }
 
-    pub fn load(&self) -> Result<Secrets> {
-        let key = read(&self.key_path())?;
-        let keys = Keys::parse(key.trim()).context("parse nostr.key")?;
-        let mnemonic =
-            Mnemonic::parse_normalized(read(&self.seed_path())?.trim()).context("parse seed")?;
-        let config = match fs::read_to_string(self.config_path()) {
+    /// `mint.toml` alone (defaults when it is missing).
+    pub fn config(&self) -> Result<MintConfig> {
+        let config: MintConfig = match fs::read_to_string(self.config_path()) {
             Ok(text) => toml::from_str(&text).context("parse mint.toml")?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => MintConfig::default(),
             Err(error) => return Err(error).context("read mint.toml"),
@@ -202,6 +213,15 @@ impl MintHome {
         if let Some(name) = &config.name {
             validate_name(name).context("mint.toml")?;
         }
+        Ok(config)
+    }
+
+    pub fn load(&self) -> Result<Secrets> {
+        let key = read(&self.key_path())?;
+        let keys = Keys::parse(key.trim()).context("parse nostr.key")?;
+        let mnemonic =
+            Mnemonic::parse_normalized(read(&self.seed_path())?.trim()).context("parse seed")?;
+        let config = self.config()?;
         Ok(Secrets {
             keys,
             seed: mnemonic.to_seed_normalized(""),
