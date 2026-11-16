@@ -46,7 +46,25 @@ pub const CLIENT_IDLE: Duration = Duration::from_secs(90);
 pub const CONNECT_WAIT: Duration = Duration::from_secs(5);
 /// 2: requests carry the client's effective `nostr://` mint relays (`mint_relays`).
 /// 3: `send` and `fund` hand-offs (T3b).
-pub const PROTOCOL_V: u8 = 3;
+/// 4: trading moved into `maxplayer trade`; every older client is the standalone `maxplayer-trade`
+///    binary, which is no longer built ([`obsolete_client`]).
+pub const PROTOCOL_V: u8 = 4;
+/// The first protocol spoken by `maxplayer trade`. A request below it comes from an old standalone
+/// `maxplayer-trade` binary: refused with [`OBSOLETE_CLIENT`], which that binary prints verbatim.
+pub const FIRST_MAXPLAYER_PROTOCOL_V: u8 = 4;
+/// What an old `maxplayer-trade` binary is told when it hands a command to a current serve.
+pub const OBSOLETE_CLIENT: &str = "this maxplayer-trade binary is obsolete: trading moved into \
+    `maxplayer trade`. Delete it (`command -v maxplayer-trade` shows where it is) and run \
+    `maxplayer trade ...` instead; nothing was queued or executed";
+/// [`OBSOLETE_CLIENT`] when `line` is a request from a pre-`maxplayer trade` client. Checked on the
+/// raw line, before the full parse, so a command this serve no longer knows still gets the reason.
+pub fn obsolete_client(line: &str) -> Option<&'static str> {
+    let v = serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("v")?
+        .as_u64()?;
+    (v < u64::from(FIRST_MAXPLAYER_PROTOCOL_V)).then_some(OBSOLETE_CLIENT)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -411,10 +429,13 @@ async fn write(stream: &mut UnixStream, reply: &Reply) -> Result<()> {
 /// never runs a request on relays other than the ones the client resolved. The requested relays
 /// are caller text (a mistyped flag may hold a token), so the message is redacted.
 fn refusal(request: &Request, relays: &[String], mint_relays: &[String]) -> Option<String> {
+    if request.v < FIRST_MAXPLAYER_PROTOCOL_V {
+        return Some(OBSOLETE_CLIENT.to_string());
+    }
     if request.v != PROTOCOL_V {
         return Some(format!(
             "serve protocol version mismatch (serve {PROTOCOL_V}, client {}); run the same \
-             maxplayer-trade version as serve",
+             maxplayer version as serve",
             request.v
         ));
     }
@@ -466,6 +487,17 @@ async fn connection(
             bail!(error)
         }
     };
+    if let Some(error) = obsolete_client(&line) {
+        let _ = write(
+            &mut stream,
+            &Reply::Exit {
+                code: 1,
+                error: Some(error.to_string()),
+            },
+        )
+        .await;
+        bail!(error)
+    }
     let request: Request = match serde_json::from_str(&line) {
         Ok(r) => r,
         Err(e) => {
@@ -1452,11 +1484,20 @@ mod tests {
         assert_eq!(refused(&r), None);
         let r = req(&["ws://127.0.0.1:1"], &["wss://x.example"], list(npub));
         assert!(refused(&r).is_some());
-        // Version mismatch names both versions.
-        // What a protocol-1 binary actually sends (no mint_relays field) reaches the version check.
+        // A newer client than serve: the mismatch names both versions.
+        let mut newer = req(&[], &[], Command::Cancel { lot: "x".into() });
+        newer.v = PROTOCOL_V + 1;
+        assert!(
+            refused(&newer)
+                .unwrap()
+                .contains(&format!("client {}", PROTOCOL_V + 1))
+        );
+        // What a protocol-1 binary actually sends (no mint_relays field) is an obsolete
+        // standalone maxplayer-trade: told to delete it, whichever check sees it first.
         let v1 = r#"{"v":1,"relays":["ws://127.0.0.1:1"],"command":{"cancel":{"lot":"x"}}}"#;
         let r = serde_json::from_str::<Request>(v1).unwrap();
-        assert!(refused(&r).unwrap().contains("client 1"));
+        assert_eq!(refused(&r).as_deref(), Some(OBSOLETE_CLIENT));
+        assert_eq!(obsolete_client(v1), Some(OBSOLETE_CLIENT));
         // Redacted: a mistyped mint relay holding token text is not echoed.
         let leak = format!("cashuB{}", "o2FteBtodHRwOi8v".repeat(4));
         let r = req(&[], &[&leak], receive(npub));
@@ -1563,5 +1604,33 @@ mod tests {
         assert!(read_line_bounded(&mut open, 8).await.is_err());
         let mut empty: &[u8] = b"";
         assert!(read_line_bounded(&mut empty, 8).await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod obsolete_client_tests {
+    use super::*;
+    /// Every request an old standalone `maxplayer-trade` (protocol 1-3) can send is refused with
+    /// the delete-it message, even a command a current serve no longer parses; a current client's
+    /// request is not.
+    #[test]
+    fn old_standalone_clients_are_told_to_delete_the_binary() {
+        for line in [
+            r#"{"v":1,"relays":[],"command":{"cancel":{"lot":"x"}}}"#,
+            r#"{"v":2,"relays":[],"mint_relays":["wss://a"],"command":{"cancel":{"lot":"x"}}}"#,
+            r#"{"v":3,"relays":[],"mint_relays":["wss://a"],"command":{"no_longer_known":{}}}"#,
+        ] {
+            assert_eq!(obsolete_client(line), Some(OBSOLETE_CLIENT), "{line}");
+        }
+        let current = serde_json::to_string(&Request {
+            v: PROTOCOL_V,
+            relays: vec![],
+            mint_relays: vec!["wss://a".into()],
+            command: Command::Cancel { lot: "x".into() },
+        })
+        .unwrap();
+        assert_eq!(obsolete_client(&current), None);
+        assert!(OBSOLETE_CLIENT.contains("maxplayer trade"));
+        assert!(OBSOLETE_CLIENT.contains("nothing was queued or executed"));
     }
 }

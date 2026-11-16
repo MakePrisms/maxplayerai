@@ -1780,7 +1780,10 @@ fn trade_writes_proof_rows_only_through_the_locked_wallet_helpers() {
         ("coordinator.rs", include_str!("../src/coordinator.rs")),
         ("serve.rs", include_str!("../src/serve.rs")),
         ("cli.rs", include_str!("../src/cli.rs")),
-        ("bin/maxplayer-trade.rs", include_str!("../src/bin/maxplayer-trade.rs")),
+        (
+            "bin/maxplayer-trade.rs",
+            include_str!("../src/bin/maxplayer-trade.rs"),
+        ),
         ("lib.rs", include_str!("../src/lib.rs")),
     ] {
         for call in [
