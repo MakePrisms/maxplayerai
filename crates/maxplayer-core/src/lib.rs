@@ -9,7 +9,10 @@ pub mod budget;
 // the gate itself rather than dragging the whole module behind it.
 pub mod capability;
 pub mod checks;
-pub mod challenge;
+pub mod swarm;
+/// Swarm events on the home's relay: EOSE-checked reads and acknowledged writes.
+#[cfg(feature = "wallet")]
+pub mod swarm_relay;
 #[cfg(feature = "wallet")]
 pub mod collect;
 #[cfg(all(feature = "wallet", feature = "gateway"))]
