@@ -110,7 +110,7 @@
 //!
 //! This is a **conditional** bound and is documented as one. What holds it up:
 //!
-//! - **`SIGKILL` cannot be caught, blocked or ignored** (POSIX, and all three platforms this product
+//! - **`SIGKILL` cannot be caught, blocked or ignored** (POSIX, and every platform this product
 //!   ships for are POSIX — see [`SHIPPED_PLATFORMS`]). No amount of libgit2 or C code in the child
 //!   can decline it. This is the property in-process cancellation could not have at any price.
 //! - **The kill goes to the process GROUP** (`kill(-pgid)`), and the child is made a group leader at
@@ -365,10 +365,11 @@ pub fn exclusion_after_reap(reap: &Result<Duration, ExecutorError>) -> Exclusion
 /// `SIGKILL`/`waitpid` contract this executor rests on is available on every one of them, which is
 /// what makes the design *feasible* rather than aspirational. There is no Windows artifact, so no
 /// `TerminateProcess` path is written, guessed at, or claimed.
-pub const SHIPPED_PLATFORMS: [&str; 3] = [
+pub const SHIPPED_PLATFORMS: [&str; 4] = [
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
     "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
 ];
 
 /// The environment the child is given — and the whole of it. The child's environment is CLEARED and

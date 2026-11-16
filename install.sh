@@ -87,13 +87,12 @@ die()  { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
 tmpl() { printf '%s/maxplayer-install-%s.XXXXXX\n' "${TMPDIR:-/tmp}" "$1"; }
 
 # ── Platform ────────────────────────────────────────────────────────────────────────────────────
-# Sets PLATFORM to a release platform name (`linux-x64`, `linux-arm64`, `darwin-arm64`). Those are
+# Sets PLATFORM to a release platform name (`linux-x64`, `linux-arm64`, `darwin-arm64`, `darwin-x64`). Those are
 # NOT rust target triples — the asset filenames are what this has to agree with.
 #
-# The OS and the architecture are resolved TOGETHER, in one nested case, because the supported set is
-# not a product of the two: linux ships both architectures, macOS ships only arm64. Checking them in
-# sequence — an OS gate, then an arch gate — cannot express that, and the arch arm would have to
-# either accept x86_64 on macOS (an asset no release publishes) or refuse it on linux.
+# The OS and the architecture are resolved TOGETHER, in one nested case, because `uname -m` does not
+# mean the same thing on both: on macOS an x86_64 answer may be Rosetta on Apple Silicon, which must
+# get the native arm64 build rather than the Intel one.
 #
 # Everything unlisted is refused BY NAME, with the reason. Silence would be the worse failure: the
 # alternative to refusing is downloading some other platform's tarball, which installs a file that
@@ -121,21 +120,22 @@ detect_platform() {
                     # "Open using Rosetta"). The discriminator is one layer out and has to be asked
                     # for: `hw.optional.arm64` is a property of the HARDWARE.
                     #
-                    # Fails closed toward the refusal — if sysctl is unavailable we refuse rather
-                    # than assume. Either direction is safe (the prove-step below rejects a binary
-                    # that cannot exec), but a named refusal beats a confusing "did not run".
+                    # If sysctl is unavailable or the key is absent (a real Intel mac answers it
+                    # with an error), this is an Intel mac and gets the x86_64 build. Either way the
+                    # result runs: the Intel build also runs under Rosetta, so a wrong guess costs
+                    # speed, not a working install.
                     if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" = 1 ]; then
                         PLATFORM="darwin-arm64"
                         warn "this shell reports x86_64 because it is running under Rosetta; the machine is Apple Silicon, so installing the native arm64 build"
                     else
-                        die "Intel macs are not supported — the release builds an Apple Silicon (arm64) mac asset only. Build from source, or use nix: nix run --refresh github:$REPO -- mcp"
+                        PLATFORM="darwin-x64"
                     fi
                     ;;
-                *) die "unsupported architecture '$_arch' on macOS — the released mac platform is Apple Silicon (arm64)" ;;
+                *) die "unsupported architecture '$_arch' on macOS — the released mac platforms are Apple Silicon (arm64) and Intel (x86_64)" ;;
             esac
             ;;
         *)
-            die "unsupported operating system '$_os' — this installer covers linux (x86_64, aarch64) and macOS (arm64)"
+            die "unsupported operating system '$_os' — this installer covers linux (x86_64, aarch64) and macOS (arm64, x86_64)"
             ;;
     esac
 }

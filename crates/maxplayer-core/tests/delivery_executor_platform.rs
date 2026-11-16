@@ -6,8 +6,8 @@
 //! child at all — reduces to that. So it is exercised here against a child that *deliberately
 //! refuses* the polite signal, rather than assumed from the man page.
 //!
-//! All three platforms this product ships (`.github/release-platforms.json`: two linux-musl targets
-//! and aarch64-apple-darwin) are POSIX, so what this file proves on one of them is the same
+//! All four platforms this product ships (`.github/release-platforms.json`: two linux-musl targets
+//! and two apple-darwin targets) are POSIX, so what this file proves on one of them is the same
 //! mechanism the others run. There is no Windows artifact and therefore no `TerminateProcess` path
 //! to test: a platform that is not on that list is not a platform this executor claims.
 

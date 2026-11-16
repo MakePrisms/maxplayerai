@@ -31,6 +31,7 @@ on:
         options:
           - ''
           - '@maxplayerai/darwin-arm64'
+          - '@maxplayerai/darwin-x64'
           - '@maxplayerai/linux-x64'
           - '@maxplayerai/linux-arm64'
       npm_probe_version:
@@ -589,7 +590,7 @@ jobs:
           # API carries whatever string it likes. The launcher (`maxplayer`) is deliberately absent:
           # it is the package users type, and its dist-tags are how `npx maxplayer` resolves.
           case "$PACKAGE" in
-            '@maxplayerai/darwin-arm64' | '@maxplayerai/linux-x64' | '@maxplayerai/linux-arm64') ;;
+            '@maxplayerai/darwin-arm64' | '@maxplayerai/darwin-x64' | '@maxplayerai/linux-x64' | '@maxplayerai/linux-arm64') ;;
             *) echo "refusing to publish '$PACKAGE': only the @maxplayerai payload packages may be probed" >&2; exit 1 ;;
           esac
 

@@ -34,7 +34,7 @@ say 22+, and that was wrong.) The `curl` installer needs no Node at all. For a n
 also fails with `EACCES` until the global prefix is writable — `npm config set prefix
 ~/.npm-global` and put `~/.npm-global/bin` on `PATH`, or install under `sudo`.
 
-Both deliver the same prebuilt binary (Linux x86_64/aarch64, macOS Apple Silicon — no Rust needed);
+Both deliver the same prebuilt binary (Linux x86_64/aarch64, macOS Apple Silicon and Intel — no Rust needed);
 the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choose the directory with
 `--bin-dir`, re-run to upgrade in place.
 

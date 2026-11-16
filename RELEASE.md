@@ -6,8 +6,8 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 ## Before the first release
 
 One setup step, done once **per package**, and it is the only thing standing between a tag and a
-publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`
-and `@maxplayerai/darwin-arm64`:
+publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`,
+`@maxplayerai/darwin-arm64` and `@maxplayerai/darwin-x64`:
 
 - Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
   repository `maxplayerai`, workflow `release.yml`.
@@ -21,13 +21,14 @@ Releases as normal, and `npm publish` fails loudly for that package. There is no
 unconfigured package fails the job rather than producing a release that looks published.
 
 The launcher publishes as the unscoped package `maxplayer`; the per-platform payloads publish under
-the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64` and `@maxplayerai/darwin-arm64` packages, in
-the npm organization `maxplayerai`. All four need their own trusted publisher entry — the setting is
-per package, not per account or per org. The GitHub side of that entry is the same for all four, and
+the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`, `@maxplayerai/darwin-arm64` and
+`@maxplayerai/darwin-x64` packages, in the npm organization `maxplayerai`. All five need their own
+trusted publisher entry — the setting is per package, not per account or per org. The GitHub side of
+that entry is the same for all five, and
 is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
 
-⚠ `@maxplayerai/darwin-arm64` is new (#446) and needs its entry before the tag that first publishes
-it. The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
+⚠ `@maxplayerai/darwin-x64` is new (Intel macs) and needs its entry before the tag that first
+publishes it, exactly as `@maxplayerai/darwin-arm64` did (#446). The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
 question this repo CAN answer, by publishing something worthless through the same path. See below.
 
 ### Proving an entry exists, before the tag
@@ -51,8 +52,8 @@ Three things about it are load-bearing:
   nothing about the launcher or the linux payloads — those are proven by something else, not by this
   run: `maxplayer`, `@maxplayerai/linux-x64` and `@maxplayerai/linux-arm64` published through this
   same workflow file, tokenless, in the rc.1 and rc.2 releases. Production runs are the strongest
-  evidence an entry exists. `@maxplayerai/darwin-arm64` is the only one with no such run behind it,
-  which is why it is the one to probe.
+  evidence an entry exists. A payload with no release behind it yet — `@maxplayerai/darwin-x64` until
+  its first tag — is the one to probe.
 - **Bump the version every run.** npm never allows reusing a version, probe or not.
 
 A red has three causes that look identical — npm answers a trusted-publishing mismatch with a 404 or
@@ -184,8 +185,11 @@ git cat-file -e "$TAG":.github/workflows/release.yml && echo present || echo abs
 | linux-x64 | `ubuntu-latest` | archive + `@maxplayerai/linux-x64` |
 | linux-arm64 | `ubuntu-24.04-arm` | archive + `@maxplayerai/linux-arm64` |
 | darwin-arm64 | `macos-15` | archive + `@maxplayerai/darwin-arm64` |
+| darwin-x64 | `macos-15-intel` | archive + `@maxplayerai/darwin-x64` |
 
-**darwin-x64 and Windows are out of scope.**
+**Windows is out of scope.** darwin-x64 builds natively on GitHub's Intel mac runner so every
+verify step runs the binary on real x86_64 hardware; when GitHub retires that label, move to the
+next `macos-*-intel` label, or cross-compile from the arm64 runner and run the checks under Rosetta.
 
 Adding a platform means: a matrix entry in `release.yml`, a package under `npm/`, an entry in
 `PLATFORM_PACKAGES` in `npm/maxplayer/bin/maxplayer.js`, an `optionalDependencies` pin, the platform in

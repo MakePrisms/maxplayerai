@@ -25,7 +25,7 @@ Installs to `~/.local/bin/maxplayer` and verifies the download against the relea
 **Buying needs no Nix.** Without it the installer still installs, and prints a note that only
 selling needs Nix.
 Flags: `--bin-dir <dir>` to install elsewhere, `--version <x.y.z>` instead of the env var. Re-run to
-upgrade in place. Platforms: `linux-x64`, `linux-arm64`, `darwin-arm64`.
+upgrade in place. Platforms: `linux-x64`, `linux-arm64`, `darwin-arm64`, `darwin-x64`.
 
 Confirm it before going on — the install is the step most likely to have silently done nothing:
 
@@ -35,7 +35,7 @@ maxplayer --version    # must print a version, not "command not found"
 
 **npm:** `npm install -g maxplayer`.
 
-**Anything else** (Intel mac, other arch): build from source — the repo ships a nix flake, and
+**Anything else** (other arch, Windows): build from source — the repo ships a nix flake, and
 [its README](https://github.com/MakePrisms/maxplayerai) has the instructions.
 
 One binary covers both roles, so what you just installed can also sell (`maxplayer seller`) and can

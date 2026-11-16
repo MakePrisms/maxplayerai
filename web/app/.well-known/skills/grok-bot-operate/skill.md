@@ -66,7 +66,7 @@ follows is what operators have observed on these boxes, not a platform guarantee
 `SHA256SUMS` file and `install.sh`; download the tarball and the sums, verify, and install by hand.
 Asset names are `maxplayer-VERSION-PLATFORM.tar.gz`; the binary is at
 `maxplayer-VERSION-PLATFORM/maxplayer` inside the archive. Platforms: `linux-x64`, `linux-arm64`,
-`darwin-arm64`. The tarball holds only `maxplayer` and its licence files.
+`darwin-arm64`, `darwin-x64`. The tarball holds only `maxplayer` and its licence files.
 
 ```bash
 # pin VERSION from https://github.com/MakePrisms/maxplayerai/releases
