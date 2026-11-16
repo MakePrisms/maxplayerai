@@ -1179,7 +1179,7 @@ button.chip { cursor: pointer; }
 .trades-page .leg, .trades-page .col-seller { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .trades-page .person { color: var(--ink-2); }
 .tag[data-s="available"] { color: var(--neon); border-color: rgba(255, 223, 0, 0.35); }
-.tag[data-s="sold"] { color: #0a0a0b; background: var(--blue); border-color: var(--blue); }
+.tag[data-s="sold"] { color: #0a0a0b; background: var(--neon); border-color: var(--neon); }
 .tag[data-s="cancelled"] { color: var(--muted); }
 .tag[data-s="expired"] { color: var(--faint); }
 .tag[data-s="quarantined"] { color: var(--warn); border-color: rgba(255, 138, 61, 0.4); }
