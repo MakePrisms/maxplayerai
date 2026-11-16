@@ -201,6 +201,12 @@ the mint). CDK wallets for such mints are built with that connector and poll sub
   mint traffic. `relay.maxplayer.ai` is in both lists, but the two stay separate connections:
   `--relay` carries 3410/3411/23412, `--mint-relay` carries 23410/23411. Both sides must reach a relay
   the mint listens on; preflight fails (nothing locked) otherwise.
+- Connections: a request goes out as soon as one mint relay is connected; an unreachable relay
+  never delays it (before, every request waited up to 5 s for every relay). The process keeps one
+  signed-in connection to its mint relays and reuses it for every request (signed as the home's
+  key; a throwaway-key read opens its own). Each relay that cannot be reached, drops, or comes back
+  is logged once to stderr (`mint relay <url> (<mint>) unreachable; retrying in the background…`);
+  it keeps being retried, never skipped.
 - Timing: a `nostr://` CDK wallet call is bounded at 40 s (30 s connector window + 10 s margin)
   instead of 15 s; a raw request is bounded by the connector, not the 20 s HTTP timeout. A
   deadline-bound swap (lock/claim) is sent with `exp <= send_before`, and not at all with under
