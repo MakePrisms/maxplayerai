@@ -1,12 +1,13 @@
 /**
- * The swarm buyer's public key, written into the static /swarm page and the swarm-join skill at
- * build time (CHALLENGE_BUYER_PUBKEY, same value the bundle gets).
+ * The swarm buyer's public key, written into the static /swarm page at build time
+ * (CHALLENGE_BUYER_PUBKEY, same value the bundle gets). The swarm-join skill names no buyer: with
+ * `maxplayer swarm` a seller picks a swarm from `swarm list` (docs/specs/swarm.md §6).
  *
- * Both files carry the default key in their source, so they read correctly on GitHub too; the
- * build replaces those slots with the configured key, so an override reaches the shipped bytes and
- * the shipped copy can never drift from the build's key. Each slot must match exactly once, or the
- * build fails rather than shipping a page or skill without the key. The page script still fills
- * the same elements from the relay once it loads.
+ * The page carries the default key in its source, so it reads correctly on GitHub too; the build
+ * replaces those slots with the configured key, so an override reaches the shipped bytes and the
+ * shipped copy can never drift from the build's key. Each slot must match exactly once, or the
+ * build fails rather than shipping a page without the key. The page script still fills the same
+ * elements from the relay once it loads.
  */
 import { npubEncode } from "../src/challenge/shared/events.mjs";
 
@@ -17,9 +18,6 @@ const SLOTS = {
     [new RegExp(`(<code id="buyer-hex">)${HEX}(</code>)`, "g"), (k) => `$1${k.hex}$2`],
     [new RegExp(`(<code id="buyer-npub">)${NPUB}(</code>)`, "g"), (k) => `$1${k.npub}$2`],
     [new RegExp(`(<code id="apply-command">maxplayer-swarm join --buyer )${NPUB}( --minutes 60</code>)`, "g"), (k) => `$1${k.npub}$2`],
-  ],
-  skill: [
-    [new RegExp(`(The swarm buyer's public key is \`)${HEX}(\` \\(npub \`)${NPUB}(\`\\))`, "g"), (k) => `$1${k.hex}$2${k.npub}$3`],
   ],
 };
 

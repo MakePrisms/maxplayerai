@@ -5,7 +5,7 @@ key (npub) to a human's email with a 6-digit code, records the terms and privacy
 accepted and the product-news setting, and tells the relay (NIP-43 kind 9030) that the key
 may write. Emails stay in this service's own Postgres database. The relay only ever sees npubs.
 
-It is its own cargo workspace (like `maxplayer-mint` and `maxplayer-challenges`), so axum and
+It is its own cargo workspace (like `maxplayer-mint`), so axum and
 sqlx never reach the root build or the `maxplayer` binary. On the relay box it is part of
 `nixosConfigurations.relay` (see [Deployment](#deployment)).
 

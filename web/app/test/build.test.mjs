@@ -408,32 +408,24 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(existsSync(join(root, "dist", ".well-known", "skills", "swarm-join", "skill.md")), "swarm-join skill ships");
   const skill = readFileSync(join(root, ".well-known", "skills", "swarm-join", "skill.md"), "utf8");
   assert.match(skill, /^---\nname: maxplayer-swarm-join\n/);
-  assert.ok(skill.includes("tree/main/crates/maxplayer-challenges") && !skill.includes("feat/challenges-sidecar"), "sidecar link points at main");
-  assert.ok(skill.includes("Experimental: build from source; there is\nno release binary yet.") && !skill.includes("Not deployed yet"));
-  // bob (2026-10-19 00:49): commands use maxplayer-swarm and --run; the crate dir keeps its name.
-  const commands = skill.split("\n").map((l) => l.trim()).filter((l) => /^maxplayer-(swarm|challenges) /.test(l));
-  assert.ok(commands.length >= 6 && commands.every((l) => /^maxplayer-swarm (status|join|leave) /.test(l)), "every command line runs maxplayer-swarm");
-  assert.ok(skill.includes("`status --run <id>`") && !skill.includes("--challenge"), "the day flag is --run");
-  assert.ok(skill.includes("--manifest-path crates/maxplayer-challenges/Cargo.toml") && skill.includes("target/release/maxplayer-swarm`"), "build line unchanged; binary named");
-  assert.match(skill, /old `maxplayer-challenges` binary\? That name is gone: rebuild[\s\S]*membership carries over unchanged/, "one line for existing members");
-  // Skill walkthrough fixes (2026-10-19): free-job prerequisite, tested version, strict minutes-change read.
+  // docs/specs/swarm.md §6: the sidecar is gone; every command is `maxplayer swarm …` on the home's relay.
+  const commands = skill.split("\n").map((l) => l.trim()).filter((l) => /^maxplayer[ -](swarm|challenges)\b/.test(l));
+  assert.ok(commands.length >= 6 && commands.every((l) => /^maxplayer swarm (list|show|join|leave|job status) /.test(l)), `every command line runs maxplayer swarm: ${commands}`);
+  assert.ok(!/maxplayer-swarm (join|status|leave)|--buyer|quorum|--run\b/.test(skill), "no sidecar command, buyer flag, quorum or --run left");
+  assert.ok(!skill.includes("crates/maxplayer-challenges") && !/target\/release\/maxplayer-swarm/.test(skill), "no sidecar build line");
+  assert.ok(skill.includes("those memberships\ndo not carry over"), "old members are told to join again");
+  assert.ok(skill.includes("`[sessions] enabled = true`"), "the skill asks for session jobs");
   // Swarm member feedback (2026-10-21, item 2): free jobs are an option, not a prerequisite.
   assert.ok(!/Prerequisite: free swarm jobs/.test(skill), "free jobs are not a prerequisite");
-  assert.match(skill, /\*\*Paid or free: your choice\.\*\* Swarm jobs are paid like any other job\. A paid seller keeps its\n`rate_sats`/, "paid sellers keep their rate");
+  assert.match(skill, /\*\*Paid or free: your choice\.\*\* Swarm tasks are paid like any other job\. A paid seller keeps its\n`rate_sats`/, "paid sellers keep their rate");
   assert.ok(skill.includes("To work for\nfree instead, set `takes_no_payment = true` and `rate_sats = 0`"), "free is opt-in, with its rate pairing");
   // Item 3 (bob 2026-10-21): allowlisting is the only step; the open surfaces are the operator's choice.
   assert.ok(!/Never enable open-pool\/open-targeted admission/.test(skill) && !/must also keep both `false`/.test(skill), "no requirement to close them");
   assert.ok(skill.includes("`claim_open_pool` and `accept_open_targeted` are the operator's choice,\n   on or off"), "on or off is the member's choice");
   assert.ok(skill.includes("with either on also takes free work from any buyer that reaches it"), "free-seller consequence stated");
-  assert.ok(skill.includes("Tested with seller 0.6.1.") && !/⟨TBD⟩|or later/.test(skill), "tested version, no invented minimum");
-  assert.ok(skill.includes("needs every relay, whether or not a swarm run is\n   in progress"), "minutes change needs every relay");
   assert.ok(!/\b300\b/.test(skill), "no unexercised 300-second floor");
-  // bob (2026-10-19 02:08): the --json top-level `challenge` object is `run` (#1176).
-  for (const key of ["`run.buyer`", "`run.goal`", "`run.starts`/`run.ends`", "`run.budget_sats`", '`"run": null`']) {
-    assert.ok(skill.includes(key), `skill reads ${key}`);
-  }
   assert.ok(!/`challenge\.|"challenge"|the `challenge` object/.test(skill), "no `challenge` JSON field left in the skill");
-  assert.equal([...skill.matchAll(/(?<!crates\/)maxplayer-challenges/g)].length, 1, "the old binary name appears only in the existing-members line");
+  assert.ok(!skill.includes("maxplayer-challenges"), "the old binary name is gone");
   // bob (2026-10-19 00:49): the CLI is maxplayer-swarm and the day flag is --run.
   const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
   assert.ok(bundle.includes("maxplayer-swarm join --buyer ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer-swarm");
@@ -449,11 +441,11 @@ test("the community page builds at /swarm, every page links it there, and /chall
 
 // Swarm member feedback (2026-10-21, item 1): an agent following the one-line join must find the
 // buyer key without running the page script. The build writes CHALLENGE_BUYER_PUBKEY into the
-// static page and the join skill, and an override reaches both.
+// static page. The join skill names no buyer (sellers pick a swarm from `maxplayer swarm list`).
 const SWARM_BUYER = "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5";
 const SWARM_NPUB = "npub1jjvf7aj6d8ju8ykkqv2qa4eu0lnpuyelhfm8ee2f2k85alzw2l2sf7haqz";
 const swarmKeySlots = (html) => [...html.matchAll(/<code id="(buyer-hex|buyer-npub|apply-command)">([^<]*)<\/code>/g)].map((m) => [m[1], m[2]]);
-test("the built /swarm page and join skill carry the swarm buyer key without JavaScript", () => {
+test("the built /swarm page carries the swarm buyer key without JavaScript", () => {
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
   assert.deepEqual(swarmKeySlots(page), [
     ["buyer-hex", SWARM_BUYER],
@@ -462,8 +454,7 @@ test("the built /swarm page and join skill carry the swarm buyer key without Jav
   ]);
   assert.ok(!/Not announced yet|announced with the first swarm|Available when the swarm is announced/.test(page), "no placeholder left");
   const skill = readFileSync(join(root, "dist", ".well-known", "skills", "swarm-join", "skill.md"), "utf8");
-  assert.ok(skill.includes(`The swarm buyer's public key is \`${SWARM_BUYER}\` (npub \`${SWARM_NPUB}\`).`), "the shipped skill names the key");
-  assert.ok(!/from the operator, not a member's note/.test(skill), "no 'ask the operator' step");
+  assert.ok(!skill.includes(SWARM_BUYER) && !skill.includes(SWARM_NPUB), "the shipped skill names no buyer");
   // The page script keeps filling the same elements from the relay.
   const src = readFileSync(join(root, "src", "swarm.ts"), "utf8");
   for (const id of ["buyer-hex", "buyer-npub", "apply-command"]) assert.ok(src.includes(`text("${id}",`), `swarm.ts still fills #${id}`);
@@ -473,7 +464,7 @@ test("the built /swarm page and join skill carry the swarm buyer key without Jav
   assert.equal([...page.matchAll(/<code>accept_open_targeted<\/code> on or off; they only affect market work from other buyers/g)].length, 2, "manual steps and FAQ both say on or off");
   assert.ok(!/never enable `claim_open_pool`/.test(skill) && skill.includes("are the operator's choice"), "skill makes them optional");
 });
-test("CHALLENGE_BUYER_PUBKEY overrides the key in the shipped page, skill and discovery digest", async () => {
+test("CHALLENGE_BUYER_PUBKEY overrides the key in the shipped page; the skill digest is of the shipped bytes", async () => {
   const { mkdtempSync, cpSync, rmSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { schnorr } = await import("@noble/curves/secp256k1");
@@ -488,22 +479,19 @@ test("CHALLENGE_BUYER_PUBKEY overrides the key in the shipped page, skill and di
     const page = readFileSync(join(copy, "dist", "swarm.html"), "utf8");
     assert.deepEqual(swarmKeySlots(page).map(([, v]) => v), [other, `maxplayer-swarm join --buyer ${npubEncode(other)} --minutes 60`, npubEncode(other)]);
     const skillBytes = readFileSync(join(copy, "dist", ".well-known", "skills", "swarm-join", "skill.md"));
-    assert.ok(skillBytes.toString().includes(`\`${other}\` (npub \`${npubEncode(other)}\`)`));
-    for (const f of ["dist/swarm.html", "dist/.well-known/skills/swarm-join/skill.md"]) assert.ok(!readFileSync(join(copy, f), "utf8").includes(SWARM_BUYER), `${f}: no default key left`);
+    assert.ok(!skillBytes.toString().includes(other), "the skill is shipped as written");
+    assert.ok(!readFileSync(join(copy, "dist/swarm.html"), "utf8").includes(SWARM_BUYER), "dist/swarm.html: no default key left");
     const index = JSON.parse(readFileSync(join(copy, "dist", ".well-known", "agent-skills", "index.json"), "utf8"));
     const row = index.skills.find((r) => r.url.endsWith("/swarm-join/skill.md"));
     assert.equal(row.digest, `sha256:${createHash("sha256").update(skillBytes).digest("hex")}`, "digest is of the shipped skill");
   } finally { rmSync(copy, { recursive: true, force: true }); }
 });
-test("the build refuses a page or skill whose buyer-key slot is missing", async () => {
+test("the build refuses a page whose buyer-key slot is missing", async () => {
   const { withSwarmBuyer } = await import("../scripts/swarm-buyer.mjs");
   const page = readFileSync(join(root, "public", "swarm.html"), "utf8");
-  const skill = readFileSync(join(root, ".well-known", "skills", "swarm-join", "skill.md"), "utf8");
-  // The sources carry the default key, so they read correctly unbuilt and build to themselves.
+  // The source carries the default key, so it reads correctly unbuilt and builds to itself.
   assert.equal(withSwarmBuyer(page, "html", SWARM_BUYER), page);
-  assert.equal(withSwarmBuyer(skill, "skill", SWARM_BUYER), skill);
   assert.throws(() => withSwarmBuyer(page.replace(`id="buyer-npub">${SWARM_NPUB}`, 'id="buyer-npub">TBD'), "html", SWARM_BUYER), /matched 0 times/);
-  assert.throws(() => withSwarmBuyer(skill.replace("The swarm buyer's public key is", "Ask for the key"), "skill", SWARM_BUYER), /matched 0 times/);
   assert.throws(() => withSwarmBuyer(page, "html", "ABC"), /lowercase hex/);
 });
 
