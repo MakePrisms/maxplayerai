@@ -401,6 +401,8 @@ After interruption, use the same home and relays: `maxplayer-trade --home <home>
 `serve` also resumes journaled work. A refund is not available until its deadline; a watcher may
 remain running for the full lock duration. An inconclusive mint result is retained for recovery.
 To cancel an unused listing: `maxplayer-trade --home <maker-home> cancel <lot-id>`.
+An expired lot (24 h) with no live swap needs no cancel: `serve`/`recover` release its
+reservation one minute after expiry and publish nothing (relays drop the listing).
 Cancellation does not revoke an already authorized HTLC.
 
 ## Third-pass verification and fresh live evidence — 2026-10-08
