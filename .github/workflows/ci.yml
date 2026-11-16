@@ -325,34 +325,21 @@ jobs:
             exit 1
           fi
 
-  maxplayer-challenges:
-    name: maxplayer-challenges sidecar (maxplayer-swarm)
+  # The maxplayer-swarm sidecar is gone (swarm commands are `maxplayer swarm …`, docs/specs/swarm.md
+  # §6). Only the old runner's Python helpers remain until scripts/challenges is retired (PR 6).
+  challenges-scripts:
+    name: scripts/challenges Python helpers
     runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: crates/maxplayer-challenges -> target
-      - run: cargo fmt --manifest-path crates/maxplayer-challenges/Cargo.toml --check
-      - run: cargo clippy --manifest-path crates/maxplayer-challenges/Cargo.toml --locked --all-targets --no-deps -- -D warnings
-      - run: cargo test --manifest-path crates/maxplayer-challenges/Cargo.toml --locked
-      # The crate keeps its package name; the installed command is `maxplayer-swarm` ([[bin]]).
-      - name: Binary is named maxplayer-swarm
-        run: |
-          set -euo pipefail
-          cargo build --manifest-path crates/maxplayer-challenges/Cargo.toml --locked --bins
-          crates/maxplayer-challenges/target/debug/maxplayer-swarm --help | grep -q '^Usage: maxplayer-swarm <command>'
       # scripts/challenges Python helpers (stdlib unittest, no deps; ubuntu-latest ships python3).
       # The e2e harness itself needs a relay/Postgres/Redis and stays manual (run-e2e.sh).
       - run: python3 -m unittest discover -s scripts/challenges -p 'test_*.py' -v
 
   # The email registration service (crates/maxplayer-registration; spec: email signup v2.12). Its
-  # OWN cargo workspace with its own Cargo.lock, like the mint and challenges sidecars, so axum/sqlx
+  # OWN cargo workspace with its own Cargo.lock, like the mint sidecar, so axum/sqlx
   # never reach the root build. Integration tests need a real Postgres: each test creates a fresh
   # database owned by a fresh NOSUPERUSER role from this admin URL, and talks to in-process fake
   # relay + fake Resend servers. Nothing here reaches a real relay, Resend or any email address.

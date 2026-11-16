@@ -168,7 +168,7 @@
           };
 
           # Email registration service (crate `maxplayer-registration`, email-signup spec v2.12): its OWN
-          # cargo workspace with its own Cargo.lock (like maxplayer-mint / maxplayer-challenges), so the
+          # cargo workspace with its own Cargo.lock (like maxplayer-mint), so the
           # source is just that subtree and axum/sqlx never touch the root lock. Stock nixpkgs rustc
           # (26.05: 1.95) meets its floor (sqlx 0.9 needs >= 1.94, edition 2024). sqlx uses runtime
           # queries plus the embedded `sqlx::migrate!()` migrator, so the build needs no database.
