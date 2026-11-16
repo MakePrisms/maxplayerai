@@ -88,11 +88,22 @@ fn send_line(a: &SendAttempt) -> (String, bool, bool) {
         SendState::Swapped => line.push_str("; token file pending (run recover or rerun the send)"),
         _ => {}
     }
+    if let Some((n, at)) = a.reclaim_retry() {
+        line.push_str(&format!(
+            "; reclaim retry {n}/{} at {} (keep serve running or run recover)",
+            crate::send::RECLAIM_RETRY_SECONDS.len(),
+            crate::clock::iso(at)
+        ));
+    }
     let manual = a.manual_recovery();
     if manual {
         line.push_str("; MANUAL RECOVERY: journaled legs and secrets retained");
     }
-    (line, !a.terminal() || manual, manual)
+    (
+        line,
+        !a.terminal() || manual || a.reclaim_retry_pending(),
+        manual,
+    )
 }
 
 pub fn render(home: &Path) -> Result<String> {
