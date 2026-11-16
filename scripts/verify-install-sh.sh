@@ -280,7 +280,7 @@ ok "two runs, rc=0 both times, exactly one maxplayer on PATH, still $got"
 #
 # ★★ WHAT THE DARWIN LEGS DO AND DO NOT PROVE. They run on linux, so they prove the PLATFORM
 #    RESOLUTION — that Darwin+arm64 resolves to `darwin-arm64` and therefore constructs the
-#    darwin asset name, that an Intel mac is refused, that the Rosetta branch fires. That logic is
+#    darwin asset name, that an Intel mac resolves to `darwin-x64`, that the Rosetta branch fires. That logic is
 #    plain shell and platform-independent, so exercising it here is real.
 #    They CANNOT prove a darwin install works: no mac binary can execute in a linux container, and
 #    this box has no mac emulation of any kind. `install.sh`'s own prove-step (run the binary, match
@@ -347,25 +347,20 @@ if grep -q "maxplayer-$VERSION-darwin-arm64.tar.gz" /legs/darwin-arm.out; then
     ok "  …and the constructed asset name appears: maxplayer-$VERSION-darwin-arm64.tar.gz"
 fi
 
-echo "leg 4b: an Intel mac is refused by name, before any download"
+echo "leg 4b: an Intel mac resolves to the darwin-x64 asset"
 BIN4B="$(leg_dir darwin-intel)"
 shim_uname Darwin x86_64
 shim_sysctl intel
 if PATH="/shim:$PATH" MAXPLAYER_VERSION="$VERSION" MAXPLAYER_BIN_DIR="$BIN4B" \
         sh "$INSTALLER" >/legs/darwin-intel.out 2>&1; then
-    fail "the installer exited 0 on an Intel mac, for which no asset is built"
+    fail "the installer exited 0 while installing a mac binary on linux"
 fi
-grep -qi 'Intel macs are not supported' /legs/darwin-intel.out \
-    || fail "refused on an Intel mac, but not by name. Output: $(cat /legs/darwin-intel.out)"
-# Refused at DETECTION, not after fetching something. `installing maxplayer …` is the first thing a
-# run prints once it has committed to a platform, so its absence places the refusal before that.
 # `if`, not `grep … && fail`: under `set -e` an AND-list whose left side fails takes the whole list
 # non-zero and kills the driver — so the good case would abort the run instead of passing.
-if grep -q 'installing maxplayer' /legs/darwin-intel.out; then
-    fail "the Intel-mac refusal happened after the installer had already committed to a platform"
+if grep -qi 'Rosetta' /legs/darwin-intel.out; then
+    fail "the Rosetta branch fired on an Intel mac, so it would get the arm64 build. Output: $(cat /legs/darwin-intel.out)"
 fi
-assert_empty "$BIN4B" "leg 4b"
-ok "Intel mac -> $(grep -i 'Intel macs' /legs/darwin-intel.out | head -n 1 | cut -c1-88) (non-zero, no download)"
+assert_resolved_platform /legs/darwin-intel.out "$BIN4B" darwin-x64 "leg 4b (Darwin/x86_64, Intel)"
 
 echo "leg 4c: Apple Silicon under Rosetta is detected despite uname saying x86_64"
 BIN4C="$(leg_dir darwin-rosetta)"

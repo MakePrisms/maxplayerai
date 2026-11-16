@@ -110,12 +110,12 @@ Reverse proxy (Caddy) terminates TLS and routes: relay WS, `/git/…`, blossom
   derived from the flake. See [`DOCKER.md`](DOCKER.md).
 - **GitHub Releases + `install.sh`** — outside the flake entirely.
   `.github/workflows/release.yml` builds one artifact per platform — `linux-x64` and `linux-arm64`
-  statically linked against musl, `darwin-arm64` linked against the base macOS libraries (macOS cannot
+  statically linked against musl, `darwin-arm64` and `darwin-x64` linked against the base macOS libraries (macOS cannot
   link libSystem statically, so the check there is that it pulls in no Homebrew or `/usr/local`
   dylib) — and attaches them with a `SHA256SUMS`. `install.sh` is attached to every release and
   resolves, verifies and installs one — `releases/latest/download/install.sh` resolves the latest
-  release, and `MAXPLAYER_VERSION=x.y.z` pins a specific one. Intel macs are not
-  covered: the matrix builds `aarch64-apple-darwin` only. ★ These artifacts are
+  release, and `MAXPLAYER_VERSION=x.y.z` pins a specific one. Intel macs get
+  `darwin-x64` (`x86_64-apple-darwin`). ★ These artifacts are
   built `--no-default-features --features wallet,acp` — the whole surface. `maxplayer seller` is in
   every one of them, so this path deploys a seller as readily as a buyer. A buyer-only narrowing
   (`--no-default-features --features wallet`) is buildable from source; no release publishes it.
@@ -201,9 +201,9 @@ component plus the client binary, so each service builds from the same source an
 - **seller** — `maxplayer seller`, run two ways by taste: `nix run --refresh … -- seller`
   (quick) or the Docker image. Same binary, same config contract.
 - **buyer** — `curl -fsSL …/releases/latest/download/install.sh | sh`, then `maxplayer mcp` wired into
-  their agent (Claude etc.). Zero clone, no nix; linux x86_64/aarch64 and macOS Apple Silicon.
-  `nix run --refresh … -- mcp` stays supported and is the answer on any platform the release does not
-  cover — an Intel mac, or a linux architecture outside those two.
+  their agent (Claude etc.). Zero clone, no nix; linux x86_64/aarch64 and macOS (Apple Silicon and
+  Intel). `nix run --refresh … -- mcp` stays supported and is the answer on any platform the release
+  does not cover — a linux architecture outside those two, or Windows.
 
 Secrets (relay key, seller key, mint auth) are always file-references with 0600
 perms, never baked into images or the nix store.

@@ -33,13 +33,13 @@ curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/in
 maxplayer --version
 ```
 
-Linux x86_64/aarch64 and macOS Apple Silicon, no toolchain needed. Buying needs no Nix; selling
+Linux x86_64/aarch64 and macOS (Apple Silicon and Intel), no toolchain needed. Buying needs no Nix; selling
 does (`maxplayer seller` refuses to start without a working `nix`). Via npm:
 `npm install -g maxplayer` — that route needs Node 18+ (the package's declared `engines.node`; the
 launcher shim itself only needs 14.18, for the `node:` prefix in `require()`, so debian's stock Node
 20 is fine), and for a non-root user needs a writable global prefix (`npm config set prefix
 ~/.npm-global`, then `~/.npm-global/bin` on `PATH`) or `sudo`, else it fails with `EACCES`. On any
-other platform — an Intel mac included — build from the repo, which ships a nix flake.
+other platform, build from the repo, which ships a nix flake.
 
 That one install is both roles. Buying and selling are two ways to run the same command.
 

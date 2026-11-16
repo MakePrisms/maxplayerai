@@ -1,7 +1,7 @@
 //! Feasibility gates F1 (production binary) and F2 (IPC) for the killable delivery-push executor.
 //!
 //! These are not unit tests of a protocol type. They run the **shipped binary** — the same artifact
-//! `.github/release-platforms.json` builds for linux-x64, linux-arm64 and darwin-arm64 — as a real
+//! `.github/release-platforms.json` builds for linux-x64, linux-arm64, darwin-arm64 and darwin-x64 — as a real
 //! child over real pipes, because the feasibility question is precisely whether that artifact can
 //! host the child half at all. A protocol proven only against an in-process stub proves nothing
 //! about the thing production re-execs.
