@@ -100,8 +100,7 @@ ID and keep `serve` running until complete or refunded. Listing authorizes servi
 that fixed lot, not further listings or price changes.
 
 `cancel <lot>` only with **no active quote/swap**; it never revokes an authorized
-HTLC lock. An expired lot nobody traded needs no `cancel`: `serve`/`recover` release its
-reservation one minute after expiry. On rejection, continue recovery; never force-release reservations. **Done:** terminal trade state and balances checked, or a confirmed
+HTLC lock. Expired untraded lots release themselves. On rejection, continue recovery; never force-release reservations. **Done:** terminal trade state and balances checked, or a confirmed
 inactive cancellation is reported; an unresolved lock is never called cancelled.
 
 ### Find listings / buy that lot
