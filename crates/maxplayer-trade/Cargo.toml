@@ -1,7 +1,7 @@
 [package]
 name = "maxplayer-trade"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 publish = false
 license = "MIT OR Apache-2.0"
 
@@ -13,7 +13,6 @@ license = "MIT OR Apache-2.0"
 local-test-mints = []
 lab = ["local-test-mints"]
 
-[workspace]
 
 [dependencies]
 cdk-common = { version = "=0.17.2", default-features = false, features = ["wallet"] }
@@ -55,7 +54,7 @@ cdk-sqlite = { version = "=0.17.2", features = ["mint", "wallet"] }
 cdk-fake-wallet = "=0.17.2"
 cdk-axum = "=0.17.2"
 axum = "0.8"
-nostr-relay-builder = "=0.44.0"
+nostr-relay-builder = "0.44.1"
 # tests/auth_gated.rs: the shared sign-in-gated relay front (maxplayer-core tests/support).
 tokio-tungstenite = "=0.26.2"
 futures-util = "0.3"
