@@ -15,7 +15,7 @@ planner that runs on whatever LLM agent the buyer already has.
 | **swarm** | The feature, and a named group of sellers a buyer creates ("Math", "Help activists"). Sellers join a swarm once and stay available for all its swarm jobs. | (no object; implied by memberships) |
 | **swarm job** | A goal the buyer gives to one of its swarms (title, goal, window, budget). | challenge / run |
 | **task** | One piece of a swarm job handed to one seller. On the wire it is an ordinary maxplayer job (offer → claim → award → result → collect). | assignment / job |
-| **member** | A seller that joined a swarm and is accepted by its buyer. | member |
+| **member** | A seller that joined a swarm and is accepted for it by its buyer (buyer-wide or for that swarm, §4). | member |
 
 The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers do not change.
 
@@ -42,7 +42,10 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
 12. **Swarms are explicit and a buyer may have several.** The buyer creates a swarm (name, purpose)
     before any swarm job; sellers discover and join it, commit minutes per day, and stay available
     for every swarm job in it without re-joining. (Josip, Bob)
-13. **Acceptance is per buyer:** accepting a seller once trusts it in all that buyer's swarms. (Bob)
+13. **Acceptance at two levels.** A buyer-wide decision trusts or blocks a seller in all that buyer's
+    swarms (one click, Bob's default); an optional per-swarm decision accepts or excludes a seller in
+    one swarm. Eligible = accepted at either level and denied at neither. (Bob 13 Nov; Josip 16 Nov
+    14:33)
 14. **No cross-swarm cap:** a seller in several swarms of one buyer may get a task from each at the
     same time; only the seller's own slot count limits it. (Bob)
 15. **First-draft questions:** `join` edits seller config (append-only); `solved` needs one
@@ -113,14 +116,19 @@ untouched; no `PROTOCOL_VERSION` bump.
 | `30344` **new** | SWARM | buyer | slug | `name`, `status` (`open`\|`closed`), `tasks` (`public`\|`private`, default `public`) | purpose / description (markdown) |
 | `30341` | SWARM JOB | buyer | slug | `a` = `30344:<buyer>:<swarm d>` **(new, required)**, `title`, `starts`, `ends`, `status`, `budget <n> sat`, optional `update`, `result` | goal |
 | `30342` | SWARM MEMBERSHIP | seller | `<buyer>:<swarm d>` **(was `<buyer>`)** | `a` = swarm address **(was forbidden)**, `p` = buyer, `since`, `minutes` (1–480), `status` (`joined`\|`left`) | note |
-| `30343` | SWARM DECISION | buyer | seller pubkey | `p` = seller, `decision` | reason (unchanged; per buyer) |
+| `30343` | SWARM DECISION | buyer | `<seller>` (buyer-wide, as today) or `<seller>:<swarm d>` **(new, per swarm)** | `p` = seller, `decision` (`accepted`\|`denied`), `a` = swarm address **(only and required on per-swarm decisions)** | reason |
 
 - Validators: a swarm job's `a` must name a swarm by the same author; a membership's `a`, `p` and `d`
   must agree. `30344` is unused at the anchor except as a "wrong kind is refused" test value
   (`challenge.rs:435`), which moves to another number.
 - **Eligibility** for a swarm job: membership of that job's swarm, `status = joined`, published and
-  `since` at or before the job's `starts` (unchanged rule), and the buyer's latest decision for the
-  seller is `accepted`.
+  `since` at or before the job's `starts` (unchanged rule), and the buyer's decisions allow the
+  seller in that swarm: take the latest buyer-wide decision and the latest decision for this swarm;
+  the seller is eligible if at least one is `accepted` and neither is `denied`. So a buyer-wide deny
+  blocks everywhere, a per-swarm deny excludes from one swarm, and a per-swarm accept admits to one
+  swarm without trusting the seller elsewhere.
+- Decision validator: a per-swarm decision's `d` suffix, `a` and `p` must agree and the swarm must be
+  by the same buyer; a buyer-wide decision carries no `a`.
 - **Minutes** are per swarm per day: used = sum over that swarm's tasks to that seller whose award
   falls in the day, across all the swarm's jobs. Two overlapping swarm jobs in one swarm share the
   seller's minutes (today each challenge counted separately, `model.mjs:143`, `:150`).
@@ -153,7 +161,7 @@ untouched; no `PROTOCOL_VERSION` bump.
 | `maxplayer swarm create --name … --purpose-file … [--slug …]` | buyer (ops) | Same daemon request as MCP `swarm_create`. |
 | `maxplayer swarm job create <swarm> --goal-file … --budget-sats N [--title …] [--starts … --ends …]` | buyer (ops) | Same daemon request as MCP `swarm_job_create`. |
 | `maxplayer swarm job status <swarm job> [--json]` | both | Replaces sidecar `status`. |
-| `maxplayer swarm decide --seller <npub\|hex> --accept\|--deny` | buyer | Per buyer. |
+| `maxplayer swarm decide --seller <npub\|hex> --accept\|--deny [--swarm <swarm>]` | buyer | Buyer-wide without `--swarm`, per swarm with it. |
 | `maxplayer swarm members [<swarm>] [--json]` | buyer | Applicants and members, per swarm or all. |
 | `maxplayer swarm planner-test` | buyer | §9.3. |
 
@@ -273,7 +281,7 @@ claims advertise `["session","1"]`; sellers need `[sessions] enabled = true` (de
 |---|---|
 | `swarm_create {name, purpose, slug?, tasks?: public\|private}` | Publishes a 30344 swarm. Returns its address. |
 | `swarm_list {}` / `swarm_members {swarm?}` | The buyer's swarms; applicants and members with minutes. |
-| `swarm_decide {seller, accept}` | Per-buyer acceptance. |
+| `swarm_decide {seller, accept, swarm?}` | Buyer-wide decision, or per swarm when `swarm` is given. |
 | `swarm_job_create {swarm, goal, title?, starts?, ends?, budget_sats, tasks?[]}` | Publishes a 30341 swarm job (default: now → +24 h). Optional tasks are queued (fan-out without a planner). Says whether a planner is configured. |
 | `swarm_job_status {swarm_job, results_page?}` | Status, members with minutes, queue, running tasks, results (paged), budget, planner state, last idle reason. |
 | `swarm_job_tasks {swarm_job, add?[], drop?[], replace?[]}` | Edit the queue. |
@@ -335,15 +343,9 @@ Agent-queued tasks are dispatched; results wait for the agent's next `swarm_job_
 Boards are tools, not a structure. A swarm job starts with **no boards**; the planner prompt
 describes what the primitives can do and leaves it to the lead (planner, or the buyer's agent)
 whether to use them at all. Board operations are part of the lead's JSON output, so the lead still
-needs no tools. A lead that wants the Fermat run's setup can build it from these primitives:
-
-| Their table | How a lead could build it |
-|---|---|
-| Announce | a board the lead creates with `include: all` |
-| Assign | a board the lead writes, plus task pins and workstream owners |
-| Notes | seller reports go to the lead's inbox; the lead republishes what it chooses to a board |
-| Subtasks | the task queue; sellers *propose* subtasks with a `parent` link, the lead accepts them into the queue (task tree) |
-| Landed | the results log, filled automatically; only the lead decides what of it other sellers see |
+needs no tools. The prompt gives no example structure, so it does not steer the lead toward one
+kind of setup; boards are domain-neutral (orders, assignments, sources already checked, style rules,
+anything the lead wants to keep and show).
 
 - **Rule: the lead is the only writer.** Nothing a seller writes reaches another seller unless the
   lead itself writes it to a board or into a task. No board has member write access.
@@ -423,7 +425,9 @@ Each behind a default-off flag where it changes running behaviour.
    on swarm jobs), `maxplayer swarm …` (§6), `swarm-join` skill rewrite, delete
    `crates/maxplayer-challenges` and its CI job. Tests: port the sidecar's event/eligibility tests;
    `list` shows swarms of two buyers; `join` publishes `d = <buyer>:<swarm>`; config append keeps
-   entries; minutes change refused mid-job; join during a running job reports next-job eligibility.
+   entries; minutes change refused mid-job; join during a running job reports next-job eligibility; decision vectors: buyer-wide accept +
+   per-swarm deny excludes from that swarm only, per-swarm accept alone admits to that swarm only,
+   buyer-wide deny wins over a per-swarm accept.
 3. **Board on our relay.** `/swarm` lists swarms from every buyer, `/swarm/<naddr>` one swarm and its
    jobs; drop the denylist and build-time buyer key; minutes per swarm and the shared vectors (§7.4).
    Vercel deploy.
@@ -441,7 +445,7 @@ Each behind a default-off flag where it changes running behaviour.
    `step` with board operations, triggers, output filter, verify-before-solved. Tests: stub planner;
    rejected output fed back; canaries refuse a writing / reading command; idle ceiling; one call per
    settled batch; a swarm job with no boards works exactly like one without the feature; a stub
-   lead that chooses to build the five Fermat-style boards can drive a task tree with them.
+   lead that creates its own boards and accepts proposed subtasks can drive a task tree with them.
 6. **Retire** `scripts/challenges/` and the old docs after one live swarm job on the new path.
 
 Bob's rule stands: no swarm merges while a swarm job is live; confirm the board deploy before telling
@@ -490,7 +494,6 @@ materializes a read-only copy (`collect.rs:253`), and the default `ContentPolicy
 diffs (`contribution.rs:285`). A stricter default policy and an "untrusted code" warning in the buyer
 skill and collect output are separate from swarm work.
 - Restricting who may create swarms (addable later as a relay rule on 30344).
-- Per-swarm acceptance (acceptance is per buyer, §1.13).
 - Opting out of one swarm job inside a swarm (membership is per swarm).
 - MCP sampling as a planner backend.
 
