@@ -1,3 +1,4 @@
+//! The `maxplayer trade` command line (formerly the standalone `maxplayer-trade` binary).
 use anyhow::{Context, Result, ensure};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
@@ -7,6 +8,7 @@ use std::{
     path::{Path, PathBuf},
 };
 #[derive(Parser)]
+#[command(name = "maxplayer trade")]
 struct Cli {
     /// The maxplayer home to trade from (default: $MAXPLAYER_HOME, else ~/.maxplayer): its `key`
     /// signs and its wallet pays; trade's journal lives in <home>/trade. A legacy standalone
@@ -147,43 +149,64 @@ enum Command {
     /// Read spendable wallet balance without submitting existing money authorizations.
     Balance { mint: String },
 }
-use maxplayer_trade::{
+use crate::{
     Asset, Leg, coordinator, journal::Journal, market::Market, wallet::preflight,
 };
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+/// `maxplayer trade …`: parse `args` (the first item is the program name shown in usage) and run
+/// one trade command to completion. Returns the process exit code. Owns its own tokio runtime, so
+/// call it from synchronous code only (the `maxplayer` dispatcher, the test binary).
+pub fn main_from<I, T>(args: I) -> u8
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            return e.exit_code().clamp(0, 255) as u8;
+        }
+    };
+    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(rt) => rt.block_on(run(cli)),
+        Err(e) => {
+            eprintln!("tokio runtime: {e}");
+            1
+        }
+    }
+}
+async fn run(cli: Cli) -> u8 {
     // Keep ownership through the final snapshot and socket cleanup, not just execute().
     let mut owner_lock = None;
-    match execute(&mut owner_lock).await {
+    match execute(cli, &mut owner_lock).await {
         Ok(()) => {
-            maxplayer_trade::shutdown::finished(0, None);
-            std::process::ExitCode::SUCCESS
+            crate::shutdown::finished(0, None);
+            0
         }
         Err(error) => {
             if let Some(f) = error.downcast_ref::<DoctorExit>() {
-                return std::process::ExitCode::from(f.0);
+                return f.0;
             }
-            if let Some(f) = error.downcast_ref::<maxplayer_trade::serve::Forwarded>() {
-                return std::process::ExitCode::from(f.0);
+            if let Some(f) = error.downcast_ref::<crate::serve::Forwarded>() {
+                return f.0;
             }
             eprintln!("{error}");
             let code = if error.is::<coordinator::RecoveryIncomplete>() {
                 3
             } else if error.is::<coordinator::ManualRecovery>() {
                 4
-            } else if error.is::<maxplayer_trade::shutdown::Stopped>() {
-                maxplayer_trade::shutdown::EXIT_STOPPED
+            } else if error.is::<crate::shutdown::Stopped>() {
+                crate::shutdown::EXIT_STOPPED
             } else {
                 1
             };
             // serve only: the final lifecycle line (reason, exit code, unfinished work).
-            maxplayer_trade::shutdown::finished(code, Some(&error));
-            std::process::ExitCode::from(code)
+            crate::shutdown::finished(code, Some(&error));
+            code
         }
     }
 }
-async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
-    let cli = Cli::parse();
+async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
     if let Command::Doctor {
         mint,
         mint_relay,
@@ -220,11 +243,11 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     // Argument-only refusal, like the zero check: before any home is resolved or created.
     if let Command::Fund { amount, .. } = &cli.command {
         ensure!(
-            *amount <= maxplayer_trade::real_money::CAP,
+            *amount <= crate::real_money::CAP,
             "funding cap exceeds 100,000 sats"
         );
     }
-    maxplayer_trade::transport::configure_mint_relays(&cli.mint_relay)?;
+    crate::transport::configure_mint_relays(&cli.mint_relay)?;
     // Argument-only mint fence (no http:// mints in a user build): before any home is resolved,
     // created or locked, any hand-off, and any mint or relay is contacted.
     let arg_mints: Vec<&String> = match &cli.command {
@@ -248,9 +271,9 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     }
     // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
     match &cli.command {
-        Command::Fund { mint, .. } => maxplayer_trade::transport::require_http(mint, "fund")?,
+        Command::Fund { mint, .. } => crate::transport::require_http(mint, "fund")?,
         Command::Withdraw { mint, .. } => {
-            maxplayer_trade::transport::require_http(mint, "withdraw")?
+            crate::transport::require_http(mint, "withdraw")?
         }
         _ => {}
     }
@@ -264,34 +287,34 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         | Command::Receive { mint, .. }
         | Command::Send {
             mint: Some(mint), ..
-        } => maxplayer_trade::wallet::check_mint(home, &Asset::from_cli(mint)?.mint_url)?,
+        } => crate::wallet::check_mint(home, &Asset::from_cli(mint)?.mint_url)?,
         _ => {}
     }
     // Mint requests sign as this home's key: the default mint relay only admits registered keys.
     // A read-only command never creates a key (`discover` on an empty or legacy home).
-    maxplayer_trade::transport::configure_mint_identity(home, is_read_only(&cli.command));
+    crate::transport::configure_mint_identity(home, is_read_only(&cli.command));
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
         let asset = Asset::from_cli(mint)?;
         println!(
             "{}",
-            serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":maxplayer_trade::wallet::read_balance(home, &asset.mint_url)?})
+            serde_json::json!({"mint":asset.mint_url,"unit":"sat","balance":crate::wallet::read_balance(home, &asset.mint_url)?})
         );
         return Ok(());
     }
     if let Command::Status { json, check_sends } = cli.command {
         if json {
-            println!("{}", maxplayer_trade::wallet::read_status(home)?);
+            println!("{}", crate::wallet::read_status(home)?);
         } else {
-            println!("{}", maxplayer_trade::report::render(home)?);
+            println!("{}", crate::report::render(home)?);
         }
         if check_sends {
-            maxplayer_trade::send::check_redeemed(home).await?;
+            crate::send::check_redeemed(home).await?;
         }
         return Ok(());
     }
     let relays: Vec<String> = if cli.relay.is_empty() {
-        maxplayer_trade::market::DEFAULT_RELAYS
+        crate::market::DEFAULT_RELAYS
             .iter()
             .map(|s| s.to_string())
             .collect()
@@ -355,7 +378,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             want,
             max_fees,
             ..
-        } => Some(maxplayer_trade::serve::Command::List {
+        } => Some(crate::serve::Command::List {
             give_mint: give_mint.clone(),
             give: *give,
             want_mint: want_mint.clone(),
@@ -368,14 +391,14 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             min_receive,
             max_fees,
             ..
-        } => Some(maxplayer_trade::serve::Command::Take {
+        } => Some(crate::serve::Command::Take {
             lot: lot.clone(),
             max_give: *max_give,
             min_receive: *min_receive,
             max_fees: *max_fees,
         }),
         Command::Cancel { lot } => {
-            Some(maxplayer_trade::serve::Command::Cancel { lot: lot.clone() })
+            Some(crate::serve::Command::Cancel { lot: lot.clone() })
         }
         Command::Send {
             mint: Some(mint),
@@ -383,11 +406,11 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             out: Some(out),
             max_fees,
             reclaim: None,
-        } => Some(maxplayer_trade::serve::Command::Send {
+        } => Some(crate::serve::Command::Send {
             mint: mint.clone(),
             amount: *amount,
             // serve runs in another directory: hand over the absolute path the user meant.
-            out: maxplayer_trade::send::target(out)?
+            out: crate::send::target(out)?
                 .to_str()
                 .context("--out path must be UTF-8")?
                 .to_owned(),
@@ -400,10 +423,10 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             id,
         } => {
             ensure!(
-                *amount <= maxplayer_trade::real_money::CAP,
+                *amount <= crate::real_money::CAP,
                 "funding cap exceeds 100,000 sats"
             );
-            Some(maxplayer_trade::serve::Command::Fund {
+            Some(crate::serve::Command::Fund {
                 mint: mint.clone(),
                 amount: *amount,
                 id: match id {
@@ -419,24 +442,24 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             let raw = token.as_deref().unwrap_or_default().trim();
             // Refused before connecting, exactly as the local path refuses it.
             ensure!(
-                raw.len() <= maxplayer_trade::receive::MAX_TOKEN_BYTES,
+                raw.len() <= crate::receive::MAX_TOKEN_BYTES,
                 "token missing or oversized"
             );
-            Some(maxplayer_trade::serve::Command::Receive {
+            Some(crate::serve::Command::Receive {
                 mint: mint.clone(),
-                token: maxplayer_trade::serve::TokenText(raw.to_owned()),
+                token: crate::serve::TokenText(raw.to_owned()),
             })
         }
         _ => None,
     }
-    .map(|command| maxplayer_trade::serve::Request {
-        v: maxplayer_trade::serve::PROTOCOL_V,
+    .map(|command| crate::serve::Request {
+        v: crate::serve::PROTOCOL_V,
         relays: relays.clone(),
-        mint_relays: maxplayer_trade::transport::mint_relays(),
+        mint_relays: crate::transport::mint_relays(),
         command,
     });
-    if let Some(maxplayer_trade::serve::Request {
-        command: maxplayer_trade::serve::Command::Fund {
+    if let Some(crate::serve::Request {
+        command: crate::serve::Command::Fund {
             id, quote: None, ..
         },
         ..
@@ -450,16 +473,16 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     }
     if let Some(request) = &handoff {
         if home.is_dir() {
-            if let Some(code) = maxplayer_trade::serve::forward(home, request).await? {
+            if let Some(code) = crate::serve::forward(home, request).await? {
                 return forwarded(code);
             }
         }
     }
-    if !maxplayer_trade::wallet::is_maxplayer_home(home) {
+    if !crate::wallet::is_maxplayer_home(home) {
         fs::create_dir_all(home)?;
         fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
     }
-    let state = maxplayer_trade::wallet::ensure_state_dir(home)?;
+    let state = crate::wallet::ensure_state_dir(home)?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -473,9 +496,9 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         let Some(request) = &handoff else {
             return Err(busy).context("home is already in use");
         };
-        let end = tokio::time::Instant::now() + maxplayer_trade::serve::CONNECT_WAIT;
+        let end = tokio::time::Instant::now() + crate::serve::CONNECT_WAIT;
         loop {
-            if let Some(code) = maxplayer_trade::serve::forward(home, request).await? {
+            if let Some(code) = crate::serve::forward(home, request).await? {
                 return forwarded(code);
             }
             if lock.try_lock_exclusive().is_ok() {
@@ -494,13 +517,13 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     // Bind while holding owner.lock (an existing socket file is stale) and before the startup
     // recovery pass, so hand-offs queue instead of failing while serve recovers.
     let mut jobs = if matches!(cli.command, Command::Serve) {
-        maxplayer_trade::shutdown::start(home, &relays)?;
-        Some(maxplayer_trade::serve::bind(home, relays.clone())?)
+        crate::shutdown::start(home, &relays)?;
+        Some(crate::serve::bind(home, relays.clone())?)
     } else {
         None
     };
     // `recover` is one bounded pass: it waits for mint pacing instead of skipping an item.
-    maxplayer_trade::backoff::set_wait_for_pacing(matches!(cli.command, Command::Recover));
+    crate::backoff::set_wait_for_pacing(matches!(cli.command, Command::Recover));
     let money_journal = Journal::open(home).await?;
     // Inspection must not submit an earlier payment authorization. Newly credited
     // money proofs remain reserved until explicit recovery settles their journal.
@@ -514,7 +537,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             .await?
             .is_empty()
     {
-        let pending = maxplayer_trade::money::recover(home, &money_journal).await?;
+        let pending = crate::money::recover(home, &money_journal).await?;
         return coordinator::recovery_status(&money_journal, pending).await;
     }
     if !matches!(
@@ -526,13 +549,13 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             | Command::Receive { .. }
             | Command::Send { .. }
     ) {
-        let keys = maxplayer_trade::wallet::identity(home)?;
+        let keys = crate::wallet::identity(home)?;
         let j = Journal::open(home).await?;
         let mut m = Market::connect(keys, &relays).await?;
         // serve starts the same recovery as its first scheduled units (`sched`), before any
         // message or request it admits, so one slow mint never holds the start either.
         if !matches!(cli.command, Command::Recover | Command::Serve) {
-            maxplayer_trade::shutdown::bounded(coordinator::recover(home, &j, &m)).await?;
+            crate::shutdown::bounded(coordinator::recover(home, &j, &m)).await?;
         }
         return match cli.command {
             Command::List {
@@ -586,7 +609,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         reclaim,
     } = &cli.command
     {
-        return maxplayer_trade::send::command(
+        return crate::send::command(
             home,
             &money_journal,
             mint.as_deref(),
@@ -605,7 +628,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         | Command::Receive { mint, .. } => mint,
         _ => unreachable!(),
     };
-    let asset = maxplayer_trade::Asset::from_cli(mint_arg)?;
+    let asset = crate::Asset::from_cli(mint_arg)?;
     asset.fence()?;
     let mint = &asset.mint_url;
 
@@ -618,7 +641,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
         ..
     } = cli.command
     {
-        let a = match maxplayer_trade::money::withdraw_bounded(
+        let a = match crate::money::withdraw_bounded(
             home,
             &money_journal,
             mint,
@@ -631,7 +654,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             Err(error) => {
                 // A submitted withdrawal whose resolution failed (mint unreachable after
                 // POST, change not yet restorable) is unresolved work, never a refusal.
-                if maxplayer_trade::money::submitted_unresolved(&money_journal, invoice)
+                if crate::money::submitted_unresolved(&money_journal, invoice)
                     .await
                     .unwrap_or(true)
                 {
@@ -646,7 +669,7 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
             return Err(coordinator::RecoveryIncomplete.into());
         }
         ensure!(
-            a.state == maxplayer_trade::money::MeltState::Done,
+            a.state == crate::money::MeltState::Done,
             "withdrawal not paid; terminal {:?}",
             a.state
         );
@@ -655,48 +678,48 @@ async fn execute(owner_lock: &mut Option<fs::File>) -> Result<()> {
     if matches!(cli.command, Command::Receive { .. }) {
         let raw = token.take().unwrap_or_default();
         drop(handoff);
-        let r = maxplayer_trade::receive::receive(home, &money_journal, mint, &raw).await;
+        let r = crate::receive::receive(home, &money_journal, mint, &raw).await;
         drop(raw);
         let r = r?;
         println!("{}", r.summary());
-        return maxplayer_trade::receive::verdict(&r);
+        return crate::receive::verdict(&r);
     }
     if let Command::Fund {
         amount, ref quote, ..
     } = cli.command
     {
         let id = match &handoff {
-            Some(maxplayer_trade::serve::Request {
-                command: maxplayer_trade::serve::Command::Fund { id, .. },
+            Some(crate::serve::Request {
+                command: crate::serve::Command::Fund { id, .. },
                 ..
             }) => id.clone(),
             _ => uuid::Uuid::new_v4().to_string(),
         };
         ensure!(
-            amount > 0 && amount <= maxplayer_trade::real_money::CAP,
+            amount > 0 && amount <= crate::real_money::CAP,
             "funding cap exceeds 100,000 sats"
         );
         let mut f = if let Some(id) = quote {
             money_journal
-                .all::<maxplayer_trade::money::Funding>("funding")
+                .all::<crate::money::Funding>("funding")
                 .await?
                 .into_iter()
                 .find(|f| f.quote.as_ref() == Some(id) && f.mint == *mint && f.amount == amount)
                 .context("quote not journaled for this mint and amount")?
         } else {
-            maxplayer_trade::money::fund_with_id(home, &money_journal, mint, amount, &id).await?
+            crate::money::fund_with_id(home, &money_journal, mint, amount, &id).await?
         };
         println!(
             "{}",
             serde_json::json!({"funding_id":f.id,"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
         );
         // Quote polling: one status GET per FUND_POLL (about 30 s in total).
-        for _ in 0..maxplayer_trade::money::FUND_POLLS {
-            maxplayer_trade::money::resume_fund(home, &money_journal, &mut f).await?;
+        for _ in 0..crate::money::FUND_POLLS {
+            crate::money::resume_fund(home, &money_journal, &mut f).await?;
             if f.done {
                 return Ok(());
             }
-            tokio::time::sleep(maxplayer_trade::money::fund_poll(&f.mint)).await;
+            tokio::time::sleep(crate::money::fund_poll(&f.mint)).await;
         }
         anyhow::bail!("funding remains pending; invoice and intent retained; run recover");
     }
@@ -722,7 +745,7 @@ fn is_read_only(command: &Command) -> bool {
 }
 
 fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
-    use maxplayer_trade::wallet;
+    use crate::wallet;
     let home = match arg {
         Some(path) => path.to_path_buf(),
         None => maxplayer_core::home::default_home_dir().map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -770,7 +793,7 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
 /// excess byte lets `receive::inspect` refuse an oversized token instead of truncating it).
 fn read_token(token_file: Option<&std::path::Path>) -> Result<String> {
     use std::io::Read;
-    let limit = maxplayer_trade::receive::MAX_TOKEN_BYTES as u64 + 1;
+    let limit = crate::receive::MAX_TOKEN_BYTES as u64 + 1;
     let mut raw = String::new();
     match token_file {
         Some(path) => fs::File::open(path)
@@ -790,14 +813,14 @@ fn forwarded(code: u8) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
-        Err(maxplayer_trade::serve::Forwarded(code).into())
+        Err(crate::serve::Forwarded(code).into())
     }
 }
 
 /// Commands that never take owner.lock, never open the journal and never create files.
 mod lockfree {
     use anyhow::{Context, Result, bail, ensure};
-    use maxplayer_trade::{Asset, dryrun, market::Market, parse_lot, wallet};
+    use crate::{Asset, dryrun, market::Market, parse_lot, wallet};
     use std::path::Path;
     /// Discovery needs no trade key and must not create one: a read-only market that never
     /// signs in (lots and statuses are public reads).
@@ -814,13 +837,13 @@ mod lockfree {
         );
         let m = market(relays).await?;
         let lots = m.discover(None).await?;
-        let now = maxplayer_trade::coordinator::now();
+        let now = crate::coordinator::now();
         let parsed = lots
             .into_iter()
             .map(|e| Ok((parse_lot(&e, now)?, e)))
             .collect::<Result<Vec<_>>>()?;
         let (terms, lots): (Vec<_>, Vec<_>) =
-            maxplayer_trade::select_lots(parsed, give.as_ref(), want.as_ref())
+            crate::select_lots(parsed, give.as_ref(), want.as_ref())
                 .into_iter()
                 .unzip();
         let fees = dryrun::discover_fees(&terms).await;
@@ -831,7 +854,7 @@ mod lockfree {
         Ok(())
     }
     async fn preflight(mints: [&str; 2]) -> Result<[dryrun::Keysets; 2]> {
-        maxplayer_trade::diagnostics::notice();
+        crate::diagnostics::notice();
         for mint in mints {
             Asset::new(mint)?.fence()?;
         }
@@ -906,7 +929,7 @@ mod lockfree {
             .into_iter()
             .next()
             .context("lot unavailable, invalid, expired or cancelled")?;
-        let l = parse_lot(&e, maxplayer_trade::coordinator::now())?;
+        let l = parse_lot(&e, crate::coordinator::now())?;
         // Self-trade check without creating a trade key.
         let own = wallet::existing_identity(home).ok().flatten();
         for mint in [&l.give.asset.mint_url, &l.want.asset.mint_url] {
@@ -1021,8 +1044,8 @@ async fn doctor(
             // refusal is a fixed string, so name it.
             let text = format!("{error:#}");
             let reason = [
-                maxplayer_trade::transport::HTTP_MINT_REFUSED,
-                maxplayer_trade::transport::WS_MINT_RELAY_REFUSED,
+                crate::transport::HTTP_MINT_REFUSED,
+                crate::transport::WS_MINT_RELAY_REFUSED,
             ]
             .into_iter()
             .find(|r| text.contains(r));
@@ -1057,10 +1080,10 @@ async fn doctor_inner(
     let asset = Asset::from_cli(mint)?;
     asset.fence()?;
     ensure!(
-        maxplayer_trade::transport::is_nostr(&asset.mint_url),
+        crate::transport::is_nostr(&asset.mint_url),
         "doctor requires a nostr:// mint and one explicit --mint-relay"
     );
-    maxplayer_trade::transport::configure_mint_relays(&[relay.to_owned()])?;
+    crate::transport::configure_mint_relays(&[relay.to_owned()])?;
     let window = Duration::from_secs(seconds);
     let connector = NostrMintConnector::new(&asset.mint_url.parse()?, vec![relay.to_owned()])?
         // Resend the identical event on the production cadence, so a first delivery lost on
@@ -1073,7 +1096,7 @@ async fn doctor_inner(
     // A sign-in-required relay only admits registered keys (`maxplayer account link
     // --trade-home`), so sign as the home's trade key when it has one. Never create it here.
     let identity = match home {
-        Some(home) => maxplayer_trade::wallet::existing_identity(home)
+        Some(home) => crate::wallet::existing_identity(home)
             .ok()
             .flatten(),
         None => None,
@@ -1081,7 +1104,7 @@ async fn doctor_inner(
     let signer = match &identity {
         Some(keys) => {
             let npub = keys.public_key().to_bech32()?;
-            let source = if home.is_some_and(maxplayer_trade::wallet::is_maxplayer_home) {
+            let source = if home.is_some_and(crate::wallet::is_maxplayer_home) {
                 "home key"
             } else {
                 "home trade.key"
@@ -1113,7 +1136,7 @@ async fn doctor_inner(
     let compatibility = result
         .as_ref()
         .ok()
-        .map(maxplayer_trade::compatibility::assess);
+        .map(crate::compatibility::assess);
     let incompatible = evidence.outcome == "unsupported_protocol"
         || compatibility
             .as_ref()

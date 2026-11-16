@@ -14,6 +14,15 @@ local-test-mints = []
 lab = ["local-test-mints"]
 
 
+# The standalone binary is gone: users run `maxplayer trade`. This one exists only for the
+# integration tests (they drive a real process), and only in builds with the test-only
+# `local-test-mints` feature, which every `cargo test` gets through the self dev-dependency below.
+# `cargo build`/`cargo install` of this crate therefore produce no binary at all.
+[[bin]]
+name = "maxplayer-trade"
+path = "src/bin/maxplayer-trade.rs"
+required-features = ["local-test-mints"]
+
 [dependencies]
 cdk-common = { version = "=0.17.2", default-features = false, features = ["wallet"] }
 anyhow = "1"
