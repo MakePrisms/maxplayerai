@@ -149,9 +149,7 @@ enum Command {
     /// Read spendable wallet balance without submitting existing money authorizations.
     Balance { mint: String },
 }
-use crate::{
-    Asset, Leg, coordinator, journal::Journal, market::Market, wallet::preflight,
-};
+use crate::{Asset, Leg, coordinator, journal::Journal, market::Market, wallet::preflight};
 /// `maxplayer trade …`: parse `args` (the first item is the program name shown in usage) and run
 /// one trade command to completion. Returns the process exit code. Owns its own tokio runtime, so
 /// call it from synchronous code only (the `maxplayer` dispatcher, the test binary).
@@ -167,7 +165,10 @@ where
             return e.exit_code().clamp(0, 255) as u8;
         }
     };
-    match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(rt) => rt.block_on(run(cli)),
         Err(e) => {
             eprintln!("tokio runtime: {e}");
@@ -272,9 +273,7 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
     // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
     match &cli.command {
         Command::Fund { mint, .. } => crate::transport::require_http(mint, "fund")?,
-        Command::Withdraw { mint, .. } => {
-            crate::transport::require_http(mint, "withdraw")?
-        }
+        Command::Withdraw { mint, .. } => crate::transport::require_http(mint, "withdraw")?,
         _ => {}
     }
     let resolved = resolve_home(cli.home.as_deref(), &cli.command)?;
@@ -397,9 +396,7 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
             min_receive: *min_receive,
             max_fees: *max_fees,
         }),
-        Command::Cancel { lot } => {
-            Some(crate::serve::Command::Cancel { lot: lot.clone() })
-        }
+        Command::Cancel { lot } => Some(crate::serve::Command::Cancel { lot: lot.clone() }),
         Command::Send {
             mint: Some(mint),
             amount: Some(amount),
@@ -641,14 +638,8 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         ..
     } = cli.command
     {
-        let a = match crate::money::withdraw_bounded(
-            home,
-            &money_journal,
-            mint,
-            invoice,
-            max_debit,
-        )
-        .await
+        let a = match crate::money::withdraw_bounded(home, &money_journal, mint, invoice, max_debit)
+            .await
         {
             Ok(a) => a,
             Err(error) => {
@@ -769,23 +760,22 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
         }
         return Ok(home);
     }
-    if wallet::is_maxplayer_home(&home) {
-        ensure!(
-            fs::symlink_metadata(home.join("key")).is_ok(),
-            "maxplayer home {h} has no key yet: create it with `maxplayer whoami --home {h}` and \
-             link it with `maxplayer account link --home {h}`",
-            h = home.display()
-        );
+    // Read-only commands never create anything: no home, key, config or journal ("SAFETY: discover
+    // created a home", tests/ux.rs). They run against whatever is there.
+    if is_read_only(command) {
         return Ok(home);
     }
-    ensure!(
-        is_read_only(command),
-        "no maxplayer home at {h} (no key or config.toml): trading uses a maxplayer home's key and \
-         wallet. Create one with `maxplayer wallet setup --home {h}` (or `maxplayer whoami --home \
-         {h}`), link its key with `maxplayer account link --home {h}`, then retry; nothing was \
-         created",
-        h = home.display()
-    );
+    // Every other command can move money, so it gets a complete maxplayer home first, exactly as
+    // the rest of `maxplayer` does (`home::bootstrap`: 0700 dir, config.toml, a 0600 key, wallet/).
+    // Idempotent on an existing home. Bootstrap does not register the key with the relay.
+    let boot = maxplayer_core::home::bootstrap(&home).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if boot.key_created {
+        eprintln!(
+            "created a new key for maxplayer home {h}; link it with `maxplayer account link --home \
+             {h}` so relay.maxplayer.ai accepts its listings and mint requests",
+            h = home.display()
+        );
+    }
     Ok(home)
 }
 
@@ -819,8 +809,8 @@ fn forwarded(code: u8) -> Result<()> {
 
 /// Commands that never take owner.lock, never open the journal and never create files.
 mod lockfree {
-    use anyhow::{Context, Result, bail, ensure};
     use crate::{Asset, dryrun, market::Market, parse_lot, wallet};
+    use anyhow::{Context, Result, bail, ensure};
     use std::path::Path;
     /// Discovery needs no trade key and must not create one: a read-only market that never
     /// signs in (lots and statuses are public reads).
@@ -1096,9 +1086,7 @@ async fn doctor_inner(
     // A sign-in-required relay only admits registered keys (`maxplayer account link
     // --trade-home`), so sign as the home's trade key when it has one. Never create it here.
     let identity = match home {
-        Some(home) => crate::wallet::existing_identity(home)
-            .ok()
-            .flatten(),
+        Some(home) => crate::wallet::existing_identity(home).ok().flatten(),
         None => None,
     };
     let signer = match &identity {
@@ -1133,10 +1121,7 @@ async fn doctor_inner(
     let (result, evidence) = connector
         .call_observed("info", serde_json::Value::Null)
         .await;
-    let compatibility = result
-        .as_ref()
-        .ok()
-        .map(crate::compatibility::assess);
+    let compatibility = result.as_ref().ok().map(crate::compatibility::assess);
     let incompatible = evidence.outcome == "unsupported_protocol"
         || compatibility
             .as_ref()

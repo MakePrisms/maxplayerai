@@ -597,18 +597,51 @@ async fn legacy_home_allow_refuse_matrix() {
             "SAFETY: drain path refused: {args:?}: {e}"
         );
     }
-    // A directory that is neither home: read-only commands only, nothing created.
+    // A directory that is neither home: read-only commands create nothing there.
     let empty = tempfile::tempdir().unwrap();
-    let out = trade(
-        Some(empty.path()),
-        &["send", mint, "--amount", "5", "--out", "/nonexistent/t"],
+    for args in [
+        vec!["status"],
+        vec!["status", "--json"],
+        vec!["balance", mint],
+    ] {
+        let out = trade(Some(empty.path()), &args);
+        assert!(out.status.success(), "{args:?}: {}", err(&out));
+        assert_eq!(
+            std::fs::read_dir(empty.path()).unwrap().count(),
+            0,
+            "SAFETY: read-only {args:?} created something"
+        );
+    }
+    // Any other command bootstraps a full maxplayer home there first (home::bootstrap, as every
+    // other `maxplayer` command does) and says the new key still needs linking.
+    let out = trade(Some(empty.path()), &["recover"]);
+    assert!(out.status.success(), "{}", err(&out));
+    for f in ["key", "config.toml", "wallet"] {
+        assert!(
+            empty.path().join(f).exists(),
+            "recover did not bootstrap {f}"
+        );
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(empty.path().join("key"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "key must be 0600");
+    assert!(
+        err(&out).contains("maxplayer account link --home"),
+        "new key must come with the link hint: {}",
+        err(&out)
     );
-    assert_eq!(out.status.code(), Some(1));
-    assert!(err(&out).contains("no maxplayer home at"), "{}", err(&out));
-    assert_eq!(
-        std::fs::read_dir(empty.path()).unwrap().count(),
-        0,
-        "nothing created"
+    // A second run reuses the home: no new key, no hint.
+    let key = std::fs::read(empty.path().join("key")).unwrap();
+    let again = trade(Some(empty.path()), &["recover"]);
+    assert!(again.status.success(), "{}", err(&again));
+    assert_eq!(key, std::fs::read(empty.path().join("key")).unwrap());
+    assert!(
+        !err(&again).contains("created a new key"),
+        "{}",
+        err(&again)
     );
     assert!(trade(Some(empty.path()), &["status"]).status.success());
 }
@@ -1746,7 +1779,8 @@ fn trade_writes_proof_rows_only_through_the_locked_wallet_helpers() {
         ("send.rs", include_str!("../src/send.rs")),
         ("coordinator.rs", include_str!("../src/coordinator.rs")),
         ("serve.rs", include_str!("../src/serve.rs")),
-        ("main.rs", include_str!("../src/main.rs")),
+        ("cli.rs", include_str!("../src/cli.rs")),
+        ("bin/maxplayer-trade.rs", include_str!("../src/bin/maxplayer-trade.rs")),
         ("lib.rs", include_str!("../src/lib.rs")),
     ] {
         for call in [
