@@ -140,7 +140,7 @@ impl Market {
                 for relay in c.relays().await.into_values() {
                     maxplayer_core::relay_auth::resubscribe_on_auth(
                         relay,
-                        "maxplayer-trade market",
+                        "maxplayer trade market",
                     );
                 }
             }
