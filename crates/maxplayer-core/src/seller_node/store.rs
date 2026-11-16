@@ -1731,13 +1731,26 @@ impl SellerStore {
     /// narrow (it is what stops a release from regressing an awarded or terminal row), so a 0 is a
     /// normal outcome, not an error — and a caller that reports success on a 0 is reporting an
     /// action the UPDATE never performed. Use [`Self::claim_row_state`] to name the state instead.
+    ///
+    /// #1299: a release also expires the claim's outbox row if it was never published. The buyer
+    /// never saw that claim, so nothing can be awarded against it, and a still-pending row would
+    /// otherwise be retried for its whole window (and hold a drain open for it).
     pub fn release_claim(&self, job_id: &str, now_unix: i64) -> Result<usize, StoreError> {
-        let conn = self.lock()?;
-        let released = conn.execute(
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let released = tx.execute(
             "UPDATE claims SET state = 'released', updated_at_unix = ?2
              WHERE job_id = ?1 AND state = 'claimed'",
             params![job_id, now_unix],
         )?;
+        if released > 0 {
+            tx.execute(
+                "UPDATE nostr_event_outbox SET state = 'expired', updated_at_unix = ?2
+                 WHERE dedup_key = 'claim:' || ?1 AND state = 'pending'",
+                params![job_id, now_unix],
+            )?;
+        }
+        tx.commit()?;
         Ok(released)
     }
 
@@ -3939,7 +3952,10 @@ mod tests {
         store
             .claim_and_enqueue("job-c", "job-c", Some("creq"), &draft, 1, 9_999_999_999, 1)
             .expect("claim");
+        assert_eq!(store.pending_outbox(2).expect("outbox").len(), 1, "the claim awaits publish");
         assert_eq!(store.release_claim("job-c", 6).expect("release"), 1, "a parked claim releases");
+        // #1299: and its never-published claim event is expired with it.
+        assert!(store.pending_outbox(7).expect("outbox").is_empty(), "released: nothing left to publish");
         assert_eq!(
             store.release_claim("job-c", 7).expect("re-release"),
             0,

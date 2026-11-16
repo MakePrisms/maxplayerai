@@ -69,7 +69,11 @@ export function coordinate(snapshot, { now = snapshot.asOf, durationSeconds = 30
     // R3-2: a seller whose newest heartbeat says it can run nothing (status=not_serving or
     // serving=0/N) is not assigned work. Absent/unknown stays eligible, exactly as before.
     const notServing = s.servingState === 'not_serving' || s.serving?.available === 0;
-    const own = [...(fits ? [] : ['insufficient_minutes']), ...(notServing ? ['seller_not_serving'] : [])];
+    // #1299: a seat that still serves but says accepting=n is draining (or retracted on exit): it
+    // takes no new work and is not coming back as this process, so it is not assigned work and does
+    // not hold the day open. A not_serving seat also says accepting=n; it keeps its own reason only.
+    const notAccepting = !notServing && s.accepting === 'n';
+    const own = [...(fits ? [] : ['insufficient_minutes']), ...(notServing ? ['seller_not_serving'] : []), ...(notAccepting ? ['seller_not_accepting'] : [])];
     return { seller_pubkey:s.pubkey, remainingMinutes:s.minutesRemaining, deadlineUnix, postingAllowed:reasons.length === 0 && own.length === 0, reasons:[...reasons, ...own] };
   }).sort((a,b) => a.seller_pubkey.localeCompare(b.seller_pubkey));
   return { asOf:now, challengeId:c?.id ?? null, budgetHeadroomSats:headroom, budgetSource:budgetState ? 'buyer' : 'public_estimate', amountSats, durationSeconds, postingAllowed:reasons.length === 0 && sellers.some(s => s.postingAllowed), reasons, sellers };

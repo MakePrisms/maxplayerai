@@ -15,6 +15,15 @@ test('R3-2: a seller whose heartbeat says not_serving or serving=0/N is ineligib
     const r=allowed(change);assert.equal(r.postingAllowed,true,JSON.stringify(change));assert.deepEqual(r.reasons,[]);
   }
 });
+test('#1299: a serving seller that says accepting=n (draining) is ineligible and does not hold the day open; a not_serving one keeps only its own reason',()=>{
+  const r=change=>{const s=fixture();Object.assign(s.sellers[0],change);return coordinate(s,{durationSeconds:60});};
+  const draining=r({servingState:'serving',serving:{available:1,configured:1},accepting:'n'});
+  assert.equal(draining.sellers[0].postingAllowed,false);assert.deepEqual(draining.sellers[0].reasons,['seller_not_accepting']);
+  assert.equal(waitingOnHarnessProbe(draining,1000),false);
+  const broken=r({servingState:'not_serving',serving:{available:0,configured:1},accepting:'n'});
+  assert.deepEqual(broken.sellers[0].reasons,['seller_not_serving']);
+  for(const accepting of ['y',null,undefined]) assert.equal(r({accepting}).sellers[0].postingAllowed,true,String(accepting));
+});
 test('R3-2 advisor r1: only a seller whose SOLE reason is seller_not_serving and whose task fits the window holds the day open',()=>{
   const d=(reasons,deadlineUnix=500,roster=[])=>({reasons:roster,sellers:[{reasons,deadlineUnix}]});
   assert.equal(waitingOnHarnessProbe(d(['seller_not_serving']),1000),true);

@@ -89,6 +89,11 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     if args.first().map(String::as_str) == Some("fees") {
         return crate::seller_fees::run(&args[1..], out, err);
     }
+    // `maxplayer seller drain` (#1299): asks the RUNNING seller on this home to drain, then waits for
+    // it to exit. Dispatched before the option parser for the same reason as `fees`: it boots nothing.
+    if args.first().map(String::as_str) == Some("drain") {
+        return crate::seller_drain::run(&args[1..], out, err);
+    }
     let options = match SellOptions::parse(args) {
         Ok(options) => options,
         Err(message) => {
@@ -305,6 +310,17 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             maxplayer_core::seller_node::shutdown::spawn_os_signal_listener(
                 runner.shutdown_handle(),
             );
+            // #1299: SIGUSR1 drains instead — no new claims, finish in-flight work, then exit 0
+            // through the same retraction path. SIGTERM/SIGINT above still stop immediately. The
+            // pid goes into seller.lock only once the handler is registered: until then SIGUSR1
+            // would kill this node, so `maxplayer seller drain` must not be able to find it.
+            if maxplayer_core::seller_node::shutdown::spawn_drain_signal_listener(
+                runner.drain_handle(),
+            )
+            .is_some()
+            {
+                runner.enable_drain_command();
+            }
             runner.run().await
         })
         .map_err(|error| {
@@ -794,7 +810,7 @@ impl SellOptions {
 fn sell_usage(w: &mut dyn Write) {
     let _ = writeln!(
         w,
-        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)\n{}",
+        "Usage:\n  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch\n  maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted\n  maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm\n  maxplayer seller drain [--home <dir>] [--no-wait | --timeout <secs>]   # finish in-flight jobs, then exit 0 (upgrade without interrupting a job)\n\nNotes:\n  - required user choices: --agent (or --agent-argv) + --rate-sats (first run)\n  - defaults: relay=wss://relay.maxplayer.ai mint=mint.minibits.cash git-remote=relay-git key=0600 auto\n  - no --key (packaged key file only)\n  - startup runs the doctor readiness gate and REFUSES to boot on a blocking failure (no working nix, agent unresolvable, no mint reachable, seller key missing, relay unreachable), each with a fix hint\n  - --skip-doctor: bypass the startup readiness checks (default: checks-on; not recommended). The nix check still runs — it is an environment requirement (#745) with no bypass\n  - --unsafe-no-sandbox: serve a STRANGER-FACING surface with no working sandbox (either open surface) — this box then runs code written by strangers with no containment (waives only that one check)\n  - BOTH open surfaces are OFF by default, and they are separate: --claim-open-pool opts in to untargeted pool offers, --accept-open-targeted opts in to targeted offers from buyers you have not named\n  - with neither set and no [seller] accept_offers_only_from, this seat claims NOTHING and says so at boot\n  - --offer-backfill-secs <n>: see OPEN-POOL offers posted up to n seconds before startup (default 1200; 0 = live-only; targeted offers always backfill)\n{}",
         crate::skill::docs_pointer_line()
     );
 }
