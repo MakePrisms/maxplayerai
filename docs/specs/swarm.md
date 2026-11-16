@@ -52,13 +52,14 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
     independent verify task, no buyer confirmation; our buyer uses the `claude` preset; `codex`
     ships as a preset only after a live canary. (Josip, accepted defaults)
 16. **Private tasks are a setting.** A swarm can send its tasks as private offers. (Bob, 13 Nov 17:13)
-17. **The lead has the tools to set up its own coordination structure if it wants to**, e.g. the five
-    tables in Anthropic's Fermat run (Announce, Assign, Notes, Subtasks, Landed). Nothing is
-    prescribed: no default boards, no required structure. Team-wide orders reach sellers inside the
-    task text. (Bob, 13 Nov 17:03–17:18)
+17. **Lead-defined coordination structure (boards) moves to the shared-repo follow-up.** Bob asked
+    that the lead have the tools to build its own structure (as in Anthropic's Fermat run), with
+    nothing prescribed. Without a shared work product, one text per task covers what v1 problems
+    need, so v1 communicates as the runner does today (§9.5) and the boards design is kept in §14.2.
+    (Bob, 13 Nov 17:03–17:18; Josip, 16 Nov 14:42)
 18. **Everything passes through the lead.** Sellers never take orders from other sellers: only the
-    lead writes boards and the queue; seller notes and proposed subtasks go to the lead, which
-    decides what, if anything, other sellers see. (Bob, 13 Nov 17:17)
+    lead writes task text and the queue; what a seller reports goes to the lead, which decides what,
+    if anything, other sellers see. The follow-up keeps this rule for boards. (Bob, 13 Nov 17:17)
 19. **Session jobs are the default** where the seller supports them: one session per seller per swarm
     job, later tasks as reply turns; fall back to a one-off job otherwise or when the lead marks a
     task `fresh`. Swarm members are told to enable sessions. (Bob, 13 Nov 17:26)
@@ -237,7 +238,7 @@ per-seller eligibility and minutes per swarm out), run by both test suites.
   public view of a private swarm uses the buyer-signed tally in the swarm job's `update` (§4).
   Sellers see their own tasks locally.
 - **Public view of a private swarm:** name, purpose, members, buyer-reported minutes and task counts.
-  No task text, answers or boards.
+  No task text or answers.
 - **Seller support:** `join` on a private swarm refuses when the local `[privacy].private_jobs` is
   `false`. Any seller with `maxplayer swarm` runs a build that has private jobs.
 - **Not a security boundary against the seller.** A private task still reaches one untrusted
@@ -253,8 +254,8 @@ claims advertise `["session","1"]`; sellers need `[sessions] enabled = true` (de
 
 - **One session per seller per swarm job.** The seller's first task in that swarm job is an ordinary
   task job. If its claim advertised sessions, the daemon records a session; the seller's next task
-  from that swarm job goes as a `reply` turn on it (same agent conversation), with the same task
-  text assembly (§9.5), so the turn stands on its own if memory is lost.
+  from that swarm job goes as a `reply` turn on it (same agent conversation), with self-contained
+  task text, so the turn stands on its own if memory is lost.
 - **Falls back to a new one-off task** when: the claim did not advertise sessions; the task is
   `fresh`; the session is `dead` (reply refused, or the turn never started before its deadline —
   parked sessions expire after 6 h or a seller host/Docker restart, and can be evicted for disk);
@@ -287,7 +288,6 @@ claims advertise `["session","1"]`; sellers need `[sessions] enabled = true` (de
 | `swarm_job_tasks {swarm_job, add?[], drop?[], replace?[]}` | Edit the queue. |
 | `swarm_job_steer {swarm_job, note}` | Note the planner sees on every call. |
 | `swarm_job_close {swarm_job, result?, status: completed\|cancelled}` | Stop posting; in-flight tasks still settle and pay. |
-| `swarm_job_boards {swarm_job, create?[], post?[], remove?[]}` | Same board operations as the planner (§9.5), for a buyer's agent acting as lead. |
 
 A `swarm-buyer` skill and the tool descriptions carry the guidance: create a swarm first, write
 self-contained tasks of ≥ 5 min, verify before closing as solved.
@@ -338,50 +338,22 @@ JSON back, plus the canaries in §10. Failure disables the planner and shows in
 Agent-queued tasks are dispatched; results wait for the agent's next `swarm_job_status`.
 `swarm_job_create` says so.
 
-### 9.5 Boards: optional primitives for the lead
+### 9.5 How the lead and sellers communicate (as today)
 
-Boards are tools, not a structure. A swarm job starts with **no boards**; the planner prompt
-describes what the primitives can do and leaves it to the lead (planner, or the buyer's agent)
-whether to use them at all. Board operations are part of the lead's JSON output, so the lead still
-needs no tools. The prompt gives no example structure, so it does not steer the lead toward one
-kind of setup; boards are domain-neutral (orders, assignments, sources already checked, style rules,
-anything the lead wants to keep and show).
+v1 keeps the runner's model. Boards, a shared "team orders" text and structured seller reports move to
+the follow-up with the shared repo (§14.2), where there is a real work product to coordinate around.
 
-- **Rule: the lead is the only writer.** Nothing a seller writes reaches another seller unless the
-  lead itself writes it to a board or into a task. No board has member write access.
-- **Board** = named, ordered list of short text entries stored by the daemon per swarm job.
-  Fields set by the lead: `name`, `purpose`, `include`
-  (`all` \| `workstream` \| `none`: which tasks get it pasted in), `cap_chars` (how much of the newest
-  entries is pasted). The lead creates, renames, posts to, and removes entries from any board, and
-  may define none or as many as it likes (limit 16 per swarm job).
-- **Into the task text.** The daemon builds each task as:
-  `## Team orders` / boards selected by `include`, newest first, trimmed to `cap_chars` /
-  `## Your task` / `## Reporting` (how to report back). Every entry was written by the lead.
-  Ordinary job text, so sellers and the wire do not change.
-- **Back from sellers: to the lead only.** A seller may end its answer with one fenced JSON block:
-  `{"notes":["text"],"proposed_subtasks":[{"text","parent","workstream","durationSeconds"}]}`.
-  The daemon strips it from the answer, checks sizes (≤ 2 KB per note, ≤ 8 notes and ≤ 8 proposals
-  per task) and that `parent` exists, and stores it in the **lead inbox**, marked untrusted with its
-  seller and task. Nothing from the inbox is pasted into any task or board automatically.
-- **Lead decides.** `step` receives the inbox, every board and the task tree, and returns board
-  writes and queue additions in its own words: accept a proposal (`accept: [proposal id]`, optionally
-  edited), reject it, or summarise several notes into one board entry. Accepted subtasks keep their
-  `parent`, so the tree still grows from sellers' splits. Dispatch then enforces minutes, rate and
-  budget as for any task. New inbox items count as a change for the `step` trigger (§9.2).
-- **Cost.** Every seller-to-team hop now waits for a lead call (seconds to a few minutes), and the
-  lead's input grows with the inbox (trimmed like results, newest first). With a few dozen members
-  this is fine; at Fermat scale (hundreds of helpers splitting work themselves) the lead becomes
-  the bottleneck. Accepted trade-off.
-- **No planner (check-in mode).** The inbox waits for the buyer's agent, which accepts or rejects
-  through `swarm_job_boards` / `swarm_job_tasks`.
-- **Timing.** Sellers see board updates when their next task starts. Tasks are 5–30 min, so that is
-  the coordination delay. Mid-task reads/writes are a later phase (§14).
-- **Visibility.** In a public swarm, boards are public because the task text is. In a private swarm
-  they travel only inside encrypted task text (§7.5).
-- **Injection.** A seller can still try to steer the lead through its notes, as it can through its
-  answer today. The prompt treats inbox items as untrusted data, the lead restates rather than
-  copies, and the output filter (§10.4) applies to board writes as to tasks. There is no direct
-  seller-to-seller path.
+- **Lead → seller:** only through the task text the lead writes. Team-wide context is written into
+  each task. The lead may attach up to 5 earlier answers (`includeAnswers`, `planner-llm.mjs:44`),
+  appended as untrusted data.
+- **Seller → lead:** only through the task's answer, which the lead sees in `step` results. A seller
+  may suggest next steps or splits in prose; the lead decides.
+- **No seller-to-seller path:** everything another seller sees was written or selected by the lead
+  (§1.18).
+- **Buyer's agent → lead:** steering notes (`swarm_job_steer`), seen on every call. They reach sellers
+  only if the lead writes them into tasks.
+- **New versus today:** with session jobs (§7.6) a seller's agent keeps its own earlier tasks of the
+  swarm job in memory.
 
 ## 10. Security of the planner call
 
@@ -432,20 +404,17 @@ Each behind a default-off flag where it changes running behaviour.
    jobs; drop the denylist and build-time buyer key; minutes per swarm and the shared vectors (§7.4).
    Vercel deploy.
 4. **Daemon engine + MCP, no planner** (§7, §8) behind `[swarm].enabled`, including private tasks
-   (§7.5) and boards with task-text assembly and seller report parsing (§9.5). Tests: fan-out of N
+   (§7.5). Tests: fan-out of N
    tasks over M members with a stub seller; budget never exceeded; restart resumes from the store;
    expired task frees its seller; a member of two swarms gets one task from each; vectors pass in
    Rust; a private swarm's offers carry no task text or swarm link in public events and its tally
-   matches the store; board text lands in the next task; a seller report lands only in the lead
-   inbox, never in another seller's task text, until the lead accepts it; reports past the caps are
-   refused; with a session-capable stub seller, the second task to it in one swarm job is a `reply`
+   matches the store; with a session-capable stub seller, the second task to it in one swarm job is a `reply`
    turn and its minutes are counted from the follow-up; a `fresh` task, a non-session claim and a dead
    session each produce a new one-off job; closing the swarm job closes its sessions.
 5. **Planner** (§9, §10): presets, `planner_command`, `planner-test` with canaries, `analyze` +
-   `step` with board operations, triggers, output filter, verify-before-solved. Tests: stub planner;
+   `step`, triggers, output filter, verify-before-solved. Tests: stub planner;
    rejected output fed back; canaries refuse a writing / reading command; idle ceiling; one call per
-   settled batch; a swarm job with no boards works exactly like one without the feature; a stub
-   lead that creates its own boards and accepts proposed subtasks can drive a task tree with them.
+   settled batch; `includeAnswers` appends earlier answers as untrusted data.
 6. **Retire** `scripts/challenges/` and the old docs after one live swarm job on the new path.
 
 Bob's rule stands: no swarm merges while a swarm job is live; confirm the board deploy before telling
@@ -463,8 +432,7 @@ period.
 - Input files, git/code delivery for tasks (text/inline only; see #1250), and a buyer-run checker
   plus toolchain capabilities such as `lean`. Needed for proof/code swarm jobs like the Fermat run;
   follow-up spec, see §14.1.
-- Live boards: sellers reading or writing boards mid-task. Needs a seller tool and network access
-  from the sandbox; next phase after file delivery.
+- Boards, a shared team-orders text and structured seller reports (§14.2).
 - Fully hidden swarms (encrypted name, purpose, goal and roster; invite-only discovery).
 
 ### 14.1 Notes for the follow-up: shared work product
@@ -498,3 +466,20 @@ skill and collect output are separate from swarm work.
 - MCP sampling as a planner backend.
 
 No open questions remain.
+
+### 14.2 Notes for the follow-up: boards
+
+Designed in this spec's earlier revisions (PR #1313 history, commit `a9c40938` §9.5); moved out on
+16 Nov because without a shared repo one text per task is enough. Starting point:
+
+- **Board:** named list of short text entries per swarm job, written **only by the lead** (planner
+  JSON output, or the buyer's agent via MCP). The lead chooses which tasks get it pasted (all, one
+  workstream, none = lead memory) and how much. No default boards; the prompt gives no example
+  structure.
+- **Into tasks:** the daemon prepends selected boards under `## Team orders`; ordinary job text, no
+  wire change.
+- **Seller reports:** an optional JSON block at the end of an answer (`notes`, `proposed_subtasks`
+  with a `parent` link), size-capped, stored in a lead inbox marked untrusted. Nothing reaches
+  another seller until the lead restates or accepts it (§1.18). Accepted subtasks grow a task tree.
+- **Costs:** every seller-to-team hop waits for a lead call; the lead bottlenecks at hundreds of
+  sellers. Mid-task (live) boards need a seller tool and sandbox network access.
