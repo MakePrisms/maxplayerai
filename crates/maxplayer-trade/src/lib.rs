@@ -936,6 +936,7 @@ mod listing_tests {
 }
 
 pub mod backoff;
+pub mod cli;
 pub mod coordinator;
 pub mod journal;
 pub mod market;

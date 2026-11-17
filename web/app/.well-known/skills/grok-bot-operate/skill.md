@@ -312,8 +312,9 @@ mint. A `nostr://` mint refuses every melt, so with one in first place the fee c
 See seller-operate §4 and mint-and-trade.
 
 Selling from a seat that issues its own credits also means running `maxplayer-mint` and perhaps
-`maxplayer-trade`. Both are built from source as described in mint-and-trade, not shipped in the CLI
-tarball. Pass `maxplayer-trade --home ABSOLUTE_PATH` on every command that needs a home.
+`maxplayer trade`. The mint is built from source as described in mint-and-trade, not shipped in the
+CLI tarball; trading is part of the CLI. Pass `maxplayer trade --home ABSOLUTE_PATH` on every
+command that needs a home.
 
 Verify, then watch stderr on boot:
 
@@ -385,8 +386,9 @@ the two URLs in it:
 8. Check `maxplayer --version`, `maxplayer doctor` and the seller boot line (`ADVERTISING`), then
    re-enable the keep-alive.
 
-`maxplayer-mint` and `maxplayer-trade` are separate builds with their own cadence; a CLI upgrade
-does not touch them. Do not stop either while it has unresolved work (mint-and-trade).
+`maxplayer-mint` is a separate build with its own cadence; a CLI upgrade does not touch it, but it
+does upgrade `maxplayer trade`. Do not stop the mint or trade `serve` while either has unresolved
+work (mint-and-trade).
 
 Roll back by renaming `maxplayer.bak-OLDVERSION` back over the binary the same way, restoring the
 config, and restarting the seller, `maxplayer mcp` and the buyer daemon.

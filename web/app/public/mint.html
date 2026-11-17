@@ -102,9 +102,9 @@
           </div>
           <details class="h-manual">
             <summary>Or set it up yourself</summary>
-            <p>Install both tools into <code>~/.local/bin</code>, matching the mint service (early: build from source in the repository; the mint needs <code>protoc</code>). Add that directory to your PATH:</p>
+            <p>Install the mint into <code>~/.local/bin</code>, matching the mint service (early: build from source in the repository; it needs <code>protoc</code>). Trading is <code>maxplayer trade</code>, already in the CLI. Add that directory to your PATH:</p>
           <div class="h-copy small">
-            <code id="cmd-install">cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local" &amp;&amp; cargo install --locked --path crates/maxplayer-trade --root "$HOME/.local"</code>
+            <code id="cmd-install">cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"</code>
             <button type="button" data-copy="cmd-install" aria-label="Copy the install command">copy</button>
           </div>
             <p>For a new mint, initialize and run it below. Reuse an existing mint instead. Follow the <a href="/.well-known/skills/mint-and-trade/skill.md">combined setup guide</a> for persistent services, stopped backups and a separate trading home:</p>
@@ -122,7 +122,7 @@
             <code id="cmd-issue">maxplayer-mint issue 1000</code>
             <button type="button" data-copy="cmd-issue" aria-label="Copy the issue command">copy</button>
           </div>
-            <p>Sell them for sats with <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md" target="_blank" rel="noopener">maxplayer-trade</a>. Full guide: <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-mint/README.md" target="_blank" rel="noopener">maxplayer-mint README</a></p>
+            <p>Sell them for sats with <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md" target="_blank" rel="noopener"><code>maxplayer trade</code></a>. Full guide: <a href="https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-mint/README.md" target="_blank" rel="noopener">maxplayer-mint README</a></p>
           </details>
         </div>
       </section>
@@ -133,7 +133,7 @@
           <h2 id="faq-h">Questions, answered.</h2>
           <details><summary>Are my tokens bitcoin?</summary><p>No. They’re your own ecash, counted in sats. They pay for jobs with sellers who accept your mint, but your mint can’t turn them back into bitcoin.</p></details>
           <details><summary>Who accepts my tokens?</summary><p>You, and any seller who adds your mint by hand. Nobody accepts them automatically.</p></details>
-          <details><summary>How do I sell them?</summary><p>List a fixed lot with <code>maxplayer-trade</code>, like 1,000 tokens for 800 sats. A buyer takes the whole lot in one swap. You can also send a token file to a buyer directly.</p></details>
+          <details><summary>How do I sell them?</summary><p>List a fixed lot with <code>maxplayer trade</code>, like 1,000 tokens for 800 sats. A buyer takes the whole lot in one swap. You can also send a token file to a buyer directly.</p></details>
           <details><summary>Do I need a server or a domain?</summary><p>No. The mint only connects out to Nostr relays: no website, domain, certificate or open port.</p></details>
           <details><summary>Do I need to keep a process running?</summary><p>Yes. Tokens can only be spent or moved while <code>maxplayer-mint run</code> is up.</p></details>
           <details><summary>What if I lose my mint files?</summary><p>Every token you issued becomes worthless. Back up <code>~/.maxplayer/mint</code> after <code>init</code> and keep exactly one live copy. There is no platform backup.</p></details>

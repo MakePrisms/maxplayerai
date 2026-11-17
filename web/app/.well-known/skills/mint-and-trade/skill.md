@@ -1,13 +1,13 @@
 ---
 name: maxplayer-mint-and-trade
-description: Set up a seller's own token mint and token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs both binaries, connects the mint and the maxplayer home, and prepares an approved issuance and listing.
+description: Set up a seller's own token mint and token trading together. Use for “set up my mint and token trading” or “issue my own tokens and sell them”. Preserves existing identity and custody, installs the mint, connects the mint and the maxplayer home, and prepares an approved issuance and listing.
 ---
 
 # Set up a mint and token trading
 
 Complete both parts of setup from this one instruction. `maxplayer-mint` issues
-and services the human's tokens; `maxplayer-trade` exchanges them for another
-mint's tokens. Installing ordinary `maxplayer` does not install either binary.
+and services the human's tokens; `maxplayer trade` (part of the `maxplayer` CLI) exchanges
+them for another mint's tokens. Installing ordinary `maxplayer` does not install the mint.
 These are service credits counted in sats, **not automatically bitcoin-backed
 sats**. The credit mint has no Lightning cash-out. A listing sells only if a buyer
 accepts the price; it is not guaranteed redemption.
@@ -26,7 +26,7 @@ database or start a second writer to fix a setup failure. Record the chosen
 revision and paths without displaying secrets.
 
 The mint lives under `<MAXPLAYER_HOME>/mint` (default `~/.maxplayer/mint`).
-Trading uses the **same maxplayer home**: `maxplayer-trade` signs with its `key`, pays from
+Trading uses the **same maxplayer home**: `maxplayer trade` signs with its `key`, pays from
 its wallet, and keeps its journal in `<MAXPLAYER_HOME>/trade` (pass `--home <path>` only to
 pick a home other than `$MAXPLAYER_HOME`/`~/.maxplayer`). Only the home's mints can be traded: the
 default, `extra_mints` (`maxplayer wallet mints add`) and, on a seller, `accepted_mints`. A seller
@@ -37,16 +37,19 @@ home (with `wallet.seed`/`trade.key`) is drain-only: move its funds with its `se
 ## 2. Install and connect both tools
 
 From one checkout of the chosen revision, install missing binaries using the mint
-README and [trading build instructions](https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md).
-Both are separate Cargo workspaces; check Rust prerequisites. The mint build also
-needs `protoc`; the production trading build does not. From the repository root:
+README. The mint is its own Cargo workspace; check Rust prerequisites. Its build needs
+`protoc`. From the repository root:
 
 ```sh
 cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"
-cargo install --locked --path crates/maxplayer-trade --root "$HOME/.local"
 ```
 
-This explicitly installs both binaries in `~/.local/bin`, matching the mint
+Trading needs no install: it is `maxplayer trade`. If `maxplayer trade --help` fails, the
+installed `maxplayer` predates it; upgrade it (see the
+[trading build instructions](https://github.com/MakePrisms/maxplayerai/blob/main/crates/maxplayer-trade/README.md)).
+Delete any old standalone `maxplayer-trade` binary (`maxplayer doctor` warns about one).
+
+This explicitly installs the mint in `~/.local/bin`, matching the mint
 README's `ExecStart=%h/.local/bin/maxplayer-mint run`. Use those absolute executable
 paths for services and checks; add `~/.local/bin` to the interactive PATH if needed.
 For an existing installation elsewhere, preserve it and use its verified absolute

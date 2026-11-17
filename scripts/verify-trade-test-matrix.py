@@ -168,9 +168,22 @@ def check_change_filter():
         sys.exit(f"verify-trade-test-matrix: no TRADE_PATHS in job {CHANGES_JOB} — INSTRUMENT FAILURE")
     meta = json.loads(run("cargo", "metadata", "--locked", "--format-version", "1",
                           "--manifest-path", MANIFEST))
-    local = [p for p in meta["packages"] if p["source"] is None]
-    if not any(p["name"] == "maxplayer-trade" for p in local):
+    # maxplayer-trade is a root workspace member, so `packages` lists every member. Walk the
+    # resolve graph from maxplayer-trade instead (all dependency kinds, dev included) and keep the
+    # path packages it actually reaches.
+    by_id = {p["id"]: p for p in meta["packages"]}
+    nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
+    roots = [i for i, p in by_id.items() if p["name"] == "maxplayer-trade" and p["source"] is None]
+    if len(roots) != 1:
         sys.exit("verify-trade-test-matrix: maxplayer-trade missing from its own metadata — INSTRUMENT FAILURE")
+    seen, todo = set(), list(roots)
+    while todo:
+        i = todo.pop()
+        if i in seen:
+            continue
+        seen.add(i)
+        todo.extend(d["pkg"] for d in nodes[i]["deps"])
+    local = [by_id[i] for i in sorted(seen) if by_id[i]["source"] is None]
     for p in local:
         manifest = p["manifest_path"]
         crate_dir = rel(os.path.dirname(manifest)) + "/"

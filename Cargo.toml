@@ -7,6 +7,7 @@ members = [
     "crates/maxplayer",
     "crates/maxplayer-relay-write-policy",
     "crates/maxplayer-tool-kit",
+    "crates/maxplayer-trade",
 ]
 # maxplayer-desktop pulls egui's native deps (wayland/x11/fontconfig); keep it out of
 # default builds so headless boxes and CI don't inherit them. Build with -p maxplayer-desktop.
@@ -18,6 +19,13 @@ default-members = [
     "crates/maxplayer-relay-write-policy",
     "crates/maxplayer-tool-kit",
 ]
+# maxplayer-trade is a member (one Cargo.lock; `maxplayer` links it through its `wallet` feature)
+# but not a default member: its dev-dependencies start in-process cdk mints, which need protoc, so a
+# bare `cargo test` at the root stays protoc-free. Its suites run with `-p maxplayer-trade` (CI's
+# trade jobs install protoc).
+# Own cargo workspaces (own Cargo.lock): the mint sidecar is a dev-dependency of maxplayer-trade
+# (tests only) but must never become a root member, so cdk's `mint` feature stays out of every build.
+exclude = ["crates/maxplayer-mint"]
 resolver = "3"
 
 [workspace.package]

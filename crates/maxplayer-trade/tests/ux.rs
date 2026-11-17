@@ -522,7 +522,11 @@ async fn stale_socket_and_bounded_protocol() {
         .await
         .unwrap();
         s.write_all(
-            b"{\"v\":1,\"relays\":[],\"command\":{\"cancel\":{\"lot\":\"x\",\"extra\":1}}}\n",
+            format!(
+                "{{\"v\":{},\"relays\":[],\"command\":{{\"cancel\":{{\"lot\":\"x\",\"extra\":1}}}}}}\n",
+                maxplayer_trade::serve::PROTOCOL_V
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();
@@ -952,7 +956,7 @@ fn status_golden(home: &Path) -> String {
     let db =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
-    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive')").unwrap();
+    let mut stmt = db.prepare("SELECT secondary_namespace, value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace IN ('swap','funding','withdrawal','receive') AND key != 'obsolete-maxplayer-trade-tombstone'").unwrap();
     let mut records = vec![];
     for row in stmt
         .query_map([], |r| {

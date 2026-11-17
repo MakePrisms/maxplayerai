@@ -13,7 +13,7 @@
 //! human's behalf (spec §12: no non-interactive terms acceptance). There is no unlink (spec §4).
 //!
 //! The key is the home `key` file (the same key the wallet signs mint requests with, #1210, and the
-//! key `maxplayer-trade` signs listings and mint requests with), or with `--mint` the mint server's
+//! key `maxplayer trade` signs listings and mint requests with), or with `--mint` the mint server's
 //! `<home>/mint/nostr.key`. `--trade-home <dir>` is deprecated: it still parses, is ignored with a
 //! warning on stderr, and never creates a `trade.key`. The secret is never printed.
 
@@ -45,7 +45,7 @@ fn write_usage(out: &mut dyn Write) {
          agent's Nostr profile name unless the agent already has one (`maxplayer profile set`).\n\
          --entered-by: who typed the code (default: human at the prompt, agent with --code).\n\
          --mint: use this home's mint server key (<home>/mint/nostr.key) instead of the agent key.\n\
-         The agent key is also the key maxplayer-trade trades with, so linking it covers trading.\n\
+         The agent key is also the key `maxplayer trade` trades with, so linking it covers trading.\n\
          --trade-home <dir>: deprecated and ignored (trading uses this home's key).\n\
          Service: registration_url in config.toml or MAXPLAYER_REGISTRATION_URL\n\
          (default https://relay.maxplayer.ai/account).\n\

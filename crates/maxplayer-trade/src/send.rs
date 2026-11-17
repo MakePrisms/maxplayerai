@@ -1428,9 +1428,9 @@ pub async fn check_redeemed(home: &Path) -> Result<()> {
         )?;
         db.busy_timeout(std::time::Duration::from_secs(2))?;
         let mut stmt = db.prepare(
-            "SELECT value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace='send'",
+            "SELECT value FROM kv_store WHERE primary_namespace='trade-v1' AND secondary_namespace='send' AND key != ?1",
         )?;
-        stmt.query_map([], |r| r.get(0))?
+        stmt.query_map([crate::journal::OBSOLETE_TOMBSTONE_KEY], |r| r.get(0))?
             .collect::<std::result::Result<_, _>>()?
     };
     for bytes in rows {

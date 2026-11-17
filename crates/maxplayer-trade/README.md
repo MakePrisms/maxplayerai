@@ -1,6 +1,7 @@
-# maxplayer-trade — real-money Cashu trades from your maxplayer home
+# `maxplayer trade` — real-money Cashu trades from your maxplayer home
 
-A fixed-lot CLI, independent of jobs (still a separate binary from `maxplayer`). It trades from
+A fixed-lot CLI, independent of jobs: `maxplayer trade <command>`, part of the `maxplayer` binary
+(this crate is its library; the standalone `maxplayer-trade` binary is no longer built). It trades from
 the **maxplayer home** (see [Home and wallet](#home-and-wallet)). Market traffic goes first to
 `relay.maxplayer.ai`, which stores lots and statuses from relay members since relay-v5 (#1246),
 with public relays as fallbacks; `nostr://` mint traffic (kinds 23410/23411) uses it too.
@@ -15,9 +16,10 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
 - **Home.** `--home <dir>` names a maxplayer home (a directory with `key` and/or `config.toml`);
   without `--home` it is the buyer's home, `$MAXPLAYER_HOME` else `~/.maxplayer` (resolved by
   `maxplayer_core::home`). Create one with `maxplayer wallet setup --home <dir>` (or
-  `maxplayer whoami --home <dir>`). A directory that is neither a maxplayer home nor a legacy
-  trading home runs read-only commands only (`balance`, `status`, `discover`, `preflight`, dry
-  runs); writing commands refuse and create nothing.
+  `maxplayer whoami --home <dir>`). Read-only commands (`balance`, `status`, `discover`,
+  `preflight`, `list`/`take --dry-run`) never create anything. Every other command first sets up
+  the maxplayer home like the rest of `maxplayer` does (config, a `0600` key, `wallet/`) and, when
+  it created the key, says to link it with `maxplayer account link --home <dir>`.
 - **Identity.** Lots, statuses and `nostr://` mint requests are signed with the home's `key`,
   the key `maxplayer account link --home <dir>` registers. There is no `trade.key` in a
   maxplayer home. `maxplayer account … --trade-home <dir>` is deprecated: it still parses,
@@ -35,7 +37,7 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   `per_job_budget_sats`, and pay no platform fee. Trade's own per-mint caps still apply.
 - **Trade state.** The journal (`trade.sqlite`), `owner.lock` and `serve.sock` live in
   `<home>/trade/` (0700).
-- **Two writers, one wallet.** The buyer daemon / `maxplayer wallet` and `maxplayer-trade` may run
+- **Two writers, one wallet.** The buyer daemon / `maxplayer wallet` and `maxplayer trade` may run
   at once. Every step that picks unspent proofs and reserves them holds an exclusive OS advisory
   lock (`flock`) on `<home>/wallet/select.lock`, in both programs: core's `prepare_send` /
   `prepare_melt` (job payments, `wallet send`/`melt`, the cross-mint hop) and trade's
@@ -57,15 +59,22 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   warning. Draining and finishing still work: `balance`, `status`, `recover`, `send`
   (incl. `--reclaim`), `withdraw`, `preflight`, `doctor`, and `serve`/`cancel` for lots and
   swaps already in flight. New `list`, `take`, `fund` and `receive` are refused. Move the money
-  with `maxplayer-trade --home <legacy> send <mint> --amount <n> --out <file>`, then
+  with `maxplayer trade --home <legacy> send <mint> --amount <n> --out <file>`, then
   `maxplayer wallet receive "$(cat <file>)"` on the maxplayer home; never delete a legacy home
   that still holds funds or unfinished records.
 - **A maxplayer home with legacy files at its top level** (`key` or `config.toml` next to
   `wallet.seed`, `trade.key`, a root `trade.sqlite` or `owner.lock`, as an older
   `maxplayer-trade --home ~/.maxplayer` left them): every command refuses, names the stray files
   and creates nothing (never a `wallet.seed` or `trade.key`). A lone `owner.lock`/`serve.sock`
-  holds no money: delete it once no older `maxplayer-trade` runs there. Otherwise move exactly
-  the named files into their own directory and finish and drain that legacy home from there.
+  holds no money: delete it once no older `maxplayer-trade` binary runs there. Otherwise move
+  exactly the named files into their own directory and finish and drain that legacy home from
+  there.
+- **The old standalone `maxplayer-trade` binary** is obsolete; delete it. A current journal stops
+  its startup recovery, `fund`, `withdraw`, `receive` and `send` before they act (a tombstone row
+  in each money namespace that it cannot read, with the reason in the error); `fund --id <id>`
+  of an already journaled funding and `send --reclaim <id>` read one record directly and are not
+  stopped this way. A current `serve` refuses its
+  hand-offs with the same reason, and `maxplayer doctor` warns while one is on PATH.
 Earlier dated verification sections are historical snapshots, not current coverage totals.
 
 ## Round 5 final-review policy
@@ -262,18 +271,13 @@ It is not installed in the Maxplayer website skill index. The CLI regression
 
 ## Build and automated tests (historical round-three counts below)
 
-This crate is its **own Cargo workspace**, with pinned CDK/Cashu 0.17.2 and Nostr SDK 0.44.1.
-Do not add it to the root workspace. Because it is not a root-workspace member,
-`cargo build -p maxplayer-trade` from the repository root fails with
-``package ID specification `maxplayer-trade` did not match any packages``; always pass
-`--manifest-path`. To build (or install) the production CLI from the repository root:
+This crate is a root-workspace member (one `Cargo.lock`), with pinned CDK/Cashu 0.17.2 and Nostr
+SDK 0.44.1. Users get it as `maxplayer trade` in the released `maxplayer` binary; from source:
 
 ```sh
-# protoc is NOT needed for the production binary; it only builds the wallet-side CDK.
-cargo build --release --manifest-path crates/maxplayer-trade/Cargo.toml --locked
-# -> crates/maxplayer-trade/target/release/maxplayer-trade (or $CARGO_TARGET_DIR/release/...)
-# or put it on PATH:
-cargo install --locked --path crates/maxplayer-trade
+# protoc is NOT needed: the CLI only builds the wallet-side CDK.
+cargo build --release -p maxplayer --locked
+# -> target/release/maxplayer (or $CARGO_TARGET_DIR/release/maxplayer); run `maxplayer trade --help`
 ```
 
 Tests and examples are different. From the repository root:
@@ -282,13 +286,13 @@ Tests and examples are different. From the repository root:
 # Tests/examples enable the real CDK mint dev-dependencies (cdk `mint` -> cdk-signatory),
 # whose build script needs protoc.
 export PROTOC="$(find /nix/store -maxdepth 3 -path '*/bin/protoc' -print -quit)"
-cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bins --examples
-cargo test --manifest-path crates/maxplayer-trade/Cargo.toml --locked -- --test-threads=1
-TRADE_LAB_SECONDS=1 cargo test --manifest-path crates/maxplayer-trade/Cargo.toml \
-  --locked --features lab -- --test-threads=1
-# Rebuild the production executable after the lab build.
-cargo build --manifest-path crates/maxplayer-trade/Cargo.toml --locked --bin maxplayer-trade
+cargo build -p maxplayer-trade --locked --bins --examples --features local-test-mints
+cargo test -p maxplayer-trade --locked -- --test-threads=1
+TRADE_LAB_SECONDS=1 cargo test -p maxplayer-trade --locked --features lab -- --test-threads=1
 ```
+
+The tests drive a test-only `maxplayer-trade` binary (`src/bin/maxplayer-trade.rs`, built only
+with `local-test-mints`): the same `maxplayer_trade::cli` that `maxplayer trade` runs.
 
 Long runs should be backgrounded once, redirected to a log and awaited through that process;
 do not pipe a build through tail/grep or start duplicate watchers. If cargo is unavailable,
@@ -299,7 +303,7 @@ loopback mint relays (the fake CDK mints and local relays in `tests/`). Every `c
 `--examples` and `clippy --all-targets` build gets it through a self dev-dependency in
 `Cargo.toml`; `lab` implies it. `cargo build`/`cargo install` never resolve dev-dependencies, so
 the binary users install refuses both. CI checks that with
-`scripts/check-user-build-mint-fence.sh` (builds without features, then checks `preflight`,
+`scripts/check-user-build-mint-fence.sh` (builds `maxplayer` as users do, then checks `maxplayer trade` `preflight`,
 `balance`, `fund`, `withdraw`, `receive`, `send`, `list`, `doctor` and `--mint-relay` refuse
 `http://127.0.0.1:<port>` and `ws://127.0.0.1:<port>` before any connection or home write).
 Without that feature `transport::loopback_only` is always false, so no production timing ever
@@ -356,7 +360,7 @@ NIP-44 negotiation, not mocked successful swaps:
 - lot and status split across two relays still discovered through the union; unreachable is
   distinguished from a real empty EOSE response.
 
-Root CI does not run this independent workspace. These local counts are separate from root CI.
+These local counts predate the move into the root workspace; root CI now runs the trade suites.
 
 ## Rerunnable public-relay trade
 
@@ -366,41 +370,42 @@ The only public data is signed listing/status metadata and encrypted negotiation
 ```sh
 set -eu
 umask 077
-TRADE="$PWD/crates/maxplayer-trade/target/debug/maxplayer-trade"
+MAXPLAYER="$PWD/target/debug/maxplayer"   # cargo build -p maxplayer --locked
+trade() { "$MAXPLAYER" trade "$@"; }
 RUN="$(mktemp -d /tmp/maxplayer-trade-live.XXXXXX)"
 A=https://testnut.cashudevkit.org
 B=https://testnut.cashu.space
-"$TRADE" --home "$RUN/maker" fund "$A" --amount 128
-"$TRADE" --home "$RUN/taker" fund "$B" --amount 128
+trade --home "$RUN/maker" fund "$A" --amount 128
+trade --home "$RUN/taker" fund "$B" --amount 128
 # Record balances on both mints before trading.
 for role in maker taker; do
-  "$TRADE" --home "$RUN/$role" balance "$A"
-  "$TRADE" --home "$RUN/$role" balance "$B"
+  trade --home "$RUN/$role" balance "$A"
+  trade --home "$RUN/$role" balance "$B"
 done
-"$TRADE" --home "$RUN/maker" list --give-mint "$A" --give 32 \
+trade --home "$RUN/maker" list --give-mint "$A" --give 32 \
   --want-mint "$B" --want 24 > "$RUN/list.jsonl"
 LOT="$(python3 -c 'import json,sys; print([json.loads(l)["lot_id"] for l in sys.stdin if "lot_id" in json.loads(l)][-1])' < "$RUN/list.jsonl")"
-"$TRADE" --home "$RUN/maker" serve > "$RUN/maker.log" 2>&1 &
+trade --home "$RUN/maker" serve > "$RUN/maker.log" 2>&1 &
 MAKER_PID=$!
-"$TRADE" --home "$RUN/taker" discover
-"$TRADE" --home "$RUN/taker" take "$LOT" --max-give 40 --min-receive 32 --dry-run
-"$TRADE" --home "$RUN/taker" take "$LOT" --max-give 40 --min-receive 32
+trade --home "$RUN/taker" discover
+trade --home "$RUN/taker" take "$LOT" --max-give 40 --min-receive 32 --dry-run
+trade --home "$RUN/taker" take "$LOT" --max-give 40 --min-receive 32
 # Only stop the maker after both sides are complete; otherwise keep recovery running.
 kill "$MAKER_PID"
 wait "$MAKER_PID" || true
 for role in maker taker; do
-  "$TRADE" --home "$RUN/$role" balance "$A"
-  "$TRADE" --home "$RUN/$role" balance "$B"
+  trade --home "$RUN/$role" balance "$A"
+  trade --home "$RUN/$role" balance "$B"
 done
 cat "$RUN/maker.log"
 # Independent public readback: uses neither the coordinator nor wallet/journal.
 cargo run --manifest-path crates/maxplayer-trade/Cargo.toml --locked --example read_trade -- "$LOT"
 ```
 
-After interruption, use the same home and relays: `maxplayer-trade --home <home> recover`.
+After interruption, use the same home and relays: `maxplayer trade --home <home> recover`.
 `serve` also resumes journaled work. A refund is not available until its deadline; a watcher may
 remain running for the full lock duration. An inconclusive mint result is retained for recovery.
-To cancel an unused listing: `maxplayer-trade --home <maker-home> cancel <lot-id>`.
+To cancel an unused listing: `maxplayer trade --home <maker-home> cancel <lot-id>`.
 An expired lot (24 h) with no live swap needs no cancel: `serve`/`recover` release its
 reservation one minute after expiry and publish nothing (relays drop the listing).
 Cancellation does not revoke an already authorized HTLC.
@@ -773,7 +778,7 @@ A mint can still lie, withhold evidence, or process an already-delivered request
 
 ## Receive (import a Cashu token)
 
-`maxplayer-trade --home <home> receive <mint> --token-file <path>` (or the token on stdin;
+`maxplayer trade --home <home> receive <mint> --token-file <path>` (or the token on stdin;
 never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code: `src/receive.rs`.
 
 - Refused before any journal write: token mint not exactly `<mint>` after canonicalization,
@@ -829,7 +834,7 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 
 ## Send (export a Cashu token)
 
-`maxplayer-trade --home <home> send <mint> --amount <sats> --out <path> [--max-fees <sats>]`
+`maxplayer trade --home <home> send <mint> --amount <sats> --out <path> [--max-fees <sats>]`
 writes one single-mint V4 token for exactly `<amount>` sats to a new 0600 file. It is the
 counterpart to `receive`, for moving funds to another wallet without Lightning. Code: `src/send.rs`.
 
@@ -1042,7 +1047,7 @@ The skill documents these states and the CLI help regression includes `withdraw 
 
 ### Mint diagnostics
 
-`maxplayer-trade doctor nostr://<npub> --mint-relay ws://127.0.0.1:<port> --json`
+`maxplayer trade doctor nostr://<npub> --mint-relay ws://127.0.0.1:<port> --json`
 uses exactly one logical **info** request to the explicit relay, re-sending the identical
 event every 5 s like trade admission does. It needs no `--home`, wallet, seed or journal; with
 `--home` before the command it signs as that home's `key` (a legacy home: its existing

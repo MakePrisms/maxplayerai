@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# The maxplayer-trade binary users install has no plain-HTTP mint and no ws:// mint relay, on
-# loopback or anywhere (Petar, 2026-11-06). Loopback fixtures exist only in builds with the
-# test-only `local-test-mints` feature, which every `cargo test` gets through a self
-# dev-dependency. This check is the one place that runs the binary built WITHOUT it.
+# The `maxplayer` binary users install has no plain-HTTP mint and no ws:// mint relay in
+# `maxplayer trade`, on loopback or anywhere (Petar, 2026-11-06). Loopback fixtures exist only in
+# builds with the test-only `local-test-mints` feature of crates/maxplayer-trade, which every
+# `cargo test` of that crate gets through a self dev-dependency. This check is the one place that
+# runs the user binary, built WITHOUT it.
 #
-# Usage (repo root): scripts/check-user-build-mint-fence.sh [path/to/maxplayer-trade]
-# Without an argument it builds the binary the way a user does: no features, `--locked`, no
-# dev-dependencies (`cargo install --locked --path crates/maxplayer-trade` resolves the same
-# features; this uses the debug profile to stay cheap in CI).
+# Usage (repo root): scripts/check-user-build-mint-fence.sh [path/to/maxplayer]
+# Without an argument it builds `maxplayer` the way a user does: default features, `--locked`, no
+# dev-dependencies (the release build adds `acp`, which does not touch trading); debug profile to
+# stay cheap in CI.
 #
 # Every refusal must happen before any mint or relay is contacted (a local listener counts
 # connections) and before the --home directory is created. https:// and nostr:// mints must
 # still pass the fence (checked through `balance` on an absent home: no network, prints 0).
 set -euo pipefail
 
-MANIFEST=crates/maxplayer-trade/Cargo.toml
 HTTP_REFUSED='http:// mints are not supported; use https:// or nostr://'
 WS_REFUSED='ws:// mint relays are not supported; use wss://'
 NPUB=npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d
@@ -22,10 +22,10 @@ NPUB=npub10xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqpkge6d
 if [ $# -ge 1 ]; then
   BIN=$1
 else
-  cargo build --manifest-path "$MANIFEST" --locked --bin maxplayer-trade
-  target=$(cargo metadata --manifest-path "$MANIFEST" --format-version 1 --no-deps |
+  cargo build -p maxplayer --locked --bin maxplayer
+  target=$(cargo metadata --format-version 1 --no-deps |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
-  BIN=$target/debug/maxplayer-trade
+  BIN=$target/debug/maxplayer
 fi
 [ -x "$BIN" ] || { echo "FAIL: no binary at $BIN"; exit 1; }
 
@@ -59,19 +59,19 @@ run() {
   shift 2
   n=$((n + 1))
   local home=$work/home-$n code=0
-  env -u MAXPLAYER_HOME "$BIN" --home "$home" "$@" >"$work/out" 2>"$work/err" || code=$?
+  env -u MAXPLAYER_HOME "$BIN" trade --home "$home" "$@" >"$work/out" 2>"$work/err" || code=$?
   local all
   all=$(cat "$work/out" "$work/err")
   if [ "$code" != "$want_code" ]; then
-    echo "FAIL: maxplayer-trade $*: exit $code, expected $want_code"; echo "$all"; fail=1; return
+    echo "FAIL: maxplayer trade $*: exit $code, expected $want_code"; echo "$all"; fail=1; return
   fi
   if [ -n "$want_text" ] && ! grep -qF -- "$want_text" <<<"$all"; then
-    echo "FAIL: maxplayer-trade $*: output lacks '$want_text'"; echo "$all"; fail=1; return
+    echo "FAIL: maxplayer trade $*: output lacks '$want_text'"; echo "$all"; fail=1; return
   fi
   if [ -e "$home" ]; then
-    echo "FAIL: maxplayer-trade $*: created --home $home"; fail=1; return
+    echo "FAIL: maxplayer trade $*: created --home $home"; fail=1; return
   fi
-  echo "ok: maxplayer-trade $* -> exit $code: $(grep -F -- "${want_text:-\"balance\"}" <<<"$all" | head -1)"
+  echo "ok: maxplayer trade $* -> exit $code: $(grep -F -- "${want_text:-\"balance\"}" <<<"$all" | head -1)"
 }
 
 # Refused: plain HTTP mints on loopback, in every command that takes a mint.
@@ -102,7 +102,7 @@ if [ "$connections" != 0 ]; then
   fail=1
 fi
 if [ "$fail" != 0 ]; then
-  echo "FAIL: the user build of maxplayer-trade must refuse http:// mints and ws:// mint relays"
+  echo "FAIL: the user build of maxplayer trade must refuse http:// mints and ws:// mint relays"
   exit 1
 fi
 echo "PASS: user build refuses http:// mints and ws:// mint relays ($n commands, 0 connections)"
