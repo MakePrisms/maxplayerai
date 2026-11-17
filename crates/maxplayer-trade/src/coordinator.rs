@@ -1372,21 +1372,33 @@ async fn recover_listing(
             l.active = Some(s.id.clone());
             j.put("listing", &l.event.id.to_hex(), &l).await?;
         }
-        // An expired lot nobody is trading: no new request can be admitted (`parse_lot` refuses
-        // it), so release its reservation instead of waiting for a manual `cancel`. A live maker
-        // swap (from the swap rows, as `cancel` checks) keeps it reserved until that swap ends.
-        // Nothing is published: relays already drop the listing at its NIP-40 expiration.
+        // An expired lot nobody traded: no new request can be admitted (`parse_lot` refuses
+        // it), so release its reservation instead of waiting for a manual `cancel`. Only when
+        // every maker swap on it ended `expired` (no lock): a live swap keeps it reserved until
+        // it ends, and a completed, refunded or quarantined one spent (or holds) its inputs and
+        // is settled by swap recovery, never here. Nothing is published: relays already drop
+        // the listing at its NIP-40 expiration.
         if !l.expired
             && !l.cancelled
+            && l.active.is_none()
             && lifecycle(&l.event, &l.statuses)? == Status::Available
             && lot_past_expiry(&l, now())
-            && !live_maker_swap(j, &l.event.id.to_hex()).await?
+            && !swaps
+                .iter()
+                .any(|s| s.role == "maker" && s.lot.id == l.event.id && s.state != "expired")
         {
             l.expired = true;
             j.put("listing", &l.event.id.to_hex(), &l).await?;
         }
-        if l.expired && !l.expired_released {
-            mint::release(home, &l.plan, &l.reservation).await?;
+        if l.expired
+            && !l.expired_released
+            && lifecycle(&l.event, &l.statuses)? == Status::Available
+        {
+            // Idempotent across a crash after the wallet release but before this journal write
+            // (the freed inputs may be spent since): nothing held under the reservation is done.
+            if crate::wallet::holds(home, &l.plan.mint, &l.reservation).await? {
+                mint::release(home, &l.plan, &l.reservation).await?;
+            }
             l.expired_released = true;
             j.put("listing", &l.event.id.to_hex(), &l).await?;
             eprintln!(

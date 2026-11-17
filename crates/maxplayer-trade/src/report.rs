@@ -160,13 +160,17 @@ pub fn render(home: &Path) -> Result<String> {
                 t.give.net, t.give.asset.mint_url, t.want.net, t.want.asset.mint_url
             ));
         }
-        if status == "available" && !l.cancelled && !l.expired {
+        if status == "available" && !l.cancelled && !l.expired_released {
             line.push_str(&format!(
                 "; reserves debit {} {}",
                 l.plan.debit, l.plan.mint
             ));
         }
-        settled.push(line);
+        if l.expired && !l.expired_released && status == "available" {
+            unresolved.push(line);
+        } else {
+            settled.push(line);
+        }
     }
     for (_, v, _) in observe::journal_rows(home, "funding")? {
         let Ok(f) = serde_json::from_slice::<Funding>(&v) else {
