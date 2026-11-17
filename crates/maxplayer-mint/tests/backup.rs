@@ -2,6 +2,7 @@
 //! rotation, the change trigger, shutdown, failures that never stop serving, and restore.
 
 use std::fs;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -130,6 +131,28 @@ fn is_spent(path: &Path, y: &PublicKey) -> bool {
         )
         .unwrap()
         == 1
+}
+
+/// Overwrite `table`'s root page in the database file at `path` with garbage. `count(*)` still
+/// answers from the table's covering indexes; reading its rows fails.
+fn damage_table(path: &Path, table: &str) {
+    let (root, size): (i64, i64) = {
+        let conn = read_only(path);
+        let root = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let size = conn.query_row("PRAGMA page_size", [], |r| r.get(0)).unwrap();
+        (root, size)
+    };
+    let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    let offset = ((root - 1) * size) as u64;
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&vec![0x5a; size as usize]).unwrap();
+    file.sync_all().unwrap();
 }
 
 fn mode(path: &Path) -> u32 {
@@ -544,6 +567,9 @@ async fn diverged_database_and_snapshot_are_refused() {
     let in_snapshot = swap(&f.mint).await;
     snap.snapshot().unwrap();
     drop(snap);
+    backup::save_restore_set(f.home.dir(), &dir).unwrap();
+    fs::create_dir_all(dir.join("issued")).unwrap();
+    fs::write(dir.join("issued/backed-up.token"), b"cashuB...").unwrap();
     let (home, _keep) = f.stop().await;
     replace_db(&home, &base);
     let secrets = home.load().unwrap();
@@ -553,10 +579,17 @@ async fn diverged_database_and_snapshot_are_refused() {
     mint.stop().await.unwrap();
     drop(mint);
 
+    // A refusal writes nothing into <home>/mint/, not even files it lacks.
+    fs::remove_file(home.dir().join("mint.toml")).unwrap();
     let refused = backup::restore(&home, &dir).unwrap_err();
     assert!(format!("{refused:#}").contains("DIVERGED"), "{refused:#}");
     assert!(is_spent(&home.db_path(), &in_live), "mint.sqlite was replaced");
     assert!(!is_spent(&home.db_path(), &in_snapshot));
+    assert!(!home.dir().join("mint.toml").exists(), "a refused restore copied mint.toml");
+    assert!(
+        !home.dir().join("issued/backed-up.token").exists(),
+        "a refused restore copied a token file"
+    );
 }
 
 /// A token file the backup couldn't copy is retried with no further database change, and the
@@ -696,4 +729,93 @@ async fn sigterm_takes_the_stop_snapshot() {
         1,
         "issued token copied on stop"
     );
+}
+
+/// A backup directory that can't be listed (no permission, a file in its path) is warned about and
+/// the mint starts, even though its nostr.key and seed can't be read either.
+#[tokio::test(flavor = "multi_thread")]
+async fn unlistable_backup_dir_only_warns() {
+    let f = fixture().await;
+    let dir = f.backups();
+    backup::save_restore_set(f.home.dir(), &dir).unwrap();
+    Snapshotter::open(&f.home.db_path(), &dir, 10)
+        .unwrap()
+        .snapshot()
+        .unwrap();
+    let (home, _keep) = f.stop().await;
+    let db = home.db_path();
+
+    let blocked = home.dir().join("not-a-dir");
+    fs::write(&blocked, b"a file where the backup directory should be").unwrap();
+    backup::check_live(home.dir(), &db, &blocked.join("backups")).unwrap();
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let as_root = fs::read_dir(&dir).is_ok();
+    let started = backup::check_live(home.dir(), &db, &dir);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    if !as_root {
+        started.unwrap();
+    }
+}
+
+/// Damage `count(*)` can't see (a table page under a covering index): in the newest snapshot the
+/// guard falls back to an older one; in mint.sqlite it refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn damaged_table_pages_are_detected() {
+    let f = fixture().await;
+    let dir = f.backups();
+    let mut snap = Snapshotter::open(&f.home.db_path(), &dir, 10).unwrap();
+    let before = snap.snapshot().unwrap();
+    swap(&f.mint).await;
+    let readable = snap.snapshot().unwrap();
+    swap(&f.mint).await;
+    let damaged = snap.snapshot().unwrap();
+    drop(snap);
+    let (home, _keep) = f.stop().await;
+    let db = home.db_path();
+    damage_table(&damaged, "proof");
+    read_only(&damaged)
+        .query_row(
+            "SELECT (SELECT count(*) FROM proof) + (SELECT count(*) FROM blind_signature)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("count(*) still answers from the indexes");
+
+    // The live database holds everything: the mint starts.
+    backup::check_live(home.dir(), &db, &dir).unwrap();
+    // And is compared against the newest snapshot that reads.
+    replace_db(&home, &before);
+    let refused = backup::check_live(home.dir(), &db, &dir).unwrap_err();
+    let text = format!("{refused:#}");
+    assert!(text.contains("OLDER"), "{text}");
+    assert!(text.contains(&readable.display().to_string()), "{text}");
+
+    // The same damage in mint.sqlite fails closed.
+    replace_db(&home, &readable);
+    damage_table(&db, "proof");
+    let refused = backup::check_live(home.dir(), &db, &dir).unwrap_err();
+    assert!(format!("{refused:#}").contains("cannot be read"), "{refused:#}");
+}
+
+/// A restore-set copy that fails at start and succeeds on an idle retry clears the error.
+#[tokio::test(flavor = "multi_thread")]
+async fn recovered_restore_set_copy_clears_the_error() {
+    let f = fixture().await;
+    let dir = f.backups();
+    let config = f.home.dir().join("mint.toml");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&config).is_ok() {
+        return; // running as root: modes don't stop reads
+    }
+    let task = backup::start(f.home.dir(), &f.home.db_path(), &dir, fast());
+    wait_for("the startup snapshot", || task.status().snapshots == 1).await;
+    assert!(task.status().last_error.is_some(), "a failed mint.toml copy was not reported");
+
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    wait_for("the mint.toml copy", || dir.join("mint.toml").exists()).await;
+    wait_for("the error to clear", || task.status().last_error.is_none()).await;
+    assert_eq!(task.status().snapshots, 1, "no database change was needed");
+    let status = task.stop().await;
+    assert!(status.last_error.is_none(), "{:?}", status.last_error);
 }

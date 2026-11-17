@@ -261,6 +261,8 @@ struct Worker {
 
 impl Worker {
     fn attempt(&mut self) -> bool {
+        // A retried copy that succeeds must still reach the error-clearing below.
+        let retried_restore_set = !self.restore_set_saved;
         if !self.restore_set_saved {
             match save_restore_set(&self.mint_dir, &self.dir) {
                 Ok(()) => self.restore_set_saved = true,
@@ -285,9 +287,25 @@ impl Worker {
                 return true;
             }
         };
-        if !changed && self.issued_saved && self.restore_set_saved {
+        if !changed && !retried_restore_set && self.issued_saved && self.restore_set_saved {
             self.snap = Some(snap);
             return false;
+        }
+        // Snapshot BEFORE copying token files: `issue` renames `<id>.token` into place before it
+        // commits `Written`, so a `Written` inside this snapshot has its file on disk for the copy
+        // below, and one committed after it leaves `changed` set for the next attempt.
+        let mut snapshotted = false;
+        if changed {
+            match snap.snapshot() {
+                Ok(path) => {
+                    eprintln!("maxplayer-mint: backup saved {}", path.display());
+                    let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+                    status.snapshots += 1;
+                    status.last = Some(path);
+                    snapshotted = true;
+                }
+                Err(error) => self.fail(error),
+            }
         }
         if changed || !self.issued_saved {
             match save_issued(&self.mint_dir, &self.dir) {
@@ -298,23 +316,9 @@ impl Worker {
                 }
             }
         }
-        // The error stays reported until every part of the backup has caught up.
-        let whole = self.issued_saved && self.restore_set_saved;
-        if changed {
-            match snap.snapshot() {
-                Ok(path) => {
-                    eprintln!("maxplayer-mint: backup saved {}", path.display());
-                    let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-                    status.snapshots += 1;
-                    status.last = Some(path);
-                    if whole {
-                        status.last_error = None;
-                    }
-                }
-                Err(error) => self.fail(error),
-            }
-        } else if whole {
-            // A retried copy caught up; no snapshot is pending (a failed one leaves `changed`).
+        // The error stays reported until every part of the backup has caught up (a failed
+        // snapshot leaves `changed`, so it is retried).
+        if self.issued_saved && self.restore_set_saved && (snapshotted || !changed) {
             self.status.lock().unwrap_or_else(|p| p.into_inner()).last_error = None;
         }
         self.snap = Some(snap);
@@ -454,8 +458,15 @@ fn same_secret(a: &[u8], b: &[u8]) -> bool {
     a.trim_ascii() == b.trim_ascii()
 }
 
-/// Fully read the tables the double-spend guard relies on.
+/// Check every page (`quick_check`: a count alone reads only covering indexes), then that the
+/// tables the double-spend guard relies on exist.
 fn scan(conn: &Connection) -> Result<()> {
+    let check: String = conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .context("quick_check")?;
+    if check != "ok" {
+        bail!("damaged ({check})");
+    }
     conn.query_row(
         "SELECT (SELECT count(*) FROM main.proof) + (SELECT count(*) FROM main.blind_signature)",
         [],
@@ -471,6 +482,17 @@ fn scan(conn: &Connection) -> Result<()> {
 /// unreadable backup directory is only warned about: backups must never keep the mint from
 /// starting.
 pub fn check_live(mint_dir: &Path, db: &Path, dir: &Path) -> Result<()> {
+    // Listed first: a directory that can't be read (EACCES, ENOTDIR, an offline mount) only warns.
+    let all = match snapshots(dir) {
+        Ok(all) => all,
+        Err(error) => {
+            eprintln!(
+                "maxplayer-mint: WARNING: cannot read backups in {}: {error:#}; not checking mint.sqlite against them",
+                dir.display()
+            );
+            return Ok(());
+        }
+    };
     for name in ["nostr.key", "seed"] {
         if let Some(theirs) = read_if_present(&dir.join(name))? {
             let ours = fs::read(mint_dir.join(name)).with_context(|| format!("read {name}"))?;
@@ -482,16 +504,6 @@ pub fn check_live(mint_dir: &Path, db: &Path, dir: &Path) -> Result<()> {
             }
         }
     }
-    let all = match snapshots(dir) {
-        Ok(all) => all,
-        Err(error) => {
-            eprintln!(
-                "maxplayer-mint: WARNING: cannot read backups in {}: {error:#}; not checking mint.sqlite against them",
-                dir.display()
-            );
-            return Ok(());
-        }
-    };
     let Some(newest) = all.last() else {
         return Ok(());
     };
@@ -520,7 +532,17 @@ pub fn check_live(mint_dir: &Path, db: &Path, dir: &Path) -> Result<()> {
             );
             continue;
         }
-        let missing = differences(db, snapshot)?.missing;
+        // mint.sqlite passed its check above, so a failure here is the snapshot's.
+        let missing = match differences(db, snapshot) {
+            Ok(d) => d.missing,
+            Err(error) => {
+                eprintln!(
+                    "maxplayer-mint: WARNING: backup {} cannot be compared ({error:#}); checking mint.sqlite against an older one",
+                    snapshot.display()
+                );
+                continue;
+            }
+        };
         if missing > 0 {
             bail!(
                 "{} is OLDER than the newest backup {} ({missing} spent proofs or signatures missing). Serving it could let spent credits be spent again. If it was restored from an old copy, run `maxplayer-mint restore` to put back the newest backup",
@@ -674,18 +696,7 @@ pub fn restore(home: &MintHome, from: &Path) -> Result<Restored> {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     let _lock = home.lock_run()?;
-    let mut copied = Vec::new();
-    for name in RESTORE_SET {
-        let Some(theirs) = read_if_present(&from.join(name))? else {
-            continue;
-        };
-        // Only missing files: a different mint.toml is the operator's newer setting.
-        if read_if_present(&dir.join(name))?.is_none() {
-            write_atomic(&dir.join(name), &theirs)?;
-            copied.push(name);
-        }
-    }
-    let issued = save_issued(from, dir).context("restore issued token files")?;
+    // Refusals come before anything is written into <home>/mint/.
     let db = home.db_path();
     if db.exists() {
         match differences(&db, &snapshot) {
@@ -712,6 +723,18 @@ pub fn restore(home: &MintHome, from: &Path) -> Result<Restored> {
             ),
         }
     }
+    let mut copied = Vec::new();
+    for name in RESTORE_SET {
+        let Some(theirs) = read_if_present(&from.join(name))? else {
+            continue;
+        };
+        // Only missing files: a different mint.toml is the operator's newer setting.
+        if read_if_present(&dir.join(name))?.is_none() {
+            write_atomic(&dir.join(name), &theirs)?;
+            copied.push(name);
+        }
+    }
+    let issued = save_issued(from, dir).context("restore issued token files")?;
     // Staged and fsynced BEFORE the live files move, so a failed copy leaves mint.sqlite in place.
     let tmp = dir.join(".mint.sqlite.restore.tmp");
     let _ = fs::remove_file(&tmp);
