@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [features]
 # Plain-`http://` loopback mints and `ws://` loopback mint relays, for local test fixtures ONLY.
-# A user build (`cargo install --locked --path crates/maxplayer-trade`, `cargo build`) never
+# A user build (`maxplayer` with its default `wallet` feature, which links this library) never
 # enables it and accepts only `https://`/`nostr://` mints and `wss://` mint relays (Petar,
 # 2026-11-06). Every test build gets it through the self dev-dependency below; `lab` implies it.
 local-test-mints = []
@@ -50,7 +50,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 bitcoin = "0.32"
 # nostr:// mint transport (kinds 23410/23411): the reviewed core connector and wire contract,
-# exactly as crates/maxplayer-mint uses them. Path dependency; this crate stays its own workspace.
+# exactly as crates/maxplayer-mint uses them. Path dependency (root workspace member).
 maxplayer-core = { path = "../maxplayer-core", features = ["wallet"] }
 
 [dev-dependencies]

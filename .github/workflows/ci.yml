@@ -430,6 +430,8 @@ jobs:
         Cargo.lock
         crates/maxplayer/Cargo.toml
         crates/maxplayer/src/cli.rs
+        crates/maxplayer/src/main.rs
+        crates/maxplayer/build.rs
         crates/buzz/Cargo.toml
         rust-toolchain
         rust-toolchain.toml

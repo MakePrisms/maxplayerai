@@ -30,8 +30,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// One read-only info request to an explicit mint/relay pair; no wallet or journal. Signed
-    /// with the trade.key of --home when it exists (never created), else a throwaway key that
-    /// a sign-in-required relay (relay.maxplayer.ai) refuses.
+    /// with the key of --home when it exists (a legacy home's trade.key; never created), else a
+    /// throwaway key that a sign-in-required relay (relay.maxplayer.ai) refuses.
     Doctor {
         mint: String,
         #[arg(long = "mint-relay")]
@@ -276,6 +276,17 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         Command::Withdraw { mint, .. } => crate::transport::require_http(mint, "withdraw")?,
         _ => {}
     }
+    // Local-only argument checks before resolve_home can create a home or key: a mistyped command
+    // must not leave a fresh unlinked key behind.
+    if let Command::Fund { id: Some(id), .. } = &cli.command {
+        uuid::Uuid::parse_str(id).context("--id must be a UUID")?;
+    }
+    // The token is read once, bounded, before any home or hand-off: a running serve receives it
+    // over its socket; otherwise the local path below uses this same text.
+    let mut token = match &cli.command {
+        Command::Receive { token_file, .. } => Some(read_token(token_file.as_deref())?),
+        _ => None,
+    };
     let resolved = resolve_home(cli.home.as_deref(), &cli.command)?;
     let home = &resolved;
     // A maxplayer home moves money only at its own mints (default, extra_mints, the seller's
@@ -311,6 +322,11 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
             crate::send::check_redeemed(home).await?;
         }
         return Ok(());
+    }
+    // Preflight only talks to the mint: no home, lock or journal (a journal created here would turn
+    // an empty --home into a legacy-looking directory).
+    if let Command::Preflight { ref mint } = cli.command {
+        return preflight(&Asset::from_cli(mint)?.mint_url).await;
     }
     let relays: Vec<String> = if cli.relay.is_empty() {
         crate::market::DEFAULT_RELAYS
@@ -349,12 +365,6 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         }
         _ => {}
     }
-    // The token is read once, bounded, before any hand-off: a running serve receives it over its
-    // socket; otherwise the local path below uses this same text.
-    let mut token = match &cli.command {
-        Command::Receive { token_file, .. } => Some(read_token(token_file.as_deref())?),
-        _ => None,
-    };
     // A partial send (no --reclaim) can never run: say what is missing before any hand-off or lock.
     if let Command::Send {
         mint,
@@ -539,8 +549,7 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
     }
     if !matches!(
         &cli.command,
-        Command::Preflight { .. }
-            | Command::Fund { .. }
+        Command::Fund { .. }
             | Command::Balance { .. }
             | Command::Withdraw { .. }
             | Command::Receive { .. }
@@ -618,8 +627,7 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         .await;
     }
     let mint_arg = match &cli.command {
-        Command::Preflight { mint }
-        | Command::Fund { mint, .. }
+        Command::Fund { mint, .. }
         | Command::Balance { mint }
         | Command::Withdraw { mint, .. }
         | Command::Receive { mint, .. } => mint,
@@ -629,9 +637,6 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
     asset.fence()?;
     let mint = &asset.mint_url;
 
-    if matches!(cli.command, Command::Preflight { .. }) {
-        return preflight(mint).await;
-    }
     if let Command::Withdraw {
         ref invoice,
         max_debit,
@@ -721,7 +726,8 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
 /// The home a command runs against. `--home` (else the maxplayer home: $MAXPLAYER_HOME, else
 /// ~/.maxplayer) names either a maxplayer home (`key`/`config.toml`: shared mode) or a legacy
 /// standalone trading home (`wallet.seed`/`trade.key`/root `trade.sqlite`: drain-only, warned).
-/// A directory that is neither serves read-only commands only; nothing is created there.
+/// A directory that is neither: read-only commands create nothing there; every other command
+/// bootstraps it into a maxplayer home first.
 /// Commands that run without a home and must create nothing in one (no home, key or journal).
 fn is_read_only(command: &Command) -> bool {
     matches!(
@@ -764,6 +770,17 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
     // created a home", tests/ux.rs). They run against whatever is there.
     if is_read_only(command) {
         return Ok(home);
+    }
+    // A mint this home may not use is refused before bootstrap creates anything (the config is
+    // resolved read-only; an absent config.toml means the defaults bootstrap would write).
+    if let Command::Fund { mint, .. }
+    | Command::Withdraw { mint, .. }
+    | Command::Receive { mint, .. }
+    | Command::Send {
+        mint: Some(mint), ..
+    } = command
+    {
+        wallet::check_shared_mint(&home, &crate::Asset::from_cli(mint)?.mint_url)?;
     }
     // Every other command can move money, so it gets a complete maxplayer home first, exactly as
     // the rest of `maxplayer` does (`home::bootstrap`: 0700 dir, config.toml, a 0600 key, wallet/).
@@ -1041,7 +1058,7 @@ async fn doctor(
             .find(|r| text.contains(r));
             let message = format!(
                 "Diagnostic not started: check the mint identifier, the explicit relay URL and \
-                 the --home trade.key{}",
+                 the --home key{}",
                 reason.map(|r| format!(" ({r})")).unwrap_or_default()
             );
             if json_output {

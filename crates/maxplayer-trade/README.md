@@ -64,14 +64,16 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   that still holds funds or unfinished records.
 - **A maxplayer home with legacy files at its top level** (`key` or `config.toml` next to
   `wallet.seed`, `trade.key`, a root `trade.sqlite` or `owner.lock`, as an older
-  `maxplayer trade --home ~/.maxplayer` left them): every command refuses, names the stray files
+  `maxplayer-trade --home ~/.maxplayer` left them): every command refuses, names the stray files
   and creates nothing (never a `wallet.seed` or `trade.key`). A lone `owner.lock`/`serve.sock`
-  holds no money: delete it once no older `maxplayer-trade` binary runs there.
-- **The old standalone `maxplayer-trade` binary** is obsolete. A current journal stops it before
-  it acts (a tombstone row it cannot read, with the reason in the error), a current `serve`
-  refuses its hand-offs with the same reason, and `maxplayer doctor` warns while one is on PATH.
-  Delete it. Otherwise move exactly
-  the named files into their own directory and finish and drain that legacy home from there.
+  holds no money: delete it once no older `maxplayer-trade` binary runs there. Otherwise move
+  exactly the named files into their own directory and finish and drain that legacy home from
+  there.
+- **The old standalone `maxplayer-trade` binary** is obsolete; delete it. A current journal stops
+  its startup recovery, `fund`, `withdraw`, `receive` and `send` before they act (a tombstone row
+  in each money namespace that it cannot read, with the reason in the error); `send --reclaim
+  <id>` reads one record directly and is not stopped this way. A current `serve` refuses its
+  hand-offs with the same reason, and `maxplayer doctor` warns while one is on PATH.
 Earlier dated verification sections are historical snapshots, not current coverage totals.
 
 ## Round 5 final-review policy
@@ -357,7 +359,7 @@ NIP-44 negotiation, not mocked successful swaps:
 - lot and status split across two relays still discovered through the union; unreachable is
   distinguished from a real empty EOSE response.
 
-Root CI does not run this independent workspace. These local counts are separate from root CI.
+These local counts predate the move into the root workspace; root CI now runs the trade suites.
 
 ## Rerunnable public-relay trade
 

@@ -40,11 +40,21 @@ pub fn ensure(home: &MaxplayerHome) -> Result<PathBuf, String> {
     let deadline = Instant::now() + SPAWN_READY_TIMEOUT;
     loop {
         if let Ok(response) = client::status(&sock) {
-            if let Some(pid) = response.result.as_ref().and_then(|result| result["pid"].as_u64()) {
+            if let Some(pid) = response
+                .result
+                .as_ref()
+                .and_then(|result| result["pid"].as_u64())
+            {
                 // Announce only on the path where this invocation spawned, after a daemon is ready.
                 // In a double-spawn race this reports the winner's pid, not necessarily our child.
-                let display_home = home.root.canonicalize().unwrap_or_else(|_| home.root.clone());
-                eprintln!("spawned buyer daemon pid={pid} home={}", display_home.display());
+                let display_home = home
+                    .root
+                    .canonicalize()
+                    .unwrap_or_else(|_| home.root.clone());
+                eprintln!(
+                    "spawned buyer daemon pid={pid} home={}",
+                    display_home.display()
+                );
                 return Ok(sock);
             }
         }
@@ -93,8 +103,9 @@ fn serving(sock: &Path, lock: &Path) -> bool {
 /// outlives the spawning session (a later session connects to the same daemon). A double-spawn is
 /// safe — the loser fails closed at the exclusive home lock and exits.
 fn spawn_detached(home_root: &Path) -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve the maxplayer binary to spawn the buyer daemon: {error}"))?;
+    let exe = std::env::current_exe().map_err(|error| {
+        format!("cannot resolve the maxplayer binary to spawn the buyer daemon: {error}")
+    })?;
     let mut command = Command::new(exe);
     command
         .arg("buyer")
@@ -111,9 +122,9 @@ fn spawn_detached(home_root: &Path) -> Result<(), String> {
         // New process group: the daemon is not killed when the spawning session exits.
         command.process_group(0);
     }
-    command
-        .spawn()
-        .map_err(|error| format!("failed to spawn the buyer daemon (`maxplayer buyer serve`): {error}"))?;
+    command.spawn().map_err(|error| {
+        format!("failed to spawn the buyer daemon (`maxplayer buyer serve`): {error}")
+    })?;
     Ok(())
 }
 
@@ -130,7 +141,11 @@ pub fn call(sock: &Path, method: &str, params: Value) -> Result<Value, String> {
 }
 
 /// Ensure a daemon is serving `home`, then call `method` — the one-shot the MCP and CLI use.
-pub fn ensure_then_call(home: &MaxplayerHome, method: &str, params: Value) -> Result<Value, String> {
+pub fn ensure_then_call(
+    home: &MaxplayerHome,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
     let sock = ensure(home)?;
     call(&sock, method, params)
 }

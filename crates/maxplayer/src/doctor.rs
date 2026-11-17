@@ -114,7 +114,10 @@ impl Check {
     fn fail_transient(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         let check = Self::fail(name, detail, hint);
         #[cfg(any(feature = "acp", test))]
-        let check = Self { transient: true, ..check };
+        let check = Self {
+            transient: true,
+            ..check
+        };
         check
     }
 
@@ -129,7 +132,10 @@ impl Check {
     fn fail_environment(name: &str, detail: impl Into<String>, hint: impl Into<String>) -> Self {
         let check = Self::fail(name, detail, hint);
         #[cfg(any(feature = "acp", test))]
-        let check = Self { skip_doctor_exempt: true, ..check };
+        let check = Self {
+            skip_doctor_exempt: true,
+            ..check
+        };
         check
     }
 
@@ -256,7 +262,10 @@ fn run_readiness_with_retry(
             attempt += 1;
             continue;
         }
-        let failures: Vec<&Check> = results.iter().filter(|c| c.status == Status::Fail).collect();
+        let failures: Vec<&Check> = results
+            .iter()
+            .filter(|c| c.status == Status::Fail)
+            .collect();
         let _ = writeln!(
             err,
             "\nmaxplayer seller REFUSING to start: {} blocking readiness check(s) failed —",
@@ -281,7 +290,10 @@ fn run_readiness_with_retry(
             );
         } else {
             let names = exempt.join(", ");
-            let _ = writeln!(err, "resolve the item(s) above, then re-run `maxplayer seller`.");
+            let _ = writeln!(
+                err,
+                "resolve the item(s) above, then re-run `maxplayer seller`."
+            );
             if failures.len() > exempt.len() {
                 let _ = writeln!(
                     err,
@@ -305,8 +317,8 @@ mod checks {
 
     use maxplayer_core::doctor::{self, RelayProbe};
     use maxplayer_core::home::DEFAULT_MINIBITS_MINT_URL;
-    use maxplayer_core::relay_info::{self, ScopedTokenSupport};
     use maxplayer_core::home::{AgentPresetConfig, SandboxConfig, SellerConfig, TelemetryConfig};
+    use maxplayer_core::relay_info::{self, ScopedTokenSupport};
     use maxplayer_core::seller_exec::SandboxPolicy;
 
     use crate::sandbox_probe::{Containment, ContainmentModel};
@@ -439,7 +451,10 @@ mod checks {
         let remedy = check.hint.unwrap_or_default();
         Check::skip(
             NIX_CHECK,
-            format!("not needed to buy, and this home has no [seller] section — {}", check.detail),
+            format!(
+                "not needed to buy, and this home has no [seller] section — {}",
+                check.detail
+            ),
             format!(
                 "nix is a seller requirement (#745), and buying never uses it; `maxplayer seller` \
                  refuses to start without it, so before selling: {remedy}"
@@ -501,16 +516,23 @@ mod checks {
             .filter(|dir| !dir.as_os_str().is_empty())
             .map(|dir| dir.join("maxplayer-trade"))
             .filter(|f| {
-                std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                std::fs::metadata(f)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             })
             .map(|f| f.display().to_string())
             .collect();
         if found.is_empty() {
-            Check::pass(OBSOLETE_TRADE_CHECK, "no standalone maxplayer-trade binary on PATH")
+            Check::pass(
+                OBSOLETE_TRADE_CHECK,
+                "no standalone maxplayer-trade binary on PATH",
+            )
         } else {
             Check::warn(
                 OBSOLETE_TRADE_CHECK,
-                format!("obsolete standalone maxplayer-trade on PATH: {}", found.join(", ")),
+                format!(
+                    "obsolete standalone maxplayer-trade on PATH: {}",
+                    found.join(", ")
+                ),
                 "trading is `maxplayer trade ...` now; delete the old binary (it is refused by current \
                  trade journals and serve, but should not be run)",
             )
@@ -521,7 +543,10 @@ mod checks {
         match seller_git::resolve_git_credential_nostr() {
             Some(path) => Check::pass(
                 CREDENTIAL_HELPER_CHECK,
-                format!("git-credential-nostr at {} (optional — seller signs NIP-98 in-process)", path.display()),
+                format!(
+                    "git-credential-nostr at {} (optional — seller signs NIP-98 in-process)",
+                    path.display()
+                ),
             ),
             None => Check::pass(
                 CREDENTIAL_HELPER_CHECK,
@@ -558,13 +583,16 @@ mod checks {
             );
         };
         let outcome = match build_runtime() {
-            Ok(runtime) => runtime.block_on(doctor::probe_relay(&relay_url, &secret, RELAY_TIMEOUT)),
+            Ok(runtime) => {
+                runtime.block_on(doctor::probe_relay(&relay_url, &secret, RELAY_TIMEOUT))
+            }
             Err(error) => Err(error),
         };
         match outcome {
-            Ok(RelayProbe::Authenticated) => {
-                Check::pass(RELAY_CHECK, format!("{relay_url}: connected + NIP-42 authenticated"))
-            }
+            Ok(RelayProbe::Authenticated) => Check::pass(
+                RELAY_CHECK,
+                format!("{relay_url}: connected + NIP-42 authenticated"),
+            ),
             Ok(RelayProbe::ConnectedNoChallenge) => Check::pass(
                 RELAY_CHECK,
                 format!("{relay_url}: connected (relay issued no NIP-42 challenge)"),
@@ -686,7 +714,9 @@ mod checks {
         let policy = match SandboxPolicy::from_config_as(sandbox.as_ref(), container_uid) {
             Ok(policy) => policy,
             // An unresolvable [sandbox] is already FAILed by the launcher check; do not double-report.
-            Err(_) => return Check::pass(RELAY_TOKEN_POLICY_CHECK, "no resolvable docker executor"),
+            Err(_) => {
+                return Check::pass(RELAY_TOKEN_POLICY_CHECK, "no resolvable docker executor");
+            }
         };
         let Some(delivery) = policy.container_delivery() else {
             return Check::pass(
@@ -778,7 +808,11 @@ mod checks {
                         relay_info::LongLivedVerdict::FIX,
                     )
                 } else {
-                    Check::fail(RELAY_TOKEN_POLICY_CHECK, detail, relay_info::LongLivedVerdict::FIX)
+                    Check::fail(
+                        RELAY_TOKEN_POLICY_CHECK,
+                        detail,
+                        relay_info::LongLivedVerdict::FIX,
+                    )
                 }
             }
         }
@@ -828,23 +862,34 @@ mod checks {
         let reachable = probes.iter().filter(|(_, result)| result.is_ok()).count();
         let down: Vec<String> = probes
             .iter()
-            .filter_map(|(url, result)| result.as_ref().err().map(|error| format!("{url}: {error}")))
+            .filter_map(|(url, result)| {
+                result.as_ref().err().map(|error| format!("{url}: {error}"))
+            })
             .collect();
         if down.is_empty() {
-            Check::pass(MINT_CHECK, format!("all {total} accepted mint(s) reachable"))
+            Check::pass(
+                MINT_CHECK,
+                format!("all {total} accepted mint(s) reachable"),
+            )
         } else if reachable == 0 {
             // Transient: mints ARE configured but every one is unreachable right now — a dependency
             // blip the boot gate retries, distinct from the no-mints-configured Fail above, which is
             // a misconfiguration a re-run cannot fix and therefore stays a plain (unrecoverable) fail.
             Check::fail_transient(
                 MINT_CHECK,
-                format!("no accepted mint reachable — cannot settle anywhere ({})", down.join("; ")),
+                format!(
+                    "no accepted mint reachable — cannot settle anywhere ({})",
+                    down.join("; ")
+                ),
                 "check the mint URLs in [accepted_mints] and network availability",
             )
         } else {
             Check::warn(
                 MINT_CHECK,
-                format!("{reachable}/{total} accepted mint(s) reachable; degraded: {}", down.join("; ")),
+                format!(
+                    "{reachable}/{total} accepted mint(s) reachable; degraded: {}",
+                    down.join("; ")
+                ),
                 "an accepted mint is unreachable but the seller can still settle at another — check the degraded mint(s)",
             )
         }
@@ -923,7 +968,10 @@ mod checks {
         if advertised.is_empty() {
             format!("registry resolves (raw agent_command hatch; argv0={argv0})")
         } else {
-            format!("registry resolves: {} (preferred argv0={argv0})", advertised.join(", "))
+            format!(
+                "registry resolves: {} (preferred argv0={argv0})",
+                advertised.join(", ")
+            )
         }
     }
 
@@ -942,11 +990,16 @@ mod checks {
         let Some(argv0) = telemetry.command.first().cloned() else {
             return Check::pass(
                 TELEMETRY_CHECK,
-                format!("armed, no sink command configured (episodes.jsonl still captured){mirror}"),
+                format!(
+                    "armed, no sink command configured (episodes.jsonl still captured){mirror}"
+                ),
             );
         };
         if argv0_resolvable(&argv0) {
-            Check::pass(TELEMETRY_CHECK, format!("armed, sink '{argv0}' resolvable{mirror}"))
+            Check::pass(
+                TELEMETRY_CHECK,
+                format!("armed, sink '{argv0}' resolvable{mirror}"),
+            )
         } else {
             Check::warn(
                 TELEMETRY_CHECK,
@@ -987,7 +1040,7 @@ mod checks {
                     SANDBOX_CHECK,
                     format!("[sandbox] does not resolve into an executor: {error}"),
                     "fix the [sandbox] section (or remove it to run unsandboxed)",
-                )
+                );
             }
         };
         // Under `mode = "docker"` there is no launcher argv; the spawn is `docker run …`, so the
@@ -1100,7 +1153,10 @@ mod checks {
         };
         // A host executor has no container to contain. Never a spurious warning.
         if policy.docker_image().is_none() {
-            return Check::pass(EGRESS_CHECK, "not a docker executor; no container egress to contain");
+            return Check::pass(
+                EGRESS_CHECK,
+                "not a docker executor; no container egress to contain",
+            );
         }
         // ADVISORY for every docker seat: this check reports, it does not block. `Status::Warn` is
         // deliberate and is the whole policy of this check — see `boot_gate` and its doc comment,
@@ -1240,7 +1296,12 @@ mod checks {
         let policy = match SandboxPolicy::from_config(sandbox.as_ref()) {
             Ok(policy) => policy,
             // A config that does not resolve is already FAILed by the launcher check; do not double-report.
-            Err(_) => return Check::pass(CREDENTIAL_CONTAINMENT_CHECK, "no resolvable docker executor"),
+            Err(_) => {
+                return Check::pass(
+                    CREDENTIAL_CONTAINMENT_CHECK,
+                    "no resolvable docker executor",
+                );
+            }
         };
         let uncontained =
             maxplayer_core::seller_exec::uncontained_forwarded_credentials(&policy, lookup);
@@ -1295,7 +1356,10 @@ mod checks {
             Err(_) => return Check::pass(SANDBOX_IMAGE_CHECK, "no docker image to check"),
         };
         let Some(image) = policy.docker_image() else {
-            return Check::pass(SANDBOX_IMAGE_CHECK, "no docker image to check (not mode=docker)");
+            return Check::pass(
+                SANDBOX_IMAGE_CHECK,
+                "no docker image to check (not mode=docker)",
+            );
         };
         // Only probe the image once docker itself resolves — otherwise the inspect would ENOENT and be
         // misread as an absent image. A missing docker is the launcher check's verdict, not this one's.
@@ -1313,9 +1377,10 @@ mod checks {
     pub(super) fn fold_sandbox_image(image: &str, availability: ImageAvailability) -> Check {
         let pull = format!("docker pull {image}");
         match availability {
-            ImageAvailability::Present => {
-                Check::pass(SANDBOX_IMAGE_CHECK, format!("image '{image}' present locally"))
-            }
+            ImageAvailability::Present => Check::pass(
+                SANDBOX_IMAGE_CHECK,
+                format!("image '{image}' present locally"),
+            ),
             ImageAvailability::Pullable => Check::warn(
                 SANDBOX_IMAGE_CHECK,
                 format!(
@@ -1381,7 +1446,7 @@ mod checks {
         match docker_probe(&["image", "inspect", image]) {
             ProbeOutcome::Ok => return ImageAvailability::Present,
             ProbeOutcome::TimedOut => {
-                return ImageAvailability::Indeterminate("docker image inspect")
+                return ImageAvailability::Indeterminate("docker image inspect");
             }
             ProbeOutcome::Failed => {}
         }
@@ -1425,7 +1490,7 @@ mod checks {
                         ProbeOutcome::Ok
                     } else {
                         ProbeOutcome::Failed
-                    }
+                    };
                 }
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
@@ -1461,7 +1526,11 @@ mod checks {
     /// syscalls to the allowlist in 2019 and the revert ([moby/moby#41223]) was closed UNMERGED, so
     /// every Engine from 2019 through 24.x explicitly PERMITS io_uring. Below the floor the profile
     /// is not silent about io_uring — it allows it.
-    const DOCKER_ENGINE_FLOOR: EngineVersion = EngineVersion { major: 25, minor: 0, patch: 0 };
+    const DOCKER_ENGINE_FLOOR: EngineVersion = EngineVersion {
+        major: 25,
+        minor: 0,
+        patch: 0,
+    };
 
     /// A Docker Engine version, ordered by (major, minor, patch) — derived `Ord` over the fields in
     /// declaration order is exactly that comparison.
@@ -1498,8 +1567,11 @@ mod checks {
     /// The leading run of ASCII digits in `field`, so `7-ce` reads as 7. `None` when the field opens
     /// with no digit — never 0, so "unparseable" stays distinguishable from "zero".
     fn leading_number(field: &str) -> Option<u32> {
-        let digits: String =
-            field.trim().chars().take_while(|character| character.is_ascii_digit()).collect();
+        let digits: String = field
+            .trim()
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
         digits.parse().ok()
     }
 
@@ -1535,11 +1607,14 @@ mod checks {
             Ok(policy) => policy,
             // An unresolvable [sandbox] is already FAILed by the launcher check; don't double-report.
             Err(_) => {
-                return Check::pass(SANDBOX_ENGINE_CHECK, "no docker executor to version-check")
+                return Check::pass(SANDBOX_ENGINE_CHECK, "no docker executor to version-check");
             }
         };
         if policy.docker_image().is_none() {
-            return Check::pass(SANDBOX_ENGINE_CHECK, "no Engine floor to check (not mode=docker)");
+            return Check::pass(
+                SANDBOX_ENGINE_CHECK,
+                "no Engine floor to check (not mode=docker)",
+            );
         }
         // Same ordering rule as check_sandbox_image: probe only once docker itself resolves, or the
         // spawn would ENOENT and be misreported as an unreadable Engine version. A missing docker is
@@ -1550,7 +1625,11 @@ mod checks {
                 "docker not resolvable; Engine version unchecked (see sandbox launcher)",
             );
         }
-        fold_sandbox_engine_floor(&probe_engine_version(), runtime.as_deref(), serves_strangers)
+        fold_sandbox_engine_floor(
+            &probe_engine_version(),
+            runtime.as_deref(),
+            serves_strangers,
+        )
     }
 
     /// Turn a probed Engine version into a Check. Pure, so every verdict — including the below-floor
@@ -1811,8 +1890,12 @@ mod checks {
 
     impl SeatExposure {
         /// A seat only its named buyers can reach.
-        pub(super) const CLOSED: Self =
-            Self { open_pool: false, open_targeted: false, named_buyers: 0, unusable_buyers: 0 };
+        pub(super) const CLOSED: Self = Self {
+            open_pool: false,
+            open_targeted: false,
+            named_buyers: 0,
+            unusable_buyers: 0,
+        };
 
         /// Whether the operator listed ANY buyer. The fence turns on emptiness, never on validity.
         pub(super) fn allowlist_populated(self) -> bool {
@@ -1876,7 +1959,9 @@ mod checks {
         /// buyers it named)" — a sentence that contradicts itself inside one parenthesis.
         fn stranger_surface(self) -> &'static str {
             match (self.open_pool, self.open_targeted) {
-                (true, true) => "claims OPEN-POOL jobs and accepts targeted offers from unnamed buyers",
+                (true, true) => {
+                    "claims OPEN-POOL jobs and accepts targeted offers from unnamed buyers"
+                }
                 (true, false) => "claims OPEN-POOL jobs",
                 (false, true) => "accepts targeted offers from buyers it has not named",
                 (false, false) => "is reachable only by the buyers it named",
@@ -2048,7 +2133,7 @@ mod checks {
                     CONTAINMENT_CHECK,
                     format!("[sandbox] does not resolve into an executor: {error}"),
                     "fix the [sandbox] section so the containment probe has an executor to measure",
-                )
+                );
             }
         };
         let containment = crate::sandbox_probe::probe_containment(&policy, &home_root);
@@ -2069,7 +2154,10 @@ mod checks {
                 // nobody — and a later WARN elsewhere does not make an earlier diagnosis true.
                 other => Check::warn(
                     CONTAINMENT_CHECK,
-                    format!("not reachable by strangers, so advisory — {}", other.detail()),
+                    format!(
+                        "not reachable by strangers, so advisory — {}",
+                        other.detail()
+                    ),
                     not_stranger_facing_remedy(exposure),
                 ),
             };
@@ -2354,10 +2442,12 @@ mod checks {
             let dirs = seller_agents::harness_credential_dirs(agent, &user_home);
             if dirs.is_empty() {
                 match &agent.name {
-                    None => unresolvable
-                        .push("raw --agent-argv hatch (no preset label)".to_owned()),
-                    Some(name) => unresolvable
-                        .push(format!("harness {name} (no known credential directory)")),
+                    None => {
+                        unresolvable.push("raw --agent-argv hatch (no preset label)".to_owned())
+                    }
+                    Some(name) => {
+                        unresolvable.push(format!("harness {name} (no known credential directory)"))
+                    }
                 }
                 continue;
             }
@@ -2386,27 +2476,28 @@ mod checks {
             use std::io::ErrorKind;
             use std::os::unix::fs::PermissionsExt;
 
-            let consider = |path: &Path, missing_ok: bool, too_open: &mut Vec<String>| -> Option<Check> {
-                let metadata = match std::fs::metadata(path) {
-                    Ok(metadata) => metadata,
-                    Err(error) if missing_ok && error.kind() == ErrorKind::NotFound => {
-                        return None;
+            let consider =
+                |path: &Path, missing_ok: bool, too_open: &mut Vec<String>| -> Option<Check> {
+                    let metadata = match std::fs::metadata(path) {
+                        Ok(metadata) => metadata,
+                        Err(error) if missing_ok && error.kind() == ErrorKind::NotFound => {
+                            return None;
+                        }
+                        Err(error) => {
+                            return Some(Check::warn(
+                                HARNESS_CREDS_CHECK,
+                                format!("could not read {} permissions: {error}", path.display()),
+                                "check the harness credential path exists and is readable",
+                            ));
+                        }
+                    };
+                    let mode = metadata.permissions().mode() & 0o777;
+                    // Group/other WRITE only. See the check's doc comment for why not 0o077.
+                    if mode & 0o022 != 0 {
+                        too_open.push(format!("{} ({mode:#o})", path.display()));
                     }
-                    Err(error) => {
-                        return Some(Check::warn(
-                            HARNESS_CREDS_CHECK,
-                            format!("could not read {} permissions: {error}", path.display()),
-                            "check the harness credential path exists and is readable",
-                        ));
-                    }
+                    None
                 };
-                let mode = metadata.permissions().mode() & 0o777;
-                // Group/other WRITE only. See the check's doc comment for why not 0o077.
-                if mode & 0o022 != 0 {
-                    too_open.push(format!("{} ({mode:#o})", path.display()));
-                }
-                None
-            };
 
             for (label, dirs) in &groups {
                 let mut present = 0usize;
@@ -2428,9 +2519,9 @@ mod checks {
                     if let Some(check) = consider(dir, false, &mut too_open) {
                         return check;
                     }
-                // settings.json STEERS the harness when present; absence is not a permissions
-                // problem (the file is optional) so NotFound is skipped, never a silent skip of
-                // a metadata error on a file that does exist.
+                    // settings.json STEERS the harness when present; absence is not a permissions
+                    // problem (the file is optional) so NotFound is skipped, never a silent skip of
+                    // a metadata error on a file that does exist.
                     if let Some(check) = consider(&dir.join("settings.json"), true, &mut too_open) {
                         return check;
                     }
@@ -2765,7 +2856,9 @@ fn build_checks_with_environment(
     // home with no [seller] (build_report_checks). Everything below is shared, never a second list.
     let mut checks: Vec<Box<dyn FnOnce() -> Check>> = environment;
     checks.push(Box::new(checks::check_credential_helper));
-    checks.push(Box::new(move || checks::check_seller_key(&key_path, key_present)));
+    checks.push(Box::new(move || {
+        checks::check_seller_key(&key_path, key_present)
+    }));
     let secret_for_mints = secret.clone();
     checks.push(Box::new(move || checks::check_relay(relay_url, secret)));
     // What the relay promises about a branch-scoped push token's lifetime. Information under the
@@ -2789,7 +2882,9 @@ fn build_checks_with_environment(
     checks.push(Box::new(move || checks::check_telemetry(telemetry)));
     // The seller boot gate blocks on this (issue #357): a launcher that cannot spawn would let the
     // node advertise and then fail every job. Bypassable, like every check, via --skip-doctor.
-    checks.push(Box::new(move || checks::check_sandbox_launcher(sandbox_for_launcher)));
+    checks.push(Box::new(move || {
+        checks::check_sandbox_launcher(sandbox_for_launcher)
+    }));
     // #647 P2: the credential proxy contains every KNOWN model-credential variable. What it cannot
     // recognize is an operator-added forward_env var (which may itself be a credential), so this WARNs
     // when one is set. Advisory — never blocks boot; the operator chose to forward it.
@@ -2800,11 +2895,15 @@ fn build_checks_with_environment(
     // missing is indistinguishable from a contained one FROM INSIDE A JOB. The operator is the only
     // one who can be told, so this WARNs. Advisory — never blocks boot, because turning a working
     // docker seat red on upgrade is a behaviour change, not a doctor's call.
-    checks.push(Box::new(move || checks::check_sandbox_egress(sandbox_for_egress)));
+    checks.push(Box::new(move || {
+        checks::check_sandbox_egress(sandbox_for_egress)
+    }));
     // #792 phase 3: under mode=docker, the image the seat runs jobs in must be present or pullable,
     // or the first awarded job stalls. On absence this prints the exact `docker pull` command. A
     // non-docker policy is a no-op Pass. Placed after the launcher (docker-resolves) check.
-    checks.push(Box::new(move || checks::check_sandbox_image(sandbox_for_image)));
+    checks.push(Box::new(move || {
+        checks::check_sandbox_image(sandbox_for_image)
+    }));
     // #796: under mode=docker the Engine's DEFAULT seccomp profile is the only syscall filter standing
     // on a non-gVisor seat — docs/SANDBOXING.md §4 declines to hand-write one on purpose. The io_uring
     // block first ships in Engine 25.0.0, and every Engine from 2019 through 24.x explicitly ALLOWS
@@ -3094,7 +3193,11 @@ mod tests {
             },
         ];
         let results = run_checks(checks);
-        assert_eq!(ran.get(), 3, "an early FAIL must not short-circuit later checks");
+        assert_eq!(
+            ran.get(),
+            3,
+            "an early FAIL must not short-circuit later checks"
+        );
         assert_eq!(results.len(), 3);
         assert_eq!(exit_code(&results), FAILURE, "any FAIL ⇒ exit 1");
     }
@@ -3140,14 +3243,26 @@ mod tests {
             Check::warn("b", "meh", "fix"),
             Check::pass("c", "ok"),
         ];
-        assert_eq!(exit_code(&results), SUCCESS, "WARN alone must not fail the exit");
+        assert_eq!(
+            exit_code(&results),
+            SUCCESS,
+            "WARN alone must not fail the exit"
+        );
     }
 
     #[test]
     fn render_shows_fix_hint_only_when_not_pass() {
         assert!(!Check::pass("x", "ok").render().contains("fix:"));
-        assert!(Check::fail("x", "bad", "do this").render().contains("(fix: do this)"));
-        assert!(Check::warn("x", "hmm", "do this").render().contains("(fix: do this)"));
+        assert!(
+            Check::fail("x", "bad", "do this")
+                .render()
+                .contains("(fix: do this)")
+        );
+        assert!(
+            Check::warn("x", "hmm", "do this")
+                .render()
+                .contains("(fix: do this)")
+        );
     }
 
     // Issue #107: a missing seller key must BLOCK `maxplayer seller` (Fail, not Warn) and carry a fix hint.
@@ -3158,7 +3273,11 @@ mod tests {
         let key = Path::new("/some/seat/home/key");
         assert_eq!(checks::check_seller_key(key, true).status, Status::Pass);
         let missing = checks::check_seller_key(key, false);
-        assert_eq!(missing.status, Status::Fail, "a missing key must block boot");
+        assert_eq!(
+            missing.status,
+            Status::Fail,
+            "a missing key must block boot"
+        );
         assert!(missing.render().contains("fix:"), "must give a fix hint");
     }
 
@@ -3186,7 +3305,11 @@ mod tests {
     #[test]
     fn doctor_parses_home_and_refuses_unknown_flags() {
         use std::path::PathBuf;
-        assert_eq!(parse_doctor_args(&[]).unwrap(), None, "no args ⇒ default home");
+        assert_eq!(
+            parse_doctor_args(&[]).unwrap(),
+            None,
+            "no args ⇒ default home"
+        );
         assert_eq!(
             parse_doctor_args(&["--home".into(), "/srv/seat-b".into()]).unwrap(),
             Some(PathBuf::from("/srv/seat-b")),
@@ -3223,7 +3346,10 @@ mod tests {
         ));
 
         let home = resolve_doctor_home(Some(tmp.clone())).expect("bootstrap the overridden home");
-        assert_eq!(home.root, tmp, "doctor must bootstrap the --home dir, not the default");
+        assert_eq!(
+            home.root, tmp,
+            "doctor must bootstrap the --home dir, not the default"
+        );
         assert!(
             home.key_path.starts_with(&tmp),
             "the inspected key must live under the overridden home: {}",
@@ -3240,7 +3366,6 @@ mod tests {
 
         std::fs::remove_dir_all(&tmp).ok();
     }
-
 
     // ---- Relay token policy: information under `fresh-after-agent`, a gate under `long-lived` ----
     //
@@ -3358,7 +3483,10 @@ mod tests {
         )
         .detail;
         assert!(detail.contains("delivery path: CONTAINER"), "{detail}");
-        assert!(detail.contains("the default for"), "the reason is the default: {detail}");
+        assert!(
+            detail.contains("the default for"),
+            "the reason is the default: {detail}"
+        );
 
         // docker + true ⇒ CONTAINER, credited to the config.
         let detail = checks::check_relay_token_policy_in(
@@ -3388,13 +3516,19 @@ mod tests {
         let detail = checks::check_relay_token_policy_in(
             TOKEN_POLICY_RELAY.into(),
             Some(TOKEN_POLICY_REMOTE.into()),
-            Some(SandboxConfig { mode: SandboxMode::Launcher, ..Default::default() }),
+            Some(SandboxConfig {
+                mode: SandboxMode::Launcher,
+                ..Default::default()
+            }),
             NON_ROOT_UID,
             |_| ScopedTokenSupport::Advertised(TOKEN_POLICY_CAP),
         )
         .detail;
         assert!(detail.contains("delivery path: HOST"), "{detail}");
-        assert!(detail.contains("launcher"), "the reason is the mode: {detail}");
+        assert!(
+            detail.contains("launcher"),
+            "the reason is the mode: {detail}"
+        );
 
         // The path is also named when the seat has no remote to push to.
         let detail = checks::check_relay_token_policy_in(
@@ -3459,7 +3593,10 @@ mod tests {
         .detail;
         assert!(detail.contains("delivery path: HOST"), "{detail}");
         assert!(detail.contains("root"), "the reason is the uid: {detail}");
-        assert!(detail.contains("container_delivery = true"), "names the opt-in: {detail}");
+        assert!(
+            detail.contains("container_delivery = true"),
+            "names the opt-in: {detail}"
+        );
 
         let detail = checks::check_relay_token_policy_in(
             TOKEN_POLICY_RELAY.into(),
@@ -3648,7 +3785,10 @@ mod tests {
             "an unresolvable launcher must block boot: {}",
             bogus.render()
         );
-        assert!(bogus.render().contains("fix:"), "a FAIL must carry a fix hint");
+        assert!(
+            bogus.render().contains("fix:"),
+            "a FAIL must carry a fix hint"
+        );
 
         // An existing file always resolves; the test binary itself is one, so this holds on any box.
         let real = std::env::current_exe()
@@ -3732,9 +3872,7 @@ mod tests {
         assert_eq!(check.status, Status::Pass, "{}", check.render());
         #[cfg(target_os = "macos")]
         assert!(
-            check
-                .detail
-                .contains("assumed deny-list for this platform"),
+            check.detail.contains("assumed deny-list for this platform"),
             "macOS PASS must name the assumed deny-list model:\n{}",
             check.detail
         );
@@ -3785,7 +3923,10 @@ mod tests {
             let open_pool = checks::check_sandbox_containment_with_model(
                 Some(contained_probe_launcher()),
                 home.clone(),
-                checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED },
+                checks::SeatExposure {
+                    open_pool: true,
+                    ..checks::SeatExposure::CLOSED
+                },
                 false,
                 model,
             );
@@ -3798,26 +3939,35 @@ mod tests {
             let open_targeted = checks::check_sandbox_containment_with_model(
                 Some(contained_probe_launcher()),
                 home.clone(),
-                checks::SeatExposure { open_targeted: true, ..checks::SeatExposure::CLOSED },
+                checks::SeatExposure {
+                    open_targeted: true,
+                    ..checks::SeatExposure::CLOSED
+                },
                 false,
                 model,
             );
-            assert_eq!(open_targeted.status, Status::Pass, "{}", open_targeted.render());
+            assert_eq!(
+                open_targeted.status,
+                Status::Pass,
+                "{}",
+                open_targeted.render()
+            );
             assert_eq!(open_targeted.detail, expected_pass);
 
             let overridden = checks::check_sandbox_containment_with_model(
                 Some(contained_probe_launcher()),
                 home.clone(),
-                checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED },
+                checks::SeatExposure {
+                    open_pool: true,
+                    ..checks::SeatExposure::CLOSED
+                },
                 true,
                 model,
             );
             assert_eq!(overridden.status, Status::Warn, "{}", overridden.render());
             assert_eq!(
                 overridden.detail,
-                format!(
-                    "--unsafe-no-sandbox passed, though the launcher does confine ({clause})"
-                )
+                format!("--unsafe-no-sandbox passed, though the launcher does confine ({clause})")
             );
 
             std::fs::remove_dir_all(home).ok();
@@ -3858,13 +4008,19 @@ mod tests {
         // open_targeted` at the call site: repeating the expression under test would restate the
         // implementation and pass under any rewrite of it, including one that dropped a surface.
         assert!(
-            checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED }
-                .serves_strangers(),
+            checks::SeatExposure {
+                open_pool: true,
+                ..checks::SeatExposure::CLOSED
+            }
+            .serves_strangers(),
             "the open pool alone must count as stranger-serving"
         );
         assert!(
-            checks::SeatExposure { open_targeted: true, ..checks::SeatExposure::CLOSED }
-                .serves_strangers(),
+            checks::SeatExposure {
+                open_targeted: true,
+                ..checks::SeatExposure::CLOSED
+            }
+            .serves_strangers(),
             "the targeted surface alone must count — this is the one the old claim_open_pool proxy missed"
         );
         assert!(
@@ -3905,13 +4061,19 @@ mod tests {
             (false, true, "the targeted surface"),
             (true, true, "both surfaces"),
         ] {
-            let no_list =
-                checks::SeatExposure { open_pool, open_targeted, ..checks::SeatExposure::CLOSED };
+            let no_list = checks::SeatExposure {
+                open_pool,
+                open_targeted,
+                ..checks::SeatExposure::CLOSED
+            };
             assert!(
                 no_list.serves_strangers(),
                 "CONTROL: with no allowlist, {label} must serve strangers"
             );
-            let listed = checks::SeatExposure { named_buyers: 1, ..no_list };
+            let listed = checks::SeatExposure {
+                named_buyers: 1,
+                ..no_list
+            };
             assert!(
                 listed.serves_strangers(),
                 "#923: naming a buyer must NOT un-open {label} — the list admits who it names and \
@@ -3945,8 +4107,11 @@ mod tests {
             "and the seat IS reachable: the open routes carry it, whatever the junk entry does"
         );
         // FOIL: the same junk list with both routes OFF really does reach nobody.
-        let junk_and_closed =
-            checks::SeatExposure { named_buyers: 0, unusable_buyers: 1, ..checks::SeatExposure::CLOSED };
+        let junk_and_closed = checks::SeatExposure {
+            named_buyers: 0,
+            unusable_buyers: 1,
+            ..checks::SeatExposure::CLOSED
+        };
         assert!(
             !junk_and_closed.serves_strangers() && junk_and_closed.is_unreachable(),
             "with no usable entry and no open route, nothing can arrive"
@@ -3969,8 +4134,11 @@ mod tests {
         use checks::{EngineProbe, EngineVersion};
         let below =
             EngineProbe::Reported(EngineVersion::parse("24.0.9").expect("'24.0.9' must parse"));
-        let open_and_listed =
-            checks::SeatExposure { open_pool: true, named_buyers: 1, ..checks::SeatExposure::CLOSED };
+        let open_and_listed = checks::SeatExposure {
+            open_pool: true,
+            named_buyers: 1,
+            ..checks::SeatExposure::CLOSED
+        };
         assert_eq!(
             checks::fold_sandbox_engine_floor(&below, None, open_and_listed.serves_strangers())
                 .status,
@@ -3979,8 +4147,10 @@ mod tests {
         );
         // FOIL: a seat with a list and NO open route is genuinely stranger-free and stays advisory.
         // Without this, the assertion above is satisfied by a predicate that simply always blocks.
-        let listed_and_closed =
-            checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED };
+        let listed_and_closed = checks::SeatExposure {
+            named_buyers: 1,
+            ..checks::SeatExposure::CLOSED
+        };
         assert_eq!(
             checks::fold_sandbox_engine_floor(&below, None, listed_and_closed.serves_strangers())
                 .status,
@@ -4006,7 +4176,11 @@ mod tests {
         let open_and_listed = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
             home.clone(),
-            checks::SeatExposure { open_pool: true, named_buyers: 1, ..checks::SeatExposure::CLOSED },
+            checks::SeatExposure {
+                open_pool: true,
+                named_buyers: 1,
+                ..checks::SeatExposure::CLOSED
+            },
             false,
             crate::sandbox_probe::ContainmentModel::AllowList,
         );
@@ -4021,7 +4195,10 @@ mod tests {
         let listed_and_closed = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
             home.clone(),
-            checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED },
+            checks::SeatExposure {
+                named_buyers: 1,
+                ..checks::SeatExposure::CLOSED
+            },
             false,
             crate::sandbox_probe::ContainmentModel::AllowList,
         );
@@ -4092,7 +4269,8 @@ mod tests {
         );
         let rendered = check.render();
         assert_eq!(
-            check.status, Status::Fail,
+            check.status,
+            Status::Fail,
             "#923: a junk list fences nothing, so both open routes make this stranger-facing:\n{rendered}"
         );
         assert!(
@@ -4105,13 +4283,18 @@ mod tests {
         let closed = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
             home.clone(),
-            checks::SeatExposure { named_buyers: 0, unusable_buyers: 2, ..checks::SeatExposure::CLOSED },
+            checks::SeatExposure {
+                named_buyers: 0,
+                unusable_buyers: 2,
+                ..checks::SeatExposure::CLOSED
+            },
             false,
             crate::sandbox_probe::ContainmentModel::AllowList,
         );
         let closed_rendered = closed.render();
         assert_eq!(
-            closed.status, Status::Warn,
+            closed.status,
+            Status::Warn,
             "FOIL: a junk list with both routes off reaches nobody — advisory:\n{closed_rendered}"
         );
         assert!(
@@ -4140,7 +4323,10 @@ mod tests {
         let check = checks::check_sandbox_containment_with_model(
             Some(uncontained_probe_launcher()),
             home.clone(),
-            checks::SeatExposure { named_buyers: 2, ..checks::SeatExposure::CLOSED },
+            checks::SeatExposure {
+                named_buyers: 2,
+                ..checks::SeatExposure::CLOSED
+            },
             false,
             crate::sandbox_probe::ContainmentModel::AllowList,
         );
@@ -4176,7 +4362,11 @@ mod tests {
         // Asserted against the RENDERED finding — the string an operator actually reads — rather
         // than a field, so a hint that stops being rendered cannot keep this test green.
         let rendered = checks::check_seat_reachability(checks::SeatExposure::CLOSED).render();
-        for route in ["accept_offers_only_from", "accept_open_targeted", "claim_open_pool"] {
+        for route in [
+            "accept_offers_only_from",
+            "accept_open_targeted",
+            "claim_open_pool",
+        ] {
             assert!(
                 rendered.contains(route),
                 "the finding must name `{route}` as a route back to reachable:\n{rendered}"
@@ -4190,20 +4380,34 @@ mod tests {
     fn seat_reachability_passes_on_each_route_in() {
         for (exposure, label) in [
             (
-                checks::SeatExposure { named_buyers: 1, ..checks::SeatExposure::CLOSED },
+                checks::SeatExposure {
+                    named_buyers: 1,
+                    ..checks::SeatExposure::CLOSED
+                },
                 "a named buyer",
             ),
             (
-                checks::SeatExposure { open_targeted: true, ..checks::SeatExposure::CLOSED },
+                checks::SeatExposure {
+                    open_targeted: true,
+                    ..checks::SeatExposure::CLOSED
+                },
                 "the targeted surface",
             ),
             (
-                checks::SeatExposure { open_pool: true, ..checks::SeatExposure::CLOSED },
+                checks::SeatExposure {
+                    open_pool: true,
+                    ..checks::SeatExposure::CLOSED
+                },
                 "the open pool",
             ),
         ] {
             let check = checks::check_seat_reachability(exposure);
-            assert_eq!(check.status, Status::Pass, "{label} must be a way in:\n{}", check.render());
+            assert_eq!(
+                check.status,
+                Status::Pass,
+                "{label} must be a way in:\n{}",
+                check.render()
+            );
         }
     }
 
@@ -4291,7 +4495,9 @@ mod tests {
         // fails if the shared constant is weakened back to shape-only. Either alone leaves one of
         // the two ways this regressed still open.
         assert!(
-            check.render().contains(maxplayer_core::home::USABLE_BUYER_ENTRY),
+            check
+                .render()
+                .contains(maxplayer_core::home::USABLE_BUYER_ENTRY),
             "the guidance must read the SHARED criterion, not a local copy:\n{}",
             check.render()
         );
@@ -4412,15 +4618,18 @@ mod tests {
         );
 
         // A known credential (now contained) is NOT flagged, even when set.
-        let contained_env = |key: &str| (key == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "oauth-real".to_owned());
+        let contained_env =
+            |key: &str| (key == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "oauth-real".to_owned());
         assert_eq!(
-            checks::check_sandbox_credential_containment_in(docker(Vec::new()), contained_env).status,
+            checks::check_sandbox_credential_containment_in(docker(Vec::new()), contained_env)
+                .status,
             Status::Pass,
             "a contained credential must not be flagged",
         );
         // A non-docker seat forwards nothing into a container ⇒ Pass regardless of the environment.
         assert_eq!(
-            checks::check_sandbox_credential_containment_in(None, |_| Some("set".to_owned())).status,
+            checks::check_sandbox_credential_containment_in(None, |_| Some("set".to_owned()))
+                .status,
             Status::Pass,
         );
     }
@@ -4477,7 +4686,8 @@ mod tests {
         let unreadable = checks::check_sandbox_egress_in(docker(Some("sbx")), |_| Err(()));
         assert_eq!(unreadable.status, Status::Warn, "{}", unreadable.render());
         assert!(
-            unreadable.detail.contains("could not be asked") && unreadable.detail.contains("UNVERIFIED"),
+            unreadable.detail.contains("could not be asked")
+                && unreadable.detail.contains("UNVERIFIED"),
             "must say it could not look, not that nothing is there: {}",
             unreadable.detail
         );
@@ -4664,7 +4874,9 @@ mod tests {
             unconfigured.detail
         );
         assert!(
-            !unconfigured.detail.contains("resolver(s) `[sandbox] dns_servers` resolves to"),
+            !unconfigured
+                .detail
+                .contains("resolver(s) `[sandbox] dns_servers` resolves to"),
             "an unconfigured seat must not claim a named resolver count: {}",
             unconfigured.detail
         );
@@ -4682,7 +4894,8 @@ mod tests {
         for refused in ["127.0.0.53", "169.254.169.254", "dns.example.com"] {
             let check = checks::check_sandbox_egress_in(seat(&[refused]), |_| Ok(true));
             assert_eq!(
-                check.detail, "no resolvable docker executor",
+                check.detail,
+                "no resolvable docker executor",
                 "`{refused}` must not resolve to a policy, so this row defers to the launcher \
                  check: {}",
                 check.render()
@@ -4700,7 +4913,12 @@ mod tests {
         let pull = format!("docker pull {image}");
 
         let absent = checks::fold_sandbox_image(image, ImageAvailability::Absent);
-        assert_eq!(absent.status, Status::Fail, "an absent image must FAIL: {}", absent.render());
+        assert_eq!(
+            absent.status,
+            Status::Fail,
+            "an absent image must FAIL: {}",
+            absent.render()
+        );
         assert!(
             absent.render().contains(&pull),
             "an absent image must print the exact `{pull}` command: {}",
@@ -4708,10 +4926,20 @@ mod tests {
         );
 
         let present = checks::fold_sandbox_image(image, ImageAvailability::Present);
-        assert_eq!(present.status, Status::Pass, "a present image must PASS: {}", present.render());
+        assert_eq!(
+            present.status,
+            Status::Pass,
+            "a present image must PASS: {}",
+            present.render()
+        );
 
         let pullable = checks::fold_sandbox_image(image, ImageAvailability::Pullable);
-        assert_eq!(pullable.status, Status::Warn, "a pullable image WARNs: {}", pullable.render());
+        assert_eq!(
+            pullable.status,
+            Status::Warn,
+            "a pullable image WARNs: {}",
+            pullable.render()
+        );
         assert!(
             pullable.render().contains(&pull),
             "a pullable image must still offer the pre-pull command: {}",
@@ -4821,8 +5049,10 @@ mod tests {
         use checks::ImageAvailability;
         let image = "ghcr.io/makeprisms/maxplayer-sandbox:v9.9.9";
 
-        let stuck =
-            checks::fold_sandbox_image(image, ImageAvailability::Indeterminate("docker manifest inspect"));
+        let stuck = checks::fold_sandbox_image(
+            image,
+            ImageAvailability::Indeterminate("docker manifest inspect"),
+        );
         let rendered = stuck.render();
 
         assert_eq!(
@@ -4860,7 +5090,10 @@ mod tests {
             "a seat strangers can reach, below the floor, must FAIL: {rendered}"
         );
         for needle in ["24.0.9", "25.0.0", "io_uring_setup", "BELOW"] {
-            assert!(rendered.contains(needle), "below-floor text must name '{needle}': {rendered}");
+            assert!(
+                rendered.contains(needle),
+                "below-floor text must name '{needle}': {rendered}"
+            );
         }
         assert!(
             rendered.contains("upgrade the Docker Engine to 25.0.0"),
@@ -5170,15 +5403,33 @@ mod tests {
     #[test]
     fn doctor_engine_version_parse_keeps_unknown_distinct_from_zero() {
         use checks::EngineVersion;
-        assert!(EngineVersion::parse("not-a-version").is_none(), "garbage must be unknown, not 0.0.0");
-        assert!(EngineVersion::parse("").is_none(), "an empty report must be unknown");
-        assert!(EngineVersion::parse("   ").is_none(), "a blank report must be unknown");
+        assert!(
+            EngineVersion::parse("not-a-version").is_none(),
+            "garbage must be unknown, not 0.0.0"
+        );
+        assert!(
+            EngineVersion::parse("").is_none(),
+            "an empty report must be unknown"
+        );
+        assert!(
+            EngineVersion::parse("   ").is_none(),
+            "a blank report must be unknown"
+        );
 
         // Vendor, distro and pre-release suffixes are common in the wild and must not defeat the
         // comparison: `24.0.7-ce` is still 24.0.7.
-        assert_eq!(EngineVersion::parse("24.0.7-ce"), EngineVersion::parse("24.0.7"));
-        assert_eq!(EngineVersion::parse("v25.0.3"), EngineVersion::parse("25.0.3"));
-        assert_eq!(EngineVersion::parse("26.1.4+dfsg1"), EngineVersion::parse("26.1.4"));
+        assert_eq!(
+            EngineVersion::parse("24.0.7-ce"),
+            EngineVersion::parse("24.0.7")
+        );
+        assert_eq!(
+            EngineVersion::parse("v25.0.3"),
+            EngineVersion::parse("25.0.3")
+        );
+        assert_eq!(
+            EngineVersion::parse("26.1.4+dfsg1"),
+            EngineVersion::parse("26.1.4")
+        );
 
         // A truncated report still orders correctly rather than collapsing to unknown.
         assert_eq!(EngineVersion::parse("25"), EngineVersion::parse("25.0.0"));
@@ -5240,14 +5491,15 @@ mod tests {
 
         let results = run_checks(build_checks(&home, false));
         assert!(
-            results.iter().any(|check| check.name == "sandbox engine floor"),
+            results
+                .iter()
+                .any(|check| check.name == "sandbox engine floor"),
             "build_checks must run the sandbox engine floor check; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
         );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
-
 
     // RED-PROVE (wiring): the relay token-policy row must sit in the ONE registry that both
     // `maxplayer doctor` and the seller boot gate run — drop the `check_relay_token_policy` push
@@ -5342,7 +5594,8 @@ mod tests {
         assert!(
             results.iter().any(|c| c.status == Status::Fail
                 && c.detail.contains("no-such-registry.invalid/nope:v0")
-                && c.render().contains("docker pull no-such-registry.invalid/nope:v0")),
+                && c.render()
+                    .contains("docker pull no-such-registry.invalid/nope:v0")),
             "build_checks must run the sandbox image check and FAIL with the pull command; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
         );
@@ -5382,10 +5635,8 @@ mod tests {
 
         let results = run_checks(build_checks(&home, false));
         assert!(
-            results
-                .iter()
-                .any(|c| c.status == Status::Fail
-                    && c.detail.contains("definitely-not-a-real-binary-xyz")),
+            results.iter().any(|c| c.status == Status::Fail
+                && c.detail.contains("definitely-not-a-real-binary-xyz")),
             "build_checks must run the sandbox launcher check and FAIL on a bogus launcher; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
         );
@@ -5434,8 +5685,11 @@ mod tests {
         };
 
         // Boot's verdict: the registry the seller node actually boots with.
-        let boot =
-            seller_agents::resolve(&seller, &presets, maxplayer_core::agent_presets::AdapterHost::Host);
+        let boot = seller_agents::resolve(
+            &seller,
+            &presets,
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert!(boot.is_ok(), "boot resolves the verbatim agent_command");
 
         // Doctor must report the SAME verdict, not a FAIL derived from a PATH probe of the preset.
@@ -5534,8 +5788,11 @@ mod tests {
             claim_award_timeout_secs: None,
         };
 
-        let boot =
-            seller_agents::resolve(&seller, &presets, maxplayer_core::agent_presets::AdapterHost::Host);
+        let boot = seller_agents::resolve(
+            &seller,
+            &presets,
+            maxplayer_core::agent_presets::AdapterHost::Host,
+        );
         assert!(
             matches!(boot, Err(RegistryError::AllFailed(_))),
             "boot must refuse a registry with no launchable harness"
@@ -5568,11 +5825,22 @@ mod tests {
         );
         // One of two down ⇒ Warn (degraded but can still settle — must NOT block boot).
         let partial = checks::fold_mint_reachability(&[ok("https://a"), down("https://b")]);
-        assert_eq!(partial.status, Status::Warn, "single mint down must not block boot");
-        assert!(partial.render().contains("https://b"), "names the degraded mint");
+        assert_eq!(
+            partial.status,
+            Status::Warn,
+            "single mint down must not block boot"
+        );
+        assert!(
+            partial.render().contains("https://b"),
+            "names the degraded mint"
+        );
         // Every mint down ⇒ Fail (cannot settle anywhere — blocks boot).
         let all_down = checks::fold_mint_reachability(&[down("https://a"), down("https://b")]);
-        assert_eq!(all_down.status, Status::Fail, "no reachable mint must block boot");
+        assert_eq!(
+            all_down.status,
+            Status::Fail,
+            "no reachable mint must block boot"
+        );
         // No accepted mints configured ⇒ Fail.
         let none = checks::fold_mint_reachability(&[]);
         assert_eq!(none.status, Status::Fail);
@@ -5639,7 +5907,10 @@ mod tests {
     // ---- Issue #715: doctor inspects the configured harness's credential directory ----
 
     #[cfg(feature = "wallet")]
-    fn seller_for_agents(agents: Vec<String>, agent_command: Vec<String>) -> maxplayer_core::home::SellerConfig {
+    fn seller_for_agents(
+        agents: Vec<String>,
+        agent_command: Vec<String>,
+    ) -> maxplayer_core::home::SellerConfig {
         maxplayer_core::home::SellerConfig {
             agent_command,
             rate_sats: 5,
@@ -5658,7 +5929,8 @@ mod tests {
     }
 
     #[cfg(feature = "wallet")]
-    fn claude_preset_table() -> std::collections::BTreeMap<String, maxplayer_core::home::AgentPresetConfig> {
+    fn claude_preset_table()
+    -> std::collections::BTreeMap<String, maxplayer_core::home::AgentPresetConfig> {
         let existing = std::env::current_exe()
             .expect("current exe")
             .to_string_lossy()
@@ -5689,9 +5961,15 @@ mod tests {
         // A home that is deliberately never created, so BOTH cursor candidates are absent. Built from
         // the pid rather than a fixed name: a fixed path under the shared temp directory is another
         // user's to create, and this test's whole meaning is that the path does not exist.
-        let home = std::env::temp_dir()
-            .join(format!("maxplayer-doctor-unlinked-cursor-{}", std::process::id()));
-        assert!(!home.exists(), "the fixture home must not exist: {}", home.display());
+        let home = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-unlinked-cursor-{}",
+            std::process::id()
+        ));
+        assert!(
+            !home.exists(),
+            "the fixture home must not exist: {}",
+            home.display()
+        );
         let existing = std::env::current_exe()
             .expect("current exe")
             .to_string_lossy()
@@ -5736,11 +6014,14 @@ mod tests {
     fn a_cursor_seat_that_linked_at_the_measured_location_passes_and_names_it() {
         // Built from the pid, not a fixed name: a fixed path under the shared temp directory is
         // another user's to create, and this test writes into it.
-        let home = std::env::temp_dir()
-            .join(format!("maxplayer-doctor-configcursor-{}", std::process::id()));
+        let home = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-configcursor-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&home);
         let measured = home.join(".config").join("cursor");
-        std::fs::create_dir_all(&measured).expect("create the measured cursor credential directory");
+        std::fs::create_dir_all(&measured)
+            .expect("create the measured cursor credential directory");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -5862,9 +6143,14 @@ mod tests {
         // SKIP since #1015 — an unknown label has no known credential path, so nothing was measured.
         assert_eq!(check.status, Status::Skip, "{}", check.render());
         let rendered = check.render();
-        assert!(rendered.contains("grok"), "must name the unresolvable harness: {rendered}");
         assert!(
-            !rendered.contains(".claude") && !rendered.contains(".cursor") && !rendered.contains(".codex"),
+            rendered.contains("grok"),
+            "must name the unresolvable harness: {rendered}"
+        );
+        assert!(
+            !rendered.contains(".claude")
+                && !rendered.contains(".cursor")
+                && !rendered.contains(".codex"),
             "must not fall back to a built-in directory: {rendered}"
         );
     }
@@ -5885,7 +6171,11 @@ mod tests {
             maxplayer_core::agent_presets::AdapterHost::Host,
         );
         assert_eq!(none.status, Status::Skip, "{}", none.render());
-        assert!(none.detail.contains("no [seller] section"), "{}", none.render());
+        assert!(
+            none.detail.contains("no [seller] section"),
+            "{}",
+            none.render()
+        );
         assert!(
             none.render().starts_with("SKIP"),
             "an absent cause must be visible in the report, not swallowed: {}",
@@ -5962,8 +6252,17 @@ mod tests {
         // Owner-only directory, no settings.json ⇒ Pass.
         std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let tight = run(&base);
-        assert_eq!(tight.status, Status::Pass, "owner-only dir must pass: {}", tight.render());
-        assert!(tight.detail.contains(&claude_dir.display().to_string()), "{}", tight.render());
+        assert_eq!(
+            tight.status,
+            Status::Pass,
+            "owner-only dir must pass: {}",
+            tight.render()
+        );
+        assert!(
+            tight.detail.contains(&claude_dir.display().to_string()),
+            "{}",
+            tight.render()
+        );
 
         // 0755 = group/other read+execute, not write. 0o077 would flag this; 0o022 must not.
         std::fs::set_permissions(&claude_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -5984,7 +6283,12 @@ mod tests {
             "a group-writable credential dir must WARN: {}",
             writable.render()
         );
-        assert_ne!(writable.status, Status::Fail, "advisory, not an alarm: {}", writable.render());
+        assert_ne!(
+            writable.status,
+            Status::Fail,
+            "advisory, not an alarm: {}",
+            writable.render()
+        );
         assert!(
             writable.detail.contains("inert") && writable.detail.contains("second account"),
             "copy must carry the single-account bound: {}",
@@ -6177,8 +6481,7 @@ mod tests {
             maxplayer_core::agent_presets::AdapterHost::Container,
         ] {
             let presets = std::collections::BTreeMap::new();
-            let preset =
-                checks::check_agent_registry(Some(seller.clone()), presets.clone(), host);
+            let preset = checks::check_agent_registry(Some(seller.clone()), presets.clone(), host);
             let creds = checks::check_harness_credential_permissions(
                 Some(seller.clone()),
                 presets,
@@ -6266,7 +6569,9 @@ mod tests {
             docker_seat.render()
         );
         assert!(
-            !docker_seat.detail.contains(&claude_dir.display().to_string()),
+            !docker_seat
+                .detail
+                .contains(&claude_dir.display().to_string()),
             "the skip must not name a path it did not inspect: {}",
             docker_seat.render()
         );
@@ -6299,7 +6604,11 @@ mod tests {
         assert_ne!(skipped.status, Status::Warn, "a skip is not a finding");
 
         let results = vec![Check::pass("ok", "fine"), skipped];
-        assert_eq!(exit_code(&results), SUCCESS, "a skip must not fail the exit");
+        assert_eq!(
+            exit_code(&results),
+            SUCCESS,
+            "a skip must not fail the exit"
+        );
         assert!(readiness_ok(&results), "a skip must not block boot");
     }
 
@@ -6334,7 +6643,9 @@ mod tests {
             results.iter().any(|c| {
                 c.name == "harness credential permissions"
                     && c.status == Status::Skip
-                    && (c.detail.contains("cannot resolve") || c.detail.contains("will not guess") || c.detail.contains("no preset label"))
+                    && (c.detail.contains("cannot resolve")
+                        || c.detail.contains("will not guess")
+                        || c.detail.contains("no preset label"))
             }),
             "build_checks must run the harness credential check and SKIP, saying so, on an unlabelled hatch; got: {:?}",
             results.iter().map(Check::render).collect::<Vec<_>>()
@@ -6361,10 +6672,7 @@ mod tests {
         err: String,
     }
 
-    fn drive_gate(
-        max_attempts: u32,
-        mut script: impl FnMut(usize) -> Vec<Check>,
-    ) -> GateDrive {
+    fn drive_gate(max_attempts: u32, mut script: impl FnMut(usize) -> Vec<Check>) -> GateDrive {
         let attempts = std::cell::Cell::new(0usize);
         let waits = std::cell::RefCell::new(Vec::new());
         let mut out: Vec<u8> = Vec::new();
@@ -6429,20 +6737,40 @@ mod tests {
     fn transient_failure_then_success_boots() {
         let run = drive_gate(READINESS_MAX_ATTEMPTS, |n| {
             if n == 0 {
-                vec![Check::fail_transient("relay reachability", "relay down", "check relay")]
+                vec![Check::fail_transient(
+                    "relay reachability",
+                    "relay down",
+                    "check relay",
+                )]
             } else {
-                vec![Check::pass("relay reachability", "connected + NIP-42 authenticated")]
+                vec![Check::pass(
+                    "relay reachability",
+                    "connected + NIP-42 authenticated",
+                )]
             }
         });
-        assert_eq!(run.result, Ok(()), "a transient blip that clears must boot; stderr: {}", run.err);
+        assert_eq!(
+            run.result,
+            Ok(()),
+            "a transient blip that clears must boot; stderr: {}",
+            run.err
+        );
         assert_eq!(run.attempts, 2, "exactly one retry after the blip");
         assert_eq!(
             run.waits,
             vec![readiness_backoff(1)],
             "exactly one backoff — the first-retry wait"
         );
-        assert!(run.out.contains("retry 1/"), "operator must see the retry wait: {}", run.out);
-        assert!(run.out.contains("starting seller"), "the recovered gate boots: {}", run.out);
+        assert!(
+            run.out.contains("retry 1/"),
+            "operator must see the retry wait: {}",
+            run.out
+        );
+        assert!(
+            run.out.contains("starting seller"),
+            "the recovered gate boots: {}",
+            run.out
+        );
     }
 
     // (2) An unrecoverable misconfiguration refuses on the FIRST pass — no retry, no sleep — because
@@ -6452,11 +6780,18 @@ mod tests {
     #[test]
     fn unrecoverable_failure_refuses_immediately_without_retry() {
         let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
-            vec![Check::fail("seller key", "key missing — seller has no signing key", "generate the key")]
+            vec![Check::fail(
+                "seller key",
+                "key missing — seller has no signing key",
+                "generate the key",
+            )]
         });
         assert_eq!(run.result, Err(()), "an unrecoverable failure must refuse");
         assert_eq!(run.attempts, 1, "no retry on an unrecoverable failure");
-        assert!(run.waits.is_empty(), "must not sleep before refusing an unrecoverable failure");
+        assert!(
+            run.waits.is_empty(),
+            "must not sleep before refusing an unrecoverable failure"
+        );
         assert!(
             run.err.contains("REFUSING to start"),
             "the fail-closed refusal message is preserved: {}",
@@ -6472,12 +6807,19 @@ mod tests {
     fn exhausted_transient_retries_still_refuse_fail_closed() {
         use std::time::Duration;
         let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
-            vec![Check::fail_transient("relay reachability", "relay down", "check relay")]
+            vec![Check::fail_transient(
+                "relay reachability",
+                "relay down",
+                "check relay",
+            )]
         });
-        assert_eq!(run.result, Err(()), "exhausted transient retries must still refuse");
         assert_eq!(
-            run.attempts,
-            READINESS_MAX_ATTEMPTS as usize,
+            run.result,
+            Err(()),
+            "exhausted transient retries must still refuse"
+        );
+        assert_eq!(
+            run.attempts, READINESS_MAX_ATTEMPTS as usize,
             "every attempt is consumed before refusing"
         );
         assert_eq!(
@@ -6514,8 +6856,14 @@ mod tests {
             ]
         });
         assert_eq!(run.result, Err(()));
-        assert_eq!(run.attempts, 1, "a single unrecoverable failure refuses at once");
-        assert!(run.waits.is_empty(), "no sleep when an unrecoverable failure is present");
+        assert_eq!(
+            run.attempts, 1,
+            "a single unrecoverable failure refuses at once"
+        );
+        assert!(
+            run.waits.is_empty(),
+            "no sleep when an unrecoverable failure is present"
+        );
     }
 
     // ---- Issue #745: `maxplayer seller` refuses to start without a working nix ----
@@ -6535,7 +6883,12 @@ mod tests {
     #[test]
     fn nix_check_failure_carries_installer_one_liner_and_names_path_skew() {
         let check = checks::fold_nix(false, None);
-        assert_eq!(check.status, Status::Fail, "no working nix must block boot: {}", check.render());
+        assert_eq!(
+            check.status,
+            Status::Fail,
+            "no working nix must block boot: {}",
+            check.render()
+        );
         let rendered = check.render();
         assert!(
             rendered
@@ -6568,7 +6921,9 @@ mod tests {
     fn nix_check_reports_an_installed_off_path_nix_as_path_skew_not_uninstalled() {
         let check = checks::fold_nix(
             false,
-            Some(std::path::PathBuf::from("/nix/var/nix/profiles/default/bin/nix")),
+            Some(std::path::PathBuf::from(
+                "/nix/var/nix/profiles/default/bin/nix",
+            )),
         );
         assert_eq!(check.status, Status::Fail, "{}", check.render());
         let rendered = check.render();
@@ -6669,7 +7024,11 @@ mod tests {
         let rendered = found.render();
         assert!(rendered.contains(&bin.display().to_string()), "{rendered}");
         assert!(rendered.contains("maxplayer trade"), "{rendered}");
-        assert_eq!(exit_code(&[found]), SUCCESS, "a leftover binary must not fail doctor");
+        assert_eq!(
+            exit_code(&[found]),
+            SUCCESS,
+            "a leftover binary must not fail doctor"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6682,8 +7041,15 @@ mod tests {
         assert_eq!(pass.status, Status::Pass, "{}", pass.render());
 
         let skewed = std::path::PathBuf::from("/nix/var/nix/profiles/default/bin/nix");
-        for (failed, skew) in [(checks::fold_nix(false, None), false), (checks::fold_nix(false, Some(skewed)), true)] {
-            assert_eq!(failed.status, Status::Fail, "precondition: the gate's verdict is FAIL");
+        for (failed, skew) in [
+            (checks::fold_nix(false, None), false),
+            (checks::fold_nix(false, Some(skewed)), true),
+        ] {
+            assert_eq!(
+                failed.status,
+                Status::Fail,
+                "precondition: the gate's verdict is FAIL"
+            );
             let reported = checks::nix_for_buyer_home(failed);
             assert_eq!(reported.status, Status::Skip, "{}", reported.render());
             assert_eq!(reported.name, "nix");
@@ -6693,12 +7059,21 @@ mod tests {
             // reported to a buyer as "install it" (advisor r1, #1312).
             assert_eq!(rendered.contains("do NOT reinstall"), skew, "{rendered}");
             assert_eq!(rendered.contains("nix IS installed"), skew, "{rendered}");
-            assert!(rendered.contains("`maxplayer seller`"), "names what needs nix: {rendered}");
             assert!(
-                rendered.contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
+                rendered.contains("`maxplayer seller`"),
+                "names what needs nix: {rendered}"
+            );
+            assert!(
+                rendered.contains(
+                    "curl -fsSL https://install.determinate.systems/nix | sh -s -- install"
+                ),
                 "says how to install it before selling: {rendered}"
             );
-            assert_eq!(exit_code(&[reported]), SUCCESS, "a buyer's missing nix must not fail the exit");
+            assert_eq!(
+                exit_code(&[reported]),
+                SUCCESS,
+                "a buyer's missing nix must not fail the exit"
+            );
         }
     }
 
@@ -6727,7 +7102,10 @@ mod tests {
             config.accepted_mints = Vec::new();
         })
         .expect("write a network-free config");
-        assert!(home.config.seller.is_none(), "precondition: a fresh home has no [seller]");
+        assert!(
+            home.config.seller.is_none(),
+            "precondition: a fresh home has no [seller]"
+        );
 
         let doctor = |root: &std::path::Path| {
             let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -6750,18 +7128,33 @@ mod tests {
         let (_, buyer) = doctor(&tmp);
         let buyer_nix = nix_line(&buyer);
         assert!(buyer_nix.starts_with("SKIP nix"), "buyer home: {buyer_nix}");
-        assert!(buyer_nix.contains("no [seller] section"), "buyer home: {buyer_nix}");
+        assert!(
+            buyer_nix.contains("no [seller] section"),
+            "buyer home: {buyer_nix}"
+        );
         // The report (and only the report) carries the leftover-maxplayer-trade row.
-        assert!(buyer.contains("obsolete maxplayer-trade"), "doctor report: {buyer}");
+        assert!(
+            buyer.contains("obsolete maxplayer-trade"),
+            "doctor report: {buyer}"
+        );
 
         maxplayer_core::home::save_config(&mut home, |config| {
-            config.seller = Some(seller_for_agents(vec!["claude".into()], vec!["claude-agent-acp".into()]));
+            config.seller = Some(seller_for_agents(
+                vec!["claude".into()],
+                vec!["claude-agent-acp".into()],
+            ));
         })
         .expect("write a [seller] section");
         let (code, seller) = doctor(&tmp);
         let seller_nix = nix_line(&seller);
-        assert!(seller_nix.starts_with("FAIL nix"), "seller home: {seller_nix}");
-        assert_eq!(code, FAILURE, "a seller home without nix must fail doctor: {seller}");
+        assert!(
+            seller_nix.starts_with("FAIL nix"),
+            "seller home: {seller_nix}"
+        );
+        assert_eq!(
+            code, FAILURE,
+            "a seller home without nix must fail doctor: {seller}"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
@@ -6772,7 +7165,11 @@ mod tests {
     #[test]
     fn environment_failure_refusal_does_not_advertise_skip_doctor() {
         let run = drive_gate(READINESS_MAX_ATTEMPTS, |_| {
-            vec![Check::fail_environment("nix", "no working nix", "install nix")]
+            vec![Check::fail_environment(
+                "nix",
+                "no working nix",
+                "install nix",
+            )]
         });
         assert_eq!(run.result, Err(()), "an environment failure must refuse");
         assert_eq!(run.attempts, 1, "unrecoverable: no retry");
@@ -6808,7 +7205,8 @@ mod tests {
         assert_eq!(run.result, Err(()));
         assert_eq!(run.attempts, 1, "the unrecoverable pair refuses at once");
         assert!(
-            run.err.contains("--skip-doctor can bypass the readiness failure(s)"),
+            run.err
+                .contains("--skip-doctor can bypass the readiness failure(s)"),
             "the readiness failure keeps its documented bypass: {}",
             run.err
         );

@@ -522,7 +522,11 @@ async fn stale_socket_and_bounded_protocol() {
         .await
         .unwrap();
         s.write_all(
-            b"{\"v\":1,\"relays\":[],\"command\":{\"cancel\":{\"lot\":\"x\",\"extra\":1}}}\n",
+            format!(
+                "{{\"v\":{},\"relays\":[],\"command\":{{\"cancel\":{{\"lot\":\"x\",\"extra\":1}}}}}}\n",
+                maxplayer_trade::serve::PROTOCOL_V
+            )
+            .as_bytes(),
         )
         .await
         .unwrap();

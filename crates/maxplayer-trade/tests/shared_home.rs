@@ -612,6 +612,37 @@ async fn legacy_home_allow_refuse_matrix() {
             "SAFETY: read-only {args:?} created something"
         );
     }
+    // preflight only talks to the mint (unreachable here, so it fails): still nothing on disk, no
+    // owner.lock or trade.sqlite that would make the directory look like a legacy home.
+    // A money command refused on its own arguments or mint creates no home or key either.
+    let token_missing = empty.path().join("no-such-token");
+    for args in [
+        vec!["preflight", "https://127.0.0.1:1"],
+        vec!["fund", mint, "--amount", "5", "--id", "not-a-uuid"],
+        vec![
+            "receive",
+            mint,
+            "--token-file",
+            token_missing.to_str().unwrap(),
+        ],
+        vec![
+            "send",
+            "https://example.com",
+            "--amount",
+            "5",
+            "--out",
+            "tok",
+        ],
+    ] {
+        let out = trade(Some(empty.path()), &args);
+        assert!(!out.status.success(), "{args:?} must fail here");
+        assert_eq!(
+            std::fs::read_dir(empty.path()).unwrap().count(),
+            0,
+            "SAFETY: {args:?} created something: {}",
+            err(&out)
+        );
+    }
     // Any other command bootstraps a full maxplayer home there first (home::bootstrap, as every
     // other `maxplayer` command does) and says the new key still needs linking.
     let out = trade(Some(empty.path()), &["recover"]);

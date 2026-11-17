@@ -33,7 +33,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use maxplayer_core::seller_exec::{
-    force_remove_argv, probe_container_name, JobLaunch, SandboxPolicy,
+    JobLaunch, SandboxPolicy, force_remove_argv, probe_container_name,
 };
 
 const SUCCESS: i32 = 0;
@@ -356,7 +356,7 @@ fn run_under_launcher(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> 
         Err(error) => {
             return Containment::Inconclusive(format!(
                 "cannot locate this executable to run the probe with ({error})"
-            ))
+            ));
         }
     };
     let payload: Vec<String> = vec![
@@ -427,7 +427,7 @@ fn run_in_container(policy: &SandboxPolicy, canary: &Path, workdir: &Path) -> Co
         Err(error) => {
             return Containment::Inconclusive(format!(
                 "could not build the container launch for the probe ({error})"
-            ))
+            ));
         }
     };
     let mut argv = Vec::with_capacity(launch.args.len() + 1);
@@ -528,7 +528,7 @@ fn spawn_and_read(argv: &[String]) -> Containment {
             return Containment::LauncherUnusable(format!(
                 "the launcher '{program}' could not be started ({error}) — every awarded job would \
                  die the same way at spawn"
-            ))
+            ));
         }
     };
 
@@ -549,7 +549,9 @@ fn spawn_and_read(argv: &[String]) -> Containment {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(error) => {
-                return Containment::Inconclusive(format!("could not wait for the launcher ({error})"))
+                return Containment::Inconclusive(format!(
+                    "could not wait for the launcher ({error})"
+                ));
             }
         }
     }
@@ -557,7 +559,9 @@ fn spawn_and_read(argv: &[String]) -> Containment {
     let output = match child.wait_with_output() {
         Ok(output) => output,
         Err(error) => {
-            return Containment::Inconclusive(format!("could not read the probe's output ({error})"))
+            return Containment::Inconclusive(format!(
+                "could not read the probe's output ({error})"
+            ));
         }
     };
 
@@ -674,7 +678,11 @@ mod tests {
             &mut out,
             &mut err,
         );
-        assert!(String::from_utf8(out).expect("utf8").contains(CANARY_READ_OK));
+        assert!(
+            String::from_utf8(out)
+                .expect("utf8")
+                .contains(CANARY_READ_OK)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -691,19 +699,27 @@ mod tests {
     #[test]
     fn a_readable_canary_is_not_containment() {
         let verdict = verdict_from_payload("canary_read=ok\nworkdir_write=ok\n");
-        assert!(matches!(verdict, Containment::NotContained(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, Containment::NotContained(_)),
+            "{verdict:?}"
+        );
     }
 
     #[test]
     fn both_legs_as_required_is_containment() {
-        let verdict = verdict_from_payload("canary_read=denied (permission denied)\nworkdir_write=ok\n");
+        let verdict =
+            verdict_from_payload("canary_read=denied (permission denied)\nworkdir_write=ok\n");
         assert_eq!(verdict, Containment::Contained);
     }
 
     #[test]
     fn a_sandbox_too_tight_to_write_is_refused_on_its_own_terms() {
-        let verdict = verdict_from_payload("canary_read=denied\nworkdir_write=denied (read-only)\n");
-        assert!(matches!(verdict, Containment::WorkdirUnwritable(_)), "{verdict:?}");
+        let verdict =
+            verdict_from_payload("canary_read=denied\nworkdir_write=denied (read-only)\n");
+        assert!(
+            matches!(verdict, Containment::WorkdirUnwritable(_)),
+            "{verdict:?}"
+        );
     }
 
     // The motivating live failure: bubblewrap resolves, then dies at spawn. No probe line is
@@ -711,8 +727,14 @@ mod tests {
     #[test]
     fn a_launcher_that_never_ran_the_payload_is_not_containment() {
         let verdict = verdict_from_payload("bwrap: setting up uid map: Permission denied\n");
-        assert!(matches!(verdict, Containment::LauncherUnusable(_)), "{verdict:?}");
-        assert!(verdict.detail().contains("uid map"), "the launcher's own diagnostic must survive: {verdict:?}");
+        assert!(
+            matches!(verdict, Containment::LauncherUnusable(_)),
+            "{verdict:?}"
+        );
+        assert!(
+            verdict.detail().contains("uid map"),
+            "the launcher's own diagnostic must survive: {verdict:?}"
+        );
     }
 
     #[test]
@@ -720,7 +742,10 @@ mod tests {
         // Only the read leg reported: the payload died between the two writes, so nothing is known
         // about the workdir.
         let verdict = verdict_from_payload("canary_read=denied\n");
-        assert!(matches!(verdict, Containment::LauncherUnusable(_)), "{verdict:?}");
+        assert!(
+            matches!(verdict, Containment::LauncherUnusable(_)),
+            "{verdict:?}"
+        );
     }
 
     // ── Admission ───────────────────────────────────────────────────────────────────────────────
@@ -741,7 +766,9 @@ mod tests {
     #[test]
     fn the_override_is_the_only_way_past_a_failed_probe() {
         assert!(open_pool_admission(true, &Containment::NotContained("x".into()), true).is_ok());
-        assert!(open_pool_admission(true, &Containment::LauncherUnusable("x".into()), true).is_ok());
+        assert!(
+            open_pool_admission(true, &Containment::LauncherUnusable("x".into()), true).is_ok()
+        );
     }
 
     // Every non-Contained variant must refuse an open-pool seat. Enumerated rather than sampled:
@@ -766,8 +793,14 @@ mod tests {
         let root = scratch();
         let verdict = probe_containment(&SandboxPolicy::passthrough(), &root);
         let _ = std::fs::remove_dir_all(&root);
-        assert!(matches!(verdict, Containment::NotContained(_)), "{verdict:?}");
-        assert!(verdict.detail().contains("no [sandbox] launcher"), "{verdict:?}");
+        assert!(
+            matches!(verdict, Containment::NotContained(_)),
+            "{verdict:?}"
+        );
+        assert!(
+            verdict.detail().contains("no [sandbox] launcher"),
+            "{verdict:?}"
+        );
     }
 
     // ── the container payload ───────────────────────────────────────────────────────────────────
@@ -797,7 +830,10 @@ mod tests {
         std::fs::write(&canary, b"canary\n").expect("write canary");
         let reachable = run_payload_on_host(&canary, &workdir);
         assert!(
-            matches!(verdict_from_payload(&reachable), Containment::NotContained(_)),
+            matches!(
+                verdict_from_payload(&reachable),
+                Containment::NotContained(_)
+            ),
             "a readable canary must read as NotContained, got: {reachable:?}"
         );
 
@@ -823,7 +859,10 @@ mod tests {
             if super::owner_of(&readonly).map(|(uid, _)| uid) != Some(0) {
                 let denied = run_payload_on_host(&canary, &readonly);
                 assert!(
-                    matches!(verdict_from_payload(&denied), Containment::WorkdirUnwritable(_)),
+                    matches!(
+                        verdict_from_payload(&denied),
+                        Containment::WorkdirUnwritable(_)
+                    ),
                     "an unwritable workdir must not read as contained, got: {denied:?}"
                 );
             }
