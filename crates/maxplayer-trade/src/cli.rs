@@ -226,7 +226,9 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
             "{}",
             moved(
                 "withdraw",
-                "maxplayer wallet melt <bolt11> --max-debit <sats> --mint <url>"
+                "maxplayer wallet melt <bolt11> --max-debit <sats> --mint <url>` (its --max-debit \
+                 bounds invoice + fee reserve; input fees come on top; a legacy standalone home \
+                 drains with `maxplayer trade --home <legacy> send"
             )
         ),
         Command::Receive { .. } => anyhow::bail!(
@@ -465,7 +467,7 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
             .await?
             .is_empty()
     {
-        let pending = crate::money::recover(home, &money_journal).await?;
+        let pending = crate::money::recover_explicit(home, &money_journal).await?;
         return coordinator::recovery_status(&money_journal, pending).await;
     }
     if !matches!(&cli.command, Command::Balance { .. } | Command::Send { .. }) {

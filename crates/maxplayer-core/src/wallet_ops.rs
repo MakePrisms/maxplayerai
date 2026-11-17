@@ -2590,15 +2590,20 @@ pub fn melt_blocking(
     runtime.block_on(melt_async(home, bolt11, mint_override))
 }
 
+/// The amount of a BOLT11 invoice in millisats. An undecodable or amountless invoice is an error.
+pub fn invoice_amount_msat(bolt11: &str) -> Result<u64, WalletOpsError> {
+    let invoice = cdk::Bolt11Invoice::from_str(bolt11.trim())
+        .map_err(|error| WalletOpsError::Wallet(format!("invalid bolt11 invoice: {error}")))?;
+    invoice
+        .amount_milli_satoshis()
+        .ok_or_else(|| WalletOpsError::Wallet("invoice has no amount".into()))
+}
+
 /// The amount of a BOLT11 invoice in whole sats, for a caller that bounds a melt by it
 /// (`maxplayer wallet melt --max-debit`). An amountless or sub-sat invoice is refused: a ceiling
 /// needs the exact invoice amount.
 pub fn invoice_amount_sats(bolt11: &str) -> Result<u64, WalletOpsError> {
-    let invoice = cdk::Bolt11Invoice::from_str(bolt11.trim())
-        .map_err(|error| WalletOpsError::Wallet(format!("invalid bolt11 invoice: {error}")))?;
-    let msat = invoice
-        .amount_milli_satoshis()
-        .ok_or_else(|| WalletOpsError::Wallet("invoice has no amount".into()))?;
+    let msat = invoice_amount_msat(bolt11)?;
     if msat % 1000 != 0 {
         return Err(WalletOpsError::Wallet(
             "invoice amount is not a whole number of sats".into(),
@@ -3013,6 +3018,8 @@ mod tests {
                 .to_string()
         };
         assert_eq!(invoice_amount_sats(&invoice(31_000)).unwrap(), 31);
+        assert_eq!(invoice_amount_msat(&invoice(31_500)).unwrap(), 31_500);
+        assert!(invoice_amount_msat("lnbc1bogus").is_err());
         assert!(
             invoice_amount_sats(&invoice(31_500)).is_err(),
             "sub-sat refused"

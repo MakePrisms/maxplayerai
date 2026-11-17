@@ -299,8 +299,8 @@ One swap of the selected inputs into the exact send outputs plus change; inputs,
 outputs and secrets are journaled before the POST. Ambiguity → NUT-09 restore of the
 same outputs and identical replay only. The file is written only after the swap is
 definitive and every output verifies DLEQ; the token is kept in the private journal so
-`recover` rewrites the same token after a crash. Rerunning the same command with the
-same `--out` resumes that attempt, or rewrites the same journaled token if the file was
+`recover` rewrites the same token after a crash. On a legacy home, rerunning the same command
+with the same `--out` resumes that attempt, or rewrites the same journaled token if the file was
 moved or deleted (only if NUT-07 shows every sent proof UNSPENT; SPENT, PENDING or an
 unreachable mint exit 1, "already (partially) redeemed or pending; choose another --out"; a rewrite prints a stderr notice
 and `"rewritten": true`); it never sends twice. A `reclaiming` send's `--out` is

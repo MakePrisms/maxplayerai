@@ -1206,9 +1206,11 @@ async fn advance_inner(home: &Path, j: &Journal, m: &Market, s: &mut Swap) -> Re
     Ok(())
 }
 pub async fn recover(home: &Path, j: &Journal, m: &Market) -> Result<()> {
-    recover_pass(home, j, m).await.map(|_| ())
+    recover_pass(home, j, m, false).await.map(|_| ())
 }
-async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
+/// `explicit`: the `recover` command, which also re-polls `expired_unpaid` fundings
+/// ([`crate::money::recover_explicit`]).
+async fn recover_pass(home: &Path, j: &Journal, m: &Market, explicit: bool) -> Result<bool> {
     let mut deferred = false;
     // Swaps first: their claims and refunds have hard deadlines, while wallet money recovery
     // (funding, withdraw, receive, send) has none and can spend a whole item budget on one slow
@@ -1226,7 +1228,20 @@ async fn recover_pass(home: &Path, j: &Journal, m: &Market) -> Result<bool> {
     for s in swaps {
         deferred |= recover_swap(home, j, m, s).await?;
     }
-    deferred |= recover_money(home, j, None).await;
+    deferred |= if explicit {
+        match crate::money::recover_fundings(home, j, None, true).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!(
+                    "money recovery deferred; journal retained: {}",
+                    crate::redact_reason(&format!("{error:#}"))
+                );
+                true
+            }
+        }
+    } else {
+        recover_money(home, j, None).await
+    };
     let swaps = j.all::<Swap>("swap").await?;
     for l in j.all::<Listing>("listing").await? {
         deferred |= recover_listing(home, j, m, l, &swaps).await;
@@ -1844,7 +1859,7 @@ impl std::error::Error for ManualRecovery {}
 /// One bounded pass, without admitting fresh requests or waiting for deadlines.
 /// The historical function name is retained for library callers.
 pub async fn recover_until_settled(home: &Path, j: &Journal, m: &mut Market) -> Result<()> {
-    let deferred = recover_pass(home, j, m).await?;
+    let deferred = recover_pass(home, j, m, true).await?;
     recovery_status(j, deferred).await
 }
 

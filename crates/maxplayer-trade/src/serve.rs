@@ -60,6 +60,21 @@ pub fn obsolete_client(line: &str) -> Option<&'static str> {
         .as_u64()?;
     (v < u64::from(FIRST_MAXPLAYER_PROTOCOL_V)).then_some(OBSOLETE_CLIENT)
 }
+/// The version-mismatch refusal for any other client whose `v` is not [`PROTOCOL_V`], read off the
+/// raw line so a command this serve no longer parses (a v4 `receive`) still gets the reason.
+fn version_mismatch(line: &str) -> Option<String> {
+    let v = serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("v")?
+        .as_u64()?;
+    (v != u64::from(PROTOCOL_V)).then(|| mismatch_text(v))
+}
+fn mismatch_text(v: u64) -> String {
+    format!(
+        "serve protocol version mismatch (serve {PROTOCOL_V}, client {v}); run the same \
+         maxplayer version as serve; nothing was queued or executed"
+    )
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -347,11 +362,7 @@ fn refusal(request: &Request, relays: &[String], mint_relays: &[String]) -> Opti
         return Some(OBSOLETE_CLIENT.to_string());
     }
     if request.v != PROTOCOL_V {
-        return Some(format!(
-            "serve protocol version mismatch (serve {PROTOCOL_V}, client {}); run the same \
-             maxplayer version as serve",
-            request.v
-        ));
+        return Some(mismatch_text(u64::from(request.v)));
     }
     let (market, mint) = request.command.relay_needs();
     if market && request.relays != relays {
@@ -407,6 +418,17 @@ async fn connection(
             &Reply::Exit {
                 code: 1,
                 error: Some(error.to_string()),
+            },
+        )
+        .await;
+        bail!(error)
+    }
+    if let Some(error) = version_mismatch(&line) {
+        let _ = write(
+            &mut stream,
+            &Reply::Exit {
+                code: 1,
+                error: Some(error.clone()),
             },
         )
         .await;
@@ -1119,6 +1141,10 @@ mod obsolete_client_tests {
         })
         .unwrap();
         assert_eq!(obsolete_client(&current), None);
+        assert_eq!(version_mismatch(&current), None);
+        // A protocol-4 `maxplayer trade` handing off a command serve 5 dropped gets the reason.
+        let v4 = r#"{"v":4,"relays":[],"mint_relays":[],"command":{"receive":{"mint":"m","token":"t"}}}"#;
+        assert!(version_mismatch(v4).unwrap().contains("client 4"));
         assert!(OBSOLETE_CLIENT.contains("maxplayer trade"));
         assert!(OBSOLETE_CLIENT.contains("nothing was queued or executed"));
     }

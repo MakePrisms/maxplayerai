@@ -13,6 +13,10 @@ use maxplayer_core::wallet_ops;
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
 const RUNTIME_ERROR: i32 = 2;
+/// `wallet send --out`: the send went through but the token file could not be written; the token
+/// was printed on stdout instead. Distinct from [`RUNTIME_ERROR`] ("nothing left the wallet").
+#[cfg(feature = "wallet")]
+const SENT_TOKEN_NOT_WRITTEN: i32 = 5;
 
 #[derive(Debug, Default)]
 struct CommonOpts {
@@ -166,6 +170,7 @@ fn take_value_flag(args: &[String], flag: &str) -> Result<(Option<String>, Vec<S
             index += 1;
             let given = args
                 .get(index)
+                .filter(|value| !value.starts_with("--"))
                 .ok_or_else(|| format!("{flag} requires a value"))?;
             if value.replace(given.clone()).is_some() {
                 return Err(format!("{flag} given more than once"));
@@ -980,20 +985,39 @@ fn cmd_send(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         );
         return USAGE_ERROR;
     }
-    // A taken --out is refused before anything is sent: the token file is never overwritten.
-    if let Some(path) = &out_file
-        && std::fs::symlink_metadata(path).is_ok()
-    {
-        let _ = writeln!(
-            err,
-            "--out {} already exists; nothing was sent (choose a new file)",
-            path.display()
-        );
-        return USAGE_ERROR;
-    }
+    // The --out file is created (new, 0600) BEFORE anything is sent: a taken, unwritable or
+    // missing path is refused while the money is still in the wallet, and the file is never
+    // overwritten. It is removed again if nothing is sent.
+    let mut reserved = match &out_file {
+        Some(path) => match reserve_token_file(path) {
+            Ok(file) => Some(file),
+            Err(error) => {
+                let _ = writeln!(
+                    err,
+                    "--out {}: {}; nothing was sent (choose a new file in a writable directory)",
+                    path.display(),
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        "already exists".to_string()
+                    } else {
+                        error.to_string()
+                    }
+                );
+                return USAGE_ERROR;
+            }
+        },
+        None => None,
+    };
+    let unreserve = |path: &Option<PathBuf>| {
+        if let Some(path) = path {
+            let _ = std::fs::remove_file(path);
+        }
+    };
     let home = match bootstrap_home(&opts, err) {
         Ok(home) => home,
-        Err(code) => return code,
+        Err(code) => {
+            unreserve(&out_file);
+            return code;
+        }
     };
     match wallet_ops::send_blocking(&home, amount, opts.mint.as_deref()) {
         Ok(outcome) => {
@@ -1003,11 +1027,11 @@ fn cmd_send(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 "sent_sats={} balance_sats={} mint={}",
                 outcome.sent_sats, outcome.balance_sats, outcome.mint_url
             );
-            let Some(path) = out_file else {
+            let (Some(path), Some(file)) = (out_file, reserved.take()) else {
                 let _ = writeln!(out, "{}", outcome.token);
                 return SUCCESS;
             };
-            match write_token_file(&path, &outcome.token) {
+            match write_token_file(file, &path, &outcome.token) {
                 Ok(()) => {
                     let _ = writeln!(
                         err,
@@ -1019,18 +1043,26 @@ fn cmd_send(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                     SUCCESS
                 }
                 Err(error) => {
-                    // The value has already left the balance: the token must not be lost.
+                    // The value has already left the balance: the token must not be lost. A
+                    // partial file is removed so it is never mistaken for the token.
+                    let _ = std::fs::remove_file(&path);
+                    let printed = writeln!(out, "{}", outcome.token).and_then(|()| out.flush());
                     let _ = writeln!(
                         err,
-                        "could not write --out {} ({error}); the token is printed on stdout instead",
-                        path.display()
+                        "SENT but could not write --out {} ({error}); {}",
+                        path.display(),
+                        if printed.is_ok() {
+                            "the token is on stdout instead: keep it private"
+                        } else {
+                            "and stdout failed too: the token was not output"
+                        }
                     );
-                    let _ = writeln!(out, "{}", outcome.token);
-                    RUNTIME_ERROR
+                    SENT_TOKEN_NOT_WRITTEN
                 }
             }
         }
         Err(error) => {
+            unreserve(&out_file);
             let _ = writeln!(err, "{error}");
             RUNTIME_ERROR
         }
@@ -1038,17 +1070,32 @@ fn cmd_send(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 
 #[cfg(feature = "wallet")]
-/// Create `path` (0600, never an existing file) holding `token` and a newline, synced to disk.
-fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+/// Create `path` empty (0600, never an existing file or a symlink), before the send.
+fn reserve_token_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)?;
+        .open(path)
+}
+
+#[cfg(feature = "wallet")]
+/// Write `token` and a newline through the file [`reserve_token_file`] created, then sync it and
+/// its directory.
+fn write_token_file(
+    mut file: std::fs::File,
+    path: &std::path::Path,
+    token: &str,
+) -> std::io::Result<()> {
     file.write_all(token.as_bytes())?;
     file.write_all(b"\n")?;
-    file.sync_all()
+    file.sync_all()?;
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => std::path::Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(feature = "wallet")]
@@ -1434,16 +1481,22 @@ fn cmd_melt(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return USAGE_ERROR;
         }
     };
-    // The per-operation cap needs the invoice amount; so does the ceiling. An undecodable or
-    // amountless invoice is refused only when one of them needs it (plain `melt` behaves as before).
-    if let Ok(invoice_sats) = wallet_ops::invoice_amount_sats(bolt11)
-        && invoice_sats > MAX_SPEND_SATS
-    {
-        let _ = writeln!(
-            err,
-            "melt refused: {invoice_sats} sats is over the {MAX_SPEND_SATS}-sat limit per melt"
-        );
-        return USAGE_ERROR;
+    // The per-operation cap fails closed: an invoice whose amount cannot be read (undecodable,
+    // amountless) is refused, and a sub-sat amount counts rounded up.
+    match wallet_ops::invoice_amount_msat(bolt11) {
+        Ok(msat) if msat.div_ceil(1000) <= MAX_SPEND_SATS => {}
+        Ok(msat) => {
+            let _ = writeln!(
+                err,
+                "melt refused: {} sats is over the {MAX_SPEND_SATS}-sat limit per melt",
+                msat.div_ceil(1000)
+            );
+            return USAGE_ERROR;
+        }
+        Err(error) => {
+            let _ = writeln!(err, "melt refused: {error}");
+            return USAGE_ERROR;
+        }
     }
     // The ceiling needs the invoice's exact amount; an undecodable or amountless invoice is refused
     // before any home is created or any mint is asked.
@@ -1743,6 +1796,21 @@ mod tests {
         assert_eq!(code, USAGE_ERROR, "{err}");
         assert!(err.contains("already exists; nothing was sent"), "{err}");
         assert_eq!(std::fs::read_to_string(&taken).unwrap(), "keep");
+        // A missing directory is refused before sending (review r1 H2), not after.
+        let missing = dir.join("no-such-dir").join("t");
+        let (code, err) = run(&[
+            "5",
+            "--out",
+            missing.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+        ]);
+        assert_eq!(code, USAGE_ERROR, "{err}");
+        assert!(err.contains("nothing was sent"), "{err}");
+        // A flag is never taken as the --out value.
+        let (code, err) = run(&["5", "--out", "--home", home.to_str().unwrap()]);
+        assert_eq!(code, USAGE_ERROR, "{err}");
+        assert!(err.contains("requires a value"), "{err}");
         let (code, err) = run(&["100001", "--home", home.to_str().unwrap()]);
         assert_eq!(code, USAGE_ERROR, "{err}");
         assert!(err.contains("100000-sat limit"), "{err}");
@@ -1758,16 +1826,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t");
-        write_token_file(&path, "cashuBx").unwrap();
+        let file = reserve_token_file(&path).unwrap();
+        write_token_file(file, &path, "cashuBx").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "cashuBx\n");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        assert!(
-            write_token_file(&path, "cashuBy").is_err(),
-            "never overwritten"
-        );
+        assert!(reserve_token_file(&path).is_err(), "never overwritten");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "cashuBx\n");
+        // A dangling symlink is not followed.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("target"), &link).unwrap();
+        assert!(reserve_token_file(&link).is_err(), "symlink not followed");
+        assert!(!dir.join("target").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The 100,000-sat melt cap fails closed (review r1 M1): an invoice over it by a fraction of a
+    /// sat, and an amountless or undecodable one, are refused before any home is created.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn melt_cap_counts_sub_sat_amounts_and_refuses_unreadable_invoices() {
+        let invoice = |msat: Option<u64>| {
+            use cdk::lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+            use cdk::secp256k1::hashes::{Hash as _, sha256};
+            use cdk::secp256k1::{Secp256k1, SecretKey};
+            let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+            let builder = InvoiceBuilder::new(Currency::Bitcoin)
+                .description(String::new())
+                .payment_hash(sha256::Hash::hash(&[1u8]))
+                .payment_secret(PaymentSecret([42u8; 32]))
+                .current_timestamp()
+                .min_final_cltv_expiry_delta(144);
+            match msat {
+                Some(msat) => builder
+                    .amount_milli_satoshis(msat)
+                    .build_signed(|h| Secp256k1::new().sign_ecdsa_recoverable(h, &key))
+                    .unwrap()
+                    .to_string(),
+                None => builder
+                    .build_signed(|h| Secp256k1::new().sign_ecdsa_recoverable(h, &key))
+                    .unwrap()
+                    .to_string(),
+            }
+        };
+        let dir = std::env::temp_dir().join(format!("wallet-melt-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        for (bolt11, needle) in [
+            (invoice(Some(100_000_001)), "100001 sats is over"),
+            (invoice(None), "no amount"),
+            ("lnbc1bogus".to_string(), "invalid bolt11"),
+        ] {
+            let args = vec![bolt11, "--home".into(), home.to_str().unwrap().into()];
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_melt(&args, &mut out, &mut err);
+            let err = String::from_utf8_lossy(&err);
+            assert_eq!(code, USAGE_ERROR, "{err}");
+            assert!(err.contains(needle), "{needle}: {err}");
+            assert!(!home.exists(), "SAFETY: a refused melt created the home");
+        }
     }
 
     /// `wallet melt --max-debit` needs the invoice amount: an undecodable invoice and a zero ceiling

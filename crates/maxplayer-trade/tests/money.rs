@@ -651,3 +651,27 @@ async fn zero_amounts_are_refused_before_caps_journal_or_mint() {
     assert!(j.all::<Withdrawal>("withdrawal").await.unwrap().is_empty());
     assert_eq!(m.faults.requests.load(SeqCst), 0, "SAFETY: no mint request");
 }
+
+/// A real withdrawal process (the test binary's lab entry point: `trade withdraw` moved to
+/// `maxplayer wallet melt`) crashes after the melt reply; `recover` finishes the journaled record
+/// without resubmitting (review r1 M3, #1332).
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn crash_after_melt_reply_recovers_without_resubmission() {
+    let (h, m, j) = setup().await;
+    let home = h.path().to_owned();
+    let url = m.url.clone();
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args(["__lab-withdraw", home.to_str().unwrap(), &url, &invoice(31)])
+            .env("TRADE_CRASH_AFTER_MELT", "1")
+            .output()
+            .unwrap()
+            .status
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.code(), Some(86));
+    money::recover(h.path(), &j).await.unwrap();
+    assert_eq!(balance(h.path(), &m.url).await, 96);
+}

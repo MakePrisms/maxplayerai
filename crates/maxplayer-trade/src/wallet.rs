@@ -468,7 +468,7 @@ pub fn mixed_refusal(home: &Path) -> String {
                 "Move exactly those files into a new directory <dir> (e.g. {h}-legacy-trade), finish \
                  and drain it there (`maxplayer trade --home <dir> recover`, then `maxplayer trade \
                  --home <dir> send <mint> --amount <n> --out <file>` and `maxplayer wallet receive \
-                 \"$(cat <file>)\" --home {h}`), then retry here.",
+                 --token-file <file> --home {h}`), then retry here.",
                 h = home.display()
             )
         }
@@ -745,7 +745,7 @@ pub fn legacy_warning(home: &Path) -> String {
     format!(
         "warning: {} is a legacy standalone trading home (wallet.seed / trade.key); this mode is \
          deprecated. Only draining it and finishing in-flight trades are allowed there (balance, \
-         status, recover, send, withdraw, serve, cancel, doctor). Move its funds to your maxplayer \
+         status, recover, send, serve, cancel, doctor). Move its funds to your maxplayer \
          home and trade from there.",
         home.display()
     )
@@ -756,7 +756,7 @@ pub fn legacy_refusal(home: &Path) -> String {
         "refused: {h} is a legacy standalone trading home; new trades and deposits are no longer \
          made there (finish in-flight trades with `serve`/`recover`/`cancel` first). Move its funds \
          to your maxplayer home: `maxplayer trade --home {h} send <mint> --amount <n> --out <file>`, \
-         then `maxplayer wallet receive \"$(cat <file>)\"`. Then trade from the maxplayer home \
+         then `maxplayer wallet receive --token-file <file>`. Then trade from the maxplayer home \
          (`maxplayer trade` with no --home uses $MAXPLAYER_HOME or ~/.maxplayer).",
         h = home.display()
     )

@@ -37,7 +37,8 @@ also preflights before list/take/send
 ([checks](references/commands.md#enforced-monetary-policy)). Never bypass a failed check. Capped at
 **100,000 sats** per lock, `wallet send` and `wallet melt`. Money in and out is `maxplayer wallet`
 (same home, same wallet). Pass `wallet melt --max-debit` to cap invoice + the mint's fee
-reserve. Fees can push a net lock over the cap.
+reserve; the mint's input fee comes on top, so approve a total that leaves room for it. Fees can
+push a net lock over the cap.
 
 **Before every real-money funding, `list`, `take`, withdrawal or send, present
 the exact operation and get an explicit yes.** For `list`/`take`, first show the

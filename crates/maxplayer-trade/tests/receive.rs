@@ -729,3 +729,149 @@ async fn recover_prints_redacted_deferral_reason_for_receive() {
     );
     assert_secret_free(&out, &token, &proofs);
 }
+
+/// A real `receive` process (the test binary's lab entry point: the CLI arm moved to `maxplayer
+/// wallet`) with one crash hook set, so `recover` finds the journaled record a crashed pre-upgrade
+/// receive left behind (review r1 M3, #1332).
+#[cfg(feature = "lab")]
+async fn crashed_receive(
+    home: &Path,
+    mint: &str,
+    token: &str,
+    hook: &'static str,
+) -> std::process::Output {
+    use std::io::Write;
+    let (home, mint, token) = (home.to_owned(), mint.to_owned(), token.to_owned());
+    tokio::task::spawn_blocking(move || {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args(["__lab-receive", home.to_str().unwrap(), &mint])
+            .env(hook, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(token.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn crash_after_journal_before_post_then_recover_completes() {
+    let m = MintFixture::start(0).await;
+    let (_s, proofs, token) = issue(&m, 56).await;
+    let (h, j) = home().await;
+    let out = crashed_receive(h.path(), &m.url, &token, "TRADE_CRASH_BEFORE_RECEIVE_SWAP").await;
+    assert_eq!(out.status.code(), Some(87));
+    assert_secret_free(&out, &token, &proofs);
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        0,
+        "SAFETY: crashed before POST"
+    );
+    assert_eq!(receipts(&j).await.len(), 1, "SAFETY: journaled before POST");
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(m.faults.swaps.load(SeqCst), 1);
+    assert_eq!(balance(h.path(), &m.url).await, 56);
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn crash_after_post_before_wallet_commit_then_recover_completes() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 56).await;
+    let (h, j) = home().await;
+    let out = crashed_receive(h.path(), &m.url, &token, "TRADE_CRASH_AFTER_RECEIVE_SWAP").await;
+    assert_eq!(out.status.code(), Some(86));
+    assert_eq!(m.faults.swaps.load(SeqCst), 1);
+    assert_eq!(balance(h.path(), &m.url).await, 0, "crashed before credit");
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: no second swap");
+    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: credited once");
+    money::recover(h.path(), &j).await.unwrap();
+    assert_eq!(balance(h.path(), &m.url).await, 56);
+}
+
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn journaled_token_spent_elsewhere_is_terminal_already_spent() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 40).await;
+    let (h, j) = home().await;
+    let out = crashed_receive(h.path(), &m.url, &token, "TRADE_CRASH_BEFORE_RECEIVE_SWAP").await;
+    assert_eq!(out.status.code(), Some(87));
+    let (other, jo) = home().await;
+    receive::receive(other.path(), &jo, &m.url, &token)
+        .await
+        .unwrap();
+    let swaps = m.faults.swaps.load(SeqCst);
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::AlreadySpent);
+    assert_eq!(
+        m.faults.swaps.load(SeqCst),
+        swaps,
+        "SAFETY: no POST of spent inputs"
+    );
+    assert_eq!(
+        balance(h.path(), &m.url).await,
+        0,
+        "SAFETY: nothing credited"
+    );
+}
+
+/// Credited rows stay RESERVED (unspendable) until `done` is journaled.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn credited_rows_unspendable_until_done_is_journaled() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 56).await;
+    let (h, j) = home().await;
+    let out = crashed_receive(h.path(), &m.url, &token, "TRADE_CRASH_BEFORE_RECEIVE_DONE").await;
+    assert_eq!(out.status.code(), Some(85));
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
+    assert_eq!(
+        balance(h.path(), &m.url).await,
+        0,
+        "SAFETY: credited rows are not spendable before done"
+    );
+    let invoice = cdk_fake_wallet::create_fake_invoice(20_000, String::new()).to_string();
+    assert!(
+        money::withdraw(h.path(), &j, &m.url, &invoice)
+            .await
+            .is_err(),
+        "SAFETY: withdraw cannot spend undone receive rows"
+    );
+    money::recover(h.path(), &j).await.unwrap();
+    assert_eq!(receipts(&j).await[0].state, ReceiveState::Done);
+    assert!(receipts(&j).await[0].settled());
+    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: credited once");
+    assert_eq!(m.faults.swaps.load(SeqCst), 1);
+}
+
+/// A crash after `done` is journaled but before release leaves the rows reserved; `recover`
+/// releases them exactly once.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn crash_after_done_before_release_is_released_by_recover() {
+    let m = MintFixture::start(0).await;
+    let (_s, _, token) = issue(&m, 56).await;
+    let (h, j) = home().await;
+    let out = crashed_receive(h.path(), &m.url, &token, "TRADE_CRASH_AFTER_RECEIVE_DONE").await;
+    assert_eq!(out.status.code(), Some(84));
+    let r = &receipts(&j).await[0];
+    assert!(r.state == ReceiveState::Done && !r.settled());
+    assert_eq!(balance(h.path(), &m.url).await, 0, "still reserved");
+    money::recover(h.path(), &j).await.unwrap();
+    assert!(receipts(&j).await[0].settled());
+    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: released once");
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    assert_eq!(balance(h.path(), &m.url).await, 56);
+}

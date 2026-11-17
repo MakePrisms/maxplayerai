@@ -109,12 +109,6 @@ will survive logout or reboot.
 trading limits. Explain these limits before asking for the amount, then validate
 the proposed terms against the chosen mint and existing trading home:
 
-- A token received must be at most **100,000 sats gross**. All funding intents
-  plus charged receives share a **100,000-sat cumulative cap per mint per home**.
-  Inspect `status` and the recorded history, not just the current balance. Count
-  `prepared`, `submitted`, `done` and `quarantined` receives; exclude `refused` and
-  `already_spent`. Remaining capacity is `100,000 - funding intents - charged
-  receives`. Spending or sending tokens out does not reset this lifetime cap.
 - Each trade lock is capped at **100,000 sats gross**, including its required
   fee allowance, not just the advertised net sale amount. Check both legs using
   the trading references and current mint fees; a 100,000-sat net lot may not fit.
@@ -123,10 +117,10 @@ the proposed terms against the chosen mint and existing trading home:
   chosen revision's issuance split and receive sizing rules before issuing;
   a face amount under the cap alone is not proof that an arbitrary token fits.
 
-If remaining capacity, fee-inclusive locks or proof/payload fit cannot be
-established, stop before issuance and report the uncertainty. Do not test capacity
-by issuing spendable tokens, silently lower amounts, split batches to evade the
-cumulative cap, or create a new home to bypass it. Propose supported terms for
+If fee-inclusive locks or proof/payload fit cannot be established, stop before
+issuance and report the uncertainty. Do not test capacity by issuing spendable
+tokens, silently lower amounts, split batches to evade a cap, or create a new home
+to bypass it. Propose supported terms for
 fresh approval. Recheck capacity immediately before issuance if the home changed.
 
 Ask only for missing terms: how many tokens to issue and import, how many to sell,
