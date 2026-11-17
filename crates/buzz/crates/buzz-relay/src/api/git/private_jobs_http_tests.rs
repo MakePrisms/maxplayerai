@@ -245,6 +245,7 @@ async fn harness(service: &Keys, bind_addr: Option<std::net::SocketAddr>) -> Har
     config.require_relay_membership = false;
     config.git_public_read = true; // Deliberately enable the generic public-read exception.
     config.private_job_repos = true;
+    config.team_repos = true;
     config.private_service_pubkey = Some(service.public_key().to_hex());
     config.git_pack_cache_path = temp.path().join("cache");
     config.git_repo_path = temp.path().join("repos");
@@ -777,5 +778,141 @@ async fn buyer_prepared_repo(open_pool: bool) {
         assert!(after.refs.contains_key(&delivery));
     }
     server.abort();
+    h.object_server.abort();
+}
+
+
+/// MAXPLAYER teams (docs/specs/maxplayer-team.md §3–4), end to end with the real `git`
+/// client: only the owner provisions; members clone and push; the service reads but
+/// can't push; outsiders and removed members are refused; history is append-only.
+#[tokio::test]
+#[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
+async fn team_repo_members_push_service_reads_outsiders_and_removed_members_denied() {
+    let owner_keys = Keys::generate();
+    let member = Keys::generate();
+    let service = Keys::generate();
+    let outsider = Keys::generate();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = harness(&service, Some(addr)).await;
+    let app = super::transport::git_router(h.state.clone());
+    let served = app
+        .clone()
+        .merge(super::git_policy_router(h.state.clone()))
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, served).await.unwrap();
+    });
+    let owner = owner_keys.public_key().to_hex();
+    let team = "41".repeat(32);
+    let put_path = format!("/api/teams/{team}");
+    let get_path = format!("/api/teams/{owner}/{team}");
+    let put = |keys: &Keys, body: serde_json::Value| {
+        let body = serde_json::to_vec(&body).unwrap();
+        let auth = token(keys, &format!("https://{}{put_path}", h.host), "PUT", Some(&body));
+        (auth, body)
+    };
+    let members = vec![member.public_key().to_hex()];
+    // Only the owner's own namespace: an outsider signing the same path creates a team
+    // in the OUTSIDER's namespace, never the owner's.
+    let (auth, body) = put(&owner_keys, serde_json::json!({"members": members, "expected_version": 0}));
+    let created = request(&app, &h.host, "PUT", &put_path, Some(&auth), body).await;
+    assert_eq!(created.status(), StatusCode::OK);
+    let created: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(created.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(created["version"], 1);
+    assert_eq!(created["owner"], owner);
+    // Replay of the same signed request is refused; a stale version conflicts.
+    let (auth, body) = put(&owner_keys, serde_json::json!({"members": members, "expected_version": 0}));
+    assert_eq!(request(&app, &h.host, "PUT", &put_path, Some(&auth), body.clone()).await.status(), StatusCode::CONFLICT);
+    assert_eq!(request(&app, &h.host, "PUT", &put_path, Some(&auth), body).await.status(), StatusCode::UNAUTHORIZED);
+    let (auth, body) = put(&owner_keys, serde_json::json!({"members": members, "expected_version": 9}));
+    assert_eq!(request(&app, &h.host, "PUT", &put_path, Some(&auth), body).await.status(), StatusCode::CONFLICT);
+    // Unknown fields and bad keys are refused.
+    let (auth, body) = put(&owner_keys, serde_json::json!({"members": ["zz"], "expected_version": 1}));
+    assert_eq!(request(&app, &h.host, "PUT", &put_path, Some(&auth), body).await.status(), StatusCode::BAD_REQUEST);
+
+    // The member list is readable by members and the service, not outsiders.
+    for (keys, ok) in [(&member, true), (&service, true), (&outsider, false)] {
+        let auth = token(keys, &format!("https://{}{get_path}", h.host), "GET", None);
+        let status = request(&app, &h.host, "GET", &get_path, Some(&auth), vec![]).await.status();
+        assert_eq!(status == StatusCode::OK, ok, "GET as {}", keys.public_key());
+    }
+
+    let repo_root = format!("https://{}/git/{owner}/{team}", h.host);
+    let remote = format!("http://{addr}/git/{owner}/{team}");
+    let work = tempfile::tempdir().unwrap();
+    let a = work.path().join("a");
+    let b = work.path().join("b");
+    for dir in [&a, &b] {
+        std::fs::create_dir(dir).unwrap();
+        stdout(&git(dir, &h.host, None, &["init", "-q", "-b", "main"]).await);
+    }
+    std::fs::write(a.join("TASKS.md"), "- one\n").unwrap();
+    stdout(&git(&a, &h.host, None, &["add", "TASKS.md"]).await);
+    stdout(&git(&a, &h.host, None, &["commit", "-q", "-m", "one"]).await);
+    let first = stdout(&git(&a, &h.host, None, &["rev-parse", "HEAD"]).await);
+    // The owner creates main.
+    let auth = token(&owner_keys, &repo_root, "GET", None);
+    stdout(&git(&a, &h.host, Some(&auth), &["push", "-q", &remote, "HEAD:refs/heads/main"]).await);
+    // The member fetches it, fast-forwards main and adds a branch.
+    let auth = token(&member, &repo_root, "GET", None);
+    stdout(&git(&b, &h.host, Some(&auth), &["fetch", "-q", &remote, "main"]).await);
+    stdout(&git(&b, &h.host, None, &["reset", "-q", "--hard", "FETCH_HEAD"]).await);
+    std::fs::write(b.join("TASKS.md"), "- one\n- two\n").unwrap();
+    stdout(&git(&b, &h.host, None, &["commit", "-q", "-am", "two"]).await);
+    let second = stdout(&git(&b, &h.host, None, &["rev-parse", "HEAD"]).await);
+    let auth = token(&member, &repo_root, "GET", None);
+    stdout(&git(&b, &h.host, Some(&auth), &["push", "-q", &remote, "HEAD:refs/heads/main", "HEAD:refs/heads/notes"]).await);
+    let manifest = published_manifest(&h.objects, h.tenant, &owner, &team);
+    assert_eq!(manifest.refs.get("refs/heads/main"), Some(&second));
+    assert!(manifest.refs.contains_key("refs/heads/notes"));
+    // Non-fast-forward (owner's stale `first` tip, forced) and deletion are refused.
+    std::fs::write(a.join("TASKS.md"), "- rewritten\n").unwrap();
+    stdout(&git(&a, &h.host, None, &["commit", "-q", "-am", "diverge"]).await);
+    let auth = token(&owner_keys, &repo_root, "GET", None);
+    assert!(!git(&a, &h.host, Some(&auth), &["push", "-q", "-f", &remote, "HEAD:refs/heads/main"]).await.status.success());
+    let auth = token(&member, &repo_root, "GET", None);
+    assert!(!git(&b, &h.host, Some(&auth), &["push", "-q", &remote, ":refs/heads/notes"]).await.status.success());
+    // The service can read, not push. Outsiders get neither, before any hydration.
+    let auth = token(&service, &repo_root, "GET", None);
+    let svc = work.path().join("svc");
+    std::fs::create_dir(&svc).unwrap();
+    stdout(&git(&svc, &h.host, None, &["init", "-q"]).await);
+    stdout(&git(&svc, &h.host, Some(&auth), &["fetch", "-q", &remote, "main"]).await);
+    let auth = token(&service, &repo_root, "GET", None);
+    assert!(!git(&b, &h.host, Some(&auth), &["push", "-q", &remote, "HEAD:refs/heads/svc"]).await.status.success());
+    let before = h.accesses.load(Ordering::SeqCst);
+    for keys in [&outsider] {
+        let auth = token(keys, &repo_root, "GET", None);
+        for svc_name in ["git-upload-pack", "git-receive-pack"] {
+            let denied = request(&app, &h.host, "GET", &format!("/git/{owner}/{team}/info/refs?service={svc_name}"), Some(&auth), vec![]).await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
+    }
+    assert_eq!(h.accesses.load(Ordering::SeqCst), before, "denied before hydration");
+    // Removing the member takes effect on the next request.
+    let (auth, body) = put(&owner_keys, serde_json::json!({"members": [], "expected_version": 1}));
+    assert_eq!(request(&app, &h.host, "PUT", &put_path, Some(&auth), body).await.status(), StatusCode::OK);
+    let auth = token(&member, &repo_root, "GET", None);
+    assert!(!git(&b, &h.host, Some(&auth), &["fetch", "-q", &remote, "main"]).await.status.success());
+    // A team id can't later be provisioned as a private job, and pushes leave first intact.
+    let offer = private_offer(&owner_keys, &member, &team);
+    let body = serde_json::to_vec(&serde_json::json!({"signed_offer": offer})).unwrap();
+    let job_path = format!("/api/jobs/private/{team}");
+    let auth = token(&owner_keys, &format!("https://{}{job_path}", h.host), "PUT", Some(&body));
+    assert_ne!(request(&app, &h.host, "PUT", &job_path, Some(&auth), body).await.status(), StatusCode::OK);
+    assert_ne!(first, second);
+    // Flag off: provisioning stops, existing team repos stay gated (never public).
+    drop(app);
+    server.abort();
+    // AppState clones share inner Arcs; only the config is replaced.
+    let mut state = (*h.state).clone();
+    Arc::make_mut(&mut state.config).team_repos = false;
+    let app = super::transport::git_router(Arc::new(state));
+    let (auth, body) = put(&owner_keys, serde_json::json!({"members": [], "expected_version": 2}));
+    assert_eq!(request(&app, &h.host, "PUT", &put_path, Some(&auth), body).await.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let auth = token(&outsider, &repo_root, "GET", None);
+    assert_eq!(request(&app, &h.host, "GET", &format!("/git/{owner}/{team}/info/refs?service=git-upload-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
     h.object_server.abort();
 }
