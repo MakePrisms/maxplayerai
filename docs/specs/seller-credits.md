@@ -178,8 +178,12 @@ Nostr identity, but connection metadata, timing and request sizes can still link
 - `maxplayer-mint init` creates `<home>/mint/` (key, seed, `mint.sqlite`, `mint.toml`) and prints the
   `nostr://` URL plus the line to append to `accepted_mints` (accepting sellers also run
   `wallet mints add`, §1 item 2). It refuses if `<home>/mint/` exists
-  and prints the backup warning (decision 9): losing `<home>/mint/` makes every credit worthless,
-  and restoring an old copy can let spent credits be spent again.
+  and prints the backup note (decision 9): losing `<home>/mint/` makes every credit worthless,
+  and restoring an old copy can let spent credits be spent again. `run` backs the mint up
+  automatically (online `VACUUM INTO` snapshots after each change, plus key, seed, `mint.toml` and
+  token files) into `backups/` or `backup_dir`; the operator's one step is copying that directory
+  off-box once. `run` refuses a missing or older `mint.sqlite`; `restore` takes the newest
+  snapshot only.
 - `maxplayer-mint run` is the relay listener. The operator runs it (a systemd unit is documented).
 - `maxplayer-mint issue <amount>` mints proofs in-process to a local token file. No quote and no
   payment processor: it signs through cdk's signatory (`Mint::blind_sign`) and stores the
