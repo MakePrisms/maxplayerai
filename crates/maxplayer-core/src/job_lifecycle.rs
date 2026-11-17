@@ -1280,7 +1280,7 @@ pub async fn get_job_async(
             maybe_attach_display_names_async(home, &mut view, request.include_display_names).await;
             return Ok(view);
         }
-        let this_fetch = fetch_timeout.min(remaining);
+        let this_fetch = wait_read_window(fetch_timeout, remaining);
         let mut view =
             fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
         if view_is_ready(&view, wait_for) {
@@ -1295,6 +1295,25 @@ pub async fn get_job_async(
         }
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
+}
+
+/// The shortest window ONE view read inside a `wait_for` long-poll may be given.
+///
+/// The long-poll deadline bounds how long we WAIT for the job to become ready; it must never
+/// shrink the read that reports the job's state. Clamping the read to the time left handed the
+/// final pass of every unmet wait a 1 ms window (or a few ms in the poll variant): the SDK's
+/// auto-closing subscriptions then time out before the relay can answer, the offer read returns
+/// `Ok(empty)`, the liveness probe gives up, and the caller gets a view with no offer,
+/// `read_confirmed: false`, plus a `buyer offer-read empty … relay_answered=false elapsed_ms=4
+/// (#602)` line that looks like a relay or SDK failure. A healthy relay answers in well under
+/// 100 ms, so this floor costs nothing when the relay is fine and at most this much past the cap
+/// when it is slow.
+const MIN_WAIT_READ: Duration = Duration::from_secs(2);
+
+/// The window for one view read inside a `wait_for` long-poll: the normal fetch timeout, cut to
+/// the time left on the wait, but never below [`MIN_WAIT_READ`].
+fn wait_read_window(fetch_timeout: Duration, remaining: Duration) -> Duration {
+    fetch_timeout.min(remaining.max(MIN_WAIT_READ))
 }
 
 /// How long a subscription-driven wait will sit before re-reading the view anyway.
@@ -1343,7 +1362,7 @@ pub async fn get_job_awaiting_events_async(
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let this_fetch = fetch_timeout.min(remaining.max(Duration::from_millis(1)));
+        let this_fetch = wait_read_window(fetch_timeout, remaining);
         let mut view =
             fetch_job_view_async(home, &keys, &request.job_id, this_fetch, now_unix()).await?;
         if view_is_ready(&view, wait_for) {
@@ -3753,9 +3772,10 @@ pub(crate) async fn fetch_job_view_async(
         // the relay answered our REQ, whether the recheck found the offer, and how long it took.
         crate::opline!(
             "buyer offer-read empty job={job_id} relay_answered={confirmed} offer_on_recheck={} \
-             elapsed_ms={} (#602)",
+             elapsed_ms={} window_ms={} (#602)",
             offer_events.iter().any(|event| event.id == offer_id),
-            offer_read_started.elapsed().as_millis()
+            offer_read_started.elapsed().as_millis(),
+            timeout.as_millis()
         );
         // A recheck that again returned only unverifiable frames does not certify absence either.
         confirmed && !(offer_poisoned && !offer_events.iter().any(|event| event.id == offer_id))
@@ -7036,6 +7056,96 @@ mod tests {
             "the wait must resolve on the EVENT, not on the {SAFETY_RECHECK:?} backstop — took \
              {elapsed:?}; if this fails on timing alone the subscription is not doing the work"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A relay that answers every REQ after a fixed, realistic delay (a WAN round trip), so a
+    /// read given a near-zero window can never be answered in time.
+    #[derive(Debug)]
+    struct SlowQueries(Duration);
+
+    impl nostr_relay_builder::prelude::QueryPolicy for SlowQueries {
+        fn admit_query<'a>(
+            &'a self,
+            _query: &'a nostr_sdk::Filter,
+            _addr: &'a std::net::SocketAddr,
+        ) -> nostr_relay_builder::prelude::BoxedFuture<
+            'a,
+            nostr_relay_builder::prelude::PolicyResult,
+        > {
+            Box::pin(async move {
+                tokio::time::sleep(self.0).await;
+                nostr_relay_builder::prelude::PolicyResult::Accept
+            })
+        }
+    }
+
+    // The long-poll deadline bounds the WAIT, never the read that reports the job's state.
+    #[test]
+    fn a_wait_read_window_never_shrinks_below_the_floor() {
+        let fetch = Duration::from_secs(DEFAULT_FETCH_TIMEOUT_SECS);
+        for remaining in [Duration::ZERO, Duration::from_millis(1), Duration::from_millis(400)] {
+            assert_eq!(wait_read_window(fetch, remaining), MIN_WAIT_READ, "{remaining:?}");
+        }
+        assert_eq!(wait_read_window(fetch, Duration::from_secs(3)), Duration::from_secs(3));
+        assert_eq!(wait_read_window(fetch, Duration::from_secs(9)), fetch);
+        const { assert!(MIN_WAIT_READ.as_secs() <= DEFAULT_FETCH_TIMEOUT_SECS) };
+    }
+
+    // TOOTH — the report behind this: every `get_job(wait_for=…)` that ran out its cap ended on a
+    // read given a 1 ms window. Against any real relay that read cannot be answered, so the
+    // returned view had NO offer and `read_confirmed: false`, and the daemon logged
+    // `buyer offer-read empty … relay_answered=false elapsed_ms=4 (#602)` — which an operator read
+    // as the relay or the SDK dropping the award loop's reads.
+    //
+    // The relay here answers each REQ after 50 ms. The job is genuinely not ready (claim + award,
+    // no result), so the wait runs out its 1 s cap and returns its FINAL read. That read must
+    // still see the offer the relay holds.
+    //
+    // BITE: restore `fetch_timeout.min(remaining.max(Duration::from_millis(1)))` in
+    // `get_job_awaiting_events_async` and the offer disappears from the returned view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_timed_out_wait_still_returns_an_answered_read() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(
+            RelayBuilder::default().query_policy(SlowQueries(Duration::from_millis(50))),
+        );
+        relay.run().await.expect("relay run");
+        let (root, mut home) = temp_job_home("wait-final-read");
+        home.config.relay_url = relay.url().await.to_string();
+        let (evidence, buyer) = crate::private_content::public_v2::tests::fixture(false, false);
+        // Public deterministic fixture identities, never operator credentials.
+        std::fs::write(&home.key_path, format!("{:064x}", 1)).expect("fixture buyer");
+        let seller = nostr_sdk::Keys::parse(&format!("{:064x}", 2)).unwrap();
+        for (signer, event) in [(&buyer, &evidence.offer), (&seller, &evidence.claim), (&buyer, &evidence.award)] {
+            publish_signed_event_async(&home, signer, event).await.expect("publish v2 selection");
+        }
+        let job_id = evidence.offer.id.to_hex();
+
+        // Held open for the whole wait: a closed fan-out would wake the loop on every pass.
+        let (_tx, rx) = tokio::sync::broadcast::channel(8);
+        let view = get_job_awaiting_events_async(
+            &home,
+            GetJobRequest {
+                job_id: job_id.clone(),
+                wait_for: Some(WaitFor::Result),
+                timeout_secs: Some(1),
+                include_display_names: false,
+            },
+            rx,
+        )
+        .await
+        .expect("wait");
+
+        assert!(view.pending, "no result was published, so the wait must run out");
+        assert_eq!(
+            view.offer.as_ref().map(|offer| offer.event_id.as_str()),
+            Some(job_id.as_str()),
+            "the final read of a timed-out wait must still be answered by the relay"
+        );
+        assert!(view.read_confirmed, "the final read must not report an unanswered offer read");
 
         let _ = std::fs::remove_dir_all(&root);
     }
