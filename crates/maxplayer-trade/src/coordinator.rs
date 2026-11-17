@@ -1645,13 +1645,46 @@ async fn run_units(
     mut jobs: Option<tokio::sync::mpsc::Receiver<crate::serve::Job>>,
 ) -> Result<()> {
     let mut sched: crate::sched::Scheduler<'_, Unit> = crate::sched::Scheduler::default();
+    let result = run_loop(home, j, m, inbox, until, &mut jobs, &mut sched).await;
+    // An error ends serve (a hosting daemon restarts it): requests handed off but not started
+    // are answered "not started" instead of a dropped connection (exit 3, "may have been
+    // applied"). A stop already answered them.
+    if result
+        .as_ref()
+        .is_err_and(|e| !e.is::<crate::shutdown::Stopped>())
+    {
+        const WHY: &str =
+            "serve ended on an error before starting this request; nothing was applied";
+        for unit in sched.drain_queued() {
+            if let Unit::Job(job) = unit {
+                crate::serve::refuse(job, WHY);
+            }
+        }
+        if let Some(rx) = jobs.as_mut() {
+            rx.close();
+            while let Ok(job) = rx.try_recv() {
+                crate::serve::refuse(job, WHY);
+            }
+        }
+    }
+    result
+}
+async fn run_loop<'a>(
+    home: &'a Path,
+    j: &'a Journal,
+    m: &'a Market,
+    inbox: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    until: Option<&str>,
+    jobs: &mut Option<tokio::sync::mpsc::Receiver<crate::serve::Job>>,
+    sched: &mut crate::sched::Scheduler<'a, Unit>,
+) -> Result<()> {
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut warned = crate::observe::Warned::default();
     let mut inbox_open = true;
     let mut job_seq: u64 = 0;
     // Startup recovery comes first in every key's line: before any message or request.
-    enqueue_recovery(j, &mut sched).await?;
+    enqueue_recovery(j, sched).await?;
     loop {
         // A stop request (serve: SIGTERM/SIGINT) admits nothing new: queued requests are refused
         // as not started, queued units are dropped (nothing of theirs ran), and units already
@@ -1739,7 +1772,7 @@ async fn run_units(
                 }
             }
             Next::Tick => {
-                if let Err(error) = enqueue_recovery(j, &mut sched).await {
+                if let Err(error) = enqueue_recovery(j, sched).await {
                     eprintln!("recovery scan deferred: {error}");
                 }
                 // Display only: derived from the journal, never fed back into the state machine.

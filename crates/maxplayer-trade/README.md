@@ -46,7 +46,9 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   daemon is trade's safe stop (the running step finishes or is cancelled at its next wait, journal
   intact; final `exited` line with `exit` 5; the buyer daemon exits 5, the seller keeps its own exit
   code). `[trade] serve = false` in `config.toml` turns it off; `[trade] relays` / `mint_relays` set
-  the relays the hosted serve uses and `maxplayer trade` defaults to, so hand-offs match.
+  the relays the hosted serve uses and `maxplayer trade` defaults to, so hand-offs match (the
+  daemon reads them when it starts). A hosted serve also appends its lifecycle lines to
+  `<home>/trade/serve.log` (rotated at 1 MiB), since the auto-spawned buyer daemon has no stderr.
   Legacy standalone homes are never hosted.
 - **Two writers, one wallet.** The buyer daemon / `maxplayer wallet` and `maxplayer trade` may run
   at once. Every step that picks unspent proofs and reserves them holds an exclusive OS advisory

@@ -142,9 +142,17 @@ async fn run_hosting_trade(
         }
     });
     tokio::pin!(daemon);
+    let mut rx = rx;
     let hosted = tokio::select! {
-        result = &mut daemon => return result.map(|()| None),
-        hosted = rx => hosted.ok(),
+        result = &mut daemon => {
+            // The daemon may fail in the same poll that started the host (review of #1334, M1):
+            // never leave it running unattended.
+            if let Ok(hosted) = rx.try_recv() {
+                hosted.shutdown("buyer daemon exiting").await;
+            }
+            return result.map(|()| None);
+        }
+        hosted = &mut rx => hosted.ok(),
     };
     let Some(hosted) = hosted else {
         return daemon.await.map(|()| None);
@@ -155,7 +163,16 @@ async fn run_hosting_trade(
             result.map(|()| None)
         }
         () = hosted.stop_requested() => {
-            hosted.shutdown("buyer daemon exiting").await;
+            // Keep answering clients while trade stops safely (review of #1334, L2).
+            let stop = hosted.shutdown("buyer daemon exiting");
+            tokio::pin!(stop);
+            tokio::select! {
+                () = &mut stop => {}
+                result = &mut daemon => {
+                    stop.await;
+                    result?;
+                }
+            }
             Ok(Some(i32::from(maxplayer_trade::shutdown::EXIT_STOPPED)))
         }
     }

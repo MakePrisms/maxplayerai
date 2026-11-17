@@ -382,14 +382,15 @@ fn refusal(request: &Request, relays: &[String], mint_relays: &[String]) -> Opti
     let (market, mint) = request.command.relay_needs();
     if market && request.relays != relays {
         return Some(crate::redact_reason(&format!(
-            "serve uses relays {relays:?}; this command asked for {:?}. Use exactly serve's --relay list (same values, same order); nothing was queued or executed",
+            "serve uses relays {relays:?}; this command asked for {:?}. Use exactly serve's --relay list (same values, same order; a serve hosted by the buyer daemon or seller uses `[trade] relays` in config.toml, read when it starts); nothing was queued or executed",
             request.relays
         )));
     }
     if mint && !crate::transport::same_mint_relays(&request.mint_relays, mint_relays) {
         return Some(crate::redact_reason(&format!(
             "serve uses mint relays {mint_relays:?}; this command asked for {:?}. Use the same \
-             --mint-relay set as serve; nothing was queued or executed",
+             --mint-relay set as serve (a hosted serve: `[trade] mint_relays`); nothing was \
+             queued or executed",
             request.mint_relays
         )));
     }

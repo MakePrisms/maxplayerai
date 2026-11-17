@@ -175,7 +175,8 @@ The buyer daemon and the seller host serve on a home that trades (`[trade] serve
 its `[trade] relays` / `mint_relays` are also the commands' defaults), so a running daemon is
 usually the serve that answers; `serve` itself then refuses ("trade serve is already running").
 `recover` and `send` (drain or `--reclaim`) still need the home lock (`home is already in
-use` while serve runs); stop serve first. `maxplayer wallet` commands never need it. Protocol
+use` while serve runs, naming the serve); stop serve first (a hosted serve: `[trade] serve =
+false` and restart the daemon). serve recovers continuously, so `recover` is not needed meanwhile. `maxplayer wallet` commands never need it. Protocol
 version 5: a client of another version is refused with a version mismatch, and an old
 standalone `maxplayer-trade` binary is told to delete itself.
 `cancel` first recovers existing authorizations when it runs without serve.

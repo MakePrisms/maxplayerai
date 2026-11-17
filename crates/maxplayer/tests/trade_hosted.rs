@@ -91,9 +91,17 @@ impl Daemon {
             .spawn()
             .unwrap();
         let d = Self { child, log };
-        d.until("buyer online", 30, |log| {
-            log.contains("maxplayer buyer online")
-        });
+        // Ready means it owns the home and answers (the host is started by then); "online" is
+        // printed before the lock is taken.
+        let start = Instant::now();
+        while run(home, &["buyer", "status"]).0 != Some(0) {
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "daemon not up:\n{}",
+                d.log()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
         d
     }
     fn log(&self) -> String {
@@ -224,4 +232,29 @@ fn trade_serve_false_leaves_serving_to_the_standalone_command() {
         daemon.log()
     );
     assert!(lifecycle(&daemon.log()).is_empty(), "{}", daemon.log());
+}
+
+/// The buyer daemon fails right after it started hosting (its `buyer.sock` path is taken by a
+/// non-empty directory, so the socket cannot bind): the hosted serve is stopped safely, never left
+/// running unattended until the process exits (review of #1334, M1).
+#[test]
+fn a_buyer_daemon_that_fails_after_starting_the_host_stops_it_safely() {
+    let dir = trading_home("bindfail", true);
+    let home = dir.path();
+    std::fs::create_dir(home.join("buyer.sock")).unwrap();
+    std::fs::write(home.join("buyer.sock/keep"), b"x").unwrap();
+    let out = maxplayer(home).args(["buyer", "serve"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(
+        !home.join("trade/serve.sock").exists(),
+        "SAFETY: socket left behind:\n{stderr}"
+    );
+    let lines = lifecycle(&stderr);
+    let started = lines.iter().filter(|v| v["serve"] == "started").count();
+    let exited = lines.iter().filter(|v| v["serve"] == "exited").count();
+    assert_eq!(
+        started, exited,
+        "every started session has its final line:\n{stderr}"
+    );
 }

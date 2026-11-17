@@ -4153,6 +4153,31 @@ mod tests {
         );
     }
 
+    /// `[trade]` defaults (serve on, no relays), is never written while default, and every key is
+    /// reachable through the environment (`MAXPLAYER_TRADE__SERVE=false` is the documented off
+    /// switch).
+    #[test]
+    fn trade_table_defaults_and_env_overrides() {
+        let config = MaxplayerConfig::default();
+        assert!(config.trade.serve);
+        assert!(config.trade.relays.is_empty() && config.trade.mint_relays.is_empty());
+        assert!(!toml::to_string(&config).unwrap().contains("[trade]"));
+        let config = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[
+                ("MAXPLAYER_TRADE__SERVE", "false"),
+                ("MAXPLAYER_TRADE__RELAYS", "wss://a.example,wss://b.example"),
+                ("MAXPLAYER_TRADE__MINT_RELAYS", "wss://m.example"),
+            ]),
+        )
+        .expect("trade env");
+        assert!(!config.trade.serve);
+        assert_eq!(config.trade.relays, vec!["wss://a.example", "wss://b.example"]);
+        assert_eq!(config.trade.mint_relays, vec!["wss://m.example"]);
+        assert!(!parse_config_toml("[trade]\nserve = false\n").unwrap().trade.serve);
+        assert!(parse_config_toml("[trade]\nbogus = 1\n").is_err());
+    }
+
     #[test]
     fn hop_fee_buffer_multiplier_defaults_to_two_and_zero_is_exact() {
         assert_eq!(default_hop_fee_buffer_multiplier(), 2);

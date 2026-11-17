@@ -8,7 +8,8 @@ use maxplayer_trade::host::{self, Hosted};
 
 /// Start hosting trade serve for `home` from inside the daemon's runtime, once the daemon owns its
 /// home. `None` when `[trade] serve` is off or the `[trade]` relays are invalid (said once; the
-/// daemon runs on without trading).
+/// daemon runs on without trading). TERM/INT for the hosted serve are listened for on the daemon's
+/// own runtime, which lives as long as the process (review of #1334, M2).
 pub fn start(home: &MaxplayerHome, who: &'static str) -> Option<Hosted> {
     if !home.config.trade.serve {
         return None;
@@ -23,9 +24,11 @@ pub fn start(home: &MaxplayerHome, who: &'static str) -> Option<Hosted> {
 }
 
 fn options(home: &MaxplayerHome, who: &'static str) -> host::Options {
-    host::Options::new(
+    let mut options = host::Options::new(
         who,
         home.config.trade.relays.clone(),
         home.config.trade.mint_relays.clone(),
-    )
+    );
+    options.signal_runtime = tokio::runtime::Handle::try_current().ok();
+    options
 }

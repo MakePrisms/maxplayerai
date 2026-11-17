@@ -145,7 +145,13 @@ async fn a_home_that_does_not_trade_gets_nothing_created() {
     // A home that starts trading later (its first trade command creates the journal) is served.
     shutdown::reset();
     let h = host::spawn(fresh.path(), options(&["ws://127.0.0.1:1"])).unwrap();
-    drop(Journal::open(fresh.path()).await.unwrap());
+    {
+        // As the CLI does: the journal is created under owner.lock, never half-made under a host.
+        std::fs::create_dir_all(fresh.path().join("trade")).unwrap();
+        let lock = std::fs::File::create(fresh.path().join("trade/owner.lock")).unwrap();
+        lock.lock_exclusive().unwrap();
+        drop(Journal::open(fresh.path()).await.unwrap());
+    }
     until("served once trading", 30, || h.serving()).await;
     until("socket", 30, || socket(fresh.path()).exists()).await;
     h.shutdown("test").await;
@@ -178,9 +184,20 @@ async fn hosted_serve_owns_the_home_and_takes_hand_offs() {
         "SAFETY: a second serve on the home is refused with the reason: {stderr}"
     );
     assert!(h.serving(), "the refused serve changed nothing");
+    // A lock-needing command says who holds the home (review of #1334, L5).
+    let (code, stderr) = output(cmd(&f.maker, Some(&f.relay_url), &["recover"])).await;
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(
+        stderr.contains("trade serve is running") && stderr.contains("home is already in use"),
+        "{stderr}"
+    );
     h.shutdown("test").await;
     assert!(!socket(&f.maker).exists(), "socket removed");
     assert!(lock_free(&f.maker), "home released");
+    // Lifecycle lines are kept in <home>/trade/serve.log: the auto-spawned daemon has no stderr.
+    let log = std::fs::read_to_string(wallet::state_dir(&f.maker).join("serve.log")).unwrap();
+    assert!(log.contains("\"serve\":\"started\""), "{log}");
+    assert!(log.contains("\"serve\":\"exited\""), "{log}");
     shutdown::reset();
 }
 
@@ -346,5 +363,47 @@ async fn daemon_shutdown_lets_the_money_step_in_progress_finish() {
     assert!(!socket(&f.taker).exists());
     assert!(lock_free(&f.taker), "home released for the next start");
     let _ = client.kill().await;
+    shutdown::reset();
+}
+
+/// A panic in serve is contained like an error (review of #1334, M2): the session ends with its
+/// final line and releases the home, and the host restarts serve instead of dying.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panic_in_serve_restarts_it_instead_of_ending_the_host() {
+    let _g = SERIAL.lock().await;
+    shutdown::reset();
+    let f = Fixture::new(0).await;
+    host::PANIC_NEXT_SESSION.store(true, std::sync::atomic::Ordering::SeqCst);
+    let h = host::spawn(&f.maker, options(&[&f.relay_url])).unwrap();
+    until("restarted after the panic", 60, || {
+        h.sessions() >= 2 && h.serving()
+    })
+    .await;
+    assert!(h.running(), "SAFETY: the host outlives a panicking session");
+    until("socket", 30, || socket(&f.maker).exists()).await;
+    let log = std::fs::read_to_string(wallet::state_dir(&f.maker).join("serve.log")).unwrap();
+    assert!(log.contains("serve panicked"), "{log}");
+    h.shutdown("test").await;
+    shutdown::reset();
+}
+
+/// Dropping a host without `shutdown` (the daemon failed right after starting it, or a panic
+/// unwound past it) still stops serve safely: final line, socket removed, home released
+/// (review of #1334, M1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_a_host_stops_serve_safely() {
+    let _g = SERIAL.lock().await;
+    shutdown::reset();
+    let f = Fixture::new(0).await;
+    let h = host::spawn(&f.maker, options(&[&f.relay_url])).unwrap();
+    until("socket", 30, || socket(&f.maker).exists()).await;
+    tokio::task::spawn_blocking(move || drop(h)).await.unwrap();
+    assert!(
+        !socket(&f.maker).exists(),
+        "SAFETY: no serve left running unattended"
+    );
+    assert!(lock_free(&f.maker), "home released");
+    let log = std::fs::read_to_string(wallet::state_dir(&f.maker).join("serve.log")).unwrap();
+    assert_eq!(log.matches("\"serve\":\"exited\"").count(), 1, "{log}");
     shutdown::reset();
 }

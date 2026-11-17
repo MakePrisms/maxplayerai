@@ -24,6 +24,7 @@
 use crate::{coordinator, journal::Journal, market::Market, shutdown, wallet};
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
+use futures_util::FutureExt;
 use std::{
     fs::OpenOptions,
     os::unix::fs::OpenOptionsExt,
@@ -34,6 +35,11 @@ use std::{
     },
     time::Duration,
 };
+
+/// Test builds only: the next session panics once started (proves a panic is contained).
+#[cfg(feature = "local-test-mints")]
+#[doc(hidden)]
+pub static PANIC_NEXT_SESSION: AtomicBool = AtomicBool::new(false);
 
 /// How often a host that is not serving checks again (the home starts trading, `owner.lock` frees).
 pub const POLL: Duration = Duration::from_secs(5);
@@ -57,6 +63,11 @@ pub struct Options {
     /// Install TERM/INT handling once a session starts (production). Tests stop through
     /// [`Hosted::shutdown`] and [`crate::shutdown::request`] instead.
     pub signals: bool,
+    /// The runtime the TERM/INT listener runs on; `None`: serve's own. A daemon with no other
+    /// listener (the buyer) passes its own runtime, which lives as long as the process: tokio never
+    /// restores the default disposition, so a listener that died with serve's runtime would leave
+    /// TERM/INT swallowed.
+    pub signal_runtime: Option<tokio::runtime::Handle>,
 }
 impl Options {
     pub fn new(host: &'static str, relays: Vec<String>, mint_relays: Vec<String>) -> Self {
@@ -68,6 +79,7 @@ impl Options {
             restart_min: RESTART_MIN,
             restart_max: RESTART_MAX,
             signals: true,
+            signal_runtime: None,
         }
     }
 }
@@ -98,8 +110,10 @@ enum Idle {
     Busy,
 }
 
-/// Start hosting serve for `home` once the daemon owns its home. The relay sets are checked first; an invalid one is returned and nothing runs.
-/// Creates nothing in `home` until it trades.
+/// Start hosting serve for `home` once the daemon owns its home.
+///
+/// The relay sets are checked first; an invalid one is returned and nothing runs. Creates nothing
+/// in `home` until it trades.
 pub fn spawn(home: &Path, options: Options) -> Result<Hosted> {
     let relays: Vec<String> = if options.relays.is_empty() {
         crate::market::DEFAULT_RELAYS
@@ -120,29 +134,91 @@ pub fn spawn(home: &Path, options: Options) -> Result<Hosted> {
     let serving = Arc::new(AtomicBool::new(false));
     let sessions = Arc::new(AtomicU64::new(0));
     let (done_tx, done) = tokio::sync::watch::channel(false);
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_name("maxplayer-trade")
-        .enable_all()
-        .build()
-        .context("trade serve runtime")?;
     let (home, s, n) = (home.to_path_buf(), serving.clone(), sessions.clone());
+    let (built_tx, built_rx) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
         .name("maxplayer-trade-serve".into())
         .spawn(move || {
+            // Declared first, dropped last: `done` turns true however this thread ends (a panic
+            // included), after the runtime is gone.
+            let _done = Done(done_tx, s.clone());
+            // Built here, not in the caller: a runtime dropped inside the daemon's runtime panics.
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("maxplayer-trade")
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => {
+                    let _ = built_tx.send(Ok(()));
+                    runtime
+                }
+                Err(e) => {
+                    let _ = built_tx.send(Err(e));
+                    return;
+                }
+            };
             runtime.block_on(supervise(home, relays, options, s, n));
             // Relay clients and the socket listener die with the runtime. Bounded: a blocking task
             // still running (none should be once serve stopped) never holds the daemon's exit.
             runtime.shutdown_timeout(Duration::from_secs(5));
-            let _ = done_tx.send(true);
         })
         .context("trade serve thread")?;
+    built_rx
+        .recv()
+        .context("trade serve thread")?
+        .context("trade serve runtime")?;
     Ok(Hosted {
         thread: Some(thread),
         done,
         serving,
         sessions,
     })
+}
+
+/// Marks the host thread finished (and not serving) when dropped.
+struct Done(tokio::sync::watch::Sender<bool>, Arc<AtomicBool>);
+impl Drop for Done {
+    fn drop(&mut self) {
+        self.1.store(false, SeqCst);
+        let _ = self.0.send(true);
+    }
+}
+
+/// Request the safe stop as `reason` unless one was requested already (never escalates).
+fn request_stop(serving: bool, reason: &'static str) {
+    if shutdown::request_first(reason) && serving {
+        shutdown::announce_phase(1, reason);
+    }
+}
+/// Force the stop (the grace ran out), unless a second signal already forced it.
+fn force_stop(serving: bool) {
+    if shutdown::stop().is_some_and(|s| s.forced.is_some()) {
+        return;
+    }
+    let phase = shutdown::request("grace");
+    if serving {
+        shutdown::announce_phase(phase, "grace");
+    }
+}
+
+/// A host is never left running unattended: dropping it (the daemon failed after starting it, or
+/// a panic unwound past it) stops serve exactly as [`Hosted::shutdown`] does, blocking.
+impl Drop for Hosted {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        request_stop(self.serving(), "daemon exiting");
+        let end = std::time::Instant::now() + shutdown::GRACE;
+        while self.running() && std::time::Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if self.running() {
+            force_stop(self.serving());
+        }
+        let _ = thread.join();
+    }
 }
 
 impl Hosted {
@@ -163,27 +239,21 @@ impl Hosted {
     pub async fn stop_requested(&self) {
         let _ = shutdown::requested().await;
     }
+
     /// Stop hosting and wait until serve has stopped safely: a session in progress admits nothing
     /// new, its running step gets [`shutdown::GRACE`] and is then cancelled at its next wait
     /// (journal intact). `reason` names the stop when nothing requested one yet.
     pub async fn shutdown(mut self, reason: &'static str) {
-        if shutdown::stop().is_none() {
-            let phase = shutdown::request(reason);
-            if self.serving() {
-                shutdown::announce_phase(phase, reason);
-            }
-        }
+        request_stop(self.serving(), reason);
         if tokio::time::timeout(shutdown::GRACE, self.done.wait_for(|d| *d))
             .await
             .is_err()
         {
-            let phase = shutdown::request("grace");
-            if self.serving() {
-                shutdown::announce_phase(phase, "grace");
-            }
+            force_stop(self.serving());
             let _ = self.done.wait_for(|d| *d).await;
         }
         if let Some(thread) = self.thread.take() {
+            // `done` is set as the thread's last act, so this join returns at once.
             let _ = thread.join();
         }
     }
@@ -215,7 +285,7 @@ async fn supervise(
             Ok(idle) => {
                 if said != Some(idle) {
                     if let Some(line) = idle_line(&home, idle) {
-                        eprintln!("{line}");
+                        shutdown::emit(&line);
                     }
                     said = Some(idle);
                 }
@@ -230,12 +300,12 @@ async fn supervise(
                 if ran >= options.restart_max {
                     delay = options.restart_min;
                 }
-                eprintln!(
-                    "{}",
-                    serde_json::json!({"at":crate::clock::iso(crate::clock::now()),
+                shutdown::emit(
+                    &serde_json::json!({"at":crate::clock::iso(crate::clock::now()),
                         "serve":"restarting","host":options.host,
                         "in_seconds":delay.as_secs_f64(),
                         "after":crate::redact_reason(&format!("{error:#}"))})
+                    .to_string(),
                 );
                 pause(delay).await;
                 delay = (delay * 2).min(options.restart_max);
@@ -286,6 +356,9 @@ async fn session(
     if std::fs::symlink_metadata(state.join("trade.sqlite")).is_err() {
         return Ok(Idle::NotTrading);
     }
+    // A trading home: lifecycle lines also go to <home>/trade/serve.log (the daemon may have no
+    // stderr).
+    shutdown::log_to(Some(state.join("serve.log")));
     let started = tokio::time::Instant::now();
     let lock = OpenOptions::new()
         .create(true)
@@ -300,28 +373,55 @@ async fn session(
         return Ok(Idle::Busy);
     }
     if options.signals && !*handlers {
-        install_signal_handlers(serving.clone()).map_err(|e| (e, started.elapsed()))?;
+        install_signal_handlers(serving.clone(), options.signal_runtime.clone())
+            .map_err(|e| (e, started.elapsed()))?;
         *handlers = true;
     }
     shutdown::announce(home, relays, Some(options.host));
     sessions.fetch_add(1, SeqCst);
     serving.store(true, SeqCst);
-    let result: Result<()> = async {
+    // A panic in serve ends this session like an error (restarted after the backoff), with the
+    // lock still held so its final line and socket removal stay ours.
+    let run = std::panic::AssertUnwindSafe(async {
+        #[cfg(feature = "local-test-mints")]
+        if PANIC_NEXT_SESSION.swap(false, SeqCst) {
+            panic!("test panic in hosted serve");
+        }
         // Bound before the startup recovery, so hand-offs queue instead of failing meanwhile.
-        let jobs = crate::serve::bind(home, relays.to_vec())?;
-        let (j, mut m) = shutdown::bounded(async {
+        let mut jobs = crate::serve::bind(home, relays.to_vec())?;
+        let opened = shutdown::bounded(async {
             let j = Journal::open(home).await?;
             let m = Market::connect(wallet::identity(home)?, relays).await?;
             anyhow::Ok((j, m))
         })
-        .await?;
+        .await;
+        let (j, mut m) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                // Hand-offs queued meanwhile never started: say so (not a dropped connection).
+                jobs.close();
+                while let Ok(job) = jobs.try_recv() {
+                    crate::serve::refuse(job, "serve could not start; nothing was applied");
+                }
+                return Err(e);
+            }
+        };
         let r = coordinator::run_with(home, &j, &mut m, None, Some(jobs)).await;
         for c in &m.clients {
             let _ = tokio::time::timeout(Duration::from_secs(5), c.shutdown()).await;
         }
         r
-    }
+    })
+    .catch_unwind()
     .await;
+    let result: Result<()> = run.unwrap_or_else(|panic| {
+        let text = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        Err(anyhow::anyhow!("serve panicked: {text}"))
+    });
     let error = match result {
         Ok(()) => anyhow::anyhow!("serve returned"),
         Err(e) => e,
@@ -340,11 +440,16 @@ async fn session(
 
 /// TERM/INT once a session has started (the daemon no longer dies on them outright): the first
 /// requests the safe stop, a second one, or [`shutdown::GRACE`], forces it.
-fn install_signal_handlers(serving: Arc<AtomicBool>) -> Result<()> {
+fn install_signal_handlers(
+    serving: Arc<AtomicBool>,
+    runtime: Option<tokio::runtime::Handle>,
+) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
+    let runtime = runtime.unwrap_or_else(tokio::runtime::Handle::current);
+    let _enter = runtime.enter();
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         let first = tokio::select! {
             _ = term.recv() => "SIGTERM",
             _ = int.recv() => "SIGINT",
