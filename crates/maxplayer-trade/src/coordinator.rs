@@ -1804,7 +1804,7 @@ pub async fn recovery_status(j: &Journal, mut unresolved: bool) -> Result<()> {
         println!("{}", r.summary());
     }
     for r in j.all::<crate::send::SendAttempt>("send").await? {
-        unresolved |= !r.terminal();
+        unresolved |= !r.terminal() || r.reclaim_retry_pending();
         manual |= r.manual_recovery();
         println!("{}", r.summary());
     }
