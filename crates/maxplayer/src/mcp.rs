@@ -1464,10 +1464,17 @@ mod tests {
     #[test]
     fn swarm_tools_appear_only_when_swarm_is_enabled() {
         for sessions in [false, true] {
-            assert_eq!(with_swarm_tools(tools_for(sessions), false), tools_for(sessions));
+            assert_eq!(
+                with_swarm_tools(tools_for(sessions), false),
+                tools_for(sessions)
+            );
         }
         let names = |list: Value| -> Vec<String> {
-            list.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_owned()).collect()
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_owned())
+                .collect()
         };
         let on = names(with_swarm_tools(tools(), true));
         assert_eq!(&on[..4], ["post_job", "get_job", "collect", "award_claim"]);
@@ -1484,9 +1491,16 @@ mod tests {
         assert!(!state.home.config.swarm.enabled, "default off");
         let listed = dispatch(
             &state,
-            &McpRequest { id: Some(json!(1)), method: "tools/list".into(), params: json!({}) },
+            &McpRequest {
+                id: Some(json!(1)),
+                method: "tools/list".into(),
+                params: json!({}),
+            },
         );
-        assert_eq!(listed["result"]["tools"], tools_for(state.home.config.sessions.enabled));
+        assert_eq!(
+            listed["result"]["tools"],
+            tools_for(state.home.config.sessions.enabled)
+        );
         let called = dispatch(
             &state,
             &McpRequest {
@@ -1508,7 +1522,11 @@ mod tests {
         assert!(state.home.config.swarm.enabled);
         let listed = dispatch(
             &state,
-            &McpRequest { id: Some(json!(3)), method: "tools/list".into(), params: json!({}) },
+            &McpRequest {
+                id: Some(json!(3)),
+                method: "tools/list".into(),
+                params: json!({}),
+            },
         );
         assert_eq!(names(listed["result"]["tools"].clone())[4..], *SWARM_TOOLS);
         let _ = std::fs::remove_dir_all(&root);
