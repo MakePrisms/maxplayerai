@@ -83,8 +83,12 @@ struct Daemon {
 }
 impl Daemon {
     fn start(home: &Path) -> Self {
+        Self::start_env(home, &[])
+    }
+    fn start_env(home: &Path, env: &[(&str, &str)]) -> Self {
         let log = home.with_extension("daemon.log");
         let child = maxplayer(home)
+            .envs(env.iter().copied())
             .args(["buyer", "serve"])
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
@@ -151,8 +155,9 @@ fn lifecycle(log: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// SAFETY (bootstrap rule): a buyer daemon on a home that never traded creates nothing of trade's
-/// (no `trade/` directory, journal, `owner.lock` or socket) and prints nothing about it.
+/// SAFETY (bootstrap rule, lazy start): a buyer daemon on a home that never traded creates nothing
+/// of trade's (no `trade/` directory, journal, `trade.key`, `owner.lock` or socket) and prints
+/// nothing about it.
 #[test]
 fn a_buyer_daemon_on_a_home_that_never_traded_creates_no_trade_state() {
     let dir = temp_home("fresh");
@@ -166,6 +171,37 @@ fn a_buyer_daemon_on_a_home_that_never_traded_creates_no_trade_state() {
     assert!(lifecycle(&daemon.log()).is_empty(), "{}", daemon.log());
     // No session ever started: TERM keeps the daemon's old disposition (killed by the signal).
     assert_eq!(daemon.term(), None);
+}
+
+/// Lazy start, re-check: a buyer daemon already running on a home that never traded starts serving
+/// once the home's first trade command creates the journal, with no daemon restart.
+#[test]
+fn a_running_buyer_daemon_starts_serving_once_the_home_starts_trading() {
+    let dir = temp_home("later");
+    let home = dir.path();
+    let mut daemon = Daemon::start_env(home, &[("MAXPLAYER_TRADE__RELAYS", DEAD_RELAY)]);
+    std::thread::sleep(Duration::from_secs(6)); // at least one re-check while not trading
+    assert!(!home.join("trade").exists(), "{}", daemon.log());
+    // The first trading command (it takes owner.lock and creates the journal; the daemon holds
+    // nothing of trade's yet, so it is not refused).
+    let (code, stderr) = run(home, &["trade", "recover"]);
+    assert_eq!(code, Some(0), "{stderr}");
+    daemon.until("served without a restart", 30, |log| {
+        lifecycle(log)
+            .iter()
+            .any(|v| v["serve"] == "started" && v["host"] == "buyer daemon")
+    });
+    let start = Instant::now();
+    while !home.join("trade/serve.sock").exists() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "socket:\n{}",
+            daemon.log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(daemon.term(), Some(5), "{}", daemon.log());
+    assert!(!home.join("trade/serve.sock").exists());
 }
 
 /// A trading home: the buyer daemon hosts serve (startup line names it), owns `owner.lock`, takes a
