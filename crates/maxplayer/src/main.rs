@@ -1,6 +1,6 @@
-mod accept_cli;
 mod review_cli;
 mod reviewer_cli;
+mod accept_cli;
 // `maxplayer account link|status|marketing` — link this agent's key to an email (email signup).
 mod account_cli;
 // #818: the build-time commit stamp `--version` prints. Compiled on every build — provenance is not
@@ -10,9 +10,9 @@ mod buyer;
 mod cli;
 mod collect_cli;
 // Container-side delivery orchestrator entrypoint (`maxplayer __deliver …`, Track B). INTERNAL.
+mod deliver_cli;
 #[cfg(feature = "wallet")]
 mod daemon;
-mod deliver_cli;
 mod doctor;
 mod exec;
 mod mcp;
@@ -43,15 +43,17 @@ mod sandbox_reap;
 // MCP handshake all print from. Every build: a box with nothing but the binary must be able to
 // find the documentation.
 mod skill;
+mod swarm_cli;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
-mod swarm_cli;
 mod wallet_cli;
 mod whoami;
 
 fn main() {
-    // `trade` takes OS arguments as they are (paths need not be UTF-8); every other command needs
-    // UTF-8 and gets a clean exit 2 instead of the panic `std::env::args()` gives.
+    // Token trading (crates/maxplayer-trade): lots, takes, swap recovery and its own money commands on
+    // this home's key and wallet. It gets the OS arguments as they are (paths need not be UTF-8);
+    // clap owns its parsing, help and exit codes. Every other command needs UTF-8 and gets a usage
+    // error (exit 1) instead of the panic `std::env::args()` gives.
     let os: Vec<std::ffi::OsString> = std::env::args_os().collect();
     #[cfg(feature = "wallet")]
     if os.get(1).and_then(|a| a.to_str()) == Some("trade") {
@@ -66,7 +68,7 @@ fn main() {
         .collect::<Option<Vec<String>>>()
     else {
         eprintln!("maxplayer: arguments must be valid UTF-8");
-        std::process::exit(2);
+        std::process::exit(1);
     };
     let code = cli::run(args, &mut std::io::stdout(), &mut std::io::stderr());
     std::process::exit(code);

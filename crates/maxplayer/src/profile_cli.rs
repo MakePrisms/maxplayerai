@@ -36,21 +36,14 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             }
             "--home" => {
                 idx += 1;
-                home = Some(PathBuf::from(
-                    args.get(idx).ok_or("--home requires a value")?,
-                ));
+                home = Some(PathBuf::from(args.get(idx).ok_or("--home requires a value")?));
             }
             "--dry-run" => dry_run = true,
             other => return Err(format!("unknown argument {other}")),
         }
         idx += 1;
     }
-    Ok(Opts {
-        name,
-        about,
-        home,
-        dry_run,
-    })
+    Ok(Opts { name, about, home, dry_run })
 }
 
 fn usage(err: &mut dyn Write) {
@@ -262,11 +255,7 @@ mod tests {
         assert_eq!(result, RUNTIME_ERROR);
         assert!(!temp.0.exists());
         assert!(!temp.0.join("key").exists());
-        assert!(
-            String::from_utf8(err)
-                .expect("utf8")
-                .contains("the directory does not exist")
-        );
+        assert!(String::from_utf8(err).expect("utf8").contains("the directory does not exist"));
         assert!(out.is_empty());
     }
 
@@ -281,11 +270,7 @@ mod tests {
         assert_eq!(result, RUNTIME_ERROR);
         assert!(temp.0.exists());
         assert!(!temp.0.join("key").exists());
-        assert!(
-            String::from_utf8(err)
-                .expect("utf8")
-                .contains("has no key file")
-        );
+        assert!(String::from_utf8(err).expect("utf8").contains("has no key file"));
         assert!(out.is_empty());
     }
 
@@ -357,11 +342,7 @@ mod tests {
         assert_eq!(result, RUNTIME_ERROR);
         assert!(!temp.0.exists());
         assert!(!temp.0.join("key").exists());
-        assert!(
-            String::from_utf8(err)
-                .expect("utf8")
-                .contains("the directory does not exist")
-        );
+        assert!(String::from_utf8(err).expect("utf8").contains("the directory does not exist"));
         assert!(out.is_empty());
     }
 }

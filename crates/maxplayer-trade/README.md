@@ -71,8 +71,9 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   there.
 - **The old standalone `maxplayer-trade` binary** is obsolete; delete it. A current journal stops
   its startup recovery, `fund`, `withdraw`, `receive` and `send` before they act (a tombstone row
-  in each money namespace that it cannot read, with the reason in the error); `send --reclaim
-  <id>` reads one record directly and is not stopped this way. A current `serve` refuses its
+  in each money namespace that it cannot read, with the reason in the error); `fund --id <id>`
+  of an already journaled funding and `send --reclaim <id>` read one record directly and are not
+  stopped this way. A current `serve` refuses its
   hand-offs with the same reason, and `maxplayer doctor` warns while one is on PATH.
 Earlier dated verification sections are historical snapshots, not current coverage totals.
 

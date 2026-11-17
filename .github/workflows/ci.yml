@@ -532,7 +532,8 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
       # --all-targets builds the lib with the test-only `local-test-mints` feature (self
-      # dev-dependency); this lints the lib + bin exactly as users build them, feature off.
+      # dev-dependency); this lints the lib exactly as `maxplayer` links it, feature off (the only
+      # bin is the test driver, which requires the feature, so `--bins` adds nothing here).
       - name: Clippy (user build, no dev-dependencies)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --lib --bins --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
       - name: Clippy (lab)

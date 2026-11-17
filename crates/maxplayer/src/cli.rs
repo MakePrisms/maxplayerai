@@ -63,9 +63,10 @@ where
         // protocol from the REAL stdin/stdout rather than from `out`/`err`: the frames are a pipe
         // protocol between two processes, not CLI output a harness may capture or interleave.
         #[cfg(feature = "wallet")]
-        Some("__delivery-push") => {
-            maxplayer_core::delivery_executor::child_main(std::io::stdin(), std::io::stdout())
-        }
+        Some("__delivery-push") => maxplayer_core::delivery_executor::child_main(
+            std::io::stdin(),
+            std::io::stdout(),
+        ),
         // Run BY the boot gate, inside the configured launcher, to report what the launcher let it
         // do. Reachable by hand too: an operator debugging a sandbox wants to run exactly what the
         // gate runs rather than a description of it.
@@ -78,12 +79,7 @@ where
         #[cfg(feature = "acp")]
         Some("sandbox-reap") => crate::sandbox_reap::run(&args[2..], out, err),
         Some("wallet") => crate::wallet_cli::run(&args[2..], out, err),
-        // Token trading (crates/maxplayer-trade): lots, takes and swap recovery on this home's key and
-        // wallet. Money in and out stays under `wallet`. Clap owns this subtree's parsing and help.
-        #[cfg(feature = "wallet")]
-        Some("trade") => i32::from(maxplayer_trade::cli::main_from(
-            std::iter::once("maxplayer trade".to_string()).chain(args[2..].iter().cloned()),
-        )),
+        // `trade` is dispatched in main.rs, before this function, on the raw OS arguments.
         Some("profile") => crate::profile_cli::run(&args[2..], out, err),
         Some("whoami") => crate::whoami::run(&args[2..], out, err),
         // Email registration (spec v2.12): link this key to an email so the relay accepts its writes.
@@ -800,10 +796,7 @@ mod tests {
         for (line, marker) in cases {
             let tail: Vec<&str> = line.split(' ').collect();
             let (code, out, err) = help_captured(&tail);
-            assert_eq!(
-                code, 0,
-                "`maxplayer {line}` must exit 0\nstdout={out}\nstderr={err}"
-            );
+            assert_eq!(code, 0, "`maxplayer {line}` must exit 0\nstdout={out}\nstderr={err}");
             assert!(
                 out.contains("Usage:"),
                 "`maxplayer {line}` must print usage to stdout:\nstdout={out}\nstderr={err}"
@@ -830,14 +823,8 @@ mod tests {
     #[test]
     fn sandbox_reap_refuses_all_seats_rather_than_leaving_the_flag_unrecognised() {
         let (code, out, err) = run_captured(["maxplayer", "sandbox-reap", "--all"]);
-        assert_eq!(
-            code, 1,
-            "`--all` must be a usage error:\nstdout={out}\nstderr={err}"
-        );
-        assert!(
-            out.is_empty(),
-            "a refusal prints nothing to stdout:\nstdout={out}"
-        );
+        assert_eq!(code, 1, "`--all` must be a usage error:\nstdout={out}\nstderr={err}");
+        assert!(out.is_empty(), "a refusal prints nothing to stdout:\nstdout={out}");
         assert!(
             err.contains("--all"),
             "the refusal must NAME the flag it refuses, not print generic usage:\nstderr={err}"
@@ -857,10 +844,7 @@ mod tests {
     #[test]
     fn buyer_status_help_never_contacts_the_daemon() {
         let (code, out, err) = run_captured(["maxplayer", "buyer", "status", "--help"]);
-        assert_eq!(
-            code, 0,
-            "buyer status --help must exit 0:\nstdout={out}\nstderr={err}"
-        );
+        assert_eq!(code, 0, "buyer status --help must exit 0:\nstdout={out}\nstderr={err}");
         assert!(
             out.contains("Usage:") && out.contains("maxplayer buyer status"),
             "must print buyer usage to stdout, not connect:\nstdout={out}"
@@ -927,10 +911,7 @@ mod tests {
             code, 1,
             "equals form must refuse, not start the daemon:\nstdout={out}\nstderr={err}"
         );
-        assert!(
-            out.is_empty(),
-            "no daemon-online banner on stdout:\nstdout={out}"
-        );
+        assert!(out.is_empty(), "no daemon-online banner on stdout:\nstdout={out}");
         assert!(
             err.contains("--home") && err.contains("MAXPLAYER_HOME"),
             "error must name both --home and MAXPLAYER_HOME:\nstderr={err}"
@@ -971,8 +952,12 @@ mod tests {
         // Case B from #438 — already refused pre-fix via the generic usage fallthrough;
         // this pins that it now gets the SAME explanatory message as serve/status, not
         // plain "Usage:" text.
-        let (code, out, err) =
-            run_captured(["maxplayer", "buyer", "--home", "/tmp/should-not-be-used"]);
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "buyer",
+            "--home",
+            "/tmp/should-not-be-used",
+        ]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("--home") && err.contains("MAXPLAYER_HOME"));
@@ -993,14 +978,7 @@ mod tests {
         );
         // Invoking it cannot boot the seller: it is a plain usage error, identical to any unknown
         // command, and never reaches the discoverability/heartbeat publish.
-        let (code, out, err) = run_captured([
-            "maxplayer",
-            "seller",
-            "--agent",
-            "claude",
-            "--rate-sats",
-            "100",
-        ]);
+        let (code, out, err) = run_captured(["maxplayer", "seller", "--agent", "claude", "--rate-sats", "100"]);
         assert_eq!(code, 1);
         assert!(out.is_empty());
         assert!(err.contains("Usage:"));
@@ -1042,22 +1020,9 @@ mod tests {
     // buyer-surface test's argv was renamed to `seller`, leaving no assertion that `sell` is rejected.
     #[test]
     fn retired_sell_subcommand_is_rejected_no_alias() {
-        let (code, out, err) = run_captured([
-            "maxplayer",
-            "sell",
-            "--agent",
-            "claude",
-            "--rate-sats",
-            "100",
-        ]);
-        assert_eq!(
-            code, 1,
-            "`maxplayer sell` must be a usage error, never a dispatch"
-        );
-        assert!(
-            out.is_empty(),
-            "`maxplayer sell` must print nothing to stdout:\n{out}"
-        );
+        let (code, out, err) = run_captured(["maxplayer", "sell", "--agent", "claude", "--rate-sats", "100"]);
+        assert_eq!(code, 1, "`maxplayer sell` must be a usage error, never a dispatch");
+        assert!(out.is_empty(), "`maxplayer sell` must print nothing to stdout:\n{out}");
         assert!(
             err.contains("Usage:"),
             "`maxplayer sell` must fall through to usage, not boot a seller:\n{err}"
@@ -1335,8 +1300,12 @@ mod tests {
     #[test]
     fn whoami_prints_pubkey_npub_and_resolved_home() {
         let home = test_home("whoami-prints");
-        let (code, out, err) =
-            run_captured(["maxplayer", "whoami", "--home", home.to_str().unwrap()]);
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "whoami",
+            "--home",
+            home.to_str().unwrap(),
+        ]);
 
         assert_eq!(code, 0, "stderr: {err}");
         assert!(err.is_empty(), "stderr: {err}");
@@ -1376,8 +1345,12 @@ mod tests {
     #[test]
     fn whoami_output_never_contains_secret_key() {
         let home = test_home("whoami-nosecret");
-        let (code, out, err) =
-            run_captured(["maxplayer", "whoami", "--home", home.to_str().unwrap()]);
+        let (code, out, err) = run_captured([
+            "maxplayer",
+            "whoami",
+            "--home",
+            home.to_str().unwrap(),
+        ]);
         assert_eq!(code, 0, "stderr: {err}");
 
         // bootstrap wrote the secret to `<home>/key` (0600). Read it directly, then red-prove it
@@ -1386,10 +1359,7 @@ mod tests {
             .expect("secret key file")
             .trim()
             .to_owned();
-        assert!(
-            !secret_hex.is_empty(),
-            "precondition: key file is non-empty"
-        );
+        assert!(!secret_hex.is_empty(), "precondition: key file is non-empty");
 
         assert!(
             !out.contains(&secret_hex),
@@ -1495,9 +1465,6 @@ mod tests {
     #[cfg(feature = "wallet")]
     fn test_home(name: &str) -> PathBuf {
         let id = NEXT_TEST_ID.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!(
-            "maxplayer-cli-home-{name}-{}-{id}",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("maxplayer-cli-home-{name}-{}-{id}", std::process::id()))
     }
 }

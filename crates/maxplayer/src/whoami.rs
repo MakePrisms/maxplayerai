@@ -110,8 +110,8 @@ fn run_whoami(
 fn npub_from_pubkey_hex(pubkey_hex: &str) -> Result<String, String> {
     use nostr_sdk::prelude::{PublicKey, ToBech32};
 
-    let public_key = PublicKey::from_hex(pubkey_hex)
-        .map_err(|error| format!("pubkey parse for npub: {error}"))?;
+    let public_key =
+        PublicKey::from_hex(pubkey_hex).map_err(|error| format!("pubkey parse for npub: {error}"))?;
     public_key
         .to_bech32()
         .map_err(|error| format!("npub encode: {error}"))

@@ -155,10 +155,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
     };
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
             let _ = writeln!(err, "sandbox-reap runtime: {error}");
@@ -168,9 +165,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     if options.dry_run {
         // The same selection the real reap uses, printed instead of acted on.
-        match runtime.block_on(maxplayer_core::sandbox_netns::reapable_holders_live(
-            &options.seat,
-        )) {
+        match runtime.block_on(maxplayer_core::sandbox_netns::reapable_holders_live(&options.seat)) {
             Ok(holders) if holders.is_empty() => {
                 let _ = writeln!(
                     out,
@@ -214,11 +209,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 }
                 if report.failed.is_empty() {
                     let _ = if report.removed.is_empty() {
-                        writeln!(
-                            out,
-                            "no reapable containment holders for seat {}",
-                            options.seat
-                        )
+                        writeln!(out, "no reapable containment holders for seat {}", options.seat)
                     } else {
                         writeln!(
                             out,
@@ -270,10 +261,7 @@ mod tests {
     fn host_wide_flags_are_refused_with_a_reason_in_every_spelling() {
         for flag in HOST_WIDE_FLAGS {
             let error = parse_options(&argv(&[flag])).expect_err("must refuse");
-            assert!(
-                error.contains(flag),
-                "must name the flag it refuses: {error}"
-            );
+            assert!(error.contains(flag), "must name the flag it refuses: {error}");
             assert!(error.contains("retired"), "must say why: {error}");
             // And the refusal does not become permission when a seat is also named.
             let with_seat = parse_options(&argv(&["--seat", &seat_hex(), flag]));
@@ -308,12 +296,7 @@ mod tests {
     /// rather than report a reap of nothing.
     #[test]
     fn a_seat_that_cannot_match_a_label_is_refused_not_run() {
-        for value in [
-            "abc",
-            "A".repeat(SEAT_HEX_LEN).as_str(),
-            "",
-            "z".repeat(SEAT_HEX_LEN).as_str(),
-        ] {
+        for value in ["abc", "A".repeat(SEAT_HEX_LEN).as_str(), "", "z".repeat(SEAT_HEX_LEN).as_str()] {
             assert!(
                 parse_options(&argv(&["--seat", value])).is_err(),
                 "must refuse a seat that cannot match a label: {value:?}"
@@ -336,17 +319,11 @@ mod tests {
         let seat = seat_hex();
         assert_eq!(
             parse_options(&argv(&["--seat", &seat])).expect("parses"),
-            ReapOptions {
-                seat: seat.clone(),
-                dry_run: false
-            }
+            ReapOptions { seat: seat.clone(), dry_run: false }
         );
         assert_eq!(
             parse_options(&argv(&["--seat", &seat, "--dry-run"])).expect("parses"),
-            ReapOptions {
-                seat: seat.clone(),
-                dry_run: true
-            }
+            ReapOptions { seat: seat.clone(), dry_run: true }
         );
         // No positional seat: the id arrives through the named flag or not at all.
         assert!(parse_options(&argv(&[&seat])).is_err());

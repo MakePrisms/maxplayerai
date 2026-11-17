@@ -9,15 +9,23 @@ pub struct Journal(pub Arc<cdk_sqlite::WalletSqliteDatabase>);
 pub const JOURNAL_VERSION: u64 = 1;
 /// Key of a deliberately malformed row planted in every money namespace ([`TOMBSTONE_NAMESPACES`]).
 /// The old standalone `maxplayer-trade` binary lists a namespace into its record struct before it
-/// acts on it (startup recovery reads `swap`; `fund` reads `funding`/`receive`; `withdraw` reads
-/// `withdrawal`; `receive` reads `receive`/`funding`; `send` reads `send`), so this row stops it
-/// with its own text in the error ("invalid type: string \"maxplayer-trade is obsolete ...\"").
-/// Not covered: `send --reclaim <id>`, a point lookup of one send. Every reader in this crate skips
-/// the row ([`Journal::all`], `observe::journal_rows`, `wallet::read_status`,
+/// acts on it (startup recovery replays `inbox_retry`, then reads `swap`; `fund` reads
+/// `funding`/`receive`; `withdraw` reads `withdrawal`; `receive` reads `receive`/`funding`; `send`
+/// reads `send`), so this row stops it with its own text in the error ("invalid type: string
+/// \"maxplayer-trade is obsolete ...\""). Not covered: `fund --id <id>` of an already journaled
+/// funding and `send --reclaim <id>`, which read one record directly. Every reader in this crate
+/// skips the row ([`Journal::all`], `observe::journal_rows`, `wallet::read_status`,
 /// `send::check_redeemed`).
 pub const OBSOLETE_TOMBSTONE_KEY: &str = "obsolete-maxplayer-trade-tombstone";
 /// The namespaces that carry the tombstone: every one an old binary lists before moving money.
-pub const TOMBSTONE_NAMESPACES: [&str; 5] = ["swap", "funding", "withdrawal", "receive", "send"];
+pub const TOMBSTONE_NAMESPACES: [&str; 6] = [
+    "inbox_retry",
+    "swap",
+    "funding",
+    "withdrawal",
+    "receive",
+    "send",
+];
 /// The tombstone's value: a JSON string, never a valid record.
 pub const OBSOLETE_TOMBSTONE: &str = "maxplayer-trade is obsolete: trading moved into `maxplayer \
     trade`. Delete this binary (`command -v maxplayer-trade` shows where it is) and run `maxplayer \
@@ -151,6 +159,7 @@ mod tests {
             panic!("an old binary must fail to read the {ns} journal")
         }
         for err in [
+            old_list::<crate::coordinator::Retained>(&j, "inbox_retry").await,
             old_list::<crate::money::Funding>(&j, "funding").await,
             old_list::<crate::money::Withdrawal>(&j, "withdrawal").await,
             old_list::<crate::receive::Receipt>(&j, "receive").await,

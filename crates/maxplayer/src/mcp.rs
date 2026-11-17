@@ -309,10 +309,7 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
             }),
         ),
         "ping" => ok(id, json!({})),
-        "tools/list" => ok(
-            id,
-            json!({ "tools": tools_for(state.home.config.sessions.enabled) }),
-        ),
+        "tools/list" => ok(id, json!({ "tools": tools_for(state.home.config.sessions.enabled) })),
         "tools/call" => {
             let tool = request.params.get("name").and_then(Value::as_str);
             let deadline = tool_deadline_secs(tool);
@@ -583,11 +580,10 @@ async fn route_tool(
     let rpc = method.to_owned();
     // The daemon client is synchronous (a plain UnixStream) and may spawn+poll a daemon on cold
     // start, so run it off the async reactor under the outer tool deadline.
-    let body =
-        tokio::task::spawn_blocking(move || daemon::ensure_then_call(&home, &rpc, arguments))
-            .await
-            .map_err(|error| format!("buyer daemon call task failed: {error}"))?
-            .map_err(|error| with_prereq_hint(tool, error))?;
+    let body = tokio::task::spawn_blocking(move || daemon::ensure_then_call(&home, &rpc, arguments))
+        .await
+        .map_err(|error| format!("buyer daemon call task failed: {error}"))?
+        .map_err(|error| with_prereq_hint(tool, error))?;
     guard_never_echo(state, tool, &body)?;
     Ok(body)
 }
@@ -646,7 +642,7 @@ fn moved_tool_error(name: &str) -> String {
         other => {
             return format!(
                 "unknown tool: {other} (MCP surface is post_job, get_job, award_claim, collect)"
-            );
+            )
         }
     };
     format!(
@@ -654,6 +650,7 @@ fn moved_tool_error(name: &str) -> String {
          (post_job, get_job, award_claim, collect)."
     )
 }
+
 
 /// Wallet bootstrap/funding moved off the MCP surface to `maxplayer wallet setup`, so a kept trade tool
 /// that fails because the wallet is unfunded / its mint is unreachable appends the actionable CLI
@@ -841,7 +838,7 @@ mod tests {
     #[cfg(feature = "wallet")]
     #[test]
     fn post_job_award_filter_descriptions_match_enforcement() {
-        use maxplayer_core::buyer::lifecycle::{AwardFilters, select_awardable_claim};
+        use maxplayer_core::buyer::lifecycle::{select_awardable_claim, AwardFilters};
         use maxplayer_core::gateway::creq::build_seller_creq;
         use maxplayer_core::home::DEFAULT_MINT_URL;
         use maxplayer_core::job_lifecycle::{ClaimView, JobView};
@@ -950,19 +947,10 @@ mod tests {
         // any capability requirement.
         let rust = vec!["rust".to_owned()];
         for (axis, filters) in [
-            (
-                "harness",
-                AwardFilters {
-                    requested_agent: Some("claude"),
-                    ..neutral
-                },
-            ),
+            ("harness", AwardFilters { requested_agent: Some("claude"), ..neutral }),
             (
                 "harness_family",
-                AwardFilters {
-                    requested_harness_family: Some("claude-code"),
-                    ..neutral
-                },
+                AwardFilters { requested_harness_family: Some("claude-code"), ..neutral },
             ),
             (
                 "model",
@@ -975,13 +963,7 @@ mod tests {
                     ..neutral
                 },
             ),
-            (
-                "capabilities",
-                AwardFilters {
-                    required_capabilities: &rust,
-                    ..neutral
-                },
-            ),
+            ("capabilities", AwardFilters { required_capabilities: &rust, ..neutral }),
         ] {
             assert_eq!(
                 select_awardable_claim(&view, &filters),
@@ -996,7 +978,10 @@ mod tests {
 
     fn temp_home(label: &str) -> std::path::PathBuf {
         let id = NEXT.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("maxplayer-mcp-{label}-{}-{id}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "maxplayer-mcp-{label}-{}-{id}",
+            std::process::id()
+        ))
     }
 
     fn state_at(root: &std::path::Path) -> McpState {
@@ -1148,11 +1133,7 @@ mod tests {
         );
         // Turns ≥ 2 are auto-settled now: no description may still say they need collect.
         for (name, text) in [("reply", &reply), ("get_job", &get), ("collect", &collect)] {
-            for stale in [
-                "does not settle turns 2",
-                "settled only by collect",
-                "a session turn 2 or later, or an award",
-            ] {
+            for stale in ["does not settle turns 2", "settled only by collect", "a session turn 2 or later, or an award"] {
                 assert!(!text.contains(stale), "{name} still says {stale:?}: {text}");
             }
         }
@@ -1396,22 +1377,10 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            vec!["post_job", "get_job", "collect", "award_claim", "reply"]
-        );
-        let collect = on
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|t| t["name"] == "collect")
-            .unwrap();
+        assert_eq!(names, vec!["post_job", "get_job", "collect", "award_claim", "reply"]);
+        let collect = on.as_array().unwrap().iter().find(|t| t["name"] == "collect").unwrap();
         assert!(collect["inputSchema"]["properties"]["turn"].is_object());
-        assert!(
-            collect["inputSchema"]["properties"]
-                .get("close_session")
-                .is_none()
-        );
+        assert!(collect["inputSchema"]["properties"].get("close_session").is_none());
         let off = tools();
         let collect = off
             .as_array()
@@ -1524,10 +1493,7 @@ mod tests {
             "authorize_pay refused: the single-mint buyer wallet holds no balance at any accepted mint"
                 .to_owned(),
         );
-        assert!(
-            mapped.contains("maxplayer wallet setup"),
-            "message: {mapped}"
-        );
+        assert!(mapped.contains("maxplayer wallet setup"), "message: {mapped}");
         assert!(mapped.contains("collect prerequisite"), "message: {mapped}");
         // #595 (mints-are-mints): the hint must not fork mint classes or say "real".
         // RED-ON-REVERT: re-adding "a REAL mint" / "real sats" reds this.

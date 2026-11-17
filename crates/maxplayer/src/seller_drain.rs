@@ -31,11 +31,7 @@ struct Options {
 }
 
 fn parse(args: &[String]) -> Result<Options, String> {
-    let mut options = Options {
-        home: None,
-        wait: true,
-        timeout: None,
-    };
+    let mut options = Options { home: None, wait: true, timeout: None };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -125,10 +121,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     );
     let started = Instant::now();
     while maxplayer_core::seller_node::lock::still_holding(pid, &lock) {
-        if options
-            .timeout
-            .is_some_and(|limit| started.elapsed() >= limit)
-        {
+        if options.timeout.is_some_and(|limit| started.elapsed() >= limit) {
             let _ = writeln!(
                 err,
                 "seller drain: still draining after {}s; the drain continues — re-run to wait again",
@@ -158,19 +151,11 @@ mod tests {
     fn parses_defaults_and_flags() {
         assert_eq!(
             parse(&[]).unwrap(),
-            Options {
-                home: None,
-                wait: true,
-                timeout: None
-            }
+            Options { home: None, wait: true, timeout: None }
         );
         assert_eq!(
             parse(&args(&["--home", "/h", "--timeout", "60"])).unwrap(),
-            Options {
-                home: Some("/h".into()),
-                wait: true,
-                timeout: Some(Duration::from_secs(60))
-            }
+            Options { home: Some("/h".into()), wait: true, timeout: Some(Duration::from_secs(60)) }
         );
         assert!(!parse(&args(&["--no-wait"])).unwrap().wait);
         assert!(parse(&args(&["--no-wait", "--timeout", "5"])).is_err());
@@ -195,20 +180,15 @@ mod tests {
             maxplayer_core::seller_node::lock::holder(&lock),
             Ok(maxplayer_core::seller_node::lock::LockHolder::Pid(_))
         ) {
-            assert!(
-                Instant::now() < deadline,
-                "the stand-in never recorded its pid"
-            );
+            assert!(Instant::now() < deadline, "the stand-in never recorded its pid");
             std::thread::sleep(Duration::from_millis(20));
         }
         Some(child)
     }
 
     fn temp_root(label: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "maxplayer-drain-cli-{label}-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("maxplayer-drain-cli-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         root
@@ -224,11 +204,7 @@ mod tests {
             return;
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run(
-            &args(&["--home", root.to_str().unwrap(), "--timeout", "20"]),
-            &mut out,
-            &mut err,
-        );
+        let code = run(&args(&["--home", root.to_str().unwrap(), "--timeout", "20"]), &mut out, &mut err);
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(code, SUCCESS, "{}", String::from_utf8_lossy(&err));
@@ -247,11 +223,7 @@ mod tests {
             return;
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run(
-            &args(&["--home", root.to_str().unwrap(), "--timeout", "1"]),
-            &mut out,
-            &mut err,
-        );
+        let code = run(&args(&["--home", root.to_str().unwrap(), "--timeout", "1"]), &mut out, &mut err);
         let alive = child.try_wait().unwrap().is_none();
         let _ = child.kill();
         let _ = child.wait();
@@ -266,11 +238,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("maxplayer-drain-cli-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&root);
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run(
-            &args(&["--home", root.to_str().unwrap()]),
-            &mut out,
-            &mut err,
-        );
+        let code = run(&args(&["--home", root.to_str().unwrap()]), &mut out, &mut err);
         assert_eq!(code, NOT_SENT);
         assert!(String::from_utf8_lossy(&err).contains("no seller is running"));
         let _ = std::fs::remove_dir_all(&root);

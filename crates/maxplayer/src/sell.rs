@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use maxplayer_core::delivery_transport::is_relay_git_locator;
 use maxplayer_core::home::{
-    self, DEFAULT_MINT_URL, DEFAULT_RATE_SATS, DEFAULT_RELAY_URL, MaxplayerHome, SellerConfig,
+    self, MaxplayerHome, SellerConfig, DEFAULT_MINT_URL, DEFAULT_RATE_SATS, DEFAULT_RELAY_URL,
 };
 use maxplayer_core::profile::{self, SetProfileRequest};
 
@@ -274,8 +274,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     // honest for free.
     let runner = runtime
         .block_on(async {
-            let verdicts =
-                maxplayer_core::seller_node::run::probe_configured_harnesses(&home).await?;
+            let verdicts = maxplayer_core::seller_node::run::probe_configured_harnesses(&home).await?;
             maxplayer_core::seller_node::run::boot_advertising_only_proven(home, verdicts).await
         })
         .map_err(|error| {
@@ -291,11 +290,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
         // not" — the distinction that decides whether an empty list leaves them reachable.
         "seller node starting pubkey={} agent={} rate_sats={} claim_open_pool={} accept_open_targeted={} accept_offers_only_from={} git_remote={} (never-echo: key omitted)",
         runner.seller_pubkey(),
-        seller
-            .agents
-            .first()
-            .map(String::as_str)
-            .unwrap_or("custom"),
+        seller.agents.first().map(String::as_str).unwrap_or("custom"),
         seller.rate_sats,
         seller.claim_open_pool,
         seller.accept_open_targeted,
@@ -357,14 +352,8 @@ fn ensure_seller_config(
     // (the image bakes the adapter in); every other executor runs it on the host.
     let custom_agents = home.config.agents.clone();
     let adapter_host = agent_presets::AdapterHost::for_sandbox(home.config.sandbox.as_ref());
-    let (mut agent_label, mut agent_command) = resolve_agent(
-        options,
-        existing.as_ref(),
-        &custom_agents,
-        adapter_host,
-        out,
-        err,
-    )?;
+    let (mut agent_label, mut agent_command) =
+        resolve_agent(options, existing.as_ref(), &custom_agents, adapter_host, out, err)?;
 
     let mut rate_sats = options
         .rate_sats
@@ -378,21 +367,15 @@ fn ensure_seller_config(
     let job_timeout_secs = options
         .job_timeout_secs
         .or_else(|| existing.as_ref().and_then(|seller| seller.job_timeout_secs));
-    let claim_open_pool = options.claim_open_pool.unwrap_or_else(|| {
-        existing
-            .as_ref()
-            .map(|s| s.claim_open_pool)
-            .unwrap_or(false)
-    });
+    let claim_open_pool = options
+        .claim_open_pool
+        .unwrap_or_else(|| existing.as_ref().map(|s| s.claim_open_pool).unwrap_or(false));
     // Same precedence as the pool flag: explicit flag > existing config > CLOSED. Carrying the
     // existing value is what stops a plain relaunch from silently closing a seat its operator had
     // opened — the #369-class clobber, in the direction that takes a working seller off the market.
-    let accept_open_targeted = options.accept_open_targeted.unwrap_or_else(|| {
-        existing
-            .as_ref()
-            .map(|s| s.accept_open_targeted)
-            .unwrap_or(false)
-    });
+    let accept_open_targeted = options
+        .accept_open_targeted
+        .unwrap_or_else(|| existing.as_ref().map(|s| s.accept_open_targeted).unwrap_or(false));
     // Offer backfill window: flag > existing config > serde default (1200s / 20 min).
     let offer_backfill_secs = options.offer_backfill_secs.unwrap_or_else(|| {
         existing
@@ -402,11 +385,7 @@ fn ensure_seller_config(
     });
 
     // Default delivery = relay-git (self-owned namespace).
-    if git_remote
-        .as_ref()
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
+    if git_remote.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true) {
         let pubkey = home::public_key_hex(home).map_err(|error| {
             let _ = writeln!(err, "{error}");
             RUNTIME_ERROR
@@ -428,11 +407,7 @@ fn ensure_seller_config(
         if rate_sats.is_none() {
             missing.push("rate_sats (--rate-sats)");
         }
-        if git_remote
-            .as_ref()
-            .map(|v| v.trim().is_empty())
-            .unwrap_or(true)
-        {
+        if git_remote.as_ref().map(|v| v.trim().is_empty()).unwrap_or(true) {
             missing.push("git_remote");
         }
         if !missing.is_empty() {
@@ -462,12 +437,11 @@ fn ensure_seller_config(
                 agent_presets::preset_choices(&custom_agents)
             );
             let picked = prompt_line(out, err, "Agent", suggestion)?;
-            let (label, argv) =
-                agent_presets::resolve_agent_preset_in(&picked, &custom_agents, adapter_host)
-                    .map_err(|message| {
-                        let _ = writeln!(err, "{message}");
-                        USAGE_ERROR
-                    })?;
+            let (label, argv) = agent_presets::resolve_agent_preset_in(&picked, &custom_agents, adapter_host)
+                .map_err(|message| {
+                    let _ = writeln!(err, "{message}");
+                    USAGE_ERROR
+                })?;
             agent_command = argv;
             agent_label = Some(label.clone());
             report_agent_preset(err, &label, &agent_command[0], &custom_agents);
@@ -504,19 +478,20 @@ fn ensure_seller_config(
         // Multiple `--agent`s: resolve each named preset in preference order (dedup, order kept).
         let mut resolved: Vec<String> = Vec::with_capacity(options.agents.len());
         for name in &options.agents {
-            let (label, _argv) =
-                agent_presets::resolve_agent_preset_in(name, &custom_agents, adapter_host)
-                    .map_err(|message| {
-                        let _ = writeln!(err, "{message}");
-                        USAGE_ERROR
-                    })?;
+            let (label, _argv) = agent_presets::resolve_agent_preset_in(name, &custom_agents, adapter_host)
+                .map_err(|message| {
+                    let _ = writeln!(err, "{message}");
+                    USAGE_ERROR
+                })?;
             if !resolved.iter().any(|existing| existing == &label) {
                 resolved.push(label);
             }
         }
         let _ = writeln!(err, "agent registry: {}", resolved.join(", "));
         resolved
-    } else if options.agents.is_empty() && options.agent.is_none() && options.agent_argv.is_empty()
+    } else if options.agents.is_empty()
+        && options.agent.is_none()
+        && options.agent_argv.is_empty()
     {
         // No explicit agent input this run (a bare relaunch): carry the existing registry IN FULL so a
         // multi-harness `agents` list is never truncated to its first entry (#369 clobber class — the
@@ -554,10 +529,7 @@ fn ensure_seller_config(
         // CLI flag — `takes_no_payment` is only valid with `rate_sats = 0` and hands the operator's
         // only remaining control to admission, so it is an edit an operator makes deliberately in
         // `[seller]`, not one a wizard can set in passing.
-        takes_no_payment: existing
-            .as_ref()
-            .map(|s| s.takes_no_payment)
-            .unwrap_or(false),
+        takes_no_payment: existing.as_ref().map(|s| s.takes_no_payment).unwrap_or(false),
         // Buyer allowlist (#482): carried from an existing config so a relaunch never clobbers an
         // operator's private-seller fence (#369-class); a fresh config defaults empty, which now
         // means "no buyer named" rather than accept-all — reachability is decided by the two
@@ -576,10 +548,7 @@ fn ensure_seller_config(
             .unwrap_or(true),
         // Concurrency inherits an existing config, else the built-in default (3 since #378);
         // operators tune it by editing `[seller] slots = N`.
-        slots: existing
-            .as_ref()
-            .map(|s| s.slots)
-            .unwrap_or_else(home::default_slots),
+        slots: existing.as_ref().map(|s| s.slots).unwrap_or_else(home::default_slots),
         claim_award_timeout_secs: existing.as_ref().and_then(|s| s.claim_award_timeout_secs),
     };
     home::save_config(home, |config| {
@@ -614,17 +583,14 @@ fn resolve_agent(
 ) -> Result<(Option<String>, Vec<String>), i32> {
     if !options.agent_argv.is_empty() {
         if options.agent.is_some() {
-            let _ = writeln!(
-                err,
-                "refused: pass either --agent or --agent-argv, not both"
-            );
+            let _ = writeln!(err, "refused: pass either --agent or --agent-argv, not both");
             return Err(USAGE_ERROR);
         }
         return Ok((None, options.agent_argv.clone()));
     }
     if let Some(name) = options.agent.as_ref() {
-        let (label, argv) = agent_presets::resolve_agent_preset_in(name, custom_agents, host)
-            .map_err(|message| {
+        let (label, argv) =
+            agent_presets::resolve_agent_preset_in(name, custom_agents, host).map_err(|message| {
                 let _ = writeln!(err, "{message}");
                 USAGE_ERROR
             })?;
@@ -813,10 +779,10 @@ impl SellOptions {
                     let raw = args
                         .get(index)
                         .ok_or_else(|| "missing value for --offer-backfill-secs".to_owned())?;
-                    options.offer_backfill_secs =
-                        Some(raw.parse().map_err(|_| {
-                            format!("--offer-backfill-secs must be a u64, got {raw}")
-                        })?);
+                    options.offer_backfill_secs = Some(
+                        raw.parse()
+                            .map_err(|_| format!("--offer-backfill-secs must be a u64, got {raw}"))?,
+                    );
                 }
                 "--name" => {
                     index += 1;
@@ -959,10 +925,7 @@ mod tests {
         // The pre-existing line is preserved — this adds to the report, it does not replace it.
         assert!(printed.contains("agent preset=codex argv0=/usr/local/bin/codex-acp"));
         // The load-bearing addition: the CLI behind the adapter, and how to authenticate it.
-        assert!(
-            printed.contains("codex login"),
-            "no auth step named: {printed}"
-        );
+        assert!(printed.contains("codex login"), "no auth step named: {printed}");
         assert!(
             printed.contains("refuses to advertise"),
             "consequence not stated: {printed}"
@@ -1008,11 +971,7 @@ mod tests {
             !printed.contains("codex login"),
             "invented an auth step for someone else's argv: {printed}"
         );
-        assert_eq!(
-            printed.lines().count(),
-            1,
-            "expected only the preset line: {printed}"
-        );
+        assert_eq!(printed.lines().count(), 1, "expected only the preset line: {printed}");
     }
 
     /// The wiring, not just the helper: the real `--agent` flag path must report through
@@ -1034,15 +993,16 @@ mod tests {
         let options = SellOptions::parse(&["--agent".into(), "mine".into()]).expect("parse");
         let mut out = Vec::new();
         let mut err = Vec::new();
-        let (label, resolved) = resolve_agent(
-            &options,
-            None,
-            &custom,
-            maxplayer_core::agent_presets::AdapterHost::Host,
-            &mut out,
-            &mut err,
-        )
-        .expect("resolves");
+        let (label, resolved) =
+            resolve_agent(
+                &options,
+                None,
+                &custom,
+                maxplayer_core::agent_presets::AdapterHost::Host,
+                &mut out,
+                &mut err,
+            )
+            .expect("resolves");
 
         assert_eq!(label.as_deref(), Some("mine"));
         assert_eq!(resolved, vec![argv0.clone()]);
@@ -1076,13 +1036,8 @@ mod tests {
 
     #[test]
     fn skip_doctor_defaults_off_and_parses_on() {
-        let default = SellOptions::parse(&[
-            "--agent".into(),
-            "claude".into(),
-            "--rate-sats".into(),
-            "2".into(),
-        ])
-        .expect("parse");
+        let default = SellOptions::parse(&["--agent".into(), "claude".into(), "--rate-sats".into(), "2".into()])
+            .expect("parse");
         assert!(!default.skip_doctor, "doctor gate is on by default");
         let skipped = SellOptions::parse(&[
             "--agent".into(),
@@ -1474,13 +1429,9 @@ mod tests {
 
         // Assert the PERSISTED config, reloaded from disk exactly as the next boot loads it.
         let reloaded = home::bootstrap(&root).expect("reload persisted config");
-        let seller = reloaded
-            .config
-            .seller
-            .expect("[seller] persisted after write-back");
+        let seller = reloaded.config.seller.expect("[seller] persisted after write-back");
         assert_eq!(
-            seller.slots,
-            2,
+            seller.slots, 2,
             "operator slots must survive the write-back; pre-#369 clobbered it to \
              default_slots()={}",
             home::default_slots()

@@ -119,8 +119,8 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
 #[cfg(feature = "wallet")]
 fn status(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    use maxplayer_core::buyer::{SOCKET_FILE, client};
     use maxplayer_core::home;
+    use maxplayer_core::buyer::{SOCKET_FILE, client};
 
     let root = match home::default_home_dir() {
         Ok(root) => root,
@@ -133,8 +133,9 @@ fn status(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     match client::status(&socket) {
         Ok(response) => {
             // Print exactly what the daemon returned (result or structured error).
-            let body = serde_json::to_string(&response)
-                .unwrap_or_else(|error| format!("{{\"error\":\"encode status: {error}\"}}"));
+            let body = serde_json::to_string(&response).unwrap_or_else(|error| {
+                format!("{{\"error\":\"encode status: {error}\"}}")
+            });
             let _ = writeln!(out, "{body}");
             if response.error.is_some() {
                 RUNTIME_ERROR

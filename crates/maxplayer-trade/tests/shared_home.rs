@@ -633,6 +633,17 @@ async fn legacy_home_allow_refuse_matrix() {
             "--out",
             "tok",
         ],
+        vec![
+            "list",
+            "--give-mint",
+            "https://example.com",
+            "--give",
+            "5",
+            "--want-mint",
+            mint,
+            "--want",
+            "5",
+        ],
     ] {
         let out = trade(Some(empty.path()), &args);
         assert!(!out.status.success(), "{args:?} must fail here");

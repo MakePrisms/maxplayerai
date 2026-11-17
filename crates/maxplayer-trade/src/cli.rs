@@ -276,18 +276,23 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         Command::Withdraw { mint, .. } => crate::transport::require_http(mint, "withdraw")?,
         _ => {}
     }
-    // Local-only argument checks before resolve_home can create a home or key: a mistyped command
+    // Local-only argument checks before check_home/bootstrap_home can create a home or key: a mistyped command
     // must not leave a fresh unlinked key behind.
     if let Command::Fund { id: Some(id), .. } = &cli.command {
         uuid::Uuid::parse_str(id).context("--id must be a UUID")?;
     }
-    // The token is read once, bounded, before any home or hand-off: a running serve receives it
-    // over its socket; otherwise the local path below uses this same text.
+    // Refusals that need no write (mixed or legacy home, a mint this home may not use) come first,
+    // then the token is read, then the home is bootstrapped: a refused command creates nothing.
+    let (resolved, bootstrap) = check_home(cli.home.as_deref(), &cli.command)?;
+    // The token is read once, bounded, before any hand-off: a running serve receives it over its
+    // socket; otherwise the local path below uses this same text.
     let mut token = match &cli.command {
         Command::Receive { token_file, .. } => Some(read_token(token_file.as_deref())?),
         _ => None,
     };
-    let resolved = resolve_home(cli.home.as_deref(), &cli.command)?;
+    if bootstrap {
+        bootstrap_home(&resolved)?;
+    }
     let home = &resolved;
     // A maxplayer home moves money only at its own mints (default, extra_mints, the seller's
     // accepted_mints) that pass the real-mint fence.
@@ -741,7 +746,8 @@ fn is_read_only(command: &Command) -> bool {
     )
 }
 
-fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
+/// Returns the home and whether it still needs [`bootstrap_home`]; creates nothing.
+fn check_home(arg: Option<&Path>, command: &Command) -> Result<(PathBuf, bool)> {
     use crate::wallet;
     let home = match arg {
         Some(path) => path.to_path_buf(),
@@ -764,12 +770,12 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
         ) {
             anyhow::bail!("{}", wallet::legacy_refusal(&home));
         }
-        return Ok(home);
+        return Ok((home, false));
     }
     // Read-only commands never create anything: no home, key, config or journal ("SAFETY: discover
     // created a home", tests/ux.rs). They run against whatever is there.
     if is_read_only(command) {
-        return Ok(home);
+        return Ok((home, false));
     }
     // A mint this home may not use is refused before bootstrap creates anything (the config is
     // resolved read-only; an absent config.toml means the defaults bootstrap would write).
@@ -782,10 +788,24 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
     {
         wallet::check_shared_mint(&home, &crate::Asset::from_cli(mint)?.mint_url)?;
     }
-    // Every other command can move money, so it gets a complete maxplayer home first, exactly as
-    // the rest of `maxplayer` does (`home::bootstrap`: 0700 dir, config.toml, a 0600 key, wallet/).
-    // Idempotent on an existing home. Bootstrap does not register the key with the relay.
-    let boot = maxplayer_core::home::bootstrap(&home).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Command::List {
+        give_mint,
+        want_mint,
+        ..
+    } = command
+    {
+        for mint in [give_mint, want_mint] {
+            wallet::check_shared_mint(&home, &crate::Asset::from_cli(mint)?.mint_url)?;
+        }
+    }
+    Ok((home, true))
+}
+
+/// Every command that is not read-only can move money, so it gets a complete maxplayer home first,
+/// exactly as the rest of `maxplayer` does (`home::bootstrap`: 0700 dir, config.toml, a 0600 key,
+/// wallet/). Idempotent on an existing home. Bootstrap does not register the key with the relay.
+fn bootstrap_home(home: &Path) -> Result<()> {
+    let boot = maxplayer_core::home::bootstrap(home).map_err(|e| anyhow::anyhow!("{e}"))?;
     if boot.key_created {
         eprintln!(
             "created a new key for maxplayer home {h}; link it with `maxplayer account link --home \
@@ -793,7 +813,7 @@ fn resolve_home(arg: Option<&Path>, command: &Command) -> Result<PathBuf> {
             h = home.display()
         );
     }
-    Ok(home)
+    Ok(())
 }
 
 /// Read one token from `--token-file` or stdin, at most `MAX_TOKEN_BYTES` + 1 bytes (the
