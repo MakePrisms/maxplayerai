@@ -16548,6 +16548,42 @@ mod tests {
         id
     }
 
+    /// Wait until the relay has answered EOSE for every subscription id in `ids` on this seat's
+    /// notification stream; returns the ids that never did (empty = all live).
+    ///
+    /// `subscribe_offers`/`subscribe_all` return once the REQ is QUEUED for the socket, not once the
+    /// relay holds it, while `post_offer` returns only after the relay's OK on the buyer's own
+    /// connection. At boot the open-pool filter is live-only (`since(now).limit(0)`), so an offer
+    /// stored before the relay registers the seller's REQ is broadcast to an empty subscription map,
+    /// and the REQ that lands afterwards returns nothing (`limit 0`): the seat never sees it.
+    /// The fixture relay inserts the subscription BEFORE it sends EOSE, so EOSE is the "REQ is live"
+    /// signal. Tests that publish an untargeted offer right after subscribing must wait on it, or
+    /// they race under load (`the winner must claim the open-pool offer`, CI run 44093112869).
+    async fn await_subscriptions_live(
+        notifications: &mut tokio::sync::broadcast::Receiver<RelayPoolNotification>,
+        ids: &[&str],
+        wait: Duration,
+    ) -> Vec<String> {
+        let mut pending: std::collections::BTreeSet<String> =
+            ids.iter().map(|id| id.to_string()).collect();
+        let _ = tokio::time::timeout(wait, async {
+            while !pending.is_empty() {
+                match notifications.recv().await {
+                    Ok(RelayPoolNotification::Message {
+                        message: nostr_sdk::RelayMessage::EndOfStoredEvents(id),
+                        ..
+                    }) => {
+                        pending.remove(&id.to_string());
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+        .await;
+        pending.into_iter().collect()
+    }
+
     /// Feed JOB_OFFER events off the seller's live notification stream into `on_offer` — exactly what
     /// the run loop's select arm does — until `done` holds or the deadline passes. Returns whether
     /// `done` held.
@@ -17792,6 +17828,13 @@ mod tests {
                     .subscribe_offers(None, open_pool)
                     .await
                     .expect("establish the offer subscription");
+                let not_live = await_subscriptions_live(
+                    &mut notifications,
+                    &[OFFER_SUB_ID],
+                    Duration::from_secs(5),
+                )
+                .await;
+                assert!(not_live.is_empty(), "the relay never served these REQs: {not_live:?}");
 
                 let deadline_unix = now_unix() as u64 + 3_600;
                 let target = to_seller.as_deref();
@@ -18090,6 +18133,23 @@ mod tests {
                     .subscribe_all(None)
                     .await
                     .expect("loser offer + award subscriptions");
+                // Both offer REQs (and the loser's award REQ) must be LIVE at the relay before the
+                // untargeted offer is posted.
+                for (label, notifs, ids) in [
+                    ("winner", &mut winner_notifs, &[OFFER_SUB_ID][..]),
+                    (
+                        "loser",
+                        &mut loser_notifs,
+                        &[OFFER_SUB_ID, AWARD_SUB_ID][..],
+                    ),
+                ] {
+                    let not_live =
+                        await_subscriptions_live(notifs, ids, Duration::from_secs(5)).await;
+                    assert!(
+                        not_live.is_empty(),
+                        "the relay never served the {label}'s REQs: {not_live:?}"
+                    );
+                }
 
                 let deadline_unix = now_unix() as u64 + 3_600;
                 let job_id = post_offer(
@@ -18295,6 +18355,22 @@ mod tests {
                 // Both seats need the offer REQ (to claim) and the award/accept REQ (to see it).
                 winner.subscribe_all(None).await.expect("winner subscriptions");
                 loser.subscribe_all(None).await.expect("loser subscriptions");
+                // Both seats' offer and award/accept REQs must be LIVE at the relay before the
+                // untargeted offer is posted.
+                for (label, notifs) in
+                    [("winner", &mut winner_notifs), ("loser", &mut loser_notifs)]
+                {
+                    let not_live = await_subscriptions_live(
+                        notifs,
+                        &[OFFER_SUB_ID, AWARD_SUB_ID],
+                        Duration::from_secs(5),
+                    )
+                    .await;
+                    assert!(
+                        not_live.is_empty(),
+                        "the relay never served the {label}'s REQs: {not_live:?}"
+                    );
+                }
 
                 let deadline_unix = now_unix() as u64 + 3_600;
                 let job_id = post_offer(
