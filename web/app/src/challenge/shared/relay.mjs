@@ -131,10 +131,15 @@ export function lagTimeout(fn,ms,{thresholdMs=LAG_THRESHOLD_MS,maxCreditMs=PAGE_
 export class RelayReader {
   constructor({url,buyer,store,onChange=()=>{},WebSocketImpl=WebSocket,pollMs=15000,queueMs=300,overlap=900,
     retryMs=1000,maxRetryMs=30000,closedMaxRetryMs=300000,authWaitMs=15000,stableMs=60000,connectMs=20000,pageTimeoutMs=PAGE_TIMEOUT_MS,pageCreditMaxMs=PAGE_CPU_CREDIT_MAX_MS,lagThresholdMs=LAG_THRESHOLD_MS,filters=challengeFilters(buyer),
-    roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey(),window=false}) {
+    roster=filters.some(f=>f.kinds.includes(DECISION)),metadata=filters.some(f=>f.kinds.includes(OFFER)),applicants=roster,onRoster=null,key=schnorr.utils.randomPrivateKey(),window=false,
+    admit=e=>e.kind!==MEMBERSHIP||validMembership(e,{pubkey:buyer})}) {
     Object.assign(this,{url,buyer,store,onChange,WebSocketImpl,pollMs,queueMs,overlap,retryMs,maxRetryMs,closedMaxRetryMs,authWaitMs,stableMs,connectMs,pageTimeoutMs,pageCreditMaxMs,lagThresholdMs,readsRoster:roster,readsMetadata:metadata,applicants});
     // Window mode (see above). windowSince: undefined = not chosen yet, null = whole history, else unix seconds.
     this.windowMode=!!window; this.windowSince=undefined;
+    // admit: which verified events reach the store. The default refuses a membership that is not the
+    // old per-buyer shape; the /swarm board (src/swarm/shared/relay.mjs) passes its own (every
+    // event, its SwarmStore validates the swarm kinds).
+    this.admit=admit;
     this.onRoster=onRoster??(()=>this.setRoster(acceptedSellers(this.store.events.values(),this.buyer)));
     this.initialFilters=filters; this.extra=new Map(); this.members=new Set(); this.rosterKey=null; this.metaWarnings=[];
     this.key=key; this.closedStreak=0; this.lastClosed=null; this.expectAuth=false; // expectAuth: an earlier connection was challenged
@@ -416,7 +421,7 @@ export class RelayReader {
         }
         if(p)p.oldest=Math.min(p.oldest,e.created_at);
         this.newest.set(id,Math.max(this.newest.get(id)??0,e.created_at));
-        if(e.kind===MEMBERSHIP&&!validMembership(e,{pubkey:this.buyer}))return;
+        if(!this.admit(e))return;
         // Decisions first: the roster is applied once this relay's decision history is read,
         // then on every later (live/poll) decision.
         if(this.store.add(e)){if(e.kind===DECISION&&!this.pages.has(String(DECISION)))this.onRoster();this.onChange();}

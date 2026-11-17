@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {coalesce} from '../src/challenge/coalesce.js';
+import {coalesce} from '../src/swarm/coalesce.js';
 
 test('a burst of reader changes rebuilds the snapshot once, and a later change rebuilds again',()=>{
   const queued: (()=>void)[]=[];let runs=0;

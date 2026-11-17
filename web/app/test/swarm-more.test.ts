@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { wireMore } from "../src/challenge/more.js";
+import { wireMore } from "../src/swarm/more.js";
 
 // DOM double: the body's visible height is capped only while .is-clamped is set (as in CSS).
 function fixture(contentHeight: number, cap = 500) {

@@ -8,13 +8,13 @@ import { connectionLine, observe, renderLiveState, renderSellers, ROSTER_ONLY, U
 export interface PaintClock { nowMs: number; now: number; when: (secs: number) => string; status: string; budget: (sats: number) => string | null }
 
 export function paint(doc: Document, s: Snapshot, relay: Snapshot["relay"], t: Tracker, clock: PaintClock): Tracker {
-  const o = observe(t, relay, clock.nowMs, s.challenge);
-  const budget = s.challenge ? clock.budget(s.budget!.totalSats) : "To be announced";
-  renderFacts(doc, heroFacts(s.challenge, clock.now, clock.when, o.readyAgeS, budget));
+  const o = observe(t, relay, clock.nowMs, s.swarmJob);
+  const budget = s.swarmJob ? clock.budget(s.budget!.totalSats) : "To be announced";
+  renderFacts(doc, heroFacts(s.swarmJob, clock.now, clock.when, o.readyAgeS, budget));
   renderLiveState(doc, o.state);
-  // Rows show once the challenge data is ready (o.state "roster", the hero's gate); job states and
+  // Rows show once the swarm data is ready (o.state "roster", the hero's gate); job states and
   // the working count once the run's trade data is complete too ("live"). See live.ts.
   renderSellers(doc, s, clock.now, o.state === "live" ? "live" : o.state === "roster" ? "roster" : "loading");
-  doc.getElementById("connection-status")!.textContent = o.state === "roster" ? ROSTER_ONLY : o.state === "updating" ? UPDATING : connectionLine(relay, clock.status, o.wasLive, s.challenge);
+  doc.getElementById("connection-status")!.textContent = o.state === "roster" ? ROSTER_ONLY : o.state === "updating" ? UPDATING : connectionLine(relay, clock.status, o.wasLive, s.swarmJob);
   return { wasLive: o.wasLive, readyAt: o.readyAt };
 }

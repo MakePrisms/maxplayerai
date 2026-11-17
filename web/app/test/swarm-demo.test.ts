@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { demoSnapshot } from "../src/challenge/demo.js";
-import { parseSnapshot, sellerLine } from "../src/challenge/live.js";
+import { demoSnapshot } from "../src/swarm/demo.js";
+import { parseSnapshot, sellerLine } from "../src/swarm/live.js";
 
 test("demo snapshot passes the same validation as live data and counts running jobs up", () => {
   const now = 1_792_100_000;

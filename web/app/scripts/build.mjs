@@ -14,8 +14,6 @@
  * to cache. The files themselves keep their names; the query string is the
  * only difference.
  */
-import { parseChallengeRelays, parseChallengeQuorum } from "../src/challenge/shared/relay.mjs";
-import { withSwarmBuyer } from "./swarm-buyer.mjs";
 import { build, context } from "esbuild";
 import { createHash } from "node:crypto";
 import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -26,13 +24,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dist = join(root, "dist");
 const SITE_ORIGIN = "https://www.maxplayer.ai";
 
-const buyer = process.env.CHALLENGE_BUYER_PUBKEY ?? "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5";
-if (!/^[0-9a-f]{64}$/.test(buyer)) throw Error("CHALLENGE_BUYER_PUBKEY must be lowercase hex");
 const relay = process.env.RELAY_URL ?? "wss://relay.maxplayer.ai";
 if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid RELAY_URL");
-const challengeRelays = parseChallengeRelays(process.env.CHALLENGE_RELAYS);
-// Challenge relay quorum (run 2 #13): default 2; must be a majority of CHALLENGE_RELAYS.
-const challengeQuorum = parseChallengeQuorum(process.env.CHALLENGE_QUORUM, challengeRelays.length);
 const watch = process.argv.includes("--watch");
 // Legal pages are served one level deep, so they load assets from "/" rather than "./".
 // Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
@@ -44,9 +37,6 @@ const options = {
   entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts") },
   bundle: true,
   define: {
-    CHALLENGE_BUYER_PUBKEY: JSON.stringify(buyer),
-    CHALLENGE_RELAYS: JSON.stringify(challengeRelays),
-    CHALLENGE_QUORUM: JSON.stringify(challengeQuorum),
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
     WEB_ANALYTICS_ENABLED: String(process.env.VERCEL_ENV === "production"),
   },
@@ -62,7 +52,6 @@ if (watch) {
   // Dev loop: unstamped copies, rebuild on save. Stamping is a deploy concern.
   mkdirSync(dist, { recursive: true });
   cpSync(join(root, "public"), dist, { recursive: true });
-  writeFileSync(join(dist, "swarm.html"), withSwarmBuyer(readFileSync(join(root, "public/swarm.html"), "utf8"), "html", buyer));
   const ctx = await context(options);
   await ctx.watch();
   console.log("watching src/ …");
@@ -92,11 +81,11 @@ if (watch) {
       .replace(/url\((['"])(\.\/fonts\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
   );
   // Every page: the buyer homepage (/), the seller page (/sell), the live
-  // market (/market), the chat page (/chat), the mint page (/mint), the token-trade page (/tokens) and the community swarm (/swarm) — cleanUrls serves them.
+  // market (/market), the chat page (/chat), the mint page (/mint), the token-trade page (/tokens) and the swarms (/swarm and /swarm/<naddr>) — cleanUrls serves them.
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
-      withSwarmBuyer(readFileSync(join(root, "public", page), "utf8"), page === "swarm.html" ? "html" : null, buyer)
+      readFileSync(join(root, "public", page), "utf8")
         .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|terminal\.js|tokens\.js|swarm\.js|swarm\.css|fonts\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
     );
   }

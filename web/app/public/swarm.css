@@ -30,7 +30,7 @@
   .c-sellers .c-mins, .c-sellers .c-state { text-align: left; }
 }
 /* swarm titles are dynamic: let them wrap instead of the wordmark's single line */
-.h-hero h1#challenge-title { white-space: normal; text-wrap: balance; max-width: 980px; margin: 18px auto 0; font-size: clamp(32px, 6vw, 80px); overflow-wrap: anywhere; }
+.h-hero h1#swarm-title { white-space: normal; text-wrap: balance; max-width: 980px; margin: 18px auto 0; font-size: clamp(32px, 6vw, 80px); overflow-wrap: anywhere; }
 /* the job: the swarm event's content, read like an article */
 .c-job .h-in { text-align: left; }
 .c-job .eyebrow, .c-job h2 { display: block; text-align: center; }
@@ -48,7 +48,7 @@
 .c-summary:empty { display: none; }
 .c-summary:empty ~ .c-sellers { margin-top: 28px; }
 /* the job is capped at about one screen (the viewport minus the nav, the section padding,
-   heading and button) with a fade, and "See more" opens it (bob). src/challenge/more.ts adds
+   heading and button) with a fade, and "See more" opens it (bob). src/swarm/more.ts adds
    .is-clamped only when JS runs, so without JS the whole job is readable. */
 .c-job-body.is-clamped {
   max-height: max(240px, calc(100vh - var(--nav-h) - 380px));
@@ -72,3 +72,22 @@
   }
 }
 .eyebrow.is-off { visibility: hidden; }
+
+/* One page, two views (src/swarm.ts sets the body class from the path): /swarm lists every
+   buyer's swarms, /swarm/<naddr> shows one swarm. Until the script runs the index shows. */
+body:not(.view-swarm) [data-view="swarm"], body.view-swarm [data-view="index"] { display: none !important; }
+.c-buyer { margin: 14px 0 0; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.c-buyer code { color: var(--ink); }
+.c-swarms { list-style: none; margin: 36px 0 0; padding: 0; text-align: left; }
+.c-swarms li { padding: 18px 4px; border-bottom: 1px solid var(--line); display: grid; gap: 6px; }
+.c-swarms li:first-child { border-top: 1px solid var(--line); }
+.c-swarms a { font-family: var(--sans); font-size: 18px; font-weight: 600; color: var(--ink); text-decoration: none; overflow-wrap: anywhere; }
+.c-swarms a:hover { color: var(--neon); }
+.c-swarms .c-purpose { margin: 0; color: var(--ink); opacity: 0.85; overflow-wrap: anywhere; }
+.c-swarms .c-meta { font-size: 12.5px; color: var(--muted); overflow-wrap: anywhere; }
+.c-swarms .c-meta .c-on { color: var(--neon); }
+.c-swarms .skel { display: block; height: 0.9em; width: 60%; }
+.c-jobs { list-style: none; margin: 18px 0 0; padding: 0; text-align: left; font-size: 13px; color: var(--muted); }
+.c-jobs li { padding: 6px 0; overflow-wrap: anywhere; }
+/* A /swarm/<naddr> that names no swarm: the hero says so and links the index; nothing else shows. */
+body.view-missing main > section:not(.h-hero), body.view-missing #job-float, body.view-missing .nav-cta { display: none !important; }

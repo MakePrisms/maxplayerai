@@ -96,8 +96,9 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
     for (const asset of ["styles.css", "fonts.css", script]) {
-      // Legal pages live at /terms/<date> etc., one level deep: "./styles.css" would miss, so they use "/".
-      const prefix = /^(terms|privacy|fees)-/.test(page) ? "/" : "./";
+      // Legal pages live at /terms/<date> etc. and /swarm also at /swarm/<naddr>, one level deep:
+      // "./styles.css" would miss, so they use "/".
+      const prefix = /^(terms|privacy|fees)-/.test(page) || page === "swarm.html" ? "/" : "./";
       assert.ok(pageHtml.includes(`"${prefix}${asset}?v=${stamp}"`), `${asset} is stamped in ${page}`);
       assert.ok(!pageHtml.includes(`"./${asset}"`) && !pageHtml.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
     }
@@ -234,8 +235,8 @@ test("all site pages share navigation and footer links, with a current page and 
 
 test("/swarm hero facts start as skeletons, both labels and values, with no placeholder text (bob)", () => {
   const html = readFileSync(join(root, "dist", "swarm.html"), "utf8");
-  const facts = html.match(/<dl class="c-facts" id="challenge-facts" aria-busy="true">([\s\S]*?)<\/dl>/)?.[1] ?? "";
-  for (const id of ["challenge-start-label", "challenge-start", "challenge-budget-label", "challenge-budget"])
+  const facts = html.match(/<dl class="c-facts" id="swarm-facts" aria-busy="true" data-view="swarm">([\s\S]*?)<\/dl>/)?.[1] ?? "";
+  for (const id of ["swarm-start-label", "swarm-start", "swarm-budget-label", "swarm-budget"])
     assert.match(facts, new RegExp(`id="${id}"><span class="skel c-skel-d[dt]"></span></d[dt]>`), `${id} is a skeleton`);
   assert.equal([...facts.matchAll(/class="skel /g)].length, 4);
   for (const text of ["Loading…", "Work starts", "To be announced", "Budget"]) assert.ok(!facts.includes(text), `no static "${text}"`);
@@ -287,7 +288,7 @@ test("the /tokens CSP opens only the trade relays, only on /tokens, and is noind
   const { headers } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
   const matching = (path) => headers.filter((h) => new RegExp(`^${h.source.replace(/^\//, "\\/")}$`).test(path));
   const csp = (path) => matching(path).flatMap((h) => h.headers.filter((x) => x.key === "Content-Security-Policy").map((x) => x.value));
-  for (const path of ["/", "/market", "/sell", "/terminal.js", "/tokens.js", "/tokensx"]) {
+  for (const path of ["/", "/market", "/sell", "/terminal.js", "/tokens.js", "/tokensx", "/swarm", "/swarm.js", "/swarm/naddr1x"]) {
     const [v, ...rest] = csp(path);
     assert.equal(rest.length, 0, `${path} gets exactly one CSP`);
     assert.match(v, /connect-src 'self' wss:\/\/relay\.maxplayer\.ai https:\/\/api\.coinbase\.com;/, path);
@@ -368,7 +369,7 @@ test("swarm page stays noindexed, linked only as the footer's Swarm Lab, and iso
   const html = readFileSync(join(root, "dist/swarm.html"), "utf8");
   const { stamp } = JSON.parse(readFileSync(join(root, "dist/.buildstamp"), "utf8"));
   assert.match(html, /name="robots" content="noindex, nofollow"/);
-  assert.ok(html.includes(`./swarm.css?v=${stamp}`));
+  assert.ok(html.includes(`"/swarm.css?v=${stamp}"`));
   assert.ok(!html.includes("terminal.js"));
   // bob (2026-10-18) put Swarm in the footer; that one link is the only place pages name the route.
   for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"]) {
@@ -382,7 +383,6 @@ test("swarm page stays noindexed, linked only as the footer's Swarm Lab, and iso
     assert.ok(!text.includes("/challenges") && !/maxplayer\.ai\/swarm|\]\(\/swarm\)/.test(text), `${page} does not advertise the route`);
   }
   const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
-  assert.ok(cfg.headers.some((r) => r.source === "/swarm" && r.headers.some((h) => h.key === "X-Robots-Tag" && h.value === "noindex, nofollow")));
   assert.ok(!readFileSync(join(root, "dist/terminal.js"), "utf8").includes("data-challenge-copy"));
 });
 
@@ -426,85 +426,51 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(!/\b300\b/.test(skill), "no unexercised 300-second floor");
   assert.ok(!/`challenge\.|"challenge"|the `challenge` object/.test(skill), "no `challenge` JSON field left in the skill");
   assert.ok(!skill.includes("maxplayer-challenges"), "the old binary name is gone");
-  // bob (2026-10-19 00:49): the CLI is maxplayer-swarm and the day flag is --run.
+  // docs/specs/swarm.md §6: the manual join is `maxplayer swarm join <swarm>`.
   const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
-  assert.ok(bundle.includes("maxplayer-swarm join --buyer ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer-swarm");
+  assert.ok(bundle.includes("maxplayer swarm join ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer swarm");
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
   assert.ok(page.includes("https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md"), "the join line reads the swarm-join skill");
-  assert.match(page, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>Community swarms are early\. They may change, break or go away\.<\/span><\/p>/, "the experimental strip stays on /swarm");
-  assert.match(page, /<title>Community Swarm — MAXPLAYER AI<\/title>/);
+  assert.match(page, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>Swarms are early\. They may change, break or go away\.<\/span><\/p>/, "the experimental strip stays on /swarm");
+  assert.match(page, /<title>Swarms — MAXPLAYER AI<\/title>/);
   // Visible copy says swarm; ids and classes (challenge-*) are internal and may stay.
   const visible = page.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<[^>]*>/g, (tag) => [...tag.matchAll(/(?:content|aria-label|title|alt)="([^"]*)"/g)].map((m) => ` ${m[1]} `).join(""));
   assert.ok(!/challenge/i.test(visible), `no visible "challenge" on /swarm: ${visible.match(/.{0,40}challenge.{0,40}/i)?.[0]}`);
 });
 
-// Swarm member feedback (2026-10-21, item 1): an agent following the one-line join must find the
-// buyer key without running the page script. The build writes CHALLENGE_BUYER_PUBKEY into the
-// static page. The join skill names no buyer (sellers pick a swarm from `maxplayer swarm list`).
-const SWARM_BUYER = "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5";
-const SWARM_NPUB = "npub1jjvf7aj6d8ju8ykkqv2qa4eu0lnpuyelhfm8ee2f2k85alzw2l2sf7haqz";
-const swarmKeySlots = (html) => [...html.matchAll(/<code id="(buyer-hex|buyer-npub|apply-command)">([^<]*)<\/code>/g)].map((m) => [m[1], m[2]]);
-test("the built /swarm page carries the swarm buyer key without JavaScript", () => {
+// docs/specs/swarm.md §12 PR 3: the board lists every buyer's swarms from our relay. No buyer key
+// and no public relay is built into the page or its bundle; a swarm's page fills the join line,
+// the join command and the buyer key from the swarm it shows.
+const OLD_BUYER = "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5";
+test("the /swarm page and bundle name no buyer and no public relay", () => {
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
-  assert.deepEqual(swarmKeySlots(page), [
-    ["buyer-hex", SWARM_BUYER],
-    ["apply-command", `maxplayer-swarm join --buyer ${SWARM_NPUB} --minutes 60`],
-    ["buyer-npub", SWARM_NPUB],
-  ]);
-  assert.ok(!/Not announced yet|announced with the first swarm|Available when the swarm is announced/.test(page), "no placeholder left");
-  const skill = readFileSync(join(root, "dist", ".well-known", "skills", "swarm-join", "skill.md"), "utf8");
-  assert.ok(!skill.includes(SWARM_BUYER) && !skill.includes(SWARM_NPUB), "the shipped skill names no buyer");
-  // The page script keeps filling the same elements from the relay.
+  const js = readFileSync(join(root, "dist", "swarm.js"), "utf8");
+  for (const [name, text] of [["swarm.html", page], ["swarm.js", js]]) {
+    assert.ok(!text.includes(OLD_BUYER) && !text.includes("npub1jjvf7aj6"), `${name}: no built-in buyer`);
+    assert.ok(!/nos\.lol|relay\.primal\.net|offchain\.pub/.test(text), `${name}: no public relay`);
+    assert.ok(!/maxplayer-swarm join|--buyer/.test(text), `${name}: no sidecar command`);
+  }
+  assert.ok(js.includes("wss://relay.maxplayer.ai"), "the bundle reads our relay");
   const src = readFileSync(join(root, "src", "swarm.ts"), "utf8");
-  for (const id of ["buyer-hex", "buyer-npub", "apply-command"]) assert.ok(src.includes(`text("${id}",`), `swarm.ts still fills #${id}`);
-  // Item 3 (bob 2026-10-21): allowlisting the buyer is the only step; the open surfaces are the member's choice.
-  assert.ok(!/Disable <code>open-pool<\/code>/.test(page) && !/With <code>open-pool<\/code> and <code>open-targeted<\/code> disabled/.test(page));
+  for (const id of ["buyer-hex", "apply-command", "cmd-join"]) assert.ok(src.includes(`text("${id}",`), `swarm.ts fills #${id}`);
+  assert.match(src, /`maxplayer swarm join \$\{address\} --minutes 60`/);
+  // Item 3 (bob 2026-10-21): the open surfaces stay the member's choice.
   assert.ok(!/keep <code>claim_open_pool<\/code> and <code>accept_open_targeted<\/code> off/.test(page), "no requirement to close them");
-  assert.equal([...page.matchAll(/<code>accept_open_targeted<\/code> on or off; they only affect market work from other buyers/g)].length, 2, "manual steps and FAQ both say on or off");
-  assert.ok(!/never enable `claim_open_pool`/.test(skill) && skill.includes("are the operator's choice"), "skill makes them optional");
-});
-test("CHALLENGE_BUYER_PUBKEY overrides the key in the shipped page; the skill digest is of the shipped bytes", async () => {
-  const { mkdtempSync, cpSync, rmSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const { schnorr } = await import("@noble/curves/secp256k1");
-  const { npubEncode } = await import("../src/challenge/shared/events.mjs");
-  const other = Buffer.from(schnorr.getPublicKey(schnorr.utils.randomPrivateKey())).toString("hex");
-  // Built in a copy so the shared dist/ the other tests read keeps the default key.
-  const copy = mkdtempSync(join(tmpdir(), "swarm-key-"));
-  try {
-    for (const d of ["public", "src", "scripts", ".well-known"]) cpSync(join(root, d), join(copy, d), { recursive: true });
-    cpSync(join(root, "node_modules"), join(copy, "node_modules"), { recursive: true, dereference: false, verbatimSymlinks: true });
-    execFileSync(process.execPath, ["scripts/build.mjs"], { cwd: copy, env: { ...process.env, CHALLENGE_BUYER_PUBKEY: other }, stdio: "pipe" });
-    const page = readFileSync(join(copy, "dist", "swarm.html"), "utf8");
-    assert.deepEqual(swarmKeySlots(page).map(([, v]) => v), [other, `maxplayer-swarm join --buyer ${npubEncode(other)} --minutes 60`, npubEncode(other)]);
-    const skillBytes = readFileSync(join(copy, "dist", ".well-known", "skills", "swarm-join", "skill.md"));
-    assert.ok(!skillBytes.toString().includes(other), "the skill is shipped as written");
-    assert.ok(!readFileSync(join(copy, "dist/swarm.html"), "utf8").includes(SWARM_BUYER), "dist/swarm.html: no default key left");
-    const index = JSON.parse(readFileSync(join(copy, "dist", ".well-known", "agent-skills", "index.json"), "utf8"));
-    const row = index.skills.find((r) => r.url.endsWith("/swarm-join/skill.md"));
-    assert.equal(row.digest, `sha256:${createHash("sha256").update(skillBytes).digest("hex")}`, "digest is of the shipped skill");
-  } finally { rmSync(copy, { recursive: true, force: true }); }
-});
-test("the build refuses a page whose buyer-key slot is missing", async () => {
-  const { withSwarmBuyer } = await import("../scripts/swarm-buyer.mjs");
-  const page = readFileSync(join(root, "public", "swarm.html"), "utf8");
-  // The source carries the default key, so it reads correctly unbuilt and builds to itself.
-  assert.equal(withSwarmBuyer(page, "html", SWARM_BUYER), page);
-  assert.throws(() => withSwarmBuyer(page.replace(`id="buyer-npub">${SWARM_NPUB}`, 'id="buyer-npub">TBD'), "html", SWARM_BUYER), /matched 0 times/);
-  assert.throws(() => withSwarmBuyer(page, "html", "ABC"), /lowercase hex/);
+  assert.equal([...page.matchAll(/<code>accept_open_targeted<\/code> on or off; they only affect market work from other buyers/g)].length, 1, "the FAQ says on or off");
+  const skill = readFileSync(join(root, "dist", ".well-known", "skills", "swarm-join", "skill.md"), "utf8");
+  assert.ok(!skill.includes(OLD_BUYER), "the shipped skill names no buyer");
 });
 
-test('challenge relay connection is allowed on the unlisted route', () => {
-  const {headers}=JSON.parse(readFileSync(join(root,'vercel.json'),'utf8'));
-  const csp=path=>headers.filter(h=>new RegExp(`^${h.source}$`).test(path)).flatMap(h=>h.headers.filter(x=>x.key==='Content-Security-Policy').map(x=>x.value));
-  assert.equal(csp('/swarm').length,1);
-  assert.match(csp('/swarm')[0],/connect-src 'self' wss:\/\/relay\.maxplayer\.ai wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub https:\/\/api\.coinbase\.com;/);
-  for(const path of ['/','/market','/swarm.js'])assert.ok(!csp(path)[0].includes('community.maxplayer.ai'));
-});
-
- test("build refuses the production challenge relay hostname", () => {
-  assert.throws(() => execFileSync(process.execPath, ["scripts/build.mjs"], {cwd:root,env:{...process.env,CHALLENGE_RELAYS:"wss://RELAY.MAXPLAYER.AI./"},stdio:"pipe"}), /production relay forbidden/);
+test("/swarm/<naddr> serves the same page, which loads its assets from the site root", () => {
+  const cfg = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  assert.ok(cfg.rewrites.some((r) => r.source === "/swarm/:address" && r.destination === "/swarm"), "/swarm/<naddr> rewrites to the page");
+  for (const source of ["/swarm", "/swarm/:address"]) {
+    assert.ok(cfg.headers.some((r) => r.source === source && r.headers.some((h) => h.key === "X-Robots-Tag" && h.value === "noindex, nofollow")), `${source} is noindex`);
+  }
+  const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
+  assert.ok(!/(?:href|src)="\.\//.test(page), "no relative asset paths (the page is served one level deep)");
+  assert.match(page, /<script type="module" src="\/swarm\.js\?v=[0-9a-f]{12}"><\/script>/, "the bundle is stamped at its root path");
 });
 
 // Email signup spec v2.10 §7.1 (Bob, Petar, Josip, 2026-10-27): the terms and privacy policy are
