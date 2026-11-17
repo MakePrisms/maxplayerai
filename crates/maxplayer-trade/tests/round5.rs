@@ -353,6 +353,40 @@ async fn r5_expired_unpaid_funding_and_paid_issuance_without_preflight() {
     );
     assert_eq!(balance(h.path(), &m.url).await, 32);
 }
+/// Review r1 H1 (#1332): with `trade fund --quote` gone, the explicit `recover` is the way a funding
+/// flagged `expired_unpaid` and paid later gets issued; serve's passes still skip it.
+#[tokio::test]
+async fn r5_explicit_recover_issues_a_late_paid_expired_funding() {
+    let h = tempfile::tempdir().unwrap();
+    let m = MintFixture::start(0).await;
+    let j = Journal::open(h.path()).await.unwrap();
+    let f = money::fund(h.path(), &j, &m.url, 32).await.unwrap();
+    m.faults.expired_funding.store(true, SeqCst);
+    assert!(!money::recover(h.path(), &j).await.unwrap());
+    let flagged: money::Funding = j.get("funding", &f.id).await.unwrap().unwrap();
+    assert!(flagged.expired_unpaid);
+    m.faults.expired_funding.store(false, SeqCst);
+    m.faults.clock_offset.store(61, SeqCst);
+    money::recover(h.path(), &j).await.unwrap();
+    assert_eq!(balance(h.path(), &m.url).await, 0, "serve passes skip it");
+    for _ in 0..30 {
+        money::recover_explicit(h.path(), &j).await.unwrap();
+        if j.get::<money::Funding>("funding", &f.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .done
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        balance(h.path(), &m.url).await,
+        32,
+        "SAFETY: a late-paid funding is still issued by explicit recover"
+    );
+}
 #[cfg(feature = "lab")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r5_refund_precedes_stalled_claim() {
@@ -645,36 +679,6 @@ async fn r5_withdraw_preflight_requires_nut05() {
     assert!(error.to_string().contains("NUT-5"));
     assert!(m.faults.melt_requests.lock().unwrap().is_empty());
     assert!(!money::pending(&j).await.unwrap());
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r5_cli_nonfinal_withdraw_is_exit_three() {
-    let h = tempfile::tempdir().unwrap();
-    let m = MintFixture::start(0).await;
-    fund(h.path(), &m.url, 128).await;
-    m.faults.melt_proxy_error.store(true, SeqCst);
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args([
-            "--home",
-            h.path().to_str().unwrap(),
-            "withdraw",
-            &m.url,
-            "--invoice",
-            &invoice(31),
-            "--max-debit",
-            "62",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "SAFETY: ambiguous submitted payment must not exit success"
-    );
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],
-        "request_sent"
-    );
 }
 #[tokio::test]
 async fn r5_cli_terminal_quarantine_is_exit_four() {
@@ -1021,37 +1025,5 @@ async fn r6_expired_quote_created_is_refused_and_same_invoice_retries() {
             .state,
         MeltState::Done,
         "same invoice retries with a fresh quote"
-    );
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r6_cli_mint_dropped_after_post_is_exit_three() {
-    let h = tempfile::tempdir().unwrap();
-    let m = MintFixture::start(0).await;
-    fund(h.path(), &m.url, 128).await;
-    m.faults.die_after_melt.store(true, SeqCst);
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args([
-            "--home",
-            h.path().to_str().unwrap(),
-            "withdraw",
-            &m.url,
-            "--invoice",
-            &invoice(31),
-            "--max-debit",
-            "62",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert_eq!(
-        m.faults.melt_requests.lock().unwrap().len(),
-        1,
-        "fixture: the POST reached the mint before it dropped"
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "SAFETY: submitted-but-unresolved withdrawal must exit 3, never 1 (refusal); stderr={}",
-        String::from_utf8_lossy(&out.stderr)
     );
 }

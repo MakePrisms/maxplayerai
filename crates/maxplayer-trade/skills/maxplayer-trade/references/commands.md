@@ -4,7 +4,8 @@ Every invocation trades from a maxplayer home: `--home <home>` (a directory with
 `config.toml`), else `$MAXPLAYER_HOME`, else `~/.maxplayer`. It signs with the home `key` and
 pays from the home's wallet (a seller's too); only the home's mints (default, `extra_mints` and
 the seller's `accepted_mints`) that pass its real-mint fence are traded; trade state is in `<home>/trade/`. A legacy standalone home (`wallet.seed`/`trade.key`)
-is drain-only: new `list`/`take`/`fund`/`receive` are refused (crate README, "Home and wallet").
+is drain-only: new `list`/`take` are refused (crate README, "Home and wallet").
+Money in and out of the home's wallet is `maxplayer wallet` ([below](#money-in-and-out-maxplayer-wallet)).
 Every command below is `maxplayer trade <command>`, part of the `maxplayer` CLI. If
 `maxplayer trade --help` fails, the installed `maxplayer` predates it: upgrade it (or build it as
 in the crate README's "Build and automated tests"). Delete any old standalone `maxplayer-trade`.
@@ -35,15 +36,12 @@ doctor <mint> --mint-relay <url> [--json] [--timeout-seconds <seconds>]
 preflight <mint>
 balance <mint>
 status [--json] [--check-sends]
-fund <mint> --amount <sats> [--quote <quote-id>] [--id <funding-id>]
-receive <mint> [--token-file <path>]
-send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]
+send (<mint> --amount <sats> --out <path> | --reclaim <send-id>) [--max-fees <sats>]   # new sends: legacy homes only
 list --give-mint <mint> --give <net-sats> --want-mint <mint> --want <net-sats> --max-fees <sats> [--dry-run]
 discover [--give-mint <mint>] [--want-mint <mint>]
 serve
 cancel <lot>
 take <lot> --max-give <total-sats> --min-receive <net-sats> --max-fees <sats> [--dry-run]
-withdraw <mint> --invoice <bolt11> [--max-debit <sats>]
 recover
 ```
 
@@ -51,15 +49,12 @@ Use `-h` / `--help` at the root or on any application subcommand. The built-in
 `help [COMMAND]` also shows root or command help. There is no version option.
 `--home <HOME>` defaults to the maxplayer home; `--relay <RELAY>` is
 repeatable. All command-specific flags in the signatures above are required except
-`--timeout-seconds` (doctor: default 30 seconds), `--give-mint`/`--want-mint` on discover, `--quote`, `--max-debit`, `--token-file` (stdin when omitted), `--dry-run`, `--json`, `--check-sends`,
+`--timeout-seconds` (doctor: default 30 seconds), `--give-mint`/`--want-mint` on discover, `--dry-run`, `--json`, `--check-sends`,
 and `--max-fees` (default 16 on list/take; on send it is required unless the mint's input fee is 0). `send` takes either `<mint> --amount --out` or `--reclaim <send-id>`. Positional mint arguments are
 canonical URLs, or `nostr://<npub>` for a Nostr-reachable mint (hex or uppercase input is
-canonicalized to the lowercase npub). `fund` and `withdraw` refuse `nostr://` mints before
-any journal entry: the Maxplayer credits mint serves no NUT-04/05/20; `receive` is how credits
-enter a home. A zero `--amount`, `--give`, `--want`, `--max-give` or `--max-debit` is refused
+canonicalized to the lowercase npub). A zero `--amount`, `--give`, `--want` or `--max-give` is refused
 before anything else (no home, lock, relay or mint) with `amount must be at least 1 sat
-(<flag> 0)`; `--min-receive 0` and `--max-fees 0` stay valid bounds. Lot arguments are public lot IDs; `--quote` is a saved funding
-quote for the same mint and amount.
+(<flag> 0)`; `--min-receive 0` and `--max-fees 0` stay valid bounds. Lot arguments are public lot IDs.
 Never use a lab-feature binary for the human's funds.
 
 ## Doctor and admission diagnostics
@@ -105,11 +100,9 @@ trade; info is no guarantee of later claims, refunds or spent-witness emission.
   admission claims use the pinned quote fee, not the receiver’s outgoing budget. Refund/recovery may
   incur mint fees; disclose this rather than promising a fully refunded balance.
 - No platform/trade fee. Do not equate no platform fee with no mint/Lightning fees.
-- Hard cap: 100,000 sats gross per lock. Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do.
-  Each withdrawal invoice is also capped at 100,000 sats (millisatoshis rounded up
-  to sats). Funding counts all retained intents, including pending ones.
-  None of these limits is permission to spend that amount. Never split operations or rotate homes
-  to bypass limits. Withdrawing does not reset this cumulative cap.
+- Hard cap: 100,000 sats gross per lock, per trade `send`, and per `maxplayer wallet send` or
+  `wallet melt`. None of these limits is permission to spend that amount. Never split
+  operations or rotate homes to bypass limits.
 
 Example: a lot gives 32 A for 24 B. If the human approves **at most 27 B total**,
 **at least 32 A net**, and **3 B fee sats**, use `take <lot> --max-give 27
@@ -120,10 +113,9 @@ confirm that the incoming B claim fee fits the cap; do not blindly use 3 across
 unequal-fee mints. A larger cap needs the human’s approval, not an automatic retry.
 Never round a spend ceiling upward or a minimum receipt downward.
 
-Automatic preflight before funding, listing, taking, sending and withdrawal requires
+Automatic preflight before listing, taking and sending requires
 a reachable mint, NUT-07/09/11/12/14 support, an active sat keyset, and clock skew at most 60 seconds.
-Funding additionally requires enabled NUT-04 bolt11/sat and NUT-20; withdrawal
-requires enabled NUT-05 bolt11/sat. The explicit `preflight <mint>` checks the
+The explicit `preflight <mint>` checks the
 common trading capabilities. Diagnostic preflight output goes to stderr. No opt-in is required;
 passing advertisement checks is not independent refund interoperability evidence.
 `balance` and `status` are lock-free read-only SQLite snapshots, available during
@@ -167,43 +159,22 @@ can change in between; the real command enforces your bounds again.
 
 ## Hand-off to a running serve
 
-While `serve` owns the home, `list`, `take`, `cancel`, `receive`, `send` and `fund` hand their request to it
+While `serve` owns the home, `list`, `take` and `cancel` hand their request to it
 over `<home>/serve.sock` (mode 0600, same user only) and print serve's result with
 the usual output and exit codes. serve executes it with exactly the bounds given;
 it never fills in defaults. serve refuses a request whose relays differ from its own
 where the command uses them: `list`, `take` and `cancel` need exactly serve's `--relay`
-list (same values in the same order); `take`, `cancel`, and a `list` or `receive` with a
+list (same values in the same order); `take`, `cancel`, and a `list` with a
 `nostr://` mint need the same `--mint-relay` set (compared as a set: spelling and order do
-not matter). A refused hand-off queues and executes nothing. An HTTP `receive` never uses either,
-so any `--relay` works. serve is never asked to run a command on relays you did not give.
-The client sends only to a serve socket and peer owned by its own user. A handed-off `take` prints its swap id and that serve is watching it, then
+not matter). A refused hand-off queues and executes nothing. serve is never asked to run a
+command on relays you did not give. The client sends only to a serve socket and peer owned by
+its own user. A handed-off `take` prints its swap id and that serve is watching it, then
 streams states until settlement; if the command is interrupted, serve keeps driving
 the swap (check `status`). Without a running serve these commands behave as before.
-A handed-off `receive` is described under [Receive](#receive-through-a-running-serve).
-`recover`, `withdraw` and `send --reclaim` still need the home lock (`home is already in
-use` while serve runs); stop serve first.
-
-A handed-off `send` passes `--out` as an absolute path (resolved in your directory) and
-`--max-fees` exactly as given; serve creates that 0600 file. The same send (same `--out`)
-again resumes that attempt and never sends twice; other terms for that `--out` are refused.
-If the reply is lost (exit 3), re-run the same send. A handed-off `fund` first prints
-`{"funding_id":...}` on stderr, then the invoice line. Re-running `fund <mint> --amount N
---id <funding_id>` returns that same quote and invoice and never creates a second one (a
-different mint or amount for that id is refused). The fund id is only a lookup key; the
-wallet uses its own operation id for the funding. If the quote reply was lost, the same `--id`
-creates the quote under that same funding (no second charge against the cap). A re-run with `--id` re-checks a journaled quote (NUT-20
-binding, invoice amount) and refuses one that failed: never pay that invoice. serve's
-recovery checks issuance; the client only follows it, so an unpaid invoice never holds other
-mints' work (quote creation and one issuance check hold this mint's wallet work for at most
-one item budget each). An expired unpaid quote ends the follow with "nothing to pay".
-serve writes the send's `--out` file in its own filesystem view and reports that file's
-identity as created; the client checks its own `--out` is that file and exits 3 if not. A
-file already gone (moved or consumed by another program at once) is reported as such: the
-send is complete, so check where the token went before any `--reclaim`, which cancels a
-payment the recipient may already hold. serve and its clients must share a filesystem view:
-bind mounts of the same filesystem are fine; a private `/tmp`, container, chroot, an
-overlay's upperdir or a second NFS mount between them is not. Protocol version 3: older clients' handed-off
-`list`/`take`/`cancel`/`receive` are refused with a version mismatch.
+`recover` and `send` (drain or `--reclaim`) still need the home lock (`home is already in
+use` while serve runs); stop serve first. `maxplayer wallet` commands never need it. Protocol
+version 5: a client of another version is refused with a version mismatch, and an old
+standalone `maxplayer-trade` binary is told to delete itself.
 `cancel` first recovers existing authorizations when it runs without serve.
 `serve` continuously accepts trades and recovers obligations; keep it running while
 locks are live. `recover` is a bounded single pass, not a replacement watcher;
@@ -290,68 +261,31 @@ in one process:
   not recorded as rejected: a later delivery of the same event is handled fresh.
 - `fund` polls its quote every 5 s (6 polls), not every second.
 
-## Funding
+## Money in and out: `maxplayer wallet`
 
-`fund <mint> --amount 0` is refused with `amount must be at least 1 sat (--amount 0)`;
-above 100,000 sats it is `funding cap exceeds 100,000 sats`.
+Funding, receiving, sending and paying invoices use the home's wallet commands, with the same
+`--home`. `maxplayer trade fund`, `withdraw` and `receive` print the command to use and exit 1
+without touching anything; a new `trade send` on a maxplayer home does the same.
 
-The printed invoice is a request for payment, not proof of issuance. Confirm the
-mint and amount, then let the human pay it once from their own wallet. Include any
-external-wallet routing fee budget in the human's approval; this CLI cannot enforce
-fees charged by another wallet. Never assume a real invoice is auto-paid because
-a test mint behaved that way. Reuse the retained quote for the same mint/amount.
+```text
+maxplayer wallet mint <sats> --mint <mint>              # BOLT11 to pay; then wallet mint-complete <quote-id>
+maxplayer wallet receive --token-file <path> [--add-mint]
+maxplayer wallet send <sats> --mint <mint> --out <new-file>      # max 100,000; file 0600, never overwritten
+maxplayer wallet melt <bolt11> --max-debit <sats> --mint <mint>  # max 100,000
+maxplayer wallet balance
+```
 
-## Receive
-
-### Receive through a running serve
-
-While `serve` runs, `receive <mint> --token-file <path>` (or stdin) reads the token
-(at most 1 MiB; larger input is refused with `token missing or oversized` before serve is
-contacted) and passes it to serve over `<home>/serve.sock` only. serve runs the same
-receive below, as the only writer; listings and swaps keep running alongside it. serve's log names the request kind, mint and public attempt id, never the token;
-refusals are redacted. Output is the same JSON summary and exit code as a local receive,
-plus one stderr line `{"receive":<id>,"outcome":...}`: `credited` (this request credited
-it), `already_received` (an earlier request did; nothing new), `in_doubt` (exit 3: journaled,
-not settled yet; serve keeps recovering it) or `not_credited`. If the reply is lost
-(client killed, serve stopped), the client exits 3 naming the attempt id. Re-run the
-**same** receive or check `status`: the same token always resumes the same attempt and
-never credits twice, also after a serve restart. A receive waits at most 120 s for its
-mint; an unfinished, journaled attempt is then reported `in_doubt` and finished by
-serve's recovery. A slow receive mint delays that mint's wallet work; another swap's claim
-or refund waits for it only through a shared run slot (see
-[serve scheduling](recovery.md#serve-scheduling)).
-
-### Receive without serve
-
-`receive <mint> --token-file <path>` (or the token on stdin; never argv) imports one
-Cashu token. Refused **before anything is journaled**: a token whose mint is not
-exactly `<mint>` after canonicalization, multi-mint tokens, non-sat units, P2PK/HTLC
-or other NUT-10 locked proofs, more than 128 or duplicate proofs, an invalid incoming
-DLEQ (when present), a token above **100,000 sats**, or one that would push this
-mint past the shared cap, or (`nostr://` mint) whose swap would not fit one NIP-44
-request (error names NIP-44; exit 1, nothing journaled, cap untouched). Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do. A quarantined receive is not spendable but
-still occupies the cap. Common preflight runs, then NUT-07 must report every proof UNSPENT.
-
-One swap into fresh home-owned outputs; input proofs, blinded outputs and their
-secrets are journaled before the POST (not the token text). The mint input fee is deducted: `net = amount - fee`.
-Only DLEQ-verified result proofs are credited. Output is one JSON line with
-`receive` (attempt id), `mint`, `state`, `amount`, `fee`, `net`, `credited`; never
-the token or proofs; also `settled` and `refusal_code`. Repeating the same token
-(any encoding) resumes the same attempt and only replays its identical swap; a
-second output set is never created. Exit 0 `done` and released; 3 unresolved
-(`prepared`/`submitted`, `done` with release outstanding, or the state could not
-be journaled); 1 pre-journal refusal, `refused` or
-`already_spent`; 4 `quarantined`. Only a definitive mint NUT error (allowlisted code
-such as 11001/11005/12001-12003; HTTPS: a 400 with JSON `code` + `detail`; `nostr://`:
-a numeric NUT `code` in the mint's reply) yields `refused`; `50000`, 11002, 11003
-(outputs already signed: evidence of a landing), 11004, unknown codes, any other 400
-and every nostr transport error (`expired`, `bad_request`, `rate_limited`, timeout,
-oversized request) stay `submitted` (exit 3) and the identical swap is replayed.
-`refused` is FINAL: no command retries it, the token was not imported and can be
-redeemed elsewhere, and it does not occupy the cap.
+An invoice is a request for payment, not proof of issuance: the human pays it once from their
+own wallet. `wallet melt --max-debit` refuses before spending when the invoice plus the mint's
+quoted fee reserve exceeds it. A token written by `wallet send --out` that the recipient has not
+redeemed comes back with `maxplayer wallet receive --token-file <that file>`. Funding,
+withdrawal and receive records already in the trade journal are still finished by `serve` and
+`recover` ([recovery](recovery.md)).
 
 ## Send (export a token)
 
+A new `send` drains a legacy standalone home; on a maxplayer home use `maxplayer wallet send`.
+`send --reclaim <id>` and `status --check-sends` work on both for sends trade made.
 `send <mint> --amount <sats> --out <path> --max-fees <sats>` writes one single-mint V4
 token for exactly `<amount>` sats to a NEW file (mode 0600, created exclusively; an
 existing path, including a symlink, is refused). The token is never printed and never
@@ -365,8 +299,8 @@ One swap of the selected inputs into the exact send outputs plus change; inputs,
 outputs and secrets are journaled before the POST. Ambiguity → NUT-09 restore of the
 same outputs and identical replay only. The file is written only after the swap is
 definitive and every output verifies DLEQ; the token is kept in the private journal so
-`recover` rewrites the same token after a crash. Rerunning the same command with the
-same `--out` resumes that attempt, or rewrites the same journaled token if the file was
+`recover` rewrites the same token after a crash. On a legacy home, rerunning the same command
+with the same `--out` resumes that attempt, or rewrites the same journaled token if the file was
 moved or deleted (only if NUT-07 shows every sent proof UNSPENT; SPENT, PENDING or an
 unreachable mint exit 1, "already (partially) redeemed or pending; choose another --out"; a rewrite prints a stderr notice
 and `"rewritten": true`); it never sends twice. A `reclaiming` send's `--out` is
@@ -393,36 +327,6 @@ On a `nostr://` mint send, reclaim and `--check-sends` are supported (no NUT-04/
 needed). A swap over 128 proofs or the NIP-44 limit is refused **before anything is
 journaled or reserved** (exit 1; send a smaller amount); for a reclaim the token stays
 `sent`. The token names `nostr://npub…`: only a nostr-capable wallet (e.g.
-`maxplayer trade receive`) can redeem it, not a generic Cashu wallet; `send --reclaim`
+`maxplayer wallet receive --add-mint`) can redeem it, not a generic Cashu wallet; `send --reclaim`
 takes it back. Keep the same `--mint-relay` set for reclaim, `recover` and
 `--check-sends`; with the wrong relays they report `unknown`/retain the attempt.
-
-## Withdrawal: enforcement before execution
-
-Each invoice is capped at **100,000 sats**. The Lightning reserve ceiling is
-**max(32 sats, ceil(invoice sats × 2%))**: a 100,000-sat invoice may reserve 2,000.
-Use `withdraw <mint> --invoice <bolt11> --max-debit <approved-sats>` to enforce
-**invoice + input fee + quoted reserve** before reserving inputs/POST. Selected
-proof face value can be larger; the excess is journaled change, not extra fee
-permission. This option is optional in the CLI but required by this skill whenever
-the human supplies a total debit bound. The trade fee flag does not apply.
-Over-ceiling, invalid, lost, near-expiry, or unfundable quotes become terminal
-`refused` without a payment POST. A refusal can be retried explicitly with the
-same invoice; it cannot later pay merely because recovery runs or funds arrive.
-A first POST requires more than 60 seconds of quote lifetime. After a submitted
-request becomes ambiguous, recovery replays exactly the saved inputs/outputs/quote,
-never a replacement authorization. Deduplication uses payment hash across mints.
-
-Refused before any mint request, reservation or journal entry (exit 1): a
-non-mainnet invoice (`invoice is for testnet; this mint pays Bitcoin mainnet invoices;
-nothing was journaled or sent`), an invoice already expired (`invoice expired at
-<UTC>; nothing was journaled or sent`) or expiring within 30 seconds (`invoice expires
-at <UTC>, within 30 s; …`), an amountless, zero-amount or over-cap invoice. Resuming an
-invoice that is already journaled skips these checks and continues the saved authorization.
-
-Require an amount-bearing, unexpired user-supplied BOLT11; do not generate an
-invoice or choose a destination for the human. The receipt must distinguish the
-invoice amount, input fees, Lightning reserve/actual fee, and returned change.
-Only `done` means payment and change accounting have finished. Reconcile using
-`recover`, not a new withdrawal. Even an UNPAID status snapshot after timeout is not
-permission to release inputs or pay again.

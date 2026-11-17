@@ -111,7 +111,7 @@ maker listing stays held. A human must arrange verified recovery; no automatic
 
 | State | Meaning and action |
 | --- | --- |
-| `quote_created` | No POST authorized yet. Recovery only expires/releases it; only explicit `withdraw` with the same invoice may advance it. |
+| `quote_created` | No POST authorized yet. Recovery only expires/releases it (when the quote is within 60 s of expiry); nothing advances it. Pay the invoice with `maxplayer wallet melt` only after it is released. |
 | `request_sent` | Payment POST may have reached the mint; timeout does not mean failure. Reconcile only. |
 | `pending` | Mint reports payment pending; preserve reservation and wait/recover. |
 | `paid_change_unreconciled` | Invoice reported paid, but change/accounting not proven complete. Never pay again; preserve outputs and recover. |
@@ -139,7 +139,6 @@ serve/recover/market commands; a post-POST timeout is still unresolved, not fail
 | `already_spent` | Terminal (exit 1): inputs SPENT and none of our outputs restorable. Nothing credited, not charged. |
 | `quarantined` | Terminal manual recovery (exit 4): our outputs were signed but lack valid DLEQ; never credited, not spendable, but still occupies the cap. Preserve the home and escalate. |
 
-Cap: Funding intents plus charged receives (gross) share one 100,000-sat cap per mint per home; `refused`/`already_spent` receives do not count; `prepared`/`submitted`/`done`/`quarantined` ones do.
 Exits: 0 `done` and released, 1 `refused`/`already_spent`, 3 `prepared`/`submitted`, `done` with release outstanding (run `recover`) or a failed journal write, 4 `quarantined`.
 Inputs reported PENDING keep the attempt unresolved. A lost swap reply is never
 answered with replacement outputs.
@@ -160,13 +159,13 @@ answered with replacement outputs.
 
 A reclaim that is refused or races a partial redemption returns to `sent` (exit 1, "still outstanding"). `serve`/`recover` retry it up to 3 times (after 1 min, 10 min, 1 h) with the original `--max-fees`; an unreachable mint or PENDING proofs never use up a retry. A fee over that cap, an uneconomic or oversized reclaim, or the third refusal stops retrying: run `send --reclaim <id>` again (also restarts the count). `status` shows the pending retry. `status --check-sends` prints `redeemed`, `unredeemed`, `pending`, `partially_redeemed` (reclaim the rest) or `unknown` (mint not reachable, or no configured mint relay reaches a `nostr://` mint).
 
-While the send is still `swapped`, `recover` writes the SAME journaled token to a moved or deleted `--out`; for a `sent` row only the same `send` command rewrites it (`recover` just releases). Neither sends twice. If the path now holds other content, recovery stops for that attempt: move that file away (never edit the journal); never start a new send on another path while the journaled attempt is live. Rerunning the same command after delivery first checks NUT-07: unless every sent proof is UNSPENT (SPENT, PENDING or an unreachable mint) it refuses with "already (partially) redeemed or pending; choose another --out" (exit 1), otherwise it rewrites the same token, prints that no new value was sent and adds `"rewritten": true`.
+While the send is still `swapped`, `recover` writes the SAME journaled token to a moved or deleted `--out`; for a `sent` row only the same `send` command rewrites it (`recover` just releases); on a maxplayer home, where a new trade send is refused, `send --reclaim <id>` takes the value back instead. Neither sends twice. If the path now holds other content, recovery stops for that attempt: move that file away (never edit the journal); never start a new send on another path while the journaled attempt is live. Rerunning the same command after delivery first checks NUT-07: unless every sent proof is UNSPENT (SPENT, PENDING or an unreachable mint) it refuses with "already (partially) redeemed or pending; choose another --out" (exit 1), otherwise it rewrites the same token, prints that no new value was sent and adds `"rewritten": true`.
 
 ## Funding and market status are separate
 
 Fresh UNPAID after funding expiry +60 seconds becomes terminal `expired_unpaid`,
-still charged to the lifetime cap. A late-paid invoice may be resumed explicitly
-with its original funding quote. Never pay the old and a replacement invoice.
+A late-paid invoice is issued by an explicit `maxplayer trade recover` (serve does
+not re-poll it). Never pay the old and a replacement invoice.
 Funding has a retained quote/issuance authorization; invoice paid is not proof of
 wallet credit. Recover or resume that exact quote, never pay a second invoice to
 resolve missing credit. A historical CDK orphan-quote reservation problem needs a

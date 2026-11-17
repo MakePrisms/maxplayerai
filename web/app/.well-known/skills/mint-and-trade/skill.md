@@ -32,7 +32,9 @@ pick a home other than `$MAXPLAYER_HOME`/`~/.maxplayer`). Only the home's mints 
 default, `extra_mints` (`maxplayer wallet mints add`) and, on a seller, `accepted_mints`. A seller
 can trade from its own home: job payments land in the same wallet. An older standalone trading
 home (with `wallet.seed`/`trade.key`) is drain-only: move its funds with its `send`, then
-`maxplayer wallet receive`. Preserve all state across restarts.
+`maxplayer wallet receive --token-file`. Money in and out (fund, receive, send, pay an
+invoice) is `maxplayer wallet`; `maxplayer trade` lists, takes and recovers. Preserve all state
+across restarts.
 
 ## 2. Install and connect both tools
 
@@ -107,12 +109,6 @@ will survive logout or reboot.
 trading limits. Explain these limits before asking for the amount, then validate
 the proposed terms against the chosen mint and existing trading home:
 
-- A token received must be at most **100,000 sats gross**. All funding intents
-  plus charged receives share a **100,000-sat cumulative cap per mint per home**.
-  Inspect `status` and the recorded history, not just the current balance. Count
-  `prepared`, `submitted`, `done` and `quarantined` receives; exclude `refused` and
-  `already_spent`. Remaining capacity is `100,000 - funding intents - charged
-  receives`. Spending or sending tokens out does not reset this lifetime cap.
 - Each trade lock is capped at **100,000 sats gross**, including its required
   fee allowance, not just the advertised net sale amount. Check both legs using
   the trading references and current mint fees; a 100,000-sat net lot may not fit.
@@ -121,10 +117,10 @@ the proposed terms against the chosen mint and existing trading home:
   chosen revision's issuance split and receive sizing rules before issuing;
   a face amount under the cap alone is not proof that an arbitrary token fits.
 
-If remaining capacity, fee-inclusive locks or proof/payload fit cannot be
-established, stop before issuance and report the uncertainty. Do not test capacity
-by issuing spendable tokens, silently lower amounts, split batches to evade the
-cumulative cap, or create a new home to bypass it. Propose supported terms for
+If fee-inclusive locks or proof/payload fit cannot be established, stop before
+issuance and report the uncertainty. Do not test capacity by issuing spendable
+tokens, silently lower amounts, split batches to evade a cap, or create a new home
+to bypass it. Propose supported terms for
 fresh approval. Recheck capacity immediately before issuance if the home changed.
 
 Ask only for missing terms: how many tokens to issue and import, how many to sell,
@@ -136,9 +132,9 @@ Do not invent a price or assume that “set up” authorizes issuance or trading
    command arguments. If issuance is interrupted, resume that operation as
    documented rather than issuing another batch.
    No backup step follows `issue`, `receive` or a trade: `run` already has it.
-2. Import that file into the home's wallet, using the trading skill's `receive`
-   workflow (it lands in the same wallet `maxplayer wallet balance` shows). Verify the receive state and balance.
-   An ambiguous result needs recovery of the existing attempt, not new issuance.
+2. Import that file into the home's wallet with `maxplayer wallet receive --token-file <file>
+   --add-mint` (it lands in the same wallet `maxplayer wallet balance` shows). Verify the
+   balance. An ambiguous result needs the same file received again, not new issuance.
 3. Show the listing's `--dry-run` using the agreed mint pair, amounts and fee cap.
    Explain the debits, receipts and lock/recovery obligations from the trading
    skill, then obtain approval for publishing those exact terms. No automatic

@@ -85,7 +85,7 @@ fn send_line(a: &SendAttempt) -> (String, bool, bool) {
         SendState::Prepared | SendState::Submitted => {
             line.push_str("; inputs reserved until resolved (keep serve running or run recover)")
         }
-        SendState::Swapped => line.push_str("; token file pending (run recover or rerun the send)"),
+        SendState::Swapped => line.push_str("; token file pending (run recover)"),
         _ => {}
     }
     if let Some((0, at)) = a.reclaim_retry() {

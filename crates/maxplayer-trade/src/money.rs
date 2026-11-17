@@ -950,6 +950,12 @@ async fn resume_withdraw_inner(
 pub async fn recover(home: &Path, j: &Journal) -> Result<bool> {
     recover_for(home, j, None).await
 }
+/// [`recover`] as the explicit `recover` command runs it: also re-polls fundings flagged
+/// `expired_unpaid`, so an invoice paid after the flag is still issued. `trade fund --quote` was
+/// that resume path before money in moved to `maxplayer wallet`; serve's ticks never re-poll them.
+pub async fn recover_explicit(home: &Path, j: &Journal) -> Result<bool> {
+    recover_fundings(home, j, None, true).await
+}
 /// Every mint with wallet work [`recover_for`] would visit (one serve unit each).
 pub async fn recovery_mints(j: &Journal) -> Result<std::collections::BTreeSet<String>> {
     let mut mints = std::collections::BTreeSet::new();
@@ -972,10 +978,19 @@ pub async fn recovery_mints(j: &Journal) -> Result<std::collections::BTreeSet<St
 /// [`recover`] limited to one mint's funding, withdrawal, receive and send items (`None`: all).
 /// Items of one mint touch only that mint's wallet database and their own journal rows.
 pub async fn recover_for(home: &Path, j: &Journal, mint: Option<&str>) -> Result<bool> {
+    recover_fundings(home, j, mint, false).await
+}
+/// [`recover_for`]; `expired` also re-polls fundings flagged `expired_unpaid` ([`recover_explicit`]).
+pub async fn recover_fundings(
+    home: &Path,
+    j: &Journal,
+    mint: Option<&str>,
+    expired: bool,
+) -> Result<bool> {
     let mut failed = false;
     let other = |m: &str| mint.is_some_and(|x| x != m);
     for mut f in j.all::<Funding>("funding").await? {
-        if f.expired_unpaid || other(&f.mint) {
+        if (f.expired_unpaid && !expired) || other(&f.mint) {
             continue;
         }
         if !crate::backoff::ready(&f.id, &[&f.mint], None).await {
