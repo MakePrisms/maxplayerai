@@ -228,6 +228,15 @@ pub fn exit_code(error: &anyhow::Error) -> u8 {
     }
 }
 
+/// Whether a serve answers on `home`'s socket (a connect succeeds; a stale socket file refuses).
+/// Nothing is sent.
+pub async fn answering(home: &Path) -> bool {
+    match socket_path(home) {
+        Ok(sp) => UnixStream::connect(&sp.path).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Path used to bind/connect. Unix socket paths are limited to ~107 bytes; a longer home is
 /// reached through its open directory descriptor (`/proc/self/fd/N/serve.sock`, Linux).
 struct SocketPath {
@@ -288,7 +297,13 @@ pub fn bind_expecting(home: &Path, relays: Vec<String>, owner: u32) -> Result<mp
     tokio::spawn(async move {
         let _dir = sp;
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
+            // The session that bound this socket ended (its job receiver is gone): stop accepting,
+            // so a daemon that hosts serve again later leaves no listener behind.
+            let accepted = tokio::select! {
+                a = listener.accept() => a,
+                _ = tx.closed() => break,
+            };
+            let Ok((stream, _)) = accepted else {
                 continue;
             };
             let Ok(permit) = permits.clone().try_acquire_owned() else {

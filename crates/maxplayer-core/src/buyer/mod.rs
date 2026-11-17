@@ -307,8 +307,19 @@ fn bind_socket(path: &std::path::Path) -> Result<UnixListener, BuyerError> {
 /// Run the buyer until the process is terminated. Acquires the home lock (fail
 /// closed if held), binds the socket, and serves connections forever.
 pub async fn run(home: MaxplayerHome) -> Result<(), BuyerError> {
+    run_with_ready(home, || {}).await
+}
+
+/// [`run`], calling `ready` once this daemon owns the home (the exclusive lock is held), before
+/// anything else starts. A second daemon that fails closed at the lock never calls it, so work
+/// started from `ready` (the hosted trade serve) runs in the one daemon that owns the home.
+pub async fn run_with_ready(
+    home: MaxplayerHome,
+    ready: impl FnOnce() + Send,
+) -> Result<(), BuyerError> {
     // `_lock` is held for the whole run; dropping it releases the OS lock.
     let (_lock, context, socket_path) = bootstrap(home).await?;
+    ready();
     // Reconcile the reservation ledger against relay + journal truth before serving: a reservation
     // orphaned by a prior crash (dead job → release, paid job → spent) is resolved here, so the
     // daemon starts from a converged ledger. A failure is logged, not fatal — an unreachable relay

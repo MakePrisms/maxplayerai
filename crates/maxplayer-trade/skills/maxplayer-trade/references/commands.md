@@ -171,6 +171,9 @@ command on relays you did not give. The client sends only to a serve socket and 
 its own user. A handed-off `take` prints its swap id and that serve is watching it, then
 streams states until settlement; if the command is interrupted, serve keeps driving
 the swap (check `status`). Without a running serve these commands behave as before.
+The buyer daemon and the seller host serve on a home that trades (`[trade] serve`, default on;
+its `[trade] relays` / `mint_relays` are also the commands' defaults), so a running daemon is
+usually the serve that answers; `serve` itself then refuses ("trade serve is already running").
 `recover` and `send` (drain or `--reclaim`) still need the home lock (`home is already in
 use` while serve runs); stop serve first. `maxplayer wallet` commands never need it. Protocol
 version 5: a client of another version is refused with a version mismatch, and an old

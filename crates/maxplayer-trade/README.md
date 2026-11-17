@@ -37,6 +37,17 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
   `per_job_budget_sats`, and pay no platform fee. Trade's own per-mint caps still apply.
 - **Trade state.** The journal (`trade.sqlite`), `owner.lock` and `serve.sock` live in
   `<home>/trade/` (0700).
+- **Serve runs inside the daemons.** On a home that trades (it has `trade/trade.sqlite`), the buyer
+  daemon (`maxplayer buyer`) and the seller (`maxplayer seller`) host `serve`, so nobody runs
+  `maxplayer trade serve` by hand. A home that never traded gets nothing created. One serve per home:
+  whoever holds `owner.lock` serves (with buyer and seller on one home, whichever got it first; the
+  other stands by and takes over when it is free), and a standalone `serve` is refused with the
+  reason. A session error restarts serve after a backoff instead of stopping the daemon. Stopping the
+  daemon is trade's safe stop (the running step finishes or is cancelled at its next wait, journal
+  intact; final `exited` line with `exit` 5; the buyer daemon exits 5, the seller keeps its own exit
+  code). `[trade] serve = false` in `config.toml` turns it off; `[trade] relays` / `mint_relays` set
+  the relays the hosted serve uses and `maxplayer trade` defaults to, so hand-offs match.
+  Legacy standalone homes are never hosted.
 - **Two writers, one wallet.** The buyer daemon / `maxplayer wallet` and `maxplayer trade` may run
   at once. Every step that picks unspent proofs and reserves them holds an exclusive OS advisory
   lock (`flock`) on `<home>/wallet/select.lock`, in both programs: core's `prepare_send` /

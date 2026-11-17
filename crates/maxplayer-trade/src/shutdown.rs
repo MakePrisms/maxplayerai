@@ -21,7 +21,7 @@
 //! redacted error text only.
 use std::{
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex, OnceLock},
+    sync::{LazyLock, Mutex},
     time::Duration,
 };
 
@@ -66,7 +66,8 @@ impl std::error::Error for InboxClosed {}
 static PHASE: LazyLock<tokio::sync::watch::Sender<u8>> =
     LazyLock::new(|| tokio::sync::watch::channel(0).0);
 static SIGNALS: Mutex<(Option<&'static str>, Option<&'static str>)> = Mutex::new((None, None));
-static HOME: OnceLock<PathBuf> = OnceLock::new();
+/// The home of the serve session in progress (set by [`announce`]): [`finished`] reports it.
+static HOME: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn signals() -> (Option<&'static str>, Option<&'static str>) {
     *SIGNALS.lock().unwrap_or_else(|e| e.into_inner())
@@ -108,8 +109,15 @@ pub fn bounded<T>(
     }
 }
 
-/// Request a stop as signal `name` would (first call), or force it (second call).
+/// Request a stop as signal `name` would (first call), or force it (second call), and print the
+/// `stopping` / `stop_forced` line.
 pub fn signal(name: &'static str) {
+    let phase = request(name);
+    announce_phase(phase, name);
+}
+/// [`signal`] without the line (a daemon hosting serve prints it only while serve runs). Returns
+/// the phase now in effect: 1 stop requested, 2 forced.
+pub fn request(name: &'static str) -> u8 {
     let phase = {
         let mut s = SIGNALS.lock().unwrap_or_else(|e| e.into_inner());
         if s.0.is_none() {
@@ -126,6 +134,10 @@ pub fn signal(name: &'static str) {
         *p = (*p).max(phase);
         changed
     });
+    phase
+}
+/// The `stopping` (phase 1) or `stop_forced` (phase 2) line for a stop requested as `name`.
+pub fn announce_phase(phase: u8, name: &str) {
     let now = crate::clock::now();
     let line = if phase == 1 {
         serde_json::json!({"at":crate::clock::iso(now),"serve":"stopping","signal":name,
@@ -141,18 +153,30 @@ pub fn signal(name: &'static str) {
 /// Print the startup line and install the TERM/INT handlers (replacing their default, which
 /// kills the process without a word). Call once, before binding the socket.
 pub fn start(home: &Path, relays: &[String]) -> anyhow::Result<()> {
+    install_signal_handlers()?;
+    announce(home, relays, None);
+    Ok(())
+}
+/// The startup line of a serve session on `home`, and the home [`finished`] reports. `host`: the
+/// daemon running serve (`buyer daemon`, `seller`); `None` for a standalone `maxplayer trade serve`.
+pub fn announce(home: &Path, relays: &[String], host: Option<&str>) {
+    *HOME.lock().unwrap_or_else(|e| e.into_inner()) = Some(home.to_path_buf());
+    let now = crate::clock::now();
+    let mut line = serde_json::json!({"at":crate::clock::iso(now),"serve":"started",
+        "version":env!("CARGO_PKG_VERSION"),"commit":BUILD_COMMIT,"pid":std::process::id(),
+        "home":home,"relays":relays,"mint_relays":crate::transport::mint_relays(),
+        "stop":format!("SIGTERM/SIGINT: safe stop within {}s, exit {EXIT_STOPPED}", GRACE.as_secs())});
+    if let Some(host) = host {
+        line["host"] = host.into();
+    }
+    eprintln!("{line}");
+}
+/// Standalone serve's TERM/INT handling: the first signal requests the safe stop, a second one
+/// (or [`GRACE`]) forces it.
+fn install_signal_handlers() -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal as unix_signal};
     let mut term = unix_signal(SignalKind::terminate())?;
     let mut int = unix_signal(SignalKind::interrupt())?;
-    let _ = HOME.set(home.to_path_buf());
-    let now = crate::clock::now();
-    eprintln!(
-        "{}",
-        serde_json::json!({"at":crate::clock::iso(now),"serve":"started",
-            "version":env!("CARGO_PKG_VERSION"),"commit":BUILD_COMMIT,"pid":std::process::id(),
-            "home":home,"relays":relays,"mint_relays":crate::transport::mint_relays(),
-            "stop":format!("SIGTERM/SIGINT: safe stop within {}s, exit {EXIT_STOPPED}", GRACE.as_secs())})
-    );
     tokio::spawn(async move {
         let first = tokio::select! {
             _ = term.recv() => "SIGTERM",
@@ -170,11 +194,12 @@ pub fn start(home: &Path, relays: &[String]) -> anyhow::Result<()> {
 }
 
 /// The final line: why serve ended, its exit code and what is unfinished. A no-op unless
-/// [`start`] ran in this process. `error` is the returned error, if any.
+/// [`announce`] ran in this process. `error` is the returned error, if any.
 pub fn finished(code: u8, error: Option<&anyhow::Error>) {
-    let Some(home) = HOME.get() else {
+    let Some(home) = HOME.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
         return;
     };
+    let home = &home;
     let now = crate::clock::now();
     let mut v = serde_json::json!({"at":crate::clock::iso(now),"serve":"exited","exit":code,
         "pid":std::process::id(),"journal":"retained"});
@@ -266,6 +291,15 @@ pub fn unfinished(home: &Path, now: u64) -> serde_json::Value {
     });
     serde_json::json!({"swaps":swaps,"lots_unserved":lots,"funding":funding,
         "withdrawals":withdrawals,"receives":receives,"sends":sends})
+}
+
+/// Forget every stop request and the reported home: tests that host serve several times in one
+/// process start each from "running". Production never calls it (a stop is final).
+#[doc(hidden)]
+pub fn reset() {
+    *SIGNALS.lock().unwrap_or_else(|e| e.into_inner()) = (None, None);
+    PHASE.send_replace(0);
+    *HOME.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// The commit this binary was built from (`build.rs`), or `unknown`.
