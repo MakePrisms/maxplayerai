@@ -395,7 +395,7 @@ pub async fn send(
             r.id
         );
         ensure!(
-            r.state != SendState::Reclaiming,
+            r.state != SendState::Reclaiming && !r.reclaim_retry_pending(),
             "--out belongs to send {} which is being reclaimed; run send --reclaim {}",
             r.id,
             r.id
@@ -951,6 +951,12 @@ pub async fn reclaim(
     crate::Asset::new(&r.mint)?.fence()?;
     match r.state {
         SendState::Reclaiming => {
+            // The in-flight leg keeps its authorized fee; a later retry uses this cap.
+            update(j, &mut r, |n| {
+                set_intent(n, max_fees);
+                Ok(())
+            })
+            .await?;
             if let Err(error) = resume(home, j, &mut r).await {
                 eprintln!("send {}: {error:#}; reclaim retained", r.id);
             }
@@ -970,10 +976,17 @@ pub async fn reclaim(
         Err(error) if !error.is::<NeedsHuman>() => {
             // Nothing journaled (mint unreachable, PENDING proofs, ...): keep the intent so
             // recovery retries once the mint answers.
-            if let Err(write) = remember(j, &id, max_fees).await {
-                eprintln!("send {id}: reclaim retry not recorded: {write:#}");
+            match remember(j, &id, max_fees).await {
+                Ok(true) => Err(anyhow!(
+                    "{error:#}; send {id}: reclaim recorded; serve/recover retry it with the same \
+                     --max-fees once the mint answers (do not deliver this token)"
+                )),
+                Ok(false) => Err(error),
+                Err(write) => {
+                    eprintln!("send {id}: reclaim retry not recorded: {write:#}");
+                    Err(error)
+                }
             }
-            Err(error)
         }
         other => other,
     }
@@ -986,16 +999,21 @@ fn set_intent(n: &mut SendAttempt, max_fees: Option<u64>) {
     n.reclaim_refusals = 0;
     n.reclaim_retry_at = 0;
 }
-async fn remember(j: &Journal, id: &str, max_fees: Option<u64>) -> Result<()> {
+/// Returns whether the intent was recorded. A `swapped` send (token file never placed) becomes
+/// `sent` so recovery never places a token the human asked to take back.
+async fn remember(j: &Journal, id: &str, max_fees: Option<u64>) -> Result<bool> {
     let mut r: SendAttempt = j.get("send", id).await?.context("unknown send attempt")?;
-    if r.state != SendState::Sent {
-        return Ok(());
+    if !(r.state == SendState::Sent || (r.state == SendState::Swapped && r.committed)) {
+        return Ok(false);
     }
     update(j, &mut r, |n| {
+        n.state = SendState::Sent;
         set_intent(n, max_fees);
+        n.reclaim_retry_at = crate::coordinator::now();
         Ok(())
     })
-    .await
+    .await?;
+    Ok(true)
 }
 
 /// A reclaim attempt the human must decide on (fee over the cap, uneconomic, too large to
@@ -1226,9 +1244,12 @@ async fn resume_reclaim(home: &Path, j: &Journal, r: &mut SendAttempt) -> Result
 
 /// Count a refused/raced reclaim and schedule the next automatic attempt, or stop retrying.
 fn schedule_retry(n: &mut SendAttempt) {
+    let next = usize::try_from(n.reclaim_refusals).unwrap_or(usize::MAX);
     n.reclaim_refusals = n.reclaim_refusals.saturating_add(1);
-    match RECLAIM_RETRY_SECONDS.get(n.reclaim_refusals as usize - 1) {
-        Some(delay) if n.reclaim_wanted => n.reclaim_retry_at = crate::coordinator::now() + delay,
+    match RECLAIM_RETRY_SECONDS.get(next) {
+        Some(delay) if n.reclaim_wanted => {
+            n.reclaim_retry_at = crate::coordinator::now().saturating_add(*delay)
+        }
         _ => n.reclaim_wanted = false,
     }
 }
@@ -1236,6 +1257,10 @@ fn schedule_retry(n: &mut SendAttempt) {
 /// What happens next to a token whose reclaim did not complete.
 fn retry_note(r: &SendAttempt) -> String {
     match r.reclaim_retry() {
+        Some((0, _)) => format!(
+            "serve/recover retry it once the mint answers, or run send --reclaim {} now",
+            r.id
+        ),
         Some((n, at)) => format!(
             "serve/recover retry it at {} (retry {n}/{}), or run send --reclaim {} now",
             crate::clock::iso(at),
@@ -1260,7 +1285,11 @@ async fn stop_retrying(j: &Journal, r: &mut SendAttempt, error: anyhow::Error) -
         })
         .await
         {
-            eprintln!("send {}: reclaim retry not cleared: {write:#}", r.id);
+            // Not a clean refusal: the retry is still armed on disk.
+            return anyhow!(
+                "{error:#}; send {}: reclaim retry not cleared: {write:#}",
+                r.id
+            );
         }
     }
     NeedsHuman(format!("{error:#}")).into()
@@ -1325,13 +1354,23 @@ pub async fn recover_for(home: &Path, j: &Journal, mint: Option<&str>) -> Result
                 attempt(home, j, r.clone(), max_fees, false),
             )
             .await;
-            if !matches!(&item, Ok(Ok(n)) if n.terminal() && !n.reclaim_retry_pending()) {
-                failed = true;
-                eprintln!(
-                    "send {}: reclaim retry deferred ({}); token still outstanding",
+            match &item {
+                Ok(Ok(n)) if n.terminal() && !n.reclaim_retry_pending() => {}
+                Ok(Err(e)) if e.is::<NeedsHuman>() => eprintln!(
+                    "send {}: reclaim retry stopped ({}); token still outstanding; run send \
+                     --reclaim {} again",
                     r.id,
-                    crate::deferral_reason(&item, RECOVERY_ITEM_SECONDS)
-                );
+                    crate::redact_reason(&format!("{e:#}")),
+                    r.id
+                ),
+                _ => {
+                    failed = true;
+                    eprintln!(
+                        "send {}: reclaim retry deferred ({}); token still outstanding",
+                        r.id,
+                        crate::deferral_reason(&item, RECOVERY_ITEM_SECONDS)
+                    );
+                }
             }
             continue;
         }

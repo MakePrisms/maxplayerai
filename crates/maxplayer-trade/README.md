@@ -853,7 +853,7 @@ counterpart to `receive`, for moving funds to another wallet without Lightning. 
 - `send --reclaim <id>` swaps still-UNSPENT sent proofs back (same journaling; `reclaim_submitted`
   is journaled before each POST). It also works on a `swapped` send whose file could not be
   placed. Exits: 0 `reclaimed`; 3 `reclaiming`; 1 refused or partially redeemed meanwhile
-  (state back to `sent`; run it again) or `redeemed` (all SPENT, including the race where the
+  (state back to `sent`; `serve`/`recover` retry it up to 3 times with the same `--max-fees`, or run it again) or `redeemed` (all SPENT, including the race where the
   recipient redeemed before any POST of our leg); 4 `reclaim_unresolved` when our leg was
   POSTed (ambiguous reply, or a refusal while every input is SPENT: the mint may have executed
   it) and its outputs stayed absent on two passes (secrets kept), or `reclaim_quarantined`. `status --check-sends` performs the on-demand NUT-07 check.

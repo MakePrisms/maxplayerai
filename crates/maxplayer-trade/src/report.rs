@@ -88,7 +88,12 @@ fn send_line(a: &SendAttempt) -> (String, bool, bool) {
         SendState::Swapped => line.push_str("; token file pending (run recover or rerun the send)"),
         _ => {}
     }
-    if let Some((n, at)) = a.reclaim_retry() {
+    if let Some((0, at)) = a.reclaim_retry() {
+        line.push_str(&format!(
+            "; reclaim pending since {} (keep serve running or run recover)",
+            crate::clock::iso(at)
+        ));
+    } else if let Some((n, at)) = a.reclaim_retry() {
         line.push_str(&format!(
             "; reclaim retry {n}/{} at {} (keep serve running or run recover)",
             crate::send::RECLAIM_RETRY_SECONDS.len(),

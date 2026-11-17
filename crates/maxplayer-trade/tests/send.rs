@@ -1464,10 +1464,17 @@ async fn reclaim_retries_stop_after_three_refusals() {
         swaps + 3,
         "SAFETY: a fourth retry"
     );
-    // The human asks again: a fresh attempt (and a fresh retry budget).
-    m.faults.swap_nut_error.store(false, SeqCst);
+    // The human asks again: a fresh retry budget, even if refused again.
     let back = send::reclaim(a.path(), &ja, &r.id, None).await.unwrap();
-    assert_eq!(back.state, SendState::Reclaimed);
+    assert_eq!(
+        retry_of(&back),
+        Some(1),
+        "manual reclaim restarts the count"
+    );
+    m.faults.swap_nut_error.store(false, SeqCst);
+    retry_due(&ja, &r.id).await;
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaimed);
     assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
 }
 
@@ -1494,7 +1501,10 @@ async fn reclaim_retry_keeps_the_original_fee_cap() {
     v["reclaim_max_fees"] = 0.into();
     v["reclaim_retry_at"] = 0.into();
     ja.put("send", &r.id, &v).await.unwrap();
-    money::recover(a.path(), &ja).await.unwrap();
+    assert!(
+        !money::recover(a.path(), &ja).await.unwrap(),
+        "a stopped retry is settled, not deferred"
+    );
     let row = attempts(&ja).await.remove(0);
     assert_eq!(row.state, SendState::Sent);
     assert!(
@@ -1506,4 +1516,71 @@ async fn reclaim_retry_keeps_the_original_fee_cap() {
         swaps,
         "SAFETY: a swap over the fee cap"
     );
+}
+
+/// A `send --reclaim` that cannot reach the mint's verdict (sent proofs PENDING) is recorded and
+/// retried by recovery; meanwhile the same `--out` is refused, so the token is never re-emitted.
+#[tokio::test]
+async fn reclaim_blocked_by_pending_proofs_is_recorded_and_retried() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let r = sent(&m, a.path(), &ja, 8, "t").await;
+    m.faults.pending_inputs.store(true, SeqCst);
+    let error = send::reclaim(a.path(), &ja, &r.id, None)
+        .await
+        .err()
+        .expect("PENDING proofs");
+    assert!(
+        format!("{error:#}").contains("reclaim recorded"),
+        "{error:#}"
+    );
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Sent);
+    assert_eq!(retry_of(&row), Some(0));
+    let report = maxplayer_trade::report::render(a.path()).unwrap();
+    assert!(
+        report.contains("reclaim pending since") && !report.contains("1970"),
+        "{report}"
+    );
+    let again = send::send(a.path(), &ja, &m.url, 8, &a.path().join("t"), None)
+        .await
+        .err()
+        .expect("SAFETY: --out reused while a reclaim is pending");
+    assert!(again.to_string().contains("being reclaimed"), "{again:#}");
+    m.faults.pending_inputs.store(false, SeqCst);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaimed);
+    assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
+}
+
+/// SAFETY: a `swapped` send (token file never placed) whose reclaim hit PENDING proofs keeps the
+/// reclaim and becomes `sent`: recovery never places the token the human asked back.
+#[cfg(feature = "lab")]
+#[tokio::test]
+async fn swapped_send_reclaim_blocked_by_pending_is_never_placed() {
+    let m = MintFixture::start(0).await;
+    let (a, ja) = funded(&m, 32).await;
+    let out = a.path().join("t");
+    let o = out.to_str().unwrap();
+    let args = ["send", &m.url, "--amount", "8", "--out", o];
+    let crashed = cli(a.path(), &args, Some("TRADE_CRASH_BEFORE_SEND_FILE")).await;
+    assert_eq!(crashed.status.code(), Some(85));
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Swapped);
+    m.faults.pending_inputs.store(true, SeqCst);
+    send::reclaim(a.path(), &ja, &row.id, None)
+        .await
+        .err()
+        .expect("PENDING proofs");
+    let row = attempts(&ja).await.remove(0);
+    assert_eq!(row.state, SendState::Sent);
+    assert!(row.reclaim_retry_pending());
+    m.faults.pending_inputs.store(false, SeqCst);
+    assert!(!money::recover(a.path(), &ja).await.unwrap());
+    assert_eq!(attempts(&ja).await[0].state, SendState::Reclaimed);
+    assert!(
+        !out.exists(),
+        "SAFETY: recovery placed a token being reclaimed"
+    );
+    assert_eq!(balance(a.path(), &m.url).await, 32, "SAFETY: credited once");
 }
