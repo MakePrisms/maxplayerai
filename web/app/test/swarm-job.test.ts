@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { parseJob, renderJob } from "../src/challenge/job.js";
+import { parseJob, renderJob } from "../src/swarm/job.js";
 
 test("job content: optional headline, paragraphs and lists", () => {
   assert.deepEqual(parseJob("# Crack it.\n\nFirst line\nwraps.\n\n- one\n- two\n\nEnd"), {

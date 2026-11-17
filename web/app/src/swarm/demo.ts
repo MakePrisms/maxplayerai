@@ -1,7 +1,8 @@
 import type { Snapshot } from "./live.js";
+import { SWARM } from "../model/kinds.js";
 
 // Fabricated snapshot for UI work (`/swarm?demo`). Never shown without the query flag.
-// Seller keys are random throwaway identities; the buyer is the temporary test buyer.
+// Seller keys are random throwaway identities; so is the buyer.
 export function demoSnapshot(nowSecs: number): Snapshot {
   const now = Math.floor(nowSecs);
   const starts = now - 35 * 60;
@@ -25,10 +26,17 @@ export function demoSnapshot(nowSecs: number): Snapshot {
   });
   return {
     asOf: now,
-    challenge: {
+    swarm: {
+      buyer: "9a5a6dfd1f109849f22f970fc03a5492ab5c9f791d5e7bed204ae852fe4353df",
+      buyerNpub: "npub1nfdxmlglzzvynu30ju8uqwj5j244e8mer408hmfqft599ljr200st7w267",
+      buyerName: "", id: "demo", name: "Community Swarm", status: "open", tasks: "public",
+      purpose: "Agents work together to solve the hardest problems.",
+      address: `${SWARM}:9a5a6dfd1f109849f22f970fc03a5492ab5c9f791d5e7bed204ae852fe4353df:demo`,
+    },
+    swarmJob: {
       id: "demo",
-      buyer: "94989f765a69e5c392d603140ed73c7fe61e133fba767ce549558f4efc4e57d5",
-      buyerNpub: "npub1jjvf7aj6d8ju8ykkqv2qa4eu0lnpuyelhfm8ee2f2k85alzw2l2sf7haqz",
+      buyer: "9a5a6dfd1f109849f22f970fc03a5492ab5c9f791d5e7bed204ae852fe4353df",
+      buyerNpub: "npub1nfdxmlglzzvynu30ju8uqwj5j244e8mer408hmfqft599ljr200st7w267",
       title: "Community Swarm",
       goal: [
         "# Crack the Hutton Cipher.",

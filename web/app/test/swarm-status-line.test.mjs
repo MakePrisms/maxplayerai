@@ -6,10 +6,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { schnorr } from '@noble/curves/secp256k1';
-import { ChallengeReader } from '../src/challenge/shared/relay.mjs';
-import { EventStore } from '../src/challenge/shared/model.mjs';
-import { connectionLine, connectionText, relayStatusWord } from '../src/challenge/live.ts';
-import { paint } from '../src/challenge/page.ts';
+import { SwarmReader } from '../src/swarm/shared/relay.mjs';
+import { SwarmStore } from '../src/swarm/shared/model.mjs';
+import { connectionLine, connectionText, relayStatusWord } from '../src/swarm/live.ts';
+import { paint } from '../src/swarm/page.ts';
 import { npubEncode } from '../src/trade/nip19.ts';
 
 const buyer=Buffer.from(schnorr.getPublicKey('01'.padStart(64,'0'))).toString('hex');
@@ -23,23 +23,26 @@ class Socket extends EventTarget {
   close(){if(this.readyState===3)return;this.readyState=3;this.dispatchEvent(new Event('close'));}
 }
 const finish=r=>{while(r.pages.size)for(const id of [...r.pages.keys()])r.ws.message(['EOSE',id]);};
-// The launch relay today: the trade relay challenges, refuses the throwaway key, serves open reads.
-function gatedReader(t,{complete=3}={}) {
-  const reader=new ChallengeReader({url:'ws://trade',challengeRelays:['ws://a','ws://b','ws://c'],buyer,store:new EventStore(),WebSocketImpl:Socket,queueMs:1,pollMs:600000});
+// The launch relay today: it challenges, refuses the throwaway key, serves open reads. Both of the
+// board's readers (swarm events, then the buyer's trade window) are on it.
+function gatedReader(t,{complete=true}={}) {
+  const reader=new SwarmReader({url:'ws://r',swarm:{buyer,swarm:'math'},store:new SwarmStore(),WebSocketImpl:Socket,queueMs:1,pollMs:600000});
   reader.start();t.after(()=>reader.stop());
-  for(const r of [reader.trade,...reader.challenges])r.ws.dispatchEvent(new Event('open'));
-  const trade=reader.trade.ws;
-  trade.message(['AUTH','nonce-1']);
-  const auth=trade.sent.find(m=>m[0]==='AUTH');
-  assert.ok(auth,'the reader answered the challenge');
-  trade.message(['OK',auth[1].id,false,GATE]);
-  finish(reader.trade);
-  reader.challenges.slice(0,complete).forEach(finish);
+  for(const r of [reader.swarm,reader.trade]){
+    r.ws.dispatchEvent(new Event('open'));
+    r.ws.message(['AUTH','nonce-1']);
+    const auth=r.ws.sent.find(m=>m[0]==='AUTH');
+    assert.ok(auth,'the reader answered the challenge');
+    r.ws.message(['OK',auth[1].id,false,GATE]);
+  }
+  finish(reader.swarm);
+  assert.equal(typeof reader.trade.windowSince,'number','the trade window opens once the swarm jobs are read');
+  if(complete)finish(reader.trade);
   return reader;
 }
 // The page's paint(): the text the user actually sees in #connection-status.
 const seller={pubkey:buyer,npub:npubEncode(buyer),name:'a',minutesOffered:60,minutesUsed:0,minutesRemaining:60,state:'working',eligible:true,decision:'accepted',currentJobStart:1000};
-const snap={asOf:1500,challenge:{id:'t',buyer,buyerNpub:npubEncode(buyer),title:'T',goal:'G',starts:1000,ends:2000,status:'in_progress',result:''},sellers:[seller],jobs:[],budget:{totalSats:1,committedSats:0,paidSats:0,unknownAmounts:0,estimated:true,note:''},updates:[]};
+const snap={asOf:1500,swarmJob:{id:'t',buyer,buyerNpub:npubEncode(buyer),title:'T',goal:'G',starts:1000,ends:2000,status:'in_progress',result:''},sellers:[seller],jobs:[],budget:{totalSats:1,committedSats:0,paidSats:0,unknownAmounts:0,estimated:true,note:''},updates:[]};
 class El { textContent='';children=[];attrs={};className='';constructor(tag='#text'){this.tag=tag;}
   getAttribute(k){return this.attrs[k]??null;} setAttribute(k,v){this.attrs[k]=v;}
   querySelector(sel){return this.children.find(c=>c.tag===sel)??null;}
@@ -66,14 +69,11 @@ test('member-gated relay (AUTH refused, anonymous reads): the page line is exact
 });
 
 test('anonymous + AUTH refused + another warning: the other warning still shows after "Live"',t=>{
-  // ws://c never completes: quorum met, degraded, with the reader's own warning.
-  const s=gatedReader(t,{complete:2}).status;
-  assert.equal(s.authMode,'anonymous');assert.equal(s.degraded,true);
+  // The trade window still loading: not live yet, so the line is only "Updating…".
+  const s=gatedReader(t,{complete:false}).status;
+  assert.equal(s.authMode,'anonymous');assert.equal(s.historyComplete,false);
   assert.ok(s.warnings.includes(REFUSED),s.warnings.join('; '));
-  const degraded='Degraded: 2 of 3 challenge relays complete (quorum 2); missing: ws://c';
-  assert.equal(connectionLine(s,'Live'),`Live · ${degraded}`);
-  assert.equal(connectionText(s,'Live'),`Live · ${degraded}`);
-  assert.equal(shown(s),`Live · ${degraded}`);
+  assert.equal(shown(s),'Loading what each agent is doing…');
   // Synthetic: every other warning kind is kept, in order, with only the refusal dropped.
   const base={connected:true,authenticated:false,authMode:'anonymous',historyComplete:true,error:null};
   const others=['Recovering after relay CLOSED (x); reconnect 2','AUTH not answered (Relay did not answer AUTH (AUTH did not complete within 15s)); polling','Profile/heartbeat read incomplete','Live subscription k closed by relay (y); polling'];
@@ -89,10 +89,10 @@ test('pending, authenticated or unknown AUTH posture: an AUTH refusal still show
   assert.equal(connectionLine(base,'Polling'),`Polling · ${REFUSED}`);
 });
 
-test('anonymous: an error and unavailable relays still show',()=>{
+test('anonymous: an error still shows',()=>{
   const r={connected:true,authenticated:false,authMode:'anonymous',historyComplete:true,windowComplete:true,
-    error:'Swarm history incomplete; relay failed: wss://x',failedRelays:['wss://x'],warnings:[REFUSED,'w']};
-  assert.equal(connectionLine(r,'Live'),'Live · Swarm history incomplete; relay failed: wss://x · Unavailable: wss://x · w');
-  assert.equal(connectionText(r,'Live'),'Live · Swarm history incomplete; relay failed: wss://x · Unavailable: wss://x · w');
-  assert.equal(connectionLine({...r,error:null,warnings:[REFUSED]},'Live'),'Live · Unavailable: wss://x');
+    error:'Relay history timed out',warnings:[REFUSED,'w']};
+  assert.equal(connectionLine(r,'Live'),'Live · Relay history timed out · w');
+  assert.equal(connectionText(r,'Live'),'Live · Relay history timed out · w');
+  assert.equal(connectionLine({...r,error:null,warnings:[REFUSED]},'Live'),'Live');
 });

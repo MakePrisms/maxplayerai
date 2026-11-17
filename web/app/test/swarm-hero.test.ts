@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AGENTS_ANCHOR, budgetValue, FRESH_S, heroFacts, isRunning, renderStart, SPOT_WAIT_MS, startFact } from "../src/challenge/hero.js";
+import { AGENTS_ANCHOR, budgetValue, FRESH_S, heroFacts, isRunning, renderStart, SPOT_WAIT_MS, startFact } from "../src/swarm/hero.js";
 
 const when = (secs: number) => `t=${secs}`;
 const run = { starts: 1000, ends: 2000, status: "in_progress" };
@@ -66,7 +66,7 @@ class Node {
 test("renderStart swaps the label and puts an in-page link in the value, then back", () => {
   const label = new Node("dt"), dd = new Node("dd");
   const doc = {
-    getElementById: (id: string) => (id === "challenge-start-label" ? label : dd),
+    getElementById: (id: string) => (id === "swarm-start-label" ? label : dd),
     createElement: (tag: string) => new Node(tag),
     createTextNode: (t: string) => Object.assign(new Node(), { textContent: t }),
   } as unknown as Document;
