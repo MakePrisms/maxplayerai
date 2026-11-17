@@ -219,15 +219,16 @@ impl MintHome {
     pub fn load(&self) -> Result<Secrets> {
         let key = read(&self.key_path())?;
         let keys = Keys::parse(key.trim()).context("parse nostr.key")?;
-        let mnemonic =
-            Mnemonic::parse_normalized(read(&self.seed_path())?.trim()).context("parse seed")?;
+        let seed = parse_seed(&read(&self.seed_path())?)?;
         let config = self.config()?;
-        Ok(Secrets {
-            keys,
-            seed: mnemonic.to_seed_normalized(""),
-            config,
-        })
+        Ok(Secrets { keys, seed, config })
     }
+}
+
+/// The 64-byte seed from the text of a `seed` file (a BIP-39 mnemonic).
+pub fn parse_seed(text: &str) -> Result<[u8; 64]> {
+    let mnemonic = Mnemonic::parse_normalized(text.trim()).context("parse seed")?;
+    Ok(mnemonic.to_seed_normalized(""))
 }
 
 /// `nostr://<npub>` for the mint's key.

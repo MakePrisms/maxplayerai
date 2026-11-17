@@ -54,7 +54,10 @@ path in the service instead. Verify the service's executable exists and is the
 chosen build before starting it; do not rely on the service inheriting shell PATH.
 Check the installed commands' usage; do not guess flags or overwrite a running
 installation without checking its current version and obligations. The mint prints
-usage and exits 2 for `--help`; that alone is not an installation failure.
+usage and exits 2 for `--help`; that alone is not an installation failure. An
+existing `maxplayer-mint` whose usage has no `restore` predates automatic backups:
+upgrade it from the chosen revision (same path, then restart its service), and
+drop any stopped-backup procedure recorded for it earlier.
 
 - Initialize a mint **only if none exists**, with `maxplayer-mint init --name <name>`: wallets
   show the name next to the mint URL. Use the seller's own name unless the operator chose another.
@@ -129,6 +132,7 @@ Do not invent a price or assume that “set up” authorizes issuance or trading
    README. Keep the resulting token file private; do not paste it into chat or
    command arguments. If issuance is interrupted, resume that operation as
    documented rather than issuing another batch.
+   No backup step follows `issue`, `receive` or a trade: `run` already has it.
 2. Import that file into the home's wallet, using the trading skill's `receive`
    workflow (it lands in the same wallet `maxplayer wallet balance` shows). Verify the receive state and balance.
    An ambiguous result needs recovery of the existing attempt, not new issuance.

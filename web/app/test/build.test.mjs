@@ -315,6 +315,10 @@ test("/mint explains the seller mint with the shared page layout", () => {
   }
   assert.match(mint, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span>/, "experimental strip under the nav, like /tokens");
   assert.match(mint, /Are my tokens bitcoin\?<\/summary><p>No\./, "seller tokens are distinguished from bitcoin");
+  assert.doesNotMatch(mint, /stopped backups|separate trading home/i, "backups are automatic; trading uses the same home");
+  const skill = readFileSync(join(root, "dist", ".well-known", "skills", "mint-and-trade", "skill.md"), "utf8");
+  assert.match(skill, /maxplayer-mint\s+restore/, "the skill restores with the binary, newest backup only");
+  assert.match(skill, /usage has no `restore`/, "the skill upgrades a mint binary that predates automatic backups");
 });
 
 test("Mint's one-line instruction resolves to a shipped, discoverable combined skill", () => {

@@ -14,20 +14,25 @@
 //!
 //! Restore only the NEWEST snapshot ([`restore`]): an older one lacks proofs spent since, and
 //! would let them be spent again. [`check_live`] makes `run` refuse a `mint.sqlite` that is
-//! missing, or behind the newest snapshot.
+//! missing, unreadable, or behind the newest readable snapshot.
 
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use cdk_common::SECP256K1;
+use cdk_common::bitcoin::Network;
+use cdk_common::bitcoin::bip32::{DerivationPath, Xpriv};
+use cdk_common::nuts::{CurrencyUnit, Id, MintKeySet};
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::watch;
 
-use crate::home::MintHome;
+use crate::home::{MintHome, parse_seed};
 
 /// Snapshots kept by default (the newest is always kept).
 pub const KEEP: usize = 10;
@@ -40,10 +45,14 @@ const PREFIX: &str = "mint-";
 const SUFFIX: &str = ".sqlite";
 const SEQ_WIDTH: usize = 10;
 
-/// The sequence number of a snapshot named `mint-<seq>-<stamp>.sqlite`.
+/// The sequence number of a snapshot named `mint-<seq>-<stamp>.sqlite` (`<seq>`: at least
+/// [`SEQ_WIDTH`] ASCII digits; it grows wider past 9999999999).
 fn sequence(path: &Path) -> Option<u64> {
     let name = path.file_name()?.to_str()?;
-    let digits = name.strip_prefix(PREFIX)?.get(..SEQ_WIDTH)?;
+    let (digits, _) = name.strip_prefix(PREFIX)?.split_once('-')?;
+    if digits.len() < SEQ_WIDTH || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     digits.parse().ok()
 }
 
@@ -197,6 +206,7 @@ pub fn start(mint_dir: &Path, db: &Path, dir: &Path, schedule: Schedule) -> Back
         keep: schedule.keep,
         snap: None,
         restore_set_saved: false,
+        issued_saved: false,
         status: status.clone(),
         min_interval: schedule.min_interval,
     }));
@@ -242,6 +252,9 @@ struct Worker {
     keep: usize,
     snap: Option<Snapshotter>,
     restore_set_saved: bool,
+    /// Whether the last copy of `issued/*.token` succeeded. Until it does, every attempt retries it,
+    /// changed database or not: once `issue` records a token as written, the file is its only copy.
+    issued_saved: bool,
     status: Arc<Mutex<Status>>,
     min_interval: Duration,
 }
@@ -265,29 +278,44 @@ impl Worker {
         }
         // Taken out while in use, so `fail` can borrow `self`; put back unless it broke.
         let mut snap = self.snap.take().expect("opened above");
-        match snap.changed() {
-            Ok(false) => {
-                self.snap = Some(snap);
-                return false;
-            }
-            Ok(true) => {}
+        let changed = match snap.changed() {
+            Ok(changed) => changed,
             Err(error) => {
                 self.fail(error);
                 return true;
             }
+        };
+        if !changed && self.issued_saved && self.restore_set_saved {
+            self.snap = Some(snap);
+            return false;
         }
-        if let Err(error) = save_issued(&self.mint_dir, &self.dir) {
-            self.fail(error.context("copy issued token files"));
-        }
-        match snap.snapshot() {
-            Ok(path) => {
-                eprintln!("maxplayer-mint: backup saved {}", path.display());
-                let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-                status.snapshots += 1;
-                status.last = Some(path);
-                status.last_error = None;
+        if changed || !self.issued_saved {
+            match save_issued(&self.mint_dir, &self.dir) {
+                Ok(_) => self.issued_saved = true,
+                Err(error) => {
+                    self.issued_saved = false;
+                    self.fail(error.context("copy issued token files"));
+                }
             }
-            Err(error) => self.fail(error),
+        }
+        // The error stays reported until every part of the backup has caught up.
+        let whole = self.issued_saved && self.restore_set_saved;
+        if changed {
+            match snap.snapshot() {
+                Ok(path) => {
+                    eprintln!("maxplayer-mint: backup saved {}", path.display());
+                    let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+                    status.snapshots += 1;
+                    status.last = Some(path);
+                    if whole {
+                        status.last_error = None;
+                    }
+                }
+                Err(error) => self.fail(error),
+            }
+        } else if whole {
+            // A retried copy caught up; no snapshot is pending (a failed one leaves `changed`).
+            self.status.lock().unwrap_or_else(|p| p.into_inner()).last_error = None;
         }
         self.snap = Some(snap);
         true
@@ -309,11 +337,20 @@ impl Worker {
     }
 }
 
-/// Snapshots in `dir`, oldest first. A missing directory has none.
+/// Snapshots in `dir`, oldest first. A missing directory has none; a symlink to a missing
+/// directory (unmounted off-box storage) is an error, not "no backups".
 pub fn snapshots(dir: &Path) -> Result<Vec<PathBuf>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if fs::symlink_metadata(dir).is_ok() {
+                bail!(
+                    "{} is a symlink to a missing directory (is the backup storage mounted?)",
+                    dir.display()
+                );
+            }
+            return Ok(Vec::new());
+        }
         Err(error) => return Err(error).with_context(|| format!("list {}", dir.display())),
     };
     let mut found = Vec::new();
@@ -329,8 +366,8 @@ pub fn snapshots(dir: &Path) -> Result<Vec<PathBuf>> {
             found.push(entry.path());
         }
     }
-    // Names start with a fixed-width sequence number, so name order is snapshot order.
-    found.sort();
+    // By sequence number, not name: the number grows wider than SEQ_WIDTH eventually.
+    found.sort_by_cached_key(|p| (sequence(p), p.clone()));
     Ok(found)
 }
 
@@ -378,14 +415,16 @@ pub fn save_restore_set(mint_dir: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copy `issued/*.token` files the backup directory lacks (they never change once written).
-pub fn save_issued(mint_dir: &Path, dir: &Path) -> Result<()> {
+/// Copy `issued/*.token` files the backup directory lacks (they never change once written). Also
+/// copies them back the other way on [`restore`]. Returns how many were copied.
+pub fn save_issued(mint_dir: &Path, dir: &Path) -> Result<usize> {
     let entries = match fs::read_dir(mint_dir.join("issued")) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error).context("list issued"),
     };
     let target = dir.join("issued");
+    let mut copied = 0;
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
@@ -396,19 +435,46 @@ pub fn save_issued(mint_dir: &Path, dir: &Path) -> Result<()> {
         ensure_dir(&target)?;
         let bytes = fs::read(entry.path()).with_context(|| format!("read issued/{text}"))?;
         write_atomic(&target.join(&name), &bytes)?;
+        copied += 1;
     }
+    Ok(copied)
+}
+
+/// The file's bytes, or `None` when it does not exist. Any other read error is an error.
+fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Same key or seed, ignoring surrounding whitespace (a hand-restored file may gain a newline).
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.trim_ascii() == b.trim_ascii()
+}
+
+/// Fully read the tables the double-spend guard relies on.
+fn scan(conn: &Connection) -> Result<()> {
+    conn.query_row(
+        "SELECT (SELECT count(*) FROM main.proof) + (SELECT count(*) FROM main.blind_signature)",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .context("read proof and blind_signature")?;
     Ok(())
 }
 
 /// Refuse to serve a database that would let spent credits be spent again: `mint.sqlite` missing
-/// while snapshots exist, or missing spent proofs or signatures the newest snapshot has. Also
-/// refuses a backup directory holding a different mint's key or seed. An unreadable backup
-/// directory is only warned about: backups must never keep the mint from starting.
+/// or unreadable while snapshots exist, or missing spent proofs or signatures the newest READABLE
+/// snapshot has. Also refuses a backup directory holding a different mint's key or seed. An
+/// unreadable backup directory is only warned about: backups must never keep the mint from
+/// starting.
 pub fn check_live(mint_dir: &Path, db: &Path, dir: &Path) -> Result<()> {
     for name in ["nostr.key", "seed"] {
-        if let Ok(theirs) = fs::read(dir.join(name)) {
+        if let Some(theirs) = read_if_present(&dir.join(name))? {
             let ours = fs::read(mint_dir.join(name)).with_context(|| format!("read {name}"))?;
-            if theirs != ours {
+            if !same_secret(&theirs, &ours) {
                 bail!(
                     "{} holds the backups of a DIFFERENT mint (its {name} differs). Set backup_dir in mint.toml to this mint's own backup directory or an empty one",
                     dir.display()
@@ -416,9 +482,8 @@ pub fn check_live(mint_dir: &Path, db: &Path, dir: &Path) -> Result<()> {
             }
         }
     }
-    let newest = match newest(dir) {
-        Ok(Some(newest)) => newest,
-        Ok(None) => return Ok(()),
+    let all = match snapshots(dir) {
+        Ok(all) => all,
         Err(error) => {
             eprintln!(
                 "maxplayer-mint: WARNING: cannot read backups in {}: {error:#}; not checking mint.sqlite against them",
@@ -427,6 +492,9 @@ pub fn check_live(mint_dir: &Path, db: &Path, dir: &Path) -> Result<()> {
             return Ok(());
         }
     };
+    let Some(newest) = all.last() else {
+        return Ok(());
+    };
     if !db.exists() {
         bail!(
             "{} is MISSING but {} exists. Starting would make an empty mint that forgets every spent credit. Run `maxplayer-mint restore` to put back the newest backup",
@@ -434,45 +502,115 @@ pub fn check_live(mint_dir: &Path, db: &Path, dir: &Path) -> Result<()> {
             newest.display()
         );
     }
-    let missing = match missing_from(db, &newest) {
-        Ok(missing) => missing,
-        Err(error) => {
-            eprintln!(
-                "maxplayer-mint: WARNING: cannot compare {} with {}: {error:#}",
-                db.display(),
-                newest.display()
-            );
-            return Ok(());
-        }
-    };
-    if missing > 0 {
+    // An empty, uninitialised or damaged mint.sqlite would come up from the seed with no record
+    // of what was spent, and then be snapshotted over the good backups.
+    if let Err(error) = open_existing(db).and_then(|conn| scan(&conn)) {
         bail!(
-            "{} is OLDER than the newest backup {} ({missing} spent proofs or signatures missing). Serving it could let spent credits be spent again. If it was restored from an old copy, run `maxplayer-mint restore` to put back the newest backup",
+            "{} cannot be read ({error:#}) while backups exist in {}. Serving it could let spent credits be spent again. Run `maxplayer-mint restore` to put back the newest backup",
             db.display(),
-            newest.display()
+            dir.display()
         );
     }
+    // Against the newest snapshot that reads: a damaged newest one must not blind the check.
+    for snapshot in all.iter().rev() {
+        if let Err(error) = open_read_only(snapshot).and_then(|conn| scan(&conn)) {
+            eprintln!(
+                "maxplayer-mint: WARNING: backup {} is unreadable ({error:#}); checking mint.sqlite against an older one",
+                snapshot.display()
+            );
+            continue;
+        }
+        let missing = differences(db, snapshot)?.missing;
+        if missing > 0 {
+            bail!(
+                "{} is OLDER than the newest backup {} ({missing} spent proofs or signatures missing). Serving it could let spent credits be spent again. If it was restored from an old copy, run `maxplayer-mint restore` to put back the newest backup",
+                db.display(),
+                snapshot.display()
+            );
+        }
+        return Ok(());
+    }
+    eprintln!(
+        "maxplayer-mint: WARNING: no backup in {} is readable; not checking mint.sqlite against them",
+        dir.display()
+    );
     Ok(())
 }
 
-/// Spent proofs and signatures in `snapshot` that `live` lacks.
-pub fn missing_from(live: &Path, snapshot: &Path) -> Result<u64> {
+/// Where `live` and a snapshot disagree, counted in spent proofs and stored signatures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Differences {
+    /// In the snapshot but not in `live`: `live` is behind it.
+    pub missing: u64,
+    /// In `live` but not in the snapshot: `live` is ahead of it.
+    pub extra: u64,
+}
+
+/// Compare `live` with `snapshot`, both directions, in one read.
+pub fn differences(live: &Path, snapshot: &Path) -> Result<Differences> {
     let conn = open_existing(live)?;
-    let snapshot = snapshot.to_str().context("backup path is not UTF-8")?;
-    conn.execute("ATTACH DATABASE ?1 AS snap", [snapshot])
+    let path = snapshot.to_str().context("backup path is not UTF-8")?;
+    conn.execute("ATTACH DATABASE ?1 AS snap", [path])
         .context("attach backup")?;
-    conn.query_row(
-        "SELECT
-           (SELECT count(*) FROM snap.proof s WHERE s.state = 'SPENT' AND NOT EXISTS
-              (SELECT 1 FROM main.proof m WHERE m.y = s.y AND m.state = 'SPENT'))
-         + (SELECT count(*) FROM snap.blind_signature s WHERE s.c IS NOT NULL AND NOT EXISTS
-              (SELECT 1 FROM main.blind_signature m
-                WHERE m.blinded_message = s.blinded_message AND m.c IS NOT NULL))",
-        [],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|n| n as u64)
-    .with_context(|| format!("compare {} with {snapshot}", live.display()))
+    let only_in = |a: &str, b: &str| {
+        conn.query_row(
+            &format!(
+                "SELECT
+                   (SELECT count(*) FROM {a}.proof s WHERE s.state = 'SPENT' AND NOT EXISTS
+                      (SELECT 1 FROM {b}.proof m WHERE m.y = s.y AND m.state = 'SPENT'))
+                 + (SELECT count(*) FROM {a}.blind_signature s WHERE s.c IS NOT NULL AND NOT EXISTS
+                      (SELECT 1 FROM {b}.blind_signature m
+                        WHERE m.blinded_message = s.blinded_message AND m.c IS NOT NULL))"
+            ),
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n as u64)
+        .with_context(|| format!("compare {} with {path}", live.display()))
+    };
+    Ok(Differences {
+        missing: only_in("snap", "main")?,
+        extra: only_in("main", "snap")?,
+    })
+}
+
+/// Refuse a snapshot whose keysets `seed` does not derive: another mint's database.
+fn belongs_to(snapshot: &Path, seed: &[u8; 64], from: &Path) -> Result<()> {
+    type Row = (String, String, String, String, Option<i64>, Option<i64>);
+    let conn = open_read_only(snapshot)?;
+    let rows: Vec<Row> = conn
+        .prepare("SELECT id, unit, derivation_path, amounts, input_fee_ppk, valid_to FROM keyset")
+        .and_then(|mut stmt| {
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            })?
+            .collect()
+        })
+        .with_context(|| format!("read keysets in {}", snapshot.display()))?;
+    if rows.is_empty() {
+        bail!("{} has no keysets: not a backup of this mint", snapshot.display());
+    }
+    let xpriv = Xpriv::new_master(Network::Bitcoin, seed).context("derive keys from seed")?;
+    for (id, unit, path, amounts, fee, expiry) in rows {
+        let keyset = Id::from_str(&id).map_err(|e| anyhow!("keyset id {id}: {e}"))?;
+        let derived = MintKeySet::generate_from_xpriv(
+            &SECP256K1,
+            xpriv,
+            &serde_json::from_str::<Vec<u64>>(&amounts).context("keyset amounts")?,
+            CurrencyUnit::from_str(&unit).map_err(|e| anyhow!("keyset unit {unit}: {e}"))?,
+            DerivationPath::from_str(&path).context("keyset derivation path")?,
+            fee.unwrap_or(0) as u64,
+            expiry.map(|e| e as u64),
+            keyset.get_version(),
+        );
+        if derived.id != keyset {
+            bail!(
+                "{} holds the backups of a DIFFERENT mint (its keyset {id} is not derived from this mint's seed)",
+                from.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// What [`restore`] did.
@@ -483,12 +621,15 @@ pub struct Restored {
     pub replaced: Option<PathBuf>,
     /// Restore-set files copied into `<home>/mint/` because they were missing.
     pub copied: Vec<&'static str>,
+    /// `issued/*.token` files copied into `<home>/mint/issued/` because they were missing.
+    pub issued: usize,
 }
 
 /// Put the NEWEST snapshot in `from` back as `mint.sqlite` (never an older one). Creates
-/// `<home>/mint/` from the restore set when it is gone. Refuses while `run` serves, when the
-/// backups belong to another mint, and when `mint.sqlite` already holds everything the snapshot
-/// has. The replaced database is moved aside, never deleted.
+/// `<home>/mint/` from the restore set when it is gone, and puts back missing `issued/*.token`
+/// files. Refuses while `run` serves, when the backups or the snapshot belong to another mint,
+/// when `mint.sqlite` already holds everything the snapshot has, and when the two have diverged
+/// (each holds spends the other lacks). The replaced database is moved aside, never deleted.
 pub fn restore(home: &MintHome, from: &Path) -> Result<Restored> {
     let Some(snapshot) = newest(from)? else {
         bail!("no backups (mint-*.sqlite) in {}", from.display());
@@ -500,15 +641,31 @@ pub fn restore(home: &MintHome, from: &Path) -> Result<Restored> {
         bail!("{} is damaged ({check})", snapshot.display());
     }
     let dir = home.dir();
+    // Whose backups these are, settled before anything is written.
+    let mut seed = None;
     for name in ["nostr.key", "seed"] {
-        if !dir.join(name).exists() && !from.join(name).exists() {
-            bail!(
+        let ours = read_if_present(&dir.join(name))?;
+        let theirs = read_if_present(&from.join(name))?;
+        match (&ours, &theirs) {
+            (None, None) => bail!(
                 "{} has no {name} and {} has none to restore",
                 dir.display(),
                 from.display()
-            );
+            ),
+            (Some(ours), Some(theirs)) if !same_secret(ours, theirs) => bail!(
+                "{} holds the backups of a DIFFERENT mint (its {name} differs from {})",
+                from.display(),
+                dir.display()
+            ),
+            _ => {}
+        }
+        if name == "seed" {
+            seed = ours.or(theirs);
         }
     }
+    let seed = parse_seed(&String::from_utf8_lossy(&seed.expect("checked above")))?;
+    // Even a bare snapshot (no key or seed next to it) must be this mint's.
+    belongs_to(&snapshot, &seed, from)?;
     if !dir.exists() {
         if let Some(parent) = dir.parent() {
             fs::create_dir_all(parent)?;
@@ -519,35 +676,35 @@ pub fn restore(home: &MintHome, from: &Path) -> Result<Restored> {
     let _lock = home.lock_run()?;
     let mut copied = Vec::new();
     for name in RESTORE_SET {
-        let Ok(theirs) = fs::read(from.join(name)) else {
+        let Some(theirs) = read_if_present(&from.join(name))? else {
             continue;
         };
-        match fs::read(dir.join(name)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                write_atomic(&dir.join(name), &theirs)?;
-                copied.push(name);
-            }
-            Err(error) => return Err(error).with_context(|| format!("read {name}")),
-            // A different mint.toml is the operator's newer setting: keep it.
-            Ok(ours) if ours != theirs && name != "mint.toml" => bail!(
-                "{} holds the backups of a DIFFERENT mint (its {name} differs from {})",
-                from.display(),
-                dir.display()
-            ),
-            Ok(_) => {}
+        // Only missing files: a different mint.toml is the operator's newer setting.
+        if read_if_present(&dir.join(name))?.is_none() {
+            write_atomic(&dir.join(name), &theirs)?;
+            copied.push(name);
         }
     }
+    let issued = save_issued(from, dir).context("restore issued token files")?;
     let db = home.db_path();
     if db.exists() {
-        match missing_from(&db, &snapshot) {
-            Ok(0) => bail!(
+        match differences(&db, &snapshot) {
+            Ok(d) if d.missing == 0 => bail!(
                 "{} already holds everything in {}: nothing to restore",
                 db.display(),
                 snapshot.display()
             ),
-            Ok(missing) => eprintln!(
-                "maxplayer-mint: {} lacks {missing} spent proofs or signatures; replacing it",
-                db.display()
+            Ok(d) if d.extra > 0 => bail!(
+                "{} and the newest backup {} have DIVERGED: it lacks {} spent proofs or signatures the backup has, and has {} the backup lacks. Either one alone would forget spends, so nothing was restored. Keep the mint stopped and get help",
+                db.display(),
+                snapshot.display(),
+                d.missing,
+                d.extra
+            ),
+            Ok(d) => eprintln!(
+                "maxplayer-mint: {} lacks {} spent proofs or signatures; replacing it",
+                db.display(),
+                d.missing
             ),
             Err(error) => eprintln!(
                 "maxplayer-mint: {} is unreadable ({error:#}); replacing it",
@@ -555,33 +712,77 @@ pub fn restore(home: &MintHome, from: &Path) -> Result<Restored> {
             ),
         }
     }
-    let mut replaced = None;
+    // Staged and fsynced BEFORE the live files move, so a failed copy leaves mint.sqlite in place.
+    let tmp = dir.join(".mint.sqlite.restore.tmp");
+    let _ = fs::remove_file(&tmp);
+    if let Err(error) = copy_private(&snapshot, &tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    let mut replaced: Option<PathBuf> = None;
+    let mut swapped = Ok(());
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let file = dir.join(format!("mint.sqlite{suffix}"));
         if file.exists() {
-            let aside = replaced.get_or_insert_with(|| {
-                dir.join(format!("replaced-{}", stamp(SystemTime::now())))
-            });
-            if !aside.exists() {
-                fs::create_dir(&*aside)?;
-                fs::set_permissions(&*aside, fs::Permissions::from_mode(0o700))?;
+            let aside = replaced
+                .get_or_insert_with(|| dir.join(format!("replaced-{}", stamp(SystemTime::now()))))
+                .clone();
+            swapped = move_into(&file, &aside);
+            if swapped.is_err() {
+                break;
             }
-            fs::rename(&file, aside.join(file.file_name().expect("named")))?;
         }
     }
-    let tmp = dir.join(".mint.sqlite.restore.tmp");
-    let _ = fs::remove_file(&tmp);
-    fs::copy(&snapshot, &tmp).with_context(|| format!("copy {}", snapshot.display()))?;
-    let file = fs::File::open(&tmp)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.sync_all()?;
-    fs::rename(&tmp, &db)?;
+    let swapped = swapped
+        .and_then(|()| fs::rename(&tmp, &db).with_context(|| format!("rename to {}", db.display())));
+    if let Err(error) = swapped {
+        let _ = fs::remove_file(&tmp);
+        let note = replaced.map_or_else(
+            || "nothing was moved".to_owned(),
+            |aside| format!("the old database files are in {}", aside.display()),
+        );
+        return Err(error.context(format!("restore {} ({note})", db.display())));
+    }
     sync_dir(dir)?;
     Ok(Restored {
         snapshot,
         replaced,
         copied,
+        issued,
     })
+}
+
+/// Move `file` into `aside` (created `0700` when missing).
+fn move_into(file: &Path, aside: &Path) -> Result<()> {
+    if !aside.exists() {
+        fs::create_dir(aside).with_context(|| format!("create {}", aside.display()))?;
+        fs::set_permissions(aside, fs::Permissions::from_mode(0o700))?;
+    }
+    fs::rename(file, aside.join(file.file_name().context("no file name")?))
+        .with_context(|| format!("move {} aside", file.display()))
+}
+
+/// Copy `from` into a new `0600` file `to` and fsync it.
+fn copy_private(from: &Path, to: &Path) -> Result<()> {
+    let mut source = fs::File::open(from).with_context(|| format!("open {}", from.display()))?;
+    let mut target = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(to)
+        .with_context(|| format!("create {}", to.display()))?;
+    std::io::copy(&mut source, &mut target).with_context(|| format!("copy {}", from.display()))?;
+    target
+        .sync_all()
+        .with_context(|| format!("fsync {}", to.display()))
+}
+
+fn open_read_only(path: &Path) -> Result<Connection> {
+    Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open {}", path.display()))
 }
 
 fn open_existing(db: &Path) -> Result<Connection> {
@@ -614,9 +815,15 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(&tmp)
         .with_context(|| format!("create {}", tmp.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&tmp, path).with_context(|| format!("write {}", path.display()))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("write {}", tmp.display()))
+        .and_then(|()| fs::rename(&tmp, path).with_context(|| format!("write {}", path.display())));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written?;
     sync_dir(path.parent().context("no parent")?)
 }
 

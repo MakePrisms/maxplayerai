@@ -153,7 +153,7 @@ async fn run(home: &MintHome) -> Result<()> {
     );
     let result = tokio::select! {
         result = server.serve() => result,
-        _ = tokio::signal::ctrl_c() => Ok(()),
+        stopped = stop_signal() => stopped,
     };
     // Last snapshot after the listener stopped, so it holds every reply already sent.
     let status = backups.stop().await;
@@ -161,6 +161,20 @@ async fn run(home: &MintHome) -> Result<()> {
         eprintln!("maxplayer-mint: last backup attempt FAILED: {error}");
     }
     result
+}
+
+/// A clean stop: SIGINT (Ctrl-C), SIGTERM (`kill`, supervisors, containers) or SIGHUP (a closed
+/// terminal or tmux session). Each still takes the last backup snapshot.
+async fn stop_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).context("listen for SIGTERM")?;
+    let mut hup = signal(SignalKind::hangup()).context("listen for SIGHUP")?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+    }
+    Ok(())
 }
 
 fn restore(home: &MintHome, from: Option<PathBuf>) -> Result<()> {
@@ -179,6 +193,9 @@ fn restore(home: &MintHome, from: Option<PathBuf>) -> Result<()> {
     let done = backup::restore(home, &from)?;
     for name in &done.copied {
         println!("Restored {name}");
+    }
+    if done.issued > 0 {
+        println!("Restored {} issued token file(s) into issued/", done.issued);
     }
     if let Some(aside) = &done.replaced {
         println!("Moved the old mint.sqlite to {}", aside.display());

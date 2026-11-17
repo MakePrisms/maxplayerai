@@ -16,8 +16,8 @@ Read https://www.maxplayer.ai/.well-known/skills/mint-and-trade/skill.md and set
 ```
 
 The [combined skill](../../web/app/.well-known/skills/mint-and-trade/skill.md) covers
-installation, existing mint state, persistent services, a separate trading home and
-readiness checks. The agent asks for issuance and sale terms before issuing or
+installation, existing mint state, persistent services, trading from the same maxplayer home
+and readiness checks. The agent asks for issuance and sale terms before issuing or
 listing tokens. Mint-only setup is documented below.
 
 ## Build
@@ -105,8 +105,10 @@ systemctl --user start maxplayer-mint
 
 `restore` takes the newest snapshot and nothing older, moves the replaced `mint.sqlite` aside
 (`<home>/mint/replaced-<time>/`, never deleted), and recreates `<home>/mint/` from the backup
-directory if it is gone. It refuses another mint's backups and a database that already holds
-everything in the newest snapshot.
+directory if it is gone, including missing `issued/*.token` files. It refuses another mint's
+backups (checked against the seed even when only snapshots are there), a database that already
+holds everything in the newest snapshot, and one that has diverged from it (each holds spends the
+other lacks). `run` likewise refuses an unreadable `mint.sqlite` while backups exist.
 
 ## 2. Configure (optional)
 
@@ -138,7 +140,7 @@ ExecStart=%h/.local/bin/maxplayer-mint run
 Environment=MAXPLAYER_HOME=%h/.maxplayer
 UMask=0077
 NoNewPrivileges=yes
-# `run` shuts down cleanly on SIGINT. It does not handle SIGTERM.
+# `run` shuts down cleanly (taking a last backup) on SIGINT, SIGTERM or SIGHUP.
 KillSignal=SIGINT
 Restart=always
 RestartSec=10
