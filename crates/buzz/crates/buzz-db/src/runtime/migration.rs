@@ -764,7 +764,7 @@ mod postgres_tests {
 
         // MAXPLAYER: upstream's 60 plus the three private-job migrations, which
         // sort after every upstream version.
-        assert_eq!(migrations.len(), 63);
+        assert_eq!(migrations.len(), 64);
         assert_eq!(migrations[60].version, PRIVATE_JOB_REPOSITORIES_VERSION);
         assert_eq!(migrations[61].version, PRIVATE_JOB_REPOSITORIES_VERSION + 1);
         // Session jobs: closure ignores turn ACCEPTs (docs/specs/session-jobs.md §3.3).
@@ -773,6 +773,12 @@ mod postgres_tests {
             .sql
             .as_str()
             .contains("ALTER TABLE private_job_repositories ADD COLUMN session"));
+        // Teams: docs/specs/maxplayer-team.md §3.
+        assert_eq!(migrations[63].version, PRIVATE_JOB_REPOSITORIES_VERSION + 3);
+        assert!(migrations[63]
+            .sql
+            .as_str()
+            .contains("CREATE TABLE team_repositories"));
         assert_eq!(migrations[58].version, 59);
         assert!(migrations[58].sql.as_str().contains("buzz.push_enabled"));
         assert_eq!(migrations[59].version, 60);

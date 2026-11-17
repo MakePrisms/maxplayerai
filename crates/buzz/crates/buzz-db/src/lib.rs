@@ -28,6 +28,7 @@ mod store;
 pub mod error;
 /// Maxplayer: job-scoped private Git repository authorization (see NOTICE).
 pub mod private_jobs;
+pub mod team_repos;
 
 #[cfg(test)]
 mod test_support;

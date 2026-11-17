@@ -316,7 +316,45 @@ pub async fn hook_policy_check(
             .await
         {
             Ok(Some(job)) => job,
-            _ => {
+            // MAXPLAYER teams (docs/specs/maxplayer-team.md §4): members create or
+            // fast-forward branches and create tags; nothing is deleted or rewritten.
+            Ok(None) => {
+                let team = match state
+                    .db
+                    .team_repo(community, &req.repo_owner, &req.repo_id)
+                    .await
+                {
+                    Ok(Some(team)) => team,
+                    _ => {
+                        return (
+                            StatusCode::FORBIDDEN,
+                            "private repository policy unavailable",
+                        )
+                            .into_response()
+                    }
+                };
+                if !req.ref_updates.iter().all(|r| {
+                    team.can_update_ref(
+                        &req.pusher_pubkey,
+                        &r.ref_name,
+                        &r.old_oid,
+                        &r.new_oid,
+                        r.is_ancestor,
+                    )
+                }) {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "team repository ref update denied: create or fast-forward branches only",
+                    )
+                        .into_response();
+                }
+                return Json(HookCallbackResponse {
+                    allowed: true,
+                    denials: vec![],
+                })
+                .into_response();
+            }
+            Err(_) => {
                 return (
                     StatusCode::FORBIDDEN,
                     "private repository policy unavailable",

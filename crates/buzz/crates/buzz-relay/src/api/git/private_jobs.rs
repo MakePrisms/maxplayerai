@@ -9,7 +9,7 @@ use axum::{
 };
 use base64::Engine;
 use buzz_core::TenantContext;
-use buzz_db::private_jobs::PrivateJobRepo;
+use buzz_db::{private_jobs::PrivateJobRepo, team_repos::TeamRepo};
 use maxplayer_private_protocol::{
     is_hex, strict_json,
     wire::{self, HostPolicy},
@@ -30,6 +30,14 @@ fn unavailable() -> Response {
         .into_response()
 }
 
+/// The ACL that authorized an opaque 64-hex repository.
+#[derive(Debug)]
+pub enum OpaqueRepo {
+    Job(PrivateJobRepo),
+    /// MAXPLAYER teams (docs/specs/maxplayer-team.md §4).
+    Team(TeamRepo),
+}
+
 /// This lookup always runs, including with the development flag off. Disabling a
 /// feature must NEVER turn already-created private repositories public.
 pub async fn authorize(
@@ -39,19 +47,37 @@ pub async fn authorize(
     repo: &str,
     actor: &str,
     write: bool,
-) -> Result<Option<PrivateJobRepo>, Response> {
+) -> Result<Option<OpaqueRepo>, Response> {
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     // Random 64-hex job repos are a reserved namespace, and cannot fall through to
     // generic public hosting when a record is missing or provisioning is incomplete.
     if !is_hex(repo, 32) {
         return Ok(None);
     }
-    let job = state
+    let Some(job) = state
         .db
         .private_job_repo(tenant.community(), buyer, repo)
         .await
         .map_err(|_| unavailable())?
-        .ok_or_else(deny)?;
+    else {
+        // Not a job: a team repo, gated by its member list alone, or nothing at all.
+        let team = state
+            .db
+            .team_repo(tenant.community(), buyer, repo)
+            .await
+            .map_err(|_| unavailable())?
+            .ok_or_else(deny)?;
+        let allowed = if write {
+            team.can_write(actor)
+        } else {
+            team.can_read(actor)
+        };
+        return if allowed {
+            Ok(Some(OpaqueRepo::Team(team)))
+        } else {
+            Err(deny())
+        };
+    };
     let allowed = if write {
         !job.closed
             && (actor == job.buyer && !job.input_frozen && job.award_id.is_none()
@@ -62,7 +88,7 @@ pub async fn authorize(
     if !allowed {
         return Err(deny());
     }
-    Ok(Some(job))
+    Ok(Some(OpaqueRepo::Job(job)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

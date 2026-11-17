@@ -2204,6 +2204,11 @@ pub fn git_router(state: Arc<AppState>) -> Router {
             "/api/jobs/private/{job_id}",
             put(super::private_jobs::provision).layer(RequestBodyLimitLayer::new(128 * 1024)),
         )
+        .route(
+            "/api/teams/{team_id}",
+            put(super::team_repos::put_team).layer(RequestBodyLimitLayer::new(16 * 1024)),
+        )
+        .route("/api/teams/{owner}/{team_id}", get(super::team_repos::get_team))
         .route("/git/{owner}/{repo}/info/refs", get(info_refs))
         .route("/git/{owner}/{repo}/git-upload-pack", post(upload_pack))
         .route("/git/{owner}/{repo}/git-receive-pack", post(receive_pack))
