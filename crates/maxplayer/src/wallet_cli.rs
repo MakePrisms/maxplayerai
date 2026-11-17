@@ -24,6 +24,10 @@ struct CommonOpts {
     add_mint: bool,
 }
 
+/// The most one `wallet send` or `wallet melt` moves out of the wallet (the per-operation cap the
+/// trading commands had before they moved here).
+const MAX_SPEND_SATS: u64 = 100_000;
+
 /// Default amount `maxplayer wallet setup` asks the mint for (mirrors the old setup_wallet MCP tool).
 /// On the shipped default mint that is an invoice for 21 sats, not a gift.
 const SETUP_FUND_SATS: u64 = 21;
@@ -64,10 +68,10 @@ fn wallet_usage(err: &mut dyn Write) {
          \x20 maxplayer wallet balance [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mint-complete <quote_id> [--amount <sats>] [--mint <url>] [--home <path>]\n\
-         \x20 maxplayer wallet send <amount> [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet send <amount> [--out <file>] [--mint <url>] [--home <path>]   # max 100000; --out writes a new 0600 token file instead of stdout; take an unredeemed token back with `receive --token-file <file>`\n\
          \x20 maxplayer wallet receive (--token-file <path> | -) [--add-mint] [--home <path>]   # `-` reads the token from stdin (paste, then Ctrl-D); a <token> argument still works but lands in shell history\n\
          \x20\x20\x20# a token from a mint not in your wallet: --add-mint adds it and receives; on a terminal you are asked (not with `-`)\n\
-         \x20 maxplayer wallet melt <bolt11> [--mint <url>] [--home <path>]\n\
+         \x20 maxplayer wallet melt <bolt11> [--max-debit <sats>] [--mint <url>] [--home <path>]   # --max-debit: refuse before spending if invoice + the mint's fee reserve exceeds it\n\
          \x20 maxplayer wallet invoice <amount> [--mint <url>] [--home <path>]\n\
          \x20 maxplayer wallet mints list [--home <path>]\n\
          \x20 maxplayer wallet mints add <url> [--home <path>]\n\
@@ -149,6 +153,29 @@ fn parse_amount(raw: &str) -> Result<u64, String> {
                 Ok(amount)
             }
         })
+}
+
+/// Remove `flag <value>` (given at most once) from `args`, for a flag only one subcommand takes.
+#[cfg_attr(not(feature = "wallet"), allow(dead_code))]
+fn take_value_flag(args: &[String], flag: &str) -> Result<(Option<String>, Vec<String>), String> {
+    let mut value = None;
+    let mut rest = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == flag {
+            index += 1;
+            let given = args
+                .get(index)
+                .ok_or_else(|| format!("{flag} requires a value"))?;
+            if value.replace(given.clone()).is_some() {
+                return Err(format!("{flag} given more than once"));
+            }
+        } else {
+            rest.push(args[index].clone());
+        }
+        index += 1;
+    }
+    Ok((value, rest))
 }
 
 #[cfg(not(feature = "wallet"))]
@@ -916,7 +943,16 @@ fn cmd_mint_complete(args: &[String], out: &mut dyn Write, err: &mut dyn Write) 
 
 #[cfg(feature = "wallet")]
 fn cmd_send(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let (opts, positional) = match parse_common(args) {
+    // `--out` is send-only, so it is split out before `parse_common` (which refuses it).
+    let (out_file, rest) = match take_value_flag(args, "--out") {
+        Ok(value) => value,
+        Err(message) => {
+            let _ = writeln!(err, "{message}");
+            return USAGE_ERROR;
+        }
+    };
+    let out_file = out_file.map(PathBuf::from);
+    let (opts, positional) = match parse_common(&rest) {
         Ok(value) => value,
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -937,26 +973,82 @@ fn cmd_send(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return USAGE_ERROR;
         }
     };
+    if amount > MAX_SPEND_SATS {
+        let _ = writeln!(
+            err,
+            "send refused: {amount} sats is over the {MAX_SPEND_SATS}-sat limit per send"
+        );
+        return USAGE_ERROR;
+    }
+    // A taken --out is refused before anything is sent: the token file is never overwritten.
+    if let Some(path) = &out_file
+        && std::fs::symlink_metadata(path).is_ok()
+    {
+        let _ = writeln!(
+            err,
+            "--out {} already exists; nothing was sent (choose a new file)",
+            path.display()
+        );
+        return USAGE_ERROR;
+    }
     let home = match bootstrap_home(&opts, err) {
         Ok(home) => home,
         Err(code) => return code,
     };
     match wallet_ops::send_blocking(&home, amount, opts.mint.as_deref()) {
         Ok(outcome) => {
-            // Token alone on stdout for piping; summary on stderr.
+            // Summary on stderr; the token alone on stdout for piping, or in the --out file.
             let _ = writeln!(
                 err,
                 "sent_sats={} balance_sats={} mint={}",
                 outcome.sent_sats, outcome.balance_sats, outcome.mint_url
             );
-            let _ = writeln!(out, "{}", outcome.token);
-            SUCCESS
+            let Some(path) = out_file else {
+                let _ = writeln!(out, "{}", outcome.token);
+                return SUCCESS;
+            };
+            match write_token_file(&path, &outcome.token) {
+                Ok(()) => {
+                    let _ = writeln!(
+                        err,
+                        "token written to {} (0600); to take it back unredeemed: maxplayer wallet \
+                         receive --token-file {}",
+                        path.display(),
+                        path.display()
+                    );
+                    SUCCESS
+                }
+                Err(error) => {
+                    // The value has already left the balance: the token must not be lost.
+                    let _ = writeln!(
+                        err,
+                        "could not write --out {} ({error}); the token is printed on stdout instead",
+                        path.display()
+                    );
+                    let _ = writeln!(out, "{}", outcome.token);
+                    RUNTIME_ERROR
+                }
+            }
         }
         Err(error) => {
             let _ = writeln!(err, "{error}");
             RUNTIME_ERROR
         }
     }
+}
+
+#[cfg(feature = "wallet")]
+/// Create `path` (0600, never an existing file) holding `token` and a newline, synced to disk.
+fn write_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
 }
 
 #[cfg(feature = "wallet")]
@@ -1312,7 +1404,22 @@ fn cmd_receive_with(
 
 #[cfg(feature = "wallet")]
 fn cmd_melt(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let (opts, positional) = match parse_common(args) {
+    // `--max-debit` is melt-only, so it is split out before `parse_common` (which refuses it).
+    let (max_debit, rest) = match take_value_flag(args, "--max-debit") {
+        Ok(value) => value,
+        Err(message) => {
+            let _ = writeln!(err, "{message}");
+            return USAGE_ERROR;
+        }
+    };
+    let max_debit = match max_debit.as_deref().map(parse_amount).transpose() {
+        Ok(value) => value,
+        Err(message) => {
+            let _ = writeln!(err, "--max-debit: {message}");
+            return USAGE_ERROR;
+        }
+    };
+    let (opts, positional) = match parse_common(&rest) {
         Ok(value) => value,
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -1327,11 +1434,38 @@ fn cmd_melt(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return USAGE_ERROR;
         }
     };
+    // The per-operation cap needs the invoice amount; so does the ceiling. An undecodable or
+    // amountless invoice is refused only when one of them needs it (plain `melt` behaves as before).
+    if let Ok(invoice_sats) = wallet_ops::invoice_amount_sats(bolt11)
+        && invoice_sats > MAX_SPEND_SATS
+    {
+        let _ = writeln!(
+            err,
+            "melt refused: {invoice_sats} sats is over the {MAX_SPEND_SATS}-sat limit per melt"
+        );
+        return USAGE_ERROR;
+    }
+    // The ceiling needs the invoice's exact amount; an undecodable or amountless invoice is refused
+    // before any home is created or any mint is asked.
+    let ceiling = match max_debit {
+        Some(max_debit_sats) => match wallet_ops::invoice_amount_sats(bolt11) {
+            Ok(invoice_sats) => Some(wallet_ops::MeltCeiling {
+                max_debit_sats,
+                invoice_sats,
+                planned_quote_id: None,
+            }),
+            Err(error) => {
+                let _ = writeln!(err, "{error}");
+                return USAGE_ERROR;
+            }
+        },
+        None => None,
+    };
     let home = match bootstrap_home(&opts, err) {
         Ok(home) => home,
         Err(code) => return code,
     };
-    match wallet_ops::melt_blocking(&home, bolt11, opts.mint.as_deref()) {
+    match wallet_ops::melt_within_blocking(&home, bolt11, opts.mint.as_deref(), ceiling.as_ref()) {
         Ok(outcome) => {
             let _ = writeln!(
                 out,
@@ -1555,6 +1689,113 @@ fn seller_mint_hint(home: &MaxplayerHome, normalized: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn take_value_flag_splits_one_flag_and_refuses_a_repeat() {
+        let args: Vec<String> = ["5", "--out", "t", "--mint", "m"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (value, rest) = take_value_flag(&args, "--out").unwrap();
+        assert_eq!(value.as_deref(), Some("t"));
+        assert_eq!(rest, ["5", "--mint", "m"]);
+        let twice: Vec<String> = ["--out", "a", "--out", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            take_value_flag(&twice, "--out")
+                .unwrap_err()
+                .contains("more than once")
+        );
+        let bare: Vec<String> = vec!["--out".into()];
+        assert!(
+            take_value_flag(&bare, "--out")
+                .unwrap_err()
+                .contains("requires a value")
+        );
+    }
+
+    /// `wallet send --out`: a taken path and an over-cap amount are refused before any home is
+    /// created or any mint is asked; the token file is never overwritten.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn send_out_and_cap_refuse_before_anything_is_created() {
+        let dir = std::env::temp_dir().join(format!("wallet-send-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let taken = dir.join("taken");
+        std::fs::write(&taken, "keep").unwrap();
+        let home = dir.join("home");
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_send(&args, &mut out, &mut err);
+            (code, String::from_utf8(err).unwrap())
+        };
+        let (code, err) = run(&[
+            "5",
+            "--out",
+            taken.to_str().unwrap(),
+            "--home",
+            home.to_str().unwrap(),
+        ]);
+        assert_eq!(code, USAGE_ERROR, "{err}");
+        assert!(err.contains("already exists; nothing was sent"), "{err}");
+        assert_eq!(std::fs::read_to_string(&taken).unwrap(), "keep");
+        let (code, err) = run(&["100001", "--home", home.to_str().unwrap()]);
+        assert_eq!(code, USAGE_ERROR, "{err}");
+        assert!(err.contains("100000-sat limit"), "{err}");
+        assert!(!home.exists(), "SAFETY: a refused send created the home");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn write_token_file_is_new_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wallet-token-file-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t");
+        write_token_file(&path, "cashuBx").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "cashuBx\n");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(
+            write_token_file(&path, "cashuBy").is_err(),
+            "never overwritten"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "cashuBx\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `wallet melt --max-debit` needs the invoice amount: an undecodable invoice and a zero ceiling
+    /// are usage errors before any home is created.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn melt_max_debit_refuses_before_anything_is_created() {
+        let dir = std::env::temp_dir().join(format!("wallet-melt-ceiling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        for args in [
+            vec!["lnbc1bogus", "--max-debit", "10"],
+            vec!["lnbc1bogus", "--max-debit", "0"],
+            vec!["lnbc1bogus", "--max-debit"],
+        ] {
+            let mut args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            args.extend(["--home".to_string(), home.to_str().unwrap().to_string()]);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let code = cmd_melt(&args, &mut out, &mut err);
+            assert_eq!(
+                code,
+                USAGE_ERROR,
+                "{args:?}: {}",
+                String::from_utf8_lossy(&err)
+            );
+            assert!(!home.exists(), "SAFETY: {args:?} created the home");
+        }
+    }
 
     // #447 + #595: the help once named testnut as the default for a whole release whose default had
     // already moved (#378) — a string nothing checks. This binds the wording to the shipped constant

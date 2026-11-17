@@ -57,10 +57,10 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
 - **Legacy standalone homes** (a directory with `wallet.seed`, `trade.key`, or a root
   `trade.sqlite`/`owner.lock`, given with `--home`) are deprecated. Every command there prints a
   warning. Draining and finishing still work: `balance`, `status`, `recover`, `send`
-  (incl. `--reclaim`), `withdraw`, `preflight`, `doctor`, and `serve`/`cancel` for lots and
-  swaps already in flight. New `list`, `take`, `fund` and `receive` are refused. Move the money
+  (incl. `--reclaim`), `preflight`, `doctor`, and `serve`/`cancel` for lots and
+  swaps already in flight. New `list` and `take` are refused. Move the money
   with `maxplayer trade --home <legacy> send <mint> --amount <n> --out <file>`, then
-  `maxplayer wallet receive "$(cat <file>)"` on the maxplayer home; never delete a legacy home
+  `maxplayer wallet receive --token-file <file>` on the maxplayer home; never delete a legacy home
   that still holds funds or unfinished records.
 - **A maxplayer home with legacy files at its top level** (`key` or `config.toml` next to
   `wallet.seed`, `trade.key`, a root `trade.sqlite` or `owner.lock`, as an older
@@ -93,11 +93,10 @@ Earlier dated verification sections are historical snapshots, not current covera
 - Read-only `status` (readable summary; `--json` keeps the raw records byte-for-byte) and
   `balance` use SQLite snapshots without the writer lock; `discover` reads only relays and
   mint keysets (per-lot `expected_fees`, `unknown` if a mint is slow) with no lock, home or
-  journal access. While `serve` runs, `list`/`take`/`cancel`/`receive` hand off to it over
-  `<home>/serve.sock` (0600, both ends check the other is their own euid, token size + 16 KiB, one request
+  journal access. While `serve` runs, `list`/`take`/`cancel` hand off to it over
+  `<home>/serve.sock` (0600, both ends check the other is their own euid, at most 16 KiB, one request
   per connection; refused if the `--relay` list (exact, in order) or `--mint-relay` set (any order) the command uses differs) and serve
-  executes them with the client's exact bounds as the single writer. A handed-off `receive`
-  sends the token only over that socket; serve logs its public attempt id, never the token. `list`/`take --dry-run` preview
+  executes them with the client's exact bounds as the single writer. `list`/`take --dry-run` preview
   both legs' fees, gross amounts and max total debit with zero side effects. A swap waiting
   >180 s on its counterparty shows `counterparty_unresponsive` (display only). Keep
   serve alive from second lock through settlement. Exits: 0 success, 1 command error,
@@ -122,7 +121,11 @@ sections below describe their dated runs, not current coverage totals.
 
 ## Implemented
 
-- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `fund`, `balance`, `status`, `withdraw`, `receive`.
+- `list`, `discover`, `cancel`, `serve`, `take`, `recover`, `preflight`, `balance`, `status`,
+  `send` (legacy drain and `--reclaim`). Money in and out of the home's wallet is `maxplayer
+  wallet` (`mint`, `receive`, `send --out`, `melt --max-debit`); `trade fund`, `withdraw` and
+  `receive` name the wallet command and exit 1. Funding, withdrawal and receive records already
+  journaled are still finished by `serve`/`recover`.
 - Immutable signed 3410 lots (24 hours), hash-chained 3411 statuses, signature/content/tag
   validation, fork/gap quarantine, no terminal reopening. Every configured relay is queried;
   discovery unions their results. No EOSE is an error, not an empty market; partial relay
@@ -224,8 +227,8 @@ the mint). CDK wallets for such mints are built with that connector and poll sub
   refused at admission before anything is locked or revealed; own locks are checked the same way.
   The bound counts the claim witness but not DLEQ: cdk's `SwapRequest::new` strips every input's
   DLEQ before sending (unit test `nostr_claim_bound_covers_real_signed_claim_with_dleq`).
-- `fund` and `withdraw` refuse `nostr://` mints before touching the home: the sidecar serves no
-  NUT-04/05/20. Credits come from the operator's `maxplayer-mint issue` token file.
+- The sidecar serves no NUT-04/05/20. Credits come from the operator's `maxplayer-mint issue`
+  token file, imported with `maxplayer wallet receive --token-file <file> --add-mint`.
 - The sidecar has no configurable input fee (ppk 0).
 
 ## Agent skill
@@ -304,7 +307,7 @@ loopback mint relays (the fake CDK mints and local relays in `tests/`). Every `c
 `Cargo.toml`; `lab` implies it. `cargo build`/`cargo install` never resolve dev-dependencies, so
 the binary users install refuses both. CI checks that with
 `scripts/check-user-build-mint-fence.sh` (builds `maxplayer` as users do, then checks `maxplayer trade` `preflight`,
-`balance`, `fund`, `withdraw`, `receive`, `send`, `list`, `doctor` and `--mint-relay` refuse
+`balance`, `send`, `list`, `doctor` and `--mint-relay` refuse
 `http://127.0.0.1:<port>` and `ws://127.0.0.1:<port>` before any connection or home write).
 Without that feature `transport::loopback_only` is always false, so no production timing ever
 depends on a host being loopback.
@@ -375,8 +378,12 @@ trade() { "$MAXPLAYER" trade "$@"; }
 RUN="$(mktemp -d /tmp/maxplayer-trade-live.XXXXXX)"
 A=https://testnut.cashudevkit.org
 B=https://testnut.cashu.space
-trade --home "$RUN/maker" fund "$A" --amount 128
-trade --home "$RUN/taker" fund "$B" --amount 128
+for role in maker taker; do
+  "$MAXPLAYER" wallet mints add "$A" --home "$RUN/$role"
+  "$MAXPLAYER" wallet mints add "$B" --home "$RUN/$role"
+done
+"$MAXPLAYER" wallet mint 128 --mint "$A" --home "$RUN/maker"
+"$MAXPLAYER" wallet mint 128 --mint "$B" --home "$RUN/taker"
 # Record balances on both mints before trading.
 for role in maker taker; do
   trade --home "$RUN/$role" balance "$A"
@@ -778,8 +785,10 @@ A mint can still lie, withhold evidence, or process an already-delivered request
 
 ## Receive (import a Cashu token)
 
-`maxplayer trade --home <home> receive <mint> --token-file <path>` (or the token on stdin;
-never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code: `src/receive.rs`.
+Moved: a token is imported with `maxplayer wallet receive --token-file <path>` (add `--add-mint`
+for a mint the wallet does not have yet, e.g. a `maxplayer-mint issue` file). `maxplayer trade
+receive` names that command and exits 1. What follows describes trade's own receive
+(`src/receive.rs`), which `serve`/`recover` still use to finish receives already journaled.
 
 - Refused before any journal write: token mint not exactly `<mint>` after canonicalization,
   multi-mint, non-sat, NUT-10 locked (P2PK/HTLC), > 128 or duplicate proofs, invalid incoming
@@ -835,8 +844,9 @@ never argv) imports one token, e.g. one written by `maxplayer-mint issue`. Code:
 ## Send (export a Cashu token)
 
 `maxplayer trade --home <home> send <mint> --amount <sats> --out <path> [--max-fees <sats>]`
-writes one single-mint V4 token for exactly `<amount>` sats to a new 0600 file. It is the
-counterpart to `receive`, for moving funds to another wallet without Lightning. Code: `src/send.rs`.
+writes one single-mint V4 token for exactly `<amount>` sats to a new 0600 file. A new send drains
+a legacy standalone home; on a maxplayer home it names `maxplayer wallet send <sats> --mint <mint>
+--out <file>` and exits 1. `send --reclaim <id>` works on both for sends trade made. Code: `src/send.rs`.
 
 - Refused before any journal write: amount 0 or > 100,000 sats, insufficient ordinary balance
   (reserved and locked proofs never count), input fee above `--max-fees` (required unless the
@@ -880,6 +890,10 @@ counterpart to `receive`, for moving funds to another wallet without Lightning. 
   path builds them), `nostr_send_survives_slow_keysets_reply` (a 20 s keysets reply).
 
 ## Funding and withdrawals
+
+`maxplayer trade fund` and `withdraw` moved to `maxplayer wallet mint` and `wallet melt
+--max-debit`; they name that command and exit 1. What follows describes the records they
+journaled, which `serve`/`recover` still finish.
 
 This path is **not a production safety certification**. Public-mint results, if any, belong in
 its separate run report; the historical test counts above predate this change.

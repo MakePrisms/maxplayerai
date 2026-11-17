@@ -646,36 +646,6 @@ async fn r5_withdraw_preflight_requires_nut05() {
     assert!(m.faults.melt_requests.lock().unwrap().is_empty());
     assert!(!money::pending(&j).await.unwrap());
 }
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r5_cli_nonfinal_withdraw_is_exit_three() {
-    let h = tempfile::tempdir().unwrap();
-    let m = MintFixture::start(0).await;
-    fund(h.path(), &m.url, 128).await;
-    m.faults.melt_proxy_error.store(true, SeqCst);
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args([
-            "--home",
-            h.path().to_str().unwrap(),
-            "withdraw",
-            &m.url,
-            "--invoice",
-            &invoice(31),
-            "--max-debit",
-            "62",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "SAFETY: ambiguous submitted payment must not exit success"
-    );
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["state"],
-        "request_sent"
-    );
-}
 #[tokio::test]
 async fn r5_cli_terminal_quarantine_is_exit_four() {
     let h = tempfile::tempdir().unwrap();
@@ -1021,37 +991,5 @@ async fn r6_expired_quote_created_is_refused_and_same_invoice_retries() {
             .state,
         MeltState::Done,
         "same invoice retries with a fresh quote"
-    );
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn r6_cli_mint_dropped_after_post_is_exit_three() {
-    let h = tempfile::tempdir().unwrap();
-    let m = MintFixture::start(0).await;
-    fund(h.path(), &m.url, 128).await;
-    m.faults.die_after_melt.store(true, SeqCst);
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args([
-            "--home",
-            h.path().to_str().unwrap(),
-            "withdraw",
-            &m.url,
-            "--invoice",
-            &invoice(31),
-            "--max-debit",
-            "62",
-        ])
-        .output()
-        .await
-        .unwrap();
-    assert_eq!(
-        m.faults.melt_requests.lock().unwrap().len(),
-        1,
-        "fixture: the POST reached the mint before it dropped"
-    );
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "SAFETY: submitted-but-unresolved withdrawal must exit 3, never 1 (refusal); stderr={}",
-        String::from_utf8_lossy(&out.stderr)
     );
 }

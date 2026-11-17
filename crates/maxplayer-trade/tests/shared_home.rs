@@ -430,21 +430,12 @@ async fn shared_home_trades_only_configured_fenced_mints() {
         Some(home),
         &["send", &m.url, "--amount", "5", "--out", "/nonexistent/t"],
     );
+    // A maxplayer home sends with `maxplayer wallet send`: refused before any mint check or journal.
     assert_eq!(out.status.code(), Some(1), "{}", err(&out));
-    assert!(
-        err(&out).contains("not one of this home's mints"),
-        "{}",
-        err(&out)
-    );
+    assert!(err(&out).contains("maxplayer wallet send"), "{}", err(&out));
     assert!(
         !home.join("trade").exists(),
         "SAFETY: refused before any journal"
-    );
-    let out = trade(Some(home), &["fund", &m.url, "--amount", "5"]);
-    assert!(
-        err(&out).contains("not one of this home's mints"),
-        "{}",
-        err(&out)
     );
     // Configured, but the fence (allow_real_mints = false) refuses a real https mint.
     std::fs::write(
@@ -515,7 +506,7 @@ async fn shared_home_layout_and_default_home() {
     );
 }
 
-/// Legacy standalone homes: every command warns; NEW list/take/fund/receive are refused with the
+/// Legacy standalone homes: every command warns; NEW list/take are refused with the
 /// drain instructions and change nothing; everything needed to drain or finish still runs.
 #[tokio::test]
 async fn legacy_home_allow_refuse_matrix() {
@@ -523,9 +514,6 @@ async fn legacy_home_allow_refuse_matrix() {
     let home = h.path();
     std::fs::write(home.join("wallet.seed"), [7u8; 64]).unwrap();
     let mint = "https://testnut.cashu.space";
-    let token = home.join("token-in");
-    std::fs::write(&token, "cashuB").unwrap();
-    let token = token.to_str().unwrap();
     let refused: Vec<Vec<&str>> = vec![
         vec![
             "list",
@@ -539,8 +527,6 @@ async fn legacy_home_allow_refuse_matrix() {
             "5",
         ],
         vec!["take", "abc", "--max-give", "5", "--min-receive", "1"],
-        vec!["fund", mint, "--amount", "5"],
-        vec!["receive", mint, "--token-file", token],
     ];
     for args in refused {
         let before: Vec<_> = std::fs::read_dir(home)
@@ -688,9 +674,10 @@ async fn legacy_home_allow_refuse_matrix() {
     assert!(trade(Some(empty.path()), &["status"]).status.success());
 }
 
-/// 4(b): two PROCESSES write the one wallet database at once (cdk-sqlite 0.17.2 opens it with WAL,
-/// `busy_timeout = 10000` and `BEGIN IMMEDIATE`). `maxplayer-trade send` subprocesses run while this
-/// process selects and confirms core sends in a loop. Every command either completes or refuses
+/// 4(b): two writers on their own database connections write the one wallet database at once
+/// (cdk-sqlite 0.17.2 opens it with WAL, `busy_timeout = 10000` and `BEGIN IMMEDIATE`). Trade's
+/// send (the drain/reclaim path; `trade send` on a maxplayer home moved to `maxplayer wallet`) runs
+/// four times while core sends select and confirm in a loop. Every send either completes or refuses
 /// retryably (lock busy / inputs changed) — never `database is locked` — and the sats add up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_processes_write_the_shared_wallet_database_concurrently() {
@@ -700,22 +687,12 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
     fund(&home, &m.url, 256).await;
     let w = core_wallet(&home, &m.url).await;
     let wallet_dir = home.join("wallet");
+    let j = Journal::open(&home).await.unwrap();
     let mut children = vec![];
     for i in 0..4 {
         let out = h.path().join(format!("cli-token-{i}"));
-        let mut c = tokio::process::Command::new(BIN);
-        for (k, _) in std::env::vars_os() {
-            if k.to_string_lossy().starts_with("MAXPLAYER_") {
-                c.env_remove(k);
-            }
-        }
-        c.arg("--home")
-            .arg(&home)
-            .args(["send", &m.url, "--amount", "7", "--out"])
-            .arg(&out)
-            .stdin(std::process::Stdio::null())
-            .kill_on_drop(true);
-        children.push(c.output());
+        let (home, j, url) = (home.clone(), &j, m.url.clone());
+        children.push(async move { send::send(&home, j, &url, 7, &out, None).await });
     }
     let cli = futures_util::future::join_all(children);
     let core = async {
@@ -745,13 +722,15 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
     let (outs, core_sent) = tokio::join!(cli, core);
     let mut cli_sent = 0u64;
     for o in outs {
-        let o = o.unwrap();
-        let e = err(&o);
+        let e = match &o {
+            Ok(r) => r.summary().to_string(),
+            Err(e) => format!("{e:#}"),
+        };
         assert!(
             !e.contains("database is locked"),
             "SAFETY: SQLITE_BUSY leaked: {e}"
         );
-        if o.status.success() {
+        if o.as_ref().is_ok_and(|r| r.state == send::SendState::Sent) {
             cli_sent += 7;
         } else {
             assert!(
@@ -859,12 +838,15 @@ async fn seller_home_trades_every_accepted_mint() {
     let out = trade(
         Some(home),
         &[
-            "send",
+            "list",
+            "--give-mint",
             "https://d.example",
-            "--amount",
+            "--give",
             "1",
-            "--out",
-            "/nonexistent/t",
+            "--want-mint",
+            "https://a.example",
+            "--want",
+            "1",
         ],
     );
     assert_eq!(out.status.code(), Some(1), "{}", err(&out));
@@ -877,27 +859,12 @@ async fn seller_home_trades_every_accepted_mint() {
         !home.join("trade").exists(),
         "SAFETY: refused before any journal"
     );
-    // B trades for real: a CLI send from the seller's second accepted mint (off the runtime, which
-    // serves the fixture mint).
+    // B moves money for real: a send from the seller's second accepted mint.
     fund_unregistered(home, &b, 9).await;
     let token = home.join("token-b");
-    let (cli_home, cli_b, cli_token) = (home.to_path_buf(), b.clone(), token.clone());
-    let out = tokio::task::spawn_blocking(move || {
-        trade(
-            Some(&cli_home),
-            &[
-                "send",
-                &cli_b,
-                "--amount",
-                "4",
-                "--out",
-                cli_token.to_str().unwrap(),
-            ],
-        )
-    })
-    .await
-    .unwrap();
-    assert!(out.status.success(), "{}", err(&out));
+    let j = Journal::open(home).await.unwrap();
+    let r = send::send(home, &j, &b, 4, &token, None).await.unwrap();
+    assert_eq!(r.state, send::SendState::Sent, "{}", r.summary());
     assert!(token.exists());
     assert_eq!(balance(home, &b).await, 5);
 }
@@ -933,12 +900,15 @@ async fn accepted_mints_still_pass_the_scheme_and_real_mint_fences() {
     let out = trade(
         Some(home),
         &[
-            "send",
+            "list",
+            "--give-mint",
             "http://mint.example",
-            "--amount",
+            "--give",
             "1",
-            "--out",
-            "/nonexistent/t",
+            "--want-mint",
+            "https://a.example",
+            "--want",
+            "1",
         ],
     );
     assert_eq!(out.status.code(), Some(1), "{}", err(&out));
@@ -1575,7 +1545,6 @@ async fn a_maxplayer_home_with_a_legacy_marker_is_refused_and_never_gets_a_secon
             "--out",
             "/nonexistent/t",
         ],
-        vec!["withdraw", m.url.as_str(), "--invoice", "lnbc1"],
         vec!["serve"],
     ] {
         let out = trade(Some(home), &args);

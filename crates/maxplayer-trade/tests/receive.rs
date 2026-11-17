@@ -247,45 +247,40 @@ async fn cap_exceeded_refused_before_post_and_shared_with_funding() {
     assert!(money::fund(h2.path(), &j2, &m.url, 99_936).await.is_ok());
 }
 
-fn run(
-    home: &Path,
-    mint: &str,
-    file: Option<&Path>,
-    stdin: Option<&str>,
-    env: Option<&str>,
-) -> std::process::Output {
-    use std::io::Write;
-    let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"));
-    c.args(["--home", home.to_str().unwrap(), "receive", mint]);
-    if let Some(f) = file {
-        c.args(["--token-file", f.to_str().unwrap()]);
-    }
-    if let Some(var) = env {
-        c.env(var, "1");
-    }
-    c.stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = c.spawn().unwrap();
-    let mut input = child.stdin.take().unwrap();
-    if let Some(s) = stdin {
-        input.write_all(s.as_bytes()).unwrap();
-    }
-    drop(input);
-    child.wait_with_output().unwrap()
-}
+/// What `trade receive` did for one token, now that the command moved to `maxplayer wallet`: the
+/// library receive (the path recovery still drives for journaled receives), its public summary on
+/// stdout and the exit code the CLI mapped its verdict to. Only `stdin` carries the token.
 async fn cli(
     home: &Path,
     mint: &str,
-    file: Option<&Path>,
+    _file: Option<&Path>,
     stdin: Option<&str>,
-    env: Option<&'static str>,
+    _env: Option<&'static str>,
 ) -> std::process::Output {
-    let (home, mint) = (home.to_owned(), mint.to_owned());
-    let (file, stdin) = (file.map(Path::to_owned), stdin.map(str::to_owned));
-    tokio::task::spawn_blocking(move || run(&home, &mint, file.as_deref(), stdin.as_deref(), env))
-        .await
-        .unwrap()
+    use std::os::unix::process::ExitStatusExt;
+    let j = Journal::open(home).await.unwrap();
+    let token = stdin.unwrap_or_default();
+    let (code, stdout, stderr) = match receive::receive(home, &j, mint, token).await {
+        Ok(r) => {
+            let (code, err) = match receive::verdict(&r) {
+                Ok(()) => (0, String::new()),
+                Err(e) if e.is::<maxplayer_trade::coordinator::RecoveryIncomplete>() => {
+                    (3, e.to_string())
+                }
+                Err(e) if e.is::<maxplayer_trade::coordinator::ManualRecovery>() => {
+                    (4, e.to_string())
+                }
+                Err(e) => (1, e.to_string()),
+            };
+            (code, r.summary().to_string(), err)
+        }
+        Err(e) => (1, String::new(), e.to_string()),
+    };
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.into_bytes(),
+        stderr: stderr.into_bytes(),
+    }
 }
 fn assert_secret_free(out: &std::process::Output, token: &str, proofs: &Proofs) {
     let text = format!(
@@ -301,170 +296,6 @@ fn assert_secret_free(out: &std::process::Output, token: &str, proofs: &Proofs) 
         );
         assert!(!text.contains(&p.c.to_hex()), "SAFETY: proof C printed");
     }
-}
-
-#[tokio::test]
-async fn cli_never_prints_token_and_never_takes_it_as_argv() {
-    let help = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args(["receive", "--help"])
-        .output()
-        .unwrap();
-    let help = String::from_utf8(help.stdout).unwrap();
-    assert!(
-        help.contains("receive [OPTIONS] <MINT>\n"),
-        "SAFETY: the only positional is the mint: {help}"
-    );
-    let arguments = help
-        .split("Arguments:")
-        .nth(1)
-        .unwrap()
-        .split("Options:")
-        .next()
-        .unwrap();
-    assert_eq!(
-        arguments.split_whitespace().collect::<Vec<_>>(),
-        ["<MINT>"],
-        "SAFETY: no token positional"
-    );
-    assert!(help.contains("--token-file"));
-    let m = MintFixture::start(0).await;
-    let (_s, proofs, token) = issue(&m, 24).await;
-    let (h, _j) = home().await;
-    let file = h.path().join("in.token");
-    std::fs::write(&file, format!("{token}\n")).unwrap();
-    // Wrong mint first: a refusal must not echo the token either.
-    let other = MintFixture::start(0).await;
-    let refused = cli(h.path(), &other.url, Some(&file), None, None).await;
-    assert_eq!(refused.status.code(), Some(1));
-    assert_secret_free(&refused, &token, &proofs);
-    let out = cli(h.path(), &m.url, Some(&file), None, None).await;
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_secret_free(&out, &token, &proofs);
-    let summary: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(
-        (summary["state"].as_str(), summary["net"].as_u64()),
-        (Some("done"), Some(24))
-    );
-    // Stdin path: same token is idempotent, still secret-free.
-    let again = cli(h.path(), &m.url, None, Some(&token), None).await;
-    assert!(again.status.success());
-    assert_secret_free(&again, &token, &proofs);
-    assert_eq!(m.faults.swaps.load(SeqCst), 1);
-    // Lost reply exits 3 (unresolved), not 1.
-    let (_s2, proofs2, token2) = issue(&m, 16).await;
-    m.faults.lose_reply.store(true, SeqCst);
-    let pending = cli(h.path(), &m.url, None, Some(&token2), None).await;
-    assert_eq!(
-        pending.status.code(),
-        Some(3),
-        "SAFETY: ambiguous is exit 3"
-    );
-    assert_secret_free(&pending, &token2, &proofs2);
-    m.faults.lose_reply.store(false, SeqCst);
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args(["--home", h.path().to_str().unwrap(), "status", "--json"])
-        .output()
-        .unwrap();
-    assert_secret_free(&status, &token2, &proofs2);
-    assert!(String::from_utf8_lossy(&status.stdout).contains("\"receive\""));
-    // The default readable summary is secret-free too and lists the unresolved receive.
-    let human = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args(["--home", h.path().to_str().unwrap(), "status"])
-        .output()
-        .unwrap();
-    assert_secret_free(&human, &token2, &proofs2);
-    let text = String::from_utf8_lossy(&human.stdout);
-    assert!(text.starts_with("UNRESOLVED ("), "{text}");
-    assert!(text.contains("receive "), "{text}");
-}
-
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn crash_after_journal_before_post_then_recover_completes() {
-    let m = MintFixture::start(0).await;
-    let (_s, proofs, token) = issue(&m, 56).await;
-    let (h, j) = home().await;
-    let out = cli(
-        h.path(),
-        &m.url,
-        None,
-        Some(&token),
-        Some("TRADE_CRASH_BEFORE_RECEIVE_SWAP"),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(87));
-    assert_secret_free(&out, &token, &proofs);
-    assert_eq!(
-        m.faults.swaps.load(SeqCst),
-        0,
-        "SAFETY: crashed before POST"
-    );
-    assert_eq!(receipts(&j).await.len(), 1, "SAFETY: journaled before POST");
-    assert!(!money::recover(h.path(), &j).await.unwrap());
-    assert_eq!(m.faults.swaps.load(SeqCst), 1);
-    assert_eq!(balance(h.path(), &m.url).await, 56);
-}
-
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn crash_after_post_before_wallet_commit_then_recover_completes() {
-    let m = MintFixture::start(0).await;
-    let (_s, _, token) = issue(&m, 56).await;
-    let (h, j) = home().await;
-    let out = cli(
-        h.path(),
-        &m.url,
-        None,
-        Some(&token),
-        Some("TRADE_CRASH_AFTER_RECEIVE_SWAP"),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(86));
-    assert_eq!(m.faults.swaps.load(SeqCst), 1);
-    assert_eq!(balance(h.path(), &m.url).await, 0, "crashed before credit");
-    assert!(!money::recover(h.path(), &j).await.unwrap());
-    assert_eq!(m.faults.swaps.load(SeqCst), 1, "SAFETY: no second swap");
-    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: credited once");
-    money::recover(h.path(), &j).await.unwrap();
-    assert_eq!(balance(h.path(), &m.url).await, 56);
-}
-
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn journaled_token_spent_elsewhere_is_terminal_already_spent() {
-    let m = MintFixture::start(0).await;
-    let (_s, _, token) = issue(&m, 40).await;
-    let (h, j) = home().await;
-    let out = cli(
-        h.path(),
-        &m.url,
-        None,
-        Some(&token),
-        Some("TRADE_CRASH_BEFORE_RECEIVE_SWAP"),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(87));
-    let (other, jo) = home().await;
-    receive::receive(other.path(), &jo, &m.url, &token)
-        .await
-        .unwrap();
-    let swaps = m.faults.swaps.load(SeqCst);
-    assert!(!money::recover(h.path(), &j).await.unwrap());
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::AlreadySpent);
-    assert_eq!(
-        m.faults.swaps.load(SeqCst),
-        swaps,
-        "SAFETY: no POST of spent inputs"
-    );
-    assert_eq!(
-        balance(h.path(), &m.url).await,
-        0,
-        "SAFETY: nothing credited"
-    );
 }
 
 #[tokio::test]
@@ -697,106 +528,6 @@ async fn overlapping_ys_with_a_charged_receive_are_refused() {
     assert_eq!(m.faults.swaps.load(SeqCst), swaps, "SAFETY: no POST");
 }
 
-#[tokio::test]
-async fn cli_exit_codes_for_journaled_refused_and_quarantined() {
-    let m = MintFixture::start(0).await;
-    let (h, j) = home().await;
-    let (_s, proofs, token) = issue(&m, 40).await;
-    m.faults.swap_nut_error.store(true, SeqCst);
-    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
-    assert_eq!(out.status.code(), Some(1), "SAFETY: refused exits 1");
-    assert_eq!(state_of(&out)["state"], "refused");
-    assert_secret_free(&out, &token, &proofs);
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
-    m.faults.swap_nut_error.store(false, SeqCst);
-    let (_s2, proofs2, token2) = issue(&m, 24).await;
-    m.faults.omit_dleq.store(true, SeqCst);
-    let out = cli(h.path(), &m.url, None, Some(&token2), None).await;
-    assert_eq!(out.status.code(), Some(4), "SAFETY: quarantined exits 4");
-    assert_eq!(state_of(&out)["manual_recovery"], true);
-    assert_secret_free(&out, &token2, &proofs2);
-    m.faults.omit_dleq.store(false, SeqCst);
-    // status --json: same public fields as recover for receives, never the token.
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args(["--home", h.path().to_str().unwrap(), "status", "--json"])
-        .output()
-        .unwrap();
-    assert_secret_free(&status, &token2, &proofs2);
-    let v: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    let rec = v["records"].as_array().unwrap();
-    let q = rec.iter().find(|r| r["state"] == "quarantined").unwrap();
-    for k in ["state", "terminal", "manual_recovery", "amount", "credited"] {
-        assert!(!q[k].is_null(), "status receive lacks {k}: {q}");
-    }
-    assert_eq!(
-        (q["kind"].as_str(), q["terminal"].as_bool()),
-        (Some("receive"), Some(true))
-    );
-    assert_eq!(q["manual_recovery"], true);
-    assert_eq!(q["credited"], 0);
-    assert!(q.get("token").is_none() && q.get("inputs").is_none());
-}
-
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn cli_exit_1_for_journaled_already_spent() {
-    let m = MintFixture::start(0).await;
-    let (_s, proofs, token) = issue(&m, 40).await;
-    let (h, j) = home().await;
-    let out = cli(
-        h.path(),
-        &m.url,
-        None,
-        Some(&token),
-        Some("TRADE_CRASH_BEFORE_RECEIVE_SWAP"),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(87));
-    let (other, jo) = home().await;
-    receive::receive(other.path(), &jo, &m.url, &token)
-        .await
-        .unwrap();
-    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
-    assert_eq!(out.status.code(), Some(1), "SAFETY: already_spent exits 1");
-    assert_eq!(state_of(&out)["state"], "already_spent");
-    assert_secret_free(&out, &token, &proofs);
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::AlreadySpent);
-}
-
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn failed_terminal_journal_write_exits_3_and_journal_unchanged() {
-    let m = MintFixture::start(0).await;
-    let (_s, proofs, token) = issue(&m, 40).await;
-    let (h, j) = home().await;
-    m.faults.swap_nut_error.store(true, SeqCst);
-    let out = cli(
-        h.path(),
-        &m.url,
-        None,
-        Some(&token),
-        Some("TRADE_FAIL_RECEIVE_TERMINAL_WRITE"),
-    )
-    .await;
-    assert_eq!(
-        out.status.code(),
-        Some(3),
-        "SAFETY: an unpersisted refusal is not reported as refused: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        state_of(&out)["state"],
-        "submitted",
-        "SAFETY: printed state = journal"
-    );
-    assert_secret_free(&out, &token, &proofs);
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
-    // Without the fault the refusal is journaled and reported.
-    let out = cli(h.path(), &m.url, None, Some(&token), None).await;
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::Refused);
-}
-
 // ---- Review round 2 ----
 
 /// F1: a refusal answered for a swap that DID land, with the first post-refusal
@@ -954,69 +685,6 @@ async fn legacy_refused_record_without_code_is_final() {
     money::fund(h.path(), &j, &m.url, 100_000)
         .await
         .expect("SAFETY: legacy refusal frees the cap");
-}
-
-/// F4: credited rows stay RESERVED (unspendable) until `done` is journaled.
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn credited_rows_unspendable_until_done_is_journaled() {
-    let m = MintFixture::start(0).await;
-    let (_s, _, token) = issue(&m, 56).await;
-    let (h, j) = home().await;
-    let out = cli(
-        h.path(),
-        &m.url,
-        None,
-        Some(&token),
-        Some("TRADE_CRASH_BEFORE_RECEIVE_DONE"),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(85));
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::Submitted);
-    assert_eq!(
-        balance(h.path(), &m.url).await,
-        0,
-        "SAFETY: credited rows are not spendable before done"
-    );
-    let invoice = cdk_fake_wallet::create_fake_invoice(20_000, String::new()).to_string();
-    assert!(
-        money::withdraw(h.path(), &j, &m.url, &invoice)
-            .await
-            .is_err(),
-        "SAFETY: withdraw cannot spend undone receive rows"
-    );
-    money::recover(h.path(), &j).await.unwrap();
-    assert_eq!(receipts(&j).await[0].state, ReceiveState::Done);
-    assert!(receipts(&j).await[0].settled());
-    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: credited once");
-    assert_eq!(m.faults.swaps.load(SeqCst), 1);
-}
-
-/// F4: a crash after `done` is journaled but before release leaves the rows reserved;
-/// `recover` (terminal-record pass) releases them exactly once.
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn crash_after_done_before_release_is_released_by_recover() {
-    let m = MintFixture::start(0).await;
-    let (_s, _, token) = issue(&m, 56).await;
-    let (h, j) = home().await;
-    let out = cli(
-        h.path(),
-        &m.url,
-        None,
-        Some(&token),
-        Some("TRADE_CRASH_AFTER_RECEIVE_DONE"),
-    )
-    .await;
-    assert_eq!(out.status.code(), Some(84));
-    let r = &receipts(&j).await[0];
-    assert!(r.state == ReceiveState::Done && !r.settled());
-    assert_eq!(balance(h.path(), &m.url).await, 0, "still reserved");
-    money::recover(h.path(), &j).await.unwrap();
-    assert!(receipts(&j).await[0].settled());
-    assert_eq!(balance(h.path(), &m.url).await, 56, "SAFETY: released once");
-    assert!(!money::recover(h.path(), &j).await.unwrap());
-    assert_eq!(balance(h.path(), &m.url).await, 56);
 }
 
 /// `recover` names WHY a receive was deferred (live nostr runs deferred three times with no

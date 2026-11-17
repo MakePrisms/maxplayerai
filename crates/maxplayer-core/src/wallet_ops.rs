@@ -2590,6 +2590,23 @@ pub fn melt_blocking(
     runtime.block_on(melt_async(home, bolt11, mint_override))
 }
 
+/// The amount of a BOLT11 invoice in whole sats, for a caller that bounds a melt by it
+/// (`maxplayer wallet melt --max-debit`). An amountless or sub-sat invoice is refused: a ceiling
+/// needs the exact invoice amount.
+pub fn invoice_amount_sats(bolt11: &str) -> Result<u64, WalletOpsError> {
+    let invoice = cdk::Bolt11Invoice::from_str(bolt11.trim())
+        .map_err(|error| WalletOpsError::Wallet(format!("invalid bolt11 invoice: {error}")))?;
+    let msat = invoice
+        .amount_milli_satoshis()
+        .ok_or_else(|| WalletOpsError::Wallet("invoice has no amount".into()))?;
+    if msat % 1000 != 0 {
+        return Err(WalletOpsError::Wallet(
+            "invoice amount is not a whole number of sats".into(),
+        ));
+    }
+    Ok(msat / 1000)
+}
+
 /// [`melt_within_async`] on a runtime of its own — the seller fee remittance's spending call. Same
 /// nested-runtime refusal as every `*_blocking` wrapper here.
 pub fn melt_within_blocking(
@@ -2977,6 +2994,32 @@ mod tests {
     // redact the token — a derived Debug would print it verbatim, so any debug log of a SendOutcome
     // would leak spendable funds. Assert the debug rendering contains neither the token nor any of
     // its material, and that it carries the redaction marker + non-secret fields.
+    #[test]
+    fn invoice_amount_sats_reads_whole_sats_and_refuses_the_rest() {
+        let invoice = |msat: u64| {
+            use cdk::lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+            use cdk::secp256k1::hashes::{Hash as _, sha256};
+            use cdk::secp256k1::{Secp256k1, SecretKey};
+            let key = SecretKey::from_slice(&[7u8; 32]).unwrap();
+            InvoiceBuilder::new(Currency::Bitcoin)
+                .description(String::new())
+                .payment_hash(sha256::Hash::hash(&msat.to_be_bytes()))
+                .payment_secret(PaymentSecret([42u8; 32]))
+                .amount_milli_satoshis(msat)
+                .current_timestamp()
+                .min_final_cltv_expiry_delta(144)
+                .build_signed(|h| Secp256k1::new().sign_ecdsa_recoverable(h, &key))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(invoice_amount_sats(&invoice(31_000)).unwrap(), 31);
+        assert!(
+            invoice_amount_sats(&invoice(31_500)).is_err(),
+            "sub-sat refused"
+        );
+        assert!(invoice_amount_sats("lnbc1bogus").is_err());
+    }
+
     #[test]
     fn send_outcome_debug_redacts_bearer_token() {
         let token = "cashuAeyJ0b2tlbiI6c3BlbmRhYmxlLWJlYXJlci1lY2FzaC1zZWNyZXQ";

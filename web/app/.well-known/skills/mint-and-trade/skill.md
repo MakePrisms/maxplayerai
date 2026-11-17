@@ -32,7 +32,9 @@ pick a home other than `$MAXPLAYER_HOME`/`~/.maxplayer`). Only the home's mints 
 default, `extra_mints` (`maxplayer wallet mints add`) and, on a seller, `accepted_mints`. A seller
 can trade from its own home: job payments land in the same wallet. An older standalone trading
 home (with `wallet.seed`/`trade.key`) is drain-only: move its funds with its `send`, then
-`maxplayer wallet receive`. Preserve all state across restarts.
+`maxplayer wallet receive --token-file`. Money in and out (fund, receive, send, pay an
+invoice) is `maxplayer wallet`; `maxplayer trade` lists, takes and recovers. Preserve all state
+across restarts.
 
 ## 2. Install and connect both tools
 
@@ -125,9 +127,9 @@ Do not invent a price or assume that “set up” authorizes issuance or trading
    README. Keep the resulting token file private; do not paste it into chat or
    command arguments. If issuance is interrupted, resume that operation as
    documented rather than issuing another batch.
-2. Import that file into the home's wallet, using the trading skill's `receive`
-   workflow (it lands in the same wallet `maxplayer wallet balance` shows). Verify the receive state and balance.
-   An ambiguous result needs recovery of the existing attempt, not new issuance.
+2. Import that file into the home's wallet with `maxplayer wallet receive --token-file <file>
+   --add-mint` (it lands in the same wallet `maxplayer wallet balance` shows). Verify the
+   balance. An ambiguous result needs the same file received again, not new issuance.
 3. Show the listing's `--dry-run` using the agreed mint pair, amounts and fee cap.
    Explain the debits, receipts and lock/recovery obligations from the trading
    skill, then obtain approval for publishing those exact terms. No automatic

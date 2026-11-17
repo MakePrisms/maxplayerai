@@ -585,6 +585,11 @@ pub fn maxplayer_home() -> tempfile::TempDir {
 }
 pub async fn fund(home: &Path, mint: &str, n: u64) {
     configure(home, &[mint]);
+    fund_wallet(home, mint, n).await;
+}
+/// Mint `n` sats into whatever wallet `home` has, without making it a maxplayer home (a legacy
+/// standalone home keeps its `wallet.seed` layout).
+pub async fn fund_wallet(home: &Path, mint: &str, n: u64) {
     let w = wallet::wallet(home, mint).await.unwrap();
     let q = w
         .mint_quote(PaymentMethod::BOLT11, Some(n.into()), None, None)

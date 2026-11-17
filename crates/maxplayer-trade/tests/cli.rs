@@ -120,6 +120,9 @@ fn skill_commands_and_flags_match_binary_help() {
         .map(|path| std::fs::read_to_string(path).unwrap())
         .collect();
     assert!(docs[0].len() < 10_000, "keep SKILL.md tight");
+    // `maxplayer wallet` commands (money in and out) are documented beside trade's; their flags
+    // are the wallet's, not trade's: drop those code blocks and spans before checking flags.
+    let docs: Vec<String> = docs.iter().map(|doc| without_wallet(doc)).collect();
     let binary = env!("CARGO_BIN_EXE_maxplayer-trade");
     let read_help = |args: &[&str]| {
         let out = Command::new(binary).args(args).output().unwrap();
@@ -270,4 +273,35 @@ fn doctor_configuration_failure_is_diagnostic_exit_two() {
         assert!(!String::from_utf8_lossy(&out.stdout).contains("private-fixture"));
         assert!(!String::from_utf8_lossy(&out.stderr).contains("private-fixture"));
     }
+}
+
+/// `doc` without the fenced blocks and inline code spans that show `maxplayer wallet` commands.
+fn without_wallet(doc: &str) -> String {
+    let is_wallet = |code: &str| {
+        let code = code.trim_start_matches("text\n").trim_start();
+        code.starts_with("maxplayer wallet") || code.starts_with("wallet ")
+    };
+    let mut fenced = String::new();
+    for (i, part) in doc.split("```").enumerate() {
+        if i % 2 == 1 {
+            if !is_wallet(part) {
+                fenced.push_str("```");
+                fenced.push_str(part);
+                fenced.push_str("```");
+            }
+            continue;
+        }
+        for (k, piece) in part.split('`').enumerate() {
+            if k % 2 == 1 {
+                if !is_wallet(piece) {
+                    fenced.push('`');
+                    fenced.push_str(piece);
+                    fenced.push('`');
+                }
+            } else {
+                fenced.push_str(piece);
+            }
+        }
+    }
+    fenced
 }

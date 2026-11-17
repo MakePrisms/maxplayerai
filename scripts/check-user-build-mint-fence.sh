@@ -77,9 +77,6 @@ run() {
 # Refused: plain HTTP mints on loopback, in every command that takes a mint.
 run 1 "$HTTP_REFUSED" preflight "$HTTP_MINT"
 run 1 "$HTTP_REFUSED" balance "$HTTP_MINT"
-run 1 "$HTTP_REFUSED" fund "$HTTP_MINT" --amount 1
-run 1 "$HTTP_REFUSED" withdraw "$HTTP_MINT" --invoice lnbc1
-run 1 "$HTTP_REFUSED" receive "$HTTP_MINT" --token-file /dev/null
 run 1 "$HTTP_REFUSED" send "$HTTP_MINT" --amount 1 --out "$work/token"
 run 1 "$HTTP_REFUSED" list --give-mint "$HTTP_MINT" --give 1 --want-mint https://testnut.cashudevkit.org --want 1
 run 1 "$HTTP_REFUSED" list --give-mint https://testnut.cashudevkit.org --give 1 --want-mint "$HTTP_MINT" --want 1 --dry-run

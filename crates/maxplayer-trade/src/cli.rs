@@ -93,35 +93,27 @@ enum Command {
     Recover,
     /// Check NUT-07/09/11/12/14, an active sat keyset, and clock skew <= 60 seconds.
     Preflight { mint: String },
-    /// Create or resume keyed funding; lifetime cap is 100,000 sats per mint/home. Never pays invoices.
+    /// Moved: `maxplayer wallet mint` (money in and out is `maxplayer wallet`).
+    #[command(hide = true, disable_help_flag = true)]
     Fund {
-        mint: String,
-        #[arg(long)]
-        amount: u64,
-        #[arg(long)]
-        quote: Option<String>,
-        /// Operation id (UUID) of this funding. Re-running with the same id returns the same
-        /// journaled quote and invoice instead of creating another. Printed before the request.
-        #[arg(long, conflicts_with = "quote")]
-        id: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
     },
-    /// Pay one exact BOLT11 invoice (max 100,000 sats), journaling inputs and change.
+    /// Moved: `maxplayer wallet melt --max-debit`.
+    #[command(hide = true, disable_help_flag = true)]
     Withdraw {
-        mint: String,
-        #[arg(long)]
-        invoice: String,
-        /// Maximum invoice amount + input fee + Lightning reserve, in sats.
-        #[arg(long)]
-        max_debit: Option<u64>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
     },
-    /// Import one plain-sat Cashu token (max 100,000 sats) from a file or stdin; never argv.
+    /// Moved: `maxplayer wallet receive --token-file`.
+    #[command(hide = true, disable_help_flag = true)]
     Receive {
-        mint: String,
-        /// File holding the token; omit to read the token from stdin.
-        #[arg(long)]
-        token_file: Option<PathBuf>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        args: Vec<String>,
     },
-    /// Export exactly --amount sats as a Cashu token file (0600, never overwritten; max 100,000), or --reclaim an unredeemed send.
+    /// Drain a legacy standalone home: export exactly --amount sats as a Cashu token file (0600,
+    /// never overwritten; max 100,000). Or --reclaim an unredeemed send made by trade. On a maxplayer
+    /// home a new send is `maxplayer wallet send <amount> --out <file>`.
     Send {
         #[arg(required_unless_present = "reclaim", conflicts_with = "reclaim")]
         mint: Option<String>,
@@ -224,10 +216,28 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         )
         .await;
     }
+    // Money in and out moved to `maxplayer wallet` (one wallet, one set of commands).
+    match &cli.command {
+        Command::Fund { .. } => anyhow::bail!(
+            "{}",
+            moved("fund", "maxplayer wallet mint <amount> --mint <url>")
+        ),
+        Command::Withdraw { .. } => anyhow::bail!(
+            "{}",
+            moved(
+                "withdraw",
+                "maxplayer wallet melt <bolt11> --max-debit <sats> --mint <url>"
+            )
+        ),
+        Command::Receive { .. } => anyhow::bail!(
+            "{}",
+            moved("receive", "maxplayer wallet receive --token-file <file>")
+        ),
+        _ => {}
+    }
     // A zero amount can never succeed: refuse it before any cap check, home, lock or mint.
     let zero = match &cli.command {
-        Command::Fund { amount, .. }
-        | Command::Send {
+        Command::Send {
             amount: Some(amount),
             ..
         } => (*amount == 0).then_some("--amount"),
@@ -235,28 +245,17 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
             .then_some("--give")
             .or((*want == 0).then_some("--want")),
         Command::Take { max_give, .. } => (*max_give == 0).then_some("--max-give"),
-        Command::Withdraw { max_debit, .. } => (*max_debit == Some(0)).then_some("--max-debit"),
         _ => None,
     };
     if let Some(flag) = zero {
         anyhow::bail!("amount must be at least 1 sat ({flag} 0)");
-    }
-    // Argument-only refusal, like the zero check: before any home is resolved or created.
-    if let Command::Fund { amount, .. } = &cli.command {
-        ensure!(
-            *amount <= crate::real_money::CAP,
-            "funding cap exceeds 100,000 sats"
-        );
     }
     crate::transport::configure_mint_relays(&cli.mint_relay)?;
     // Argument-only mint fence (no http:// mints in a user build): before any home is resolved,
     // created or locked, any hand-off, and any mint or relay is contacted.
     let arg_mints: Vec<&String> = match &cli.command {
         Command::Preflight { mint }
-        | Command::Fund { mint, .. }
         | Command::Balance { mint }
-        | Command::Withdraw { mint, .. }
-        | Command::Receive { mint, .. }
         | Command::Send {
             mint: Some(mint), ..
         } => vec![mint],
@@ -270,40 +269,20 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
     for mint in arg_mints {
         Asset::from_cli(mint)?.fence()?;
     }
-    // No home, lock, journal or intent is touched for a path a nostr:// mint cannot serve.
-    match &cli.command {
-        Command::Fund { mint, .. } => crate::transport::require_http(mint, "fund")?,
-        Command::Withdraw { mint, .. } => crate::transport::require_http(mint, "withdraw")?,
-        _ => {}
-    }
-    // Local-only argument checks before check_home/bootstrap_home can create a home or key: a mistyped command
-    // must not leave a fresh unlinked key behind.
-    if let Command::Fund { id: Some(id), .. } = &cli.command {
-        uuid::Uuid::parse_str(id).context("--id must be a UUID")?;
-    }
     // Refusals that need no write (mixed or legacy home, a mint this home may not use) come first,
-    // then the token is read, then the home is bootstrapped: a refused command creates nothing.
+    // then the home is bootstrapped: a refused command creates nothing.
     let (resolved, bootstrap) = check_home(cli.home.as_deref(), &cli.command)?;
-    // The token is read once, bounded, before any hand-off: a running serve receives it over its
-    // socket; otherwise the local path below uses this same text.
-    let mut token = match &cli.command {
-        Command::Receive { token_file, .. } => Some(read_token(token_file.as_deref())?),
-        _ => None,
-    };
     if bootstrap {
         bootstrap_home(&resolved)?;
     }
     let home = &resolved;
     // A maxplayer home moves money only at its own mints (default, extra_mints, the seller's
     // accepted_mints) that pass the real-mint fence.
-    match &cli.command {
-        Command::Fund { mint, .. }
-        | Command::Withdraw { mint, .. }
-        | Command::Receive { mint, .. }
-        | Command::Send {
-            mint: Some(mint), ..
-        } => crate::wallet::check_mint(home, &Asset::from_cli(mint)?.mint_url)?,
-        _ => {}
+    if let Command::Send {
+        mint: Some(mint), ..
+    } = &cli.command
+    {
+        crate::wallet::check_mint(home, &Asset::from_cli(mint)?.mint_url)?;
     }
     // Mint requests sign as this home's key: the default mint relay only admits registered keys.
     // A read-only command never creates a key (`discover` on an empty or legacy home).
@@ -383,7 +362,7 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         amount.as_ref().context("--amount required")?;
         out.as_ref().context("--out required")?;
     }
-    // A running serve owns the home: hand list/take/cancel/receive to it, with these exact bounds.
+    // A running serve owns the home: hand list/take/cancel to it, with these exact bounds.
     let handoff = match &cli.command {
         Command::List {
             give_mint,
@@ -412,56 +391,6 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
             max_fees: *max_fees,
         }),
         Command::Cancel { lot } => Some(crate::serve::Command::Cancel { lot: lot.clone() }),
-        Command::Send {
-            mint: Some(mint),
-            amount: Some(amount),
-            out: Some(out),
-            max_fees,
-            reclaim: None,
-        } => Some(crate::serve::Command::Send {
-            mint: mint.clone(),
-            amount: *amount,
-            // serve runs in another directory: hand over the absolute path the user meant.
-            out: crate::send::target(out)?
-                .to_str()
-                .context("--out path must be UTF-8")?
-                .to_owned(),
-            max_fees: *max_fees,
-        }),
-        Command::Fund {
-            mint,
-            amount,
-            quote,
-            id,
-        } => {
-            ensure!(
-                *amount <= crate::real_money::CAP,
-                "funding cap exceeds 100,000 sats"
-            );
-            Some(crate::serve::Command::Fund {
-                mint: mint.clone(),
-                amount: *amount,
-                id: match id {
-                    Some(id) => uuid::Uuid::parse_str(id)
-                        .context("--id must be a UUID")?
-                        .to_string(),
-                    None => uuid::Uuid::new_v4().to_string(),
-                },
-                quote: quote.clone(),
-            })
-        }
-        Command::Receive { mint, .. } => {
-            let raw = token.as_deref().unwrap_or_default().trim();
-            // Refused before connecting, exactly as the local path refuses it.
-            ensure!(
-                raw.len() <= crate::receive::MAX_TOKEN_BYTES,
-                "token missing or oversized"
-            );
-            Some(crate::serve::Command::Receive {
-                mint: mint.clone(),
-                token: crate::serve::TokenText(raw.to_owned()),
-            })
-        }
         _ => None,
     }
     .map(|command| crate::serve::Request {
@@ -470,19 +399,6 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         mint_relays: crate::transport::mint_relays(),
         command,
     });
-    if let Some(crate::serve::Request {
-        command: crate::serve::Command::Fund {
-            id, quote: None, ..
-        },
-        ..
-    }) = &handoff
-    {
-        // Before anything can be created: the id that retrieves this same funding later.
-        eprintln!(
-            "{}",
-            serde_json::json!({"funding_id":id,"note":"re-run with --id to resume this funding"})
-        );
-    }
     if let Some(request) = &handoff {
         if home.is_dir() {
             if let Some(code) = crate::serve::forward(home, request).await? {
@@ -552,14 +468,7 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         let pending = crate::money::recover(home, &money_journal).await?;
         return coordinator::recovery_status(&money_journal, pending).await;
     }
-    if !matches!(
-        &cli.command,
-        Command::Fund { .. }
-            | Command::Balance { .. }
-            | Command::Withdraw { .. }
-            | Command::Receive { .. }
-            | Command::Send { .. }
-    ) {
+    if !matches!(&cli.command, Command::Balance { .. } | Command::Send { .. }) {
         let keys = crate::wallet::identity(home)?;
         let j = Journal::open(home).await?;
         let mut m = Market::connect(keys, &relays).await?;
@@ -631,101 +540,14 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         )
         .await;
     }
-    let mint_arg = match &cli.command {
-        Command::Fund { mint, .. }
-        | Command::Balance { mint }
-        | Command::Withdraw { mint, .. }
-        | Command::Receive { mint, .. } => mint,
-        _ => unreachable!(),
-    };
-    let asset = crate::Asset::from_cli(mint_arg)?;
-    asset.fence()?;
-    let mint = &asset.mint_url;
-
-    if let Command::Withdraw {
-        ref invoice,
-        max_debit,
-        ..
-    } = cli.command
-    {
-        let a = match crate::money::withdraw_bounded(home, &money_journal, mint, invoice, max_debit)
-            .await
-        {
-            Ok(a) => a,
-            Err(error) => {
-                // A submitted withdrawal whose resolution failed (mint unreachable after
-                // POST, change not yet restorable) is unresolved work, never a refusal.
-                if crate::money::submitted_unresolved(&money_journal, invoice)
-                    .await
-                    .unwrap_or(true)
-                {
-                    eprintln!("{error}");
-                    return Err(coordinator::RecoveryIncomplete.into());
-                }
-                return Err(error);
-            }
-        };
-        println!("{}", a.summary());
-        if !a.terminal() {
-            return Err(coordinator::RecoveryIncomplete.into());
-        }
-        ensure!(
-            a.state == crate::money::MeltState::Done,
-            "withdrawal not paid; terminal {:?}",
-            a.state
-        );
-        return Ok(());
-    }
-    if matches!(cli.command, Command::Receive { .. }) {
-        let raw = token.take().unwrap_or_default();
-        drop(handoff);
-        let r = crate::receive::receive(home, &money_journal, mint, &raw).await;
-        drop(raw);
-        let r = r?;
-        println!("{}", r.summary());
-        return crate::receive::verdict(&r);
-    }
-    if let Command::Fund {
-        amount, ref quote, ..
-    } = cli.command
-    {
-        let id = match &handoff {
-            Some(crate::serve::Request {
-                command: crate::serve::Command::Fund { id, .. },
-                ..
-            }) => id.clone(),
-            _ => uuid::Uuid::new_v4().to_string(),
-        };
-        ensure!(
-            amount > 0 && amount <= crate::real_money::CAP,
-            "funding cap exceeds 100,000 sats"
-        );
-        let mut f = if let Some(id) = quote {
-            money_journal
-                .all::<crate::money::Funding>("funding")
-                .await?
-                .into_iter()
-                .find(|f| f.quote.as_ref() == Some(id) && f.mint == *mint && f.amount == amount)
-                .context("quote not journaled for this mint and amount")?
-        } else {
-            crate::money::fund_with_id(home, &money_journal, mint, amount, &id).await?
-        };
-        println!(
-            "{}",
-            serde_json::json!({"funding_id":f.id,"quote":f.quote,"invoice":f.invoice,"amount":f.amount,"note":"pay externally; tool never auto-pays"})
-        );
-        // Quote polling: one status GET per FUND_POLL (about 30 s in total).
-        for _ in 0..crate::money::FUND_POLLS {
-            crate::money::resume_fund(home, &money_journal, &mut f).await?;
-            if f.done {
-                return Ok(());
-            }
-            tokio::time::sleep(crate::money::fund_poll(&f.mint)).await;
-        }
-        anyhow::bail!("funding remains pending; invoice and intent retained; run recover");
-    }
-
     unreachable!()
+}
+
+/// The refusal for a money command that moved to `maxplayer wallet`.
+fn moved(command: &str, instead: &str) -> String {
+    format!(
+        "`maxplayer trade {command}` moved to `maxplayer wallet`: use `{instead}`; nothing was done"
+    )
 }
 
 /// The home a command runs against. `--home` (else the maxplayer home: $MAXPLAYER_HOME, else
@@ -761,13 +583,7 @@ fn check_home(arg: Option<&Path>, command: &Command) -> Result<(PathBuf, bool)> 
     }
     if wallet::is_legacy_dir(&home) {
         eprintln!("{}", wallet::legacy_warning(&home));
-        if matches!(
-            command,
-            Command::List { .. }
-                | Command::Take { .. }
-                | Command::Fund { .. }
-                | Command::Receive { .. }
-        ) {
+        if matches!(command, Command::List { .. } | Command::Take { .. }) {
             anyhow::bail!("{}", wallet::legacy_refusal(&home));
         }
         return Ok((home, false));
@@ -779,14 +595,17 @@ fn check_home(arg: Option<&Path>, command: &Command) -> Result<(PathBuf, bool)> 
     }
     // A mint this home may not use is refused before bootstrap creates anything (the config is
     // resolved read-only; an absent config.toml means the defaults bootstrap would write).
-    if let Command::Fund { mint, .. }
-    | Command::Withdraw { mint, .. }
-    | Command::Receive { mint, .. }
-    | Command::Send {
-        mint: Some(mint), ..
-    } = command
-    {
-        wallet::check_shared_mint(&home, &crate::Asset::from_cli(mint)?.mint_url)?;
+    // A maxplayer home sends with `maxplayer wallet send`; trade's send drains legacy homes only.
+    if let Command::Send { reclaim: None, .. } = command {
+        anyhow::bail!(
+            "{}",
+            moved(
+                "send",
+                "maxplayer wallet send <amount> --mint <url> --out <file> (a legacy standalone \
+                 home still drains with `maxplayer trade --home <legacy> send`; `send --reclaim \
+                 <id>` still takes back a token trade sent)"
+            )
+        );
     }
     if let Command::List {
         give_mint,
@@ -814,26 +633,6 @@ fn bootstrap_home(home: &Path) -> Result<()> {
         );
     }
     Ok(())
-}
-
-/// Read one token from `--token-file` or stdin, at most `MAX_TOKEN_BYTES` + 1 bytes (the
-/// excess byte lets `receive::inspect` refuse an oversized token instead of truncating it).
-fn read_token(token_file: Option<&std::path::Path>) -> Result<String> {
-    use std::io::Read;
-    let limit = crate::receive::MAX_TOKEN_BYTES as u64 + 1;
-    let mut raw = String::new();
-    match token_file {
-        Some(path) => fs::File::open(path)
-            .context("cannot open token file")?
-            .take(limit)
-            .read_to_string(&mut raw)
-            .context("token file is not readable UTF-8")?,
-        None => std::io::stdin()
-            .take(limit)
-            .read_to_string(&mut raw)
-            .context("stdin token is not readable UTF-8")?,
-    };
-    Ok(raw)
 }
 
 fn forwarded(code: u8) -> Result<()> {

@@ -117,33 +117,6 @@ async fn funding_recover_issues_paid_quote_once() {
     money::recover(h.path(), &j).await.unwrap();
     assert_eq!(balance(h.path(), &m.url).await, 100);
 }
-#[cfg(feature = "lab")]
-#[tokio::test]
-async fn crash_after_melt_reply_recovers_without_resubmission() {
-    let (h, m, j) = setup().await;
-    let home = h.path().to_owned();
-    let url = m.url.clone();
-    let status = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-            .args([
-                "--home",
-                home.to_str().unwrap(),
-                "withdraw",
-                &url,
-                "--invoice",
-                &invoice(31),
-            ])
-            .env("TRADE_CRASH_AFTER_MELT", "1")
-            .output()
-            .unwrap()
-            .status
-    })
-    .await
-    .unwrap();
-    assert_eq!(status.code(), Some(86));
-    money::recover(h.path(), &j).await.unwrap();
-    assert_eq!(balance(h.path(), &m.url).await, 96);
-}
 #[tokio::test]
 async fn unpaid_response_releases_reserved_inputs() {
     use cashu::nuts::MeltQuoteState;
@@ -199,24 +172,42 @@ async fn pending_then_paid_waits_and_reconciles_change() {
     );
     assert_eq!(balance(h.path(), &m.url).await, 97);
 }
+/// Money in and out moved to `maxplayer wallet`: each old trade command names its replacement,
+/// exits 1 and creates nothing (no home, key, journal or wallet).
 #[test]
-fn cli_refuses_funding_above_cap_without_network() {
+fn moved_money_commands_point_to_the_wallet_and_create_nothing() {
     let h = tempfile::tempdir().unwrap();
+    let home = h.path().join("home");
     let mint = "https://mint.minibits.cash/Bitcoin";
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args([
-            "--home",
-            h.path().to_str().unwrap(),
-            "fund",
-            mint,
-            "--amount",
-            "100001",
-        ])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("100,000 sats"));
-    assert!(!h.path().join("wallet.seed").exists());
+    for (args, instead) in [
+        (vec!["fund", mint, "--amount", "5"], "maxplayer wallet mint"),
+        (
+            vec!["withdraw", mint, "--invoice", "lnbc1", "--max-debit", "9"],
+            "maxplayer wallet melt",
+        ),
+        (
+            vec!["receive", mint, "--token-file", "/nonexistent"],
+            "maxplayer wallet receive",
+        ),
+        (
+            vec!["send", mint, "--amount", "5", "--out", "/nonexistent/t"],
+            "maxplayer wallet send",
+        ),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
+            .args(["--home", home.to_str().unwrap()])
+            .args(&args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {err}");
+        assert!(
+            err.contains("moved to `maxplayer wallet`") && err.contains(instead),
+            "{args:?}: {err}"
+        );
+        assert!(!home.exists(), "SAFETY: {args:?} created the home");
+    }
 }
 #[tokio::test]
 async fn published_funding_quote_cannot_be_issued_without_its_key() {
@@ -534,37 +525,6 @@ async fn withdraw_refuses_non_mainnet_invoice_before_quote_or_journal() {
         );
         assert_withdraw_refused(&h, &m, &j, &inv, &msg).await;
     }
-    // The CLI prints the same refusal and exits 1 without a quote.
-    let inv = test_invoice(Currency::BitcoinTestnet, now, 3600, 31_000);
-    let before = m.faults.requests.load(SeqCst);
-    drop(j);
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_maxplayer-trade"))
-        .args([
-            "--home",
-            h.path().to_str().unwrap(),
-            "withdraw",
-            &m.url,
-            "--invoice",
-            &inv,
-        ])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains(
-            "invoice is for testnet; this mint pays Bitcoin mainnet invoices; nothing was journaled or sent"
-        ),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        m.faults.requests.load(SeqCst),
-        before,
-        "SAFETY: CLI sent no mint request"
-    );
-    let j = Journal::open(h.path()).await.unwrap();
-    assert!(j.all::<Withdrawal>("withdrawal").await.unwrap().is_empty());
 }
 #[tokio::test]
 async fn withdraw_refuses_expired_invoice_before_quote_or_journal() {
@@ -600,11 +560,9 @@ async fn zero_amounts_are_refused_before_caps_journal_or_mint() {
     let m = MintFixture::start(0).await;
     let home = h.path().join("home");
     let url = m.url.clone();
-    let inv = invoice(31);
     let out_file = h.path().join("token");
     let out_str = out_file.to_str().unwrap().to_owned();
     let cases: Vec<(Vec<&str>, &str)> = vec![
-        (vec!["fund", &url, "--amount", "0"], "--amount"),
         (
             vec!["send", &url, "--amount", "0", "--out", &out_str],
             "--amount",
@@ -641,10 +599,6 @@ async fn zero_amounts_are_refused_before_caps_journal_or_mint() {
         (
             vec!["take", "abc", "--max-give", "0", "--min-receive", "1"],
             "--max-give",
-        ),
-        (
-            vec!["withdraw", &url, "--invoice", &inv, "--max-debit", "0"],
-            "--max-debit",
         ),
     ];
     for (args, flag) in cases {

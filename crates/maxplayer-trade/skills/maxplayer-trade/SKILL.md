@@ -18,7 +18,7 @@ its key signs, its wallet pays (sellers too), only its mints trade. A legacy tra
 journals across restarts. Never delete it while funds, reservations, unresolved
 funding/withdrawals, or trades exist; keep it afterward for recovery.
 Never use a fresh home to evade caps. Only one writer owns it: while `serve` runs,
-`list`/`take`/`cancel`/`receive` hand off to it, exact bounds; `status`, `balance`,
+`list`/`take`/`cancel` hand off to it, exact bounds; `status`, `balance`,
 `discover` are lock-free. Don't stop serve to look. Stop it with SIGTERM (exit 5;
 [lifecycle](references/commands.md#serve-lifecycle-stopping-and-progress-lines)).
 **Do not stop serve between `second_locked` and `settling`**; a maker can lose its
@@ -33,13 +33,13 @@ homes or databases. Report only public IDs, mints, amounts, states, redacted err
 
 Run `balance <mint>` and `preflight <mint>` per mint. Passing preflight
 proves neither honesty nor full compatibility. The CLI
-also preflights before fund/list/take/withdraw/send
-([checks](references/commands.md#enforced-monetary-policy)). Never bypass a failed check. Gross locks and each withdrawal invoice are capped at
-**100,000 sats**. Funding intents plus charged receives (gross) share one
-100,000-sat cap per mint per home (what counts: [commands](references/commands.md#enforced-monetary-policy)). Pass `--max-debit`
-to cap invoice + Cashu input fee + Lightning reserve ([reserve ceiling](references/commands.md#withdrawal-enforcement-before-execution)). Fees can push a net lock over the cap.
+also preflights before list/take/send
+([checks](references/commands.md#enforced-monetary-policy)). Never bypass a failed check. Capped at
+**100,000 sats** per lock, `wallet send` and `wallet melt`. Money in and out is `maxplayer wallet`
+(same home, same wallet). Pass `wallet melt --max-debit` to cap invoice + the mint's fee
+reserve. Fees can push a net lock over the cap.
 
-**Before every real-money `fund`, `list`, `take`, `withdraw`, or `send`, present
+**Before every real-money funding, `list`, `take`, withdrawal or send, present
 the exact operation and get an explicit yes.** For `list`/`take`, first show the
 same command's `--dry-run` fees, gross amounts and max debit (changes nothing).
 A broad “trade for me”, earlier approval or published listing approves no new
@@ -64,32 +64,23 @@ If a command cannot enforce the approved bounds, **do not run it**; escalate. Ne
 
 ## 3. Execute the selected workflow
 
-### Fund my trade wallet
+### Fund, receive, send, withdraw (`maxplayer wallet`, same `--home`)
 
-After confirmation, `fund <mint> --amount <sats>`. On a real mint it prints a BOLT11
-invoice and never auto-pays. Give it privately to the human to pay from **their own wallet**; never pay it
-without separate explicit consent.
-An invoice is not funded balance. Keep the quote ID; after
-interruption use `recover`, and if needed resume that quote with
-`fund <mint> --amount <same-sats> --quote <quote-id>` after confirmation. Never create
-or pay a replacement because a reply or issuance timed out.
-**Done:** issuance reconciled and `balance <mint>` confirms it, or the retained
-quote is reported unresolved without another payment.
+- Fund: `maxplayer wallet mint <sats> --mint <mint>` prints a BOLT11 invoice; never auto-pays.
+  Give it privately to the human to pay from **their own wallet**; then
+  `maxplayer wallet mint-complete <quote-id>`. Never create a replacement after a timeout.
+- Receive (yes needed): token in a private file, `maxplayer wallet receive --token-file <file>`
+  (`maxplayer wallet receive --add-mint ...` for a mint not yet in the wallet). Never put tokens
+  in argv/chat/logs.
+- Send (yes needed): `maxplayer wallet send <sats> --mint <mint> --out <new-file>`; deliver
+  the file privately. Unredeemed, `maxplayer wallet receive --token-file <file>` takes it back.
+- Withdraw: only the human's invoice, validated first: `maxplayer wallet melt <bolt11>
+  --max-debit <approved-sats> --mint <mint>` pays immediately; it is not a preview.
+- A legacy standalone home drains with `maxplayer trade --home <legacy> send <mint> --amount
+  <sats> --out <file> --max-fees <cap>`, then `wallet receive` on the maxplayer home.
+  `trade send --reclaim <id>` still takes back a token trade sent.
 
-### Receive a token
-
-Needs the human's yes (mint, amount); charges the shared cap (§2).
-Save it to a private file; run `receive <mint> --token-file <file>` (or
-stdin). Never put tokens in argv/chat/logs. Only plain sat proofs of that
-mint; fee deducted. Works while serve runs (handed off). Exit 3: `recover` (serve running: it recovers; check `status`), never re-import; 4 `quarantined`: escalate; other exits:
-[commands](references/commands.md#receive). **Done:** `done` + `balance <mint>`.
-
-### Send a token / move funds to another wallet
-
-Needs a yes as for withdraw (mint/amount/fee cap). Run
-`send <mint> --amount <sats> --out <new-file> --max-fees <cap>`; deliver the
-file privately, not its contents. Exit 3: `recover`; never resend. Until redeemed,
-`send --reclaim <id>` takes it back. **Done:** state `sent`.
+**Done:** `maxplayer wallet balance` (or `balance <mint>`) confirms the result.
 
 ### Sell/list X of mint A for Y of mint B
 
@@ -115,15 +106,6 @@ not. Worked example: command reference.
 After confirmation, `take <lot> --max-give <total-cap> --min-receive <net-minimum>
 --max-fees <cap>`. Keep it (or serve) running through settlement. Never repeat a take
 to “fix” a timeout. `counterparty_unresponsive` is only a warning; keep serving. **Done:** verify the terminal result and per-mint balances, or enter recovery.
-
-### Withdraw
-
-Use only the human's invoice; validate amount, destination, expiry and
-fee/debit bounds before confirmation. `withdraw <mint> --invoice <bolt11> --max-debit <approved-sats>` may spend
-immediately; it is **not** a quote preview. Read the command reference's withdrawal limits first. Non-terminal is unresolved, not failed. Never create a replacement invoice, withdrawal, or payment
-while a submitted payment is unresolved. A post-POST timeout is not a failed payment;
-pre-POST/`quote_created` rules: [withdrawal states](references/recovery.md#withdrawal-states). **Done:** `done` and reconciled change/balance are confirmed,
-or report the retained authorization and recover it without paying again.
 
 ### Check balance / something got interrupted
 
