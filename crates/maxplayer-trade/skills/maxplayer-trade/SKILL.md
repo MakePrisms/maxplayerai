@@ -1,6 +1,6 @@
 ---
 name: maxplayer-trade
-description: Trade Cashu tokens for a human with the maxplayer-trade CLI from their maxplayer home, including real money. Use for “sell/list X of mint A for Y of mint B”, “buy that lot”, “find listings”, “fund my trade wallet”, “receive this token”, “send a token”, “withdraw”, “check balance”, or “something got interrupted”.
+description: Trade Cashu tokens for a human with `maxplayer trade` from their maxplayer home, including real money. Use for “sell/list X of mint A for Y of mint B”, “buy that lot”, “find listings”, “fund my trade wallet”, “receive this token”, “send a token”, “withdraw”, “check balance”, or “something got interrupted”.
 ---
 
 # Trade Cashu for the human
@@ -9,7 +9,7 @@ description: Trade Cashu tokens for a human with the maxplayer-trade CLI from th
 
 ## 1. Establish custody and scope
 
-Use the trade binary, not Maxplayer jobs. Read
+Use `maxplayer trade`, not Maxplayer jobs. Read
 [commands](references/commands.md) before a command and
 [recovery](references/recovery.md) for any interruption.
 

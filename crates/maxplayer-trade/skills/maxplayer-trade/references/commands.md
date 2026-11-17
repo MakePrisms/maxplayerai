@@ -5,9 +5,9 @@ Every invocation trades from a maxplayer home: `--home <home>` (a directory with
 pays from the home's wallet (a seller's too); only the home's mints (default, `extra_mints` and
 the seller's `accepted_mints`) that pass its real-mint fence are traded; trade state is in `<home>/trade/`. A legacy standalone home (`wallet.seed`/`trade.key`)
 is drain-only: new `list`/`take`/`fund`/`receive` are refused (crate README, "Home and wallet").
-Build the production binary as in the crate README's "Build and automated tests" section:
-the crate is its own Cargo workspace, so `cargo build -p maxplayer-trade` from the repository
-root fails; build it by manifest path, release profile, locked (no protoc needed for the binary).
+Every command below is `maxplayer trade <command>`, part of the `maxplayer` CLI. If
+`maxplayer trade --help` fails, the installed `maxplayer` predates it: upgrade it (or build it as
+in the crate README's "Build and automated tests"). Delete any old standalone `maxplayer-trade`.
 Optional repeated global `--relay <url>` goes before the subcommand; preserve the
 same relay set during recovery. Use the binary's default relays unless deliberately
 configured; the defaults are `wss://relay.maxplayer.ai` first, then `wss://nos.lol`,
@@ -393,7 +393,7 @@ On a `nostr://` mint send, reclaim and `--check-sends` are supported (no NUT-04/
 needed). A swap over 128 proofs or the NIP-44 limit is refused **before anything is
 journaled or reserved** (exit 1; send a smaller amount); for a reclaim the token stays
 `sent`. The token names `nostr://npub…`: only a nostr-capable wallet (e.g.
-`maxplayer-trade receive`) can redeem it, not a generic Cashu wallet; `send --reclaim`
+`maxplayer trade receive`) can redeem it, not a generic Cashu wallet; `send --reclaim`
 takes it back. Keep the same `--mint-relay` set for reclaim, `recover` and
 `--check-sends`; with the wrong relays they report `unknown`/retain the attempt.
 

@@ -483,6 +483,40 @@ mod checks {
     // external `git-credential-nostr` helper is not required for delivery push / base fetch.
     // We still report whether it resolves (useful for anyone driving raw `git` by hand) but never
     // fail on its absence.
+    const OBSOLETE_TRADE_CHECK: &str = "obsolete maxplayer-trade";
+
+    /// Advisory, report-only: the standalone `maxplayer-trade` binary (built from source before
+    /// trading moved into `maxplayer trade`) left on PATH. It shares this home's trade journal, and
+    /// a current journal or serve refuses it, but only deleting it stops someone running it.
+    pub(super) fn check_obsolete_trade_binary() -> Check {
+        check_obsolete_trade_binary_in(std::env::var_os("PATH"))
+    }
+
+    pub(super) fn check_obsolete_trade_binary_in(path: Option<std::ffi::OsString>) -> Check {
+        use std::os::unix::fs::PermissionsExt;
+        let found: Vec<String> = path
+            .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join("maxplayer-trade"))
+            .filter(|f| {
+                std::fs::metadata(f).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+            .map(|f| f.display().to_string())
+            .collect();
+        if found.is_empty() {
+            Check::pass(OBSOLETE_TRADE_CHECK, "no standalone maxplayer-trade binary on PATH")
+        } else {
+            Check::warn(
+                OBSOLETE_TRADE_CHECK,
+                format!("obsolete standalone maxplayer-trade on PATH: {}", found.join(", ")),
+                "trading is `maxplayer trade ...` now; delete the old binary (it is refused by current \
+                 trade journals and serve, but should not be run)",
+            )
+        }
+    }
+
     pub(super) fn check_credential_helper() -> Check {
         match seller_git::resolve_git_credential_nostr() {
             Some(path) => Check::pass(
@@ -2641,7 +2675,10 @@ fn build_report_checks(
     };
     // `doctor` reports; it never boots a seller, so there is nothing here for an unsafe override to
     // waive. The containment check is read at its own severity.
-    build_checks_with_environment(home, false, environment)
+    let mut checks = build_checks_with_environment(home, false, environment);
+    // Report-only (never in the seller boot gate): a leftover standalone maxplayer-trade binary.
+    checks.push(Box::new(checks::check_obsolete_trade_binary));
+    checks
 }
 
 /// [`build_checks`] with the environment head supplied by the caller — the one place the rest of
@@ -6599,6 +6636,43 @@ mod tests {
         );
     }
 
+    // A leftover standalone `maxplayer-trade` on PATH is a WARN naming the file (never a FAIL: it
+    // does not change the exit); a non-executable file of that name, or none, passes.
+    #[test]
+    fn obsolete_maxplayer_trade_on_path_is_a_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "maxplayer-doctor-obsolete-trade-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (with, without) = (dir.join("with"), dir.join("without"));
+        std::fs::create_dir_all(&with).unwrap();
+        std::fs::create_dir_all(&without).unwrap();
+        let path = |dirs: &[&std::path::Path]| Some(std::env::join_paths(dirs).unwrap());
+
+        let none = checks::check_obsolete_trade_binary_in(path(&[&without]));
+        assert_eq!(none.status, Status::Pass, "{}", none.render());
+
+        let bin = with.join("maxplayer-trade");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let not_exec = checks::check_obsolete_trade_binary_in(path(&[&without, &with]));
+        assert_eq!(not_exec.status, Status::Pass, "{}", not_exec.render());
+
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let found = checks::check_obsolete_trade_binary_in(path(&[&without, &with]));
+        assert_eq!(found.status, Status::Warn, "{}", found.render());
+        let rendered = found.render();
+        assert!(rendered.contains(&bin.display().to_string()), "{rendered}");
+        assert!(rendered.contains("maxplayer trade"), "{rendered}");
+        assert_eq!(exit_code(&[found]), SUCCESS, "a leftover binary must not fail doctor");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // Nix is a seller requirement: on a home with no [seller] the doctor REPORT shows a missing nix
     // as SKIP (both failure variants), never FAIL, and a working nix keeps its PASS. Pure, so it is
     // red-provable on any box — drop the fold and the two failures stay FAIL.
@@ -6677,6 +6751,8 @@ mod tests {
         let buyer_nix = nix_line(&buyer);
         assert!(buyer_nix.starts_with("SKIP nix"), "buyer home: {buyer_nix}");
         assert!(buyer_nix.contains("no [seller] section"), "buyer home: {buyer_nix}");
+        // The report (and only the report) carries the leftover-maxplayer-trade row.
+        assert!(buyer.contains("obsolete maxplayer-trade"), "doctor report: {buyer}");
 
         maxplayer_core::home::save_config(&mut home, |config| {
             config.seller = Some(seller_for_agents(vec!["claude".into()], vec!["claude-agent-acp".into()]));

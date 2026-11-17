@@ -50,10 +50,26 @@ mod wallet_cli;
 mod whoami;
 
 fn main() {
-    let code = cli::run(
-        std::env::args(),
-        &mut std::io::stdout(),
-        &mut std::io::stderr(),
-    );
+    // Token trading (crates/maxplayer-trade): lots, takes, swap recovery and its own money commands on
+    // this home's key and wallet. It gets the OS arguments as they are (paths need not be UTF-8);
+    // clap owns its parsing, help and exit codes. Every other command needs UTF-8 and gets a usage
+    // error (exit 1) instead of the panic `std::env::args()` gives.
+    let os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    #[cfg(feature = "wallet")]
+    if os.get(1).and_then(|a| a.to_str()) == Some("trade") {
+        std::process::exit(i32::from(maxplayer_trade::cli::main_from(
+            std::iter::once(std::ffi::OsString::from("maxplayer trade"))
+                .chain(os[2..].iter().cloned()),
+        )));
+    }
+    let Some(args) = os
+        .into_iter()
+        .map(|a| a.into_string().ok())
+        .collect::<Option<Vec<String>>>()
+    else {
+        eprintln!("maxplayer: arguments must be valid UTF-8");
+        std::process::exit(1);
+    };
+    let code = cli::run(args, &mut std::io::stdout(), &mut std::io::stderr());
     std::process::exit(code);
 }

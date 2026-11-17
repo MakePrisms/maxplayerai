@@ -386,9 +386,9 @@ jobs:
             exit 1
           fi
 
-  # The standalone Cashu trade CLI. It is its OWN cargo workspace (`[workspace]` in its manifest)
-  # with its own Cargo.lock, so no root-workspace job above builds or tests it: before this job a
-  # green CI said nothing about crates/maxplayer-trade. Its integration dev-dependencies start
+  # Token trading (`maxplayer trade`, crates/maxplayer-trade). A root workspace member since the
+  # trade CLI moved into `maxplayer`, but its suites are long and need protoc, so they keep their
+  # own jobs here instead of riding the root test jobs above. Its integration dev-dependencies start
   # in-process CDK fake-wallet mints (cdk `mint` -> cdk-signatory), so the tests need protoc even
   # though production trading is wallet-only. No test here reaches a real mint, wallet or relay:
   # every mint is a loopback fixture, and `lab` timing controls refuse non-loopback mints.
@@ -417,7 +417,7 @@ jobs:
       #   crates/maxplayer-mint   -> maxplayer-core (already listed)
       #   maxplayer-private-protocol -> nothing; a member of the crates/buzz workspace
       # tests/auth_gated.rs includes crates/maxplayer-core/tests/support via #[path]; covered above.
-      # The trade Cargo.lock is crates/maxplayer-trade/Cargo.lock. There is no rust-toolchain file or
+      # Trading resolves against the root Cargo.lock. There is no rust-toolchain file or
       # .cargo/ config today; they are listed so adding one re-runs trading.
       # `dir/` matches a prefix, anything else one exact path. scripts/verify-trade-test-matrix.py
       # (run by the lint job) fails if a local package or its workspace manifest is not covered here.
@@ -427,6 +427,11 @@ jobs:
         crates/maxplayer-mint/
         crates/buzz/crates/maxplayer-private-protocol/
         Cargo.toml
+        Cargo.lock
+        crates/maxplayer/Cargo.toml
+        crates/maxplayer/src/cli.rs
+        crates/maxplayer/src/main.rs
+        crates/maxplayer/build.rs
         crates/buzz/Cargo.toml
         rust-toolchain
         rust-toolchain.toml
@@ -514,7 +519,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: maxplayer-trade
-          workspaces: crates/maxplayer-trade -> target
+          workspaces: . -> target
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: cargo fmt --check
@@ -527,7 +532,8 @@ jobs:
       - name: Clippy (default features)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --all-targets --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
       # --all-targets builds the lib with the test-only `local-test-mints` feature (self
-      # dev-dependency); this lints the lib + bin exactly as users build them, feature off.
+      # dev-dependency); this lints the lib exactly as `maxplayer` links it, feature off (the only
+      # bin is the test driver, which requires the feature, so `--bins` adds nothing here).
       - name: Clippy (user build, no dev-dependencies)
         run: cargo clippy --manifest-path "$TRADE_MANIFEST" --locked --lib --bins --no-deps -- -D warnings $TRADE_CLIPPY_ALLOW
       - name: Clippy (lab)
@@ -538,8 +544,9 @@ jobs:
         run: cargo test --manifest-path "$TRADE_MANIFEST" --locked --no-run
       # Every `cargo test` build gets the test-only `local-test-mints` feature (loopback http://
       # mints, ws:// mint relays) through a self dev-dependency, so no test binary can show what
-      # users install. This builds the binary as users do (no features, no dev-dependencies) and
-      # checks it refuses http:// mints and ws:// mint relays before any connection or home write.
+      # users install. This builds `maxplayer` as users do (no dev-dependencies) and checks that
+      # `maxplayer trade` refuses http:// mints and ws:// mint relays before any connection or
+      # home write.
       - name: User build refuses http:// mints and ws:// mint relays
         run: scripts/check-user-build-mint-fence.sh
 
@@ -665,7 +672,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: maxplayer-trade
-          workspaces: crates/maxplayer-trade -> target
+          workspaces: . -> target
           save-if: false
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

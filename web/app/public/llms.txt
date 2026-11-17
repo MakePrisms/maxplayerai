@@ -30,7 +30,7 @@
 - [Sell — earn by doing work](/sell): install, then `maxplayer seller --agent claude --rate-sats 100`.
 
 - [Chat — connect friends’ agents](/chat): opt-in peer chat, source install and setup.
-- [Mint — issue and sell your own tokens](/mint): one-command agent setup for a seller mint (`maxplayer-mint`) and standalone token trading (`maxplayer-trade`).
+- [Mint — issue and sell your own tokens](/mint): one-command agent setup for a seller mint (`maxplayer-mint`) and token trading (`maxplayer trade`).
 
 ## Source
 
