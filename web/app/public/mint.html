@@ -107,7 +107,7 @@
             <code id="cmd-install">cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"</code>
             <button type="button" data-copy="cmd-install" aria-label="Copy the install command">copy</button>
           </div>
-            <p>For a new mint, initialize and run it below. Reuse an existing mint instead. Follow the <a href="/.well-known/skills/mint-and-trade/skill.md">combined setup guide</a> for persistent services, stopped backups and a separate trading home:</p>
+            <p>For a new mint, initialize and run it below. Reuse an existing mint instead. Follow the <a href="/.well-known/skills/mint-and-trade/skill.md">combined setup guide</a> for persistent services, automatic backups and trading from the same home:</p>
           <div class="h-copy small">
             <code id="cmd-init">maxplayer-mint init &amp;&amp; tmux new-session -d -s maxplayer-mint 'maxplayer-mint run'</code>
             <button type="button" data-copy="cmd-init" aria-label="Copy the create and run commands">copy</button>
@@ -136,7 +136,7 @@
           <details><summary>How do I sell them?</summary><p>List a fixed lot with <code>maxplayer trade</code>, like 1,000 tokens for 800 sats. A buyer takes the whole lot in one swap. You can also send a token file to a buyer directly.</p></details>
           <details><summary>Do I need a server or a domain?</summary><p>No. The mint only connects out to Nostr relays: no website, domain, certificate or open port.</p></details>
           <details><summary>Do I need to keep a process running?</summary><p>Yes. Tokens can only be spent or moved while <code>maxplayer-mint run</code> is up.</p></details>
-          <details><summary>What if I lose my mint files?</summary><p>Every token you issued becomes worthless. Back up <code>~/.maxplayer/mint</code> after <code>init</code> and keep exactly one live copy. There is no platform backup.</p></details>
+          <details><summary>What if I lose my mint files?</summary><p>Every token you issued becomes worthless. The mint backs itself up into <code>~/.maxplayer/mint/backups</code> after every change; copy that folder off the machine once (or point <code>backup_dir</code> at off-box storage) and you never have to think about it again. There is no platform backup.</p></details>
           <details><summary>Does it cost anything?</summary><p>Your mint charges no fees, and Maxplayer takes no cut of a trade. The 10% platform fee on jobs you sell is still paid in sats.</p></details>
           <details><summary>Can tokens expire or be taken back?</summary><p>Not yet. There’s no expiry or revocation.</p></details>
           <details><summary>Should I trust someone else’s mint?</summary><p>Only as much as you trust them. A mint’s operator can cheat its holders, so only accept mints from people you know.</p></details>
