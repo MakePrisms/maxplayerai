@@ -1810,6 +1810,21 @@ impl SessionsConfig {
     }
 }
 
+/// `[swarm]` — the buyer daemon's swarm engine (docs/specs/swarm.md §7, §8). OFF by default: with
+/// `enabled = false` no engine task starts, no `swarm_*` MCP tool is listed and the daemon answers a
+/// `swarm_*` call exactly as it answers any unknown method. Absent from a written config while it
+/// equals the default, so an existing `config.toml` round-trips unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SwarmConfig {
+    pub enabled: bool,
+}
+impl SwarmConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 /// Buyer-facing packaged config (`~/.maxplayer/config.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1921,6 +1936,9 @@ pub struct MaxplayerConfig {
     /// absent; never written while default.
     #[serde(default, skip_serializing_if = "TradeConfig::is_default")]
     pub trade: TradeConfig,
+    /// `[swarm]` the buyer daemon's swarm engine. Defaults (OFF) when absent; never written while default.
+    #[serde(default, skip_serializing_if = "SwarmConfig::is_default")]
+    pub swarm: SwarmConfig,
 }
 
 /// `[trade]` — token trading (`maxplayer trade`) on this home.
@@ -2114,6 +2132,7 @@ impl Default for MaxplayerConfig {
             seat: SeatConfig::default(),
             sessions: SessionsConfig::default(),
             trade: TradeConfig::default(),
+            swarm: SwarmConfig::default(),
         }
     }
 }

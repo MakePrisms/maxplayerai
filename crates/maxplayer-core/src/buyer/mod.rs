@@ -34,6 +34,8 @@ mod auto_award_retry;
 mod session_reply;
 /// `get_job.settlement`: whether the daemon settles a delivery on its own, and where it stands.
 mod settlement;
+/// The swarm engine (docs/specs/swarm.md §7, §8): inert unless `[swarm] enabled = true`.
+mod swarm;
 /// What a settled `get_job.settlement` reads back (commit, files, pay), so collect is not a read.
 mod settled_view;
 
@@ -365,6 +367,8 @@ pub async fn run_with_ready(
     // freed within the hour rather than at the next restart.
     spawn_reconcile_loop(context.clone());
     spawn_private_content_worker(context.clone());
+    // `[swarm] enabled` only (default off): with it off no engine task exists.
+    swarm::spawn(context.clone());
     let listener = bind_socket(&socket_path)?;
     accept_loop(listener, context).await
 }
@@ -467,6 +471,11 @@ async fn dispatch(context: &Arc<BuyerContext>, request: Request) -> Response {
         "award" => award(context, id, request.params).await,
         "collect" => collect(context, id, request.params).await,
         "reply" => session_reply::reply(context, id, request.params).await,
+        // Swarm methods exist only with `[swarm] enabled`; otherwise they are unknown methods,
+        // exactly as before the engine existed.
+        method if context.home.config.swarm.enabled && swarm::METHODS.contains(&method) => {
+            swarm::rpc(context, method, id, request.params).await
+        }
         "accept_claim" | "authorize_pay" => Response::err(
             id,
             CODE_NOT_IMPLEMENTED,

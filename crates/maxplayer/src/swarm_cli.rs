@@ -960,7 +960,7 @@ mod wired {
         let draft = j.to_event_draft().map_err(|e| e.to_string())?;
         let id = c.relay.publish(&c.home, draft, c.now).await?;
         let address = naddr(c, SWARM_JOB_KIND, &c.me, &slug);
-        c.notes.push("Status scheduled. Tasks are posted by the buyer daemon's swarm engine, which is not in this release yet.".into());
+        c.notes.push("Status scheduled. Tasks are posted by this buyer's daemon swarm engine, which runs only with [swarm] enabled = true in config.toml (queue tasks with the swarm_job_tasks MCP tool; no planner yet).".into());
         Ok((
             json!({"ok": true, "event_id": id, "job": j, "address": address}),
             format!(
