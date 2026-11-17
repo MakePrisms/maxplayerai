@@ -478,6 +478,16 @@ async fn member_of_two_swarms_gets_one_task_from_each() {
             .unwrap()
             .contains("1 busy")
     );
+    // Later ticks while both still run: still one per swarm, across both of a swarm's jobs.
+    fx.job("math-2", "math", 10_000);
+    fx.at(T0 + 60);
+    e.tick(&fx.stub).await.unwrap();
+    let m3 = fx.queue(&e, "math-2", "m3", false);
+    fx.at(T0 + 120);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, m2).state, "queued", "busy in math across ticks");
+    assert_eq!(task(&e, m3).state, "queued", "busy in math across its jobs");
+    assert_eq!(fx.stub.posts().len(), 2);
 }
 
 /// §12, §7.5: a private swarm's offers carry no task text or swarm link in public events, its
