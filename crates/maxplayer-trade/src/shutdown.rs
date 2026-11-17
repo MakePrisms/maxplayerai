@@ -262,7 +262,7 @@ pub fn unfinished(home: &Path, now: u64) -> serde_json::Value {
     });
     let sends = ids("send", &|v| {
         let a: crate::send::SendAttempt = serde_json::from_slice(v).ok()?;
-        (!a.terminal() || a.manual_recovery()).then_some(a.id)
+        (!a.terminal() || a.manual_recovery() || a.reclaim_retry_pending()).then_some(a.id)
     });
     serde_json::json!({"swaps":swaps,"lots_unserved":lots,"funding":funding,
         "withdrawals":withdrawals,"receives":receives,"sends":sends})

@@ -23,7 +23,7 @@ const REVIEW_REFUSED_FEEDBACK: &str =
 /// Bound on private follow-ups waiting for their encrypted message.
 const PENDING_FOLLOWUPS_CAP: usize = 256;
 /// Poll interval while a follow-up waits for the previous turn's payment (§8.3).
-const PAYMENT_WAIT_POLL: Duration = Duration::from_secs(5);
+pub(super) const PAYMENT_WAIT_POLL: Duration = Duration::from_secs(5);
 
 /// Per-runner session bookkeeping. The store is the durable half; this is only what must not be
 /// repeated within one process (a second task for the same follow-up).
@@ -244,13 +244,6 @@ impl SellerNodeRunner {
             self.close_session(record).await;
             return;
         }
-        // #1299: a draining node starts no new turn. Nothing is journaled, so the follow-up stays on
-        // the relay and the restarted seller reads it from history (the award REQ, which carries
-        // kind 3412, is re-issued unbounded at boot) and runs it then. `close` above is still honoured.
-        if self.drain.is_requested() {
-            opline!("seller node follow-up deferred id={fid} job_id={job_id}: draining; the restarted seller runs it");
-            return;
-        }
         let text = if crate::seller_node::privacy::is_private(&draft) {
             match self.resolve_private_followup(event, &job_id) {
                 Ok(text) => Some(text),
@@ -294,6 +287,17 @@ impl SellerNodeRunner {
         }
         if let Err(error) = store.set_turn_text(&fid, &text) {
             opline!("seller node follow-up id={fid}: message write failed ({error})");
+            return;
+        }
+        // #1299: a draining node starts no new turn, but it journals the turn first. The `received`
+        // row (with its text) is what `recover_sessions` re-drives at the next boot, so the restarted
+        // seller runs it without depending on relay history depth (an open-pool award REQ pages at
+        // the relay's limit). It is not spawned, so it does not hold the drain. `close` above is
+        // still honoured.
+        if self.drain.is_requested() {
+            opline!(
+                "seller node follow-up deferred id={fid} job_id={job_id} turn={turn}: draining; journaled for the restarted seller"
+            );
             return;
         }
         opline!("seller node follow-up admitted id={fid} job_id={job_id} turn={turn}");
@@ -507,6 +511,17 @@ impl SellerNodeRunner {
                             turn.turn,
                             turn.turn - 1
                         );
+                    }
+                    // #1299: a draining node does not wait out an unpaid previous turn (up to the
+                    // turn deadline). The row stays `waiting_payment`, which `unfinished_turns`
+                    // includes, so the restarted seller's `recover_sessions` re-drives it.
+                    if self.drain.is_requested() {
+                        opline!(
+                            "seller node session job_id={}: turn {} left waiting for payment; draining, the restarted seller resumes it",
+                            turn.job_id,
+                            turn.turn
+                        );
+                        return;
                     }
                     tokio::time::sleep(PAYMENT_WAIT_POLL).await;
                 }

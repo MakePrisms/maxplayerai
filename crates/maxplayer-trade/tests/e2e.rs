@@ -503,6 +503,71 @@ async fn expired_untraded_lot_releases_its_reservation() {
         .unwrap_err();
     assert!(error.to_string().contains("lot expired"), "{error:#}");
     assert_eq!(balance(&f.maker, &f.a.url).await, 128);
+    let report = maxplayer_trade::report::render(&f.maker).unwrap();
+    assert!(
+        report.contains("(expired; reservation released)") && !report.contains("reserves debit"),
+        "{report}"
+    );
+    // Spendable through the real coin selection (which excludes journaled lot inputs).
+    let sent = maxplayer_trade::send::send(
+        &f.maker,
+        &f.jm,
+        &f.a.url,
+        100,
+        &f.root.path().join("expired.token"),
+        Some(16),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sent.amount, 100);
+    assert_eq!(sent.state, maxplayer_trade::send::SendState::Sent);
+}
+
+/// SAFETY: an expired lot whose maker swap ended locked (here `claim_quarantined`; likewise
+/// `complete`/`refunded` before the lot is finished) is not an untraded lot: recovery never
+/// expires or releases it, so swap recovery and the manual-recovery exit keep owning it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_lot_with_a_quarantined_swap_is_not_released() {
+    let f = Fixture::new(0).await;
+    let lot = f.list(false).await;
+    let lot = age_lot(&f, &lot, 86400 + coordinator::EXPIRED_LOT_GRACE_SECONDS + 5).await;
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    let p = l.plan.clone();
+    let swap = Swap {
+        created: coordinator::now(),
+        id: uuid::Uuid::new_v4().to_string(),
+        lot: l.event.clone(),
+        role: "maker".into(),
+        peer: nostr_sdk::Keys::generate().public_key().to_hex(),
+        key: "11".repeat(32),
+        preimage: None,
+        request: coordinator::Request {
+            hash: "00".repeat(32),
+            taker_key: f.mm.keys.public_key().to_hex(),
+            funding: coordinator::Terms::from(&p),
+            max_give: 10,
+            min_receive: 10,
+            max_fees: 0,
+        },
+        quote: None,
+        plan: p,
+        state: "claim_quarantined".into(),
+        outgoing: vec![],
+        incoming: vec![],
+        max_fees: 0,
+        refund_generation: 0,
+    };
+    f.jm.put("swap", &swap.id, &swap).await.unwrap();
+    coordinator::recover(&f.maker, &f.jm, &f.mm).await.unwrap();
+    let l = f.jm.get::<Listing>("listing", &lot).await.unwrap().unwrap();
+    assert!(
+        !l.expired && !l.expired_released,
+        "SAFETY: a lot whose swap ended locked was treated as untraded"
+    );
+    assert!(
+        mint::plan(&f.maker, &f.a.url, 100, 16).await.is_err(),
+        "SAFETY: the quarantined swap's lot inputs were released"
+    );
 }
 
 /// SAFETY: a maker swap still live when its lot expires keeps the reservation; it is released

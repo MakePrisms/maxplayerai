@@ -162,7 +162,13 @@ pub fn holder(path: impl AsRef<Path>) -> Result<LockHolder, LockError> {
     let mut content = String::new();
     file.read_to_string(&mut content)
         .map_err(|error| LockError::Open(error.to_string()))?;
-    Ok(match content.trim().parse::<u32>() {
+    // #1299: `record_pid` truncates, then writes `<pid>\n`. Only a newline-terminated read is a
+    // complete pid: a probe landing between the two steps (or mid-write) reads a prefix, which must
+    // not be signalled. Off Linux nothing else checks the pid, so this is the only guard there.
+    let Some(pid) = content.strip_suffix('\n') else {
+        return Ok(LockHolder::Unrecorded);
+    };
+    Ok(match pid.trim().parse::<u32>() {
         Ok(pid) if pid > 0 => LockHolder::Pid(pid),
         _ => LockHolder::Unrecorded,
     })
@@ -335,6 +341,12 @@ mod tests {
         held.record_pid().expect("record");
         assert_eq!(holder(&path).unwrap(), LockHolder::Pid(std::process::id()));
         assert_eq!(holder(&path).unwrap(), LockHolder::Pid(std::process::id()), "probing twice");
+        // #1299 N6: a partial write (no trailing newline yet) is not a pid.
+        // RED ON REVERT: parse the content without requiring the newline and this reads `Pid(..)`.
+        std::fs::write(&path, std::process::id().to_string().get(..1).unwrap()).unwrap();
+        assert_eq!(holder(&path).unwrap(), LockHolder::Unrecorded, "a mid-write prefix is not a pid");
+        held.record_pid().expect("record again");
+        assert_eq!(holder(&path).unwrap(), LockHolder::Pid(std::process::id()));
         drop(held);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "", "the pid is cleared on release");
         assert_eq!(holder(&path).unwrap(), LockHolder::Free, "released: free");

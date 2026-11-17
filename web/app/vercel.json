@@ -19,7 +19,8 @@
   "rewrites": [
     { "source": "/terms/20261029", "destination": "/terms-20261029" },
     { "source": "/privacy/20261029", "destination": "/privacy-20261029" },
-    { "source": "/fees/20261029", "destination": "/fees-20261029" }
+    { "source": "/fees/20261029", "destination": "/fees-20261029" },
+    { "source": "/swarm/:address", "destination": "/swarm" }
   ],
   "headers": [
     {
@@ -44,7 +45,7 @@
       ]
     },
     {
-      "source": "/((?!(?:tokens|swarm)$).*)",
+      "source": "/((?!tokens$).*)",
       "headers": [
         {
           "key": "Content-Security-Policy",
@@ -71,10 +72,15 @@
         {
           "key": "X-Robots-Tag",
           "value": "noindex, nofollow"
-        },
+        }
+      ]
+    },
+    {
+      "source": "/swarm/:address",
+      "headers": [
         {
-          "key": "Content-Security-Policy",
-          "value": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self' wss://relay.maxplayer.ai wss://nos.lol wss://relay.primal.net wss://offchain.pub https://api.coinbase.com; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
         }
       ]
     }

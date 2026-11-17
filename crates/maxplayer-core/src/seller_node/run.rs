@@ -5765,6 +5765,17 @@ impl SellerNodeRunner {
         }
     }
 
+    /// #1299: the run loop's drain check, reading the work lane and event queue the loop owns (an
+    /// award mid-handler, a late award not yet handled). The loop's exit decision and its status
+    /// line both come from here, so neither can read idle while the lane still holds work.
+    fn drain_check(
+        &self,
+        lane: &Option<LaneFuture>,
+        queue: &schedule::WorkQueue<Box<nostr_sdk::Event>>,
+    ) -> DrainLeft {
+        self.drain_remaining(lane.is_some(), queue.queued_events())
+    }
+
     /// #1299: unsent private-content copies and carriers (capped count), for the drain.
     fn private_content_unsent(&self) -> Result<usize, String> {
         if !self.node.home().config.privacy.private_content_v2 {
@@ -6525,7 +6536,7 @@ impl SellerNodeRunner {
                                 heartbeat_tick.reset_immediately();
                             }
                         }
-                        let left = self.drain_remaining(lane.is_some(), queue.queued_events());
+                        let left = self.drain_check(&lane, &queue);
                         if left.idle() {
                             opline!("seller node: drain complete (nothing in flight); retracting the seat and ending the loop");
                             break;
@@ -6646,10 +6657,17 @@ impl SellerNodeRunner {
                         Some((label, busy)) => format!("work BUSY {}s on {label}", busy.as_secs()),
                     };
                     let queued = queue.queued_events();
-                    self.report_status(&format!(
-                        " · {relay_state} · {work_state}{}",
-                        if queued > 0 { format!(" ({queued} event(s) queued)") } else { String::new() }
-                    ));
+                    let drain_left = self
+                        .drain
+                        .is_requested()
+                        .then(|| self.drain_check(&lane, &queue));
+                    self.report_status(
+                        &format!(
+                            " · {relay_state} · {work_state}{}",
+                            if queued > 0 { format!(" ({queued} event(s) queued)") } else { String::new() }
+                        ),
+                        drain_left,
+                    );
                     // Wraps then offers (#560), on the lane, on this owned cadence — a recovery leg
                     // must not depend on a tick config can disable.
                     queue.request_backfill();
@@ -7279,7 +7297,7 @@ impl SellerNodeRunner {
     /// `serving` is the authority on whether the seat can take work — NOT whether `names` is empty,
     /// which is also true for an unlabelled `--agent-argv` hatch that is serving perfectly well.
     /// Both come from ONE `advertisement()` snapshot, as that method requires.
-    fn report_status(&self, loop_health: &str) {
+    fn report_status(&self, loop_health: &str, drain_left: Option<DrainLeft>) {
         let roster = self.agents.advertisement();
         let busy = self.slots.capacity.saturating_sub(self.slots.available());
         let harnesses = if roster.names.is_empty() {
@@ -7289,9 +7307,9 @@ impl SellerNodeRunner {
         };
         // #1299: a draining seat says so first — it is not advertising, and the operator waiting to
         // upgrade wants to know what it is still waiting for.
-        let state = if self.drain.is_requested() {
-            // The lane is the loop's to see; the status line reports the rest.
-            let left = self.drain_remaining(false, 0);
+        // `drain_left` is the loop's own check (lane and queue included), so "idle" here is the
+        // same verdict the loop exits on.
+        let state = if let Some(left) = drain_left.filter(|_| self.drain.is_requested()) {
             if left.idle() {
                 "DRAINING — idle, exiting".to_owned()
             } else {
@@ -21447,6 +21465,348 @@ mod tests {
             .expect("a shutdown during a drain must return promptly")
             .expect("the loop task must not panic");
         assert!(outcome.is_ok(), "{outcome:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    /// #1299 follow-up: a seller home with sessions on, for the session drain tests.
+    fn drain_session_home(root: &std::path::Path, fixture: &PGateRelay) -> crate::home::MaxplayerHome {
+        let mut home = lane_home(root, fixture);
+        home.config.seller_heartbeat.interval_secs = 3600;
+        home.config.sessions.enabled = true;
+        home
+    }
+
+    /// #1299 follow-up: a priced session job parked after turn 1 (turn 1 unpaid): offer row, our
+    /// claim journaled with `["session","1"]` (already expired, so the outbox holds no drain), the
+    /// buyer's award, and the parked session record. Returns the job id.
+    fn park_session_1299(runner: &SellerNodeRunner, buyer: &Keys) -> String {
+        let store = runner.node.store();
+        let job_id = "a".repeat(64);
+        let buyer_hex = buyer.public_key().to_hex();
+        let now = now_unix();
+        store
+            .record_offer(
+                &crate::seller_node::store::Offer {
+                    offer_id: job_id.clone(),
+                    buyer_pubkey: buyer_hex.clone(),
+                    amount_sats: 100,
+                    unit: "sat".to_owned(),
+                    task: "#1299 session".to_owned(),
+                    deadline_unix: now + 3_600,
+                    targeted: true,
+                    requested_agent: None,
+                    capability_request: None,
+                    output: Some("text/plain".to_owned()),
+                    payment_mode: crate::gateway::PaymentMode::Sat,
+                    accepts_delivery: Vec::new(),
+                },
+                now,
+            )
+            .expect("record offer");
+        let claim = crate::gateway::EventDraft::new(
+            crate::kinds::JOB_CLAIM_KIND,
+            vec![crate::gateway::TagSpec::new(["session", "1"])],
+            "",
+        );
+        store
+            .claim_and_enqueue(&job_id, &job_id, Some(""), &claim, now, now - 1, now)
+            .expect("claim");
+        store
+            .record_award(&"b".repeat(64), &job_id, &buyer_hex, now)
+            .expect("award");
+        store
+            .put_session(&crate::seller_node::store::SessionRecord {
+                job_id: job_id.clone(),
+                buyer_pubkey: buyer_hex,
+                container: "maxplayer-1299-test-absent".to_owned(),
+                holder: None,
+                holder_started_at: None,
+                image_id: String::new(),
+                orchestrator_version: String::new(),
+                acp_session_id: None,
+                harness: "claude".to_owned(),
+                model: None,
+                turn: 1,
+                last_turn_at: now as u64,
+                disk_bytes: 0,
+                state: crate::session::SessionState::Parked,
+                proxy_host: None,
+                base_oid: None,
+                holder_egress_dev: None,
+                holder_classifier: None,
+                holder_proxy_ports: None,
+            })
+            .expect("park session");
+        job_id
+    }
+
+    /// #1299 follow-up: the buyer's signed kind-3412 for `job_id` (turn 2, or a close).
+    fn followup_1299(
+        runner: &SellerNodeRunner,
+        buyer: &Keys,
+        job_id: &str,
+        status: crate::session::FollowUpStatus,
+    ) -> nostr_sdk::Event {
+        let turn = status == crate::session::FollowUpStatus::Turn;
+        let draft = crate::session::followup_draft(&crate::session::FollowUp {
+            offer_id: job_id.to_owned(),
+            seller_pubkey: runner.seller_pubkey.to_hex(),
+            status,
+            prev_result_id: turn.then(|| "c".repeat(64)),
+            turn: turn.then_some(2),
+            deadline_unix: turn.then(|| now_unix() as u64 + 3_600),
+            text: turn.then(|| "#1299 turn two".to_owned()),
+        })
+        .expect("follow-up draft");
+        crate::gateway::nostr::event_builder(&draft)
+            .expect("builder")
+            .sign_with_keys(buyer)
+            .expect("sign follow-up")
+    }
+
+    /// Wait (bounded) until `check` holds.
+    async fn eventually_1299(within: Duration, mut check: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + within;
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        check()
+    }
+
+    /// #1299 N1(a) — unsent private-content copies hold the drain (only the grace bound may leave
+    /// them behind): `drain_remaining` really reads `private-content.sqlite`.
+    /// RED ON REVERT: `private: Ok(0)` in `drain_remaining` and the runner reads idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_unsent_private_copies_hold_the_drain() {
+        use crate::private_content::{Binding, ContentBody, ContentType, PreparedContent, BODY_SCHEMA};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-private", &fixture).await;
+        assert!(runner.node.home().config.privacy.private_content_v2, "harness check: v2 on");
+        assert!(runner.drain_remaining(false, 0).idle(), "harness check: idle at rest");
+        let seller = runner.seller_pubkey.to_hex();
+        let buyer = Keys::generate().public_key().to_hex();
+        let service = Keys::generate().public_key().to_hex();
+        let mut recipients = vec![seller.clone(), buyer.clone(), service.clone()];
+        recipients.sort();
+        let (job, offer, message) = ("1".repeat(64), "2".repeat(64), "3".repeat(64));
+        let content = PreparedContent::new(ContentBody {
+            schema: BODY_SCHEMA.into(),
+            job_id: job.clone(),
+            offer_id: Some(offer.clone()),
+            award_id: None,
+            message_id: message.clone(),
+            kind: ContentType::Progress,
+            revision: 0,
+            supersedes: None,
+            author: seller.clone(),
+            recipients,
+            text: "#1299 progress".into(),
+            requested_output: None,
+            dispatch: None,
+            attachments: vec![],
+            contribution: None,
+        })
+        .expect("content");
+        let mut db = crate::private_content::store::ContentStore::open(
+            &runner.node.home().root.join("private-content.sqlite"),
+        )
+        .expect("open content store");
+        db.enqueue(
+            &content,
+            &Binding {
+                buyer: &buyer,
+                seller: &seller,
+                service: &service,
+                author: &seller,
+                job_id: &job,
+                offer_id: Some(&offer),
+                award_id: None,
+                message_id: &message,
+                commitment: content.commitment(),
+                kind: ContentType::Progress,
+            },
+        )
+        .expect("enqueue copies");
+        drop(db);
+        let left = runner.drain_remaining(false, 0);
+        assert!(matches!(left.private, Ok(n) if n > 0), "{left}");
+        assert!(!left.idle(), "unsent private copies must hold the drain: {left}");
+        assert!(left.only_private(), "and only the grace bound may leave them: {left}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N1(c) — the loop's drain check counts the work lane (an award mid-handler) and the
+    /// event queue (a late award not yet handled); the loop exits and reports on this helper alone.
+    /// RED ON REVERT: make `drain_check` call `drain_remaining(false, 0)` and both cases read idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_the_loop_drain_check_counts_the_lane_and_the_queue() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let (runner, root) = drain_runner("1299-lane", &fixture).await;
+        let mut queue: schedule::WorkQueue<Box<nostr_sdk::Event>> = schedule::WorkQueue::new(8);
+        let mut lane: Option<LaneFuture> = None;
+        assert!(runner.drain_check(&lane, &queue).idle(), "harness check: idle at rest");
+        let award = crate::gateway::nostr::event_builder(&crate::gateway::EventDraft::new(
+            crate::kinds::JOB_AWARD_KIND,
+            Vec::new(),
+            "",
+        ))
+        .expect("builder")
+        .sign_with_keys(&Keys::generate())
+        .expect("sign");
+        queue.push_event(Box::new(award));
+        let left = runner.drain_check(&lane, &queue);
+        assert!(!left.idle() && left.queued == 1, "a queued award must hold the drain: {left}");
+        let mut empty: schedule::WorkQueue<Box<nostr_sdk::Event>> = schedule::WorkQueue::new(8);
+        lane = Some(Box::pin(async { LaneDone { backfill_complete: None, drain: None } }));
+        let left = runner.drain_check(&lane, &empty);
+        assert!(!left.idle() && left.lane_busy, "a busy lane must hold the drain: {left}");
+        lane = None;
+        empty.request_tick();
+        assert!(runner.drain_check(&lane, &empty).idle(), "a periodic tick is not owed work");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N1(b) + N3 — a draining node starts no new session turn: an admitted follow-up is
+    /// journaled `received` (with its text) but not spawned, so it holds no drain; a close during
+    /// the drain still closes the session.
+    /// RED ON REVERT: drop the drain check after the turn is journaled and the turn task starts
+    /// (`in_flight_turns() == 1`); move it back before `record_turn` and no row is journaled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_draining_node_journals_a_follow_up_without_starting_it() {
+        use crate::session::{FollowUpStatus, SessionState, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1299-followup-defer");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let turn = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Turn);
+        let fid = turn.id.to_hex();
+        assert!(runner.drain_handle().request("test drain"));
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_followup(&turn).await;
+                assert_eq!(runner.session_rt.in_flight_turns(), 0, "no turn task while draining");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let store = runner.node.store();
+                let row = store.turn(&fid).expect("turn read").expect("the turn is journaled");
+                assert_eq!(row.state, TurnState::Received, "journaled, never started");
+                assert_eq!(store.turn_texts(&job_id, 2).expect("texts"), vec!["#1299 turn two".to_owned()]);
+                assert_eq!(runner.session_rt.in_flight_turns(), 0);
+                assert!(runner.drain_remaining(false, 0).idle(), "a journaled turn holds no drain");
+                // A close during the drain is still honoured.
+                let close = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Close);
+                runner.on_followup(&close).await;
+                assert_eq!(
+                    store.session(&job_id).expect("session read").expect("row").state,
+                    SessionState::Closed
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N3 — a follow-up deferred by a drain survives the restart off the store alone (no
+    /// relay history): the fresh runner's `recover_sessions` re-drives it.
+    /// RED ON REVERT: return before `record_turn` while draining (the pre-fix shape) and the
+    /// restarted seller finds nothing to run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_deferred_follow_up_runs_on_the_restarted_seller() {
+        use crate::session::{FollowUpStatus, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1299-followup-restart");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let turn = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Turn);
+        let fid = turn.id.to_hex();
+        assert!(runner.drain_handle().request("test drain"));
+        let local = tokio::task::LocalSet::new();
+        local.run_until(async { runner.on_followup(&turn).await }).await;
+        assert_eq!(runner.session_rt.in_flight_turns(), 0);
+        drop(local);
+        drop(runner);
+
+        // ---- restart: a fresh runner over the SAME home, nothing replayed from the relay --------
+        let restarted = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture))
+                .await
+                .expect("boot the restarted seller"),
+        );
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                restarted.recover_sessions().await;
+                assert_eq!(restarted.session_rt.in_flight_turns(), 1, "the journaled turn is re-driven");
+                // It runs: turn 1 is unpaid, so it reaches the payment gate and says so.
+                let store = restarted.node.store().clone();
+                assert!(
+                    eventually_1299(Duration::from_secs(5), || matches!(
+                        store.turn(&fid),
+                        Ok(Some(row)) if row.state == TurnState::WaitingPayment
+                    ))
+                    .await,
+                    "the restarted seller must run the deferred turn"
+                );
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #1299 N4 — a turn waiting for the previous turn's payment does not hold a drain until its
+    /// deadline: it returns, left `waiting_payment` for the restarted seller to re-drive.
+    /// RED ON REVERT: drop the drain check in the `PaymentGate::Wait` branch and the turn task keeps
+    /// polling (`in_flight_turns() == 1`) until the turn deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issue_1299_a_turn_waiting_for_payment_releases_the_drain() {
+        use crate::session::{FollowUpStatus, TurnState};
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("1299-followup-payment");
+        let runner = Arc::new(
+            SellerNodeRunner::boot(drain_session_home(&root, &fixture)).await.expect("boot"),
+        );
+        let buyer = Keys::generate();
+        let job_id = park_session_1299(&runner, &buyer);
+        let turn = followup_1299(&runner, &buyer, &job_id, FollowUpStatus::Turn);
+        let fid = turn.id.to_hex();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                runner.on_followup(&turn).await;
+                let store = runner.node.store().clone();
+                assert!(
+                    eventually_1299(Duration::from_secs(5), || matches!(
+                        store.turn(&fid),
+                        Ok(Some(row)) if row.state == TurnState::WaitingPayment
+                    ))
+                    .await,
+                    "harness check: the turn waits for turn 1's payment"
+                );
+                assert_eq!(runner.session_rt.in_flight_turns(), 1, "harness check: it holds the drain");
+                assert!(runner.drain_handle().request("test drain"));
+                let rt = Arc::clone(&runner);
+                assert!(
+                    eventually_1299(super::session_run::PAYMENT_WAIT_POLL + Duration::from_secs(3), || {
+                        rt.session_rt.in_flight_turns() == 0
+                    })
+                    .await,
+                    "a draining node must not wait out an unpaid previous turn"
+                );
+                let row = store.turn(&fid).expect("turn read").expect("row");
+                assert_eq!(row.state, TurnState::WaitingPayment, "left for the restarted seller");
+                assert!(
+                    store.unfinished_turns().expect("unfinished").iter().any(|t| t.followup_id == fid),
+                    "recover_sessions re-drives it at boot"
+                );
+                assert!(runner.drain_remaining(false, 0).idle());
+            })
+            .await;
         let _ = std::fs::remove_dir_all(&root);
     }
     // END #1299 drain tests

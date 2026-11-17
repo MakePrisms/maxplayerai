@@ -17,17 +17,21 @@
 //! | `3407` | REJECT (verified delivery refusal) | buyer |
 //! | `3412` | FOLLOW-UP (session turn / close) | buyer |
 //! | `30340` | SELLER HEARTBEAT (addressable, `d="maxplayer-seller"`) | seller |
+//! | `30341` | SWARM JOB (`a` = its swarm) | buyer |
+//! | `30342` | SWARM MEMBERSHIP (`d = <buyer>:<swarm d>`) | seller |
+//! | `30343` | SWARM DECISION (buyer-wide or per swarm) | buyer |
+//! | `30344` | SWARM | buyer |
+//!
+//! The swarm kinds are specified in `docs/specs/swarm.md` §4 and validated in [`crate::swarm`].
 
-//! | `30341` | CHALLENGE | buyer |
-//! | `30342` | CHALLENGE MEMBERSHIP | seller |
-//! | `30343` | CHALLENGE DECISION | buyer |
-
-/// Daily community challenge.
-pub const CHALLENGE_KIND: u16 = 30341;
-/// Persistent seller membership with a challenge buyer.
-pub const CHALLENGE_MEMBERSHIP_KIND: u16 = 30342;
-/// Persistent buyer decision on a seller membership.
-pub const CHALLENGE_DECISION_KIND: u16 = 30343;
+/// A goal a buyer gives one of its swarms.
+pub const SWARM_JOB_KIND: u16 = 30341;
+/// A seller's persistent membership of one swarm.
+pub const SWARM_MEMBERSHIP_KIND: u16 = 30342;
+/// A buyer's decision on a seller, buyer-wide or for one swarm.
+pub const SWARM_DECISION_KIND: u16 = 30343;
+/// A named group of sellers a buyer creates.
+pub const SWARM_KIND: u16 = 30344;
 
 /// Co-signed settlement receipt (buyer + seller).
 pub const JOB_RECEIPT_KIND: u16 = 3400;
@@ -103,20 +107,15 @@ mod tests {
     }
 
     #[test]
-    fn challenge_kinds_are_distinct_and_addressable() {
-        assert_eq!(
-            [
-                CHALLENGE_KIND,
-                CHALLENGE_MEMBERSHIP_KIND,
-                CHALLENGE_DECISION_KIND
-            ],
-            [30341, 30342, 30343]
-        );
-        for kind in [
-            CHALLENGE_KIND,
-            CHALLENGE_MEMBERSHIP_KIND,
-            CHALLENGE_DECISION_KIND,
-        ] {
+    fn swarm_kinds_are_distinct_and_addressable() {
+        let kinds = [
+            SWARM_JOB_KIND,
+            SWARM_MEMBERSHIP_KIND,
+            SWARM_DECISION_KIND,
+            SWARM_KIND,
+        ];
+        assert_eq!(kinds, [30341, 30342, 30343, 30344]);
+        for kind in kinds {
             assert!((30000..=39999).contains(&kind));
             assert_ne!(kind, SELLER_HEARTBEAT_KIND);
         }

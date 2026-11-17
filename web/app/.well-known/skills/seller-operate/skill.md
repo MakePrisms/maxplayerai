@@ -585,7 +585,7 @@ seller running, still booting, older than the drain feature, in a container or a
 3 means `--timeout` passed while it still drains. In a container use
 `docker exec <container> maxplayer seller drain` or `docker kill --signal=USR1 <container>`, then
 recreate the container from the new image (a restart policy reuses the old one). Under systemd use
-`systemctl kill --kill-whom=main -s USR1 <unit>`: without `--kill-whom=main` the signal also hits the
+`systemctl kill --kill-who=main -s USR1 <unit>`: without `--kill-who=main` the signal also hits the
 running job's agent and kills it. The seller then advertises `accepting=n`, claims nothing new, honours awards for claims it
 already published, finishes and delivers what is running, then exits 0 (status line: `DRAINING — …`).
 A supervisor with `Restart=always` restarts it on the new version. A plain SIGTERM instead stops at

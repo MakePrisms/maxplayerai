@@ -381,7 +381,8 @@ Until the recipient redeems it, `send --reclaim <send-id>` swaps the still-UNSPE
 proofs back (same journaling; fee needs `--max-fees` unless 0). It also works on a
 `swapped` send whose token file could not be placed. Reclaim exits 0 `reclaimed`; 3
 `reclaiming`; 1 when refused or partially redeemed meanwhile (state stays `sent`,
-token still outstanding: run `send --reclaim <id>` again) or `redeemed` (also when
+token still outstanding; `serve`/`recover` retry it with the same `--max-fees` after
+1 min, 10 min and 1 h, then stop; `send --reclaim <id>` retries now and restarts the count) or `redeemed` (also when
 the recipient won the race before any POST of our leg); 4 `reclaim_unresolved` (our
 leg POSTed, with an ambiguous reply or a refusal while every input is SPENT, and its
 outputs absent on two passes; secrets kept) or `reclaim_quarantined`. If they are already
