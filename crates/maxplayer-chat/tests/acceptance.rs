@@ -874,7 +874,7 @@ async fn advisor_timestamp_uses_clamped_outer() {
 #[test]
 fn advisor_notify_spawn_failure_retries() {
     use maxplayer_chat::Notifier;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let executable = dir.path().join("notify");
     let record = dir.path().join("record");
@@ -884,13 +884,23 @@ fn advisor_notify_spawn_failure_retries() {
     ]);
     notifier.message("friend".into());
     assert!(notifier.tick().is_err());
-    let touch = std::process::Command::new("which")
-        .arg("touch")
-        .output()
-        .unwrap();
-    symlink(String::from_utf8(touch.stdout).unwrap().trim(), &executable).unwrap();
-    notifier.tick().unwrap();
-    for _ in 0..100 {
+    // A script, not a symlink to `touch`: multi-call coreutils (uutils on Ubuntu 26.04 runners,
+    // busybox) pick the applet from argv[0] and reject "notify". The redirection needs no PATH,
+    // which the notifier clears.
+    std::fs::write(&executable, "#!/bin/sh\n: > \"$1\"\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // A test forking concurrently can briefly hold the script's write fd (ETXTBSY). That spawn
+    // failure takes the same keep-pending path as the one above, so retrying stays on contract.
+    let mut spawned = notifier.tick();
+    for _ in 0..50 {
+        if spawned.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        spawned = notifier.tick();
+    }
+    spawned.unwrap();
+    for _ in 0..500 {
         if record.exists() {
             break;
         }
