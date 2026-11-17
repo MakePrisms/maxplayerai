@@ -974,7 +974,7 @@ pub async fn reclaim(
     // is retried by recovery with this same fee cap; a new `send --reclaim` restarts the count.
     let id = r.id.clone();
     match attempt(home, j, r, max_fees, true).await {
-        Err(error) if !error.is::<NeedsHuman>() => {
+        Err(error) if !error.is::<NeedsHuman>() && !error.is::<RetryClearFailed>() => {
             // Nothing journaled (mint unreachable, PENDING proofs, ...): keep the intent so
             // recovery retries once the mint answers.
             match remember(j, &id, max_fees).await {
@@ -1027,6 +1027,17 @@ impl std::fmt::Display for NeedsHuman {
     }
 }
 impl std::error::Error for NeedsHuman {}
+
+/// `stop_retrying` could not clear the armed retry: not a clean refusal (recovery stays
+/// unresolved), and a manual reclaim must not re-arm it.
+#[derive(Debug)]
+struct RetryClearFailed(String);
+impl std::fmt::Display for RetryClearFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for RetryClearFailed {}
 
 /// One reclaim attempt of a `sent` token (the human's, or a recovery retry of it).
 async fn attempt(
@@ -1287,10 +1298,11 @@ async fn stop_retrying(j: &Journal, r: &mut SendAttempt, error: anyhow::Error) -
         .await
         {
             // Not a clean refusal: the retry is still armed on disk.
-            return anyhow!(
+            return RetryClearFailed(format!(
                 "{error:#}; send {}: reclaim retry not cleared: {write:#}",
                 r.id
-            );
+            ))
+            .into();
         }
     }
     NeedsHuman(format!("{error:#}")).into()
