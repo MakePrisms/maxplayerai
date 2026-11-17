@@ -561,7 +561,8 @@ pub(crate) async fn journaled_inputs(j: &Journal, mint: &str) -> Result<HashSet<
         }
     }
     for l in j.all::<crate::coordinator::Listing>("listing").await? {
-        if l.plan.mint == mint && !l.cancelled && !l.expired {
+        // An expired lot's inputs stay excluded until its release is journaled.
+        if l.plan.mint == mint && !l.cancelled && !l.expired_released {
             ys.extend(l.plan.inputs.ys()?);
         }
     }
