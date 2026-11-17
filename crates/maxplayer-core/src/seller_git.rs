@@ -41,6 +41,12 @@ pub enum SellerGitError {
     Transport(String),
     Unavailable,
     CommandFailed(&'static str),
+    /// [`Self::CommandFailed`] plus the failing step and libgit2's own class/code/message (see
+    /// [`git2_step`]). Renders as `seller git <op> failed: <step>: <class>/<code>: <message>`, so the
+    /// `seller git <op> failed` prefix an operator already greps for is unchanged. OPERATOR LOG ONLY:
+    /// libgit2 messages can name paths inside a private job's tree, and every relay-bound feedback
+    /// for these failures uses fixed text (`EXEC_FAILURE_FEEDBACK` / `feedback_text`), never this.
+    CommandFailedDetail { op: &'static str, detail: String },
     AuthFailed(String),
     Io(String),
     /// The completion gate found nothing the node itself observed executing — an empty from-scratch
@@ -69,6 +75,9 @@ impl std::fmt::Display for SellerGitError {
             Self::Transport(message) => write!(f, "seller git transport refused: {message}"),
             Self::Unavailable => write!(f, "seller git unavailable"),
             Self::CommandFailed(op) => write!(f, "seller git {op} failed"),
+            Self::CommandFailedDetail { op, detail } => {
+                write!(f, "seller git {op} failed: {detail}")
+            }
             Self::AuthFailed(message) => write!(f, "seller git auth failed: {message}"),
             Self::Io(message) => write!(f, "seller git io error: {message}"),
             Self::Cancelled(message) => {
@@ -222,6 +231,13 @@ pub fn init_contribution_workdir(
     checkout_base_branch(workdir, branch, base_oid)
 }
 
+/// `<step>: <class>/<code>: <message>` for a libgit2 failure — the failing step named, and the
+/// error libgit2 actually reported (class and code as their `git2` enum names). For the seller's
+/// operator log only; see [`SellerGitError::CommandFailedDetail`].
+fn git2_step(step: &str, error: &git2::Error) -> String {
+    format!("{step}: {:?}/{:?}: {}", error.class(), error.code(), error.message())
+}
+
 /// `git checkout -B <branch> <base_oid>` via git2 — the fork tip the agent extends. Force-creates
 /// the branch at `base_oid`, checks out its tree, and points HEAD at it.
 fn checkout_base_branch(
@@ -229,20 +245,21 @@ fn checkout_base_branch(
     branch: &str,
     base_oid: &str,
 ) -> Result<(), SellerGitError> {
+    let failed = |step: &str, error: git2::Error| SellerGitError::CommandFailedDetail {
+        op: "checkout-base",
+        detail: git2_step(step, &error),
+    };
     let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
     let repo =
         Repository::open(workdir).map_err(|error| SellerGitError::Io(format!("open: {error}")))?;
-    let oid =
-        Oid::from_str(base_oid).map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
-    let commit = repo
-        .find_commit(oid)
-        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+    let oid = Oid::from_str(base_oid).map_err(|e| failed("parse_oid", e))?;
+    let commit = repo.find_commit(oid).map_err(|e| failed("find_commit", e))?;
     repo.branch(branch, &commit, true)
-        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+        .map_err(|e| failed("branch", e))?;
     repo.checkout_tree(commit.as_object(), Some(CheckoutBuilder::new().force()))
-        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+        .map_err(|e| failed("checkout_tree", e))?;
     repo.set_head(&format!("refs/heads/{branch}"))
-        .map_err(|_| SellerGitError::CommandFailed("checkout-base"))?;
+        .map_err(|e| failed("set_head", e))?;
     Ok(())
 }
 
@@ -1994,6 +2011,69 @@ mod tests {
         assert_eq!(String::from_utf8(head.stdout).unwrap().trim(), base_oid);
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// A checkout-base failure names the failing step and carries libgit2's class/code/message, so
+    /// a field `seller git checkout-base failed` is diagnosable from the operator log alone. The
+    /// rendered prefix (`seller git checkout-base failed`) is unchanged for anyone grepping it.
+    /// RED ON REVERT: map these steps back to `CommandFailed("checkout-base")` and both cases fail.
+    #[test]
+    fn checkout_base_failure_names_step_and_libgit2_error() {
+        let root = temp("checkout-base-detail");
+        let _ = fs::remove_dir_all(&root);
+        init_repo(&root);
+
+        // A well-formed oid the repository does not hold: the find_commit step.
+        let missing = "a".repeat(40);
+        let err = checkout_base_branch(&root, "maxplayer/contribution/job", &missing)
+            .expect_err("a base commit absent from the repo must fail");
+        let SellerGitError::CommandFailedDetail { op, detail } = &err else {
+            panic!("expected CommandFailedDetail, got {err:?}");
+        };
+        assert_eq!(*op, "checkout-base");
+        assert!(detail.starts_with("find_commit: Odb/NotFound: "), "detail: {detail}");
+        assert!(detail.contains(&missing), "libgit2 message must be carried: {detail}");
+        assert!(
+            err.to_string().starts_with("seller git checkout-base failed: find_commit: "),
+            "display: {err}"
+        );
+
+        // Not an oid at all: the parse step, with libgit2's own message.
+        let err = checkout_base_branch(&root, "maxplayer/contribution/job", "not-an-oid")
+            .expect_err("a malformed base oid must fail");
+        let SellerGitError::CommandFailedDetail { op, detail } = &err else {
+            panic!("expected CommandFailedDetail, got {err:?}");
+        };
+        assert_eq!(*op, "checkout-base");
+        assert!(detail.starts_with("parse_oid: Invalid/"), "detail: {detail}");
+        assert!(detail.len() > "parse_oid: Invalid/GenericError: ".len(), "detail: {detail}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The private-input import keeps each fixed reason as the prefix and appends libgit2's error.
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn verified_input_failure_keeps_reason_and_adds_libgit2_error() {
+        let root = temp("input-detail");
+        let _ = fs::remove_dir_all(&root);
+        let identity = DeliveryAgentIdentity::for_seller(&"aa".repeat(32));
+        let err = init_verified_input_workdir(
+            &root.join("work"),
+            &identity,
+            &root.join("no-such-cache"),
+            &"a".repeat(40),
+            "refs/heads/delivery/x",
+        )
+        .expect_err("a missing input cache must fail");
+        let SellerGitError::Io(message) = &err else {
+            panic!("expected Io, got {err:?}");
+        };
+        assert!(
+            message.starts_with("input cache unavailable: open_bare: "),
+            "message: {message}"
+        );
+        assert!(message.contains("no-such-cache"), "libgit2 message must be carried: {message}");
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 /// Snapshot delivery: the daemon authors ONE commit from the final workdir tree, whatever git
@@ -2696,17 +2776,22 @@ mod snapshot_tests {
 #[cfg(feature = "wallet")]
 pub fn init_verified_input_workdir(workdir: &Path, identity: &DeliveryAgentIdentity,
     cache: &Path, base_oid: &str, branch: &str) -> Result<(), SellerGitError> {
-    let source = Repository::open_bare(cache).map_err(|_| SellerGitError::Io("input cache unavailable".into()))?;
+    // Each fixed reason is kept as the prefix and libgit2's error is appended (operator log only;
+    // see [`SellerGitError::CommandFailedDetail`]).
+    let io = |reason: &str, step: &str, error: git2::Error| {
+        SellerGitError::Io(format!("{reason}: {}", git2_step(step, &error)))
+    };
+    let source = Repository::open_bare(cache).map_err(|e| io("input cache unavailable", "open_bare", e))?;
     crate::private_content::repositories::check_objects(&source)
         .map_err(|e| SellerGitError::Io(e.to_string()))?;
     let target = init_repo_with_identity(workdir, identity)?;
-    let source_odb = source.odb().map_err(|_| SellerGitError::Io("input object store unavailable".into()))?;
-    let target_odb = target.odb().map_err(|_| SellerGitError::Io("execution object store unavailable".into()))?;
+    let source_odb = source.odb().map_err(|e| io("input object store unavailable", "source_odb", e))?;
+    let target_odb = target.odb().map_err(|e| io("execution object store unavailable", "target_odb", e))?;
     let mut ids = Vec::new();
-    source_odb.foreach(|id| { ids.push(*id); true }).map_err(|_| SellerGitError::Io("input objects unavailable".into()))?;
+    source_odb.foreach(|id| { ids.push(*id); true }).map_err(|e| io("input objects unavailable", "odb_foreach", e))?;
     for id in ids {
-        let object = source_odb.read(id).map_err(|_| SellerGitError::Io("input object unavailable".into()))?;
-        let copied = target_odb.write(object.kind(), object.data()).map_err(|_| SellerGitError::Io("input object import failed".into()))?;
+        let object = source_odb.read(id).map_err(|e| io("input object unavailable", "odb_read", e))?;
+        let copied = target_odb.write(object.kind(), object.data()).map_err(|e| io("input object import failed", "odb_write", e))?;
         if copied != id { return Err(SellerGitError::Io("input object identity changed".into())); }
     }
     checkout_base_branch(workdir, branch, base_oid)
