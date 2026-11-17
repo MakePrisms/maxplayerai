@@ -505,7 +505,7 @@ async fn expired_untraded_lot_releases_its_reservation() {
     assert_eq!(balance(&f.maker, &f.a.url).await, 128);
     let report = maxplayer_trade::report::render(&f.maker).unwrap();
     assert!(
-        report.contains("(expired; reservation released)"),
+        report.contains("(expired; reservation released)") && !report.contains("reserves debit"),
         "{report}"
     );
     // Spendable through the real coin selection (which excludes journaled lot inputs).
@@ -520,6 +520,7 @@ async fn expired_untraded_lot_releases_its_reservation() {
     .await
     .unwrap();
     assert_eq!(sent.amount, 100);
+    assert_eq!(sent.state, maxplayer_trade::send::SendState::Sent);
 }
 
 /// SAFETY: an expired lot whose maker swap ended locked (here `claim_quarantined`; likewise
