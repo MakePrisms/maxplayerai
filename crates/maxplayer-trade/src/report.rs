@@ -88,11 +88,27 @@ fn send_line(a: &SendAttempt) -> (String, bool, bool) {
         SendState::Swapped => line.push_str("; token file pending (run recover or rerun the send)"),
         _ => {}
     }
+    if let Some((0, at)) = a.reclaim_retry() {
+        line.push_str(&format!(
+            "; reclaim pending since {} (keep serve running or run recover)",
+            crate::clock::iso(at)
+        ));
+    } else if let Some((n, at)) = a.reclaim_retry() {
+        line.push_str(&format!(
+            "; reclaim retry {n}/{} at {} (keep serve running or run recover)",
+            crate::send::RECLAIM_RETRY_SECONDS.len(),
+            crate::clock::iso(at)
+        ));
+    }
     let manual = a.manual_recovery();
     if manual {
         line.push_str("; MANUAL RECOVERY: journaled legs and secrets retained");
     }
-    (line, !a.terminal() || manual, manual)
+    (
+        line,
+        !a.terminal() || manual || a.reclaim_retry_pending(),
+        manual,
+    )
 }
 
 pub fn render(home: &Path) -> Result<String> {
@@ -144,13 +160,17 @@ pub fn render(home: &Path) -> Result<String> {
                 t.give.net, t.give.asset.mint_url, t.want.net, t.want.asset.mint_url
             ));
         }
-        if status == "available" && !l.cancelled && !l.expired {
+        if status == "available" && !l.cancelled && !l.expired_released {
             line.push_str(&format!(
                 "; reserves debit {} {}",
                 l.plan.debit, l.plan.mint
             ));
         }
-        settled.push(line);
+        if l.expired && !l.expired_released && status == "available" {
+            unresolved.push(line);
+        } else {
+            settled.push(line);
+        }
     }
     for (_, v, _) in observe::journal_rows(home, "funding")? {
         let Ok(f) = serde_json::from_slice::<Funding>(&v) else {

@@ -723,6 +723,15 @@ pub async fn credit(
     db.update_proofs(added, remove).await?;
     Ok(())
 }
+/// Whether operation `op` (a uuid string) still holds any reserved proof in `mint`'s wallet.
+pub async fn holds(home: &Path, mint: &str, op: &str) -> Result<bool> {
+    let op = uuid::Uuid::parse_str(op)?;
+    Ok(!database(home, mint)
+        .await?
+        .get_reserved_proofs(&op)
+        .await?
+        .is_empty())
+}
 /// Release every proof `op` holds (`UPDATE … WHERE used_by_operation = op`), under the selection
 /// lock like every other proof write on a shared wallet.
 pub async fn release(home: &Path, mint: &str, op: &uuid::Uuid) -> Result<()> {
