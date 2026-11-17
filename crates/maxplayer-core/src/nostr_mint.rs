@@ -460,10 +460,18 @@ impl NostrMintConnector {
             ));
         }
         // An unusable URL would otherwise be skipped silently and leave the connector waiting.
+        // Stored as the SDK spells them, once each, so evidence keys and the shared-connection
+        // key match what the relay pool reports for equivalent spellings.
+        let mut normalized: Vec<String> = Vec::with_capacity(relays.len());
         for relay in &relays {
-            RelayUrl::parse(relay)
+            let parsed = RelayUrl::parse(relay)
                 .map_err(|error| Error::Custom(format!("invalid mint relay {relay}: {error}")))?;
+            let key = relay_key(&parsed);
+            if !normalized.contains(&key) {
+                normalized.push(key);
+            }
         }
+        let relays = normalized;
         Ok(Self {
             mint_url: mint_url.clone(),
             mint_pk,
@@ -605,6 +613,7 @@ impl NostrMintConnector {
         observation: &mut RequestObservation,
         start: Instant,
     ) -> Result<Value, Error> {
+        use nostr_sdk::prelude::RelayStatus;
         let started_unix_ms = unix_now_ms();
         let deadline = Instant::now() + self.window;
         let request = Request {
@@ -873,29 +882,6 @@ impl NostrMintConnector {
                     }
                 }
             }
-            // (Re)send the subscription on each connected relay whose socket, or sign-in, is new
-            // since it was last sent; then the request, once sending has started.
-            for (url, relay) in &relays {
-                if !relay.is_connected() {
-                    continue;
-                }
-                let sent_for = subscribed_for(observation, url);
-                if guard.req_sent.get(url) == Some(&sent_for) {
-                    continue;
-                }
-                guard.req_sent.insert(url.clone(), sent_for);
-                let _ = relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
-                // The re-sent REQ reopens a subscription the relay CLOSEd before sign-in.
-                if let Some(r) = observation.relays.get_mut(url) {
-                    r.closed = false;
-                    r.closed_category = None;
-                    r.eose = false;
-                }
-                if observation.attempts > 0 {
-                    let queued = send_event(relay);
-                    count_send(observation, url, queued);
-                }
-            }
             // Every relay we reached refused this request for lack of sign-in AND rejected
             // sign-in, both on its current socket: no path can carry a reply, so say so now
             // instead of waiting out the window. A failed sign-in alone proves nothing (many
@@ -918,8 +904,44 @@ impl NostrMintConnector {
                     )),
                 ));
             }
+            // Nothing new goes out once the window has passed: the request may already be
+            // past its `exp`, and nobody would wait for the reply.
             if Instant::now() >= deadline {
                 break Err(Error::Timeout);
+            }
+            // Every relay was shut down (a shared connection retired by another request): none
+            // can reconnect or carry a reply, so don't wait out the window. Ambiguous.
+            if relays
+                .iter()
+                .all(|(_, r)| matches!(r.status(), RelayStatus::Terminated | RelayStatus::Banned))
+            {
+                break Err(Error::HttpError(
+                    None,
+                    format!("all relays closed for mint {}", self.mint_url),
+                ));
+            }
+            // (Re)send the subscription on each connected relay whose socket, or sign-in, is new
+            // since it was last sent; then the request, once sending has started.
+            for (url, relay) in &relays {
+                if !relay.is_connected() {
+                    continue;
+                }
+                let sent_for = subscribed_for(observation, url);
+                if guard.req_sent.get(url) == Some(&sent_for) {
+                    continue;
+                }
+                guard.req_sent.insert(url.clone(), sent_for);
+                let _ = relay.send_msg(ClientMessage::req(subscription.clone(), filter.clone()));
+                // The re-sent REQ reopens a subscription the relay CLOSEd before sign-in.
+                if let Some(r) = observation.relays.get_mut(url) {
+                    r.closed = false;
+                    r.closed_category = None;
+                    r.eose = false;
+                }
+                if observation.attempts > 0 {
+                    let queued = send_event(relay);
+                    count_send(observation, url, queued);
+                }
             }
             if Instant::now() >= next_send {
                 observation.attempts += 1;
@@ -1022,11 +1044,16 @@ impl NostrMintConnector {
         for relay in &self.relays {
             let _ = client.add_relay(relay.as_str()).await;
         }
+        let retired = Arc::new(AtomicBool::new(false));
         let mut links = HashMap::new();
         for (url, relay) in client.relays().await {
             let url = relay_key(&url);
             // Both receivers are taken before connecting, so the first status change is seen.
-            let link = Arc::new(Mutex::new(RelayLink::new(url.clone(), relay.clone())));
+            let link = Arc::new(Mutex::new(RelayLink::new(
+                url.clone(),
+                relay.clone(),
+                retired.clone(),
+            )));
             tokio::spawn(watch_link(relay.notifications(), link.clone()));
             links.insert(url, link);
         }
@@ -1036,7 +1063,7 @@ impl NostrMintConnector {
             links,
             created: Instant::now(),
             runtime,
-            retired: AtomicBool::new(false),
+            retired,
         })
     }
 
@@ -1267,8 +1294,8 @@ struct Pooled {
     links: HashMap<String, Arc<Mutex<RelayLink>>>,
     created: Instant,
     runtime: tokio::runtime::Handle,
-    /// Not reused by later requests ([`CallGuard`]).
-    retired: AtomicBool,
+    /// Not reused by later requests ([`CallGuard`], [`RelayLink::drain`]).
+    retired: Arc<AtomicBool>,
 }
 
 impl Pooled {
@@ -1350,6 +1377,8 @@ struct RelayLink {
     url: String,
     relay: Relay,
     notifications: tokio::sync::broadcast::Receiver<RelayNotification>,
+    /// The shared connection's retirement flag.
+    retired: Arc<AtomicBool>,
     auth: LinkAuth,
     /// The socket (`stats().success()`) `auth` was observed on.
     socket: usize,
@@ -1358,10 +1387,11 @@ struct RelayLink {
 
 impl RelayLink {
     /// Call before connecting, so the first status change is seen.
-    fn new(url: String, relay: Relay) -> Self {
+    fn new(url: String, relay: Relay, retired: Arc<AtomicBool>) -> Self {
         Self {
             url,
             notifications: relay.notifications(),
+            retired,
             relay,
             auth: LinkAuth::Unknown,
             socket: 0,
@@ -1400,9 +1430,19 @@ impl RelayLink {
                 Ok(_) => {}
                 // Lost notifications may have ended the socket the state belongs to.
                 Err(TryRecvError::Lagged(_)) => self.auth = LinkAuth::Unknown,
-                Err(TryRecvError::Empty | TryRecvError::Closed) => return lines,
+                Err(TryRecvError::Empty | TryRecvError::Closed) => break,
             }
         }
+        // A socket that ended with messages still queued (its writer stalled or closing while
+        // the relay still read as connected) would send them on the next socket, after the
+        // requests that queued them returned and maybe after their `exp`. The SDK announces the
+        // drop and then waits at least 7 s before reconnecting; this runs on that announcement
+        // (via `watch_link`), so the relay is shut down first and the connection retired.
+        if !self.relay.is_connected() && self.relay.queue() > 0 {
+            self.relay.disconnect();
+            self.retired.store(true, Ordering::SeqCst);
+        }
+        lines
     }
 
     fn current(&self) -> LinkAuth {
@@ -1464,11 +1504,21 @@ async fn watch_link(
             wake.recv().await,
             Ok(RelayNotification::Shutdown) | Err(RecvError::Closed)
         );
-        let lines = lock(&link).drain();
+        let (lines, terminated) = {
+            let mut link = lock(&link);
+            let lines = link.drain();
+            // `Shutdown` can be lost to a lagged receiver; the status set before it cannot.
+            let terminated = matches!(
+                link.relay.status(),
+                nostr_sdk::prelude::RelayStatus::Terminated
+                    | nostr_sdk::prelude::RelayStatus::Banned
+            );
+            (lines, terminated)
+        };
         for line in lines {
             eprintln!("{line}");
         }
-        if ended {
+        if ended || terminated {
             return;
         }
     }
