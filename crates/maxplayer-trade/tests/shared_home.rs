@@ -677,8 +677,9 @@ async fn legacy_home_allow_refuse_matrix() {
 /// 4(b): two writers on their own database connections write the one wallet database at once
 /// (cdk-sqlite 0.17.2 opens it with WAL, `busy_timeout = 10000` and `BEGIN IMMEDIATE`). Trade's
 /// send (the drain/reclaim path; `trade send` on a maxplayer home moved to `maxplayer wallet`) runs
-/// four times while core sends select and confirm in a loop. Every send either completes or refuses
-/// retryably (lock busy / inputs changed) — never `database is locked` — and the sats add up.
+/// four times while core sends select and confirm in a loop. Every attempt either completes or
+/// refuses retryably (lock busy / inputs changed) — never `database is locked` — every send
+/// completes on retry, and the sats add up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_processes_write_the_shared_wallet_database_concurrently() {
     let m = MintFixture::start(0).await;
@@ -688,13 +689,38 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
     let w = core_wallet(&home, &m.url).await;
     let wallet_dir = home.join("wallet");
     let j = Journal::open(&home).await.unwrap();
-    let mut children = vec![];
-    for i in 0..4 {
-        let out = h.path().join(format!("cli-token-{i}"));
-        let (home, j, url) = (home.clone(), &j, m.url.clone());
-        children.push(async move { send::send(&home, j, &url, 7, &out, None).await });
-    }
-    let cli = futures_util::future::join_all(children);
+    // One trade writer, as in production (`owner.lock` admits one trade process per home): its
+    // four sends run one after another while core sends race it on the same wallet database.
+    // A retryable refusal (lock busy / inputs changed) journals and reserves nothing; the send is
+    // retried as a caller would, so the outcome is not decided by who wins the first race.
+    let cli = async {
+        let mut outs = vec![];
+        for i in 0..4 {
+            let mut refusals = vec![];
+            let mut result = Err("still refused after 100 attempts".to_string());
+            for attempt in 0..100 {
+                let out = home.join(format!("cli-token-{i}-{attempt}"));
+                match send::send(&home, &j, &m.url, 7, &out, None).await {
+                    Ok(r) => {
+                        result = Ok(r);
+                        break;
+                    }
+                    Err(e) => {
+                        let e = format!("{e:#}");
+                        if !(e.contains("busy") || e.contains("changed while this operation chose"))
+                        {
+                            result = Err(e);
+                            break;
+                        }
+                        refusals.push(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+            }
+            outs.push((result, refusals));
+        }
+        outs
+    };
     let core = async {
         let mut sent = 0u64;
         for _ in 0..12 {
@@ -721,25 +747,33 @@ async fn two_processes_write_the_shared_wallet_database_concurrently() {
     };
     let (outs, core_sent) = tokio::join!(cli, core);
     let mut cli_sent = 0u64;
-    for o in outs {
+    let mut seen = vec![];
+    for (o, refusals) in outs {
+        for e in &refusals {
+            assert!(
+                !e.contains("database is locked"),
+                "SAFETY: SQLITE_BUSY leaked: {e}"
+            );
+        }
+        seen.extend(refusals);
         let e = match &o {
             Ok(r) => r.summary().to_string(),
-            Err(e) => format!("{e:#}"),
+            Err(e) => e.clone(),
         };
         assert!(
             !e.contains("database is locked"),
             "SAFETY: SQLITE_BUSY leaked: {e}"
         );
-        if o.as_ref().is_ok_and(|r| r.state == send::SendState::Sent) {
-            cli_sent += 7;
-        } else {
-            assert!(
-                e.contains("busy") || e.contains("changed while this operation chose"),
-                "only a retryable refusal: {e}"
-            );
-        }
+        assert!(
+            o.as_ref().is_ok_and(|r| r.state == send::SendState::Sent),
+            "every send completes once it stops racing: {e}; refusals: {seen:#?}"
+        );
+        cli_sent += 7;
     }
-    assert!(cli_sent > 0 && core_sent > 0, "both processes spent");
+    assert!(
+        cli_sent > 0 && core_sent > 0,
+        "both writers spent: trade {cli_sent}, core {core_sent}"
+    );
     assert!(
         rows(&home, &m.url, vec![State::Reserved, State::Pending])
             .await
