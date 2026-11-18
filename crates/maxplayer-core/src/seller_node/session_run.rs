@@ -20,6 +20,9 @@ const AT_CAPACITY_TURN_FEEDBACK: &str = "seller is at capacity and could not sta
      and the session stays parked — send the turn again";
 const REVIEW_REFUSED_FEEDBACK: &str =
     "the seller's review refused this follow-up; nothing was run or charged";
+/// #1349: sizes follow in parentheses; never buyer text.
+const TURN_TOO_LARGE_FEEDBACK: &str = "this follow-up is too large for the seller's private review even without earlier \
+     history; nothing was run or charged — send a shorter turn, or close the session and post a new job";
 /// Bound on private follow-ups waiting for their encrypted message.
 const PENDING_FOLLOWUPS_CAP: usize = 256;
 /// Poll interval while a follow-up waits for the previous turn's payment (§8.3).
@@ -126,8 +129,15 @@ fn feedback_text(code: ReasonCode) -> &'static str {
         ReasonCode::DeliveryFailed => DELIVERY_FAILURE_FEEDBACK,
         ReasonCode::AtCapacity => AT_CAPACITY_TURN_FEEDBACK,
         ReasonCode::SessionExpired => SESSION_EXPIRED_FEEDBACK,
+        ReasonCode::TurnTooLarge => TURN_TOO_LARGE_FEEDBACK,
         _ => EXEC_FAILURE_FEEDBACK,
     }
+}
+
+/// Codes that answer a follow-up nothing was attempted for and that do not count against the seller
+/// (protocol-v1 §7.1 table): `refusal`, everything else keeps `error`.
+fn refusal_status(code: ReasonCode) -> Option<&'static str> {
+    matches!(code, ReasonCode::SessionExpired | ReasonCode::TurnTooLarge).then_some("refusal")
 }
 
 fn setup<E: std::fmt::Display>(error: E) -> (ReasonCode, String) {
@@ -453,9 +463,24 @@ impl SellerNodeRunner {
     }
 
     async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) {
+        self.turn_feedback_with(job_id, buyer, fid, code, None).await
+    }
+
+    /// `sizes`: a seller-computed, buyer-text-free detail appended for `turn_too_large` (#1349).
+    async fn turn_feedback_with(
+        &self,
+        job_id: &str,
+        buyer: &str,
+        fid: &str,
+        code: ReasonCode,
+        sizes: Option<&str>,
+    ) {
         // The follow-up id makes each turn's encrypted feedback a distinct content intent.
-        let reason = format!("{} (follow-up {fid})", feedback_text(code));
-        let status = (code == ReasonCode::SessionExpired).then_some("refusal");
+        let reason = match sizes {
+            Some(sizes) => format!("{} ({sizes}; follow-up {fid})", feedback_text(code)),
+            None => format!("{} (follow-up {fid})", feedback_text(code)),
+        };
+        let status = refusal_status(code);
         self.publish_buyer_feedback_tagged(
             job_id,
             buyer,
@@ -663,7 +688,8 @@ impl SellerNodeRunner {
                     code.as_str()
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
-                self.turn_feedback(&job_id, &buyer, fid, code).await;
+                let sizes = (code == ReasonCode::TurnTooLarge).then_some(detail.as_str());
+                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes).await;
             }
         }
         if store.session_close_requested(&job_id).unwrap_or(false)
@@ -742,6 +768,65 @@ impl SellerNodeRunner {
             .last()
             .cloned()
             .ok_or_else(|| setup("follow-up message missing"))?;
+        // A private follow-up is reviewed ONLY over the encrypted lane (§9): its request
+        // carries the signed carriers + encrypted bodies of this and earlier follow-ups, trimmed
+        // to what seals. Built before anything starts, so a turn too large to review even
+        // without history is refused with `turn_too_large` and nothing runs (#1349).
+        let review = home.config.review.clone();
+        let buyer = offer.buyer_pubkey.clone();
+        let private_request = if private
+            && matches!(
+                review.enabled(crate::kinds::SESSION_FOLLOWUP_KIND, &buyer),
+                Ok(true)
+            )
+        {
+            let turns: Vec<SessionTurnRecord> = store
+                .turns(job_id)
+                .map(|turns| {
+                    turns
+                        .into_iter()
+                        .filter(|t| t.turn < n && t.state != TurnState::Refused)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let earlier: Vec<String> = turns.iter().map(|t| t.followup_id.clone()).collect();
+            // Earlier deliveries (§9): turn 1's published RESULT, then each earlier
+            // turn's with the follow-up it answers. The reviewer re-authenticates each
+            // and keeps one line (turn, status, commit); unpublished ones are skipped.
+            let turn_one = store
+                .outbox_row(&format!("result:{job_id}"))
+                .ok()
+                .flatten()
+                .and_then(|(_, _, id)| id);
+            let deliveries: Vec<(String, Option<String>)> = turn_one
+                .map(|id| (id, None))
+                .into_iter()
+                .chain(turns.iter().filter_map(|t| {
+                    t.result_id
+                        .clone()
+                        .map(|id| (id, Some(t.followup_id.clone())))
+                }))
+                .collect();
+            match crate::review::private::followup_request(
+                home,
+                &seller_pubkey,
+                job_id,
+                &earlier,
+                fid,
+                &deliveries,
+            ) {
+                Err(crate::review::private::FollowUpRequestError::TooLarge { needed, limit }) => {
+                    return Err((
+                        ReasonCode::TurnTooLarge,
+                        format!("needs {needed} sealed bytes; limit {limit}"),
+                    ));
+                }
+                Err(error) => Some(Err(error.to_string())),
+                Ok(request) => Some(Ok(request)),
+            }
+        } else {
+            None
+        };
         let sandbox = SandboxPolicy::from_config(home.config.sandbox.as_ref()).map_err(setup)?;
         let delivery_policy = sandbox
             .container_delivery()
@@ -869,57 +954,12 @@ impl SellerNodeRunner {
             reset_prompt,
         };
         {
-            let review = home.config.review.clone();
             let (client, relay) = (self.client.clone(), self.relay_url.clone());
             let subject = crate::review::Subject {
                 offer: job_id.to_owned(),
                 event: fid.to_owned(),
                 kind: crate::kinds::SESSION_FOLLOWUP_KIND,
                 commit: None,
-            };
-            let buyer = offer.buyer_pubkey.clone();
-            // A private follow-up is reviewed ONLY over the encrypted lane (§9): its request
-            // carries the signed carriers + encrypted bodies of this and earlier follow-ups.
-            let private_request = if private
-                && matches!(review.enabled(subject.kind, &buyer), Ok(true))
-            {
-                let turns: Vec<SessionTurnRecord> = store
-                    .turns(job_id)
-                    .map(|turns| {
-                        turns
-                            .into_iter()
-                            .filter(|t| t.turn < n && t.state != TurnState::Refused)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let earlier: Vec<String> = turns.iter().map(|t| t.followup_id.clone()).collect();
-                // Earlier deliveries (§9): turn 1's published RESULT, then each earlier
-                // turn's with the follow-up it answers. The reviewer re-authenticates each
-                // and keeps one line (turn, status, commit); unpublished ones are skipped.
-                let turn_one = store
-                    .outbox_row(&format!("result:{job_id}"))
-                    .ok()
-                    .flatten()
-                    .and_then(|(_, _, id)| id);
-                let deliveries: Vec<(String, Option<String>)> = turn_one
-                    .map(|id| (id, None))
-                    .into_iter()
-                    .chain(turns.iter().filter_map(|t| {
-                        t.result_id
-                            .clone()
-                            .map(|id| (id, Some(t.followup_id.clone())))
-                    }))
-                    .collect();
-                Some(crate::review::private::followup_request(
-                    home,
-                    &seller_pubkey,
-                    job_id,
-                    &earlier,
-                    fid,
-                    &deliveries,
-                ))
-            } else {
-                None
             };
             let review_home = home.clone();
             let review_signer = self.node.signer().clone();
@@ -1594,6 +1634,19 @@ mod tests {
                     .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
                     .unwrap_or(false)
             })
+    }
+
+    /// #1349: an oversized follow-up is a typed refusal with sizes and advice, never the generic
+    /// execution failure, and it does not count against the seller.
+    #[test]
+    fn turn_too_large_is_a_visible_refusal() {
+        assert_eq!(ReasonCode::TurnTooLarge.as_str(), "turn_too_large");
+        assert_eq!(refusal_status(ReasonCode::TurnTooLarge), Some("refusal"));
+        assert_eq!(refusal_status(ReasonCode::SessionExpired), Some("refusal"));
+        assert_eq!(refusal_status(ReasonCode::ExecutionFailed), None);
+        let text = feedback_text(ReasonCode::TurnTooLarge);
+        assert_ne!(text, EXEC_FAILURE_FEEDBACK);
+        assert!(text.contains("too large") && text.contains("post a new job"), "{text}");
     }
 
     /// Failure test 5 (host half): a refused review writes `abort` and never the buyer's text;

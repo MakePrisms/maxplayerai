@@ -11,7 +11,10 @@ mod request_wire;
 pub(crate) use delivery_budget::seller_delivery_budget;
 
 const DOMAIN: &str = "maxplayer-private-review-v1";
-pub(super) const MAX_MESSAGE: usize = 60 * 1024;
+/// One private review message (the rumor's content) can never exceed the largest rumor that still
+/// seals (#1349); a round 60 KiB here let oversized messages pass to fail inside the seal. `wrap`
+/// stays the exact check.
+pub(super) const MAX_MESSAGE: usize = pc::transport::MAX_SEALABLE_RUMOR;
 #[derive(Clone, Deserialize)]
 #[serde(try_from = "request_wire::RequestWire")]
 pub struct Request {
@@ -345,11 +348,30 @@ impl Request {
         Ok(recipients.into_iter().collect())
     }
     pub fn draft(&self, reviewer: &str) -> Result<EventDraft, String> {
+        let draft = self.unchecked_draft(reviewer)?;
+        check_size("request", draft.content.len(), MAX_MESSAGE)?;
+        Ok(draft)
+    }
+    fn unchecked_draft(&self, reviewer: &str) -> Result<EventDraft, String> {
         let mut draft = request_draft(&self.subject, reviewer)?;
         draft.tags.push(TagSpec::new(["visibility", "private"]));
         draft.content = serde_json::to_string(self).map_err(|_| "review: request encoding")?;
-        check_size("request", draft.content.len(), MAX_MESSAGE)?;
         Ok(draft)
+    }
+    /// Seal bytes this request needs on the private lane, built exactly as `wrap` sends it but
+    /// signed by `signer`: ids, keys, signatures and timestamps are fixed-width, so only the
+    /// lengths matter and nothing here is ever sent (#1349).
+    fn sealed_len(&self, reviewer: &PublicKey, signer: &Keys) -> Result<usize, String> {
+        let event = crate::gateway::nostr::event_builder(&self.unchecked_draft(&reviewer.to_hex())?)
+            .map_err(|e| e.to_string())?
+            .sign_with_keys(signer)
+            .map_err(|e| e.to_string())?;
+        let body = serde_json::to_string(&Message {
+            domain: DOMAIN.into(),
+            event,
+        })
+        .map_err(|_| "review: encoding failed")?;
+        Ok(pc::transport::sealed_len(*reviewer, body))
     }
 }
 
@@ -388,8 +410,39 @@ pub fn offer_request(
     }))
 }
 
+/// Why a private follow-up review request could not be built.
+#[derive(Debug)]
+pub enum FollowUpRequestError {
+    /// Even the minimal request (offer, claim, award, task, current follow-up) does not seal:
+    /// `needed` seal bytes against the NIP-44 `limit` (#1349). Not retryable unchanged; a shorter
+    /// turn (or a new job with a shorter task) is.
+    TooLarge { needed: usize, limit: usize },
+    Unavailable(String),
+}
+impl std::fmt::Display for FollowUpRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { needed, limit } => write!(
+                f,
+                "review: the private follow-up review request needs {needed} sealed bytes; limit {limit}"
+            ),
+            Self::Unavailable(error) => f.write_str(error),
+        }
+    }
+}
+impl From<String> for FollowUpRequestError {
+    fn from(error: String) -> Self {
+        Self::Unavailable(error)
+    }
+}
+impl From<&str> for FollowUpRequestError {
+    fn from(error: &str) -> Self {
+        Self::Unavailable(error.into())
+    }
+}
+
 /// The seller's private follow-up review request (session-jobs §9): the selected claim/award, the
-/// current follow-up, then as many `earlier` follow-ups (oldest first) as fit the message bound,
+/// current follow-up, then as many `earlier` follow-ups (oldest first) as still seal,
 /// newest kept first, then as many earlier `deliveries` (`(result id, follow-up id it answers)`,
 /// oldest first; `None` for turn 1) as still fit, newest kept first. Buyer messages take the
 /// bound before deliveries. Everything comes from the seller's authenticated content store; the
@@ -401,7 +454,7 @@ pub fn followup_request(
     earlier: &[String],
     followup: &str,
     deliveries: &[(String, Option<String>)],
-) -> Result<Request, String> {
+) -> Result<Request, FollowUpRequestError> {
     let (mut ctx, offer) = crate::seller_node::privacy::known(home, seller, job)
         .map_err(|e| e.to_string())?
         .ok_or("review: private offer context unavailable")?;
@@ -410,6 +463,8 @@ pub fn followup_request(
         .selection(job)
         .map_err(|e| e.to_string())?
         .ok_or("review: private selection unavailable")?;
+    let reviewer =
+        PublicKey::from_hex(&ctx.policy.service).map_err(|_| "review: invalid reviewer key")?;
     let tags = pc::wire::validate_private(&offer, &ctx.policy.host).map_err(|e| e.to_string())?;
     let task_envelope = if tags.get("discovery") == Some("targeted") {
         Some(
@@ -471,21 +526,42 @@ pub fn followup_request(
             Some(DeliveryItem { result, followup })
         })
         .collect();
-    fill_followup_evidence(&mut request, earlier, deliveries, MAX_MESSAGE - 2048);
+    fit_followup_request(&mut request, earlier, deliveries, &reviewer)?;
     Ok(request)
 }
 
-/// Fill a follow-up request under the message bound (§9): earlier buyer follow-ups first (newest
-/// kept first), then earlier deliveries with whatever room is left (newest kept first). Both lists
-/// arrive oldest first; whatever is kept stays oldest first. The current follow-up is never cut.
+/// Fit a follow-up request to what the private lane can actually send (#1349): measured on the
+/// SEALED size `wrap` checks, not on request JSON (double JSON escaping plus NIP-44's 8 KiB padding
+/// steps put the real ceiling near 36 KB of JSON, far below the old 59 KB bound). A minimal request
+/// that does not seal is `TooLarge`; otherwise history is filled as [`fill_followup_evidence`] says.
+fn fit_followup_request(
+    request: &mut Request,
+    earlier: Vec<FollowUpItem>,
+    deliveries: Vec<DeliveryItem>,
+    reviewer: &PublicKey,
+) -> Result<(), FollowUpRequestError> {
+    let signer = Keys::generate();
+    let limit = pc::transport::NIP44_MAX;
+    let needed = request.sealed_len(reviewer, &signer)?;
+    if needed > limit {
+        return Err(FollowUpRequestError::TooLarge { needed, limit });
+    }
+    fill_followup_evidence(request, earlier, deliveries, |r| {
+        r.sealed_len(reviewer, &signer).is_ok_and(|n| n <= limit)
+    });
+    Ok(())
+}
+
+/// Fill a follow-up request while it `fits` (§9): earlier buyer follow-ups first (newest kept
+/// first), then earlier deliveries with whatever room is left (newest kept first). Both lists
+/// arrive oldest first; whatever is kept stays oldest first, so the oldest go first. The current
+/// follow-up is never cut.
 fn fill_followup_evidence(
     request: &mut Request,
     earlier: Vec<FollowUpItem>,
     deliveries: Vec<DeliveryItem>,
-    bound: usize,
+    fits: impl Fn(&Request) -> bool,
 ) {
-    let fits =
-        |request: &Request| serde_json::to_string(request).map_or(usize::MAX, |s| s.len()) <= bound;
     for item in earlier.into_iter().rev() {
         request
             .followup
@@ -1302,7 +1378,7 @@ mod tests {
             &mut all,
             vec![f2.clone()],
             vec![d1.clone(), d2.clone()],
-            usize::MAX,
+            |_| true,
         );
         assert_eq!(
             ids(&all),
@@ -1321,11 +1397,12 @@ mod tests {
             .insert(0, f2.clone());
         want.followup.as_mut().unwrap().deliveries.push(d2.clone());
         let mut cut = base();
+        let bound = size(&want);
         fill_followup_evidence(
             &mut cut,
             vec![f2.clone()],
             vec![d1.clone(), d2.clone()],
-            size(&want),
+            |r| size(r) <= bound,
         );
         assert_eq!(
             ids(&cut),
@@ -1335,8 +1412,167 @@ mod tests {
         // here neither fits and the current follow-up stays.
         let mut bare = base();
         let bound = size(&bare);
-        fill_followup_evidence(&mut bare, vec![f2.clone()], vec![d1, d2], bound);
+        fill_followup_evidence(&mut bare, vec![f2.clone()], vec![d1, d2], |r| size(r) <= bound);
         assert_eq!(ids(&bare), (vec![f3.carrier.id], vec![]));
+    }
+
+    /// ASCII prose with JSON-escaped characters, exactly `len` bytes; `salt` keeps turns distinct.
+    fn prose(len: usize, salt: u32) -> String {
+        let line = format!("Turn {salt}: extend the \"parser\" so quoted fields work; add tests.\n");
+        line.repeat(len / line.len() + 1)[..len].to_owned()
+    }
+
+    /// A realistic private session: a targeted task of `task_len` bytes, `earlier_turns` earlier
+    /// follow-ups of `turn_len` bytes each with their delivered RESULTs (plus turn 1's), and the
+    /// current follow-up of `current_len` bytes.
+    fn session_with_history(
+        task_len: usize,
+        turn_len: usize,
+        earlier_turns: u32,
+        current_len: usize,
+    ) -> (
+        pc::evidence::PrivateEvidence,
+        pc::runtime::Policy,
+        Vec<FollowUpItem>,
+        Vec<DeliveryItem>,
+        FollowUpItem,
+    ) {
+        use crate::session::TurnStatus;
+        let (evidence, _, _, policy) = pc::evidence::inline_fixture_with_text(
+            true,
+            false,
+            2_000_000_000,
+            vec!["https://testnut.cashu.space".into()],
+            &prose(task_len, 1),
+            "exact private answer",
+        );
+        let mut earlier = Vec::new();
+        let mut deliveries = vec![DeliveryItem {
+            result: evidence.result.clone(),
+            followup: None,
+        }];
+        let mut prev = evidence.result.id.to_hex();
+        for turn in 2..2 + earlier_turns {
+            let f = followup_item_at(&evidence, &policy, &key(1), &prose(turn_len, turn), turn, &prev);
+            let r = turn_result(&evidence, &policy, &key(2), &f.carrier, TurnStatus::Done);
+            prev = r.id.to_hex();
+            deliveries.push(DeliveryItem {
+                result: r,
+                followup: Some(f.carrier.clone()),
+            });
+            earlier.push(f);
+        }
+        let turn = 2 + earlier_turns;
+        let current = followup_item_at(&evidence, &policy, &key(1), &prose(current_len, turn), turn, &prev);
+        (evidence, policy, earlier, deliveries, current)
+    }
+
+    fn session_request(evidence: &pc::evidence::PrivateEvidence, current: &FollowUpItem) -> Request {
+        Request {
+            subject: Subject {
+                offer: evidence.offer.id.to_hex(),
+                event: current.carrier.id.to_hex(),
+                kind: SESSION_FOLLOWUP_KIND,
+                commit: None,
+            },
+            offer: evidence.offer.clone(),
+            task_envelope: evidence.task_envelope.clone(),
+            delivery: None,
+            followup: Some(FollowUpEvidence {
+                claim: evidence.claim.clone(),
+                award: evidence.award.clone(),
+                followups: vec![current.clone()],
+                deliveries: vec![],
+            }),
+        }
+    }
+
+    /// Seal `request` exactly as the seller's signer actor does; Ok(seal JSON bytes).
+    async fn seal_request(request: &Request) -> Result<usize, String> {
+        let (seller, service) = (key(2), key(3));
+        let inner = crate::gateway::nostr::event_builder(&request.draft(&service.public_key().to_hex())?)
+            .unwrap()
+            .sign_with_keys(&seller)
+            .unwrap();
+        let outer = wrap(&seller, service.public_key(), &inner).await?;
+        let seal = nostr_sdk::nostr::nips::nip44::decrypt(service.secret_key(), &outer.pubkey, &outer.content)
+            .unwrap();
+        Ok(seal.len())
+    }
+
+    /// #1349 regression: a private session with a 1.5 KB task and ~3 KB turns. Before the fix the
+    /// turn-5 request (3 earlier turns) sealed to 65,971 bytes and every later turn was refused.
+    /// Every turn must now seal, keep the current follow-up, drop the oldest first in each list,
+    /// and keep everything that still fits.
+    #[tokio::test]
+    async fn populated_followup_requests_seal_after_trimming() {
+        let reviewer = key(3).public_key();
+        let signer = Keys::generate();
+        let fits = |r: &Request| {
+            r.sealed_len(&reviewer, &signer).unwrap() <= pc::transport::NIP44_MAX
+        };
+        for n in 0..=8u32 {
+            let (ev, policy, earlier, deliveries, current) =
+                session_with_history(1500, 3000, n, 3000);
+            let mut r = session_request(&ev, &current);
+            fit_followup_request(&mut r, earlier.clone(), deliveries.clone(), &reviewer).unwrap();
+            let sealed = seal_request(&r)
+                .await
+                .unwrap_or_else(|e| panic!("{n} earlier turns: {e}"));
+            assert_eq!(sealed, r.sealed_len(&reviewer, &signer).unwrap(), "size model is exact");
+            r.validate(&key(2).public_key(), &policy).unwrap();
+            let f = r.followup.as_ref().unwrap();
+            let (kept_f, kept_d) = (f.followups.len() - 1, f.deliveries.len());
+            let want_f: Vec<_> = earlier[earlier.len() - kept_f..]
+                .iter()
+                .map(|i| i.carrier.id)
+                .chain([current.carrier.id])
+                .collect();
+            assert_eq!(f.followups.iter().map(|i| i.carrier.id).collect::<Vec<_>>(), want_f, "{n}");
+            let want_d: Vec<_> = deliveries[deliveries.len() - kept_d..]
+                .iter()
+                .map(|d| d.result.id)
+                .collect();
+            assert_eq!(f.deliveries.iter().map(|d| d.result.id).collect::<Vec<_>>(), want_d, "{n}");
+            if n <= 2 {
+                assert_eq!((kept_f, kept_d), (n as usize, n as usize + 1), "nothing trimmed");
+            } else {
+                assert!(kept_f < n as usize || kept_d < n as usize + 1, "{n}: trimmed");
+            }
+            // Nothing that would still seal was dropped.
+            if kept_f < earlier.len() {
+                let mut more = r.clone();
+                more.followup.as_mut().unwrap().followups.insert(0, earlier[earlier.len() - kept_f - 1].clone());
+                assert!(!fits(&more), "{n}: an older follow-up still fits");
+            }
+            if kept_d < deliveries.len() {
+                let mut more = r.clone();
+                more.followup.as_mut().unwrap().deliveries.insert(0, deliveries[deliveries.len() - kept_d - 1].clone());
+                assert!(!fits(&more), "{n}: an older delivery still fits");
+            }
+        }
+    }
+
+    /// #1349: when even the task plus the current follow-up cannot seal, the request is refused as
+    /// `TooLarge` with sizes only (no buyer text), and no history is added.
+    #[tokio::test]
+    async fn followup_request_that_cannot_seal_alone_is_too_large() {
+        let reviewer = key(3).public_key();
+        let (ev, _, earlier, deliveries, current) = session_with_history(13_000, 3000, 2, 13_000);
+        let mut r = session_request(&ev, &current);
+        let minimal = serde_json::to_string(&r).unwrap();
+        assert!(seal_request(&r).await.is_err(), "the minimal request really does not seal");
+        match fit_followup_request(&mut r, earlier, deliveries, &reviewer) {
+            Err(error @ FollowUpRequestError::TooLarge { needed, limit }) => {
+                assert_eq!(limit, pc::transport::NIP44_MAX);
+                assert!(needed > limit);
+                let text = error.to_string();
+                assert!(text.contains(&format!("needs {needed} sealed bytes; limit {limit}")), "{text}");
+                assert!(!text.contains("Turn "), "no buyer text in the reason");
+            }
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+        assert_eq!(serde_json::to_string(&r).unwrap(), minimal, "no history added");
     }
 
     /// Session-jobs §9 private lane: a follow-up subject carries the buyer's signed carrier and
