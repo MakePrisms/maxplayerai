@@ -38,6 +38,8 @@ struct Stub {
     refuse_reply: AtomicBool,
     fail_post: AtomicBool,
     next: AtomicU64,
+    /// `(slots, free_slots)` every seller's beat states; `None` states none (an older seller).
+    seats: StdMutex<Option<(usize, usize)>>,
 }
 
 impl Stub {
@@ -77,7 +79,11 @@ impl SwarmIo for Stub {
     async fn read(&self, _since: u64) -> Result<Vec<Event>, String> {
         let mut out = self.events.lock().unwrap().clone();
         for (keys, rate) in self.sellers.lock().unwrap().iter() {
-            let beat = HeartbeatDraft::new(true, 0, *rate, vec![MINT.into()]).to_event_draft();
+            let mut beat = HeartbeatDraft::new(true, 0, *rate, vec![MINT.into()]);
+            if let Some((total, free)) = *self.seats.lock().unwrap() {
+                beat = beat.with_slots(crate::heartbeat::SeatSlots::new(total, free));
+            }
+            let beat = beat.to_event_draft();
             out.push(sign(keys, &beat, self.now()));
         }
         Ok(out)
@@ -503,6 +509,107 @@ async fn member_of_two_swarms_runs_one_task_across_both() {
         .count();
     assert_eq!(running, 1, "one next task, not one per swarm");
     assert_eq!(fx.stub.posts().len(), 2);
+}
+
+/// §1.14 with free seats: a seller whose fresh beat states two free seats gets one task from
+/// each of two swarms at once — still one per swarm — and the third swarm's waits until a newer
+/// beat shows a seat.
+#[tokio::test]
+async fn a_seller_with_free_seats_runs_a_task_from_each_swarm() {
+    let fx = Fx::new(1, 10);
+    *fx.stub.seats.lock().unwrap() = Some((2, 2));
+    for (swarm, job) in [("math", "math-1"), ("physics", "phys-1"), ("bio", "bio-1")] {
+        fx.swarm(swarm, "public");
+        fx.member(0, swarm);
+        fx.job(job, swarm, 10_000);
+    }
+    let e = fx.engine(false);
+    let m1 = fx.queue(&e, "math-1", "m1", false);
+    let m2 = fx.queue(&e, "math-1", "m2", false);
+    let p1 = fx.queue(&e, "phys-1", "p1", false);
+    let b1 = fx.queue(&e, "bio-1", "b1", false);
+    let firsts = [("math-1", m1), ("phys-1", p1), ("bio-1", b1)];
+    e.tick(&fx.stub).await.unwrap();
+    let posted = |e: &Engine| {
+        firsts
+            .iter()
+            .filter(|(_, id)| task(e, *id).state == "posted")
+            .count()
+    };
+    assert_eq!(posted(&e), 2, "two seats: one task each from two swarms");
+    assert_eq!(
+        task(&e, m2).state,
+        "queued",
+        "still one running task per swarm"
+    );
+    assert_eq!(fx.stub.posts().len(), 2);
+    let (waiting, _) = firsts
+        .iter()
+        .find(|(_, id)| task(&e, *id).state == "queued")
+        .unwrap();
+    let members = e.store.swarm_job(waiting).unwrap().unwrap().members_json;
+    assert!(members.contains("\"seats_left\":0"), "{members}");
+
+    // The seller claimed both: its next beat (newer than both awards) says no seat is free.
+    *fx.stub.seats.lock().unwrap() = Some((2, 0));
+    fx.at(T0 + 60);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(posted(&e), 2, "free_slots=0: the third swarm waits");
+    // A newer beat shows a seat (the operator raised `slots`): the third swarm's task goes out.
+    *fx.stub.seats.lock().unwrap() = Some((3, 1));
+    fx.at(T0 + 120);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(
+        posted(&e),
+        3,
+        "a beat newer than the awards shows a free seat"
+    );
+    assert_eq!(fx.stub.posts().len(), 3);
+}
+
+/// A beat stating `free_slots=0` keeps the seller idle even with nothing running from this buyer;
+/// one free seat taken by this buyer's own unclaimed offer leaves none.
+#[tokio::test]
+async fn a_full_seat_or_an_own_unclaimed_offer_leaves_no_seat() {
+    let fx = Fx::new(1, 10);
+    *fx.stub.seats.lock().unwrap() = Some((2, 0));
+    for (swarm, job) in [("math", "math-1"), ("physics", "phys-1")] {
+        fx.swarm(swarm, "public");
+        fx.member(0, swarm);
+        fx.job(job, swarm, 10_000);
+    }
+    let e = fx.engine(false);
+    let m1 = fx.queue(&e, "math-1", "m1", false);
+    let p1 = fx.queue(&e, "phys-1", "p1", false);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(fx.stub.posts().len(), 0, "free_slots=0: nothing posted");
+    let why = e
+        .store
+        .swarm_job("math-1")
+        .unwrap()
+        .unwrap()
+        .idle_reason
+        .unwrap();
+    assert!(why.contains("1 busy"), "{why}");
+
+    *fx.stub.seats.lock().unwrap() = Some((2, 1));
+    fx.at(T0 + 60);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(fx.stub.posts().len(), 1, "one free seat: one task");
+    // Unawarded (the stub has not awarded it yet): the beat cannot reflect it.
+    for v in fx.stub.jobs.lock().unwrap().values_mut() {
+        v.awarded_at = None;
+    }
+    fx.at(T0 + 120);
+    e.tick(&fx.stub).await.unwrap();
+    let running = [m1, p1]
+        .iter()
+        .filter(|&&id| task(&e, id).state == "posted")
+        .count();
+    assert_eq!(
+        running, 1,
+        "this buyer's unclaimed offer holds the one free seat"
+    );
 }
 
 /// §12, §7.5: a private swarm's offers carry no task text or swarm link in public events, its
