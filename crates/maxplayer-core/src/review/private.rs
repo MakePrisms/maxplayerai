@@ -362,10 +362,11 @@ impl Request {
     /// signed by `signer`: ids, keys, signatures and timestamps are fixed-width, so only the
     /// lengths matter and nothing here is ever sent (#1349).
     fn sealed_len(&self, reviewer: &PublicKey, signer: &Keys) -> Result<usize, String> {
-        let event = crate::gateway::nostr::event_builder(&self.unchecked_draft(&reviewer.to_hex())?)
-            .map_err(|e| e.to_string())?
-            .sign_with_keys(signer)
-            .map_err(|e| e.to_string())?;
+        let event =
+            crate::gateway::nostr::event_builder(&self.unchecked_draft(&reviewer.to_hex())?)
+                .map_err(|e| e.to_string())?
+                .sign_with_keys(signer)
+                .map_err(|e| e.to_string())?;
         let body = serde_json::to_string(&Message {
             domain: DOMAIN.into(),
             event,
@@ -416,7 +417,10 @@ pub enum FollowUpRequestError {
     /// Even the minimal request (offer, claim, award, task, current follow-up) does not seal:
     /// `needed` seal bytes against the NIP-44 `limit` (#1349). Not retryable unchanged; a shorter
     /// turn (or a new job with a shorter task) is.
-    TooLarge { needed: usize, limit: usize },
+    TooLarge {
+        needed: usize,
+        limit: usize,
+    },
     Unavailable(String),
 }
 impl std::fmt::Display for FollowUpRequestError {
@@ -1410,13 +1414,16 @@ mod tests {
         // here neither fits and the current follow-up stays.
         let mut bare = base();
         let bound = size(&bare);
-        fill_followup_evidence(&mut bare, vec![f2.clone()], vec![d1, d2], |r| size(r) <= bound);
+        fill_followup_evidence(&mut bare, vec![f2.clone()], vec![d1, d2], |r| {
+            size(r) <= bound
+        });
         assert_eq!(ids(&bare), (vec![f3.carrier.id], vec![]));
     }
 
     /// ASCII prose with JSON-escaped characters, exactly `len` bytes; `salt` keeps turns distinct.
     fn prose(len: usize, salt: u32) -> String {
-        let line = format!("Turn {salt}: extend the \"parser\" so quoted fields work; add tests.\n");
+        let line =
+            format!("Turn {salt}: extend the \"parser\" so quoted fields work; add tests.\n");
         line.repeat(len / line.len() + 1)[..len].to_owned()
     }
 
@@ -1451,7 +1458,14 @@ mod tests {
         }];
         let mut prev = evidence.result.id.to_hex();
         for turn in 2..2 + earlier_turns {
-            let f = followup_item_at(&evidence, &policy, &key(1), &prose(turn_len, turn), turn, &prev);
+            let f = followup_item_at(
+                &evidence,
+                &policy,
+                &key(1),
+                &prose(turn_len, turn),
+                turn,
+                &prev,
+            );
             let r = turn_result(&evidence, &policy, &key(2), &f.carrier, TurnStatus::Done);
             prev = r.id.to_hex();
             deliveries.push(DeliveryItem {
@@ -1461,11 +1475,21 @@ mod tests {
             earlier.push(f);
         }
         let turn = 2 + earlier_turns;
-        let current = followup_item_at(&evidence, &policy, &key(1), &prose(current_len, turn), turn, &prev);
+        let current = followup_item_at(
+            &evidence,
+            &policy,
+            &key(1),
+            &prose(current_len, turn),
+            turn,
+            &prev,
+        );
         (evidence, policy, earlier, deliveries, current)
     }
 
-    fn session_request(evidence: &pc::evidence::PrivateEvidence, current: &FollowUpItem) -> Request {
+    fn session_request(
+        evidence: &pc::evidence::PrivateEvidence,
+        current: &FollowUpItem,
+    ) -> Request {
         Request {
             subject: Subject {
                 offer: evidence.offer.id.to_hex(),
@@ -1488,13 +1512,18 @@ mod tests {
     /// Seal `request` exactly as the seller's signer actor does; Ok(seal JSON bytes).
     async fn seal_request(request: &Request) -> Result<usize, String> {
         let (seller, service) = (key(2), key(3));
-        let inner = crate::gateway::nostr::event_builder(&request.draft(&service.public_key().to_hex())?)
-            .unwrap()
-            .sign_with_keys(&seller)
-            .unwrap();
+        let inner =
+            crate::gateway::nostr::event_builder(&request.draft(&service.public_key().to_hex())?)
+                .unwrap()
+                .sign_with_keys(&seller)
+                .unwrap();
         let outer = wrap(&seller, service.public_key(), &inner).await?;
-        let seal = nostr_sdk::nostr::nips::nip44::decrypt(service.secret_key(), &outer.pubkey, &outer.content)
-            .unwrap();
+        let seal = nostr_sdk::nostr::nips::nip44::decrypt(
+            service.secret_key(),
+            &outer.pubkey,
+            &outer.content,
+        )
+        .unwrap();
         Ok(seal.len())
     }
 
@@ -1506,9 +1535,8 @@ mod tests {
     async fn populated_followup_requests_seal_after_trimming() {
         let reviewer = key(3).public_key();
         let signer = Keys::generate();
-        let fits = |r: &Request| {
-            r.sealed_len(&reviewer, &signer).unwrap() <= pc::transport::NIP44_MAX
-        };
+        let fits =
+            |r: &Request| r.sealed_len(&reviewer, &signer).unwrap() <= pc::transport::NIP44_MAX;
         for n in 0..=8u32 {
             let (ev, policy, earlier, deliveries, current) =
                 session_with_history(1500, 3000, n, 3000);
@@ -1517,7 +1545,11 @@ mod tests {
             let sealed = seal_request(&r)
                 .await
                 .unwrap_or_else(|e| panic!("{n} earlier turns: {e}"));
-            assert_eq!(sealed, r.sealed_len(&reviewer, &signer).unwrap(), "size model is exact");
+            assert_eq!(
+                sealed,
+                r.sealed_len(&reviewer, &signer).unwrap(),
+                "size model is exact"
+            );
             r.validate(&key(2).public_key(), &policy).unwrap();
             let f = r.followup.as_ref().unwrap();
             let (kept_f, kept_d) = (f.followups.len() - 1, f.deliveries.len());
@@ -1526,26 +1558,49 @@ mod tests {
                 .map(|i| i.carrier.id)
                 .chain([current.carrier.id])
                 .collect();
-            assert_eq!(f.followups.iter().map(|i| i.carrier.id).collect::<Vec<_>>(), want_f, "{n}");
+            assert_eq!(
+                f.followups.iter().map(|i| i.carrier.id).collect::<Vec<_>>(),
+                want_f,
+                "{n}"
+            );
             let want_d: Vec<_> = deliveries[deliveries.len() - kept_d..]
                 .iter()
                 .map(|d| d.result.id)
                 .collect();
-            assert_eq!(f.deliveries.iter().map(|d| d.result.id).collect::<Vec<_>>(), want_d, "{n}");
+            assert_eq!(
+                f.deliveries.iter().map(|d| d.result.id).collect::<Vec<_>>(),
+                want_d,
+                "{n}"
+            );
             if n <= 2 {
-                assert_eq!((kept_f, kept_d), (n as usize, n as usize + 1), "nothing trimmed");
+                assert_eq!(
+                    (kept_f, kept_d),
+                    (n as usize, n as usize + 1),
+                    "nothing trimmed"
+                );
             } else {
-                assert!(kept_f < n as usize || kept_d < n as usize + 1, "{n}: trimmed");
+                assert!(
+                    kept_f < n as usize || kept_d < n as usize + 1,
+                    "{n}: trimmed"
+                );
             }
             // Nothing that would still seal was dropped.
             if kept_f < earlier.len() {
                 let mut more = r.clone();
-                more.followup.as_mut().unwrap().followups.insert(0, earlier[earlier.len() - kept_f - 1].clone());
+                more.followup
+                    .as_mut()
+                    .unwrap()
+                    .followups
+                    .insert(0, earlier[earlier.len() - kept_f - 1].clone());
                 assert!(!fits(&more), "{n}: an older follow-up still fits");
             }
             if kept_d < deliveries.len() {
                 let mut more = r.clone();
-                more.followup.as_mut().unwrap().deliveries.insert(0, deliveries[deliveries.len() - kept_d - 1].clone());
+                more.followup
+                    .as_mut()
+                    .unwrap()
+                    .deliveries
+                    .insert(0, deliveries[deliveries.len() - kept_d - 1].clone());
                 assert!(!fits(&more), "{n}: an older delivery still fits");
             }
         }
@@ -1559,18 +1614,28 @@ mod tests {
         let (ev, _, earlier, deliveries, current) = session_with_history(13_000, 3000, 2, 13_000);
         let mut r = session_request(&ev, &current);
         let minimal = serde_json::to_string(&r).unwrap();
-        assert!(seal_request(&r).await.is_err(), "the minimal request really does not seal");
+        assert!(
+            seal_request(&r).await.is_err(),
+            "the minimal request really does not seal"
+        );
         match fit_followup_request(&mut r, earlier, deliveries, &reviewer) {
             Err(error @ FollowUpRequestError::TooLarge { needed, limit }) => {
                 assert_eq!(limit, pc::transport::NIP44_MAX);
                 assert!(needed > limit);
                 let text = error.to_string();
-                assert!(text.contains(&format!("needs {needed} sealed bytes; limit {limit}")), "{text}");
+                assert!(
+                    text.contains(&format!("needs {needed} sealed bytes; limit {limit}")),
+                    "{text}"
+                );
                 assert!(!text.contains("Turn "), "no buyer text in the reason");
             }
             other => panic!("expected TooLarge, got {other:?}"),
         }
-        assert_eq!(serde_json::to_string(&r).unwrap(), minimal, "no history added");
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            minimal,
+            "no history added"
+        );
     }
 
     /// Session-jobs §9 private lane: a follow-up subject carries the buyer's signed carrier and
