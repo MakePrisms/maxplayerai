@@ -85,8 +85,9 @@ drop any stopped-backup procedure recorded for it earlier.
   These are distinct from **market relays**, which carry lots and trade messages.
   Follow the trading references. `relay.maxplayer.ai` is the first default market relay
   (it stores lots only from relay members); public relays are the fallbacks. To use it, link
-  the mint key (`maxplayer account link --mint`) and the home key (`maxplayer account link`;
-  trading signs with it, so no separate trading key exists), and run `doctor` with
+  the home key first (`maxplayer account link`, one emailed code; trading signs with it, so no
+  separate trading key exists), then the mint key (`maxplayer account link --mint`: both keys
+  sign, no second email), and run `doctor` with
   `--home <home>`. Add the mint to the wallet: `maxplayer wallet mints add nostr://<npub>`.
 - Run the trading skill's read-only readiness checks against the mint's public
   `nostr://` URL. Verify an actual mint reply, not just a running process or relay

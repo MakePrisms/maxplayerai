@@ -24,7 +24,9 @@ accepted once.
 |---|---|---|---|
 | POST | `/account/link/request` | NIP-98 | `{email, label, terms_version, privacy_version, notice_version?}` → `202 {status:"code_sent", expires_in_secs, max_attempts, terms_url, privacy_url}` |
 | POST | `/account/link/confirm` | NIP-98 | `{code, entered_by?: "human"\|"agent"}` → `200 {status:"linked", first_link, email, label, terms_version, privacy_version, relay_member:"added"\|"pending", marketing}` |
-| GET | `/account/status` | NIP-98 | → `{registered:false}` or `{registered:true, email, label, terms_version, privacy_version, accepted_at, code_entered_by, linked_at, marketing, relay_member}` |
+| POST | `/account/link/mint/challenge` | NIP-98 (account key) | `{mint_pubkey}` (hex or npub) → `200 {challenge, expires_in_secs, mint_pubkey, proof_kind:27236, proof_url}` |
+| POST | `/account/link/mint/confirm` | NIP-98 (account key) + mint proof | `{challenge, mint_pubkey, label, mint_proof}` → `200 {status:"linked", first_link, mint_pubkey, linked_by, email, label, terms_version, privacy_version, relay_member}` |
+| GET | `/account/status` | NIP-98 | → `{registered:false}` or `{registered:true, email, label, terms_version, privacy_version, accepted_at, code_entered_by, linked_by, linked_at, marketing, relay_member}` |
 | POST | `/account/marketing` | NIP-98 | `{enabled: bool, notice_version?}` → `{marketing:"subscribed"\|"unsubscribed"}` (for `maxplayer account marketing on\|off`) |
 | POST | `/account/webhooks/resend` | Svix signature | Resend events: `email.bounced`, `email.complained`, `contact.updated` (unsubscribed) |
 | GET | `/account/health` | none | `{ok:true}` after a database ping |
@@ -36,7 +38,12 @@ The codes are: `missing_auth`, `malformed_auth`, `wrong_kind`, `bad_signature`, 
 `unknown_privacy_version`, `unknown_notice_version`, `invalid_entered_by`, `resend_cooldown`,
 `rate_limited` (both with `Retry-After`), `email_send_failed`, `no_pending_code`, `wrong_code`
 (with `attempts_left`), `code_expired`, `too_many_attempts`, `key_linked_to_other_email`,
-`not_registered`, `bad_webhook_signature`, `webhook_not_configured`.
+`not_registered`, `bad_webhook_signature`, `webhook_not_configured`, and for the cosigned mint
+link `invalid_mint_pubkey`, `same_key`, `invalid_challenge`, `account_not_registered`,
+`account_is_cosigned`, `mint_linked_to_other_account`, `mint_already_linked`, `unknown_challenge`,
+`challenge_used`, `challenge_expired` and `mint_proof_invalid` (with a `reason`: `malformed`,
+`wrong_kind`, `bad_signature`, `wrong_key`, `wrong_url`, `wrong_challenge`, `wrong_account`,
+`stale`).
 
 ### Rules
 
@@ -53,6 +60,37 @@ The codes are: `missing_auth`, `malformed_auth`, `wrong_kind`, `bad_signature`, 
   as a no-op), and no second welcome email goes out.
 - On the first link, a `marketing_consents` row is created (`signup_default`, automatic
   opt-in, spec §8.1) unless that email already has one, so an earlier opt-out survives.
+
+### Cosigned mint link
+
+`maxplayer account link --mint` in a home whose agent key is already linked links the mint
+server's key (`<home>/mint/nostr.key`) to the **same account** without a second email code,
+because both keys sign:
+
+1. `POST /account/link/mint/challenge`, NIP-98 signed by the **account key** (a key linked by email
+   code), body `{mint_pubkey}`. The service stores a fresh 32-byte random challenge bound to
+   (account key, mint key), valid `limits.mint_challenge_ttl_secs` (default 300 s), and returns it.
+   Rate limit: `mint_challenges_per_pubkey_per_hour` (20) and `mint_challenges_per_ip_per_hour` (60).
+2. `POST /account/link/mint/confirm`, NIP-98 signed by the **account key** again; its `payload` tag
+   covers the whole body (challenge, mint key, label and proof). `mint_proof` is a Nostr event
+   signed by the **mint key**: kind **27236** (not 27235, so it is never a NIP-98 header), exactly
+   one `u` tag = `<public_base_url>/account/link/mint/confirm`, one `challenge` tag = the
+   challenge, one `p` tag = the account key (hex), `created_at` within `nip98_max_skew_secs`.
+
+In one transaction the confirm then consumes the challenge (single use; an unknown, used or
+expired one is refused and nothing is linked), re-checks that the account key is still an
+email link, and writes the mint's row: the account's email and accepted terms/privacy versions,
+`code_entered_by = 'cosigned'`, `linked_by = <account key>`. A NIP-43 add is queued as for a code
+link. No code or welcome email is sent.
+
+Refused: an account key that is not linked (`403 account_not_registered`) or is itself a cosigned
+key (`403 account_is_cosigned`: only an email-linked key can vouch); a mint key linked to a
+different email (`409 mint_linked_to_other_account`) or already linked to the same email by its own
+code (`409 mint_already_linked`); the account key as its own mint (`400 same_key`). Re-running it
+for a mint already cosigned to the same email refreshes the label and versions. A cosigned key can
+later link by email code to the same email; its row then becomes an ordinary code link
+(`linked_by` cleared). Removing the account row does not remove mint rows it vouched for (remove
+those keys separately).
 
 ## Relay membership (NIP-43)
 
@@ -182,8 +220,8 @@ On NixOS, `ensureDatabases` + `ensureUsers.*.ensureDBOwnership` do the same. The
 applies its own migrations (`migrations/`, embedded) at startup; `maxplayer-registration
 migrate` runs them alone. Tables: `registrations`, `email_codes`, `member_sync_outbox`,
 `managed_members`, `email_bounces`, `marketing_consents`, `rate_events`, `nip98_seen`,
-`webhook_events`. Cleanup deletes codes and counters older than a day and replay ids older
-than an hour.
+`webhook_events`, `mint_link_challenges`. Cleanup deletes codes, mint-link challenges and counters
+older than a day and replay ids older than an hour.
 
 ### nginx
 

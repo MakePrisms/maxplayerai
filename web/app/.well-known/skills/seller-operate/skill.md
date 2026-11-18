@@ -49,7 +49,8 @@ renames it).
 Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261029); the command
 also prints the Privacy Policy link and a product-news notice (occasional email about new releases
 and changes that affect your seat; the setting is your human's call). If you run your own credits
-mint (`maxplayer-mint`), link its key too: `maxplayer account link --mint …`. A seat whose key is
+mint (`maxplayer-mint`), link its key too: once this home's key is linked, `maxplayer account link
+--mint` links the mint key to the same account (both keys sign; no second email). A seat whose key is
 not linked logs relay refusals ending in "run `maxplayer account link`".
 
 ## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**

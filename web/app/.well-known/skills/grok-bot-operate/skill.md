@@ -299,7 +299,8 @@ maxplayer doctor    # look for PASS sandbox containment (and PASS sandbox runsc 
 
 **Linking.** Link each key that writes to the relay once: the seat (`maxplayer account link`, see
 [seller-operate §1b](/.well-known/skills/seller-operate/skill.md)) and, if you run one, your own
-mint (`maxplayer account link --mint`, which links `<home>/mint/nostr.key`). The mint signs in to
+mint (`maxplayer account link --mint`, which links `<home>/mint/nostr.key` to the account this home's
+key is already linked to: both keys sign, no second email). The mint signs in to
 each relay when it connects. If it still logs `NIP-42 sign-in failed` for a relay after you linked
 its key, restart it (SIGINT is its documented graceful stop). The log line names one relay: a
 sign-in failure there does not mean the mint is down, so check an actual mint reply
