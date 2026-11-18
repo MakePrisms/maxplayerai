@@ -151,6 +151,13 @@
       # DNS: relay.maxplayer.ai → 34.225.223.145 (live); ACME issues on first switch.
       enableACME = true;
       forceSSL = true;
+      # TEMPORARY (nginx2root, 18 Nov 2026): HTTP/2 off until nixpkgs ships nginx >= 1.31.9 or a
+      # backport. CVE-2026-123007 (any h2 server) and CVE-2026-123633 (h2 + proxied upstream) are
+      # pre-auth RCEs in the nginx worker and both need h2; our pin ships 1.30.6. Nothing here needs h2:
+      # websocket upgrades are HTTP/1.1, and git smart-HTTP and uploads work on h1. Re-enable (drop this
+      # line) in the same change that bumps nginx past the fix.
+      # https://xint.io/blog/nginx2root-remote-code-execution
+      http2 = false;
       locations."/" = {
         proxyPass = "http://127.0.0.1:3000";
         proxyWebsockets = true;
@@ -201,6 +208,16 @@
   # watched reboot and an EBS snapshot. The scripted stage 1 is removed in 26.11, so this must go before then.
   boot.kernelPackages = pkgs.linuxPackages_6_12;
   boot.initrd.systemd.enable = false;
+
+  # nginx2root (18 Nov 2026): the published chain goes from the nginx worker to root through a kernel SCTP
+  # bug. Nothing on this host uses SCTP. The blacklist stops alias autoload (an unprivileged
+  # socket(..., IPPROTO_SCTP) is how the module gets pulled in); the install line also refuses an explicit
+  # `modprobe sctp`. Both take effect on switch for future loads; neither unloads a module that is already
+  # loaded (check `lsmod | grep sctp`). Keep this after the nginx fix too: it is defence in depth.
+  boot.blacklistedKernelModules = [ "sctp" ];
+  boot.extraModprobeConfig = ''
+    install sctp ${pkgs.coreutils}/bin/false
+  '';
 
   networking.firewall.allowedTCPPorts = [
     80
