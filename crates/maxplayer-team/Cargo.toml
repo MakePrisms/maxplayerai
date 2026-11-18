@@ -1,0 +1,21 @@
+[package]
+name = "maxplayer-team"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+maxplayer-core = { path = "../maxplayer-core", default-features = false, features = ["gateway"] }
+# Display escaping, text validation and the home key (Home::open), unchanged.
+maxplayer-chat = { path = "../maxplayer-chat" }
+nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59", "nip98"] }
+tokio = { version = "1.52.0", default-features = false, features = ["rt", "macros", "time", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

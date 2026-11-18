@@ -2925,6 +2925,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "maxplayer-team"
+version = "0.7.3"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "maxplayer-chat",
+ "maxplayer-core",
+ "nostr-sdk",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "maxplayer-tool-kit"
 version = "0.1.0"
 dependencies = [
