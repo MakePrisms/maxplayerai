@@ -62,7 +62,8 @@ fn write_usage(out: &mut dyn Write) {
          --from: download from this release directory instead of\n\
          \x20        {RELEASE_DOWNLOAD_BASE}/v{version} (https:// or file://).\n\
          <home> is --home, else $MAXPLAYER_HOME, else ~/.maxplayer.\n\
-         Exit codes: 0 success, 1 usage error, 2 runtime error (nothing was installed)",
+         Exit codes: 0 success, 1 usage error, 2 runtime error (the message says whether the binary\n\
+         was installed: a refused download installs nothing; a failed `init` leaves it installed)",
         version = env!("CARGO_PKG_VERSION"),
     );
 }
@@ -152,8 +153,8 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 mod wallet {
     use super::*;
     use std::fs;
-    use std::io::{self, Read};
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    use std::io::{self, BufRead, Read};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::path::Path;
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
@@ -172,6 +173,10 @@ mod wallet {
     const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
     /// The registration status check `maxplayer mint` makes (never blocks the info for long).
     const STATUS_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Staging files in the bin dir: `.maxplayer-mint.install.<pid>.<suffix>`.
+    pub(super) const STAGE_PREFIX: &str = ".maxplayer-mint.install.";
+    /// A staging file this old is left over from an interrupted install even if its pid was reused.
+    const STALE_STAGE_AGE: Duration = Duration::from_secs(3600);
 
     // ── shared pieces ────────────────────────────────────────────────────────────────────────
 
@@ -201,26 +206,30 @@ mod wallet {
         format!("{MINT_BIN}-{version}-{platform}/{MINT_BIN}")
     }
 
-    /// `maxplayer-mint <version>` or `maxplayer-mint <version> (<40-hex commit>)`, nothing else —
-    /// the grammar `scripts/verify-release-version.sh` holds released artifacts to.
-    pub(super) fn version_matches(line: &str, version: &str) -> bool {
-        let bare = format!("{MINT_BIN} {version}");
-        if line == bare {
-            return true;
-        }
-        let Some(rest) = line.strip_prefix(&format!("{bare} (")) else {
+    /// Exactly a RELEASE line for `version`: `maxplayer-mint <version> (<40-hex commit>[ <text>])`,
+    /// where `<text>` holds no `)`. This is the grammar `scripts/verify-release-version.sh` holds
+    /// every released artifact to (`STAMP_RE='^\(([0-9a-f]{40})( [^)]*)?\)$'`); keep the two in
+    /// step. A bare `maxplayer-mint <version>`, or a `-dirty`/`unknown` stamp, is a source build.
+    pub(super) fn is_release_line(line: &str, version: &str) -> bool {
+        let Some(stamp) = line.strip_prefix(&format!("{MINT_BIN} {version} ")) else {
             return false;
         };
-        let Some(stamp) = rest.strip_suffix(')') else {
+        let Some(inner) = stamp.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
             return false;
         };
-        stamp.len() == 40
-            && stamp
-                .bytes()
+        let bytes = inner.as_bytes();
+        if bytes.len() < 40
+            || !bytes[..40]
+                .iter()
                 .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        {
+            return false;
+        }
+        let rest = &inner[40..];
+        rest.is_empty() || (rest.starts_with(' ') && !rest.contains(')'))
     }
 
-    /// The version field of a `maxplayer-mint <version> (...)` line, for messages.
+    /// The version field of a `maxplayer-mint <version> ...` line.
     pub(super) fn reported_version(line: &str) -> Option<&str> {
         line.strip_prefix(&format!("{MINT_BIN} "))?
             .split_whitespace()
@@ -268,14 +277,20 @@ mod wallet {
     }
 
     /// The executable `member` out of a `.tar.gz`, read into memory (nothing is unpacked to disk,
-    /// so no archive path can escape anywhere). It must be a regular file.
+    /// so no archive path can escape anywhere). It must be a regular file and appear once.
     pub(super) fn extract_member(archive: &[u8], member: &str) -> Result<Vec<u8>, String> {
         let bad = |e: io::Error| format!("could not read the archive: {e}");
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(archive));
+        let mut found: Option<Vec<u8>> = None;
         for entry in tar.entries().map_err(bad)? {
             let mut entry = entry.map_err(bad)?;
             if entry.path().map_err(bad)? != Path::new(member) {
                 continue;
+            }
+            if found.is_some() {
+                return Err(format!(
+                    "the archive holds {member} more than once; refusing it"
+                ));
             }
             if entry.header().entry_type() != tar::EntryType::Regular {
                 return Err(format!("{member} in the archive is not a regular file"));
@@ -286,11 +301,14 @@ mod wallet {
                 .take(MAX_ARCHIVE_BYTES + 1)
                 .read_to_end(&mut bytes)
                 .map_err(bad)?;
-            return Ok(bytes);
+            found = Some(bytes);
         }
-        Err(format!(
-            "the archive does not contain {member}; this is not the asset layout maxplayer expects"
-        ))
+        found.ok_or_else(|| {
+            format!(
+                "the archive does not contain {member}; this is not the asset layout maxplayer \
+                 expects"
+            )
+        })
     }
 
     /// Where the release is fetched from.
@@ -301,20 +319,38 @@ mod wallet {
     }
 
     impl Source {
-        /// `https://` or `file://`, nothing else. `http://` gets [`HTTP_REFUSED`].
+        /// `https://` or `file://` naming a directory, nothing else: `http://` gets
+        /// [`HTTP_REFUSED`]; credentials, a query or a fragment are refused (they would be glued
+        /// in front of the asset name and printed).
         pub(super) fn parse(base: &str) -> Result<Self, String> {
-            let url = reqwest::Url::parse(base.trim())
+            let trimmed = base.trim();
+            let url = reqwest::Url::parse(trimmed)
                 .map_err(|_| format!("--from {base:?} is not a URL"))?;
             match url.scheme() {
-                "https" => Ok(Self::Https(base.trim().trim_end_matches('/').to_owned())),
-                "file" => url
-                    .to_file_path()
+                "https" | "file" => {}
+                "http" => return Err(HTTP_REFUSED.to_owned()),
+                other => {
+                    return Err(format!(
+                        "--from must be an https:// or file:// URL (got {other}://)"
+                    ));
+                }
+            }
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(
+                    "--from must name a release directory with no credentials, query or fragment"
+                        .to_owned(),
+                );
+            }
+            if url.scheme() == "https" {
+                Ok(Self::Https(trimmed.trim_end_matches('/').to_owned()))
+            } else {
+                url.to_file_path()
                     .map(Self::File)
-                    .map_err(|()| format!("--from {base:?} is not a local file:// path")),
-                "http" => Err(HTTP_REFUSED.to_owned()),
-                other => Err(format!(
-                    "--from must be an https:// or file:// URL (got {other}://)"
-                )),
+                    .map_err(|()| format!("--from {base:?} is not a local file:// path"))
             }
         }
 
@@ -327,52 +363,80 @@ mod wallet {
 
         fn fetch(&self, name: &str, limit: u64) -> Result<Vec<u8>, String> {
             let where_ = self.describe(name);
-            let mut bytes = Vec::new();
             match self {
                 Self::File(dir) => {
+                    let mut bytes = Vec::new();
                     fs::File::open(dir.join(name))
                         .and_then(|f| f.take(limit + 1).read_to_end(&mut bytes))
                         .map_err(|e| format!("could not read {where_}: {e}"))?;
+                    if bytes.len() as u64 > limit {
+                        return Err(format!(
+                            "{where_} is larger than {limit} bytes; refusing it"
+                        ));
+                    }
+                    Ok(bytes)
                 }
-                Self::Https(_) => {
-                    let response = http_client()?
-                        .get(&where_)
-                        .send()
-                        .and_then(|r| r.error_for_status())
-                        .map_err(|e| format!("could not download {where_}: {e}"))?;
-                    response
-                        .take(limit + 1)
-                        .read_to_end(&mut bytes)
-                        .map_err(|e| format!("could not download {where_}: {e}"))?;
-                }
+                Self::Https(_) => fetch_https(&http_client(&[], false)?, &where_, limit),
             }
-            if bytes.len() as u64 > limit {
-                return Err(format!(
-                    "{where_} is larger than {limit} bytes; refusing it"
-                ));
-            }
-            Ok(bytes)
         }
     }
 
-    fn http_client() -> Result<reqwest::blocking::Client, String> {
-        reqwest::blocking::Client::builder()
+    /// Why a redirect to a URL with `scheme`, after `hops` earlier redirects, is refused; `None`
+    /// follows it. GitHub answers a release download with a redirect to its object store, so
+    /// redirects are followed, but only while they stay on https (the http fence).
+    pub(super) fn redirect_refusal(scheme: &str, hops: usize) -> Option<&'static str> {
+        if scheme != "https" {
+            Some("redirect away from https refused")
+        } else if hops >= 10 {
+            Some("too many redirects")
+        } else {
+            None
+        }
+    }
+
+    /// The download client. `roots` and `loopback` exist for the TLS test fixture only.
+    pub(super) fn http_client(
+        roots: &[reqwest::Certificate],
+        loopback: bool,
+    ) -> Result<reqwest::blocking::Client, String> {
+        let mut builder = reqwest::blocking::Client::builder()
             .connect_timeout(Duration::from_secs(20))
             .timeout(Duration::from_secs(600))
-            // GitHub answers a release download with a redirect to its object store; follow it
-            // only while it stays on https.
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.url().scheme() != "https" {
-                    attempt.error("redirect away from https refused")
-                } else if attempt.previous().len() >= 10 {
-                    attempt.error("too many redirects")
-                } else {
-                    attempt.follow()
-                }
-            }))
-            .user_agent(concat!("maxplayer/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .map_err(|e| format!("http client: {e}"))
+            .redirect(reqwest::redirect::Policy::custom(
+                |attempt| match redirect_refusal(attempt.url().scheme(), attempt.previous().len()) {
+                    Some(why) => attempt.error(why),
+                    None => attempt.follow(),
+                },
+            ))
+            .user_agent(concat!("maxplayer/", env!("CARGO_PKG_VERSION")));
+        for root in roots {
+            builder = builder.add_root_certificate(root.clone());
+        }
+        if loopback {
+            builder = builder.no_proxy();
+        }
+        builder.build().map_err(|e| format!("http client: {e}"))
+    }
+
+    pub(super) fn fetch_https(
+        client: &reqwest::blocking::Client,
+        url: &str,
+        limit: u64,
+    ) -> Result<Vec<u8>, String> {
+        let response = client
+            .get(url)
+            .send()
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| format!("could not download {url}: {e}"))?;
+        let mut bytes = Vec::new();
+        response
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("could not download {url}: {e}"))?;
+        if bytes.len() as u64 > limit {
+            return Err(format!("{url} is larger than {limit} bytes; refusing it"));
+        }
+        Ok(bytes)
     }
 
     fn resolve_root(opts: &Opts) -> Result<PathBuf, String> {
@@ -389,10 +453,24 @@ mod wallet {
             .ok_or_else(|| "HOME is not set, so there is no default --bin-dir; pass one".to_owned())
     }
 
+    /// `--bin-dir` (else ~/.local/bin), made absolute so a staged file is never run via PATH.
+    fn resolve_bin_dir(opts: &Opts) -> Result<PathBuf, String> {
+        let dir = match &opts.bin_dir {
+            Some(dir) => dir.clone(),
+            None => default_bin_dir()?,
+        };
+        if dir.is_absolute() {
+            return Ok(dir);
+        }
+        std::env::current_dir()
+            .map(|cwd| cwd.join(dir))
+            .map_err(|e| format!("could not resolve --bin-dir: {e}"))
+    }
+
     /// `maxplayer-mint` as the user's shell would find it: on PATH, else in ~/.local/bin.
-    fn locate_binary(bin_dir: Option<&Path>) -> Option<PathBuf> {
-        if let Some(dir) = bin_dir {
-            let path = dir.join(MINT_BIN);
+    fn locate_binary(opts: &Opts) -> Option<PathBuf> {
+        if opts.bin_dir.is_some() {
+            let path = resolve_bin_dir(opts).ok()?.join(MINT_BIN);
             return fs::symlink_metadata(&path).ok().map(|_| path);
         }
         path_lookup().or_else(|| {
@@ -410,6 +488,20 @@ mod wallet {
                 fs::metadata(candidate)
                     .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
             })
+    }
+
+    /// `path` as one shell word: unchanged when it is plain, else single-quoted.
+    pub(super) fn shell_quote(path: &Path) -> String {
+        let text = path.display().to_string();
+        if !text.is_empty()
+            && text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@%,=".contains(&b))
+        {
+            text
+        } else {
+            format!("'{}'", text.replace('\'', "'\\''"))
+        }
     }
 
     /// The child with no inherited `MAXPLAYER_*` variable except the ones set afterwards.
@@ -439,7 +531,9 @@ mod wallet {
         cmd.spawn()
     }
 
-    /// The first stdout line of `<bin> --version`, bounded by [`VERSION_PROBE_TIMEOUT`].
+    /// The first stdout line of `<bin> --version`, bounded by [`VERSION_PROBE_TIMEOUT`]. Only the
+    /// first line is read, so a background process the binary left holding its stdout cannot hold
+    /// this up.
     fn probe_version(bin: &Path) -> Result<String, String> {
         let mut child = spawn(
             command(bin)
@@ -449,11 +543,19 @@ mod wallet {
                 .stderr(Stdio::null()),
         )
         .map_err(|e| format!("could not run {}: {e}", bin.display()))?;
-        let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let _ = io::BufReader::new(stdout.take(64 << 10)).read_line(&mut line);
+                let _ = tx.send(line);
+            });
+        }
+        let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() < VERSION_PROBE_TIMEOUT => {
+                Ok(None) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Ok(None) => {
@@ -464,14 +566,11 @@ mod wallet {
                 Err(e) => return Err(format!("waiting for {}: {e}", bin.display())),
             }
         };
-        let mut stdout = String::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            let _ = pipe.by_ref().take(64 << 10).read_to_string(&mut stdout);
-        }
         if !status.success() {
             return Err(format!("{} --version failed ({status})", bin.display()));
         }
-        Ok(stdout.lines().next().unwrap_or("").trim().to_owned())
+        let line = rx.recv_timeout(Duration::from_secs(2)).unwrap_or_default();
+        Ok(line.trim().to_owned())
     }
 
     /// The mint's PUBLIC key, from `<mint dir>/nostr.key`. Read-only: unlike the home-key reader,
@@ -505,36 +604,73 @@ mod wallet {
             .unwrap_or_else(|| format!("{MINT_BIN}-{}", &keys.public_key().to_hex()[..8]))
     }
 
-    /// Whether `maxplayer-mint run` holds its single-listener lock (an exclusive `flock` on the
-    /// mint directory). `Ok(Some(pid))` running (pid 0 when unknown), `Ok(None)` not running.
-    ///
-    /// On linux this reads `/proc/locks` and never takes the lock itself, so it cannot make a
-    /// starting `run` fail with "already serving". Elsewhere it probes with a shared lock that is
-    /// released at once.
-    fn mint_runner(mint_dir: &Path) -> Result<Option<u32>, String> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let meta =
-                fs::metadata(mint_dir).map_err(|e| format!("{}: {e}", mint_dir.display()))?;
-            let locks = fs::read_to_string("/proc/locks")
-                .map_err(|e| format!("could not read /proc/locks: {e}"))?;
-            Ok(flock_holder(&locks, meta.dev(), meta.ino()))
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let dir =
-                fs::File::open(mint_dir).map_err(|e| format!("{}: {e}", mint_dir.display()))?;
-            match dir.try_lock_shared() {
-                Ok(()) => Ok(None),
-                Err(fs::TryLockError::WouldBlock) => Ok(Some(0)),
-                Err(fs::TryLockError::Error(e)) => Err(format!("{}: {e}", mint_dir.display())),
+    /// An existing `<home>/mint/` is kept only when it is a mint: a directory holding `nostr.key`,
+    /// `seed` and `mint.sqlite`. A half-made one (an `init` that failed part-way) is refused, so
+    /// `install` never reports a mint with no key as set up.
+    fn check_existing_mint(mint_dir: &Path) -> Result<(), String> {
+        let meta =
+            fs::symlink_metadata(mint_dir).map_err(|e| format!("{}: {e}", mint_dir.display()))?;
+        let is_file =
+            |name: &str| fs::symlink_metadata(mint_dir.join(name)).is_ok_and(|m| m.is_file());
+        let problem = if !meta.is_dir() {
+            Some("it is not a directory".to_owned())
+        } else {
+            match read_mint_keys(mint_dir) {
+                Ok(None) => Some("it has no nostr.key".to_owned()),
+                Err(e) => Some(e),
+                Ok(Some(_)) if !is_file("seed") => Some("it has no seed".to_owned()),
+                Ok(Some(_)) if !is_file("mint.sqlite") => Some("it has no mint.sqlite".to_owned()),
+                Ok(Some(_)) => None,
             }
+        };
+        match problem {
+            None => Ok(()),
+            Some(problem) => Err(format!(
+                "{} exists but is not a usable mint ({problem}); nothing was installed. If an \
+                 earlier setup stopped half-way, move it aside (never delete a mint that has \
+                 issued credits) and rerun.",
+                mint_dir.display()
+            )),
         }
     }
 
-    /// The pid holding a WRITE `FLOCK` on (`dev`, `ino`) in `/proc/locks` text. Blocked waiters
-    /// (`->` lines) do not count.
+    /// Whether `maxplayer-mint run` holds its single-listener lock (an exclusive `flock` on the
+    /// mint directory). `Ok(Some(pid))` running (pid 0 when unknown), `Ok(None)` not running.
+    fn mint_runner(mint_dir: &Path) -> Result<Option<u32>, String> {
+        let proc_locks = if cfg!(target_os = "linux") {
+            fs::read_to_string("/proc/locks").ok()
+        } else {
+            None
+        };
+        mint_runner_with(mint_dir, proc_locks.as_deref())
+    }
+
+    /// [`mint_runner`] with the `/proc/locks` text given. A holder listed there is found without
+    /// touching the lock and names its pid. Anything else — not listed (btrfs reports another
+    /// device there than `stat`, and another PID namespace's locks are hidden) or no
+    /// `/proc/locks` (macOS) — is asked of the lock itself, with a shared probe released at once.
+    /// That probe cannot stop a starting `maxplayer-mint run`: its `lock_run` retries for a
+    /// second before deciding another `run` is serving.
+    pub(super) fn mint_runner_with(
+        mint_dir: &Path,
+        proc_locks: Option<&str>,
+    ) -> Result<Option<u32>, String> {
+        let meta = fs::metadata(mint_dir).map_err(|e| format!("{}: {e}", mint_dir.display()))?;
+        if let Some(locks) = proc_locks
+            && let Some(pid) = flock_holder(locks, meta.dev(), meta.ino())
+        {
+            return Ok(Some(pid));
+        }
+        let dir = fs::File::open(mint_dir).map_err(|e| format!("{}: {e}", mint_dir.display()))?;
+        match dir.try_lock_shared() {
+            Ok(()) => Ok(None),
+            Err(fs::TryLockError::WouldBlock) => Ok(Some(0)),
+            Err(fs::TryLockError::Error(e)) => Err(format!("{}: {e}", mint_dir.display())),
+        }
+    }
+
+    /// The pid holding a WRITE `FLOCK` on (`dev`, `ino`) in `/proc/locks` text (0 when the pid
+    /// field is not a plain number). Blocked waiters (`->` lines) do not count.
     pub(super) fn flock_holder(locks: &str, dev: u64, ino: u64) -> Option<u32> {
         // glibc's major()/minor() decoding of st_dev; /proc/locks prints `%02x:%02x:%lu`.
         let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
@@ -547,8 +683,7 @@ mod wallet {
             }
             let at = fields.iter().position(|f| *f == "FLOCK")?;
             (fields.get(at + 2) == Some(&"WRITE") && fields.get(at + 4) == Some(&want.as_str()))
-                .then(|| fields.get(at + 3)?.parse().ok())
-                .flatten()
+                .then(|| fields.get(at + 3).and_then(|p| p.parse().ok()).unwrap_or(0))
         })
     }
 
@@ -564,17 +699,20 @@ mod wallet {
         };
         let flags = home_flag(opts);
 
-        let binary = locate_binary(opts.bin_dir.as_deref());
-        let probed = binary.as_deref().map(probe_version);
-        let (bin_version, bin_matches, bin_error) = match &probed {
-            Some(Ok(line)) => (
-                reported_version(line).map(str::to_owned),
-                version_matches(line, VERSION),
-                None,
-            ),
-            Some(Err(e)) => (None, false, Some(e.clone())),
-            None => (None, false, None),
+        let binary = locate_binary(opts);
+        let (bin_line, bin_error) = match binary.as_deref().map(probe_version) {
+            Some(Ok(line)) => (Some(line), None),
+            Some(Err(e)) => (None, Some(e)),
+            None => (None, None),
         };
+        let bin_version = bin_line
+            .as_deref()
+            .and_then(reported_version)
+            .map(str::to_owned);
+        let bin_matches = bin_version.as_deref() == Some(VERSION);
+        let bin_release = bin_line
+            .as_deref()
+            .is_some_and(|line| is_release_line(line, VERSION));
 
         let mint_dir = root.join("mint");
         let mint_exists = fs::symlink_metadata(&mint_dir).is_ok();
@@ -614,8 +752,10 @@ mod wallet {
                 "binary": {
                     "installed": binary.is_some(),
                     "path": binary.as_ref().map(|p| p.display().to_string()),
+                    "line": bin_line,
                     "version": bin_version,
                     "version_matches": bin_matches,
+                    "release_build": bin_release,
                     "error": bin_error,
                 },
                 "home": root.display().to_string(),
@@ -637,17 +777,29 @@ mod wallet {
             return SUCCESS;
         }
 
-        let binary_line = match (&binary, &bin_version, &bin_error) {
-            (None, _, _) => format!("not installed (run `maxplayer mint install{flags}`)"),
-            (Some(path), _, Some(e)) => format!("{} (version unknown: {e})", path.display()),
-            (Some(path), _, None) if bin_matches => {
+        let binary_line = match (&binary, &bin_error) {
+            (None, _) => format!("not installed (run `maxplayer mint install{flags}`)"),
+            (Some(path), Some(e)) => format!("{} (version unknown: {e})", path.display()),
+            (Some(path), None) if bin_matches && bin_release => {
                 format!("{} version {VERSION} (matches maxplayer)", path.display())
             }
-            (Some(path), version, None) => format!(
-                "{} version {} (maxplayer is {VERSION}; run `maxplayer mint install --force{flags}`)",
+            (Some(path), None) if bin_matches => format!(
+                "{} version {VERSION} (matches maxplayer; a source build: {})",
                 path.display(),
-                version.as_deref().unwrap_or("unknown")
+                bin_line.as_deref().unwrap_or("")
             ),
+            (Some(path), None) => {
+                // Name the directory it was found in: the default --bin-dir may not be the one
+                // on PATH, and advice that installs elsewhere would never clear this line.
+                let dir = path.parent().unwrap_or(Path::new("."));
+                format!(
+                    "{} version {} (maxplayer is {VERSION}; run `maxplayer mint install --force \
+                     --bin-dir {}{flags}`)",
+                    path.display(),
+                    bin_version.as_deref().unwrap_or("unknown"),
+                    shell_quote(dir)
+                )
+            }
         };
         let _ = writeln!(out, "{MINT_BIN}: {binary_line}");
         let _ = writeln!(out, "home:      {}", root.display());
@@ -714,18 +866,19 @@ mod wallet {
         }
     }
 
-    /// ` --home <dir>` when the user named one, so printed commands act on the same home.
+    /// ` --home <dir>` (shell-quoted) when the user named one, so printed commands act on the
+    /// same home.
     fn home_flag(opts: &Opts) -> String {
         opts.home
             .as_ref()
-            .map(|h| format!(" --home {}", h.display()))
+            .map(|h| format!(" --home {}", shell_quote(h)))
             .unwrap_or_default()
     }
 
     // ── maxplayer mint install ───────────────────────────────────────────────────────────────
 
     pub fn install(opts: &Opts, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-        // Every refusal of the source happens before anything is resolved, created or contacted.
+        // Every refusal of the arguments happens before anything is resolved, created or contacted.
         let default_base = format!("{RELEASE_DOWNLOAD_BASE}/v{VERSION}");
         let source = match Source::parse(opts.from.as_deref().unwrap_or(&default_base)) {
             Ok(source) => source,
@@ -734,6 +887,14 @@ mod wallet {
                 return USAGE_ERROR;
             }
         };
+        if opts
+            .bin_dir
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+        {
+            let _ = writeln!(err, "--bin-dir must not be empty");
+            return USAGE_ERROR;
+        }
         if let Some(name) = &opts.name
             && !maxplayer_core::mint_wire::valid_mint_name(name)
         {
@@ -769,41 +930,62 @@ mod wallet {
             )
         })?;
         let root = resolve_root(opts)?;
-        let bin_dir = match &opts.bin_dir {
-            Some(dir) => dir.clone(),
-            None => default_bin_dir()?,
-        };
+        let bin_dir = resolve_bin_dir(opts)?;
         let target = bin_dir.join(MINT_BIN);
         let flags = home_flag(opts);
+        let mint_dir = root.join("mint");
 
-        // An existing binary is replaced only with --force. One that already reports this version
-        // is left alone and counts as installed.
+        // An existing <home>/mint/ is kept as it is, but only a real one; checked before anything
+        // is downloaded or installed.
+        let mint_exists = fs::symlink_metadata(&mint_dir).is_ok();
+        if mint_exists {
+            check_existing_mint(&mint_dir)?;
+        }
+
+        // Staging files an interrupted install left behind (Ctrl-C, a kill, a crash).
+        remove_stale_stages(&bin_dir);
+
+        // An existing binary is replaced only with --force, and then it is not run at all. Without
+        // --force, one that already reports this version is left alone and counts as installed.
         let mut already = false;
-        if fs::symlink_metadata(&target).is_ok() {
-            let reported = probe_version(&target);
-            match (&reported, opts.force) {
-                (Ok(line), false) if version_matches(line, VERSION) => {
-                    let _ = writeln!(
-                        out,
-                        "{} is already installed at {} (left as it is).",
-                        line,
-                        target.display()
-                    );
-                    already = true;
+        let mut replaced_link = None;
+        if let Ok(meta) = fs::symlink_metadata(&target) {
+            if opts.force {
+                if meta.file_type().is_symlink() {
+                    replaced_link = Some(fs::read_link(&target).unwrap_or_default());
                 }
-                (_, false) => {
-                    let what = match &reported {
-                        Ok(line) if !line.is_empty() => format!("it reports {line:?}"),
-                        Ok(_) => "it reports no version".to_owned(),
-                        Err(e) => e.clone(),
-                    };
-                    return Err(format!(
-                        "{} already exists ({what}); not replacing it. Rerun with --force to \
-                         replace it with {MINT_BIN} {VERSION}.",
-                        target.display()
-                    ));
+            } else {
+                let reported = probe_version(&target);
+                match &reported {
+                    Ok(line) if reported_version(line) == Some(VERSION) => {
+                        let note = if is_release_line(line, VERSION) {
+                            String::new()
+                        } else {
+                            format!(
+                                "; a source build — `maxplayer mint install --force{flags}` \
+                                 replaces it with the release"
+                            )
+                        };
+                        let _ = writeln!(
+                            out,
+                            "{line} is already installed at {} (left as it is{note}).",
+                            target.display()
+                        );
+                        already = true;
+                    }
+                    _ => {
+                        let what = match &reported {
+                            Ok(line) if !line.is_empty() => format!("it reports {line:?}"),
+                            Ok(_) => "it reports no version".to_owned(),
+                            Err(e) => e.clone(),
+                        };
+                        return Err(format!(
+                            "{} already exists ({what}); not replacing it. Rerun with --force to \
+                             replace it with {MINT_BIN} {VERSION}.",
+                            target.display()
+                        ));
+                    }
                 }
-                (_, true) => {}
             }
         }
 
@@ -834,8 +1016,9 @@ mod wallet {
                 return Err("the unpacked binary is implausibly large; refusing it".to_owned());
             }
 
-            fs::create_dir_all(&bin_dir)
-                .map_err(|e| format!("could not create {}: {e}", bin_dir.display()))?;
+            // Directories made here are removed again if the install is refused (dropped
+            // without `keep`), after the staging file (declared later, dropped first).
+            let created = CreatedDirs::create(&bin_dir)?;
             let staged = Staged::write(&bin_dir, &binary)
                 .map_err(|e| format!("could not write into {}: {e}", bin_dir.display()))?;
             // Prove it before it is installed: a binary for the wrong platform or version leaves
@@ -843,41 +1026,64 @@ mod wallet {
             let line = probe_version(&staged.path).map_err(|e| {
                 format!("the downloaded {MINT_BIN} did not run here ({e}) — nothing was installed")
             })?;
-            if !version_matches(&line, VERSION) {
+            if !is_release_line(&line, VERSION) {
                 return Err(format!(
-                    "the downloaded binary reports {line:?}, but this maxplayer is {VERSION} and \
-                     the mint must match it — nothing was installed"
+                    "the downloaded binary reports {line:?}, not a `{MINT_BIN} {VERSION} \
+                     (<commit>)` release line; the mint must match this maxplayer ({VERSION}) — \
+                     nothing was installed"
                 ));
             }
-            staged.commit(&target, opts.force).map_err(|e| {
+            let warnings = staged.commit(&target, opts.force).map_err(|e| {
                 if e.kind() == io::ErrorKind::AlreadyExists {
                     format!(
-                        "{} appeared while installing; not replacing it (rerun with --force)",
+                        "{} appeared while installing; not replacing it (rerun with --force) — \
+                         nothing was installed",
                         target.display()
                     )
                 } else {
-                    format!("could not install {}: {e}", target.display())
+                    format!(
+                        "could not install {}: {e} — nothing was installed",
+                        target.display()
+                    )
                 }
             })?;
+            created.keep();
+            // The binary is in place from here on: what follows can warn, never undo it.
+            for warning in warnings {
+                let _ = writeln!(err, "warning: {warning}");
+            }
             let _ = writeln!(out, "Installed {line} -> {}", target.display());
+            if let Some(link) = replaced_link {
+                let _ = writeln!(
+                    out,
+                    "Replaced the symlink {} (it pointed to {}) with the installed file; a \
+                     package manager that owned the link (npm) no longer updates it.",
+                    target.display(),
+                    link.display()
+                );
+            }
         }
 
         // <home>/mint/: created by the installed binary's own `init` (it owns the layout); an
         // existing one is never touched.
-        let mint_dir = root.join("mint");
-        if fs::symlink_metadata(&mint_dir).is_ok() {
+        if mint_exists {
             let _ = writeln!(
                 out,
                 "Kept the existing mint at {} (not re-initialised).",
                 mint_dir.display()
             );
+            if opts.name.is_some() {
+                let _ = writeln!(
+                    out,
+                    "Ignored --name: an existing mint keeps its name; change it with \
+                     `{MINT_BIN} name <name>`."
+                );
+            }
         } else {
-            init_mint_home(&target, &root, opts.name.as_deref(), out, err)?;
+            init_mint_home(&target, &root, opts.name.as_deref(), &flags, out, err)?;
         }
 
-        if let Ok(Some(pid)) = mint_runner(&mint_dir)
-            && !already
-        {
+        if !already && let Ok(Some(pid)) = mint_runner(&mint_dir) {
             let pid = if pid == 0 {
                 String::new()
             } else {
@@ -900,16 +1106,18 @@ mod wallet {
         if path_lookup().is_none_or(|found| found != target) {
             let _ = writeln!(
                 out,
-                "Note: `{MINT_BIN}` on your PATH is not {}; add {} to PATH (or run it by its full path).",
+                "Note: `{MINT_BIN}` on your PATH is not {}; add {} to PATH (or run it by its full \
+                 path).",
                 target.display(),
                 bin_dir.display()
             );
         }
         let _ = writeln!(out);
-        // `account link --mint` cosigns with this home's agent key when there is one (PR 4,
-        // #1340); a mint-only home links the mint by email code instead.
+        // `account link --mint` cosigns with this home's agent key when that key is linked (PR 4,
+        // #1340); otherwise it links the mint by email code.
         let how = if fs::symlink_metadata(root.join("key")).is_ok() {
-            "both keys sign, no email is sent"
+            "if this home's agent key is already linked, both keys sign and no email is sent; \
+             otherwise it emails you a code"
         } else {
             "this home has no agent key, so it emails you a code"
         };
@@ -925,6 +1133,7 @@ mod wallet {
         bin: &Path,
         root: &Path,
         name: Option<&str>,
+        flags: &str,
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> Result<(), String> {
@@ -951,22 +1160,116 @@ mod wallet {
         let _ = out.write_all(&output.stdout);
         let _ = err.write_all(&output.stderr);
         if !output.status.success() {
+            let mint_dir = root.join("mint");
+            let fix = if fs::symlink_metadata(&mint_dir).is_ok() {
+                format!(
+                    "it left a partial {}: move it aside (never delete a mint that has issued \
+                     credits), then rerun `maxplayer mint install{flags}`",
+                    mint_dir.display()
+                )
+            } else {
+                format!("fix the error above, then rerun `maxplayer mint install{flags}`")
+            };
             return Err(format!(
-                "{} init failed ({}); the binary is installed, <home>/mint/ is not set up — fix \
-                 the error above and run `MAXPLAYER_HOME={} {} init`",
+                "{} init failed ({}); the binary is installed but <home>/mint/ is not set up: \
+                 {fix}",
                 bin.display(),
-                output.status,
-                root.display(),
-                bin.display()
+                output.status
             ));
         }
         Ok(())
     }
 
-    /// A fully written, fsynced copy of the binary under a temporary name in the target directory.
-    /// Dropped without [`Self::commit`] it is removed, so a refused install leaves nothing behind.
+    /// Remove `.maxplayer-mint.install.<pid>.*` regular files in `dir` whose process is gone or
+    /// that are older than [`STALE_STAGE_AGE`]. Best effort: a live install's stage is kept.
+    pub(super) fn remove_stale_stages(dir: &Path) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(STAGE_PREFIX)) else {
+                continue;
+            };
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let dead = rest
+                .split('.')
+                .next()
+                .and_then(|pid| pid.parse::<i32>().ok())
+                .is_some_and(|pid| !pid_alive(pid));
+            let old = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > STALE_STAGE_AGE);
+            if dead || old {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    fn pid_alive(pid: i32) -> bool {
+        if pid <= 0 {
+            return false;
+        }
+        // SAFETY: signal 0 only checks that the process exists; nothing is delivered.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    /// The directories [`Self::create`] made for the bin dir, removed again (if still empty)
+    /// when dropped without [`Self::keep`].
+    struct CreatedDirs {
+        /// Deepest first.
+        made: Vec<PathBuf>,
+        keep: bool,
+    }
+
+    impl CreatedDirs {
+        fn create(dir: &Path) -> Result<Self, String> {
+            let mut made = Vec::new();
+            let mut cursor = Some(dir);
+            while let Some(path) = cursor {
+                if fs::symlink_metadata(path).is_ok() {
+                    break;
+                }
+                made.push(path.to_path_buf());
+                cursor = path.parent();
+            }
+            fs::create_dir_all(dir)
+                .map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+            Ok(Self { made, keep: false })
+        }
+
+        fn keep(mut self) {
+            self.keep = true;
+        }
+    }
+
+    impl Drop for CreatedDirs {
+        fn drop(&mut self) {
+            if !self.keep {
+                for dir in &self.made {
+                    let _ = fs::remove_dir(dir);
+                }
+            }
+        }
+    }
+
+    /// A fully written, fsynced copy of the binary under a temporary name in the target directory,
+    /// owner-only until it is committed. Dropped without [`Self::commit`] it is removed, so a
+    /// refused install leaves nothing behind.
     pub(super) struct Staged {
         pub(super) path: PathBuf,
+        /// A read-only handle on the inode that was written: permissions are changed through it,
+        /// never by path.
+        handle: fs::File,
         armed: bool,
     }
 
@@ -978,7 +1281,7 @@ mod wallet {
                 .unwrap_or(0);
             for attempt in 0..32u32 {
                 let path = dir.join(format!(
-                    ".{MINT_BIN}.install.{}.{nanos:x}{attempt}",
+                    "{STAGE_PREFIX}{}.{nanos:x}{attempt}",
                     std::process::id()
                 ));
                 let mut file = match fs::OpenOptions::new()
@@ -991,11 +1294,37 @@ mod wallet {
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                     Err(e) => return Err(e),
                 };
-                let staged = Self { path, armed: true };
+                let handle = match fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&path)
+                    .and_then(|handle| {
+                        let (a, b) = (file.metadata()?, handle.metadata()?);
+                        if (a.dev(), a.ino()) == (b.dev(), b.ino()) {
+                            Ok(handle)
+                        } else {
+                            Err(io::Error::other(
+                                "the staging file was replaced while writing",
+                            ))
+                        }
+                    }) {
+                    Ok(handle) => handle,
+                    Err(e) => {
+                        let _ = fs::remove_file(&path);
+                        return Err(e);
+                    }
+                };
+                let staged = Self {
+                    path,
+                    handle,
+                    armed: true,
+                };
                 file.write_all(bytes)?;
                 file.sync_all()?;
                 drop(file);
-                fs::set_permissions(&staged.path, fs::Permissions::from_mode(0o755))?;
+                staged
+                    .handle
+                    .set_permissions(fs::Permissions::from_mode(0o700))?;
                 return Ok(staged);
             }
             Err(io::Error::new(
@@ -1004,28 +1333,54 @@ mod wallet {
             ))
         }
 
-        /// Put the staged file at `target` in one step. Without `replace`: a hard link, which fails
-        /// if `target` exists (no check-then-write race). With it: a rename over the old entry, so a
-        /// running `maxplayer-mint` keeps its old inode and no reader ever sees a partial file.
-        pub(super) fn commit(mut self, target: &Path, replace: bool) -> io::Result<()> {
+        /// Put the staged file at `target` in one step and return non-fatal warnings. With
+        /// `replace`: a rename over the old entry, so a running `maxplayer-mint` keeps its old
+        /// inode and no reader ever sees a partial file. Without: a rename that refuses an
+        /// existing target atomically (`renameat2(RENAME_NOREPLACE)` / `renamex_np(RENAME_EXCL)`),
+        /// else a hard link, which refuses it the same way; a filesystem offering neither is
+        /// refused rather than risk replacing a file that appeared meanwhile. Once the file is in
+        /// place, nothing after it (directory fsync, stage cleanup) can fail the install.
+        pub(super) fn commit(mut self, target: &Path, replace: bool) -> io::Result<Vec<String>> {
+            self.handle
+                .set_permissions(fs::Permissions::from_mode(0o755))?;
+            let mut warnings = Vec::new();
             if replace {
                 fs::rename(&self.path, target)?;
+                self.armed = false;
             } else {
-                match fs::hard_link(&self.path, target) {
-                    Ok(()) => {}
+                match rename_noreplace(&self.path, target) {
+                    Ok(()) => self.armed = false,
                     Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
-                    // A filesystem without hard links: rename when nothing is there.
-                    Err(_) if fs::symlink_metadata(target).is_err() => {
-                        fs::rename(&self.path, target)?;
-                        self.armed = false;
-                        return sync_parent(target);
-                    }
-                    Err(_) => return Err(io::ErrorKind::AlreadyExists.into()),
+                    Err(e) if rename_unsupported(&e) => match fs::hard_link(&self.path, target) {
+                        Ok(()) => {
+                            self.armed = false;
+                            if let Err(e) = fs::remove_file(&self.path) {
+                                warnings.push(format!(
+                                    "could not remove the staging file {}: {e}",
+                                    self.path.display()
+                                ));
+                            }
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+                        Err(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "this filesystem cannot install without possibly replacing a file \
+                                 that appears meanwhile; rerun with --force to replace whatever is \
+                                 there",
+                            ));
+                        }
+                    },
+                    Err(e) => return Err(e),
                 }
-                fs::remove_file(&self.path)?;
             }
-            self.armed = false;
-            sync_parent(target)
+            if let Err(e) = sync_parent(target) {
+                warnings.push(format!(
+                    "installed, but could not sync the directory of {}: {e}",
+                    target.display()
+                ));
+            }
+            Ok(warnings)
         }
     }
 
@@ -1035,6 +1390,60 @@ mod wallet {
                 let _ = fs::remove_file(&self.path);
             }
         }
+    }
+
+    fn rename_unsupported(e: &io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(code) if code == libc::EINVAL || code == libc::ENOSYS || code == libc::ENOTSUP
+        )
+    }
+
+    /// `rename(from, to)` that fails with `AlreadyExists` instead of replacing `to`.
+    #[cfg(target_os = "linux")]
+    pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let from = CString::new(from.as_os_str().as_bytes())?;
+        let to = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: two valid NUL-terminated paths that outlive the call; renameat2 only reads them.
+        // The raw syscall rather than libc's wrapper: musl (the release build) has no wrapper.
+        let rc = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// `rename(from, to)` that fails with `AlreadyExists` instead of replacing `to`.
+    #[cfg(target_os = "macos")]
+    pub(super) fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let from = CString::new(from.as_os_str().as_bytes())?;
+        let to = CString::new(to.as_os_str().as_bytes())?;
+        // SAFETY: two valid NUL-terminated paths that outlive the call.
+        let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
     fn sync_parent(path: &Path) -> io::Result<()> {
@@ -1049,6 +1458,8 @@ mod wallet {
 mod tests {
     use super::wallet::*;
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -1105,28 +1516,165 @@ mod tests {
     }
 
     #[test]
-    fn version_lines_must_name_exactly_this_version() {
+    fn only_release_lines_of_this_version_install() {
         let sha = "0123456789abcdef0123456789abcdef01234567";
-        assert!(version_matches("maxplayer-mint 0.7.3", "0.7.3"));
-        assert!(version_matches(
+        // The grammar of scripts/verify-release-version.sh: `(<40 hex>[ <text without ')'>])`.
+        assert!(is_release_line(
             &format!("maxplayer-mint 0.7.3 ({sha})"),
             "0.7.3"
         ));
-        assert!(!version_matches(
+        assert!(is_release_line(
+            &format!("maxplayer-mint 0.7.3 ({sha} 2026-11-18T10:00Z)"),
+            "0.7.3"
+        ));
+        assert!(!is_release_line("maxplayer-mint 0.7.3", "0.7.3"));
+        assert!(!is_release_line(
+            &format!("maxplayer-mint 0.7.3 ({sha}-dirty)"),
+            "0.7.3"
+        ));
+        assert!(!is_release_line("maxplayer-mint 0.7.3 (unknown)", "0.7.3"));
+        assert!(!is_release_line(
             &format!("maxplayer-mint 0.7.2 ({sha})"),
             "0.7.3"
         ));
-        assert!(!version_matches("maxplayer-mint 0.7.3-rc1", "0.7.3"));
-        assert!(!version_matches("maxplayer 0.7.3", "0.7.3"));
-        assert!(!version_matches("maxplayer-mint 0.7.3 (unknown)", "0.7.3"));
-        assert!(!version_matches(
+        assert!(!is_release_line(
+            &format!("maxplayer-mint 0.7.3-rc1 ({sha})"),
+            "0.7.3"
+        ));
+        assert!(!is_release_line(
+            &format!("maxplayer 0.7.3 ({sha})"),
+            "0.7.3"
+        ));
+        assert!(!is_release_line(
             &format!("maxplayer-mint 0.7.3 ({sha}) x"),
+            "0.7.3"
+        ));
+        assert!(!is_release_line(
+            &format!("maxplayer-mint 0.7.3 ({sha} a)b)"),
+            "0.7.3"
+        ));
+        assert!(!is_release_line(
+            &format!("maxplayer-mint 0.7.3 ({})", sha.to_uppercase()),
             "0.7.3"
         ));
         assert_eq!(
             reported_version(&format!("maxplayer-mint 0.6.0 ({sha})")),
             Some("0.6.0")
         );
+        assert_eq!(reported_version("maxplayer-mint 0.7.3"), Some("0.7.3"));
+    }
+
+    #[test]
+    fn redirects_stay_on_https() {
+        assert_eq!(redirect_refusal("https", 0), None);
+        assert_eq!(
+            redirect_refusal("http", 0),
+            Some("redirect away from https refused")
+        );
+        assert_eq!(
+            redirect_refusal("file", 0),
+            Some("redirect away from https refused")
+        );
+        assert_eq!(redirect_refusal("https", 10), Some("too many redirects"));
+    }
+
+    /// The real download client against a loopback https server that redirects to plain http:
+    /// the redirect is refused and the http listener is never contacted (review M7).
+    #[test]
+    fn the_download_client_refuses_a_redirect_to_http() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let plain = TcpListener::bind("127.0.0.1:0").unwrap();
+        let plain_port = plain.local_addr().unwrap().port();
+        plain.set_nonblocking(true).unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        std::thread::spawn(move || {
+            loop {
+                if plain.accept().is_ok() {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+        let pem = certified.cert.pem();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+        );
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certified.cert.der().clone()], key)
+            .unwrap(),
+        );
+        let tls = TcpListener::bind("127.0.0.1:0").unwrap();
+        let tls_port = tls.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in tls.incoming().flatten() {
+                let conn = rustls::ServerConnection::new(config.clone()).unwrap();
+                let mut stream = rustls::StreamOwned::new(conn, stream);
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{plain_port}/x.tar.gz\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let root = reqwest::Certificate::from_pem(pem.as_bytes()).unwrap();
+        let client = http_client(&[root], true).unwrap();
+        let err = fetch_https(
+            &client,
+            &format!("https://127.0.0.1:{tls_port}/x.tar.gz"),
+            1 << 20,
+        )
+        .unwrap_err();
+        assert!(err.contains("could not download"), "{err}");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the http listener was contacted"
+        );
+    }
+
+    #[test]
+    fn duplicate_archive_members_are_refused() {
+        let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        for body in [&b"one"[..], &b"two"[..]] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "d/maxplayer-mint", body)
+                .unwrap();
+        }
+        let archive = builder.into_inner().unwrap().finish().unwrap();
+        let err = extract_member(&archive, "d/maxplayer-mint").unwrap_err();
+        assert!(err.contains("more than once"), "{err}");
+    }
+
+    #[test]
+    fn printed_paths_are_one_shell_word() {
+        assert_eq!(shell_quote(Path::new("/srv/mint-home")), "/srv/mint-home");
+        assert_eq!(shell_quote(Path::new("/a/my home")), "'/a/my home'");
+        assert_eq!(shell_quote(Path::new("/a/it's")), "'/a/it'\\''s'");
     }
 
     #[test]
@@ -1166,6 +1714,16 @@ mod tests {
         );
         assert!(Source::parse("ftp://example.com/x").is_err());
         assert!(Source::parse("/tmp/rel").is_err());
+        for bad in [
+            "https://user:secret@example.com/r",
+            "https://example.com/r?sig=abc",
+            "https://example.com/r#frag",
+        ] {
+            assert!(
+                Source::parse(bad).unwrap_err().contains("no credentials"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -1180,12 +1738,38 @@ mod tests {
         assert_eq!(flock_holder(locks, 0xfd01, 779), None);
         assert_eq!(flock_holder(locks, 0xfd01, 780), None);
         assert_eq!(flock_holder(locks, 0xfd02, 777), None);
+        // A holder whose pid the kernel cannot attribute still counts as running.
+        assert_eq!(
+            flock_holder("1: FLOCK ADVISORY WRITE -1 fd:01:9 0 EOF\n", 0xfd01, 9),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_holder_missing_from_proc_locks_is_still_seen() {
+        // btrfs subvolumes and other PID namespaces leave /proc/locks without the line; the
+        // fallback probe must still see the exclusive lock (and release its own at once).
+        let dir = tempfile::tempdir().unwrap();
+        let held = std::fs::File::open(dir.path()).unwrap();
+        held.try_lock().unwrap();
+        assert_eq!(mint_runner_with(dir.path(), Some("")).unwrap(), Some(0));
+        assert_eq!(mint_runner_with(dir.path(), None).unwrap(), Some(0));
+        drop(held);
+        assert_eq!(mint_runner_with(dir.path(), Some("")).unwrap(), None);
+        let after = std::fs::File::open(dir.path()).unwrap();
+        after.try_lock().expect("the probe released its lock");
     }
 
     #[test]
     fn a_dropped_stage_leaves_nothing_and_commit_never_clobbers() {
         let dir = tempfile::tempdir().unwrap();
         let staged = Staged::write(dir.path(), b"new").unwrap();
+        let mode = std::fs::metadata(&staged.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "a stage is owner-only until committed");
         drop(staged);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
@@ -1202,8 +1786,43 @@ mod tests {
         );
 
         let staged = Staged::write(dir.path(), b"new").unwrap();
-        staged.commit(&target, true).unwrap();
+        assert!(staged.commit(&target, true).unwrap().is_empty());
         assert_eq!(std::fs::read(&target).unwrap(), b"new");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rename_noreplace_refuses_an_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let err = rename_noreplace(&a, &b).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
+        std::fs::remove_file(&b).unwrap();
+        rename_noreplace(&a, &b).unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), b"a");
+        assert!(!a.exists());
+    }
+
+    #[test]
+    fn stale_stages_of_dead_processes_are_removed_live_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        // pid 0 is never a process we can own; i32::MAX is never allocated.
+        let dead = dir.path().join(format!("{STAGE_PREFIX}{}.0", i32::MAX));
+        let live = dir
+            .path()
+            .join(format!("{STAGE_PREFIX}{}.0", std::process::id()));
+        let other = dir.path().join(".maxplayer-mint.other");
+        for path in [&dead, &live, &other] {
+            std::fs::write(path, b"x").unwrap();
+        }
+        remove_stale_stages(dir.path());
+        assert!(!dead.exists());
+        assert!(live.exists());
+        assert!(other.exists());
     }
 }

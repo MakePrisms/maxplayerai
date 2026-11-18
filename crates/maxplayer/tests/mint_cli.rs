@@ -103,6 +103,7 @@ impl World {
                mkdir -m 700 \"$MAXPLAYER_HOME/mint\" || exit 1\n\
                umask 077\n\
                printf '%s' '{secret}' > \"$MAXPLAYER_HOME/mint/nostr.key\"\n\
+               echo seed > \"$MAXPLAYER_HOME/mint/seed\"; : > \"$MAXPLAYER_HOME/mint/mint.sqlite\"\n\
                if [ \"$2\" = --name ]; then printf 'name = \"%s\"\\n' \"$3\" > \"$MAXPLAYER_HOME/mint/mint.toml\"; fi\n\
                echo \"Created $MAXPLAYER_HOME/mint\" ;;\n\
              *) exit 2 ;;\n\
@@ -309,14 +310,18 @@ fn a_binary_reporting_another_version_is_refused_and_leaves_nothing() {
         "maxplayer-mint 0.0.1 (0123456789abcdef0123456789abcdef01234567)".to_owned(),
         format!("maxplayer-mint {VERSION}-rc1 ({STAMP})"),
         format!("maxplayer {VERSION} ({STAMP})"),
+        // Source builds: not what a release ships (review M1).
+        format!("maxplayer-mint {VERSION}"),
+        format!("maxplayer-mint {VERSION} ({STAMP}-dirty)"),
+        format!("maxplayer-mint {VERSION} (unknown)"),
     ] {
         let w = World::new();
         w.publish(&w.script(&line), None);
         let (code, out, err) = w.install(&[]);
         assert_eq!(code, 2, "{line}: {out}\n{err}");
-        assert!(err.contains("the mint must match it"), "{err}");
+        assert!(err.contains("the mint must match this maxplayer"), "{err}");
         assert!(!w.target().exists(), "{line}: installed anyway");
-        assert_eq!(w.bin_entries(), Vec::<String>::new(), "{line}: leftovers");
+        assert!(!w.bin_dir.exists(), "{line}: bin dir left behind");
         assert!(!w.home.exists(), "{line}: home created");
     }
 }
@@ -330,7 +335,7 @@ fn a_binary_that_does_not_run_leaves_no_half_installed_file() {
     let (code, _, err) = w.install(&[]);
     assert_eq!(code, 2);
     assert!(err.contains("did not run here"), "{err}");
-    assert_eq!(w.bin_entries(), Vec::<String>::new());
+    assert!(!w.bin_dir.exists(), "bin dir left behind");
     assert!(!w.home.exists());
 }
 
@@ -555,6 +560,161 @@ fn info_flags_a_binary_of_another_version() {
         out.contains(&format!("version 0.6.0 (maxplayer is {VERSION}")),
         "{out}"
     );
-    assert!(out.contains("mint install --force"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "mint install --force --bin-dir {}",
+            w.bin_dir.display()
+        )),
+        "{out}"
+    );
     assert!(!w.home.exists());
+}
+
+#[test]
+fn a_release_stamp_with_build_text_installs() {
+    // scripts/verify-release-version.sh accepts `(<sha> <text>)`; the installer must too (M1).
+    let w = World::new();
+    w.publish(
+        &w.script(&format!("maxplayer-mint {VERSION} ({STAMP} 2026-11-18)")),
+        None,
+    );
+    let (code, out, err) = w.install(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(w.target().is_file());
+}
+
+#[test]
+fn a_half_made_mint_home_is_refused_not_reported_as_set_up() {
+    // An `init` that failed after creating <home>/mint/ (review M6): install must not print the
+    // link step for a mint with no key, and must install nothing.
+    for leave in ["empty", "key-only"] {
+        let w = World::new();
+        w.good_release();
+        fs::create_dir_all(w.home.join("mint")).unwrap();
+        if leave == "key-only" {
+            fs::write(
+                w.home.join("mint/nostr.key"),
+                w.mint_keys.secret_key().to_secret_hex(),
+            )
+            .unwrap();
+        }
+        let (code, out, err) = w.install(&[]);
+        assert_eq!(code, 2, "{leave}: {out}\n{err}");
+        assert!(err.contains("is not a usable mint"), "{leave}: {err}");
+        assert!(!out.contains("account link"), "{leave}: {out}");
+        assert!(!w.bin_dir.exists(), "{leave}: installed anyway");
+    }
+}
+
+#[test]
+fn a_failed_init_says_the_binary_is_installed_and_how_to_recover() {
+    let w = World::new();
+    // init creates mint/ and then fails, like a database error after the key was written.
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n--version) echo 'maxplayer-mint {VERSION} ({STAMP})' ;;\n\
+         init) mkdir \"$MAXPLAYER_HOME/mint\"; echo 'db error' >&2; exit 1 ;;\nesac\n"
+    );
+    w.publish(script.as_bytes(), None);
+    let (code, out, err) = w.install(&[]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("the binary is installed"), "{err}");
+    assert!(err.contains("move it aside"), "{err}");
+    assert!(w.target().is_file());
+    // A rerun refuses the half-made mint instead of reporting success.
+    let (code, _, err) = w.install(&[]);
+    assert_eq!(code, 2);
+    assert!(err.contains("is not a usable mint"), "{err}");
+}
+
+#[test]
+fn force_never_runs_the_binary_it_replaces_and_reports_a_replaced_symlink() {
+    let w = World::new();
+    w.good_release();
+    fs::create_dir_all(&w.bin_dir).unwrap();
+    let marker = w.bin_dir.parent().unwrap().join("old-ran");
+    let old = w.bin_dir.parent().unwrap().join("npm-maxplayer-mint");
+    fs::write(
+        &old,
+        format!(
+            "#!/bin/sh\ntouch '{}'\necho 'maxplayer-mint 0.6.0'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(&old, w.target()).unwrap();
+    let (code, out, err) = w.install(&["--force"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        !marker.exists(),
+        "--force ran the binary it replaced (review L3)"
+    );
+    assert!(out.contains("Replaced the symlink"), "{out}");
+    assert!(
+        !fs::symlink_metadata(w.target())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(old.exists(), "the link's target was touched");
+}
+
+#[test]
+fn stages_left_by_an_interrupted_install_are_cleaned_up() {
+    // A killed install leaves `.maxplayer-mint.install.<pid>.*` (review M3); the next run removes it.
+    let w = World::new();
+    w.good_release();
+    fs::create_dir_all(&w.bin_dir).unwrap();
+    let stale = w
+        .bin_dir
+        .join(format!(".maxplayer-mint.install.{}.0", i32::MAX));
+    fs::write(&stale, b"half").unwrap();
+    let (code, out, err) = w.install(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!stale.exists());
+    assert_eq!(w.bin_entries(), ["maxplayer-mint"]);
+}
+
+#[test]
+fn an_installed_binary_is_not_reported_as_a_failure_when_the_dir_cannot_be_synced() {
+    // Write+search but no read on the bin dir: the directory fsync fails after the file is in
+    // place (review M5). That is a warning, not "could not install", and init still runs.
+    let w = World::new();
+    w.good_release();
+    fs::create_dir_all(&w.bin_dir).unwrap();
+    fs::set_permissions(&w.bin_dir, fs::Permissions::from_mode(0o300)).unwrap();
+    let (code, out, err) = w.install(&[]);
+    fs::set_permissions(&w.bin_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        err.contains("warning: installed, but could not sync"),
+        "{err}"
+    );
+    assert!(w.target().is_file());
+    assert!(w.home.join("mint/nostr.key").is_file());
+}
+
+#[test]
+fn bad_arguments_are_usage_errors_before_anything_happens() {
+    let w = World::new();
+    for (args, want) in [
+        (vec!["--bin-dir", ""], "--bin-dir must not be empty"),
+        (
+            vec!["--from", "https://u:p@example.com/r"],
+            "no credentials",
+        ),
+        (
+            vec!["--from", "https://example.com/r?sig=1"],
+            "no credentials",
+        ),
+    ] {
+        let (code, _, err) = run(maxplayer()
+            .args(["mint", "install"])
+            .arg("--home")
+            .arg(&w.home)
+            .args(&args));
+        assert_eq!(code, 1, "{args:?}: {err}");
+        assert!(err.contains(want), "{args:?}: {err}");
+        assert!(!w.home.exists());
+    }
 }

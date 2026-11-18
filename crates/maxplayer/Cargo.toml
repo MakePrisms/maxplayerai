@@ -109,6 +109,9 @@ hex = { version = "0.4.3", optional = true }
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
 toml = { version = "0.8", optional = true }
+# `mint install`: renameat2(RENAME_NOREPLACE) / renamex_np(RENAME_EXCL) and the stale-stage pid
+# check. Already in the lockfile.
+libc = "0.2"
 
 # #905: the retired-seat reaper's `--dry-run` must remove nothing. Drives the shipped binary against
 # a recording stand-in `docker` on PATH, so it needs the subcommand compiled in (`acp`); a buyer-only
