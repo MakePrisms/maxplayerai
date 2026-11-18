@@ -145,6 +145,33 @@ mint_npm_dirs="$(
 )"
 assert_set_eq "the mint npm payload packages (npm/mint-*)" "$source_list" "$mint_npm_dirs"
 
+# ── Each payload manifest matches its directory ─────────────────────────────────────────────────
+# A payload copied from a sibling and left with the sibling's `cpu` installs nowhere it is needed
+# (npm skips it, the launcher says "no binary"); one whose bin is the launcher's name collides with
+# it. Directory names alone cannot see either (#1339 review L4).
+node -e '
+  const fs = require("fs");
+  const bad = [];
+  for (const [prefix, bin] of [["cli-", "maxplayer"], ["mint-", "maxplayer-mint"]]) {
+    for (const d of fs.readdirSync("npm").filter((d) => d.startsWith(prefix))) {
+      const p = d.slice(prefix.length);
+      const [os, cpu] = p.split("-");
+      const m = JSON.parse(fs.readFileSync(`npm/${d}/package.json`, "utf8"));
+      const want = "@maxplayerai/" + (prefix === "cli-" ? "" : "mint-") + p;
+      const binKey = `${bin}-${p}`, binPath = `bin/${bin}`;
+      if (m.name !== want) bad.push(`npm/${d}: name ${m.name}, expected ${want}`);
+      if (JSON.stringify(m.os) !== JSON.stringify([os])) bad.push(`npm/${d}: os ${JSON.stringify(m.os)}, expected ["${os}"]`);
+      if (JSON.stringify(m.cpu) !== JSON.stringify([cpu])) bad.push(`npm/${d}: cpu ${JSON.stringify(m.cpu)}, expected ["${cpu}"]`);
+      const bins = Object.entries(m.bin || {});
+      if (bins.length !== 1 || bins[0][0] !== binKey || bins[0][1] !== binPath) bad.push(`npm/${d}: bin ${JSON.stringify(m.bin)}, expected {"${binKey}":"${binPath}"}`);
+      if (!(m.files || []).includes(binPath)) bad.push(`npm/${d}: files does not list ${binPath}`);
+      if (m.scripts) bad.push(`npm/${d}: has scripts — a payload must install nothing`);
+    }
+  }
+  if (bad.length) { console.error(bad.join("\n")); process.exit(1); }
+' || die "an npm payload manifest does not match its directory (see above)"
+echo "ok: every payload manifest (name, os, cpu, bin, files) matches its directory"
+
 # ── The launchers' pinned dependencies ──────────────────────────────────────────────────────────
 # optionalDependencies is what npm consults to install one platform's binary; a pin with no payload
 # published leaves `npm i maxplayer` resolving a package that is not on the registry.

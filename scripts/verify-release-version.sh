@@ -74,7 +74,7 @@ MINT_MANIFEST="crates/maxplayer-mint/Cargo.toml"
 MINT_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path "$MINT_MANIFEST" \
     | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer-mint");if(!p){process.stderr.write("no maxplayer-mint package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
 [ "$MINT_VERSION" = "$VERSION" ] \
-    || die "crate maxplayer-mint is $MINT_VERSION but the release is $VERSION — the mint ships in lockstep with maxplayer: set version in $MINT_MANIFEST (its Cargo.lock and the root Cargo.lock follow)"
+    || die "crate maxplayer-mint is $MINT_VERSION but the release is $VERSION — the mint ships in lockstep with maxplayer: set version in $MINT_MANIFEST, then refresh crates/maxplayer-mint/Cargo.lock and the root Cargo.lock (cargo metadata in each; this script reads neither — CI's --locked builds do)"
 echo "ok: crate maxplayer-mint $MINT_VERSION (lockstep)"
 
 # ── The npm manifests ───────────────────────────────────────────────────────────────────────────

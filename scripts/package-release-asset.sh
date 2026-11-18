@@ -14,8 +14,8 @@
 # Writes <outdir>/<name>-<version>-<platform>.tar.gz and prints its path.
 #
 # `name` defaults to `maxplayer` and names the ARCHIVE — the tarball and the directory inside it.
-# The release passes nothing and takes that default: since #510 there is one shipped asset stem, and
-# naming it at the call site would only add a second place for it to drift. The argument stays for
+# The `maxplayer` build passes nothing and takes that default (one stem since #510); the mint sidecar's
+# build passes `maxplayer-mint`, its own stem. The argument stays for
 # local and experimental packaging, where an archive built beside a real one needs a name of its own.
 #
 # The executable inside is named after the binary being packaged, never after the archive. A binary

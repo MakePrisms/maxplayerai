@@ -5,7 +5,7 @@
 // its os/cpu match, so a user never needs protoc or a Rust toolchain.
 "use strict";
 
-const { spawnSync } = require("node:child_process");
+const { spawn } = require("node:child_process");
 const os = require("node:os");
 
 // Scoped under @maxplayerai with a `mint-` prefix so the sidecar's payloads cannot collide with the
@@ -40,13 +40,30 @@ if (!binary) {
   process.exit(1);
 }
 
-// stdio "inherit": `maxplayer-mint run` is a long-running service whose signals and output belong to
-// the caller (systemd, a terminal), not to this process.
-const { status, signal, error } = spawnSync(binary, process.argv.slice(2), { stdio: "inherit" });
-
-if (error) {
+// stdio "inherit": `maxplayer-mint run` is a long-running service whose output belongs to the caller
+// (systemd, a terminal), not to this process.
+//
+// Async spawn plus forwarded signals, NOT spawnSync: `run` has a shutdown contract (stop serving,
+// take the last backup), and a supervisor that signals only the main PID (`kill $(cat pidfile)`,
+// supervisord without killasgroup, systemd KillMode=process) signals THIS process. Under spawnSync
+// node died of the signal and left the mint running with no clean stop (#1339 review M3). A terminal
+// Ctrl-C reaches both processes; the mint keeps its handlers installed after the first signal, so
+// the forwarded duplicate is harmless.
+const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"]) {
+  process.on(sig, () => {
+    try {
+      child.kill(sig);
+    } catch {
+      // The child already exited; its exit handler reports the status.
+    }
+  });
+}
+child.on("error", (error) => {
   console.error(`maxplayer-mint: could not execute ${binary}: ${error.message}`);
   process.exit(1);
-}
+});
 // A child killed by a signal has no exit code; report it the way a shell does.
-process.exit(signal ? 128 + (os.constants.signals[signal] ?? 0) : (status ?? 1));
+child.on("exit", (code, signal) => {
+  process.exit(signal ? 128 + (os.constants.signals[signal] ?? 0) : (code ?? 1));
+});

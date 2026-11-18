@@ -232,8 +232,8 @@ jobs:
           echo "ok: links only against base-OS libraries"
 
       # The archive name is left to `package-release-asset.sh`'s default, `maxplayer`, which is also
-      # the name of the binary inside it and the name it answers to. One asset stem is now the whole
-      # of the release, so naming it here would only add a second place for it to drift.
+      # the name of the binary inside it and the name it answers to. The mint sidecar is packaged
+      # by `build-mint` under its own stem, `maxplayer-mint`.
       - name: Package the asset
         env:
           VERSION: ${{ needs.plan.outputs.version }}
@@ -654,46 +654,64 @@ jobs:
             publish_args+=(--tag rc)
           fi
 
-          # Payload packages first. The launcher resolves them by exact version, so publishing it
-          # ahead of them leaves a window where `npm i maxplayer` installs a launcher with no binary.
+          # ── Stage every package BEFORE the first publish ─────────────────────────────────────
+          # Extraction, chmod and licences for all ten packages happen here, so an unreadable
+          # archive stops the job while nothing is on the registry yet (#1339 review M1).
           for platform in $RELEASE_PLATFORMS; do
-            # ★ This filename is CONSTRUCTED and must never become a glob. `dist/` holds every
+            # ★ These filenames are CONSTRUCTED and must never become globs. `dist/` holds every
             # platform's archive at once, so a glob here would publish whichever one happened to
             # sort first — an arm64 binary inside the linux-x64 payload package installs fine and
             # cannot exec. The npm payload for a platform is that platform's asset and no other.
             asset="dist/maxplayer-$VERSION-$platform.tar.gz"
             [ -f "$asset" ] || { echo "no built asset for $platform at $asset" >&2; exit 1; }
-
             mkdir -p "npm/cli-$platform/bin"
             tar -xzf "$asset" -O "maxplayer-$VERSION-$platform/maxplayer" > "npm/cli-$platform/bin/maxplayer"
             chmod 755 "npm/cli-$platform/bin/maxplayer"
+            [ -s "npm/cli-$platform/bin/maxplayer" ] || { echo "extracted an empty maxplayer from $asset" >&2; exit 1; }
             cp LICENSE-MIT LICENSE-APACHE "npm/cli-$platform/"
 
-            ( cd "npm/cli-$platform" && npm publish "${publish_args[@]}" )
-          done
-
-          cp LICENSE-MIT LICENSE-APACHE npm/maxplayer/
-          ( cd npm/maxplayer && npm publish "${publish_args[@]}" )
-
-          # The mint sidecar AFTER the whole `maxplayer` set, on purpose: its five packages are new,
-          # and a missing trusted-publisher entry for one of them fails here only once `maxplayer` is
-          # already complete on the registry — the sidecar can never hold the CLI back. Same order
-          # inside: payloads first, then the `maxplayer-mint` launcher that pins them.
-          for platform in $RELEASE_PLATFORMS; do
-            # Constructed, never globbed — the same reason as the payload loop above.
-            asset="dist/maxplayer-mint-$VERSION-$platform.tar.gz"
-            [ -f "$asset" ] || { echo "no built mint asset for $platform at $asset" >&2; exit 1; }
-
+            mint_asset="dist/maxplayer-mint-$VERSION-$platform.tar.gz"
+            [ -f "$mint_asset" ] || { echo "no built mint asset for $platform at $mint_asset" >&2; exit 1; }
             mkdir -p "npm/mint-$platform/bin"
-            tar -xzf "$asset" -O "maxplayer-mint-$VERSION-$platform/maxplayer-mint" > "npm/mint-$platform/bin/maxplayer-mint"
+            tar -xzf "$mint_asset" -O "maxplayer-mint-$VERSION-$platform/maxplayer-mint" > "npm/mint-$platform/bin/maxplayer-mint"
             chmod 755 "npm/mint-$platform/bin/maxplayer-mint"
+            [ -s "npm/mint-$platform/bin/maxplayer-mint" ] || { echo "extracted an empty maxplayer-mint from $mint_asset" >&2; exit 1; }
             cp LICENSE-MIT LICENSE-APACHE "npm/mint-$platform/"
-
-            ( cd "npm/mint-$platform" && npm publish "${publish_args[@]}" )
           done
-
+          cp LICENSE-MIT LICENSE-APACHE npm/maxplayer/
           cp LICENSE-MIT LICENSE-APACHE npm/maxplayer-mint/
-          ( cd npm/maxplayer-mint && npm publish "${publish_args[@]}" )
+
+          # ── Publish, resumably ───────────────────────────────────────────────────────────────
+          # npm never allows republishing a version, so a re-run of a job that failed part-way would
+          # die on the first package it had already published, and everything after it (the mint
+          # launcher, typically — the one package that cannot be probed) would be lost for that
+          # version for good (#1339 review M1). A package whose exact version is already on the
+          # registry is therefore skipped: that skip means the publish already HAPPENED. Anything
+          # else (including a lookup failure) falls through to `npm publish`, which fails loudly.
+          publish_once() {  # <package dir>
+            local name
+            name="$(node -p "require('./$1/package.json').name")"
+            if [ "$(npm view "$name@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+              echo "already on the registry, not republishing: $name@$VERSION"
+              return
+            fi
+            ( cd "$1" && npm publish "${publish_args[@]}" )
+          }
+
+          # Order (verify-release-workflow.sh holds all four anchors in this order):
+          #  1. maxplayer payloads, 2. the maxplayer launcher that pins them — so `npm i maxplayer`
+          #     never resolves a launcher with no binary;
+          #  3. mint payloads, 4. the maxplayer-mint launcher — AFTER the whole maxplayer set, so a
+          #     mint failure (five new packages, new trusted-publisher entries) can never hold the CLI
+          #     back, and the mint launcher never pins an unpublished payload.
+          for platform in $RELEASE_PLATFORMS; do
+            publish_once "npm/cli-$platform"
+          done
+          publish_once npm/maxplayer
+          for platform in $RELEASE_PLATFORMS; do
+            publish_once "npm/mint-$platform"
+          done
+          publish_once npm/maxplayer-mint
 
   npm-probe:
     name: npm credential probe

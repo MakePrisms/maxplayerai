@@ -153,14 +153,16 @@ Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` wh
 - Verifies each artifact: the version matches the tag, `acp` and `sell` are compiled in
   (`scripts/verify-seller-surface.sh`), and on Linux that it runs inside alpine and debian with no
   toolchain present.
-- Attaches the three `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+- Attaches every platform's `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
   Each is required by name before the release is created: a count cannot tell a complete release
   from one missing a platform.
 - Builds `maxplayer-mint` on the same platforms (`build-mint`, with `protoc`), verifies its version line
   and portability the same way, and attaches `maxplayer-mint-<version>-<platform>.tar.gz` to the same
   Release and `SHA256SUMS`.
 - Publishes the npm packages: every payload package first, then the `maxplayer` launcher; then the
-  mint payloads and the `maxplayer-mint` launcher.
+  mint payloads and the `maxplayer-mint` launcher. All ten are staged before the first publish, and a
+  package already on the registry at this version is skipped, so **re-running a publish job that failed
+  part-way finishes the set** instead of failing on the first package it already published.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first
 would leave a window where `npm i maxplayer` installs a launcher whose binary is not on the registry yet.

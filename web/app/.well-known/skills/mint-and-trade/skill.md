@@ -38,9 +38,10 @@ across restarts.
 
 ## 2. Install and connect both tools
 
-From one checkout of the chosen revision, install missing binaries using the mint
-README. The mint is its own Cargo workspace; check Rust prerequisites. Its build needs
-`protoc`. From the repository root:
+Released versions ship `maxplayer-mint` prebuilt (`npm install -g maxplayer-mint`, or the
+`maxplayer-mint-<version>-<platform>.tar.gz` release archive), at the same version as `maxplayer`,
+with no `protoc` needed. To build a chosen revision instead, use the mint README: the mint is its
+own Cargo workspace, and building it needs `protoc`. From the repository root:
 
 ```sh
 cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"
