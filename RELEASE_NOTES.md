@@ -1,3 +1,157 @@
+## v0.8.0-rc1
+
+Release candidate for 0.8.0, built from main after #1346. This is a **minor** bump, not 0.7.4:
+it removes commands (`trade fund`, `trade withdraw`, `trade receive`), adds per-command caps to
+`wallet send` and `wallet melt`, changes the buyer daemon's exit code on stop, and ships a second
+released binary (`maxplayer-mint`). It is the first release with `darwin-x64` (Intel mac) binaries
+and the first with `maxplayer-mint` tarballs. After publication, install with
+`npm install -g maxplayer@0.8.0-rc1` (or `install.sh --version 0.8.0-rc1`). Publish as a GitHub
+prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Relay, reviewer and registration service: nothing to deploy for this release.** The only relay
+code change since v0.7.3 is #1323 (admit swarm kinds 30341–30344), which is already live in
+`relay-v8`. #1347 (nginx2root mitigation: HTTP/2 off on the relay vhost, `sctp` blocked) changes
+only the relay box's NixOS config; it is a security rollout tracked separately (`relay-v9`) and no
+client in this release depends on it. The `crates/maxplayer-registration` diff is comments only.
+The sandbox image's Dockerfile is unchanged from v0.7.3 (it is rebuilt and tagged
+`maxplayer-sandbox:v0.8.0-rc1`). Buyer store schema 9 → 10 (#1333, additive tables; an older
+binary still opens it); seller store schema unchanged (15).
+
+### Breaking and behaviour changes
+
+- **Breaking: trading is `maxplayer trade`; the standalone `maxplayer-trade` binary is obsolete**
+  (#1326). Every former `maxplayer-trade <cmd>` is now `maxplayer trade <cmd>`, built into the
+  released binary (no protoc, no separate install). Non-read-only trade commands bootstrap the
+  home like the rest of `maxplayer` (and print the `account link` hint when they create the key);
+  read-only ones (`discover`, `status`, `balance`, `preflight`, `--dry-run`) still create nothing.
+  The old binary fails loudly instead of acting: the serve socket refuses its protocol 1–3
+  requests ("this maxplayer-trade binary is obsolete … delete it"), and the journal gains a
+  version row plus a tombstone row the old binary cannot parse. **Once `maxplayer trade` has
+  written a home's journal, the old `maxplayer-trade` cannot use that home** — delete it from PATH;
+  `maxplayer doctor` shows a report-only WARN while one is on PATH.
+- **Breaking: trade's money commands moved to `maxplayer wallet`** (#1332).
+  `trade fund` → `maxplayer wallet mint`; `trade withdraw` → `maxplayer wallet melt --max-debit`;
+  `trade receive` → `maxplayer wallet receive --token-file`. The old names are hidden and print
+  the wallet command to use, then exit 1 having done nothing. `trade send` makes a new send only on
+  a legacy standalone home (to drain it); on a maxplayer home it names `wallet send` and exits 1.
+  `trade send --reclaim <id>` and `status --check-sends` still work for sends trade made.
+  - New: `maxplayer wallet send <amount> --out <file>` writes the token to a new 0600 file (never
+    overwrites; if the write fails after the send, the token is printed instead). Take an
+    unredeemed token back with `wallet receive --token-file <file>`.
+  - New: `maxplayer wallet melt <bolt11> --max-debit <sats>` refuses before spending when invoice +
+    the mint's fee reserve exceeds it (needs an amount-bearing invoice).
+  - **New cap: 100,000 sats per `wallet send` and per `wallet melt`.** Money in (`mint`,
+    `receive`) is not capped. Scripts that sent or melted more in one call must split it.
+  - Wallet melt does not refuse testnet/expired invoices up front the way `trade withdraw` did;
+    the mint refuses them.
+  - **Trade serve protocol v4 → v5**: serve handles `list`/`take`/`cancel` only; the
+    `receive`/`send`/`fund` hand-offs are gone. Journaled funding/withdraw/receive/send records
+    are still finished by `serve`/`recover`.
+- **Changed: the buyer daemon and the seller host trade serve on trading homes** (#1334). On a home
+  that has traded (`<home>/trade/trade.sqlite` exists), `maxplayer buyer serve` (incl. the
+  auto-spawned daemon) and `maxplayer seller` run trade's serve themselves; nobody needs to start
+  `maxplayer trade serve`. A home that never traded is untouched: nothing is created and nothing
+  is printed; the host re-checks every 5 s and starts serving once the first trade command
+  creates the journal. Legacy standalone (`wallet.seed`/`trade.key`) and mixed homes are never
+  hosted.
+  - New `[trade]` config section: `serve` (default `true`), `relays`, `mint_relays` (env
+    `MAXPLAYER_TRADE__SERVE` etc.). `relays`/`mint_relays` feed both the hosted serve and the CLI
+    defaults when no `--relay`/`--mint-relay` is given, so hand-offs agree. **Set
+    `[trade] serve = false`** to keep running `maxplayer trade serve` yourself; a standalone serve
+    on a hosted home is refused (exit 1) with that hint.
+  - One serve per home (`owner.lock`): buyer and seller on the same home both host, whichever
+    gets the lock first serves, the other stands by and takes over if it exits.
+  - **The buyer daemon exits 5 on stop on a trading home** once it has hosted a session
+    (SIGTERM/SIGINT run trade's safe stop: the running step finishes, a second signal or the 30 s
+    grace cancels it at its next wait, journal intact). A supervisor treating non-zero as failure
+    needs `SuccessExitStatus=5` (systemd) or equivalent. A daemon that never hosted keeps its old
+    exit codes.
+  - **The seller can take up to ~30 s longer to stop** on a trading home: after the node exits it
+    stops the hosted serve the same safe way, then keeps its own exit code.
+  - Serve lifecycle lines also go to **`<home>/trade/serve.log`** (0600, rotated at 1 MiB), since
+    the auto-spawned daemon's stderr is /dev/null.
+  - A home whose standalone serve used non-default `--relay`s is hosted on `[trade] relays` (or
+    the built-in defaults) once a daemon takes the lock: set `[trade] relays` (or `serve = false`)
+    on such homes before upgrading.
+- **New: `maxplayer-mint` ships with each release** (#1339, #1346). Release tarballs
+  `maxplayer-mint-<ver>-<platform>.tar.gz` for all four platforms, listed in the same `SHA256SUMS`
+  as `maxplayer`. **Not on npm.** Version-locked to maxplayer (this release ships
+  `maxplayer-mint 0.8.0-rc1`). A released mint's version line carries a `release` marker,
+  `maxplayer-mint <ver> (<commit> release)`; a source build prints the bare commit and is never
+  replaced by `mint upgrade`. protoc is needed only to build the mint from source.
+- **New: `maxplayer mint`, `mint install`, `mint upgrade`, `mint uninstall`** (#1341, #1346).
+  - `maxplayer mint [--json] [--offline]`: read-only info (installed binary and version, this
+    home's mint, npub/`nostr://` URL/name, whether `maxplayer-mint run` serves it, account link).
+    Creates nothing.
+  - `maxplayer mint install [--bin-dir <dir>] [--home <dir>] [--name <n>] [--force]`: downloads
+    this maxplayer's version of the mint tarball and `SHA256SUMS` from the GitHub release, checks
+    the sha256 and the exact release version line, installs atomically into `--bin-dir` (default
+    `~/.local/bin`), runs `maxplayer-mint init` (an existing `<home>/mint/` is never touched) and
+    prints the `maxplayer account link --mint` next step.
+  - `maxplayer mint upgrade`: replaces an older released mint with this maxplayer's version;
+    same version is a no-op; newer, source-built or unrecognised binaries are refused (use
+    `mint install --force`). A running mint keeps the old version until restarted (the command
+    says how).
+  - `maxplayer mint uninstall`: removes only the binary (a symlink, not its target); refuses while
+    `maxplayer-mint run` serves the home; never deletes `<home>/mint/` and warns what remains there.
+  - **Two separate notices.** (a) *Installed mint older than this maxplayer* — local, no network:
+    `maxplayer mint` `upgrade:` line and doctor row `maxplayer-mint version` (WARN), pointing at
+    `maxplayer mint upgrade`. (b) *Newer maxplayer available* — doctor row `maxplayer version` on
+    every home and `maxplayer mint` `update:` line, never mentioning the mint. (b) asks GitHub's
+    `releases/latest` (stable only, 5 s bound) once per `maxplayer doctor` / `maxplayer mint` run;
+    `--offline` skips it. Both are report-only and never change the exit code or the seller boot
+    gate.
+- **New: Intel mac (`darwin-x64`) binaries** (#1316): tarball, npm `@maxplayerai/darwin-x64`, and
+  `install.sh` now resolves an Intel mac to it instead of refusing (Apple Silicon under Rosetta
+  still gets arm64). Built and verified on a native `macos-15-intel` runner; not yet run on a real
+  Intel mac outside CI.
+
+### Also in this release
+
+- **New: seller drain** (#1302, #1319; fixes #1299). SIGUSR1 or `maxplayer seller drain [--no-wait |
+  --timeout <secs>]` stops new claims, finishes in-flight work (awarded jobs, follow-up turns,
+  parked claims, unpublished deliveries), then exits 0. Heartbeats say `accepting=n` while
+  draining. Follow-ups arriving during a drain are journaled and run by the restarted seller.
+  `drain` exits 0 drained/sent, 2 nothing sent (no seller, or a pre-drain seller with no pid in
+  `seller.lock`), 3 timeout. SIGTERM still stops at once. Docs use `systemctl kill --kill-who=main`.
+- **New: swarms in maxplayer** (#1313 spec, #1324, #1333). `maxplayer swarm …` (`list`, `show`,
+  `join`, `leave`, `create`, `job create|status`, `decide`, `members`) on the new swarm wire
+  (kinds 30341–30344; SWARM 30344 is new, MEMBERSHIP is now per swarm). **The `maxplayer-swarm`
+  sidecar (`crates/maxplayer-challenges`) is deleted, and old buyer-wide memberships are refused:
+  existing members must `maxplayer swarm join` again.** The buyer daemon's swarm engine and the
+  `swarm_*` MCP tools are behind `[swarm] enabled = true` (off by default; no planner yet). The
+  `/swarm` board reads every buyer's swarms from relay.maxplayer.ai (#1328, live with its merge).
+- **New: the mint backs itself up while serving** (#1320). `maxplayer-mint run` snapshots
+  `mint.sqlite` online (`VACUUM INTO`) at start, within ~30 s of any change and on clean stop, into
+  `<home>/mint/backups/` (or `backup_dir` in `mint.toml`), keeping the newest 10 plus key, seed,
+  config and issued tokens. `run` refuses to start on a missing or older `mint.sqlite` when newer
+  snapshots exist; new `maxplayer-mint restore [--from <dir>]`. No more "stop the mint and copy
+  it" after trades; only a one-time off-box copy at setup.
+- **Fixed: `nostr://` mint requests no longer wait for every relay** (#1325, #1342). A request
+  goes out on the first connected relay; with an identity, one signed-in connection is reused per
+  runtime/key/relay list instead of a new socket and NIP-42 sign-in per request; an unreachable
+  relay is logged once when it goes down and once when it comes back. Fixes trade locks missing
+  their 60 s quote deadline behind a dead default relay.
+- `maxplayer trade`: an expired, untraded lot's reservation is released automatically by
+  `serve`/`recover` (#1317, #1327, #1329); a refused or raced `send --reclaim` is retried after
+  1 min, 10 min and 1 h (#1318, #1329).
+- **Changed: seller git failures carry libgit2's detail** (#1336): `checkout-base` and
+  private-input import errors now include the libgit2 step, class, code and message instead of a
+  bare `seller git checkout-base failed`.
+- Site: `/tokens` sold tag is solid yellow (#1321).
+- CI/tests only: chat-notify fixture on ubuntu-26.04 coreutils (#1330), open-pool seller-test
+  flake (#1331), nostr-mint regression tests (#1342).
+
+### Upgrade notes
+
+- Stop any standalone `maxplayer trade serve` / old `maxplayer-trade serve` and delete the old
+  `maxplayer-trade` binary before upgrading; after upgrading, the buyer daemon or seller serves the
+  home (or set `[trade] serve = false`).
+- Restart buyer daemons and sellers to pick up the new binary. A buyer daemon on a trading home
+  exits 5 on that stop.
+- Mint operators: `maxplayer mint install --bin-dir <dir>` (or `mint upgrade` over a released
+  mint; a source-built mint needs `mint install --force`), then restart `maxplayer-mint run`.
+
 ## v0.7.3
 
 Stable release following v0.7.3-rc9, incorporating the 0.7.3 release-candidate series.
