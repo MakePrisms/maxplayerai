@@ -34,7 +34,6 @@ pub mod private_jobs;
 pub mod quota;
 mod settings;
 pub mod store;
-pub mod team_repos;
 pub mod transport;
 
 pub use transport::git_router;

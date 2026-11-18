@@ -310,37 +310,22 @@ pub async fn hook_policy_check(
 
     // Private job repos never inherit permissions from public repository announcements.
     if maxplayer_private_protocol::is_hex(&req.repo_id, 32) {
-        let job = match state
-            .db
-            .private_job_repo(community, &req.repo_owner, &req.repo_id)
-            .await
+        // MAXPLAYER teams (docs/specs/maxplayer-team.md §4): only an active member
+        // reaches the ref rule; the service key and everyone else are refused.
+        use super::private_jobs::{team_access, team_ref_update_allowed, TeamAccess};
+        match team_access(
+            &state,
+            community,
+            &req.repo_owner,
+            &req.repo_id,
+            &req.pusher_pubkey,
+        )
+        .await
         {
-            Ok(Some(job)) => job,
-            // MAXPLAYER teams (docs/specs/maxplayer-team.md §4): members create or
-            // fast-forward branches and create tags; nothing is deleted or rewritten.
-            Ok(None) => {
-                let team = match state
-                    .db
-                    .team_repo(community, &req.repo_owner, &req.repo_id)
-                    .await
-                {
-                    Ok(Some(team)) => team,
-                    _ => {
-                        return (
-                            StatusCode::FORBIDDEN,
-                            "private repository policy unavailable",
-                        )
-                            .into_response()
-                    }
-                };
+            TeamAccess::NotTeam => {}
+            TeamAccess::Allow => {
                 if !req.ref_updates.iter().all(|r| {
-                    team.can_update_ref(
-                        &req.pusher_pubkey,
-                        &r.ref_name,
-                        &r.old_oid,
-                        &r.new_oid,
-                        r.is_ancestor,
-                    )
+                    team_ref_update_allowed(&r.ref_name, &r.old_oid, &r.new_oid, r.is_ancestor)
                 }) {
                     return (
                         StatusCode::FORBIDDEN,
@@ -354,7 +339,18 @@ pub async fn hook_policy_check(
                 })
                 .into_response();
             }
-            Err(_) => {
+            TeamAccess::Read | TeamAccess::Deny | TeamAccess::Unavailable => {
+                return (StatusCode::FORBIDDEN, "private repository access denied")
+                    .into_response()
+            }
+        }
+        let job = match state
+            .db
+            .private_job_repo(community, &req.repo_owner, &req.repo_id)
+            .await
+        {
+            Ok(Some(job)) => job,
+            _ => {
                 return (
                     StatusCode::FORBIDDEN,
                     "private repository policy unavailable",

@@ -320,8 +320,8 @@ pub struct Config {
     pub private_job_repos: bool,
     /// Configured private-content service reader; never obtained from a caller's event.
     pub private_service_pubkey: Option<String>,
-    /// MAXPLAYER: enable team repository provisioning (`/api/teams`, default false).
-    /// Existing team repositories stay gated by their member list either way.
+    /// MAXPLAYER: serve team repositories, named after a private Buzz channel (default false).
+    /// Off denies them; a team-shaped name never falls through to public hosting.
     pub team_repos: bool,
 
     /// When true, anonymous WebSocket REQ reads are allowed against community-global

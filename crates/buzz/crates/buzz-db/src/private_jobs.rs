@@ -112,15 +112,6 @@ impl Db {
         job: &PrivateJobRepo,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        // MAXPLAYER teams: one opaque namespace key is either a team or a job, never both
-        // (docs/specs/maxplayer-team.md §3). Same lock as team creation.
-        sqlx::query(crate::team_repos::NAMESPACE_LOCK_SQL)
-            .bind(community.as_uuid().to_string()).bind(&job.buyer).bind(&job.job_id).execute(&mut *tx).await?;
-        let team: Option<i32> = sqlx::query_scalar("SELECT 1 FROM team_repositories WHERE community_id=$1 AND owner=$2 AND team_id=$3")
-            .bind(community.as_uuid()).bind(&job.buyer).bind(&job.job_id).fetch_optional(&mut *tx).await?;
-        if team.is_some() {
-            return Ok(false);
-        }
         sqlx::query("INSERT INTO private_job_repositories(community_id,buyer,job_id,offer_id,target,service) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING")
             .bind(community.as_uuid()).bind(&job.buyer).bind(&job.job_id).bind(&job.offer_id).bind(&job.target).bind(&job.service).execute(&mut *tx).await?;
         let row=sqlx::query("SELECT offer_id,target,service,seller,award_id,closed FROM private_job_repositories WHERE community_id=$1 AND buyer=$2 AND job_id=$3 FOR UPDATE")

@@ -98,8 +98,6 @@ pub const EXPECTED_SCOPED_TABLES: &[&str] = &[
     "private_job_repositories",
     "pubkey_allowlist",
     "push_leases",
-    // MAXPLAYER: team repositories (migration 100028).
-    "team_repositories",
     "push_match_queue",
     "push_wake_outbox",
     "reactions",
@@ -143,8 +141,6 @@ pub const PURGE_SCOPED_TABLES: &[&str] = &[
     "git_repo_names",
     // MAXPLAYER: private job repositories.
     "private_job_repositories",
-    // MAXPLAYER: team repositories.
-    "team_repositories",
     "archived_identities",
     "audit_log",
     "community_bans",
