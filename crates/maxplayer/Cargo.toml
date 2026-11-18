@@ -78,7 +78,7 @@ default = ["wallet"]
 # there is no acp-without-wallet build, so the `#[cfg(feature = "acp")]` gates on the seller surface
 # are sound (they can rely on the wallet-gated code being present). #360.
 acp = ["wallet", "maxplayer-core/acp"]
-wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk", "dep:maxplayer-trade"]
+wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk", "dep:maxplayer-trade", "dep:reqwest", "dep:sha2", "dep:hex", "dep:flate2", "dep:tar", "dep:toml"]
 # Dev-only: exposes `maxplayer stub-pay` (budget-gate exercise). Not on the settlement
 # path and not part of the default user CLI surface.
 stub-pay = []
@@ -99,6 +99,19 @@ nostr-sdk = { version = "0.44.1", optional = true }
 # `maxplayer trade ...` (token trading on this home's key and wallet). Never with `local-test-mints`:
 # a user build refuses http:// mints and ws:// mint relays (scripts/check-user-build-mint-fence.sh).
 maxplayer-trade = { path = "../maxplayer-trade", optional = true }
+# `maxplayer mint install`: download the released `maxplayer-mint` (https only, redirects kept on
+# https), check it against the release's SHA256SUMS and read the executable out of its .tar.gz in
+# memory. All already in the lockfile through maxplayer-core / maxplayer-trade except `tar`
+# (default features off: no xattr). `toml` reads the mint's name from `<home>/mint/mint.toml`.
+reqwest = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+hex = { version = "0.4.3", optional = true }
+flate2 = { version = "1", optional = true }
+tar = { version = "0.4", default-features = false, optional = true }
+toml = { version = "0.8", optional = true }
+# `mint install`: renameat2(RENAME_NOREPLACE) / renamex_np(RENAME_EXCL) and the stale-stage pid
+# check. Already in the lockfile.
+libc = "0.2"
 
 # #905: the retired-seat reaper's `--dry-run` must remove nothing. Drives the shipped binary against
 # a recording stand-in `docker` on PATH, so it needs the subcommand compiled in (`acp`); a buyer-only
@@ -125,3 +138,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 libc = "0.2"
+tempfile = "3"

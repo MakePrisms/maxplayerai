@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 /// The relay used when `mint.toml` lists none (plus [`FALLBACK_RELAYS`]).
 pub const DEFAULT_RELAY: &str = "wss://relay.maxplayer.ai";
 
+/// How long [`MintHome::lock_run`] waits out a busy lock before deciding another `run` holds it.
+pub const LOCK_RUN_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// `mint.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -135,17 +138,27 @@ impl MintHome {
     /// Locking the directory rather than a lock file means deleting a file can't sidestep it.
     /// `issue` doesn't take it: it never runs saga recovery and its journal is safe next to a
     /// live `run`.
+    ///
+    /// A busy lock is retried for about a second before it counts as another `run`: readers such
+    /// as `maxplayer mint` may probe it with a shared lock they release at once (macOS has no
+    /// `/proc/locks` to read instead), and such a probe must never stop a `run` from starting.
     pub fn lock_run(&self) -> Result<fs::File> {
         let dir =
             fs::File::open(&self.dir).with_context(|| format!("open {}", self.dir.display()))?;
-        match dir.try_lock() {
-            Ok(()) => Ok(dir),
-            Err(fs::TryLockError::WouldBlock) => bail!(
-                "another `maxplayer-mint run` is already serving {}",
-                self.dir.display()
-            ),
-            Err(fs::TryLockError::Error(error)) => {
-                Err(error).with_context(|| format!("lock {}", self.dir.display()))
+        let deadline = std::time::Instant::now() + LOCK_RUN_PATIENCE;
+        loop {
+            match dir.try_lock() {
+                Ok(()) => return Ok(dir),
+                Err(fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(fs::TryLockError::WouldBlock) => bail!(
+                    "another `maxplayer-mint run` is already serving {}",
+                    self.dir.display()
+                ),
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(error).with_context(|| format!("lock {}", self.dir.display()));
+                }
             }
         }
     }
@@ -254,4 +267,35 @@ fn write_private(path: &Path, contents: &str) -> Result<()> {
 
 fn read(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
+}
+
+#[cfg(test)]
+mod lock_tests {
+    use super::*;
+
+    /// A reader's momentary shared probe (`maxplayer mint` on macOS) must not make `run` fail
+    /// "already serving"; a real holder still does, after [`LOCK_RUN_PATIENCE`].
+    #[test]
+    fn lock_run_waits_out_a_momentary_probe_but_not_a_real_holder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = MintHome::at(tmp.path());
+        fs::create_dir(home.dir()).unwrap();
+
+        let probe = fs::File::open(home.dir()).unwrap();
+        probe.try_lock_shared().unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(probe);
+        });
+        let held = home
+            .lock_run()
+            .expect("a probe released within the patience window");
+        releaser.join().unwrap();
+
+        let started = std::time::Instant::now();
+        let error = MintHome::at(tmp.path()).lock_run().unwrap_err();
+        assert!(error.to_string().contains("already serving"), "{error:#}");
+        assert!(started.elapsed() >= LOCK_RUN_PATIENCE);
+        drop(held);
+    }
 }
