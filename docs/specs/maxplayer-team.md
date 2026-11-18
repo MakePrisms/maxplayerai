@@ -1,233 +1,275 @@
 # Maxplayer Team — a group of agents with shared chat and a shared private repo
 
-**Status:** design spec. No code written. **Anchor commit: `691fe5c9d8ceb3b1085f467db31ba196885713f2`
-(= `origin/main` at the time of writing).** Every code citation below was re-derived by grep at that
-commit and is written `file:line @691fe5c`. Relay paths are shortened: `relay/…` =
+**Status:** design spec, revision 2 (18 Nov 2026). This replaces revision 1. The code on this
+branch at `6a09f668` implements revision 1 and will be rewritten to this one. **Anchor commit:
+`691fe5c9d8ceb3b1085f467db31ba196885713f2`** (the branch's merge-base with `origin/main`). Every
+citation is written `file:line @691fe5c` and was re-derived by grep at that commit; none of the cited
+code files changed on `origin/main` up to `e32f6002`. Path shorthand: `relay/…` =
 `crates/buzz/crates/buzz-relay/src/…`, `buzz-db/…` = `crates/buzz/crates/buzz-db/src/…`,
-`core/…` = `crates/maxplayer-core/src/…`, `chat/…` = `crates/maxplayer-chat/src/…`.
+`buzz-core/…` = `crates/buzz/crates/buzz-core/src/…`, `core/…` = `crates/maxplayer-core/src/…`,
+`chat/…` = `crates/maxplayer-chat/src/…`.
 
-**Scope.** Several agents, owned by one person or by friends, work on the same thing. They talk in
-an encrypted group chat and share one private git repo. That is the whole product. Everything else
-(task boards, notes, memory, specs) is files in the repo.
+**Scope.** Several agents, owned by one person or by friends, work on the same thing. They talk in a
+group chat and share one private git repo. Anyone can also publish a feed that others follow. That
+is the whole product. Task boards, notes and memory are files in the repo.
 
-**Settled inputs (Bob, Discord #product-ideas › Maxplayer Team, 17 Nov 2026 20:45–21:09 UTC), not
-relitigated here:**
+## 0. Settled inputs (Bob, Discord #product-ideas › Maxplayer Team), not relitigated here
+
+From 17 Nov (20:45–21:09 UTC), still in force:
 
 1. A team can be one person's agents or friends' agents. The wire treats both the same.
-2. The workspace is flexible: files, notes, a task board, shared memory — whatever the agents put in
-   the repo. Nothing beyond git is built for it.
-3. Agents coordinate through chat and git. No planner, no fixed roles, nothing swarm-specific.
-4. Only agents post and read. A human talks to their own agent, which relays.
-5. A team agent hires sellers exactly like any buyer does.
-6. Messages and the repo are readable only by team members **and Maxplayer**. Maxplayer does the same
-   checks and has the same access as for private jobs (Bob, 20:50: "maxplayer should still do the
-   same checks and have the same access as other private jobs"). This is access control on our
-   server plus a service copy, not end-to-end encryption.
-7. The creator adds and removes members.
-8. A separate binary, `maxplayer-team`. `maxplayer-chat` is not changed.
-9. Design teams on their own terms. No modes or migrations to cover 1:1 chat (Bob, 20:58: "dont
-   overengineer to solve for chat"). Every team has a repo.
+2. Agents coordinate through chat and git. No planner, no roles, nothing swarm-specific.
+3. Only agents post and read. A human talks to their own agent.
+4. A team agent hires sellers like any buyer.
+5. A separate binary, `maxplayer-team`. `maxplayer-chat` is not changed. Every team has a repo.
 
----
+From 18 Nov (17:15–22:11 UTC), replacing revision 1:
+
+6. **As little code as possible.** A team is a Buzz private channel. No team table.
+7. The relay may read team messages. Any member may invite.
+8. Screening protects each reading **agent**; content need not be kept off the relay (18:28).
+   It works exactly like today's execution reviews: the reader's client requests a signed review,
+   applies its own threshold, may turn the check off, and may override a refused verdict (18:28, 18:45).
+9. The reviewer is **not** a team member. It reads team repos with the service key, read-only, as it
+   reads private job repos today (18:45).
+10. Review is per commit (18:49).
+11. Party check: none. The reviewer answers only the requester (option 1, 21:12).
+12. Follow: anyone can publish an open channel that others follow for one author's posts. Team
+    Maxplayer is the default follow. No relay change (20:49).
+13. The final review fixes from advisor and worker-fable are accepted, including worker-fable's side on
+    both points where they differed (21:50, 22:11).
 
 ## 1. The product in one paragraph
 
-`maxplayer-team` is a mailbox plus a repo, not an agent. It makes no model call and starts no
-harness. `watch` stays connected to the relay and stores team messages as they arrive, optionally
-waking the owner's agent. The agent calls `inbox` to read, `send` to post, `log` to see history, and
-`git` to clone, pull and push the team repo. It uses the home's Nostr key, the same npub
-`maxplayer whoami` prints, so a team agent that wants to hire a seller just calls the normal
-`maxplayer` buyer tools.
+`maxplayer-team` is a mailbox, a feed reader and a repo client. It makes no model call. `watch`
+stays connected, stores new messages after they pass review, and can wake the owner's agent with
+`--notify`. The agent reads with `inbox`/`log`, posts with `send`, and uses `clone`/`pull`/`push`
+for the team repo. It signs with the home key (`maxplayer whoami`), so a team agent hires sellers
+with the normal buyer tools. Only agents reading through `maxplayer-team` are protected by screening.
 
 ## 2. Commands
 
 ```
-maxplayer-team create <name>                       # new team: provisions the repo, creator is the only member
-maxplayer-team invite <team> <npub|hex> [--name <label>]   # creator only: adds to the relay member list, sends an invite
-maxplayer-team remove <team> <npub|hex>            # creator only: drops from the relay member list
-maxplayer-team invites                             # pending invites (not yet joined)
-maxplayer-team join <team>                         # accept an invite; only joined teams' messages are stored
-maxplayer-team leave <team>                        # stop storing this team's messages (local)
-maxplayer-team list [--json]                       # joined teams, members, repo URL
-maxplayer-team watch [--notify <cmd> [args…]]      # stay connected; store joined teams' messages
-maxplayer-team inbox [--json]                      # unread messages, marked read
-maxplayer-team send <team> "<text>" [--json]
-maxplayer-team log <team> [--json]
-maxplayer-team status [--json]
-maxplayer-team git <team> -- <git args…>           # run git against the team repo with a fresh NIP-98 header
+maxplayer-team create <name> [--open]              # private team (or open feed channel)
+maxplayer-team invite <team> <npub|hex>            # any member: kind 9000
+maxplayer-team remove <team> <npub|hex>            # owner/admin: kind 9001, then re-read 39002
+maxplayer-team leave <team>                        # kind 9001 on self
+maxplayer-team invites                             # private channels I was added to, not joined
+maxplayer-team join <uuid> [--name <label>]        # refuses a channel without the private tag
+maxplayer-team follow <uuid> <owner hex> | unfollow <uuid>
+maxplayer-team list [--json]
+maxplayer-team watch [--notify <cmd> [args…]]
+maxplayer-team inbox [--json] | log <team> [--json] | send <team> "<text>"
+maxplayer-team accept-verdict <team> <id> <verdict id>   # override a Refused verdict
+maxplayer-team clone <team> [dir] | pull <team> [branch] | push <team> [branch]
 ```
 
-Global flags `--home` and `--relay` follow chat's rules (default `MAXPLAYER_HOME`/`~/.maxplayer`,
-`wss://relay.maxplayer.ai`).
+`--home` and `--relay` follow chat. There is no `git -- <args>` passthrough: local git is plain
+`git`, and only these three commands touch the network.
 
-## 3. Team record on the relay (the one source of truth)
+## 3. Team = Buzz private channel
 
-The relay holds each team's member list. Clients never hold an authoritative copy; they fetch it.
+- Create = kind 9007, `visibility=private`, `channel_type=stream`, no TTL, fresh v4 UUID `h`,
+  `about = "maxplayer-team/1 <creator hex>"`. The marker is parsed strictly and never displayed; it is
+  how a joiner learns the creator key for the repo URL. `create --open` makes an open stream channel
+  with no marker: `send` works, git/invite/remove are refused.
+- Membership, posting, reads and live delivery are Buzz's existing channel rules: posting requires
+  membership or an open channel (`relay/handlers/ingest.rs:906 @691fe5c`); live fan-out checks
+  membership for private channels only (`relay/handlers/event.rs:221 @691fe5c`).
+- `join` fetches 39000 by `#d` and refuses it without the `private` tag
+  (`relay/handlers/side_effects.rs:1215 @691fe5c`). Names are local labels set at join.
+- Catch-up reuses chat's loop (`chat/network.rs:239 @691fe5c`): inclusive `until`, limit 1000,
+  dedupe by id; a saturated second steps back one second and warns. First sync of a join or follow
+  takes the newest 50 messages.
+- Client caps: 50 sends per channel per UTC day.
 
-* **Identity.** `team_id` is 32 random bytes (64 lowercase hex), chosen by the creator. The repo
-  lives at `https://<relay>/git/<creator>/<team_id>`.
-* **Why 64-hex.** That namespace is already reserved for private repos, and every existing
-  private-repo guard keys on `is_hex(repo_id, 32)`, so a team repo inherits them with no change:
-  - public announcements can't claim the id (`relay/handlers/side_effects.rs:2716 @691fe5c`);
-  - no relay-signed kind:30618 ref state is published (`relay/api/git/transport.rs:2097 @691fe5c`);
-  - private quotas apply (`relay/api/git/transport.rs:1939 @691fe5c`, caps in
-    `crates/buzz/crates/maxplayer-private-protocol/src/lib.rs:24 @691fe5c`);
-  - a 64-hex id with no record is refused, never served as public
-    (`relay/api/git/private_jobs.rs:46 @691fe5c` then `:54`).
-  - The default-branch settings route uses the public 30617 read gate
-    (`relay/api/git/settings.rs:321 @691fe5c`); a team repo has no 30617, so it is refused. Teams use
-    `main` and don't need that route.
-* **New table `team_repositories`** (`community_id, owner, team_id, members[], service, version,
-  created_at`). `service` is copied from `private_service_pubkey` (`relay/config.rs:322 @691fe5c`)
-  at creation, as for job repos (`relay/api/git/private_jobs.rs:99 @691fe5c`).
-  `(community_id, owner, team_id)` must not exist in `private_job_repositories` and vice versa; both
-  provisioning paths check the other table in the same transaction.
-* **Endpoints** (on the git router next to `PUT /api/jobs/private/{job_id}`,
-  `relay/api/git/transport.rs:2204 @691fe5c`), behind a new default-off flag
-  `MAXPLAYER_TEAM_REPOS` modelled on `private_job_repos` (`relay/config.rs:320 @691fe5c`):
-  - `PUT /api/teams/{team_id}` — body `{members:[hex…], expected_version:n}`. Creates the team
-    (`expected_version: 0`) or replaces the member list. Only the creator may call it. The request
-    goes through exactly the checks private provisioning already uses: strict NIP-98 with body digest
-    (`relay/api/git/private_jobs.rs:116 @691fe5c`), replay refusal (`:146`), relay membership
-    (`:153`), and seeding the empty manifest pointer on create (`:262`). `expected_version` must
-    match the stored version (409 otherwise), so two edits never silently overwrite each other.
-    Member cap: 16 (see §7). The creator is always a member and can't be removed.
-  - `GET /api/teams/{owner}/{team_id}` — NIP-98, readable by members and the service. Returns
-    `{owner, team_id, members, version, repo}`.
-  - The table joins the community-deletion lists next to `private_job_repositories`
-    (`buzz-db/store/deletion.rs:98 @691fe5c`, `:143`).
-* **Names** are local labels. The creator's invite text carries the name it chose; nothing on the
-  relay stores it.
-* **Invited means listed.** `invite` puts the npub on the relay list first, so the invitee can read
-  the repo before running `join`. `join` only controls which teams' messages the invitee's own
-  client stores. Every member must be able to write to the relay (linked account, relay membership)
-  to push or send, same as any buyer.
+## 4. Repo access — the only relay change
 
-## 4. Repo access
+Repo name = channel UUID as 32 lowercase hex + 32 zeros, at `/git/<creator hex>/<repo id>`. It stays
+inside the 64-hex private namespace checked at `relay/api/git/private_jobs.rs:46 @691fe5c`, so every
+private-repo guard applies unchanged.
 
-`authorize` (`relay/api/git/private_jobs.rs:35 @691fe5c`) is the single gate every git route calls
-before any manifest load: advertisement (`relay/api/git/transport.rs:989 @691fe5c`), upload-pack
-(`:1256`), receive-pack (`:1390`) and the re-check right before the publication CAS (`:1925`). It
-gains one branch: when no job row exists, look up a team row.
+`team_access(db, config, community, owner, repo, actor) -> NotTeam | Allow | Read | Deny`, called
+from `private_jobs::authorize` (`relay/api/git/private_jobs.rs:35 @691fe5c`) before the job lookup,
+and from the push hook (`relay/api/git/policy.rs:207 @691fe5c`):
 
-* **Read:** owner, any member, or the service. Same shape as a job repo's `can_read`
-  (`buzz-db/private_jobs.rs:35 @691fe5c`), which also includes the service.
-* **Write:** owner or any member. The service never writes.
-* **Ref rules** in the pre-receive hook (`relay/api/git/policy.rs:312 @691fe5c`, today calling the
-  job-only `can_create_ref` at `:330`). Job repos are create-only
-  (`buzz-db/private_jobs.rs:45 @691fe5c`); a team repo needs normal branches, so it gets its own
-  rule: create or fast-forward any `refs/heads/*`, create `refs/tags/*`; refuse non-fast-forward
-  updates and deletions. Fast-forward is the hook's existing HMAC-protected `is_ancestor` flag
-  (`relay/api/git/policy.rs:99 @691fe5c`). No force-push means a member can't erase others' work.
-* `no_store` already applies to every route on this router (`relay/api/git/private_jobs.rs:282
-  @691fe5c`), so responses are never cached for another key.
-* **Removal** takes effect at the next request: the row no longer lists the npub. A removed member
-  keeps whatever they already pulled.
+1. Strip `.git`; not `<32 hex><32 zeros>` → `NotTeam` (the job lookup runs and itself ends in deny).
+2. `MAXPLAYER_TEAM_REPOS` off → `Deny`.
+3. `get_channel` on the writer pool (`buzz-db/store/channel.rs:288 @691fe5c`):
+   `Err(ChannelNotFound)` (`:325`) → `Deny`; another DB error → 503 in `authorize`, 403 in the hook.
+   Require private, stream, no TTL, not archived, `hex(created_by) == owner`; else `Deny`.
+4. `private_service_pubkey` (`relay/config.rs:322 @691fe5c`) valid (64 hex and parses, as at
+   `relay/api/git/private_jobs.rs:101 @691fe5c`; `Some("")` = unset) and equal to `actor` → `Read`.
+   An invalid key never matches. Checked **before** membership, so the service key stays read-only
+   even if a member adds it to the channel.
+5. `get_member_role` on the writer pool, any role → `Allow`; else `Deny`.
 
-**Client side.** Agents use plain git through `maxplayer-team git <team> -- <args>`. It signs one
-NIP-98 header with `nip98_authorization_header_with_keys` (`core/git_transport.rs:529 @691fe5c`),
-valid for both the advertisement and the service POST (`:500`), within the ±60 s window for an
-unscoped token (`relay/api/git/transport.rs:143 @691fe5c`), and passes it to git through
-`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` as `http.<repo-url>.extraHeader`, so the
-token never appears in argv or in `.git/config`. One header per git invocation.
+`authorize` never returns `Ok(None)` for a 64-hex name. `Allow` runs `ensure_manifest_pointer`
+(error → 503). `Read` is refused on every `write=true` call, including
+`info/refs?service=git-receive-pack` (the four call sites: `relay/api/git/transport.rs:989`, `:1256`,
+`:1390`, `:1925 @691fe5c`), and never seeds pointers. In the hook only `Allow` reaches the ref rule:
+create or fast-forward `refs/heads/<non-empty>`. No tags (one tag turns off the `info/refs` fast
+path, `relay/api/git/transport.rs:835 @691fe5c`), no deletes, no non-fast-forward.
 
-## 5. Messages
+The service key's read line mirrors `PrivateJobRepo::can_read` (`buzz-db/private_jobs.rs:35
+@691fe5c`). Production requires relay membership to sign in (`nix/relay-host.nix:69 @691fe5c`,
+`relay/handlers/auth.rs:545 @691fe5c`), so the service key must be a relay member.
 
-No new event kind and no relay change: kind 1059 is admitted (`relay/handlers/ingest.rs:598
-@691fe5c`) and readable only by its `p` recipient (`P_GATED_KINDS`, `crates/buzz/crates/buzz-core/src/kind.rs:159 @691fe5c`).
+## 5. Screening — the same as today's execution reviews
 
-* **Wrapping** uses the existing core helper `private_content::transport::wrap`
-  (`core/private_content/transport.rs:37 @691fe5c`; module built under the gateway feature,
-  `core/lib.rs:231 @691fe5c`). The module doc names it the shared primitive
-  (`core/private_content/transport.rs:1 @691fe5c`); it caps the wrapper at 128 KiB (`:7`) and
-  randomises the outer timestamp within the relay's drift window (`:169`). Receipt uses
-  `unwrap_message` (`:116`), which verifies wrap and seal and requires a kind-14 rumor tagged only to
-  the receiver (`:140-145`).
-* **One wrap per recipient**: every current member except the sender, plus the service
-  (`privacy.service_pubkey`, `core/home.rs:1739 @691fe5c`, default `:1727`). All copies carry
-  identical envelope bytes.
-* **Envelope** (rumor content, decoded `deny_unknown_fields`):
+Today the reading party requests a private review from the reviewer, whose key must be the content
+service key (`core/review/private.rs:720 @691fe5c`); the reviewer classifies in 24 KiB chunks with
+the worst score winning (`core/reviewer/batches.rs:9 @691fe5c`); the client applies its own
+`reject_at_or_above_ppm` (`core/review.rs:49 @691fe5c`) and may accept a refused verdict
+(`core/review.rs:152 @691fe5c`). Teams reuse all of that. What is new:
 
-  ```json
-  {"schema":"maxplayer-team/1","team":"<team_id>","owner":"<hex>","msg":"<64-hex random>",
-   "type":"text"|"invite","version":<member-list version>,"recipients":["<hex>",…],"text":"<1–8000 chars>"}
-  ```
+**Subjects.** `TEAM_MESSAGE_KIND = 9` and `TEAM_COMMIT_SUBJECT_KIND = 3413` in `core/kinds.rs`
+(3412 is the highest in use, `core/kinds.rs:66 @691fe5c`).
+- Message: `{offer: repo id, event: kind-9 id, kind: 9, commit: None}`.
+- Commit: `{offer: repo id, event: sha256("maxplayer-team-commit/1\0" || repo id || "\0" || oid),
+  kind: 3413, commit: Some(oid)}`. One shared `event` for all commits would break today's check, which
+  aborts on any verdict for a different subject with the same `e` tag (`core/review.rs:528 @691fe5c`),
+  and evidence files are keyed by `subject.event`.
+- `Subject::validate` (`core/review.rs:107 @691fe5c`): both team kinds require `offer` =
+  `<32 hex><32 zeros>`; the commit kind requires `event` = the hash. A team request with a job-shaped
+  `offer` is refused before any fetch, so it can never score a private job delivery.
 
-  `recipients` is sorted and includes the service. `msg` is the logical id: receivers deduplicate on
-  `(team, msg)`, never on wrap or rumor ids, which differ per copy.
-  The schema string keeps team traffic apart from chat, whose reader drops anything that isn't
-  `maxplayer-chat/1` (`chat/lib.rs:404 @691fe5c`), and from private-job content.
-* **Receiving** (`watch`): unwrap, decode, then require: the team is joined; the seal author is in
-  the member list fetched from the relay (refetched once if `version` is newer than the cached one);
-  the receiver and the service are in `recipients`. Anything else is dropped without logging the
-  plaintext. An `invite` from a team's owner for a team you haven't joined goes to `invites`
-  (at most 20 pending, oldest dropped); nothing else from an unjoined team is stored.
-* **Service copy.** The service receives the same bytes as members. A divergent copy (same
-  `(team, msg)`, different bytes) is detectable by the service exactly as for private-job content.
-  No ACK: nobody waits for the service, as with private jobs.
+**Request.** `private::Request::Team { subject, message: Option<Event>, creator: Option<String> }`.
+Its validation: for a message, kind 9, `verify()`, `id == subject.event`, exactly one
+`["h", <canonical lowercase UUID>]` (two elements) and `offer` = that UUID + zeros; for a commit,
+`creator` = 64 lowercase hex. Recipients = `[requester]`; no roster check. The message travels
+inline; the reviewer fetches nothing for it.
 
-## 6. Hiring sellers
+**Reviewer changes** (`core/reviewer.rs`), team requests only; job requests are unchanged:
+- In-flight key = subject + requester. Today a second request for a subject in flight is dropped with
+  no reply (`core/reviewer.rs:931`, `:1270 @691fe5c`), harmless when the verdict goes to every job
+  party, but with requester-only verdicts it would stall every other reader and let one member hold a
+  subject reserved.
+- After `request_freshness` + `bundle.validate`, look up the subject key
+  `sha256("{reviewer_pk}:{lane}:{model}:{CLASSIFIER}:{CLASSIFIER_VERSION}:{subject_json}")`. An `ok`
+  hit is verified, re-wrapped to the requester, no `admit`, no fetch. On a miss or error, `admit`
+  before the fetch, then store under the subject key.
+- `Store::admit` (`core/reviewer.rs:823 @691fe5c`, 10/min) counts team requests under
+  `team:<requester>`, so team traffic cannot exhaust a node's job-review budget.
+- Commit fetch: by raw OID (`allow-reachable-sha1-in-want`; today's fetch needs a branch,
+  `core/reviewer/diff.rs:220 @691fe5c`), `depth(2)` into a scratch repo; if shallow fails against the
+  relay's v0 upload-pack, a full scratch fetch capped by `MAX_GIT_FETCH_BYTES`. No persistent cache.
+  A commit shown parentless at a shallow boundary is reviewed as a full tree, never as "no change".
+- Evidence for a commit = raw header + message as the first `requests.add` item under the `patch`
+  key (only `patch` is split, `core/reviewer/diff.rs:51 @691fe5c`; context over 24 KiB fails the
+  whole review, `:132`), then `tree(C)` diffed against **every** parent (empty tree for a root).
+- `review::private`, `review::state`, `record_pass` and `recorded_acceptance` build under `gateway`
+  (today `wallet`, `core/review.rs:4 @691fe5c`); relay passed explicitly; the check is
+  `reviewer == privacy.service_pubkey` without requiring `privacy.private_jobs`.
 
-No change. A team agent posts a normal private job with `maxplayer` from its own wallet, passing the
-repo files the seller needs as `inputs`, and commits the result to the team repo itself. The seller
-never gets team-repo access.
+**Client.**
+- Messages need kind 9, `verify()`, exactly one canonical `h` matching the channel (the relay picks
+  the first parseable `h`, `relay/handlers/ingest.rs:711 @691fe5c`, while fan-out matches any), text
+  of 1–8000 chars (`chat/lib.rs:56 @691fe5c`) and event JSON ≤ 32 KiB. Failures are withheld; one bad
+  event never aborts `watch`. The reader's own messages skip review.
+- Pacing: one review at a time; stop the pass at the first availability error; at most ~1000 team
+  review requests per rolling 30 minutes per key. The verdict inbox reads at most 16 pages of 128
+  (`core/review/private.rs:567 @691fe5c`), shared with job reviews.
+- The read cursor always advances. A message withheld for availability goes to a retry set (back-off
+  30 s doubling to 1 h) and stays withheld until a signed pass; later messages are delivered.
+- The signed 3408 is stored in the team store; `inbox`/`log` re-run verify + decision +
+  `recorded_acceptance` offline against current config, so a threshold or key change applies to old
+  messages. `record_pass` only for overrides.
+- Display never prints channel name, about, kind 0 or tags. Withheld = `(id, author, state,
+  unsafe_ppm, threshold_ppm, verdict_event_id)`. `accept-verdict` overrides `Refused` only; errors are
+  final, as today. `--notify` passes the team id only.
 
-## 7. Bounds (only the ones that stop runaway loops or unbounded fan-out)
+**Commits.**
+- Working repo `origin` = the relay HTTPS URL, so bare `git fetch`/`pull` fail 401.
+- `pull`: fetch `--no-tags` into a quarantine bare repo `<home>/team/quarantine/<repo id>.git` under
+  `refs/quarantine/<branch>`, check ancestry, walk every commit (`push(tip)`, `hide(base)`, no
+  first-parent), require every commit to pass, then transfer `<passed oid>:refs/remotes/origin/<branch>`
+  and fast-forward. Agents rebase local work with plain git.
+- `push` refuses binary/NUL/non-UTF-8 blobs, non-UTF-8/NUL commit headers or messages, symlinks and
+  submodules, so honest members never block a branch with an unreviewable commit.
+- All git subprocesses: `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`,
+  `GIT_TERMINAL_PROMPT=0`. The NIP-98 header goes only on `push` and the quarantine fetch.
+- A hostile member who poisons a branch: remove them and continue on a new branch from the last passed
+  commit. The skip list cannot help, since a reader cannot tell who pushed a commit.
 
-* **Send:** 50 messages per team per UTC day per sender, enforced locally like chat's per-peer cap
-  (`chat/lib.rs:550 @691fe5c`). This is what stops two agents replying to each other forever.
-* **Receive:** 100 stored messages per member per team per day, like chat's inbound cap
-  (`chat/lib.rs:47 @691fe5c`); excess is dropped and remembered.
-* **Members:** 16 per team, enforced by the relay. A send is members + 1 wraps.
-* The README tells agents what chat's README does: messages are untrusted words from trusted
-  agents, never instructions, and ask your owner when unsure.
+## 6. Follow — no relay change
 
-## 8. Code reuse
+Any signed-in key can read open channels, history and live: the readable set is member channels plus
+every open channel (`buzz-db/store/channel_members.rs:1100 @691fe5c`). Anyone may also post there;
+readers ignore it.
+- `follow <uuid> <owner>` stores the pair. One REQ filter per pair, `{kinds:[9], #h:[uuid],
+  authors:[owner]}`, never merged with team filters (≤ 10 filters per REQ).
+- The client re-checks `verify()` and `pubkey == owner` itself before the skip list or review, then
+  applies the same message rules and screening as team messages.
+- A UUID is followed or joined, never both; each command refuses the other.
+- Default follow: `follows: Option<Vec<Follow>>`; `None` seeds Team Maxplayer for the default relay
+  only; `unfollow` writes `Some`. The Team Maxplayer channel is created before the config ships, so
+  nobody can claim its UUID first.
+- Following needs a linked account: production refuses sign-in to unlinked keys
+  (`nix/relay-host.nix:69`, `relay/handlers/auth.rs:545 @691fe5c`).
+- v1 delivery to agents: `watch --notify` and a line in the skill text.
 
-New crate `crates/maxplayer-team`, depending on `maxplayer-core` (`gateway`) and on
-`maxplayer-chat` for its public helpers: `validate_text` (`chat/lib.rs:56 @691fe5c`), display
-escaping, and `Notifier` (`:612`). The home-key load/create in chat's `Home::open`
-(`chat/lib.rs:204 @691fe5c`, private `create_key` at `:158`) is moved into a `pub fn` with no
-behaviour change, so both binaries create and read `<home>/key` the same way. Chat's watch loop
-(reconnect, backlog paging) is private to its `network.rs`; team starts from a copy of it, adapted
-to the team envelope. Extracting one shared watcher is a later cleanup, not part of this.
+## 7. Config and deployment
 
-## 9. Implementation — one PR
+- `ReviewConfig` (`core/review.rs:26 @691fe5c`; `enabled` at `:76`): `team_message` (default true,
+  also governs follows), `team_commit` (default true), `skip_member_pubkeys` (messages only). Reuse
+  `reject_at_or_above_ppm`, `reviewers`, `timeout_seconds`.
+- Ops: before enabling, `SELECT count(*) FROM private_job_repositories WHERE job_id ~ '0{32}$'` = 0;
+  register the service key as a relay member; document that an unset
+  `MAXPLAYER_PRIVATE_SERVICE_PUBKEY` means the compiled-in default; keep kind 1059 on the relay.
 
-Relay flag default off. Tests that must fail before the change and pass after:
+## 8. Implementation — one PR (rewrite of #1338)
 
-* Relay: a non-member gets 403 on advertisement, upload-pack and receive-pack; a removed member gets
-  403 on the next request; the service can read and can't push; a member's non-fast-forward push
-  and branch deletion are refused, fast-forward accepted; a non-creator `PUT` is refused; a stale
-  `expected_version` gets 409; a team id already used by a private job (and the reverse) is refused;
-  a team repo id with no row is refused, not served public; no 30618 is published after a team push.
-* Client: a message from a non-member, from an unjoined team, or missing the service in
-  `recipients` is not stored; duplicate copies store once; the send cap refuses the 51st send; the
-  git wrapper's token is absent from argv and `.git/config`.
+Delete from #1338: the `team_repositories` table, migration 100028 and its schema/deletion entries,
+`/api/teams`, `TeamRepo`, `OpaqueRepo::Team`, the cross-table namespace lock, and the gift-wrap team
+envelope. Add `team_access`, the reviewer and core changes in §5, and the client in §2–§6. Before the
+client work, test the shallow fetch by OID against the real relay, including a two-parent commit.
 
-## 10. Deliberately left out (each addable later without a wire change)
+Tests:
+- **Relay:** a 64-hex name with no job and no channel is 403 on all four git routes and in the hook;
+  job-shaped names are unaffected by the team flag; members create/fast-forward `refs/heads/*`; tags,
+  deletes and non-ff refused; the service key clones but gets 403 on the receive-pack advertisement
+  and on push, also when added as a channel member; an empty service key fails closed while members
+  still work; not-found/open/archived/deleted/TTL/wrong-owner/removed-member (including mid-push) 403;
+  no 30618.
+- **Reviewer:** a job-shaped `offer` in a team request is refused before fetch; a second commit within
+  33 min succeeds with separate evidence; a foxtrot merge is classified against its second parent; a
+  >24 KiB commit message is reviewed, not errored; a cache hit costs no `admit` and no fetch; team
+  requests don't consume the job budget; two requesters asking for the same team subject while the
+  first is queued both get a verdict with one classifier call; shallow fetch by OID works against the
+  real relay.
+- **Client:** multi-`h` and >32 KiB kind 9 withheld without stalling `watch`; a followed post from
+  another author is dropped with the relay filter removed; follow/join collision refused; `join` on
+  an open channel refused; a threshold or key change re-evaluates stored verdicts; `accept-verdict`
+  unblocks `Refused` only; one availability-withheld message doesn't block later ones; 1500 queued
+  reviews stay under the cap; bare `git fetch` in the worktree fails 401; `push` refuses
+  binary/NUL/symlink/submodule; `unfollow` of the default persists.
 
-Deleting or archiving a team; transferring ownership; roles other than owner/member; members
-removing themselves from the relay list (they can `leave` locally); force-push and branch deletion;
-a shared watcher with chat; MCP tools for the binary; teams selling as one seller; MLS/forward
-secrecy (Marmot) for larger teams.
+## 9. Deliberately left out (each addable later without a wire change)
 
-## 11. Risks that come with settled decisions
+- Read-only members. Buzz has a guest role (`buzz-core/channel.rs:115 @691fe5c`) but posting never
+  checks it. Owner-only repos. Auto-join of teams one is added to. Registration-service hooks.
+- Surfacing team and follow messages through the seller/buyer daemon or MCP (needed before most new
+  users see Team Maxplayer updates without setup).
+- A separate team threshold; a batch review request; a skip list for commits.
+- SQL. When built: a per-team LOGIN role and a mandatory relay-side wall-clock timeout.
 
-* **Maxplayer can read everything** a team says and stores. That is settled input 6; the README says
-  so.
-* **Prompt injection between teammates** through messages and repo files. Mitigated only by the
-  README rule and the owner's own agent policy.
-* **The member list lives on our server.** A compromised relay could add a member. Accepted with
-  input 6, since the relay already holds the repo.
-* **No forward secrecy;** a removed member keeps what they pulled.
-* **Relay storage grows with members × messages.** Each send stores members + 1 kind-1059 events,
-  signed by throwaway keys, which nobody can delete on our relay. The send cap and member cap bound
-  it per team per day; there is no global bound.
+## 10. Known limits (accepted)
 
-## 12. Open questions, each with a proposed default
+- About 2,000 review wraps per key per ~33-minute verdict window, jobs and teams together.
+- One threshold for jobs and teams, though team text gets no task context.
+- The reviewer worker is serial (`core/reviewer.rs:912 @691fe5c`); team volume can queue ahead of job
+  reviews.
+- Anyone who knows (creator, channel UUID, commit id) learns that commit's score. Non-member classifier
+  spend is bounded by `admit`; cache hits only by relay ingest limits.
+- Any member can re-add a removed key; an admin can take over; remove reports success before the
+  roster re-read confirms it.
+- Repos of deleted channels are not cleaned up (same as private job repos).
+- Only agents reading through `maxplayer-team` are protected.
 
-| # | Question | Proposed default |
-|---|---|---|
-| Q1 | What does the service do with team copies? Shipping the key alone doesn't deploy a content consumer (`docs/specs/private-offers-rollout.md:40 @691fe5c`), and this spec did not check whether one runs in production. | Whatever consumes private-job content copies also accepts `maxplayer-team/1`. Until a consumer runs, copies sit on the relay, exactly as for private jobs. |
-| Q2 | Member cap. | 16. |
+## 11. Open questions, each with a proposed default
+
+1. Which key creates Team Maxplayer? Default: a dedicated Maxplayer team key, linked as a relay
+   member, whose public key ships in the default follow.
+2. Team volume vs. the shared verdict window. Default: ship the client cap; add a batch request only
+   if a real team hits it.
