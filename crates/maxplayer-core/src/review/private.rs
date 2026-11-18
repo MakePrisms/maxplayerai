@@ -1608,6 +1608,40 @@ mod tests {
         }
     }
 
+    /// #1349: the private carrier projection keeps `turn_too_large` (not `other`) and the
+    /// projected FEEDBACK passes the shared private validator with its refusal status.
+    #[test]
+    fn turn_too_large_survives_private_feedback_projection() {
+        let (evidence, _, _, policy) = pc::evidence::inline_fixture_for(true);
+        let mut local = crate::gateway::error_draft(
+            &evidence.offer.id.to_hex(),
+            &key(1).public_key().to_hex(),
+            &key(2).public_key().to_hex(),
+            crate::gateway::ReasonCode::TurnTooLarge,
+            "",
+        );
+        for tag in local.tags.iter_mut() {
+            if tag.first() == Some("status") {
+                *tag = TagSpec::new(["status", "refusal"]);
+            }
+        }
+        local
+            .tags
+            .push(TagSpec::new(["e", &"ab".repeat(32), "", "reply"]));
+        let draft = pc::carriers::project(
+            &evidence.offer,
+            &local,
+            Some(&evidence.award),
+            None,
+            &policy.host,
+        )
+        .unwrap();
+        let event = pc::builders::sign(&key(2), draft).unwrap();
+        let tags = pc::wire::validate_private(&event, &policy.host).unwrap();
+        assert_eq!(tags.get("reason_code"), Some("turn_too_large"));
+        assert_eq!(tags.get("status"), Some("refusal"));
+    }
+
     /// #1349: when even the task plus the current follow-up cannot seal, the request is refused as
     /// `TooLarge` with sizes only (no buyer text), and no history is added.
     #[tokio::test]
