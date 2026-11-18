@@ -7,9 +7,14 @@ import test from 'node:test';
 import { schnorr } from '@noble/curves/secp256k1';
 import { eventId } from '../src/challenge/shared/events.mjs';
 import { SWARM, SWARM_JOB, SWARM_MEMBERSHIP, SWARM_DECISION, OFFER, CLAIM, AWARD } from '../src/model/kinds.ts';
-import { SwarmStore, swarmSnapshot, parseUpdate, TALLY_MAX } from '../src/swarm/shared/model.mjs';
+// Namespace imports: on a base without parseUpdate/reportedLine the tests fail at assertions, not at load.
+import * as model from '../src/swarm/shared/model.mjs';
 import { swarmAddress } from '../src/swarm/shared/wire.mjs';
-import { parseSnapshot, renderSellers, sellerLine, reportedLine } from '../src/swarm/live.ts';
+import * as live from '../src/swarm/live.ts';
+const { SwarmStore, swarmSnapshot } = model, { parseSnapshot, renderSellers, sellerLine } = live;
+const parseUpdate = v => { assert.equal(typeof model.parseUpdate, 'function', 'model.parseUpdate exists'); return model.parseUpdate(v); };
+const TALLY_MAX = model.TALLY_MAX ?? 65536;
+const reportedLine = (s, a) => { assert.equal(typeof live.reportedLine, 'function', 'live.reportedLine exists'); return live.reportedLine(s, a); };
 import { demoSnapshot } from '../src/swarm/demo.ts';
 
 const key = n => n.toString(16).padStart(64, '0');
