@@ -1113,19 +1113,18 @@ mod wallet {
             );
         }
         let _ = writeln!(out);
-        // `account link --mint` cosigns with this home's agent key when that key is linked (PR 4,
-        // #1340); otherwise it links the mint by email code.
-        let how = if fs::symlink_metadata(root.join("key")).is_ok() {
-            "if this home's agent key is already linked, both keys sign and no email is sent; \
-             otherwise it emails you a code"
-        } else {
-            "this home has no agent key, so it emails you a code"
-        };
+        // `account link --mint` links the mint key by email code, like any other key: one email
+        // can link many keys, so use the email this account already uses. A terminal prompts for
+        // the email; an agent passes `--email`, then `--code` with the code from the email.
         let _ = writeln!(
             out,
-            "Next: link the mint to your Maxplayer account ({how}):"
+            "Next: link the mint to your Maxplayer account (use the email your account already \
+             uses; it emails you a code, then run the same command with --code <6 digits>):"
         );
-        let _ = writeln!(out, "  maxplayer account link --mint{flags}");
+        let _ = writeln!(
+            out,
+            "  maxplayer account link --mint{flags} --email <your email>"
+        );
         Ok(())
     }
 

@@ -246,7 +246,7 @@ fn install_verifies_installs_sets_up_the_mint_home_and_prints_the_link_step() {
         "{out}"
     );
     assert!(
-        out.contains("no agent key, so it emails you a code"),
+        out.contains("it emails you a code, then run the same command with --code"),
         "{out}"
     );
     assert!(
