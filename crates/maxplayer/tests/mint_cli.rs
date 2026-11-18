@@ -1416,3 +1416,80 @@ fn status_never_advises_force_installing_an_older_mint_over_a_newer_one() {
     assert!(!out.contains("install --force"), "{out}");
     assert!(out.contains("update maxplayer"), "{out}");
 }
+
+// ── the newer-maxplayer notice in `maxplayer doctor` (Petar, 18 Nov 19:16 UTC) ──────────────────
+
+/// `maxplayer doctor` on a fresh home with NO maxplayer-mint anywhere (PATH and ~/.local/bin
+/// empty). The relay and the accepted mint point at a closed loopback port so nothing leaves the box.
+fn doctor_without_a_mint(w: &World, latest: &str, extra: &[&str]) -> String {
+    let fake_home = w.home.parent().unwrap().join("user-home");
+    fs::create_dir_all(&fake_home).unwrap();
+    let (_, out, err) = run(maxplayer()
+        .arg("doctor")
+        .args(extra)
+        .arg("--home")
+        .arg(&w.home)
+        .env("HOME", &fake_home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("MAXPLAYER_RELAY_URL", "ws://127.0.0.1:9")
+        .env("MAXPLAYER_ACCEPTED_MINTS", "https://127.0.0.1:9")
+        .env("MAXPLAYER_RELEASES_LATEST_URL", latest));
+    format!("{out}{err}")
+}
+
+fn row<'a>(report: &'a str, name: &str) -> &'a str {
+    report
+        .lines()
+        .find(|l| {
+            l.split_once(" — ")
+                .is_some_and(|(head, _)| head.split_once(' ').map(|(_, n)| n) == Some(name))
+        })
+        .unwrap_or_else(|| panic!("no `{name}` row: {report}"))
+}
+
+#[test]
+fn doctor_shows_the_maxplayer_update_with_no_mint_installed_on_its_own_row() {
+    let w = World::new();
+    let latest = w.latest("v999.0.0");
+    let report = doctor_without_a_mint(&w, &latest, &[]);
+    // The mint row has nothing to report: no mint is installed.
+    assert!(
+        row(&report, "maxplayer-mint version").starts_with("SKIP "),
+        "{report}"
+    );
+    // (b) is its own row, shown anyway, and never about the mint.
+    let update = row(&report, "maxplayer version");
+    assert!(update.starts_with("WARN "), "{update}");
+    assert!(
+        update.contains(&format!(
+            "maxplayer 999.0.0 is available (you have {VERSION}); update it the way you installed it"
+        )),
+        "{update}"
+    );
+    assert!(
+        update.contains("install.sh | sh") && update.contains("npm install -g maxplayer@latest"),
+        "{update}"
+    );
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+
+    // Up to date: a PASS, still on its own row.
+    let same = w.latest(&format!("v{VERSION}"));
+    let report = doctor_without_a_mint(&w, &same, &[]);
+    assert!(
+        row(&report, "maxplayer version").starts_with("PASS "),
+        "{report}"
+    );
+    // --offline: not checked, never an error; a failed check: "could not check", never an error.
+    let report = doctor_without_a_mint(&w, &latest, &["--offline"]);
+    let offline = row(&report, "maxplayer version");
+    assert!(
+        offline.starts_with("PASS ") && offline.contains("not checked (--offline)"),
+        "{offline}"
+    );
+    let report = doctor_without_a_mint(&w, "file:///nonexistent/latest.json", &[]);
+    let failed = row(&report, "maxplayer version");
+    assert!(
+        failed.starts_with("PASS ") && failed.contains("could not check"),
+        "{failed}"
+    );
+}

@@ -86,9 +86,9 @@ fn write_usage(out: &mut dyn Write) {
          installed one is an OLDER {MINT_BIN} release; at {version} already there is nothing to do.\n\
          A newer version, a source build or an unrecognised binary is refused (`maxplayer mint\n\
          install --force` replaces anything). <home>/mint/ is not touched and `init` never runs. A\n\
-         running `{MINT_BIN} run` keeps the old version until it is restarted. For a newer mint,\n\
-         first update maxplayer the way you installed it (install.sh, or npm install -g\n\
-         maxplayer@latest), then run `maxplayer mint upgrade`.\n\
+         running `{MINT_BIN} run` keeps the old version until it is restarted. The mint is\n\
+         version-locked to maxplayer: once maxplayer itself is updated, `maxplayer mint` reports the\n\
+         installed {MINT_BIN} as older, and that is when to run `maxplayer mint upgrade`.\n\
          \n\
          `maxplayer mint uninstall` removes the {MINT_BIN} binary in --bin-dir (a symlink is removed,\n\
          not what it points to). It refuses while `{MINT_BIN} run` is serving <home>, and never\n\
