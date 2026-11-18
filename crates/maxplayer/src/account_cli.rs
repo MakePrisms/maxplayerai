@@ -247,9 +247,10 @@ mod wallet {
         pub home: Option<MaxplayerHome>,
         /// `[profile].name` when it is a valid label: the label prompt's default.
         pub profile_name: Option<String>,
-        /// `--mint` only: this home's agent key (`<home>/key`) when one exists. It is the account
-        /// key that vouches for the mint key in a cosigned link. Never created here.
-        pub account: Option<Keys>,
+        /// `--mint` only: this home's agent key file (`<home>/key`) when one exists. It is the
+        /// account key that vouches for the mint key in a cosigned link. Read only by that link
+        /// (review L3: `status`, `marketing` and the code flow never touch it); never created.
+        pub account: Option<std::path::PathBuf>,
         /// `--mint` only: the cosigned link's default label (the mint's name).
         pub mint_label: Option<String>,
     }
@@ -352,18 +353,12 @@ mod wallet {
                 .to_bech32()
                 .map_err(|e| format!("npub encode: {e}"))?;
             let config = home::resolve_config_read_only(root).map_err(|e| e.to_string())?;
-            // The agent key, read (never created) for a cosigned link. A home without one links
-            // the mint by email code.
+            // The agent key's path for a cosigned link (read there, never created). A home
+            // without one links the mint by email code.
             let account_path = root.join("key");
-            let account = if std::fs::symlink_metadata(&account_path).is_ok() {
-                let secret = home::read_key_file_hex(&account_path).map_err(|e| e.to_string())?;
-                Some(
-                    Keys::parse(&secret)
-                        .map_err(|_| format!("{} is not a valid key", account_path.display()))?,
-                )
-            } else {
-                None
-            };
+            let account = std::fs::symlink_metadata(&account_path)
+                .is_ok()
+                .then_some(account_path);
             let mint_toml = std::fs::read_to_string(root.join("mint").join("mint.toml")).ok();
             let mint_label = Some(registration::default_mint_label(
                 mint_toml.as_deref(),
@@ -389,6 +384,12 @@ mod wallet {
         /// A client that signs with the account (agent) key, for the cosigned mint link.
         fn account_client(&self, account: &Keys) -> Result<RegistrationClient, RegistrationError> {
             RegistrationClient::new(&self.base_url, account.clone())
+        }
+
+        /// Reads the agent key at `path` (with the home key's checks).
+        fn read_account(path: &std::path::Path) -> Result<Keys, String> {
+            let secret = home::read_key_file_hex(path).map_err(|e| e.to_string())?;
+            Keys::parse(&secret).map_err(|_| format!("{} is not a valid key", path.display()))
         }
     }
 
@@ -588,16 +589,28 @@ mod wallet {
         err: &mut dyn Write,
     ) -> i32 {
         // `--mint` with an agent key in this home and no email-flow flags: the cosigned link.
-        if let Some(account) = ctx
+        if let Some(path) = ctx
             .account
             .as_ref()
             .filter(|_| opts.email.is_none() && opts.code.is_none())
         {
+            let account = match Context::read_account(path) {
+                Ok(account) => account,
+                Err(message) => {
+                    let _ = writeln!(
+                        err,
+                        "account refused: {message}. Fix this home's agent key, or link the mint \
+                         key by email code: `{} --email <your email>`.",
+                        ctx.command("link")
+                    );
+                    return RUNTIME_ERROR;
+                }
+            };
             let label = match opts.label.as_deref().or(ctx.mint_label.as_deref()) {
                 Some(label) => label.to_owned(),
                 None => ctx.npub.clone(),
             };
-            return link_mint_cosigned(ctx, account, &label, out, err);
+            return link_mint_cosigned(ctx, &account, &label, out, err);
         }
         let client = match ctx.client() {
             Ok(client) => client,

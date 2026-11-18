@@ -105,6 +105,15 @@ pub async fn registered_pubkeys(db: &PgPool) -> Result<Vec<String>> {
     rows.iter().map(|r| Ok(r.try_get("pubkey")?)).collect()
 }
 
+/// Keys a cosigned link made `account` the voucher for (`linked_by = account`), sorted.
+pub async fn vouched_by(db: &PgPool, account: &str) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT pubkey FROM registrations WHERE linked_by = $1 ORDER BY pubkey")
+        .bind(account)
+        .fetch_all(db)
+        .await?;
+    rows.iter().map(|r| Ok(r.try_get("pubkey")?)).collect()
+}
+
 /// Operator removal: delete the row and queue the NIP-43 remove in one transaction.
 /// Returns (row existed, outbox id).
 pub async fn remove_registration(
@@ -437,7 +446,7 @@ pub async fn link_mint(
     let sql = format!(
         "INSERT INTO registrations (pubkey, email, label, terms_version, privacy_version, accepted_at, \
          code_entered_by, linked_by, created_at, updated_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, 'cosigned', $7, $6, $6) \
+         VALUES ($1, $2, $3, $4, $5, $8, 'cosigned', $7, $6, $6) \
          ON CONFLICT (pubkey) DO UPDATE SET label = EXCLUDED.label, terms_version = EXCLUDED.terms_version, \
          privacy_version = EXCLUDED.privacy_version, accepted_at = EXCLUDED.accepted_at, \
          linked_by = EXCLUDED.linked_by, updated_at = EXCLUDED.updated_at \
@@ -452,11 +461,22 @@ pub async fn link_mint(
         .bind(&acct.privacy_version)
         .bind(now)
         .bind(account)
+        // The terms were accepted when the account key was linked by code: keep that time.
+        .bind(acct.accepted_at)
         .fetch_optional(&mut *tx)
         .await?
     else {
+        // A concurrent writer got the row first (the guard refused). Name what it holds now.
         // Rolls back: the challenge stays unused.
-        return Ok(MintLinkOutcome::MintLinkedToOtherEmail);
+        let now_email: Option<String> =
+            sqlx::query_scalar("SELECT email FROM registrations WHERE pubkey = $1")
+                .bind(mint)
+                .fetch_optional(&mut *tx)
+                .await?;
+        return Ok(match now_email {
+            Some(email) if email == acct.email => MintLinkOutcome::MintIsEmailLinked,
+            _ => MintLinkOutcome::MintLinkedToOtherEmail,
+        });
     };
     let registration = reg_from_row(&reg_row)?;
     let inserted: bool = reg_row.try_get("inserted")?;

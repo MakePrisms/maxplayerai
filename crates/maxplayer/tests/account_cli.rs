@@ -1204,3 +1204,134 @@ fn mint_link_with_email_still_uses_the_code_flow() {
     assert!(fake.pending(&mint.public_key().to_hex()).is_some());
     assert_eq!(paths(&fake), ["/account/link/request"]);
 }
+
+// ------------------------------------------------------------- review r1 (PR #1340) additions
+
+/// M1 (mutant E): `--mint --code` in a home with an agent key confirms the mint's own code; it
+/// does not take the cosign path.
+#[test]
+fn mint_link_with_code_still_uses_the_code_flow() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    let mint_hex = mint.public_key().to_hex();
+    fake.set_next_code("482913");
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &[
+            "link",
+            "--mint",
+            "--email",
+            "ops@example.com",
+            "--label",
+            "m",
+        ],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &["link", "--mint", "--code", "482913"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        paths(&fake),
+        ["/account/link/request", "/account/link/confirm"]
+    );
+    for r in fake.requests() {
+        assert_eq!(
+            r.auth.unwrap().pubkey.to_hex(),
+            mint_hex,
+            "signed by the mint key"
+        );
+    }
+    let reg = fake.registration(&mint_hex).unwrap();
+    assert_ne!(
+        reg.entered_by, "cosigned",
+        "a code link, not a cosigned one"
+    );
+    assert_eq!(reg.linked_by, None);
+}
+
+/// M1 (mutant F): a challenge that is not 64 lowercase hex is never signed by the mint key.
+#[test]
+fn mint_link_refuses_a_malformed_challenge() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    fake.set_challenge_value_override("not-a-challenge");
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("unexpected answer"), "{err}");
+    assert_eq!(
+        paths(&fake),
+        ["/account/link/mint/challenge"],
+        "no confirm was sent"
+    );
+    assert!(fake.registration(&mint.public_key().to_hex()).is_none());
+}
+
+/// L3: a broken agent key no longer breaks `status --mint`, `marketing --mint` or the code flow;
+/// only the cosign path reads it, and it says what to do.
+#[test]
+fn a_bad_agent_key_only_affects_the_cosigned_link() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    std::fs::write(home.root.join("key"), "not a key").unwrap();
+    let (code, out, err) = run(&home, &fake.base_url(), &["status", "--mint", "--json"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &[
+            "link",
+            "--mint",
+            "--email",
+            "ops@example.com",
+            "--label",
+            "m",
+        ],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(fake.pending(&mint.public_key().to_hex()).is_some());
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("--mint --email <your email>"), "{err}");
+}
+
+/// L4: against a service without the new routes (axum's empty 404), the CLI says to use the
+/// email flow instead of "try again in a few minutes".
+#[test]
+fn mint_link_against_an_older_service_points_to_the_email_flow() {
+    let fake = FakeRegistration::start();
+    let (home, _) = cosign_home(&fake, None);
+    fake.without_mint_routes();
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("does not support"), "{err}");
+    assert!(
+        err.contains("`maxplayer account link --mint --email <your email>`"),
+        "{err}"
+    );
+    assert!(!err.contains("few minutes"), "{err}");
+}
+
+/// L5: with `--home`, the "link the agent key first" advice keeps `--home` (and drops `--mint`).
+#[test]
+fn unlinked_agent_key_advice_keeps_the_home() {
+    let fake = FakeRegistration::start();
+    let (home, _) = cosign_home(&fake, None);
+    let fresh = FakeRegistration::start();
+    let home_arg = home.root.to_str().unwrap().to_owned();
+    let out = maxplayer()
+        .env("MAXPLAYER_REGISTRATION_URL", fresh.base_url())
+        .stdin(Stdio::null())
+        .args(["account", "link", "--mint", "--home", &home_arg])
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains(&format!("`maxplayer account link --home {home_arg}` first")),
+        "{err}"
+    );
+}

@@ -175,6 +175,9 @@ pub struct ApiError {
     pub message: String,
     pub retry_after_secs: Option<u64>,
     pub attempts_left: Option<u32>,
+    /// `mint_proof_invalid` only: which part of the mint key's proof was refused (`wrong_key`,
+    /// `wrong_url`, `wrong_challenge`, `wrong_account`, `stale`, …).
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +257,22 @@ impl std::fmt::Display for RegistrationError {
 
 impl std::error::Error for RegistrationError {}
 
+fn unsupported_mint_link() -> RegistrationError {
+    RegistrationError::Api(ApiError {
+        status: 404,
+        code: "mint_link_unsupported".to_owned(),
+        message: "no cosigned mint link route".to_owned(),
+        retry_after_secs: None,
+        attempts_left: None,
+        reason: None,
+    })
+}
+
+/// The agent key's own link command for a `--mint` link command: the same flags without `--mint`.
+fn agent_link(link: &str) -> String {
+    link.replace(" --mint", "")
+}
+
 /// The command every "link again" message names when no flags apply.
 pub const LINK_COMMAND: &str = "maxplayer account link";
 
@@ -323,13 +342,19 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
         "replayed_auth" => {
             "The registration service saw this signed request twice. Try again.".to_owned()
         }
-        "account_not_registered" => "This home's agent key is not linked to an email yet, so it \
-             cannot vouch for the mint key. Run `maxplayer account link` first (it emails a \
-             code), then `maxplayer account link --mint` again."
-            .to_owned(),
-        "account_is_cosigned" => "This home's agent key was itself linked by a cosignature, so it \
-             cannot vouch for another key. Use the home whose key was linked by email code."
-            .to_owned(),
+        "account_not_registered" => format!(
+            "This home's agent key is not linked to an email yet, so it cannot vouch for the mint \
+             key. Run `{}` first (it emails a code), then `{link}` again.",
+            agent_link(link)
+        ),
+        "account_is_cosigned" => format!(
+            "This home's agent key was itself linked by a cosignature, so it cannot vouch for \
+             another key. Link the mint key by email code instead: `{link} --email <your email>`."
+        ),
+        "mint_link_unsupported" => format!(
+            "This registration service does not support linking a mint key without an email yet. \
+             Link it by email code instead: `{link} --email <your email>`."
+        ),
         "mint_linked_to_other_account" => "This mint key is already linked to a different \
              account. Changing it is not supported; `maxplayer account status --mint` shows the \
              current link."
@@ -346,10 +371,22 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
                 api.code
             )
         }
-        "mint_proof_invalid" => "The registration service did not accept the mint key's \
-             signature. Check this computer's clock and `registration_url`, then run the command \
-             again."
-            .to_owned(),
+        "mint_proof_invalid" => match api.reason.as_deref() {
+            Some("stale") => "The registration service refused the mint key's signature as too \
+                 old or too new. Check that this computer's clock is right, then try again."
+                .to_owned(),
+            Some("wrong_url") => "The registration service expected a different address in the \
+                 mint key's signature. Check `registration_url` (or MAXPLAYER_REGISTRATION_URL): it \
+                 must be the service's public URL."
+                .to_owned(),
+            Some(reason) => format!(
+                "The registration service did not accept the mint key's signature ({reason}). \
+                 Update maxplayer and try again."
+            ),
+            None => "The registration service did not accept the mint key's signature. Check \
+                 this computer's clock and `registration_url`, then run the command again."
+                .to_owned(),
+        },
         "invalid_mint_pubkey" | "invalid_challenge" => format!(
             "The registration service did not accept this request ({}). Update maxplayer and try \
              again.",
@@ -552,6 +589,8 @@ struct ErrorBody {
     retry_after_secs: Option<u64>,
     #[serde(default)]
     attempts_left: Option<u32>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 /// One registration-service session for one key.
@@ -656,7 +695,15 @@ impl RegistrationClient {
             )
         })?;
         let body = serde_json::json!({ "mint_pubkey": mint_pk.to_hex() });
-        let issued: MintChallenge = self.send("POST", PATH_LINK_MINT_CHALLENGE, Some(&body))?;
+        // A service without the route answers 404 (axum's default has an empty body): say so
+        // instead of "try again later", which would never help.
+        let issued: MintChallenge = self
+            .send("POST", PATH_LINK_MINT_CHALLENGE, Some(&body))
+            .map_err(|error| match &error {
+                RegistrationError::BadResponse { status: 404, .. } => unsupported_mint_link(),
+                RegistrationError::Api(api) if api.status == 404 => unsupported_mint_link(),
+                _ => error,
+            })?;
         // Sign only a challenge issued for THIS mint key, in the documented shape.
         if issued.mint_pubkey != mint_pk.to_hex() || !valid_challenge(&issued.challenge) {
             return Err(RegistrationError::BadResponse {
@@ -753,6 +800,7 @@ impl RegistrationClient {
                 message: error.message,
                 retry_after_secs: error.retry_after_secs.or(header_retry),
                 attempts_left: error.attempts_left,
+                reason: error.reason,
             })),
             Err(_) => Err(RegistrationError::BadResponse {
                 url,
@@ -896,7 +944,44 @@ mod tests {
             message: String::new(),
             retry_after_secs: None,
             attempts_left: None,
+            reason: None,
         }
+    }
+
+    /// Review L5/N2/N3: the mint-link messages keep this home's flags and name the refused part.
+    #[test]
+    fn mint_link_messages_keep_the_home_and_name_the_reason() {
+        let link = "maxplayer account link --mint --home /srv/m";
+        let text = plain_message_for(&api("account_not_registered", 403), link);
+        assert!(
+            text.contains("`maxplayer account link --home /srv/m` first"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("`{link}` again")), "{text}");
+        let text = plain_message_for(&api("account_is_cosigned", 403), link);
+        assert!(
+            text.contains(&format!("`{link} --email <your email>`")),
+            "{text}"
+        );
+        let text = plain_message_for(&api("mint_link_unsupported", 404), link);
+        assert!(
+            text.contains(&format!("`{link} --email <your email>`")),
+            "{text}"
+        );
+        let wrong_key = ApiError {
+            reason: Some("wrong_key".to_owned()),
+            ..api("mint_proof_invalid", 401)
+        };
+        let text = plain_message_for(&wrong_key, link);
+        assert!(
+            text.contains("(wrong_key)") && !text.contains("clock"),
+            "{text}"
+        );
+        let stale = ApiError {
+            reason: Some("stale".to_owned()),
+            ..api("mint_proof_invalid", 401)
+        };
+        assert!(plain_message_for(&stale, link).contains("clock"));
     }
 
     #[test]

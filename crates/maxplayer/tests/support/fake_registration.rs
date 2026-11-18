@@ -86,6 +86,10 @@ struct State {
     /// Test knob: answer the next mint challenge naming this mint key instead (a hostile or buggy
     /// service), so the client's own check is exercised.
     challenge_mint_override: Option<String>,
+    /// Test knob: answer the next mint challenge with this (malformed) challenge string.
+    challenge_value_override: Option<String>,
+    /// Test knob: behave like a service that predates the cosigned mint link (no such routes).
+    no_mint_routes: bool,
 }
 
 pub struct FakeRegistration {
@@ -151,6 +155,8 @@ impl FakeRegistration {
             relay_member: "added".into(),
             mint_challenges: HashMap::new(),
             challenge_mint_override: None,
+            challenge_value_override: None,
+            no_mint_routes: false,
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -238,6 +244,14 @@ impl FakeRegistration {
         self.state.lock().unwrap().challenge_mint_override = Some(mint_hex.to_owned());
     }
 
+    pub fn set_challenge_value_override(&self, challenge: &str) {
+        self.state.lock().unwrap().challenge_value_override = Some(challenge.to_owned());
+    }
+
+    pub fn without_mint_routes(&self) {
+        self.state.lock().unwrap().no_mint_routes = true;
+    }
+
     pub fn mint_challenge_count(&self) -> usize {
         self.state.lock().unwrap().mint_challenges.len()
     }
@@ -296,7 +310,12 @@ fn serve(stream: TcpStream, state: &Mutex<State>) {
         });
         answer
     };
-    let text = answer.body.to_string();
+    // An unknown route gets axum's default 404: no body (Value::Null here), like the real server.
+    let text = if answer.body.is_null() {
+        String::new()
+    } else {
+        answer.body.to_string()
+    };
     let reason = match answer.status {
         200 => "OK",
         202 => "Accepted",
@@ -408,8 +427,9 @@ fn handle(
             | ("POST", "/account/link/mint/challenge")
             | ("POST", "/account/link/mint/confirm")
     );
-    if !known {
-        return (fail(404, "not_found", "no such route"), None);
+    let mint_route = path.starts_with("/account/link/mint/");
+    if !known || (mint_route && state.no_mint_routes) {
+        return (ok(404, Value::Null), None);
     }
     let event = match authenticate(state, header, path, method, body) {
         Ok(event) => event,
@@ -729,6 +749,7 @@ fn mint_challenge(state: &mut State, account: &str, body: &Value) -> Answer {
     );
     let proof_url = format!("{}/link/mint/confirm", state.public_base);
     let mint = state.challenge_mint_override.take().unwrap_or(mint);
+    let challenge = state.challenge_value_override.take().unwrap_or(challenge);
     ok(
         200,
         json!({
@@ -763,8 +784,14 @@ fn mint_confirm(state: &mut State, account: &str, body: &Value) -> Answer {
             "mint_pubkey must be a 64-hex or npub public key",
         );
     };
+    // The server's validate::normalize_label.
     let label = label.trim().to_owned();
-    if label.is_empty() || label.chars().count() > 64 {
+    if label.is_empty()
+        || label.chars().count() > 64
+        || !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+    {
         return fail(
             400,
             "invalid_label",

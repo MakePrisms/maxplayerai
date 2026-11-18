@@ -606,10 +606,10 @@ async fn link_mint_challenge(
     let req: MintChallengeReq = parse_json(&body)?;
     let mint = parse_mint_pubkey(&req.mint_pubkey, &account)?;
     let mint_hex = mint.to_hex();
-    let acct = require_email_linked(&state, &account_hex).await?;
-    check_mint_free(&state, &mint_hex, &acct.email).await?;
     let limits = &state.cfg.limits;
     let ip = client_ip(&state, &headers, peer);
+    // Counted before any lookup, so a refusal (which says whether a key is linked elsewhere)
+    // costs a slot too.
     rate_limit(
         &state,
         "mint_challenge",
@@ -623,6 +623,8 @@ async fn link_mint_challenge(
         "rate_limited",
     )
     .await?;
+    let acct = require_email_linked(&state, &account_hex).await?;
+    check_mint_free(&state, &mint_hex, &acct.email).await?;
     let challenge = mint_link::new_challenge();
     let now = state.now();
     db::issue_mint_challenge(
@@ -658,6 +660,7 @@ struct MintConfirmReq {
 
 async fn link_mint_confirm(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult {
@@ -665,6 +668,23 @@ async fn link_mint_confirm(
     // and the mint's proof.
     let account = authenticate(&state, &headers, PATH_LINK_MINT_CONFIRM, "POST", &body).await?;
     let account_hex = account.to_hex();
+    // Every attempt counts (failed ones cost two signature checks and a transaction), on the
+    // code-confirm limits.
+    let limits = &state.cfg.limits;
+    let ip = client_ip(&state, &headers, peer);
+    rate_limit(
+        &state,
+        "mint_confirm",
+        &[
+            (format!("ip:{ip}"), limits.confirms_per_ip_per_hour),
+            (
+                format!("pk:{account_hex}"),
+                limits.confirms_per_pubkey_per_hour,
+            ),
+        ],
+        "rate_limited",
+    )
+    .await?;
     let req: MintConfirmReq = parse_json(&body)?;
     let mint = parse_mint_pubkey(&req.mint_pubkey, &account)?;
     let mint_hex = mint.to_hex();

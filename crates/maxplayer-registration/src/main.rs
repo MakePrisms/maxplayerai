@@ -167,6 +167,9 @@ async fn main() -> Result<()> {
             let pk = nostr::PublicKey::parse(&target).context("not an npub or hex pubkey")?;
             maxplayer_registration::migrate(&pool).await?;
             let state = AppState::from_config(cfg, pool)?;
+            // Keys this one vouched for by cosignature stay linked: name them so a ban can
+            // remove them too.
+            let vouched = maxplayer_registration::db::vouched_by(&state.db, &pk.to_hex()).await?;
             let (existed, confirmed) = sync::remove_key(&state, &pk).await?;
             println!(
                 "registration {}; relay remove {}",
@@ -181,6 +184,16 @@ async fn main() -> Result<()> {
                     "queued for retry (see journal)"
                 }
             );
+            if !vouched.is_empty() {
+                println!(
+                    "{} key(s) linked by this key's cosignature are still linked (same email); \
+                     remove each to cut them off too:",
+                    vouched.len()
+                );
+                for key in &vouched {
+                    println!("  maxplayer-registration remove {key}");
+                }
+            }
         }
         other => bail!("unknown command {other:?}\n{USAGE}"),
     }

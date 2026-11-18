@@ -1,5 +1,6 @@
 //! Cosigned mint link (`/account/link/mint/*`) against a real Postgres, the fake relay and the
-//! fake Resend. Each test targets one check, so removing that check fails exactly here.
+//! fake Resend. Each test targets one check, so removing that check fails here (the race and
+//! confirm-time guards included: review r1 M1).
 
 mod common;
 
@@ -499,4 +500,184 @@ async fn cleanup_drops_old_challenges() {
         app.count("SELECT count(*) FROM mint_link_challenges").await,
         0
     );
+}
+
+// ------------------------------------------------------------- review r1 (PR #1340) additions
+
+/// M1 (mutant A): a mint key code-linked between challenge and confirm is not downgraded.
+#[tokio::test]
+async fn code_link_between_challenge_and_confirm_is_not_downgraded() {
+    let app = TestApp::start().await;
+    let acct = account(&app).await;
+    let mint = Keys::generate();
+    let r = challenge(&app, &acct, &mint.public_key()).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    let c = r.body["challenge"].as_str().unwrap().to_string();
+    app.state.clock.advance(61);
+    assert_eq!(app.link(&mint, EMAIL, "own").await.status, 200);
+    let p = proof(&app, &mint, &c, &acct.public_key());
+    let r = confirm(&app, &acct, body(&c, &mint.public_key(), "m", p)).await;
+    assert_eq!(err(&r), (409, Some("mint_already_linked")));
+    let reg = db::get_registration(&app.db, &mint.public_key().to_hex())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(reg.code_entered_by, "cosigned");
+    assert_eq!(reg.linked_by, None);
+    assert_eq!(reg.label, "own");
+}
+
+/// M1 (mutant C): two concurrent confirms of one challenge link once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_concurrent_confirms_of_one_challenge_link_once() {
+    let app = TestApp::start().await;
+    let acct = account(&app).await;
+    for _ in 0..10 {
+        let mint = Keys::generate();
+        let r = challenge(&app, &acct, &mint.public_key()).await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+        let c = r.body["challenge"].as_str().unwrap().to_string();
+        let p = proof(&app, &mint, &c, &acct.public_key());
+        let b = body(&c, &mint.public_key(), "m", p);
+        let (r1, r2) = tokio::join!(
+            confirm(&app, &acct, b.clone()),
+            confirm(&app, &acct, b.clone())
+        );
+        let mut codes = [r1.status, r2.status];
+        codes.sort();
+        assert_eq!(codes, [200, 410], "{:?} {:?}", r1.body, r2.body);
+    }
+}
+
+/// M1 (mutant B): two accounts on different emails racing for one new mint key link it once,
+/// and the row names the winner on the winner's email.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_accounts_racing_for_one_mint_link_it_once() {
+    let app = TestApp::start().await;
+    let a1 = account(&app).await;
+    let a2 = Keys::generate();
+    assert_eq!(app.link(&a2, "other@example.com", "o").await.status, 200);
+    for _ in 0..8 {
+        let mint = Keys::generate();
+        let m = mint.public_key();
+        let r = challenge(&app, &a1, &m).await;
+        let c1 = r.body["challenge"].as_str().unwrap().to_string();
+        let r = challenge(&app, &a2, &m).await;
+        let c2 = r.body["challenge"].as_str().unwrap().to_string();
+        let b1 = body(&c1, &m, "m1", proof(&app, &mint, &c1, &a1.public_key()));
+        let b2 = body(&c2, &m, "m2", proof(&app, &mint, &c2, &a2.public_key()));
+        let (r1, r2) = tokio::join!(confirm(&app, &a1, b1), confirm(&app, &a2, b2));
+        let mut codes = [r1.status, r2.status];
+        codes.sort();
+        assert_eq!(codes, [200, 409], "{:?} {:?}", r1.body, r2.body);
+        let (winner, email) = if r1.status == 200 {
+            (&a1, EMAIL)
+        } else {
+            (&a2, "other@example.com")
+        };
+        let reg = db::get_registration(&app.db, &m.to_hex())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reg.email, email);
+        assert_eq!(reg.linked_by, Some(winner.public_key().to_hex()));
+    }
+}
+
+/// M1 (mutant D): the per-IP challenge limit.
+#[tokio::test]
+async fn challenges_are_rate_limited_per_ip() {
+    let app = TestApp::start_with(|cfg| cfg.limits.mint_challenges_per_ip_per_hour = 2).await;
+    let mut accts = Vec::new();
+    for i in 0..3 {
+        let k = Keys::generate();
+        let r = app.link(&k, &format!("u{i}@example.com"), "l").await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+        accts.push(k);
+    }
+    for k in &accts[..2] {
+        let r = challenge(&app, k, &Keys::generate().public_key()).await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+    }
+    let r = challenge(&app, &accts[2], &Keys::generate().public_key()).await;
+    assert_eq!(err(&r), (429, Some("rate_limited")));
+}
+
+/// L1: the limiter runs before the lookups, so refusals (which say a key is linked elsewhere)
+/// cost a slot too.
+#[tokio::test]
+async fn challenge_refusals_count_against_the_limit() {
+    let app = TestApp::start_with(|cfg| cfg.limits.mint_challenges_per_pubkey_per_hour = 2).await;
+    let acct = account(&app).await;
+    let taken = Keys::generate();
+    app.state.clock.advance(61);
+    assert_eq!(
+        app.link(&taken, "someone@else.example", "x").await.status,
+        200
+    );
+    for _ in 0..2 {
+        let r = challenge(&app, &acct, &taken.public_key()).await;
+        assert_eq!(err(&r), (409, Some("mint_linked_to_other_account")));
+    }
+    let r = challenge(&app, &acct, &taken.public_key()).await;
+    assert_eq!(err(&r), (429, Some("rate_limited")));
+}
+
+/// L1: confirm attempts are limited too (failed ones included).
+#[tokio::test]
+async fn confirms_are_rate_limited() {
+    let app = TestApp::start_with(|cfg| cfg.limits.confirms_per_pubkey_per_hour = 2).await;
+    let acct = account(&app).await;
+    let mint = Keys::generate();
+    let unknown = "ab".repeat(32);
+    for _ in 0..2 {
+        let p = proof(&app, &mint, &unknown, &acct.public_key());
+        let r = confirm(&app, &acct, body(&unknown, &mint.public_key(), "m", p)).await;
+        assert_eq!(err(&r), (404, Some("unknown_challenge")));
+    }
+    let p = proof(&app, &mint, &unknown, &acct.public_key());
+    let r = confirm(&app, &acct, body(&unknown, &mint.public_key(), "m", p)).await;
+    assert_eq!(err(&r), (429, Some("rate_limited")));
+}
+
+/// L2: the mint's row keeps the account's acceptance time, on first link and on re-link.
+#[tokio::test]
+async fn cosigned_row_keeps_the_accounts_acceptance_time() {
+    let app = TestApp::start().await;
+    let acct = account(&app).await;
+    let acct_reg = db::get_registration(&app.db, &acct.public_key().to_hex())
+        .await
+        .unwrap()
+        .unwrap();
+    let mint = Keys::generate();
+    app.state.clock.advance(3 * 86_400);
+    assert_eq!(cosign(&app, &acct, &mint, "m").await.status, 200);
+    app.state.clock.advance(86_400);
+    assert_eq!(cosign(&app, &acct, &mint, "m2").await.status, 200);
+    let reg = db::get_registration(&app.db, &mint.public_key().to_hex())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reg.accepted_at, acct_reg.accepted_at);
+    assert_eq!(reg.label, "m2");
+}
+
+/// M2: an operator can list the keys an account vouched for (what `remove` prints).
+#[tokio::test]
+async fn vouched_keys_are_listed_by_voucher() {
+    let app = TestApp::start().await;
+    let acct = account(&app).await;
+    let (m1, m2) = (Keys::generate(), Keys::generate());
+    assert_eq!(cosign(&app, &acct, &m1, "a").await.status, 200);
+    assert_eq!(cosign(&app, &acct, &m2, "b").await.status, 200);
+    let mut want = vec![m1.public_key().to_hex(), m2.public_key().to_hex()];
+    want.sort();
+    let got = db::vouched_by(&app.db, &acct.public_key().to_hex())
+        .await
+        .unwrap();
+    assert_eq!(got, want);
+    let none = db::vouched_by(&app.db, &Keys::generate().public_key().to_hex())
+        .await
+        .unwrap();
+    assert!(none.is_empty());
 }
