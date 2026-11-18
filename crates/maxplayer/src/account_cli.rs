@@ -14,7 +14,12 @@
 //!
 //! The key is the home `key` file (the same key the wallet signs mint requests with, #1210, and the
 //! key `maxplayer trade` signs listings and mint requests with), or with `--mint` the mint server's
-//! `<home>/mint/nostr.key`. `--trade-home <dir>` is deprecated: it still parses, is ignored with a
+//! `<home>/mint/nostr.key`.
+//!
+//! **Cosigned mint link.** `account link --mint` without `--email`/`--code`, in a home whose agent
+//! key is already linked, links the mint key to that same account with no second email: the agent
+//! key and the mint key both sign one fresh, single-use challenge (registration README "Cosigned
+//! mint link"). A home with no agent key (a mint-only home) keeps the email-code flow. `--trade-home <dir>` is deprecated: it still parses, is ignored with a
 //! warning on stderr, and never creates a `trade.key`. The secret is never printed.
 
 use std::io::{BufRead, Write};
@@ -34,6 +39,7 @@ fn write_usage(out: &mut dyn Write) {
         "Usage:\n\
          \x20 maxplayer account link [--email <email>] [--label <name>] [--home <dir>] [--mint]\n\
          \x20 maxplayer account link --code <6 digits> [--entered-by human|agent] [--home <dir>] [--mint]\n\
+         \x20 maxplayer account link --mint [--label <name>] [--home <dir>]   (cosigned, no email)\n\
          \x20 maxplayer account status [--json] [--home <dir>] [--mint]\n\
          \x20 maxplayer account marketing on|off [--home <dir>] [--mint]\n\
          \n\
@@ -45,6 +51,9 @@ fn write_usage(out: &mut dyn Write) {
          agent's Nostr profile name unless the agent already has one (`maxplayer profile set`).\n\
          --entered-by: who typed the code (default: human at the prompt, agent with --code).\n\
          --mint: use this home's mint server key (<home>/mint/nostr.key) instead of the agent key.\n\
+         `link --mint` with no --email/--code links the mint key to the account this home's agent\n\
+         key is already linked to: both keys sign, no email is sent (--label defaults to the\n\
+         mint's name). A home without an agent key links the mint by email code instead.\n\
          The agent key is also the key `maxplayer trade` trades with, so linking it covers trading.\n\
          --trade-home <dir>: deprecated and ignored (trading uses this home's key).\n\
          Service: registration_url in config.toml or MAXPLAYER_REGISTRATION_URL\n\
@@ -218,8 +227,8 @@ mod wallet {
     use maxplayer_core::home::{self, MaxplayerHome};
     use maxplayer_core::profile::{self, NameFill};
     use maxplayer_core::registration::{
-        self, CodeSent, EnteredBy, Linked, MARKETING_NOTICE, RegistrationClient, RegistrationError,
-        TERMS_VERSION,
+        self, CodeSent, EnteredBy, Linked, MARKETING_NOTICE, MintLinked, RegistrationClient,
+        RegistrationError, TERMS_VERSION,
     };
     use nostr_sdk::prelude::{Keys, ToBech32};
 
@@ -238,6 +247,11 @@ mod wallet {
         pub home: Option<MaxplayerHome>,
         /// `[profile].name` when it is a valid label: the label prompt's default.
         pub profile_name: Option<String>,
+        /// `--mint` only: this home's agent key (`<home>/key`) when one exists. It is the account
+        /// key that vouches for the mint key in a cosigned link. Never created here.
+        pub account: Option<Keys>,
+        /// `--mint` only: the cosigned link's default label (the mint's name).
+        pub mint_label: Option<String>,
     }
 
     /// `{"error": <code>, "message": <text>}` on stdout: the `--json` failure shape.
@@ -312,6 +326,8 @@ mod wallet {
                 flags,
                 home: Some(home),
                 profile_name,
+                account: None,
+                mint_label: None,
             })
         }
 
@@ -336,6 +352,23 @@ mod wallet {
                 .to_bech32()
                 .map_err(|e| format!("npub encode: {e}"))?;
             let config = home::resolve_config_read_only(root).map_err(|e| e.to_string())?;
+            // The agent key, read (never created) for a cosigned link. A home without one links
+            // the mint by email code.
+            let account_path = root.join("key");
+            let account = if std::fs::symlink_metadata(&account_path).is_ok() {
+                let secret = home::read_key_file_hex(&account_path).map_err(|e| e.to_string())?;
+                Some(
+                    Keys::parse(&secret)
+                        .map_err(|_| format!("{} is not a valid key", account_path.display()))?,
+                )
+            } else {
+                None
+            };
+            let mint_toml = std::fs::read_to_string(root.join("mint").join("mint.toml")).ok();
+            let mint_label = Some(registration::default_mint_label(
+                mint_toml.as_deref(),
+                &keys.public_key().to_hex(),
+            ));
             Ok(Self {
                 keys,
                 npub,
@@ -344,11 +377,18 @@ mod wallet {
                 flags,
                 home: None,
                 profile_name: None,
+                account,
+                mint_label,
             })
         }
 
         fn client(&self) -> Result<RegistrationClient, RegistrationError> {
             RegistrationClient::new(&self.base_url, self.keys.clone())
+        }
+
+        /// A client that signs with the account (agent) key, for the cosigned mint link.
+        fn account_client(&self, account: &Keys) -> Result<RegistrationClient, RegistrationError> {
+            RegistrationClient::new(&self.base_url, account.clone())
         }
     }
 
@@ -485,6 +525,59 @@ mod wallet {
         }
     }
 
+    /// `account link --mint` with this home's agent key as the account key: both keys sign, no
+    /// email is sent.
+    fn link_mint_cosigned(
+        ctx: &Context,
+        account: &Keys,
+        label: &str,
+        out: &mut dyn Write,
+        err: &mut dyn Write,
+    ) -> i32 {
+        let account_npub = account
+            .public_key()
+            .to_bech32()
+            .unwrap_or_else(|_| account.public_key().to_hex());
+        let _ = writeln!(
+            out,
+            "Linking {} ({}) to the account of this home's agent key ({account_npub}). Both keys \
+             sign; no email is sent.",
+            ctx.whose, ctx.npub
+        );
+        let linked = match ctx
+            .account_client(account)
+            .and_then(|client| client.link_mint(&ctx.keys, label))
+        {
+            Ok(linked) => linked,
+            Err(error) => return report(ctx, err, &error),
+        };
+        print_mint_linked(out, ctx, &linked);
+        SUCCESS
+    }
+
+    fn print_mint_linked(out: &mut dyn Write, ctx: &Context, linked: &MintLinked) {
+        let _ = writeln!(
+            out,
+            "Done, linked to {} (mint \"{}\", {}), vouched for by this home's agent key.",
+            linked.email, linked.label, ctx.npub
+        );
+        if !linked.first_link {
+            let _ = writeln!(
+                out,
+                "This mint key was already linked this way; the link was refreshed."
+            );
+        }
+        let relay = if linked.relay_member == "added" {
+            "The relay now accepts writes from this mint key.".to_owned()
+        } else {
+            format!(
+                "Relay membership queued; `{}` shows when it is added.",
+                ctx.command("status")
+            )
+        };
+        let _ = writeln!(out, "{relay}");
+    }
+
     /// `account link`. `interactive` = stdin is a terminal (the prompts are allowed).
     pub fn link(
         ctx: &Context,
@@ -494,6 +587,18 @@ mod wallet {
         out: &mut dyn Write,
         err: &mut dyn Write,
     ) -> i32 {
+        // `--mint` with an agent key in this home and no email-flow flags: the cosigned link.
+        if let Some(account) = ctx
+            .account
+            .as_ref()
+            .filter(|_| opts.email.is_none() && opts.code.is_none())
+        {
+            let label = match opts.label.as_deref().or(ctx.mint_label.as_deref()) {
+                Some(label) => label.to_owned(),
+                None => ctx.npub.clone(),
+            };
+            return link_mint_cosigned(ctx, account, &label, out, err);
+        }
         let client = match ctx.client() {
             Ok(client) => client,
             Err(error) => return report(ctx, err, &error),
@@ -773,6 +878,8 @@ mod interactive_tests {
             flags: String::new(),
             home: None,
             profile_name: None,
+            account: None,
+            mint_label: None,
         }
     }
 

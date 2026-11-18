@@ -7,6 +7,12 @@
 //! (6-digit code, 5 tries, 10 minutes, 60 s resend cooldown, 5 sends per key per hour, 409 for a key
 //! linked to another email). It never sends email: the "emailed" code is set by the test.
 //!
+//! The cosigned mint link (`/account/link/mint/challenge` + `/confirm`) applies the service's
+//! `mint_link.rs` + `api.rs` rules: the challenge is single use, 300 s, bound to (account key, mint
+//! key); the account key must be email-linked (not itself cosigned); the mint proof is kind 27236
+//! signed by the mint key with exactly one `u` (the confirm URL), `challenge` and `p` (the account
+//! key) tag, within 60 s; a mint key linked to another email, or by its own code, is refused.
+//!
 //! Shared by path from `src/account_cli.rs` (interactive unit tests) and `tests/account_cli.rs`.
 #![allow(dead_code)]
 
@@ -40,7 +46,10 @@ pub struct Pending {
 pub struct Registration {
     pub email: String,
     pub label: String,
+    /// `human`, `agent` or `cosigned`.
     pub entered_by: String,
+    /// For a cosigned mint key: the account key (hex) that vouched for it.
+    pub linked_by: Option<String>,
     pub terms_version: String,
     pub privacy_version: String,
     pub notice_version: String,
@@ -72,6 +81,8 @@ struct State {
     requests: Vec<Recorded>,
     /// What confirm and status report as `relay_member` (`added` unless a test changes it).
     relay_member: String,
+    /// challenge -> (account hex, mint hex, expires_at, used)
+    mint_challenges: HashMap<String, (String, String, u64, bool)>,
 }
 
 pub struct FakeRegistration {
@@ -135,6 +146,7 @@ impl FakeRegistration {
             confirm_calls: 0,
             requests: Vec::new(),
             relay_member: "added".into(),
+            mint_challenges: HashMap::new(),
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -190,6 +202,7 @@ impl FakeRegistration {
                 email: email.to_owned(),
                 label: "earlier".into(),
                 entered_by: "human".into(),
+                linked_by: None,
                 terms_version: "20261029".into(),
                 privacy_version: "20261029".into(),
                 notice_version: "v1".into(),
@@ -208,6 +221,17 @@ impl FakeRegistration {
 
     pub fn marketing(&self, email: &str) -> Option<bool> {
         self.state.lock().unwrap().marketing.get(email).copied()
+    }
+
+    /// Let every mint-link challenge run out.
+    pub fn expire_mint_challenges(&self) {
+        for c in self.state.lock().unwrap().mint_challenges.values_mut() {
+            c.2 = 0;
+        }
+    }
+
+    pub fn mint_challenge_count(&self) -> usize {
+        self.state.lock().unwrap().mint_challenges.len()
     }
 
     pub fn confirm_calls(&self) -> usize {
@@ -373,6 +397,8 @@ fn handle(
             | ("POST", "/account/link/confirm")
             | ("GET", "/account/status")
             | ("POST", "/account/marketing")
+            | ("POST", "/account/link/mint/challenge")
+            | ("POST", "/account/link/mint/confirm")
     );
     if !known {
         return (fail(404, "not_found", "no such route"), None);
@@ -399,6 +425,8 @@ fn handle(
         "/account/link/request" => link_request(state, &pk, &parsed),
         "/account/link/confirm" => link_confirm(state, &pk, &parsed),
         "/account/status" => status(state, &pk),
+        "/account/link/mint/challenge" => mint_challenge(state, &pk, &parsed),
+        "/account/link/mint/confirm" => mint_confirm(state, &pk, &parsed),
         _ => marketing(state, &pk, &parsed),
     };
     (answer, Some(event))
@@ -559,6 +587,7 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             email: pending.email.clone(),
             label: pending.label.clone(),
             entered_by: entered_by.to_owned(),
+            linked_by: None,
             terms_version: "20261029".into(),
             privacy_version: "20261029".into(),
             notice_version: "v1".into(),
@@ -595,6 +624,7 @@ fn status(state: &State, pk: &str) -> Answer {
             "privacy_version": reg.privacy_version,
             "accepted_at": "2026-10-28T12:00:00+00:00",
             "code_entered_by": reg.entered_by,
+            "linked_by": reg.linked_by,
             "linked_at": "2026-10-28T12:00:00+00:00",
             "marketing": if subscribed { "subscribed" } else { "unsubscribed" },
             "relay_member": state.relay_member,
@@ -618,5 +648,197 @@ fn marketing(state: &mut State, pk: &str, body: &Value) -> Answer {
     ok(
         200,
         json!({ "marketing": if enabled { "subscribed" } else { "unsubscribed" } }),
+    )
+}
+
+fn parse_pk(raw: &str) -> Option<String> {
+    nostr_sdk::prelude::PublicKey::parse(raw.trim())
+        .ok()
+        .map(|pk| pk.to_hex())
+}
+
+/// The service's `require_email_linked` + `check_mint_free` + `parse_mint_pubkey`.
+fn mint_preconditions(state: &State, account: &str, mint_raw: &str) -> Result<String, Answer> {
+    let Some(mint) = parse_pk(mint_raw) else {
+        return Err(fail(
+            400,
+            "invalid_mint_pubkey",
+            "mint_pubkey must be a 64-hex or npub public key",
+        ));
+    };
+    if mint == account {
+        return Err(fail(
+            400,
+            "same_key",
+            "the mint key and the account key must be different keys",
+        ));
+    }
+    let email = match state.regs.get(account) {
+        Some(reg) if reg.entered_by == "cosigned" => {
+            return Err(fail(
+                403,
+                "account_is_cosigned",
+                "this key was itself linked by a cosignature",
+            ));
+        }
+        Some(reg) => reg.email.clone(),
+        None => {
+            return Err(fail(
+                403,
+                "account_not_registered",
+                "the signing key is not linked to an email",
+            ));
+        }
+    };
+    match state.regs.get(&mint) {
+        Some(reg) if reg.email != email => Err(fail(
+            409,
+            "mint_linked_to_other_account",
+            "this mint key is already linked to a different account",
+        )),
+        Some(reg) if reg.entered_by != "cosigned" => Err(fail(
+            409,
+            "mint_already_linked",
+            "this mint key is already linked to this email by its own code",
+        )),
+        _ => Ok(mint),
+    }
+}
+
+fn mint_challenge(state: &mut State, account: &str, body: &Value) -> Answer {
+    let Some(raw) = body["mint_pubkey"].as_str() else {
+        return fail(400, "invalid_body", "request body is not the expected JSON");
+    };
+    let mint = match mint_preconditions(state, account, raw) {
+        Ok(mint) => mint,
+        Err(answer) => return answer,
+    };
+    // 64 random lowercase hex without another dev-dependency: a fresh x-only public key.
+    let challenge = nostr_sdk::prelude::Keys::generate().public_key().to_hex();
+    state.mint_challenges.insert(
+        challenge.clone(),
+        (account.to_owned(), mint.clone(), now() + 300, false),
+    );
+    let proof_url = format!("{}/link/mint/confirm", state.public_base);
+    ok(
+        200,
+        json!({
+            "challenge": challenge,
+            "expires_in_secs": 300,
+            "mint_pubkey": mint,
+            "proof_kind": 27236,
+            "proof_url": proof_url,
+        }),
+    )
+}
+
+fn mint_confirm(state: &mut State, account: &str, body: &Value) -> Answer {
+    let (Some(challenge), Some(mint_raw), Some(label)) = (
+        body["challenge"].as_str(),
+        body["mint_pubkey"].as_str(),
+        body["label"].as_str(),
+    ) else {
+        return fail(400, "invalid_body", "request body is not the expected JSON");
+    };
+    if !body["mint_proof"].is_object() {
+        return fail(
+            400,
+            "invalid_body",
+            "mint_proof must be the mint key's signed event",
+        );
+    }
+    let Some(mint) = parse_pk(mint_raw) else {
+        return fail(
+            400,
+            "invalid_mint_pubkey",
+            "mint_pubkey must be a 64-hex or npub public key",
+        );
+    };
+    let label = label.trim().to_owned();
+    if label.is_empty() || label.chars().count() > 64 {
+        return fail(
+            400,
+            "invalid_label",
+            "label must be 1-64 letters, digits, spaces, '.', '_' or '-'",
+        );
+    }
+    // The mint key's proof.
+    let proof_error = |reason: &str| {
+        let mut a = fail(
+            401,
+            "mint_proof_invalid",
+            "the mint key's signature does not cover this request",
+        );
+        a.body["reason"] = json!(reason);
+        a
+    };
+    let Ok(proof) = Event::from_json(body["mint_proof"].to_string()) else {
+        return proof_error("malformed");
+    };
+    if proof.kind != Kind::from(27236u16) {
+        return proof_error("wrong_kind");
+    }
+    if proof.verify().is_err() {
+        return proof_error("bad_signature");
+    }
+    if proof.pubkey.to_hex() != mint {
+        return proof_error("wrong_key");
+    }
+    let confirm_url = format!("{}/link/mint/confirm", state.public_base);
+    let urls = tag_values(&proof, "u");
+    if urls.len() != 1 || urls[0].trim_end_matches('/') != confirm_url {
+        return proof_error("wrong_url");
+    }
+    if tag_values(&proof, "challenge") != [challenge] {
+        return proof_error("wrong_challenge");
+    }
+    if tag_values(&proof, "p") != [account] {
+        return proof_error("wrong_account");
+    }
+    if proof.created_at.as_secs().abs_diff(now()) > 60 {
+        return proof_error("stale");
+    }
+    match state.mint_challenges.get(challenge) {
+        Some((a, m, _, _)) if a == account && *m == mint => {}
+        _ => return fail(404, "unknown_challenge", "no such challenge for these keys"),
+    }
+    let (_, _, expires_at, used) = state.mint_challenges[challenge].clone();
+    if used {
+        return fail(410, "challenge_used", "this challenge was already used");
+    }
+    if expires_at <= now() {
+        return fail(410, "challenge_expired", "the challenge has expired");
+    }
+    if let Err(answer) = mint_preconditions(state, account, &mint) {
+        return answer;
+    }
+    state.mint_challenges.get_mut(challenge).unwrap().3 = true;
+    let acct = state.regs[account].clone();
+    let first_link = !state.regs.contains_key(&mint);
+    state.regs.insert(
+        mint.clone(),
+        Registration {
+            email: acct.email.clone(),
+            label: label.clone(),
+            entered_by: "cosigned".into(),
+            linked_by: Some(account.to_owned()),
+            terms_version: acct.terms_version.clone(),
+            privacy_version: acct.privacy_version.clone(),
+            notice_version: acct.notice_version.clone(),
+        },
+    );
+    ok(
+        200,
+        json!({
+            "status": "linked",
+            "first_link": first_link,
+            "mint_pubkey": mint,
+            "linked_by": account,
+            "email": acct.email,
+            "label": label,
+            "terms_version": acct.terms_version,
+            "privacy_version": acct.privacy_version,
+            "relay_member": state.relay_member,
+        }),
     )
 }

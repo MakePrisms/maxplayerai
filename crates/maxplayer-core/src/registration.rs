@@ -45,6 +45,12 @@ pub const MARKETING_NOTICE: &str = "We'll send occasional product news too; unsu
 pub const PATH_LINK_REQUEST: &str = "/link/request";
 pub const PATH_LINK_CONFIRM: &str = "/link/confirm";
 pub const PATH_STATUS: &str = "/status";
+/// Cosigned mint link (`account link --mint`): the account key asks for a challenge, then confirms
+/// with the mint key's proof. No email code (README "Cosigned mint link").
+pub const PATH_LINK_MINT_CHALLENGE: &str = "/link/mint/challenge";
+pub const PATH_LINK_MINT_CONFIRM: &str = "/link/mint/confirm";
+/// Kind of the mint key's proof event (ephemeral range, never a NIP-98 27235).
+pub const MINT_PROOF_KIND: u16 = 27236;
 pub const PATH_MARKETING: &str = "/marketing";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -99,6 +105,32 @@ pub struct Linked {
     pub marketing: String,
 }
 
+/// `200` from `POST /link/mint/challenge`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MintChallenge {
+    /// 64 lowercase hex, single use.
+    pub challenge: String,
+    pub expires_in_secs: u64,
+    /// The mint key the challenge is bound to (hex).
+    pub mint_pubkey: String,
+}
+
+/// `200 linked` from `POST /link/mint/confirm`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct MintLinked {
+    pub status: String,
+    pub first_link: bool,
+    pub mint_pubkey: String,
+    /// The account key (hex) that vouched for the mint key.
+    pub linked_by: String,
+    pub email: String,
+    pub label: String,
+    pub terms_version: String,
+    pub privacy_version: String,
+    /// `added` or `pending`.
+    pub relay_member: String,
+}
+
 /// `GET /status`: `{registered:false}` or the full link.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Status {
@@ -115,6 +147,9 @@ pub struct Status {
     pub accepted_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_entered_by: Option<String>,
+    /// For a key linked by cosignature (`code_entered_by: "cosigned"`): the hex key that vouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linked_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -288,6 +323,38 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
         "replayed_auth" => {
             "The registration service saw this signed request twice. Try again.".to_owned()
         }
+        "account_not_registered" => "This home's agent key is not linked to an email yet, so it \
+             cannot vouch for the mint key. Run `maxplayer account link` first (it emails a \
+             code), then `maxplayer account link --mint` again."
+            .to_owned(),
+        "account_is_cosigned" => "This home's agent key was itself linked by a cosignature, so it \
+             cannot vouch for another key. Use the home whose key was linked by email code."
+            .to_owned(),
+        "mint_linked_to_other_account" => "This mint key is already linked to a different \
+             account. Changing it is not supported; `maxplayer account status --mint` shows the \
+             current link."
+            .to_owned(),
+        "mint_already_linked" => "This mint key is already linked to this email with its own \
+             code; nothing to do (`maxplayer account status --mint`)."
+            .to_owned(),
+        "same_key" => "The mint key and this home's agent key are the same key; a mint needs its \
+             own key (`maxplayer-mint init`)."
+            .to_owned(),
+        "challenge_expired" | "challenge_used" | "unknown_challenge" => {
+            format!(
+                "The mint link challenge was not accepted ({}). Run `{link}` again.",
+                api.code
+            )
+        }
+        "mint_proof_invalid" => "The registration service did not accept the mint key's \
+             signature. Check this computer's clock and `registration_url`, then run the command \
+             again."
+            .to_owned(),
+        "invalid_mint_pubkey" | "invalid_challenge" => format!(
+            "The registration service did not accept this request ({}). Update maxplayer and try \
+             again.",
+            api.code
+        ),
         code if api.status >= 500 => format!(
             "The registration service had a problem ({code}, HTTP {}). Try again in a few minutes.",
             api.status
@@ -374,6 +441,55 @@ pub fn authorization(
         "Nostr {}",
         base64::engine::general_purpose::STANDARD.encode(event.as_json())
     ))
+}
+
+/// The mint key's proof for a cosigned link: kind [`MINT_PROOF_KIND`], one `u` tag = the confirm
+/// URL, one `challenge` tag, one `p` tag = the account key (hex), signed by `mint`.
+pub fn mint_proof(
+    mint: &Keys,
+    confirm_url: &str,
+    challenge: &str,
+    account_hex: &str,
+    created_at: Timestamp,
+) -> Result<nostr_sdk::prelude::Event, RegistrationError> {
+    EventBuilder::new(Kind::from(MINT_PROOF_KIND), "")
+        .tags([
+            Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::U)),
+                [confirm_url.to_owned()],
+            ),
+            Tag::custom(TagKind::custom("challenge"), [challenge.to_owned()]),
+            Tag::custom(
+                TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P)),
+                [account_hex.to_owned()],
+            ),
+        ])
+        .custom_created_at(created_at)
+        .sign_with_keys(mint)
+        .map_err(|error| {
+            RegistrationError::Input(format!("could not sign the mint proof: {error}"))
+        })
+}
+
+/// A challenge in the service's shape: 64 lowercase hex.
+pub fn valid_challenge(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The label a cosigned mint link uses when none is given: `name` from `<home>/mint/mint.toml`
+/// when it is a valid label, else `maxplayer-mint-<first 8 hex of the key>` (the mint's own
+/// default name, `crates/maxplayer-mint` `default_name`).
+pub fn default_mint_label(mint_toml: Option<&str>, mint_pubkey_hex: &str) -> String {
+    mint_toml
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| {
+            table
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .and_then(|name| normalize_label(&name))
+        .unwrap_or_else(|| format!("maxplayer-mint-{}", &mint_pubkey_hex[..8]))
 }
 
 fn random_nonce() -> String {
@@ -519,6 +635,52 @@ impl RegistrationClient {
         })?;
         let body = serde_json::json!({ "code": code, "entered_by": entered_by.as_str() });
         self.send("POST", PATH_LINK_CONFIRM, Some(&body))
+    }
+
+    /// Cosigned mint link: this client's key (the email-linked account key) vouches for `mint`.
+    /// Both keys sign: the account key's NIP-98 covers the confirm body (challenge, mint key,
+    /// label, proof); the mint key's proof ([`mint_proof`]) covers the confirm URL, the challenge
+    /// and the account key. No email is sent. The secret of `mint` never leaves this process.
+    pub fn link_mint(&self, mint: &Keys, label: &str) -> Result<MintLinked, RegistrationError> {
+        let mint_pk = mint.public_key();
+        if mint_pk == self.keys.public_key() {
+            return Err(RegistrationError::Input(
+                "The mint key and this home's agent key are the same key; a mint needs its own \
+                 key (`maxplayer-mint init`)."
+                    .to_owned(),
+            ));
+        }
+        let label = normalize_label(label).ok_or_else(|| {
+            RegistrationError::Input(
+                "The label must be 1-64 letters, digits, spaces, '.', '_' or '-'.".to_owned(),
+            )
+        })?;
+        let body = serde_json::json!({ "mint_pubkey": mint_pk.to_hex() });
+        let issued: MintChallenge = self.send("POST", PATH_LINK_MINT_CHALLENGE, Some(&body))?;
+        // Sign only a challenge issued for THIS mint key, in the documented shape.
+        if issued.mint_pubkey != mint_pk.to_hex() || !valid_challenge(&issued.challenge) {
+            return Err(RegistrationError::BadResponse {
+                url: self.url(PATH_LINK_MINT_CHALLENGE),
+                status: 200,
+            });
+        }
+        let proof = mint_proof(
+            mint,
+            &self.url(PATH_LINK_MINT_CONFIRM),
+            &issued.challenge,
+            &self.keys.public_key().to_hex(),
+            Timestamp::now(),
+        )?;
+        let proof: serde_json::Value = serde_json::from_str(&proof.as_json()).map_err(|error| {
+            RegistrationError::Input(format!("could not encode the mint proof: {error}"))
+        })?;
+        let body = serde_json::json!({
+            "challenge": issued.challenge,
+            "mint_pubkey": mint_pk.to_hex(),
+            "label": label,
+            "mint_proof": proof,
+        });
+        self.send("POST", PATH_LINK_MINT_CONFIRM, Some(&body))
     }
 
     pub fn status(&self) -> Result<Status, RegistrationError> {
@@ -806,6 +968,17 @@ mod tests {
             "no_pending_code",
             "too_many_attempts",
             "not_registered",
+            "account_not_registered",
+            "account_is_cosigned",
+            "mint_linked_to_other_account",
+            "mint_already_linked",
+            "same_key",
+            "challenge_expired",
+            "challenge_used",
+            "unknown_challenge",
+            "mint_proof_invalid",
+            "invalid_mint_pubkey",
+            "invalid_challenge",
         ] {
             let text = plain_message(&api(code, 400));
             assert!(!text.contains("refused the request ("), "{code}: {text}");
@@ -889,6 +1062,44 @@ mod tests {
             target_hits.load(Ordering::SeqCst),
             0,
             "the redirect target was never contacted"
+        );
+    }
+
+    #[test]
+    fn mint_proof_names_the_url_challenge_and_account_and_is_signed_by_the_mint() {
+        let mint = Keys::generate();
+        let account = Keys::generate().public_key().to_hex();
+        let url = "https://relay.maxplayer.ai/account/link/mint/confirm";
+        let challenge = "ab".repeat(32);
+        let proof = mint_proof(&mint, url, &challenge, &account, Timestamp::now()).unwrap();
+        proof.verify().unwrap();
+        assert_eq!(proof.kind, Kind::from(MINT_PROOF_KIND));
+        assert_ne!(proof.kind, Kind::HttpAuth);
+        assert_eq!(proof.pubkey, mint.public_key());
+        assert_eq!(tag(&proof, "u"), [url]);
+        assert_eq!(tag(&proof, "challenge"), [challenge.as_str()]);
+        assert_eq!(tag(&proof, "p"), [account.as_str()]);
+        assert!(valid_challenge(&challenge));
+        assert!(!valid_challenge(&"AB".repeat(32)));
+        assert!(!valid_challenge("ab"));
+    }
+
+    #[test]
+    fn default_mint_label_uses_the_mint_name_else_its_default_name() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert_eq!(default_mint_label(None, &hex), "maxplayer-mint-01234567");
+        assert_eq!(
+            default_mint_label(Some("name = \"ops mint\"\nrate_limit = 20\n"), &hex),
+            "ops mint"
+        );
+        // A mint name that is not a valid label (quotes, '=' are allowed in names only).
+        assert_eq!(
+            default_mint_label(Some("name = \"a<b>\"\n"), &hex),
+            "maxplayer-mint-01234567"
+        );
+        assert_eq!(
+            default_mint_label(Some("not toml ["), &hex),
+            "maxplayer-mint-01234567"
         );
     }
 
