@@ -386,8 +386,9 @@ the two URLs in it:
 8. Check `maxplayer --version`, `maxplayer doctor` and the seller boot line (`ADVERTISING`), then
    re-enable the keep-alive.
 
-`maxplayer-mint` is a separate build with its own cadence; a CLI upgrade does not touch it, but it
-does upgrade `maxplayer trade`. Do not stop the mint or trade `serve` while either has unresolved
+`maxplayer-mint` is a separate binary, version-locked to `maxplayer`; a CLI upgrade does not
+replace it (it does upgrade `maxplayer trade`). If the seat runs a mint, run `maxplayer mint upgrade`
+after the CLI upgrade, then restart the mint service. Do not stop the mint or trade `serve` while either has unresolved
 work (mint-and-trade).
 
 Roll back by renaming `maxplayer.bak-OLDVERSION` back over the binary the same way, restoring the

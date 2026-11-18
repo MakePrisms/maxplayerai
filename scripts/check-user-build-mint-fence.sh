@@ -10,9 +10,11 @@
 # dev-dependencies (the release build adds `acp`, which does not touch trading); debug profile to
 # stay cheap in CI.
 #
-# `maxplayer mint install --from <url>` is fenced the same way: its download source (the released
-# `maxplayer-mint`) is https:// or file:// only, so a plain-HTTP source on loopback is refused before
-# it is contacted and before --home or --bin-dir is created.
+# `maxplayer mint install --from <url>` and `maxplayer mint upgrade --from <url>` are fenced the same
+# way: their download source (the released `maxplayer-mint`) is https:// or file:// only, so a
+# plain-HTTP source on loopback is refused before it is contacted and before --home or --bin-dir is
+# created. So is a plain-HTTP latest-release source for `maxplayer mint` (MAXPLAYER_RELEASES_LATEST_URL):
+# it is reported as "could not check", never contacted, and `maxplayer mint` still creates nothing.
 #
 # Every refusal must happen before any mint or relay is contacted (a local listener counts
 # connections) and before the --home directory is created. https:// and nostr:// mints must
@@ -98,30 +100,44 @@ run 0 '"balance":0' balance https://testnut.cashudevkit.org
 run 0 '"balance":0' balance "nostr://$NPUB"
 run 0 '"balance":0' --mint-relay wss://relay.maxplayer.ai balance "nostr://$NPUB"
 
-# `maxplayer mint install`: a plain-HTTP release source is refused (usage error, exit 1) with
-# nothing contacted and neither the home nor the bin dir created.
+# `maxplayer mint install|upgrade`: a plain-HTTP release source is refused (usage error, exit 1)
+# with nothing contacted and neither the home nor the bin dir created.
 run_mint_install() {
-  local from=$1
+  local from=$1 sub=${2:-install}
   n=$((n + 1))
   local home=$work/home-$n bin=$work/bin-$n code=0
-  env -u MAXPLAYER_HOME "$BIN" mint install --from "$from" --home "$home" --bin-dir "$bin" \
+  env -u MAXPLAYER_HOME "$BIN" mint "$sub" --from "$from" --home "$home" --bin-dir "$bin" \
     >"$work/out" 2>"$work/err" || code=$?
   local all
   all=$(cat "$work/out" "$work/err")
   if [ "$code" != 1 ]; then
-    echo "FAIL: maxplayer mint install --from $from: exit $code, expected 1"; echo "$all"; fail=1; return
+    echo "FAIL: maxplayer mint $sub --from $from: exit $code, expected 1"; echo "$all"; fail=1; return
   fi
   if ! grep -qF -- "$HTTP_SOURCE_REFUSED" <<<"$all"; then
-    echo "FAIL: maxplayer mint install --from $from: output lacks '$HTTP_SOURCE_REFUSED'"; echo "$all"; fail=1; return
+    echo "FAIL: maxplayer mint $sub --from $from: output lacks '$HTTP_SOURCE_REFUSED'"; echo "$all"; fail=1; return
   fi
   if [ -e "$home" ] || [ -e "$bin" ]; then
-    echo "FAIL: maxplayer mint install --from $from: created --home or --bin-dir"; fail=1; return
+    echo "FAIL: maxplayer mint $sub --from $from: created --home or --bin-dir"; fail=1; return
   fi
-  echo "ok: maxplayer mint install --from $from -> exit 1: $HTTP_SOURCE_REFUSED"
+  echo "ok: maxplayer mint $sub --from $from -> exit 1: $HTTP_SOURCE_REFUSED"
 }
 run_mint_install "http://127.0.0.1:$PORT/release"
 run_mint_install "http://localhost:$PORT/release"
 run_mint_install "http://[::1]:$PORT/release"
+run_mint_install "http://127.0.0.1:$PORT/release" upgrade
+run_mint_install "http://localhost:$PORT/release" upgrade
+
+# `maxplayer mint` (status): a plain-HTTP latest-release source is not contacted; the check reads
+# "could not check", the exit is 0, and the absent home is not created.
+n=$((n + 1))
+home=$work/home-$n code=0
+env -u MAXPLAYER_HOME MAXPLAYER_RELEASES_LATEST_URL="http://127.0.0.1:$PORT/releases/latest" \
+  "$BIN" mint --home "$home" --bin-dir "$work/bin-$n" >"$work/out" 2>"$work/err" || code=$?
+if [ "$code" != 0 ] || ! grep -qF 'latest:    could not check (http:// is not supported' "$work/out" || [ -e "$home" ]; then
+  echo "FAIL: maxplayer mint with an http:// latest-release source: exit $code"; cat "$work/out" "$work/err"; fail=1
+else
+  echo "ok: maxplayer mint with an http:// latest-release source -> could not check, nothing created"
+fi
 
 connections=$(wc -l <"$work/connections")
 if [ "$connections" != 0 ]; then
@@ -132,4 +148,4 @@ if [ "$fail" != 0 ]; then
   echo "FAIL: the user build must refuse http:// mints, ws:// mint relays and http:// mint downloads"
   exit 1
 fi
-echo "PASS: user build refuses http:// mints, ws:// mint relays and http:// mint downloads ($n commands, 0 connections)"
+echo "PASS: user build refuses http:// mints, ws:// mint relays, http:// mint downloads and http:// release checks ($n commands, 0 connections)"

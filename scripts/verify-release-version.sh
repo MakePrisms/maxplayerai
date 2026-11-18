@@ -66,7 +66,7 @@ echo "ok: crate maxplayer $CRATE_VERSION"
 
 # ── The mint sidecar, in lockstep ───────────────────────────────────────────────────────────────
 # `maxplayer-mint` is released from the same tag as `maxplayer`, at the same version (its own
-# tarballs and npm packages). It is its own cargo workspace (protoc stays out of the root build), so
+# tarballs, in the same SHA256SUMS). It is its own cargo workspace (protoc stays out of the root build), so
 # it cannot inherit `version.workspace` and its version is a second literal that a bump can forget.
 # A forgotten one would ship `maxplayer-mint 0.5.11` inside archives named for this release.
 MINT_MANIFEST="crates/maxplayer-mint/Cargo.toml"
@@ -89,22 +89,18 @@ echo "ok: every npm package is version $VERSION"
 
 # ── The payload pins ────────────────────────────────────────────────────────────────────────────
 # Asserted as an exact match, not a range: the launcher must resolve the payload built from THIS
-# commit. A caret or a stale pin both resolve to something else. Both launchers: `maxplayer` and the
-# mint sidecar's `maxplayer-mint`.
-for launcher in npm/maxplayer npm/maxplayer-mint; do
-    [ -f "$launcher/package.json" ] || die "$launcher/package.json is missing"
-    PIN_REPORT="$(node -e '
+# commit. A caret or a stale pin both resolve to something else.
+PIN_REPORT="$(node -e '
 const pkg = require(process.argv[1]);
 const deps = pkg.optionalDependencies || {};
 const names = Object.keys(deps);
-if (names.length === 0) { console.error(process.argv[1] + " declares no optionalDependencies — the launcher has no payload to resolve"); process.exit(1); }
+if (names.length === 0) { console.error("npm/maxplayer/package.json declares no optionalDependencies — the launcher has no payload to resolve"); process.exit(1); }
 const wrong = names.filter((n) => deps[n] !== process.argv[2]);
 if (wrong.length) { console.error("stale payload pins: " + wrong.map((n) => n + "@" + deps[n]).join(", ")); process.exit(1); }
 process.stdout.write(names.join(", "));
-' "$PWD/$launcher/package.json" "$VERSION")" \
-        || die "$launcher/package.json payload pins are not all $VERSION"
-    echo "ok: $launcher payload pins at $VERSION -> $PIN_REPORT"
-done
+' "$PWD/npm/maxplayer/package.json" "$VERSION")" \
+    || die "npm/maxplayer/package.json payload pins are not all $VERSION"
+echo "ok: payload pins at $VERSION -> $PIN_REPORT"
 
 # ── The release notes ───────────────────────────────────────────────────────────────────────────
 # RELEASE_NOTES.md is version-specific prose living at a permanent path, and the release job passes

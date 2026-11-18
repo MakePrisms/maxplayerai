@@ -49,7 +49,11 @@ renames it).
 Entering the code accepts the Maxplayer Terms (https://www.maxplayer.ai/terms/20261029); the command
 also prints the Privacy Policy link and a product-news notice (occasional email about new releases
 and changes that affect your seat; the setting is your human's call). If you run your own credits
-mint (`maxplayer-mint`), link its key too: `maxplayer account link --mint …`. A seat whose key is
+mint, install it with `maxplayer mint install` and link its key too:
+`maxplayer account link --mint --email <your account email>`, then `--code <6 digits>`. After
+updating `maxplayer`, run `maxplayer mint upgrade` and restart the mint (it is version-locked to
+`maxplayer`; `maxplayer mint` and `maxplayer doctor` say when it is behind). `maxplayer mint
+uninstall` removes only the binary, never `<home>/mint/` (the mint's key, seed and credits). A seat whose key is
 not linked logs relay refusals ending in "run `maxplayer account link`".
 
 ## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**

@@ -78,7 +78,7 @@ default = ["wallet"]
 # there is no acp-without-wallet build, so the `#[cfg(feature = "acp")]` gates on the seller surface
 # are sound (they can rely on the wallet-gated code being present). #360.
 acp = ["wallet", "maxplayer-core/acp"]
-wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk", "dep:maxplayer-trade", "dep:reqwest", "dep:sha2", "dep:hex", "dep:flate2", "dep:tar", "dep:toml"]
+wallet = ["maxplayer-core/wallet", "dep:git2", "dep:nostr-sdk", "dep:maxplayer-trade", "dep:reqwest", "dep:sha2", "dep:hex", "dep:flate2", "dep:tar", "dep:toml", "dep:semver"]
 # Dev-only: exposes `maxplayer stub-pay` (budget-gate exercise). Not on the settlement
 # path and not part of the default user CLI surface.
 stub-pay = []
@@ -109,6 +109,9 @@ hex = { version = "0.4.3", optional = true }
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", default-features = false, optional = true }
 toml = { version = "0.8", optional = true }
+# `mint upgrade` / the newer-version notice: which `maxplayer-mint` (or maxplayer release) is older.
+# Already in the lockfile.
+semver = { version = "1", optional = true }
 # `mint install`: renameat2(RENAME_NOREPLACE) / renamex_np(RENAME_EXCL) and the stale-stage pid
 # check. Already in the lockfile.
 libc = "0.2"

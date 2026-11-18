@@ -484,6 +484,52 @@ mod checks {
     // We still report whether it resolves (useful for anyone driving raw `git` by hand) but never
     // fail on its absence.
     const OBSOLETE_TRADE_CHECK: &str = "obsolete maxplayer-trade";
+    pub(super) const MINT_VERSION_CHECK: &str = "maxplayer-mint version";
+
+    /// Advisory, report-only: whether a newer `maxplayer-mint` is available. The mint is
+    /// version-locked to maxplayer, so that means the installed one is an older release (run
+    /// `maxplayer mint upgrade`) or a newer maxplayer is released (update it, then upgrade the
+    /// mint) — the same notice `maxplayer mint` prints. Not applicable with no mint installed; the
+    /// GitHub latest-release check runs only when one is (a few seconds at most, never an error).
+    pub(super) fn check_mint_version() -> Check {
+        check_mint_version_from(crate::mint_cli::version_notice())
+    }
+
+    pub(super) fn check_mint_version_from(notice: Option<crate::mint_cli::VersionNotice>) -> Check {
+        use crate::mint_cli::{Latest, Relation};
+        let Some(notice) = notice else {
+            return Check::skip(
+                MINT_VERSION_CHECK,
+                "no maxplayer-mint installed",
+                "only a seller running its own credit mint needs one (`maxplayer mint install`)",
+            );
+        };
+        let updates = notice.updates();
+        let what = match (&notice.relation, notice.line.as_deref()) {
+            (Relation::Same, Some(line)) => format!("{line} at {}", notice.path.display()),
+            (_, Some(line)) => format!(
+                "{line} at {} (maxplayer is {})",
+                notice.path.display(),
+                env!("CARGO_PKG_VERSION")
+            ),
+            (_, None) => format!("{} did not report a version", notice.path.display()),
+        };
+        let latest = match &notice.latest {
+            Latest::Found(_) => String::new(),
+            other => format!("; latest release: {}", other.describe()),
+        };
+        if !updates.is_empty() {
+            return Check::warn(MINT_VERSION_CHECK, format!("{what}{latest}"), updates.join("; "));
+        }
+        match notice.relation {
+            Relation::Same => Check::pass(MINT_VERSION_CHECK, format!("{what}{latest}")),
+            _ => Check::warn(
+                MINT_VERSION_CHECK,
+                format!("{what}{latest}"),
+                "it is not this maxplayer's release; `maxplayer mint install --force` replaces it",
+            ),
+        }
+    }
 
     /// Advisory, report-only: the standalone `maxplayer-trade` binary (built from source before
     /// trading moved into `maxplayer trade`) left on PATH. It shares this home's trade journal, and
@@ -2678,6 +2724,8 @@ fn build_report_checks(
     let mut checks = build_checks_with_environment(home, false, environment);
     // Report-only (never in the seller boot gate): a leftover standalone maxplayer-trade binary.
     checks.push(Box::new(checks::check_obsolete_trade_binary));
+    // Report-only: a newer maxplayer-mint (older installed mint, or a newer maxplayer release).
+    checks.push(Box::new(checks::check_mint_version));
     checks
 }
 
@@ -6753,6 +6801,8 @@ mod tests {
         assert!(buyer_nix.contains("no [seller] section"), "buyer home: {buyer_nix}");
         // The report (and only the report) carries the leftover-maxplayer-trade row.
         assert!(buyer.contains("obsolete maxplayer-trade"), "doctor report: {buyer}");
+        // ...and the newer-maxplayer-mint row (the same notice `maxplayer mint` prints).
+        assert!(buyer.contains("maxplayer-mint version"), "doctor report: {buyer}");
 
         maxplayer_core::home::save_config(&mut home, |config| {
             config.seller = Some(seller_for_agents(vec!["claude".into()], vec!["claude-agent-acp".into()]));
@@ -6764,6 +6814,37 @@ mod tests {
         assert_eq!(code, FAILURE, "a seller home without nix must fail doctor: {seller}");
 
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[cfg(feature = "wallet")]
+    #[test]
+    fn doctor_mint_version_row_reports_an_older_mint_and_a_newer_release() {
+        use crate::mint_cli::{Latest, Relation, VersionNotice};
+        let this = env!("CARGO_PKG_VERSION");
+        let notice = |relation: Relation, latest: Latest| VersionNotice {
+            path: std::path::PathBuf::from("/b/maxplayer-mint"),
+            line: Some("maxplayer-mint x (y)".into()),
+            relation,
+            latest,
+        };
+        let none = checks::check_mint_version_from(None);
+        assert_eq!(none.status, Status::Skip, "{}", none.render());
+
+        let current = checks::check_mint_version_from(Some(notice(Relation::Same, Latest::Found(this.into()))));
+        assert_eq!(current.status, Status::Pass, "{}", current.render());
+        // A failed check is shown, never a failure.
+        let unchecked = checks::check_mint_version_from(Some(notice(Relation::Same, Latest::Failed("timed out".into()))));
+        assert_eq!(unchecked.status, Status::Pass, "{}", unchecked.render());
+        assert!(unchecked.render().contains("could not check (timed out)"), "{}", unchecked.render());
+
+        let older = checks::check_mint_version_from(Some(notice(Relation::Older("0.0.1".into()), Latest::Found(this.into()))));
+        assert_eq!(older.status, Status::Warn, "{}", older.render());
+        assert!(older.render().contains("maxplayer mint upgrade --bin-dir /b"), "{}", older.render());
+
+        let newer = checks::check_mint_version_from(Some(notice(Relation::Same, Latest::Found("999.0.0".into()))));
+        assert_eq!(newer.status, Status::Warn, "{}", newer.render());
+        assert!(newer.render().contains("maxplayer 999.0.0 is released"), "{}", newer.render());
+        assert_eq!(exit_code(&[older, newer]), SUCCESS, "advisory only");
     }
 
     // #745's ruled-out bypass, pinned: the refusal for an environment failure must NOT advertise
