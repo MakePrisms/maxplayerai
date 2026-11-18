@@ -2019,6 +2019,170 @@ mod tests {
         assert!(!lock(&POOL).keys().any(|key| key.runtime == id));
     }
 
+    /// A relay that accepts TCP and never answers the websocket handshake, so the SDK stays
+    /// `Connecting` until `close` is sent; then every held socket closes and the handshake fails.
+    async fn closable_black_hole() -> (String, tokio::sync::oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (close, closed) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            tokio::select! {
+                _ = async {
+                    while let Ok((socket, _)) = listener.accept().await {
+                        held.push(socket);
+                    }
+                } => {}
+                _ = closed => {}
+            }
+        });
+        (url, close)
+    }
+
+    /// One relay with its own [`RelayLink`] and [`watch_link`], as a shared connection has.
+    async fn watched(url: &str) -> (Client, Relay, Arc<AtomicBool>) {
+        let client = Client::new(Keys::generate());
+        client.add_relay(url).await.unwrap();
+        let relay = client.relays().await.into_values().next().unwrap();
+        let retired = Arc::new(AtomicBool::new(false));
+        let link = Arc::new(Mutex::new(RelayLink::new(
+            url.to_owned(),
+            relay.clone(),
+            retired.clone(),
+        )));
+        tokio::spawn(watch_link(relay.notifications(), link));
+        (client, relay, retired)
+    }
+
+    /// Review r2 H1: a shared relay that leaves `Connected` with messages still queued would send
+    /// them on its next socket, after the requests that queued them returned and maybe after
+    /// their `exp`. [`watch_link`] shuts it down on the status change, well before the SDK's
+    /// >= 7 s reconnect, and retires the connection. A relay that drops with nothing queued is
+    /// left to reconnect: a request still waiting on it needs the next socket.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_relay_down_with_queued_messages_is_shut_down_and_retires_the_connection() {
+        use nostr_sdk::prelude::RelayStatus;
+        let (url, close) = closable_black_hole().await;
+        let (_queued_client, queued, queued_retired) = watched(&url).await;
+        let (_idle_client, idle, idle_retired) = watched(&url).await;
+        queued.connect();
+        idle.connect();
+        let started = Instant::now();
+        while queued.status() != RelayStatus::Connecting || idle.status() != RelayStatus::Connecting
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "never connecting"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Queued and never written: the socket's writer only runs once the handshake completes.
+        queued
+            .send_msg(ClientMessage::close(SubscriptionId::generate()))
+            .unwrap();
+        assert_eq!(queued.queue(), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = close.send(());
+
+        let dropped = Instant::now();
+        while queued.status() != RelayStatus::Terminated || !queued_retired.load(Ordering::SeqCst) {
+            assert!(
+                dropped.elapsed() < Duration::from_secs(3),
+                "a relay down with {} queued message(s) was left to reconnect: {:?}",
+                queued.queue(),
+                queued.status()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while idle.status() == RelayStatus::Connecting {
+            assert!(
+                dropped.elapsed() < Duration::from_secs(3),
+                "idle relay never dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !idle_retired.load(Ordering::SeqCst),
+            "a relay down with nothing queued retired its connection"
+        );
+        assert_ne!(idle.status(), RelayStatus::Terminated);
+    }
+
+    /// Review r2 M2: once every relay of a shared connection is shut down (another request
+    /// retired it), none can reconnect or carry a reply, so a request waiting on it ends at once,
+    /// ambiguously, instead of waiting out its window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_ends_at_once_when_every_shared_relay_is_shut_down() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+        let local = LocalRelay::new(RelayBuilder::default());
+        local.run().await.expect("relay run");
+        let identity = Keys::generate();
+        // No mint listens for G_NPUB: only the shutdown can end the request before its window.
+        let connector = NostrMintConnector::new(
+            &MintUrl::from_str(&format!("nostr://{G_NPUB}")).unwrap(),
+            vec![local.url().await.to_string()],
+        )
+        .unwrap()
+        .with_timing(
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+            Duration::from_secs(3),
+        )
+        .with_identity(identity.clone())
+        .with_persistent_connections();
+        let call = tokio::spawn({
+            let connector = connector.clone();
+            async move { connector.call_observed(op::INFO, Value::Null).await }
+        });
+
+        let signer = identity.public_key().to_hex();
+        let started = Instant::now();
+        let pooled = loop {
+            let found = lock(&POOL)
+                .iter()
+                .find(|(key, _)| key.signer == signer)
+                .and_then(|(_, slot)| slot.conn.clone());
+            if let Some(pooled) = found {
+                break pooled;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "no shared connection"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let relays = pooled.client.relays().await;
+        while !relays.values().all(|r| r.is_connected()) {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "never connected"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // The request is out and waiting for its reply.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!call.is_finished());
+
+        let shut = Instant::now();
+        for relay in relays.values() {
+            relay.disconnect();
+        }
+        let (result, obs) = call.await.unwrap();
+        let error = result.expect_err("nobody answers");
+        assert!(
+            matches!(&error, Error::HttpError(None, m) if m.contains("all relays closed")),
+            "{error:?} {obs:?}"
+        );
+        assert!(!error.is_definitive_failure(), "{error:?}");
+        assert!(
+            shut.elapsed() < Duration::from_secs(2),
+            "waited {:?} after every relay was shut down: {obs:?}",
+            shut.elapsed()
+        );
+        drop(pooled);
+    }
+
     #[test]
     fn observed_request_future_is_bounded() {
         let connector = NostrMintConnector::new(
