@@ -7592,12 +7592,15 @@ impl SellerNodeRunner {
         self.publish_seat_announcement(draft, "heartbeat").await
     }
 
-    /// Has the slot gate's free count moved since the last beat was built?
+    /// Has the slot gate's free count moved since the last beat was built? `false` before the first
+    /// beat: the boot beat announces the seats, and counting "no beat yet" as a change would fire a
+    /// redundant beat AND start the debounce window, delaying the first real change by up to
+    /// [`SEAT_CHANGE_BEAT_DEBOUNCE`].
     fn seats_changed_since_last_beat(&self) -> bool {
-        self.slots.advertised().free
-            != self
-                .announced_free_slots
-                .load(std::sync::atomic::Ordering::SeqCst)
+        let announced = self
+            .announced_free_slots
+            .load(std::sync::atomic::Ordering::SeqCst);
+        announced != u32::MAX && self.slots.advertised().free != announced
     }
 
     /// R3-2: has the roster's serving state changed since the last beat was built?
@@ -22059,8 +22062,14 @@ mod tests {
                 // A claim-time reservation: no job row, so in_flight stays 0 — the case
                 // queue_depth could never show — while one seat is gone.
                 assert_eq!(slots.try_reserve("held-by-a-claim"), Reserve::Reserved);
+                // Bounded by the debounce window plus a tick, never the hour-long interval.
                 assert!(
-                    fixture.wait_until_published(FIXTURE_WAIT, beat_with_free("1")).await,
+                    fixture
+                        .wait_until_published(
+                            SEAT_CHANGE_BEAT_DEBOUNCE + FIXTURE_WAIT,
+                            beat_with_free("1")
+                        )
+                        .await,
                     "a reserved seat must be re-announced now (free_slots=1), not an interval later"
                 );
                 let held = fixture.events().await;
