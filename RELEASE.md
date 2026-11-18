@@ -5,17 +5,19 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 
 The same tag also ships the mint sidecar, `maxplayer-mint` (`crates/maxplayer-mint`), as a separate
 binary at the same version: `maxplayer-mint-<version>-<platform>.tar.gz` archives listed in the same
-`SHA256SUMS`, and the npm launcher `maxplayer-mint` with payloads `@maxplayerai/mint-<platform>`. It is
-built by the `build-mint` job, the only release job that installs `protoc` (cdk's mint signatory needs
-it at build time); users never need it.
+`SHA256SUMS`, on the GitHub Release only — there is no npm package for it. A released mint reports
+`maxplayer-mint <version> (<commit> release)` (build-mint sets `MINT_SIDECAR_BUILD`); a source build
+prints the bare commit, and `maxplayer mint upgrade` replaces only the former. Users install it with
+`maxplayer mint install` (and later `maxplayer mint upgrade`), which downloads the archive for
+`maxplayer`'s own version and checks it against `SHA256SUMS`. It is built by the `build-mint` job, the
+only release job that installs `protoc` (cdk's mint signatory needs it at build time); users never
+need it.
 
 ## Before the first release
 
 One setup step, done once **per package**, and it is the only thing standing between a tag and a
 publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`,
-`@maxplayerai/darwin-arm64` and `@maxplayerai/darwin-x64` — and, for the mint sidecar, `maxplayer-mint`,
-`@maxplayerai/mint-linux-x64`, `@maxplayerai/mint-linux-arm64`, `@maxplayerai/mint-darwin-arm64` and
-`@maxplayerai/mint-darwin-x64`:
+`@maxplayerai/darwin-arm64` and `@maxplayerai/darwin-x64`:
 
 - Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
   repository `maxplayerai`, workflow `release.yml`.
@@ -34,12 +36,6 @@ the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`, `@maxplayerai/darwin-a
 trusted publisher entry — the setting is per package, not per account or per org. The GitHub side of
 that entry is the same for all five, and
 is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
-
-⚠ The five mint packages are new and need entries before the first tag that ships them. The publish
-job publishes them AFTER the whole `maxplayer` set, so a missing mint entry fails the job only once
-`maxplayer` is complete on the registry — but that version of the mint package is then lost, so
-probe each `@maxplayerai/mint-*` payload first (the launcher `maxplayer-mint` cannot be probed; an org
-admin creates it, or its first publish proves it).
 
 ⚠ `@maxplayerai/darwin-x64` is new (Intel macs) and needs its entry before the tag that first
 publishes it, exactly as `@maxplayerai/darwin-arm64` did (#446). The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
@@ -89,8 +85,8 @@ fails outright.
 1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
    entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
    release build passes `--locked` and fails on a stale lockfile), and `version` in every
-   `npm/*/package.json`, the `optionalDependencies` pins in `npm/maxplayer/package.json` and
-   `npm/maxplayer-mint/package.json`, and `version` in `crates/maxplayer-mint/Cargo.toml` (its own
+   `npm/*/package.json`, the `optionalDependencies` pins in `npm/maxplayer/package.json`, and
+   `version` in `crates/maxplayer-mint/Cargo.toml` (its own
    workspace, so it cannot inherit the root version; refresh `crates/maxplayer-mint/Cargo.lock` too). All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
@@ -158,11 +154,9 @@ Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` wh
   from one missing a platform.
 - Builds `maxplayer-mint` on the same platforms (`build-mint`, with `protoc`), verifies its version line
   and portability the same way, and attaches `maxplayer-mint-<version>-<platform>.tar.gz` to the same
-  Release and `SHA256SUMS`.
-- Publishes the npm packages: every payload package first, then the `maxplayer` launcher; then the
-  mint payloads and the `maxplayer-mint` launcher. All ten are staged before the first publish, and a
-  package already on the registry at this version is skipped, so **re-running a publish job that failed
-  part-way finishes the set** instead of failing on the first package it already published.
+  Release and `SHA256SUMS` (required by name, like `maxplayer`'s archives). The mint is not published to
+  npm.
+- Publishes the npm packages: every payload package first, then the `maxplayer` launcher.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first
 would leave a window where `npm i maxplayer` installs a launcher whose binary is not on the registry yet.
@@ -296,8 +290,10 @@ make it load-bearing.
 
 - **The tag produced no run at all.** The tagged commit has no `release.yml` — see the warning under
   Dry run. Delete the tag, then tag a `main` that contains `release.yml` and push it again.
-- **Publish failed, Release exists.** Fix the cause and re-run just the publish job. The build is
-  reproducible from the tag.
+- **Publish failed, Release exists.** Fix the cause and re-run just the publish job, but only if no
+  package was published yet: npm does not allow republishing a version, so a re-run after a partial
+  publish fails on the first package already there (see the trusted-publisher note above); cut the
+  next patch version instead. The build is reproducible from the tag.
 - **A version disagreed with the tag.** Nothing was published — the check runs before any upload.
   Delete the tag, fix the versions, tag again.
 - **A bad version reached npm.** npm does not allow republishing a version. Bump and release again;

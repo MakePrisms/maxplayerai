@@ -41,17 +41,30 @@ fn asset() -> String {
     format!("maxplayer-mint-{VERSION}-{}.tar.gz", platform())
 }
 
-/// The binary with no inherited `MAXPLAYER_*` variables (the config layer refuses unknown names).
+/// The binary with no inherited `MAXPLAYER_*` variables (the config layer refuses unknown names)
+/// and no proxy. The latest-release check is pointed at a file that does not exist, so no test ever
+/// reaches GitHub; a test that wants a reply sets `MAXPLAYER_RELEASES_LATEST_URL` itself.
 fn maxplayer() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_maxplayer"));
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("MAXPLAYER_") {
+        let name = key.to_string_lossy();
+        if name.starts_with("MAXPLAYER_")
+            || name.eq_ignore_ascii_case("https_proxy")
+            || name.eq_ignore_ascii_case("http_proxy")
+            || name.eq_ignore_ascii_case("all_proxy")
+        {
             cmd.env_remove(key);
         }
     }
+    cmd.env(
+        "MAXPLAYER_RELEASES_LATEST_URL",
+        "file:///nonexistent/maxplayer-test/releases-latest.json",
+    );
     cmd.stdin(Stdio::null());
     cmd
 }
+
+const OLD_LINE: &str = "maxplayer-mint 0.6.0 (0123456789abcdef0123456789abcdef01234567 release)";
 
 fn run(cmd: &mut Command) -> (i32, String, String) {
     let Output {
@@ -152,7 +165,7 @@ impl World {
 
     fn good_release(&self) {
         self.publish(
-            &self.script(&format!("maxplayer-mint {VERSION} ({STAMP})")),
+            &self.script(&format!("maxplayer-mint {VERSION} ({STAMP} release)")),
             None,
         );
     }
@@ -180,6 +193,55 @@ impl World {
 
     fn target(&self) -> PathBuf {
         self.bin_dir.join("maxplayer-mint")
+    }
+
+    fn upgrade(&self, extra: &[&str]) -> (i32, String, String) {
+        run(maxplayer()
+            .args(["mint", "upgrade", "--from", &self.from()])
+            .arg("--home")
+            .arg(&self.home)
+            .arg("--bin-dir")
+            .arg(&self.bin_dir)
+            .args(extra))
+    }
+
+    fn uninstall(&self) -> (i32, String, String) {
+        run(maxplayer()
+            .args(["mint", "uninstall"])
+            .arg("--home")
+            .arg(&self.home)
+            .arg("--bin-dir")
+            .arg(&self.bin_dir)
+            .env("PATH", "/usr/bin:/bin"))
+    }
+
+    /// An installed stand-in that reports `line` (written directly, not through install).
+    fn put_installed(&self, line: &str) -> Vec<u8> {
+        fs::create_dir_all(&self.bin_dir).unwrap();
+        let bytes = self.script(line);
+        fs::write(self.target(), &bytes).unwrap();
+        fs::set_permissions(self.target(), fs::Permissions::from_mode(0o755)).unwrap();
+        bytes
+    }
+
+    /// A mint home as `init` makes it, without installing anything.
+    fn make_mint_home(&self) {
+        let mint = self.home.join("mint");
+        fs::create_dir_all(mint.join("issued")).unwrap();
+        fs::write(
+            mint.join("nostr.key"),
+            self.mint_keys.secret_key().to_secret_hex(),
+        )
+        .unwrap();
+        fs::write(mint.join("seed"), b"seed").unwrap();
+        fs::write(mint.join("mint.sqlite"), b"db").unwrap();
+    }
+
+    /// A `releases/latest` reply naming `tag`, as a file:// URL.
+    fn latest(&self, tag: &str) -> String {
+        let path = self.release.parent().unwrap().join("latest.json");
+        fs::write(&path, format!("{{\"tag_name\":\"{tag}\",\"draft\":false}}")).unwrap();
+        format!("file://{}", path.display())
     }
 
     /// Every entry left in the bin dir (staging files included).
@@ -228,7 +290,9 @@ fn install_verifies_installs_sets_up_the_mint_home_and_prints_the_link_step() {
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(out.contains("Verified sha256"), "{out}");
     assert!(
-        out.contains(&format!("Installed maxplayer-mint {VERSION} ({STAMP})")),
+        out.contains(&format!(
+            "Installed maxplayer-mint {VERSION} ({STAMP} release)"
+        )),
         "{out}"
     );
     let mode = fs::metadata(w.target()).unwrap().permissions().mode();
@@ -271,7 +335,7 @@ fn a_checksum_mismatch_is_refused_and_leaves_nothing_installed() {
     let w = World::new();
     let wrong = "d".repeat(64);
     w.publish(
-        &w.script(&format!("maxplayer-mint {VERSION} ({STAMP})")),
+        &w.script(&format!("maxplayer-mint {VERSION} ({STAMP} release)")),
         Some(&wrong),
     );
     let (code, out, err) = w.install(&[]);
@@ -307,9 +371,9 @@ fn a_checksum_mismatch_is_refused_and_leaves_nothing_installed() {
 #[test]
 fn a_binary_reporting_another_version_is_refused_and_leaves_nothing() {
     for line in [
-        "maxplayer-mint 0.0.1 (0123456789abcdef0123456789abcdef01234567)".to_owned(),
-        format!("maxplayer-mint {VERSION}-rc1 ({STAMP})"),
-        format!("maxplayer {VERSION} ({STAMP})"),
+        "maxplayer-mint 0.0.1 (0123456789abcdef0123456789abcdef01234567 release)".to_owned(),
+        format!("maxplayer-mint {VERSION}-rc1 ({STAMP} release)"),
+        format!("maxplayer {VERSION} ({STAMP} release)"),
         // Source builds: not what a release ships (review M1).
         format!("maxplayer-mint {VERSION}"),
         format!("maxplayer-mint {VERSION} ({STAMP}-dirty)"),
@@ -344,14 +408,16 @@ fn an_existing_binary_is_not_replaced_without_force() {
     let w = World::new();
     w.good_release();
     fs::create_dir_all(&w.bin_dir).unwrap();
-    let old = w.script("maxplayer-mint 0.6.0 (0123456789abcdef0123456789abcdef01234567)");
+    let old = w.script("maxplayer-mint 0.6.0 (0123456789abcdef0123456789abcdef01234567 release)");
     fs::write(w.target(), &old).unwrap();
     fs::set_permissions(w.target(), fs::Permissions::from_mode(0o755)).unwrap();
 
     let (code, out, err) = w.install(&[]);
     assert_eq!(code, 2, "{out}\n{err}");
     assert!(err.contains("not replacing it"), "{err}");
-    assert!(err.contains("--force"), "{err}");
+    // An older release is what `upgrade` is for: install points there, not at --force.
+    assert!(err.contains("maxplayer mint upgrade --bin-dir"), "{err}");
+    assert!(!err.contains("--force"), "{err}");
     assert!(err.contains("0.6.0"), "{err}");
     assert_eq!(fs::read(w.target()).unwrap(), old, "old binary changed");
     assert_eq!(w.bin_entries(), ["maxplayer-mint"]);
@@ -363,7 +429,7 @@ fn an_existing_binary_is_not_replaced_without_force() {
     assert!(
         fs::read_to_string(w.target())
             .unwrap()
-            .contains(&format!("maxplayer-mint {VERSION} ({STAMP})"))
+            .contains(&format!("maxplayer-mint {VERSION} ({STAMP} release)"))
     );
     assert_eq!(w.bin_entries(), ["maxplayer-mint"]);
 }
@@ -373,11 +439,11 @@ fn a_refused_force_install_keeps_the_old_binary_intact() {
     // --force with a bad download must not have touched the old binary.
     let w = World::new();
     w.publish(
-        &w.script("maxplayer-mint 9.9.9 (0123456789abcdef0123456789abcdef01234567)"),
+        &w.script("maxplayer-mint 9.9.9 (0123456789abcdef0123456789abcdef01234567 release)"),
         None,
     );
     fs::create_dir_all(&w.bin_dir).unwrap();
-    let old = w.script("maxplayer-mint 0.6.0 (0123456789abcdef0123456789abcdef01234567)");
+    let old = w.script("maxplayer-mint 0.6.0 (0123456789abcdef0123456789abcdef01234567 release)");
     fs::write(w.target(), &old).unwrap();
     let (code, _, _) = w.install(&["--force"]);
     assert_eq!(code, 2);
@@ -550,7 +616,7 @@ fn info_flags_a_binary_of_another_version() {
     fs::create_dir_all(&w.bin_dir).unwrap();
     fs::write(
         w.target(),
-        w.script("maxplayer-mint 0.6.0 (0123456789abcdef0123456789abcdef01234567)"),
+        w.script("maxplayer-mint 0.6.0 (0123456789abcdef0123456789abcdef01234567 release)"),
     )
     .unwrap();
     fs::set_permissions(w.target(), fs::Permissions::from_mode(0o755)).unwrap();
@@ -561,23 +627,33 @@ fn info_flags_a_binary_of_another_version() {
         "{out}"
     );
     assert!(
-        out.contains(&format!(
-            "mint install --force --bin-dir {}",
-            w.bin_dir.display()
-        )),
+        out.contains(&format!("mint upgrade --bin-dir {}", w.bin_dir.display())),
         "{out}"
     );
     assert!(!w.home.exists());
+
+    // Anything that is not an older release still needs install --force.
+    w.put_installed("maxplayer-mint 0.6.0");
+    let (_, out, _) = w.info(&["--offline"]);
+    assert!(out.contains("mint install --force --bin-dir"), "{out}");
 }
 
 #[test]
-fn a_release_stamp_with_build_text_installs() {
-    // scripts/verify-release-version.sh accepts `(<sha> <text>)`; the installer must too (M1).
+fn only_a_stamp_carrying_the_release_marker_installs() {
+    // A clean source build prints the bare commit; only `(<sha> release)` (release.yml build-mint)
+    // is a release (#1346 review 2).
+    for stamp in [format!("({STAMP})"), format!("({STAMP} 2026-11-18)")] {
+        let w = World::new();
+        w.publish(
+            &w.script(&format!("maxplayer-mint {VERSION} {stamp}")),
+            None,
+        );
+        let (code, out, err) = w.install(&[]);
+        assert_eq!(code, 2, "{stamp}: {out}\n{err}");
+        assert!(!w.target().exists(), "{stamp}");
+    }
     let w = World::new();
-    w.publish(
-        &w.script(&format!("maxplayer-mint {VERSION} ({STAMP} 2026-11-18)")),
-        None,
-    );
+    w.good_release();
     let (code, out, err) = w.install(&[]);
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(w.target().is_file());
@@ -611,7 +687,7 @@ fn a_failed_init_says_the_binary_is_installed_and_how_to_recover() {
     let w = World::new();
     // init creates mint/ and then fails, like a database error after the key was written.
     let script = format!(
-        "#!/bin/sh\ncase \"$1\" in\n--version) echo 'maxplayer-mint {VERSION} ({STAMP})' ;;\n\
+        "#!/bin/sh\ncase \"$1\" in\n--version) echo 'maxplayer-mint {VERSION} ({STAMP} release)' ;;\n\
          init) mkdir \"$MAXPLAYER_HOME/mint\"; echo 'db error' >&2; exit 1 ;;\nesac\n"
     );
     w.publish(script.as_bytes(), None);
@@ -717,4 +793,703 @@ fn bad_arguments_are_usage_errors_before_anything_happens() {
         assert!(err.contains(want), "{args:?}: {err}");
         assert!(!w.home.exists());
     }
+}
+
+// ── maxplayer mint upgrade ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn upgrade_replaces_an_older_release_and_keeps_the_mint_home() {
+    let w = World::new();
+    w.good_release();
+    w.put_installed(OLD_LINE);
+    w.make_mint_home();
+    let before = snapshot(&w.home);
+    let (code, out, err) = w.upgrade(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("Verified sha256"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "from maxplayer-mint 0.6.0 to maxplayer-mint {VERSION} ({STAMP} release)"
+        )),
+        "{out}"
+    );
+    assert!(
+        fs::read_to_string(w.target())
+            .unwrap()
+            .contains(&format!("maxplayer-mint {VERSION} ({STAMP} release)"))
+    );
+    assert_eq!(w.bin_entries(), ["maxplayer-mint"], "no staging file left");
+    // <home>/mint/ untouched, and `init` never ran (it would have failed on the existing dir).
+    assert_eq!(snapshot(&w.home), before, "upgrade changed the mint home");
+    assert!(!out.contains("Created"), "{out}");
+    assert!(!out.contains("is serving"), "{out}");
+}
+
+#[test]
+fn upgrade_on_an_absent_home_creates_nothing_there() {
+    let w = World::new();
+    w.good_release();
+    w.put_installed(OLD_LINE);
+    let (code, out, err) = w.upgrade(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!w.home.exists(), "upgrade created the home (init ran?)");
+}
+
+#[test]
+fn upgrade_at_this_version_is_a_no_op() {
+    let w = World::new();
+    w.good_release();
+    let bytes = w.put_installed(&format!("maxplayer-mint {VERSION} ({STAMP} release)"));
+    // Even a broken release would not be touched: nothing is downloaded.
+    fs::remove_file(w.release.join("SHA256SUMS")).unwrap();
+    let (code, out, err) = w.upgrade(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("nothing to upgrade"), "{out}");
+    assert!(!out.contains("Downloading"), "{out}");
+    assert_eq!(fs::read(w.target()).unwrap(), bytes);
+}
+
+#[test]
+fn upgrade_refuses_newer_source_built_and_unknown_binaries() {
+    for (line, want) in [
+        (
+            "maxplayer-mint 999.0.0 (0123456789abcdef0123456789abcdef01234567 release)".to_owned(),
+            "newer than this maxplayer",
+        ),
+        ("maxplayer-mint 0.6.0".to_owned(), "a source build"),
+        // A clean checkout's build: the bare commit, no release marker (#1346 review 2).
+        (format!("maxplayer-mint 0.6.0 ({STAMP})"), "a source build"),
+        (
+            format!("maxplayer-mint {VERSION} ({STAMP}-dirty)"),
+            "a source build",
+        ),
+        (
+            "something else 1.2.3".to_owned(),
+            "not a maxplayer-mint release line",
+        ),
+    ] {
+        let w = World::new();
+        w.good_release();
+        let bytes = w.put_installed(&line);
+        let (code, out, err) = w.upgrade(&[]);
+        assert_eq!(code, 2, "{line}: {out}\n{err}");
+        assert!(err.contains(want), "{line}: {err}");
+        assert!(
+            err.contains("maxplayer mint install --force --bin-dir"),
+            "{line}: {err}"
+        );
+        assert!(!out.contains("Downloading"), "{line}: {out}");
+        assert_eq!(
+            fs::read(w.target()).unwrap(),
+            bytes,
+            "{line}: replaced anyway"
+        );
+        assert_eq!(w.bin_entries(), ["maxplayer-mint"]);
+    }
+    // A binary that does not run at all is refused the same way.
+    let w = World::new();
+    w.good_release();
+    fs::create_dir_all(&w.bin_dir).unwrap();
+    fs::write(w.target(), b"\x7fELF nope").unwrap();
+    fs::set_permissions(w.target(), fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, _, err) = w.upgrade(&[]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("install --force"), "{err}");
+    assert_eq!(fs::read(w.target()).unwrap(), b"\x7fELF nope");
+    // --force is not an upgrade flag.
+    let (code, _, err) = w.upgrade(&["--force"]);
+    assert_eq!(code, 1, "{err}");
+}
+
+#[test]
+fn upgrade_with_nothing_installed_points_at_install() {
+    let w = World::new();
+    w.good_release();
+    let (code, _, err) = w.upgrade(&[]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("maxplayer mint install --bin-dir"), "{err}");
+    assert!(!w.bin_dir.exists());
+}
+
+#[test]
+fn a_refused_upgrade_keeps_the_old_binary() {
+    let w = World::new();
+    w.publish(
+        &w.script(&format!("maxplayer-mint {VERSION} ({STAMP} release)")),
+        Some(&"d".repeat(64)),
+    );
+    let old = w.put_installed(OLD_LINE);
+    let (code, _, err) = w.upgrade(&[]);
+    assert_eq!(code, 2);
+    assert!(err.contains("does not match the release"), "{err}");
+    assert_eq!(fs::read(w.target()).unwrap(), old);
+    assert_eq!(w.bin_entries(), ["maxplayer-mint"]);
+}
+
+#[test]
+fn upgrading_under_a_running_mint_says_it_keeps_the_old_version_until_restarted() {
+    let w = World::new();
+    w.good_release();
+    w.put_installed(OLD_LINE);
+    w.make_mint_home();
+    let held = fs::File::open(w.home.join("mint")).unwrap();
+    held.try_lock().unwrap();
+    let (code, out, err) = w.upgrade(&[]);
+    drop(held);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("keeps running 0.6.0 until it is restarted"),
+        "{out}"
+    );
+    assert!(
+        out.contains("systemctl --user restart maxplayer-mint"),
+        "{out}"
+    );
+}
+
+// ── maxplayer mint uninstall ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn uninstall_removes_the_binary_and_never_the_mint_home() {
+    let w = World::new();
+    w.put_installed(&format!("maxplayer-mint {VERSION} ({STAMP} release)"));
+    w.make_mint_home();
+    let before = snapshot(&w.home);
+    let (code, out, err) = w.uninstall();
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!w.target().exists());
+    assert_eq!(snapshot(&w.home), before, "uninstall touched <home>/mint/");
+    assert!(out.contains("nostr.key"), "{out}");
+    assert!(out.contains("seed"), "{out}");
+    assert!(out.contains("mint.sqlite"), "{out}");
+    assert!(out.contains("destroys the mint"), "{out}");
+    assert!(out.contains("back it up first"), "{out}");
+
+    // Nothing left to uninstall: said, exit 0, still nothing touched.
+    let (code, out, err) = w.uninstall();
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("nothing to uninstall"), "{out}");
+    assert_eq!(snapshot(&w.home), before);
+}
+
+#[test]
+fn uninstall_refuses_while_the_mint_is_serving() {
+    let w = World::new();
+    let bytes = w.put_installed(&format!("maxplayer-mint {VERSION} ({STAMP} release)"));
+    w.make_mint_home();
+    let held = fs::File::open(w.home.join("mint")).unwrap();
+    held.try_lock().unwrap();
+    let (code, out, err) = w.uninstall();
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("is serving"), "{err}");
+    assert!(
+        err.contains("systemctl --user disable --now maxplayer-mint"),
+        "{err}"
+    );
+    assert!(err.contains("kill -INT"), "{err}");
+    assert_eq!(
+        fs::read(w.target()).unwrap(),
+        bytes,
+        "removed while serving"
+    );
+    drop(held);
+    let (code, _, err) = w.uninstall();
+    assert_eq!(code, 0, "{err}");
+}
+
+#[test]
+fn uninstall_removes_a_symlink_not_its_target() {
+    let w = World::new();
+    fs::create_dir_all(&w.bin_dir).unwrap();
+    let real = w.bin_dir.parent().unwrap().join("npm-maxplayer-mint");
+    fs::write(&real, w.script(OLD_LINE)).unwrap();
+    std::os::unix::fs::symlink(&real, w.target()).unwrap();
+    let (code, out, err) = w.uninstall();
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        fs::symlink_metadata(w.target()).is_err(),
+        "link still there"
+    );
+    assert!(real.is_file(), "the link's target was removed");
+    assert!(out.contains("Removed the symlink"), "{out}");
+    assert!(out.contains(&real.display().to_string()), "{out}");
+}
+
+#[test]
+fn uninstall_refuses_what_is_not_a_file_or_symlink() {
+    let w = World::new();
+    fs::create_dir_all(w.target()).unwrap();
+    let (code, _, err) = w.uninstall();
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("not a regular file or a symlink"), "{err}");
+    assert!(w.target().is_dir());
+}
+
+// ── the newer-version notice in `maxplayer mint` ─────────────────────────────────────────────
+
+#[test]
+fn status_says_when_the_installed_mint_is_older() {
+    let w = World::new();
+    w.put_installed(OLD_LINE);
+    let (code, out, err) = w.info(&["--offline"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains(&format!(
+            "upgrade:   maxplayer-mint 0.6.0 is older than this maxplayer ({VERSION}): run `maxplayer mint upgrade --bin-dir {}",
+            w.bin_dir.display()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("latest:    not checked (--offline)"), "{out}");
+    let (_, out, _) = w.info(&["--offline", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["mint_update"]["relation"], "older", "{out}");
+    assert_eq!(v["mint_update"]["upgrade_available"], true, "{out}");
+    assert!(
+        v["mint_update"]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("maxplayer mint upgrade --bin-dir"),
+        "{out}"
+    );
+    // The two notices are separate fields; offline, the maxplayer one was not checked.
+    assert_eq!(v["maxplayer_update"]["checked"], false, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], false, "{out}");
+    assert!(v["maxplayer_update"]["notice"].is_null(), "{out}");
+    assert!(v.get("update").is_none(), "{out}");
+}
+
+#[test]
+fn status_says_when_a_newer_maxplayer_is_released() {
+    let w = World::new();
+    w.put_installed(&format!("maxplayer-mint {VERSION} ({STAMP} release)"));
+    let latest = w.latest("v999.0.0");
+    let info = |extra: &[&str]| {
+        run(maxplayer()
+            .arg("mint")
+            .arg("--home")
+            .arg(&w.home)
+            .arg("--bin-dir")
+            .arg(&w.bin_dir)
+            .args(extra)
+            .env("PATH", "/usr/bin:/bin")
+            .env("MAXPLAYER_RELEASES_LATEST_URL", &latest))
+    };
+    let (code, out, err) = info(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains(&format!("latest:    maxplayer 999.0.0 (this is {VERSION})")),
+        "{out}"
+    );
+    let update = out
+        .lines()
+        .find(|l| l.starts_with("update:"))
+        .unwrap_or_else(|| panic!("no update line: {out}"));
+    assert!(
+        update.contains(&format!(
+            "maxplayer 999.0.0 is available (you have {VERSION}); update it the way you installed it"
+        )),
+        "{out}"
+    );
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+    assert!(!out.contains("upgrade:"), "the mint is current: {out}");
+    let (_, out, _) = info(&["--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["maxplayer_update"]["latest"], "999.0.0", "{out}");
+    assert_eq!(v["maxplayer_update"]["current"], VERSION, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], true, "{out}");
+    assert!(
+        !v["maxplayer_update"]["notice"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("mint"),
+        "{out}"
+    );
+    assert_eq!(v["mint_update"]["upgrade_available"], false, "{out}");
+    assert!(v["mint_update"]["notice"].is_null(), "{out}");
+    assert!(!w.home.exists(), "status created the home");
+
+    // The same release as this one: nothing to say.
+    let same = w.latest(&format!("v{VERSION}"));
+    let (_, out, _) = run(maxplayer()
+        .arg("mint")
+        .arg("--home")
+        .arg(&w.home)
+        .arg("--bin-dir")
+        .arg(&w.bin_dir)
+        .env("PATH", "/usr/bin:/bin")
+        .env("MAXPLAYER_RELEASES_LATEST_URL", &same));
+    assert!(!out.contains("update:"), "{out}");
+    assert!(out.contains("up to date"), "{out}");
+}
+
+#[test]
+fn the_maxplayer_update_notice_shows_with_no_mint_installed_and_never_names_the_mint() {
+    let w = World::new();
+    let latest = w.latest("v999.0.0");
+    let info = |extra: &[&str]| {
+        run(maxplayer()
+            .arg("mint")
+            .arg("--home")
+            .arg(&w.home)
+            .arg("--bin-dir")
+            .arg(&w.bin_dir)
+            .args(extra)
+            .env("PATH", "/usr/bin:/bin")
+            .env("MAXPLAYER_RELEASES_LATEST_URL", &latest))
+    };
+    let (code, out, err) = info(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("not installed"), "{out}");
+    let update = out
+        .lines()
+        .find(|l| l.starts_with("update:"))
+        .unwrap_or_else(|| panic!("no update line without a mint: {out}"));
+    assert!(
+        update.contains(&format!(
+            "maxplayer 999.0.0 is available (you have {VERSION})"
+        )),
+        "{update}"
+    );
+    assert!(update.contains("install.sh | sh"), "{update}");
+    assert!(
+        update.contains("npm install -g maxplayer@latest"),
+        "{update}"
+    );
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+    assert!(!out.contains("upgrade:"), "{out}");
+    let (_, out, _) = info(&["--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["binary"]["installed"], false, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], true, "{out}");
+    assert!(v["maxplayer_update"]["notice"].is_string(), "{out}");
+    assert!(v["mint_update"]["relation"].is_null(), "{out}");
+    assert!(v["mint_update"]["notice"].is_null(), "{out}");
+    assert!(!w.home.exists(), "status created the home");
+
+    // Both at once: an older mint and a newer maxplayer are two separate lines and fields.
+    w.put_installed(OLD_LINE);
+    let (_, out, _) = info(&[]);
+    let upgrade = out.lines().find(|l| l.starts_with("upgrade:")).unwrap();
+    assert!(
+        upgrade.contains("run `maxplayer mint upgrade --bin-dir"),
+        "{out}"
+    );
+    let update = out.lines().find(|l| l.starts_with("update:")).unwrap();
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+    let (_, out, _) = info(&["--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["mint_update"]["upgrade_available"], true, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], true, "{out}");
+    assert_ne!(
+        v["mint_update"]["notice"], v["maxplayer_update"]["notice"],
+        "{out}"
+    );
+}
+
+#[test]
+fn a_failed_latest_check_is_shown_not_an_error_and_offline_asks_nobody() {
+    // A loopback listener that counts connections and never speaks TLS: the check fails.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let counter = connections.clone();
+    std::thread::spawn(move || {
+        loop {
+            if let Ok((stream, _)) = listener.accept() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let url = format!("https://127.0.0.1:{port}/releases/latest");
+    let w = World::new();
+    w.put_installed(&format!("maxplayer-mint {VERSION} ({STAMP} release)"));
+    let info = |extra: &[&str]| {
+        run(maxplayer()
+            .arg("mint")
+            .arg("--home")
+            .arg(&w.home)
+            .arg("--bin-dir")
+            .arg(&w.bin_dir)
+            .args(extra)
+            .env("PATH", "/usr/bin:/bin")
+            .env("MAXPLAYER_RELEASES_LATEST_URL", &url))
+    };
+
+    let (code, out, err) = info(&["--offline"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("latest:    not checked (--offline)"), "{out}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        connections.load(Ordering::SeqCst),
+        0,
+        "--offline made a request"
+    );
+
+    let (code, out, err) = info(&[]);
+    assert_eq!(code, 0, "a failed check is not an error: {out}\n{err}");
+    assert!(out.contains("latest:    could not check"), "{out}");
+    assert!(!out.contains("update:"), "{out}");
+    assert!(
+        connections.load(Ordering::SeqCst) >= 1,
+        "the check never ran"
+    );
+    let (code, out, _) = info(&["--json"]);
+    assert_eq!(code, 0);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["maxplayer_update"]["checked"], false, "{out}");
+    assert!(
+        v["maxplayer_update"]["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("could not check"),
+        "{out}"
+    );
+    assert!(!w.home.exists(), "status created the home");
+}
+
+// ── review r1 (#1346) ────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn upgrade_refuses_when_the_binary_changes_during_the_download() {
+    // Review 3: the asset is a FIFO, so the download blocks until fed; meanwhile a NEWER mint is
+    // put at the target. The upgrade must not overwrite it on the strength of the old probe.
+    let w = World::new();
+    let archive = w.publish(
+        &w.script(&format!("maxplayer-mint {VERSION} ({STAMP} release)")),
+        None,
+    );
+    let asset = w.release.join(asset());
+    fs::remove_file(&asset).unwrap();
+    assert!(
+        Command::new("mkfifo")
+            .arg(&asset)
+            .status()
+            .unwrap()
+            .success()
+    );
+    w.put_installed(OLD_LINE);
+    let child = maxplayer()
+        .args(["mint", "upgrade", "--from", &w.from()])
+        .arg("--home")
+        .arg(&w.home)
+        .arg("--bin-dir")
+        .arg(&w.bin_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(800));
+    let newer = w.script(&format!("maxplayer-mint 999.0.0 ({STAMP} release)"));
+    let tmp = w.bin_dir.join("swap");
+    fs::write(&tmp, &newer).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::rename(&tmp, w.target()).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&asset)
+        .unwrap()
+        .write_all(&archive)
+        .unwrap();
+    let Output { status, stderr, .. } = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&stderr);
+    assert_eq!(status.code(), Some(2), "{err}");
+    assert!(err.contains("changed while"), "{err}");
+    assert_eq!(
+        fs::read(w.target()).unwrap(),
+        newer,
+        "the newer binary was overwritten"
+    );
+    assert_eq!(w.bin_entries(), ["maxplayer-mint"], "staging file left");
+}
+
+#[test]
+fn uninstall_refuses_when_it_cannot_tell_whether_the_mint_is_serving() {
+    // Review 5: an unsearchable home used to skip the running-mint guard.
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root reads through any mode
+    }
+    let w = World::new();
+    let bytes = w.put_installed(&format!("maxplayer-mint {VERSION} ({STAMP} release)"));
+    w.make_mint_home();
+    fs::set_permissions(&w.home, fs::Permissions::from_mode(0o000)).unwrap();
+    let (code, out, err) = w.uninstall();
+    fs::set_permissions(&w.home, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("could not tell whether"), "{err}");
+    assert_eq!(fs::read(w.target()).unwrap(), bytes);
+}
+
+#[test]
+fn upgrade_and_uninstall_point_at_the_mint_on_path_instead_of_reporting_nothing() {
+    // Review 6: status finds the mint on PATH; without --bin-dir these default to ~/.local/bin.
+    let w = World::new();
+    w.good_release();
+    let user_home = w.home.parent().unwrap().join("userhome");
+    fs::create_dir_all(&user_home).unwrap();
+    let pathbin = w.home.parent().unwrap().join("pathbin");
+    fs::create_dir_all(&pathbin).unwrap();
+    let bytes = w.script(OLD_LINE);
+    fs::write(pathbin.join("maxplayer-mint"), &bytes).unwrap();
+    fs::set_permissions(
+        pathbin.join("maxplayer-mint"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!("{}:/usr/bin:/bin", pathbin.display());
+    for sub in ["upgrade", "uninstall"] {
+        let (code, out, err) = run(maxplayer()
+            .args(["mint", sub, "--from", &w.from()])
+            .arg("--home")
+            .arg(&w.home)
+            .env("HOME", &user_home)
+            .env("PATH", &path));
+        let (code, err) = if sub == "uninstall" && code == 1 {
+            // uninstall takes no --from
+            let (c, o, e) = run(maxplayer()
+                .args(["mint", sub])
+                .arg("--home")
+                .arg(&w.home)
+                .env("HOME", &user_home)
+                .env("PATH", &path));
+            let _ = o;
+            (c, e)
+        } else {
+            let _ = out;
+            (code, err)
+        };
+        assert_eq!(code, 2, "{sub}: {err}");
+        assert!(
+            err.contains(&format!(
+                "rerun `maxplayer mint {sub} --bin-dir {}",
+                pathbin.display()
+            )),
+            "{sub}: {err}"
+        );
+        assert_eq!(
+            fs::read(pathbin.join("maxplayer-mint")).unwrap(),
+            bytes,
+            "{sub}"
+        );
+        assert!(
+            !user_home.join(".local/bin").exists(),
+            "{sub}: installed a second copy"
+        );
+    }
+}
+
+#[test]
+fn uninstall_warns_about_a_symlinked_mint_dir_too() {
+    // Review 10: <home>/mint -> elsewhere is still the mint.
+    let w = World::new();
+    w.put_installed(&format!("maxplayer-mint {VERSION} ({STAMP} release)"));
+    let real = w.home.parent().unwrap().join("data-mint");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("seed"), b"s").unwrap();
+    fs::create_dir_all(&w.home).unwrap();
+    std::os::unix::fs::symlink(&real, w.home.join("mint")).unwrap();
+    let (code, out, err) = w.uninstall();
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("destroys the mint"), "{out}");
+    assert!(out.contains("seed"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "maxplayer mint install --bin-dir {}",
+            w.bin_dir.display()
+        )),
+        "the reinstall hint keeps --bin-dir/--home: {out}"
+    );
+    assert!(real.join("seed").exists());
+}
+
+#[test]
+fn status_never_advises_force_installing_an_older_mint_over_a_newer_one() {
+    // Review 9a.
+    let w = World::new();
+    w.put_installed(&format!("maxplayer-mint 999.0.0 ({STAMP} release)"));
+    let (code, out, _) = w.info(&["--offline"]);
+    assert_eq!(code, 0);
+    assert!(!out.contains("install --force"), "{out}");
+    assert!(out.contains("update maxplayer"), "{out}");
+}
+
+// ── the newer-maxplayer notice in `maxplayer doctor` (Petar, 18 Nov 19:16 UTC) ──────────────────
+
+/// `maxplayer doctor` on a fresh home with NO maxplayer-mint anywhere (PATH and ~/.local/bin
+/// empty). The relay and the accepted mint point at a closed loopback port so nothing leaves the box.
+fn doctor_without_a_mint(w: &World, latest: &str, extra: &[&str]) -> String {
+    let fake_home = w.home.parent().unwrap().join("user-home");
+    fs::create_dir_all(&fake_home).unwrap();
+    let (_, out, err) = run(maxplayer()
+        .arg("doctor")
+        .args(extra)
+        .arg("--home")
+        .arg(&w.home)
+        .env("HOME", &fake_home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("MAXPLAYER_RELAY_URL", "ws://127.0.0.1:9")
+        .env("MAXPLAYER_ACCEPTED_MINTS", "https://127.0.0.1:9")
+        .env("MAXPLAYER_RELEASES_LATEST_URL", latest));
+    format!("{out}{err}")
+}
+
+fn row<'a>(report: &'a str, name: &str) -> &'a str {
+    report
+        .lines()
+        .find(|l| {
+            l.split_once(" — ")
+                .is_some_and(|(head, _)| head.split_once(' ').map(|(_, n)| n) == Some(name))
+        })
+        .unwrap_or_else(|| panic!("no `{name}` row: {report}"))
+}
+
+#[test]
+fn doctor_shows_the_maxplayer_update_with_no_mint_installed_on_its_own_row() {
+    let w = World::new();
+    let latest = w.latest("v999.0.0");
+    let report = doctor_without_a_mint(&w, &latest, &[]);
+    // The mint row has nothing to report: no mint is installed.
+    assert!(
+        row(&report, "maxplayer-mint version").starts_with("SKIP "),
+        "{report}"
+    );
+    // (b) is its own row, shown anyway, and never about the mint.
+    let update = row(&report, "maxplayer version");
+    assert!(update.starts_with("WARN "), "{update}");
+    assert!(
+        update.contains(&format!(
+            "maxplayer 999.0.0 is available (you have {VERSION}); update it the way you installed it"
+        )),
+        "{update}"
+    );
+    assert!(
+        update.contains("install.sh | sh") && update.contains("npm install -g maxplayer@latest"),
+        "{update}"
+    );
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+
+    // Up to date: a PASS, still on its own row.
+    let same = w.latest(&format!("v{VERSION}"));
+    let report = doctor_without_a_mint(&w, &same, &[]);
+    assert!(
+        row(&report, "maxplayer version").starts_with("PASS "),
+        "{report}"
+    );
+    // --offline: not checked, never an error; a failed check: "could not check", never an error.
+    let report = doctor_without_a_mint(&w, &latest, &["--offline"]);
+    let offline = row(&report, "maxplayer version");
+    assert!(
+        offline.starts_with("PASS ") && offline.contains("not checked (--offline)"),
+        "{offline}"
+    );
+    let report = doctor_without_a_mint(&w, "file:///nonexistent/latest.json", &[]);
+    let failed = row(&report, "maxplayer version");
+    assert!(
+        failed.starts_with("PASS ") && failed.contains("could not check"),
+        "{failed}"
+    );
 }

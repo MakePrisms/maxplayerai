@@ -2447,6 +2447,8 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_ACP_SMOKE",
     "MAXPLAYER_ACP_SMOKE_CMD",
     "MAXPLAYER_EVALS_SNAPSHOT_DIR",
+    // `maxplayer mint` / `doctor`: where the latest-release check asks (tests point it at a file).
+    "MAXPLAYER_RELEASES_LATEST_URL",
 ];
 
 /// [`MaxplayerConfig`] fields whose env value is a comma-separated list. The env source must be told

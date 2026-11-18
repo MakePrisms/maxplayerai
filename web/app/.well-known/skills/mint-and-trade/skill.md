@@ -38,10 +38,30 @@ across restarts.
 
 ## 2. Install and connect both tools
 
-Released versions ship `maxplayer-mint` prebuilt (`npm install -g maxplayer-mint`, or the
-`maxplayer-mint-<version>-<platform>.tar.gz` release archive), at the same version as `maxplayer`,
-with no `protoc` needed. To build a chosen revision instead, use the mint README: the mint is its
-own Cargo workspace, and building it needs `protoc`. From the repository root:
+Install the mint with `maxplayer` itself. It downloads the released `maxplayer-mint` for **this**
+`maxplayer`'s version (GitHub release archive, checked against the release's `SHA256SUMS` and the
+version it reports; no npm package, no `protoc`), installs it into `~/.local/bin` and runs
+`maxplayer-mint init` only when `<home>/mint/` does not exist yet:
+
+```sh
+maxplayer mint                       # read-only: installed?, version, mint URL, running?, linked?, updates
+maxplayer mint install --name <name>
+maxplayer account link --mint --email <your account email>   # emails a code
+maxplayer account link --mint --code <6 digits from the email>
+```
+
+Use the email the human's Maxplayer account already uses. The mint is version-locked to
+`maxplayer`: after updating `maxplayer` (the way it was installed), run `maxplayer mint upgrade`
+(it replaces only an older released mint, keeps `<home>/mint/`, never runs `init`), then restart
+the mint service; a running mint keeps the old version until restarted. `maxplayer mint` and
+`maxplayer doctor` show two separate notices: `upgrade:` when the installed mint is older than
+`maxplayer` (run `maxplayer mint upgrade`), and `update:` when a newer `maxplayer` is released
+(update it the way it was installed; `--offline` skips that check). In `--json` they are
+`mint_update` and `maxplayer_update`. `maxplayer mint uninstall` removes only the
+binary (refused while the mint is serving) and never `<home>/mint/`; never delete that folder, it
+is the mint and every credit it issued. To build a chosen revision from source instead, use the
+mint README: the mint is its own Cargo workspace, and building it needs `protoc`. From the
+repository root:
 
 ```sh
 cargo install --locked --path crates/maxplayer-mint --root "$HOME/.local"
@@ -62,8 +82,9 @@ Check the installed commands' usage; do not guess flags or overwrite a running
 installation without checking its current version and obligations. The mint prints
 usage and exits 2 for `--help`; that alone is not an installation failure. An
 existing `maxplayer-mint` whose usage has no `restore` predates automatic backups:
-upgrade it from the chosen revision (same path, then restart its service), and
-drop any stopped-backup procedure recorded for it earlier.
+upgrade it (`maxplayer mint upgrade` for an older release, or from the chosen revision at the
+same path), then restart its service, and drop any stopped-backup procedure recorded for it
+earlier.
 
 - Initialize a mint **only if none exists**, with `maxplayer-mint init --name <name>`: wallets
   show the name next to the mint URL. Use the seller's own name unless the operator chose another.

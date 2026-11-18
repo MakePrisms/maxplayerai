@@ -19,6 +19,8 @@
 #     which are built from that list, cannot silently derive a different set than the file names);
 #   - the built artifacts match the source (a build job that failed for one platform still lets the
 #     others upload — fail-fast is off — so "some artifacts arrived" must not read as complete);
+#   - the built `maxplayer-mint` artifacts match the source too: the mint sidecar ships from the same
+#     tag as GitHub release archives only (no npm packages), so a missing mint archive is caught here;
 #   - the npm payload directories match the source (a payload with no platform, or a platform with
 #     no payload, is the #446 shape);
 #   - the launcher's pins AND its runtime resolver match the source (a pin with no payload installs
@@ -43,11 +45,10 @@ PLAN_PLATFORMS="${3:-}"
 MANIFEST=".github/release-platforms.json"
 LAUNCHER_PKG="npm/maxplayer/package.json"
 LAUNCHER_JS="npm/maxplayer/bin/maxplayer.js"
-# The mint sidecar ships from the same tag, on the same platform set, as its own archives and npm
-# packages (`maxplayer-mint` launcher + `@maxplayerai/mint-<platform>` payloads). Every check below
-# that holds a `maxplayer` surface to the source holds the matching mint surface to it too.
-MINT_LAUNCHER_PKG="npm/maxplayer-mint/package.json"
-MINT_LAUNCHER_JS="npm/maxplayer-mint/bin/maxplayer-mint.js"
+# The mint sidecar ships from the same tag, on the same platform set, as GitHub release archives
+# (`maxplayer-mint-<version>-<platform>.tar.gz`, listed in the same SHA256SUMS) and nothing else: it
+# has no npm packages, and `maxplayer mint install` is how users get it. A mint npm package in the
+# tree would be a second, unchecked channel, so its presence fails this script.
 
 die() { echo "verify-release-surface: $*" >&2; exit 1; }
 
@@ -61,8 +62,6 @@ command -v node >/dev/null 2>&1 || die "node not found"
 [ -f "$MANIFEST" ]     || die "no platform source at $MANIFEST"
 [ -f "$LAUNCHER_PKG" ] || die "no launcher manifest at $LAUNCHER_PKG"
 [ -f "$LAUNCHER_JS" ]  || die "no launcher at $LAUNCHER_JS"
-[ -f "$MINT_LAUNCHER_PKG" ] || die "no mint launcher manifest at $MINT_LAUNCHER_PKG"
-[ -f "$MINT_LAUNCHER_JS" ]  || die "no mint launcher at $MINT_LAUNCHER_JS"
 
 # Compare two sets given as newline-separated lists; name what is missing and what is extra. Both
 # inputs are sorted, de-duplicated and stripped of blank lines here, so callers pass raw lists.
@@ -136,14 +135,26 @@ npm_dirs="$(
 )"
 assert_set_eq "the npm payload packages (npm/cli-*)" "$source_list" "$npm_dirs"
 
-mint_npm_dirs="$(
+# ── No mint npm packages ────────────────────────────────────────────────────────────────────────
+# The mint is distributed only as release archives (`maxplayer mint install`); nothing publishes an
+# npm package for it, so one in the tree would be dead, unversioned and unverified.
+stray_mint_npm="$(
   shopt -s nullglob
-  for d in npm/mint-*/; do
-    b="$(basename "$d")"
-    printf '%s\n' "${b#mint-}"
-  done
+  for d in npm/maxplayer-mint npm/mint-*; do [ -d "$d" ] && printf '%s\n' "$d"; done
+  # Any other directory whose manifest names a mint package, whatever the directory is called.
+  node -e '
+    const fs = require("fs");
+    for (const d of fs.readdirSync("npm")) {
+      const f = `npm/${d}/package.json`;
+      if (!fs.existsSync(f)) continue;
+      const n = JSON.parse(fs.readFileSync(f, "utf8")).name || "";
+      if (n === "maxplayer-mint" || n.startsWith("@maxplayerai/mint-")) process.stdout.write(`${f} (${n})\n`);
+    }
+  '
+  true
 )"
-assert_set_eq "the mint npm payload packages (npm/mint-*)" "$source_list" "$mint_npm_dirs"
+[ -z "$stray_mint_npm" ] || die "mint npm packages in the tree: $(echo $stray_mint_npm) — the mint ships only as release archives (maxplayer-mint-<version>-<platform>.tar.gz + SHA256SUMS); remove them"
+echo "ok: no mint npm packages (the mint ships only as release archives)"
 
 # ── Each payload manifest matches its directory ─────────────────────────────────────────────────
 # A payload copied from a sibling and left with the sibling's `cpu` installs nowhere it is needed
@@ -152,12 +163,12 @@ assert_set_eq "the mint npm payload packages (npm/mint-*)" "$source_list" "$mint
 node -e '
   const fs = require("fs");
   const bad = [];
-  for (const [prefix, bin] of [["cli-", "maxplayer"], ["mint-", "maxplayer-mint"]]) {
+  for (const [prefix, bin] of [["cli-", "maxplayer"]]) {
     for (const d of fs.readdirSync("npm").filter((d) => d.startsWith(prefix))) {
       const p = d.slice(prefix.length);
       const [os, cpu] = p.split("-");
       const m = JSON.parse(fs.readFileSync(`npm/${d}/package.json`, "utf8"));
-      const want = "@maxplayerai/" + (prefix === "cli-" ? "" : "mint-") + p;
+      const want = "@maxplayerai/" + p;
       const binKey = `${bin}-${p}`, binPath = `bin/${bin}`;
       if (m.name !== want) bad.push(`npm/${d}: name ${m.name}, expected ${want}`);
       if (JSON.stringify(m.os) !== JSON.stringify([os])) bad.push(`npm/${d}: os ${JSON.stringify(m.os)}, expected ["${os}"]`);
@@ -172,27 +183,24 @@ node -e '
 ' || die "an npm payload manifest does not match its directory (see above)"
 echo "ok: every payload manifest (name, os, cpu, bin, files) matches its directory"
 
-# ── The launchers' pinned dependencies ──────────────────────────────────────────────────────────
+# ── The launcher's pinned dependencies ──────────────────────────────────────────────────────────
 # optionalDependencies is what npm consults to install one platform's binary; a pin with no payload
 # published leaves `npm i maxplayer` resolving a package that is not on the registry.
-launcher_pins() {  # <package.json> <payload prefix inside @maxplayerai/>
-  node -e '
-    const fs = require("fs");
-    const p = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    const od = p.optionalDependencies || {};
-    const pref = "@maxplayerai/" + process.argv[2];
-    for (const k of Object.keys(od)) process.stdout.write((k.startsWith(pref) ? k.slice(pref.length) : k) + "\n");
-  ' "./$1" "$2"
-}
-assert_set_eq "the launcher optionalDependencies ($LAUNCHER_PKG)" "$source_list" "$(launcher_pins "$LAUNCHER_PKG" "")"
-assert_set_eq "the mint launcher optionalDependencies ($MINT_LAUNCHER_PKG)" "$source_list" "$(launcher_pins "$MINT_LAUNCHER_PKG" "mint-")"
+opt_deps="$(node -e '
+  const fs = require("fs");
+  const p = JSON.parse(fs.readFileSync("./npm/maxplayer/package.json", "utf8"));
+  const od = p.optionalDependencies || {};
+  const pref = "@maxplayerai/";
+  for (const k of Object.keys(od)) process.stdout.write((k.startsWith(pref) ? k.slice(pref.length) : k) + "\n");
+')"
+assert_set_eq "the launcher optionalDependencies ($LAUNCHER_PKG)" "$source_list" "$opt_deps"
 
-# ── The launchers' runtime resolvers ────────────────────────────────────────────────────────────
+# ── The launcher's runtime resolver ────────────────────────────────────────────────────────────
 # PLATFORM_PACKAGES maps `${process.platform}-${process.arch}` to the payload it resolves at run
 # time. A platform missing here is refused a binary that was in fact published; one present with no
 # payload behind it is dead weight. The file is parsed, not executed — running it launches the binary.
-# Each VALUE is checked too: the mint launcher resolving a `maxplayer` payload (or the reverse) would
-# install cleanly and run the wrong program.
+# Each VALUE is checked too: a key resolving another platform's payload would install cleanly and
+# run a binary that cannot exec.
 launcher_resolver() {  # <launcher.js> <payload prefix inside @maxplayerai/>
   node -e '
     const fs = require("fs");
@@ -210,7 +218,5 @@ launcher_resolver() {  # <launcher.js> <payload prefix inside @maxplayerai/>
 }
 resolver="$(launcher_resolver "$LAUNCHER_JS" "")" || die "the launcher resolver in $LAUNCHER_JS is malformed (see above)"
 assert_set_eq "the launcher resolver PLATFORM_PACKAGES ($LAUNCHER_JS)" "$source_list" "$resolver"
-mint_resolver="$(launcher_resolver "$MINT_LAUNCHER_JS" "mint-")" || die "the mint launcher resolver in $MINT_LAUNCHER_JS is malformed (see above)"
-assert_set_eq "the mint launcher resolver PLATFORM_PACKAGES ($MINT_LAUNCHER_JS)" "$source_list" "$mint_resolver"
 
 echo "PASS: every release surface — built, published and launcher — matches $MANIFEST"

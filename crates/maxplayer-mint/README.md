@@ -22,17 +22,60 @@ listing tokens. Mint-only setup is documented below.
 
 ## Install
 
+These commands need a `maxplayer` that has `maxplayer mint` (check `maxplayer mint --help`).
 `maxplayer-mint` is released with `maxplayer`, from the same tag and at the same version, for
-linux-x64, linux-arm64, darwin-arm64 and darwin-x64. No `protoc` or Rust toolchain is needed:
+linux-x64, linux-arm64, darwin-arm64 and darwin-x64, as GitHub release archives
+(`maxplayer-mint-<version>-<platform>.tar.gz`, listed in the release's `SHA256SUMS`). There is no npm
+package. No `protoc` or Rust toolchain is needed. Install it with `maxplayer` itself:
 
 ```bash
-npm install -g maxplayer-mint      # or: npx -y maxplayer-mint --version
-maxplayer-mint --version           # maxplayer-mint <version> (<commit>)
+maxplayer mint install --name <name>   # downloads the mint for THIS maxplayer's version, checks
+                                       # SHA256SUMS and its version line, installs it into
+                                       # ~/.local/bin (--bin-dir to choose), then runs
+                                       # `maxplayer-mint init` (an existing <home>/mint/ is kept)
+maxplayer mint                         # what is installed, the mint URL, running?, linked?, updates
 ```
 
-Or download `maxplayer-mint-<version>-<platform>.tar.gz` from the GitHub Release, check it against
-that release's `SHA256SUMS`, and put the `maxplayer-mint` binary on your PATH. Keep it at the same
-version as your `maxplayer`.
+Then link the mint key to your Maxplayer account, with the email your account already uses. It
+emails a code; run the same command again with the code:
+
+```bash
+maxplayer account link --mint --email <your account email>
+maxplayer account link --mint --code <6 digits from the email>
+```
+
+### Upgrade
+
+The mint is version-locked to `maxplayer`. After updating `maxplayer` (the way you installed it:
+the install script, or `npm install -g maxplayer@latest`), upgrade the mint to match:
+
+```bash
+maxplayer mint upgrade                    # replaces an OLDER released maxplayer-mint; keeps <home>/mint/
+systemctl --user restart maxplayer-mint   # a running mint keeps the old version until restarted
+```
+
+`upgrade` downloads and checks the release exactly like `install`, and swaps the binary in one
+rename, so a running mint is never left with a half-written file. It does nothing when the mint is
+already at this version, and refuses a newer version, a source build or an unrecognised binary
+(`maxplayer mint install --force` replaces anything). It never touches `<home>/mint/` and never runs
+`init`. `maxplayer mint` and `maxplayer doctor` carry two separate notices. One says the installed
+mint is older than `maxplayer` and to run `maxplayer mint upgrade` (a local check). The other says a
+newer `maxplayer` is released and to update it the way you installed it; it shows with or without a
+mint and does not mention the mint (checked against GitHub's latest release, a few seconds at most;
+`--offline` skips it on both commands, and a failed check shows "could not check"). After you update
+`maxplayer`, the first notice is what tells you to upgrade the mint.
+
+### Uninstall
+
+```bash
+maxplayer mint uninstall   # removes the maxplayer-mint binary only
+```
+
+It refuses while `maxplayer-mint run` is serving the home (stop it first:
+`systemctl --user disable --now maxplayer-mint`). A symlink is
+removed, not the file it points to (the link's target is left as it was). It **never** deletes `<home>/mint/`: the key, seed and ecash
+database stay, and `maxplayer mint install` picks the mint up again. Deleting that folder destroys
+the mint and every credit it issued; back it up first if you really mean to delete it.
 
 ### Build from source
 
@@ -45,6 +88,9 @@ install -m 0755 crates/maxplayer-mint/target/release/maxplayer-mint ~/.local/bin
 ```
 
 ## 1. Create the mint
+
+`maxplayer mint install --name <name>` already did this step if `<home>/mint/` did not exist yet.
+To create the mint by hand (for example after building from source):
 
 ```bash
 maxplayer-mint init --name <name>
