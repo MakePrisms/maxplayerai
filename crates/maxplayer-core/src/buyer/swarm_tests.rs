@@ -499,7 +499,7 @@ async fn private_swarm_hides_tasks_and_tally_matches_the_store() {
     fx.stub.session_claims.store(true, Ordering::SeqCst);
     let e = fx.engine(true);
     let a = fx.queue(&e, "math-1", "Prove the secret lemma", false);
-    fx.queue(&e, "math-1", "second", false);
+    let b = fx.queue(&e, "math-1", "second", false);
     e.tick(&fx.stub).await.unwrap();
     let post = fx.stub.posts()[0].clone();
     assert_eq!(post["visibility"], "private");
@@ -541,14 +541,26 @@ async fn private_swarm_hides_tasks_and_tally_matches_the_store() {
         );
     }
     let job_id = fx.stub.job_ids()[0].clone();
+    // The seller raises its rate before turn 2: the turn is still priced like its session's job.
+    for (_, rate) in fx.stub.sellers.lock().unwrap().iter_mut() {
+        *rate = 25;
+    }
     fx.stub.deliver(&job_id);
     fx.at(T0 + 300);
     e.tick(&fx.stub).await.unwrap();
     assert_eq!(task(&e, a).state, "collected");
-    // Decision for review: a private swarm sends one-off tasks only, so no session is opened.
-    assert!(e.store.swarm_sessions("math-1").unwrap().is_empty());
-    assert!(fx.stub.replies.lock().unwrap().is_empty());
-    assert_eq!(fx.stub.posts().len(), 2);
+    assert_eq!(
+        task(&e, b).price_sats,
+        Some(10),
+        "turn 2 at the session's price"
+    );
+    // §7.6: a private swarm's second task to a session-capable seller is a `reply` turn on the
+    // private job (encrypted by `reply`), not a second public offer.
+    assert_eq!(e.store.swarm_sessions("math-1").unwrap().len(), 1);
+    let replies = fx.stub.replies.lock().unwrap().clone();
+    assert_eq!(replies.len(), 1, "second task goes out as a session turn");
+    assert_eq!((replies[0].0.as_str(), replies[0].2), (job_id.as_str(), 2));
+    assert_eq!(fx.stub.posts().len(), 1, "no second offer");
     let events = fx.stub.read(0).await.unwrap();
     let world = e.world(&events, T0 + 300).unwrap();
     let row = e.store.swarm_job("math-1").unwrap().unwrap();

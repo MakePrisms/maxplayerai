@@ -409,17 +409,6 @@ impl Engine {
             .map_err(es)
     }
 
-    fn public_swarm(&self, job: &str) -> Result<bool, String> {
-        let Some(j) = self.store.swarm_job(job).map_err(es)? else {
-            return Ok(false);
-        };
-        Ok(self
-            .store
-            .swarm_row(&j.swarm)
-            .map_err(es)?
-            .is_some_and(|s| s.tasks == "public"))
-    }
-
     async fn settle_one<I: SwarmIo + ?Sized>(
         &self,
         io: &I,
@@ -543,7 +532,7 @@ impl Engine {
                     .swarm_session(&t.job, seller)
                     .map_err(es)?
                     .is_some_and(|s| s.state != "dead");
-                if view.session && self.sessions && !live && self.public_swarm(&t.job)? {
+                if view.session && self.sessions && !live {
                     self.store
                         .put_swarm_session(&t.job, seller, job_id, 1, "open", now)
                         .map_err(es)?;
@@ -845,7 +834,7 @@ impl Engine {
                 };
                 let rate = seller_price(hb);
                 // A session turn is priced like the session's job (session-jobs §8.1).
-                let session_price = self.session_price(&j, swarm, &m.seller)?;
+                let session_price = self.session_price(&j, &m.seller)?;
                 let price_of = |t: &TaskRow| match session_price {
                     Some(p) if !t.fresh => p,
                     _ => rate,
@@ -918,13 +907,8 @@ impl Engine {
     }
 
     /// The price of `seller`'s live session in `job`, when its next task would be a turn.
-    fn session_price(
-        &self,
-        job: &SwarmJobRow,
-        swarm: &Swarm,
-        seller: &str,
-    ) -> Result<Option<u64>, String> {
-        if !self.sessions || swarm.tasks != "public" {
+    fn session_price(&self, job: &SwarmJobRow, seller: &str) -> Result<Option<u64>, String> {
+        if !self.sessions {
             return Ok(None);
         }
         let Some(s) = self.store.swarm_session(&job.d, seller).map_err(es)? else {
@@ -956,8 +940,9 @@ impl Engine {
         now: u64,
     ) -> Result<bool, String> {
         let deadline = now + task.duration_secs;
-        // Private swarms send one-off tasks only (decision for review, §7.6 last bullet).
-        let session = if self.sessions && swarm.tasks == "public" && !task.fresh {
+        // Private swarms use session turns too: `reply` encrypts a private job's follow-up like its
+        // offer (session-jobs §2.1), proven live on free and paid private jobs (§7.6 last bullet).
+        let session = if self.sessions && !task.fresh {
             self.store
                 .swarm_session(&job.d, seller)
                 .map_err(es)?
