@@ -228,6 +228,15 @@ pub fn exit_code(error: &anyhow::Error) -> u8 {
     }
 }
 
+/// Whether a serve answers on `home`'s socket (a connect succeeds; a stale socket file refuses).
+/// Nothing is sent.
+pub async fn answering(home: &Path) -> bool {
+    match socket_path(home) {
+        Ok(sp) => UnixStream::connect(&sp.path).await.is_ok(),
+        Err(_) => false,
+    }
+}
+
 /// Path used to bind/connect. Unix socket paths are limited to ~107 bytes; a longer home is
 /// reached through its open directory descriptor (`/proc/self/fd/N/serve.sock`, Linux).
 struct SocketPath {
@@ -288,7 +297,13 @@ pub fn bind_expecting(home: &Path, relays: Vec<String>, owner: u32) -> Result<mp
     tokio::spawn(async move {
         let _dir = sp;
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
+            // The session that bound this socket ended (its job receiver is gone): stop accepting,
+            // so a daemon that hosts serve again later leaves no listener behind.
+            let accepted = tokio::select! {
+                a = listener.accept() => a,
+                _ = tx.closed() => break,
+            };
+            let Ok((stream, _)) = accepted else {
                 continue;
             };
             let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -367,14 +382,15 @@ fn refusal(request: &Request, relays: &[String], mint_relays: &[String]) -> Opti
     let (market, mint) = request.command.relay_needs();
     if market && request.relays != relays {
         return Some(crate::redact_reason(&format!(
-            "serve uses relays {relays:?}; this command asked for {:?}. Use exactly serve's --relay list (same values, same order); nothing was queued or executed",
+            "serve uses relays {relays:?}; this command asked for {:?}. Use exactly serve's --relay list (same values, same order; a serve hosted by the buyer daemon or seller uses `[trade] relays` in config.toml, read when it starts); nothing was queued or executed",
             request.relays
         )));
     }
     if mint && !crate::transport::same_mint_relays(&request.mint_relays, mint_relays) {
         return Some(crate::redact_reason(&format!(
             "serve uses mint relays {mint_relays:?}; this command asked for {:?}. Use the same \
-             --mint-relay set as serve; nothing was queued or executed",
+             --mint-relay set as serve (a hosted serve: `[trade] mint_relays`); nothing was \
+             queued or executed",
             request.mint_relays
         )));
     }

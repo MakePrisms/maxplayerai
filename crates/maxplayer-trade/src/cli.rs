@@ -289,6 +289,14 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
     // Mint requests sign as this home's key: the default mint relay only admits registered keys.
     // A read-only command never creates a key (`discover` on an empty or legacy home).
     crate::transport::configure_mint_identity(home, is_read_only(&cli.command));
+    // Without flags, a maxplayer home's `[trade] relays` / `mint_relays` (what the buyer daemon or
+    // seller hosting serve uses, so hand-offs match), else the built-in defaults. Applied before
+    // every command that may reach a mint (status --check-sends, preflight included).
+    let (configured_relays, configured_mint_relays) = configured_relays(home);
+    if cli.mint_relay.is_empty() && !configured_mint_relays.is_empty() {
+        crate::transport::configure_mint_relays(&configured_mint_relays)
+            .context("[trade] mint_relays in config.toml")?;
+    }
     // Read-only observations remain available while serve owns the writer lock.
     if let Command::Balance { ref mint } = cli.command {
         let asset = Asset::from_cli(mint)?;
@@ -314,13 +322,15 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
     if let Command::Preflight { ref mint } = cli.command {
         return preflight(&Asset::from_cli(mint)?.mint_url).await;
     }
-    let relays: Vec<String> = if cli.relay.is_empty() {
+    let relays: Vec<String> = if !cli.relay.is_empty() {
+        cli.relay.clone()
+    } else if !configured_relays.is_empty() {
+        configured_relays
+    } else {
         crate::market::DEFAULT_RELAYS
             .iter()
             .map(|s| s.to_string())
             .collect()
-    } else {
-        cli.relay.clone()
     };
     // Lock-free, journal-free commands: they only read relays, mints and SQLite snapshots.
     match &cli.command {
@@ -424,6 +434,14 @@ async fn execute(cli: Cli, owner_lock: &mut Option<fs::File>) -> Result<()> {
         // Another process owns the home: a serve (possibly still binding its socket) gets the
         // request; a short-lived writer such as recover is waited out. Never two writers.
         let Some(request) = &handoff else {
+            // One serve per home: a buyer daemon or seller hosting serve here (or another
+            // standalone serve) holds owner.lock and answers on the socket. Say so; start nothing.
+            if crate::serve::answering(home).await {
+                if matches!(cli.command, Command::Serve) {
+                    anyhow::bail!("{}", already_served(home));
+                }
+                anyhow::bail!("{}", held_by_serve(home));
+            }
             return Err(busy).context("home is already in use");
         };
         let end = tokio::time::Instant::now() + crate::serve::CONNECT_WAIT;
@@ -635,6 +653,53 @@ fn bootstrap_home(home: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `[trade] relays` and `mint_relays` of a maxplayer home, read-only (both empty when unset, when
+/// the config cannot be read, or for any other directory).
+fn configured_relays(home: &Path) -> (Vec<String>, Vec<String>) {
+    if !crate::wallet::is_maxplayer_home(home) {
+        return (vec![], vec![]);
+    }
+    match maxplayer_core::home::resolve_config_read_only(home) {
+        Ok(config) => (config.trade.relays, config.trade.mint_relays),
+        Err(e) => {
+            eprintln!(
+                "warning: {} could not be read ({e}); [trade] relays/mint_relays ignored, using \
+                 the built-in relays",
+                home.join("config.toml").display()
+            );
+            (vec![], vec![])
+        }
+    }
+}
+
+/// The refusal of a standalone `serve` on a home whose serve already runs (exit 1).
+pub fn already_served(home: &Path) -> String {
+    let state = crate::wallet::state_dir(home);
+    format!(
+        "home is already in use: trade serve is already running on {h}: a buyer daemon, a seller or another `maxplayer \
+         trade serve` holds {lock} and answers on {sock}, and list/take/cancel hand off to it. \
+         Nothing was started. To run serve on its own instead, set `[trade] serve = false` in \
+         {config} and restart that daemon (a hosted serve uses `[trade] relays` / `mint_relays` \
+         from that file; set them to keep serving on other relays)",
+        h = home.display(),
+        lock = state.join("owner.lock").display(),
+        sock = state.join(crate::serve::SOCKET).display(),
+        config = home.join("config.toml").display(),
+    )
+}
+
+/// The refusal of a command that needs the home lock (`recover`, `send`) while a serve owns it.
+pub fn held_by_serve(home: &Path) -> String {
+    format!(
+        "home is already in use: trade serve is running on {h} (a buyer daemon, a seller or \
+         `maxplayer trade serve`) and owns it; nothing was done. serve recovers continuously, so \
+         `recover` is not needed while it runs. For `send`, stop that process, or set `[trade] \
+         serve = false` in {config} and restart the daemon",
+        h = home.display(),
+        config = home.join("config.toml").display(),
+    )
 }
 
 fn forwarded(code: u8) -> Result<()> {

@@ -44,6 +44,9 @@ mod sandbox_reap;
 // find the documentation.
 mod skill;
 mod swarm_cli;
+// Trade's serve hosted in the buyer daemon and the seller (`[trade] serve`).
+#[cfg(feature = "wallet")]
+mod trade_host;
 #[cfg(feature = "stub-pay")]
 mod stub_pay_cli;
 mod wallet_cli;

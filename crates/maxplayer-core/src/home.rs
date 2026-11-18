@@ -47,6 +47,9 @@
 //! | `buyer.blocked_sellers` | `MAXPLAYER_BUYER__BLOCKED_SELLERS` (comma-separated) |
 //! | `buyer.hop_fee_buffer_multiplier` | `MAXPLAYER_BUYER__HOP_FEE_BUFFER_MULTIPLIER` |
 //! | `contribution.allowed_paths` (list) | `MAXPLAYER_CONTRIBUTION__ALLOWED_PATHS=…` |
+//! | `trade.serve` | `MAXPLAYER_TRADE__SERVE` |
+//! | `trade.relays` (list) | `MAXPLAYER_TRADE__RELAYS=wss://a,wss://b` |
+//! | `trade.mint_relays` (list) | `MAXPLAYER_TRADE__MINT_RELAYS=wss://a` |
 //!
 //! List fields comma-split only for the paths in [`LIST_ENV_KEYS`]. The `agents` map is file-only
 //! via env: its keys are dynamic, so a nested `argv` list path cannot be pre-registered for
@@ -1914,6 +1917,45 @@ pub struct MaxplayerConfig {
     /// `[sessions]` multi-turn jobs. Defaults (OFF) when absent; never written while default.
     #[serde(default, skip_serializing_if = "SessionsConfig::is_default")]
     pub sessions: SessionsConfig,
+    /// `[trade]` token trading hosted by the daemons. Defaults (serve ON, default relays) when
+    /// absent; never written while default.
+    #[serde(default, skip_serializing_if = "TradeConfig::is_default")]
+    pub trade: TradeConfig,
+}
+
+/// `[trade]` — token trading (`maxplayer trade`) on this home.
+///
+/// `serve`: the buyer daemon (`maxplayer buyer`) and the seller (`maxplayer seller`) host trade's
+/// `serve` for this home, so nobody runs `maxplayer trade serve` by hand. Only a home that already
+/// trades is served (it has a trade journal, `<home>/trade/trade.sqlite`); a home that never traded
+/// gets nothing created. Default **true**; `false` leaves serving to a standalone
+/// `maxplayer trade serve`.
+///
+/// `relays` / `mint_relays`: the market relays and the `nostr://` mint relays trading uses on this
+/// home, both by the hosted serve and as the `maxplayer trade` defaults (so commands hand off to
+/// it). Empty ⇒ trade's built-in defaults. Checked by trade, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TradeConfig {
+    pub serve: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub relays: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mint_relays: Vec<String>,
+}
+impl Default for TradeConfig {
+    fn default() -> Self {
+        Self {
+            serve: true,
+            relays: Vec::new(),
+            mint_relays: Vec::new(),
+        }
+    }
+}
+impl TradeConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// `[seat]` — the operator-declared half of the seat's advertisement (#784).
@@ -2071,6 +2113,7 @@ impl Default for MaxplayerConfig {
             sandbox: None,
             seat: SeatConfig::default(),
             sessions: SessionsConfig::default(),
+            trade: TradeConfig::default(),
         }
     }
 }
@@ -2400,6 +2443,8 @@ const LIST_ENV_KEYS: &[&str] = &[
     "telemetry.command",
     "contribution.allowed_paths",
     "contribution.forbidden_paths",
+    "trade.relays",
+    "trade.mint_relays",
 ];
 
 /// The process environment's config-layer variables: every `MAXPLAYER_`-prefixed var that is not a
@@ -4106,6 +4151,31 @@ mod tests {
                 .blocked_sellers
                 .is_empty()
         );
+    }
+
+    /// `[trade]` defaults (serve on, no relays), is never written while default, and every key is
+    /// reachable through the environment (`MAXPLAYER_TRADE__SERVE=false` is the documented off
+    /// switch).
+    #[test]
+    fn trade_table_defaults_and_env_overrides() {
+        let config = MaxplayerConfig::default();
+        assert!(config.trade.serve);
+        assert!(config.trade.relays.is_empty() && config.trade.mint_relays.is_empty());
+        assert!(!toml::to_string(&config).unwrap().contains("[trade]"));
+        let config = apply_env_layer(
+            &MaxplayerConfig::default(),
+            env(&[
+                ("MAXPLAYER_TRADE__SERVE", "false"),
+                ("MAXPLAYER_TRADE__RELAYS", "wss://a.example,wss://b.example"),
+                ("MAXPLAYER_TRADE__MINT_RELAYS", "wss://m.example"),
+            ]),
+        )
+        .expect("trade env");
+        assert!(!config.trade.serve);
+        assert_eq!(config.trade.relays, vec!["wss://a.example", "wss://b.example"]);
+        assert_eq!(config.trade.mint_relays, vec!["wss://m.example"]);
+        assert!(!parse_config_toml("[trade]\nserve = false\n").unwrap().trade.serve);
+        assert!(parse_config_toml("[trade]\nbogus = 1\n").is_err());
     }
 
     #[test]

@@ -272,6 +272,7 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
     // award-is-payment a buyer commits the sats at award. The probe is local compute only (no
     // sats/mint); the gate + roster narrowing live in maxplayer-core so the kind-30340 heartbeat is
     // honest for free.
+    let trade_home = home.clone();
     let runner = runtime
         .block_on(async {
             let verdicts = maxplayer_core::seller_node::run::probe_configured_harnesses(&home).await?;
@@ -321,7 +322,15 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             {
                 runner.enable_drain_command();
             }
-            runner.run().await
+            // Trade's serve for this home, now that this seller holds its home lock (a second seller
+            // refused at the lock never gets here). Stopped safely after the node leaves: the step
+            // in progress finishes or is cancelled at its next wait with its journal intact.
+            let trade = crate::trade_host::start(&trade_home, "seller");
+            let result = runner.run().await;
+            if let Some(trade) = trade {
+                trade.shutdown("seller exiting").await;
+            }
+            result
         })
         .map_err(|error| {
             let _ = writeln!(err, "{error}");
@@ -817,6 +826,31 @@ fn sell_usage(w: &mut dyn Write) {
 
 #[cfg(test)]
 mod tests {
+    /// The seller hosts trade serve (`[trade] serve`) only after its home lock is held and the node
+    /// has booted (a second seller refused at the lock never reaches it), and stops it through trade's
+    /// safe stop after the node leaves. A seller cannot boot hermetically (doctor gate, harness probe),
+    /// so the wiring is pinned on the source; the behaviour is tested in maxplayer-trade
+    /// `tests/hosted_serve.rs` and through the buyer daemon in `tests/trade_hosted.rs`.
+    #[test]
+    fn the_seller_hosts_trade_serve_after_boot_and_stops_it_safely() {
+        let src = include_str!("sell.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        let boot = body
+            .find("boot_advertising_only_proven(home, verdicts)")
+            .unwrap();
+        let start = body
+            .find("crate::trade_host::start(&trade_home, \"seller\")")
+            .expect("seller hosts trade serve");
+        let run = body.find("let result = runner.run().await;").unwrap();
+        let stop = body
+            .find("trade.shutdown(\"seller exiting\").await")
+            .expect("safe stop after the node");
+        assert!(
+            boot < start && start < run && run < stop,
+            "order: boot (lock held), host, run, safe stop"
+        );
+    }
+
     use super::*;
 
     // #595 (mints-are-mints): the seller `--help` names the shipped default mint but must not fork

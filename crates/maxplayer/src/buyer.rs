@@ -108,11 +108,72 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     );
     let _ = out.flush();
 
-    match runtime.block_on(maxplayer_core::buyer::run(home)) {
-        Ok(()) => SUCCESS,
+    let result = runtime.block_on(run_hosting_trade(home));
+    // The daemon only returns on an error or after trade's safe stop; whatever is still parked on
+    // the runtime (relay sessions, blocking store calls) must not hold the exit.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    match result {
+        Ok(None) => SUCCESS,
+        Ok(Some(code)) => code,
         Err(error) => {
             let _ = writeln!(err, "maxplayer buyer: {error}");
             RUNTIME_ERROR
+        }
+    }
+}
+
+/// The buyer daemon plus trade's serve for this home ([`crate::trade_host`]), started once the
+/// daemon holds its home lock (a second daemon that fails at the lock never hosts it).
+///
+/// While a serve session runs, TERM/INT stop the daemon through trade's safe stop: nothing new is
+/// admitted, the step in progress finishes (or is cancelled at its next wait after the grace, its
+/// journal intact), the session's final line is printed, and the daemon exits
+/// `maxplayer_trade::shutdown::EXIT_STOPPED` (5). A daemon that never started a session keeps the
+/// default disposition (killed by the signal, as before).
+#[cfg(feature = "wallet")]
+async fn run_hosting_trade(
+    home: maxplayer_core::home::MaxplayerHome,
+) -> Result<Option<i32>, maxplayer_core::buyer::BuyerError> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let for_trade = home.clone();
+    let daemon = maxplayer_core::buyer::run_with_ready(home, move || {
+        if let Some(hosted) = crate::trade_host::start(&for_trade, "buyer daemon") {
+            let _ = tx.send(hosted);
+        }
+    });
+    tokio::pin!(daemon);
+    let mut rx = rx;
+    let hosted = tokio::select! {
+        result = &mut daemon => {
+            // The daemon may fail in the same poll that started the host (review of #1334, M1):
+            // never leave it running unattended.
+            if let Ok(hosted) = rx.try_recv() {
+                hosted.shutdown("buyer daemon exiting").await;
+            }
+            return result.map(|()| None);
+        }
+        hosted = &mut rx => hosted.ok(),
+    };
+    let Some(hosted) = hosted else {
+        return daemon.await.map(|()| None);
+    };
+    tokio::select! {
+        result = &mut daemon => {
+            hosted.shutdown("buyer daemon exiting").await;
+            result.map(|()| None)
+        }
+        () = hosted.stop_requested() => {
+            // Keep answering clients while trade stops safely (review of #1334, L2).
+            let stop = hosted.shutdown("buyer daemon exiting");
+            tokio::pin!(stop);
+            tokio::select! {
+                () = &mut stop => {}
+                result = &mut daemon => {
+                    stop.await;
+                    result?;
+                }
+            }
+            Ok(Some(i32::from(maxplayer_trade::shutdown::EXIT_STOPPED)))
         }
     }
 }
