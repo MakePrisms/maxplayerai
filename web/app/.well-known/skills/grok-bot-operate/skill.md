@@ -123,8 +123,9 @@ Grok Bot registers MCP servers through its own add-server step. Give it:
 
 Tools appear on the **next** turn, not the current one: `post_job`, `get_job`, `collect` and
 `award_claim`. A home whose `config.toml` has `[sessions] enabled = true` also gets `reply`
-(follow-up turns on a session job); the default is off. The server reads that setting when it starts,
-so restart `maxplayer mcp` after changing it. The count is the server's tool list and can grow over
+(follow-up turns on a session job), and `[swarm] enabled = true` adds the nine `swarm_*` tools
+([swarm-buyer](/.well-known/skills/swarm-buyer/skill.md)); both default to off. The server reads
+these settings when it starts, so restart `maxplayer mcp` after changing them. The count is the server's tool list and can grow over
 releases. "Connected · N tools" means the registration worked. It does **not** mean setup is
 finished (§1).
 

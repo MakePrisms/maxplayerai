@@ -38,7 +38,8 @@ with plain `wallet`.
 ## Buyer track
 
 The MCP implementation in [`crates/maxplayer/src/mcp.rs`](crates/maxplayer/src/mcp.rs) is authoritative.
-It exposes exactly the four-tool buyer trade loop:
+With the default config it exposes exactly the four-tool buyer trade loop below; two opt-in config
+flags add tools (session jobs and swarms, after the list):
 
 1. `post_job` — publish an offer. The buyer daemon auto-awards a payable claim under the hood.
 2. `get_job` — read claims and results.
@@ -63,6 +64,16 @@ and `collect` gains `turn`. (`collect close_session` is a deprecated daemon alia
 the follow-up id, settled by the delivery watcher like turn 1 (or `collect turn=<n>`), and
 materialized into `results/<job_id>-t<n>`. With the flag off the surface above
 is unchanged.
+
+Swarms ([`docs/specs/swarm.md`](docs/specs/swarm.md) §7–§8, behind `[swarm] enabled`, default
+**off**): with the flag on, the buyer daemon runs the swarm engine and the MCP adds nine tools —
+`swarm_create`, `swarm_list`, `swarm_members`, `swarm_decide`, `swarm_job_create`,
+`swarm_job_status`, `swarm_job_tasks`, `swarm_job_steer`, `swarm_job_close` — each routed to the
+daemon RPC of the same name (`crates/maxplayer-core/src/buyer/swarm.rs`). The engine posts each
+queued task through the same `post_job` (or, with `[sessions]` on too, `reply`) path, so awards and
+payment stay on the trade loop above. With the flag off no engine task starts, the tool list is
+unchanged and a `swarm_*` call is an unknown tool. Buyer guide:
+[`web/app/.well-known/skills/swarm-buyer/skill.md`](web/app/.well-known/skills/swarm-buyer/skill.md).
 
 `MAXPLAYER_HOME` is the state directory for a buyer or seller. It contains configuration, the packaged
 key, wallet and budget state, and results; the default is `~/.maxplayer`. The MCP command has no

@@ -62,6 +62,14 @@ pub const DEBUG_BUYING_SKILL_PATH: &str = skill_path!("debug-buying");
 /// MCP `collect` description LEADS with it, and every MCP tool error result points at it (`mcp.rs`).
 pub const DEBUG_BUYING_SKILL_URL: &str = concat!(site_base!(), skill_path!("debug-buying"));
 
+/// Site path of the swarm buyer skill (`maxplayer-swarm-buyer`).
+pub const SWARM_BUYER_SKILL_PATH: &str = skill_path!("swarm-buyer");
+
+/// The swarm buyer skill: `[swarm] enabled`, swarms, members, swarm jobs, tasks, minutes, budget.
+/// The MCP `swarm_create` and `swarm_job_create` descriptions LEAD with it (`mcp.rs`), listed only
+/// with `[swarm] enabled`.
+pub const SWARM_BUYER_SKILL_URL: &str = concat!(site_base!(), skill_path!("swarm-buyer"));
+
 /// The one-line pointer shared by `maxplayer --help`, `maxplayer doctor` and the seller first-run
 /// path. One function, not three strings, so the pointer cannot be present on one surface and
 /// stale on another.
@@ -175,6 +183,14 @@ mod tests {
             DEBUG_BUYING_SKILL_URL,
             "https://www.maxplayer.ai/.well-known/skills/debug-buying/skill.md"
         );
+        assert_eq!(
+            SWARM_BUYER_SKILL_URL,
+            format!("{SITE_BASE}{SWARM_BUYER_SKILL_PATH}")
+        );
+        assert_eq!(
+            SWARM_BUYER_SKILL_URL,
+            "https://www.maxplayer.ai/.well-known/skills/swarm-buyer/skill.md"
+        );
         assert_eq!(SKILL_URL, format!("{SITE_BASE}/skill.md"));
         assert_eq!(
             SKILL_INDEX_URL,
@@ -199,7 +215,11 @@ mod tests {
             .filter_map(|skill| skill["path"].as_str())
             .collect();
         let web_app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/app");
-        for path in [BUYER_OPERATE_SKILL_PATH, DEBUG_BUYING_SKILL_PATH] {
+        for path in [
+            BUYER_OPERATE_SKILL_PATH,
+            DEBUG_BUYING_SKILL_PATH,
+            SWARM_BUYER_SKILL_PATH,
+        ] {
             assert!(
                 listed.contains(&path),
                 "{path} is not listed in web/app/.well-known/skills/index.json: {listed:?}"

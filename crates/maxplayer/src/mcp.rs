@@ -226,6 +226,14 @@ fn collect_guide_lead() -> String {
     )
 }
 
+/// The sentence `swarm_create` and `swarm_job_create` LEAD with: the swarm buyer skill.
+fn swarm_guide_lead() -> String {
+    format!(
+        "Before your first swarm, read {}.",
+        crate::skill::SWARM_BUYER_SKILL_URL
+    )
+}
+
 /// The docs pointer in the handshake, built from the shared URL constants (`crate::skill`) so
 /// this route and the CLI routes (`--help`, `doctor`, seller first-run, `maxplayer skill`) cannot
 /// drift apart. It keeps the orientation page (every companion skill hangs off it) and also names
@@ -568,11 +576,14 @@ fn with_swarm_tools(mut list: Value, swarm: bool) -> Value {
         "additionalProperties": false
     });
     let address = "A swarm address: the naddr1… swarm_create/swarm_list print, <your npub|hex>/<slug>, or just the slug.";
+    // The guide pointer LEADS the two swarm tools an agent calls first (create a swarm) and the one
+    // that commits a budget (create a swarm job), as post_job leads with buyer-operate.
+    let guide = swarm_guide_lead();
     let job_address = "A swarm job address: the naddr1… swarm_job_create prints, <your npub|hex>/<slug>, or just the slug.";
     let tools = list.as_array_mut().expect("tools array");
     tools.extend([
         json!({"name": "swarm_create",
-            "description": "Create a SWARM (kind 30344 on the configured relay): a named group of sellers you keep for many swarm jobs. Sellers discover it and join with `maxplayer swarm join`; you then accept them with swarm_decide. Create a swarm before any swarm job. tasks=private sends every task as a private (encrypted, targeted) job: no task text or swarm link is public, and the public view shows only names, members and a tally. Returns the swarm's naddr.",
+            "description": led_by(guide.clone(), "Create a SWARM (kind 30344 on the configured relay): a named group of sellers you keep for many swarm jobs. Sellers discover it and join with `maxplayer swarm join`; you then accept them with swarm_decide. Create a swarm before any swarm job. tasks=private sends every task as a private (encrypted, targeted) job: no task text or swarm link is public, and the public view shows only names, members and a tally. Returns the swarm's naddr."),
             "inputSchema": {"type": "object", "properties": {
                 "name": {"type": "string"}, "purpose": {"type": "string", "description": "Markdown description sellers read before joining."},
                 "slug": {"type": "string", "description": "Optional d tag (1-64 of a-z, 0-9, -); default from the name."},
@@ -587,7 +598,7 @@ fn with_swarm_tools(mut list: Value, swarm: bool) -> Value {
                 "seller": {"type": "string", "description": "npub or hex"}, "accept": {"type": "boolean", "description": "true accepts, false denies"},
                 "swarm": {"type": "string", "description": address}},
                 "required": ["seller", "accept"], "additionalProperties": false}}),
-        json!({"name": "swarm_job_create", "description": "Publish a SWARM JOB (kind 30341) in one of your open swarms: a goal with a window (default now → +24 h) and a budget in sats the daemon never exceeds. Optional tasks are queued at once (fan-out). No planner is configured in this build (check-in mode): the daemon dispatches only tasks you queue, each to a free, accepted member with enough minutes left today, at that member's rate, as a real priced job (or a session turn with that member); results wait for your next swarm_job_status. Write self-contained tasks of at least 5 minutes, and verify an answer (a fresh task to a different member) before closing as solved. Requires the swarm engine ([swarm] enabled) on this buyer.",
+        json!({"name": "swarm_job_create", "description": led_by(guide, "Publish a SWARM JOB (kind 30341) in one of your open swarms: a goal with a window (default now → +24 h) and a budget in sats the daemon never exceeds. Optional tasks are queued at once (fan-out). No planner is configured in this build (check-in mode): the daemon dispatches only tasks you queue, each to a free, accepted member with enough minutes left today, at that member's rate, as a real priced job (or a session turn with that member); results wait for your next swarm_job_status. Write self-contained tasks of at least 5 minutes, and verify an answer (a fresh task to a different member) before closing as solved. Requires the swarm engine ([swarm] enabled) on this buyer."),
             "inputSchema": {"type": "object", "properties": {
                 "swarm": {"type": "string", "description": address}, "goal": {"type": "string"},
                 "budget_sats": {"type": "integer", "minimum": 0}, "title": {"type": "string"},
@@ -1530,6 +1541,45 @@ mod tests {
         );
         assert_eq!(names(listed["result"]["tools"].clone())[4..], *SWARM_TOOLS);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The swarm-buyer guide LEADS the first swarm tool an agent calls and the one that commits a
+    /// budget, once each and inside the first 200 characters (clients truncate); the other seven
+    /// swarm tools stay clean, as get_job and award_claim do.
+    #[test]
+    fn swarm_create_and_swarm_job_create_lead_with_the_swarm_buyer_guide() {
+        let listed = with_swarm_tools(tools(), true);
+        let description = |name: &str| -> String {
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap_or_else(|| panic!("{name} listed"))["description"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let url = crate::skill::SWARM_BUYER_SKILL_URL;
+        let lead = format!("Before your first swarm, read {url}. ");
+        for (carrier, rest) in [
+            ("swarm_create", "Create a SWARM (kind 30344"),
+            ("swarm_job_create", "Publish a SWARM JOB (kind 30341)"),
+        ] {
+            let text = description(carrier);
+            assert!(text.starts_with(&lead), "{carrier}:\n{text}");
+            assert!(text[lead.len()..].starts_with(rest), "{carrier}:\n{text}");
+            assert_eq!(text.matches(url).count(), 1, "{carrier}:\n{text}");
+            let shown: String = text.chars().take(200).collect();
+            assert!(shown.contains(url), "{carrier}: {shown}");
+        }
+        for quiet in &SWARM_TOOLS[..] {
+            if matches!(*quiet, "swarm_create" | "swarm_job_create") {
+                continue;
+            }
+            let text = description(quiet);
+            assert!(!text.contains("maxplayer.ai"), "{quiet}:\n{text}");
+        }
     }
     // END swarm tests
 
