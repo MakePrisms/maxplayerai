@@ -19,8 +19,10 @@
 //! 4. `maxplayer mint upgrade` runs the same download/verify/commit pipeline, at THIS binary's
 //!    version, over an installed `maxplayer-mint` — but only one that reports an OLDER release line.
 //!    It never touches `<home>/mint/` and never runs `init`. The mint is version-locked to
-//!    `maxplayer`, so "a newer mint" means an older installed mint (upgrade) or a newer `maxplayer`
-//!    release (update maxplayer, then upgrade); `maxplayer mint` and `maxplayer doctor` say which.
+//!    `maxplayer`, so `maxplayer mint` and `maxplayer doctor` carry two separate notices: (a) the
+//!    installed mint is older than this maxplayer (local; the only one that says `maxplayer mint
+//!    upgrade`), and (b) a newer `maxplayer` is released (general, mint or no mint, and it never
+//!    mentions the mint: once maxplayer is updated, (a) is what points at the mint).
 //! 5. `maxplayer mint uninstall` removes only the binary (a symlink, not its target), refuses while
 //!    `maxplayer-mint run` serves the home, and never deletes `<home>/mint/`.
 //!
@@ -64,10 +66,10 @@ fn write_usage(out: &mut dyn Write) {
          `maxplayer mint` shows this home's credit mint: whether `{MINT_BIN}` is installed and its\n\
          version, the mint key (npub and nostr:// URL), whether `{MINT_BIN} run` is serving it, and\n\
          whether the mint key is linked to an account (asks the registration service; --offline\n\
-         skips that). It also says when a newer mint is available: the installed {MINT_BIN} is older\n\
-         than this maxplayer (run `maxplayer mint upgrade`), or a newer maxplayer release is out\n\
-         (asks GitHub's latest release, a few seconds at most; --offline skips it; a failed check is\n\
-         shown, never an error). It only reads: it creates no home, key or file.\n\
+         skips that). Two separate notices: `upgrade:` when the installed {MINT_BIN} is older than\n\
+         this maxplayer (run `maxplayer mint upgrade`), and `update:` when a newer maxplayer is\n\
+         released (asks GitHub's latest release, a few seconds at most; --offline skips it; a failed\n\
+         check is shown, never an error). It only reads: it creates no home, key or file.\n\
          \n\
          `maxplayer mint install` downloads the released `{MINT_BIN}` for this platform at THIS\n\
          maxplayer's version ({version}), checks it against the release's SHA256SUMS and the version\n\
@@ -201,7 +203,9 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 
 #[cfg(feature = "wallet")]
-pub(crate) use wallet::{Latest, Relation, VersionNotice, version_notice};
+pub(crate) use wallet::{
+    Latest, Relation, VersionNotice, latest_release, maxplayer_update_notice, version_notice,
+};
 
 #[cfg(feature = "wallet")]
 mod wallet {
@@ -984,83 +988,76 @@ mod wallet {
         Ok(version.to_owned())
     }
 
+    /// The two ways `maxplayer` is installed, as update commands (both resolve GitHub's latest
+    /// release).
+    const INSTALL_SH_UPDATE: &str = "curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh";
+    const NPM_UPDATE: &str = "npm install -g maxplayer@latest";
+
     /// How to update `maxplayer` itself: npm when this binary runs from an npm install, else the
-    /// install script (both resolve GitHub's latest release).
+    /// install script.
     fn maxplayer_update_hint() -> &'static str {
         let npm = std::env::current_exe().is_ok_and(|exe| {
             exe.components()
                 .any(|c| c.as_os_str() == std::ffi::OsStr::new("node_modules"))
         });
-        if npm {
-            "npm install -g maxplayer@latest"
-        } else {
-            "curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/install.sh | sh"
-        }
+        if npm { NPM_UPDATE } else { INSTALL_SH_UPDATE }
     }
 
-    /// The "a newer mint is available" lines, empty when none applies. The mint is version-locked
-    /// to maxplayer, so there are exactly two cases: (a) the installed mint is an OLDER release than
-    /// this maxplayer — `maxplayer mint upgrade`; (b) a newer maxplayer is released — update
-    /// maxplayer the way it was installed, then upgrade the mint. `relation` is `None` when no
-    /// mint binary is installed; `bin_dir` is where the installed one was found.
-    pub(super) fn update_lines(
+    /// (b) A newer `maxplayer` is released: a general notice about maxplayer itself. It is the
+    /// same line whether or not a mint is installed, and it never mentions the mint — the mint's
+    /// own notice ([`mint_notice`]) says `maxplayer mint upgrade` once maxplayer is updated.
+    pub(crate) fn maxplayer_update_notice(latest: &Latest) -> Option<String> {
+        latest.newer().map(|newer| {
+            format!(
+                "maxplayer {newer} is available (you have {VERSION}); update it the way you \
+                 installed it: `{INSTALL_SH_UPDATE}` (install.sh) or `{NPM_UPDATE}` (npm)"
+            )
+        })
+    }
+
+    /// (a) The installed mint against this maxplayer: local, no network, `None` when nothing
+    /// applies. The mint is version-locked to maxplayer, so an OLDER release is what `maxplayer
+    /// mint upgrade` fixes — this is the only notice that says so (after maxplayer itself is
+    /// updated, this is what then points at the mint). A NEWER one means maxplayer is behind it.
+    /// `relation` is `None` when no mint binary is installed; `bin_dir` is where it was found.
+    pub(super) fn mint_notice(
         relation: Option<&Relation>,
         bin_dir: Option<&Path>,
-        latest: &Latest,
         flags: &str,
-    ) -> Vec<String> {
+    ) -> Option<String> {
         let bin = bin_dir
             .map(|dir| format!(" --bin-dir {}", shell_quote(dir)))
             .unwrap_or_default();
-        let mut lines = Vec::new();
-        if let Some(Relation::Newer(newer)) = relation {
-            lines.push(format!(
+        match relation? {
+            Relation::Older(old) => Some(format!(
+                "{MINT_BIN} {old} is older than this maxplayer ({VERSION}): run `maxplayer mint \
+                 upgrade{bin}{flags}`"
+            )),
+            Relation::Newer(newer) => Some(format!(
                 "{MINT_BIN} {newer} is newer than this maxplayer ({VERSION}): update maxplayer the \
                  way you installed it (e.g. `{}`); the mint is version-locked to it",
                 maxplayer_update_hint()
-            ));
+            )),
+            _ => None,
         }
-        if let Some(Relation::Older(old)) = relation {
-            lines.push(format!(
-                "{MINT_BIN} {old} is older than this maxplayer ({VERSION}): run `maxplayer mint \
-                 upgrade{bin}{flags}`"
-            ));
-        }
-        if let Some(newer) = latest.newer() {
-            let then = match relation {
-                None => format!("maxplayer mint install{flags}"),
-                Some(Relation::Same | Relation::Older(_) | Relation::Newer(_)) => {
-                    format!("maxplayer mint upgrade{bin}{flags}")
-                }
-                Some(_) => format!("maxplayer mint install --force{bin}{flags}"),
-            };
-            lines.push(format!(
-                "maxplayer {newer} is released (this is {VERSION}): update maxplayer the way you \
-                 installed it (e.g. `{}`), then run `{then}`",
-                maxplayer_update_hint()
-            ));
-        }
-        lines
     }
 
-    /// The installed mint as `maxplayer doctor` reports it.
+    /// The installed mint as `maxplayer doctor` reports it (local only: no network).
     pub(crate) struct VersionNotice {
         pub(crate) path: PathBuf,
         pub(crate) line: Option<String>,
         pub(crate) relation: Relation,
-        pub(crate) latest: Latest,
     }
 
     impl VersionNotice {
-        pub(crate) fn updates(&self) -> Vec<String> {
-            update_lines(Some(&self.relation), self.path.parent(), &self.latest, "")
+        pub(crate) fn notice(&self) -> Option<String> {
+            mint_notice(Some(&self.relation), self.path.parent(), "")
         }
     }
 
     /// For `maxplayer doctor`: the `maxplayer-mint` `maxplayer mint` would find (PATH, then
-    /// ~/.local/bin), what it is, and the latest release; `None` (and no network) when none is
-    /// installed.
-    pub(crate) fn version_notice(offline: bool) -> Option<VersionNotice> {
+    /// ~/.local/bin) and what it is; `None` when none is installed. Never asks the network.
+    pub(crate) fn version_notice() -> Option<VersionNotice> {
         let path = locate_binary(&Opts::default())?;
         let line = probe_version(&path).ok();
         let relation = line
@@ -1070,7 +1067,6 @@ mod wallet {
             path,
             line,
             relation,
-            latest: latest_release(offline),
         })
     }
 
@@ -1143,14 +1139,16 @@ mod wallet {
                 .as_deref()
                 .map_or(Relation::Unknown, |line| classify(line, VERSION))
         });
-        // One request at most, bounded, and only now: no background check and no cache file.
-        let latest = latest_release(opts.offline);
-        let updates = update_lines(
+        // (a) local: the installed mint against this maxplayer.
+        let mint_update = mint_notice(
             relation.as_ref(),
             binary.as_deref().and_then(Path::parent),
-            &latest,
             &flags,
         );
+        // (b) a newer maxplayer, mint or no mint. One request at most, bounded, and only now: no
+        // background check and no cache file.
+        let latest = latest_release(opts.offline);
+        let maxplayer_update = maxplayer_update_notice(&latest);
 
         let mint_dir = root.join("mint");
         let mint_exists = fs::symlink_metadata(&mint_dir).is_ok();
@@ -1210,23 +1208,27 @@ mod wallet {
                 },
                 "linked": linked,
                 "link_error": link_error,
-                "update": {
-                    // (a) the installed mint is an older release than this maxplayer.
+                // (a) the installed mint against this maxplayer (local, no network).
+                "mint_update": {
                     "relation": relation.as_ref().map(Relation::label),
-                    "mint_upgrade_available": matches!(relation, Some(Relation::Older(_))),
-                    // (b) a newer maxplayer is released (GitHub releases/latest).
-                    "latest_maxplayer": match &latest {
+                    "upgrade_available": matches!(relation, Some(Relation::Older(_))),
+                    "notice": mint_update,
+                },
+                // (b) a newer maxplayer is released (GitHub releases/latest), mint or no mint.
+                "maxplayer_update": {
+                    "current": VERSION,
+                    "latest": match &latest {
                         Latest::Found(v) => Some(v.as_str()),
                         _ => None,
                     },
-                    "maxplayer_update_available": latest.newer().is_some(),
-                    "latest_checked": matches!(latest, Latest::Found(_)),
-                    "latest_error": match &latest {
+                    "available": latest.newer().is_some(),
+                    "checked": matches!(latest, Latest::Found(_)),
+                    "error": match &latest {
                         Latest::Found(_) => None,
                         Latest::NotChecked(why) => Some(format!("not checked ({why})")),
                         Latest::Failed(why) => Some(format!("could not check ({why})")),
                     },
-                    "notices": updates,
+                    "notice": maxplayer_update,
                 },
             });
             let _ = writeln!(out, "{value}");
@@ -1309,8 +1311,11 @@ mod wallet {
             (None, e, _) => format!("unknown ({})", e.as_deref().unwrap_or("")),
         };
         let _ = writeln!(out, "linked:    {linked_line}");
+        if let Some(line) = &mint_update {
+            let _ = writeln!(out, "upgrade:   {line}");
+        }
         let _ = writeln!(out, "latest:    {}", latest.describe());
-        for line in &updates {
+        if let Some(line) = &maxplayer_update {
             let _ = writeln!(out, "update:    {line}");
         }
         SUCCESS
@@ -2869,54 +2874,52 @@ mod tests {
     }
 
     #[test]
-    fn the_notice_covers_an_older_mint_and_a_newer_maxplayer() {
+    fn the_mint_notice_and_the_maxplayer_notice_are_separate() {
         let this = wallet::VERSION;
         let dir = Path::new("/opt/my bin");
-        let none = Latest::Failed("offline".into());
-        // (a) older installed mint.
-        let lines = update_lines(Some(&Relation::Older("0.0.1".into())), Some(dir), &none, "");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            lines[0].contains("maxplayer mint upgrade --bin-dir '/opt/my bin'"),
-            "{lines:?}"
-        );
-        // Nothing to say at this version with no newer release, or when the check failed.
-        assert!(update_lines(Some(&Relation::Same), Some(dir), &none, "").is_empty());
-        assert!(
-            update_lines(
-                Some(&Relation::Same),
-                Some(dir),
-                &Latest::Found(this.into()),
-                ""
-            )
-            .is_empty()
-        );
-        // (b) a newer maxplayer: update it, then upgrade (or install when no mint is installed).
-        let newer = Latest::Found("999.0.0".into());
-        let lines = update_lines(Some(&Relation::Same), Some(dir), &newer, " --home /h");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(
-            lines[0].contains("maxplayer 999.0.0 is released"),
-            "{lines:?}"
-        );
-        assert!(
-            lines[0].contains("then run `maxplayer mint upgrade --bin-dir"),
-            "{lines:?}"
-        );
-        assert!(lines[0].ends_with("--home /h`"), "{lines:?}");
-        let lines = update_lines(None, None, &newer, "");
-        assert!(
-            lines[0].contains("then run `maxplayer mint install`"),
-            "{lines:?}"
-        );
-        // Both at once.
-        let both = update_lines(
+        // (a) older installed mint: the only notice that says `maxplayer mint upgrade`.
+        let line = mint_notice(
             Some(&Relation::Older("0.0.1".into())),
             Some(dir),
-            &newer,
-            "",
+            " --home /h",
+        )
+        .unwrap();
+        assert!(
+            line.contains("maxplayer mint upgrade --bin-dir '/opt/my bin' --home /h`"),
+            "{line}"
         );
-        assert_eq!(both.len(), 2, "{both:?}");
+        // Nothing to say for the mint at this version, a source build, or no mint.
+        assert_eq!(mint_notice(Some(&Relation::Same), Some(dir), ""), None);
+        assert_eq!(
+            mint_notice(Some(&Relation::SourceBuild(this.into())), Some(dir), ""),
+            None
+        );
+        assert_eq!(mint_notice(None, None, ""), None);
+        // A newer mint means maxplayer is behind it; never a downgrade.
+        let line = mint_notice(Some(&Relation::Newer("999.0.0".into())), Some(dir), "").unwrap();
+        assert!(
+            line.contains("update maxplayer") && !line.contains("mint upgrade"),
+            "{line}"
+        );
+
+        // (b) a newer maxplayer: general, the same whatever the mint, and never about the mint.
+        let line = maxplayer_update_notice(&Latest::Found("999.0.0".into())).unwrap();
+        assert!(
+            line.starts_with(&format!("maxplayer 999.0.0 is available (you have {this}); update it the way you installed it")),
+            "{line}"
+        );
+        assert!(line.contains("install.sh | sh"), "{line}");
+        assert!(line.contains("npm install -g maxplayer@latest"), "{line}");
+        assert!(!line.to_lowercase().contains("mint"), "{line}");
+        // Nothing when up to date, older, not checked or failed.
+        for latest in [
+            Latest::Found(this.into()),
+            Latest::Found("0.0.1".into()),
+            Latest::NotChecked("--offline".into()),
+            Latest::Failed("timed out".into()),
+        ] {
+            assert_eq!(maxplayer_update_notice(&latest), None, "{latest:?}");
+        }
     }
 
     #[test]

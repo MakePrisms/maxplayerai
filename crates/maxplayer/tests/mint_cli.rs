@@ -1035,7 +1035,7 @@ fn status_says_when_the_installed_mint_is_older() {
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(
         out.contains(&format!(
-            "update:    maxplayer-mint 0.6.0 is older than this maxplayer ({VERSION}): run `maxplayer mint upgrade --bin-dir {}",
+            "upgrade:   maxplayer-mint 0.6.0 is older than this maxplayer ({VERSION}): run `maxplayer mint upgrade --bin-dir {}",
             w.bin_dir.display()
         )),
         "{out}"
@@ -1043,9 +1043,20 @@ fn status_says_when_the_installed_mint_is_older() {
     assert!(out.contains("latest:    not checked (--offline)"), "{out}");
     let (_, out, _) = w.info(&["--offline", "--json"]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-    assert_eq!(v["update"]["relation"], "older", "{out}");
-    assert_eq!(v["update"]["mint_upgrade_available"], true, "{out}");
-    assert_eq!(v["update"]["latest_checked"], false, "{out}");
+    assert_eq!(v["mint_update"]["relation"], "older", "{out}");
+    assert_eq!(v["mint_update"]["upgrade_available"], true, "{out}");
+    assert!(
+        v["mint_update"]["notice"]
+            .as_str()
+            .unwrap()
+            .contains("maxplayer mint upgrade --bin-dir"),
+        "{out}"
+    );
+    // The two notices are separate fields; offline, the maxplayer one was not checked.
+    assert_eq!(v["maxplayer_update"]["checked"], false, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], false, "{out}");
+    assert!(v["maxplayer_update"]["notice"].is_null(), "{out}");
+    assert!(v.get("update").is_none(), "{out}");
 }
 
 #[test]
@@ -1070,19 +1081,33 @@ fn status_says_when_a_newer_maxplayer_is_released() {
         out.contains(&format!("latest:    maxplayer 999.0.0 (this is {VERSION})")),
         "{out}"
     );
+    let update = out
+        .lines()
+        .find(|l| l.starts_with("update:"))
+        .unwrap_or_else(|| panic!("no update line: {out}"));
     assert!(
-        out.contains("update:    maxplayer 999.0.0 is released"),
+        update.contains(&format!(
+            "maxplayer 999.0.0 is available (you have {VERSION}); update it the way you installed it"
+        )),
         "{out}"
     );
-    assert!(
-        out.contains("then run `maxplayer mint upgrade --bin-dir"),
-        "{out}"
-    );
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+    assert!(!out.contains("upgrade:"), "the mint is current: {out}");
     let (_, out, _) = info(&["--json"]);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-    assert_eq!(v["update"]["latest_maxplayer"], "999.0.0", "{out}");
-    assert_eq!(v["update"]["maxplayer_update_available"], true, "{out}");
-    assert_eq!(v["update"]["mint_upgrade_available"], false, "{out}");
+    assert_eq!(v["maxplayer_update"]["latest"], "999.0.0", "{out}");
+    assert_eq!(v["maxplayer_update"]["current"], VERSION, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], true, "{out}");
+    assert!(
+        !v["maxplayer_update"]["notice"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("mint"),
+        "{out}"
+    );
+    assert_eq!(v["mint_update"]["upgrade_available"], false, "{out}");
+    assert!(v["mint_update"]["notice"].is_null(), "{out}");
     assert!(!w.home.exists(), "status created the home");
 
     // The same release as this one: nothing to say.
@@ -1097,6 +1122,70 @@ fn status_says_when_a_newer_maxplayer_is_released() {
         .env("MAXPLAYER_RELEASES_LATEST_URL", &same));
     assert!(!out.contains("update:"), "{out}");
     assert!(out.contains("up to date"), "{out}");
+}
+
+#[test]
+fn the_maxplayer_update_notice_shows_with_no_mint_installed_and_never_names_the_mint() {
+    let w = World::new();
+    let latest = w.latest("v999.0.0");
+    let info = |extra: &[&str]| {
+        run(maxplayer()
+            .arg("mint")
+            .arg("--home")
+            .arg(&w.home)
+            .arg("--bin-dir")
+            .arg(&w.bin_dir)
+            .args(extra)
+            .env("PATH", "/usr/bin:/bin")
+            .env("MAXPLAYER_RELEASES_LATEST_URL", &latest))
+    };
+    let (code, out, err) = info(&[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("not installed"), "{out}");
+    let update = out
+        .lines()
+        .find(|l| l.starts_with("update:"))
+        .unwrap_or_else(|| panic!("no update line without a mint: {out}"));
+    assert!(
+        update.contains(&format!(
+            "maxplayer 999.0.0 is available (you have {VERSION})"
+        )),
+        "{update}"
+    );
+    assert!(update.contains("install.sh | sh"), "{update}");
+    assert!(
+        update.contains("npm install -g maxplayer@latest"),
+        "{update}"
+    );
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+    assert!(!out.contains("upgrade:"), "{out}");
+    let (_, out, _) = info(&["--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["binary"]["installed"], false, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], true, "{out}");
+    assert!(v["maxplayer_update"]["notice"].is_string(), "{out}");
+    assert!(v["mint_update"]["relation"].is_null(), "{out}");
+    assert!(v["mint_update"]["notice"].is_null(), "{out}");
+    assert!(!w.home.exists(), "status created the home");
+
+    // Both at once: an older mint and a newer maxplayer are two separate lines and fields.
+    w.put_installed(OLD_LINE);
+    let (_, out, _) = info(&[]);
+    let upgrade = out.lines().find(|l| l.starts_with("upgrade:")).unwrap();
+    assert!(
+        upgrade.contains("run `maxplayer mint upgrade --bin-dir"),
+        "{out}"
+    );
+    let update = out.lines().find(|l| l.starts_with("update:")).unwrap();
+    assert!(!update.to_lowercase().contains("mint"), "{update}");
+    let (_, out, _) = info(&["--json"]);
+    let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(v["mint_update"]["upgrade_available"], true, "{out}");
+    assert_eq!(v["maxplayer_update"]["available"], true, "{out}");
+    assert_ne!(
+        v["mint_update"]["notice"], v["maxplayer_update"]["notice"],
+        "{out}"
+    );
 }
 
 #[test]
@@ -1152,9 +1241,9 @@ fn a_failed_latest_check_is_shown_not_an_error_and_offline_asks_nobody() {
     let (code, out, _) = info(&["--json"]);
     assert_eq!(code, 0);
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
-    assert_eq!(v["update"]["latest_checked"], false, "{out}");
+    assert_eq!(v["maxplayer_update"]["checked"], false, "{out}");
     assert!(
-        v["update"]["latest_error"]
+        v["maxplayer_update"]["error"]
             .as_str()
             .unwrap()
             .starts_with("could not check"),

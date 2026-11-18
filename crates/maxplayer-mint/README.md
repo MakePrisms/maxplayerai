@@ -58,9 +58,12 @@ systemctl --user restart maxplayer-mint   # a running mint keeps the old version
 rename, so a running mint is never left with a half-written file. It does nothing when the mint is
 already at this version, and refuses a newer version, a source build or an unrecognised binary
 (`maxplayer mint install --force` replaces anything). It never touches `<home>/mint/` and never runs
-`init`. `maxplayer mint` and `maxplayer doctor` say when a newer mint is available: the installed one
-is older than `maxplayer`, or a newer `maxplayer` is released (checked against GitHub's latest
-release; `maxplayer mint --offline` skips that).
+`init`. `maxplayer mint` and `maxplayer doctor` carry two separate notices. One says the installed
+mint is older than `maxplayer` and to run `maxplayer mint upgrade` (a local check). The other says a
+newer `maxplayer` is released and to update it the way you installed it; it shows with or without a
+mint and does not mention the mint (checked against GitHub's latest release, a few seconds at most;
+`--offline` skips it on both commands, and a failed check shows "could not check"). After you update
+`maxplayer`, the first notice is what tells you to upgrade the mint.
 
 ### Uninstall
 

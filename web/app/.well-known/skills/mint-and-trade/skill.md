@@ -54,7 +54,10 @@ Use the email the human's Maxplayer account already uses. The mint is version-lo
 `maxplayer`: after updating `maxplayer` (the way it was installed), run `maxplayer mint upgrade`
 (it replaces only an older released mint, keeps `<home>/mint/`, never runs `init`), then restart
 the mint service; a running mint keeps the old version until restarted. `maxplayer mint` and
-`maxplayer doctor` say when a newer mint is available. `maxplayer mint uninstall` removes only the
+`maxplayer doctor` show two separate notices: `upgrade:` when the installed mint is older than
+`maxplayer` (run `maxplayer mint upgrade`), and `update:` when a newer `maxplayer` is released
+(update it the way it was installed; `--offline` skips that check). In `--json` they are
+`mint_update` and `maxplayer_update`. `maxplayer mint uninstall` removes only the
 binary (refused while the mint is serving) and never `<home>/mint/`; never delete that folder, it
 is the mint and every credit it issued. To build a chosen revision from source instead, use the
 mint README: the mint is its own Cargo workspace, and building it needs `protoc`. From the

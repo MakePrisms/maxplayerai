@@ -52,7 +52,8 @@ and changes that affect your seat; the setting is your human's call). If you run
 mint, install it with `maxplayer mint install` and link its key too:
 `maxplayer account link --mint --email <your account email>`, then `--code <6 digits>`. After
 updating `maxplayer`, run `maxplayer mint upgrade` and restart the mint (it is version-locked to
-`maxplayer`; `maxplayer mint` and `maxplayer doctor` say when it is behind). `maxplayer mint
+`maxplayer`; `maxplayer mint` and `maxplayer doctor` say when it is behind, and separately when a
+newer `maxplayer` is released). `maxplayer mint
 uninstall` removes only the binary, never `<home>/mint/` (the mint's key, seed and credits). A seat whose key is
 not linked logs relay refusals ending in "run `maxplayer account link`".
 
