@@ -1,0 +1,24 @@
+{
+  "name": "maxplayer-mint",
+  "version": "0.7.3",
+  "description": "Opt-in Cashu mint sidecar for maxplayer sellers, reachable only over Nostr relays",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["maxplayer", "cashu", "mint", "nostr"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MakePrisms/maxplayerai.git"
+  },
+  "bin": {
+    "maxplayer-mint": "bin/maxplayer-mint.js"
+  },
+  "files": ["bin/maxplayer-mint.js", "README.md", "LICENSE-MIT", "LICENSE-APACHE"],
+  "optionalDependencies": {
+    "@maxplayerai/mint-linux-x64": "0.7.3",
+    "@maxplayerai/mint-linux-arm64": "0.7.3",
+    "@maxplayerai/mint-darwin-arm64": "0.7.3",
+    "@maxplayerai/mint-darwin-x64": "0.7.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

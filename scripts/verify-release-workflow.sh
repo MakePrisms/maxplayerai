@@ -114,6 +114,7 @@ echo "ok: one artifact, built with wallet,acp and verified by $verifier"
 # check needs nothing installed. It fails closed: if the jobs cannot be located, it does not pass.
 node - "$WORKFLOW" <<'NODE'
 const fs = require("fs");
+const nodePath = require("path");
 const path = process.argv[2];
 const lines = fs.readFileSync(path, "utf8").split("\n");
 
@@ -199,8 +200,19 @@ if (probeBody) {
   }
   // The launcher is the package users type. It must not be probeable at all: its dist-tags are how
   // `npx maxplayer` resolves, and the allow-list arm is what keeps it out.
-  if (/'maxplayer'\s*\)/.test(probeCode)) {
-    fail("job 'npm-probe' admits the launcher package — only the scoped payload packages may be probed");
+  // Parsed, not matched against spellings (#1339 review L1): every admitting arm (`) ;;`) of the
+  // `case "$PACKAGE"` may name only exact '@maxplayerai/<p>' or '@maxplayerai/mint-<p>' for a
+  // release platform — no launcher, no glob, no other quoting.
+  const platformNames = JSON.parse(fs.readFileSync(nodePath.join(nodePath.dirname(path), "..", "release-platforms.json"), "utf8")).map((e) => e.platform);
+  const allowed = new Set(platformNames.flatMap((p) => [`'@maxplayerai/${p}'`, `'@maxplayerai/mint-${p}'`]));
+  const caseBlock = probeCode.match(/case "\$PACKAGE" in([\s\S]*?)\besac\b/);
+  if (!caseBlock) fail("job 'npm-probe' has no case \"$PACKAGE\" allow-list");
+  const admitting = caseBlock[1].split("\n").filter((l) => /\)\s*;;\s*$/.test(l));
+  if (admitting.length === 0) fail("job 'npm-probe' allow-list admits nothing — this check is out of date with the workflow");
+  for (const arm of admitting) {
+    for (const pat of arm.replace(/\)\s*;;\s*$/, "").split("|").map((x) => x.trim()).filter(Boolean)) {
+      if (!allowed.has(pat)) fail(`job 'npm-probe' admits ${pat} — only the scoped payload packages of release platforms may be probed (never a launcher, never a glob)`);
+    }
   }
   // Publishing under `latest` would repoint what a bare install of a payload package resolves.
   if (!probeCode.includes("--tag probe")) {
@@ -216,7 +228,6 @@ if (probeBody) {
 // A probe in a workflow of its own would prove a DIFFERENT credential (npm matches the workflow
 // filename), so a green run there would say nothing about the release path while looking like it
 // did. Nothing else in .github/workflows may publish.
-const nodePath = require("path");
 const workflowDir = nodePath.dirname(path);
 for (const entry of fs.readdirSync(workflowDir)) {
   if (!/\.ya?ml$/.test(entry) || entry === nodePath.basename(path)) continue;
@@ -296,6 +307,102 @@ for (const name of ["release", "publish"]) {
 if (!surface.join("\n").includes("verify-release-surface.sh")) {
   fail("job 'verify-surface' does not run scripts/verify-release-surface.sh — it would gate on nothing");
 }
+
+
+// ── The mint sidecar ships from the same tag, and protoc stays in its build job ─────────────────
+// Agreed design (#merge-binaries, 2026-11-16): `maxplayer-mint` is a separate binary released with
+// `maxplayer` — its own archives in the same SHA256SUMS, its own npm launcher and payloads, the same
+// version — and `protoc` is a CI build dependency only. Each property is one edit away from being
+// lost without anything going red, so each is asserted.
+const mint = jobs.get("build-mint");
+if (!mint) fail("no 'build-mint' job — the release would ship without the maxplayer-mint sidecar");
+const mintCode = mint.filter((l) => !/^\s*#/.test(l)).join("\n");
+if (!mintCode.includes("--manifest-path crates/maxplayer-mint/Cargo.toml")) {
+  fail("job 'build-mint' does not build crates/maxplayer-mint — it would package something else");
+}
+if (!mintCode.includes("needs.plan.outputs.matrix")) {
+  fail("job 'build-mint' does not take its matrix from the plan (.github/release-platforms.json) — the mint could ship to a different platform set than maxplayer");
+}
+// Each verifier on the MINT binary (possibly after a backslash continuation), so a step pointed at
+// the wrong artifact fails (#1339 review L2).
+for (const verifier of ["verify-release-version.sh", "verify-static-artifact.sh", "package-release-asset.sh"]) {
+  const re = new RegExp(verifier.replace(/\./g, "\\.") + String.raw`(?:[^\n]*\\\n)*[^\n]*"crates/maxplayer-mint/target/`);
+  if (!re.test(mintCode)) {
+    fail(`job 'build-mint' does not run scripts/${verifier} on crates/maxplayer-mint/target/… — the mint artifact would ship unchecked`);
+  }
+}
+if (!/cargo build --manifest-path crates\/maxplayer-mint\/Cargo\.toml[^\n]*--locked/.test(mintCode)) {
+  fail("job 'build-mint' does not build with --locked — the mint could ship dependencies its Cargo.lock never pinned");
+}
+if (!/otool -L "\$BIN" \| grep -Eq '\/opt\/homebrew\|\/usr\/local'/.test(mintCode)) {
+  fail("job 'build-mint' lost its darwin otool check — a mint linking Homebrew protobuf would ship and not start on a clean mac");
+}
+if (!/cmp "dist\/\$ASSET" "dist-recheck\/\$ASSET"/.test(mintCode)) {
+  fail("job 'build-mint' lost its deterministic-archive check");
+}
+if (/continue-on-error|\|\|\s*true/.test(mintCode) || /^\s+if:\s*(false|\$\{\{\s*false)/m.test(mintCode)) {
+  fail("job 'build-mint' can swallow a failed step (continue-on-error, '|| true' or a disabled step)");
+}
+if (!/apt-get install[^\n]*\bprotobuf-compiler\b/.test(mintCode) || !/brew install[^\n]*\bprotobuf\b/.test(mintCode)) {
+  fail("job 'build-mint' does not install protoc on both linux and darwin — cdk's mint signatory cannot build without it");
+}
+// protoc belongs to the mint build only. Anywhere else it would be a sign the root graph (which builds
+// `maxplayer`) started needing it — the very leak the mint's own workspace exists to prevent.
+for (const [name, body] of jobs) {
+  if (name === "build-mint") continue;
+  // Whole tokens only, comments stripped: "protocol" in a step name is not protoc.
+  const code = body.filter((l) => !/^\s*#/.test(l)).map((l) => l.replace(/\s#.*$/, ""));
+  if (code.some((l) => /\bprotoc\b|\bprotobuf(-compiler)?\b|setup-protoc/i.test(l))) {
+    fail(`job '${name}' names protoc — only build-mint may; the maxplayer build must stay protoc-free`);
+  }
+}
+for (const name of ["verify-surface", "release", "publish"]) {
+  const needs = jobs.get(name).join("\n").match(/^ {4}needs:(.*)$/m);
+  if (!needs || !/\bbuild-mint\b/.test(needs[1])) {
+    fail(`job '${name}' does not depend on build-mint (needs:) — a failed mint build would not stop the ${name}`);
+  }
+}
+const releaseCode = jobs.get("release").filter((l) => !/^\s*#/.test(l)).join("\n");
+if (!releaseCode.includes('maxplayer-mint-$VERSION-$platform.tar.gz')) {
+  fail("the release completeness gate does not require maxplayer-mint-$VERSION-$platform.tar.gz — a release could publish without the mint for a platform");
+}
+// Staging reads the constructed mint asset path, never a glob (the reason is at the CLI loop).
+if (!publishCode.includes('mint_asset="dist/maxplayer-mint-$VERSION-$platform.tar.gz"') ||
+    !publishCode.includes('tar -xzf "$mint_asset" -O')) {
+  fail("the publish job does not stage each mint payload from its own constructed asset path");
+}
+// Publish ORDER, all four anchors (#1339 review M2): maxplayer payloads, the maxplayer launcher, mint
+// payloads, the maxplayer-mint launcher. Payloads before their launcher, so no launcher ever pins an
+// unpublished payload; the whole maxplayer set before any mint package, so a mint failure can never
+// leave maxplayer half-published. Comparing only the two launchers passed "all payloads first".
+const publishAt = (re, what) => {
+  const m = publishCode.match(re);
+  if (!m) fail(`the publish job no longer publishes ${what}`);
+  return m.index;
+};
+const publishOrder = [
+  publishAt(/^\s*publish_once "npm\/cli-\$platform"\s*$/m, "the maxplayer payloads"),
+  publishAt(/^\s*publish_once npm\/maxplayer\s*$/m, "the maxplayer launcher"),
+  publishAt(/^\s*publish_once "npm\/mint-\$platform"\s*$/m, "the mint payloads"),
+  publishAt(/^\s*publish_once npm\/maxplayer-mint\s*$/m, "the maxplayer-mint launcher"),
+];
+if (publishOrder.some((v, i) => i > 0 && v < publishOrder[i - 1])) {
+  fail("publish order must be: maxplayer payloads, maxplayer, mint payloads, maxplayer-mint — a payload after its launcher, or a mint package before maxplayer is complete, publishes a release partially");
+}
+// Every package is staged before the first publish, so a bad archive stops the job with nothing on
+// the registry (#1339 review M1).
+if (publishCode.indexOf('tar -xzf "$mint_asset"') > publishOrder[0] || publishCode.indexOf('tar -xzf "$asset"') > publishOrder[0]) {
+  fail("the publish job extracts an archive after publishing has begun — a bad archive would stop the job with packages already on the registry");
+}
+// The helper's only skip is a version already on the registry; everything else reaches npm publish.
+if (!/publish_once\(\)[\s\S]*if \[ "\$\(npm view "\$name@\$VERSION" version 2>\/dev\/null\)" = "\$VERSION" \]; then[\s\S]*npm publish "\$\{publish_args\[@\]\}"/.test(publishCode)) {
+  fail("publish_once no longer skips exactly the versions already on the registry and publishes the rest — a re-run of a part-failed release could not finish it");
+}
+if (/\|\|\s*true/.test(publishCode)) {
+  fail("the publish job swallows a failure with '|| true' — a failed publish would be reported as a success");
+}
+console.log("ok: build-mint builds the sidecar on the release platform set, verified, and gates verify-surface, release and publish");
+console.log("ok: no release job but build-mint names protoc");
 
 console.log("ok: verify-surface runs in dry runs and gates release and publish (the #249 fix)");
 

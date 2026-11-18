@@ -28,6 +28,10 @@
 # Usage:
 #   ./scripts/verify-release-version.sh <version> [path-to-binary]
 #     e.g. ./scripts/verify-release-version.sh 0.1.0 result/bin/maxplayer
+#          ./scripts/verify-release-version.sh 0.1.0 crates/maxplayer-mint/target/release/maxplayer-mint
+#
+# The binary may be either shipped program: `maxplayer` or the `maxplayer-mint` sidecar. Each must
+# answer `<its name> <version> (<commit>)`.
 #
 # Pass the version WITHOUT a leading `v` — the workflow strips it from the tag.
 
@@ -60,6 +64,19 @@ CRATE_VERSION="$(cargo metadata --no-deps --format-version 1 \
     || die "crate maxplayer is $CRATE_VERSION but the release is $VERSION — bump [workspace.package] version in Cargo.toml before tagging"
 echo "ok: crate maxplayer $CRATE_VERSION"
 
+# ── The mint sidecar, in lockstep ───────────────────────────────────────────────────────────────
+# `maxplayer-mint` is released from the same tag as `maxplayer`, at the same version (its own
+# tarballs and npm packages). It is its own cargo workspace (protoc stays out of the root build), so
+# it cannot inherit `version.workspace` and its version is a second literal that a bump can forget.
+# A forgotten one would ship `maxplayer-mint 0.5.11` inside archives named for this release.
+MINT_MANIFEST="crates/maxplayer-mint/Cargo.toml"
+[ -f "$MINT_MANIFEST" ] || die "$MINT_MANIFEST is missing — the mint sidecar is part of every release"
+MINT_VERSION="$(cargo metadata --no-deps --format-version 1 --manifest-path "$MINT_MANIFEST" \
+    | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer-mint");if(!p){process.stderr.write("no maxplayer-mint package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
+[ "$MINT_VERSION" = "$VERSION" ] \
+    || die "crate maxplayer-mint is $MINT_VERSION but the release is $VERSION — the mint ships in lockstep with maxplayer: set version in $MINT_MANIFEST, then refresh crates/maxplayer-mint/Cargo.lock and the root Cargo.lock (cargo metadata in each; this script reads neither — CI's --locked builds do)"
+echo "ok: crate maxplayer-mint $MINT_VERSION (lockstep)"
+
 # ── The npm manifests ───────────────────────────────────────────────────────────────────────────
 # Every directory under npm/ is checked, including any not yet wired into a build, so a package
 # added ahead of its platform cannot drift out of step unnoticed.
@@ -72,18 +89,22 @@ echo "ok: every npm package is version $VERSION"
 
 # ── The payload pins ────────────────────────────────────────────────────────────────────────────
 # Asserted as an exact match, not a range: the launcher must resolve the payload built from THIS
-# commit. A caret or a stale pin both resolve to something else.
-PIN_REPORT="$(node -e '
+# commit. A caret or a stale pin both resolve to something else. Both launchers: `maxplayer` and the
+# mint sidecar's `maxplayer-mint`.
+for launcher in npm/maxplayer npm/maxplayer-mint; do
+    [ -f "$launcher/package.json" ] || die "$launcher/package.json is missing"
+    PIN_REPORT="$(node -e '
 const pkg = require(process.argv[1]);
 const deps = pkg.optionalDependencies || {};
 const names = Object.keys(deps);
-if (names.length === 0) { console.error("npm/maxplayer/package.json declares no optionalDependencies — the launcher has no payload to resolve"); process.exit(1); }
+if (names.length === 0) { console.error(process.argv[1] + " declares no optionalDependencies — the launcher has no payload to resolve"); process.exit(1); }
 const wrong = names.filter((n) => deps[n] !== process.argv[2]);
 if (wrong.length) { console.error("stale payload pins: " + wrong.map((n) => n + "@" + deps[n]).join(", ")); process.exit(1); }
 process.stdout.write(names.join(", "));
-' "$PWD/npm/maxplayer/package.json" "$VERSION")" \
-    || die "npm/maxplayer/package.json payload pins are not all $VERSION"
-echo "ok: payload pins at $VERSION -> $PIN_REPORT"
+' "$PWD/$launcher/package.json" "$VERSION")" \
+        || die "$launcher/package.json payload pins are not all $VERSION"
+    echo "ok: $launcher payload pins at $VERSION -> $PIN_REPORT"
+done
 
 # ── The release notes ───────────────────────────────────────────────────────────────────────────
 # RELEASE_NOTES.md is version-specific prose living at a permanent path, and the release job passes

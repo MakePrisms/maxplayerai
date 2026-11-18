@@ -11,12 +11,30 @@ const USAGE: &str = "usage: maxplayer-mint <init [--name <name>]|name <name>|run
   issue [amount]  finish any interrupted issue, then issue <amount> sat into a token file
   restore         with `run` stopped, put back the NEWEST backup as mint.sqlite (from backup_dir,
                   or --from <dir>; recreates <home>/mint/ from the backup if it is gone)
+  version         print `maxplayer-mint <version> (<commit>)` (also --version); needs no home
 <home> is $MAXPLAYER_HOME, or ~/.maxplayer";
+
+/// The line both `--version` and `version` print. Same grammar as `maxplayer --version`
+/// (`<name> <version> (<40-hex commit>)`), because `scripts/verify-release-version.sh` holds every
+/// released artifact to it; the mint ships in lockstep with `maxplayer` at the same version.
+fn version_line() -> String {
+    format!(
+        "maxplayer-mint {} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("MINT_SIDECAR_BUILD")
+    )
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // Before the home is resolved: a version query must answer on a machine with no HOME and no
+    // mint (the release and install checks run it in bare containers).
+    if matches!(args.as_slice(), ["--version"] | ["version"]) {
+        println!("{}", version_line());
+        return Ok(());
+    }
     let home = MintHome::at(&home_dir()?);
     match args.as_slice() {
         ["init"] => init(&home, None).await,

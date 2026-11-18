@@ -43,6 +43,11 @@ PLAN_PLATFORMS="${3:-}"
 MANIFEST=".github/release-platforms.json"
 LAUNCHER_PKG="npm/maxplayer/package.json"
 LAUNCHER_JS="npm/maxplayer/bin/maxplayer.js"
+# The mint sidecar ships from the same tag, on the same platform set, as its own archives and npm
+# packages (`maxplayer-mint` launcher + `@maxplayerai/mint-<platform>` payloads). Every check below
+# that holds a `maxplayer` surface to the source holds the matching mint surface to it too.
+MINT_LAUNCHER_PKG="npm/maxplayer-mint/package.json"
+MINT_LAUNCHER_JS="npm/maxplayer-mint/bin/maxplayer-mint.js"
 
 die() { echo "verify-release-surface: $*" >&2; exit 1; }
 
@@ -56,6 +61,8 @@ command -v node >/dev/null 2>&1 || die "node not found"
 [ -f "$MANIFEST" ]     || die "no platform source at $MANIFEST"
 [ -f "$LAUNCHER_PKG" ] || die "no launcher manifest at $LAUNCHER_PKG"
 [ -f "$LAUNCHER_JS" ]  || die "no launcher at $LAUNCHER_JS"
+[ -f "$MINT_LAUNCHER_PKG" ] || die "no mint launcher manifest at $MINT_LAUNCHER_PKG"
+[ -f "$MINT_LAUNCHER_JS" ]  || die "no mint launcher at $MINT_LAUNCHER_JS"
 
 # Compare two sets given as newline-separated lists; name what is missing and what is extra. Both
 # inputs are sorted, de-duplicated and stripped of blank lines here, so callers pass raw lists.
@@ -109,6 +116,14 @@ else
     done
   )"
   assert_set_eq "the built artifacts in $DIST" "$source_list" "$built"
+  built_mint="$(
+    shopt -s nullglob
+    for f in "$DIST"/maxplayer-mint-"$VERSION"-*.tar.gz; do
+      b="$(basename "$f" .tar.gz)"
+      printf '%s\n' "${b#maxplayer-mint-$VERSION-}"
+    done
+  )"
+  assert_set_eq "the built mint artifacts in $DIST" "$source_list" "$built_mint"
 fi
 
 # ── The npm payload directories ─────────────────────────────────────────────────────────────────
@@ -121,31 +136,81 @@ npm_dirs="$(
 )"
 assert_set_eq "the npm payload packages (npm/cli-*)" "$source_list" "$npm_dirs"
 
-# ── The launcher's pinned dependencies ──────────────────────────────────────────────────────────
+mint_npm_dirs="$(
+  shopt -s nullglob
+  for d in npm/mint-*/; do
+    b="$(basename "$d")"
+    printf '%s\n' "${b#mint-}"
+  done
+)"
+assert_set_eq "the mint npm payload packages (npm/mint-*)" "$source_list" "$mint_npm_dirs"
+
+# ── Each payload manifest matches its directory ─────────────────────────────────────────────────
+# A payload copied from a sibling and left with the sibling's `cpu` installs nowhere it is needed
+# (npm skips it, the launcher says "no binary"); one whose bin is the launcher's name collides with
+# it. Directory names alone cannot see either (#1339 review L4).
+node -e '
+  const fs = require("fs");
+  const bad = [];
+  for (const [prefix, bin] of [["cli-", "maxplayer"], ["mint-", "maxplayer-mint"]]) {
+    for (const d of fs.readdirSync("npm").filter((d) => d.startsWith(prefix))) {
+      const p = d.slice(prefix.length);
+      const [os, cpu] = p.split("-");
+      const m = JSON.parse(fs.readFileSync(`npm/${d}/package.json`, "utf8"));
+      const want = "@maxplayerai/" + (prefix === "cli-" ? "" : "mint-") + p;
+      const binKey = `${bin}-${p}`, binPath = `bin/${bin}`;
+      if (m.name !== want) bad.push(`npm/${d}: name ${m.name}, expected ${want}`);
+      if (JSON.stringify(m.os) !== JSON.stringify([os])) bad.push(`npm/${d}: os ${JSON.stringify(m.os)}, expected ["${os}"]`);
+      if (JSON.stringify(m.cpu) !== JSON.stringify([cpu])) bad.push(`npm/${d}: cpu ${JSON.stringify(m.cpu)}, expected ["${cpu}"]`);
+      const bins = Object.entries(m.bin || {});
+      if (bins.length !== 1 || bins[0][0] !== binKey || bins[0][1] !== binPath) bad.push(`npm/${d}: bin ${JSON.stringify(m.bin)}, expected {"${binKey}":"${binPath}"}`);
+      if (!(m.files || []).includes(binPath)) bad.push(`npm/${d}: files does not list ${binPath}`);
+      if (m.scripts) bad.push(`npm/${d}: has scripts — a payload must install nothing`);
+    }
+  }
+  if (bad.length) { console.error(bad.join("\n")); process.exit(1); }
+' || die "an npm payload manifest does not match its directory (see above)"
+echo "ok: every payload manifest (name, os, cpu, bin, files) matches its directory"
+
+# ── The launchers' pinned dependencies ──────────────────────────────────────────────────────────
 # optionalDependencies is what npm consults to install one platform's binary; a pin with no payload
 # published leaves `npm i maxplayer` resolving a package that is not on the registry.
-opt_deps="$(node -e '
-  const fs = require("fs");
-  const p = JSON.parse(fs.readFileSync("./npm/maxplayer/package.json", "utf8"));
-  const od = p.optionalDependencies || {};
-  const pref = "@maxplayerai/";
-  for (const k of Object.keys(od)) process.stdout.write((k.startsWith(pref) ? k.slice(pref.length) : k) + "\n");
-')"
-assert_set_eq "the launcher optionalDependencies ($LAUNCHER_PKG)" "$source_list" "$opt_deps"
+launcher_pins() {  # <package.json> <payload prefix inside @maxplayerai/>
+  node -e '
+    const fs = require("fs");
+    const p = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    const od = p.optionalDependencies || {};
+    const pref = "@maxplayerai/" + process.argv[2];
+    for (const k of Object.keys(od)) process.stdout.write((k.startsWith(pref) ? k.slice(pref.length) : k) + "\n");
+  ' "./$1" "$2"
+}
+assert_set_eq "the launcher optionalDependencies ($LAUNCHER_PKG)" "$source_list" "$(launcher_pins "$LAUNCHER_PKG" "")"
+assert_set_eq "the mint launcher optionalDependencies ($MINT_LAUNCHER_PKG)" "$source_list" "$(launcher_pins "$MINT_LAUNCHER_PKG" "mint-")"
 
-# ── The launcher's runtime resolver ─────────────────────────────────────────────────────────────
+# ── The launchers' runtime resolvers ────────────────────────────────────────────────────────────
 # PLATFORM_PACKAGES maps `${process.platform}-${process.arch}` to the payload it resolves at run
 # time. A platform missing here is refused a binary that was in fact published; one present with no
-# payload behind it is dead weight. The file is parsed, not executed — running it launches maxplayer.
-resolver="$(node -e '
-  const fs = require("fs");
-  const src = fs.readFileSync("./npm/maxplayer/bin/maxplayer.js", "utf8");
-  const m = src.match(/PLATFORM_PACKAGES\s*=\s*\{([\s\S]*?)\}/);
-  if (!m) { console.error("could not find PLATFORM_PACKAGES in the launcher"); process.exit(1); }
-  const keys = [...m[1].matchAll(/["\x27]([\w-]+)["\x27]\s*:/g)].map(x => x[1]);
-  if (keys.length === 0) { console.error("PLATFORM_PACKAGES has no entries"); process.exit(1); }
-  for (const k of keys) process.stdout.write(k + "\n");
-')"
+# payload behind it is dead weight. The file is parsed, not executed — running it launches the binary.
+# Each VALUE is checked too: the mint launcher resolving a `maxplayer` payload (or the reverse) would
+# install cleanly and run the wrong program.
+launcher_resolver() {  # <launcher.js> <payload prefix inside @maxplayerai/>
+  node -e '
+    const fs = require("fs");
+    const src = fs.readFileSync(process.argv[1], "utf8");
+    const m = src.match(/PLATFORM_PACKAGES\s*=\s*\{([\s\S]*?)\}/);
+    if (!m) { console.error("could not find PLATFORM_PACKAGES in " + process.argv[1]); process.exit(1); }
+    const pairs = [...m[1].matchAll(/["\x27]([\w-]+)["\x27]\s*:\s*["\x27]([^"\x27]+)["\x27]/g)];
+    if (pairs.length === 0) { console.error("PLATFORM_PACKAGES has no entries in " + process.argv[1]); process.exit(1); }
+    for (const [, k, v] of pairs) {
+      const want = "@maxplayerai/" + process.argv[2] + k;
+      if (v !== want) { console.error(process.argv[1] + ": " + k + " resolves " + v + ", expected " + want); process.exit(1); }
+      process.stdout.write(k + "\n");
+    }
+  ' "./$1" "$2"
+}
+resolver="$(launcher_resolver "$LAUNCHER_JS" "")" || die "the launcher resolver in $LAUNCHER_JS is malformed (see above)"
 assert_set_eq "the launcher resolver PLATFORM_PACKAGES ($LAUNCHER_JS)" "$source_list" "$resolver"
+mint_resolver="$(launcher_resolver "$MINT_LAUNCHER_JS" "mint-")" || die "the mint launcher resolver in $MINT_LAUNCHER_JS is malformed (see above)"
+assert_set_eq "the mint launcher resolver PLATFORM_PACKAGES ($MINT_LAUNCHER_JS)" "$source_list" "$mint_resolver"
 
 echo "PASS: every release surface — built, published and launcher — matches $MANIFEST"

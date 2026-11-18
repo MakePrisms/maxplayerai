@@ -3,11 +3,19 @@
 `maxplayer` ships two ways from one tag: downloadable archives on a GitHub Release, and `npx maxplayer` from
 npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v*` tag.
 
+The same tag also ships the mint sidecar, `maxplayer-mint` (`crates/maxplayer-mint`), as a separate
+binary at the same version: `maxplayer-mint-<version>-<platform>.tar.gz` archives listed in the same
+`SHA256SUMS`, and the npm launcher `maxplayer-mint` with payloads `@maxplayerai/mint-<platform>`. It is
+built by the `build-mint` job, the only release job that installs `protoc` (cdk's mint signatory needs
+it at build time); users never need it.
+
 ## Before the first release
 
 One setup step, done once **per package**, and it is the only thing standing between a tag and a
 publish. On npmjs.com, for each of `maxplayer`, `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`,
-`@maxplayerai/darwin-arm64` and `@maxplayerai/darwin-x64`:
+`@maxplayerai/darwin-arm64` and `@maxplayerai/darwin-x64` — and, for the mint sidecar, `maxplayer-mint`,
+`@maxplayerai/mint-linux-x64`, `@maxplayerai/mint-linux-arm64`, `@maxplayerai/mint-darwin-arm64` and
+`@maxplayerai/mint-darwin-x64`:
 
 - Settings → **Trusted publishing** → add a GitHub Actions publisher: organization `MakePrisms`,
   repository `maxplayerai`, workflow `release.yml`.
@@ -26,6 +34,12 @@ the `@maxplayerai/linux-x64`, `@maxplayerai/linux-arm64`, `@maxplayerai/darwin-a
 trusted publisher entry — the setting is per package, not per account or per org. The GitHub side of
 that entry is the same for all five, and
 is unaffected by the npm scope: organization `MakePrisms`, repository `maxplayerai`.
+
+⚠ The five mint packages are new and need entries before the first tag that ships them. The publish
+job publishes them AFTER the whole `maxplayer` set, so a missing mint entry fails the job only once
+`maxplayer` is complete on the registry — but that version of the mint package is then lost, so
+probe each `@maxplayerai/mint-*` payload first (the launcher `maxplayer-mint` cannot be probed; an org
+admin creates it, or its first publish proves it).
 
 ⚠ `@maxplayerai/darwin-x64` is new (Intel macs) and needs its entry before the tag that first
 publishes it, exactly as `@maxplayerai/darwin-arm64` did (#446). The setting lives on npmjs.com and needs an org admin — but whether it is really there is a
@@ -75,7 +89,9 @@ fails outright.
 1. **Bump the version.** `[workspace.package].version` in `Cargo.toml`, the workspace crate
    entries in `Cargo.lock` (refreshed by any `cargo` invocation — e.g. `cargo build` — since the
    release build passes `--locked` and fails on a stale lockfile), and `version` in every
-   `npm/*/package.json`, and the `optionalDependencies` pins in `npm/maxplayer/package.json`. All of
+   `npm/*/package.json`, the `optionalDependencies` pins in `npm/maxplayer/package.json` and
+   `npm/maxplayer-mint/package.json`, and `version` in `crates/maxplayer-mint/Cargo.toml` (its own
+   workspace, so it cannot inherit the root version; refresh `crates/maxplayer-mint/Cargo.lock` too). All of
    them must read the same string, and it must match the tag with the `v` dropped — the build
    asserts this and stops if anything disagrees.
 2. **Open a PR from the bump branch to `main` and squash-merge it.** `main` rejects direct pushes, so
@@ -137,10 +153,16 @@ Release a pre-release and publishes under the `rc` dist-tag, leaving `latest` wh
 - Verifies each artifact: the version matches the tag, `acp` and `sell` are compiled in
   (`scripts/verify-seller-surface.sh`), and on Linux that it runs inside alpine and debian with no
   toolchain present.
-- Attaches the three `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
+- Attaches every platform's `maxplayer-<version>-<platform>.tar.gz` plus `SHA256SUMS` to a GitHub Release.
   Each is required by name before the release is created: a count cannot tell a complete release
   from one missing a platform.
-- Publishes the npm packages: every payload package first, then the `maxplayer` launcher.
+- Builds `maxplayer-mint` on the same platforms (`build-mint`, with `protoc`), verifies its version line
+  and portability the same way, and attaches `maxplayer-mint-<version>-<platform>.tar.gz` to the same
+  Release and `SHA256SUMS`.
+- Publishes the npm packages: every payload package first, then the `maxplayer` launcher; then the
+  mint payloads and the `maxplayer-mint` launcher. All ten are staged before the first publish, and a
+  package already on the registry at this version is skipped, so **re-running a publish job that failed
+  part-way finishes the set** instead of failing on the first package it already published.
 
 The publish order matters. The launcher pins its payload by exact version, so publishing it first
 would leave a window where `npm i maxplayer` installs a launcher whose binary is not on the registry yet.
