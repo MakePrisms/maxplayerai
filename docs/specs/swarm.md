@@ -46,8 +46,11 @@ The word "challenge" is removed from code, docs, CLI and UI (§10). Kind numbers
     swarms (one click, Bob's default); an optional per-swarm decision accepts or excludes a seller in
     one swarm. Eligible = accepted at either level and denied at neither. (Bob 13 Nov; Josip 16 Nov
     14:33)
-14. **No cross-swarm cap:** a seller in several swarms of one buyer may get a task from each at the
-    same time; only the seller's own slot count limits it. (Bob)
+14. **One running task per seller across one buyer's swarms:** a seller in several swarms of one
+    buyer gets one task at a time across all of them. Heartbeats publish no free-seat count
+    (`queue_depth` is not free capacity, `protocol-v1.md`), so a second swarm's offer would only sit
+    unclaimed behind the first. Replaces "no cross-swarm cap" (Bob) until sellers publish free seats
+    (follow-up). (Josip 18 Nov)
 15. **First-draft questions:** `join` edits seller config (append-only); `solved` needs one
     independent verify task, no buyer confirmation; our buyer uses the `claude` preset; `codex`
     ships as a preset only after a live canary. (Josip, accepted defaults)
@@ -211,9 +214,8 @@ Started next to the existing loops (`buyer/mod.rs:352`, `:355`) when `[swarm].en
 ### 7.3 Queue and dispatch
 
 - Ordered queue of `queued` tasks per swarm job.
-- A seller is free for a swarm when it has no running task from that swarm and its heartbeat shows a
-  free slot (the runner reads heartbeat serving state today, `model.mjs:158`). No cross-swarm cap
-  (§1.14).
+- A seller is free when it has no running task from any of this buyer's swarms (§1.14) and its
+  heartbeat shows it serving (the runner reads heartbeat serving state today, `model.mjs:158`).
 - For each free, eligible member, take the first task that fits: pin matches or none; duration
   ≥ 300 s and ≤ minutes left; price ≥ seller rate and ≤ `max_sats`; reserved + price ≤ budget. Post
   as today (`swarm.mjs:1857`): public, targeted, `text/plain`, inline, prefixed, deterministic

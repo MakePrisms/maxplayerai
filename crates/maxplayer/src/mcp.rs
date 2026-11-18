@@ -309,7 +309,13 @@ async fn dispatch_async(state: &McpState, request: &McpRequest) -> Value {
             }),
         ),
         "ping" => ok(id, json!({})),
-        "tools/list" => ok(id, json!({ "tools": tools_for(state.home.config.sessions.enabled) })),
+        "tools/list" => ok(
+            id,
+            json!({ "tools": with_swarm_tools(
+                tools_for(state.home.config.sessions.enabled),
+                state.home.config.swarm.enabled,
+            ) }),
+        ),
         "tools/call" => {
             let tool = request.params.get("name").and_then(Value::as_str);
             let deadline = tool_deadline_secs(tool);
@@ -529,6 +535,87 @@ fn tools_for(sessions: bool) -> Value {
     list
 }
 
+/// The swarm tools (docs/specs/swarm.md §8). Each routes to the daemon RPC of the same name.
+const SWARM_TOOLS: &[&str] = &[
+    "swarm_create",
+    "swarm_list",
+    "swarm_members",
+    "swarm_decide",
+    "swarm_job_create",
+    "swarm_job_status",
+    "swarm_job_tasks",
+    "swarm_job_steer",
+    "swarm_job_close",
+];
+
+/// With `[swarm] enabled = true` the surface gains the swarm tools (§8); with it off `list` is
+/// returned unchanged, so the tool list is byte-identical to before the swarm engine existed.
+fn with_swarm_tools(mut list: Value, swarm: bool) -> Value {
+    if !swarm {
+        return list;
+    }
+    let task = json!({
+        "type": "object",
+        "properties": {
+            "text": { "type": "string", "description": "Self-contained task text: everything the seller needs, since sellers see nothing else of the swarm job." },
+            "duration_secs": { "type": "integer", "minimum": 300, "description": "Time the seller gets (the offer deadline); at least 300 s, and only a member with that many minutes left today takes it." },
+            "max_sats": { "type": "integer", "minimum": 0, "description": "Most this task may pay. The task goes at the seller's advertised rate, and only to a member whose rate is at or under this." },
+            "seller": { "type": "string", "description": "Optional: pin the task to this member (hex pubkey)." },
+            "fresh": { "type": "boolean", "description": "Optional: a new agent with no history (never a session turn)." },
+            "workstream": { "type": "string", "description": "Optional label for your own bookkeeping." }
+        },
+        "required": ["text", "duration_secs", "max_sats"],
+        "additionalProperties": false
+    });
+    let address = "A swarm address: the naddr1… swarm_create/swarm_list print, <your npub|hex>/<slug>, or just the slug.";
+    let job_address = "A swarm job address: the naddr1… swarm_job_create prints, <your npub|hex>/<slug>, or just the slug.";
+    let tools = list.as_array_mut().expect("tools array");
+    tools.extend([
+        json!({"name": "swarm_create",
+            "description": "Create a SWARM (kind 30344 on the configured relay): a named group of sellers you keep for many swarm jobs. Sellers discover it and join with `maxplayer swarm join`; you then accept them with swarm_decide. Create a swarm before any swarm job. tasks=private sends every task as a private (encrypted, targeted) job: no task text or swarm link is public, and the public view shows only names, members and a tally. Returns the swarm's naddr.",
+            "inputSchema": {"type": "object", "properties": {
+                "name": {"type": "string"}, "purpose": {"type": "string", "description": "Markdown description sellers read before joining."},
+                "slug": {"type": "string", "description": "Optional d tag (1-64 of a-z, 0-9, -); default from the name."},
+                "tasks": {"type": "string", "enum": ["public", "private"]}},
+                "required": ["name", "purpose"], "additionalProperties": false}}),
+        json!({"name": "swarm_list", "description": "Your swarms on the relay: name, purpose (first line), tasks setting, accepted members and open swarm jobs.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}}),
+        json!({"name": "swarm_members", "description": "Applicants and members of your swarms (or one): minutes offered and used today, your buyer-wide and per-swarm decisions, and whether each is accepted. Undecided applicants are a sample of the newest 256.",
+            "inputSchema": {"type": "object", "properties": {"swarm": {"type": "string", "description": address}}, "additionalProperties": false}}),
+        json!({"name": "swarm_decide", "description": "Accept or deny a seller: buyer-wide (all your swarms) without swarm, or in one swarm with it. A seller gets tasks when at least one of its latest buyer-wide and per-swarm decisions is accepted and neither is denied. Only memberships published before a swarm job starts count for that job.",
+            "inputSchema": {"type": "object", "properties": {
+                "seller": {"type": "string", "description": "npub or hex"}, "accept": {"type": "boolean", "description": "true accepts, false denies"},
+                "swarm": {"type": "string", "description": address}},
+                "required": ["seller", "accept"], "additionalProperties": false}}),
+        json!({"name": "swarm_job_create", "description": "Publish a SWARM JOB (kind 30341) in one of your open swarms: a goal with a window (default now → +24 h) and a budget in sats the daemon never exceeds. Optional tasks are queued at once (fan-out). No planner is configured in this build (check-in mode): the daemon dispatches only tasks you queue, each to a free, accepted member with enough minutes left today, at that member's rate, as a real priced job (or a session turn with that member); results wait for your next swarm_job_status. Write self-contained tasks of at least 5 minutes, and verify an answer (a fresh task to a different member) before closing as solved. Requires the swarm engine ([swarm] enabled) on this buyer.",
+            "inputSchema": {"type": "object", "properties": {
+                "swarm": {"type": "string", "description": address}, "goal": {"type": "string"},
+                "budget_sats": {"type": "integer", "minimum": 0}, "title": {"type": "string"},
+                "starts": {"type": "integer", "description": "Unix seconds; default now"}, "ends": {"type": "integer", "description": "Unix seconds; default starts + 24 h"},
+                "slug": {"type": "string"}, "tasks": {"type": "array", "items": task.clone()}},
+                "required": ["swarm", "goal", "budget_sats"], "additionalProperties": false}}),
+        json!({"name": "swarm_job_status", "description": "One swarm job from the daemon's store: status, members with minutes, queue, running tasks, results (newest first, 10 per page, with each answer), budget (committed, spent, headroom), sessions, steering notes, planner state and the last idle reason (why queued tasks did not go out). Call it to check in on results.",
+            "inputSchema": {"type": "object", "properties": {"swarm_job": {"type": "string", "description": job_address}, "results_page": {"type": "integer", "minimum": 0}},
+                "required": ["swarm_job"], "additionalProperties": false}}),
+        json!({"name": "swarm_job_tasks", "description": "Edit a swarm job's queue: add tasks, drop queued task ids, or replace queued tasks by id. Only queued tasks can change; a posted task is already a job.",
+            "inputSchema": {"type": "object", "properties": {
+                "swarm_job": {"type": "string", "description": job_address},
+                "add": {"type": "array", "items": task.clone()},
+                "drop": {"type": "array", "items": {"type": "integer"}},
+                "replace": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer"}, "task": task}, "required": ["id", "task"], "additionalProperties": false}}},
+                "required": ["swarm_job"], "additionalProperties": false}}),
+        json!({"name": "swarm_job_steer", "description": "Store a steering note on a swarm job. A planner sees every note on every call; with no planner configured it is only recorded and shown in swarm_job_status. Notes never reach sellers unless written into tasks.",
+            "inputSchema": {"type": "object", "properties": {"swarm_job": {"type": "string", "description": job_address}, "note": {"type": "string"}},
+                "required": ["swarm_job", "note"], "additionalProperties": false}}),
+        json!({"name": "swarm_job_close", "description": "Close a swarm job as completed (optionally with a result) or cancelled: queued tasks are dropped and nothing new is posted; in-flight tasks still settle and pay, and sessions close once their running turn settled.",
+            "inputSchema": {"type": "object", "properties": {
+                "swarm_job": {"type": "string", "description": job_address},
+                "status": {"type": "string", "enum": ["completed", "cancelled"]}, "result": {"type": "string"}},
+                "required": ["swarm_job", "status"], "additionalProperties": false}}),
+    ]);
+    list
+}
+
 async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, String> {
     let name = params
         .get("name")
@@ -547,6 +634,9 @@ async fn call_tool_async(state: &McpState, params: &Value) -> Result<Value, Stri
         "award_claim" => route_tool(state, "award_claim", "award", arguments).await?,
         "reply" if state.home.config.sessions.enabled => {
             route_tool(state, "reply", "reply", arguments).await?
+        }
+        swarm if state.home.config.swarm.enabled && SWARM_TOOLS.contains(&swarm) => {
+            route_tool(state, swarm, swarm, arguments).await?
         }
         moved => return Err(moved_tool_error(moved)),
     };
@@ -1367,6 +1457,82 @@ mod tests {
 
     /// Session jobs §10: `reply` and the collect params appear only with `[sessions] enabled`;
     /// with the flag off the list is byte-identical to the trade loop above.
+    // BEGIN swarm tests
+    /// docs/specs/swarm.md §8, §12 PR 4: the swarm tools appear only with `[swarm] enabled`; with
+    /// it off (the default) `tools/list` is exactly the pre-swarm list and a `swarm_*` call is an
+    /// unknown tool that never reaches the daemon.
+    #[test]
+    fn swarm_tools_appear_only_when_swarm_is_enabled() {
+        for sessions in [false, true] {
+            assert_eq!(
+                with_swarm_tools(tools_for(sessions), false),
+                tools_for(sessions)
+            );
+        }
+        let names = |list: Value| -> Vec<String> {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_owned())
+                .collect()
+        };
+        let on = names(with_swarm_tools(tools(), true));
+        assert_eq!(&on[..4], ["post_job", "get_job", "collect", "award_claim"]);
+        assert_eq!(&on[4..], SWARM_TOOLS);
+        for tool in with_swarm_tools(tools(), true).as_array().unwrap() {
+            assert_eq!(tool["inputSchema"]["type"], "object", "{tool}");
+            assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{tool}");
+        }
+
+        // Default config: tools/list and tools/call through the real dispatch.
+        let root = temp_home("swarm-off");
+        let _ = std::fs::remove_dir_all(&root);
+        let state = state_at(&root);
+        assert!(!state.home.config.swarm.enabled, "default off");
+        let listed = dispatch(
+            &state,
+            &McpRequest {
+                id: Some(json!(1)),
+                method: "tools/list".into(),
+                params: json!({}),
+            },
+        );
+        assert_eq!(
+            listed["result"]["tools"],
+            tools_for(state.home.config.sessions.enabled)
+        );
+        let called = dispatch(
+            &state,
+            &McpRequest {
+                id: Some(json!(2)),
+                method: "tools/call".into(),
+                params: json!({"name": "swarm_list", "arguments": {}}),
+            },
+        );
+        assert_eq!(called["result"]["isError"], true);
+        let text = called["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("unknown tool: swarm_list"), "{text}");
+
+        // `[swarm] enabled = true` in config.toml lists them.
+        let root = temp_home("swarm-on");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("config.toml"), "[swarm]\nenabled = true\n").unwrap();
+        let state = state_at(&root);
+        assert!(state.home.config.swarm.enabled);
+        let listed = dispatch(
+            &state,
+            &McpRequest {
+                id: Some(json!(3)),
+                method: "tools/list".into(),
+                params: json!({}),
+            },
+        );
+        assert_eq!(names(listed["result"]["tools"].clone())[4..], *SWARM_TOOLS);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // END swarm tests
+
     #[test]
     fn session_tools_appear_only_when_sessions_are_enabled() {
         assert_eq!(tools_for(false), tools());

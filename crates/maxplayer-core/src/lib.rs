@@ -10,6 +10,9 @@ pub mod budget;
 pub mod capability;
 pub mod checks;
 pub mod swarm;
+/// Minutes per swarm per UTC day: the Rust port of the board's `model.mjs` (§7.4).
+#[cfg(feature = "gateway")]
+pub mod swarm_minutes;
 /// Swarm events on the home's relay: EOSE-checked reads and acknowledged writes.
 #[cfg(feature = "wallet")]
 pub mod swarm_relay;

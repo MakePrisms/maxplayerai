@@ -48,9 +48,12 @@ use super::reservations::{
 /// - v9 — session jobs (docs/specs/session-jobs.md §8.1): `sessions` (per-job cap and state) and
 ///   `session_turns` (the write-once signed follow-up per turn, its reservation key and result).
 ///   Additive tables; both stay empty while `[sessions] enabled = false`.
-pub const SCHEMA_VERSION: i64 = 9;
+/// - v10 — the swarm engine (docs/specs/swarm.md §7.1): `swarms`, `swarm_jobs`, `swarm_tasks`,
+///   `swarm_sessions`. Additive tables; all stay empty while `[swarm] enabled = false`.
+pub const SCHEMA_VERSION: i64 = 10;
 
 pub(crate) mod preparations;
+pub(crate) mod swarm;
 
 /// A cloneable handle to the daemon-owned SQLite state.
 #[derive(Clone)]
@@ -279,6 +282,7 @@ impl BuyerStore {
                  updated_at_unix INTEGER NOT NULL
              );",
         )?;
+        conn.execute_batch(swarm::SCHEMA)?;
         Self::migrate(conn)?;
         // Forward-only, monotone schema-version bump. A fresh DB is stamped at SCHEMA_VERSION; a
         // pre-existing lower version is upgraded to it; a (hypothetical) higher version is left
