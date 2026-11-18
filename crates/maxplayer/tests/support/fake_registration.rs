@@ -83,6 +83,9 @@ struct State {
     relay_member: String,
     /// challenge -> (account hex, mint hex, expires_at, used)
     mint_challenges: HashMap<String, (String, String, u64, bool)>,
+    /// Test knob: answer the next mint challenge naming this mint key instead (a hostile or buggy
+    /// service), so the client's own check is exercised.
+    challenge_mint_override: Option<String>,
 }
 
 pub struct FakeRegistration {
@@ -147,6 +150,7 @@ impl FakeRegistration {
             requests: Vec::new(),
             relay_member: "added".into(),
             mint_challenges: HashMap::new(),
+            challenge_mint_override: None,
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -228,6 +232,10 @@ impl FakeRegistration {
         for c in self.state.lock().unwrap().mint_challenges.values_mut() {
             c.2 = 0;
         }
+    }
+
+    pub fn set_challenge_mint_override(&self, mint_hex: &str) {
+        self.state.lock().unwrap().challenge_mint_override = Some(mint_hex.to_owned());
     }
 
     pub fn mint_challenge_count(&self) -> usize {
@@ -720,6 +728,7 @@ fn mint_challenge(state: &mut State, account: &str, body: &Value) -> Answer {
         (account.to_owned(), mint.clone(), now() + 300, false),
     );
     let proof_url = format!("{}/link/mint/confirm", state.public_base);
+    let mint = state.challenge_mint_override.take().unwrap_or(mint);
     ok(
         200,
         json!({

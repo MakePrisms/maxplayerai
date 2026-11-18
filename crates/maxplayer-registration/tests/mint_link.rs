@@ -292,6 +292,28 @@ async fn only_an_email_linked_key_can_vouch() {
     assert_eq!(err(&r), (403, Some("account_is_cosigned")));
 }
 
+/// The confirm re-checks the voucher under lock: an account that stopped being an email link
+/// (here: rewritten to a cosigned row by SQL) after the challenge cannot confirm.
+#[tokio::test]
+async fn an_account_that_became_cosigned_cannot_confirm() {
+    let app = TestApp::start().await;
+    let acct = account(&app).await;
+    let mint = Keys::generate();
+    let r = challenge(&app, &acct, &mint.public_key()).await;
+    let c = r.body["challenge"].as_str().unwrap().to_string();
+    sqlx::query(
+        "UPDATE registrations SET code_entered_by = 'cosigned', linked_by = $2 WHERE pubkey = $1",
+    )
+    .bind(acct.public_key().to_hex())
+    .bind(Keys::generate().public_key().to_hex())
+    .execute(&app.db)
+    .await
+    .unwrap();
+    let p = proof(&app, &mint, &c, &acct.public_key());
+    let r = confirm(&app, &acct, body(&c, &mint.public_key(), "m", p)).await;
+    assert_eq!(err(&r), (403, Some("account_is_cosigned")));
+}
+
 #[tokio::test]
 async fn an_account_removed_after_the_challenge_cannot_confirm() {
     let app = TestApp::start().await;

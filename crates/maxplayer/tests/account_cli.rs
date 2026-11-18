@@ -446,6 +446,7 @@ fn top_level_help_lists_the_account_command() {
     for needle in [
         "account link [--email <email>] [--label <name>]",
         "account link --code <6 digits>",
+        "account link --mint [--label <name>] [--home <dir>]   (cosigned, no email)",
         "account status [--json]",
         "account marketing on|off",
         "MAXPLAYER_REGISTRATION_URL",
@@ -876,7 +877,10 @@ fn link_confirm_publish_failure_still_succeeds_with_a_hint() {
         err.contains("Could not publish \"my-laptop\" as this agent's public name"),
         "{err}"
     );
-    assert!(err.contains("the next maxplayer start tries again"), "{err}");
+    assert!(
+        err.contains("the next maxplayer start tries again"),
+        "{err}"
+    );
     assert!(
         err.contains("maxplayer profile set --name \"my-laptop\""),
         "{err}"
@@ -1017,4 +1021,186 @@ fn trade_home_is_deprecated_ignored_and_never_creates_a_trade_key() {
     assert!(err.contains(TRADE_HOME_DEPRECATED), "{err}");
     assert!(err.contains("no mint key at"), "{err}");
     assert!(names_in(&trade).is_empty());
+}
+
+// ------------------------------------------------------------------ cosigned `link --mint`
+
+/// A home whose agent key is linked to `ops@example.com`, with a mint key in `<home>/mint/`.
+fn cosign_home(
+    fake: &FakeRegistration,
+    mint_name: Option<&str>,
+) -> (Home, nostr_sdk::prelude::Keys) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = new_home();
+    fake.link_existing(&home.pubkey, "ops@example.com");
+    let mint = nostr_sdk::prelude::Keys::generate();
+    let dir = home.root.join("mint");
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("nostr.key");
+    std::fs::write(&key, mint.secret_key().to_secret_hex()).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if let Some(name) = mint_name {
+        std::fs::write(dir.join("mint.toml"), format!("name = \"{name}\"\n")).unwrap();
+    }
+    (home, mint)
+}
+
+fn paths(fake: &FakeRegistration) -> Vec<String> {
+    fake.requests().iter().map(|r| r.path.clone()).collect()
+}
+
+#[test]
+fn mint_link_is_cosigned_by_the_agent_key_with_no_email() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, Some("ops mint"));
+    let mint_hex = mint.public_key().to_hex();
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("Both keys sign; no email is sent."), "{out}");
+    assert!(
+        out.contains("Done, linked to ops@example.com (mint \"ops mint\""),
+        "{out}"
+    );
+    assert!(
+        out.contains("The relay now accepts writes from this mint key."),
+        "{out}"
+    );
+    let reg = fake.registration(&mint_hex).unwrap();
+    assert_eq!(reg.entered_by, "cosigned");
+    assert_eq!(reg.linked_by.as_deref(), Some(home.pubkey.as_str()));
+    assert_eq!(
+        reg.label, "ops mint",
+        "the mint's name is the default label"
+    );
+    // Exactly the two cosign calls, both signed by the AGENT key; no code was requested.
+    assert_eq!(
+        paths(&fake),
+        ["/account/link/mint/challenge", "/account/link/mint/confirm"]
+    );
+    for r in fake.requests() {
+        assert_eq!(r.auth.unwrap().pubkey.to_hex(), home.pubkey);
+    }
+    assert!(fake.pending(&mint_hex).is_none());
+
+    // `status --mint` then reports the mint key's link and who vouched for it.
+    let (code, out, _) = run(&home, &fake.base_url(), &["status", "--mint", "--json"]);
+    assert_eq!(code, 0);
+    let status: Value = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(status["code_entered_by"], "cosigned");
+    assert_eq!(status["linked_by"], home.pubkey);
+
+    // Again: a refresh, with an explicit label.
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &["link", "--mint", "--label", "m2"],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("the link was refreshed"), "{out}");
+    assert_eq!(fake.registration(&mint_hex).unwrap().label, "m2");
+}
+
+#[test]
+fn mint_link_without_a_mint_name_uses_the_mints_default_name() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    let mint_hex = mint.public_key().to_hex();
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert_eq!(
+        fake.registration(&mint_hex).unwrap().label,
+        format!("maxplayer-mint-{}", &mint_hex[..8])
+    );
+}
+
+#[test]
+fn mint_link_needs_an_email_linked_agent_key() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    // Forget the agent's link: the service refuses it as a voucher.
+    let fresh = FakeRegistration::start();
+    let (code, out, err) = run(&home, &fresh.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(
+        err.contains("agent key is not linked to an email yet"),
+        "{err}"
+    );
+    assert!(err.contains("`maxplayer account link`"), "{err}");
+    assert!(fresh.registration(&mint.public_key().to_hex()).is_none());
+    assert_eq!(paths(&fresh), ["/account/link/mint/challenge"]);
+}
+
+#[test]
+fn mint_link_refuses_a_mint_key_linked_to_another_account() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    let mint_hex = mint.public_key().to_hex();
+    fake.link_existing(&mint_hex, "someone@else.example");
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(
+        err.contains("already linked to a different account"),
+        "{err}"
+    );
+    assert_eq!(
+        fake.registration(&mint_hex).unwrap().email,
+        "someone@else.example"
+    );
+}
+
+/// The client signs a mint proof only for a challenge issued for ITS mint key: a service answer
+/// naming another key is refused before the mint key signs anything.
+#[test]
+fn mint_link_refuses_a_challenge_for_another_mint_key() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    fake.set_challenge_mint_override(&nostr_sdk::prelude::Keys::generate().public_key().to_hex());
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("unexpected answer"), "{err}");
+    assert_eq!(
+        paths(&fake),
+        ["/account/link/mint/challenge"],
+        "no confirm was sent"
+    );
+    assert!(fake.registration(&mint.public_key().to_hex()).is_none());
+}
+
+/// A mint whose key IS the agent key cannot vouch for itself: refused before any request.
+#[test]
+fn mint_link_refuses_the_agent_key_as_its_own_voucher() {
+    let fake = FakeRegistration::start();
+    let (home, _) = cosign_home(&fake, None);
+    let agent_secret = std::fs::read_to_string(home.root.join("key")).unwrap();
+    std::fs::write(
+        home.root.join("mint").join("nostr.key"),
+        agent_secret.trim(),
+    )
+    .unwrap();
+    let (code, out, err) = run(&home, &fake.base_url(), &["link", "--mint"]);
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("same key"), "{err}");
+    assert!(fake.requests().is_empty());
+}
+
+/// `--mint --email` keeps the email-code flow for the mint key (e.g. a different email).
+#[test]
+fn mint_link_with_email_still_uses_the_code_flow() {
+    let fake = FakeRegistration::start();
+    let (home, mint) = cosign_home(&fake, None);
+    let (code, out, err) = run(
+        &home,
+        &fake.base_url(),
+        &[
+            "link",
+            "--mint",
+            "--email",
+            "ops@example.com",
+            "--label",
+            "m",
+        ],
+    );
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(fake.pending(&mint.public_key().to_hex()).is_some());
+    assert_eq!(paths(&fake), ["/account/link/request"]);
 }
