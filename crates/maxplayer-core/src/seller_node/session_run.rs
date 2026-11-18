@@ -463,7 +463,8 @@ impl SellerNodeRunner {
     }
 
     async fn turn_feedback(&self, job_id: &str, buyer: &str, fid: &str, code: ReasonCode) {
-        self.turn_feedback_with(job_id, buyer, fid, code, None).await
+        self.turn_feedback_with(job_id, buyer, fid, code, None)
+            .await
     }
 
     /// `sizes`: a seller-computed, buyer-text-free detail appended for `turn_too_large` (#1349).
@@ -689,7 +690,8 @@ impl SellerNodeRunner {
                 );
                 let _ = store.set_turn_state(fid, TurnState::Refused, None, None, now_secs());
                 let sizes = (code == ReasonCode::TurnTooLarge).then_some(detail.as_str());
-                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes).await;
+                self.turn_feedback_with(&job_id, &buyer, fid, code, sizes)
+                    .await;
             }
         }
         if store.session_close_requested(&job_id).unwrap_or(false)
@@ -778,8 +780,7 @@ impl SellerNodeRunner {
             && matches!(
                 review.enabled(crate::kinds::SESSION_FOLLOWUP_KIND, &buyer),
                 Ok(true)
-            )
-        {
+            ) {
             let turns: Vec<SessionTurnRecord> = store
                 .turns(job_id)
                 .map(|turns| {
@@ -1646,7 +1647,10 @@ mod tests {
         assert_eq!(refusal_status(ReasonCode::ExecutionFailed), None);
         let text = feedback_text(ReasonCode::TurnTooLarge);
         assert_ne!(text, EXEC_FAILURE_FEEDBACK);
-        assert!(text.contains("too large") && text.contains("post a new job"), "{text}");
+        assert!(
+            text.contains("too large") && text.contains("post a new job"),
+            "{text}"
+        );
     }
 
     /// Failure test 5 (host half): a refused review writes `abort` and never the buyer's text;

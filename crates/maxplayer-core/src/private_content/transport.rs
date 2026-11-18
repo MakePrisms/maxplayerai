@@ -193,7 +193,9 @@ mod size_tests {
             rumor.as_json().len()
         };
         let overhead = rumor_len("");
-        for len in [1, 100, 255, 1_000, 30_000, 40_000, 40_681, 40_682, 40_683, 45_000, 60_000] {
+        for len in [
+            1, 100, 255, 1_000, 30_000, 40_000, 40_681, 40_682, 40_683, 45_000, 60_000,
+        ] {
             // Quotes and newlines escape, so the rumor is longer than the message.
             let message: String = "ab\"\n".repeat(len)[..len].to_owned();
             let wrapped = wrap_checked(&keys, recipient, message.clone()).await;
@@ -201,11 +203,22 @@ mod size_tests {
             assert!(rumor >= overhead + len, "{len}");
             match (&wrapped, check_sealable(recipient, message)) {
                 (Ok(outer), Ok(())) => {
-                    let seal = nip44::decrypt(Keys::generate().secret_key(), &outer.pubkey, &outer.content);
+                    let seal = nip44::decrypt(
+                        Keys::generate().secret_key(),
+                        &outer.pubkey,
+                        &outer.content,
+                    );
                     assert!(seal.is_err(), "only the recipient decrypts");
                     assert!(rumor <= MAX_SEALABLE_RUMOR, "{len}");
                 }
-                (Err(WrapError::Size { layer, actual, .. }), Err(WrapError::Size { layer: l, actual: a, .. })) => {
+                (
+                    Err(WrapError::Size { layer, actual, .. }),
+                    Err(WrapError::Size {
+                        layer: l,
+                        actual: a,
+                        ..
+                    }),
+                ) => {
                     assert_eq!((*layer, *actual), (l, a), "{len}");
                     assert!(rumor > MAX_SEALABLE_RUMOR, "{len}");
                 }
@@ -219,8 +232,8 @@ mod size_tests {
             let outer = wrap_checked(&keys, recipient_keys.public_key(), message.clone())
                 .await
                 .unwrap();
-            let seal = nip44::decrypt(recipient_keys.secret_key(), &outer.pubkey, &outer.content)
-                .unwrap();
+            let seal =
+                nip44::decrypt(recipient_keys.secret_key(), &outer.pubkey, &outer.content).unwrap();
             assert_eq!(seal.len(), seal_json_len(rumor_len(&message)), "{len}");
         }
     }
