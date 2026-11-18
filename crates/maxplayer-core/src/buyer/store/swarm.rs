@@ -463,6 +463,16 @@ impl BuyerStore {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// Sellers holding a running (`posted`) task in any swarm job of this buyer (§1.14).
+    pub fn posted_swarm_sellers(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT seller FROM swarm_tasks WHERE state = 'posted' AND seller IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// `queued → posted` for `seller` at `price`, recorded BEFORE anything is posted so a crash
     /// leaves a task the next tick retries with the identical request. `false` when the task is
     /// no longer queued (dropped or replaced meanwhile): nothing was changed.

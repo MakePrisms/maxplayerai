@@ -776,6 +776,15 @@ impl Engine {
         now: u64,
     ) -> Result<Vec<String>, String> {
         let mut errors = Vec::new();
+        // One running task per seller across ALL of this buyer's swarms (§1.14, Josip 18 Nov): the
+        // engine cannot see a seller's free seats (`queue_depth` is not free capacity), so a second
+        // swarm's offer would only sit unclaimed behind the first. Shared by every job this tick.
+        let mut busy: BTreeSet<String> = self
+            .store
+            .posted_swarm_sellers()
+            .map_err(es)?
+            .into_iter()
+            .collect();
         for j in self.store.swarm_jobs(None, true).map_err(es)? {
             if j.status != "in_progress" {
                 continue;
@@ -797,15 +806,6 @@ impl Engine {
                 .filter(|t| holds_budget(t))
                 .map(|t| t.price_sats.unwrap_or(0))
                 .sum();
-            // One running task per seller per swarm (§7.3); no cross-swarm cap (§1.14).
-            let mut busy: BTreeSet<String> = self
-                .store
-                .swarm_tasks_of_swarm(&j.swarm)
-                .map_err(es)?
-                .into_iter()
-                .filter(|t| t.state == "posted")
-                .filter_map(|t| t.seller)
-                .collect();
             let mut queued: Vec<TaskRow> =
                 tasks.into_iter().filter(|t| t.state == "queued").collect();
             let members = world.eligible.get(&j.d).cloned().unwrap_or_default();

@@ -448,10 +448,10 @@ async fn expired_task_frees_its_seller() {
     assert_eq!(task(&e, b).seller, Some(fx.seller(0)));
 }
 
-/// §12: a member of two swarms gets one task from each at once (no cross-swarm cap), never two
-/// from one.
+/// §1.14 (Josip 18 Nov): a member of two of this buyer's swarms runs one task at a time across
+/// both, never one from each at once; the next goes out once the running one is collected.
 #[tokio::test]
-async fn member_of_two_swarms_gets_one_task_from_each() {
+async fn member_of_two_swarms_runs_one_task_across_both() {
     let fx = Fx::new(1, 10);
     fx.swarm("math", "public");
     fx.swarm("physics", "public");
@@ -465,28 +465,43 @@ async fn member_of_two_swarms_gets_one_task_from_each() {
     let p1 = fx.queue(&e, "phys-1", "p1", false);
     e.tick(&fx.stub).await.unwrap();
     let states = [m1, m2, p1].map(|id| task(&e, id).state);
-    assert_eq!(states, ["posted", "queued", "posted"].map(String::from));
-    let posts = fx.stub.posts();
-    assert_eq!(posts.len(), 2);
-    assert!(posts.iter().all(|p| p["seller_pubkey"] == fx.seller(0)));
-    assert!(
-        e.store
-            .swarm_job("math-1")
+    assert_eq!(states, ["posted", "queued", "queued"].map(String::from));
+    assert_eq!(fx.stub.posts().len(), 1, "one task across both swarms");
+    for job in ["math-1", "phys-1"] {
+        let why = e
+            .store
+            .swarm_job(job)
             .unwrap()
             .unwrap()
             .idle_reason
-            .unwrap()
-            .contains("1 busy")
-    );
-    // Later ticks while both still run: still one per swarm, across both of a swarm's jobs.
+            .unwrap();
+        assert!(why.contains("1 busy"), "{job}: {why}");
+    }
+    // Later ticks while m1 still runs: nothing more, from either swarm or a new job.
     fx.job("math-2", "math", 10_000);
     fx.at(T0 + 60);
     e.tick(&fx.stub).await.unwrap();
     let m3 = fx.queue(&e, "math-2", "m3", false);
     fx.at(T0 + 120);
     e.tick(&fx.stub).await.unwrap();
-    assert_eq!(task(&e, m2).state, "queued", "busy in math across ticks");
-    assert_eq!(task(&e, m3).state, "queued", "busy in math across its jobs");
+    assert_eq!(
+        task(&e, p1).state,
+        "queued",
+        "busy in math, so not sent physics"
+    );
+    assert_eq!(task(&e, m3).state, "queued", "busy across a swarm's jobs");
+    assert_eq!(fx.stub.posts().len(), 1);
+    // m1 collected: the seller is free again and gets exactly one next task.
+    let job_m1 = fx.stub.job_ids()[0].clone();
+    fx.stub.deliver(&job_m1);
+    fx.at(T0 + 300);
+    e.tick(&fx.stub).await.unwrap();
+    assert_eq!(task(&e, m1).state, "collected");
+    let running = [m2, m3, p1]
+        .iter()
+        .filter(|&&id| task(&e, id).state == "posted")
+        .count();
+    assert_eq!(running, 1, "one next task, not one per swarm");
     assert_eq!(fx.stub.posts().len(), 2);
 }
 
