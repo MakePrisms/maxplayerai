@@ -70,16 +70,19 @@ because both keys sign:
 1. `POST /account/link/mint/challenge`, NIP-98 signed by the **account key** (a key linked by email
    code), body `{mint_pubkey}`. The service stores a fresh 32-byte random challenge bound to
    (account key, mint key), valid `limits.mint_challenge_ttl_secs` (default 300 s), and returns it.
-   Rate limit: `mint_challenges_per_pubkey_per_hour` (20) and `mint_challenges_per_ip_per_hour` (60).
+   Rate limit: `mint_challenges_per_pubkey_per_hour` (20) and `mint_challenges_per_ip_per_hour` (60),
+   counted before any lookup, so refusals cost a slot too.
 2. `POST /account/link/mint/confirm`, NIP-98 signed by the **account key** again; its `payload` tag
    covers the whole body (challenge, mint key, label and proof). `mint_proof` is a Nostr event
    signed by the **mint key**: kind **27236** (not 27235, so it is never a NIP-98 header), exactly
    one `u` tag = `<public_base_url>/account/link/mint/confirm`, one `challenge` tag = the
    challenge, one `p` tag = the account key (hex), `created_at` within `nip98_max_skew_secs`.
+   Every attempt counts against `confirms_per_pubkey_per_hour` / `confirms_per_ip_per_hour`.
 
 In one transaction the confirm then consumes the challenge (single use; an unknown, used or
 expired one is refused and nothing is linked), re-checks that the account key is still an
-email link, and writes the mint's row: the account's email and accepted terms/privacy versions,
+email link, and writes the mint's row: the account's email, accepted terms/privacy versions and
+acceptance time (`accepted_at`),
 `code_entered_by = 'cosigned'`, `linked_by = <account key>`. A NIP-43 add is queued as for a code
 link. No code or welcome email is sent.
 
@@ -89,8 +92,9 @@ different email (`409 mint_linked_to_other_account`) or already linked to the sa
 code (`409 mint_already_linked`); the account key as its own mint (`400 same_key`). Re-running it
 for a mint already cosigned to the same email refreshes the label and versions. A cosigned key can
 later link by email code to the same email; its row then becomes an ordinary code link
-(`linked_by` cleared). Removing the account row does not remove mint rows it vouched for (remove
-those keys separately).
+(`linked_by` cleared). Removing the account row does not remove mint rows it vouched for:
+`maxplayer-registration remove <account key>` prints each key it vouched for (with the command to
+remove it), so a ban removes those too.
 
 ## Relay membership (NIP-43)
 
@@ -206,6 +210,13 @@ plain systemd unit for non-NixOS hosts.
 
    It must show `["member","<service admin pubkey>","admin"]`. Until then every confirm answers
    `relay_member:"pending"` and the outbox retries; nothing is lost.
+
+### Rolling back a migration
+
+Migrations are forward-only. Once `0002_mint_cosign.sql` has run, an older binary refuses to start
+(sqlx rejects an applied migration it does not know), and it would also fail a code confirm on a
+cosigned row (it leaves `linked_by` set). Roll back by restoring the pre-deploy backup, not by
+starting the older binary.
 
 ### Database and role
 
