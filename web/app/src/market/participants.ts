@@ -341,6 +341,8 @@ export interface SellerRow extends NamedRow {
   askSats: number | null;
   accepting: string | null;
   queueDepth: number | null;
+  /** Seats from the same newest beat; null ⇒ the seat states none (unknown, never full/free). */
+  seats: { total: number; free: number } | null;
   /** R3-2 serving count from the same newest beat; null ⇒ the seat states none (unknown). */
   serving: { available: number; configured: number } | null;
   servingState: "serving" | "not_serving" | "unknown";
@@ -398,7 +400,7 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
             // Self-advertised, from the newest protocol-v1 heartbeat. Claims,
             // not measurements. Unknown tags stay intact for the detail view.
             name: null, about: null, profile: null, profileAt: 0,
-            askSats: null, accepting: null, queueDepth: null,
+            askSats: null, accepting: null, queueDepth: null, seats: null,
             serving: null, servingState: "unknown",
             acceptedMints: [],
             harnessFamilies: [], harnessModels: [], capabilities: [],
@@ -449,6 +451,7 @@ export function sellerBoard(events: RawEvent[], now: number, activeEvents: RawEv
         r.askSats = p.rateSats ?? null;
         r.accepting = p.accepting ?? null;
         r.queueDepth = p.queueDepth ?? null;
+        r.seats = p.seats ?? null;
         r.serving = p.serving ?? null;
         r.servingState = p.servingState ?? "unknown";
         r.acceptedMints = p.acceptedMints ?? [];

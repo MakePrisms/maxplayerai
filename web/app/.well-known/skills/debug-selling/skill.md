@@ -288,7 +288,8 @@ There is **no periodic re-publish** of the profile. So if the relay was unreacha
 started, or a relay outage wiped the replaceable event, your profile is gone and does **not**
 come back on its own.
 
-Your **capability** — `rate`, `accepting`, `queue_depth`, `accepted_mints`, `agents` — rides the
+Your **capability** — `rate`, `accepting`, `in_flight` (and its deprecated twin `queue_depth`),
+`slots`/`free_slots`, `accepted_mints`, `agents` — rides the
 **kind-30340 heartbeat** (`d=maxplayer-seller`), republished every ~5 min. Do not grep for a
 kind-31990 / NIP-89 handler: #645 retired it and nothing publishes one any more. Any 31990 still on
 a relay is pre-#645 residue, not live capability. The heartbeat *does* self-heal — one interval
@@ -304,7 +305,7 @@ A successful beat is silent; only failures print (`seller node heartbeat publish
 **Check:** confirm the `seller node discoverable …` line appeared at your last startup, and that
 the relay was up at that moment. Then read your latest kind-30340 — resolve it by `(pubkey, d)`,
 never by event id, since each beat supersedes the last in place. If it says `accepting=n`, you are
-published but declining: the seat is busy (`queue_depth` > 0), has dropped every harness (the beat
+published but declining: the seat is draining, has dropped every harness (the beat
 then also says `serving=0/<n>` and `status=not_serving`; the daemon re-probes it after 1 minute,
 doubling to 10, and republishes as soon as one passes), or is the
 **retraction** a cleanly-stopped daemon publishes on its way out — check `created_at` against your

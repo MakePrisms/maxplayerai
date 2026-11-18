@@ -11,6 +11,7 @@ import {
   RESULT, SELF_TRADE_TAG, TRADE_STAGES, type Stage,
 } from "./kinds.js";
 import { servingFromTags } from "./serving.mjs";
+import { inFlightFromTags, seatSlotsFromTags } from "./seats.mjs";
 
 /** A raw NIP-01 event as the relay sends it. Untrusted input. */
 export interface RawEvent {
@@ -89,7 +90,10 @@ export interface ParsedEvent {
   d?: string;
   version?: string | null;
   accepting?: string | null;
+  /** Live load: `in_flight`, falling back to the deprecated `queue_depth`. NOT free capacity. */
   queueDepth?: number | null;
+  /** `["slots",n]` + `["free_slots",m]`, or null when the beat states no valid pair (unknown). */
+  seats?: { total: number; free: number } | null;
   /** R3-2 `["serving","a/n"]`, or null when the beat states none (unknown, never "not serving"). */
   serving?: { available: number; configured: number } | null;
   servingState?: "serving" | "not_serving" | "unknown";
@@ -502,7 +506,9 @@ function parseEventUncached(event: RawEvent): ParsedEvent | null {
                d: firstTag(event, "d") || "",
                version: firstTag(event, "v"),
                accepting: firstTag(event, "accepting"),
-               queueDepth: firstNumber(event, "queue_depth"),
+               // `in_flight` (new name) or the deprecated `queue_depth` (older seats).
+               queueDepth: inFlightFromTags(event.tags),
+               seats: seatSlotsFromTags(event.tags),
                // R3-2: harnesses able to run a job now, out of those the seat resolved.
                serving: servingFromTags(event.tags).count,
                servingState: servingFromTags(event.tags).state,

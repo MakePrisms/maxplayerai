@@ -2,8 +2,9 @@
 //!
 //! A running seller republishes an **addressable** (NIP-01 parameterized-replaceable) event,
 //! `d="maxplayer-seller"`, on a ~5-minute cadence. It carries every seat-level fact a buyer needs
-//! before it trades: whether the seat is `accepting` new work, its `queue_depth`, its `rate`, the
-//! `accepted_mints` it can be paid on, and the `agents` it can run. Every fact is current as of that
+//! before it trades: whether the seat is `accepting` new work, its live load (`in_flight`, plus the
+//! deprecated `queue_depth` carrying the same number), its execution seats (`slots` and
+//! `free_slots`), its `rate`, the `accepted_mints` it can be paid on, and the `agents` it can run. Every fact is current as of that
 //! beat EXCEPT two: [`HARNESS_MODEL_TAG`] is last-observed and [`CAPABILITIES_TAG`] is bounded by
 //! the seat's uptime. `docs/protocol-v1.md` §4.5.4 is normative for both.
 //!
@@ -313,6 +314,101 @@ pub const STATUS_TAG: &str = "status";
 /// The one [`STATUS_TAG`] value this build emits.
 pub const STATUS_NOT_SERVING: &str = "not_serving";
 
+/// `["in_flight", n]` — the seat's LIVE LOAD: jobs it holds in `Awarded` or `Executing`
+/// ([`crate::seller_node::store`]'s `jobs_in_flight`). Required on every beat this build emits.
+///
+/// It is the correctly named twin of [`QUEUE_DEPTH_TAG`]. A seat has no queue: it either claims an
+/// offer into a free seat or does not claim it, so a "queue depth" invited readers to treat it as
+/// backlog or as the complement of free capacity, and it is neither. It EXCLUDES claim-time seat
+/// reservations — [`FREE_SLOTS_TAG`] is the capacity number.
+pub const IN_FLIGHT_TAG: &str = "in_flight";
+
+/// `["queue_depth", n]` — DEPRECATED. Emitted with exactly the [`IN_FLIGHT_TAG`] value so readers
+/// built before `in_flight` keep working. New readers prefer `in_flight` and fall back to this
+/// ([`in_flight_from_tags`]); a future protocol revision may stop emitting it.
+pub const QUEUE_DEPTH_TAG: &str = "queue_depth";
+
+/// `["slots", n]` — the seat's total execution seats, its `[seller] slots` (clamped to at least 1,
+/// as the slot gate clamps it). Single value, a decimal integer. Same word as the config key.
+pub const SLOTS_TAG: &str = "slots";
+
+/// `["free_slots", n]` — execution seats free RIGHT NOW: [`SLOTS_TAG`] minus the seats held by
+/// awarded/executing jobs (and session turns) minus the seats reserved by claims still awaiting
+/// their award. It is the exact number the seat's claim gate (`SlotGate::try_reserve`) tests, so a
+/// seat publishing `free_slots=0` declines every offer until a seat frees.
+///
+/// ⛔ ABSENT IS UNKNOWN, NEVER "FULL" OR "FREE". Every seat built before this tag publishes neither
+/// `slots` nor `free_slots`; a reader then behaves as it did before the tags existed. The pair is
+/// read together ([`seat_slots_from_tags`]): one without the other, a non-decimal value, `slots=0`
+/// or `free_slots > slots` states nothing.
+///
+/// Like every beat fact it is the seat's own statement as of the beat, not a reservation: another
+/// buyer can take the seat between the beat and an offer. It also says nothing about the seat's
+/// other gates (`accepting`, `rate`, admission, harness): read it beside them.
+pub const FREE_SLOTS_TAG: &str = "free_slots";
+
+/// The seat's execution seats as one beat states them: `total` from [`SLOTS_TAG`], `free` from
+/// [`FREE_SLOTS_TAG`]. `free <= total` and `total > 0` by construction on both sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct SeatSlots {
+    pub total: u32,
+    pub free: u32,
+}
+
+impl SeatSlots {
+    /// Build the advertisement from the slot gate's numbers. `total` is clamped to at least 1 and
+    /// `free` to at most `total`, so the emitter can never publish a pair the reader rejects.
+    pub fn new(total: usize, free: usize) -> Self {
+        let total = u32::try_from(total).unwrap_or(u32::MAX).max(1);
+        let free = u32::try_from(free).unwrap_or(u32::MAX).min(total);
+        Self { total, free }
+    }
+}
+
+/// The `slots` and `free_slots` tags.
+pub fn seat_slots_tags(slots: SeatSlots) -> Vec<TagSpec> {
+    vec![
+        TagSpec::new([SLOTS_TAG, &slots.total.to_string()]),
+        TagSpec::new([FREE_SLOTS_TAG, &slots.free.to_string()]),
+    ]
+}
+
+/// Read the seat's slots off a beat. `None` — UNKNOWN — unless BOTH tags are present as plain
+/// decimal integers (surrounding whitespace tolerated), `slots > 0` and `free_slots <= slots`.
+pub fn seat_slots_from_tags(tags: &[TagSpec]) -> Option<SeatSlots> {
+    let decimal = |name: &str| -> Option<u32> {
+        let value = first_tag_value(tags, name)?.trim();
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        value.parse().ok()
+    };
+    let slots = SeatSlots {
+        total: decimal(SLOTS_TAG)?,
+        free: decimal(FREE_SLOTS_TAG)?,
+    };
+    (slots.total > 0 && slots.free <= slots.total).then_some(slots)
+}
+
+/// Read the seat's live load: [`IN_FLIGHT_TAG`] when it parses, else the deprecated
+/// [`QUEUE_DEPTH_TAG`] (every seat built before `in_flight` publishes only that). Both carry the
+/// same number on a beat this build emits. `Err` names the tag that failed when neither parses.
+pub fn in_flight_from_tags(tags: &[TagSpec]) -> Result<u32, HeartbeatParseError> {
+    let new = first_tag_value(tags, IN_FLIGHT_TAG);
+    if let Some(count) = new.and_then(|raw| raw.parse().ok()) {
+        return Ok(count);
+    }
+    match first_tag_value(tags, QUEUE_DEPTH_TAG) {
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| HeartbeatParseError::InvalidInFlight(raw.to_owned())),
+        None => Err(match new {
+            Some(raw) => HeartbeatParseError::InvalidInFlight(raw.to_owned()),
+            None => HeartbeatParseError::MissingTag(IN_FLIGHT_TAG),
+        }),
+    }
+}
+
 /// The `serving` count: harnesses able to run a job now, out of those resolved at boot (R3-2).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ServingCount {
@@ -556,8 +652,13 @@ impl SeatCapability {
 pub struct HeartbeatDraft {
     /// Is the seller taking new work right now (`y`/`n`).
     pub accepting: bool,
-    /// Current in-flight job count.
-    pub queue_depth: u32,
+    /// Live load: jobs in `Awarded`/`Executing`. Emitted as `in_flight` AND the deprecated
+    /// `queue_depth`, same value.
+    pub in_flight: u32,
+    /// The seat's execution seats, or `None` to state nothing (the tag set published before
+    /// `slots`/`free_slots` existed). The production publish paths always set it from the slot
+    /// gate, so a real seat always answers.
+    pub slots: Option<SeatSlots>,
     /// The seller's advertised rate (sats).
     pub rate_sats: u64,
     /// Does this seat take NO payment at all (§4.1)? `false` — the default — emits no tag, so a
@@ -589,13 +690,14 @@ pub struct HeartbeatDraft {
 impl HeartbeatDraft {
     pub fn new(
         accepting: bool,
-        queue_depth: u32,
+        in_flight: u32,
         rate_sats: u64,
         accepted_mints: Vec<String>,
     ) -> Self {
         Self {
             accepting,
-            queue_depth,
+            in_flight,
+            slots: None,
             rate_sats,
             takes_no_payment: false,
             accepted_mints,
@@ -610,6 +712,13 @@ impl HeartbeatDraft {
     /// when `a` is zero. Take it from the SAME roster snapshot that decided `accepting`.
     pub fn with_serving(mut self, serving: ServingCount) -> Self {
         self.serving = Some(serving);
+        self
+    }
+
+    /// Advertise the seat's execution seats: `["slots",total]` and `["free_slots",free]`. Take
+    /// both from the slot gate in ONE read, the same gate the claim decision consults.
+    pub fn with_slots(mut self, slots: SeatSlots) -> Self {
+        self.slots = Some(slots);
         self
     }
 
@@ -638,14 +747,15 @@ impl HeartbeatDraft {
     }
 
     /// The §4.2 tag set, in the order the spec table lists it: `d`, `t`, `v`, `rate`, `accepting`,
-    /// `queue_depth`, `accepted_mints`, and `agents` when the seat states a roster — followed by the
-    /// #784 capability tags, filterable first then display-only.
+    /// `in_flight`, `queue_depth` (deprecated, same value), `accepted_mints`, and `agents` when the
+    /// seat states a roster — then `slots`/`free_slots` and `serving` when stated, then the #784
+    /// capability tags, filterable first then display-only.
     ///
     /// The beat emits BOTH capability sets; a claim emits only the filterable one. Both take them
     /// from [`SeatCapability`], so the two events cannot spell a shared field differently.
     pub fn to_event_draft(&self) -> EventDraft {
         let accepting = if self.accepting { "y" } else { "n" };
-        let queue_depth = self.queue_depth.to_string();
+        let in_flight = self.in_flight.to_string();
         let rate = self.rate_sats.to_string();
 
         let mut tags = vec![
@@ -654,7 +764,9 @@ impl HeartbeatDraft {
             TagSpec::new(["v", PROTOCOL_VERSION]),
             TagSpec::new(["rate", &rate]),
             TagSpec::new(["accepting", accepting]),
-            TagSpec::new(["queue_depth", &queue_depth]),
+            TagSpec::new([IN_FLIGHT_TAG, &in_flight]),
+            // Deprecated, kept byte-identical for readers built before `in_flight`.
+            TagSpec::new([QUEUE_DEPTH_TAG, &in_flight]),
             multi_value_tag(ACCEPTED_MINTS_TAG, &self.accepted_mints),
         ];
         // §4.1 — stated next to `rate`, and only when true. `false` emits nothing, which reads as
@@ -670,6 +782,9 @@ impl HeartbeatDraft {
         }
         if let Some(admission) = self.admission.as_ref() {
             tags.extend(admission_tags(admission));
+        }
+        if let Some(slots) = self.slots {
+            tags.extend(seat_slots_tags(slots));
         }
         if let Some(serving) = self.serving {
             tags.extend(serving_tags(serving));
@@ -955,7 +1070,8 @@ fn tag_values(tags: &[TagSpec], name: &str) -> Vec<String> {
 /// destroyed the count at the signature — the `queue_depth` on the wire could then only ever be 0 or
 /// 1 no matter what the caller knew, while this doc still claimed it was the in-flight count. The
 /// caller then supplied that bool as `COUNT(*) FROM jobs > 0`, a LIFETIME row count, so a seat
-/// published `accepting=n` permanently from its first job onward (#313).
+/// published `accepting=n` permanently from its first job onward (#313). (The wire tag is now
+/// `in_flight`, with `queue_depth` kept beside it carrying the same number.)
 /// ★ The 0/1 cast is why it survived: a seat holding 5 finished jobs advertised `1`, which reads as
 /// plausible. A literal `5` on an idle seat would have looked absurd to anyone. **A lossy encoding of
 /// a quantity hides a wrong answer inside a believable one** — so keep this a count, and let the wire
@@ -989,7 +1105,8 @@ pub fn heartbeat_for_state(
     // part: with `[seller] slots` defaulting to 3, gating on `in_flight == 0` published `n` from
     // the first job onward while two slots stood free, and said nothing `queue_depth` did not.
     // Capacity is enforced where it is known — `SlotGate::try_reserve` at claim time — and a full
-    // seat signals fullness by not claiming. `queue_depth` stays the live count, unchanged.
+    // seat signals fullness by not claiming — and, since the beat states it, by `free_slots=0`,
+    // which the publish path adds with `with_slots`. `in_flight` stays the live count, unchanged.
     HeartbeatDraft::new(anything_serving, in_flight, rate_sats, accepted_mints)
     // §4.1 — derived from the SAME `SellerConfig` the admission gate reads, in the same call, so
     // the advertisement cannot lie about the gate that enforces it.
@@ -1069,7 +1186,12 @@ pub fn retraction_for_state(
 pub struct ParsedHeartbeat {
     pub d: String,
     pub accepting: bool,
-    pub queue_depth: u32,
+    /// Live load: `in_flight`, or the deprecated `queue_depth` on a seat that predates it (see
+    /// [`in_flight_from_tags`]). NOT free capacity — that is [`Self::slots`].
+    pub in_flight: u32,
+    /// The seat's execution seats, or `None` when the beat states none (an older seat, or a
+    /// malformed pair). `None` is UNKNOWN: behave as before the tags existed.
+    pub slots: Option<SeatSlots>,
     pub rate_sats: u64,
     /// Does this seat state that it takes NO payment (§4.1)? `false` ⇒ the seat stated nothing,
     /// which is UNSTATED and never a claim that it does take payment.
@@ -1136,7 +1258,8 @@ pub enum HeartbeatParseError {
     WrongVersion(Option<String>),
     MissingTag(&'static str),
     InvalidAccepting(String),
-    InvalidQueueDepth(String),
+    /// Neither `in_flight` nor the deprecated `queue_depth` parses as a count.
+    InvalidInFlight(String),
     InvalidRate(String),
     /// The `accepted_mints` tag is absent or lists no mint. §4.2 requires at least one — a seat a
     /// buyer cannot pay is not a tradeable seat, so this is a rejection rather than an empty list.
@@ -1164,7 +1287,9 @@ impl std::fmt::Display for HeartbeatParseError {
             Self::InvalidAccepting(value) => {
                 write!(f, "accepting must be y/n, got {value}")
             }
-            Self::InvalidQueueDepth(value) => write!(f, "invalid queue_depth: {value}"),
+            Self::InvalidInFlight(value) => {
+                write!(f, "invalid in_flight/queue_depth: {value}")
+            }
             Self::InvalidRate(value) => write!(f, "invalid rate: {value}"),
             Self::MissingAcceptedMints => write!(
                 f,
@@ -1206,11 +1331,7 @@ pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatP
         None => return Err(HeartbeatParseError::MissingTag("accepting")),
     };
 
-    let queue_raw = first_tag_value(&event.tags, "queue_depth")
-        .ok_or(HeartbeatParseError::MissingTag("queue_depth"))?;
-    let queue_depth = queue_raw
-        .parse()
-        .map_err(|_| HeartbeatParseError::InvalidQueueDepth(queue_raw.to_owned()))?;
+    let in_flight = in_flight_from_tags(&event.tags)?;
 
     let rate_raw =
         first_tag_value(&event.tags, "rate").ok_or(HeartbeatParseError::MissingTag("rate"))?;
@@ -1226,7 +1347,8 @@ pub fn parse_heartbeat(event: &EventDraft) -> Result<ParsedHeartbeat, HeartbeatP
     Ok(ParsedHeartbeat {
         d: SELLER_HEARTBEAT_D.to_owned(),
         accepting,
-        queue_depth,
+        in_flight,
+        slots: seat_slots_from_tags(&event.tags),
         rate_sats,
         // §4.1. Absent ⇒ false ⇒ UNSTATED. Read AFTER the `v` check above and the
         // `MissingAcceptedMints` check below, neither of which the free lane touches.
@@ -1306,8 +1428,8 @@ mod tests {
         vec!["https://testnut.example/Bitcoin".to_owned()]
     }
 
-    fn draft(accepting: bool, queue_depth: u32, rate_sats: u64) -> HeartbeatDraft {
-        HeartbeatDraft::new(accepting, queue_depth, rate_sats, mints())
+    fn draft(accepting: bool, in_flight: u32, rate_sats: u64) -> HeartbeatDraft {
+        HeartbeatDraft::new(accepting, in_flight, rate_sats, mints())
     }
 
     fn tag_names(event: &EventDraft) -> Vec<&str> {
@@ -1592,7 +1714,7 @@ mod tests {
         let bare = draft(true, 0, 7).to_event_draft();
         assert_eq!(
             tag_names(&bare),
-            ["accepted_mints", "accepting", "d", "queue_depth", "rate", "t", "v"]
+            ["accepted_mints", "accepting", "d", "in_flight", "queue_depth", "rate", "t", "v"]
         );
 
         let with_roster = draft(true, 0, 7)
@@ -1600,7 +1722,7 @@ mod tests {
             .to_event_draft();
         assert_eq!(
             tag_names(&with_roster),
-            ["accepted_mints", "accepting", "agents", "d", "queue_depth", "rate", "t", "v"]
+            ["accepted_mints", "accepting", "agents", "d", "in_flight", "queue_depth", "rate", "t", "v"]
         );
 
         // Named individually so a revert says WHICH tag came back rather than only diffing a list.
@@ -1659,6 +1781,7 @@ mod tests {
                 "harness_model",
                 "harness_model",
                 "harness_variant",
+                "in_flight",
                 "queue_depth",
                 "rate",
                 "t",
@@ -1666,9 +1789,9 @@ mod tests {
             ]
         );
 
-        // The denominator, stated rather than left to be counted off the list above: 8 pre-#784 tags
-        // (7 plus `agents`) and 6 capability tags, because `full_capability` carries two models.
-        assert_eq!(event.tags.len(), 14, "14 tags, 13 distinct names: {:?}", tag_names(&event));
+        // The denominator, stated rather than left to be counted off the list above: 9 pre-#784 tags
+        // (8 plus `agents`) and 6 capability tags, because `full_capability` carries two models.
+        assert_eq!(event.tags.len(), 15, "15 tags, 14 distinct names: {:?}", tag_names(&event));
         assert_eq!(
             tag_names(&event).iter().filter(|name| **name == HARNESS_MODEL_TAG).count(),
             2,
@@ -1697,7 +1820,7 @@ mod tests {
         assert_eq!(seat.agents, vec!["claude", "codex"]);
         assert_eq!(seat.rate_sats, 21);
         assert!(seat.accepting);
-        assert_eq!(seat.queue_depth, 0);
+        assert_eq!(seat.in_flight, 0);
     }
 
     /// A seat that names no payable mint is REJECTED, never read as "pays on anything".
@@ -1760,7 +1883,7 @@ mod tests {
         // about spare capacity.
         let zero_depth = heartbeat_for_state(0, true, 5, false, mints(), Vec::new(), SeatCapability::default(), TEST_POLICY);
         assert!(zero_depth.accepting);
-        assert_eq!(zero_depth.queue_depth, 0);
+        assert_eq!(zero_depth.in_flight, 0);
         assert_eq!(
             first_tag_value(&zero_depth.to_event_draft().tags, "accepting"),
             Some("y")
@@ -1771,7 +1894,7 @@ mod tests {
             busy.accepting,
             "one job held of three slots is not a closed seat"
         );
-        assert_eq!(busy.queue_depth, 1);
+        assert_eq!(busy.in_flight, 1);
         assert_eq!(
             first_tag_value(&busy.to_event_draft().tags, "accepting"),
             Some("y")
@@ -1945,7 +2068,7 @@ mod tests {
         let parsed = parse_heartbeat(&draft.to_event_draft()).expect("round-trip parse");
         assert_eq!(parsed.d, SELLER_HEARTBEAT_D);
         assert!(!parsed.accepting);
-        assert_eq!(parsed.queue_depth, 3);
+        assert_eq!(parsed.in_flight, 3);
         assert_eq!(parsed.rate_sats, 21);
         assert_eq!(parsed.accepted_mints, announced);
     }
@@ -2250,7 +2373,7 @@ mod tests {
             .to_event_draft();
         assert_eq!(
             tag_names(&event),
-            vec!["accepted_mints", "accepting", "agents", "d", "queue_depth", "rate", "t", "v"],
+            vec!["accepted_mints", "accepting", "agents", "d", "in_flight", "queue_depth", "rate", "t", "v"],
             "an unstated capability must add nothing to the §4.2 tag set"
         );
         assert_eq!(parse_heartbeat(&event).expect("parses").capability, SeatCapability::default());
@@ -2890,4 +3013,136 @@ mod free_lane_tests {
         assert_eq!(first_tag_value(&terminal.tags, STATUS_TAG), None);
     }
     // END R3-2 serving tests
+
+    // BEGIN free-seats tests
+    fn draft(accepting: bool, in_flight: u32, rate_sats: u64) -> HeartbeatDraft {
+        HeartbeatDraft::new(accepting, in_flight, rate_sats, mints())
+    }
+
+    /// `in_flight` is the live load and `queue_depth` rides beside it with the SAME value, so a
+    /// reader built before `in_flight` reads exactly what it always did.
+    #[test]
+    fn in_flight_and_the_deprecated_queue_depth_carry_the_same_count() {
+        for depth in [0_u32, 1, 3, 17] {
+            let event = draft(true, depth, 5).to_event_draft();
+            let want = depth.to_string();
+            assert_eq!(first_tag_value(&event.tags, IN_FLIGHT_TAG), Some(want.as_str()));
+            assert_eq!(
+                first_tag_value(&event.tags, QUEUE_DEPTH_TAG),
+                Some(want.as_str()),
+                "queue_depth stays on the wire, unchanged, for old readers"
+            );
+            assert_eq!(parse_heartbeat(&event).expect("parses").in_flight, depth);
+        }
+    }
+
+    /// The seat tags carry the slot gate's numbers verbatim and read back unchanged; a draft that
+    /// was not given them states nothing.
+    #[test]
+    fn slots_and_free_slots_are_emitted_and_read_back() {
+        let event = draft(true, 1, 5).with_slots(SeatSlots::new(3, 1)).to_event_draft();
+        assert_eq!(first_tag_value(&event.tags, SLOTS_TAG), Some("3"));
+        assert_eq!(first_tag_value(&event.tags, FREE_SLOTS_TAG), Some("1"));
+        let parsed = parse_heartbeat(&event).expect("parses");
+        assert_eq!(parsed.slots, Some(SeatSlots { total: 3, free: 1 }));
+        assert_eq!(parsed.in_flight, 1);
+
+        // Full: every seat held, and it says so.
+        let full = draft(true, 0, 5).with_slots(SeatSlots::new(2, 0)).to_event_draft();
+        assert_eq!(first_tag_value(&full.tags, FREE_SLOTS_TAG), Some("0"));
+        assert_eq!(
+            parse_heartbeat(&full).unwrap().slots,
+            Some(SeatSlots { total: 2, free: 0 }),
+            "in_flight=0 with free_slots=0 is the reservation case queue_depth could not show"
+        );
+
+        let bare = draft(true, 0, 5).to_event_draft();
+        assert!(bare
+            .tags
+            .iter()
+            .all(|t| t.first() != Some(SLOTS_TAG) && t.first() != Some(FREE_SLOTS_TAG)));
+        assert_eq!(parse_heartbeat(&bare).unwrap().slots, None);
+    }
+
+    /// The emitter clamps so it can never publish a pair the reader rejects.
+    #[test]
+    fn seat_slots_new_clamps_to_a_readable_pair() {
+        assert_eq!(SeatSlots::new(0, 0), SeatSlots { total: 1, free: 0 });
+        assert_eq!(SeatSlots::new(2, 5), SeatSlots { total: 2, free: 2 });
+        assert_eq!(SeatSlots::new(4, 3), SeatSlots { total: 4, free: 3 });
+    }
+
+    /// One tag without the other, a malformed value, `slots=0` or `free > slots` is UNKNOWN — and
+    /// never fails the parse, because the seat is otherwise a valid seat.
+    #[test]
+    fn a_partial_or_malformed_seat_pair_is_unknown() {
+        let with = |pairs: &[(&str, &str)]| {
+            let mut event = draft(true, 0, 5).to_event_draft();
+            for (name, value) in pairs {
+                event.tags.push(TagSpec::new([*name, *value]));
+            }
+            parse_heartbeat(&event).expect("a bad seat pair never fails the parse").slots
+        };
+        assert_eq!(with(&[(SLOTS_TAG, "3")]), None, "slots alone");
+        assert_eq!(with(&[(FREE_SLOTS_TAG, "1")]), None, "free_slots alone");
+        assert_eq!(with(&[(SLOTS_TAG, "0"), (FREE_SLOTS_TAG, "0")]), None, "slots=0");
+        assert_eq!(with(&[(SLOTS_TAG, "2"), (FREE_SLOTS_TAG, "3")]), None, "free > slots");
+        for bad in ["", "-1", "+1", "1.5", "a", "1 2"] {
+            assert_eq!(with(&[(SLOTS_TAG, "3"), (FREE_SLOTS_TAG, bad)]), None, "{bad:?}");
+            assert_eq!(with(&[(SLOTS_TAG, bad), (FREE_SLOTS_TAG, "0")]), None, "{bad:?}");
+        }
+        assert_eq!(
+            with(&[(SLOTS_TAG, " 3 "), (FREE_SLOTS_TAG, "0")]),
+            Some(SeatSlots { total: 3, free: 0 }),
+            "surrounding whitespace is tolerated, like the other readers"
+        );
+        assert_eq!(
+            with(&[(SLOTS_TAG, "3"), (FREE_SLOTS_TAG, "3")]),
+            Some(SeatSlots { total: 3, free: 3 })
+        );
+    }
+
+    /// A beat from a seat built before `in_flight` (only `queue_depth`) still parses, and reads its
+    /// load from `queue_depth`. A new beat prefers `in_flight`, and falls back when it is malformed.
+    #[test]
+    fn the_reader_prefers_in_flight_and_falls_back_to_queue_depth() {
+        let mut old = draft(true, 4, 5).to_event_draft();
+        old.tags.retain(|t| t.first() != Some(IN_FLIGHT_TAG));
+        assert_eq!(parse_heartbeat(&old).expect("an older beat still parses").in_flight, 4);
+
+        // Both present and disagreeing: in_flight wins.
+        let mut both = draft(true, 4, 5).to_event_draft();
+        for tag in &mut both.tags {
+            if tag.first() == Some(QUEUE_DEPTH_TAG) {
+                *tag = TagSpec::new([QUEUE_DEPTH_TAG, "9"]);
+            }
+        }
+        assert_eq!(parse_heartbeat(&both).unwrap().in_flight, 4, "in_flight is preferred");
+
+        // in_flight malformed: fall back to queue_depth.
+        let mut bad_new = draft(true, 2, 5).to_event_draft();
+        for tag in &mut bad_new.tags {
+            if tag.first() == Some(IN_FLIGHT_TAG) {
+                *tag = TagSpec::new([IN_FLIGHT_TAG, "x"]);
+            }
+        }
+        assert_eq!(parse_heartbeat(&bad_new).unwrap().in_flight, 2);
+
+        // Neither: still the required-tag error, now naming the new tag.
+        let mut neither = draft(true, 0, 5).to_event_draft();
+        neither
+            .tags
+            .retain(|t| t.first() != Some(IN_FLIGHT_TAG) && t.first() != Some(QUEUE_DEPTH_TAG));
+        assert_eq!(
+            parse_heartbeat(&neither),
+            Err(HeartbeatParseError::MissingTag(IN_FLIGHT_TAG))
+        );
+        // Only a malformed in_flight: invalid, not missing.
+        neither.tags.push(TagSpec::new([IN_FLIGHT_TAG, "x"]));
+        assert_eq!(
+            parse_heartbeat(&neither),
+            Err(HeartbeatParseError::InvalidInFlight("x".into()))
+        );
+    }
+    // END free-seats tests
 }

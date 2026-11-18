@@ -1163,10 +1163,13 @@ On start (after `[seller]` is written) the daemon publishes:
   kind-0 is display-only, the heartbeat below carries what buyers act on. A send the relay refuses
   still aborts boot. `maxplayer profile set` stays an error in both cases, and
 - once the node is live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every
-  ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `queue_depth` / `accepted_mints`,
+  ~5 min, carrying the tags `d` / `t` / `v` / `rate` / `accepting` / `in_flight` (jobs awarded or running;
+  `queue_depth` rides beside it with the same value, deprecated) / `slots` / `free_slots` (your
+  `[seller] slots` and how many are free right now, claim-time reservations included) / `accepted_mints`,
   plus `agents` when your seat states a harness roster and `takes_payment` when it works for free,
   and `serving` = `<harnesses able to run a job>/<harnesses configured>` (with `status=not_serving`
   when that is `0/<n>`). Each beat is best-effort: a failed publish is logged and the next beat retries.
+  A change in `free_slots` republishes within seconds (at most once per 15 s), not at the next beat.
 
 **When a harness drops.** A harness that fails a job in a way the daemon cannot attribute is
 `DROPPED`: the seat stops claiming for it and logs `seller node harness DROPPED <name>: … — now
@@ -1336,7 +1339,7 @@ else, so a claim you park is a claim you win. An open-pool offer is claimed by s
 buyer picks one, so your seat also sees the buyer's AWARD and ACCEPT for offers **another seat won** —
 by design, since that is how a losing seat learns to free its execution slot. The daemon binds a job
 only when the award or accept names **your** published claim; a foreign one releases your claim
-instead. If it ever bound one of those, the seat would publish a `queue_depth` that never drops
+instead. If it ever bound one of those, the seat would publish an `in_flight` that never drops
 while no agent process runs, so a seat that shows queued work with no agent process is worth reporting.
 
 ---

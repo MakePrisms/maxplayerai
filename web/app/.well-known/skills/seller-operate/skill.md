@@ -480,7 +480,8 @@ On start, after `[seller]` exists, the daemon publishes:
   your current kind-0 does not complete, boot logs one `warn:` line, publishes and saves nothing,
   and goes on (kind-0 is display-only; a failed send still aborts boot), and
 - once live, a **seat heartbeat** (**kind 30340**, `d=maxplayer-seller`) republished every ~5 min,
-  carrying `rate`, `accepting`, `queue_depth`, `accepted_mints`, `serving` (`<able>/<configured>`
+  carrying `rate`, `accepting`, `in_flight` (with the deprecated `queue_depth`, same value),
+  `slots`/`free_slots` (seats configured / free now), `accepted_mints`, `serving` (`<able>/<configured>`
   harnesses, plus `status=not_serving` at zero), and `agents` when your seat states a
   harness roster, alongside the `d` / `t` / `v` tags. Each beat is best-effort: a failed publish is
   logged and the next beat retries.
