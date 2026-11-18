@@ -292,6 +292,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("limit 65408 bytes"), "{error}");
+        // #1349: past the largest sealable rumor the seal jumps a whole NIP-44 padding step.
+        assert!(error.contains("private seal is 65971 bytes"), "{error}");
         assert!(super::super::permanent_error(&error));
         assert!(!error.contains("xxxx"));
     }

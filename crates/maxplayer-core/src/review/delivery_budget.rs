@@ -62,10 +62,13 @@ pub(crate) async fn seller_delivery_budget(
         return Ok(false);
     }
     let inline = budget_request(&request, &claim, &award, &ctx.policy, true)?;
-    match identity
-        .request(inline.draft(&reviewer.to_hex())?, reviewer)
-        .await
-    {
+    // The request guard is derived from the seal limit (#1349), so an inline reservation too large
+    // to seal can now fail in `draft` instead of `wrap`: both are permanent, both mean "Git".
+    let sent = match inline.draft(&reviewer.to_hex()) {
+        Ok(draft) => identity.request(draft, reviewer).await,
+        Err(error) => Err(error),
+    };
+    match sent {
         Ok(_) => Ok(true),
         Err(error) if permanent_error(&error) => Ok(false),
         Err(error) => Err(error),
@@ -204,7 +207,10 @@ mod tests {
         }
     }
     async fn wraps(r: &Request, buyer: &Keys, service: PublicKey) -> bool {
-        let draft = r.draft(&service.to_hex()).unwrap();
+        // #1349: the request guard now sits at the seal limit, so too large fails in `draft`.
+        let Ok(draft) = r.draft(&service.to_hex()) else {
+            return false;
+        };
         let inner = crate::gateway::nostr::event_builder(&draft)
             .unwrap()
             .sign_with_keys(buyer)

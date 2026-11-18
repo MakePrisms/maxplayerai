@@ -879,6 +879,7 @@ to determine the class.
 | `delivery_failed` | `error` | yes |
 | `no_sentinel` | `refusal` | yes |
 | `session_expired` | `refusal` | no |
+| `turn_too_large` | `refusal` | no |
 | `capability_missing` | `refusal` | no |
 
 `capability_missing` means the awarded seat cannot run what the job requires (for example the
@@ -888,6 +889,11 @@ allowlist, `capability_missing` included, to `other`.
 
 `session_expired` answers a follow-up (§6.9) whose parked session is gone; it carries
 `["e", followup_id, "", "reply"]`. Nothing was delivered or charged.
+
+`turn_too_large` answers a private follow-up that the seller cannot send for review even
+without earlier history, because the minimal review request does not fit one NIP-44 seal. It
+carries the same `reply` tag. Nothing was run or charged, and the session stays parked: a
+shorter turn may still run.
 
 The vocabulary is extensible. A reader that meets an unknown `reason_code` MUST fall back to the
 class named by `status`. That reader MUST NOT treat the event as malformed.

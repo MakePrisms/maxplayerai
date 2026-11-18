@@ -625,7 +625,8 @@ clears it. It never closes a session.
   *Found while implementing:* the encrypted (private) review lane's `Request` carried only an offer or
   a delivery. It now has an optional `followup` evidence block: the selected claim and award plus the
   buyer's signed 3412 carriers with their encrypted `FollowUp` bodies, oldest first (the last is the
-  subject), trimmed oldest-first to the 60 KiB message bound. The reviewer re-authenticates every
+  subject), trimmed oldest-first to what still fits one NIP-59 seal (#1349: measured on the sealed
+  size; the largest sealable rumor is 40,960 bytes, about 36 KB of request JSON). The reviewer re-authenticates every
   carrier and body against the signed offer/claim/award chain (buyer-authored, `bind_content`),
   admits the buyer and the selected seller as requesters, and builds the context from those bodies
   only.
@@ -637,7 +638,7 @@ clears it. It never closes a session.
   earlier than the follow-up under review, and reduces each to one line from the signed public tags only
   (`turn n: <turn_status>, commit <oid|inline>`); it never decrypts a delivery body. The context is
   rendered by the same function as the public lane (follow-ups labelled by their own turn number), so
-  both lanes give the same text for the same facts. Under the 60 KiB message bound buyer follow-ups are
+  both lanes give the same text for the same facts. Under that seal bound buyer follow-ups are
   kept first (newest first), deliveries take what is left (newest first); the current follow-up is never
   cut. Neither party authors any line: the seller only forwards signed events, and a forged, misattributed
   or misordered one fails the whole request. `deliveries` is omitted when empty, and every non-follow-up
