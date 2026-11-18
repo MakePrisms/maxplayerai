@@ -20,10 +20,21 @@ installation, existing mint state, persistent services, trading from the same ma
 and readiness checks. The agent asks for issuance and sale terms before issuing or
 listing tokens. Mint-only setup is documented below.
 
-## Build
+## Install
 
-There is no prebuilt release of `maxplayer-mint` yet; build it from source (Bob, 24 Sep: revisit
-once operators outside the team want to run a mint).
+`maxplayer-mint` is released with `maxplayer`, from the same tag and at the same version, for
+linux-x64, linux-arm64, darwin-arm64 and darwin-x64. No `protoc` or Rust toolchain is needed:
+
+```bash
+npm install -g maxplayer-mint      # or: npx -y maxplayer-mint --version
+maxplayer-mint --version           # maxplayer-mint <version> (<commit>)
+```
+
+Or download `maxplayer-mint-<version>-<platform>.tar.gz` from the GitHub Release, check it against
+that release's `SHA256SUMS`, and put the `maxplayer-mint` binary on your PATH. Keep it at the same
+version as your `maxplayer`.
+
+### Build from source
 
 The mint needs `protoc` to build (Debian/Ubuntu: `sudo apt-get install -y protobuf-compiler`).
 It is its own cargo workspace, so build it by manifest path from the repo root:

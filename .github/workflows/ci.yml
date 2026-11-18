@@ -315,6 +315,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Test maxplayer-mint
         run: cargo test --manifest-path crates/maxplayer-mint/Cargo.toml --locked
+      # The mint ships from the same tag as `maxplayer`, at the same version (release.yml build-mint).
+      # This holds crates/maxplayer-mint/Cargo.toml to the root version on every pull request (the
+      # script fails when they diverge) and checks the built binary's `--version`/`version` line with
+      # the same script the release runs on it.
+      - name: Verify the mint is in lockstep and its binary reports the release line
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 \
+            | node -e 'const m=JSON.parse(require("fs").readFileSync(0,"utf8"));const p=m.packages.find(p=>p.name==="maxplayer");if(!p){process.stderr.write("no maxplayer package in cargo metadata\n");process.exit(1)}process.stdout.write(p.version)')"
+          ./scripts/verify-release-version.sh "$VERSION" crates/maxplayer-mint/target/debug/maxplayer-mint
+      - name: npm launcher launches the mint (packed locally, nothing published)
+        run: ./scripts/npm-pack-mint-local.sh crates/maxplayer-mint/target/debug/maxplayer-mint
       - name: Default maxplayer build carries no cdk mint code
         # pipefail + a captured tree: a failing `cargo tree` must turn this step red, not green.
         run: |

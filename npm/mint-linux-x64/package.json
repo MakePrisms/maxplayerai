@@ -1,0 +1,16 @@
+{
+  "name": "@maxplayerai/mint-linux-x64",
+  "version": "0.7.3",
+  "description": "maxplayer-mint binary for linux-x64 — payload package, install `maxplayer-mint` instead",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MakePrisms/maxplayerai.git"
+  },
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "bin": {
+    "maxplayer-mint-linux-x64": "bin/maxplayer-mint"
+  },
+  "files": ["bin/maxplayer-mint", "LICENSE-MIT", "LICENSE-APACHE"]
+}

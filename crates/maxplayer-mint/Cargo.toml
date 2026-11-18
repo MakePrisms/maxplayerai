@@ -1,6 +1,10 @@
 [package]
 name = "maxplayer-mint"
-version = "0.5.11"
+# LOCKSTEP with `[workspace.package].version` in the root Cargo.toml: the mint is released from the
+# same tag as `maxplayer`, at the same version (RELEASE.md). `scripts/verify-release-version.sh`
+# fails CI when the two differ. It cannot inherit the root's version because this is its own
+# workspace (see below).
+version = "0.7.3"
 edition = "2024"
 description = "Opt-in Cashu mint sidecar for Maxplayer seller credits, reachable only over Nostr relays"
 repository = "https://github.com/MakePrisms/maxplayerai"

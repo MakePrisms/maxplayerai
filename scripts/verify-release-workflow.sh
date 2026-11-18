@@ -199,8 +199,8 @@ if (probeBody) {
   }
   // The launcher is the package users type. It must not be probeable at all: its dist-tags are how
   // `npx maxplayer` resolves, and the allow-list arm is what keeps it out.
-  if (/'maxplayer'\s*\)/.test(probeCode)) {
-    fail("job 'npm-probe' admits the launcher package — only the scoped payload packages may be probed");
+  if (/'maxplayer'\s*\)/.test(probeCode) || /'maxplayer-mint'\s*[|)]/.test(probeCode)) {
+    fail("job 'npm-probe' admits a launcher package (maxplayer or maxplayer-mint) — only the scoped payload packages may be probed");
   }
   // Publishing under `latest` would repoint what a bare install of a payload package resolves.
   if (!probeCode.includes("--tag probe")) {
@@ -296,6 +296,56 @@ for (const name of ["release", "publish"]) {
 if (!surface.join("\n").includes("verify-release-surface.sh")) {
   fail("job 'verify-surface' does not run scripts/verify-release-surface.sh — it would gate on nothing");
 }
+
+
+// ── The mint sidecar ships from the same tag, and protoc stays in its build job ─────────────────
+// Agreed design (#merge-binaries, 2026-11-16): `maxplayer-mint` is a separate binary released with
+// `maxplayer` — its own archives in the same SHA256SUMS, its own npm launcher and payloads, the same
+// version — and `protoc` is a CI build dependency only. Each property is one edit away from being
+// lost without anything going red, so each is asserted.
+const mint = jobs.get("build-mint");
+if (!mint) fail("no 'build-mint' job — the release would ship without the maxplayer-mint sidecar");
+const mintCode = mint.filter((l) => !/^\s*#/.test(l)).join("\n");
+if (!mintCode.includes("--manifest-path crates/maxplayer-mint/Cargo.toml")) {
+  fail("job 'build-mint' does not build crates/maxplayer-mint — it would package something else");
+}
+if (!mintCode.includes("needs.plan.outputs.matrix")) {
+  fail("job 'build-mint' does not take its matrix from the plan (.github/release-platforms.json) — the mint could ship to a different platform set than maxplayer");
+}
+for (const verifier of ["verify-release-version.sh", "verify-static-artifact.sh", "package-release-asset.sh"]) {
+  if (!mintCode.includes(verifier)) fail(`job 'build-mint' does not run scripts/${verifier} — the mint artifact would ship unchecked`);
+}
+if (!/protobuf-compiler/.test(mintCode) || !/brew install protobuf/.test(mintCode)) {
+  fail("job 'build-mint' does not install protoc on both linux and darwin — cdk's mint signatory cannot build without it");
+}
+// protoc belongs to the mint build only. Anywhere else it would be a sign the root graph (which builds
+// `maxplayer`) started needing it — the very leak the mint's own workspace exists to prevent.
+for (const [name, body] of jobs) {
+  if (name === "build-mint") continue;
+  if (body.filter((l) => !/^\s*#/.test(l)).some((l) => /protobuf|protoc/.test(l))) {
+    fail(`job '${name}' installs or uses protoc — only build-mint may; the maxplayer build must stay protoc-free`);
+  }
+}
+for (const name of ["verify-surface", "release", "publish"]) {
+  const needs = jobs.get(name).join("\n").match(/^ {4}needs:(.*)$/m);
+  if (!needs || !/\bbuild-mint\b/.test(needs[1])) {
+    fail(`job '${name}' does not depend on build-mint (needs:) — a failed mint build would not stop the ${name}`);
+  }
+}
+const releaseCode = jobs.get("release").filter((l) => !/^\s*#/.test(l)).join("\n");
+if (!releaseCode.includes('maxplayer-mint-$VERSION-$platform.tar.gz')) {
+  fail("the release completeness gate does not require maxplayer-mint-$VERSION-$platform.tar.gz — a release could publish without the mint for a platform");
+}
+if (!publishCode.includes('dist/maxplayer-mint-$VERSION-$platform.tar.gz') || !publishCode.includes("cd npm/maxplayer-mint && npm publish")) {
+  fail("the publish job does not publish the mint payloads and the maxplayer-mint launcher");
+}
+// The mint publishes after the whole maxplayer set, so a missing trusted publisher for one of its new
+// packages can never leave `maxplayer` half-published.
+if (publishCode.indexOf("cd npm/maxplayer-mint && npm publish") < publishCode.indexOf("cd npm/maxplayer && npm publish")) {
+  fail("the publish job publishes the mint before the maxplayer launcher — a mint publish failure must not be able to hold maxplayer back");
+}
+console.log("ok: build-mint builds the sidecar on the release platform set, verified, and gates verify-surface, release and publish");
+console.log("ok: protoc is installed only in build-mint");
 
 console.log("ok: verify-surface runs in dry runs and gates release and publish (the #249 fix)");
 
