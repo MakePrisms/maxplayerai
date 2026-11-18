@@ -9,7 +9,7 @@
 // whole window. The daemon (PR 4) ports the same rules; src/swarm/shared/vectors.json pins both.
 import { OFFER, CLAIM, RESULT, AWARD, ACCEPT, FOLLOW_UP, PROFILE, SWARM, SWARM_JOB, SWARM_MEMBERSHIP, SWARM_DECISION } from '../../model/kinds.ts';
 import { verify, tag, one, hex, root, claimRef, mentions, newer, npubEncode, tradeNamespace } from '../../challenge/shared/events.mjs';
-import { Decisions, latestMemberships, latestSwarmJobs, latestSwarms, parseDecision, parseMembership, parseSwarm, parseSwarmJob, swarmAddress, value } from './wire.mjs';
+import { Decisions, latestMemberships, latestSwarmJobs, latestSwarms, parseDecision, parseMembership, parseSwarm, parseSwarmJob, swarmAddress, validHex, value } from './wire.mjs';
 
 export const DAY_S = 86400;
 export const dayStart = now => now - (((now % DAY_S) + DAY_S) % DAY_S);
@@ -151,9 +151,45 @@ export function swarmIndex(events, now, { all = false } = {}) {
 }
 
 /** The swarm job a swarm page shows: the newest (by event time) not cancelled, else the newest. */
-export function shownJob(jobPairs) {
+export const shownJob = jobPairs => shownJobPair(jobPairs)?.[1] ?? null;
+function shownJobPair(jobPairs) {
   const sorted = [...jobPairs].sort(([a], [b]) => b.created_at - a.created_at || (a.id < b.id ? -1 : 1));
-  return (sorted.find(([, j]) => j.status !== 'cancelled') ?? sorted[0])?.[1] ?? null;
+  return sorted.find(([, j]) => j.status !== 'cancelled') ?? sorted[0] ?? null;
+}
+
+// The swarm job's `update` (docs/specs/swarm.md §4, §7.5). The daemon publishes a buyer-signed JSON
+// tally there every 180 s: {"members":{"<seller hex>":{"tasks_done":n,"minutes_today":m}}}, where
+// tasks_done counts the member's collected tasks in this swarm job and minutes_today the minutes it
+// used today (UTC) in the swarm. The old runner wrote a plain status line instead.
+export const TALLY_MAX = 65536; // UTF-16 units; ~600 members' entries
+const MINUTES_PER_DAY = 1440;
+const plainObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+/**
+ * Reads an `update` value. Returns { text } for a plain status line, { tally } (Map seller →
+ * { tasksDone, minutesToday }) for a tally, or null when there is nothing to show: empty, JSON that
+ * is malformed, oversized or not a tally. JSON is never returned as text. A tally entry that is not
+ * a hex key with a non-negative integer task count and 0–1440 minutes is dropped on its own.
+ */
+export function parseUpdate(update) {
+  if (typeof update !== 'string' || !update.trim()) return null;
+  const t = update.trim();
+  // `{…}` is a tally attempt: shown only when it is one, never as text. A whole-line JSON array is an
+  // unknown shape (hidden too); anything else, `[note] …` included, is a plain status line.
+  if (t[0] === '[') { try { JSON.parse(t); return null; } catch { return { text: update }; } }
+  if (t[0] !== '{') return { text: update };
+  if (update.length > TALLY_MAX) return null;
+  let v;
+  try { v = JSON.parse(t); } catch { return null; }
+  if (!plainObject(v) || !Object.hasOwn(v, 'members') || !plainObject(v.members)) return null;
+  const tally = new Map();
+  for (const [seller, m] of Object.entries(v.members)) {
+    if (!validHex(seller) || !plainObject(m)) continue;
+    const done = m.tasks_done, minutes = m.minutes_today;
+    if (!Number.isSafeInteger(done) || done < 0) continue;
+    if (typeof minutes !== 'number' || !Number.isFinite(minutes) || minutes < 0 || minutes > MINUTES_PER_DAY) continue;
+    tally.set(seller, { tasksDone: done, minutesToday: minutes });
+  }
+  return { tally };
 }
 
 const BUDGET_NOTE = 'Estimates from awarded offer prices; ACCEPT authorises payment, not proof of settlement. Private payments and fees are not visible.';
@@ -168,9 +204,19 @@ export function swarmSnapshot(events, { buyer, swarm: slug }, now) {
   if (!swarmPair) return empty;
   const s = swarmPair[1];
   const jobPairs = latestSwarmJobs(list).filter(([, j]) => j.buyer === buyer && j.swarm === slug);
-  const jobs = jobPairs.map(([, j]) => j), c = shownJob(jobPairs);
+  const jobs = jobPairs.map(([, j]) => j), shown = shownJobPair(jobPairs), c = shown?.[1] ?? null;
   const facts = taskFacts(list, buyer, jobs);
   const from = dayStart(now);
+  // The tally comes only from the shown swarm job: an event this buyer signed for this swarm
+  // (latestSwarmJobs keys on the author; parseSwarmJob requires the `a` buyer to be the author).
+  // Its minutes are today's only when it was published today (UTC); an older tally keeps its task
+  // count (per swarm job) and reports no minutes.
+  const update = c ? parseUpdate(c.update) : null;
+  const tally = update?.tally ?? null, tallyToday = !!shown && shown[0].created_at >= from && shown[0].created_at < from + DAY_S;
+  const reportedFor = seller => {
+    const r = tally?.get(seller);
+    return r ? { tasksDone: r.tasksDone, minutesToday: tallyToday ? r.minutesToday : null } : null;
+  };
   const today = facts.filter(f => f.start >= from && f.start < from + DAY_S).map(f => taskAt(f, now));
   const decisions = new Decisions(buyer, list);
   const memberships = latestMemberships(list).filter(([, m]) => m.buyer === buyer && m.swarm === slug);
@@ -188,7 +234,9 @@ export function swarmSnapshot(events, { buyer, swarm: slug }, now) {
     const state = m.status === 'left' ? 'left' : running.length ? (running.every(t => t.result) ? 'awaiting acceptance' : 'working') : eligible && own.length ? 'done' : 'accepted';
     sellers.push({ pubkey: m.seller, npub: npubEncode(m.seller), name: names.get(m.seller) ?? '', since: m.since, membershipStatus: m.status,
       minutesOffered: m.minutes, minutesUsed: used, minutesRemaining: m.minutes - used, state, eligible, decision: 'accepted',
-      currentJobStart: running.length ? Math.min(...running.map(t => t.start)) : null, note: m.note });
+      currentJobStart: running.length ? Math.min(...running.map(t => t.start)) : null, note: m.note,
+      // Buyer-reported (tally) figures, listed members only. The page shows them for private swarms.
+      reported: reportedFor(m.seller) });
   }
   sellers.sort((a, b) => a.npub.localeCompare(b.npub));
   applicants.sort((a, b) => b.joinedAt - a.joinedAt || a.pubkey.localeCompare(b.pubkey));
@@ -201,7 +249,7 @@ export function swarmSnapshot(events, { buyer, swarm: slug }, now) {
       .sort((a, b) => b.starts - a.starts || b.createdAt - a.createdAt),
     sellers, applicants,
     jobs: today.map(t => ({ id: t.id, seller: t.seller, start: t.start, deadline: t.deadline, end: t.end, running: t.running, usedMinutes: t.usedMinutes, job: t.job, turn: t.turn })),
-    updates: c?.update ? [c.update] : [],
+    updates: update?.text ? [update.text] : [],
     budget: c && { totalSats: c.budgetSats, committedSats: shownTasks.filter(t => !t.accepted).reduce((n, t) => n + (t.amountSats ?? 0), 0),
       paidSats: shownTasks.filter(t => t.accepted).reduce((n, t) => n + (t.amountSats ?? 0), 0), estimated: true,
       unknownAmounts: shownTasks.filter(t => t.amountSats === null).length, note: BUDGET_NOTE },

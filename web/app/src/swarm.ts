@@ -36,7 +36,8 @@ for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
   });
 }
 
-const demo = new URLSearchParams(location.search).has("demo");
+const query = new URLSearchParams(location.search);
+const demo = query.has("demo");
 const where = demo ? null : route(location.pathname);
 const RENDER_MS = 250; // at most one rebuild per RENDER_MS (see swarm/coalesce.ts)
 
@@ -150,7 +151,7 @@ function swarmPage(target: Exclude<typeof where, { view: "index" }>): void {
     const back = document.querySelector<HTMLAnchorElement>('a.h-button[data-view="index"]');
     if (back) { back.href = "/swarm"; back.firstElementChild!.textContent = "See the swarms"; }
   }
-  if (demo) { demoStatus = "Demo data · not a real swarm"; receive(demoSnapshot(Date.now() / 1000)); }
+  if (demo) { demoStatus = "Demo data · not a real swarm"; receive(demoSnapshot(Date.now() / 1000, { privateTasks: query.get("demo") === "private" })); }
   else if (target?.view !== "swarm") notFound("That address isn't a swarm."); else {
     const store = new SwarmStore();
     const { buyer, swarm } = target;
