@@ -4,6 +4,8 @@
 //! |--------|-------------------------------|---------|-------------------------------------------|
 //! | POST   | /account/link/request         | NIP-98  | email a 6-digit code (spec §3 steps 3–4)  |
 //! | POST   | /account/link/confirm         | NIP-98  | check the code, link the key, NIP-43 add  |
+//! | POST   | /account/link/mint/challenge  | NIP-98  | challenge for a cosigned mint link        |
+//! | POST   | /account/link/mint/confirm    | NIP-98 + mint proof | link a mint key, no email code |
 //! | GET    | /account/status               | NIP-98  | this key's link (for `account status`)    |
 //! | POST   | /account/marketing            | NIP-98  | product news on/off (`account marketing`) |
 //! | POST   | /account/webhooks/resend      | Svix    | bounces, complaints, unsubscribes         |
@@ -28,8 +30,9 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::AppState;
-use crate::db::{self, ConfirmOutcome};
+use crate::db::{self, ConfirmOutcome, MintLinkOutcome};
 use crate::email::{CodeEmail, WelcomeEmail};
+use crate::mint_link;
 use crate::nip98;
 use crate::sync;
 use crate::validate;
@@ -37,6 +40,8 @@ use crate::webhook;
 
 pub const PATH_LINK_REQUEST: &str = "/account/link/request";
 pub const PATH_LINK_CONFIRM: &str = "/account/link/confirm";
+pub const PATH_LINK_MINT_CHALLENGE: &str = "/account/link/mint/challenge";
+pub const PATH_LINK_MINT_CONFIRM: &str = "/account/link/mint/confirm";
 pub const PATH_STATUS: &str = "/account/status";
 pub const PATH_MARKETING: &str = "/account/marketing";
 pub const PATH_WEBHOOK: &str = "/account/webhooks/resend";
@@ -122,6 +127,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route(PATH_LINK_REQUEST, post(link_request))
         .route(PATH_LINK_CONFIRM, post(link_confirm))
+        .route(PATH_LINK_MINT_CHALLENGE, post(link_mint_challenge))
+        .route(PATH_LINK_MINT_CONFIRM, post(link_mint_confirm))
         .route(PATH_STATUS, get(status))
         .route(PATH_MARKETING, post(marketing))
         .route(PATH_WEBHOOK, post(resend_webhook))
@@ -519,6 +526,267 @@ async fn link_confirm(
     }
 }
 
+// ------------------------------------------------------------------ cosigned mint link
+
+/// `mint_pubkey` as hex or npub; never the caller's own key.
+fn parse_mint_pubkey(raw: &str, account: &PublicKey) -> Result<PublicKey, ApiError> {
+    let mint = PublicKey::parse(raw.trim()).map_err(|_| {
+        ApiError::bad(
+            "invalid_mint_pubkey",
+            "mint_pubkey must be a 64-hex or npub public key",
+        )
+    })?;
+    if &mint == account {
+        return Err(ApiError::bad(
+            "same_key",
+            "the mint key and the account key must be different keys",
+        ));
+    }
+    Ok(mint)
+}
+
+/// The account key must already be linked by email code. A cosigned key cannot vouch for others.
+async fn require_email_linked(
+    state: &AppState,
+    account: &str,
+) -> Result<db::Registration, ApiError> {
+    match db::get_registration(&state.db, account).await? {
+        Some(reg) if reg.code_entered_by == "cosigned" => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_is_cosigned",
+            "this key was itself linked by a cosignature; sign with the key that was linked by email code",
+        )),
+        Some(reg) => Ok(reg),
+        None => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "account_not_registered",
+            "the signing key is not linked to an email; link it with `maxplayer account link` first",
+        )),
+    }
+}
+
+/// The mint key must be new, or already cosigned to the same email (a re-link).
+async fn check_mint_free(state: &AppState, mint: &str, email: &str) -> Result<(), ApiError> {
+    match db::get_registration(&state.db, mint).await? {
+        Some(reg) if reg.email != email => Err(mint_linked_elsewhere()),
+        Some(reg) if reg.code_entered_by != "cosigned" => Err(mint_email_linked()),
+        _ => Ok(()),
+    }
+}
+
+fn mint_linked_elsewhere() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "mint_linked_to_other_account",
+        "this mint key is already linked to a different account; changing it is not supported",
+    )
+}
+
+fn mint_email_linked() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        "mint_already_linked",
+        "this mint key is already linked to this email by its own code; nothing to do",
+    )
+}
+
+#[derive(Deserialize)]
+struct MintChallengeReq {
+    mint_pubkey: String,
+}
+
+async fn link_mint_challenge(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let account = authenticate(&state, &headers, PATH_LINK_MINT_CHALLENGE, "POST", &body).await?;
+    let account_hex = account.to_hex();
+    let req: MintChallengeReq = parse_json(&body)?;
+    let mint = parse_mint_pubkey(&req.mint_pubkey, &account)?;
+    let mint_hex = mint.to_hex();
+    let acct = require_email_linked(&state, &account_hex).await?;
+    check_mint_free(&state, &mint_hex, &acct.email).await?;
+    let limits = &state.cfg.limits;
+    let ip = client_ip(&state, &headers, peer);
+    rate_limit(
+        &state,
+        "mint_challenge",
+        &[
+            (format!("ip:{ip}"), limits.mint_challenges_per_ip_per_hour),
+            (
+                format!("pk:{account_hex}"),
+                limits.mint_challenges_per_pubkey_per_hour,
+            ),
+        ],
+        "rate_limited",
+    )
+    .await?;
+    let challenge = mint_link::new_challenge();
+    let now = state.now();
+    db::issue_mint_challenge(
+        &state.db,
+        &challenge,
+        &account_hex,
+        &mint_hex,
+        now + TimeDelta::seconds(limits.mint_challenge_ttl_secs),
+        now,
+    )
+    .await?;
+    info!(account = %account_hex, mint = %mint_hex, "mint link challenge issued");
+    ok(
+        StatusCode::OK,
+        json!({
+            "challenge": challenge,
+            "expires_in_secs": limits.mint_challenge_ttl_secs,
+            "mint_pubkey": mint_hex,
+            "proof_kind": mint_link::PROOF_KIND,
+            "proof_url": state.cfg.public_url(PATH_LINK_MINT_CONFIRM),
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct MintConfirmReq {
+    challenge: String,
+    mint_pubkey: String,
+    label: String,
+    /// The mint key's signed proof event, as a JSON object.
+    mint_proof: serde_json::Value,
+}
+
+async fn link_mint_confirm(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    // The account key's NIP-98 `payload` tag covers this whole body: challenge, mint key, label
+    // and the mint's proof.
+    let account = authenticate(&state, &headers, PATH_LINK_MINT_CONFIRM, "POST", &body).await?;
+    let account_hex = account.to_hex();
+    let req: MintConfirmReq = parse_json(&body)?;
+    let mint = parse_mint_pubkey(&req.mint_pubkey, &account)?;
+    let mint_hex = mint.to_hex();
+    if !mint_link::valid_challenge(&req.challenge) {
+        return Err(ApiError::bad(
+            "invalid_challenge",
+            "challenge must be the 64-hex value from /account/link/mint/challenge",
+        ));
+    }
+    let label = validate::normalize_label(&req.label).ok_or_else(|| {
+        ApiError::bad(
+            "invalid_label",
+            "label must be 1-64 letters, digits, spaces, '.', '_' or '-'",
+        )
+    })?;
+    let proof_json = match &req.mint_proof {
+        serde_json::Value::Object(_) => req.mint_proof.to_string(),
+        _ => {
+            return Err(ApiError::bad(
+                "invalid_body",
+                "mint_proof must be the mint key's signed event",
+            ));
+        }
+    };
+    mint_link::verify_proof(
+        &proof_json,
+        &mint,
+        &account,
+        &req.challenge,
+        &state.cfg.public_url(PATH_LINK_MINT_CONFIRM),
+        state.clock.unix(),
+        state.cfg.limits.nip98_max_skew_secs as u64,
+    )
+    .map_err(|e| {
+        let mut err = ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "mint_proof_invalid",
+            "the mint key's signature does not cover this request",
+        );
+        err.extra = Some(json!({ "reason": e.reason() }));
+        err
+    })?;
+
+    let outcome = db::link_mint(
+        &state.db,
+        &req.challenge,
+        &account_hex,
+        &mint_hex,
+        &label,
+        state.now(),
+    )
+    .await?;
+    let (registration, inserted, outbox_id) = match outcome {
+        MintLinkOutcome::UnknownChallenge => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unknown_challenge",
+                "no such challenge was issued for this account key and mint key; request a new one",
+            ));
+        }
+        MintLinkOutcome::ChallengeUsed => {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "challenge_used",
+                "this challenge was already used; request a new one",
+            ));
+        }
+        MintLinkOutcome::ChallengeExpired => {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "challenge_expired",
+                "the challenge has expired; request a new one",
+            ));
+        }
+        MintLinkOutcome::AccountNotRegistered => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "account_not_registered",
+                "the signing key is not linked to an email; link it with `maxplayer account link` first",
+            ));
+        }
+        MintLinkOutcome::AccountIsCosigned => {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "account_is_cosigned",
+                "this key was itself linked by a cosignature; sign with the key that was linked by email code",
+            ));
+        }
+        MintLinkOutcome::MintLinkedToOtherEmail => return Err(mint_linked_elsewhere()),
+        MintLinkOutcome::MintIsEmailLinked => return Err(mint_email_linked()),
+        MintLinkOutcome::Linked {
+            registration,
+            inserted,
+            outbox_id,
+        } => (registration, inserted, outbox_id),
+    };
+    info!(account = %account_hex, mint = %mint_hex, first_link = inserted, "mint key linked by cosignature");
+    let member = match sync::deliver(&state, outbox_id).await {
+        Ok(true) => "added",
+        Ok(false) => "pending",
+        Err(e) => {
+            warn!(mint = %mint_hex, error = %format!("{e:#}"), "member add not delivered yet");
+            "pending"
+        }
+    };
+    // No welcome email: the account's human was welcomed when the account key was linked.
+    ok(
+        StatusCode::OK,
+        json!({
+            "status": "linked",
+            "first_link": inserted,
+            "mint_pubkey": mint_hex,
+            "linked_by": account_hex,
+            "email": registration.email,
+            "label": registration.label,
+            "terms_version": registration.terms_version,
+            "privacy_version": registration.privacy_version,
+            "relay_member": member,
+        }),
+    )
+}
+
 // ------------------------------------------------------------------ status + marketing
 
 async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult {
@@ -539,6 +807,7 @@ async fn status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiRe
             "privacy_version": reg.privacy_version,
             "accepted_at": reg.accepted_at.to_rfc3339(),
             "code_entered_by": reg.code_entered_by,
+            "linked_by": reg.linked_by,
             "linked_at": reg.created_at.to_rfc3339(),
             "marketing": marketing_label(&consent),
             "relay_member": match sync_state { "done" => "added", "pending" => "pending", _ => "unknown" },

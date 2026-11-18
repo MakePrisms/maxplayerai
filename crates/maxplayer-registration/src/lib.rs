@@ -9,6 +9,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod email;
+pub mod mint_link;
 pub mod nip98;
 pub mod relay;
 pub mod secrets;

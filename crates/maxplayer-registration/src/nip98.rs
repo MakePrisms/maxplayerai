@@ -59,7 +59,7 @@ fn u_kind() -> TagKind<'static> {
     TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::U))
 }
 
-fn same_url(a: &str, b: &str) -> bool {
+pub fn same_url(a: &str, b: &str) -> bool {
     // Scheme and host compare case-insensitively (Url normalises them); the path
     // compares exactly, ignoring one trailing slash. No query strings are used.
     match (url::Url::parse(a), url::Url::parse(b)) {

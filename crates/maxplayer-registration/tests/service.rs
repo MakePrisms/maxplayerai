@@ -186,7 +186,7 @@ async fn service_runs_as_a_non_superuser_role() {
     let migrations: i64 = app
         .count("SELECT count(*) FROM _sqlx_migrations WHERE success")
         .await;
-    assert_eq!(migrations, 1);
+    assert_eq!(migrations, 2);
 }
 
 // ------------------------------------------------------------------ wrong code, expiry

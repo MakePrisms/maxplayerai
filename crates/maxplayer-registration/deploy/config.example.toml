@@ -40,6 +40,9 @@ sends_per_ip_per_hour = 20
 confirms_per_pubkey_per_hour = 30
 confirms_per_ip_per_hour = 60
 nip98_max_skew_secs = 60
+mint_challenge_ttl_secs = 300                      # cosigned `account link --mint`
+mint_challenges_per_pubkey_per_hour = 20
+mint_challenges_per_ip_per_hour = 60
 
 [sync]
 outbox_interval_secs = 30

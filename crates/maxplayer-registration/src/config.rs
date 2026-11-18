@@ -185,6 +185,11 @@ pub struct Limits {
     pub confirms_per_ip_per_hour: i32,
     /// NIP-98 `created_at` must be within this many seconds of now.
     pub nip98_max_skew_secs: i64,
+    /// Lifetime of a cosigned mint-link challenge (`/account/link/mint/challenge`).
+    pub mint_challenge_ttl_secs: i64,
+    /// Mint-link challenges per account key, and per IP, per hour.
+    pub mint_challenges_per_pubkey_per_hour: i32,
+    pub mint_challenges_per_ip_per_hour: i32,
 }
 
 impl Default for Limits {
@@ -199,6 +204,9 @@ impl Default for Limits {
             confirms_per_pubkey_per_hour: 30,
             confirms_per_ip_per_hour: 60,
             nip98_max_skew_secs: 60,
+            mint_challenge_ttl_secs: 300,
+            mint_challenges_per_pubkey_per_hour: 20,
+            mint_challenges_per_ip_per_hour: 60,
         }
     }
 }
@@ -327,6 +335,9 @@ impl Config {
             || l.confirms_per_pubkey_per_hour <= 0
             || l.confirms_per_ip_per_hour <= 0
             || l.nip98_max_skew_secs <= 0
+            || l.mint_challenge_ttl_secs <= 0
+            || l.mint_challenges_per_pubkey_per_hour <= 0
+            || l.mint_challenges_per_ip_per_hour <= 0
         {
             bail!("every [limits] value must be positive");
         }

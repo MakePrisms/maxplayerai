@@ -68,9 +68,12 @@ pub struct Registration {
     pub accepted_at: DateTime<Utc>,
     pub code_entered_by: String,
     pub created_at: DateTime<Utc>,
+    /// For a cosigned mint key: the email-linked key that vouched for it. `None` for a key linked
+    /// by email code.
+    pub linked_by: Option<String>,
 }
 
-const REG_COLUMNS: &str = "pubkey, email, label, terms_version, privacy_version, accepted_at, code_entered_by, created_at";
+const REG_COLUMNS: &str = "pubkey, email, label, terms_version, privacy_version, accepted_at, code_entered_by, created_at, linked_by";
 
 fn reg_from_row(row: &sqlx::postgres::PgRow) -> Result<Registration> {
     Ok(Registration {
@@ -82,6 +85,7 @@ fn reg_from_row(row: &sqlx::postgres::PgRow) -> Result<Registration> {
         accepted_at: row.try_get("accepted_at")?,
         code_entered_by: row.try_get("code_entered_by")?,
         created_at: row.try_get("created_at")?,
+        linked_by: row.try_get("linked_by")?,
     })
 }
 
@@ -192,7 +196,7 @@ pub enum ConfirmOutcome {
     /// the request-time check).
     ConflictingEmail,
     Linked {
-        registration: Registration,
+        registration: Box<Registration>,
         inserted: bool,
         notice_version: String,
         outbox_id: i64,
@@ -271,7 +275,7 @@ pub async fn confirm_code(
          code_entered_by, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $6) \
          ON CONFLICT (pubkey) DO UPDATE SET label = EXCLUDED.label, terms_version = EXCLUDED.terms_version, \
          privacy_version = EXCLUDED.privacy_version, accepted_at = EXCLUDED.accepted_at, \
-         code_entered_by = EXCLUDED.code_entered_by, updated_at = EXCLUDED.updated_at \
+         code_entered_by = EXCLUDED.code_entered_by, linked_by = NULL, updated_at = EXCLUDED.updated_at \
          WHERE registrations.email = EXCLUDED.email \
          RETURNING {REG_COLUMNS}, (xmax = 0) AS inserted"
     );
@@ -305,9 +309,162 @@ pub async fn confirm_code(
     let outbox_id = enqueue(&mut tx, pubkey, MemberAction::Add, now).await?;
     tx.commit().await?;
     Ok(ConfirmOutcome::Linked {
-        registration,
+        registration: Box::new(registration),
         inserted,
         notice_version,
+        outbox_id,
+    })
+}
+
+// ---------------------------------------------------------------- cosigned mint link
+
+/// Store a new mint-link challenge for (account, mint). Earlier unused challenges for the same
+/// pair are left alone; each one is single use and expires on its own.
+pub async fn issue_mint_challenge(
+    db: &PgPool,
+    challenge: &str,
+    account: &str,
+    mint: &str,
+    expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO mint_link_challenges (challenge, account_pubkey, mint_pubkey, expires_at, created_at) \
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(challenge)
+    .bind(account)
+    .bind(mint)
+    .bind(expires_at)
+    .bind(now)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+#[derive(Debug)]
+pub enum MintLinkOutcome {
+    /// No challenge with this value was issued to this (account, mint) pair.
+    UnknownChallenge,
+    ChallengeUsed,
+    ChallengeExpired,
+    /// The account key is not (or no longer) linked to an email.
+    AccountNotRegistered,
+    /// The account key is itself a cosigned mint key: only an email-linked key can vouch.
+    AccountIsCosigned,
+    /// The mint key is linked to a different email.
+    MintLinkedToOtherEmail,
+    /// The mint key is already linked to this email by email code (its own account).
+    MintIsEmailLinked,
+    Linked {
+        registration: Box<Registration>,
+        inserted: bool,
+        outbox_id: i64,
+    },
+}
+
+/// Consume the challenge and link `mint` to `account`'s email in one transaction: the mint's row
+/// copies the account's email and accepted versions, records `code_entered_by = 'cosigned'` and
+/// `linked_by = account`, and a NIP-43 add is queued. A refusal rolls back, so the challenge
+/// stays unused only when nothing was linked.
+pub async fn link_mint(
+    db: &PgPool,
+    challenge: &str,
+    account: &str,
+    mint: &str,
+    label: &str,
+    now: DateTime<Utc>,
+) -> Result<MintLinkOutcome> {
+    let mut tx = db.begin().await?;
+    let row = sqlx::query(
+        "SELECT expires_at, used_at FROM mint_link_challenges \
+         WHERE challenge = $1 AND account_pubkey = $2 AND mint_pubkey = $3 FOR UPDATE",
+    )
+    .bind(challenge)
+    .bind(account)
+    .bind(mint)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        return Ok(MintLinkOutcome::UnknownChallenge);
+    };
+    let used_at: Option<DateTime<Utc>> = row.try_get("used_at")?;
+    let expires_at: DateTime<Utc> = row.try_get("expires_at")?;
+    if used_at.is_some() {
+        return Ok(MintLinkOutcome::ChallengeUsed);
+    }
+    if expires_at <= now {
+        return Ok(MintLinkOutcome::ChallengeExpired);
+    }
+
+    // Lock the account's row so a concurrent operator removal cannot leave a mint vouched for by
+    // a deleted account.
+    let sql = format!("SELECT {REG_COLUMNS} FROM registrations WHERE pubkey = $1 FOR UPDATE");
+    let Some(acct_row) = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(account)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        return Ok(MintLinkOutcome::AccountNotRegistered);
+    };
+    let acct = reg_from_row(&acct_row)?;
+    if acct.linked_by.is_some() {
+        return Ok(MintLinkOutcome::AccountIsCosigned);
+    }
+
+    let sql = format!("SELECT {REG_COLUMNS} FROM registrations WHERE pubkey = $1 FOR UPDATE");
+    let existing = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(mint)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if let Some(row) = &existing {
+        let reg = reg_from_row(row)?;
+        if reg.email != acct.email {
+            return Ok(MintLinkOutcome::MintLinkedToOtherEmail);
+        }
+        if reg.linked_by.is_none() {
+            return Ok(MintLinkOutcome::MintIsEmailLinked);
+        }
+    }
+
+    sqlx::query("UPDATE mint_link_challenges SET used_at = $2 WHERE challenge = $1")
+        .bind(challenge)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
+    // Same email only (the WHERE): a row that changed email since the read above is not touched.
+    let sql = format!(
+        "INSERT INTO registrations (pubkey, email, label, terms_version, privacy_version, accepted_at, \
+         code_entered_by, linked_by, created_at, updated_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'cosigned', $7, $6, $6) \
+         ON CONFLICT (pubkey) DO UPDATE SET label = EXCLUDED.label, terms_version = EXCLUDED.terms_version, \
+         privacy_version = EXCLUDED.privacy_version, accepted_at = EXCLUDED.accepted_at, \
+         linked_by = EXCLUDED.linked_by, updated_at = EXCLUDED.updated_at \
+         WHERE registrations.email = EXCLUDED.email AND registrations.code_entered_by = 'cosigned' \
+         RETURNING {REG_COLUMNS}, (xmax = 0) AS inserted"
+    );
+    let Some(reg_row) = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(mint)
+        .bind(&acct.email)
+        .bind(label)
+        .bind(&acct.terms_version)
+        .bind(&acct.privacy_version)
+        .bind(now)
+        .bind(account)
+        .fetch_optional(&mut *tx)
+        .await?
+    else {
+        // Rolls back: the challenge stays unused.
+        return Ok(MintLinkOutcome::MintLinkedToOtherEmail);
+    };
+    let registration = reg_from_row(&reg_row)?;
+    let inserted: bool = reg_row.try_get("inserted")?;
+    let outbox_id = enqueue(&mut tx, mint, MemberAction::Add, now).await?;
+    tx.commit().await?;
+    Ok(MintLinkOutcome::Linked {
+        registration: Box::new(registration),
+        inserted,
         outbox_id,
     })
 }
@@ -599,6 +756,10 @@ pub async fn cleanup(db: &PgPool, now: DateTime<Utc>) -> Result<u64> {
         ),
         (
             "DELETE FROM rate_events WHERE created_at < $1",
+            TimeDelta::days(1),
+        ),
+        (
+            "DELETE FROM mint_link_challenges WHERE created_at < $1",
             TimeDelta::days(1),
         ),
         (
