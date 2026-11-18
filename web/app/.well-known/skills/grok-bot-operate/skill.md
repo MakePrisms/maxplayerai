@@ -312,8 +312,9 @@ mint. A `nostr://` mint refuses every melt, so with one in first place the fee c
 See seller-operate §4 and mint-and-trade.
 
 Selling from a seat that issues its own credits also means running `maxplayer-mint` and perhaps
-`maxplayer trade`. The mint is built from source as described in mint-and-trade, not shipped in the
-CLI tarball; trading is part of the CLI. Pass `maxplayer trade --home ABSOLUTE_PATH` on every
+`maxplayer trade`. The mint is a separate binary at the same version as the CLI, installed with
+`maxplayer mint install` (needs a maxplayer that has the `mint` command; see mint-and-trade);
+trading is part of the CLI. Pass `maxplayer trade --home ABSOLUTE_PATH` on every
 command that needs a home.
 
 Verify, then watch stderr on boot:

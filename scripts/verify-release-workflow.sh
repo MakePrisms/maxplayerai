@@ -322,6 +322,15 @@ const mintCode = mint.filter((l) => !/^\s*#/.test(l)).join("\n");
 if (!mintCode.includes("--manifest-path crates/maxplayer-mint/Cargo.toml")) {
   fail("job 'build-mint' does not build crates/maxplayer-mint — it would package something else");
 }
+// The release marker (`maxplayer-mint <v> (<sha> release)`): `maxplayer mint upgrade` replaces
+// only binaries that carry it, so a mint built without it could never be upgraded, and the version
+// check must demand it.
+if (!/^\s+MINT_SIDECAR_BUILD: \$\{\{ github\.sha \}\} release\s*$/m.test(mintCode)) {
+  fail("job 'build-mint' does not stamp MINT_SIDECAR_BUILD='<sha> release' — released mints would look like source builds to `maxplayer mint upgrade`");
+}
+if (!/^\s+MINT_RELEASE_MARKER: '1'\s*$/m.test(mintCode)) {
+  fail("job 'build-mint' does not run verify-release-version.sh with MINT_RELEASE_MARKER=1 — a mint without the release marker would ship");
+}
 if (!mintCode.includes("needs.plan.outputs.matrix")) {
   fail("job 'build-mint' does not take its matrix from the plan (.github/release-platforms.json) — the mint could ship to a different platform set than maxplayer");
 }

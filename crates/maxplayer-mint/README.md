@@ -22,6 +22,7 @@ listing tokens. Mint-only setup is documented below.
 
 ## Install
 
+These commands need a `maxplayer` that has `maxplayer mint` (check `maxplayer mint --help`).
 `maxplayer-mint` is released with `maxplayer`, from the same tag and at the same version, for
 linux-x64, linux-arm64, darwin-arm64 and darwin-x64, as GitHub release archives
 (`maxplayer-mint-<version>-<platform>.tar.gz`, listed in the release's `SHA256SUMS`). There is no npm
@@ -68,8 +69,8 @@ maxplayer mint uninstall   # removes the maxplayer-mint binary only
 ```
 
 It refuses while `maxplayer-mint run` is serving the home (stop it first:
-`systemctl --user disable --now maxplayer-mint`). A symlink (for example from an old npm install) is
-removed, not the file it points to. It **never** deletes `<home>/mint/`: the key, seed and ecash
+`systemctl --user disable --now maxplayer-mint`). A symlink is
+removed, not the file it points to (the link's target is left as it was). It **never** deletes `<home>/mint/`: the key, seed and ecash
 database stay, and `maxplayer mint install` picks the mint up again. Deleting that folder destroys
 the mint and every credit it issued; back it up first if you really mean to delete it.
 
@@ -84,6 +85,9 @@ install -m 0755 crates/maxplayer-mint/target/release/maxplayer-mint ~/.local/bin
 ```
 
 ## 1. Create the mint
+
+`maxplayer mint install --name <name>` already did this step if `<home>/mint/` did not exist yet.
+To create the mint by hand (for example after building from source):
 
 ```bash
 maxplayer-mint init --name <name>

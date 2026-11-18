@@ -171,6 +171,12 @@ if [ -n "$BINARY" ]; then
         [ "$stamp" != "$reported" ] && [[ "$stamp" =~ $STAMP_RE ]] \
             || die "$BINARY $form reports '$reported', expected '$SHIPPED_AS $VERSION (<40-hex commit sha>)' — either this artifact is not the one this release is packaging, or it carries no build stamp (#818)"
         stamp_sha="${BASH_REMATCH[1]}"
+        # A released mint says so: `(<sha> release)`, set by release.yml build-mint through
+        # MINT_SIDECAR_BUILD. A clean source build prints the bare sha, and `maxplayer mint upgrade`
+        # replaces only binaries carrying the marker, so a release without it could never be upgraded.
+        if [ "${MINT_RELEASE_MARKER:-}" = 1 ] && [ "${BASH_REMATCH[2]}" != " release" ]; then
+            die "$BINARY $form reports '$reported' — a released maxplayer-mint must say '($stamp_sha release)' (build it with MINT_SIDECAR_BUILD=\"<sha> release\")"
+        fi
         echo "ok: artifact reports $reported ($form)"
     done
 

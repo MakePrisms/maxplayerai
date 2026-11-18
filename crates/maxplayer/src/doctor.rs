@@ -492,7 +492,9 @@ mod checks {
     /// mint) — the same notice `maxplayer mint` prints. Not applicable with no mint installed; the
     /// GitHub latest-release check runs only when one is (a few seconds at most, never an error).
     pub(super) fn check_mint_version() -> Check {
-        check_mint_version_from(crate::mint_cli::version_notice())
+        check_mint_version_from(crate::mint_cli::version_notice(
+            super::DOCTOR_OFFLINE.load(std::sync::atomic::Ordering::Relaxed),
+        ))
     }
 
     pub(super) fn check_mint_version_from(notice: Option<crate::mint_cli::VersionNotice>) -> Check {
@@ -526,7 +528,15 @@ mod checks {
             _ => Check::warn(
                 MINT_VERSION_CHECK,
                 format!("{what}{latest}"),
-                "it is not this maxplayer's release; `maxplayer mint install --force` replaces it",
+                format!(
+                    "it is not this maxplayer's release; `maxplayer mint install --force --bin-dir {}` \
+                     replaces it",
+                    notice
+                        .path
+                        .parent()
+                        .map(|d| d.display().to_string())
+                        .unwrap_or_else(|| ".".into())
+                ),
             ),
         }
     }
@@ -2597,7 +2607,7 @@ mod checks {
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer doctor [--home <dir>]   # seller environment self-check (nix — FAILs only on a home with a [seller] section, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
+        "Usage:\n  maxplayer doctor [--home <dir>] [--offline]   # seller environment self-check (nix — FAILs only on a home with a [seller] section, credential helper, seller key, relay, mint, agent, sandbox, home permissions, harness credential permissions, maxplayer-mint version; --offline skips its GitHub latest-release check)\n\nExit codes: 0 all checks passed, 1 a blocking check FAILed\n{}",
         crate::skill::docs_pointer_line()
     );
 }
@@ -2641,6 +2651,12 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 
     #[cfg(feature = "wallet")]
     {
+        // `--offline` skips the one check that asks a third party (GitHub's latest release, for the
+        // maxplayer-mint row). Taken out before the strict `--home` parse below.
+        let offline = args.iter().any(|a| a == "--offline");
+        DOCTOR_OFFLINE.store(offline, std::sync::atomic::Ordering::Relaxed);
+        let args: Vec<String> = args.iter().filter(|a| *a != "--offline").cloned().collect();
+        let args = args.as_slice();
         let home_override = match parse_doctor_args(args) {
             Ok(home_override) => home_override,
             Err(message) => {
@@ -2651,6 +2667,10 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         run_doctor(home_override, out, err)
     }
 }
+
+/// `maxplayer doctor --offline`: skip the GitHub latest-release check of the maxplayer-mint row.
+#[cfg(feature = "wallet")]
+static DOCTOR_OFFLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Parse `maxplayer doctor`'s argv (everything after the `doctor` subcommand). The only accepted
 /// argument is `--home <dir>`; anything else is refused so the operator is told to use `--home` or
@@ -2671,7 +2691,7 @@ fn parse_doctor_args(args: &[String]) -> Result<Option<std::path::PathBuf>, Stri
             }
             other => {
                 return Err(format!(
-                    "unknown doctor option: {other} (doctor accepts only `--home <dir>`; \
+                    "unknown doctor option: {other} (doctor accepts only `--home <dir>` and `--offline`; \
                      the home may also be set via MAXPLAYER_HOME)"
                 ));
             }

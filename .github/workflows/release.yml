@@ -274,7 +274,8 @@ jobs:
 
   # The mint sidecar (`crates/maxplayer-mint`), released from the same tag at the same version as
   # `maxplayer` (#merge-binaries, 2026-11-16): its own archive per platform, listed in the same
-  # SHA256SUMS, and its own npm launcher + payload packages. It is its own cargo workspace because
+  # SHA256SUMS, and no npm packages (`maxplayer mint install` fetches the archive). It is its own
+  # cargo workspace because
   # cdk's `mint` feature needs `protoc` at BUILD time; this job is therefore the only one in the
   # release that installs protoc, and users never need it — they get the prebuilt binary.
   # verify-release-workflow.sh asserts both halves (protoc here, and nowhere else in this file).
@@ -319,6 +320,10 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          # `maxplayer-mint --version` -> `maxplayer-mint <v> (<sha> release)`. The word `release` is
+          # the only thing that tells a released mint from a build of a clean checkout (which prints
+          # the bare sha); `maxplayer mint upgrade` replaces only lines carrying it.
+          MINT_SIDECAR_BUILD: ${{ github.sha }} release
         run: |
           protoc --version
           cargo build --manifest-path crates/maxplayer-mint/Cargo.toml --release --locked \
@@ -329,6 +334,7 @@ jobs:
       - name: Verify the version matches the release
         env:
           VERSION: ${{ needs.plan.outputs.version }}
+          MINT_RELEASE_MARKER: '1'
         run: |
           ./scripts/verify-release-version.sh "$VERSION" \
             "crates/maxplayer-mint/target/${{ matrix.target }}/release/maxplayer-mint"

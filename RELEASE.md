@@ -5,7 +5,9 @@ npm. Both come out of `.github/workflows/release.yml`, which runs on a pushed `v
 
 The same tag also ships the mint sidecar, `maxplayer-mint` (`crates/maxplayer-mint`), as a separate
 binary at the same version: `maxplayer-mint-<version>-<platform>.tar.gz` archives listed in the same
-`SHA256SUMS`, on the GitHub Release only — there is no npm package for it. Users install it with
+`SHA256SUMS`, on the GitHub Release only — there is no npm package for it. A released mint reports
+`maxplayer-mint <version> (<commit> release)` (build-mint sets `MINT_SIDECAR_BUILD`); a source build
+prints the bare commit, and `maxplayer mint upgrade` replaces only the former. Users install it with
 `maxplayer mint install` (and later `maxplayer mint upgrade`), which downloads the archive for
 `maxplayer`'s own version and checks it against `SHA256SUMS`. It is built by the `build-mint` job, the
 only release job that installs `protoc` (cdk's mint signatory needs it at build time); users never
@@ -288,8 +290,10 @@ make it load-bearing.
 
 - **The tag produced no run at all.** The tagged commit has no `release.yml` — see the warning under
   Dry run. Delete the tag, then tag a `main` that contains `release.yml` and push it again.
-- **Publish failed, Release exists.** Fix the cause and re-run just the publish job. The build is
-  reproducible from the tag.
+- **Publish failed, Release exists.** Fix the cause and re-run just the publish job, but only if no
+  package was published yet: npm does not allow republishing a version, so a re-run after a partial
+  publish fails on the first package already there (see the trusted-publisher note above); cut the
+  next patch version instead. The build is reproducible from the tag.
 - **A version disagreed with the tag.** Nothing was published — the check runs before any upload.
   Delete the tag, fix the versions, tag again.
 - **A bad version reached npm.** npm does not allow republishing a version. Bump and release again;
