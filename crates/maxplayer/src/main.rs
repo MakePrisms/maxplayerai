@@ -16,6 +16,8 @@ mod daemon;
 mod doctor;
 mod exec;
 mod mcp;
+// `maxplayer mint` (info) and `maxplayer mint install` (the released `maxplayer-mint` + <home>/mint/).
+mod mint_cli;
 mod profile_cli;
 // The `sell` surface is the seller advertise path: it publishes the kind-0 identity and boots the
 // heartbeat loop that announces capability. `acp` compiles in the agent-execution that lets a seat
