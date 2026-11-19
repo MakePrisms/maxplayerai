@@ -970,8 +970,20 @@ pub(crate) fn fetch_review_commit(
     deadline: std::time::Instant,
 ) -> Result<(), TransportError> {
     assert_allowed_repo_locator(remote_url)?;
+    fetch_review_commit_inner(repo, remote_url, commit, Some(header), max_bytes, deadline)
+}
+/// If the shallow fetch fails, one full fetch under the same byte cap and deadline.
+fn fetch_review_commit_inner(
+    repo: &Repository,
+    remote_url: &str,
+    commit: &str,
+    header: Option<String>,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> Result<(), TransportError> {
     let refspec = format!("+{commit}:refs/review/delivery");
-    fetch_review_inner(repo, remote_url, &refspec, Some(header), max_bytes, deadline, Some(2))
+    fetch_review_inner(repo, remote_url, &refspec, header.clone(), max_bytes, deadline, Some(2))
+        .or_else(|_| fetch_review_inner(repo, remote_url, &refspec, header, max_bytes, deadline, None))
 }
 
 fn fetch_review_ref_inner(
@@ -2335,6 +2347,45 @@ mod tests {
             .is_err()
         );
         drop((target, limited, expired, tree, builder));
+        drop(source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A team commit is fetched by id. The local transport refuses shallow fetches, as a v0
+    /// upload-pack may, so this also takes the full-fetch fallback; a merge brings both parents,
+    /// a root none, and the byte cap still holds.
+    #[test]
+    fn team_commit_fetch_by_id_falls_back_to_a_full_fetch() {
+        let root = temp_root("team-commit-fetch");
+        let source = Repository::init_bare(root.join("source")).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        let commit = |name: &str, parents: &[git2::Oid]| {
+            let blob = source.blob(name.as_bytes()).unwrap();
+            let mut builder = source.treebuilder(None).unwrap();
+            builder.insert(name, blob, 0o100644).unwrap();
+            let tree = source.find_tree(builder.write().unwrap()).unwrap();
+            let parents: Vec<_> = parents.iter().map(|p| source.find_commit(*p).unwrap()).collect();
+            source.commit(None, &sig, &sig, name, &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
+        };
+        let base = commit("base", &[]);
+        let left = commit("left", &[base]);
+        let right = commit("right", &[base]);
+        let merge = commit("merge", &[left, right]);
+        source.reference("refs/heads/main", merge, true, "tip").unwrap();
+        let url = url::Url::from_directory_path(source.path()).unwrap().to_string();
+        let deadline = || std::time::Instant::now() + std::time::Duration::from_secs(5);
+        for (n, (tip, parents)) in [(merge, vec![left, right]), (base, vec![])].into_iter().enumerate() {
+            let target = Repository::init_bare(root.join(format!("t{n}"))).unwrap();
+            fetch_review_commit_inner(&target, &url, &tip.to_string(), None, 1024 * 1024, deadline()).unwrap();
+            assert_eq!(target.refname_to_id("refs/review/delivery").unwrap(), tip);
+            let got = target.find_commit(tip).unwrap();
+            assert_eq!(got.parent_ids().collect::<Vec<_>>(), parents);
+            for p in parents {
+                assert!(target.find_commit(p).is_ok(), "parent {p} fetched");
+            }
+        }
+        let capped = Repository::init_bare(root.join("capped")).unwrap();
+        assert!(fetch_review_commit_inner(&capped, &url, &merge.to_string(), None, 1, deadline()).is_err());
         drop(source);
         std::fs::remove_dir_all(root).unwrap();
     }

@@ -245,11 +245,14 @@ pub(super) fn team_plan(
     let tip = repo.find_commit(oid).map_err(|_| "input_unavailable")?;
     let tree = tip.tree().map_err(|_| "input_unavailable")?;
     verify_object(&repo, tree.id(), git2::ObjectType::Tree)?;
-    let header = std::str::from_utf8(tip.raw_header_bytes()).map_err(|_| "unsupported_input")?;
-    let message = std::str::from_utf8(tip.message_raw_bytes()).map_err(|_| "unsupported_input")?;
-    if header.contains('\0') || message.contains('\0') {
+    // The raw object, not the parsed message: libgit2 cuts a message at its first NUL.
+    let odb = repo.odb().map_err(|_| "input_unavailable")?;
+    let raw = odb.read(oid).map_err(|_| "input_unavailable")?;
+    if raw.data().contains(&0) {
         return Err("unsupported_input".into());
     }
+    let header = std::str::from_utf8(tip.raw_header_bytes()).map_err(|_| "unsupported_input")?;
+    let message = std::str::from_utf8(tip.message_raw_bytes()).map_err(|_| "unsupported_input")?;
     let mut requests = Requests {
         context: json!({"subject":subject,"team_commit":commit}),
         changes: vec![],
@@ -645,6 +648,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init_bare(dir.path()).unwrap();
         let tip = merge(&repo, &[("bin", b"\0bytes")], &[], "binary");
+        assert_eq!(team(&repo, dir.path(), tip).unwrap_err(), "unsupported_input");
+        // A text-only commit whose message holds a NUL.
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert("f", repo.blob(b"text\n").unwrap(), 0o100644).unwrap();
+        let raw = format!("tree {}\nauthor a <a@x> 1 +0000\ncommitter a <a@x> 1 +0000\n\nmsg\0nul\n", builder.write().unwrap());
+        let tip = repo.odb().unwrap().write(git2::ObjectType::Commit, raw.as_bytes()).unwrap();
         assert_eq!(team(&repo, dir.path(), tip).unwrap_err(), "unsupported_input");
     }
 

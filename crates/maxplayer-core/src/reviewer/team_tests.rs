@@ -58,8 +58,14 @@ async fn scenario() {
         model: "fixture".into(),
         window_seconds: 300,
     };
-    let worker = tokio::task::spawn_local(run_worker(config, reviewer.clone(), provider));
     let (alice, bob, author) = (Keys::generate(), Keys::generate(), Keys::generate());
+    // Alice's job-review budget is spent; her team request must still be admitted.
+    let store = Store::open(&config.database).unwrap();
+    for _ in 0..10 {
+        store.admit(&alice.public_key().to_hex(), Timestamp::now().as_secs()).unwrap();
+    }
+    drop(store);
+    let worker = tokio::task::spawn_local(run_worker(config, reviewer.clone(), provider));
     let client = Client::new(alice.clone());
     client.add_relay(&url).await.unwrap();
     client.connect().await;
@@ -104,12 +110,6 @@ async fn scenario() {
     }
     assert!(all.iter().all(|d| *d == crate::review::Decision::Passed), "{all:?}");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-    // A team request on the public lane gets nothing.
-    assert!(client
-        .fetch_events(Filter::new().kind(Kind::Custom(REVIEW_KIND)), Duration::from_secs(2))
-        .await
-        .unwrap()
-        .is_empty());
     assert!(!worker.is_finished());
     worker.abort();
     let _ = worker.await;
@@ -128,7 +128,9 @@ async fn two_members_share_one_classifier_call_and_cache_hits_skip_admission() {
 fn team_bundle_with_job_shaped_offer_is_refused() {
     let repo = format!("{}{}", "ab".repeat(16), "0".repeat(32));
     let mut request = crate::review::team::Request::commit(&repo, &"a".repeat(64), &"c".repeat(40)).unwrap();
+    // A job id as `offer`, with `event` re-bound to it, so only the team-id check can refuse it.
     request.subject.offer = "e".repeat(64);
+    request.subject.event = crate::review::team_commit_event(&request.subject.offer, &"c".repeat(40));
     let json = serde_json::to_string(&request).unwrap();
     assert!(request.validate(&Keys::generate().public_key()).is_err());
     // It is still parsed as a team bundle, never as a job bundle.

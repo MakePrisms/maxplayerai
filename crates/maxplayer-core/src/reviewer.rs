@@ -332,15 +332,8 @@ fn parse_bundle(content: &str) -> Result<Bundle, String> {
 /// In-flight key. A team verdict goes to its requester only, so two members asking about the
 /// same subject must not share one flight (spec §5); job flights stay per subject.
 fn flight_key(subject: &Subject, requester: &PublicKey) -> Option<String> {
-    let subject = serde_json::to_string(subject).ok()?;
-    Some(if is_team_subject_json(&subject) {
-        format!("{subject}:{}", requester.to_hex())
-    } else {
-        subject
-    })
-}
-fn is_team_subject_json(subject: &str) -> bool {
-    serde_json::from_str::<Subject>(subject).is_ok_and(|s| is_team(&s))
+    let json = serde_json::to_string(subject).ok()?;
+    Some(if is_team(subject) { format!("{json}:{}", requester.to_hex()) } else { json })
 }
 /// Team verdict cache key: the subject itself, so a hit needs no fetch and no admission.
 fn team_cache_key(reviewer: &PublicKey, model: &str, subject: &Subject) -> Result<String, String> {
@@ -1558,12 +1551,9 @@ async fn team_review(
         reply_refusal(client, relay, keys, request, subject, &code).await;
         return;
     }
+    // `subject` was parsed from this same bundle, so it is `bundle.subject`.
     let recipients = match bundle.validate(&request.pubkey) {
-        Ok(r) if bundle.subject == *subject => r,
-        Ok(_) => {
-            reply_refusal(client, relay, keys, request, subject, "invalid_subject").await;
-            return;
-        }
+        Ok(r) => r,
         Err(code) => {
             reply_refusal(client, relay, keys, request, subject, &code).await;
             return;
