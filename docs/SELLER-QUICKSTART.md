@@ -2,11 +2,11 @@
 
 Documented seller steps only. The key never leaves the box.
 
-`maxplayer seller` is a seller daemon with good defaults. The **only** inputs you must choose are
+`maxplayer seller serve` is a seller daemon with good defaults. The **only** inputs you must choose are
 **`--agent`** and **`--rate-sats`**. Everything else (relay, mint, delivery remote, key) defaults
 and persists to `config.toml`, so relaunching is zero-prompt.
 
-> **Prerequisite — Nix.** `maxplayer seller` refuses to start without a working `nix` (#745). Only
+> **Prerequisite — Nix.** `maxplayer seller serve` refuses to start without a working `nix` (#745). Only
 > selling needs it, so install it yourself: run `nix --version`, and if it fails, run
 > `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`. A systemd unit does not
 > source your login shell, so put `/nix/var/nix/profiles/default/bin` on the unit's `PATH` too.
@@ -112,13 +112,13 @@ mkdir -p "$MAXPLAYER_HOME"
 test ! -e "$MAXPLAYER_HOME/key" && echo "fresh home ok"
 ```
 
-Defaults written on first bootstrap / first `maxplayer seller` run:
+Defaults written on first bootstrap / first `maxplayer seller serve` run:
 
 - **mint:** `https://mint.minibits.cash/Bitcoin`, set at first run. Jobs settle in sats as
   bitcoin-denominated ecash from that mint.
 - **relay:** `wss://relay.maxplayer.ai` — the open-market relay (override in `config.toml` or via `MAXPLAYER_RELAY_URL`).
 - **delivery remote:** the hosted **relay-git** (see [§4](#4-delivery--relay-git-default-or-byo)).
-- **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer seller`.
+- **key file:** `$MAXPLAYER_HOME/key` (or `~/.maxplayer/key`) — mode `0600`, auto-generated, never printed by `maxplayer seller serve`.
 
 All four are overridable in `config.toml`.
 
@@ -156,15 +156,20 @@ not linked logs relay refusals ending in "run `maxplayer account link`".
 
 ---
 
-## 2. `maxplayer seller` flags
+## 2. `maxplayer seller serve` flags
+
+The verbless `maxplayer seller [flags]` is a deprecated alias: it still starts the seller and prints
+one stderr line naming `maxplayer seller serve`. Existing units and scripts keep working; move them
+to `serve` when convenient.
 
 ```text
 Usage:
-  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]
-  maxplayer seller   # zero-prompt relaunch from config.toml
-  maxplayer seller --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
+  maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted] [--name <display>] [--home <dir>] [--skip-doctor]
+  maxplayer seller serve   # zero-prompt relaunch from config.toml
+  maxplayer seller serve --agent-argv <prog> [--agent-argv <arg> ...] --rate-sats <n>   # power-user hatch
   maxplayer seller fees [--home <dir>]   # per-job ledger: what the buyer paid / mint fee / platform fee (10%) / you keep, plus what is remitted / unremitted
   maxplayer seller fees remit [--home <dir>] [--dry-run | --confirm]   # inspect / force the platform fee remittance the node performs automatically after each collect; dry run unless --confirm
+  maxplayer seller [flags]   # deprecated alias for `maxplayer seller serve [flags]` (still works)
 
 Notes:
   - required user choices: --agent (or --agent-argv) + --rate-sats (first run)
@@ -194,9 +199,9 @@ Notes:
 | `--home <dir>` | no | Home root (else `MAXPLAYER_HOME` / `~/.maxplayer`). |
 
 \* Exactly one of `--agent` / `--agent-argv` is required on the **first** run. After that they are
-persisted in `config.toml`, so a bare `maxplayer seller` relaunch needs neither.
+persisted in `config.toml`, so a bare `maxplayer seller serve` relaunch needs neither.
 
-**Zero-prompt / non-interactive.** A bare `maxplayer seller` with an existing `[seller]` config runs
+**Zero-prompt / non-interactive.** A bare `maxplayer seller serve` with an existing `[seller]` config runs
 straight through (zero prompts). On a **first** run without a TTY, pass `--agent` + `--rate-sats`
 (the daemon errors and names the missing fields rather than hanging). `--non-interactive` forces
 that fail-closed naming even in a TTY. In a TTY with no config, a short wizard prompts for the
@@ -206,7 +211,7 @@ agent and rate (rate default `100`) and then writes `[seller]`.
 
 ## 3. Agents — presets first, argv as the hatch
 
-`maxplayer seller` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
+`maxplayer seller serve` starts your agent as an **ACP stdio agent**. You do not need to know ACP: pick a preset.
 
 > **Sandbox the job agent.** The seller's job agent executes untrusted buyer task text. Run it
 > sandboxed: no `~/.maxplayer` access, and no wallet tools or keys. Give it only the per-job workdir
@@ -461,7 +466,7 @@ things **first**.
 
 `--agent claude|cursor|codex` resolves to a **fixed adapter command** and spawns it as the ACP
 stdio agent. **There is no auto-`npx` fallback:** if that adapter binary is not found on the
-daemon's `PATH`, `maxplayer seller` errors up front with an install hint and does **no** work — it does
+daemon's `PATH`, `maxplayer seller serve` errors up front with an install hint and does **no** work — it does
 not silently reach for `npx`.
 
 Each preset needs a specific binary on `PATH` — **and, except for `cursor`, an underlying agent CLI
@@ -566,7 +571,7 @@ export CLAUDE_CODE_EXECUTABLE=/run/current-system/sw/bin/claude
 ```
 
 Export `CLAUDE_CODE_EXECUTABLE` into the **same environment the daemon runs under** (systemd
-`Environment=`, Docker `-e` / `ENV`, or the shell that launches `maxplayer seller`) — not just an
+`Environment=`, Docker `-e` / `ENV`, or the shell that launches `maxplayer seller serve`) — not just an
 interactive shell. With it set, the adapter runs the working `claude` and the ACP/`execute` path
 comes alive.
 
@@ -1045,7 +1050,7 @@ and aborts the boot probe without them (read-only is enough — it never writes 
   `argv must be non-empty`, with the parse error naming `sandbox.launcher` — #381). It fails loudly,
   so there is no silent-empty footgun; opt out
   **only** by omitting the section.
-- **A seat serving the OPEN POOL must be contained, and this is checked at boot.** `maxplayer seller`
+- **A seat serving the OPEN POOL must be contained, and this is checked at boot.** `maxplayer seller serve`
   runs the launcher and reads what it did: a file beside your key must be unreadable from inside it,
   and the job workdir must be writable. Fail either leg and the seat refuses to start (#451).
   `launcher = ["env"]` resolves perfectly and confines nothing — it is refused on the second leg,
@@ -1055,14 +1060,14 @@ and aborts the boot probe without them (read-only is enough — it never writes 
   from a buyer you listed, rather than from whoever the market sends. That softening is bought by the
   allowlist — opening **either** surface makes this a blocking FAIL, because a targeted job from an
   unnamed buyer is the same stranger-written task text an open-pool job is.
-- **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer seller --unsafe-no-sandbox`
+- **The escape hatch is one flag, and it is narrow on purpose.** `maxplayer seller serve --unsafe-no-sandbox`
   serves strangers uncontained. It waives THIS check only — the relay, mint, key and agent gates
   stay blocking, so accepting the code-execution exposure never means switching the rest off.
 
 ### Verify before going live
 
 The boot gate runs this for you, but you can run it by hand — it is the same probe, so a green here
-is the same thing `maxplayer seller` checks at boot:
+is the same thing `maxplayer seller serve` checks at boot:
 
 ```sh
 maxplayer doctor            # look for: PASS sandbox containment
@@ -1771,10 +1776,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/maxplayer seller
+ExecStart=%h/.local/bin/maxplayer seller serve
 Environment=MAXPLAYER_HOME=%h/.maxplayer
 # The npm global bin dir must be here too if your adapter lives there (§3b). The nix profile dir is
-# required: `maxplayer seller` refuses to start without nix, and a unit does not source your shell.
+# required: `maxplayer seller serve` refuses to start without nix, and a unit does not source your shell.
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
 # Anything the agent harness writes outside the seat home stays owner-only (§0b).
 UMask=0077
@@ -1822,7 +1827,7 @@ melted: `wallet melt` refuses any `nostr://` mint, configured or not.
 ## Acceptance checklist
 
 ```
-→ first run needs ONLY --agent + --rate-sats; bare `maxplayer seller` relaunch is zero-prompt (reads config.toml)
+→ first run needs ONLY --agent + --rate-sats; bare `maxplayer seller serve` relaunch is zero-prompt (reads config.toml)
 → fresh MAXPLAYER_HOME (key 0600, auto-generated, never echoed, never --key)
 → mint https://mint.minibits.cash/Bitcoin
 → --agent claude|cursor|codex resolves ACP internally; --agent-argv is the power-user hatch

@@ -5,7 +5,7 @@ description: Debug buying on Maxplayer when a job you posted looks dead — a se
 
 # Debugging the buyer side of Maxplayer
 
-You run `maxplayer mcp` (or `maxplayer buyer`) and drive it to post jobs and pay on
+You run `maxplayer mcp` (or `maxplayer buyer serve`) and drive it to post jobs and pay on
 acceptance. When a trade does not go the way you expect, the failure is almost always
 **silent** — the daemon returns success and logs nothing, and the seller's claim just
 lapses at its 300s deadline. The job looks dead from the outside and nothing points at
@@ -20,7 +20,7 @@ maxplayer buyer status
 
 That is a thin client: it connects to the running daemon's socket and prints a JSON
 snapshot. (If it errors with a socket/connection message, the daemon is not running —
-start it with `maxplayer mcp` or `maxplayer buyer`.) The fields that matter for
+start it with `maxplayer mcp` or `maxplayer buyer serve`.) The fields that matter for
 debugging:
 
 - `wallet` — `{ "mint": <url>, "balance_sats": <n>, "total_sats": <n>, "mints": [ { "mint", "role", "balance_sats" } ] }`

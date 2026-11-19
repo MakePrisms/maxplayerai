@@ -179,12 +179,12 @@ Nostr identity, but connection metadata, timing and request sizes can still link
   `nostr://` URL plus the line to append to `accepted_mints` (accepting sellers also run
   `wallet mints add`, §1 item 2). It refuses if `<home>/mint/` exists
   and prints the backup note (decision 9): losing `<home>/mint/` makes every credit worthless,
-  and restoring an old copy can let spent credits be spent again. `run` backs the mint up
+  and restoring an old copy can let spent credits be spent again. `serve` backs the mint up
   automatically (online `VACUUM INTO` snapshots after each change, plus key, seed, `mint.toml` and
   token files) into `backups/` or `backup_dir`; the operator's one step is copying that directory
-  off-box once. `run` refuses a missing or older `mint.sqlite`; `restore` takes the newest
+  off-box once. `serve` refuses a missing or older `mint.sqlite`; `restore` takes the newest
   snapshot only.
-- `maxplayer-mint run` is the relay listener. The operator runs it (a systemd unit is documented).
+- `maxplayer-mint serve` is the relay listener. The operator runs it (a systemd unit is documented).
 - `maxplayer-mint issue <amount>` mints proofs in-process to a local token file. No quote and no
   payment processor: it signs through cdk's signatory (`Mint::blind_sign`) and stores the
   signatures through cdk's own database API, so restore and `total_issued` see them like swap
@@ -200,7 +200,7 @@ Nostr identity, but connection metadata, timing and request sizes can still link
    dev-dependency) and a scripted mint responder, so core gains no cdk `mint` dependency and its CI
    needs no `protoc`. The real CDK mint over relays is tested in stage 2. No behavior change for
    `https://`.
-2. **`maxplayer-mint`.** `init`, `run`, `issue`, idempotent swap replay, rate cap, CI job.
+2. **`maxplayer-mint`.** `init`, `serve`, `issue`, idempotent swap replay, rate cap, CI job.
 3. **End to end.** Seller A runs `maxplayer-mint`, seller B accepts A's mint, a buyer holds only A's
    credits. B does a job, is paid in A's credits and pays its fee in real sats from its Lightning
    mint. Run behind NAT with no inbound ports and outbound HTTP denied except to B's Lightning mint.

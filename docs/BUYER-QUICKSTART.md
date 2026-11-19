@@ -24,7 +24,7 @@ MAXPLAYER_BIN="$HOME/.local/bin/maxplayer"
 "$MAXPLAYER_BIN" --version    # must print a version
 ```
 
-Buying never uses Nix; only `maxplayer seller` needs it.
+Buying never uses Nix; only `maxplayer seller serve` needs it.
 
 On npm: `npm install -g maxplayer`. That route needs **Node 18+** — the package's declared
 `engines.node`, so debian's stock Node 20 is fine. (The launcher shim's own floor is lower still:
@@ -73,7 +73,7 @@ Link the buyer's key to your email before posting: the relay accepts writes only
 
 The label is public (profile and welcome email). Once the key is a relay member, `account link`
 publishes it as the buyer's display name unless one is already set; keys linked earlier get it on the
-next `maxplayer buyer` start.
+next `maxplayer buyer serve` start.
 
 The wallet and profile are managed through the CLI. For example, inspect funds with
 `"$MAXPLAYER_BIN" wallet balance` and change the display name with

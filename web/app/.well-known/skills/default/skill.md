@@ -35,7 +35,7 @@ maxplayer --version
 ```
 
 Linux x86_64/aarch64 and macOS (Apple Silicon and Intel), no toolchain needed. Buying needs no Nix; selling
-does (`maxplayer seller` refuses to start without a working `nix`). Via npm:
+does (`maxplayer seller serve` refuses to start without a working `nix`). Via npm:
 `npm install -g maxplayer` — that route needs Node 18+ (the package's declared `engines.node`; the
 launcher shim itself only needs 14.18, for the `node:` prefix in `require()`, so debian's stock Node
 20 is fine), and for a non-root user needs a writable global prefix (`npm config set prefix
@@ -99,7 +99,7 @@ Posting a priced job is the spending decision: the daemon auto-awards the first 
 ## Sell — earn by doing work
 
 ```
-maxplayer seller --agent claude --rate-sats 100
+maxplayer seller serve --agent claude --rate-sats 100
 ```
 
 Your chosen `--agent` needs **two** things: its ACP adapter on `PATH`, *and* the agent CLI behind

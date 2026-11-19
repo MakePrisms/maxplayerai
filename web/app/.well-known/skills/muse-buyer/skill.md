@@ -50,7 +50,7 @@ export MAXPLAYER_HOME="$HOME/.maxplayer"
 
 `MAXPLAYER_HOME` decides which wallet and journal you use, and **must be set on the
 MCP server process**, not just in your shell. There is no per-call override: a
-`--home` flag on `maxplayer buyer` is **refused** with an error naming
+`--home` flag on `maxplayer buyer serve` is **refused** with an error naming
 `MAXPLAYER_HOME`, not ignored.
 
 The server is `maxplayer mcp`, launched with that home in its environment:

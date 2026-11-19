@@ -1,11 +1,11 @@
 ---
 name: maxplayer-debug-selling
-description: Debug selling on Maxplayer when your seller won't start, isn't earning, or looks dead. Covers `maxplayer seller` refusing to boot (the startup doctor / readiness gate), a fresh seller bricking at the relay-git seed with a 404, health-checks that show nothing on a perfectly healthy daemon (which log line actually proves liveness), a seat that buyers can't discover, and a seller that quietly stops claiming new jobs. Says exactly which command to run, which log line to grep, and where to report a dead end.
+description: Debug selling on Maxplayer when your seller won't start, isn't earning, or looks dead. Covers `maxplayer seller serve` refusing to boot (the startup doctor / readiness gate), a fresh seller bricking at the relay-git seed with a 404, health-checks that show nothing on a perfectly healthy daemon (which log line actually proves liveness), a seat that buyers can't discover, and a seller that quietly stops claiming new jobs. Says exactly which command to run, which log line to grep, and where to report a dead end.
 ---
 
 # Debugging the seller side of Maxplayer
 
-The seller is `maxplayer seller` — the same binary a buyer installs, run in its other mode. It watches
+The seller is `maxplayer seller serve` — the same binary a buyer installs, run in its other mode. It watches
 the relay for open jobs, claims what it can do, delivers, and collects.
 
 **The first move for almost everything here is the doctor:**
@@ -14,22 +14,22 @@ the relay for open jobs, claims what it can do, delivers, and collects.
 maxplayer doctor
 ```
 
-It runs the same checks `maxplayer seller` runs at startup: `nix`, `credential helper`,
+It runs the same checks `maxplayer seller serve` runs at startup: `nix`, `credential helper`,
 `seller key`, `relay reachability`, `relay token policy`, `mint reachability`, `agent preset`,
 `telemetry`, the sandbox checks (`sandbox launcher`, `sandbox credential containment`,
 `sandbox egress`, `sandbox image`, `sandbox engine floor`, `sandbox containment`),
 `seat reachability`, `home permissions` and `harness credential permissions`. Each prints `PASS`/`WARN`/`FAIL` and, when not PASS,
 a one-line `(fix: …)` hint. Exit is `0` unless something `FAIL`ed; a `WARN` never fails. One
-difference: until the first `maxplayer seller` run writes a `[seller]` section, `doctor` reports a
-missing `nix` as `SKIP`, while `maxplayer seller` itself still refuses to start without it.
+difference: until the first `maxplayer seller serve` run writes a `[seller]` section, `doctor` reports a
+missing `nix` as `SKIP`, while `maxplayer seller serve` itself still refuses to start without it.
 Every check runs even after one fails, so one run shows the whole picture. Add
 `--home <dir>` to diagnose a specific seat.
 
 ---
 
-## Symptom: `maxplayer seller` refuses to start
+## Symptom: `maxplayer seller serve` refuses to start
 
-On startup, `maxplayer seller` runs the doctor as a readiness gate and **refuses to boot if any
+On startup, `maxplayer seller serve` runs the doctor as a readiness gate and **refuses to boot if any
 blocking check FAILs** — this is by design, so a seat never advertises work it cannot do.
 You will see:
 
@@ -42,7 +42,7 @@ followed by the check lines, and on failure:
 ```
 ... REFUSING to start: N blocking readiness check(s) failed —
   FAIL <check> — <detail> (fix: <hint>)
-resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT
+resolve the item(s) above, then re-run `maxplayer seller serve`. To bypass these checks (NOT
 recommended), pass --skip-doctor.
 ```
 
@@ -68,7 +68,7 @@ For a seat strangers can reach (`--claim-open-pool` or `--accept-open-targeted`)
 on a seat only named buyers reach they are WARNs. A `WARN` (e.g. one of several mints down,
 or `no [seller] section configured`) prints but does **not** block boot.
 
-**Fix:** resolve the FAILed item using its hint, then re-run `maxplayer seller`. Re-running
+**Fix:** resolve the FAILed item using its hint, then re-run `maxplayer seller serve`. Re-running
 `maxplayer doctor` confirms it before you retry. `--skip-doctor` bypasses every check except
 `nix`, and is not recommended — a bad launcher or unresolvable agent means every awarded job dies at
 spawn and you lose the award.
@@ -208,7 +208,7 @@ so the `ls-remote` 404s and the seller refuses to boot. It fails closed: no mone
 **Fix / workaround — bring your own delivery host (the tool's own recommended fix):**
 
 ```
-maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https-url>
+maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> --git-remote <https-url>
 ```
 
 `--git-remote <https-url>` points delivery at a git host you control (e.g. an HTTPS repo
@@ -316,7 +316,7 @@ Note the converse, and do not read it as good news: an `accepting=y` beat left b
 replaceable and a dead seat publishes nothing to supersede it. A seat announcement is only worth what
 its `created_at` says — a stale `accepting=y` means nothing.
 
-**Fix:** **restart the seller** (`maxplayer seller`). Boot re-publishes the kind-0 profile and
+**Fix:** **restart the seller** (`maxplayer seller serve`). Boot re-publishes the kind-0 profile and
 resumes the heartbeat, and you are listed again. This is the correct response after any relay outage
 that happened while your seat was already running — though if only capability looked stale, waiting
 one heartbeat interval would have fixed that much on its own.

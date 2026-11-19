@@ -214,3 +214,75 @@ fn wait_child(child: &mut std::process::Child, timeout: Duration) -> Option<std:
         }
     }
 }
+
+/// `buyer serve` is the start verb; the verbless `maxplayer buyer` is a deprecated alias that still
+/// serves. Both print the version start line first (#1354); the alias then prints exactly one
+/// deprecation line naming `maxplayer buyer serve`, before the daemon's own lines; `buyer serve`
+/// prints none.
+#[test]
+fn verbless_buyer_still_serves_with_one_deprecation_line_and_serve_prints_none() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    for (args, deprecated) in [(&["buyer"][..], true), (&["buyer", "serve"][..], false)] {
+        let home = temp_home(if deprecated { "verbless" } else { "serve-verb" });
+        let _ = std::fs::remove_dir_all(&home);
+        let mut child = maxplayer(&home)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn buyer daemon");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stderr = child.stderr.take().unwrap();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        // Collect stderr up to the daemon's own startup line.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut lines = Vec::new();
+        while !lines
+            .iter()
+            .any(|l: &String| l.contains("maxplayer buyer online"))
+        {
+            match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(line) => lines.push(line),
+                Err(_) => {
+                    let _ = child.kill();
+                    panic!("{args:?} never came online; stderr so far: {lines:?}");
+                }
+            }
+        }
+        // It really serves: the thin client reaches it.
+        let served = wait_for_daemon(&home).expect("the daemon answers `buyer status`");
+        assert_eq!(
+            served["pid"].as_u64(),
+            Some(u64::from(child.id())),
+            "{args:?}"
+        );
+        let warnings = lines.iter().filter(|l| l.contains("deprecated")).count();
+        assert!(
+            lines[0].starts_with(&format!("maxplayer {} (", env!("CARGO_PKG_VERSION")))
+                && lines[0].ends_with(&format!(") — buyer starting, home {}", home.display())),
+            "{args:?}: the version start line comes first: {lines:?}"
+        );
+        if deprecated {
+            assert_eq!(warnings, 1, "exactly one deprecation line: {lines:?}");
+            assert_eq!(
+                lines[1],
+                "maxplayer: `maxplayer buyer` without `serve` is deprecated and still works; use `maxplayer buyer serve`",
+                "the deprecation follows the version line, before the daemon's own lines: {lines:?}"
+            );
+        } else {
+            assert_eq!(
+                warnings, 0,
+                "`buyer serve` is the documented form: {lines:?}"
+            );
+        }
+        kill(u64::from(child.id()));
+        let _ = wait_child(&mut child, Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}

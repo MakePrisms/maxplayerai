@@ -1,6 +1,7 @@
 //! `maxplayer buyer` — the persistent per-home daemon and its thin client.
 //!
-//! - `maxplayer buyer` (or `maxplayer buyer serve`) runs the daemon: it takes the exclusive
+//! - `maxplayer buyer serve` runs the daemon (a bare `maxplayer buyer` is its deprecated alias and
+//!   says so on stderr): it takes the exclusive
 //!   home lock, opens the wallet + identity behind serialized actors and the
 //!   durable state DB, and serves the local unix socket until terminated. A second
 //!   daemon on the same home fails closed.
@@ -22,14 +23,15 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         write_usage(out);
         return SUCCESS;
     }
-    let (dispatch, rest): (fn(&mut dyn Write, &mut dyn Write) -> i32, &[String]) =
-        match args.first().map(String::as_str) {
-            None => (serve, args),
-            Some("serve") => (serve, &args[1..]),
-            Some("status") => (status, &args[1..]),
-            Some("--home") => (serve, args),
-            _ => return usage(err),
-        };
+    // `serve` is the start verb; the verbless `maxplayer buyer` is its deprecated alias.
+    // `start` is None for `status` (a client, not a daemon start), else whether the verb was missing.
+    let (rest, start): (&[String], Option<bool>) = match args.first().map(String::as_str) {
+        None => (args, Some(true)),
+        Some("serve") => (&args[1..], Some(false)),
+        Some("status") => (&args[1..], None),
+        Some("--home") => (args, Some(true)),
+        _ => return usage(err),
+    };
     // #438: `maxplayer buyer` takes its home ONLY from $MAXPLAYER_HOME (or ~/.maxplayer) —
     // never from --home, in either its space-separated or `--home=<dir>` form. Honoring it
     // would require the daemon to plumb an operator flag through its exclusive-lock/socket-path
@@ -43,7 +45,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             let _ = writeln!(
                 err,
                 "error: 'maxplayer buyer' takes its home from $MAXPLAYER_HOME (or ~/.maxplayer); \
-                 --home is not supported here. Use: MAXPLAYER_HOME=<dir> maxplayer buyer"
+                 --home is not supported here. Use: MAXPLAYER_HOME=<dir> maxplayer buyer serve"
             );
         } else {
             let _ = writeln!(err, "error: unknown argument: {arg}");
@@ -51,15 +53,26 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
         return USAGE_ERROR;
     }
-    dispatch(out, err)
+    // Only a form that actually starts the daemon reaches `serve` (a refused `buyer --home` above
+    // never served, and `status` is a client).
+    match start {
+        Some(deprecated) => serve(deprecated.then_some(BUYER_VERBLESS), out, err),
+        None => status(out, err),
+    }
 }
+
+/// The verbless `maxplayer buyer`: still starts the daemon, deprecated for `buyer serve`.
+const BUYER_VERBLESS: crate::cli::DeprecatedStart = crate::cli::DeprecatedStart {
+    old: "maxplayer buyer",
+    new: "maxplayer buyer serve",
+};
 
 /// Help that was asked for goes to stdout and succeeds; the same text on stderr means the
 /// invocation was wrong. Only the destination and exit code differ, so both render here.
 fn write_usage(out: &mut dyn Write) {
     let _ = writeln!(
         out,
-        "Usage:\n  maxplayer buyer          # run the persistent per-home daemon (exclusive lock)\n  maxplayer buyer serve    # alias for `maxplayer buyer`\n  maxplayer buyer status   # thin client: query the running daemon over its socket"
+        "Usage:\n  maxplayer buyer serve    # run the persistent per-home daemon (exclusive lock)\n  maxplayer buyer status   # thin client: query the running daemon over its socket\n  maxplayer buyer          # deprecated alias for `maxplayer buyer serve` (still works)"
     );
 }
 
@@ -69,7 +82,11 @@ fn usage(err: &mut dyn Write) -> i32 {
 }
 
 #[cfg(feature = "wallet")]
-fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn serve(
+    deprecated: Option<crate::cli::DeprecatedStart>,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
     use maxplayer_core::home;
 
     let root = match home::default_home_dir() {
@@ -79,11 +96,13 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return RUNTIME_ERROR;
         }
     };
-    // First line of the daemon's log: which build is serving (before anything that can fail).
-    let _ = writeln!(
+    // First lines of the daemon's log: which build is serving (before anything that can fail), then
+    // the deprecation of the verbless form right after it.
+    crate::cli::daemon_preamble(
         err,
-        "{}",
-        crate::build_stamp::start_line("buyer", &format!("home {}", root.display()))
+        "buyer",
+        &format!("home {}", root.display()),
+        deprecated,
     );
     let home = match home::bootstrap(&root) {
         Ok(home) => home,
@@ -218,7 +237,15 @@ fn status(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 
 #[cfg(not(feature = "wallet"))]
-fn serve(_out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn serve(
+    deprecated: Option<crate::cli::DeprecatedStart>,
+    _out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> i32 {
+    // No daemon starts without the wallet feature, so no start line; the alias is still named.
+    if let Some(alias) = deprecated {
+        let _ = writeln!(err, "{}", alias.line());
+    }
     let _ = writeln!(
         err,
         "maxplayer buyer requires the wallet feature: rebuild with `--features wallet` (on by default)"

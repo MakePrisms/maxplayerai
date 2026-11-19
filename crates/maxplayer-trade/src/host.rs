@@ -1,5 +1,5 @@
 //! Trade's `serve`, hosted inside a long-running maxplayer daemon (the buyer daemon `maxplayer
-//! buyer` and the seller `maxplayer seller`), so nobody runs `maxplayer trade serve` by hand.
+//! buyer serve` and the seller `maxplayer seller serve`), so nobody runs `maxplayer trade serve` by hand.
 //!
 //! It is the same serve as the standalone command: it holds `<home>/trade/owner.lock` for the whole
 //! session, binds `<home>/trade/serve.sock` (protocol [`crate::serve::PROTOCOL_V`]) before its

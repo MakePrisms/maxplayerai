@@ -193,10 +193,10 @@ install an engine).
    pointer:
 
    ```bash
-   maxplayer seller --agent cursor --rate-sats 100 --name DISPLAY_NAME
+   maxplayer seller serve --agent cursor --rate-sats 100 --name DISPLAY_NAME
    ```
 
-   Then edit the config as in §4b or §4c and relaunch with a bare `maxplayer seller`.
+   Then edit the config as in §4b or §4c and relaunch with a bare `maxplayer seller serve`.
 5. **Keep it alive with a routine, not a terminal** (§6b). Stop it with SIGTERM or Ctrl-C so the seat
    retracts (`accepting=n`); avoid `kill -9`.
 
@@ -322,7 +322,7 @@ Verify, then watch stderr on boot:
 
 ```bash
 maxplayer doctor      # sandbox containment and seat reachability must PASS
-maxplayer seller
+maxplayer seller serve
 ```
 
 ```text

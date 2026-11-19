@@ -84,10 +84,13 @@ fn buyer_serve_prints_its_version_first() {
 #[cfg(feature = "acp")]
 #[test]
 fn seller_prints_its_version_first() {
-    let home = NotADir::new("seller");
-    let mut command = maxplayer();
-    command.arg("seller").arg("--home").arg(&home.0);
-    assert_first_line(command, "seller", &home_place(&home.0));
+    // `seller serve`, and the deprecated verbless `seller` (its deprecation line comes second).
+    for args in [&["seller", "serve"][..], &["seller"][..]] {
+        let home = NotADir::new("seller");
+        let mut command = maxplayer();
+        command.args(args).arg("--home").arg(&home.0);
+        assert_first_line(command, "seller", &home_place(&home.0));
+    }
 }
 
 #[test]

@@ -35,8 +35,8 @@ pub fn version_line() -> String {
 ///
 /// An operator who starts a daemon by bare name with an older binary first on `PATH` must be able to
 /// tell from the log alone which build is serving. The prefix is [`version_line`] verbatim, so the
-/// log and `--version` cannot disagree. `starting` is deliberately verb-neutral (the start verbs —
-/// `serve`, bare `seller`, `run`, `watch` — differ between commands).
+/// log and `--version` cannot disagree. `starting` is deliberately verb-neutral (`serve`, the
+/// deprecated verbless `seller`/`buyer`, chat's `watch`). A deprecation line follows it, never leads.
 pub fn start_line(role: &str, place: &str) -> String {
     format!("{} — {role} starting, {place}", version_line())
 }

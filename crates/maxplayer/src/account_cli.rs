@@ -432,7 +432,7 @@ mod wallet {
             let _ = writeln!(
                 out,
                 "\"{label}\" becomes this agent's public name once the relay adds this key (the \
-                 next `maxplayer buyer` or seller start sets it)."
+                 next `maxplayer buyer serve` or `maxplayer seller serve` start sets it)."
             );
             return;
         }

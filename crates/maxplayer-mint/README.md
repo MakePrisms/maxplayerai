@@ -37,19 +37,19 @@ maxplayer mint                         # what is installed, the mint URL, runnin
 ```
 
 Every `maxplayer-mint` command below is also reachable as `maxplayer mint <command>`:
-`maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|run|issue|restore|version> [args...]`
+`maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|serve|issue|restore|version> [args...]`
 runs the same `maxplayer-mint` that `maxplayer mint` reports (`--bin-dir`, else the first on PATH,
 else `~/.local/bin`) with `MAXPLAYER_HOME` set to that home, so it can never pick up another copy
 of the mint on PATH or serve `~/.maxplayer` by mistake. Arguments after the command go to the mint
 unchanged (`maxplayer mint restore --from <dir>`, `maxplayer mint init --name <name>`); put
 `--home`/`--bin-dir` before it. `maxplayer` replaces itself with the mint process, so Ctrl-C and
-`kill` reach `run` directly and the exit code is the mint's. One alias then covers a mint kept
+`kill` reach `serve` directly and the exit code is the mint's. One alias then covers a mint kept
 outside the defaults, for every command including `install`/`upgrade`/`uninstall`:
 
 ```bash
 alias seller-mint='maxplayer mint --home ~/sellers/acme/.maxplayer --bin-dir ~/sellers/acme/bin'
 seller-mint install --name acme   # the first time
-seller-mint run                   # serve it (foreground)
+seller-mint serve                 # serve it (foreground)
 seller-mint issue 1000
 ```
 
@@ -88,7 +88,7 @@ mint and does not mention the mint (checked against GitHub's latest release, a f
 maxplayer mint uninstall   # removes the maxplayer-mint binary only
 ```
 
-It refuses while `maxplayer-mint run` is serving the home (stop it first:
+It refuses while `maxplayer-mint serve` is serving the home (stop it first:
 `systemctl --user disable --now maxplayer-mint`). A symlink is
 removed, not the file it points to (the link's target is left as it was). It **never** deletes `<home>/mint/`: the key, seed and ecash
 database stay, and `maxplayer mint install` picks the mint up again. Deleting that folder destroys
@@ -121,7 +121,7 @@ know you by, ideally your seller name. Like a seller's profile name it is self-c
 
 Without `--name` the mint is called `maxplayer-mint-<first 8 hex of its key>`, the same way an
 unnamed seller is `maxplayer-seller-<8 hex>`. That works, but nobody will recognise it. Name or
-rename an existing mint at any time with `maxplayer-mint name <name>`, then restart `run`; holders
+rename an existing mint at any time with `maxplayer-mint name <name>`, then restart `serve`; holders
 see the new name after their wallet next talks to the mint, or right away after
 `maxplayer wallet mints add <url>`. Names are up to 64 characters, without `=`, `"` or `\`, and
 without leading or trailing spaces.
@@ -136,13 +136,13 @@ step 4. It refuses if `<home>/mint/` already exists.
 - `mint.sqlite`: the keysets and every proof already spent.
 - `mint.toml`: relays, rate limit, name and `backup_dir`.
 - `issued/`: one token file per `issue`. A file nobody has received yet is spendable credits.
-- `backups/`: the automatic backups `run` keeps (below).
+- `backups/`: the automatic backups `serve` keeps (below).
 
 The directory is created `0700`, and that mode is what keeps it private. `nostr.key`, `seed`,
 `mint.toml` and the token files are `0600`, but cdk creates `mint.sqlite` under your umask, so
 never loosen the directory mode.
 
-**Backups are automatic.** While `run` serves, it keeps the backup directory
+**Backups are automatic.** While `serve` serves, it keeps the backup directory
 (`<home>/mint/backups/`, or `backup_dir` in `mint.toml`) current by itself:
 
 - A consistent snapshot of `mint.sqlite`, taken online with SQLite `VACUUM INTO` (no stopping
@@ -156,7 +156,7 @@ never loosen the directory mode.
 
 **The one manual step, once at setup: get the backup directory off this machine.** A backup on
 the same disk does not survive losing that disk. Either set `backup_dir` in `mint.toml` to a
-mounted off-box location (network share, a second disk, a synced folder) and restart `run`, or
+mounted off-box location (network share, a second disk, a synced folder) and restart `serve`, or
 have your existing backup or sync tool copy `<home>/mint/backups/` off the box on its own
 schedule. Nothing else is needed after trades: never stop the mint to back it up.
 
@@ -164,7 +164,7 @@ schedule. Nothing else is needed after trades: never stop the mint to back it up
   platform backup.
 - An **old or missing** `mint.sqlite` can let credits that were already spent be spent again:
   with the seed still there, the mint comes back with the same keys and no record of what was
-  spent. Never delete `mint.sqlite` to fix a problem, and never run two copies. `run` refuses to
+  spent. Never delete `mint.sqlite` to fix a problem, and never run two copies. `serve` refuses to
   start when `mint.sqlite` is missing or older than the newest backup.
 - Protect the backup directory like the mint: it can issue credits and holds every unreceived
   token.
@@ -183,7 +183,7 @@ systemctl --user start maxplayer-mint
 directory if it is gone, including missing `issued/*.token` files. It refuses another mint's
 backups (checked against the seed even when only snapshots are there), a database that already
 holds everything in the newest snapshot, and one that has diverged from it (each holds spends the
-other lacks). `run` likewise refuses an unreadable `mint.sqlite` while backups exist.
+other lacks). `serve` likewise refuses an unreadable `mint.sqlite` while backups exist.
 
 ## 2. Configure (optional)
 
@@ -201,7 +201,9 @@ Wallets use the same default and fallback relays, so leave `relays` empty unless
 ## 3. Run it as a service
 
 Credits can only be spent or moved while the mint is running, so run it like the seller daemon,
-as a systemd user service:
+as a systemd user service. `maxplayer-mint serve` is the start command.
+The deprecated alias `maxplayer-mint run` (the name before 0.8.0) still serves and prints one
+stderr line naming `serve`, so an existing unit keeps working until you edit it:
 
 ```ini
 # ~/.config/systemd/user/maxplayer-mint.service
@@ -211,11 +213,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/maxplayer-mint run
+ExecStart=%h/.local/bin/maxplayer-mint serve
 Environment=MAXPLAYER_HOME=%h/.maxplayer
 UMask=0077
 NoNewPrivileges=yes
-# `run` shuts down cleanly (taking a last backup) on SIGINT, SIGTERM or SIGHUP.
+# `serve` shuts down cleanly (taking a last backup) on SIGINT, SIGTERM or SIGHUP.
 KillSignal=SIGINT
 Restart=always
 RestartSec=10
@@ -238,29 +240,28 @@ loginctl enable-linger "$USER"    # without this the mint stops when you log out
 journalctl --user -u maxplayer-mint -f
 ```
 
-The unit runs the binary directly, not `maxplayer mint run`: systemd already sets
+The unit runs the binary directly, not `maxplayer mint serve`: systemd already sets
 `MAXPLAYER_HOME` and the absolute `ExecStart` path, and this way the service keeps working whatever
 `maxplayer` is (or isn't) on the service's PATH and does not depend on the two versions matching.
 
 ### Without systemd (macOS, or any OS)
 
-`run` stays in the foreground until it is stopped, so keep it in something that outlives your
+`serve` stays in the foreground until it is stopped, so keep it in something that outlives your
 terminal (tmux, screen, a launchd agent on macOS):
 
 ```bash
-maxplayer mint --home ~/.maxplayer run                        # Ctrl-C stops it cleanly, with a last backup
-tmux new-session -d -s maxplayer-mint 'maxplayer mint run'    # detached, default home
+maxplayer mint --home ~/.maxplayer serve                        # Ctrl-C stops it cleanly, with a last backup
+tmux new-session -d -s maxplayer-mint 'maxplayer mint serve'    # detached, default home
 ```
 
-Add `--bin-dir <dir>` when the mint is not the one on PATH. (`run` is being renamed `serve`, with
-`run` kept as an alias; `maxplayer mint serve` is already passed on and works once your
-`maxplayer-mint` has it.) This is the same as
-`MAXPLAYER_HOME=<home> <bin-dir>/maxplayer-mint run`, without the risk of starting another copy of
+Add `--bin-dir <dir>` when the mint is not the one on PATH. This is the same as
+`MAXPLAYER_HOME=<home> <bin-dir>/maxplayer-mint serve`, without the risk of starting another copy of
 the mint or the wrong home. A mint whose version differs from `maxplayer` still starts, after a
 warning with the fix `maxplayer mint` prints (usually `maxplayer mint upgrade`).
 
-On start it logs `maxplayer-mint: serving nostr://npub1… on [relays]`. Only one `run` can serve a
-mint directory: a second one exits with `another maxplayer-mint run is already serving`. A mint
+On start it logs its version line first, then `maxplayer-mint: serving nostr://npub1… on [relays]`.
+Only one `serve` can serve a mint directory: a second one exits with
+`another maxplayer-mint serve is already serving`. A mint
 killed mid-request finishes or undoes that request on the next start.
 
 ## 4. Accept your own credits
@@ -284,7 +285,7 @@ Without this step your node still takes payment in credits, but `maxplayer walle
 them as `role=unconfigured` and `send` refuses them. With it, your wallet can send, receive and
 pay jobs directly with the credits. It never melts them: `wallet melt` and cross-mint hops refuse
 any `nostr://` mint, configured or not, and the mint itself serves no mint or melt. Restart
-`maxplayer seller` after editing `config.toml`.
+`maxplayer seller serve` after editing `config.toml`.
 
 Any other seller who wants to accept your credits does the same two steps with your URL.
 

@@ -201,7 +201,7 @@ try:
         (RUN / 'browser.json').write_text(json.dumps({'url': f'http://127.0.0.1:{siteport}/swarm.html', 'relay': relay, 'buyer': BUYER}))
     start('buyer', [BIN, 'buyer', 'serve'], buyer_env)
     for name, env in [('seller', seller_env), ('denied', denied_env)]:
-        start(name, [BIN, 'seller', '--non-interactive', '--skip-doctor'], env)
+        start(name, [BIN, 'seller', 'serve', '--non-interactive', '--skip-doctor'], env)
     # Buyer foreground service owns its daemon lifecycle; no operator home is consulted.
     time.sleep(2)
     if not ARGS.baseline:

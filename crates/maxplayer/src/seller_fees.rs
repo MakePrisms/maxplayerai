@@ -157,7 +157,7 @@ fn open_store(
     let db = root.join(STATE_DB_FILE);
     if !db.exists() {
         return Err(format!(
-            "no seller store at {} — this seat has not run `maxplayer seller` yet",
+            "no seller store at {} — this seat has not run `maxplayer seller serve` yet",
             db.display()
         ));
     }
