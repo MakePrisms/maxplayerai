@@ -865,16 +865,24 @@ mod wallet {
         }
 
         pub(crate) fn describe(&self) -> String {
+            self.describe_against(VERSION)
+        }
+
+        /// [`Self::describe`] as seen from maxplayer version `this`.
+        pub(super) fn describe_against(&self, this: &str) -> String {
             match self {
                 Self::NotChecked(why) => format!("not checked ({why})"),
                 Self::Failed(why) => format!("could not check ({why})"),
-                Self::Found(v) if is_newer(v, VERSION) => {
-                    format!("maxplayer {v} (this is {VERSION})")
-                }
-                Self::Found(v) if v == VERSION => {
+                Self::Found(v) if is_newer(v, this) => format!("maxplayer {v} (this is {this})"),
+                Self::Found(v) if v == this => {
                     format!("maxplayer {v} (this maxplayer is up to date)")
                 }
-                Self::Found(v) => format!("maxplayer {v} (this maxplayer, {VERSION}, is newer)"),
+                // `releases/latest` never names a pre-release, so an rc build is always ahead of
+                // it: say what each one is rather than "is newer", which reads like an update.
+                Self::Found(v) if parse_version(this).is_some_and(|t| !t.pre.is_empty()) => {
+                    format!("maxplayer {v} (latest stable; this is {this}, a pre-release)")
+                }
+                Self::Found(v) => format!("maxplayer {v} (this maxplayer, {this}, is newer)"),
             }
         }
     }
@@ -2937,6 +2945,26 @@ mod tests {
         assert!(line.contains("install.sh | sh"), "{line}");
         assert!(line.contains("npm install -g maxplayer@latest"), "{line}");
         assert!(!line.to_lowercase().contains("mint"), "{line}");
+        // The `latest:` wording: a pre-release ahead of the latest stable says so, never "is newer"
+        // (rc-testing: `maxplayer 0.7.3 (this maxplayer, 0.8.0-rc1, is newer)` read like an update).
+        let stable = Latest::Found("0.7.3".into());
+        assert_eq!(
+            stable.describe_against("0.8.0-rc1"),
+            "maxplayer 0.7.3 (latest stable; this is 0.8.0-rc1, a pre-release)"
+        );
+        assert_eq!(
+            stable.describe_against("0.8.0"),
+            "maxplayer 0.7.3 (this maxplayer, 0.8.0, is newer)"
+        );
+        assert_eq!(
+            stable.describe_against("0.7.3"),
+            "maxplayer 0.7.3 (this maxplayer is up to date)"
+        );
+        // An rc behind the latest stable is behind it: the update wording, not "pre-release".
+        assert_eq!(
+            Latest::Found("0.8.0".into()).describe_against("0.8.0-rc1"),
+            "maxplayer 0.8.0 (this is 0.8.0-rc1)"
+        );
         // Nothing when up to date, older, not checked or failed.
         for latest in [
             Latest::Found(this.into()),

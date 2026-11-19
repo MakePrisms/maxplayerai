@@ -6906,6 +6906,25 @@ mod tests {
 
         // (b) the maxplayer row: no mint involved at all.
         let up_to_date = checks::check_maxplayer_version_from(Latest::Found(this.into()));
+        // Ahead of the latest stable: a pass. A pre-release (an rc) says what it is, never "is
+        // newer", which read like an update notice in rc-testing.
+        let ahead = checks::check_maxplayer_version_from(Latest::Found("0.0.1".into()));
+        assert_eq!(ahead.status, Status::Pass, "{}", ahead.render());
+        let text = ahead.render();
+        if this.contains('-') {
+            assert!(
+                text.contains(&format!(
+                    "maxplayer 0.0.1 (latest stable; this is {this}, a pre-release)"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("is newer"), "{text}");
+        } else {
+            assert!(
+                text.contains(&format!("(this maxplayer, {this}, is newer)")),
+                "{text}"
+            );
+        }
         assert_eq!(up_to_date.status, Status::Pass, "{}", up_to_date.render());
         // A failed check is shown, never a failure; --offline is shown as not checked.
         let failed = checks::check_maxplayer_version_from(Latest::Failed("timed out".into()));
