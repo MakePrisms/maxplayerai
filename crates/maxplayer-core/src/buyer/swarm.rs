@@ -100,6 +100,8 @@ pub(crate) struct World {
     pub used_secs: BTreeMap<String, BTreeMap<String, u64>>,
     /// Fresh heartbeats per seller.
     pub heartbeats: BTreeMap<String, ParsedHeartbeat>,
+    /// `created_at` of each seller's heartbeat in [`Self::heartbeats`].
+    pub beat_at: BTreeMap<String, u64>,
 }
 
 pub(crate) struct Engine {
@@ -121,6 +123,36 @@ pub(crate) fn seller_price(hb: &ParsedHeartbeat) -> u64 {
         0 => 1,
         rate => rate,
     }
+}
+
+/// Seats `seller` has left for this buyer per its heartbeat (§1.14, §7.3): the beat's `free_slots`
+/// minus this buyer's running tasks to it that the beat may not reflect yet. `None` when the beat
+/// states no seats (a seller built before `slots`/`free_slots`): the caller falls back to one
+/// running task per seller across all of this buyer's swarms.
+///
+/// A one-off task holds its seat from the seller's claim, so the beat reflects it only when the beat
+/// is newer than its award (the claim precedes the award); a session turn holds its seat from
+/// receipt, so only when the beat is newer than its post. Every other running task — unclaimed,
+/// claimed but unawarded, or awarded after the beat — is subtracted. That can count a seat twice
+/// (a claim the beat already shows), never zero times: the engine may wait one beat too long, but
+/// never posts an offer the seller has no seat for by its own statement.
+pub(crate) fn seats_left(hb: &ParsedHeartbeat, beat_at: u64, running: &[&TaskRow]) -> Option<u32> {
+    let seats = hb.slots?;
+    let unreflected = running
+        .iter()
+        .filter(|t| {
+            let since = match t.turn {
+                Some(n) if n >= 2 => t.posted_at_unix,
+                _ => t.awarded_at_unix,
+            };
+            since.is_none_or(|at| at >= beat_at)
+        })
+        .count();
+    Some(
+        seats
+            .free
+            .saturating_sub(u32::try_from(unreflected).unwrap_or(u32::MAX)),
+    )
 }
 
 /// The heartbeat shows a seat that can take work now.
@@ -358,6 +390,7 @@ impl Engine {
             }
             if let Some(hb) = heartbeat_of(e) {
                 newest.insert(seller.clone(), at);
+                world.beat_at.insert(seller.clone(), at);
                 world.heartbeats.insert(seller, hb);
             }
         }
@@ -776,15 +809,44 @@ impl Engine {
         now: u64,
     ) -> Result<Vec<String>, String> {
         let mut errors = Vec::new();
-        // One running task per seller across ALL of this buyer's swarms (§1.14, Josip 18 Nov): the
-        // engine cannot see a seller's free seats (`queue_depth` is not free capacity), so a second
-        // swarm's offer would only sit unclaimed behind the first. Shared by every job this tick.
-        let mut busy: BTreeSet<String> = self
+        // Seats across ALL of this buyer's swarms (§1.14): a seller takes another task while its
+        // fresh heartbeat shows a free seat after this buyer's running tasks it may not reflect
+        // ([`seats_left`]); one running task per swarm per seller still (§7.3: a session runs one
+        // turn at a time). A seller whose beat states no seats falls back to one running task
+        // across all swarms (Josip 18 Nov). Built once and shared by every job this tick.
+        let swarm_of: BTreeMap<String, String> = self
             .store
-            .posted_swarm_sellers()
+            .swarm_jobs(None, false)
             .map_err(es)?
             .into_iter()
+            .map(|j| (j.d, j.swarm))
             .collect();
+        let running: Vec<TaskRow> = self
+            .store
+            .swarm_tasks_live()
+            .map_err(es)?
+            .into_iter()
+            .filter(|t| t.state == "posted" && t.seller.is_some())
+            .collect();
+        // (swarm, seller) pairs with a running task.
+        let mut in_swarm: BTreeSet<(String, String)> = running
+            .iter()
+            .filter_map(|t| Some((swarm_of.get(&t.job)?.clone(), t.seller.clone()?)))
+            .collect();
+        let mut any_running: BTreeSet<String> =
+            running.iter().filter_map(|t| t.seller.clone()).collect();
+        // Seats left per seller with a seat-stating beat; tasks sent this tick come off it.
+        let mut seats: BTreeMap<String, u32> = BTreeMap::new();
+        for (seller, hb) in &world.heartbeats {
+            let mine: Vec<&TaskRow> = running
+                .iter()
+                .filter(|t| t.seller.as_deref() == Some(seller.as_str()))
+                .collect();
+            let at = world.beat_at.get(seller).copied().unwrap_or(0);
+            if let Some(left) = seats_left(hb, at, &mine) {
+                seats.insert(seller.clone(), left);
+            }
+        }
         for j in self.store.swarm_jobs(None, true).map_err(es)? {
             if j.status != "in_progress" {
                 continue;
@@ -813,6 +875,11 @@ impl Engine {
             let mut why = Why::default();
             let mut rows = Vec::new();
             for m in &members {
+                let busy = in_swarm.contains(&(j.swarm.clone(), m.seller.clone()))
+                    || match seats.get(&m.seller) {
+                        Some(left) => *left == 0,
+                        None => any_running.contains(&m.seller),
+                    };
                 let used_secs = used.and_then(|u| u.get(&m.seller)).copied().unwrap_or(0);
                 let left = (m.minutes * 60).saturating_sub(used_secs);
                 let hb = world.heartbeats.get(&m.seller);
@@ -821,10 +888,11 @@ impl Engine {
                     "minutes_offered": m.minutes,
                     "minutes_used_today": used_secs as f64 / 60.0,
                     "minutes_left": left / 60,
-                    "busy": busy.contains(&m.seller),
-                    "heartbeat": hb.map(|h| json!({"accepting": h.accepting, "rate_sats": h.rate_sats, "takes_no_payment": h.takes_no_payment})),
+                    "busy": busy,
+                    "seats_left": seats.get(&m.seller),
+                    "heartbeat": hb.map(|h| json!({"accepting": h.accepting, "rate_sats": h.rate_sats, "takes_no_payment": h.takes_no_payment, "slots": h.slots.map(|s| s.total), "free_slots": h.slots.map(|s| s.free)})),
                 }));
-                if busy.contains(&m.seller) {
+                if busy {
                     why.busy += 1;
                     continue;
                 }
@@ -873,9 +941,13 @@ impl Engine {
                 let price = price_of(&task);
                 match self.send(io, &j, swarm, &task, &m.seller, price, now).await {
                     Ok(true) => {
-                        busy.insert(m.seller.clone());
+                        in_swarm.insert((j.swarm.clone(), m.seller.clone()));
+                        any_running.insert(m.seller.clone());
+                        if let Some(left) = seats.get_mut(&m.seller) {
+                            *left = left.saturating_sub(1);
+                        }
                         reserved += price;
-                        // Busy now: the rest of the queue cannot go to this member this tick.
+                        // Busy in this swarm now: the rest of its queue waits for this member.
                         why.busy += 1;
                     }
                     Ok(false) => {}

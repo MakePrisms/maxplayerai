@@ -287,9 +287,16 @@ impl SlotGate {
         lapsed
     }
 
-    /// Permits currently free. For logging and tests.
+    /// Permits currently free — the number [`Self::try_reserve`] tests, so the beat's `free_slots`.
     fn available(&self) -> usize {
         self.permits.available_permits()
+    }
+
+    /// The beat's `["slots",n]` / `["free_slots",m]` pair, from ONE read of the gate. `free` is
+    /// exactly what the claim decision tests: capacity minus executing jobs, session turns and
+    /// claim-time reservations (`parked`) alike, because each holds a permit.
+    fn advertised(&self) -> crate::heartbeat::SeatSlots {
+        crate::heartbeat::SeatSlots::new(self.capacity, self.available())
     }
 
     /// #1299: execution tasks not yet returned (running or waiting for a permit).
@@ -4754,6 +4761,12 @@ const RETRACTION_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cadence of the outbox drain / housekeeping tick.
 const DRAIN_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Minimum spacing between two beats fired by a `free_slots` change. A change is noticed on the
+/// drain tick (every [`DRAIN_INTERVAL`]); the first change after a quiet spell republishes on that
+/// tick, and a seat whose seats churn faster than this republishes at most once per window, the
+/// last value winning. The periodic beat is unaffected.
+const SEAT_CHANGE_BEAT_DEBOUNCE: Duration = Duration::from_secs(15);
+
 /// #1299: how long a drain waits once ONLY unsent private-content copies hold it. They are durable
 /// (`private-content.sqlite`) and re-sent by the next boot, and a copy the relay keeps refusing is
 /// retried indefinitely, so this bounds the wait instead of letting one copy pin the seat.
@@ -4838,6 +4851,12 @@ pub struct SellerNodeRunner {
     /// seconds. Recorded on every publish ATTEMPT: a relay that refuses the beat is the watchdog's
     /// business, and retrying it every drain tick would turn the interval into five seconds.
     announced_serving_generation: std::sync::atomic::AtomicU64,
+    /// The `free_slots` the last kind-30340 beat was built from. The drain tick compares it with the
+    /// slot gate and, on a difference, fires the heartbeat supervision now (debounced by
+    /// [`SEAT_CHANGE_BEAT_DEBOUNCE`]) rather than an interval later, so a buyer reading the beat
+    /// sees a seat free up or fill within seconds. `u32::MAX` until the first beat. Recorded on every
+    /// publish ATTEMPT, like `announced_serving_generation`.
+    announced_free_slots: std::sync::atomic::AtomicU32,
     /// Whether `nix` works in the JOB environment, measured once at boot alongside the capability
     /// probe ([`crate::capability::probe_seat_nix`]). Read into every job prompt. `false` until
     /// measured, so a node booted without the probe keeps the generic install advice.
@@ -5374,6 +5393,7 @@ impl SellerNodeRunner {
             sign_in,
             agents,
             announced_serving_generation: std::sync::atomic::AtomicU64::new(0),
+            announced_free_slots: std::sync::atomic::AtomicU32::new(u32::MAX),
             job_nix: std::sync::atomic::AtomicBool::new(false),
             held_tools,
             slots,
@@ -6440,6 +6460,8 @@ impl SellerNodeRunner {
         // and since when only private-content copies have held it (see DRAIN_PRIVATE_GRACE).
         let mut drain_noticed = false;
         let mut drain_beat_fired = false;
+        // When a `free_slots` change last fired a beat (debounce, see SEAT_CHANGE_BEAT_DEBOUNCE).
+        let mut last_seat_change_beat: Option<tokio::time::Instant> = None;
         let mut drain_private_only_since: Option<tokio::time::Instant> = None;
         // The serialized work lane and what feeds it. Events queue (bounded: when full, relay reads
         // pause until it drains); ticks and backfills coalesce to one pending pass each and take
@@ -6573,6 +6595,22 @@ impl SellerNodeRunner {
                              republishing kind-30340 now",
                             ad.harnesses.available,
                             ad.harnesses.configured
+                        );
+                        heartbeat_tick.reset_immediately();
+                    } else if heartbeat_enabled
+                        && supervision.is_none()
+                        && self.seats_changed_since_last_beat()
+                        && last_seat_change_beat
+                            .is_none_or(|at| at.elapsed() >= SEAT_CHANGE_BEAT_DEBOUNCE)
+                    {
+                        // A seat freed or filled since the last beat: republish now, so a buyer
+                        // choosing by `free_slots` does not wait out the interval. Debounced.
+                        last_seat_change_beat = Some(tokio::time::Instant::now());
+                        let seats = self.slots.advertised();
+                        opline_verbose!(
+                            "seller node seats changed: {}/{} free — republishing kind-30340 now",
+                            seats.free,
+                            seats.total
                         );
                         heartbeat_tick.reset_immediately();
                     }
@@ -7506,6 +7544,10 @@ impl SellerNodeRunner {
             return true;
         };
         let in_flight = self.live_in_flight("heartbeat");
+        // ONE gate read for both seat tags; recorded so the drain tick can republish on a change.
+        let seats = self.slots.advertised();
+        self.announced_free_slots
+            .store(seats.free, std::sync::atomic::Ordering::SeqCst);
         // R3-2: the generation is read BEFORE the snapshot, so a transition landing between the two
         // leaves the recorded value behind the roster — one extra beat, never a missed one.
         let generation = self.agents.generation();
@@ -7542,10 +7584,23 @@ impl SellerNodeRunner {
         // R3-2 — the count from the SAME snapshot as `accepting`, so `serving=0/n` and
         // `accepting=n` cannot describe two different moments.
         .with_serving(roster.harnesses)
+        // `slots` / `free_slots`: the claim gate's own numbers.
+        .with_slots(seats)
         .to_event_draft();
         self.announced_serving_generation
             .store(generation, std::sync::atomic::Ordering::SeqCst);
         self.publish_seat_announcement(draft, "heartbeat").await
+    }
+
+    /// Has the slot gate's free count moved since the last beat was built? `false` before the first
+    /// beat: the boot beat announces the seats, and counting "no beat yet" as a change would fire a
+    /// redundant beat AND start the debounce window, delaying the first real change by up to
+    /// [`SEAT_CHANGE_BEAT_DEBOUNCE`].
+    fn seats_changed_since_last_beat(&self) -> bool {
+        let announced = self
+            .announced_free_slots
+            .load(std::sync::atomic::Ordering::SeqCst);
+        announced != u32::MAX && self.slots.advertised().free != announced
     }
 
     /// R3-2: has the roster's serving state changed since the last beat was built?
@@ -7606,6 +7661,8 @@ impl SellerNodeRunner {
         // working harnesses says `serving=1/1` beside `accepting=n`, which is how a reader tells a
         // retraction from a seat that cannot work.
         .with_serving(roster.harnesses)
+        // The seats ride it too, so the terminal beat carries the same tag set as a live one.
+        .with_slots(self.slots.advertised())
         .to_event_draft();
 
         opline!("seller node: publishing terminal kind-30340 (accepting=n) — retracting this seat");
@@ -7641,13 +7698,13 @@ impl SellerNodeRunner {
             Err(error) => {
                 // Fall back to publishing ZERO DEPTH, as this path always has, but say so: a silent
                 // read failure that inflated the count would be the same invisible shape as #313
-                // itself. The fallback moves `queue_depth` and nothing else — `accepting` comes from
+                // itself. The fallback moves `in_flight`/`queue_depth` and nothing else — `accepting` comes from
                 // `anything_serving` on the live beat, and on the retraction path that beat says
                 // `accepting=n` whatever the count is (`retraction_for_state` passes
                 // `anything_serving = false` as a literal).
                 opline!(
                     "seller node {what}: in-flight count unavailable ({error}); \
-                     publishing queue_depth=0 this tick"
+                     publishing in_flight=0 this tick"
                 );
                 0
             }
@@ -21956,6 +22013,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     // END R3-2 run-loop tests
+
+    // BEGIN free-seats run-loop tests
+    /// The beat the relay RECEIVES states the slot gate's own numbers — `slots`, `free_slots`, and
+    /// `in_flight` beside the deprecated `queue_depth` — and a seat change (a claim-time reservation
+    /// taken, then released) republishes it promptly in both directions, not an interval later.
+    /// The heartbeat interval is an hour, so every beat after the boot one is change-driven.
+    ///
+    /// RED ON REVERT: drop the `seats_changed_since_last_beat` arm on the drain tick and no second
+    /// beat arrives; drop `.with_slots(seats)` in `publish_heartbeat` and the boot beat lacks the tags.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_seat_change_republishes_the_beat_with_free_slots_in_both_directions() {
+        let fixture = PGateRelay::start(Duration::from_millis(0)).await;
+        let root = throwaway_root("free-seats-change");
+        let mut home = lane_home(&root, &fixture);
+        home.config.seller_heartbeat.interval_secs = 3600;
+        if let Some(seller) = home.config.seller.as_mut() {
+            seller.slots = 2;
+        }
+        let runner = SellerNodeRunner::boot(home).await.expect("boot runner");
+        let slots = Arc::clone(&runner.slots);
+        let shutdown = runner.shutdown_handle();
+        let local = tokio::task::LocalSet::new();
+        let loop_handle = local.spawn_local(async move { runner.run().await });
+        let beat_with_free = |free: &'static str| {
+            move |events: &[PublishedEvent]| {
+                seat_announcements(events).last().is_some_and(|e| {
+                    e.tag_value(crate::heartbeat::SLOTS_TAG) == Some("2")
+                        && e.tag_value(crate::heartbeat::FREE_SLOTS_TAG) == Some(free)
+                })
+            }
+        };
+        local
+            .run_until(async {
+                assert!(
+                    fixture.wait_until_published(FIXTURE_WAIT, beat_with_free("2")).await,
+                    "the boot beat states slots=2 free_slots=2"
+                );
+                let boot = fixture.events().await;
+                let first = *seat_announcements(&boot).last().expect("a beat");
+                assert_eq!(first.tag_value(crate::heartbeat::IN_FLIGHT_TAG), Some("0"));
+                assert_eq!(
+                    first.tag_value(crate::heartbeat::QUEUE_DEPTH_TAG),
+                    Some("0"),
+                    "the deprecated tag still rides the beat"
+                );
+
+                // A claim-time reservation: no job row, so in_flight stays 0 — the case
+                // queue_depth could never show — while one seat is gone.
+                assert_eq!(slots.try_reserve("held-by-a-claim"), Reserve::Reserved);
+                // Bounded by the debounce window plus a tick, never the hour-long interval.
+                assert!(
+                    fixture
+                        .wait_until_published(
+                            SEAT_CHANGE_BEAT_DEBOUNCE + FIXTURE_WAIT,
+                            beat_with_free("1")
+                        )
+                        .await,
+                    "a reserved seat must be re-announced now (free_slots=1), not an interval later"
+                );
+                let held = fixture.events().await;
+                let last = *seat_announcements(&held).last().expect("a beat");
+                assert_eq!(last.tag_value(crate::heartbeat::IN_FLIGHT_TAG), Some("0"));
+
+                // Released: the seat frees again. Debounced, so allow the window plus a tick.
+                slots.release("held-by-a-claim");
+                assert!(
+                    fixture
+                        .wait_until_published(
+                            SEAT_CHANGE_BEAT_DEBOUNCE + FIXTURE_WAIT,
+                            beat_with_free("2")
+                        )
+                        .await,
+                    "a freed seat must be re-announced (free_slots=2) within the debounce window"
+                );
+                assert!(shutdown.request("free-seats stop"));
+                let _ = tokio::time::timeout(FIXTURE_WAIT, loop_handle).await;
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `advertised()` is the claim gate's own number: a reservation and an execution permit both
+    /// take a seat, and `free` reaches 0 exactly when `try_reserve` answers `Full`.
+    #[tokio::test]
+    async fn the_advertised_free_seats_are_the_claim_gates_number() {
+        let gate = Arc::new(SlotGate::new(2, Duration::from_secs(3600)));
+        assert_eq!(gate.advertised(), crate::heartbeat::SeatSlots { total: 2, free: 2 });
+        assert_eq!(gate.try_reserve("a"), Reserve::Reserved);
+        assert_eq!(gate.advertised().free, 1, "a claim-time reservation holds a seat");
+        let executing = gate.take_for_execution("a").expect("parked permit");
+        assert_eq!(gate.advertised().free, 1, "an executing job still holds its seat");
+        let unreserved = gate.acquire_unreserved().await.expect("permit");
+        assert_eq!(gate.advertised().free, 0);
+        assert_eq!(gate.try_reserve("b"), Reserve::Full, "free_slots=0 ⇔ the gate refuses");
+        drop(executing);
+        drop(unreserved);
+        assert_eq!(gate.advertised().free, 2);
+        // `slots = 0` is clamped to one seat, as the gate itself clamps it.
+        assert_eq!(
+            SlotGate::new(0, Duration::from_secs(1)).advertised(),
+            crate::heartbeat::SeatSlots { total: 1, free: 1 }
+        );
+    }
+    // END free-seats run-loop tests
 
     // BEGIN #1228 tests
     /// #1228: a seat whose sign-in the relay refuses must not report ADVERTISING, and only a

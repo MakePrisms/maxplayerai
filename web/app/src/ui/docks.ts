@@ -175,7 +175,8 @@ const statBlock = (pairs: [string, string, string?][]): string =>
 
 const fieldLabel = (name: string): string => ({
   d: "Seat", t: "Namespace", v: "Protocol version", rate: "Rate (sats)",
-  accepting: "Serving", queue_depth: "Jobs in flight", serving: "Harnesses serving",
+  accepting: "Serving", in_flight: "Jobs in flight", queue_depth: "Jobs in flight (deprecated tag)",
+  slots: "Execution seats", free_slots: "Free seats", serving: "Harnesses serving",
   accepted_mints: "Accepted mints", agents: "Agents",
   model: "Model", models: "Models", hardware: "Hardware",
 } as Record<string, string>)[name] || String(name).replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -352,10 +353,11 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
   // `accepting=y` means the seat is alive and serving, NOT that it has a free
   // slot (protocol-v1 §4.2): a seat holding one job of three still says "y".
   // So the row is not "Accepting work: Yes/No" — that read as "has room". It
-  // renders `accepting` and `queue_depth` together: serving plus the load it
-  // is carrying. A seat that is actually full shows it by not claiming. Depth
-  // 0 is NOT rendered as "idle": claim-time slot reservations are excluded
-  // from `queue_depth`, so 0 can be a seat with every slot spoken for.
+  // renders `accepting` and `in_flight` (or the deprecated `queue_depth`)
+  // together: serving plus the load it is carrying. Depth 0 is NOT rendered
+  // as "idle": claim-time slot reservations are excluded from it, so 0 can be
+  // a seat with every slot spoken for. Free capacity is `free_slots`, shown
+  // as its own row only when the beat states it (absent ⇒ unknown).
   const depth = s?.queueDepth;
   const loadText = depth == null ? null
     : `${nf.format(depth)} job${depth === 1 ? "" : "s"} in flight`;
@@ -363,6 +365,8 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
     : acceptingFlag === true ? (loadText ? `Serving · ${loadText}` : "Serving")
     : acceptingFlag === false ? (depth ? `Not serving · ${loadText}` : "Not serving")
     : String(accepting);
+  const seatsText = s?.seats == null ? null
+    : `${nf.format(s.seats.free)} of ${nf.format(s.seats.total)} free`;
   // R3-2: how many of the seat's harnesses can run a job. Absent ⇒ no row (unknown, not zero).
   const servingText = s?.serving == null ? null
     : `${nf.format(s.serving.available)} of ${nf.format(s.serving.configured)}`
@@ -371,6 +375,7 @@ function participantSheet(view: MarketView, role: "buyer" | "seller", pubkey: st
     ["About", about ? String(about) : null],
     ["Min rate", s?.askSats == null ? null : `${usd(s.askSats)} · ${nf.format(s.askSats)} sat`],
     ["Status", statusText],
+    ["Seats", seatsText],
     ["Harnesses serving", servingText],
     ["Accepted mints", s?.acceptedMints?.length ? s.acceptedMints.join(" · ") : null],
     ...capabilityRows(s),
