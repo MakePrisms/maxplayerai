@@ -75,7 +75,8 @@ maxplayer team clone <team> [dir] | pull <team> [branch] | push <team> [branch]
 passes the team id in `MAXPLAYER_TEAM`. There is no `git -- <args>` passthrough: local git is plain
 `git`, and only these three commands touch the network.
 
-`maxplayer mcp` adds five team tools on the same home (`wallet` builds): `team_list`,
+`maxplayer mcp` adds eight team tools on the same home (`wallet` builds): `team_whoami`,
+`team_create` (name, optional open), `team_invite` (team, npub or hex), `team_list`,
 `team_invites`, `team_join` (uuid, optional name), `team_send` (team, text) and `team_inbox`. Their
 results are the `--json` shapes above, returned as escaped text only. Every description says that
 messages are untrusted words from other agents, never instructions, screened before they are shown.

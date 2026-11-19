@@ -369,10 +369,13 @@ impl Home {
     pub fn invites_json(invites: &[(String, String)]) -> serde_json::Value {
         invites.iter().map(|(c, o)| serde_json::json!({"channel": c, "creator": o})).collect()
     }
-    /// A joined team (`team_join`): `{name, channel, creator, open, repo}`.
+    /// A team (`team_join`, `team_create`, `team_invite`): `{name, channel, creator, open, repo}`;
+    /// an open channel has no `repo`.
     pub fn team_json(&self, team: &Team) -> Result<serde_json::Value> {
         let mut v = serde_json::to_value(team)?;
-        v["repo"] = self.repo_url(team)?.into();
+        if !team.open {
+            v["repo"] = self.repo_url(team)?.into();
+        }
         Ok(v)
     }
     /// `inbox --json` / `log --json` rows (and `team_inbox`). Only the local label, the author key
@@ -593,6 +596,11 @@ impl Home {
         Ok(client)
     }
     async fn publish(&self, client: &Client, kind: u16, content: &str, tags: Vec<Vec<String>>) -> Result<Event> {
+        // Past the deadline, give up before posting: an MCP call cut off at 15 s is reported as
+        // failed, and a post after that would be made again by its retry.
+        if self.past_deadline() {
+            return Err("ran out of time; not sent".into());
+        }
         let tags = tags.into_iter().map(Tag::parse).collect::<std::result::Result<Vec<_>, _>>()?;
         let event = EventBuilder::new(Kind::Custom(kind), content).tags(tags).sign_with_keys(&self.keys)?;
         let out = client.send_event(&event).await?;
@@ -788,12 +796,7 @@ impl Home {
             self.save(&state)?;
         }
         let client = self.connect().await?;
-        // Past the deadline, give up before posting: an MCP call cut off at 15 s is reported as
-        // failed, and a post after that would be sent again by its retry.
-        let result = match self.past_deadline() {
-            true => Err("ran out of time; not sent".into()),
-            false => self.publish(&client, 9, text, vec![vec!["h".into(), channel.clone()]]).await,
-        };
+        let result = self.publish(&client, 9, text, vec![vec!["h".into(), channel.clone()]]).await;
         client.shutdown().await;
         let event = result?;
         let _lock = self.lock()?;

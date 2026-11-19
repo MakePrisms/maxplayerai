@@ -1641,7 +1641,20 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["post_job", "get_job", "collect", "award_claim", "team_list", "team_invites", "team_join", "team_send", "team_inbox"]
+            [
+                "post_job",
+                "get_job",
+                "collect",
+                "award_claim",
+                "team_whoami",
+                "team_create",
+                "team_invite",
+                "team_list",
+                "team_invites",
+                "team_join",
+                "team_send",
+                "team_inbox"
+            ]
         );
         assert_eq!(&names[4..], team::TEAM_TOOLS);
         for tool in &tools[4..] {
@@ -1659,7 +1672,10 @@ mod tests {
         assert_eq!(schema("team_join")["required"], json!(["uuid"]));
         assert!(schema("team_join")["properties"]["name"].is_object());
         assert_eq!(schema("team_send")["required"], json!(["team", "text"]));
-        for name in ["team_list", "team_invites", "team_inbox"] {
+        assert_eq!(schema("team_create")["required"], json!(["name"]));
+        assert_eq!(schema("team_create")["properties"]["open"]["type"], "boolean");
+        assert_eq!(schema("team_invite")["required"], json!(["team", "npub"]));
+        for name in ["team_whoami", "team_list", "team_invites", "team_inbox"] {
             assert_eq!(schema(name)["properties"], json!({}), "{name}");
         }
         let _ = std::fs::remove_dir_all(&root);
@@ -1694,6 +1710,12 @@ mod tests {
             ("team_send", json!(["crew", "hi"]), "team_send: arguments must be an object"),
             ("team_list", json!({"all": true}), "team_list: unknown argument all"),
             ("team_inbox", json!({"since": "x"}), "team_inbox: unknown argument since"),
+            ("team_create", json!({"open": true}), "team_create: missing name"),
+            ("team_create", json!({"name": "crew", "open": "yes"}), "team_create: open must be a boolean"),
+            ("team_create", json!({"name": true}), "team_create: name must be a string"),
+            ("team_invite", json!({"team": "crew"}), "team_invite: missing npub"),
+            ("team_invite", json!({"team": "crew", "who": "x"}), "team_invite: unknown argument who"),
+            ("team_whoami", json!({"hex": "x"}), "team_whoami: unknown argument hex"),
         ] {
             let text = call(name, arguments);
             assert!(text.starts_with(expected), "{name}: {text}");
@@ -1746,10 +1768,11 @@ mod tests {
         let wire = String::from_utf8(wire).unwrap();
         assert!(!wire.contains('\u{202e}') && !wire.contains('\u{1b}'), "{wire}");
     }
-    /// invites → join → send → inbox through the real MCP dispatch, two homes on an in-process
-    /// relay (the `LocalRelay` + AddrInUse-retry fixture of `tests/account_cli.rs`). The relay is
-    /// not Buzz: the channel metadata (39000) and the add (9000) Buzz would publish are posted by
-    /// hand, and message screening is off in both homes (no reviewer on a loopback relay).
+    /// whoami → create → invite → invites → join → send → inbox through the real MCP dispatch,
+    /// two homes on an in-process relay (the `LocalRelay` + AddrInUse-retry fixture of
+    /// `tests/account_cli.rs`). The relay is not Buzz: the channel metadata (39000) Buzz would
+    /// publish is posted by hand, and message screening is off in both homes (no reviewer on a
+    /// loopback relay).
     #[cfg(feature = "wallet")]
     #[test]
     fn team_tools_round_trip_invite_join_send_inbox_on_a_local_relay() {
@@ -1789,29 +1812,6 @@ mod tests {
         };
         let (keys_a, keys_b) = (keys(&root_a), keys(&root_b));
 
-        // A creates the team (library, as `maxplayer team create` does); the relay-side
-        // metadata and B's add are posted by hand.
-        let channel = rt.block_on(async {
-            let mut a = maxplayer_team::Home::open(&root_a, &url).unwrap();
-            a.sync_deadline = Some(std::time::Instant::now() + Duration::from_secs(4));
-            let team = a.create("crew", false).await.unwrap();
-            let client = Client::default();
-            client.add_relay(&url).await.unwrap();
-            client.connect().await;
-            let tag = |t: &[&str]| Tag::parse(t.iter().copied()).unwrap();
-            let about = format!("{} {}", maxplayer_team::MARKER, keys_a.public_key().to_hex());
-            for event in [
-                EventBuilder::new(Kind::Custom(39000), "")
-                    .tags([tag(&["d", &team.channel]), tag(&["private"]), tag(&["about", &about])]),
-                EventBuilder::new(Kind::Custom(9000), "")
-                    .tags([tag(&["h", &team.channel]), tag(&["p", &keys_b.public_key().to_hex()])]),
-            ] {
-                client.send_event(&event.sign_with_keys(&keys_a).unwrap()).await.unwrap();
-            }
-            client.disconnect().await;
-            team.channel
-        });
-
         let call = |state: &McpState, name: &str, arguments: Value| -> Value {
             let response = dispatch(
                 state,
@@ -1827,6 +1827,38 @@ mod tests {
             serde_json::from_str(text).unwrap()
         };
         let a_hex = keys_a.public_key().to_hex();
+
+        // B finds its key to share; A creates the team and invites B by that npub.
+        let whoami = call(&state_b, "team_whoami", json!({}));
+        assert_eq!(whoami["hex"], json!(keys_b.public_key().to_hex()));
+        let b_npub = whoami["npub"].as_str().unwrap().to_owned();
+        assert_eq!(b_npub, keys_b.public_key().to_bech32().unwrap());
+        // A create past the team deadline posts nothing (its retry would post it again).
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let late_args = serde_json::Map::from_iter([("name".to_owned(), json!("crew"))]);
+        let started = std::time::Instant::now() - Duration::from_secs(11);
+        let late = rt.block_on(team::run(&root_a, &url, "team_create", &late_args, &flag, started));
+        assert!(late.unwrap_err().contains("not sent"));
+        assert_eq!(call(&state_a, "team_list", json!({}))["teams"], json!({}));
+        let created = call(&state_a, "team_create", json!({"name": "crew"}));
+        let channel = created["channel"].as_str().unwrap().to_owned();
+        assert_eq!((created["name"].as_str(), created["open"].as_bool()), (Some("crew"), Some(false)));
+        assert_eq!(created["creator"], json!(a_hex));
+        assert!(created["repo"].as_str().unwrap().contains(&format!("/git/{a_hex}/")));
+        // The relay-side channel metadata Buzz would publish for the create.
+        rt.block_on(async {
+            let client = Client::default();
+            client.add_relay(&url).await.unwrap();
+            client.connect().await;
+            let tag = |t: &[&str]| Tag::parse(t.iter().copied()).unwrap();
+            let about = format!("{} {a_hex}", maxplayer_team::MARKER);
+            let meta = EventBuilder::new(Kind::Custom(39000), "")
+                .tags([tag(&["d", &channel]), tag(&["private"]), tag(&["about", &about])]);
+            client.send_event(&meta.sign_with_keys(&keys_a).unwrap()).await.unwrap();
+            client.disconnect().await;
+        });
+        let invited = call(&state_a, "team_invite", json!({"team": "crew", "npub": b_npub}));
+        assert_eq!(invited["channel"], json!(channel));
 
         let invites = call(&state_b, "team_invites", json!({}));
         assert_eq!(invites["result"], json!([{"channel": channel, "creator": a_hex}]));

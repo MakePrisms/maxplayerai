@@ -1,5 +1,5 @@
-//! The team tools of `maxplayer mcp` (docs/specs/maxplayer-team.md): list, invites, join, send and
-//! inbox on this home's key and its `relay_url`. They call the `maxplayer-team` library directly,
+//! The team tools of `maxplayer mcp` (docs/specs/maxplayer-team.md): whoami, create, invite, list,
+//! invites, join, send and inbox on this home's key and its `relay_url`. They call the `maxplayer-team` library directly,
 //! not the buyer daemon: team state is the home's `team/` directory, guarded by its own lock, and
 //! no money moves. Results are the JSON `maxplayer team … --json` prints, tagged `ok: true` (a
 //! JSON array arrives under `result`).
@@ -16,10 +16,14 @@ use std::time::{Duration, Instant};
 
 use maxplayer_core::home::MaxplayerHome;
 use maxplayer_team::{Home, display_json, display_text};
+use nostr_sdk::prelude::ToBech32;
 use serde_json::{Map, Value, json};
 
 /// The team tools, in listing order.
 pub(super) const TEAM_TOOLS: &[&str] = &[
+    "team_whoami",
+    "team_create",
+    "team_invite",
     "team_list",
     "team_invites",
     "team_join",
@@ -48,6 +52,21 @@ pub(super) fn tools() -> Vec<Value> {
     let none = json!({"type": "object", "properties": {}, "additionalProperties": false});
     let team = json!({"type": "string", "description": "A joined team: your local label for it, or its channel id."});
     vec![
+        json!({"name": "team_whoami",
+            "description": format!("Your key on this home, as `maxplayer team whoami` prints it: {{npub, hex}}. Share the npub so a team member can add you with team_invite. {UNTRUSTED}"),
+            "inputSchema": none.clone()}),
+        json!({"name": "team_create",
+            "description": format!("Create a Maxplayer team on this home's relay, as `maxplayer team create` does: a private channel with a shared git repo, or with open: true an open feed channel (no members, no repo). name is your local label (1-64 letters, digits, '-', '_' or '.'). Returns {{name, channel, creator, open, repo}}. Then add members with team_invite. {UNTRUSTED}"),
+            "inputSchema": {"type": "object", "properties": {
+                "name": {"type": "string", "description": "Your local label for the team."},
+                "open": {"type": "boolean", "description": "An open feed channel instead of a private team (default false)."}},
+                "required": ["name"], "additionalProperties": false}}),
+        json!({"name": "team_invite",
+            "description": format!("Add an agent to a joined private team by its npub (or 64-character hex key), as `maxplayer team invite` does; any member may invite. The agent then sees it in team_invites and joins with team_join. Returns {{name, channel, creator, open, repo}}. {UNTRUSTED}"),
+            "inputSchema": {"type": "object", "properties": {
+                "team": team.clone(),
+                "npub": {"type": "string", "description": "The agent's npub (from its team_whoami) or hex public key."}},
+                "required": ["team", "npub"], "additionalProperties": false}}),
         json!({"name": "team_list",
             "description": format!("Your joined Maxplayer teams and follows, from this home's local team state (no network): the JSON of `maxplayer team list --json`, {{teams: {{<channel>: {{name, channel, creator, open}}}}, follows: [{{channel, owner}}]}}. Team names are the local labels chosen at join. {UNTRUSTED}"),
             "inputSchema": none.clone()}),
@@ -73,9 +92,11 @@ pub(super) fn tools() -> Vec<Value> {
 }
 
 /// Validate a team tool's arguments before anything is opened: an object (or absent), only the
-/// listed keys, every value a string, every required key present.
+/// listed keys, every value a string (`open` a boolean), every required key present.
 fn arguments(tool: &str, arguments: &Value) -> Result<Map<String, Value>, String> {
     let (allowed, required): (&[&str], &[&str]) = match tool {
+        "team_create" => (&["name", "open"], &["name"]),
+        "team_invite" => (&["team", "npub"], &["team", "npub"]),
         "team_join" => (&["uuid", "name"], &["uuid"]),
         "team_send" => (&["team", "text"], &["team", "text"]),
         _ => (&[], &[]),
@@ -89,7 +110,10 @@ fn arguments(tool: &str, arguments: &Value) -> Result<Map<String, Value>, String
         if !allowed.contains(&key.as_str()) {
             return Err(format!("{tool}: unknown argument {}", display_text(key)));
         }
-        if !value.is_string() {
+        if key == "open" && !value.is_boolean() {
+            return Err(format!("{tool}: open must be a boolean"));
+        }
+        if key != "open" && !value.is_string() {
             return Err(format!("{tool}: {key} must be a string"));
         }
     }
@@ -146,6 +170,28 @@ pub(super) async fn run(
     let mut team = Home::open(root, relay).map_err(text)?;
     team.sync_deadline = Some(started + RELAY_BUDGET);
     match tool {
+        "team_whoami" => {
+            let npub = team.keys.public_key().to_bech32().map_err(text)?;
+            Ok(json!({ "npub": npub, "hex": team.me() }))
+        }
+        "team_create" => {
+            let open = args.get("open").and_then(Value::as_bool).unwrap_or(false);
+            let created = team
+                .create(arg("name").unwrap_or_default(), open)
+                .await
+                .map_err(text)?;
+            team.team_json(&created).map_err(text)
+        }
+        "team_invite" => {
+            let invited = team
+                .invite(
+                    arg("team").unwrap_or_default(),
+                    arg("npub").unwrap_or_default(),
+                )
+                .await
+                .map_err(text)?;
+            team.team_json(&invited).map_err(text)
+        }
         "team_list" => team.list_json().map_err(text),
         "team_invites" => Ok(Home::invites_json(&team.invites().await.map_err(text)?)),
         "team_join" => {
