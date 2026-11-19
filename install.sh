@@ -6,7 +6,7 @@
 #
 # What it does: resolves a release, downloads that release's asset for THIS platform, verifies the
 # download against the release's own SHA256SUMS, proves the binary runs and reports the version it was supposed to be, and only then
-# puts it on PATH. Nix is not required to install or to buy; only `maxplayer seller` needs it (#745),
+# puts it on PATH. Nix is not required to install or to buy; only `maxplayer seller serve` needs it (#745),
 # and when it is missing the installer says so in one note after a successful install.
 #
 # Options (flags and environment are equivalent; the flag wins):
@@ -18,7 +18,7 @@
 #
 # ── One artifact ────────────────────────────────────────────────────────────────────────────────
 # A release publishes ONE build per platform and this installs it. It carries the whole surface:
-# buying, and — through `maxplayer seller` — advertising a seat, claiming a job and executing it. Buyer
+# buying, and — through `maxplayer seller serve` — advertising a seat, claiming a job and executing it. Buyer
 # and seller are runtime modes of one command, not two downloads (#510).
 #
 # `--seller` selected a second, separately named asset in earlier releases. That asset no longer exists, so
@@ -176,7 +176,7 @@ fetch() {
 }
 
 # ── Nix (#745) ──────────────────────────────────────────────────────────────────────────────────
-# Nix is a SELLER requirement, not an install or buyer one: `maxplayer seller` refuses to start
+# Nix is a SELLER requirement, not an install or buyer one: `maxplayer seller serve` refuses to start
 # without a working nix (its boot gate, #745), and `maxplayer doctor` reports it as a FAIL only on a
 # home configured to sell. Buying, `mcp` and `version` never use it.
 #
@@ -198,7 +198,7 @@ note_nix_for_sellers() {
         return 0
     fi
     say ""
-    say "note: no working nix found. Buying does not need it. Selling does: \`maxplayer seller\` refuses"
+    say "note: no working nix found. Buying does not need it. Selling does: \`maxplayer seller serve\` refuses"
     say "to start without nix. Install it before you sell:"
     say "  curl -fsSL https://install.determinate.systems/nix | sh -s -- install"
     say "If \`nix --version\` works in another shell, nix is installed but not on this PATH: do not reinstall."
@@ -350,7 +350,7 @@ main() {
     # stderr, not stdout: this is not part of the install's report, and the script is routinely run
     # through a pipe whose stdout somebody is reading.
     if [ -n "$seller" ]; then
-        warn "--seller (MAXPLAYER_SELLER) is deprecated and does nothing: one binary ships and it can already sell — run 'maxplayer seller'"
+        warn "--seller (MAXPLAYER_SELLER) is deprecated and does nothing: one binary ships and it can already sell — run 'maxplayer seller serve'"
     fi
 
     # A leading `v` is what a user copies out of a tag name, and `v0.1.0` would build an asset name

@@ -102,6 +102,43 @@ where
     }
 }
 
+/// The first stderr lines a daemon prints when it starts (`buyer serve`, `seller serve`), once its
+/// home is resolved and before anything that can fail. Every daemon start goes through here, so the
+/// order is decided in ONE place: the version start line ([`crate::build_stamp::start_line`], #1354)
+/// is always FIRST, and the deprecation line of a verbless start comes right after it — it never
+/// becomes the daemon's first line.
+#[cfg(feature = "wallet")]
+pub(crate) fn daemon_preamble(
+    err: &mut dyn Write,
+    role: &str,
+    place: &str,
+    deprecated: Option<DeprecatedStart>,
+) {
+    let _ = writeln!(err, "{}", crate::build_stamp::start_line(role, place));
+    if let Some(alias) = deprecated {
+        let _ = writeln!(err, "{}", alias.line());
+    }
+}
+
+/// A verbless daemon start form that still works but is deprecated: `serve` is the start verb for
+/// every daemon (`buyer serve`, `seller serve`, `reviewer serve`, `maxplayer-mint serve`).
+#[derive(Clone, Copy)]
+pub(crate) struct DeprecatedStart {
+    pub old: &'static str,
+    pub new: &'static str,
+}
+
+impl DeprecatedStart {
+    /// One line naming the new command, so a supervisor log shows the fix while the daemon keeps
+    /// serving exactly as before.
+    pub(crate) fn line(self) -> String {
+        format!(
+            "maxplayer: `{}` without `serve` is deprecated and still works; use `{}`",
+            self.old, self.new
+        )
+    }
+}
+
 /// A sole `--help` request at a subcommand level. True when `--help` is the final token and every
 /// token before it is a subcommand SELECTOR (a non-flag word such as `status` or `mints`), so it
 /// matches `--help`, `<sub> --help`, and `<sub> <subsub> --help` at any nesting depth. This is a
@@ -349,7 +386,7 @@ fn usage(err: &mut dyn Write) -> i32 {
 fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
-        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer     # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n  maxplayer account <link|status|marketing on|off>   # link this agent's key to your email (required to write to the relay)\n  maxplayer mint [install|upgrade|uninstall|init|name|run|issue|restore|version]   # this home's credit mint: show it, install/upgrade the released maxplayer-mint at this version, uninstall the binary, or run a maxplayer-mint command for this home\n  maxplayer swarm <list|show|join|leave|create|job|decide|members> ...   # swarms: groups of sellers a buyer gives goals to\n"
+        "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer serve   # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n  maxplayer account <link|status|marketing on|off>   # link this agent's key to your email (required to write to the relay)\n  maxplayer mint [install|upgrade|uninstall|init|name|serve|issue|restore|version]   # this home's credit mint: show it, install/upgrade the released maxplayer-mint at this version, uninstall the binary, or run a maxplayer-mint command for this home\n  maxplayer swarm <list|show|join|leave|create|job|decide|members> ...   # swarms: groups of sellers a buyer gives goals to\n"
     );
     #[cfg(feature = "wallet")]
     let _ = writeln!(
@@ -367,7 +404,7 @@ fn write_usage(out: &mut dyn Write) {
     #[cfg(feature = "acp")]
     let _ = write!(
         out,
-        "  maxplayer seller --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller   # zero-prompt relaunch from config.toml\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]   # remove a RETIRED seat's leftover containment holders\n"
+        "  maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n> [--git-remote <url>] [--claim-open-pool] [--accept-open-targeted]\n  maxplayer seller serve   # zero-prompt relaunch from config.toml\n  maxplayer sandbox-reap --seat <64-hex> [--dry-run]   # remove a RETIRED seat's leftover containment holders\n"
     );
     let _ = writeln!(
         out,
@@ -790,6 +827,8 @@ mod tests {
         // dispatch arms in `run`), so this tracks the surface a given build actually ships.
         #[cfg(feature = "acp")]
         cases.push(("seller --help", "maxplayer seller"));
+        #[cfg(feature = "acp")]
+        cases.push(("seller serve --help", "maxplayer seller serve"));
         #[cfg(feature = "acp")]
         cases.push(("sandbox-reap --help", "maxplayer sandbox-reap"));
         #[cfg(feature = "wallet")]

@@ -633,7 +633,7 @@ fn info_on_a_mint_home_reads_only_and_reports_key_version_running_and_link() {
     );
     assert_eq!(snapshot(&w.home), before, "maxplayer mint changed the home");
 
-    // Linked, and served: `maxplayer-mint run` holds an exclusive flock on <home>/mint/.
+    // Linked, and served: `maxplayer-mint serve` holds an exclusive flock on <home>/mint/.
     fake.link_existing(&w.mint_keys.public_key().to_hex(), "op@example.com");
     let held = fs::File::open(w.home.join("mint")).unwrap();
     held.try_lock().unwrap();
@@ -1576,7 +1576,7 @@ fn doctor_shows_the_maxplayer_update_with_no_mint_installed_on_its_own_row() {
     );
 }
 
-// ── maxplayer mint <init|name|run|issue|restore|version> (forwarded to maxplayer-mint) ─────────
+// ── maxplayer mint <init|name|serve|issue|restore|version> (forwarded to maxplayer-mint) ─────────
 
 impl World {
     /// Where [`World::recorder`] writes what it was run with.
@@ -1664,7 +1664,7 @@ fn forwarded_args_arrive_verbatim_with_maxplayer_home_set_and_maxplayer_becomes_
         "{record}"
     );
     // exec, not a child process: the mint IS the process we started, so signals sent to it (and
-    // Ctrl-C to its terminal) reach `maxplayer-mint run` directly.
+    // Ctrl-C to its terminal) reach `maxplayer-mint serve` directly.
     assert!(
         lines.contains(&format!("pid={pid}").as_str()),
         "pid {pid}: {record}"
@@ -1688,7 +1688,7 @@ fn without_home_the_mint_gets_the_home_maxplayer_resolves() {
     let (code, _, err) = run(maxplayer()
         .args(["mint", "--bin-dir"])
         .arg(&w.bin_dir)
-        .arg("run")
+        .arg("serve")
         .env("MAXPLAYER_HOME", &w.home)
         .env("PATH", "/usr/bin:/bin"));
     assert_eq!(code, 0, "{err}");
@@ -1697,7 +1697,7 @@ fn without_home_the_mint_gets_the_home_maxplayer_resolves() {
         record.contains(&format!("home={}\n", w.home.display())),
         "{record}"
     );
-    assert!(record.contains("arg=run\n"), "{record}");
+    assert!(record.contains("arg=serve\n"), "{record}");
 }
 
 #[test]
@@ -1708,7 +1708,7 @@ fn the_bin_dir_mint_is_used_over_one_on_path_and_without_bin_dir_path_wins() {
     w.recorder(&pathbin.join("maxplayer-mint"), &this_line(), "path");
     let path = format!("{}:/usr/bin:/bin", pathbin.display());
 
-    let (code, _, err) = run(w.forward(&["run"]).env("PATH", &path));
+    let (code, _, err) = run(w.forward(&["serve"]).env("PATH", &path));
     assert_eq!(code, 0, "{err}");
     assert!(w.record("bin").is_some(), "the --bin-dir mint did not run");
     assert!(
@@ -1720,7 +1720,7 @@ fn the_bin_dir_mint_is_used_over_one_on_path_and_without_bin_dir_path_wins() {
     let (code, _, err) = run(maxplayer()
         .args(["mint", "--home"])
         .arg(&w.home)
-        .arg("run")
+        .arg("serve")
         .env("PATH", &path));
     assert_eq!(code, 0, "{err}");
     assert!(w.record("path").is_some(), "the PATH mint did not run");
@@ -1742,7 +1742,7 @@ fn the_mints_exit_code_and_output_are_its_own() {
 #[test]
 fn with_nothing_installed_it_points_at_install_with_the_same_flags() {
     let w = World::new();
-    let (code, out, err) = run(&mut w.forward(&["run"]));
+    let (code, out, err) = run(&mut w.forward(&["serve"]));
     assert_eq!(code, 2, "{out}\n{err}");
     assert!(
         err.contains(&format!(
@@ -1797,8 +1797,8 @@ fn typos_and_misplaced_flags_are_usage_errors_that_run_nothing() {
     for (args, want) in [
         (&["rnu"][..], "unknown subcommand rnu"),
         (
-            &["run", "--home", "/h"][..],
-            "--home after `run` would be passed",
+            &["serve", "--home", "/h"][..],
+            "--home after `serve` would be passed",
         ),
     ] {
         let (code, out, err) = run(&mut w.forward(args));
@@ -1829,7 +1829,7 @@ fn a_mint_of_another_version_still_runs_after_the_status_fix_hint() {
     ] {
         w.recorder(&w.target(), line, "bin");
         let _ = fs::remove_file(w.record_path("bin"));
-        let (code, out, err) = run(&mut w.forward(&["run"]));
+        let (code, out, err) = run(&mut w.forward(&["serve"]));
         assert_eq!(code, 0, "{out}\n{err}");
         assert!(err.contains("maxplayer mint: warning:"), "{err}");
         assert!(
@@ -1849,20 +1849,22 @@ fn a_mint_of_another_version_still_runs_after_the_status_fix_hint() {
 }
 
 #[test]
-fn serve_is_forwarded_ahead_of_the_mint_renaming_run() {
-    // feat/serve-verbs renames `maxplayer-mint run` to `serve` (run stays an alias): the proxy
-    // already passes it on, so it works as soon as the installed mint knows it.
-    let w = World::new();
-    w.recorder(&w.target(), &this_line(), "bin");
-    let (code, out, err) = run(&mut w.forward(&["serve"]));
-    assert_eq!(code, 0, "{out}\n{err}");
-    let record = w.record("bin").expect("serve was not forwarded");
-    assert!(record.contains("arg=serve\n"), "{record}");
-    assert!(
-        record.contains(&format!("home={}\n", w.home.display())),
-        "{record}"
-    );
-    // Own flags after it are refused like after any forwarded command.
-    let (code, _, err) = run(&mut w.forward(&["serve", "--bin-dir", "/b"]));
-    assert_eq!(code, 1, "{err}");
+fn serve_and_its_deprecated_alias_run_are_both_forwarded() {
+    // `serve` is the mint's start verb; `run`, its deprecated alias, still reaches the mint (which
+    // prints its own deprecation line), so an existing `maxplayer mint run` keeps working.
+    for verb in ["serve", "run"] {
+        let w = World::new();
+        w.recorder(&w.target(), &this_line(), "bin");
+        let (code, out, err) = run(&mut w.forward(&[verb]));
+        assert_eq!(code, 0, "{verb}: {out}\n{err}");
+        let record = w.record("bin").expect("not forwarded");
+        assert!(record.contains(&format!("arg={verb}\n")), "{record}");
+        assert!(
+            record.contains(&format!("home={}\n", w.home.display())),
+            "{record}"
+        );
+        // Own flags after it are refused like after any forwarded command.
+        let (code, _, err) = run(&mut w.forward(&[verb, "--bin-dir", "/b"]));
+        assert_eq!(code, 1, "{verb}: {err}");
+    }
 }

@@ -72,7 +72,7 @@ fn require_initialized(root: &Path) -> Result<(), String> {
     Err(format!(
         "profile set refused: no initialized maxplayer home at {}\n\
          {} — this looks like a typo'd or new --home path.\n\
-         `profile set` never creates a new identity: run `maxplayer seller --home {} ...` \
+         `profile set` never creates a new identity: run `maxplayer seller serve --home {} ...` \
          (or check the home with `maxplayer doctor --home {}`) to initialize a home first, \
          or check the path is correct.",
         root.display(),
@@ -284,7 +284,7 @@ mod tests {
         let message = require_initialized(Path::new("/nonexistent/home/for-655"))
             .expect_err("uninitialized home must refuse");
         assert!(
-            message.contains("maxplayer seller --home"),
+            message.contains("maxplayer seller serve --home"),
             "must recommend the real seller subcommand: {message}"
         );
         assert!(

@@ -671,7 +671,7 @@ async fn sigterm_takes_the_stop_snapshot() {
     tokio::task::spawn_blocking(move || {
         let bin = env!("CARGO_BIN_EXE_maxplayer-mint");
         let mut run = Command::new(bin)
-            .arg("run")
+            .arg("serve")
             .env("MAXPLAYER_HOME", &root)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

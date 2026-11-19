@@ -1943,7 +1943,7 @@ pub struct MaxplayerConfig {
 
 /// `[trade]` — token trading (`maxplayer trade`) on this home.
 ///
-/// `serve`: the buyer daemon (`maxplayer buyer`) and the seller (`maxplayer seller`) host trade's
+/// `serve`: the buyer daemon (`maxplayer buyer serve`) and the seller (`maxplayer seller serve`) host trade's
 /// `serve` for this home, so nobody runs `maxplayer trade serve` by hand. Only a home that already
 /// trades is served (it has a trade journal, `<home>/trade/trade.sqlite`); a home that never traded
 /// gets nothing created. Default **true**; `false` leaves serving to a standalone
@@ -2630,7 +2630,7 @@ fn documented_config_toml(config: &MaxplayerConfig) -> Result<String, HomeError>
     let mut out = String::new();
     out.push_str("# maxplayer config.toml — written on first run.\n");
     out.push_str("# Edit freely. Comments are NOT preserved when the app rewrites this file\n");
-    out.push_str("# (e.g. `maxplayer seller` setup or a wallet change).\n");
+    out.push_str("# (e.g. `maxplayer seller serve` setup or a wallet change).\n");
     out.push_str("# ⚠ This node's DEFAULTS accept and pay REAL sats — see accepted_mints.\n\n");
     for line in body.lines() {
         let key = line.split('=').next().unwrap_or("").trim();

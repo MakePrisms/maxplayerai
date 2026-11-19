@@ -1,3 +1,17 @@
+## Unreleased
+
+Not yet released. Client-only: no relay, registration-service or sandbox change. The website
+skill pages and `/sell`, `/mint` copy go live with the merge (Vercel).
+
+- **Changed: `serve` is the start verb for every daemon.** Use `maxplayer seller serve [flags]`,
+  `maxplayer buyer serve`, `maxplayer reviewer serve <config.json>` and `maxplayer-mint serve`;
+  docs, usage text, the Docker image's default command, docker-compose, the desktop app and the
+  challenge runner now use them. The old forms are **deprecated and still work**: a verbless
+  `maxplayer seller [flags]`, a bare `maxplayer buyer` and `maxplayer-mint run` start exactly as
+  before and print one stderr line naming the new command. Existing systemd units and scripts need
+  no change to keep running; move them to `serve` when convenient. `maxplayer-chat watch`,
+  `maxplayer run` and `maxplayer mock run` are not daemons that serve and are unchanged.
+
 ## v0.8.0-rc2
 
 Release candidate for 0.8.0, built from main after #1343, #1344 and #1345. It carries everything in

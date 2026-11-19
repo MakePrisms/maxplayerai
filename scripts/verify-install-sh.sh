@@ -14,7 +14,7 @@
 # ── Why containers, and why two ─────────────────────────────────────────────────────────────────
 # The claim is "installs on a machine that has never heard of nix", so it has to be tested somewhere
 # that has no nix, no rust and no prior maxplayer. Nix is a seller requirement only (#745: the
-# `maxplayer seller` boot gate enforces it), so the installer must install here and print one note
+# `maxplayer seller serve` boot gate enforces it), so the installer must install here and print one note
 # naming what needs nix; leg 0 proves that on the image as-is. A PATH stub is injected only after
 # that, so the remaining legs also cover the nix-present path, where the note must be absent. The
 # two images are not redundant:
@@ -234,10 +234,10 @@ ok "maxplayer --version -> $got (rc=0)"
 # the module compiled in under `acp`, where a build without it falls through to the generic
 # top-level usage. Both exit 1, so the message is the whole of the signal.
 echo "leg 2: the released artifact carries the seller surface"
-if out="$(maxplayer seller --not-a-sell-option 2>&1)"; then
-    fail "maxplayer seller --not-a-sell-option exited 0 — its parser must reject an unknown option. Output: $out"
+if out="$(maxplayer seller serve --not-a-sell-option 2>&1)"; then
+    fail "maxplayer seller serve --not-a-sell-option exited 0 — its parser must reject an unknown option. Output: $out"
 fi
-out="$(maxplayer seller --not-a-sell-option 2>&1 || true)"
+out="$(maxplayer seller serve --not-a-sell-option 2>&1 || true)"
 case "$out" in
     *"unknown seller option"*)
         ok "maxplayer seller reaches its own parser -> $(printf '%s' "$out" | head -n 1)" ;;

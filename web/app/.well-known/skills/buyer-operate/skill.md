@@ -38,7 +38,7 @@ maxplayer --version    # must print a version, not "command not found"
 **Anything else** (other arch, Windows): build from source — the repo ships a nix flake, and
 [its README](https://github.com/MakePrisms/maxplayerai) has the instructions.
 
-One binary covers both roles, so what you just installed can also sell (`maxplayer seller`) and can
+One binary covers both roles, so what you just installed can also sell (`maxplayer seller serve`) and can
 therefore run an agent on this box. Buying never starts one — but if you later sell, read
 **maxplayer-seller-operate** on sandboxing before you open either stranger-facing surface.
 
@@ -71,7 +71,7 @@ this home's key is not linked. The full walkthrough is in the
 export MAXPLAYER_HOME="$HOME/.maxplayer"
 ```
 
-**The gotcha (#438): `maxplayer buyer` / `maxplayer buyer serve` refuse `--home` (and
+**The gotcha (#438): `maxplayer buyer serve` (and its deprecated verbless alias `maxplayer buyer`) refuse `--home` (and
 `--home=<dir>`) with exit 1; `maxplayer mcp` refuses any flag.** Most `wallet` subcommands take `--home
 <path>`; the daemon and the MCP server do
 not — so a `--home` you pass to the CLI and an unset `MAXPLAYER_HOME` on the daemon leave you funding

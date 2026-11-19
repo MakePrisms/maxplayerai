@@ -4,7 +4,7 @@
 //! Mint onboarding is three pieces (Petar, #merge-binaries, 2026-11-16):
 //!
 //! 1. `maxplayer mint` says whether a mint binary is installed, its version, whether this home has
-//!    a mint (`<home>/mint/`), its key, whether `maxplayer-mint run` is serving it, and whether the
+//!    a mint (`<home>/mint/`), its key, whether `maxplayer-mint serve` is serving it, and whether the
 //!    mint key is linked to an account. It CREATES NOTHING: no home, no `config.toml`, no agent key,
 //!    no `wallet/`, and no chmod of the mint key (the bootstrap rule: a read never mints an identity).
 //! 2. `maxplayer mint install` downloads the release asset `maxplayer-mint-<v>-<platform>.tar.gz`
@@ -25,16 +25,16 @@
 //!    upgrade`), and (b) a newer `maxplayer` is released (general, mint or no mint, and it never
 //!    mentions the mint: once maxplayer is updated, (a) is what points at the mint).
 //! 5. `maxplayer mint uninstall` removes only the binary (a symlink, not its target), refuses while
-//!    `maxplayer-mint run` serves the home, and never deletes `<home>/mint/`.
-//! 6. `maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|run|issue|restore|version> ...`
+//!    `maxplayer-mint serve` serves the home, and never deletes `<home>/mint/`.
+//! 6. `maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|serve|issue|restore|version> ...`
 //!    runs the installed `maxplayer-mint` command for this home (Petar, #rc-testing, 2026-11-19: a
 //!    different `maxplayer-mint` was first on PATH and, without MAXPLAYER_HOME, the mint served
 //!    ~/.maxplayer). The binary is the one `maxplayer mint` reports (`--bin-dir`, else PATH, else
 //!    ~/.local/bin), MAXPLAYER_HOME is set to the resolved home, and on unix this process `exec`s
-//!    into it, so signals (`run` takes a last backup on SIGINT/SIGTERM/SIGHUP), stdio and the exit
+//!    into it, so signals (`serve` takes a last backup on SIGINT/SIGTERM/SIGHUP), stdio and the exit
 //!    code are the mint's own. Everything after the subcommand goes to the mint verbatim, so its
 //!    `restore --from` and `init --name` never meet install's `--from`/`--name`. The forwarded set
-//!    is [`FORWARDED`]; a unit test holds it to the mint's own argument match, and any other word
+//!    is [`FORWARDED`] (with the mint's deprecated `run`); a unit test holds it to the mint's own argument match, and any other word
 //!    is a usage error naming both lists. A version mismatch is a warning on stderr (with the fix
 //!    `maxplayer mint` prints), never a refusal: refusing would keep a seller's credits
 //!    unspendable over a notice the user can act on after the mint is up.
@@ -81,7 +81,7 @@ fn write_usage(out: &mut dyn Write) {
          (`alias seller-mint='maxplayer mint --home <dir> --bin-dir <dir>'`) works for every form.\n\
          \n\
          `maxplayer mint` shows this home's credit mint: whether `{MINT_BIN}` is installed and its\n\
-         version, the mint key (npub and nostr:// URL), whether `{MINT_BIN} run` is serving it, and\n\
+         version, the mint key (npub and nostr:// URL), whether `{MINT_BIN} serve` is serving it, and\n\
          whether the mint key is linked to an account (asks the registration service; --offline\n\
          skips that). Two separate notices: `upgrade:` when the installed {MINT_BIN} is older than\n\
          this maxplayer (run `maxplayer mint upgrade`), and `update:` when a newer maxplayer is\n\
@@ -103,23 +103,23 @@ fn write_usage(out: &mut dyn Write) {
          installed one is an OLDER {MINT_BIN} release; at {version} already there is nothing to do.\n\
          A newer version, a source build or an unrecognised binary is refused (`maxplayer mint\n\
          install --force` replaces anything). <home>/mint/ is not touched and `init` never runs. A\n\
-         running `{MINT_BIN} run` keeps the old version until it is restarted. The mint is\n\
+         running `{MINT_BIN} serve` keeps the old version until it is restarted. The mint is\n\
          version-locked to maxplayer: once maxplayer itself is updated, `maxplayer mint` reports the\n\
          installed {MINT_BIN} as older, and that is when to run `maxplayer mint upgrade`.\n\
          \n\
          `maxplayer mint uninstall` removes the {MINT_BIN} binary in --bin-dir (a symlink is removed,\n\
-         not what it points to). It refuses while `{MINT_BIN} run` is serving <home>, and never\n\
+         not what it points to). It refuses while `{MINT_BIN} serve` is serving <home>, and never\n\
          deletes <home>/mint/: the mint's key, seed and ecash database stay there.\n\
          \n\
          `maxplayer mint <{forwarded}> [args...]` runs that {MINT_BIN} command (`{MINT_BIN} --help`\n\
-         lists them: init [--name <name>], name <name>, run, issue [amount], restore [--from <dir>],\n\
-         version; `serve` is forwarded too, as `run`'s upcoming name, and works once the installed\n\
-         {MINT_BIN} has it) with MAXPLAYER_HOME set to <home>, using the same binary `maxplayer mint` reports\n\
+         lists them: init [--name <name>], name <name>, serve, issue [amount], restore [--from <dir>],\n\
+         version; `run`, the deprecated alias of `serve`, is forwarded too) with MAXPLAYER_HOME set\n\
+         to <home>, using the same binary `maxplayer mint` reports\n\
          (--bin-dir, else the first on PATH, else ~/.local/bin). Everything after the subcommand is\n\
          passed to it unchanged, so put --home/--bin-dir BEFORE the subcommand (after it they are\n\
          refused: {MINT_BIN} takes neither). maxplayer replaces itself with the mint process: Ctrl-C,\n\
-         SIGTERM and SIGHUP reach it directly (`run` takes its last backup), and the exit code is\n\
-         the mint's. `run` stays in the foreground; keep it alive with a service (the README's\n\
+         SIGTERM and SIGHUP reach it directly (`serve` takes its last backup), and the exit code is\n\
+         the mint's. `serve` stays in the foreground; keep it alive with a service (the README's\n\
          systemd unit), tmux or launchd. A mint whose version differs from this maxplayer still\n\
          runs, after a warning on stderr with the fix `maxplayer mint` prints.\n\
          \n\
@@ -147,13 +147,14 @@ const FORWARDED: &[&str] = &[
     "version",
     "--version",
 ];
-/// Forwarded ahead of the mint: `serve` is `run`'s new name (feat/serve-verbs, Petar 2026-11-19;
-/// `run` stays as an alias), so `maxplayer mint serve` works the moment the installed mint has it.
-/// A mint without it answers with its own usage (exit 2). Once the mint's `main.rs` matches `serve`
-/// the entry may leave PENDING; the pinning test passes either way.
-const PENDING: &[&str] = &["serve"];
-/// [`FORWARDED`] for prose (`--version` is spelled as `version` there).
-const FORWARDED_LIST: &str = "init|name|run|issue|restore|version";
+/// The mint's deprecated `run` (`serve`'s name before feat/serve-verbs, Petar 2026-11-19): still
+/// forwarded, so an existing `maxplayer mint run` keeps serving (the mint itself prints the
+/// deprecation line), but left out of [`FORWARDED_LIST`] so help and the typo error teach `serve`.
+/// The pinning test holds both lists to it.
+#[cfg(test)]
+const DEPRECATED_ALIASES: &[&str] = &["run"];
+/// [`FORWARDED`] for prose (`--version` is spelled as `version` there; deprecated aliases omitted).
+const FORWARDED_LIST: &str = "init|name|serve|issue|restore|version";
 /// This command's flags that may come before any subcommand, forwarded ones included.
 const LEADING_FLAGS: &[&str] = &["--home", "--bin-dir"];
 
@@ -808,7 +809,7 @@ mod wallet {
         }
     }
 
-    /// Whether `maxplayer-mint run` holds its single-listener lock (an exclusive `flock` on the
+    /// Whether `maxplayer-mint serve` holds its single-listener lock (an exclusive `flock` on the
     /// mint directory). `Ok(Some(pid))` running (pid 0 when unknown), `Ok(None)` not running.
     fn mint_runner(mint_dir: &Path) -> Result<Option<u32>, String> {
         let proc_locks = if cfg!(target_os = "linux") {
@@ -823,7 +824,7 @@ mod wallet {
     /// touching the lock and names its pid. Anything else — not listed (btrfs reports another
     /// device there than `stat`, and another PID namespace's locks are hidden) or no
     /// `/proc/locks` (macOS) — is asked of the lock itself, with a shared probe released at once.
-    /// That probe cannot stop a starting `maxplayer-mint run`: its `lock_run` retries for a
+    /// That probe cannot stop a starting `maxplayer-mint serve`: its `lock_run` retries for a
     /// second before deciding another `run` is serving.
     pub(super) fn mint_runner_with(
         mint_dir: &Path,
@@ -1175,19 +1176,19 @@ mod wallet {
         })
     }
 
-    /// What to tell the user when a `maxplayer-mint run` serves `mint_dir` while its binary was
+    /// What to tell the user when a `maxplayer-mint serve` serves `mint_dir` while its binary was
     /// just replaced: the rename left the running process on its old inode.
     fn running_note(root: &Path, target: &Path, old: &str) -> Option<String> {
         let mint_dir = root.join("mint");
         let restart = format!(
             "`systemctl --user restart {MINT_BIN}` if it runs as the README's service, else stop it \
-             and start `MAXPLAYER_HOME={} {} run` again",
+             and start `MAXPLAYER_HOME={} {} serve` again",
             shell_quote(root),
             shell_quote(target)
         );
         let unknown = |e: String| {
             Some(format!(
-                "Could not tell whether a `{MINT_BIN} run` is serving {} ({e}); if one is, it \
+                "Could not tell whether a `{MINT_BIN} serve` is serving {} ({e}); if one is, it \
                  keeps running {old} until restarted: {restart}.",
                 mint_dir.display()
             ))
@@ -1207,7 +1208,7 @@ mod wallet {
             (format!(" (pid {pid})"), format!("kill -INT {pid}"))
         };
         Some(format!(
-            "A `{MINT_BIN} run` is serving {}{pid_text}: it keeps running {old} until it is \
+            "A `{MINT_BIN} serve` is serving {}{pid_text}: it keeps running {old} until it is \
              restarted. Restart it to run {VERSION}: {restart} (stop: `{kill}`).",
             mint_dir.display()
         ))
@@ -1443,7 +1444,7 @@ mod wallet {
         }
     }
 
-    // ── maxplayer mint <init|name|run|issue|restore|version> ─────────────────────────────────
+    // ── maxplayer mint <init|name|serve|issue|restore|version> ─────────────────────────────────
 
     /// Run `maxplayer-mint <args>` (`args[0]` is the subcommand, the rest passes unchanged) with
     /// MAXPLAYER_HOME set to this home, using the binary `maxplayer mint` reports. This process
@@ -1748,7 +1749,7 @@ mod wallet {
             };
             let _ = writeln!(
                 out,
-                "A `{MINT_BIN} run` is serving this home{pid}: restart it to run {VERSION}."
+                "A `{MINT_BIN} serve` is serving this home{pid}: restart it to run {VERSION}."
             );
         }
         let keys = read_mint_keys(&mint_dir).ok().flatten();
@@ -2062,7 +2063,7 @@ mod wallet {
             .then(|| fs::read_link(&target).unwrap_or_default());
 
         remove_stale_stages(&bin_dir);
-        // `replace`: a rename over the old entry, so a running `maxplayer-mint run` keeps its old
+        // `replace`: a rename over the old entry, so a running `maxplayer-mint serve` keeps its old
         // inode and never sees a partial file.
         let unchanged = || {
             if fingerprint(&target) == before {
@@ -2165,7 +2166,7 @@ mod wallet {
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => {
                 return Err(format!(
-                    "could not tell whether `{MINT_BIN} run` is serving {} ({e}); not uninstalling",
+                    "could not tell whether `{MINT_BIN} serve` is serving {} ({e}); not uninstalling",
                     mint_dir.display()
                 ));
             }
@@ -2179,7 +2180,7 @@ mod wallet {
                         (format!(" (pid {pid})"), format!("kill -INT {pid}"))
                     };
                     return Err(format!(
-                        "`{MINT_BIN} run` is serving {}{pid_text} (or a `{MINT_BIN} restore` holds \
+                        "`{MINT_BIN} serve` is serving {}{pid_text} (or a `{MINT_BIN} restore` holds \
                          it); not uninstalling while it runs. Stop it first: `systemctl --user \
                          disable --now {MINT_BIN}` if it runs as the README's service, else `{kill}` \
                          (it shuts down cleanly on SIGINT). Then rerun `maxplayer mint \
@@ -2190,7 +2191,7 @@ mod wallet {
                 Ok(None) => {}
                 Err(e) => {
                     return Err(format!(
-                        "could not tell whether `{MINT_BIN} run` is serving {} ({e}); not \
+                        "could not tell whether `{MINT_BIN} serve` is serving {} ({e}); not \
                          uninstalling",
                         mint_dir.display()
                     ));
@@ -3184,34 +3185,31 @@ mod tests {
             .collect();
         theirs.sort_unstable();
         theirs.dedup();
-        // Every mint command is forwarded; beyond them only a PENDING one (forwarded ahead of the
-        // mint gaining it), whether or not the mint has it yet.
-        let mut ours: Vec<&str> = FORWARDED
-            .iter()
-            .copied()
-            .filter(|c| !PENDING.contains(c) || theirs.contains(c))
-            .collect();
+        // Exactly the mint's commands are forwarded, its deprecated alias `run` included.
+        let mut ours: Vec<&str> = FORWARDED.to_vec();
         ours.sort_unstable();
         assert_eq!(
             ours, theirs,
             "update FORWARDED (and FORWARDED_LIST) to the mint's commands"
         );
-        assert!(PENDING.iter().all(|c| FORWARDED.contains(c)));
+        assert!(DEPRECATED_ALIASES.iter().all(|c| FORWARDED.contains(c)));
         for own in ["install", "upgrade", "uninstall"] {
             assert!(!FORWARDED.contains(&own), "{own} is maxplayer's own");
         }
-        for cmd in FORWARDED
-            .iter()
-            .filter(|c| !c.starts_with('-') && !PENDING.contains(c))
-        {
-            assert!(FORWARDED_LIST.split('|').any(|c| c == *cmd), "{cmd}");
+        // The prose list names every forwarded command except the deprecated aliases.
+        for cmd in FORWARDED.iter().filter(|c| !c.starts_with('-')) {
+            assert_eq!(
+                FORWARDED_LIST.split('|').any(|c| c == *cmd),
+                !DEPRECATED_ALIASES.contains(cmd),
+                "{cmd}"
+            );
         }
     }
 
     #[test]
     fn leading_flags_precede_any_subcommand_and_forwarded_args_are_not_parsed() {
         assert_eq!(
-            leading_own_flags(&args(&["--home", "/h", "--bin-dir", "/b", "run"])),
+            leading_own_flags(&args(&["--home", "/h", "--bin-dir", "/b", "serve"])),
             4
         );
         assert_eq!(leading_own_flags(&args(&["restore", "--from", "/x"])), 0);
@@ -3219,6 +3217,7 @@ mod tests {
         // Own flags after a forwarded subcommand are refused (the mint takes neither), before
         // anything is resolved.
         for form in [
+            &["serve", "--home", "/h"][..],
             &["run", "--home", "/h"][..],
             &["issue", "5", "--bin-dir", "/b"][..],
         ] {

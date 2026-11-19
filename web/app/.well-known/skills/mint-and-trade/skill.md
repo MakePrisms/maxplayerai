@@ -73,7 +73,7 @@ installed `maxplayer` predates it; upgrade it (see the
 Delete any old standalone `maxplayer-trade` binary (`maxplayer doctor` warns about one).
 
 This explicitly installs the mint in `~/.local/bin`, matching the mint
-README's `ExecStart=%h/.local/bin/maxplayer-mint run`. Use those absolute executable
+README's `ExecStart=%h/.local/bin/maxplayer-mint serve`. Use those absolute executable
 paths for services and checks; add `~/.local/bin` to the interactive PATH if needed.
 For an existing installation elsewhere, preserve it and use its verified absolute
 path in the service instead. Verify the service's executable exists and is the
@@ -90,14 +90,14 @@ earlier.
   show the name next to the mint URL. Use the seller's own name unless the operator chose another.
   For an existing unnamed mint, suggest `maxplayer-mint name <name>` and a service restart. Follow the README to run it under a
   persistent service appropriate to this host (a systemd unit runs the binary by absolute path;
-  without systemd, e.g. macOS, run `maxplayer mint --home <home> [--bin-dir <dir>] run` in
+  without systemd, e.g. macOS, run `maxplayer mint --home <home> [--bin-dir <dir>] serve` in
   tmux or a launchd agent). Every mint command is also `maxplayer mint [--home <home>]
-  [--bin-dir <dir>] <init|name|run|issue|restore|version> [args...]`: it runs the binary
+  [--bin-dir <dir>] <init|name|serve|issue|restore|version> [args...]`: it runs the binary
   `maxplayer mint` reports with `MAXPLAYER_HOME` set to that home, so it cannot start another
   copy of the mint from PATH or serve the default home by mistake. Inspect and preserve existing
   service configuration. The mint's documented graceful stop is SIGINT; do not
   assume it uses the trading server's shutdown signal.
-- Keep exactly one live mint. **Backups are automatic:** `maxplayer-mint run`
+- Keep exactly one live mint. **Backups are automatic:** `maxplayer-mint serve`
   snapshots the database online after every change and keeps the key, seed,
   config and issued token files in its backup directory (`<home>/mint/backups/`,
   or `backup_dir` in `mint.toml`). The only backup step is **one-time, at setup**:
@@ -158,7 +158,7 @@ Do not invent a price or assume that “set up” authorizes issuance or trading
    README. Keep the resulting token file private; do not paste it into chat or
    command arguments. If issuance is interrupted, resume that operation as
    documented rather than issuing another batch.
-   No backup step follows `issue`, `receive` or a trade: `run` already has it.
+   No backup step follows `issue`, `receive` or a trade: `serve` already has it.
 2. Import that file into the home's wallet with `maxplayer wallet receive --token-file <file>
    --add-mint` (it lands in the same wallet `maxplayer wallet balance` shows). Verify the
    balance. An ambiguous result needs the same file received again, not new issuance.

@@ -14,7 +14,7 @@ run a seller — both self-contained, from install to first paid trade. Served l
 ## Install
 
 One binary, one install, either role. Buying and selling are two ways to run the same command —
-`maxplayer` and `maxplayer seller`.
+`maxplayer` and `maxplayer seller serve`.
 
 ```bash
 npm install -g maxplayer          # or:
@@ -24,7 +24,7 @@ curl -fsSL https://github.com/MakePrisms/maxplayerai/releases/latest/download/in
 Both resolve the latest release. `npx -y maxplayer mcp` wires a buyer into an MCP client without
 installing. Confirm with `maxplayer --version` before going on.
 
-Buying needs no Nix. Selling does: `maxplayer seller` refuses to start without a working `nix`
+Buying needs no Nix. Selling does: `maxplayer seller serve` refuses to start without a working `nix`
 (#745). Install it before you sell: `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`.
 
 The npm route needs **Node 18+** — the floor the package actually declares in `engines.node`, so
@@ -40,7 +40,7 @@ the script puts it in `~/.local/bin` and verifies the release `SHA256SUMS`. Choo
 
 One home, too. `MAXPLAYER_HOME` (default `~/.maxplayer`) holds a seat's `config.toml`, key, wallet
 and results — buyer settings at the root, seller settings in a `[seller]` section that is inert
-until you run `maxplayer seller`.
+until you run `maxplayer seller serve`.
 
 ## Link your agent to your email
 
@@ -87,11 +87,11 @@ Full walkthrough: [`docs/BUYER-QUICKSTART.md`](docs/BUYER-QUICKSTART.md).
 
 ## Run a seller
 
-First run takes two required choices; they persist to `config.toml`, so a bare `maxplayer seller`
+First run takes two required choices; they persist to `config.toml`, so a bare `maxplayer seller serve`
 relaunches with zero prompts:
 
 ```bash
-maxplayer seller --agent claude --rate-sats 100              # --agent claude|cursor|codex
+maxplayer seller serve --agent claude --rate-sats 100              # --agent claude|cursor|codex
 ```
 
 `--agent` needs two things in place: its ACP adapter on `PATH`, *and* the agent CLI behind that
@@ -100,7 +100,7 @@ each with a fix hint.
 
 > **⚠ Your agent runs task text written by strangers.** Out of the box it runs as a plain child
 > process with your filesystem, so configure a `[sandbox]` launcher before you serve the open pool —
-> `maxplayer seller` runs the launcher at boot and refuses an open-pool seat that it does not confine.
+> `maxplayer seller serve` runs the launcher at boot and refuses an open-pool seat that it does not confine.
 > The documented launcher is `bwrap` (bubblewrap), which is not installed on a stock box — install
 > it first (`sudo apt install bubblewrap`, or your distro's package).
 
@@ -111,7 +111,7 @@ Full walkthrough: [`docs/SELLER-QUICKSTART.md`](docs/SELLER-QUICKSTART.md).
 ```bash
 git clone https://github.com/MakePrisms/maxplayerai.git && cd maxplayerai
 cargo build -p maxplayer --release --no-default-features --features wallet,acp   # what releases ship
-cargo build -p maxplayer --release --no-default-features --features wallet       # buyer only: no `maxplayer seller`, no agent execution
+cargo build -p maxplayer --release --no-default-features --features wallet       # buyer only: no `maxplayer seller serve`, no agent execution
 ```
 
 Both land at `target/release/maxplayer`. `default = ["wallet"]`, so a bare `cargo build -p maxplayer
@@ -119,7 +119,7 @@ Both land at `target/release/maxplayer`. `default = ["wallet"]`, so a bare `carg
 publishes it. A nix build gives you the full surface without a toolchain:
 
 ```bash
-nix run --refresh github:MakePrisms/maxplayerai -- seller    # always --refresh; nix caches the git ref
+nix run --refresh github:MakePrisms/maxplayerai -- seller serve    # always --refresh; nix caches the git ref
 ```
 
 `maxplayer mcp` is a stdio MCP server; a bare run prints `ready` to stderr and waits.

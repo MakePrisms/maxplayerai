@@ -153,7 +153,7 @@ impl MintHome {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 Err(fs::TryLockError::WouldBlock) => bail!(
-                    "another `maxplayer-mint run` is already serving {}",
+                    "another `maxplayer-mint serve` is already serving {}",
                     self.dir.display()
                 ),
                 Err(fs::TryLockError::Error(error)) => {

@@ -277,11 +277,14 @@ fn run_readiness_with_retry(
         if exempt.is_empty() {
             let _ = writeln!(
                 err,
-                "resolve the item(s) above, then re-run `maxplayer seller`. To bypass these checks (NOT recommended), pass --skip-doctor."
+                "resolve the item(s) above, then re-run `maxplayer seller serve`. To bypass these checks (NOT recommended), pass --skip-doctor."
             );
         } else {
             let names = exempt.join(", ");
-            let _ = writeln!(err, "resolve the item(s) above, then re-run `maxplayer seller`.");
+            let _ = writeln!(
+                err,
+                "resolve the item(s) above, then re-run `maxplayer seller serve`."
+            );
             if failures.len() > exempt.len() {
                 let _ = writeln!(
                     err,
@@ -441,7 +444,7 @@ mod checks {
             NIX_CHECK,
             format!("not needed to buy, and this home has no [seller] section — {}", check.detail),
             format!(
-                "nix is a seller requirement (#745), and buying never uses it; `maxplayer seller` \
+                "nix is a seller requirement (#745), and buying never uses it; `maxplayer seller serve` \
                  refuses to start without it, so before selling: {remedy}"
             ),
         )
@@ -961,7 +964,7 @@ mod checks {
             return Check::warn(
                 AGENT_CHECK,
                 "no [seller] section configured",
-                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
+                "run `maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n>` once to configure",
             );
         };
         match seller_agents::resolve(&seller, &presets, host) {
@@ -2346,7 +2349,7 @@ mod checks {
             return Check::skip(
                 HARNESS_CREDS_CHECK,
                 "no [seller] section configured — no harness, so no credential directory to inspect",
-                "run `maxplayer seller --agent <claude|cursor|codex> --rate-sats <n>` once to configure a harness; the agent preset check reports this same cause",
+                "run `maxplayer seller serve --agent <claude|cursor|codex> --rate-sats <n>` once to configure a harness; the agent preset check reports this same cause",
             );
         };
         // ⛔ RESOLVE WITH THE CALLER'S `host`, NEVER A HARDCODED `AdapterHost::Host` (#1015).
@@ -6792,7 +6795,10 @@ mod tests {
             // reported to a buyer as "install it" (advisor r1, #1312).
             assert_eq!(rendered.contains("do NOT reinstall"), skew, "{rendered}");
             assert_eq!(rendered.contains("nix IS installed"), skew, "{rendered}");
-            assert!(rendered.contains("`maxplayer seller`"), "names what needs nix: {rendered}");
+            assert!(
+                rendered.contains("`maxplayer seller serve`"),
+                "names what needs nix: {rendered}"
+            );
             assert!(
                 rendered.contains("curl -fsSL https://install.determinate.systems/nix | sh -s -- install"),
                 "says how to install it before selling: {rendered}"

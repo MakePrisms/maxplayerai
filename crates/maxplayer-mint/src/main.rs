@@ -4,15 +4,21 @@ use anyhow::{Context, Result, bail};
 use maxplayer_mint::home::{MintHome, mint_url};
 use maxplayer_mint::{backend, backup, issue, server};
 
-const USAGE: &str = "usage: maxplayer-mint <init [--name <name>]|name <name>|run|issue [amount]|restore [--from <dir>]>
+const USAGE: &str = "usage: maxplayer-mint <init [--name <name>]|name <name>|serve|issue [amount]|restore [--from <dir>]>
   init            create <home>/mint/ and print the nostr:// mint URL
-  name <name>     set the name wallets show next to the mint URL (restart `run` to serve it)
-  run             serve the mint over its relays until interrupted; backs itself up automatically
+  name <name>     set the name wallets show next to the mint URL (restart `serve` to serve it)
+  serve           serve the mint over its relays until interrupted; backs itself up automatically
   issue [amount]  finish any interrupted issue, then issue <amount> sat into a token file
-  restore         with `run` stopped, put back the NEWEST backup as mint.sqlite (from backup_dir,
+  restore         with `serve` stopped, put back the NEWEST backup as mint.sqlite (from backup_dir,
                   or --from <dir>; recreates <home>/mint/ from the backup if it is gone)
   version         print `maxplayer-mint <version> (<commit>)` (also --version); needs no home
+  run             deprecated alias for `serve` (still works)
 <home> is $MAXPLAYER_HOME, or ~/.maxplayer";
+
+/// The one stderr line the deprecated `run` prints before serving anyway. Same shape as the
+/// `maxplayer` daemons' deprecation line, printed right after [`start_line`], so it never becomes
+/// the first line of the mint's output.
+const RUN_DEPRECATED: &str = "maxplayer-mint: `maxplayer-mint run` is deprecated and still works; use `maxplayer-mint serve`";
 
 /// The line both `--version` and `version` print. Same grammar as `maxplayer --version`
 /// (`<name> <version> (<40-hex commit>)`), because `scripts/verify-release-version.sh` holds every
@@ -25,9 +31,10 @@ fn version_line() -> String {
     )
 }
 
-/// The FIRST stderr line of `run`: `<version_line> — mint starting, dir <home>/mint`. An operator who
-/// starts `maxplayer-mint run` by bare name with an older binary first on `PATH` reads from the log
-/// which build is serving. `starting`, not a verb: the daemons' start verbs differ (`run`, `serve`).
+/// The FIRST stderr line of `serve` (and of its deprecated alias `run`): `<version_line> — mint
+/// starting, dir <home>/mint`. An operator who starts `maxplayer-mint serve` by bare name with an
+/// older binary first on `PATH` reads from the log which build is serving. `starting`, not a verb,
+/// like the `maxplayer` daemons' start line.
 fn start_line(home: &MintHome) -> String {
     format!(
         "{} — mint starting, dir {}",
@@ -57,14 +64,16 @@ async fn main() -> Result<()> {
                 home.dir().join("mint.toml").display()
             );
             println!(
-                "Restart `maxplayer-mint run` to serve it (systemctl --user restart maxplayer-mint)."
+                "Restart `maxplayer-mint serve` to serve it (systemctl --user restart maxplayer-mint)."
             );
             println!(
                 "Wallets show it after they next talk to the mint, or re-run `maxplayer wallet mints add <url>`."
             );
             Ok(())
         }
-        ["run"] => run(&home).await,
+        ["serve"] => serve(&home, false).await,
+        // Deprecated alias: serves exactly as `serve` does, after one stderr line naming it.
+        ["run"] => serve(&home, true).await,
         ["issue"] => issue_cmd(&home, None).await,
         ["issue", amount] => issue_cmd(&home, Some(amount.to_string())).await,
         ["restore"] => restore(&home, None),
@@ -106,14 +115,14 @@ async fn init(home: &MintHome, name: Option<String>) -> Result<()> {
     println!();
     let backups = secrets.config.backup_dir_in(home.dir());
     println!(
-        "Backups are automatic: `maxplayer-mint run` keeps {} current (key, seed, mint.toml and the newest database snapshots).",
+        "Backups are automatic: `maxplayer-mint serve` keeps {} current (key, seed, mint.toml and the newest database snapshots).",
         backups.display()
     );
     println!(
         "ONE-TIME step: have that directory copied off this machine (or set backup_dir in mint.toml to off-box storage). Losing nostr.key or seed makes every credit this mint issued worthless."
     );
     println!(
-        "Never delete mint.sqlite or run two copies. To restore, stop `run` and use `maxplayer-mint restore` (it takes the newest backup only)."
+        "Never delete mint.sqlite or run two copies. To restore, stop `serve` and use `maxplayer-mint restore` (it takes the newest backup only)."
     );
     Ok(())
 }
@@ -149,9 +158,13 @@ async fn issue_cmd(home: &MintHome, amount: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn run(home: &MintHome) -> Result<()> {
-    // Before anything that can fail, so even a refused start names its binary.
+async fn serve(home: &MintHome, deprecated_run: bool) -> Result<()> {
+    // Before anything that can fail, so even a refused start names its binary; `run`'s deprecation
+    // line comes right after it and never becomes the first line of the mint's output.
     eprintln!("{}", start_line(home));
+    if deprecated_run {
+        eprintln!("{RUN_DEPRECATED}");
+    }
     let secrets = home.load().with_context(|| {
         format!(
             "load {} (run `maxplayer-mint init` first)",
@@ -236,6 +249,6 @@ fn restore(home: &MintHome, from: Option<PathBuf>) -> Result<()> {
         done.snapshot.display(),
         home.db_path().display()
     );
-    println!("Start `maxplayer-mint run` again.");
+    println!("Start `maxplayer-mint serve` again.");
     Ok(())
 }

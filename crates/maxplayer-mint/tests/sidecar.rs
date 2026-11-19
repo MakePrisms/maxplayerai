@@ -1021,6 +1021,8 @@ async fn second_run_process_exits_while_first_serves() {
     let root = dir.path().to_owned();
     tokio::task::spawn_blocking(move || {
         let bin = env!("CARGO_BIN_EXE_maxplayer-mint");
+        // The deprecated `run` alias still serves and still takes the single-listener lock, so the
+        // `serve` below is refused by it exactly as by another `serve`.
         let mut first = Command::new(bin)
             .arg("run")
             .env("MAXPLAYER_HOME", &root)
@@ -1047,7 +1049,7 @@ async fn second_run_process_exits_while_first_serves() {
             }
         }
         let mut second = Command::new(bin)
-            .arg("run")
+            .arg("serve")
             .env("MAXPLAYER_HOME", &root)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

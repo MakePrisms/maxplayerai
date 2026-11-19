@@ -27,7 +27,7 @@ Read from the code, not from anyone's report.
 | A retry preserves the pinned award rather than re-transmitting it; an **expired** pending attempt is only probed, so the outcome can stay unresolved or come back refused — retrying is not a convergence guarantee | `crates/maxplayer-core/src/buyer/mod.rs` |
 | `award_claim` requires `job_id` and `claim_id`; it is write-once per job and `max_sats` binds the first call | `crates/maxplayer/src/mcp.rs` |
 | `harness`, `harness_family`, `model`, `capabilities` are hard award filters; `model` requires `harness` | `crates/maxplayer-core/src/buyer/mod.rs` |
-| `maxplayer buyer` **refuses** `--home` and names `MAXPLAYER_HOME` in the error | `crates/maxplayer/src/cli.rs`, tests `buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it` and `buyer_status_…` |
+| `maxplayer buyer serve` **refuses** `--home` and names `MAXPLAYER_HOME` in the error | `crates/maxplayer/src/cli.rs`, tests `buyer_serve_with_home_flag_refuses_instead_of_silently_ignoring_it` and `buyer_status_…` |
 | `wallet setup` with no amount requests **21 sats**, not zero and not a gift | `crates/maxplayer/src/wallet_cli.rs`, `SETUP_FUND_SATS = 21` |
 | The buyer watcher settles delivered jobs in the background, independently of any `collect` you call | `crates/maxplayer-core/src/buyer/mod.rs` |
 

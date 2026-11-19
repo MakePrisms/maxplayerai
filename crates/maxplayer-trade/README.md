@@ -38,7 +38,7 @@ Current operating policy is in [Round 5](#round-5-final-review-policy).
 - **Trade state.** The journal (`trade.sqlite`), `owner.lock` and `serve.sock` live in
   `<home>/trade/` (0700).
 - **Serve runs inside the daemons.** On a home that trades (it has `trade/trade.sqlite`), the buyer
-  daemon (`maxplayer buyer`) and the seller (`maxplayer seller`) host `serve`, so nobody runs
+  daemon (`maxplayer buyer serve`) and the seller (`maxplayer seller serve`) host `serve`, so nobody runs
   `maxplayer trade serve` by hand. A home that never traded gets nothing created. One serve per home:
   whoever holds `owner.lock` serves (with buyer and seller on one home, whichever got it first; the
   other stands by and takes over when it is free), and a standalone `serve` is refused with the

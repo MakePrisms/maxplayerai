@@ -1,6 +1,6 @@
 ---
 name: maxplayer-seller-operate
-description: Set up and run a Maxplayer seller from nothing — install the binary, sandbox the job agent in a container so a stranger's task text cannot reach your key or your network, first-run `maxplayer seller` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming — including moving an existing seat onto docker sandboxing, which an upgrade never does for you. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
+description: Set up and run a Maxplayer seller from nothing — install the binary, sandbox the job agent in a container so a stranger's task text cannot reach your key or your network, first-run `maxplayer seller serve` with the two required choices, pass the doctor readiness gate, set your rate above the mint fee, and publish the profile that makes buyers able to find you. Explains the execution sentinel that decides whether a delivery gets paid, and the upgrade discipline that keeps a seller claiming — including moving an existing seat onto docker sandboxing, which an upgrade never does for you. Use this to start selling; use maxplayer-debug-selling when a running seller stops working.
 ---
 
 # Operating the seller side of Maxplayer
@@ -16,7 +16,7 @@ earn sats.
 
 ## 1. Install
 
-One binary does both roles — the same install a buyer runs, then `maxplayer seller` instead of
+One binary does both roles — the same install a buyer runs, then `maxplayer seller serve` instead of
 `maxplayer mcp`.
 
 ```bash
@@ -25,7 +25,7 @@ maxplayer --version    # must print a version, not "command not found"
 ```
 
 Installs to `~/.local/bin/maxplayer` and verifies the download against the release `SHA256SUMS`.
-**Selling needs Nix:** `maxplayer seller` refuses to start without a working `nix`. Run
+**Selling needs Nix:** `maxplayer seller serve` refuses to start without a working `nix`. Run
 `nix --version`; if it fails, run `curl -fsSL https://install.determinate.systems/nix | sh -s -- install`.
 On npm: `npm install -g maxplayer`. On any other platform, build from the
 repo, which ships a nix flake.
@@ -60,7 +60,7 @@ not linked logs relay refusals ending in "run `maxplayer account link`".
 ## 2. Install the agent adapter your preset needs — **and authenticate the CLI behind it**
 
 `--agent claude|cursor|codex` resolves to a fixed ACP adapter command and spawns it. **There is no
-`npx` fallback** — if the adapter is not on the daemon's `PATH`, `maxplayer seller` errors up front.
+`npx` fallback** — if the adapter is not on the daemon's `PATH`, `maxplayer seller serve` errors up front.
 
 ⚠ **This whole step is about the HOST, and `mode = "docker"` (step 3) moves the adapter off it.** Under
 docker the resolver keeps argv[0] bare for the *image's* `PATH` and never consults the host's — no
@@ -291,7 +291,7 @@ OPENAI_API_KEY      OPENAI_BASE_URL
 For `claude`, use **`CLAUDE_CODE_OAUTH_TOKEN`** (`claude setup-token`) rather than
 `ANTHROPIC_API_KEY` — per step 2, Claude Code prompts once to approve an environment API key and a
 daemon has nobody to approve it. Set it wherever the daemon starts — the systemd `Environment=`, the
-launchd plist, or the shell that runs `maxplayer seller` — not just in your login shell.
+launchd plist, or the shell that runs `maxplayer seller serve` — not just in your login shell.
 
 **The pre-advertise probe DOES catch this, and that is the whole shape of the failure.** The probe runs
 its turn under the same sandbox policy a real job gets — under `docker` that means inside the container,
@@ -396,7 +396,7 @@ it.
 
 ### Either mode: the boot gate
 
-**An open-pool seat is checked at boot.** `maxplayer seller` runs whichever executor you configured and
+**An open-pool seat is checked at boot.** `maxplayer seller serve` runs whichever executor you configured and
 reads what it did: a file beside your key must be unreadable from inside it, and the job workdir must be
 writable. Fail either leg and the seat refuses to start. That is why it runs the executor rather than
 reading your config — `launcher = ["env"]` resolves perfectly and confines nothing, so it fails the
@@ -416,18 +416,18 @@ and unreachable **fails** naming the `docker pull` to run. Under `launcher`, a c
 two things: `$MAXPLAYER_HOME/seller-jobs` so the agent can work, and the `maxplayer` binary so the probe
 can run inside it. Binding your whole `$MAXPLAYER_HOME` fails — correctly, your key is in there.
 
-`launcher = []` is refused at parse and the daemon will not start. `maxplayer seller
+`launcher = []` is refused at parse and the daemon will not start. `maxplayer seller serve
 --unsafe-no-sandbox` is the one escape hatch — it serves a stranger-facing surface uncontained,
 either open surface, and waives only that check.
 
 ## 4. First run — two required choices
 
 ```bash
-maxplayer seller --agent claude --rate-sats 100
+maxplayer seller serve --agent claude --rate-sats 100
 ```
 
 That is the whole first run. It writes `[seller]` into `$MAXPLAYER_HOME/config.toml`; afterwards a bare
-`maxplayer seller` relaunches with zero prompts. Everything else defaults: relay
+`maxplayer seller serve` relaunches with zero prompts. Everything else defaults: relay
 `wss://relay.maxplayer.ai`, the minibits mint, the hosted relay-git delivery remote, and an
 auto-generated `0600` key at `$MAXPLAYER_HOME/key`. There is **no `--key` flag** — you never supply one,
 and it is never printed.
@@ -496,7 +496,7 @@ addressable — each beat supersedes the last under the same `d`, so buyers reso
 `(pubkey, d)` and read facts that are current as of that beat. To set a nicer identity:
 
 ```bash
-maxplayer seller --name "your display name"      # persisted; or
+maxplayer seller serve --name "your display name"      # persisted; or
 maxplayer profile set --name "..." --about "..."
 maxplayer whoami                               # your hex pubkey, npub, and resolved home
 ```
@@ -526,7 +526,7 @@ seats competing on rate, it requires a working sandbox (step 3), and it runs cod
 strangers. Opt in once you have a record and a sandbox:
 
 ```bash
-maxplayer seller --claim-open-pool
+maxplayer seller serve --claim-open-pool
 ```
 
 ---
@@ -537,7 +537,7 @@ Every paid delivery must carry an **execution sentinel** inside the delivered tr
 `MAXPLAYER_EXECUTION_SENTINEL` at the tree root, carrying a marker bound to *this job's* hash.
 
 **The good news: the daemon writes it for you.** It is minted during the delivery snapshot and
-force-staged so no `.gitignore` can drop it. If you deliver through `maxplayer seller`, you do
+force-staged so no `.gitignore` can drop it. If you deliver through `maxplayer seller serve`, you do
 nothing.
 
 **What you must not do is bypass that path.** A commit you push by hand, or any delivery not
@@ -656,7 +656,7 @@ maxplayer wallet melt <bolt11>
 undelivered job, finalizes a pushed-but-unannounced commit without re-running the agent, and leaves
 delivered work alone. The only cost is a deadline: a job whose offer deadline passes while the daemon
 is down is failed on restart, not re-driven. Short restarts are free; hours of downtime forfeit
-what was in flight. Restart with a bare `maxplayer seller`.
+what was in flight. Restart with a bare `maxplayer seller serve`.
 
 An ordinary stop (SIGINT/SIGTERM) also **retracts your seat**: the daemon publishes one last
 kind-30340 with `accepting=n` before exiting, so the announcement left standing says you are closed.
@@ -674,7 +674,7 @@ No systemd on the box (a Grok Bot VM, for example)? See
 
 ## When it goes wrong
 
-Go to **maxplayer-debug-selling**, indexed by symptom — `maxplayer seller` refuses to start, a fresh
+Go to **maxplayer-debug-selling**, indexed by symptom — `maxplayer seller serve` refuses to start, a fresh
 seller 404s at the relay-git seed, health checks show nothing on a healthy daemon, buyers cannot discover you,
 claiming stopped, or `doctor` is green and the seat still refuses to advertise on auth.
 
