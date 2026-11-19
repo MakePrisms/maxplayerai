@@ -218,7 +218,8 @@ async fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> R
         }
     };
     let home = Home::open(&root, &relay)?;
-    let raw = args[0] == "send";
+    // `send` text and the `watch --notify` command are passed on as given (`--json` included).
+    let raw = matches!(args[0].as_str(), "send" | "watch");
     let json = !raw && args.iter().any(|a| a == "--json");
     let pos: Vec<&str> = args
         .iter()
@@ -323,11 +324,12 @@ async fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> R
                     display_text(&e.to_string())
                 )?;
             }
-            let rows = home.take_inbox()?;
-            if !json && rows.is_empty() {
-                writeln!(out, "no new messages")?;
-            }
-            print_entries(&home, &rows, json, out)?;
+            home.take_inbox(|rows| {
+                if !json && rows.is_empty() {
+                    writeln!(out, "no new messages")?;
+                }
+                print_entries(&home, rows, json, out)
+            })?;
         }
         ("log", [team]) => print_entries(&home, &home.log(team)?, json, out)?,
         ("accept-verdict", [team, id, verdict]) => {

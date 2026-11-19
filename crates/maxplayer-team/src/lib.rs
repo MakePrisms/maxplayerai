@@ -36,20 +36,26 @@ pub fn display_text(text: &str) -> String {
         })
         .collect()
 }
+/// Invisible format characters (Unicode `Cf`): bidi controls, zero-width characters, the soft
+/// hyphen, invisible operators and the tag block.
 fn visual_format(c: char) -> bool {
-    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-        | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{200b}' | '\u{200c}'
-        | '\u{feff}' | '\u{2060}')
+    matches!(c, '\u{ad}' | '\u{600}'..='\u{605}' | '\u{61c}' | '\u{6dd}' | '\u{70f}'
+        | '\u{890}' | '\u{891}' | '\u{8e2}' | '\u{180e}' | '\u{200b}'..='\u{200f}'
+        | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206f}'
+        | '\u{feff}' | '\u{fff9}'..='\u{fffb}' | '\u{110bd}' | '\u{110cd}'
+        | '\u{13430}'..='\u{1343f}' | '\u{1bca0}'..='\u{1bca3}' | '\u{1d173}'..='\u{1d17a}'
+        | '\u{e0000}'..='\u{e007f}')
 }
-/// JSON output with bidi/zero-width format characters and line/paragraph separators escaped
-/// (serde already escapes controls, but not U+2028/U+2029).
+/// JSON output with controls (serde escapes only those below U+0020, not DEL or C1), invisible
+/// format characters and line/paragraph separators escaped as `\uXXXX` (a surrogate pair above
+/// U+FFFF).
 pub fn display_json(value: serde_json::Value) -> String {
     value
         .to_string()
         .chars()
         .map(|c| {
-            if visual_format(c) || matches!(c, '\u{2028}' | '\u{2029}') {
-                format!("\\u{:04x}", c as u32)
+            if c.is_control() || visual_format(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+                c.encode_utf16(&mut [0; 2]).iter().map(|u| format!("\\u{u:04x}")).collect()
             } else {
                 c.to_string()
             }
@@ -75,6 +81,13 @@ pub const REVIEW_WINDOW: u64 = 1800;
 /// How long past a [`Home::sync_deadline`] the state lock is still waited for (so the inbox can
 /// still be read and marked after a catch-up that ran to the deadline).
 pub const LOCK_GRACE: Duration = Duration::from_secs(2);
+/// The relay accepts event timestamps this far from its clock, so a catch-up re-reads this much
+/// before its cursor (a message that arrives late with an older stamp is still fetched; repeats
+/// are dropped by id).
+pub const CLOCK_SKEW: u64 = 900;
+/// `watch` waits this long for one verdict while it holds the state lock; a later verdict is
+/// picked up by the retry (30 s).
+pub const WATCH_REVIEW_WAIT: Duration = Duration::from_secs(5);
 /// Default follow on the default relay (spec §6): Team Maxplayer, posted by maxie-agent for now.
 /// The channel must exist on the relay before a release ships this.
 pub const TEAM_MAXPLAYER: (&str, &str) = (
@@ -194,6 +207,8 @@ enum Outcome {
     Verdict(Option<Event>),
     Final(String),
     Retry,
+    /// The reviewer's per-key admission limit (10 a minute).
+    RateLimited,
 }
 
 /// Shape checks before anything is stored or reviewed (spec §5, §6): kind 9, valid signature,
@@ -307,6 +322,9 @@ pub struct Home {
     /// `maxplayer mcp`'s `team_inbox` sets it so a slow reviewer cannot run past the tool deadline
     /// and mark messages read that the caller never received. `None` (the CLI) waits.
     pub sync_deadline: Option<std::time::Instant>,
+    /// Longest wait for one verdict (`watch`: [`WATCH_REVIEW_WAIT`]); a review still waiting
+    /// counts as unavailable and is retried.
+    pub review_wait: Option<Duration>,
 }
 
 impl Home {
@@ -328,7 +346,7 @@ impl Home {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir.join("quarantine"))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         http_base(relay)?;
-        Ok(Self { root, keys, relay: relay.to_owned(), config, sync_deadline: None })
+        Ok(Self { root, keys, relay: relay.to_owned(), config, sync_deadline: None, review_wait: None })
     }
     /// One relay read: 10 s, or what is left before [`Home::sync_deadline`] (at least 100 ms).
     fn read_wait(&self) -> Duration {
@@ -450,7 +468,10 @@ impl Home {
             if line.trim().is_empty() {
                 continue;
             }
-            let s: Stored = serde_json::from_str(&line)?;
+            let Ok(s) = serde_json::from_str::<Stored>(&line) else {
+                eprintln!("warning: skipping a damaged line in team/messages.jsonl");
+                continue;
+            };
             match at.get(&s.event.id) {
                 Some(&i) => out[i] = s,
                 None => {
@@ -651,12 +672,24 @@ impl Home {
     pub async fn invites(&self) -> Result<Vec<(String, String)>> {
         let state = self.load()?;
         let client = self.connect().await?;
+        // The pool returns no events, not an error, for a relay it could not reach.
+        if !client.relay(&self.relay).await?.is_connected() {
+            client.shutdown().await;
+            return Err("could not reach the relay".into());
+        }
         let adds = client
             .fetch_events(Filter::new().kind(Kind::Custom(9000)).pubkey(self.keys.public_key()).limit(500), self.read_wait())
             .await;
+        let adds = match adds {
+            Ok(adds) => adds,
+            Err(e) => {
+                client.shutdown().await;
+                return Err(e.into());
+            }
+        };
         let mut out = vec![];
         let mut seen = BTreeSet::new();
-        for event in adds.map(|e| e.into_iter().collect::<Vec<_>>()).unwrap_or_default() {
+        for event in adds {
             let Some(channel) = tag_value(&event, "h") else { continue };
             if review::repo_id(&channel).is_none() || state.teams.contains_key(&channel) || !seen.insert(channel.clone()) {
                 continue;
@@ -763,9 +796,10 @@ impl Home {
         }
         state.review_times.push(t);
         let check = review::check(&self.config, &self.relay, client, &self.keys, request, counterparty);
-        let result = match self.sync_deadline {
+        let left = self.sync_deadline.map(|d| d.saturating_duration_since(std::time::Instant::now()));
+        let result = match left.into_iter().chain(self.review_wait).min() {
             None => check.await,
-            Some(d) => match tokio::time::timeout(d.saturating_duration_since(std::time::Instant::now()), check).await {
+            Some(wait) => match tokio::time::timeout(wait, check).await {
                 Ok(r) => r,
                 Err(_) => return Outcome::Retry,
             },
@@ -774,7 +808,7 @@ impl Home {
             Ok(v) => Outcome::Verdict(v),
             Err(e) if failure_state(&e) == "error" => {
                 eprintln!("review unavailable: {}", display_text(&e));
-                Outcome::Retry
+                if e.contains("(rate_limited)") { Outcome::RateLimited } else { Outcome::Retry }
             }
             Err(e) => Outcome::Final(e),
         }
@@ -793,10 +827,10 @@ impl Home {
         event: Event,
         available: &mut bool,
     ) -> Result<bool> {
-        state.cursors.insert(channel.into(), state.cursors.get(channel).copied().unwrap_or(0).max(event.created_at.as_secs().min(now())));
         if known.contains(&event.id) || admit(&event, channel, owner).is_err() {
             return Ok(false);
         }
+        state.cursors.insert(channel.into(), state.cursors.get(channel).copied().unwrap_or(0).max(event.created_at.as_secs().min(now())));
         known.insert(event.id);
         let author = event.pubkey.to_hex();
         let mut stored = Stored { channel: channel.into(), event, verdict: None, error: None };
@@ -806,7 +840,7 @@ impl Home {
             match outcome {
                 Outcome::Verdict(v) => stored.verdict = v,
                 Outcome::Final(e) => stored.error = Some(e),
-                Outcome::Retry => {
+                Outcome::Retry | Outcome::RateLimited => {
                     *available = false;
                     state.retry.insert(stored.event.id.to_hex(), Retry { next: now() + 30, delay: 30 });
                 }
@@ -831,7 +865,7 @@ impl Home {
             };
             let request = review::Request::message(s.event.clone()).map_err(|e| e.to_string())?;
             match self.review(client, state, &request, &s.event.pubkey.to_hex()).await {
-                Outcome::Retry => {
+                Outcome::Retry | Outcome::RateLimited => {
                     let r = state.retry.get_mut(&id).expect("due");
                     r.delay = (r.delay * 2).min(3600);
                     r.next = now() + r.delay;
@@ -841,7 +875,7 @@ impl Home {
                     match outcome {
                         Outcome::Verdict(v) => s.verdict = v,
                         Outcome::Final(e) => s.error = Some(e),
-                        Outcome::Retry => unreachable!(),
+                        _ => unreachable!(),
                     }
                     state.retry.remove(&id);
                     self.append(&s)?;
@@ -871,7 +905,15 @@ impl Home {
     /// Catch up every source from its cursor (inclusive `until` paging, dedupe by id); a first
     /// sync takes the newest [`FIRST_SYNC`]. Returns channels with newly delivered messages.
     async fn catch_up(&self, client: &Client, state: &mut State) -> Result<Vec<String>> {
-        let mut known: BTreeSet<EventId> = self.stored()?.into_iter().map(|s| s.event.id).collect();
+        let stored = self.stored()?;
+        // A message stored while review was off has no verdict and no retry entry: once review
+        // applies to it, it is reviewed like an availability-withheld one.
+        for s in &stored {
+            if s.verdict.is_none() && s.error.is_none() && !state.retry.contains_key(&s.event.id.to_hex()) && self.status(state, s) == withheld("pending") {
+                state.retry.insert(s.event.id.to_hex(), Retry { next: 0, delay: 30 });
+            }
+        }
+        let mut known: BTreeSet<EventId> = stored.into_iter().map(|s| s.event.id).collect();
         let mut available = true;
         let mut delivered = vec![];
         for (channel, owner) in self.sources(state) {
@@ -888,7 +930,8 @@ impl Home {
                         events.insert(e.id, e);
                     }
                 }
-                Some(&since) => {
+                Some(&cursor) => {
+                    let since = cursor.saturating_sub(CLOCK_SKEW);
                     let mut until = None;
                     for _ in 0..20 {
                         let mut f = base.clone().since(Timestamp::from(since)).limit(1000);
@@ -904,9 +947,10 @@ impl Home {
                         }
                         match oldest {
                             Some(o) if full && events.len() > before => until = Some(o),
-                            Some(_) if full => {
+                            // A saturated second: step back one second and warn.
+                            Some(o) if full && o.as_secs() > since => {
                                 eprintln!("warning: more than 1000 messages in one second; some skipped");
-                                break;
+                                until = Some(Timestamp::from(o.as_secs() - 1));
                             }
                             _ => break,
                         }
@@ -942,7 +986,8 @@ impl Home {
     }
 
     /// Stay connected; reconnect fresh every five minutes. Never returns except on a fatal error.
-    pub async fn watch(&self, notify: Vec<String>) -> Result<()> {
+    pub async fn watch(mut self, notify: Vec<String>) -> Result<()> {
+        self.review_wait = Some(WATCH_REVIEW_WAIT);
         let mut notifier = Notifier::new(notify);
         let mut failures = 0u32;
         loop {
@@ -962,7 +1007,7 @@ impl Home {
     }
     async fn watch_once(&self, notifier: &mut Notifier) -> Result<()> {
         let client = self.connect().await?;
-        let start = Timestamp::now();
+        let start = Timestamp::from(now().saturating_sub(CLOCK_SKEW));
         let sources = {
             let _lock = self.lock()?;
             let mut state = self.load()?;
@@ -977,11 +1022,10 @@ impl Home {
             .map(|(c, o)| Self::source_filter(c, o.as_deref()).map(|f| f.since(start)))
             .collect::<Result<Vec<_>>>()?;
         let mut notes = client.notifications();
-        for chunk in filters.chunks(10) {
-            for f in chunk {
-                client.subscribe(f.clone(), None).await?;
-            }
+        for f in filters {
+            client.subscribe(f, None).await?;
         }
+        let mut known: BTreeSet<EventId> = self.stored()?.into_iter().map(|s| s.event.id).collect();
         let refresh = tokio::time::Instant::now() + Duration::from_secs(300);
         let mut retry_tick = tokio::time::Instant::now() + Duration::from_secs(30);
         let result = loop {
@@ -1004,7 +1048,6 @@ impl Home {
                     let Some((_, owner)) = sources.iter().find(|(c, _)| *c == channel) else { continue };
                     let _lock = self.lock()?;
                     let mut state = self.load()?;
-                    let mut known: BTreeSet<EventId> = self.stored()?.into_iter().map(|s| s.event.id).collect();
                     let mut available = true;
                     let delivered = self
                         .ingest(&client, &mut state, &mut known, &channel, owner.as_deref(), *event, &mut available)
@@ -1027,8 +1070,9 @@ impl Home {
     }
 
     /// Inbox lines not shown before, oldest first: delivered messages, and each withheld state
-    /// once. Marks them shown.
-    pub fn take_inbox(&self) -> Result<Vec<(Stored, Status)>> {
+    /// once. They are marked shown only after `render` has turned them into the output; an error
+    /// from it (a caller past its deadline) marks nothing.
+    pub fn take_inbox<T>(&self, render: impl FnOnce(&[(Stored, Status)]) -> Result<T>) -> Result<T> {
         let _lock = self.lock()?;
         let mut state = self.load()?;
         let mut out = vec![];
@@ -1045,15 +1089,20 @@ impl Home {
                 out.push((s, status));
             }
         }
+        let rendered = render(&out)?;
         self.save(&state)?;
-        Ok(out)
+        Ok(rendered)
+    }
+    /// A joined team (name, id or prefix) or a followed channel id.
+    fn channel_of(&self, state: &State, team: &str) -> Result<String> {
+        match state.resolve(team) {
+            Ok(t) => Ok(t.channel.clone()),
+            Err(e) => Ok(self.follows(state).into_iter().find(|f| f.channel == team).map(|f| f.channel).ok_or(e)?),
+        }
     }
     pub fn log(&self, team: &str) -> Result<Vec<(Stored, Status)>> {
         let state = self.load()?;
-        let channel = match state.resolve(team) {
-            Ok(t) => t.channel.clone(),
-            Err(e) => self.follows(&state).into_iter().find(|f| f.channel == team).map(|f| f.channel).ok_or(e)?,
-        };
+        let channel = self.channel_of(&state, team)?;
         Ok(self
             .stored()?
             .into_iter()
@@ -1068,8 +1117,8 @@ impl Home {
     pub fn accept_verdict(&self, team: &str, id: &str, verdict: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut state = self.load()?;
-        let t = state.resolve(team)?.clone();
         let subject = if id.len() == 40 {
+            let t = state.resolve(team)?.clone();
             let event = state
                 .commit_verdicts
                 .get(&maxplayer_core::review::team_commit_event(&t.repo(), id))
@@ -1081,10 +1130,11 @@ impl Home {
                 _ => return Err("only a Refused verdict can be accepted".into()),
             }
         } else {
+            let channel = self.channel_of(&state, team)?;
             let s = self
                 .stored()?
                 .into_iter()
-                .find(|s| s.channel == t.channel && s.event.id.to_hex() == id)
+                .find(|s| s.channel == channel && s.event.id.to_hex() == id)
                 .ok_or("no such message in this team")?;
             match self.status(&state, &s) {
                 Status::Withheld { state: st, verdict: Some(v), .. } if st == "refused" && v == verdict => id.to_owned(),
@@ -1118,12 +1168,16 @@ impl Home {
         }
         Ok(cmd.args(args).output()?)
     }
-    fn git_ok(&self, dir: &Path, auth: Option<&str>, args: &[&str]) -> Result<String> {
+    /// Stdout of a git command that must succeed.
+    fn git_out(&self, dir: &Path, auth: Option<&str>, args: &[&str]) -> Result<Vec<u8>> {
         let out = self.git(dir, auth, args)?;
         if !out.status.success() {
             return Err(format!("git {}: {}", args[0], display_text(String::from_utf8_lossy(&out.stderr).trim())).into());
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        Ok(out.stdout)
+    }
+    fn git_ok(&self, dir: &Path, auth: Option<&str>, args: &[&str]) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.git_out(dir, auth, args)?).trim().to_owned())
     }
     fn worktree(&self, team: &Team, dir: &Path) -> Result<String> {
         let url = self.repo_url(team)?;
@@ -1142,17 +1196,25 @@ impl Home {
             return Err("target directory already exists".into());
         }
         fs::create_dir_all(&dir)?;
-        self.git_ok(&dir, None, &["init", "-q"])?;
-        self.git_ok(&dir, None, &["remote", "add", "origin", &url])?;
-        let head = self.git_ok(&dir, Some(&url), &["ls-remote", "--symref", &url, "HEAD"])?;
-        let Some(branch) = head
-            .lines()
-            .find_map(|l| l.strip_prefix("ref: refs/heads/").and_then(|r| r.split('\t').next()))
-            .map(str::to_owned)
-        else {
-            return Ok(format!("cloned an empty repo into {}", dir.display()));
-        };
-        self.pull_in(&t, &dir, &branch).await
+        let cloned = async {
+            self.git_ok(&dir, None, &["init", "-q"])?;
+            self.git_ok(&dir, None, &["remote", "add", "origin", &url])?;
+            let head = self.git_ok(&dir, Some(&url), &["ls-remote", "--symref", &url, "HEAD"])?;
+            let Some(branch) = head
+                .lines()
+                .find_map(|l| l.strip_prefix("ref: refs/heads/").and_then(|r| r.split('\t').next()))
+                .map(str::to_owned)
+            else {
+                return Ok(format!("cloned an empty repo into {}", display_text(&dir.display().to_string())));
+            };
+            self.pull_in(&t, &dir, &branch).await
+        }
+        .await;
+        // A clone that fails half-way leaves nothing behind.
+        if cloned.is_err() {
+            let _ = fs::remove_dir_all(&dir);
+        }
+        cloned
     }
     pub async fn pull(&self, team: &str, branch: Option<&str>) -> Result<String> {
         let t = self.load()?.resolve(team)?.clone();
@@ -1169,19 +1231,20 @@ impl Home {
         let url = self.worktree(t, dir)?;
         let q = self.path(&format!("quarantine/{}.git", t.repo()));
         if !q.exists() {
-            Command::new("git").args(["init", "--bare", "-q"]).arg(&q).status()?;
+            self.git_ok(&self.path("quarantine"), None, &["init", "--bare", "-q", &q.to_string_lossy()])?;
         }
+        let shown = display_text(branch);
         let qref = format!("refs/quarantine/{branch}");
         self.git_ok(&q, Some(&url), &["fetch", "-q", "--no-tags", &url, &format!("+refs/heads/{branch}:{qref}")])?;
         let tip = self.git_ok(&q, None, &["rev-parse", &format!("{qref}^{{commit}}")])?;
         let origin = format!("refs/remotes/origin/{branch}");
         let base = self.git_ok(dir, None, &["rev-parse", "--verify", "-q", &format!("{origin}^{{commit}}")]).ok();
         if base.as_deref() == Some(tip.as_str()) {
-            return Ok(format!("{branch} is up to date"));
+            return Ok(format!("{shown} is up to date"));
         }
         if let Some(base) = &base {
             if !self.git(&q, None, &["merge-base", "--is-ancestor", base, &tip])?.status.success() {
-                return Err(format!("origin/{branch} was rewritten; refusing (start a new branch from the last passed commit)").into());
+                return Err(format!("origin/{shown} was rewritten; refusing (start a new branch from the last passed commit)").into());
             }
         }
         let range = match &base {
@@ -1207,20 +1270,18 @@ impl Home {
         if let Some(e) = failure {
             return Err(e);
         }
-        self.git_ok(dir, None, &["fetch", "-q", "--no-tags", &q.to_string_lossy(), &format!("+{qref}:{origin}")])?;
-        if self.git_ok(dir, None, &["rev-parse", &origin])? != tip {
-            return Err("quarantine changed during pull; run pull again".into());
-        }
+        // The screened oid itself, never the quarantine ref: a concurrent pull may have moved it.
+        self.git_ok(dir, None, &["fetch", "-q", "--no-tags", &q.to_string_lossy(), &format!("+{tip}:{origin}")])?;
         let current = self.git_ok(dir, None, &["symbolic-ref", "--short", "HEAD"]).unwrap_or_default();
         let has_head = self.git(dir, None, &["rev-parse", "--verify", "-q", "HEAD"])?.status.success();
         if !has_head {
             self.git_ok(dir, None, &["checkout", "-q", "-B", branch, &origin])?;
         } else if current == branch {
             if !self.git(dir, None, &["merge", "--ff-only", "-q", &origin])?.status.success() {
-                return Ok(format!("{} passed review; origin/{branch} updated; your {branch} has local commits: rebase onto origin/{branch}", commits.len()));
+                return Ok(format!("{} passed review; origin/{shown} updated; your {shown} has local commits: rebase onto origin/{shown}", commits.len()));
             }
         }
-        Ok(format!("{} new commit(s) passed review; origin/{branch} at {}", commits.len(), short(&tip)))
+        Ok(format!("{} new commit(s) passed review; origin/{shown} at {}", commits.len(), short(&tip)))
     }
     async fn screen_commit(&self, client: &Client, state: &mut State, t: &Team, commit: &str) -> Result<()> {
         if !self.config.review.enabled(maxplayer_core::kinds::TEAM_COMMIT_SUBJECT_KIND, "")? {
@@ -1228,17 +1289,30 @@ impl Home {
         }
         let request = review::Request::commit(&t.repo(), &t.creator, commit).map_err(|e| e.to_string())?;
         let key = request.subject.event.clone();
-        let verdict = match state.commit_verdicts.get(&key) {
+        // A cached verdict that no longer verifies (say, a new reviewer key) is asked for again.
+        let cached = state.commit_verdicts.get(&key).filter(|v| review::decide(&self.config, &self.relay, v, &request.subject, None).is_ok());
+        let verdict = match cached {
             Some(v) => v.clone(),
-            None => match self.review(client, state, &request, "").await {
-                Outcome::Verdict(Some(v)) => {
-                    state.commit_verdicts.insert(key.clone(), v.clone());
-                    v
+            None => {
+                let mut waits = 0;
+                loop {
+                    match self.review(client, state, &request, "").await {
+                        Outcome::Verdict(Some(v)) => {
+                            state.commit_verdicts.insert(key.clone(), v.clone());
+                            break v;
+                        }
+                        Outcome::Verdict(None) => return Ok(()),
+                        Outcome::Final(e) => return Err(format!("commit {}: {}", short(commit), display_text(&e)).into()),
+                        // More than 10 new commits in a minute: wait for the reviewer's window.
+                        Outcome::RateLimited if waits < 10 && self.sync_deadline.is_none() => {
+                            waits += 1;
+                            eprintln!("reviewer rate limit (10 commits a minute): waiting a minute");
+                            tokio::time::sleep(Duration::from_secs(61)).await;
+                        }
+                        _ => return Err(format!("commit {}: review unavailable; pull again later", short(commit)).into()),
+                    }
                 }
-                Outcome::Verdict(None) => return Ok(()),
-                Outcome::Final(e) => return Err(format!("commit {}: {}", short(commit), display_text(&e)).into()),
-                Outcome::Retry => return Err(format!("commit {}: review unavailable; pull again later", short(commit)).into()),
-            },
+            }
         };
         let accepted = state.accepted.get(&key).map(String::as_str);
         match review::decide(&self.config, &self.relay, &verdict, &request.subject, accepted)? {
@@ -1256,8 +1330,11 @@ impl Home {
     /// non-UTF-8 commit text, symlinks and submodules.
     pub fn push(&self, team: &str, branch: Option<&str>) -> Result<String> {
         let t = self.load()?.resolve(team)?.clone();
-        let dir = std::env::current_dir()?;
-        let url = self.worktree(&t, &dir)?;
+        self.push_in(&t, &std::env::current_dir()?, branch)
+    }
+    fn push_in(&self, t: &Team, dir: &Path, branch: Option<&str>) -> Result<String> {
+        let dir = dir.to_path_buf();
+        let url = self.worktree(t, &dir)?;
         let branch = match branch {
             Some(b) => b.to_owned(),
             None => self.git_ok(&dir, None, &["symbolic-ref", "--short", "HEAD"])?,
@@ -1275,16 +1352,16 @@ impl Home {
         }
         self.git_ok(&dir, Some(&url), &["push", "-q", &url, &format!("{head}:refs/heads/{branch}")])?;
         self.git_ok(&dir, None, &["update-ref", &origin, &head])?;
-        Ok(format!("pushed {branch} at {}", short(&head)))
+        Ok(format!("pushed {} at {}", display_text(&branch), short(&head)))
     }
     fn check_pushable(&self, dir: &Path, commit: &str) -> Result<()> {
         let refuse = |why: &str| -> Result<()> { Err(format!("commit {} not pushed: {why}", short(commit)).into()) };
-        let raw = self.git(dir, None, &["cat-file", "commit", commit])?.stdout;
+        let raw = self.git_out(dir, None, &["cat-file", "commit", commit])?;
         if raw.contains(&0) || std::str::from_utf8(&raw).is_err() {
             return refuse("commit header or message has NUL or non-UTF-8 bytes");
         }
-        let out = self.git(dir, None, &["diff-tree", "-r", "-z", "--raw", "--root", "-m", "--no-commit-id", commit])?;
-        let fields: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+        let out = self.git_out(dir, None, &["diff-tree", "-r", "-z", "--raw", "--root", "-m", "--no-commit-id", commit])?;
+        let fields: Vec<&[u8]> = out.split(|b| *b == 0).collect();
         let mut i = 0;
         while i + 1 < fields.len() {
             let meta = std::str::from_utf8(fields[i]).unwrap_or("");
@@ -1303,7 +1380,7 @@ impl Home {
                 "000000" => continue,
                 _ => {}
             }
-            let blob = self.git(dir, None, &["cat-file", "blob", parts[3]])?.stdout;
+            let blob = self.git_out(dir, None, &["cat-file", "blob", parts[3]])?;
             if blob.contains(&0) || std::str::from_utf8(&blob).is_err() {
                 return refuse(&format!("{} is binary or not UTF-8", display_text(&String::from_utf8_lossy(path))));
             }

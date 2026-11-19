@@ -1841,7 +1841,14 @@ mod tests {
         let sent = call(&state_a, "team_send", json!({"team": "crew", "text": words}));
         let id = sent["id"].as_str().unwrap().to_owned();
 
+        // A call abandoned by the MCP deadline, or past the cutoff, marks nothing shown.
+        for (abandoned, started) in [(true, std::time::Instant::now()), (false, std::time::Instant::now() - Duration::from_secs(14))] {
+            let flag = std::sync::atomic::AtomicBool::new(abandoned);
+            let late = rt.block_on(team::run(&root_b, &url, "team_inbox", &serde_json::Map::new(), &flag, started));
+            assert!(late.unwrap_err().contains("nothing was marked shown"));
+        }
         let inbox = call(&state_b, "team_inbox", json!({}));
+        assert_eq!(inbox["untrusted"], team::UNTRUSTED_RESULT);
         assert!(inbox.get("warning").is_none(), "{inbox}");
         let rows = inbox["result"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "{inbox}");
