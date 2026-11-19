@@ -11,7 +11,7 @@ mod request_wire;
 pub(crate) use delivery_budget::seller_delivery_budget;
 
 const DOMAIN: &str = "maxplayer-private-review-v1";
-const MAX_MESSAGE: usize = 60 * 1024;
+pub(super) const MAX_MESSAGE: usize = 60 * 1024;
 #[derive(Clone, Deserialize)]
 #[serde(try_from = "request_wire::RequestWire")]
 pub struct Request {
@@ -229,7 +229,7 @@ pub async fn wrap(keys: &Keys, recipient: PublicKey, event: &Event) -> Result<Ev
             pc::transport::WrapError::Other(message) => format!("review: {message}"),
         })
 }
-fn check_size(layer: &str, actual: usize, allowed: usize) -> Result<(), String> {
+pub(super) fn check_size(layer: &str, actual: usize, allowed: usize) -> Result<(), String> {
     if actual > allowed {
         return Err(format!(
             "review: permanent input error: private {layer} is {actual} bytes; limit {allowed} bytes; retrying unchanged input cannot help"
@@ -615,12 +615,14 @@ where
     ))
 }
 
-struct Transport<'a> {
-    client: &'a Client,
-    relay: &'a str,
-    identity: Identity<'a>,
-    request: &'a Request,
-    reviewer: PublicKey,
+/// Encrypted request/verdict lane. `draft` signs a fresh request per attempt, so job and team
+/// requests (`super::team`) share one transport.
+pub(super) struct Transport<'a> {
+    pub(super) client: &'a Client,
+    pub(super) relay: &'a str,
+    pub(super) identity: Identity<'a>,
+    pub(super) draft: &'a (dyn Fn(&str) -> Result<EventDraft, String> + Sync),
+    pub(super) reviewer: PublicKey,
 }
 impl wire::Transport for Transport<'_> {
     async fn fetch(&self, subject: &Subject, reviewer: &PublicKey) -> Result<Vec<Event>, String> {
@@ -673,7 +675,7 @@ impl wire::Transport for Transport<'_> {
     async fn request(&self, _: EventDraft) -> Result<(), String> {
         let outer = self
             .identity
-            .request(self.request.draft(&self.reviewer.to_hex())?, self.reviewer)
+            .request((self.draft)(&self.reviewer.to_hex())?, self.reviewer)
             .await?;
         let output = self
             .client
@@ -727,7 +729,7 @@ pub async fn check_detailed(
         client,
         relay: &home.config.relay_url,
         identity,
-        request,
+        draft: &|reviewer| request.draft(reviewer),
         reviewer: PublicKey::from_hex(reviewer).map_err(|_| "review: invalid reviewer key")?,
     };
     // Reuse the exact decision/retry contract, but only with the encrypted transport.

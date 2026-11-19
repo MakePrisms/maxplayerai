@@ -4,9 +4,13 @@
 pub mod private;
 #[cfg(feature = "wallet")]
 pub mod state;
+/// Maxplayer Team screening requests (docs/specs/maxplayer-team.md §5).
+#[cfg(feature = "wallet")]
+pub mod team;
 use crate::gateway::{EventDraft, MAXPLAYER_TAG, PROTOCOL_VERSION, TagSpec};
 use crate::kinds::{
     JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_KIND, REVIEW_REQUEST_KIND, SESSION_FOLLOWUP_KIND,
+    TEAM_COMMIT_SUBJECT_KIND, TEAM_MESSAGE_KIND,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -34,6 +38,11 @@ pub struct ReviewConfig {
     /// Provisional mock-stage default; calibration is required before release.
     pub reject_at_or_above_ppm: u32,
     pub timeout_seconds: u64,
+    /// Team chat messages and followed posts (docs/specs/maxplayer-team.md §7).
+    pub team_message: bool,
+    pub team_commit: bool,
+    /// Team members whose messages skip review (messages only: a commit's pusher is unknown).
+    pub skip_member_pubkeys: Vec<String>,
 }
 impl Default for ReviewConfig {
     fn default() -> Self {
@@ -48,6 +57,9 @@ impl Default for ReviewConfig {
             )]),
             reject_at_or_above_ppm: 500_000,
             timeout_seconds: 300,
+            team_message: true,
+            team_commit: true,
+            skip_member_pubkeys: vec![],
         }
     }
 }
@@ -66,6 +78,7 @@ impl ReviewConfig {
             .skip_buyer_pubkeys
             .iter()
             .chain(&self.skip_seller_pubkeys)
+            .chain(&self.skip_member_pubkeys)
             .chain(self.reviewers.values())
             .any(|s| !hex_id(s))
         {
@@ -85,9 +98,27 @@ impl ReviewConfig {
                 Ok(self.buyer_delivery
                     && !self.skip_seller_pubkeys.iter().any(|p| p == counterparty))
             }
+            TEAM_MESSAGE_KIND => Ok(self.team_message
+                && !self.skip_member_pubkeys.iter().any(|p| p == counterparty)),
+            TEAM_COMMIT_SUBJECT_KIND => Ok(self.team_commit),
             _ => Err("review: unsupported subject kind".into()),
         }
     }
+}
+/// A team repo id: the channel UUID's 32 hex digits, then 32 zeros (spec §3).
+pub fn team_repo_id(id: &str) -> bool {
+    hex_id(id) && id.ends_with(&"0".repeat(32))
+}
+/// The per-commit subject `event` (spec §5): unique per repo and commit, so verdicts and
+/// evidence of different commits never share an `e` tag.
+pub fn team_commit_event(repo: &str, commit: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"maxplayer-team-commit/1\0");
+    hash.update(repo.as_bytes());
+    hash.update(b"\0");
+    hash.update(commit.as_bytes());
+    hex::encode(hash.finalize())
 }
 fn hex_id(s: &str) -> bool {
     s.len() == 64
@@ -118,6 +149,19 @@ impl Subject {
                         && c.bytes()
                             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
                 }) =>
+            {
+                Ok(())
+            }
+            // Team subjects never carry a job id: a team request cannot score a job delivery.
+            TEAM_MESSAGE_KIND if team_repo_id(&self.offer) && self.commit.is_none() => Ok(()),
+            TEAM_COMMIT_SUBJECT_KIND
+                if team_repo_id(&self.offer)
+                    && self.commit.as_ref().is_some_and(|c| {
+                        c.len() == 40
+                            && c.bytes()
+                                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                            && self.event == team_commit_event(&self.offer, c)
+                    }) =>
             {
                 Ok(())
             }

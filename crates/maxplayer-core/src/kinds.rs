@@ -64,6 +64,11 @@ pub const REVIEW_REQUEST_KIND: u16 = 3409;
 /// (`docs/specs/session-jobs.md` §2.1). Deliberately outside the contiguous `3400`–`3407` block
 /// (`3410`/`3411` belong to `maxplayer-trade`).
 pub const SESSION_FOLLOWUP_KIND: u16 = 3412;
+/// Maxplayer Team chat message: a Buzz channel message (NIP-29 kind 9), reviewed as a subject
+/// (`docs/specs/maxplayer-team.md` §5).
+pub const TEAM_MESSAGE_KIND: u16 = 9;
+/// Review subject kind for one team-repo commit (§5). Never published as an event of its own.
+pub const TEAM_COMMIT_SUBJECT_KIND: u16 = 3413;
 /// Addressable seller liveness heartbeat, `d="maxplayer-seller"`. Must stay in the NIP-01
 /// parameterized-replaceable range `30000`–`39999`, hence `30340` (not a `34xx` value).
 pub const SELLER_HEARTBEAT_KIND: u16 = 30340;

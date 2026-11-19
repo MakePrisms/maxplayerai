@@ -958,6 +958,22 @@ pub(crate) fn fetch_review_ref(
     fetch_review_ref_inner(repo, remote_url, refspec, Some(header), max_bytes, deadline)
 }
 
+/// Fetch one commit by id with its parents (`depth(2)`), for a team commit review
+/// (docs/specs/maxplayer-team.md §5). The relay offers `allow-reachable-sha1-in-want`; an
+/// unreachable id fails.
+pub(crate) fn fetch_review_commit(
+    repo: &Repository,
+    remote_url: &str,
+    commit: &str,
+    header: String,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+) -> Result<(), TransportError> {
+    assert_allowed_repo_locator(remote_url)?;
+    let refspec = format!("+{commit}:refs/review/delivery");
+    fetch_review_inner(repo, remote_url, &refspec, Some(header), max_bytes, deadline, Some(2))
+}
+
 fn fetch_review_ref_inner(
     repo: &Repository,
     remote_url: &str,
@@ -965,6 +981,18 @@ fn fetch_review_ref_inner(
     header: Option<String>,
     max_bytes: usize,
     deadline: std::time::Instant,
+) -> Result<(), TransportError> {
+    fetch_review_inner(repo, remote_url, refspec, header, max_bytes, deadline, None)
+}
+
+fn fetch_review_inner(
+    repo: &Repository,
+    remote_url: &str,
+    refspec: &str,
+    header: Option<String>,
+    max_bytes: usize,
+    deadline: std::time::Instant,
+    depth: Option<i32>,
 ) -> Result<(), TransportError> {
     ensure_registered()?;
     let budget = Arc::new(ReadBudget {
@@ -980,6 +1008,9 @@ fn fetch_review_ref_inner(
     options
         .download_tags(AutotagOption::None)
         .remote_callbacks(callbacks);
+    if let Some(depth) = depth {
+        options.depth(depth);
+    }
     let mut remote = bound_remote(repo, remote_url)?;
     let context = LegContext {
         mint: header.map(static_auth),

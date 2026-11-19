@@ -30,6 +30,12 @@ impl Requests {
         self.changes.clear();
         Ok(())
     }
+    fn flush_rest(&mut self) -> Result<(), String> {
+        if !self.changes.is_empty() || self.ranges.is_empty() {
+            self.flush()?;
+        }
+        Ok(())
+    }
     fn add(&mut self, value: Value) -> Result<(), String> {
         if std::time::Instant::now() >= self.deadline {
             return Err("input_unavailable".into());
@@ -132,6 +138,23 @@ pub(super) fn plan(
     if requests.state(&[])?.len() > 24 * 1024 {
         return Err("input_too_large".into());
     }
+    add_changes(&repo, &diff, &mut requests, None, deadline)?;
+    if !requests.changes.is_empty() || requests.ranges.is_empty() {
+        requests.flush()?;
+    }
+    Plan::prepared(requests.file, requests.ranges, model, deadline)
+}
+
+
+/// Every delta of `diff` as bounded change items. Symlinks, submodules, binary and non-UTF-8
+/// blobs fail closed. `against` names the parent for a team commit (one diff per parent).
+fn add_changes(
+    repo: &git2::Repository,
+    diff: &git2::Diff<'_>,
+    requests: &mut Requests,
+    against: Option<&str>,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
     for (i, delta) in diff.deltas().enumerate() {
         if std::time::Instant::now() >= deadline {
             return Err("input_unavailable".into());
@@ -161,7 +184,7 @@ pub(super) fn plan(
             if len > crate::private_content::MAX_FILE_BYTES as usize {
                 return Err("input_too_large".into());
             }
-            verify_object(&repo, file.id(), git2::ObjectType::Blob)?;
+            verify_object(repo, file.id(), git2::ObjectType::Blob)?;
             let blob = repo.find_blob(file.id()).map_err(|_| "input_unavailable")?;
             if blob.is_binary()
                 || blob.content().contains(&0)
@@ -170,8 +193,11 @@ pub(super) fn plan(
                 return Err("unsupported_input".into());
             }
         }
-        let header = json!({"status":format!("{:?}",delta.status()),"old_path":delta.old_file().path().and_then(Path::to_str),"new_path":delta.new_file().path().and_then(Path::to_str),"old_mode":i32::from(delta.old_file().mode()),"new_mode":i32::from(delta.new_file().mode())});
-        let patch = git2::Patch::from_diff(&diff, i).map_err(|_| "input_unavailable")?;
+        let mut header = json!({"status":format!("{:?}",delta.status()),"old_path":delta.old_file().path().and_then(Path::to_str),"new_path":delta.new_file().path().and_then(Path::to_str),"old_mode":i32::from(delta.old_file().mode()),"new_mode":i32::from(delta.new_file().mode())});
+        if let Some(parent) = against {
+            header["against_parent"] = json!(parent);
+        }
+        let patch = git2::Patch::from_diff(diff, i).map_err(|_| "input_unavailable")?;
         if let Some(patch) = patch {
             if patch.num_hunks() == 0 {
                 requests.add(header.clone())?;
@@ -198,9 +224,71 @@ pub(super) fn plan(
             requests.add(header)?;
         }
     }
-    if !requests.changes.is_empty() || requests.ranges.is_empty() {
-        requests.flush()?;
+    Ok(())
+}
+
+/// A team commit (docs/specs/maxplayer-team.md §5): raw header and message first, then the
+/// commit's tree against EVERY parent (empty tree for a root, or for a parent missing at the
+/// shallow boundary), so a merge is never classified against one chosen side only.
+pub(super) fn team_plan(
+    path: &Path,
+    commit: &str,
+    subject: &Subject,
+    model: &str,
+    deadline: std::time::Instant,
+) -> Result<Plan, String> {
+    let repo = git2::Repository::open_bare(path).map_err(|_| "input_unavailable")?;
+    crate::private_content::repositories::check_object_quotas(&repo)
+        .map_err(|_| "input_too_large")?;
+    let oid = git2::Oid::from_str(commit).map_err(|_| "invalid_subject")?;
+    verify_object(&repo, oid, git2::ObjectType::Commit)?;
+    let tip = repo.find_commit(oid).map_err(|_| "input_unavailable")?;
+    let tree = tip.tree().map_err(|_| "input_unavailable")?;
+    verify_object(&repo, tree.id(), git2::ObjectType::Tree)?;
+    let header = std::str::from_utf8(tip.raw_header_bytes()).map_err(|_| "unsupported_input")?;
+    let message = std::str::from_utf8(tip.message_raw_bytes()).map_err(|_| "unsupported_input")?;
+    if header.contains('\0') || message.contains('\0') {
+        return Err("unsupported_input".into());
     }
+    let mut requests = Requests {
+        context: json!({"subject":subject,"team_commit":commit}),
+        changes: vec![],
+        file: private_spool()?,
+        ranges: vec![],
+        offset: 0,
+        model: model.into(),
+        deadline,
+    };
+    if requests.state(&[])?.len() > 24 * 1024 {
+        return Err("input_too_large".into());
+    }
+    requests.add(json!({"commit_header_and_message":true,"patch":format!("{header}\n{message}")}))?;
+    let mut options = git2::DiffOptions::new();
+    options.context_lines(3).force_text(true);
+    let mut bases: Vec<(Option<git2::Tree<'_>>, Option<String>)> = Vec::new();
+    for parent in tip.parent_ids() {
+        // A parent outside the fetched depth is absent: review against the empty tree.
+        let base = match repo.find_commit(parent) {
+            Ok(p) => {
+                verify_object(&repo, parent, git2::ObjectType::Commit)?;
+                let t = p.tree().map_err(|_| "input_unavailable")?;
+                verify_object(&repo, t.id(), git2::ObjectType::Tree)?;
+                Some(t)
+            }
+            Err(_) => None,
+        };
+        bases.push((base, Some(parent.to_string())));
+    }
+    if bases.is_empty() {
+        bases.push((None, None));
+    }
+    for (base, parent) in &bases {
+        let diff = repo
+            .diff_tree_to_tree(base.as_ref(), Some(&tree), Some(&mut options))
+            .map_err(|_| "input_unavailable")?;
+        add_changes(&repo, &diff, &mut requests, parent.as_deref(), deadline)?;
+    }
+    requests.flush_rest()?;
     Plan::prepared(requests.file, requests.ranges, model, deadline)
 }
 
