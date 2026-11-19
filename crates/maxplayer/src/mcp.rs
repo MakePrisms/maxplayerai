@@ -1673,7 +1673,10 @@ mod tests {
         assert!(schema("team_join")["properties"]["name"].is_object());
         assert_eq!(schema("team_send")["required"], json!(["team", "text"]));
         assert_eq!(schema("team_create")["required"], json!(["name"]));
-        assert_eq!(schema("team_create")["properties"]["open"]["type"], "boolean");
+        assert_eq!(
+            schema("team_create")["properties"]["open"]["type"],
+            "boolean"
+        );
         assert_eq!(schema("team_invite")["required"], json!(["team", "npub"]));
         for name in ["team_whoami", "team_list", "team_invites", "team_inbox"] {
             assert_eq!(schema(name)["properties"], json!({}), "{name}");
@@ -1837,14 +1840,29 @@ mod tests {
         let flag = std::sync::atomic::AtomicBool::new(false);
         let late_args = serde_json::Map::from_iter([("name".to_owned(), json!("crew"))]);
         let started = std::time::Instant::now() - Duration::from_secs(11);
-        let late = rt.block_on(team::run(&root_a, &url, "team_create", &late_args, &flag, started));
+        let late = rt.block_on(team::run(
+            &root_a,
+            &url,
+            "team_create",
+            &late_args,
+            &flag,
+            started,
+        ));
         assert!(late.unwrap_err().contains("not sent"));
         assert_eq!(call(&state_a, "team_list", json!({}))["teams"], json!({}));
         let created = call(&state_a, "team_create", json!({"name": "crew"}));
         let channel = created["channel"].as_str().unwrap().to_owned();
-        assert_eq!((created["name"].as_str(), created["open"].as_bool()), (Some("crew"), Some(false)));
+        assert_eq!(
+            (created["name"].as_str(), created["open"].as_bool()),
+            (Some("crew"), Some(false))
+        );
         assert_eq!(created["creator"], json!(a_hex));
-        assert!(created["repo"].as_str().unwrap().contains(&format!("/git/{a_hex}/")));
+        assert!(
+            created["repo"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("/git/{a_hex}/"))
+        );
         // The relay-side channel metadata Buzz would publish for the create.
         rt.block_on(async {
             let client = Client::default();
@@ -1852,12 +1870,22 @@ mod tests {
             client.connect().await;
             let tag = |t: &[&str]| Tag::parse(t.iter().copied()).unwrap();
             let about = format!("{} {a_hex}", maxplayer_team::MARKER);
-            let meta = EventBuilder::new(Kind::Custom(39000), "")
-                .tags([tag(&["d", &channel]), tag(&["private"]), tag(&["about", &about])]);
-            client.send_event(&meta.sign_with_keys(&keys_a).unwrap()).await.unwrap();
+            let meta = EventBuilder::new(Kind::Custom(39000), "").tags([
+                tag(&["d", &channel]),
+                tag(&["private"]),
+                tag(&["about", &about]),
+            ]);
+            client
+                .send_event(&meta.sign_with_keys(&keys_a).unwrap())
+                .await
+                .unwrap();
             client.disconnect().await;
         });
-        let invited = call(&state_a, "team_invite", json!({"team": "crew", "npub": b_npub}));
+        let invited = call(
+            &state_a,
+            "team_invite",
+            json!({"team": "crew", "npub": b_npub}),
+        );
         assert_eq!(invited["channel"], json!(channel));
 
         let invites = call(&state_b, "team_invites", json!({}));
