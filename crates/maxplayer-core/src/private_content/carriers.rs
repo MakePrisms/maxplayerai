@@ -189,6 +189,7 @@ pub fn project(
                         "delivery_failed",
                         "no_sentinel",
                         "session_expired",
+                        "turn_too_large",
                         "other",
                     ][..]
                 };
