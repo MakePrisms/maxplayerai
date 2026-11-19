@@ -170,14 +170,22 @@ impl World {
         );
     }
 
+    /// Install over this world. An install that keeps an existing mint asks the registration
+    /// service whether its key is linked: pointed at a closed loopback port so no test reaches the
+    /// real one (the lookup fails and the link step is printed).
     fn install(&self, extra: &[&str]) -> (i32, String, String) {
+        self.install_with_registration("http://127.0.0.1:9", extra)
+    }
+
+    fn install_with_registration(&self, url: &str, extra: &[&str]) -> (i32, String, String) {
         run(maxplayer()
             .args(["mint", "install", "--from", &self.from()])
             .arg("--home")
             .arg(&self.home)
             .arg("--bin-dir")
             .arg(&self.bin_dir)
-            .args(extra))
+            .args(extra)
+            .env("MAXPLAYER_REGISTRATION_URL", url))
     }
 
     fn info(&self, extra: &[&str]) -> (i32, String, String) {
@@ -328,6 +336,49 @@ fn install_verifies_installs_sets_up_the_mint_home_and_prints_the_link_step() {
     assert!(out.contains("already installed"), "{out}");
     assert!(out.contains("Kept the existing mint"), "{out}");
     assert_eq!(snapshot(&w.home), before);
+}
+
+#[test]
+fn install_over_an_already_linked_mint_drops_the_link_step() {
+    // rc-testing: `install --force` over a working, linked mint still said "Next: link the mint".
+    let w = World::new();
+    w.good_release();
+    let fake = FakeRegistration::start();
+    let link_step = "Next: link the mint to your Maxplayer account";
+
+    // A fresh mint (`init` just made its key) is never linked: the step is printed, nobody asked.
+    let (code, out, err) = w.install_with_registration(&fake.base_url(), &[]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains(link_step), "{out}");
+    assert!(fake.requests().is_empty(), "a fresh mint key was looked up");
+
+    // A kept mint that is not linked yet: still the step.
+    let (code, out, err) = w.install_with_registration(&fake.base_url(), &["--force"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("Kept the existing mint"), "{out}");
+    assert!(out.contains(link_step), "{out}");
+    assert!(!out.contains("already linked"), "{out}");
+    assert!(
+        !fake.requests().is_empty(),
+        "the kept mint's key was not looked up"
+    );
+
+    // Linked: one line saying so, and no link command.
+    fake.link_existing(&w.mint_keys.public_key().to_hex(), "op@example.com");
+    let (code, out, err) = w.install_with_registration(&fake.base_url(), &["--force"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        out.contains("The mint key is already linked to a Maxplayer account; nothing to link"),
+        "{out}"
+    );
+    assert!(!out.contains(link_step), "{out}");
+    assert!(!out.contains("account link --mint"), "{out}");
+
+    // A lookup that fails keeps the step.
+    let (code, out, err) = w.install(&["--force"]);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains(link_step), "{out}");
+    assert!(!out.contains("already linked"), "{out}");
 }
 
 #[test]
@@ -636,6 +687,37 @@ fn info_flags_a_binary_of_another_version() {
     w.put_installed("maxplayer-mint 0.6.0");
     let (_, out, _) = w.info(&["--offline"]);
     assert!(out.contains("mint install --force --bin-dir"), "{out}");
+}
+
+#[test]
+fn info_on_a_mint_that_answers_no_version_names_install_force() {
+    // A mint released before 0.8.0 has no `--version`: it prints usage and exits 2. `upgrade`
+    // refuses such a binary, so the status line must name the command that replaces it.
+    let w = World::new();
+    fs::create_dir_all(&w.bin_dir).unwrap();
+    fs::write(
+        w.target(),
+        "#!/bin/sh\necho 'usage: maxplayer-mint <init|run>' >&2\nexit 2\n",
+    )
+    .unwrap();
+    fs::set_permissions(w.target(), fs::Permissions::from_mode(0o755)).unwrap();
+    let (code, out, _) = w.info(&["--offline"]);
+    assert_eq!(code, 0, "{out}");
+    let line = out
+        .lines()
+        .find(|l| l.starts_with("maxplayer-mint:"))
+        .unwrap();
+    assert!(line.contains("version unknown"), "{line}");
+    assert!(
+        line.contains(&format!(
+            "run `maxplayer mint install --force --bin-dir {} --home {}`",
+            w.bin_dir.display(),
+            w.home.display()
+        )),
+        "{line}"
+    );
+    assert!(!line.contains("mint upgrade"), "{line}");
+    assert!(!w.home.exists(), "info must create nothing");
 }
 
 #[test]

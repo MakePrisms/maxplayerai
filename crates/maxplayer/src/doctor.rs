@@ -540,19 +540,31 @@ mod checks {
         if let Some(notice) = notice.notice() {
             return Check::warn(MINT_VERSION_CHECK, what, notice);
         }
+        let dir = notice
+            .path
+            .parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_else(|| ".".into());
         match notice.relation {
             Relation::Same => Check::pass(MINT_VERSION_CHECK, what),
+            // Every mint released before 0.8.0 has no `--version` (it prints usage and exits 2), and
+            // `maxplayer mint upgrade` refuses a binary it cannot classify.
+            _ if notice.line.is_none() => Check::warn(
+                MINT_VERSION_CHECK,
+                what,
+                format!(
+                    "a maxplayer-mint older than 0.8.0 reports no version and `maxplayer mint \
+                     upgrade` cannot replace it; `maxplayer mint install --force --bin-dir {dir}` \
+                     replaces it with {}, keeping <home>/mint/",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            ),
             _ => Check::warn(
                 MINT_VERSION_CHECK,
                 what,
                 format!(
-                    "it is not this maxplayer's release; `maxplayer mint install --force --bin-dir {}` \
-                     replaces it",
-                    notice
-                        .path
-                        .parent()
-                        .map(|d| d.display().to_string())
-                        .unwrap_or_else(|| ".".into())
+                    "it is not this maxplayer's release; `maxplayer mint install --force --bin-dir {dir}` \
+                     replaces it"
                 ),
             ),
         }
@@ -6874,6 +6886,23 @@ mod tests {
         let older = checks::check_mint_version_from(Some(notice(Relation::Older("0.0.1".into()))));
         assert_eq!(older.status, Status::Warn, "{}", older.render());
         assert!(older.render().contains("maxplayer mint upgrade --bin-dir /b"), "{}", older.render());
+        // A pre-0.8.0 mint answers no `--version`: `upgrade` refuses it, so the fix is install --force.
+        let silent = checks::check_mint_version_from(Some(VersionNotice {
+            line: None,
+            ..notice(Relation::Unknown)
+        }));
+        assert_eq!(silent.status, Status::Warn, "{}", silent.render());
+        let text = silent.render();
+        assert!(
+            text.contains("/b/maxplayer-mint did not report a version"),
+            "{text}"
+        );
+        assert!(text.contains("older than 0.8.0"), "{text}");
+        assert!(
+            text.contains("`maxplayer mint install --force --bin-dir /b`"),
+            "{text}"
+        );
+        assert!(!text.contains("maxplayer mint upgrade --bin-dir"), "{text}");
 
         // (b) the maxplayer row: no mint involved at all.
         let up_to_date = checks::check_maxplayer_version_from(Latest::Found(this.into()));

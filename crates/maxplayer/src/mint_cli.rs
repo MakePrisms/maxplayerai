@@ -15,7 +15,8 @@
 //!    replace an existing binary without `--force`, and finishes by running the installed
 //!    `maxplayer-mint init`, which owns the `<home>/mint/` layout (crates/maxplayer-mint/src/home.rs).
 //!    An existing `<home>/mint/` is never touched.
-//! 3. The user links the mint with `maxplayer account link --mint`; `install` prints that step.
+//! 3. The user links the mint with `maxplayer account link --mint`; `install` prints that step
+//!    (or, when it kept a mint whose key the registration service already has, says so instead).
 //! 4. `maxplayer mint upgrade` runs the same download/verify/commit pipeline, at THIS binary's
 //!    version, over an installed `maxplayer-mint` — but only one that reports an OLDER release line.
 //!    It never touches `<home>/mint/` and never runs `init`. The mint is version-locked to
@@ -1237,7 +1238,16 @@ mod wallet {
 
         let binary_line = match (&binary, &bin_error) {
             (None, _) => format!("not installed (run `maxplayer mint install{flags}`)"),
-            (Some(path), Some(e)) => format!("{} (version unknown: {e})", path.display()),
+            // A binary that does not answer `--version` (every mint released before 0.8.0 exits 2
+            // on it) cannot be upgraded: `upgrade` refuses what it cannot classify, so name the
+            // one command that replaces it, in the directory it was found in.
+            (Some(path), Some(e)) => format!(
+                "{} (version unknown: {e}; a {MINT_BIN} older than 0.8.0 reports no version — run \
+                 `maxplayer mint install --force --bin-dir {}{flags}` to replace it with {VERSION}, \
+                 keeping <home>/mint/)",
+                path.display(),
+                shell_quote(path.parent().unwrap_or(Path::new("."))),
+            ),
             (Some(path), None) if bin_matches && bin_release => {
                 format!("{} version {VERSION} (matches maxplayer)", path.display())
             }
@@ -1537,7 +1547,8 @@ mod wallet {
                 "A `{MINT_BIN} run` is serving this home{pid}: restart it to run {VERSION}."
             );
         }
-        if let Ok(Some(keys)) = read_mint_keys(&mint_dir)
+        let keys = read_mint_keys(&mint_dir).ok().flatten();
+        if let Some(keys) = &keys
             && let Ok(npub) = keys.public_key().to_bech32()
         {
             let _ = writeln!(
@@ -1556,6 +1567,21 @@ mod wallet {
             );
         }
         let _ = writeln!(out);
+        // A kept mint may already be linked (an `install --force` over a working setup): ask the
+        // registration service, as `maxplayer mint` does, and only then drop the link step. A key
+        // `init` just made was never linked, so it is not asked; a failed lookup keeps the step.
+        let linked = match &keys {
+            Some(keys) if mint_exists => link_status(&root, keys).0,
+            _ => None,
+        };
+        if linked == Some(true) {
+            let _ = writeln!(
+                out,
+                "The mint key is already linked to a Maxplayer account; nothing to link \
+                 (`maxplayer mint{flags}` shows it)."
+            );
+            return Ok(());
+        }
         // `account link --mint` links the mint key by email code, like any other key: one email
         // can link many keys, so use the email this account already uses. A terminal prompts for
         // the email; an agent passes `--email`, then `--code` with the code from the email.
