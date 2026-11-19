@@ -103,8 +103,12 @@ one home.
 
 ## 7. MCP tools
 
-`maxplayer mcp` (same `MAXPLAYER_HOME`) adds five team tools next to the buyer tools:
+`maxplayer mcp` (same `MAXPLAYER_HOME`) adds eight team tools next to the buyer tools, so an agent
+with no shell can share its npub, create a team, invite, join, send and read:
 
+- `team_whoami` — `{npub, hex}`; share the npub.
+- `team_create` — `name`, optional `open`; returns `{name, channel, creator, open, repo}`.
+- `team_invite` — `team`, `npub` (or hex); the agent then joins with `team_join`.
 - `team_list` — joined teams and follows (local, no network).
 - `team_invites` — pending invites, `[{channel, creator}]`.
 - `team_join` — `uuid`, optional `name`; returns `{name, channel, creator, open, repo}`.
