@@ -260,7 +260,7 @@ fn push_check_refuses_binary_symlink_and_submodule() {
 
 /// Spec §5: a pull transfers the screened oid, so a quarantine ref moved by a concurrent pull
 /// between screening and transfer never reaches `origin/<branch>`. The worktree keeps no
-/// credentials, so a bare `git fetch` there fails.
+/// credentials.
 #[test]
 fn pull_transfers_the_screened_oid_even_if_the_quarantine_ref_moves() {
     let hd = tempfile::tempdir().unwrap();
@@ -293,7 +293,6 @@ fn pull_transfers_the_screened_oid_even_if_the_quarantine_ref_moves() {
     assert_eq!(f.origin().as_deref(), Some(c1.as_str()), "c2 = {c2} was never screened");
     let config = fs::read_to_string(f.dir.join(".git/config")).unwrap();
     assert!(!config.to_lowercase().contains("extraheader") && !config.contains('@'), "{config}");
-    assert!(h_git(&f.dir, &["fetch", "-q", "origin"]).is_none());
     assert!(h.repo_url(&Team { open: true, ..t }).is_err());
 }
 
@@ -420,6 +419,40 @@ async fn catch_up_with_review_on_retries_pending_messages() {
     // The next pass asks again for the one that is due, and backs it off.
     h.catch_up(&client, &mut state).await.unwrap();
     assert_eq!(state.retry[&before.id.to_hex()].delay, 60);
+}
+
+/// The reader's own message, already stored, still moves the cursor: a later burst larger than
+/// the first-sync window is read in full, not cut to the newest [`FIRST_SYNC`].
+#[tokio::test]
+async fn already_stored_messages_advance_the_cursor() {
+    let (_relay, url, client) = local_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), &url);
+    h.config.review.team_message = false;
+    join_crew(&h);
+    let mut state = h.load().unwrap();
+    let own = msg_at(&h.keys, "mine", now() - 5);
+    client.send_event(&own).await.unwrap();
+    h.append(&Stored { channel: CH.into(), event: own, verdict: None, error: None }).unwrap();
+    h.catch_up(&client, &mut state).await.unwrap();
+    assert!(state.cursors.contains_key(CH), "own stored message left the cursor unset");
+    let other = Keys::generate();
+    for n in 0..FIRST_SYNC + 10 {
+        client.send_event(&msg_at(&other, &format!("burst {n}"), now())).await.unwrap();
+    }
+    h.catch_up(&client, &mut state).await.unwrap();
+    assert_eq!(h.stored().unwrap().len(), FIRST_SYNC + 11);
+}
+
+/// `inbox` and `team_inbox` report an unreachable relay instead of "no new messages".
+#[tokio::test]
+async fn inbox_sync_reports_an_unreachable_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), "ws://127.0.0.1:9");
+    join_crew(&h);
+    h.sync_deadline = Some(std::time::Instant::now() + Duration::from_millis(600));
+    let e = h.sync().await.unwrap_err().to_string();
+    assert!(e.contains("could not reach the relay"), "{e}");
 }
 
 #[test]

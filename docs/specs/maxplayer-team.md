@@ -187,7 +187,8 @@ inline; the reviewer fetches nothing for it.
 - Pacing: one review at a time; stop the pass at the first availability error; at most ~1000 team
   review requests per rolling 30 minutes per key. The verdict inbox reads at most 16 pages of 128
   (`core/review/private.rs:567 @691fe5c`), shared with job reviews.
-- The read cursor always advances. A message withheld for availability goes to a retry set (back-off
+- The read cursor advances past every stored or admitted message (never past one that fails
+  admission). A message withheld for availability goes to a retry set (back-off
   30 s doubling to 1 h) and stays withheld until a signed pass; later messages are delivered.
 - The signed 3408 is stored in the team store; `inbox`/`log` re-run verify + decision offline
   against current config and the overrides in `team/state.json`, so a threshold or key change

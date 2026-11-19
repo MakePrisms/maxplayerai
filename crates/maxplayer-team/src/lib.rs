@@ -582,6 +582,16 @@ impl Home {
             _ => Ok(client),
         }
     }
+    /// [`Home::connect`], failing when the relay was not reached: the pool returns no events,
+    /// not an error, for a relay it could not reach.
+    async fn connected(&self) -> Result<Client> {
+        let client = self.connect().await?;
+        if !client.relay(&self.relay).await?.is_connected() {
+            client.shutdown().await;
+            return Err("could not reach the relay".into());
+        }
+        Ok(client)
+    }
     async fn publish(&self, client: &Client, kind: u16, content: &str, tags: Vec<Vec<String>>) -> Result<Event> {
         let tags = tags.into_iter().map(Tag::parse).collect::<std::result::Result<Vec<_>, _>>()?;
         let event = EventBuilder::new(Kind::Custom(kind), content).tags(tags).sign_with_keys(&self.keys)?;
@@ -671,12 +681,7 @@ impl Home {
     /// Private team channels this key was added to and has not joined: (channel, creator).
     pub async fn invites(&self) -> Result<Vec<(String, String)>> {
         let state = self.load()?;
-        let client = self.connect().await?;
-        // The pool returns no events, not an error, for a relay it could not reach.
-        if !client.relay(&self.relay).await?.is_connected() {
-            client.shutdown().await;
-            return Err("could not reach the relay".into());
-        }
+        let client = self.connected().await?;
         let adds = client
             .fetch_events(Filter::new().kind(Kind::Custom(9000)).pubkey(self.keys.public_key()).limit(500), self.read_wait())
             .await;
@@ -690,6 +695,9 @@ impl Home {
         let mut out = vec![];
         let mut seen = BTreeSet::new();
         for event in adds {
+            if self.past_deadline() {
+                break;
+            }
             let Some(channel) = tag_value(&event, "h") else { continue };
             if review::repo_id(&channel).is_none() || state.teams.contains_key(&channel) || !seen.insert(channel.clone()) {
                 continue;
@@ -780,7 +788,12 @@ impl Home {
             self.save(&state)?;
         }
         let client = self.connect().await?;
-        let result = self.publish(&client, 9, text, vec![vec!["h".into(), channel.clone()]]).await;
+        // Past the deadline, give up before posting: an MCP call cut off at 15 s is reported as
+        // failed, and a post after that would be sent again by its retry.
+        let result = match self.past_deadline() {
+            true => Err("ran out of time; not sent".into()),
+            false => self.publish(&client, 9, text, vec![vec!["h".into(), channel.clone()]]).await,
+        };
         client.shutdown().await;
         let event = result?;
         let _lock = self.lock()?;
@@ -827,11 +840,16 @@ impl Home {
         event: Event,
         available: &mut bool,
     ) -> Result<bool> {
-        if known.contains(&event.id) || admit(&event, channel, owner).is_err() {
+        // The cursor passes what is already stored (the reader's own sends too) and a newly
+        // admitted message, never one that fails admission.
+        let seen = known.contains(&event.id);
+        if !seen && admit(&event, channel, owner).is_err() {
             return Ok(false);
         }
         state.cursors.insert(channel.into(), state.cursors.get(channel).copied().unwrap_or(0).max(event.created_at.as_secs().min(now())));
-        known.insert(event.id);
+        if !known.insert(event.id) {
+            return Ok(false);
+        }
         let author = event.pubkey.to_hex();
         let mut stored = Stored { channel: channel.into(), event, verdict: None, error: None };
         if author != self.me() && self.config.review.enabled(9, &author)? {
@@ -847,7 +865,8 @@ impl Home {
             }
         }
         self.append(&stored)?;
-        Ok(self.status(state, &stored) == Status::Delivered)
+        // The reader's own message is never news (`watch` may see it before `send` stores it).
+        Ok(author != self.me() && self.status(state, &stored) == Status::Delivered)
     }
 
     /// Retry due availability-withheld messages, each on its own back-off (30 s doubling to 1 h).
@@ -909,7 +928,7 @@ impl Home {
         // A message stored while review was off has no verdict and no retry entry: once review
         // applies to it, it is reviewed like an availability-withheld one.
         for s in &stored {
-            if s.verdict.is_none() && s.error.is_none() && !state.retry.contains_key(&s.event.id.to_hex()) && self.status(state, s) == withheld("pending") {
+            if self.config.review.team_message && s.verdict.is_none() && s.error.is_none() && !state.retry.contains_key(&s.event.id.to_hex()) && self.status(state, s) == withheld("pending") {
                 state.retry.insert(s.event.id.to_hex(), Retry { next: 0, delay: 30 });
             }
         }
@@ -934,6 +953,12 @@ impl Home {
                     let since = cursor.saturating_sub(CLOCK_SKEW);
                     let mut until = None;
                     for _ in 0..20 {
+                        // Out of time mid-paging: ingest nothing from this channel, or the cursor
+                        // would pass the older pages not fetched yet.
+                        if self.past_deadline() {
+                            events.clear();
+                            break;
+                        }
                         let mut f = base.clone().since(Timestamp::from(since)).limit(1000);
                         if let Some(u) = until {
                             f = f.until(u);
@@ -976,7 +1001,7 @@ impl Home {
 
     /// One-shot catch-up (used by `inbox`).
     pub async fn sync(&self) -> Result<usize> {
-        let client = self.connect().await?;
+        let client = self.connected().await?;
         let _lock = self.lock()?;
         let mut state = self.load()?;
         let result = self.catch_up(&client, &mut state).await;
@@ -1047,6 +1072,10 @@ impl Home {
                     let Some(channel) = tag_value(&event, "h") else { continue };
                     let Some((_, owner)) = sources.iter().find(|(c, _)| *c == channel) else { continue };
                     let _lock = self.lock()?;
+                    // Another process (send, inbox) may have stored it since `known` was read.
+                    if !known.contains(&event.id) {
+                        known.extend(self.stored()?.into_iter().map(|s| s.event.id));
+                    }
                     let mut state = self.load()?;
                     let mut available = true;
                     let delivered = self
@@ -1255,16 +1284,34 @@ impl Home {
         let commits: Vec<&str> = commits.lines().filter(|l| !l.is_empty()).collect();
         let client = self.connect().await?;
         let mut failure = None;
-        {
-            let _lock = self.lock()?;
-            let mut state = self.load()?;
-            for c in &commits {
-                if let Err(e) = self.screen_commit(&client, &mut state, t, c).await {
+        let (mut i, mut waits) = (0, 0);
+        // The lock is taken per commit: each verdict is saved as it arrives, and nothing waits
+        // behind the rate-limit sleep.
+        while let Some(c) = commits.get(i) {
+            let screened = {
+                let _lock = self.lock()?;
+                let mut state = self.load()?;
+                let screened = self.screen_commit(&client, &mut state, t, c).await;
+                self.save(&state)?;
+                screened
+            };
+            match screened {
+                Ok(true) => (i, waits) = (i + 1, 0),
+                // More than 10 new commits in a minute: wait for the reviewer's window.
+                Ok(false) if waits < 10 && self.sync_deadline.is_none() => {
+                    waits += 1;
+                    eprintln!("reviewer rate limit (10 commits a minute): waiting a minute");
+                    tokio::time::sleep(Duration::from_secs(61)).await;
+                }
+                Ok(false) => {
+                    failure = Some(format!("commit {}: reviewer rate limit; pull again in a minute", short(c)).into());
+                    break;
+                }
+                Err(e) => {
                     failure = Some(e);
                     break;
                 }
             }
-            self.save(&state)?;
         }
         client.shutdown().await;
         if let Some(e) = failure {
@@ -1283,9 +1330,10 @@ impl Home {
         }
         Ok(format!("{} new commit(s) passed review; origin/{shown} at {}", commits.len(), short(&tip)))
     }
-    async fn screen_commit(&self, client: &Client, state: &mut State, t: &Team, commit: &str) -> Result<()> {
+    /// Ok(false): the reviewer's rate limit; screen it again after a minute.
+    async fn screen_commit(&self, client: &Client, state: &mut State, t: &Team, commit: &str) -> Result<bool> {
         if !self.config.review.enabled(maxplayer_core::kinds::TEAM_COMMIT_SUBJECT_KIND, "")? {
-            return Ok(());
+            return Ok(true);
         }
         let request = review::Request::commit(&t.repo(), &t.creator, commit).map_err(|e| e.to_string())?;
         let key = request.subject.event.clone();
@@ -1293,30 +1341,20 @@ impl Home {
         let cached = state.commit_verdicts.get(&key).filter(|v| review::decide(&self.config, &self.relay, v, &request.subject, None).is_ok());
         let verdict = match cached {
             Some(v) => v.clone(),
-            None => {
-                let mut waits = 0;
-                loop {
-                    match self.review(client, state, &request, "").await {
-                        Outcome::Verdict(Some(v)) => {
-                            state.commit_verdicts.insert(key.clone(), v.clone());
-                            break v;
-                        }
-                        Outcome::Verdict(None) => return Ok(()),
-                        Outcome::Final(e) => return Err(format!("commit {}: {}", short(commit), display_text(&e)).into()),
-                        // More than 10 new commits in a minute: wait for the reviewer's window.
-                        Outcome::RateLimited if waits < 10 && self.sync_deadline.is_none() => {
-                            waits += 1;
-                            eprintln!("reviewer rate limit (10 commits a minute): waiting a minute");
-                            tokio::time::sleep(Duration::from_secs(61)).await;
-                        }
-                        _ => return Err(format!("commit {}: review unavailable; pull again later", short(commit)).into()),
-                    }
+            None => match self.review(client, state, &request, "").await {
+                Outcome::Verdict(Some(v)) => {
+                    state.commit_verdicts.insert(key.clone(), v.clone());
+                    v
                 }
-            }
+                Outcome::Verdict(None) => return Ok(true),
+                Outcome::Final(e) => return Err(format!("commit {}: {}", short(commit), display_text(&e)).into()),
+                Outcome::RateLimited => return Ok(false),
+                Outcome::Retry => return Err(format!("commit {}: review unavailable; pull again later", short(commit)).into()),
+            },
         };
         let accepted = state.accepted.get(&key).map(String::as_str);
         match review::decide(&self.config, &self.relay, &verdict, &request.subject, accepted)? {
-            Decision::Passed => Ok(()),
+            Decision::Passed => Ok(true),
             Decision::Refused { unsafe_ppm } => Err(format!(
                 "commit {commit} withheld: unsafe {unsafe_ppm} ppm >= threshold {} ppm; verdict {}; `accept-verdict {} {commit} {}` overrides",
                 self.config.review.reject_at_or_above_ppm, verdict.id, display_text(&t.name), verdict.id
