@@ -131,6 +131,12 @@ fn run_sell(options: SellOptions, out: &mut dyn Write, err: &mut dyn Write) -> R
             RUNTIME_ERROR
         })?,
     };
+    // First line of the seller's log: which build is serving (before anything that can fail).
+    let _ = writeln!(
+        err,
+        "{}",
+        crate::build_stamp::start_line("seller", &format!("home {}", root.display()))
+    );
     let mut home = home::bootstrap(&root).map_err(|error| {
         let _ = writeln!(err, "{error}");
         RUNTIME_ERROR

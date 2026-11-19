@@ -162,6 +162,18 @@ fn lifecycle(log: &str) -> Vec<serde_json::Value> {
 fn a_buyer_daemon_on_a_home_that_never_traded_creates_no_trade_state() {
     let dir = temp_home("fresh");
     let mut daemon = Daemon::start(dir.path());
+    // The daemon's log opens with the build that is serving (`tests/daemon_start_line.rs` covers the
+    // other daemons and the failed-start case); this is the booted daemon writing it to its log file.
+    let log = daemon.log();
+    let first = log.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with(&format!("maxplayer {} (", env!("CARGO_PKG_VERSION")))
+            && first.ends_with(&format!(
+                ") — buyer starting, home {}",
+                dir.path().display()
+            )),
+        "first daemon.log line is not the version start line:\n{log}"
+    );
     std::thread::sleep(Duration::from_secs(6)); // past the host's 5 s poll
     assert!(
         !dir.path().join("trade").exists(),

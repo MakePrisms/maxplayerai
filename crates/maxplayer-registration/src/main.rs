@@ -29,6 +29,16 @@ struct Args {
     config: PathBuf,
 }
 
+/// `maxplayer-registration <version> — registration starting, config <path>`: the first log line of
+/// `serve`. This crate has no build stamp, so the version stands alone. `starting`, not the verb.
+fn start_line(config: &std::path::Path) -> String {
+    format!(
+        "maxplayer-registration {} — registration starting, config {}",
+        env!("CARGO_PKG_VERSION"),
+        config.display()
+    )
+}
+
 fn parse_args() -> Result<Args> {
     let mut args = std::env::args().skip(1);
     let mut command = None;
@@ -123,6 +133,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
     let args = parse_args()?;
+    if args.command == "serve" {
+        // First log line of the service, before the config is read: which build is serving.
+        info!("{}", start_line(&args.config));
+    }
     let cfg = Config::load(&args.config)?;
     let pool = maxplayer_registration::connect(&cfg).await?;
 

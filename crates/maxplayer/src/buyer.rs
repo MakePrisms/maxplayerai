@@ -79,6 +79,12 @@ fn serve(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             return RUNTIME_ERROR;
         }
     };
+    // First line of the daemon's log: which build is serving (before anything that can fail).
+    let _ = writeln!(
+        err,
+        "{}",
+        crate::build_stamp::start_line("buyer", &format!("home {}", root.display()))
+    );
     let home = match home::bootstrap(&root) {
         Ok(home) => home,
         Err(error) => {
