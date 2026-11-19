@@ -131,6 +131,13 @@ fn post_job_guides() -> Value {
 
 /// Run the MCP server on the provided stdio handles until stdin EOF.
 pub fn run(out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    // First stderr line (stdout is the JSON-RPC stream): which build the harness launched, printed
+    // before the home bootstrap so even a failed start names its binary.
+    let place = match home::default_home_dir() {
+        Ok(root) => format!("home {}", root.display()),
+        Err(_) => "home unresolved".to_owned(),
+    };
+    let _ = writeln!(err, "{}", crate::build_stamp::start_line("mcp", &place));
     let state = match bootstrap_state() {
         Ok(state) => state,
         Err(error) => {

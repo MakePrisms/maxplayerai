@@ -25,6 +25,17 @@ fn version_line() -> String {
     )
 }
 
+/// The FIRST stderr line of `run`: `<version_line> — mint starting, dir <home>/mint`. An operator who
+/// starts `maxplayer-mint run` by bare name with an older binary first on `PATH` reads from the log
+/// which build is serving. `starting`, not a verb: the daemons' start verbs differ (`run`, `serve`).
+fn start_line(home: &MintHome) -> String {
+    format!(
+        "{} — mint starting, dir {}",
+        version_line(),
+        home.dir().display()
+    )
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -139,6 +150,8 @@ async fn issue_cmd(home: &MintHome, amount: Option<String>) -> Result<()> {
 }
 
 async fn run(home: &MintHome) -> Result<()> {
+    // Before anything that can fail, so even a refused start names its binary.
+    eprintln!("{}", start_line(home));
     let secrets = home.load().with_context(|| {
         format!(
             "load {} (run `maxplayer-mint init` first)",

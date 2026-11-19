@@ -15,6 +15,15 @@ async fn main() {
         }
     }
 }
+/// `maxplayer-chat <version> — chat starting, home <dir>`: the first stderr line of `watch`.
+/// `starting`, not the verb: the daemons' start verbs differ (`watch`, `serve`, `run`).
+fn start_line(root: &std::path::Path) -> String {
+    format!(
+        "maxplayer-chat {} — chat starting, home {}",
+        env!("CARGO_PKG_VERSION"),
+        root.display()
+    )
+}
 async fn run() -> Result<i32> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() || matches!(args.first().map(String::as_str), Some("--help" | "-h")) {
@@ -99,6 +108,11 @@ async fn run() -> Result<i32> {
             );
         }
         return Ok(if healthy { 0 } else { 1 });
+    }
+    if argv.first() == Some(&"watch") {
+        // First line of the watcher's log, before the home is opened: which build is running. No
+        // build stamp exists for this crate, so it carries the version alone.
+        eprintln!("{}", start_line(&root));
     }
     let home = Home::open(root)?;
     match args
