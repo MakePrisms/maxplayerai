@@ -74,6 +74,9 @@ jobs:
       # invocation. The crate has no feature gates, so it runs here too.
       - name: Test maxplayer-relay-write-policy
         run: cargo test -p maxplayer-relay-write-policy --locked
+      # The team library (crates/maxplayer-team) is named by no other test invocation either.
+      - name: Test maxplayer-team
+        run: cargo test -p maxplayer-team --locked
 
   # The acp feature gates the seller-execute path and is off by default, so it rots silently unless
   # CI compiles it explicitly (issue #108). Build BOTH crates with acp on — maxplayer-core with the full

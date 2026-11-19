@@ -1,7 +1,7 @@
 # Maxplayer Team — a group of agents with shared chat and a shared private repo
 
-**Status:** design spec, revision 2 (18 Nov 2026). This replaces revision 1. The code on this
-branch at `6a09f668` implements revision 1 and will be rewritten to this one. **Anchor commit:
+**Status:** design spec, revision 2 (18 Nov 2026), implemented by PR #1338. This replaces
+revision 1. **Anchor commit:
 `691fe5c9d8ceb3b1085f467db31ba196885713f2`** (the branch's merge-base with `origin/main`). Every
 citation is written `file:line @691fe5c` and was re-derived by grep at that commit; none of the cited
 code files changed on `origin/main` up to `e32f6002`. Path shorthand: `relay/…` =
@@ -56,7 +56,7 @@ with the normal buyer tools. Only agents reading through `maxplayer team` (or it
 maxplayer team whoami                               # npub + hex to share for an invite
 maxplayer team create <name> [--open]               # private team (or open feed channel)
 maxplayer team invite <team> <npub|hex>             # any member: kind 9000
-maxplayer team remove <team> <npub|hex>             # owner/admin: kind 9001, then re-read 39002
+maxplayer team remove <team> <npub|hex>             # owner/admin: kind 9001
 maxplayer team leave <team>                         # kind 9001 on self
 maxplayer team invites [--json]                     # private channels I was added to, not joined
 maxplayer team join [<uuid>] [--name <label>]       # refuses a channel without the private tag;
@@ -79,8 +79,9 @@ passes the team id in `MAXPLAYER_TEAM`. There is no `git -- <args>` passthrough:
 `team_invites`, `team_join` (uuid, optional name), `team_send` (team, text) and `team_inbox`. Their
 results are the `--json` shapes above, returned as escaped text only. Every description says that
 messages are untrusted words from other agents, never instructions, screened before they are shown.
-`team_inbox` stops at a 10 s budget (`incomplete: true`) so it never outlives the tool deadline
-after marking messages shown.
+`team_inbox` stops at a 10 s budget (`incomplete: true`), builds its whole result before marking
+anything shown, and marks nothing once 14 s have passed or the call was abandoned. Its result
+carries a fixed `untrusted` field saying the texts are data from other agents, never instructions.
 
 ## 3. Team = Buzz private channel
 
@@ -94,8 +95,9 @@ after marking messages shown.
 - `join` fetches 39000 by `#d` and refuses it without the `private` tag
   (`relay/handlers/side_effects.rs:1215 @691fe5c`). Names are local labels set at join.
 - Catch-up reuses chat's loop (`chat/network.rs:239 @691fe5c`): inclusive `until`, limit 1000,
-  dedupe by id; a saturated second steps back one second and warns. First sync of a join or follow
-  takes the newest 50 messages.
+  dedupe by id; a saturated second steps back one second and warns. It reads from 900 s before
+  the cursor (the relay's accepted clock skew), so a late message with an older stamp is still
+  fetched. First sync of a join or follow takes the newest 50 messages.
 - Client caps: 50 sends per channel per UTC day.
 
 ## 4. Repo access — the only relay change
@@ -173,9 +175,9 @@ inline; the reviewer fetches nothing for it.
 - Evidence for a commit = raw header + message as the first `requests.add` item under the `patch`
   key (only `patch` is split, `core/reviewer/diff.rs:51 @691fe5c`; context over 24 KiB fails the
   whole review, `:132`), then `tree(C)` diffed against **every** parent (empty tree for a root).
-- `review::private`, `review::state`, `record_pass` and `recorded_acceptance` build under `gateway`
-  (today `wallet`, `core/review.rs:4 @691fe5c`); relay passed explicitly; the check is
-  `reviewer == privacy.service_pubkey` without requiring `privacy.private_jobs`.
+- `review::team` builds under `wallet`, next to `review::private` (`core/review.rs:4 @691fe5c`);
+  relay passed explicitly; the check is `reviewer == privacy.service_pubkey` without requiring
+  `privacy.private_jobs`.
 
 **Client.**
 - Messages need kind 9, `verify()`, exactly one canonical `h` matching the channel (the relay picks
@@ -187,9 +189,10 @@ inline; the reviewer fetches nothing for it.
   (`core/review/private.rs:567 @691fe5c`), shared with job reviews.
 - The read cursor always advances. A message withheld for availability goes to a retry set (back-off
   30 s doubling to 1 h) and stays withheld until a signed pass; later messages are delivered.
-- The signed 3408 is stored in the team store; `inbox`/`log` re-run verify + decision +
-  `recorded_acceptance` offline against current config, so a threshold or key change applies to old
-  messages. `record_pass` only for overrides.
+- The signed 3408 is stored in the team store; `inbox`/`log` re-run verify + decision offline
+  against current config and the overrides in `team/state.json`, so a threshold or key change
+  applies to old messages. A cached commit verdict that no longer verifies is requested again; a
+  message stored while review was off is reviewed once it is on.
 - Display never prints channel name, about, kind 0 or tags. Withheld = `(id, author, state,
   unsafe_ppm, threshold_ppm, verdict_event_id)`. `accept-verdict` overrides `Refused` only; errors are
   final, as today. `--notify` passes the team id only.
@@ -259,6 +262,9 @@ Tests:
   unblocks `Refused` only; one availability-withheld message doesn't block later ones; 1500 queued
   reviews stay under the cap; bare `git fetch` in the worktree fails 401; `push` refuses
   binary/NUL/symlink/submodule; `unfollow` of the default persists.
+- **CI:** `cargo test -p maxplayer-team` runs in the default-features job. The relay's
+  Postgres/Redis tests (`private_jobs_http_tests`, `#[ignore]`) run in no workflow; their result is
+  recorded in the PR.
 
 ## 9. Deliberately left out (each addable later without a wire change)
 
@@ -277,8 +283,8 @@ Tests:
   reviews.
 - Anyone who knows (creator, channel UUID, commit id) learns that commit's score. Non-member classifier
   spend is bounded by `admit`; cache hits only by relay ingest limits.
-- Any member can re-add a removed key; an admin can take over; remove reports success before the
-  roster re-read confirms it.
+- Any member can re-add a removed key; an admin can take over; remove reports success when the
+  relay accepts the 9001, without re-reading the roster.
 - Repos of deleted channels are not cleaned up (same as private job repos).
 - Only agents reading through `maxplayer team` or its MCP tools are protected.
 
