@@ -36,6 +36,23 @@ maxplayer mint install --name <name>   # downloads the mint for THIS maxplayer's
 maxplayer mint                         # what is installed, the mint URL, running?, linked?, updates
 ```
 
+Every `maxplayer-mint` command below is also reachable as `maxplayer mint <command>`:
+`maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|run|issue|restore|version> [args...]`
+runs the same `maxplayer-mint` that `maxplayer mint` reports (`--bin-dir`, else the first on PATH,
+else `~/.local/bin`) with `MAXPLAYER_HOME` set to that home, so it can never pick up another copy
+of the mint on PATH or serve `~/.maxplayer` by mistake. Arguments after the command go to the mint
+unchanged (`maxplayer mint restore --from <dir>`, `maxplayer mint init --name <name>`); put
+`--home`/`--bin-dir` before it. `maxplayer` replaces itself with the mint process, so Ctrl-C and
+`kill` reach `run` directly and the exit code is the mint's. One alias then covers a mint kept
+outside the defaults, for every command including `install`/`upgrade`/`uninstall`:
+
+```bash
+alias seller-mint='maxplayer mint --home ~/sellers/acme/.maxplayer --bin-dir ~/sellers/acme/bin'
+seller-mint install --name acme   # the first time
+seller-mint run                   # serve it (foreground)
+seller-mint issue 1000
+```
+
 Then link the mint key to your Maxplayer account, with the email your account already uses. It
 emails a code; run the same command again with the code:
 
@@ -93,7 +110,7 @@ install -m 0755 crates/maxplayer-mint/target/release/maxplayer-mint ~/.local/bin
 To create the mint by hand (for example after building from source):
 
 ```bash
-maxplayer-mint init --name <name>
+maxplayer-mint init --name <name>      # or: maxplayer mint [--home <dir>] init --name <name>
 ```
 
 **Give your mint a name.** It is what wallets show next to your mint's URL
@@ -157,6 +174,7 @@ schedule. Nothing else is needed after trades: never stop the mint to back it up
 ```bash
 systemctl --user stop maxplayer-mint
 maxplayer-mint restore                 # from backup_dir; or: maxplayer-mint restore --from <dir>
+                                       # (same as: maxplayer mint [--home <dir>] restore [--from <dir>])
 systemctl --user start maxplayer-mint
 ```
 
@@ -219,6 +237,25 @@ systemctl --user enable --now maxplayer-mint
 loginctl enable-linger "$USER"    # without this the mint stops when you log out
 journalctl --user -u maxplayer-mint -f
 ```
+
+The unit runs the binary directly, not `maxplayer mint run`: systemd already sets
+`MAXPLAYER_HOME` and the absolute `ExecStart` path, and this way the service keeps working whatever
+`maxplayer` is (or isn't) on the service's PATH and does not depend on the two versions matching.
+
+### Without systemd (macOS, or any OS)
+
+`run` stays in the foreground until it is stopped, so keep it in something that outlives your
+terminal (tmux, screen, a launchd agent on macOS):
+
+```bash
+maxplayer mint --home ~/.maxplayer run                        # Ctrl-C stops it cleanly, with a last backup
+tmux new-session -d -s maxplayer-mint 'maxplayer mint run'    # detached, default home
+```
+
+Add `--bin-dir <dir>` when the mint is not the one on PATH. This is the same as
+`MAXPLAYER_HOME=<home> <bin-dir>/maxplayer-mint run`, without the risk of starting another copy of
+the mint or the wrong home. A mint whose version differs from `maxplayer` still starts, after a
+warning with the fix `maxplayer mint` prints (usually `maxplayer mint upgrade`).
 
 On start it logs `maxplayer-mint: serving nostr://npub1… on [relays]`. Only one `run` can serve a
 mint directory: a second one exits with `another maxplayer-mint run is already serving`. A mint

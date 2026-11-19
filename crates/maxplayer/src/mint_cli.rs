@@ -25,6 +25,18 @@
 //!    mentions the mint: once maxplayer is updated, (a) is what points at the mint).
 //! 5. `maxplayer mint uninstall` removes only the binary (a symlink, not its target), refuses while
 //!    `maxplayer-mint run` serves the home, and never deletes `<home>/mint/`.
+//! 6. `maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|run|issue|restore|version> ...`
+//!    runs the installed `maxplayer-mint` command for this home (Petar, #rc-testing, 2026-11-19: a
+//!    different `maxplayer-mint` was first on PATH and, without MAXPLAYER_HOME, the mint served
+//!    ~/.maxplayer). The binary is the one `maxplayer mint` reports (`--bin-dir`, else PATH, else
+//!    ~/.local/bin), MAXPLAYER_HOME is set to the resolved home, and on unix this process `exec`s
+//!    into it, so signals (`run` takes a last backup on SIGINT/SIGTERM/SIGHUP), stdio and the exit
+//!    code are the mint's own. Everything after the subcommand goes to the mint verbatim, so its
+//!    `restore --from` and `init --name` never meet install's `--from`/`--name`. The forwarded set
+//!    is [`FORWARDED`]; a unit test holds it to the mint's own argument match, and any other word
+//!    is a usage error naming both lists. A version mismatch is a warning on stderr (with the fix
+//!    `maxplayer mint` prints), never a refusal: refusing would keep a seller's credits
+//!    unspendable over a notice the user can act on after the mint is up.
 //!
 //! The newer-release check asks GitHub's `releases/latest` (what `install.sh` uses), with a short
 //! timeout, only when `maxplayer mint` or `doctor` runs (never in the background), and caches nothing:
@@ -62,6 +74,10 @@ fn write_usage(out: &mut dyn Write) {
          \x20 maxplayer mint install [--home <dir>] [--bin-dir <dir>] [--name <name>] [--force] [--from <url>]\n\
          \x20 maxplayer mint upgrade [--home <dir>] [--bin-dir <dir>] [--from <url>]\n\
          \x20 maxplayer mint uninstall [--home <dir>] [--bin-dir <dir>]\n\
+         \x20 maxplayer mint [--home <dir>] [--bin-dir <dir>] <{forwarded}> [args...]\n\
+         \n\
+         --home and --bin-dir may also come BEFORE install, upgrade or uninstall, so one alias\n\
+         (`alias seller-mint='maxplayer mint --home <dir> --bin-dir <dir>'`) works for every form.\n\
          \n\
          `maxplayer mint` shows this home's credit mint: whether `{MINT_BIN}` is installed and its\n\
          version, the mint key (npub and nostr:// URL), whether `{MINT_BIN} run` is serving it, and\n\
@@ -94,12 +110,52 @@ fn write_usage(out: &mut dyn Write) {
          not what it points to). It refuses while `{MINT_BIN} run` is serving <home>, and never\n\
          deletes <home>/mint/: the mint's key, seed and ecash database stay there.\n\
          \n\
+         `maxplayer mint <{forwarded}> [args...]` runs that {MINT_BIN} command (`{MINT_BIN} --help`\n\
+         lists them: init [--name <name>], name <name>, run, issue [amount], restore [--from <dir>],\n\
+         version) with MAXPLAYER_HOME set to <home>, using the same binary `maxplayer mint` reports\n\
+         (--bin-dir, else the first on PATH, else ~/.local/bin). Everything after the subcommand is\n\
+         passed to it unchanged, so put --home/--bin-dir BEFORE the subcommand (after it they are\n\
+         refused: {MINT_BIN} takes neither). maxplayer replaces itself with the mint process: Ctrl-C,\n\
+         SIGTERM and SIGHUP reach it directly (`run` takes its last backup), and the exit code is\n\
+         the mint's. `run` stays in the foreground; keep it alive with a service (the README's\n\
+         systemd unit), tmux or launchd. A mint whose version differs from this maxplayer still\n\
+         runs, after a warning on stderr with the fix `maxplayer mint` prints.\n\
+         \n\
          <home> is --home, else $MAXPLAYER_HOME, else ~/.maxplayer.\n\
          Exit codes: 0 success (including nothing to upgrade or uninstall), 1 usage error, 2 runtime\n\
          error or refusal (the message says whether the binary was installed: a refused download\n\
-         installs nothing; a failed `init` leaves it installed)",
+         installs nothing; a failed `init` leaves it installed). A forwarded command exits with\n\
+         {MINT_BIN}'s own code; 2 also means no {MINT_BIN} is installed or it could not be started",
         version = env!("CARGO_PKG_VERSION"),
+        forwarded = FORWARDED_LIST,
     );
+}
+
+/// The `maxplayer-mint` commands `maxplayer mint <cmd>` runs, exactly as the mint's own argument
+/// match spells them (`--version` included). The one list: dispatch, help and the typo error read it,
+/// and `forwarded_commands_are_the_mints_own` holds it to crates/maxplayer-mint/src/main.rs. None
+/// collides with this command's own `install`, `upgrade` or `uninstall`, which always win.
+const FORWARDED: &[&str] = &[
+    "init",
+    "name",
+    "run",
+    "issue",
+    "restore",
+    "version",
+    "--version",
+];
+/// [`FORWARDED`] for prose (`--version` is spelled as `version` there).
+const FORWARDED_LIST: &str = "init|name|run|issue|restore|version";
+/// This command's flags that may come before any subcommand, forwarded ones included.
+const LEADING_FLAGS: &[&str] = &["--home", "--bin-dir"];
+
+/// How many leading arguments are `--home <dir>` / `--bin-dir <dir>` pairs.
+fn leading_own_flags(args: &[String]) -> usize {
+    let mut index = 0;
+    while index < args.len() && LEADING_FLAGS.contains(&args[index].as_str()) {
+        index += 2;
+    }
+    index.min(args.len())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -124,6 +180,8 @@ enum Sub {
     Install,
     Upgrade,
     Uninstall,
+    /// A `maxplayer-mint` command ([`FORWARDED`]), run for this home.
+    Forward,
 }
 
 fn parse(args: &[String], allowed: &[&str]) -> Result<Opts, String> {
@@ -162,19 +220,49 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         write_usage(out);
         return SUCCESS;
     }
-    let (sub, rest) = match args.first().map(String::as_str) {
-        Some("install") => (Sub::Install, &args[1..]),
-        Some("upgrade") => (Sub::Upgrade, &args[1..]),
-        Some("uninstall") => (Sub::Uninstall, &args[1..]),
-        _ => (Sub::Info, args),
+    // `--home`/`--bin-dir` may precede the subcommand (one alias then serves every form).
+    let (leading, after) = args.split_at(leading_own_flags(args));
+    let (sub, rest) = match after.first().map(String::as_str) {
+        Some("install") => (Sub::Install, &after[1..]),
+        Some("upgrade") => (Sub::Upgrade, &after[1..]),
+        Some("uninstall") => (Sub::Uninstall, &after[1..]),
+        Some(cmd) if FORWARDED.contains(&cmd) => (Sub::Forward, &after[..0]),
+        Some(cmd) if !cmd.starts_with('-') => {
+            let _ = writeln!(
+                err,
+                "unknown subcommand {cmd}: `maxplayer mint` takes install, upgrade or uninstall, or \
+                 a {MINT_BIN} command to run for this home ({FORWARDED_LIST})"
+            );
+            write_usage(err);
+            return USAGE_ERROR;
+        }
+        _ => (Sub::Info, after),
     };
     let allowed = match sub {
         Sub::Info => INFO_FLAGS,
         Sub::Install => INSTALL_FLAGS,
         Sub::Upgrade => UPGRADE_FLAGS,
         Sub::Uninstall => UNINSTALL_FLAGS,
+        Sub::Forward => LEADING_FLAGS,
     };
-    let opts = match parse(rest, allowed) {
+    let own: Vec<String> = leading.iter().chain(rest).cloned().collect();
+    // Forwarded: only the flags before the subcommand are ours; the rest is the mint's, verbatim.
+    let forwarded = if sub == Sub::Forward { after } else { &[] };
+    if let Some(flag) = forwarded
+        .iter()
+        .skip(1)
+        .find(|arg| LEADING_FLAGS.contains(&arg.as_str()))
+    {
+        let _ = writeln!(
+            err,
+            "{flag} after `{}` would be passed to {MINT_BIN}, which takes no {flag}: put it before \
+             the subcommand (`maxplayer mint {flag} <dir> {} ...`)",
+            forwarded[0], forwarded[0]
+        );
+        write_usage(err);
+        return USAGE_ERROR;
+    }
+    let opts = match parse(&own, allowed) {
         Ok(opts) => opts,
         Err(message) => {
             let _ = writeln!(err, "{message}");
@@ -184,7 +272,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
     #[cfg(not(feature = "wallet"))]
     {
-        let _ = (opts, sub, out);
+        let _ = (opts, sub, out, forwarded);
         let _ = writeln!(
             err,
             "maxplayer mint requires the wallet feature (rebuild with default features)"
@@ -198,6 +286,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             Sub::Install => wallet::install(&opts, out, err),
             Sub::Upgrade => wallet::upgrade(&opts, out, err),
             Sub::Uninstall => wallet::uninstall(&opts, out, err),
+            Sub::Forward => wallet::forward(&opts, forwarded, err),
         }
     }
 }
@@ -1250,18 +1339,7 @@ mod wallet {
                 // Name the directory it was found in: the default --bin-dir may not be the one
                 // on PATH, and advice that installs elsewhere would never clear this line. An older
                 // release is what `upgrade` is for; anything else needs `install --force`.
-                let dir = shell_quote(path.parent().unwrap_or(Path::new(".")));
-                let fix = match relation {
-                    Some(Relation::Older(_)) => {
-                        format!("run `maxplayer mint upgrade --bin-dir {dir}{flags}`")
-                    }
-                    // Never advise force-installing an older mint over a home a newer one served.
-                    Some(Relation::Newer(_)) => format!(
-                        "update maxplayer to match it, e.g. `{}`",
-                        maxplayer_update_hint()
-                    ),
-                    _ => format!("run `maxplayer mint install --force --bin-dir {dir}{flags}`"),
-                };
+                let fix = binary_fix(relation.as_ref(), path, &flags);
                 format!(
                     "{} version {} (maxplayer is {VERSION}; {fix})",
                     path.display(),
@@ -1319,6 +1397,117 @@ mod wallet {
             let _ = writeln!(out, "update:    {line}");
         }
         SUCCESS
+    }
+
+    /// What fixes an installed `bin` whose version is not this maxplayer's, naming the directory it
+    /// was found in: the default --bin-dir may not be the one on PATH, and advice that installs
+    /// elsewhere would never clear the line. An older release is what `upgrade` is for; anything
+    /// else needs `install --force`. Shared by `maxplayer mint` and the forwarded commands.
+    fn binary_fix(relation: Option<&Relation>, bin: &Path, flags: &str) -> String {
+        let dir = shell_quote(bin.parent().unwrap_or(Path::new(".")));
+        match relation {
+            Some(Relation::Older(_)) => {
+                format!("run `maxplayer mint upgrade --bin-dir {dir}{flags}`")
+            }
+            // Never advise force-installing an older mint over a home a newer one served.
+            Some(Relation::Newer(_)) => format!(
+                "update maxplayer to match it, e.g. `{}`",
+                maxplayer_update_hint()
+            ),
+            _ => format!("run `maxplayer mint install --force --bin-dir {dir}{flags}`"),
+        }
+    }
+
+    // ── maxplayer mint <init|name|run|issue|restore|version> ─────────────────────────────────
+
+    /// Run `maxplayer-mint <args>` (`args[0]` is the subcommand, the rest passes unchanged) with
+    /// MAXPLAYER_HOME set to this home, using the binary `maxplayer mint` reports. This process
+    /// becomes the mint (`exec`): signals, stdio and the exit code are the mint's. Returns only when
+    /// the mint could not be found or started.
+    pub fn forward(opts: &Opts, args: &[String], err: &mut dyn Write) -> i32 {
+        use std::os::unix::process::CommandExt;
+
+        if opts
+            .bin_dir
+            .as_ref()
+            .is_some_and(|dir| dir.as_os_str().is_empty())
+        {
+            let _ = writeln!(err, "--bin-dir must not be empty");
+            return USAGE_ERROR;
+        }
+        let root = match resolve_root(opts) {
+            Ok(root) => root,
+            Err(message) => {
+                let _ = writeln!(err, "{message}");
+                return RUNTIME_ERROR;
+            }
+        };
+        let flags = home_flag(opts);
+        let Some(bin) = locate_binary(opts) else {
+            let (place, bin_flag) = match &opts.bin_dir {
+                Some(dir) => (
+                    format!("in {}", dir.display()),
+                    format!(" --bin-dir {}", shell_quote(dir)),
+                ),
+                None => ("on PATH or in ~/.local/bin".to_owned(), String::new()),
+            };
+            let _ = writeln!(
+                err,
+                "no {MINT_BIN} is installed {place}: run `maxplayer mint install{bin_flag}{flags}` \
+                 first"
+            );
+            return RUNTIME_ERROR;
+        };
+        // A version query answers for itself; anything else is told when the mint is not this
+        // maxplayer's version. A warning, not a refusal: the mint still serves (credits spend only
+        // while it runs), and the fix is the one `maxplayer mint` prints.
+        if !matches!(
+            args.first().map(String::as_str),
+            Some("version" | "--version")
+        ) && let Some(warning) = version_warning(&bin, &flags)
+        {
+            let _ = writeln!(err, "maxplayer mint: warning: {warning}");
+        }
+        let mut cmd = command(&bin);
+        cmd.args(&args[..]).env("MAXPLAYER_HOME", &root);
+        // ETXTBSY (26): a binary written a moment ago can be briefly busy (see `spawn`).
+        let mut delay = Duration::from_millis(10);
+        let error = loop {
+            let error = cmd.exec();
+            if error.raw_os_error() != Some(26) || delay > Duration::from_millis(1280) {
+                break error;
+            }
+            std::thread::sleep(delay);
+            delay *= 2;
+        };
+        let _ = writeln!(err, "could not run {}: {error}", bin.display());
+        RUNTIME_ERROR
+    }
+
+    /// The mismatch between the installed `bin` and this maxplayer, with its fix; `None` when it
+    /// is this version (a source build of this version included).
+    fn version_warning(bin: &Path, flags: &str) -> Option<String> {
+        let line = match probe_version(bin) {
+            Ok(line) => line,
+            Err(e) => {
+                return Some(format!(
+                    "could not tell which version {} is ({e}); {}",
+                    bin.display(),
+                    binary_fix(Some(&Relation::Unknown), bin, flags)
+                ));
+            }
+        };
+        let relation = classify(&line, VERSION);
+        let reported = reported_version(&line);
+        if reported == Some(VERSION) {
+            return None;
+        }
+        Some(format!(
+            "{} is version {} but this maxplayer is {VERSION}; {}",
+            bin.display(),
+            reported.unwrap_or("unknown"),
+            binary_fix(Some(&relation), bin, flags)
+        ))
     }
 
     /// The registration service's answer for the mint key: `(Some(registered), None)`, or
@@ -2387,6 +2576,7 @@ mod tests {
             assert!(text.contains("maxplayer mint install"));
             assert!(text.contains("maxplayer mint upgrade"));
             assert!(text.contains("maxplayer mint uninstall"));
+            assert!(text.contains(&format!("<{FORWARDED_LIST}> [args...]")));
             assert!(err.is_empty());
         }
     }
@@ -2920,6 +3110,67 @@ mod tests {
         ] {
             assert_eq!(maxplayer_update_notice(&latest), None, "{latest:?}");
         }
+    }
+
+    /// The forwarded set is exactly what `maxplayer-mint` itself matches on (the first word of each
+    /// argument pattern in its `main`), so a command added there is not silently unreachable here.
+    #[test]
+    fn forwarded_commands_are_the_mints_own() {
+        let main = include_str!("../../maxplayer-mint/src/main.rs");
+        let mut theirs: Vec<&str> = main
+            .match_indices("[\"")
+            .filter_map(|(at, _)| main[at + 2..].split('"').next())
+            .collect();
+        theirs.sort_unstable();
+        theirs.dedup();
+        let mut ours = FORWARDED.to_vec();
+        ours.sort_unstable();
+        assert_eq!(
+            ours, theirs,
+            "update FORWARDED (and FORWARDED_LIST) to the mint's commands"
+        );
+        for own in ["install", "upgrade", "uninstall"] {
+            assert!(!FORWARDED.contains(&own), "{own} is maxplayer's own");
+        }
+        for cmd in FORWARDED.iter().filter(|c| !c.starts_with('-')) {
+            assert!(FORWARDED_LIST.split('|').any(|c| c == *cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn leading_flags_precede_any_subcommand_and_forwarded_args_are_not_parsed() {
+        assert_eq!(
+            leading_own_flags(&args(&["--home", "/h", "--bin-dir", "/b", "run"])),
+            4
+        );
+        assert_eq!(leading_own_flags(&args(&["restore", "--from", "/x"])), 0);
+        assert_eq!(leading_own_flags(&args(&["--home"])), 1);
+        // Own flags after a forwarded subcommand are refused (the mint takes neither), before
+        // anything is resolved.
+        for form in [
+            &["run", "--home", "/h"][..],
+            &["issue", "5", "--bin-dir", "/b"][..],
+        ] {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                run(&args(form), &mut out, &mut err),
+                USAGE_ERROR,
+                "{form:?}"
+            );
+            let text = String::from_utf8_lossy(&err);
+            assert!(text.contains("put it before the subcommand"), "{text}");
+        }
+        // A typo is a usage error naming both lists, not a silent `maxplayer mint` status.
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            run(&args(&["--home", "/h", "rnu"]), &mut out, &mut err),
+            USAGE_ERROR
+        );
+        let text = String::from_utf8_lossy(&err);
+        assert!(text.contains("unknown subcommand rnu"), "{text}");
+        assert!(text.contains("install, upgrade or uninstall"), "{text}");
+        assert!(text.contains(FORWARDED_LIST), "{text}");
+        assert!(out.is_empty());
     }
 
     #[test]

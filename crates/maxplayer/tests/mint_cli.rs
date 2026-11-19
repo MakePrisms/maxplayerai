@@ -1493,3 +1493,275 @@ fn doctor_shows_the_maxplayer_update_with_no_mint_installed_on_its_own_row() {
         "{failed}"
     );
 }
+
+// ── maxplayer mint <init|name|run|issue|restore|version> (forwarded to maxplayer-mint) ─────────
+
+impl World {
+    /// Where [`World::recorder`] writes what it was run with.
+    fn record_path(&self, tag: &str) -> PathBuf {
+        self.home.parent().unwrap().join(format!("record-{tag}"))
+    }
+
+    /// A stand-in `maxplayer-mint` at `path` that answers `--version`/`version` with `line` and
+    /// records every other run (its args, MAXPLAYER_HOME, its pid and every MAXPLAYER_* it sees)
+    /// into `record_path(tag)`. `issue <n>` exits `n`.
+    fn recorder(&self, path: &Path, line: &str, tag: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             case \"$1\" in --version|version) echo '{line}'; exit 0 ;; esac\n\
+             {{ echo \"home=$MAXPLAYER_HOME\"; echo \"pid=$$\"; env | grep '^MAXPLAYER_' | sort | sed 's/^/env=/'; \
+             for a in \"$@\"; do echo \"arg=$a\"; done; }} > '{record}'\n\
+             if [ \"$1\" = issue ]; then exit \"$2\"; fi\n\
+             exit 0\n",
+            record = self.record_path(tag).display(),
+        );
+        fs::write(path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn record(&self, tag: &str) -> Option<String> {
+        fs::read_to_string(self.record_path(tag)).ok()
+    }
+
+    /// `maxplayer mint --home <home> --bin-dir <bin_dir> <args>`, PATH without any mint.
+    fn forward(&self, args: &[&str]) -> Command {
+        let mut cmd = maxplayer();
+        cmd.arg("mint")
+            .arg("--home")
+            .arg(&self.home)
+            .arg("--bin-dir")
+            .arg(&self.bin_dir)
+            .args(args)
+            .env("PATH", "/usr/bin:/bin");
+        cmd
+    }
+}
+
+fn this_line() -> String {
+    format!("maxplayer-mint {VERSION} ({STAMP} release)")
+}
+
+#[test]
+fn forwarded_args_arrive_verbatim_with_maxplayer_home_set_and_maxplayer_becomes_the_mint() {
+    let w = World::new();
+    w.recorder(&w.target(), &this_line(), "bin");
+    // `--from`/`--name` here are the MINT's (restore/init), not install's: passed, never parsed.
+    let mut child = w
+        .forward(&["restore", "--from", "/backups/a b", "--name", "x"])
+        // An inherited MAXPLAYER_HOME names another home: --home wins.
+        .env("MAXPLAYER_HOME", "/elsewhere")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let status = child.wait().unwrap();
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "{err}");
+    assert!(err.is_empty(), "same version, no warning: {err}");
+    let record = w.record("bin").expect("the mint ran");
+    let lines: Vec<&str> = record.lines().collect();
+    assert!(
+        lines.contains(&format!("home={}", w.home.display()).as_str()),
+        "{record}"
+    );
+    let args: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("arg="))
+        .collect();
+    assert_eq!(
+        args,
+        ["restore", "--from", "/backups/a b", "--name", "x"],
+        "{record}"
+    );
+    // exec, not a child process: the mint IS the process we started, so signals sent to it (and
+    // Ctrl-C to its terminal) reach `maxplayer-mint run` directly.
+    assert!(
+        lines.contains(&format!("pid={pid}").as_str()),
+        "pid {pid}: {record}"
+    );
+    // No other MAXPLAYER_* reaches the mint (the test sets MAXPLAYER_RELEASES_LATEST_URL).
+    let env: Vec<&str> = lines
+        .iter()
+        .filter_map(|l| l.strip_prefix("env="))
+        .collect();
+    assert_eq!(
+        env,
+        [format!("MAXPLAYER_HOME={}", w.home.display())],
+        "{record}"
+    );
+}
+
+#[test]
+fn without_home_the_mint_gets_the_home_maxplayer_resolves() {
+    let w = World::new();
+    w.recorder(&w.target(), &this_line(), "bin");
+    let (code, _, err) = run(maxplayer()
+        .args(["mint", "--bin-dir"])
+        .arg(&w.bin_dir)
+        .arg("run")
+        .env("MAXPLAYER_HOME", &w.home)
+        .env("PATH", "/usr/bin:/bin"));
+    assert_eq!(code, 0, "{err}");
+    let record = w.record("bin").unwrap();
+    assert!(
+        record.contains(&format!("home={}\n", w.home.display())),
+        "{record}"
+    );
+    assert!(record.contains("arg=run\n"), "{record}");
+}
+
+#[test]
+fn the_bin_dir_mint_is_used_over_one_on_path_and_without_bin_dir_path_wins() {
+    let w = World::new();
+    w.recorder(&w.target(), &this_line(), "bin");
+    let pathbin = w.home.parent().unwrap().join("pathbin");
+    w.recorder(&pathbin.join("maxplayer-mint"), &this_line(), "path");
+    let path = format!("{}:/usr/bin:/bin", pathbin.display());
+
+    let (code, _, err) = run(w.forward(&["run"]).env("PATH", &path));
+    assert_eq!(code, 0, "{err}");
+    assert!(w.record("bin").is_some(), "the --bin-dir mint did not run");
+    assert!(
+        w.record("path").is_none(),
+        "the PATH mint ran instead of --bin-dir's"
+    );
+
+    // No --bin-dir: the one `maxplayer mint` would report, first on PATH.
+    let (code, _, err) = run(maxplayer()
+        .args(["mint", "--home"])
+        .arg(&w.home)
+        .arg("run")
+        .env("PATH", &path));
+    assert_eq!(code, 0, "{err}");
+    assert!(w.record("path").is_some(), "the PATH mint did not run");
+}
+
+#[test]
+fn the_mints_exit_code_and_output_are_its_own() {
+    let w = World::new();
+    w.recorder(&w.target(), &this_line(), "bin");
+    let (code, _, err) = run(&mut w.forward(&["issue", "7"]));
+    assert_eq!(code, 7, "{err}");
+    let (code, out, err) = run(&mut w.forward(&["version"]));
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(out.trim(), this_line());
+    let (code, out, _) = run(&mut w.forward(&["--version"]));
+    assert_eq!((code, out.trim()), (0, this_line().as_str()));
+}
+
+#[test]
+fn with_nothing_installed_it_points_at_install_with_the_same_flags() {
+    let w = World::new();
+    let (code, out, err) = run(&mut w.forward(&["run"]));
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(
+        err.contains(&format!(
+            "no maxplayer-mint is installed in {}: run `maxplayer mint install --bin-dir {} --home {}` first",
+            w.bin_dir.display(),
+            w.bin_dir.display(),
+            w.home.display()
+        )),
+        "{err}"
+    );
+    assert!(!w.home.exists(), "created the home");
+    assert!(!w.bin_dir.exists(), "created the bin dir");
+}
+
+#[test]
+fn own_subcommands_win_and_are_never_forwarded() {
+    let w = World::new();
+    w.good_release();
+    // An older mint that records any run other than `--version`: install refuses it and upgrade
+    // replaces it without ever running it, so a record means an own subcommand was forwarded.
+    w.recorder(&w.target(), OLD_LINE, "bin");
+    // Status with leading flags only asks the binary for its version.
+    let (code, out, err) = run(&mut w.forward(&["--offline"]));
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains("version 0.6.0 (maxplayer is"), "{out}");
+    // install, upgrade, uninstall: maxplayer's own, with --home/--bin-dir in front as an alias
+    // puts them.
+    let (code, out, err) = run(&mut w.forward(&["install", "--from", &w.from()]));
+    assert_eq!(code, 2, "{out}\n{err}");
+    assert!(err.contains("maxplayer mint upgrade --bin-dir"), "{err}");
+    let (code, out, err) = run(&mut w.forward(&["upgrade", "--from", &w.from()]));
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(
+        fs::read_to_string(w.target())
+            .unwrap()
+            .contains(&this_line()),
+        "upgrade did not replace the binary"
+    );
+    let (code, out, err) = run(&mut w.forward(&["uninstall"]));
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(!w.target().exists(), "uninstall did not remove the binary");
+    assert!(
+        w.record("bin").is_none(),
+        "an own subcommand reached the mint"
+    );
+}
+
+#[test]
+fn typos_and_misplaced_flags_are_usage_errors_that_run_nothing() {
+    let w = World::new();
+    w.recorder(&w.target(), &this_line(), "bin");
+    for (args, want) in [
+        (&["rnu"][..], "unknown subcommand rnu"),
+        (
+            &["run", "--home", "/h"][..],
+            "--home after `run` would be passed",
+        ),
+    ] {
+        let (code, out, err) = run(&mut w.forward(args));
+        assert_eq!(code, 1, "{args:?}: {out}\n{err}");
+        assert!(err.contains(want), "{args:?}: {err}");
+        assert!(w.record("bin").is_none(), "{args:?} ran the mint");
+    }
+}
+
+#[test]
+fn a_mint_of_another_version_still_runs_after_the_status_fix_hint() {
+    let w = World::new();
+    for (line, fix) in [
+        (
+            OLD_LINE,
+            format!(
+                "run `maxplayer mint upgrade --bin-dir {}",
+                w.bin_dir.display()
+            ),
+        ),
+        (
+            "not a version line",
+            format!(
+                "run `maxplayer mint install --force --bin-dir {}",
+                w.bin_dir.display()
+            ),
+        ),
+    ] {
+        w.recorder(&w.target(), line, "bin");
+        let _ = fs::remove_file(w.record_path("bin"));
+        let (code, out, err) = run(&mut w.forward(&["run"]));
+        assert_eq!(code, 0, "{out}\n{err}");
+        assert!(err.contains("maxplayer mint: warning:"), "{err}");
+        assert!(
+            err.contains(&format!("but this maxplayer is {VERSION}")),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("{fix} --home {}`", w.home.display())),
+            "{err}"
+        );
+        assert!(w.record("bin").is_some(), "{line}: the mint did not run");
+        // A version query answers for itself, without the warning.
+        let (code, _, err) = run(&mut w.forward(&["version"]));
+        assert_eq!(code, 0);
+        assert!(err.is_empty(), "{err}");
+    }
+}
