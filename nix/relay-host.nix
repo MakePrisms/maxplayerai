@@ -68,6 +68,11 @@
     # Before adding a new service that writes, add its key to the member list first.
     requireRelayMembership = true;
 
+    # Maxplayer Team repos (#1338). Before the first switch with this on: the private service key is a
+    # relay member, kind 1059 stays enabled, and
+    # `SELECT count(*) FROM private_job_repositories WHERE job_id ~ '0{32}$'` returns 0.
+    teamRepos = true;
+
     # Relay identity key. Referenced by PATH only — gudnuf places a file here containing
     #   BUZZ_RELAY_PRIVATE_KEY=<64-hex>
     # before the first switch. It must PERSIST across reboots (the relay's stable NIP-42/NIP-11
