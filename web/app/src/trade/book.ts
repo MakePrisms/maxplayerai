@@ -211,12 +211,50 @@ export function createBook() {
 
 export type Book = ReturnType<typeof createBook>;
 
-/** Window toggles for completed-trade stats, as on /market. `null` = all time. */
-export const WINDOWS: readonly { key: string; label: string; seconds: number | null }[] = [
-  { key: "24h", label: "24 hours", seconds: 86400 },
-  { key: "7d", label: "Week", seconds: 7 * 86400 },
-  { key: "all", label: "All time", seconds: null },
+export interface TimeWindow {
+  key: string;
+  label: string;
+  /** `null` = all time. */
+  seconds: number | null;
+  /**
+   * The closed-lots list shows only sold lots. Over 24h it also shows
+   * cancelled and expired ones; over longer windows those would bury the
+   * trades, and the public relays lose them anyway once the listing is
+   * deleted (only a `sold` status carries its listing), so the list would
+   * depend on which relays answered.
+   */
+  soldOnly: boolean;
+  /** Closed-lots meta after the count: "3 in 24h", "4 sold all time". */
+  meta: string;
+  /** Closed-lots list when the window holds nothing. */
+  empty: string;
+}
+
+/** Window toggles for completed-trade stats and the closed-lots list, as on /market. */
+export const WINDOWS: readonly TimeWindow[] = [
+  { key: "24h", label: "24 hours", seconds: 86400, soldOnly: false, meta: "in 24h", empty: "Nothing sold, cancelled or expired in the last 24 hours." },
+  { key: "7d", label: "Week", seconds: 7 * 86400, soldOnly: true, meta: "sold this week", empty: "No completed trades this week." },
+  { key: "all", label: "All time", seconds: null, soldOnly: true, meta: "sold all time", empty: "No completed trades yet." },
 ];
+
+/** Rows the closed-lots list renders at most; the meta still counts them all. */
+export const CLOSED_ROW_CAP = 120;
+
+/**
+ * The closed-lots list for a window, newest first: every row completedStats
+ * counts as a trade, plus (24h only) cancelled and expired lots. Same time
+ * rule as the stats: a lot belongs to the window of its last status.
+ */
+export function closedRows(v: BookView, now: number, w: TimeWindow): LotRow[] {
+  const since = w.seconds == null ? -Infinity : now - w.seconds;
+  return v.closed.filter((r) => r.updated_at >= since && (!w.soldOnly || r.state === "sold"));
+}
+
+/** "4 sold all time", or "130 sold all time · newest 120" past the row cap. */
+export function closedMeta(count: number, w: TimeWindow): string {
+  const base = `${count} ${w.meta}`;
+  return count > CLOSED_ROW_CAP ? `${base} · newest ${CLOSED_ROW_CAP}` : base;
+}
 
 export interface CompletedStats {
   /** Sold lots in the window, newest first. */
