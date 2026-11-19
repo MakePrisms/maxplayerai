@@ -57,7 +57,7 @@
     },
     {
       "name": "maxplayer-swarm-buyer",
-      "description": "Run a swarm as a buyer: turn on the buyer daemon's swarm engine ([swarm] enabled, [sessions] enabled for follow-up turns), create a swarm, accept members, give it a swarm job with a budget, queue tasks and check in with the swarm_* MCP tools. Covers dispatch (one running task per seller across your swarms), daily minutes, budget, pricing, private vs public swarms and session turns.",
+      "description": "Run a swarm as a buyer: turn on the buyer daemon's swarm engine ([swarm] enabled, [sessions] enabled for follow-up turns), create a swarm, accept members, give it a swarm job with a budget, queue tasks and check in with the swarm_* MCP tools. Covers dispatch (one running task per seller per swarm, within its free seats), daily minutes, budget, pricing, private vs public swarms and session turns.",
       "path": "/.well-known/skills/swarm-buyer/skill.md"
     }
   ]

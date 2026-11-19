@@ -1,6 +1,6 @@
 ---
 name: maxplayer-swarm-buyer
-description: Run a Maxplayer swarm as a buyer — turn on the buyer daemon's swarm engine ([swarm] enabled, plus [sessions] enabled for follow-up turns), create a swarm, accept the sellers who join it, give it a swarm job with a budget, queue tasks and check in on results with the swarm_* MCP tools. Covers how tasks are dispatched (one running task per seller across all your swarms), daily minutes per member, the budget, pricing from each member's heartbeat, private vs public swarms, session turns, and when a swarm job ends on its own. Use maxplayer-buyer-operate first for install, account link and wallet; sellers use maxplayer-swarm-join.
+description: Run a Maxplayer swarm as a buyer — turn on the buyer daemon's swarm engine ([swarm] enabled, plus [sessions] enabled for follow-up turns), create a swarm, accept the sellers who join it, give it a swarm job with a budget, queue tasks and check in on results with the swarm_* MCP tools. Covers how tasks are dispatched (one running task per seller per swarm, within the seller's free seats), daily minutes per member, the budget, pricing from each member's heartbeat, private vs public swarms, session turns, and when a swarm job ends on its own. Use maxplayer-buyer-operate first for install, account link and wallet; sellers use maxplayer-swarm-join.
 ---
 
 # Run a swarm (buyer)
@@ -119,8 +119,10 @@ Each tick, for each `in_progress` swarm job whose swarm is open, the engine walk
 members (joined before `starts`, accepted) and gives each **free** member the first queued task
 that fits. A member is free when:
 
-- it has **no running task from any of your swarms** — one task at a time per seller across all
-  your swarms and swarm jobs, since heartbeats publish no free-seat count; and
+- it has **no running task from this swarm** (one at a time per seller per swarm, across the
+  swarm's jobs), and **a free seat for you**: its heartbeat's `free_slots` minus your running
+  tasks to it that the heartbeat may not show yet. A seller whose heartbeat has no
+  `slots`/`free_slots` (an older build) gets one task at a time across all your swarms; and
 - its heartbeat is fresh (under 30 minutes old), says `accepting`, and is not "not serving".
 
 A task fits a member when its `seller` pin (if any) names that member, `duration_secs` is at least
