@@ -1,9 +1,10 @@
 import type { Snapshot } from "./live.js";
 import { SWARM } from "../model/kinds.js";
 
-// Fabricated snapshot for UI work (`/swarm?demo`). Never shown without the query flag.
+// Fabricated snapshot for UI work (`/swarm?demo`; `/swarm?demo=private` for a private-tasks swarm,
+// whose rows come from the buyer-signed tally). Never shown without the query flag.
 // Seller keys are random throwaway identities; so is the buyer.
-export function demoSnapshot(nowSecs: number): Snapshot {
+export function demoSnapshot(nowSecs: number, { privateTasks = false }: { privateTasks?: boolean } = {}): Snapshot {
   const now = Math.floor(nowSecs);
   const starts = now - 35 * 60;
   const min = (m: number) => m * 60;
@@ -24,7 +25,7 @@ export function demoSnapshot(nowSecs: number): Snapshot {
     id, seller: sellerKey, start, deadline, end, running: end === null,
     usedMinutes: Math.max(0, Math.min(end ?? now, deadline) - start) / 60,
   });
-  return {
+  const s0: Snapshot = {
     asOf: now,
     swarm: {
       buyer: "9a5a6dfd1f109849f22f970fc03a5492ab5c9f791d5e7bed204ae852fe4353df",
@@ -72,5 +73,18 @@ export function demoSnapshot(nowSecs: number): Snapshot {
     ],
     budget: { totalSats: 10_000, committedSats: 2_400, paidSats: 3_600, estimated: true, unknownAmounts: 0, note: "Demo figures." },
     relay: { connected: true, authenticated: true, historyComplete: true, error: null },
+  };
+  if (!privateTasks) return s0;
+  // Private tasks: no public task events, so no jobs; each member's figures are the buyer's tally.
+  const reported: Record<string, { tasksDone: number; minutesToday: number | null } | null> = {
+    [s.a[0]]: { tasksDone: 3, minutesToday: 32 }, [s.c[0]]: { tasksDone: 2, minutesToday: 41.5 },
+    [s.d[0]]: null, [s.b[0]]: { tasksDone: 2, minutesToday: 30 }, [s.f[0]]: { tasksDone: 1, minutesToday: 15 },
+  };
+  return {
+    ...s0,
+    swarm: { ...s0.swarm!, name: "Private Swarm", tasks: "private" },
+    sellers: s0.sellers.map((a) => ({ ...a, state: a.state === "working" ? "accepted" : a.state, currentJobStart: null, reported: reported[a.pubkey] ?? null })),
+    jobs: [],
+    updates: ["Demo data: not a real swarm run."],
   };
 }

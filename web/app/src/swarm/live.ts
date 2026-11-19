@@ -1,7 +1,10 @@
 import { npubEncode } from '../trade/nip19.js';
 import { FRESH_S } from './hero.js';
 export interface Job { id: string; seller: string; start: number; deadline: number; end: number|null; running: boolean; usedMinutes: number; }
-export interface Seller { pubkey: string; npub: string; name: string; minutesOffered: number; minutesUsed: number; minutesRemaining: number; state: string; eligible: boolean; decision: string; currentJobStart: number|null; }
+// reported: the member's entry in the buyer-signed tally of the shown swarm job (model.mjs parseUpdate):
+// tasks done in that swarm job, minutes used today (null when the tally is from an earlier UTC day).
+export interface Reported { tasksDone: number; minutesToday: number|null }
+export interface Seller { pubkey: string; npub: string; name: string; minutesOffered: number; minutesUsed: number; minutesRemaining: number; state: string; eligible: boolean; decision: string; currentJobStart: number|null; reported?: Reported|null; }
 // Untrusted pending joins (no buyer decision yet). Display only; never eligible.
 export interface Applicant { pubkey: string; npub: string; minutesOffered: number; since: number; joinedAt: number; note: string; }
 export type SwarmJobStatus = 'scheduled'|'in_progress'|'completed'|'cancelled';
@@ -61,18 +64,37 @@ export function parseSnapshot(value: unknown): Snapshot {
     if(![c.id,c.title,c.goal,c.result,c.buyer,c.buyerNpub].every(v=>typeof v==='string')||!/^[0-9a-f]{64}$/.test(c.buyer)||npubEncode(c.buyer)!==c.buyerNpub||![c.starts,c.ends].every(finite)||!['scheduled','in_progress','completed','cancelled'].includes(c.status))throw Error('Invalid swarm job');
     if(!s.budget||![s.budget.totalSats,s.budget.committedSats,s.budget.paidSats,s.budget.unknownAmounts].every(finite)||typeof s.budget.note!=='string')throw Error('Invalid budget');
   } else if(s.swarmJob!==null)throw Error('Missing swarm job');
-  for(const a of s.sellers)if(![a.pubkey,a.npub,a.name,a.state,a.decision].every(v=>typeof v==='string')||![a.minutesOffered,a.minutesUsed,a.minutesRemaining].every(finite)||typeof a.eligible!=='boolean')throw Error('Invalid seller');
+  for(const a of s.sellers)if(![a.pubkey,a.npub,a.name,a.state,a.decision].every(v=>typeof v==='string')||![a.minutesOffered,a.minutesUsed,a.minutesRemaining].every(finite)||typeof a.eligible!=='boolean'||!validReported(a.reported))throw Error('Invalid seller');
   if(s.applicants!==undefined&&(!Array.isArray(s.applicants)||!s.applicants.every(a=>[a.pubkey,a.npub].every(v=>typeof v==='string')&&finite(a.minutesOffered))))throw Error('Invalid applicant');
   for(const j of s.jobs)if(![j.id,j.seller].every(v=>typeof v==='string')||![j.start,j.deadline,j.usedMinutes].every(finite)||typeof j.running!=='boolean')throw Error('Invalid job');
   return s;
 }
+function validReported(r: unknown): boolean {
+  if(r===undefined||r===null)return true;
+  const x=r as Reported;
+  return typeof r==='object'&&Number.isSafeInteger(x.tasksDone)&&x.tasksDone>=0&&(x.minutesToday===null||finite(x.minutesToday)&&x.minutesToday>=0);
+}
+// A private swarm's tasks carry no public swarm link, so the relay holds no minutes or tasks for its
+// members: the buyer-signed tally is the only source (docs/specs/swarm.md §7.5) and the rows say so.
+// A public swarm's minutes come from the relay's signed task events only; its tally is not shown.
+export const privateTasks=(s: Snapshot)=>s.swarm?.tasks==='private';
 export function sellerMinutes(s: Snapshot,a: Seller,now: number): number {
+  if(privateTasks(s))return a.reported?.minutesToday??0;
   // Advance only the running component, capped at each offer deadline. No server/client clock skew jump.
   const elapsed=Math.max(0,now-s.asOf);
   return a.minutesUsed+s.jobs.filter(j=>j.seller===a.pubkey&&j.running).reduce((sum,j)=>sum+Math.max(0,Math.max(0,Math.min(s.asOf+elapsed,j.deadline)-j.start)/60-j.usedMinutes),0);
 }
 export function sellerLine(s: Snapshot,a: Seller,now: number): string {
+  if(privateTasks(s)){const m=a.reported?.minutesToday;return `${m===null||m===undefined?'–':Math.floor(m)} / ${a.minutesOffered} min`;}
   return `${Math.floor(sellerMinutes(s,a,now))} / ${a.minutesOffered} min`;
+}
+// The private-swarm line under a member's row: the tally's task count, labelled as the buyer's report.
+// tasks_done is per swarm job (the one shown), minutes per swarm per UTC day, as on public swarms.
+export function reportedLine(s: Snapshot,a: Seller): string|null {
+  if(!privateTasks(s))return null;
+  const r=a.reported;
+  if(!r)return 'No report from the buyer yet';
+  return `${r.tasksDone} ${r.tasksDone===1?'task':'tasks'} in this job · reported by the buyer`;
 }
 const running=(s: Snapshot,a: Seller,now: number)=>s.jobs.some(j=>j.seller===a.pubkey&&j.running&&now<j.deadline);
 export function sellerState(s: Snapshot,a: Seller,now: number): string {
@@ -167,8 +189,10 @@ const shortNpub=(npub: string)=>npub.length>20?`${npub.slice(0,12)}…${npub.sli
 // In 'roster' the jobs aren't known yet, so every leaver is held back until 'live': a row that
 // appears once the trade data is in beats one that shows and then vanishes. Display only: the
 // shared snapshot (runner, CLI) still carries every left seller.
+// A private swarm has no public tasks, so there a leaver is listed when the buyer's tally reports work.
+const worked=(s: Snapshot,a: Seller)=>s.jobs.some(j=>j.seller===a.pubkey)||privateTasks(s)&&!!a.reported&&(a.reported.tasksDone>0||(a.reported.minutesToday??0)>0);
 export function listedSellers(s: Snapshot,roster=false): Seller[] {
-  return s.sellers.filter(a=>a.decision!=='denied'&&(a.state!=='left'||!roster&&s.jobs.some(j=>j.seller===a.pubkey)));
+  return s.sellers.filter(a=>a.decision!=='denied'&&(a.state!=='left'||!roster&&worked(s,a)));
 }
 // Public page: denied members are not listed. Remote text only ever reaches textContent.
 // mode 'loading' (or true: not live and no fresh swarm data, e.g. before the first data or
@@ -201,7 +225,10 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
     const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
     const st=doc.createElement('span');st.className='c-state';
     if(state===null)st.append(skel(doc,'c-skel-state'));else st.textContent=state;
-    row.append(name,mins,id,st);fragment.append(row);
+    row.append(name,mins,id,st);
+    const reported=roster?null:reportedLine(s,a);
+    if(reported!==null){const r=doc.createElement('span');r.className='c-reported';r.textContent=reported;row.append(r);}
+    fragment.append(row);
   }
   // Waiting for approval: an untrusted, capped sample. Never counted as agents in the swarm.
   const waiting=s.applicants??[],partial=!!s.relay?.applicantsIncomplete;
@@ -214,7 +241,8 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
     row.append(name,mins,id,st);fragment.append(row);
   }
   list.replaceChildren(fragment);
-  const working=roster?'':` · ${shown.filter(a=>sellerState(s,a,now)==='Working now').length} working now`;
+  // A private swarm's running tasks aren't public: no "working now" count there.
+  const working=roster||privateTasks(s)?'':` · ${shown.filter(a=>sellerState(s,a,now)==='Working now').length} working now`;
   const pending=waiting.length||partial?` · ${waiting.length}${partial?'+':''} waiting for approval`:'';
   doc.getElementById('seller-summary')!.textContent=(shown.length?`${shown.length} ${shown.length===1?'agent':'agents'}${working}`:'No members yet.')+pending;
 }
