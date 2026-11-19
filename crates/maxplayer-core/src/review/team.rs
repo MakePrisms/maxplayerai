@@ -3,7 +3,6 @@
 //! encrypted lane, classifier, threshold and override as private job reviews; the verdict goes
 //! only to the requester, and no roster check is made.
 use super::*;
-use crate::home::MaxplayerHome;
 use nostr_sdk::prelude::*;
 
 /// Largest team chat event, as JSON (§5 client rules).
@@ -107,28 +106,37 @@ impl Request {
     }
 }
 
-/// Ask for (or reuse) the verdict on one team subject. `Ok(None)`: review switched off for it.
-/// The reviewer must be the configured content-service key; private jobs need not be enabled.
+/// The content-service reviewer key for `relay`, which must be the configured service key.
+fn reviewer(config: &crate::home::MaxplayerConfig, relay: &str) -> Result<PublicKey, String> {
+    config.review.validate()?;
+    let reviewer = config
+        .review
+        .reviewers
+        .get(relay)
+        .ok_or("review: configure the content-service reviewer key for this relay")?;
+    if config.privacy.service_pubkey.as_deref() != Some(reviewer.as_str()) {
+        return Err("review: team reviewer must be the configured content-service identity".into());
+    }
+    PublicKey::from_hex(reviewer).map_err(|_| "review: invalid reviewer key".into())
+}
+
+/// Ask for (or reuse) the signed verdict on one team subject on `relay`. `Ok(None)`: review is
+/// switched off for it. A refused verdict is returned too: the reader stores the signed event and
+/// re-decides it with [`decide`] against its current config (spec §5). Private jobs need not be
+/// enabled.
 pub async fn check(
-    home: &MaxplayerHome,
+    config: &crate::home::MaxplayerConfig,
+    relay: &str,
     client: &Client,
     keys: &Keys,
     request: &Request,
     counterparty: &str,
-    accepted_verdict: Option<&str>,
-) -> Result<Option<Pass>, String> {
-    let config = &home.config.review;
-    if !config.enabled(request.subject.kind, counterparty)? {
+) -> Result<Option<Event>, String> {
+    use super::wire::Transport as _;
+    if !config.review.enabled(request.subject.kind, counterparty)? {
         return Ok(None);
     }
-    let relay = &home.config.relay_url;
-    let reviewer = config
-        .reviewers
-        .get(relay)
-        .ok_or("review: configure the content-service reviewer key for this relay")?;
-    if home.config.privacy.service_pubkey.as_deref() != Some(reviewer.as_str()) {
-        return Err("review: team reviewer must be the configured content-service identity".into());
-    }
+    let reviewer = reviewer(config, relay)?;
     request
         .validate(&keys.public_key())
         .map_err(|code| reviewer_error(&code))?;
@@ -138,18 +146,45 @@ pub async fn check(
         relay,
         identity: super::private::Identity::Buyer(keys),
         draft: &draft,
-        reviewer: PublicKey::from_hex(reviewer).map_err(|_| "review: invalid reviewer key")?,
+        reviewer,
     };
-    wire::check_detailed(
-        &transport,
-        config,
-        relay,
-        &request.subject,
-        counterparty,
-        false,
-        accepted_verdict,
-    )
-    .await
+    let subject = &request.subject;
+    let id = match wire::check_detailed(&transport, &config.review, relay, subject, counterparty, false, None).await {
+        Ok(Some(pass)) => pass.event_id,
+        Ok(None) => return Ok(None),
+        Err(e) if e.starts_with(VERDICT_REFUSED_PREFIX) => e
+            .split("verdict event ")
+            .nth(1)
+            .and_then(|rest| rest.get(..64))
+            .filter(|id| hex_id(id))
+            .ok_or("review: refused verdict without an event id")?
+            .to_owned(),
+        Err(e) => return Err(e),
+    };
+    transport
+        .fetch(subject, &reviewer)
+        .await?
+        .into_iter()
+        .find(|e| e.id.to_hex() == id)
+        .map(Some)
+        .ok_or_else(|| "review: verdict event not found".into())
+}
+
+/// Re-decide a stored verdict offline against the current config (threshold, reviewer key).
+/// `accepted` is a verdict id the reader accepted with `accept-verdict`: it overrides `Refused`
+/// for exactly that verdict, never an error.
+pub fn decide(
+    config: &crate::home::MaxplayerConfig,
+    relay: &str,
+    verdict: &Event,
+    subject: &Subject,
+    accepted: Option<&str>,
+) -> Result<Decision, String> {
+    let review = wire::verify(verdict, &reviewer(config, relay)?, subject)?;
+    Ok(match review.decision(subject, config.review.reject_at_or_above_ppm)? {
+        Decision::Refused { .. } if accepted == Some(verdict.id.to_hex().as_str()) => Decision::Passed,
+        other => other,
+    })
 }
 
 #[cfg(test)]

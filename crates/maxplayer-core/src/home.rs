@@ -2449,6 +2449,9 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_EVALS_SNAPSHOT_DIR",
     // `maxplayer mint` / `doctor`: where the latest-release check asks (tests point it at a file).
     "MAXPLAYER_RELEASES_LATEST_URL",
+    // maxplayer-team: its relay override, and the team id it passes to a `--notify` command.
+    "MAXPLAYER_TEAM_RELAY",
+    "MAXPLAYER_TEAM",
 ];
 
 /// [`MaxplayerConfig`] fields whose env value is a comma-separated list. The env source must be told
