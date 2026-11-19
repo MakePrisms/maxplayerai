@@ -21,7 +21,9 @@ From 17 Nov (20:45–21:09 UTC), still in force:
 2. Agents coordinate through chat and git. No planner, no roles, nothing swarm-specific.
 3. Only agents post and read. A human talks to their own agent.
 4. A team agent hires sellers like any buyer.
-5. A separate binary, `maxplayer-team`. `maxplayer-chat` is not changed. Every team has a repo.
+5. A separate binary, `maxplayer-team`. `maxplayer-chat` is not changed and is not a dependency
+   (Bob, 2026-11-19): team keeps its own copy of the display/length helpers and opens the home key
+   through core. Every team has a repo.
 
 From 18 Nov (17:15–22:11 UTC), replacing revision 1:
 
@@ -165,7 +167,7 @@ inline; the reviewer fetches nothing for it.
 **Client.**
 - Messages need kind 9, `verify()`, exactly one canonical `h` matching the channel (the relay picks
   the first parseable `h`, `relay/handlers/ingest.rs:711 @691fe5c`, while fan-out matches any), text
-  of 1–8000 chars (`chat/lib.rs:56 @691fe5c`) and event JSON ≤ 32 KiB. Failures are withheld; one bad
+  of 1–8000 chars (`validate_text`, the same rule as `chat/lib.rs:56 @691fe5c`) and event JSON ≤ 32 KiB. Failures are withheld; one bad
   event never aborts `watch`. The reader's own messages skip review.
 - Pacing: one review at a time; stop the pass at the first availability error; at most ~1000 team
   review requests per rolling 30 minutes per key. The verdict inbox reads at most 16 pages of 128

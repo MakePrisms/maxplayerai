@@ -3,7 +3,6 @@
 //! every pulled commit is screened by the content service before it is shown or merged. It makes
 //! no model call and starts no harness.
 use base64::Engine as _;
-use maxplayer_chat::{display_text, validate_text};
 use maxplayer_core::home::MaxplayerConfig;
 use maxplayer_core::review::state::failure_state;
 use maxplayer_core::review::team as review;
@@ -22,6 +21,40 @@ use std::process::Command;
 use std::time::Duration;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Untrusted text made safe for a terminal: control characters, line/paragraph separators and
+/// bidi/zero-width format characters are escaped, everything else is shown as is.
+pub fn display_text(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || visual_format(c) {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+fn visual_format(c: char) -> bool {
+    matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{200b}' | '\u{200c}'
+        | '\u{feff}' | '\u{2060}')
+}
+/// JSON output with bidi/zero-width format characters escaped (serde already escapes controls).
+pub fn display_json(value: serde_json::Value) -> String {
+    value
+        .to_string()
+        .chars()
+        .map(|c| if visual_format(c) { format!("\\u{:04x}", c as u32) } else { c.to_string() })
+        .collect()
+}
+/// A team message is 1–8000 characters.
+pub fn validate_text(text: &str) -> Result<()> {
+    if text.is_empty() || text.chars().count() > 8000 {
+        return Err("message must contain 1–8000 characters".into());
+    }
+    Ok(())
+}
 pub const DEFAULT_RELAY: &str = "wss://relay.maxplayer.ai";
 /// `about` marker of a team channel: `maxplayer-team/1 <creator hex>` (spec §3).
 pub const MARKER: &str = "maxplayer-team/1";
@@ -261,11 +294,17 @@ pub struct Home {
 }
 
 impl Home {
-    /// Chat's home-key loader and the maxplayer config (review settings), both unchanged.
+    /// The maxplayer home (created on first use, exactly as every other `maxplayer` command does):
+    /// its key and its config (review settings).
     pub fn open(root: impl AsRef<Path>, relay: &str) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
-        let keys = maxplayer_chat::Home::open(&root)?.keys;
-        let config = maxplayer_core::home::resolve_config_read_only(&root).map_err(|e| e.to_string())?;
+        if fs::symlink_metadata(&root).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err("home directories must not be symlinks".into());
+        }
+        let home = maxplayer_core::home::bootstrap(&root).map_err(|e| e.to_string())?;
+        let secret = maxplayer_core::home::read_secret_key_hex(&home).map_err(|e| e.to_string())?;
+        let keys = Keys::parse(&secret).map_err(|_| "invalid home key")?;
+        let config = home.config;
         let dir = root.join("team");
         if fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err("home directories must not be symlinks".into());

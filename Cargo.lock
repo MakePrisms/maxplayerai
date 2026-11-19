@@ -2930,7 +2930,6 @@ version = "0.8.0-rc1"
 dependencies = [
  "base64 0.22.1",
  "libc",
- "maxplayer-chat",
  "maxplayer-core",
  "nostr-sdk",
  "reqwest",

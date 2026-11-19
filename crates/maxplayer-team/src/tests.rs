@@ -172,3 +172,27 @@ fn worktree_origin_has_no_credentials_so_bare_git_fetch_fails() {
     let open = Team { open: true, ..t };
     assert!(h.repo_url(&open).is_err());
 }
+
+#[test]
+fn home_key_is_the_maxplayer_home_key_created_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = home(dir.path(), "ws://127.0.0.1:9");
+    let second = home(dir.path(), "ws://127.0.0.1:9");
+    assert_eq!(first.me(), second.me());
+    let core = maxplayer_core::home::bootstrap(dir.path()).unwrap();
+    let secret = maxplayer_core::home::read_secret_key_hex(&core).unwrap();
+    assert_eq!(Keys::parse(&secret).unwrap().public_key().to_hex(), first.me());
+    let link = dir.path().with_extension("link");
+    std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+    assert!(Home::open(&link, "ws://127.0.0.1:9").is_err());
+    fs::remove_file(link).unwrap();
+}
+
+#[test]
+fn untrusted_text_is_escaped_and_length_checked() {
+    assert_eq!(display_text("a\u{202e}b\nc\u{200b}"), "a\\u{202e}b\\nc\\u{200b}");
+    assert_eq!(display_json(serde_json::json!("x\u{2066}y")), "\"x\\u2066y\"");
+    assert!(validate_text("").is_err());
+    assert!(validate_text(&"é".repeat(8000)).is_ok());
+    assert!(validate_text(&"é".repeat(8001)).is_err());
+}

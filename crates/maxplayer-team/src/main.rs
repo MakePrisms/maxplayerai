@@ -1,5 +1,4 @@
-use maxplayer_chat::display_text;
-use maxplayer_team::{DEFAULT_RELAY, Home, Result, Status, Stored};
+use maxplayer_team::{DEFAULT_RELAY, Home, Result, Status, Stored, display_json, display_text};
 use nostr_sdk::prelude::ToBech32;
 use std::path::PathBuf;
 
@@ -67,7 +66,7 @@ fn print_entries(home: &Home, rows: &[(Stored, Status)], json: bool) -> Result<(
                 v
             })
             .collect();
-        println!("{}", maxplayer_chat::display_json(serde_json::Value::Array(out)));
+        println!("{}", display_json(serde_json::Value::Array(out)));
         return Ok(());
     }
     for (s, st) in rows {
@@ -141,7 +140,7 @@ async fn run() -> Result<i32> {
             let invites = home.invites().await?;
             if json {
                 let v: Vec<_> = invites.iter().map(|(c, o)| serde_json::json!({"channel": c, "creator": o})).collect();
-                println!("{}", maxplayer_chat::display_json(serde_json::Value::Array(v)));
+                println!("{}", display_json(serde_json::Value::Array(v)));
             } else if invites.is_empty() {
                 println!("no pending invites");
             } else {
@@ -170,7 +169,7 @@ async fn run() -> Result<i32> {
             let state = home.load()?;
             let follows = home.follows(&state);
             if json {
-                println!("{}", maxplayer_chat::display_json(serde_json::json!({"teams": state.teams, "follows": follows})));
+                println!("{}", display_json(serde_json::json!({"teams": state.teams, "follows": follows})));
             } else {
                 for t in state.teams.values() {
                     let kind = if t.open { "open channel" } else { "team" };

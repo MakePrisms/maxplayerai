@@ -8,8 +8,6 @@ publish.workspace = true
 [dependencies]
 # `wallet` for review::team (the encrypted review lane); spec §5 wants it under `gateway` — follow-up.
 maxplayer-core = { path = "../maxplayer-core", default-features = false, features = ["gateway", "wallet"] }
-# Display escaping, text validation and the home key (Home::open), unchanged.
-maxplayer-chat = { path = "../maxplayer-chat" }
 nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59", "nip98"] }
 tokio = { version = "1.52.0", default-features = false, features = ["rt", "macros", "time", "sync"] }
 serde.workspace = true
