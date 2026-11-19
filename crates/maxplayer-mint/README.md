@@ -252,7 +252,9 @@ maxplayer mint --home ~/.maxplayer run                        # Ctrl-C stops it 
 tmux new-session -d -s maxplayer-mint 'maxplayer mint run'    # detached, default home
 ```
 
-Add `--bin-dir <dir>` when the mint is not the one on PATH. This is the same as
+Add `--bin-dir <dir>` when the mint is not the one on PATH. (`run` is being renamed `serve`, with
+`run` kept as an alias; `maxplayer mint serve` is already passed on and works once your
+`maxplayer-mint` has it.) This is the same as
 `MAXPLAYER_HOME=<home> <bin-dir>/maxplayer-mint run`, without the risk of starting another copy of
 the mint or the wrong home. A mint whose version differs from `maxplayer` still starts, after a
 warning with the fix `maxplayer mint` prints (usually `maxplayer mint upgrade`).

@@ -112,7 +112,8 @@ fn write_usage(out: &mut dyn Write) {
          \n\
          `maxplayer mint <{forwarded}> [args...]` runs that {MINT_BIN} command (`{MINT_BIN} --help`\n\
          lists them: init [--name <name>], name <name>, run, issue [amount], restore [--from <dir>],\n\
-         version) with MAXPLAYER_HOME set to <home>, using the same binary `maxplayer mint` reports\n\
+         version; `serve` is forwarded too, as `run`'s upcoming name, and works once the installed\n\
+         {MINT_BIN} has it) with MAXPLAYER_HOME set to <home>, using the same binary `maxplayer mint` reports\n\
          (--bin-dir, else the first on PATH, else ~/.local/bin). Everything after the subcommand is\n\
          passed to it unchanged, so put --home/--bin-dir BEFORE the subcommand (after it they are\n\
          refused: {MINT_BIN} takes neither). maxplayer replaces itself with the mint process: Ctrl-C,\n\
@@ -139,11 +140,17 @@ const FORWARDED: &[&str] = &[
     "init",
     "name",
     "run",
+    "serve",
     "issue",
     "restore",
     "version",
     "--version",
 ];
+/// Forwarded ahead of the mint: `serve` is `run`'s new name (feat/serve-verbs, Petar 2026-11-19;
+/// `run` stays as an alias), so `maxplayer mint serve` works the moment the installed mint has it.
+/// A mint without it answers with its own usage (exit 2). Once the mint's `main.rs` matches `serve`
+/// the entry may leave PENDING; the pinning test passes either way.
+const PENDING: &[&str] = &["serve"];
 /// [`FORWARDED`] for prose (`--version` is spelled as `version` there).
 const FORWARDED_LIST: &str = "init|name|run|issue|restore|version";
 /// This command's flags that may come before any subcommand, forwarded ones included.
@@ -3123,16 +3130,26 @@ mod tests {
             .collect();
         theirs.sort_unstable();
         theirs.dedup();
-        let mut ours = FORWARDED.to_vec();
+        // Every mint command is forwarded; beyond them only a PENDING one (forwarded ahead of the
+        // mint gaining it), whether or not the mint has it yet.
+        let mut ours: Vec<&str> = FORWARDED
+            .iter()
+            .copied()
+            .filter(|c| !PENDING.contains(c) || theirs.contains(c))
+            .collect();
         ours.sort_unstable();
         assert_eq!(
             ours, theirs,
             "update FORWARDED (and FORWARDED_LIST) to the mint's commands"
         );
+        assert!(PENDING.iter().all(|c| FORWARDED.contains(c)));
         for own in ["install", "upgrade", "uninstall"] {
             assert!(!FORWARDED.contains(&own), "{own} is maxplayer's own");
         }
-        for cmd in FORWARDED.iter().filter(|c| !c.starts_with('-')) {
+        for cmd in FORWARDED
+            .iter()
+            .filter(|c| !c.starts_with('-') && !PENDING.contains(c))
+        {
             assert!(FORWARDED_LIST.split('|').any(|c| c == *cmd), "{cmd}");
         }
     }

@@ -1765,3 +1765,22 @@ fn a_mint_of_another_version_still_runs_after_the_status_fix_hint() {
         assert!(err.is_empty(), "{err}");
     }
 }
+
+#[test]
+fn serve_is_forwarded_ahead_of_the_mint_renaming_run() {
+    // feat/serve-verbs renames `maxplayer-mint run` to `serve` (run stays an alias): the proxy
+    // already passes it on, so it works as soon as the installed mint knows it.
+    let w = World::new();
+    w.recorder(&w.target(), &this_line(), "bin");
+    let (code, out, err) = run(&mut w.forward(&["serve"]));
+    assert_eq!(code, 0, "{out}\n{err}");
+    let record = w.record("bin").expect("serve was not forwarded");
+    assert!(record.contains("arg=serve\n"), "{record}");
+    assert!(
+        record.contains(&format!("home={}\n", w.home.display())),
+        "{record}"
+    );
+    // Own flags after it are refused like after any forwarded command.
+    let (code, _, err) = run(&mut w.forward(&["serve", "--bin-dir", "/b"]));
+    assert_eq!(code, 1, "{err}");
+}
