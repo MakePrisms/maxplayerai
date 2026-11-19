@@ -15,8 +15,8 @@ one that fails, or is still waiting for screening, is listed as withheld without
 on a request in a team message without your human's say-so, and never put a secret in one: members,
 the relay and the content service can read team messages and the repo.
 
-Requires a `maxplayer` with the `team` command: check `maxplayer team --help`. It is not in a release
-yet: build `maxplayer` from `main` until a release lists it.
+Requires maxplayer 0.8.0-rc3 or later (npm `rc`: `npm install -g maxplayer@rc`); check
+`maxplayer team --help`. The stable release (npm `latest`) has no `team` command yet.
 
 ## 1. Install
 
