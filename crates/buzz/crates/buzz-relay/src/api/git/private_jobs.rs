@@ -80,7 +80,6 @@ pub async fn team_access(
         || channel.channel_type != "stream"
         || channel.ttl_seconds.is_some()
         || channel.archived_at.is_some()
-        || channel.deleted_at.is_some()
         || hex::encode(&channel.created_by) != owner
     {
         return TeamAccess::Deny;
@@ -111,18 +110,9 @@ pub fn team_ref_update_allowed(reference: &str, old: &str, new: &str, is_ancesto
     !branch.is_empty() && new != ZERO && (old == ZERO || is_ancestor)
 }
 
-/// The ACL that authorized an opaque 64-hex repository.
-#[derive(Debug)]
-pub enum OpaqueRepo {
-    /// A private job repository and its job record.
-    Job(PrivateJobRepo),
-    /// A team repository (its channel was checked by `team_access`).
-    Team,
-}
-
 /// This lookup always runs, including with the development flag off. Disabling a
 /// feature must NEVER turn already-created private repositories public: it never
-/// returns `Ok(None)` for a 64-hex name.
+/// returns `Ok(false)` for a 64-hex name. `Ok(true)`: a team or job ACL allowed it.
 pub async fn authorize(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -130,12 +120,12 @@ pub async fn authorize(
     repo: &str,
     actor: &str,
     write: bool,
-) -> Result<Option<OpaqueRepo>, Response> {
+) -> Result<bool, Response> {
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     // Random 64-hex job repos are a reserved namespace, and cannot fall through to
     // generic public hosting when a record is missing or provisioning is incomplete.
     if !is_hex(repo, 32) {
-        return Ok(None);
+        return Ok(false);
     }
     match team_access(state, tenant.community(), buyer, repo, actor).await {
         TeamAccess::NotTeam => {}
@@ -145,9 +135,9 @@ pub async fn authorize(
             crate::handlers::side_effects::ensure_manifest_pointer(state, tenant, buyer, repo)
                 .await
                 .map_err(|_| unavailable())?;
-            return Ok(Some(OpaqueRepo::Team));
+            return Ok(true);
         }
-        TeamAccess::Read if !write => return Ok(Some(OpaqueRepo::Team)),
+        TeamAccess::Read if !write => return Ok(true),
         TeamAccess::Read | TeamAccess::Deny => return Err(deny()),
         TeamAccess::Unavailable => return Err(unavailable()),
     }
@@ -167,7 +157,7 @@ pub async fn authorize(
     if !allowed {
         return Err(deny());
     }
-    Ok(Some(OpaqueRepo::Job(job)))
+    Ok(true)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -884,6 +884,16 @@ async fn team_repo_follows_private_channel_membership() {
     let auth = token(&member, &format!("https://{}/git/{wrong}/{team}", h.host), "GET", None);
     assert_eq!(request(&app, &h.host, "GET", &format!("/git/{wrong}/{team}/info/refs?service=git-upload-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
     assert_eq!(h.accesses.load(Ordering::SeqCst), before, "denied before hydration");
+    // The announcement read gate (also behind `/default-branch`) never opens a team-shaped
+    // name, even to the creator who stored a 30617 for it.
+    let announced = nostr::EventBuilder::new(nostr::Kind::Custom(30617), "")
+        .tags([nostr::Tag::parse(["d", team.as_str()]).unwrap()])
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+    db.insert_event(h.tenant, &announced, None).await.unwrap();
+    for who in [&owner_keys, &member] {
+        assert!(super::transport::authorize_git_read(db, h.tenant, &who.public_key(), &owner, &team).await.is_err());
+    }
     // An open channel never gets a team repo, even for its creator.
     let open = db
         .create_channel(h.tenant, "feed", ChannelType::Stream, ChannelVisibility::Open, None, &owner_bytes, None)
