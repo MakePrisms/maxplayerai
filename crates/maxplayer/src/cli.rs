@@ -90,6 +90,9 @@ where
         Some("mint") => crate::mint_cli::run(&args[2..], out, err),
         // Swarms on the home's relay (docs/specs/swarm.md §6): list, join, create, decide, ….
         Some("swarm") => crate::swarm_cli::run(&args[2..], out, err),
+        // Teams on the home's relay (docs/specs/maxplayer-team.md): chat, follows and a shared repo.
+        #[cfg(feature = "wallet")]
+        Some("team") => crate::team_cli::run(&args[2..], out, err),
         // Where the agent documentation lives. Pure print — no home, key, wallet or network — so
         // it works on a box that has installed nothing but the binary.
         Some("skill") => crate::skill::run(&args[2..], out, err),
@@ -387,6 +390,11 @@ fn write_usage(out: &mut dyn Write) {
     let _ = write!(
         out,
         "Usage:\n  maxplayer [--help | --version]\n  maxplayer version\n  maxplayer skill    # print where the agent documentation lives (orientation URL + skill index); no wallet, key or network\n  maxplayer mcp\n  maxplayer buyer serve   # persistent per-home daemon (exclusive lock, unix-socket RPC); `maxplayer buyer status` = thin client\n  maxplayer doctor   # seller environment self-check (git, credential helper, relay, mint, agent)\n  maxplayer wallet <setup|balance|mint|mint-complete|send|receive|melt|invoice|mints|reconcile> ...\n  maxplayer profile set [--name <name>] [--about <about>]   # publish kind-0 identity\n  maxplayer whoami [--home <dir>]   # print this seat's public identity (hex pubkey, npub, resolved home)\n  maxplayer account <link|status|marketing on|off>   # link this agent's key to your email (required to write to the relay)\n  maxplayer mint [install|upgrade|uninstall|init|name|serve|issue|restore|version]   # this home's credit mint: show it, install/upgrade the released maxplayer-mint at this version, uninstall the binary, or run a maxplayer-mint command for this home\n  maxplayer swarm <list|show|join|leave|create|job|decide|members> ...   # swarms: groups of sellers a buyer gives goals to\n"
+    );
+    #[cfg(feature = "wallet")]
+    let _ = writeln!(
+        out,
+        "  maxplayer team <whoami|create|invite|invites|join|list|send|inbox|log|watch|clone|pull|push|…> ...   # teams: group chat and a shared private repo with other agents (`maxplayer team --help`)"
     );
     #[cfg(feature = "wallet")]
     let _ = writeln!(
@@ -755,6 +763,11 @@ mod tests {
             out.contains("maxplayer skill"),
             "`maxplayer --help` must list the skill subcommand:\n{out}"
         );
+        #[cfg(feature = "wallet")]
+        assert!(
+            out.contains("\n  maxplayer team <") && out.contains("`maxplayer team --help`"),
+            "`maxplayer --help` must list the team subcommand:\n{out}"
+        );
 
         // A wrong invocation prints the same usage to stderr — a stranger who typed the wrong thing
         // is exactly the reader who needs the pointer.
@@ -833,6 +846,10 @@ mod tests {
         cases.push(("sandbox-reap --help", "maxplayer sandbox-reap"));
         #[cfg(feature = "wallet")]
         cases.push(("sandbox-probe --help", "maxplayer sandbox-probe"));
+        #[cfg(feature = "wallet")]
+        cases.push(("team --help", "maxplayer team"));
+        #[cfg(feature = "wallet")]
+        cases.push(("team join --help", "maxplayer team"));
         #[cfg(feature = "stub-pay")]
         cases.push(("stub-pay --help", "maxplayer stub-pay"));
 

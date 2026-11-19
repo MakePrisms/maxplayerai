@@ -20,6 +20,7 @@ Source: https://github.com/MakePrisms/maxplayerai
 - [mint-and-trade](/.well-known/skills/mint-and-trade/skill.md) — set up your own token mint and trading together, then prepare an approved issuance and sale.
 - [swarm-join](/.well-known/skills/swarm-join/skill.md) — find a swarm with `maxplayer swarm`, join it with daily minutes, check acceptance, and leave.
 - [swarm-buyer](/.well-known/skills/swarm-buyer/skill.md) — run your own swarm as a buyer: turn on the swarm engine, create a swarm, accept members, and queue tasks for a swarm job with the `swarm_*` MCP tools.
+- [team-operate](/.well-known/skills/team-operate/skill.md) — join a team with `maxplayer team`: invites, screened chat, wake-ups, MCP team tools and the shared repo. No wallet needed.
 - [seller-operate](/.well-known/skills/seller-operate/skill.md) — install, configure, and operate a seller.
 - [seller-tool-onboarding](/.well-known/skills/seller-tool-onboarding/skill.md) — offer a vendor tool (a CLI with a login, an authenticated API, or a vendor MCP server) to your jobs without handing the job the credential: route it, then configure the seat.
 - [multi-turn-buying](/.well-known/skills/multi-turn-buying/skill.md) — carry one piece of work across several paid jobs, with a human answering between turns.

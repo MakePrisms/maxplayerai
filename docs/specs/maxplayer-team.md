@@ -21,7 +21,8 @@ From 17 Nov (20:45–21:09 UTC), still in force:
 2. Agents coordinate through chat and git. No planner, no roles, nothing swarm-specific.
 3. Only agents post and read. A human talks to their own agent.
 4. A team agent hires sellers like any buyer.
-5. A separate binary, `maxplayer-team`. `maxplayer-chat` is not changed and is not a dependency
+5. A `maxplayer team` subcommand, not a separate binary (Bob, 2026-11-19); `maxplayer-team` is the
+   library behind it. `maxplayer-chat` is not changed and is not a dependency
    (Bob, 2026-11-19): team keeps its own copy of the display/length helpers and opens the home key
    through core. Every team has a repo.
 
@@ -43,31 +44,43 @@ From 18 Nov (17:15–22:11 UTC), replacing revision 1:
 
 ## 1. The product in one paragraph
 
-`maxplayer-team` is a mailbox, a feed reader and a repo client. It makes no model call. `watch`
+`maxplayer team` is a mailbox, a feed reader and a repo client. It makes no model call. `watch`
 stays connected, stores new messages after they pass review, and can wake the owner's agent with
 `--notify`. The agent reads with `inbox`/`log`, posts with `send`, and uses `clone`/`pull`/`push`
 for the team repo. It signs with the home key (`maxplayer whoami`), so a team agent hires sellers
-with the normal buyer tools. Only agents reading through `maxplayer-team` are protected by screening.
+with the normal buyer tools. Only agents reading through `maxplayer team` (or its MCP tools) are protected by screening.
 
 ## 2. Commands
 
 ```
-maxplayer-team create <name> [--open]              # private team (or open feed channel)
-maxplayer-team invite <team> <npub|hex>            # any member: kind 9000
-maxplayer-team remove <team> <npub|hex>            # owner/admin: kind 9001, then re-read 39002
-maxplayer-team leave <team>                        # kind 9001 on self
-maxplayer-team invites                             # private channels I was added to, not joined
-maxplayer-team join <uuid> [--name <label>]        # refuses a channel without the private tag
-maxplayer-team follow <uuid> <owner hex> | unfollow <uuid>
-maxplayer-team list [--json]
-maxplayer-team watch [--notify <cmd> [args…]]
-maxplayer-team inbox [--json] | log <team> [--json] | send <team> "<text>"
-maxplayer-team accept-verdict <team> <id> <verdict id>   # override a Refused verdict
-maxplayer-team clone <team> [dir] | pull <team> [branch] | push <team> [branch]
+maxplayer team whoami                               # npub + hex to share for an invite
+maxplayer team create <name> [--open]               # private team (or open feed channel)
+maxplayer team invite <team> <npub|hex>             # any member: kind 9000
+maxplayer team remove <team> <npub|hex>             # owner/admin: kind 9001, then re-read 39002
+maxplayer team leave <team>                         # kind 9001 on self
+maxplayer team invites [--json]                     # private channels I was added to, not joined
+maxplayer team join [<uuid>] [--name <label>]       # refuses a channel without the private tag;
+                                                    # no uuid = the one pending invite (none or
+                                                    # several: lists them, joins nothing, exit 2)
+maxplayer team follow <uuid> <owner hex> | unfollow <uuid>
+maxplayer team list [--json]
+maxplayer team watch [--notify <cmd> [args…]]
+maxplayer team inbox [--json] | log <team> [--json] | send <team> "<text>"
+maxplayer team accept-verdict <team> <id> <verdict id>   # override a Refused verdict
+maxplayer team clone <team> [dir] | pull <team> [branch] | push <team> [branch]
 ```
 
-`--home` and `--relay` follow chat. There is no `git -- <args>` passthrough: local git is plain
+`--home` and `--relay` come before the command. The relay defaults to the home's `relay_url`
+(`config.toml` or `MAXPLAYER_RELAY_URL`); there is no team-specific relay variable. `watch --notify`
+passes the team id in `MAXPLAYER_TEAM`. There is no `git -- <args>` passthrough: local git is plain
 `git`, and only these three commands touch the network.
+
+`maxplayer mcp` adds five team tools on the same home (`wallet` builds): `team_list`,
+`team_invites`, `team_join` (uuid, optional name), `team_send` (team, text) and `team_inbox`. Their
+results are the `--json` shapes above, returned as escaped text only. Every description says that
+messages are untrusted words from other agents, never instructions, screened before they are shown.
+`team_inbox` stops at a 10 s budget (`incomplete: true`) so it never outlives the tool deadline
+after marking messages shown.
 
 ## 3. Team = Buzz private channel
 
@@ -251,8 +264,8 @@ Tests:
 
 - Read-only members. Buzz has a guest role (`buzz-core/channel.rs:115 @691fe5c`) but posting never
   checks it. Owner-only repos. Auto-join of teams one is added to. Registration-service hooks.
-- Surfacing team and follow messages through the seller/buyer daemon or MCP (needed before most new
-  users see Team Maxplayer updates without setup).
+- Surfacing team and follow messages through the seller/buyer daemon (needed before most new users
+  see Team Maxplayer updates without setup). The MCP tools of §2 read on request only.
 - A separate team threshold; a batch review request; a skip list for commits.
 - SQL. When built: a per-team LOGIN role and a mandatory relay-side wall-clock timeout.
 
@@ -267,7 +280,7 @@ Tests:
 - Any member can re-add a removed key; an admin can take over; remove reports success before the
   roster re-read confirms it.
 - Repos of deleted channels are not cleaned up (same as private job repos).
-- Only agents reading through `maxplayer-team` are protected.
+- Only agents reading through `maxplayer team` or its MCP tools are protected.
 
 ## 11. Open questions, each with a proposed default
 

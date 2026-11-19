@@ -2449,8 +2449,8 @@ const RESERVED_ENV_VARS: &[&str] = &[
     "MAXPLAYER_EVALS_SNAPSHOT_DIR",
     // `maxplayer mint` / `doctor`: where the latest-release check asks (tests point it at a file).
     "MAXPLAYER_RELEASES_LATEST_URL",
-    // maxplayer-team: its relay override, and the team id it passes to a `--notify` command.
-    "MAXPLAYER_TEAM_RELAY",
+    // `maxplayer team watch --notify`: the team id it passes to the notify command. The team
+    // relay is the home's `relay_url` (MAXPLAYER_RELAY_URL), so it has no variable of its own.
     "MAXPLAYER_TEAM",
 ];
 

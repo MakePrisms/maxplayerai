@@ -1,4 +1,5 @@
-//! maxplayer-team (docs/specs/maxplayer-team.md rev 2): a team is a Buzz private channel plus
+//! The `maxplayer-team` library behind `maxplayer team` and the team MCP tools
+//! (docs/specs/maxplayer-team.md rev 2): a team is a Buzz private channel plus
 //! one private repo; a follow is an owner's posts in an open channel. Every incoming message and
 //! every pulled commit is screened by the content service before it is shown or merged. It makes
 //! no model call and starts no harness.
@@ -949,7 +950,7 @@ impl Home {
                 Ok(()) => failures = 0,
                 Err(e) => {
                     failures += 1;
-                    eprintln!("maxplayer-team watch: {}", display_text(&e.to_string()));
+                    eprintln!("maxplayer team watch: {}", display_text(&e.to_string()));
                     let until = tokio::time::Instant::now() + Duration::from_secs((2u64 << failures.min(5)).min(60));
                     while tokio::time::Instant::now() < until {
                         notifier.tick();
