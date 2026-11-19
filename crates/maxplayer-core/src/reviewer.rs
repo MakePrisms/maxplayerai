@@ -1915,6 +1915,28 @@ mod tests {
         s.admit("alice", 161).unwrap();
     }
     #[test]
+    fn team_reviews_have_their_own_budget_and_team_kinds_stay_off_the_public_lane() {
+        let p = temp();
+        let s = Store::open(&p.join("db")).unwrap();
+        for _ in 0..10 {
+            s.admit("team:alice", 100).unwrap();
+        }
+        assert_eq!(s.admit("team:alice", 100).unwrap_err(), "rate_limited");
+        s.admit("alice", 100).unwrap();
+        let repo = format!("{}{}", "ab".repeat(16), "0".repeat(32));
+        let subject = crate::review::team::Request::commit(&repo, &"a".repeat(64), &"c".repeat(40))
+            .unwrap()
+            .subject;
+        let keys = Keys::generate();
+        let draft = request_draft(&subject, &keys.public_key().to_hex()).unwrap();
+        let public = crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&keys).unwrap();
+        assert_eq!(validate_request(&public, &keys.public_key()).unwrap_err(), "invalid_request");
+        // In-flight keys: per requester for team subjects, per subject for jobs.
+        let (a, b) = (Keys::generate().public_key(), Keys::generate().public_key());
+        assert_ne!(flight_key(&subject, &a), flight_key(&subject, &b));
+        assert_eq!(flight_key(&super::tests::subject(), &a), flight_key(&super::tests::subject(), &b));
+    }
+    #[test]
     fn request_binds_signer_target_and_subject_and_nonce_is_unique() {
         let k = Keys::generate();
         let other = Keys::generate();
@@ -2384,3 +2406,7 @@ mod private_tests;
 #[cfg(test)]
 #[path = "reviewer/sqlite_lock_tests.rs"]
 mod sqlite_lock_tests;
+
+#[cfg(test)]
+#[path = "reviewer/team_tests.rs"]
+mod team_tests;

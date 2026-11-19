@@ -576,6 +576,78 @@ mod tests {
         );
     }
 
+    fn team(repo: &git2::Repository, dir: &Path, tip: git2::Oid) -> Result<Vec<Value>, String> {
+        let _ = repo;
+        team_plan(dir, &tip.to_string(), &super::super::tests::subject(), "model",
+            std::time::Instant::now() + WINDOW).map(|p| states(&p))
+    }
+    fn merge(repo: &git2::Repository, files: &[(&str, &[u8])], parents: &[git2::Oid], msg: &str) -> git2::Oid {
+        let mut builder = repo.treebuilder(None).unwrap();
+        for (name, bytes) in files {
+            builder.insert(name, repo.blob(bytes).unwrap(), 0o100644).unwrap();
+        }
+        let tree = repo.find_tree(builder.write().unwrap()).unwrap();
+        let sig = git2::Signature::now("test", "test@example.test").unwrap();
+        let parents: Vec<_> = parents.iter().map(|p| repo.find_commit(*p).unwrap()).collect();
+        repo.commit(None, &sig, &sig, msg, &tree, &parents.iter().collect::<Vec<_>>()).unwrap()
+    }
+    #[test]
+    fn team_merge_is_diffed_against_every_parent_with_message_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let base = merge(&repo, &[("f", b"base\n")], &[], "base");
+        let main = merge(&repo, &[("f", b"main change\n")], &[base], "main");
+        let side = merge(&repo, &[("f", b"base\n"), ("x", b"side canary\n")], &[base], "side");
+        // Foxtrot: the side branch is the FIRST parent, so a first-parent-only review would
+        // see only `main change` and miss nothing of side; a second-parent-only one would miss it.
+        let tip = merge(&repo, &[("f", b"main change\n"), ("x", b"side canary\n")], &[side, main], "MERGE_MSG_CANARY");
+        let states = team(&repo, dir.path(), tip).unwrap();
+        let text = serde_json::to_string(&states).unwrap();
+        let first = &states[0]["changes"][0];
+        assert_eq!(first["commit_header_and_message"], true);
+        assert!(first["patch"].as_str().unwrap().contains("MERGE_MSG_CANARY"));
+        assert!(first["patch"].as_str().unwrap().contains(&format!("parent {main}")));
+        for parent in [side, main] {
+            assert!(text.contains(&format!("\"against_parent\":\"{parent}\"")), "{text}");
+        }
+        assert!(text.contains("+side canary"), "change against the second parent: {text}");
+        assert!(text.contains("+main change"), "change against the first parent: {text}");
+    }
+    #[test]
+    fn team_commit_message_over_24k_is_split_not_errored_and_root_is_full_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let message = "long message line\n".repeat(2500);
+        let tip = merge(&repo, &[("file", b"ROOT_CONTENT\n")], &[], &message);
+        let states = team(&repo, dir.path(), tip).unwrap();
+        assert!(states.len() > 1);
+        let text = serde_json::to_string(&states).unwrap();
+        assert!(text.contains("+ROOT_CONTENT"));
+        let joined: String = states.iter().flat_map(|s| s["changes"].as_array().unwrap().clone())
+            .filter(|c| c["commit_header_and_message"] == true)
+            .map(|c| c["patch"].as_str().unwrap().to_owned()).collect();
+        assert!(joined.ends_with(&message));
+    }
+    #[test]
+    fn team_parent_missing_at_shallow_boundary_is_reviewed_as_full_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let mut builder = repo.treebuilder(None).unwrap();
+        builder.insert("file", repo.blob(b"UNSEEN_PARENT_CONTENT\n").unwrap(), 0o100644).unwrap();
+        let tree = builder.write().unwrap();
+        let raw = format!("tree {tree}\nparent {}\nauthor a <a@x> 1 +0000\ncommitter a <a@x> 1 +0000\n\nshallow\n", "f".repeat(40));
+        let tip = repo.odb().unwrap().write(git2::ObjectType::Commit, raw.as_bytes()).unwrap();
+        let text = serde_json::to_string(&team(&repo, dir.path(), tip).unwrap()).unwrap();
+        assert!(text.contains("+UNSEEN_PARENT_CONTENT"), "{text}");
+    }
+    #[test]
+    fn team_commit_refuses_binary_and_nul_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_bare(dir.path()).unwrap();
+        let tip = merge(&repo, &[("bin", b"\0bytes")], &[], "binary");
+        assert_eq!(team(&repo, dir.path(), tip).unwrap_err(), "unsupported_input");
+    }
+
     #[tokio::test]
     async fn contextual_diff_failure_never_approves_partial_review() {
         let dir = tempfile::tempdir().unwrap();
