@@ -722,6 +722,12 @@ pub(super) async fn authorize_git_read(
         (StatusCode::NOT_FOUND, "repository not found").into_response()
     }
 
+    // MAXPLAYER: a 64-hex name is a private job or team repo, decided by its own ACL
+    // (`private_jobs::authorize`), never by an announcement: the settings routes
+    // (`/default-branch`) must not open it to whoever can store a 30617 for it.
+    if maxplayer_private_protocol::is_hex(repo_name, 32) {
+        return Err(denied());
+    }
     let Ok(owner_bytes) = hex::decode(owner_hex) else {
         return Err(denied());
     };
@@ -995,7 +1001,7 @@ pub async fn info_refs(
         service == "git-receive-pack",
     )
     .await?;
-    if private_job.is_none() {
+    if !private_job {
         // SEC-005: channel-membership gate before any manifest load, hydration,
         // or subprocess work. Both services — the receive-pack advertisement
         // leaks the ref list just like the upload-pack one.
@@ -1262,7 +1268,7 @@ pub async fn upload_pack(
         false,
     )
     .await?;
-    if private_job.is_none() {
+    if !private_job {
         // SEC-005: the reused NIP-98 token means the GET advertisement's
         // authorization cannot stand in for POST-time membership — gate this
         // door independently, before body decode work is driven or hydration

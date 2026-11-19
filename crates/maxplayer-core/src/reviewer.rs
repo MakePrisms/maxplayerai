@@ -7,7 +7,10 @@ mod diff;
 use batches::Plan;
 use std::sync::Arc;
 use crate::gateway::{MAXPLAYER_TAG, TagSpec};
-use crate::kinds::{JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_REQUEST_KIND, SESSION_FOLLOWUP_KIND};
+use crate::kinds::{
+    JOB_OFFER_KIND, JOB_RESULT_KIND, REVIEW_REQUEST_KIND, SESSION_FOLLOWUP_KIND,
+    TEAM_COMMIT_SUBJECT_KIND, TEAM_MESSAGE_KIND,
+};
 use crate::review::*;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
@@ -271,10 +274,15 @@ fn validate_request_content(request: &Event, reviewer: &PublicKey) -> Result<Sub
         return Err("invalid_request".into());
     }
     let subject: Subject = if crate::review::private::is_private(request) {
-        serde_json::from_str::<crate::review::private::Request>(&request.content).map_err(|_| "invalid_request")?.subject
+        match parse_bundle(&request.content)? {
+            Bundle::Job(b) => b.subject,
+            Bundle::Team(b) => b.subject,
+        }
     } else {
         if request.content.len() > 2048 { return Err("invalid_request".into()); }
-        serde_json::from_str(&request.content).map_err(|_| "invalid_request")?
+        let subject: Subject = serde_json::from_str(&request.content).map_err(|_| "invalid_request")?;
+        if is_team(&subject) { return Err("invalid_request".into()); }
+        subject
     };
     let expected = request_draft(&subject, &reviewer.to_hex())?;
     for tag in expected.tags {
@@ -296,6 +304,43 @@ fn validate_request_content(request: &Event, reviewer: &PublicKey) -> Result<Sub
         }
     }
     Ok(subject)
+}
+
+fn is_team(subject: &Subject) -> bool {
+    matches!(subject.kind, TEAM_MESSAGE_KIND | TEAM_COMMIT_SUBJECT_KIND)
+}
+/// A private request is a job bundle or a team bundle; team kinds never travel in a job bundle,
+/// and never on the public lane (that parse refuses them through `Subject` binding below).
+enum Bundle {
+    Job(Box<crate::review::private::Request>),
+    Team(crate::review::team::Request),
+}
+fn parse_bundle(content: &str) -> Result<Bundle, String> {
+    if let Ok(team) = serde_json::from_str::<crate::review::team::Request>(content) {
+        if !is_team(&team.subject) {
+            return Err("invalid_request".into());
+        }
+        return Ok(Bundle::Team(team));
+    }
+    let job = serde_json::from_str::<crate::review::private::Request>(content)
+        .map_err(|_| "invalid_request")?;
+    if is_team(&job.subject) {
+        return Err("invalid_request".into());
+    }
+    Ok(Bundle::Job(Box::new(job)))
+}
+/// In-flight key. A team verdict goes to its requester only, so two members asking about the
+/// same subject must not share one flight (spec §5); job flights stay per subject.
+fn flight_key(subject: &Subject, requester: &PublicKey) -> Option<String> {
+    let json = serde_json::to_string(subject).ok()?;
+    Some(if is_team(subject) { format!("{json}:{}", requester.to_hex()) } else { json })
+}
+/// Team verdict cache key: the subject itself, so a hit needs no fetch and no admission.
+fn team_cache_key(reviewer: &PublicKey, model: &str, subject: &Subject) -> Result<String, String> {
+    let subject = serde_json::to_string(subject).map_err(|_| "review_store")?;
+    Ok(input_digest(
+        format!("{reviewer}:team:{model}:{CLASSIFIER}:{CLASSIFIER_VERSION}:{subject}").as_bytes(),
+    ))
 }
 
 /// Freshness alone, separated so intake can still answer a stale-but-authentic
@@ -850,6 +895,28 @@ impl Store {
         self.db.execute("INSERT INTO reviews VALUES (?1,?2,NULL) ON CONFLICT(key) DO UPDATE SET request=excluded.request,event=NULL",rusqlite::params![key,request]).map_err(|_| "review_store")?;
         Ok(None)
     }
+    /// A stored `ok` verdict under `key`, if any (team subject cache).
+    fn lookup_ok(&self, key: &str) -> Result<Option<Event>, String> {
+        use rusqlite::OptionalExtension;
+        let event: Option<Option<String>> = self
+            .db
+            .query_row("SELECT event FROM reviews WHERE key=?1", [key], |r| r.get(0))
+            .optional()
+            .map_err(|_| "review_store")?;
+        let Some(Some(event)) = event else { return Ok(None) };
+        let event = Event::from_json(event).map_err(|_| "review_store")?;
+        let review: Review = serde_json::from_str(&event.content).map_err(|_| "review_store")?;
+        Ok((review.status == "ok").then_some(event))
+    }
+    fn remember(&self, key: &str, request: &str, event: &Event) -> Result<(), String> {
+        self.db
+            .execute(
+                "INSERT INTO reviews VALUES (?1,?2,?3) ON CONFLICT(key) DO UPDATE SET request=excluded.request,event=excluded.event",
+                rusqlite::params![key, request, event.as_json()],
+            )
+            .map_err(|_| "review_store")?;
+        Ok(())
+    }
     fn finish(&self, key: &str, event: &Event) -> Result<(), String> {
         self.db
             .execute(
@@ -930,9 +997,9 @@ struct Flight {
 impl Flight {
     fn reserve(
         registry: &std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
-        subject: &Subject,
+        key: Option<String>,
     ) -> Option<Self> {
-        let key = serde_json::to_string(subject).ok()?;
+        let key = key?;
         let mut active = registry.lock().ok()?;
         if !active.insert(key.clone()) {
             return None;
@@ -1266,7 +1333,7 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
             // A stale-but-authentic request still gets a signed `stale_request`
             // reply from the worker loop, after the per-requester admission check.
             let precheck = request_freshness(&request).err();
-            let Some(flight) = Flight::reserve(&flights, &subject) else {
+            let Some(flight) = Flight::reserve(&flights, flight_key(&subject, &request.pubkey)) else {
                 crate::opline_verbose!("reviewer: a request for this subject is already in flight");
                 continue;
             };
@@ -1297,6 +1364,10 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
         let Some((_flight, request, subject, precheck)) = next else {
             return Err("intake_stopped".into());
         };
+        if is_team(&subject) {
+            team_review(&client, &config, &keys, &provider, &store, &private, &request, &subject, precheck).await;
+            continue;
+        }
         if let Err(code) = store.admit(&request.pubkey.to_hex(), Timestamp::now().as_secs()) {
             reply_refusal(&client, &config.relay, &keys, &request, &subject, &code).await;
             continue;
@@ -1453,6 +1524,133 @@ async fn run_worker(config: ServiceConfig, keys: Keys, provider: TypeSafe) -> Re
     }
     client.disconnect().await;
     Ok(())
+}
+
+/// One team review (docs/specs/maxplayer-team.md §5). A cached `ok` verdict for the subject is
+/// re-sent to this requester with no admission and no fetch; otherwise the request is admitted
+/// under its own `team:` budget, classified, and stored under the subject key. The verdict goes
+/// only to the requester.
+#[allow(clippy::too_many_arguments)]
+async fn team_review(
+    client: &Client,
+    config: &ServiceConfig,
+    keys: &Keys,
+    provider: &TypeSafe,
+    store: &Store,
+    private: &Result<crate::private_content::runtime::Policy, String>,
+    request: &Event,
+    subject: &Subject,
+    precheck: Option<String>,
+) {
+    let relay = &config.relay;
+    let Ok(Bundle::Team(bundle)) = parse_bundle(&request.content) else {
+        log_drop(request, "invalid_request");
+        return;
+    };
+    if let Some(code) = precheck {
+        reply_refusal(client, relay, keys, request, subject, &code).await;
+        return;
+    }
+    // `subject` was parsed from this same bundle, so it is `bundle.subject`.
+    let recipients = match bundle.validate(&request.pubkey) {
+        Ok(r) => r,
+        Err(code) => {
+            reply_refusal(client, relay, keys, request, subject, &code).await;
+            return;
+        }
+    };
+    let cache_key = team_cache_key(&keys.public_key(), &config.model, subject);
+    let cached = cache_key.as_deref().map_err(Clone::clone).and_then(|k| store.lookup_ok(k));
+    if let Ok(Some(event)) = cached {
+        if crate::review::wire::verify(&event, &keys.public_key(), subject).is_ok() {
+            publish_or_log(client, relay, keys, &event, Some(&recipients), request).await;
+            return;
+        }
+    }
+    if let Err(code) = store.admit(&format!("team:{}", request.pubkey.to_hex()), Timestamp::now().as_secs()) {
+        reply_refusal(client, relay, keys, request, subject, &code).await;
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(config.window_seconds.clamp(60, 3600));
+    let started = std::time::Instant::now();
+    let plan = team_snapshot(config, keys, private, &bundle, deadline.into_std()).await;
+    let event = match plan {
+        Ok(plan) => {
+            let digest = plan.digest.clone();
+            let (review, model) = match plan.classify(provider, subject, deadline).await {
+                Ok((review, model)) => (review, Some(model)),
+                Err(code) => (error_review(subject, digest, &code), None),
+            };
+            match signed(keys, &review, request, model.as_deref()).await {
+                Ok(event) => event,
+                Err(code) => return log_drop(request, &code),
+            }
+        }
+        Err(code) => {
+            let code = match code.as_str() {
+                "input_too_large" | "unsupported_input" | "invalid_subject" | "input_integrity" => code,
+                _ => "input_unavailable".into(),
+            };
+            let error = error_review(subject, input_digest(request.content.as_bytes()), &code);
+            match signed(keys, &error, request, None).await {
+                Ok(event) => event,
+                Err(code) => return log_drop(request, &code),
+            }
+        }
+    };
+    // Persist before publishing, as for job reviews. Only `ok` verdicts are reused.
+    if let Ok(key) = &cache_key {
+        if let Err(code) = store.remember(key, &request.id.to_hex(), &event) {
+            reply_refusal(client, relay, keys, request, subject, &code).await;
+            return;
+        }
+    }
+    publish_or_log(client, relay, keys, &event, Some(&recipients), request).await;
+    crate::opline!(
+        "reviewer: review_wall_ms={} subject_kind={} subject={}",
+        started.elapsed().as_millis(),
+        subject.kind,
+        subject.event
+    );
+}
+
+/// A message is reviewed from the inline signed event; a commit is fetched by id at depth 2
+/// from the team repo into a scratch repo that is removed afterwards.
+async fn team_snapshot(
+    config: &ServiceConfig,
+    keys: &Keys,
+    private: &Result<crate::private_content::runtime::Policy, String>,
+    bundle: &crate::review::team::Request,
+    deadline: std::time::Instant,
+) -> Result<Plan, String> {
+    let model = config.model.clone();
+    let subject = bundle.subject.clone();
+    if let Some(message) = &bundle.message {
+        let metadata = json!({"schema":2,"subject":subject,"team_message":{
+            "id":message.id,"author":message.pubkey,"created_at":message.created_at,"text":message.content}});
+        let files = file_manifest(Vec::new())?;
+        return tokio::task::spawn_blocking(move || Plan::from_parts(&metadata, &files, &model, deadline))
+            .await
+            .map_err(|_| "input_unavailable")?;
+    }
+    let policy = private.as_ref().map_err(|_| "input_unavailable")?;
+    let creator = bundle.creator.clone().ok_or("invalid_subject")?;
+    let commit = subject.commit.clone().ok_or("invalid_subject")?;
+    let url = format!("{}{creator}/{}", policy.host.git_prefix, subject.offer);
+    let (relay, keys) = (config.relay.clone(), keys.clone());
+    tokio::task::spawn_blocking(move || {
+        validate_git_destination(&relay, &url)?;
+        let scratch = ReviewScratch::new()?;
+        let repo = git2::Repository::init_bare(&scratch.0).map_err(|_| "input_unavailable")?;
+        let header = crate::git_transport::nip98_authorization_header_with_keys(&url, &keys, None, None)
+            .map_err(|_| "input_unavailable")?;
+        crate::git_transport::fetch_review_commit(&repo, &url, &commit, header, MAX_GIT_FETCH_BYTES, deadline)
+            .map_err(|_| "input_unavailable")?;
+        verify_fetched_tip(&repo, &commit)?;
+        diff::team_plan(&scratch.0, &commit, &subject, &model, deadline)
+    })
+    .await
+    .map_err(|_| "input_unavailable")?
 }
 
 #[cfg(test)]
@@ -1705,6 +1903,28 @@ mod tests {
         assert_eq!(s.admit("alice", 100).unwrap_err(), "rate_limited");
         s.admit("bob", 100).unwrap();
         s.admit("alice", 161).unwrap();
+    }
+    #[test]
+    fn team_reviews_have_their_own_budget_and_team_kinds_stay_off_the_public_lane() {
+        let p = temp();
+        let s = Store::open(&p.join("db")).unwrap();
+        for _ in 0..10 {
+            s.admit("team:alice", 100).unwrap();
+        }
+        assert_eq!(s.admit("team:alice", 100).unwrap_err(), "rate_limited");
+        s.admit("alice", 100).unwrap();
+        let repo = format!("{}{}", "ab".repeat(16), "0".repeat(32));
+        let subject = crate::review::team::Request::commit(&repo, &"a".repeat(64), &"c".repeat(40))
+            .unwrap()
+            .subject;
+        let keys = Keys::generate();
+        let draft = request_draft(&subject, &keys.public_key().to_hex()).unwrap();
+        let public = crate::gateway::nostr::event_builder(&draft).unwrap().sign_with_keys(&keys).unwrap();
+        assert_eq!(validate_request(&public, &keys.public_key()).unwrap_err(), "invalid_request");
+        // In-flight keys: per requester for team subjects, per subject for jobs.
+        let (a, b) = (Keys::generate().public_key(), Keys::generate().public_key());
+        assert_ne!(flight_key(&subject, &a), flight_key(&subject, &b));
+        assert_eq!(flight_key(&super::tests::subject(), &a), flight_key(&super::tests::subject(), &b));
     }
     #[test]
     fn request_binds_signer_target_and_subject_and_nonce_is_unique() {
@@ -2016,25 +2236,25 @@ mod concurrent_tests {
             commit: None,
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let first = Flight::reserve(&registry, &subject).unwrap();
+        let first = Flight::reserve(&registry, flight_key(&subject, &Keys::generate().public_key())).unwrap();
         assert!(tx.send(first).await.is_ok());
         assert!(
-            Flight::reserve(&registry, &subject).is_none(),
+            Flight::reserve(&registry, flight_key(&subject, &Keys::generate().public_key())).is_none(),
             "queued work is shared"
         );
         let in_progress = rx.recv().await.unwrap();
         assert!(
-            Flight::reserve(&registry, &subject).is_none(),
+            Flight::reserve(&registry, flight_key(&subject, &Keys::generate().public_key())).is_none(),
             "provider work is shared even before its outcome is known"
         );
         // Same lifetime as the worker's error publication path: the reservation is held
         // through publication and dropped on continue, not just for successful assessments.
         let error = error_review(&subject, input_digest(b"input"), "provider_timeout");
         assert_eq!(error.status, "error");
-        assert!(Flight::reserve(&registry, &subject).is_none());
+        assert!(Flight::reserve(&registry, flight_key(&subject, &Keys::generate().public_key())).is_none());
         drop(in_progress);
         assert!(
-            Flight::reserve(&registry, &subject).is_some(),
+            Flight::reserve(&registry, flight_key(&subject, &Keys::generate().public_key())).is_some(),
             "a later explicit request may retry availability"
         );
     }
@@ -2176,3 +2396,7 @@ mod private_tests;
 #[cfg(test)]
 #[path = "reviewer/sqlite_lock_tests.rs"]
 mod sqlite_lock_tests;
+
+#[cfg(test)]
+#[path = "reviewer/team_tests.rs"]
+mod team_tests;

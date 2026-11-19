@@ -46,6 +46,9 @@ mod sandbox_reap;
 // find the documentation.
 mod skill;
 mod swarm_cli;
+// `maxplayer team …` (docs/specs/maxplayer-team.md); replaces the separate team binary.
+#[cfg(feature = "wallet")]
+mod team_cli;
 // Trade's serve hosted in the buyer daemon and the seller (`[trade] serve`).
 #[cfg(feature = "wallet")]
 mod trade_host;

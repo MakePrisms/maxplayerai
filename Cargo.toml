@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/maxplayer-chat",
+    "crates/maxplayer-team",
     "crates/maxplayer-core",
     "crates/maxplayer-desktop",
     "crates/maxplayer-evals",
@@ -13,6 +14,7 @@ members = [
 # default builds so headless boxes and CI don't inherit them. Build with -p maxplayer-desktop.
 default-members = [
     "crates/maxplayer-chat",
+    "crates/maxplayer-team",
     "crates/maxplayer-core",
     "crates/maxplayer-evals",
     "crates/maxplayer",

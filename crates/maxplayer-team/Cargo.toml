@@ -1,0 +1,21 @@
+[package]
+name = "maxplayer-team"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# `wallet` for review::team (the encrypted review lane, next to review::private).
+maxplayer-core = { path = "../maxplayer-core", default-features = false, features = ["gateway", "wallet"] }
+nostr-sdk = { version = "0.44.1", features = ["nip44", "nip59", "nip98"] }
+tokio = { version = "1.52.0", default-features = false, features = ["rt", "macros", "time", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+libc = "0.2"
+uuid = "1.23.5"
+
+[dev-dependencies]
+tempfile = "3"
+nostr-relay-builder = "0.44.1"

@@ -245,6 +245,7 @@ async fn harness(service: &Keys, bind_addr: Option<std::net::SocketAddr>) -> Har
     config.require_relay_membership = false;
     config.git_public_read = true; // Deliberately enable the generic public-read exception.
     config.private_job_repos = true;
+    config.team_repos = true;
     config.private_service_pubkey = Some(service.public_key().to_hex());
     config.git_pack_cache_path = temp.path().join("cache");
     config.git_repo_path = temp.path().join("repos");
@@ -777,5 +778,146 @@ async fn buyer_prepared_repo(open_pool: bool) {
         assert!(after.refs.contains_key(&delivery));
     }
     server.abort();
+    h.object_server.abort();
+}
+
+
+/// MAXPLAYER teams (docs/specs/maxplayer-team.md §4), end to end with the real `git`
+/// client: a team repo is named after a private Buzz channel and follows its membership.
+/// Members create or fast-forward branches; the service key reads but never pushes, even
+/// as a channel member; outsiders, removed members and unsuitable channels are refused
+/// before hydration; a team-shaped name never falls through to public hosting.
+#[tokio::test]
+#[ignore = "requires disposable PRIVATE_JOB_TEST_DATABASE_URL and PRIVATE_JOB_TEST_REDIS_URL"]
+async fn team_repo_follows_private_channel_membership() {
+    use buzz_core::channel::{ChannelType, ChannelVisibility, MemberRole};
+    let owner_keys = Keys::generate();
+    let member = Keys::generate();
+    let service = Keys::generate();
+    let outsider = Keys::generate();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let h = harness(&service, Some(addr)).await;
+    let app = super::transport::git_router(h.state.clone());
+    let served = app
+        .clone()
+        .merge(super::git_policy_router(h.state.clone()))
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, served).await.unwrap();
+    });
+    let owner = owner_keys.public_key().to_hex();
+    let owner_bytes = owner_keys.public_key().to_bytes();
+    let db = &h.state.db;
+    let channel = db
+        .create_channel(h.tenant, "crew", ChannelType::Stream, ChannelVisibility::Private, None, &owner_bytes, None)
+        .await
+        .unwrap();
+    for keys in [&member, &service] {
+        db.add_member(h.tenant, channel.id, &keys.public_key().to_bytes(), MemberRole::Member, Some(&owner_bytes))
+            .await
+            .unwrap();
+    }
+    let team = format!("{}{}", channel.id.simple(), "0".repeat(32));
+    let repo_root = format!("https://{}/git/{owner}/{team}", h.host);
+    let remote = format!("http://{addr}/git/{owner}/{team}");
+    let advert = |svc: &str| format!("/git/{owner}/{team}/info/refs?service={svc}");
+
+    let work = tempfile::tempdir().unwrap();
+    let a = work.path().join("a");
+    let b = work.path().join("b");
+    for dir in [&a, &b] {
+        std::fs::create_dir(dir).unwrap();
+        stdout(&git(dir, &h.host, None, &["init", "-q", "-b", "main"]).await);
+    }
+    std::fs::write(a.join("TASKS.md"), "- one\n").unwrap();
+    stdout(&git(&a, &h.host, None, &["add", "TASKS.md"]).await);
+    stdout(&git(&a, &h.host, None, &["commit", "-q", "-m", "one"]).await);
+    // The owner creates main: no provisioning step, the first member request seeds it.
+    let auth = token(&owner_keys, &repo_root, "GET", None);
+    stdout(&git(&a, &h.host, Some(&auth), &["push", "-q", &remote, "HEAD:refs/heads/main"]).await);
+    // A member fetches, fast-forwards main and adds a branch.
+    let auth = token(&member, &repo_root, "GET", None);
+    stdout(&git(&b, &h.host, Some(&auth), &["fetch", "-q", &remote, "main"]).await);
+    stdout(&git(&b, &h.host, None, &["reset", "-q", "--hard", "FETCH_HEAD"]).await);
+    std::fs::write(b.join("TASKS.md"), "- one\n- two\n").unwrap();
+    stdout(&git(&b, &h.host, None, &["commit", "-q", "-am", "two"]).await);
+    let second = stdout(&git(&b, &h.host, None, &["rev-parse", "HEAD"]).await);
+    let auth = token(&member, &repo_root, "GET", None);
+    stdout(&git(&b, &h.host, Some(&auth), &["push", "-q", &remote, "HEAD:refs/heads/main", "HEAD:refs/heads/notes"]).await);
+    let manifest = published_manifest(&h.objects, h.tenant, &owner, &team);
+    assert_eq!(manifest.refs.get("refs/heads/main"), Some(&second));
+    assert!(manifest.refs.contains_key("refs/heads/notes"));
+    // Non-fast-forward, deletion and tags are refused.
+    std::fs::write(a.join("TASKS.md"), "- rewritten\n").unwrap();
+    stdout(&git(&a, &h.host, None, &["commit", "-q", "-am", "diverge"]).await);
+    let auth = token(&owner_keys, &repo_root, "GET", None);
+    assert!(!git(&a, &h.host, Some(&auth), &["push", "-q", "-f", &remote, "HEAD:refs/heads/main"]).await.status.success());
+    let auth = token(&member, &repo_root, "GET", None);
+    assert!(!git(&b, &h.host, Some(&auth), &["push", "-q", &remote, ":refs/heads/notes"]).await.status.success());
+    let auth = token(&member, &repo_root, "GET", None);
+    assert!(!git(&b, &h.host, Some(&auth), &["push", "-q", &remote, "HEAD:refs/tags/v1"]).await.status.success());
+    let manifest = published_manifest(&h.objects, h.tenant, &owner, &team);
+    assert!(!manifest.refs.keys().any(|r| r.starts_with("refs/tags/")));
+    // The service key reads, but can't push nor see the receive-pack advertisement,
+    // although it was added as a channel member.
+    let svc = work.path().join("svc");
+    std::fs::create_dir(&svc).unwrap();
+    stdout(&git(&svc, &h.host, None, &["init", "-q"]).await);
+    let auth = token(&service, &repo_root, "GET", None);
+    stdout(&git(&svc, &h.host, Some(&auth), &["fetch", "-q", &remote, "main"]).await);
+    let auth = token(&service, &repo_root, "GET", None);
+    assert_eq!(request(&app, &h.host, "GET", &advert("git-receive-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
+    let auth = token(&service, &repo_root, "GET", None);
+    assert!(!git(&b, &h.host, Some(&auth), &["push", "-q", &remote, "HEAD:refs/heads/svc"]).await.status.success());
+    // Outsiders get neither advertisement, before any hydration.
+    let before = h.accesses.load(Ordering::SeqCst);
+    for svc_name in ["git-upload-pack", "git-receive-pack"] {
+        let auth = token(&outsider, &repo_root, "GET", None);
+        assert_eq!(request(&app, &h.host, "GET", &advert(svc_name), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
+    }
+    // A team-shaped name with no channel, or under the wrong owner, is refused too.
+    let ghost = format!("{}{}", uuid::Uuid::new_v4().simple(), "0".repeat(32));
+    let auth = token(&member, &format!("https://{}/git/{owner}/{ghost}", h.host), "GET", None);
+    assert_eq!(request(&app, &h.host, "GET", &format!("/git/{owner}/{ghost}/info/refs?service=git-upload-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
+    let wrong = member.public_key().to_hex();
+    let auth = token(&member, &format!("https://{}/git/{wrong}/{team}", h.host), "GET", None);
+    assert_eq!(request(&app, &h.host, "GET", &format!("/git/{wrong}/{team}/info/refs?service=git-upload-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
+    assert_eq!(h.accesses.load(Ordering::SeqCst), before, "denied before hydration");
+    // The announcement read gate (also behind `/default-branch`) never opens a team-shaped
+    // name, even to the creator who stored a 30617 for it.
+    let announced = nostr::EventBuilder::new(nostr::Kind::Custom(30617), "")
+        .tags([nostr::Tag::parse(["d", team.as_str()]).unwrap()])
+        .sign_with_keys(&owner_keys)
+        .unwrap();
+    db.insert_event(h.tenant, &announced, None).await.unwrap();
+    for who in [&owner_keys, &member] {
+        assert!(super::transport::authorize_git_read(db, h.tenant, &who.public_key(), &owner, &team).await.is_err());
+    }
+    // An open channel never gets a team repo, even for its creator.
+    let open = db
+        .create_channel(h.tenant, "feed", ChannelType::Stream, ChannelVisibility::Open, None, &owner_bytes, None)
+        .await
+        .unwrap();
+    let open_repo = format!("{}{}", open.id.simple(), "0".repeat(32));
+    let auth = token(&owner_keys, &format!("https://{}/git/{owner}/{open_repo}", h.host), "GET", None);
+    assert_eq!(request(&app, &h.host, "GET", &format!("/git/{owner}/{open_repo}/info/refs?service=git-upload-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
+    // Removing the member takes effect on the next request.
+    db.remove_member(h.tenant, channel.id, &member.public_key().to_bytes(), &owner_bytes).await.unwrap();
+    let auth = token(&member, &repo_root, "GET", None);
+    assert!(!git(&b, &h.host, Some(&auth), &["fetch", "-q", &remote, "main"]).await.status.success());
+    // Flag off: the repo stays gated (never public), even for the owner.
+    drop(app);
+    server.abort();
+    let mut state = (*h.state).clone();
+    Arc::make_mut(&mut state.config).team_repos = false;
+    let off = super::transport::git_router(Arc::new(state));
+    let auth = token(&owner_keys, &repo_root, "GET", None);
+    assert_eq!(request(&off, &h.host, "GET", &advert("git-upload-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
+    // An archived channel closes its repo.
+    db.archive_channel(h.tenant, channel.id).await.unwrap();
+    let app = super::transport::git_router(h.state.clone());
+    let auth = token(&owner_keys, &repo_root, "GET", None);
+    assert_eq!(request(&app, &h.host, "GET", &advert("git-upload-pack"), Some(&auth), vec![]).await.status(), StatusCode::FORBIDDEN);
     h.object_server.abort();
 }

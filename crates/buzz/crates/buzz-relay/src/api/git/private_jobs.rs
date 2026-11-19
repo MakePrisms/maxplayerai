@@ -30,21 +30,116 @@ fn unavailable() -> Response {
         .into_response()
 }
 
-/// This lookup always runs, including with the development flag off. Disabling a
-/// feature must NEVER turn already-created private repositories public.
-pub async fn authorize(
+/// MAXPLAYER teams (docs/specs/maxplayer-team.md §4): who may use a team repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeamAccess {
+    /// Not a team-shaped name: the private-job lookup decides.
+    NotTeam,
+    /// An active member of the team's channel: read and write.
+    Allow,
+    /// The configured content-service key: read only, never write.
+    Read,
+    /// Anyone else, a missing or unsuitable channel, or teams switched off.
+    Deny,
+    /// A database error other than "no such channel".
+    Unavailable,
+}
+
+/// A team repo is named after its Buzz channel: the UUID as 32 lowercase hex, then 32
+/// zeros. That keeps it inside the 64-hex private namespace and its guards.
+pub fn team_channel(repo: &str) -> Option<uuid::Uuid> {
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    if !is_hex(repo, 32) || !repo[32..].bytes().all(|b| b == b'0') {
+        return None;
+    }
+    uuid::Uuid::parse_str(&repo[..32]).ok()
+}
+
+/// The service key is checked before membership, so a member adding it to the channel
+/// can never give it write access. Membership reads the writer pool, uncached, so a
+/// removal takes effect on the next request.
+pub async fn team_access(
     state: &AppState,
+    community: buzz_core::CommunityId,
+    owner: &str,
+    repo: &str,
+    actor: &str,
+) -> TeamAccess {
+    let Some(channel_id) = team_channel(repo) else {
+        return TeamAccess::NotTeam;
+    };
+    if !state.config.team_repos {
+        return TeamAccess::Deny;
+    }
+    let channel = match state.db.get_channel(community, channel_id).await {
+        Ok(channel) => channel,
+        Err(buzz_db::DbError::ChannelNotFound(_)) => return TeamAccess::Deny,
+        Err(_) => return TeamAccess::Unavailable,
+    };
+    if channel.visibility != "private"
+        || channel.channel_type != "stream"
+        || channel.ttl_seconds.is_some()
+        || channel.archived_at.is_some()
+        || hex::encode(&channel.created_by) != owner
+    {
+        return TeamAccess::Deny;
+    }
+    let service = state
+        .config
+        .private_service_pubkey
+        .as_deref()
+        .filter(|s| is_hex(s, 32) && nostr::PublicKey::from_hex(s).is_ok());
+    if service == Some(actor) {
+        return TeamAccess::Read;
+    }
+    let Ok(actor) = hex::decode(actor) else {
+        return TeamAccess::Deny;
+    };
+    match state.db.get_member_role(community, channel_id, &actor).await {
+        Ok(Some(_)) => TeamAccess::Allow,
+        Ok(None) => TeamAccess::Deny,
+        Err(_) => TeamAccess::Unavailable,
+    }
+}
+
+/// Branches are created or fast-forwarded. No tags (one tag turns off the `info/refs`
+/// fast path), no deletes, no rewrites.
+pub fn team_ref_update_allowed(reference: &str, old: &str, new: &str, is_ancestor: bool) -> bool {
+    const ZERO: &str = "0000000000000000000000000000000000000000";
+    let branch = reference.strip_prefix("refs/heads/").unwrap_or("");
+    !branch.is_empty() && new != ZERO && (old == ZERO || is_ancestor)
+}
+
+/// This lookup always runs, including with the development flag off. Disabling a
+/// feature must NEVER turn already-created private repositories public: it never
+/// returns `Ok(false)` for a 64-hex name. `Ok(true)`: a team or job ACL allowed it.
+pub async fn authorize(
+    state: &Arc<AppState>,
     tenant: &TenantContext,
     buyer: &str,
     repo: &str,
     actor: &str,
     write: bool,
-) -> Result<Option<PrivateJobRepo>, Response> {
+) -> Result<bool, Response> {
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     // Random 64-hex job repos are a reserved namespace, and cannot fall through to
     // generic public hosting when a record is missing or provisioning is incomplete.
     if !is_hex(repo, 32) {
-        return Ok(None);
+        return Ok(false);
+    }
+    match team_access(state, tenant.community(), buyer, repo, actor).await {
+        TeamAccess::NotTeam => {}
+        TeamAccess::Allow => {
+            // No provisioning step exists for a team repo: the first member request
+            // seeds the empty manifest pointer. The service reader never does.
+            crate::handlers::side_effects::ensure_manifest_pointer(state, tenant, buyer, repo)
+                .await
+                .map_err(|_| unavailable())?;
+            return Ok(true);
+        }
+        TeamAccess::Read if !write => return Ok(true),
+        TeamAccess::Read | TeamAccess::Deny => return Err(deny()),
+        TeamAccess::Unavailable => return Err(unavailable()),
     }
     let job = state
         .db
@@ -62,7 +157,7 @@ pub async fn authorize(
     if !allowed {
         return Err(deny());
     }
-    Ok(Some(job))
+    Ok(true)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -373,5 +468,36 @@ mod tests {
         let response = no_store((StatusCode::FORBIDDEN, "denied").into_response()).await;
         assert_eq!(response.headers()["cache-control"], "private, no-store");
         assert_eq!(response.headers()["vary"], "Authorization");
+    }
+}
+
+#[cfg(test)]
+mod team_tests {
+    use super::{team_channel, team_ref_update_allowed};
+    const Z: &str = "0000000000000000000000000000000000000000";
+    const A: &str = "1111111111111111111111111111111111111111";
+    const B: &str = "2222222222222222222222222222222222222222";
+
+    #[test]
+    fn team_names_are_channel_hex_plus_32_zeros() {
+        let id = uuid::Uuid::new_v4();
+        let name = format!("{}{}", id.simple(), "0".repeat(32));
+        assert_eq!(team_channel(&name), Some(id));
+        assert_eq!(team_channel(&format!("{name}.git")), Some(id));
+        // A random job id, uppercase hex and short names are not teams.
+        assert_eq!(team_channel(&"ab".repeat(32)), None);
+        assert_eq!(team_channel(&name.to_uppercase()), None);
+        assert_eq!(team_channel(&id.simple().to_string()), None);
+    }
+
+    #[test]
+    fn team_refs_create_or_fast_forward_branches_only() {
+        assert!(team_ref_update_allowed("refs/heads/main", Z, A, false));
+        assert!(team_ref_update_allowed("refs/heads/main", A, B, true));
+        assert!(!team_ref_update_allowed("refs/heads/main", A, B, false), "non-ff");
+        assert!(!team_ref_update_allowed("refs/heads/main", A, Z, false), "delete");
+        assert!(!team_ref_update_allowed("refs/heads/", Z, A, false));
+        assert!(!team_ref_update_allowed("refs/tags/v1", Z, A, false), "tags");
+        assert!(!team_ref_update_allowed("refs/notes/x", Z, A, false));
     }
 }

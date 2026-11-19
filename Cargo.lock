@@ -2787,6 +2787,7 @@ dependencies = [
  "hex",
  "libc",
  "maxplayer-core",
+ "maxplayer-team",
  "maxplayer-trade",
  "nostr-relay-builder",
  "nostr-sdk",
@@ -2922,6 +2923,22 @@ version = "0.8.0-rc2"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "maxplayer-team"
+version = "0.8.0-rc2"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "maxplayer-core",
+ "nostr-relay-builder",
+ "nostr-sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
