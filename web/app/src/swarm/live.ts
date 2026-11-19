@@ -89,11 +89,12 @@ export function sellerLine(s: Snapshot,a: Seller,now: number): string {
   return `${Math.floor(sellerMinutes(s,a,now))} / ${a.minutesOffered} min`;
 }
 // The private-swarm line under a member's row: the tally's task count, labelled as the buyer's report.
+// tasks_done is per swarm job (the one shown), minutes per swarm per UTC day, as on public swarms.
 export function reportedLine(s: Snapshot,a: Seller): string|null {
   if(!privateTasks(s))return null;
   const r=a.reported;
   if(!r)return 'No report from the buyer yet';
-  return `${r.tasksDone} ${r.tasksDone===1?'task':'tasks'} done · reported by the buyer`;
+  return `${r.tasksDone} ${r.tasksDone===1?'task':'tasks'} in this job · reported by the buyer`;
 }
 const running=(s: Snapshot,a: Seller,now: number)=>s.jobs.some(j=>j.seller===a.pubkey&&j.running&&now<j.deadline);
 export function sellerState(s: Snapshot,a: Seller,now: number): string {

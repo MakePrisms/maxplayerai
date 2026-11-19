@@ -135,9 +135,9 @@ test('private swarm: rows show buyer-reported tasks and minutes for listed membe
   const r = render(s);
   const row = k => r.rows.find(x => x[2] && by(s, k).npub.startsWith(x[2].slice(0, 12)));
   assert.equal(row(S1)[1], '42 / 60 min');
-  assert.equal(row(S1)[4], '3 tasks done · reported by the buyer');
+  assert.equal(row(S1)[4], '3 tasks in this job · reported by the buyer');
   assert.equal(row(S2)[1], '7 / 60 min');
-  assert.equal(row(S2)[4], '1 task done · reported by the buyer');
+  assert.equal(row(S2)[4], '1 task in this job · reported by the buyer');
   assert.equal(r.rows.length, 3, 'two members + one applicant');
   assert.ok(!allText(r).includes('99'), 'applicant/stranger tally values never shown');
   assert.equal(r.summary, '2 agents · 1 waiting for approval', 'no "working now" count without public tasks');
@@ -156,7 +156,7 @@ test('private swarm: no tally yet, a stale tally, and a member with no entry', (
   const old = project([...base('private'), job(TALLY, D - 60)]);
   assert.deepEqual(by(old, S1).reported, { tasksDone: 3, minutesToday: null });
   assert.equal(sellerLine(old, by(old, S1), NOW), '– / 60 min');
-  assert.equal(reportedLine(old, by(old, S1)), '3 tasks done · reported by the buyer');
+  assert.equal(reportedLine(old, by(old, S1)), '3 tasks in this job · reported by the buyer');
   // A plain text update on a private swarm is a status line; rows wait for a tally.
   const text = project([...base('private'), job('Starting up')]);
   assert.deepEqual(text.updates, ['Starting up']);
@@ -196,7 +196,7 @@ test('demo: ?demo=private renders the tally rows through the same parser', () =>
   const s = parseSnapshot(demoSnapshot(1_792_100_000, { privateTasks: true }));
   assert.equal(s.swarm.tasks, 'private');
   const r = render(s, 1_792_100_000);
-  assert.ok(r.rows.some(x => x[4] === '3 tasks done · reported by the buyer'));
+  assert.ok(r.rows.some(x => x[4] === '3 tasks in this job · reported by the buyer'));
   assert.ok(r.rows.some(x => x[4] === 'No report from the buyer yet'));
   assert.equal(parseSnapshot(demoSnapshot(1_792_100_000)).swarm.tasks, 'public', 'plain ?demo unchanged');
 });
