@@ -1,3 +1,46 @@
+## v0.8.0-rc2
+
+Release candidate for 0.8.0, built from main after #1343, #1344 and #1345. It carries everything in
+v0.8.0-rc1 plus seller free-seat announcements and swarm dispatch by free seats. After publication,
+install with `npm install -g maxplayer@0.8.0-rc2` (or `install.sh --version 0.8.0-rc2`). Publish as
+a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Relay, reviewer and registration service: nothing to deploy.** No relay, sandbox or Nix change
+since v0.8.0-rc1; the sandbox image is rebuilt and tagged `maxplayer-sandbox:v0.8.0-rc2`. Buyer and
+seller store schemas are unchanged from v0.8.0-rc1. The website changes below deploy from main on
+their own (Vercel); they are listed because they describe this release.
+
+### Changes
+
+- **Sellers announce their free seats** (#1345). The kind-30340 heartbeat gains `slots` (total
+  execution seats), `free_slots` (seats free right now: the same count the seat checks before it
+  claims, so `free_slots` `0` means it claims nothing) and `in_flight` (jobs awarded or executing).
+  `queue_depth` is still published with the same value as `in_flight` and is deprecated: readers
+  use `in_flight` and fall back to `queue_depth`. Neither is free capacity; read `free_slots`
+  (`docs/protocol-v1.md`).
+- **Heartbeat on a seat change** (#1345). A seat now republishes its heartbeat when `free_slots`
+  changes, debounced to at most one such beat per 15 s, instead of only on its interval timer.
+- **Swarm engine dispatches by free seats** (#1345). A member gets a task while it has none running
+  from that swarm and its fresh heartbeat shows a free seat for this buyer (`free_slots` minus this
+  buyer's running tasks the beat may not reflect yet). A seller whose heartbeat states no
+  `slots`/`free_slots` (built before this release) gets one task at a time across all of the
+  buyer's swarms, as in v0.8.0-rc1.
+- **Swarm tool descriptions link the new `swarm-buyer` skill** (#1344): `swarm_create` and
+  `swarm_job_create` start with its URL, like `post_job` and `collect`. Website: the new
+  `/.well-known/skills/swarm-buyer/skill.md` page, and the tool lists in AGENTS.md, the buyer
+  quickstart and buyer skill pages name `reply` and the swarm tools behind their config flags.
+  The page says to install from npm `rc` (0.8.0-rc1 already carries the swarm engine).
+- **Website: the swarm board reads the buyer's tally** (#1343). A private swarm's members show
+  minutes today and "N tasks in this job · reported by the buyer" from the buyer-signed tally in the
+  swarm job's `update`; a plain-text `update` still shows as text, and malformed JSON is never
+  shown raw. The market page shows each seller's free seats ("m of n free") from the new heartbeat tags (#1345).
+
+### Upgrade order
+
+Any order is safe. A seller on an older build keeps working: buyers fall back to the one-task rule
+for it. A buyer on an older build ignores the new tags. To run swarms, the buyer upgrades and sets
+`[swarm] enabled` (plus `[sessions] enabled` for follow-up turns), then restarts `maxplayer buyer`.
+
 ## v0.8.0-rc1
 
 Release candidate for 0.8.0, built from main after #1346. This is a **minor** bump, not 0.7.4:
