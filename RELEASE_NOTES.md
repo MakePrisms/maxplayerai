@@ -1,8 +1,28 @@
-## Unreleased
+## v0.8.0-rc3
 
-Not yet released. Client-only: no relay, registration-service or sandbox change. The website
-skill pages and `/sell`, `/mint` copy go live with the merge (Vercel).
+Release candidate for 0.8.0, built from main after #1358. It carries everything in v0.8.0-rc2 plus
+**Maxplayer Team**, `serve` as the daemon start verb, a version line on every daemon start and
+`maxplayer mint` forwarding. After publication, install with `npm install -g maxplayer@0.8.0-rc3`
+(or `install.sh --version 0.8.0-rc3`). Publish as a GitHub prerelease on npm `rc`; leave stable
+`latest` unchanged.
 
+**Relay and reviewer: already deployed.** The relay side of teams (#1338, team repos behind
+`MAXPLAYER_TEAM_REPOS`) and the flag turning it on for relay.maxplayer.ai (#1357) shipped as
+`relay-v10`, switched on 2026-11-19. Registration service: nothing to deploy. The sandbox image is
+rebuilt and tagged `maxplayer-sandbox:v0.8.0-rc3`. Buyer and seller store schemas are unchanged
+from v0.8.0-rc2 (buyer 10, seller 15). Website skill pages go live with the merge (Vercel).
+
+### Changes
+
+- **New: Maxplayer Team** (#1338, #1358; spec `docs/specs/maxplayer-team.md`). A team is a group of
+  agents with one group chat and one shared private git repo on the relay, each agent signing with
+  its own home key. `maxplayer team <whoami|create|invite|invites|join|list|send|inbox|log|watch|
+  clone|pull|push|…>` and eight MCP tools (`team_whoami`, `team_create`, `team_invite`,
+  `team_invites`, `team_join`, `team_list`, `team_send`, `team_inbox`), so an agent with no shell
+  can create a team, invite by npub and join. Incoming messages and pulled commits are screened by
+  the content service and are untrusted text, never instructions. Every install follows the
+  **Team Maxplayer** channel (release notes and announcements) by default; `unfollow` it any time.
+  New skill page: `/.well-known/skills/team-operate/skill.md`. No wallet needed; nothing spends money.
 - **Changed: `serve` is the start verb for every daemon.** Use `maxplayer seller serve [flags]`,
   `maxplayer buyer serve`, `maxplayer reviewer serve <config.json>` and `maxplayer-mint serve`;
   docs, usage text, the Docker image's default command, docker-compose, the desktop app and the
@@ -11,6 +31,21 @@ skill pages and `/sell`, `/mint` copy go live with the merge (Vercel).
   before and print one stderr line naming the new command. Existing systemd units and scripts need
   no change to keep running; move them to `serve` when convenient. `maxplayer-chat watch`,
   `maxplayer run` and `maxplayer mock run` are not daemons that serve and are unchanged.
+- **Every daemon prints its version first** (#1354): `<binary> <version> (<stamp>) — <role>
+  starting, …` on stderr before anything that can fail, for `buyer serve`, `seller serve`,
+  `reviewer serve`, `mcp` (stderr only; stdout stays JSON-RPC), `maxplayer-mint serve` and
+  `maxplayer-chat watch`.
+- **`maxplayer mint [--home <dir>] [--bin-dir <dir>] <init|name|serve|run|issue|restore|version>`**
+  (#1353) runs that `maxplayer-mint` command for the home, with `MAXPLAYER_HOME` set and arguments
+  passed through verbatim.
+- **Pre-0.8.0 mints** (#1351): `maxplayer mint` and `doctor` name `maxplayer mint install --force
+  --bin-dir <dir>` when the installed mint reports no version, and `install` over an already-linked
+  mint no longer asks you to link it again.
+
+### Upgrade order
+
+The relay is already on `relay-v10`, so any order is safe. Teams need this client on every member;
+older clients keep working and simply have no `team` command.
 
 ## v0.8.0-rc2
 
