@@ -89,7 +89,12 @@ earlier.
 - Initialize a mint **only if none exists**, with `maxplayer-mint init --name <name>`: wallets
   show the name next to the mint URL. Use the seller's own name unless the operator chose another.
   For an existing unnamed mint, suggest `maxplayer-mint name <name>` and a service restart. Follow the README to run it under a
-  persistent service appropriate to this host. Inspect and preserve existing
+  persistent service appropriate to this host (a systemd unit runs the binary by absolute path;
+  without systemd, e.g. macOS, run `maxplayer mint --home <home> [--bin-dir <dir>] run` in
+  tmux or a launchd agent). Every mint command is also `maxplayer mint [--home <home>]
+  [--bin-dir <dir>] <init|name|run|issue|restore|version> [args...]`: it runs the binary
+  `maxplayer mint` reports with `MAXPLAYER_HOME` set to that home, so it cannot start another
+  copy of the mint from PATH or serve the default home by mistake. Inspect and preserve existing
   service configuration. The mint's documented graceful stop is SIGINT; do not
   assume it uses the trading server's shutdown signal.
 - Keep exactly one live mint. **Backups are automatic:** `maxplayer-mint run`
