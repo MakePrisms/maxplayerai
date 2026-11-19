@@ -40,12 +40,19 @@ fn visual_format(c: char) -> bool {
         | '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{200b}' | '\u{200c}'
         | '\u{feff}' | '\u{2060}')
 }
-/// JSON output with bidi/zero-width format characters escaped (serde already escapes controls).
+/// JSON output with bidi/zero-width format characters and line/paragraph separators escaped
+/// (serde already escapes controls, but not U+2028/U+2029).
 pub fn display_json(value: serde_json::Value) -> String {
     value
         .to_string()
         .chars()
-        .map(|c| if visual_format(c) { format!("\\u{:04x}", c as u32) } else { c.to_string() })
+        .map(|c| {
+            if visual_format(c) || matches!(c, '\u{2028}' | '\u{2029}') {
+                format!("\\u{:04x}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
         .collect()
 }
 /// A team message is 1–8000 characters.
@@ -64,6 +71,9 @@ pub const FIRST_SYNC: usize = 50;
 /// Team review requests per key per rolling window (spec §5 pacing).
 pub const REVIEW_CAP: usize = 1000;
 pub const REVIEW_WINDOW: u64 = 1800;
+/// How long past a [`Home::sync_deadline`] the state lock is still waited for (so the inbox can
+/// still be read and marked after a catch-up that ran to the deadline).
+pub const LOCK_GRACE: Duration = Duration::from_secs(2);
 /// Default follow on the default relay (spec §6): Team Maxplayer, posted by maxie-agent for now.
 /// The channel must exist on the relay before a release ships this.
 pub const TEAM_MAXPLAYER: (&str, &str) = (
@@ -291,6 +301,11 @@ pub struct Home {
     pub keys: Keys,
     pub relay: String,
     pub config: MaxplayerConfig,
+    /// When set, a catch-up stops at the next message boundary once this passes, and a review
+    /// still waiting at that point counts as unavailable (retried with back-off, state saved).
+    /// `maxplayer mcp`'s `team_inbox` sets it so a slow reviewer cannot run past the tool deadline
+    /// and mark messages read that the caller never received. `None` (the CLI) waits.
+    pub sync_deadline: Option<std::time::Instant>,
 }
 
 impl Home {
@@ -312,7 +327,56 @@ impl Home {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir.join("quarantine"))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         http_base(relay)?;
-        Ok(Self { root, keys, relay: relay.to_owned(), config })
+        Ok(Self { root, keys, relay: relay.to_owned(), config, sync_deadline: None })
+    }
+    /// One relay read: 10 s, or what is left before [`Home::sync_deadline`] (at least 100 ms).
+    fn read_wait(&self) -> Duration {
+        match self.sync_deadline {
+            None => Duration::from_secs(10),
+            Some(d) => d.saturating_duration_since(std::time::Instant::now()).clamp(Duration::from_millis(100), Duration::from_secs(10)),
+        }
+    }
+    fn past_deadline(&self) -> bool {
+        self.sync_deadline.is_some_and(|d| std::time::Instant::now() >= d)
+    }
+
+    /// `list --json` (and the `team_list` MCP tool): joined teams and follows.
+    pub fn list_json(&self) -> Result<serde_json::Value> {
+        let state = self.load()?;
+        let follows = self.follows(&state);
+        Ok(serde_json::json!({"teams": state.teams, "follows": follows}))
+    }
+    /// `invites --json` (and `team_invites`): `[{channel, creator}]`.
+    pub fn invites_json(invites: &[(String, String)]) -> serde_json::Value {
+        invites.iter().map(|(c, o)| serde_json::json!({"channel": c, "creator": o})).collect()
+    }
+    /// A joined team (`team_join`): `{name, channel, creator, open, repo}`.
+    pub fn team_json(&self, team: &Team) -> Result<serde_json::Value> {
+        let mut v = serde_json::to_value(team)?;
+        v["repo"] = self.repo_url(team)?.into();
+        Ok(v)
+    }
+    /// `inbox --json` / `log --json` rows (and `team_inbox`). Only the local label, the author key
+    /// and the text of a message that passed review; never channel names, about text or tags.
+    pub fn entries_json(&self, rows: &[(Stored, Status)]) -> Result<serde_json::Value> {
+        let state = self.load()?;
+        Ok(rows
+            .iter()
+            .map(|(s, st)| {
+                let mut v = serde_json::json!({"team": s.channel, "label": self.label(&state, &s.channel),
+                    "id": s.event.id.to_hex(), "from": s.event.pubkey.to_hex(), "at": s.event.created_at.as_secs()});
+                match st {
+                    Status::Delivered => v["text"] = s.event.content.clone().into(),
+                    Status::Withheld { state, unsafe_ppm, verdict } => {
+                        v["withheld"] = state.clone().into();
+                        v["unsafe_ppm"] = serde_json::json!(unsafe_ppm);
+                        v["threshold_ppm"] = self.config.review.reject_at_or_above_ppm.into();
+                        v["verdict"] = serde_json::json!(verdict);
+                    }
+                }
+                v
+            })
+            .collect())
     }
     pub fn me(&self) -> String {
         self.keys.public_key().to_hex()
@@ -320,13 +384,34 @@ impl Home {
     fn path(&self, name: &str) -> PathBuf {
         self.root.join("team").join(name)
     }
+    /// The state lock. With a [`Home::sync_deadline`] it is polled, and given up
+    /// [`LOCK_GRACE`] after the deadline, instead of blocking the thread behind a `watch` that
+    /// holds it through a slow review.
     fn lock(&self) -> Result<Lock> {
         let file = private_file(&self.path("state.lock"))?;
-        // SAFETY: valid owned descriptor; flock changes only its advisory lock.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
+        let give_up = self.sync_deadline.map(|d| d + LOCK_GRACE);
+        loop {
+            let flags = if give_up.is_some() { libc::LOCK_EX | libc::LOCK_NB } else { libc::LOCK_EX };
+            // SAFETY: valid owned descriptor; flock changes only its advisory lock.
+            if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+                return Ok(Lock(file));
+            }
+            let e = std::io::Error::last_os_error();
+            match give_up {
+                Some(at) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => {
+                    if std::time::Instant::now() >= at {
+                        return Err("team state is busy (another `maxplayer team` command, such as `watch`, holds it); retry shortly".into());
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => return Err(e.into()),
+            }
         }
-        Ok(Lock(file))
+    }
+    /// True once a [`Home::sync_deadline`] has passed: a catch-up that ran into it stopped early
+    /// and more messages may be waiting on the relay.
+    pub fn deadline_reached(&self) -> bool {
+        self.past_deadline()
     }
     pub fn load(&self) -> Result<State> {
         match fs::read_to_string(self.path("state.json")) {
@@ -448,7 +533,13 @@ impl Home {
         let relay = client.relay(&self.relay).await?;
         let mut notes = relay.notifications();
         client.connect().await;
-        let signed_in = tokio::time::timeout(Duration::from_secs(10), async {
+        // With a deadline, sign-in may take at most half of what is left, so the reads that
+        // follow still get the other half.
+        let wait = match self.sync_deadline {
+            None => Duration::from_secs(10),
+            Some(d) => (d.saturating_duration_since(std::time::Instant::now()) / 2).min(Duration::from_secs(10)),
+        };
+        let signed_in = tokio::time::timeout(wait, async {
             loop {
                 match notes.recv().await {
                     Ok(RelayNotification::Authenticated) => return Ok(()),
@@ -482,7 +573,7 @@ impl Home {
     /// Channel metadata (39000): (private, creator from the strict marker).
     async fn metadata(&self, client: &Client, channel: &str) -> Result<(bool, Option<String>)> {
         let events = client
-            .fetch_events(Filter::new().kind(Kind::Custom(39000)).identifier(channel), Duration::from_secs(10))
+            .fetch_events(Filter::new().kind(Kind::Custom(39000)).identifier(channel), self.read_wait())
             .await?;
         let event = events.into_iter().max_by_key(|e| e.created_at).ok_or("channel not found")?;
         let private = event.tags.iter().any(|t| t.as_slice() == ["private"]);
@@ -560,7 +651,7 @@ impl Home {
         let state = self.load()?;
         let client = self.connect().await?;
         let adds = client
-            .fetch_events(Filter::new().kind(Kind::Custom(9000)).pubkey(self.keys.public_key()).limit(500), Duration::from_secs(10))
+            .fetch_events(Filter::new().kind(Kind::Custom(9000)).pubkey(self.keys.public_key()).limit(500), self.read_wait())
             .await;
         let mut out = vec![];
         let mut seen = BTreeSet::new();
@@ -670,7 +761,15 @@ impl Home {
             return Outcome::Retry;
         }
         state.review_times.push(t);
-        match review::check(&self.config, &self.relay, client, &self.keys, request, counterparty).await {
+        let check = review::check(&self.config, &self.relay, client, &self.keys, request, counterparty);
+        let result = match self.sync_deadline {
+            None => check.await,
+            Some(d) => match tokio::time::timeout(d.saturating_duration_since(std::time::Instant::now()), check).await {
+                Ok(r) => r,
+                Err(_) => return Outcome::Retry,
+            },
+        };
+        match result {
             Ok(v) => Outcome::Verdict(v),
             Err(e) if failure_state(&e) == "error" => {
                 eprintln!("review unavailable: {}", display_text(&e));
@@ -775,11 +874,16 @@ impl Home {
         let mut available = true;
         let mut delivered = vec![];
         for (channel, owner) in self.sources(state) {
+            // Past the deadline: stop; the cursor covers only what was ingested, so the rest is
+            // fetched again next time.
+            if self.past_deadline() {
+                break;
+            }
             let base = Self::source_filter(&channel, owner.as_deref())?;
             let mut events: BTreeMap<EventId, Event> = BTreeMap::new();
             match state.cursors.get(&channel) {
                 None => {
-                    for e in client.fetch_events(base.limit(FIRST_SYNC), Duration::from_secs(10)).await? {
+                    for e in client.fetch_events(base.limit(FIRST_SYNC), self.read_wait()).await? {
                         events.insert(e.id, e);
                     }
                 }
@@ -790,7 +894,7 @@ impl Home {
                         if let Some(u) = until {
                             f = f.until(u);
                         }
-                        let page: Vec<Event> = client.fetch_events(f, Duration::from_secs(10)).await?.into_iter().collect();
+                        let page: Vec<Event> = client.fetch_events(f, self.read_wait()).await?.into_iter().collect();
                         let full = page.len() >= 1000;
                         let oldest = page.iter().map(|e| e.created_at).min();
                         let before = events.len();
@@ -811,12 +915,15 @@ impl Home {
             let mut ordered: Vec<Event> = events.into_values().collect();
             ordered.sort_by_key(|e| e.created_at);
             for event in ordered {
+                if self.past_deadline() {
+                    break;
+                }
                 if self.ingest(client, state, &mut known, &channel, owner.as_deref(), event, &mut available).await? {
                     delivered.push(channel.clone());
                 }
             }
         }
-        if available {
+        if available && !self.past_deadline() {
             delivered.extend(self.retry_due(client, state).await?);
         }
         Ok(delivered)

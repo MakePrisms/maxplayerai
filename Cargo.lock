@@ -2787,6 +2787,7 @@ dependencies = [
  "hex",
  "libc",
  "maxplayer-core",
+ "maxplayer-team",
  "maxplayer-trade",
  "nostr-relay-builder",
  "nostr-sdk",
