@@ -318,9 +318,15 @@ Agreed in Discord #team-invite-links (Bob, Josip, Petar, 2026-11-20). No relay c
 4. `maxplayer team invite revoke <team>` (`POST /account/team/revoke`, a linked member) revokes the
    team's live links, and the invite key leaves the team at once.
 5. The service's reconcile loop also sweeps: a team with no live link left gets a 9001 from the
-   invite key naming itself (leave). Creating a link and the sweep lock the same team row, so a new
-   link never lands just after the key left.
+   invite key naming itself (leave). The sweep lags expiry by up to the reconcile interval
+   (default 5 min). Creating a link, revoking and the sweep take the same per-team lock, so a new
+   link never lands just after the key left. A revoke needs the caller in the member list; with
+   the list unreadable a caller may revoke only its own links and the key is not removed.
+   The service checks membership only; the team marker (39000) is left to clients, which refuse to
+   join a channel without it.
 6. The invite key's pubkey is compiled into the client (`maxplayer_team::INVITE_PUBKEY`); clients
    drop any message it signs, so it never shows as a speaker. Its secret is the service's
    `teams.invite_key_file`; it must be a relay member (NIP-43) to sign in, like the content-service
    key. While it is in a team the operator's service can read that team, which teams already accept.
+   A test deployment with its own invite key sets `MAXPLAYER_TEAM_INVITE_PUBKEY` (64 hex) on its
+   clients.

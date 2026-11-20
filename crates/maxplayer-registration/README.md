@@ -48,6 +48,19 @@ Team invite links (docs/specs/maxplayer-team.md §12) need `[teams] invite_key_f
 invite key, whose pubkey is compiled into maxplayer as `maxplayer_team::INVITE_PUBKEY`) and
 `relay.relay_pubkey`. The invite key must be a relay member (owner kind 9030, like the
 content-service key). Membership is read from the team's relay-signed 39002, as the invite key.
+The service checks only membership, not the team marker in 39000: clients refuse to `join` a
+channel without it. Joins and revokes are limited per key (`team_joins_per_pubkey_per_hour`,
+`team_revokes_per_pubkey_per_hour`, 30 each), because each is a relay call signed by the one
+shared invite key. A revoke needs the caller in the member list; when the list is unreadable
+(the invite key was removed) a caller may revoke only links it made, and no 9001 is sent.
+
+Turning invite links on (operator, once): place `/var/lib/secrets/maxplayer-team-invite-key`
+(0600) holding the key whose pubkey is `INVITE_PUBKEY`; grant it relay membership as the owner
+(`nak event --prompt-sec --auth -k 9030 -t - -p <invite pubkey hex> -t role=member
+wss://relay.maxplayer.ai`); set `services.maxplayer.registration.inviteKeyFile` in
+`nix/relay-host.nix` and deploy; check that `journalctl -u maxplayer-registration -g 'team invite
+key loaded'` shows that pubkey. A test deployment with its own invite key sets
+`MAXPLAYER_TEAM_INVITE_PUBKEY=<its hex>` for the clients that use it.
 
 ### Rules
 
@@ -111,6 +124,7 @@ None of these are in the repo, the config file or the Nix store.
 | Relay admin key | `relay.admin_key_file` | 64-hex or `nsec1…`; the key must be `admin` on the relay |
 | Resend API key | `email.api_key_file`, else env `RESEND_API_KEY` | `re_…`, needs sending access |
 | Resend webhook signing secret | `email.webhook_secret_file`, else env `RESEND_WEBHOOK_SECRET` | `whsec_…`; if missing, the webhook answers 503 |
+| Team invite key | `teams.invite_key_file` | 64-hex or `nsec1…`; its pubkey must equal `maxplayer_team::INVITE_PUBKEY`; if unset, invite links answer 503 |
 
 Each secret file must be a regular file with no group/other access (`chmod 600`), or startup
 fails with `secret_file_must_be_private`. Under systemd `LoadCredential` the copies are 0440,
@@ -193,8 +207,8 @@ On NixOS, `ensureDatabases` + `ensureUsers.*.ensureDBOwnership` do the same. The
 applies its own migrations (`migrations/`, embedded) at startup; `maxplayer-registration
 migrate` runs them alone. Tables: `registrations`, `email_codes`, `member_sync_outbox`,
 `managed_members`, `email_bounces`, `marketing_consents`, `rate_events`, `nip98_seen`,
-`webhook_events`. Cleanup deletes codes and counters older than a day and replay ids older
-than an hour.
+`webhook_events`, `team_invite_links`, `team_invite_channels`. Cleanup deletes codes and
+counters older than a day, replay ids older than an hour and invite links 30 days past expiry.
 
 ### nginx
 

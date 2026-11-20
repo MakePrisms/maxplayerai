@@ -40,6 +40,9 @@ sends_per_ip_per_hour = 20
 confirms_per_pubkey_per_hour = 30
 confirms_per_ip_per_hour = 60
 nip98_max_skew_secs = 60
+invite_links_per_pubkey_per_hour = 30
+team_joins_per_pubkey_per_hour = 30
+team_revokes_per_pubkey_per_hour = 30
 
 [sync]
 outbox_interval_secs = 30
