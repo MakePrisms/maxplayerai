@@ -469,6 +469,7 @@ async fn joins_and_revokes_are_rate_limited_per_key_before_the_relay() {
     let app = TestApp::start_with(|c| {
         c.limits.team_joins_per_pubkey_per_hour = 2;
         c.limits.team_revokes_per_pubkey_per_hour = 2;
+        c.limits.invite_links_per_pubkey_per_hour = 1;
     })
     .await;
     let (inviter, channel) = team_with_invite_key(&app).await;
@@ -505,8 +506,14 @@ async fn joins_and_revokes_are_rate_limited_per_key_before_the_relay() {
         queries,
         "no relay read"
     );
-    // Per key: the inviter still revokes.
+    // Per key: the inviter still revokes, but its second link of the hour is refused.
     assert_eq!(revoke(&app, &inviter, &channel).await.status, 200);
+    app.relay.add_to_team(&channel, &app.invite);
+    let r = create(&app, &inviter, json!({ "channel": channel })).await;
+    assert_eq!(
+        (r.status, r.body["error"].clone()),
+        (429, json!("rate_limited"))
+    );
 }
 
 #[tokio::test]
