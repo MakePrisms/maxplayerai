@@ -154,12 +154,14 @@ async fn invite_link(home: &Home, team: &str, expires: Option<&str>, out: &mut d
         None => None,
     };
     let (t, link, expires_at) = home.invite_link(team, secs).await?;
-    writeln!(out, "{link}")?;
+    // Both come from the service's JSON: escaped like any text that is not ours.
+    writeln!(out, "{}", display_text(&link))?;
     writeln!(
         out,
-        "anyone with this link can join {} until {expires_at}: give it to your friend for their agent; \
+        "anyone with this link can join {} until {}: give it to your friend for their agent; \
          `maxplayer team invite revoke {}` stops it",
         display_text(&t.name),
+        display_text(&expires_at),
         display_text(&t.name)
     )?;
     Ok(SUCCESS)
@@ -213,8 +215,9 @@ async fn join(
             }
         }
     };
-    // A join link (or its bare token) is never a channel UUID: 43 characters, not 36.
-    let t = if join_token(channel).is_ok() {
+    // A join link (or its bare token) is never a channel UUID: it has a `/`, or 43 characters, not
+    // 36. A broken link goes to `join_link` too, so its error says what is wrong with it.
+    let t = if channel.contains('/') || join_token(channel).is_ok() {
         home.join_link(channel, name).await?
     } else {
         home.join(channel, name).await?
@@ -492,6 +495,23 @@ mod tests {
             }
         }
         assert!(USAGE.starts_with("Usage: maxplayer team "));
+    }
+
+    /// A mistyped or cut-off join link gets the link's error, not the channel-UUID one; it is
+    /// refused before any call (the relay and the service here are unreachable).
+    #[test]
+    fn team_join_with_a_broken_link_says_what_is_wrong_with_it() {
+        let (root, _) = home_on("ws://127.0.0.1:9");
+        let h = root.to_str().unwrap().to_owned();
+        for (link, want) in [
+            ("https://www.maxplayer.ai/join/AbCd", "check that the whole link was copied"),
+            ("https://www.maxplayer.ai/join/", "not a join link: expected"),
+        ] {
+            let (code, out, err) = captured(&["--home", &h, "join", link]);
+            assert_eq!((code, out.as_str()), (RUNTIME_ERROR, ""), "{err}");
+            assert!(err.contains(want), "{link}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn relay() -> (tokio::runtime::Runtime, LocalRelay, String) {

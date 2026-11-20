@@ -565,3 +565,40 @@ fn the_invite_key_is_a_valid_key_and_its_messages_are_never_admitted() {
     forged.pubkey = invite;
     assert_eq!(admit(&forged, CH, None).unwrap_err(), "the invite key does not post");
 }
+
+#[test]
+fn a_test_deployment_overrides_the_invite_key_only_with_a_valid_key() {
+    let other = Keys::generate().public_key().to_hex();
+    assert_eq!(invite_pubkey_from(Some(other.clone())), other);
+    for bad in [None, Some(String::new()), Some("nope".into()), Some(other.to_uppercase())] {
+        assert_eq!(invite_pubkey_from(bad), INVITE_PUBKEY);
+    }
+}
+
+/// Local refusals come before anything is sent: no 9000 adds the invite key for a lifetime the
+/// service refuses, no link is redeemed for a name `join` refuses, and an open channel has no
+/// links to revoke. (The relay and the registration service here are unreachable.)
+#[tokio::test]
+async fn invite_links_refuse_bad_input_before_the_relay_or_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), "ws://127.0.0.1:9");
+    h.config.registration_url = "http://127.0.0.1:9/account".into();
+    join_crew(&h);
+    for secs in [59, 30 * 86400 + 1] {
+        let e = h.invite_link("crew", Some(secs)).await.unwrap_err().to_string();
+        assert!(e.contains("between 1 minute and 30 days"), "{e}");
+    }
+    let link = format!("https://www.maxplayer.ai/join/{}", "A".repeat(43));
+    let e = h.join_link(&link, Some("crew")).await.unwrap_err().to_string();
+    assert!(e.contains("already use that name"), "{e}");
+    let e = h.join_link(&link, Some("bad name")).await.unwrap_err().to_string();
+    assert!(e.contains("team names are"), "{e}");
+    {
+        let _l = h.lock().unwrap();
+        let mut s = h.load().unwrap();
+        s.teams.insert(OTHER.into(), Team { name: "feed".into(), channel: OTHER.into(), creator: "ab".repeat(32), open: true });
+        h.save(&s).unwrap();
+    }
+    let e = h.revoke_links("feed").await.unwrap_err().to_string();
+    assert!(e.contains("open channel"), "{e}");
+}

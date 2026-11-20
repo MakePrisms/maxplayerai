@@ -101,8 +101,19 @@ pub const TEAM_MAXPLAYER: (&str, &str) = (
 /// person: clients drop its messages and leave it out of any member list ([`is_invite_key`]).
 pub const INVITE_PUBKEY: &str = "4e6fba923eef12c189508146981d4c386fcfdbb9e9824d36bbef56a39aa6e008";
 
+/// A test deployment whose registration service holds another invite key names its pubkey here.
+pub const INVITE_PUBKEY_ENV: &str = "MAXPLAYER_TEAM_INVITE_PUBKEY";
+
+/// The invite key in use: [`INVITE_PUBKEY_ENV`] (64 lowercase hex) if set, else [`INVITE_PUBKEY`].
+pub fn invite_pubkey() -> String {
+    invite_pubkey_from(std::env::var(INVITE_PUBKEY_ENV).ok())
+}
+fn invite_pubkey_from(var: Option<String>) -> String {
+    var.filter(|k| is_hex(k, 32)).unwrap_or_else(|| INVITE_PUBKEY.to_owned())
+}
+
 pub fn is_invite_key(hex: &str) -> bool {
-    hex.eq_ignore_ascii_case(INVITE_PUBKEY)
+    hex.eq_ignore_ascii_case(INVITE_PUBKEY) || hex.eq_ignore_ascii_case(&invite_pubkey())
 }
 
 /// The token of a join link: `https://<site>/join/<token>` (a trailing `/`, query or fragment is
@@ -727,25 +738,45 @@ impl Home {
         call: impl FnOnce(&RegistrationClient) -> std::result::Result<T, RegistrationError> + Send + 'static,
     ) -> Result<T> {
         let (url, keys) = (self.config.registration_url.clone(), self.keys.clone());
-        Ok(tokio::task::spawn_blocking(move || call(&RegistrationClient::new(&url, keys)?)).await??)
+        // Under a deadline (MCP) the call must not outlive it and act after the caller gave up.
+        let timeout = match self.sync_deadline {
+            None => Duration::from_secs(30),
+            Some(d) => d.saturating_duration_since(std::time::Instant::now()).clamp(Duration::from_secs(1), Duration::from_secs(30)),
+        };
+        Ok(tokio::task::spawn_blocking(move || call(&RegistrationClient::with_timeout(&url, keys, timeout)?)).await??)
     }
     /// `invite <team> --link`: add the invite key to the team (kind 9000; the relay accepts it
     /// from a member only), then ask the registration service for a join link.
     pub async fn invite_link(&self, team: &str, expires_in_secs: Option<u64>) -> Result<(Team, String, String)> {
-        let t = self.member_event(team, INVITE_PUBKEY, 9000).await?;
+        // The service refuses other lifetimes; refused here, the invite key is never added.
+        if expires_in_secs.is_some_and(|s| !(60..=30 * 86400).contains(&s)) {
+            return Err("an invite link lasts between 1 minute and 30 days".into());
+        }
+        let t = self.member_event(team, &invite_pubkey(), 9000).await?;
         let channel = t.channel.clone();
         let link = self.registration(move |c| c.team_invite_link(&channel, expires_in_secs)).await?;
         Ok((t, link.link, link.expires_at))
     }
     /// `invite revoke <team>`: every live link of the team stops working; the invite key leaves.
     pub async fn revoke_links(&self, team: &str) -> Result<u64> {
-        let channel = self.load()?.resolve(team)?.channel.clone();
+        let t = self.load()?.resolve(team)?.clone();
+        if t.open {
+            return Err("an open channel has no invite links".into());
+        }
+        let channel = t.channel;
         Ok(self.registration(move |c| c.team_revoke(&channel)).await?.revoked)
     }
     /// `join <link>`: the service adds this key (it must be linked to an email), then the
     /// normal join records the team.
     pub async fn join_link(&self, link: &str, name: Option<&str>) -> Result<Team> {
         let token = join_token(link)?;
+        // Checked before the service adds this key, so a bad name never leaves it half-joined.
+        if let Some(n) = name {
+            validate_name(n)?;
+            if self.load()?.teams.values().any(|t| t.name == n) {
+                return Err("you already use that name; pass --name".into());
+            }
+        }
         let joined = self.registration(move |c| c.team_join(&token)).await?;
         self.join(&joined.channel, name).await
     }

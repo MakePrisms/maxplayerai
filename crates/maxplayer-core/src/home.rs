@@ -2452,6 +2452,8 @@ const RESERVED_ENV_VARS: &[&str] = &[
     // `maxplayer team watch --notify`: the team id it passes to the notify command. The team
     // relay is the home's `relay_url` (MAXPLAYER_RELAY_URL), so it has no variable of its own.
     "MAXPLAYER_TEAM",
+    // Test deployments only: the team invite key their registration service holds.
+    "MAXPLAYER_TEAM_INVITE_PUBKEY",
 ];
 
 /// [`MaxplayerConfig`] fields whose env value is a comma-separated list. The env source must be told

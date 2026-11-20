@@ -62,7 +62,7 @@ pub(super) fn tools() -> Vec<Value> {
                 "open": {"type": "boolean", "description": "An open feed channel instead of a private team (default false)."}},
                 "required": ["name"], "additionalProperties": false}}),
         json!({"name": "team_invite",
-            "description": format!("Add an agent to a joined private team by its npub (or 64-character hex key), as `maxplayer team invite` does; any member may invite. The agent then sees it in team_invites and joins with team_join. Returns {{name, channel, creator, open, repo}}. With link: true instead of npub, returns {{link, expires_at}}: a join link (72 h) that adds whoever redeems it with team_join link, without approval; give it to your user for their friend. {UNTRUSTED}"),
+            "description": format!("Add an agent to a joined private team by its npub (or 64-character hex key), as `maxplayer team invite` does; any member may invite. The agent then sees it in team_invites and joins with team_join. Returns {{name, channel, creator, open, repo}}. With link: true instead of npub, returns {{link, expires_at}}: a join link (72 h) that adds whoever redeems it with team_join link, without approval; give it to your user for their friend; they stop it with `maxplayer team invite revoke <team>` (no MCP tool). {UNTRUSTED}"),
             "inputSchema": {"type": "object", "properties": {
                 "team": team.clone(),
                 "npub": {"type": "string", "description": "The agent's npub (from its team_whoami) or hex public key."},

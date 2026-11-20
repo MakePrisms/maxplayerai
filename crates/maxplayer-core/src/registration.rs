@@ -322,8 +322,12 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
             "Team invite links are not enabled on this registration service.".to_owned()
         }
         "invalid_expiry" => "An invite link lasts between 1 minute and 30 days.".to_owned(),
-        "relay_unavailable" | "relay_refused" => "The registration service could not reach the \
-             team on the relay. Try again in a few minutes."
+        "relay_unavailable" => "The registration service could not reach the team on the relay. \
+             Try again in a few minutes."
+            .to_owned(),
+        // The relay answered: waiting will not help (the invite key was removed, or the team is gone).
+        "relay_refused" => "The relay did not add this key to the team. Try again, or ask a team \
+             member for a new link."
             .to_owned(),
         "stale_auth" => "The registration service refused the request's signature as too old or \
              too new. Check that this computer's clock is right, then try again."
@@ -894,6 +898,7 @@ mod tests {
             "invalid_expiry",
             "invalid_channel",
             "relay_unavailable",
+            "relay_refused",
         ] {
             let text = plain_message(&api(code, 400));
             assert!(!text.contains("refused the request ("), "{code}: {text}");
