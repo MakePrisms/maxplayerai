@@ -284,7 +284,7 @@ test("/tokens ships its own read-only bundle and is linked from the footer", () 
   }
 });
 
-test("the /tokens CSP opens only the trade relays, only on /tokens, and is noindex", () => {
+test("the /tokens CSP opens our relay and the public trade relays, only on /tokens, and is noindex", () => {
   const { headers } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
   const matching = (path) => headers.filter((h) => new RegExp(`^${h.source.replace(/^\//, "\\/")}$`).test(path));
   const csp = (path) => matching(path).flatMap((h) => h.headers.filter((x) => x.key === "Content-Security-Policy").map((x) => x.value));
@@ -296,8 +296,13 @@ test("the /tokens CSP opens only the trade relays, only on /tokens, and is noind
   }
   const [t, ...more] = csp("/tokens");
   assert.equal(more.length, 0, "/tokens gets exactly one CSP");
-  assert.match(t, /connect-src 'self' wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub;/);
-  assert.ok(!t.includes("relay.maxplayer.ai"), "/tokens cannot reach the production relay");
+  assert.match(t, /connect-src 'self' wss:\/\/relay\.maxplayer\.ai wss:\/\/nos\.lol wss:\/\/relay\.primal\.net wss:\/\/offchain\.pub;/);
+  // Every relay the page reads is allowed, and no other.
+  const tokensJs = readFileSync(join(root, "dist", "tokens.js"), "utf8");
+  const connect = t.match(/connect-src ([^;]+);/)[1].split(" ").filter((x) => x.startsWith("wss://"));
+  for (const url of connect) assert.ok(tokensJs.includes(`"${url}"`), `tokens.js reads ${url}`);
+  const label = readFileSync(join(root, "dist", "tokens.html"), "utf8").match(/<span class="col-meta">Read-only · ([^<]+)<\/span>/)[1];
+  assert.deepEqual(label.split(" · "), connect.map((u) => u.replace("wss://", "")), "the board label names the relays it reads");
   assert.match(t, /script-src 'self';/);
   const robots = matching("/tokens").flatMap((h) => h.headers.filter((x) => x.key === "X-Robots-Tag").map((x) => x.value));
   assert.deepEqual(robots, ["noindex, nofollow"]);

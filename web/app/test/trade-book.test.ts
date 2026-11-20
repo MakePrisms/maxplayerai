@@ -9,10 +9,11 @@ import { schnorr } from "@noble/curves/secp256k1";
 import { sha256 } from "@noble/hashes/sha256";
 import { bytesToHex } from "@noble/hashes/utils";
 import { TRADE_LOT, TRADE_STATUS } from "../src/model/kinds.js";
-import { WINDOWS, completedStats, createBook } from "../src/trade/book.js";
+import { CLOSED_ROW_CAP, WINDOWS, closedMeta, closedRows, completedStats, createBook } from "../src/trade/book.js";
 import { lifecycle, parseLot, type NostrEvent } from "../src/trade/validate.js";
-import { allowedRelay, createTradeReader, drain, liveFilters, lotFilter, NUDGE_MS, soldHistoryFilter, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
+import { DEFAULT_TRADE_RELAYS, allowedRelay, createTradeReader, drain, liveFilters, lotFilter, NUDGE_MS, soldHistoryFilter, statusFilters, STATUS_CHUNK } from "../src/trade/relays.js";
 import { dockSide, mintLabel, rate, timeLeft } from "../src/trade/format.js";
+import { boardSettled, relaySummary } from "../src/trade/conn.js";
 
 /** The fixture generator's test keys: bytes 0x11… (maker) and 0x22… (other). */
 const MAKER = "11".repeat(32);
@@ -197,9 +198,21 @@ test("filters: listings by tag and window, statuses by lot AND maker, never nego
   assert.deepEqual(fs[1]!.authors, ["a"]);
 });
 
-test("relay URLs: wss only, and never the production relay", () => {
-  for (const ok of ["wss://nos.lol", "wss://relay.primal.net", "ws://127.0.0.1:7777"]) assert.equal(allowedRelay(ok), true, ok);
-  for (const no of ["wss://relay.maxplayer.ai", "wss://RELAY.maxplayer.ai/", "ws://nos.lol", "https://nos.lol", "nope"]) assert.equal(allowedRelay(no), false, no);
+test("relay URLs: wss, or ws on loopback only", () => {
+  for (const ok of ["wss://relay.maxplayer.ai", "wss://nos.lol", "wss://relay.primal.net", "ws://127.0.0.1:7777"]) assert.equal(allowedRelay(ok), true, ok);
+  for (const no of ["ws://relay.maxplayer.ai", "ws://nos.lol", "https://nos.lol", "nope"]) assert.equal(allowedRelay(no), false, no);
+});
+
+test("default relays are the trade CLI's market::DEFAULT_RELAYS, ours first", () => {
+  // Petar (2026-11-19): our relay is a source of truth too. It keeps listings
+  // past their 24h expiry, which the public relays delete.
+  const rs = readFileSync(new URL("../../../crates/maxplayer-trade/src/market.rs", import.meta.url), "utf8");
+  const block = /pub const DEFAULT_RELAYS: \[&str; \d+\] = \[([^\]]*)\]/.exec(rs);
+  assert.ok(block, "market.rs declares DEFAULT_RELAYS");
+  const cli = [...block[1]!.matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual([...DEFAULT_TRADE_RELAYS], cli);
+  assert.equal(DEFAULT_TRADE_RELAYS[0], "wss://relay.maxplayer.ai");
+  for (const url of DEFAULT_TRADE_RELAYS) assert.equal(allowedRelay(url), true, url);
 });
 
 test("drain pages below a relay's own cap until a page brings nothing new", async () => {
@@ -296,7 +309,7 @@ test("reader: a refused relay URL fails without a socket", () => {
   const states: string[] = [];
   let opened = 0;
   const reader = createTradeReader(
-    { relays: ["wss://relay.maxplayer.ai"], openSocket: () => { opened++; return {} as WebSocket; }, knownLots: () => [] },
+    { relays: ["ws://relay.maxplayer.ai"], openSocket: () => { opened++; return {} as WebSocket; }, knownLots: () => [] },
     { onEvent() {}, onStatusesRead() {}, onRelayState: (_u, s) => states.push(s), onRound() {} },
   );
   reader.start();
@@ -536,4 +549,69 @@ test("reader: reads every status under the tag, so a sold trade whose listing is
   const reqs = sockets[0]!.sent.filter((f) => f[0] === "REQ").map((f) => f[2]);
   assert.deepEqual(reqs[1], soldHistoryFilter(0));
   assert.deepEqual(book.view(NOW + 30 * 86400).closed.map((r) => [r.id, r.state]), [[l.id, "sold"]]);
+});
+
+/* ---------------- the closed-lots list follows the period buttons ---------------- */
+
+test("closed lots: the list follows the window; 24h keeps cancelled and expired, longer windows list sold only", () => {
+  const book = createBook();
+  const t = T0 + 10 * 86400;
+  const sell = (l: NostrEvent, soldAt: number, key = MAKER) => {
+    const s1 = status(l, 1, l.id, "available", key, l.created_at + 1);
+    book.ingest(l); book.ingest(s1); book.ingest(status(l, 2, s1.id, "sold", key, soldAt));
+  };
+  const today = lot(MAKER, t - 3600, 100, 90);
+  const lastWeek = lot(OTHER, t - 3 * 86400, 50, 60, [B, A]);
+  const old = lot(MAKER, t - 9 * 86400, 10, 9);
+  sell(today, t - 3000);
+  sell(lastWeek, t - 3 * 86400 + 600, OTHER);
+  sell(old, t - 9 * 86400 + 60);
+  const cancelledToday = lot(MAKER, t - 7200, 5, 5);
+  const cs = status(cancelledToday, 1, cancelledToday.id, "available");
+  book.ingest(cancelledToday); book.ingest(cs); book.ingest(status(cancelledToday, 2, cs.id, "cancelled", MAKER, t - 7000));
+  const expiredToday = lot(OTHER, t - 86400 - 600, 7, 7);
+  book.ingest(expiredToday); book.ingest(status(expiredToday, 1, expiredToday.id, "available", OTHER));
+  const cancelledOld = lot(OTHER, t - 5 * 86400, 3, 3);
+  const co = status(cancelledOld, 1, cancelledOld.id, "available", OTHER);
+  book.ingest(cancelledOld); book.ingest(co); book.ingest(status(cancelledOld, 2, co.id, "cancelled", OTHER, t - 5 * 86400 + 60));
+  const v = book.view(t);
+  const w = (key: string) => WINDOWS.find((x) => x.key === key)!;
+  const ids = (key: string) => closedRows(v, t, w(key)).map((r) => [r.id, r.state]);
+  // Newest first: an expired lot dates from its expiry (t - 600 here).
+  assert.deepEqual(ids("24h"), [[expiredToday.id, "expired"], [today.id, "sold"], [cancelledToday.id, "cancelled"]]);
+  assert.deepEqual(ids("7d"), [[today.id, "sold"], [lastWeek.id, "sold"]]);
+  assert.deepEqual(ids("all"), [[today.id, "sold"], [lastWeek.id, "sold"], [old.id, "sold"]]);
+  // All time lists exactly the trades the Trades stat counts, in the same order.
+  for (const x of WINDOWS.filter((x) => x.soldOnly)) {
+    assert.deepEqual(closedRows(v, t, x).map((r) => r.id), completedStats(v, t, x.seconds).rows.map((r) => r.id), x.key);
+  }
+  assert.equal(closedMeta(3, w("24h")), "3 in 24h");
+  assert.equal(closedMeta(2, w("7d")), "2 sold this week");
+  assert.equal(closedMeta(3, w("all")), "3 sold all time");
+});
+
+test("closed lots: past the row cap the meta still counts every row and says which are shown", () => {
+  const all = WINDOWS.find((x) => x.key === "all")!;
+  assert.equal(closedMeta(CLOSED_ROW_CAP, all), `${CLOSED_ROW_CAP} sold all time`);
+  assert.equal(closedMeta(CLOSED_ROW_CAP + 10, all), `${CLOSED_ROW_CAP + 10} sold all time · newest ${CLOSED_ROW_CAP}`);
+  for (const x of WINDOWS) assert.ok(x.empty.length > 0 && !/48/.test(x.empty + x.meta), x.key);
+});
+
+test("four relays: one slow relay never holds the page, and the status counts all four", () => {
+  const total = DEFAULT_TRADE_RELAYS.length;
+  assert.equal(total, 4);
+  // Nothing has answered: skeletons stay, even after the grace period.
+  assert.equal(boardSettled(false, 0, total, true), false);
+  // Three of four answered, one is still reading: wait for it, but only until the grace ends.
+  assert.equal(boardSettled(true, 3, total, false), false);
+  assert.equal(boardSettled(true, 3, total, true), true);
+  assert.equal(boardSettled(true, total, total, false), true);
+  const states = new Map(DEFAULT_TRADE_RELAYS.map((u) => [u, "live" as const]));
+  assert.deepEqual(relaySummary(states, total), { state: "live", text: "live · 4/4 relays" });
+  const slow = new Map<string, "live" | "syncing" | "failed">(states);
+  slow.set("wss://relay.maxplayer.ai", "syncing");
+  slow.set("wss://offchain.pub", "failed");
+  assert.deepEqual(relaySummary(slow, total), { state: "live", text: "live · 2/4 relays" });
+  assert.deepEqual(relaySummary(new Map([["wss://nos.lol", "failed"]]), total), { state: "connecting", text: "syncing" }, "relays not yet reported are still connecting");
+  assert.deepEqual(relaySummary(new Map(DEFAULT_TRADE_RELAYS.map((u) => [u, "failed" as const])), total), { state: "failed", text: "relays unreachable" });
 });
