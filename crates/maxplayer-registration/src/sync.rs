@@ -9,9 +9,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use nostr::{PublicKey, Timestamp};
 use tracing::{info, warn};
 
-use crate::AppState;
 use crate::db::{self, OutboxItem};
-use crate::relay::MemberAction;
+use crate::relay::{KIND_REMOVE_USER, MemberAction};
+use crate::{AppState, TeamLock};
 
 fn ts(now: DateTime<Utc>) -> Timestamp {
     Timestamp::from(now.timestamp().max(0) as u64)
@@ -112,6 +112,9 @@ pub async fn reconcile_once(state: &AppState) -> Result<Option<ReconcileReport>>
         .filter_map(|k| PublicKey::parse(k).ok().map(|p| p.to_hex()))
         .collect();
     keep.insert(state.relay.admin_pubkey().to_hex());
+    if let Some(invite) = &state.invite {
+        keep.insert(invite.public_key().to_hex());
+    }
     keep.insert(relay_pk.to_hex());
 
     let on_relay: HashSet<&str> = members.iter().map(|(pk, _)| pk.as_str()).collect();
@@ -147,6 +150,60 @@ pub async fn reconcile_once(state: &AppState) -> Result<Option<ReconcileReport>>
         );
     }
     Ok(Some(report))
+}
+
+/// The invite link sweep (runs after each reconcile): the invite key leaves every team that has
+/// no live (unexpired, unrevoked) link left, with a 9001 naming itself. The team stays locked
+/// ([`AppState::lock_team`]) while it leaves, so a link created meanwhile waits and then finds the
+/// key gone. Returns how many teams it left.
+pub async fn sweep_invites(state: &AppState) -> Result<usize> {
+    let Some(invite) = state.invite.as_ref() else {
+        return Ok(0);
+    };
+    let mut left = 0;
+    for channel in db::invite_channels(&state.db).await? {
+        if leave_if_idle(state, invite, &channel).await? {
+            left += 1;
+        }
+    }
+    Ok(left)
+}
+
+/// One team of [`sweep_invites`]. `Ok(true)` = the key left.
+pub async fn leave_if_idle(state: &AppState, invite: &nostr::Keys, channel: &str) -> Result<bool> {
+    let team = state.lock_team(channel).await;
+    leave_if_idle_locked(state, invite, channel, &team).await
+}
+
+/// [`leave_if_idle`] for a caller already holding the team's lock (it is not reentrant).
+pub(crate) async fn leave_if_idle_locked(
+    state: &AppState,
+    invite: &nostr::Keys,
+    channel: &str,
+    _locked: &TeamLock<'_>,
+) -> Result<bool> {
+    if !db::idle_invite_channel(&state.db, channel, state.now()).await? {
+        return Ok(false);
+    }
+    let now = ts(state.now());
+    match state
+        .relay
+        .send_team_command(invite, KIND_REMOVE_USER, channel, &invite.public_key(), now)
+        .await
+    {
+        Ok(()) => {}
+        // Removed by an owner already (buzz `NotActiveMember`): nothing to leave.
+        Err(e) if e.contains("not an active member") => {}
+        // The team was deleted: nothing to leave, and a retry would never succeed.
+        Err(e) if e.contains("channel not found") => {}
+        Err(e) => {
+            warn!(%channel, error = %e, "invite key could not leave a team; will retry");
+            return Ok(false);
+        }
+    }
+    db::forget_invite_channel(&state.db, channel).await?;
+    info!(%channel, "invite key left a team with no live invite link");
+    Ok(true)
 }
 
 /// Operator removal (ban): delete the registration and send the 9031 now (it stays

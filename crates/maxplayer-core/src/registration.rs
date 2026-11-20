@@ -46,6 +46,10 @@ pub const PATH_LINK_REQUEST: &str = "/link/request";
 pub const PATH_LINK_CONFIRM: &str = "/link/confirm";
 pub const PATH_STATUS: &str = "/status";
 pub const PATH_MARKETING: &str = "/marketing";
+/// Team invite links (docs/specs/maxplayer-team.md §12).
+pub const PATH_TEAM_INVITE: &str = "/team/invite";
+pub const PATH_TEAM_JOIN: &str = "/team/join";
+pub const PATH_TEAM_REVOKE: &str = "/team/revoke";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -129,6 +133,29 @@ pub struct Status {
 pub struct Marketing {
     /// `subscribed` or `unsubscribed`.
     pub marketing: String,
+}
+
+/// `POST /team/invite`: a join link for a team.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TeamLink {
+    pub link: String,
+    pub channel: String,
+    pub expires_at: String,
+    pub expires_in_secs: u64,
+}
+
+/// `POST /team/join`: the invite key added this key to `channel`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TeamJoined {
+    pub status: String,
+    pub channel: String,
+}
+
+/// `POST /team/revoke`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct TeamRevoked {
+    pub revoked: u64,
+    pub channel: String,
 }
 
 /// A refusal the service answered with its `{error, message}` body.
@@ -267,7 +294,7 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
             "The registration service no longer accepts the terms or privacy version this \
              maxplayer offers ({TERMS_VERSION}). Update maxplayer and try again."
         ),
-        "invalid_entered_by" | "invalid_body" => format!(
+        "invalid_entered_by" | "invalid_body" | "invalid_channel" => format!(
             "The registration service did not accept this request ({}). Update maxplayer and try \
              again.",
             api.code
@@ -278,6 +305,30 @@ pub fn plain_message_for(api: &ApiError, link: &str) -> String {
         "not_registered" => {
             format!("This key is not linked to an email yet. Run `{link}` first.")
         }
+        "invite_expired" => "This invite link has expired. Ask a team member for a new one \
+             (`maxplayer team invite <team> --link`)."
+            .to_owned(),
+        "invite_revoked" => {
+            "This invite link was revoked. Ask a team member for a new one.".to_owned()
+        }
+        "invalid_invite" => "No such invite link. Check that the whole link was copied.".to_owned(),
+        "not_team_member" => {
+            "Only a member of the team can make or revoke its invite links.".to_owned()
+        }
+        "invite_key_not_in_team" => {
+            "The team's invite key was not added yet. Try again in a moment.".to_owned()
+        }
+        "invites_not_configured" => {
+            "Team invite links are not enabled on this registration service.".to_owned()
+        }
+        "invalid_expiry" => "An invite link lasts between 1 minute and 30 days.".to_owned(),
+        "relay_unavailable" => "The registration service could not reach the team on the relay. \
+             Try again in a few minutes."
+            .to_owned(),
+        // The relay answered: waiting will not help (the invite key was removed, or the team is gone).
+        "relay_refused" => "The relay did not add this key to the team. Try again, or ask a team \
+             member for a new link."
+            .to_owned(),
         "stale_auth" => "The registration service refused the request's signature as too old or \
              too new. Check that this computer's clock is right, then try again."
             .to_owned(),
@@ -530,6 +581,38 @@ impl RegistrationClient {
         let body =
             serde_json::json!({ "enabled": enabled, "notice_version": MARKETING_NOTICE_VERSION });
         self.send("POST", PATH_MARKETING, Some(&body))
+    }
+
+    /// A join link for the team `channel` (the caller must be a member, and the team invite key
+    /// must already be in it).
+    pub fn team_invite_link(
+        &self,
+        channel: &str,
+        expires_in_secs: Option<u64>,
+    ) -> Result<TeamLink, RegistrationError> {
+        let mut body = serde_json::json!({ "channel": channel });
+        if let Some(secs) = expires_in_secs {
+            body["expires_in_secs"] = secs.into();
+        }
+        self.send("POST", PATH_TEAM_INVITE, Some(&body))
+    }
+
+    /// Redeem a link's token: the service adds this key to the team.
+    pub fn team_join(&self, token: &str) -> Result<TeamJoined, RegistrationError> {
+        self.send(
+            "POST",
+            PATH_TEAM_JOIN,
+            Some(&serde_json::json!({ "token": token })),
+        )
+    }
+
+    /// Revoke every live link of the team `channel`.
+    pub fn team_revoke(&self, channel: &str) -> Result<TeamRevoked, RegistrationError> {
+        self.send(
+            "POST",
+            PATH_TEAM_REVOKE,
+            Some(&serde_json::json!({ "channel": channel })),
+        )
     }
 
     fn send<T: serde::de::DeserializeOwned>(
@@ -806,6 +889,16 @@ mod tests {
             "no_pending_code",
             "too_many_attempts",
             "not_registered",
+            "invite_expired",
+            "invite_revoked",
+            "invalid_invite",
+            "not_team_member",
+            "invite_key_not_in_team",
+            "invites_not_configured",
+            "invalid_expiry",
+            "invalid_channel",
+            "relay_unavailable",
+            "relay_refused",
         ] {
             let text = plain_message(&api(code, 400));
             assert!(!text.contains("refused the request ("), "{code}: {text}");

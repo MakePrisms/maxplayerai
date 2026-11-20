@@ -8,6 +8,9 @@
 //! | POST   | /account/marketing            | NIP-98  | product news on/off (`account marketing`) |
 //! | POST   | /account/webhooks/resend      | Svix    | bounces, complaints, unsubscribes         |
 //! | GET    | /account/health               | none    | liveness + database ping                  |
+//! | POST   | /account/team/invite          | NIP-98  | a member makes a team invite link         |
+//! | POST   | /account/team/join            | NIP-98  | a linked key redeems a link (kind 9000)   |
+//! | POST   | /account/team/revoke          | NIP-98  | a member revokes the team's live links    |
 //!
 //! NIP-98 `u` tags must be `<public_base_url><path>` exactly. Every error body is
 //! `{"error": <stable code>, "message": <text>}` and never contains an email address.
@@ -22,15 +25,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::TimeDelta;
-use nostr::PublicKey;
+use nostr::{Keys, PublicKey, Timestamp};
 use serde::Deserialize;
 use serde_json::json;
 use tracing::{info, warn};
 
 use crate::AppState;
-use crate::db::{self, ConfirmOutcome};
+use crate::db::{self, ConfirmOutcome, LinkState};
 use crate::email::{CodeEmail, WelcomeEmail};
 use crate::nip98;
+use crate::relay::KIND_PUT_USER;
 use crate::sync;
 use crate::validate;
 use crate::webhook;
@@ -41,6 +45,9 @@ pub const PATH_STATUS: &str = "/account/status";
 pub const PATH_MARKETING: &str = "/account/marketing";
 pub const PATH_WEBHOOK: &str = "/account/webhooks/resend";
 pub const PATH_HEALTH: &str = "/account/health";
+pub const PATH_TEAM_INVITE: &str = "/account/team/invite";
+pub const PATH_TEAM_JOIN: &str = "/account/team/join";
+pub const PATH_TEAM_REVOKE: &str = "/account/team/revoke";
 
 /// Request bodies are a few hundred bytes; Resend webhooks a few KiB.
 const MAX_BODY: usize = 64 * 1024;
@@ -126,6 +133,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(PATH_MARKETING, post(marketing))
         .route(PATH_WEBHOOK, post(resend_webhook))
         .route(PATH_HEALTH, get(health))
+        .route(PATH_TEAM_INVITE, post(team_invite))
+        .route(PATH_TEAM_JOIN, post(team_join))
+        .route(PATH_TEAM_REVOKE, post(team_revoke))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
@@ -588,6 +598,281 @@ async fn marketing(
     ok(
         StatusCode::OK,
         json!({ "marketing": marketing_label(&consent) }),
+    )
+}
+
+// ------------------------------------------------------------------ team invite links
+//
+// docs/specs/maxplayer-team.md §12. The service never decides membership itself: the relay's
+// signed member list (39002) of the team, read as the invite key, says who is in it.
+
+/// The invite key and the relay pubkey (signer of member lists), or 503.
+fn invite_setup(state: &AppState) -> Result<(&Keys, PublicKey), ApiError> {
+    let relay = (state.cfg.relay.relay_pubkey.as_deref()).and_then(|p| PublicKey::parse(p).ok());
+    match (state.invite.as_ref(), relay) {
+        (Some(keys), Some(relay)) => Ok((keys, relay)),
+        _ => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invites_not_configured",
+            "team invite links are not enabled on this service",
+        )),
+    }
+}
+
+async fn require_linked(state: &AppState, pk_hex: &str) -> Result<(), ApiError> {
+    if db::get_registration(&state.db, pk_hex).await?.is_none() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "not_registered",
+            "this key is not linked; run `maxplayer account link` first",
+        ));
+    }
+    Ok(())
+}
+
+fn channel_of(raw: &str) -> Result<String, ApiError> {
+    validate::is_channel_id(raw)
+        .then(|| raw.to_string())
+        .ok_or_else(|| ApiError::bad("invalid_channel", "channel must be a lowercase UUID"))
+}
+
+fn not_member(what: &str) -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "not_team_member",
+        format!("only a member of the team can {what} its invite links"),
+    )
+}
+
+/// The team's members (hex) from the relay, read as the invite key.
+async fn team_members(
+    state: &AppState,
+    invite: &Keys,
+    relay: &PublicKey,
+    channel: &str,
+) -> Result<Vec<String>, ApiError> {
+    let now = Timestamp::from(state.clock.unix());
+    state
+        .relay
+        .fetch_team_members(invite, relay, channel, now)
+        .await
+        .map_err(|e| {
+            warn!(%channel, error = %e, "team member list unreadable");
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "relay_unavailable",
+                "could not read the team from the relay, try again",
+            )
+        })
+}
+
+#[derive(Deserialize)]
+struct InviteReq {
+    channel: String,
+    #[serde(default)]
+    expires_in_secs: Option<i64>,
+}
+
+/// The inviter's client has already added the invite key to the team (kind 9000, which the relay
+/// accepts from members only); the member list then proves both are in it.
+async fn team_invite(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let pubkey = authenticate(&state, &headers, PATH_TEAM_INVITE, "POST", &body).await?;
+    let (invite, relay) = invite_setup(&state)?;
+    let pk_hex = pubkey.to_hex();
+    let req: InviteReq = parse_json(&body)?;
+    let channel = channel_of(&req.channel)?;
+    let teams = &state.cfg.teams;
+    let ttl = req.expires_in_secs.unwrap_or(teams.link_ttl_secs);
+    if !(60..=teams.max_link_ttl_secs).contains(&ttl) {
+        return Err(ApiError::bad(
+            "invalid_expiry",
+            format!(
+                "a link lasts between 60 seconds and {} seconds",
+                teams.max_link_ttl_secs
+            ),
+        ));
+    }
+    require_linked(&state, &pk_hex).await?;
+    rate_limit(
+        &state,
+        "team_invite",
+        &[(
+            format!("pk:{pk_hex}"),
+            state.cfg.limits.invite_links_per_pubkey_per_hour,
+        )],
+        "rate_limited",
+    )
+    .await?;
+    // Locked before the member list is read: a sweep or revoke that makes the invite key leave
+    // this team either finished (the list shows it gone) or waits until this link is stored.
+    let _team = state.lock_team(&channel).await;
+    let members = team_members(&state, invite, &relay, &channel).await?;
+    let now = state.now();
+    if !members.contains(&invite.public_key().to_hex()) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "invite_key_not_in_team",
+            "the invite key is not in this team yet; add it (kind 9000) and try again",
+        ));
+    }
+    // The key is in the team: tracked even if this request is refused below, so the sweep makes
+    // it leave once no link is live.
+    db::track_invite_channel(&state.db, &channel, now).await?;
+    if !members.contains(&pk_hex) {
+        return Err(not_member("create"));
+    }
+    let token = validate::generate_token();
+    let expires_at = now + TimeDelta::seconds(ttl);
+    let hash = validate::token_hash(&token);
+    db::insert_invite_link(&state.db, &hash, &channel, &pk_hex, expires_at, now).await?;
+    info!(pubkey = %pk_hex, %channel, "team invite link created");
+    ok(
+        StatusCode::OK,
+        json!({
+            "link": format!("{}/{token}", teams.join_url.trim_end_matches('/')),
+            "channel": channel,
+            "expires_at": expires_at.to_rfc3339(),
+            "expires_in_secs": ttl,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct JoinReq {
+    token: String,
+}
+
+/// Redeem a link: the joiner (signer) must be linked; the invite key adds it with a kind 9000.
+async fn team_join(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let pubkey = authenticate(&state, &headers, PATH_TEAM_JOIN, "POST", &body).await?;
+    let (invite, _) = invite_setup(&state)?;
+    let pk_hex = pubkey.to_hex();
+    let req: JoinReq = parse_json(&body)?;
+    // Before the token is looked at, so an unlinked key learns nothing about it.
+    require_linked(&state, &pk_hex).await?;
+    // Every redeem is a relay write signed by the one shared invite key.
+    rate_limit(
+        &state,
+        "team_join",
+        &[(
+            format!("pk:{pk_hex}"),
+            state.cfg.limits.team_joins_per_pubkey_per_hour,
+        )],
+        "rate_limited",
+    )
+    .await?;
+    let hash = validate::token_hash(req.token.trim());
+    let channel = match db::invite_link_state(&state.db, &hash, state.now()).await? {
+        LinkState::Live { channel } => channel,
+        LinkState::Expired => {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "invite_expired",
+                "this invite link has expired; ask a member for a new one",
+            ));
+        }
+        LinkState::Revoked => {
+            return Err(ApiError::new(
+                StatusCode::GONE,
+                "invite_revoked",
+                "this invite link was revoked; ask a member for a new one",
+            ));
+        }
+        LinkState::Unknown => {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "invalid_invite",
+                "no such invite link; check that the whole link was copied",
+            ));
+        }
+    };
+    let now = Timestamp::from(state.clock.unix());
+    if let Err(e) = state
+        .relay
+        .send_team_command(invite, KIND_PUT_USER, &channel, &pubkey, now)
+        .await
+    {
+        warn!(pubkey = %pk_hex, %channel, error = %e, "invite add refused");
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "relay_refused",
+            "the relay did not add this key to the team; try again or ask for a new link",
+        ));
+    }
+    info!(pubkey = %pk_hex, %channel, "joined a team by invite link");
+    ok(
+        StatusCode::OK,
+        json!({ "status": "joined", "channel": channel }),
+    )
+}
+
+#[derive(Deserialize)]
+struct RevokeReq {
+    channel: String,
+}
+
+/// Revoke a team's live links (a member only), then the invite key leaves the team at once.
+/// Fails closed: see the comment on the member list below.
+async fn team_revoke(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> ApiResult {
+    let pubkey = authenticate(&state, &headers, PATH_TEAM_REVOKE, "POST", &body).await?;
+    let (invite, relay) = invite_setup(&state)?;
+    let pk_hex = pubkey.to_hex();
+    let req: RevokeReq = parse_json(&body)?;
+    let channel = channel_of(&req.channel)?;
+    require_linked(&state, &pk_hex).await?;
+    // Every revoke reads the member list as the one shared invite key.
+    rate_limit(
+        &state,
+        "team_revoke",
+        &[(
+            format!("pk:{pk_hex}"),
+            state.cfg.limits.team_revokes_per_pubkey_per_hour,
+        )],
+        "rate_limited",
+    )
+    .await?;
+    let team = state.lock_team(&channel).await;
+    let members = team_members(&state, invite, &relay, &channel).await?;
+    // A readable list (the invite key is in the team) must name the caller: every live link
+    // goes and the key leaves. An unreadable one (the key was removed, or the relay sent no
+    // list) proves nothing: the caller may revoke only links it made itself, no 9001 is sent,
+    // and anyone else gets the same 403.
+    let revoked = if !members.contains(&invite.public_key().to_hex()) {
+        let n = db::revoke_invite_links(&state.db, &channel, Some(&pk_hex), state.now()).await?;
+        if n == 0 {
+            return Err(not_member("revoke"));
+        }
+        n
+    } else {
+        if !members.contains(&pk_hex) {
+            return Err(not_member("revoke"));
+        }
+        // Tracked even with no row (a link request refused after the key was added), so a
+        // stranded key leaves now.
+        db::track_invite_channel(&state.db, &channel, state.now()).await?;
+        let n = db::revoke_invite_links(&state.db, &channel, None, state.now()).await?;
+        if let Err(e) = sync::leave_if_idle_locked(&state, invite, &channel, &team).await {
+            // The sweep retries.
+            warn!(%channel, error = %format!("{e:#}"), "invite key leave after revoke failed");
+        }
+        n
+    };
+    info!(pubkey = %pk_hex, %channel, revoked, "team invite links revoked");
+    ok(
+        StatusCode::OK,
+        json!({ "revoked": revoked, "channel": channel }),
     )
 }
 

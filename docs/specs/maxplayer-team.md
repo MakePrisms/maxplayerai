@@ -296,3 +296,40 @@ Tests:
    member, whose public key ships in the default follow.
 2. Team volume vs. the shared verdict window. Default: ship the client cap; add a batch request only
    if a real team hits it.
+
+## 12. Invite links (join by weblink)
+
+Agreed in Discord #team-invite-links (Bob, Josip, Petar, 2026-11-20). No relay change.
+
+1. `maxplayer team invite <team> --link [--expires 72h]` (MCP `team_invite` with `link: true`):
+   the client adds ONE service-wide **invite key** to the team with a normal kind 9000 (the relay
+   accepts it from members only), then calls the registration service `POST /account/team/invite`
+   NIP-98 signed by the inviter's linked key. The service reads the team's relay-signed member list
+   (39002) as the invite key, requires both the invite key and the inviter in it, and returns
+   `https://www.maxplayer.ai/join/<token>`: 32 random bytes, no key in it, stored as SHA-256 only.
+   Default 72 h, at most 30 days; no use cap; no approval step.
+2. `/join/<token>` is one static plain-text page for every token ("give this link to your agent":
+   install, `account link`, `team join <link>`). Opening it redeems nothing.
+3. `maxplayer team join <link-or-token>` (MCP `team_join` with `link`) calls `POST /account/team/join`
+   signed by the joiner's own key. An unlinked key is refused (`not_registered`: run
+   `maxplayer account link`); an expired, revoked or unknown token is refused. Otherwise the service
+   adds the joiner with a kind 9000 signed by the invite key and returns the channel; the client
+   then does the normal `join`.
+4. `maxplayer team invite revoke <team>` (`POST /account/team/revoke`, a linked member) revokes the
+   team's live links, and the invite key leaves the team at once.
+5. The service's reconcile loop also sweeps: a team with no live link left gets a 9001 from the
+   invite key naming itself (leave). The sweep lags expiry by up to the reconcile interval
+   (default 5 min). Creating a link, revoking and the sweep take the same per-team lock, so a new
+   link never lands just after the key left. The lock is in-process: one `serve` process writes
+   invite links and sweeps (run no second `serve` against the same database);
+   `maxplayer-registration sync` does not sweep. A revoke needs the caller in the member list; with
+   the list unreadable a caller may revoke only its own links and the key is not removed.
+   The service checks membership only; the team marker (39000) is left to clients, which refuse to
+   join a channel without it.
+6. The invite key's pubkey is compiled into the client (`maxplayer_team::INVITE_PUBKEY`); clients
+   drop any message it signs, so it never shows as a speaker. Its secret is the service's
+   `teams.invite_key_file`; it must be a relay member (NIP-43) to sign in, like the content-service
+   key. While it is in a team the operator's service can read that team, which teams already accept.
+   A test deployment with its own invite key sets `MAXPLAYER_TEAM_INVITE_PUBKEY` (64 lowercase
+   hex) on its clients. The client refuses it when its relay or registration URL is on
+   relay.maxplayer.ai, and refuses a malformed value, instead of ignoring it.
