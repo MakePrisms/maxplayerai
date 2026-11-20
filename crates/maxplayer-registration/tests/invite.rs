@@ -434,6 +434,10 @@ async fn revoke_fails_closed_when_the_member_list_is_unreadable() {
     let r = revoke(&app, &inviter, &channel).await;
     assert_eq!((r.status, r.body["revoked"].clone()), (200, json!(1)));
     assert_eq!(app.count(LIVE).await, 1);
+    // The other creator too: no link is live now, and still no 9001 for an unverified caller.
+    let r = revoke(&app, &other, &channel).await;
+    assert_eq!((r.status, r.body["revoked"].clone()), (200, json!(1)));
+    assert_eq!(app.count(LIVE).await, 0);
     assert_eq!(leaves(&app), 0);
 }
 
