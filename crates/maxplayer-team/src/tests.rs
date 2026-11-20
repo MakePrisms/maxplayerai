@@ -524,3 +524,44 @@ fn untrusted_text_is_escaped_and_length_checked() {
     assert!(validate_text(&"é".repeat(8000)).is_ok());
     assert!(validate_text(&"é".repeat(8001)).is_err());
 }
+
+#[test]
+fn join_links_and_bare_tokens_parse_and_anything_else_is_refused() {
+    let token = "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789-_abcde";
+    assert_eq!(token.len(), 43);
+    for input in [
+        format!("https://www.maxplayer.ai/join/{token}"),
+        format!("  https://www.maxplayer.ai/join/{token}/  "),
+        format!("https://www.maxplayer.ai/join/{token}?utm=x#frag"),
+        format!("http://127.0.0.1:8080/join/{token}"),
+        token.to_owned(),
+    ] {
+        assert_eq!(join_token(&input).unwrap(), token, "{input}");
+    }
+    for bad in [
+        String::new(),
+        CH.to_owned(),
+        format!("https://www.maxplayer.ai/{token}"),
+        format!("https://www.maxplayer.ai/join/{token}/extra"),
+        format!("https://www.maxplayer.ai/join/{}", &token[..42]),
+        format!("{token}a"),
+        token.replace('A', "+"),
+    ] {
+        assert!(join_token(&bad).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn the_invite_key_is_a_valid_key_and_its_messages_are_never_admitted() {
+    let invite = PublicKey::from_hex(INVITE_PUBKEY).unwrap();
+    assert_eq!(invite.to_hex(), INVITE_PUBKEY);
+    assert!(is_invite_key(INVITE_PUBKEY) && is_invite_key(&INVITE_PUBKEY.to_uppercase()));
+    assert!(!is_invite_key(&Keys::generate().public_key().to_hex()));
+    // A real member's message passes; one signed by the invite key would be dropped, whoever
+    // holds its secret. (Signed here with a stand-in: only the author key is checked first.)
+    let member = Keys::generate();
+    assert!(admit(&msg(&member, vec![vec!["h", CH]], "hi"), CH, None).is_ok());
+    let mut forged = msg(&member, vec![vec!["h", CH]], "hi");
+    forged.pubkey = invite;
+    assert_eq!(admit(&forged, CH, None).unwrap_err(), "the invite key does not post");
+}

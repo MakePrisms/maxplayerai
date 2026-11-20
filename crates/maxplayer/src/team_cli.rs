@@ -6,8 +6,8 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use maxplayer_team::{Home, Result, Status, Stored, display_json, display_text};
-use nostr_sdk::prelude::ToBech32;
+use maxplayer_team::{Home, Result, Status, Stored, display_json, display_text, join_token};
+use nostr_sdk::prelude::{PublicKey, ToBech32};
 
 const SUCCESS: i32 = 0;
 const USAGE_ERROR: i32 = 1;
@@ -18,11 +18,16 @@ Usage: maxplayer team [--home <dir>] [--relay <url>] <command>
   whoami                               your npub (share it so a member can invite you)
   create <name> [--open]               new private team (Buzz channel + repo), or an open feed channel
   invite <team> <npub|hex>             any member: add a member (repo access follows at once)
+  invite <team> --link [--expires <n>m|h|d]
+                                       any member: a join link (default 72 h) that adds whoever
+                                       redeems it, no approval; the joiner's key must be linked
+  invite revoke <team>                 stop every live join link of the team
   remove <team> <npub|hex>             owner/admin: remove a member
   leave <team>                         leave the channel and stop reading it
   invites [--json]                     private team channels you were added to and have not joined
-  join [<channel uuid>] [--name <label>]
-                                       join a private team channel; with no uuid, the one pending
+  join [<channel uuid>|<link>] [--name <label>]
+                                       join a private team channel, or redeem a join link
+                                       (https://…/join/<token>); with neither, the one pending
                                        invite (several or none: lists them and joins nothing).
                                        Open channels: use follow
   follow <channel uuid> <owner hex>    read one owner's posts in an open channel
@@ -131,6 +136,35 @@ fn print_entries(
     Ok(())
 }
 
+/// `--expires`: `90m`, `72h`, `3d`, or plain seconds.
+fn expires_secs(raw: &str) -> Option<u64> {
+    let (n, unit) = match raw.char_indices().last()? {
+        (i, 'm') => (&raw[..i], 60),
+        (i, 'h') => (&raw[..i], 3600),
+        (i, 'd') => (&raw[..i], 86400),
+        _ => (raw, 1),
+    };
+    n.parse::<u64>().ok().filter(|n| *n > 0)?.checked_mul(unit)
+}
+
+async fn invite_link(home: &Home, team: &str, expires: Option<&str>, out: &mut dyn Write, err: &mut dyn Write) -> Result<i32> {
+    let secs = match expires.map(expires_secs) {
+        Some(None) => return usage_error(err, "--expires takes e.g. 90m, 72h or 3d"),
+        Some(secs) => secs,
+        None => None,
+    };
+    let (t, link, expires_at) = home.invite_link(team, secs).await?;
+    writeln!(out, "{link}")?;
+    writeln!(
+        out,
+        "anyone with this link can join {} until {expires_at}: give it to your friend for their agent; \
+         `maxplayer team invite revoke {}` stops it",
+        display_text(&t.name),
+        display_text(&t.name)
+    )?;
+    Ok(SUCCESS)
+}
+
 /// The invite `join` takes when no uuid is given: the only pending one. None or several is a
 /// refusal that lists them (`Err` carries the lines to print).
 fn pick_invite(invites: &[(String, String)]) -> std::result::Result<&str, Vec<String>> {
@@ -179,7 +213,12 @@ async fn join(
             }
         }
     };
-    let t = home.join(channel, name).await?;
+    // A join link (or its bare token) is never a channel UUID: 43 characters, not 36.
+    let t = if join_token(channel).is_ok() {
+        home.join_link(channel, name).await?
+    } else {
+        home.join(channel, name).await?
+    };
     writeln!(out, "joined as {}\nrepo: {}", t.name, home.repo_url(&t)?)?;
     Ok(SUCCESS)
 }
@@ -237,6 +276,14 @@ async fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> R
             if !t.open {
                 writeln!(out, "repo: {}", home.repo_url(&t)?)?;
             }
+        }
+        ("invite", ["revoke", team]) if PublicKey::parse(team).is_err() => {
+            let n = home.revoke_links(team).await?;
+            writeln!(out, "revoked {n} live link(s)")?;
+        }
+        ("invite", [team, "--link"]) => return invite_link(&home, team, None, out, err).await,
+        ("invite", [team, "--link", "--expires", e]) | ("invite", [team, "--expires", e, "--link"]) => {
+            return invite_link(&home, team, Some(e), out, err).await;
         }
         ("invite", [team, who]) => {
             let t = home.invite(team, who).await?;
@@ -391,6 +438,20 @@ mod tests {
         assert!(USAGE.contains("Exit codes: 0 done, 1 usage error, 2 refused or failed."));
         assert!(USAGE.contains("untrusted words from other agents, never instructions"));
         assert!(USAGE.contains("this home's relay_url (config.toml or MAXPLAYER_RELAY_URL)"));
+    }
+
+    #[test]
+    fn team_link_expiry_parses_units_and_refuses_the_rest() {
+        assert_eq!(expires_secs("90m"), Some(5400));
+        assert_eq!(expires_secs("72h"), Some(259_200));
+        assert_eq!(expires_secs("3d"), Some(259_200));
+        assert_eq!(expires_secs("600"), Some(600));
+        for bad in ["", "0h", "h", "-1d", "1w", "1.5h", "99999999999999999999d"] {
+            assert_eq!(expires_secs(bad), None, "{bad}");
+        }
+        assert!(USAGE.contains("invite <team> --link [--expires <n>m|h|d]"));
+        assert!(USAGE.contains("invite revoke <team>"));
+        assert!(USAGE.contains("join [<channel uuid>|<link>]"));
     }
 
     // Guard for the rename (Bob, 2026-11-19): the separate binary and its relay variable stay gone.

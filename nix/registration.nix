@@ -17,6 +17,7 @@
 #   /var/lib/secrets/maxplayer-registration-admin-key     64-hex or nsec1 (the relay admin key)
 #   /var/lib/secrets/maxplayer-registration-resend-key    re_...
 #   /var/lib/secrets/maxplayer-registration-resend-webhook whsec_...
+#   /var/lib/secrets/maxplayer-team-invite-key            64-hex or nsec1 (only with inviteKeyFile set)
 # A missing file fails only this unit (LoadCredential), never the relay.
 {
   config,
@@ -45,7 +46,11 @@ let
         api_key_file = "${runDir}/resend-key";
         webhook_secret_file = "${runDir}/resend-webhook";
       };
-    } cfg.settings
+    }
+    // lib.optionalAttrs (cfg.inviteKeyFile != null) {
+      teams.invite_key_file = "${runDir}/invite-key";
+    }
+    // cfg.settings
   );
 in
 {
@@ -95,6 +100,15 @@ in
     resendWebhookSecretFile = lib.mkOption {
       type = lib.types.str;
       default = "/var/lib/secrets/maxplayer-registration-resend-webhook";
+    };
+    inviteKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/var/lib/secrets/maxplayer-team-invite-key";
+      description = ''
+        Team invite key (team invite links, docs/specs/maxplayer-team.md §12). Its pubkey is compiled
+        into maxplayer; it must be a relay member (owner kind 9030). null = invite links off (503).
+      '';
     };
     backup = lib.mkOption {
       type = lib.types.bool;
@@ -165,16 +179,20 @@ in
           "admin-key:${cfg.adminKeyFile}"
           "resend-key:${cfg.resendKeyFile}"
           "resend-webhook:${cfg.resendWebhookSecretFile}"
-        ];
+        ]
+        ++ lib.optional (cfg.inviteKeyFile != null) "invite-key:${cfg.inviteKeyFile}";
         # LoadCredential copies are 0440; the service refuses group-readable secrets
         # (secret_file_must_be_private), so re-install them 0600 into the 0700 RuntimeDirectory.
         ExecStartPre =
           map (n: "${pkgs.coreutils}/bin/install -m 0600 \${CREDENTIALS_DIRECTORY}/${n} ${runDir}/${n}")
-            [
-              "admin-key"
-              "resend-key"
-              "resend-webhook"
-            ];
+            (
+              [
+                "admin-key"
+                "resend-key"
+                "resend-webhook"
+              ]
+              ++ lib.optional (cfg.inviteKeyFile != null) "invite-key"
+            );
         ExecStart = "${lib.getExe cfg.package} serve --config ${configFile}";
         Restart = "on-failure";
         RestartSec = 5;

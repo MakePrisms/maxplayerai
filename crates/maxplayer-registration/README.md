@@ -28,6 +28,9 @@ accepted once.
 | POST | `/account/marketing` | NIP-98 | `{enabled: bool, notice_version?}` → `{marketing:"subscribed"\|"unsubscribed"}` (for `maxplayer account marketing on\|off`) |
 | POST | `/account/webhooks/resend` | Svix signature | Resend events: `email.bounced`, `email.complained`, `contact.updated` (unsubscribed) |
 | GET | `/account/health` | none | `{ok:true}` after a database ping |
+| POST | `/account/team/invite` | NIP-98 | `{channel, expires_in_secs?}` → `{link, channel, expires_at, expires_in_secs}` (a linked team member; the invite key must already be in the team) |
+| POST | `/account/team/join` | NIP-98 | `{token}` → `{status:"joined", channel}` (a linked key; the invite key adds it with kind 9000) |
+| POST | `/account/team/revoke` | NIP-98 | `{channel}` → `{revoked, channel}` (a linked team member; the invite key then leaves) |
 
 Errors are `{"error": <stable code>, "message": <text>}` and never contain an email address.
 The codes are: `missing_auth`, `malformed_auth`, `wrong_kind`, `bad_signature`, `stale_auth`,
@@ -36,7 +39,15 @@ The codes are: `missing_auth`, `malformed_auth`, `wrong_kind`, `bad_signature`, 
 `unknown_privacy_version`, `unknown_notice_version`, `invalid_entered_by`, `resend_cooldown`,
 `rate_limited` (both with `Retry-After`), `email_send_failed`, `no_pending_code`, `wrong_code`
 (with `attempts_left`), `code_expired`, `too_many_attempts`, `key_linked_to_other_email`,
-`not_registered`, `bad_webhook_signature`, `webhook_not_configured`.
+`not_registered`, `bad_webhook_signature`, `webhook_not_configured`; team invite links add
+`invites_not_configured` (503), `invalid_channel`, `invalid_expiry`, `not_team_member`,
+`invite_key_not_in_team`, `invalid_invite` (404), `invite_expired` and `invite_revoked` (410),
+`relay_unavailable` and `relay_refused` (502).
+
+Team invite links (docs/specs/maxplayer-team.md §12) need `[teams] invite_key_file` (the team
+invite key, whose pubkey is compiled into maxplayer as `maxplayer_team::INVITE_PUBKEY`) and
+`relay.relay_pubkey`. The invite key must be a relay member (owner kind 9030, like the
+content-service key). Membership is read from the team's relay-signed 39002, as the invite key.
 
 ### Rules
 

@@ -1669,15 +1669,17 @@ mod tests {
             );
         }
         let schema = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap()["inputSchema"].clone();
-        assert_eq!(schema("team_join")["required"], json!(["uuid"]));
+        assert_eq!(schema("team_join")["required"], Value::Null, "uuid or link");
         assert!(schema("team_join")["properties"]["name"].is_object());
+        assert_eq!(schema("team_join")["properties"]["link"]["type"], "string");
+        assert_eq!(schema("team_invite")["properties"]["link"]["type"], "boolean");
         assert_eq!(schema("team_send")["required"], json!(["team", "text"]));
         assert_eq!(schema("team_create")["required"], json!(["name"]));
         assert_eq!(
             schema("team_create")["properties"]["open"]["type"],
             "boolean"
         );
-        assert_eq!(schema("team_invite")["required"], json!(["team", "npub"]));
+        assert_eq!(schema("team_invite")["required"], json!(["team"]));
         for name in ["team_whoami", "team_list", "team_invites", "team_inbox"] {
             assert_eq!(schema(name)["properties"], json!({}), "{name}");
         }
@@ -1705,7 +1707,12 @@ mod tests {
             response["result"]["content"][0]["text"].as_str().unwrap().to_owned()
         };
         for (name, arguments, expected) in [
-            ("team_join", json!({}), "team_join: missing uuid"),
+            ("team_join", json!({}), "team_join: missing uuid or link"),
+            ("team_join", json!({"uuid": "x", "link": "y"}), "team_join: give uuid or link, not both"),
+            ("team_join", json!({"link": true}), "team_join: link must be a string"),
+            ("team_invite", json!({"team": "crew", "link": false}), "team_invite: missing npub or link"),
+            ("team_invite", json!({"team": "crew", "link": "yes"}), "team_invite: link must be a boolean"),
+            ("team_invite", json!({"team": "crew", "npub": "x", "link": true}), "team_invite: give npub or link, not both"),
             ("team_join", json!({"uuid": 7}), "team_join: uuid must be a string"),
             ("team_join", json!({"uuid": "x", "label": "y"}), "team_join: unknown argument label"),
             ("team_send", json!({"team": "crew"}), "team_send: missing text"),
@@ -1716,7 +1723,7 @@ mod tests {
             ("team_create", json!({"open": true}), "team_create: missing name"),
             ("team_create", json!({"name": "crew", "open": "yes"}), "team_create: open must be a boolean"),
             ("team_create", json!({"name": true}), "team_create: name must be a string"),
-            ("team_invite", json!({"team": "crew"}), "team_invite: missing npub"),
+            ("team_invite", json!({"team": "crew"}), "team_invite: missing npub or link"),
             ("team_invite", json!({"team": "crew", "who": "x"}), "team_invite: unknown argument who"),
             ("team_whoami", json!({"hex": "x"}), "team_whoami: unknown argument hex"),
         ] {

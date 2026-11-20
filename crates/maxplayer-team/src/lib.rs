@@ -5,6 +5,7 @@
 //! no model call and starts no harness.
 use base64::Engine as _;
 use maxplayer_core::home::MaxplayerConfig;
+use maxplayer_core::registration::{RegistrationClient, RegistrationError};
 use maxplayer_core::review::state::failure_state;
 use maxplayer_core::review::team as review;
 use maxplayer_core::review::Decision;
@@ -94,6 +95,35 @@ pub const TEAM_MAXPLAYER: (&str, &str) = (
     "93f1b02d-f8ac-4dea-aae0-576e6d9d5ee8",
     "5b298ab6c880322489d638b1923ebd299c98b50156f09681f17990edb7c8807e",
 );
+
+/// The service-wide team invite key (spec §12): `invite <team> --link` adds it to the team, and
+/// the registration service, which holds its secret, adds whoever redeems a link. It is never a
+/// person: clients drop its messages and leave it out of any member list ([`is_invite_key`]).
+pub const INVITE_PUBKEY: &str = "4e6fba923eef12c189508146981d4c386fcfdbb9e9824d36bbef56a39aa6e008";
+
+pub fn is_invite_key(hex: &str) -> bool {
+    hex.eq_ignore_ascii_case(INVITE_PUBKEY)
+}
+
+/// The token of a join link: `https://<site>/join/<token>` (a trailing `/`, query or fragment is
+/// ignored) or the bare token, 43 characters of base64url.
+pub fn join_token(input: &str) -> Result<String> {
+    let s = input.trim();
+    let token = if s.contains("://") {
+        let url = Url::parse(s).map_err(|_| "not a join link")?;
+        let segments: Vec<&str> = url.path_segments().map(|p| p.filter(|s| !s.is_empty()).collect()).unwrap_or_default();
+        match segments.as_slice() {
+            [.., "join", token] => (*token).to_owned(),
+            _ => return Err("not a join link: expected https://…/join/<token>".into()),
+        }
+    } else {
+        s.to_owned()
+    };
+    if token.len() != 43 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') {
+        return Err("not a join link or token: check that the whole link was copied".into());
+    }
+    Ok(token)
+}
 
 fn is_hex(s: &str, bytes: usize) -> bool {
     s.len() == bytes * 2 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -215,6 +245,10 @@ enum Outcome {
 /// one canonical `h` naming this channel, bounded text and size; a followed post must come from
 /// its owner (checked here, not trusted to the relay filter).
 pub fn admit(event: &Event, channel: &str, owner: Option<&str>) -> std::result::Result<(), String> {
+    // The invite key is in many teams and only ever adds members; it has nothing to say.
+    if is_invite_key(&event.pubkey.to_hex()) {
+        return Err("the invite key does not post".into());
+    }
     if owner.is_some_and(|o| event.pubkey.to_hex() != o) {
         return Err("not the followed owner".into());
     }
@@ -685,6 +719,35 @@ impl Home {
         state.cursors.remove(&t.channel);
         self.save(&state)?;
         Ok(t.channel)
+    }
+    /// One call to the registration service as this key (NIP-98), for invite links. The client
+    /// is blocking, so it is built, used and dropped on a blocking thread.
+    async fn registration<T: Send + 'static>(
+        &self,
+        call: impl FnOnce(&RegistrationClient) -> std::result::Result<T, RegistrationError> + Send + 'static,
+    ) -> Result<T> {
+        let (url, keys) = (self.config.registration_url.clone(), self.keys.clone());
+        Ok(tokio::task::spawn_blocking(move || call(&RegistrationClient::new(&url, keys)?)).await??)
+    }
+    /// `invite <team> --link`: add the invite key to the team (kind 9000; the relay accepts it
+    /// from a member only), then ask the registration service for a join link.
+    pub async fn invite_link(&self, team: &str, expires_in_secs: Option<u64>) -> Result<(Team, String, String)> {
+        let t = self.member_event(team, INVITE_PUBKEY, 9000).await?;
+        let channel = t.channel.clone();
+        let link = self.registration(move |c| c.team_invite_link(&channel, expires_in_secs)).await?;
+        Ok((t, link.link, link.expires_at))
+    }
+    /// `invite revoke <team>`: every live link of the team stops working; the invite key leaves.
+    pub async fn revoke_links(&self, team: &str) -> Result<u64> {
+        let channel = self.load()?.resolve(team)?.channel.clone();
+        Ok(self.registration(move |c| c.team_revoke(&channel)).await?.revoked)
+    }
+    /// `join <link>`: the service adds this key (it must be linked to an email), then the
+    /// normal join records the team.
+    pub async fn join_link(&self, link: &str, name: Option<&str>) -> Result<Team> {
+        let token = join_token(link)?;
+        let joined = self.registration(move |c| c.team_join(&token)).await?;
+        self.join(&joined.channel, name).await
     }
     /// Private team channels this key was added to and has not joined: (channel, creator).
     pub async fn invites(&self) -> Result<Vec<(String, String)>> {

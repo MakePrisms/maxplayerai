@@ -47,3 +47,9 @@ reconcile_interval_secs = 300
 reconcile_removals = false     # true = also remove unregistered `member` keys this service did not add
 keep_members = []              # e.g. the deploy probe's npub
 cleanup_interval_secs = 3600
+
+[teams]                        # team invite links; unset invite_key_file = off (503)
+invite_key_file = "/var/lib/secrets/maxplayer-team-invite-key"   # 64-hex or nsec, 0600; must be a relay member
+join_url = "https://www.maxplayer.ai/join"
+link_ttl_secs = 259200         # 72 h
+max_link_ttl_secs = 2592000    # 30 days

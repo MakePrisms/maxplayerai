@@ -37,6 +37,8 @@ pub struct AppState {
     pub pepper: [u8; 32],
     pub webhook_secret: Option<Vec<u8>>,
     pub clock: Arc<Clock>,
+    /// The team invite key (`teams.invite_key_file`); `None` = invite links are off.
+    pub invite: Option<nostr::Keys>,
 }
 
 /// Wall clock plus a test-only offset, so code expiry, rate windows and retry
@@ -77,6 +79,7 @@ impl AppState {
             pepper,
             webhook_secret,
             clock: Arc::new(Clock::default()),
+            invite: None,
         })
     }
 
@@ -92,7 +95,15 @@ impl AppState {
             webhook::parse_secret(&raw).context("Resend webhook secret is not whsec_<base64>")
         })
         .transpose()?;
-        Self::new(cfg, db, admin, resend, webhook)
+        let invite = cfg
+            .teams
+            .invite_key_file
+            .as_deref()
+            .map(|p| secrets::load_keys(p, "team invite key"))
+            .transpose()?;
+        let mut state = Self::new(cfg, db, admin, resend, webhook)?;
+        state.invite = invite;
+        Ok(state)
     }
 
     pub fn now(&self) -> DateTime<Utc> {
