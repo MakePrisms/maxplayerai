@@ -708,14 +708,9 @@ async fn team_invite(
     )
     .await?;
     let now = state.now();
-    // Locked before the member list is read: a sweep that makes the invite key leave this team
-    // either finished (the list shows it gone) or waits until this link is stored.
-    let mut tx = state
-        .db
-        .begin()
-        .await
-        .map_err(|e| ApiError::internal(e.into()))?;
-    db::lock_invite_channel(&mut tx, &channel, now).await?;
+    // Locked before the member list is read: a sweep or revoke that makes the invite key leave
+    // this team either finished (the list shows it gone) or waits until this link is stored.
+    let _team = state.lock_team(&channel).await;
     let members = team_members(&state, invite, &relay, &channel).await?;
     if !members.contains(&invite.public_key().to_hex()) {
         return Err(ApiError::new(
@@ -724,16 +719,16 @@ async fn team_invite(
             "the invite key is not in this team yet; add it (kind 9000) and try again",
         ));
     }
+    // The key is in the team: tracked even if this request is refused below, so the sweep makes
+    // it leave once no link is live.
+    db::track_invite_channel(&state.db, &channel, now).await?;
     if !members.contains(&pk_hex) {
         return Err(not_member("create"));
     }
     let token = validate::generate_token();
     let expires_at = now + TimeDelta::seconds(ttl);
     let hash = validate::token_hash(&token);
-    db::insert_invite_link(&mut tx, &hash, &channel, &pk_hex, expires_at, now).await?;
-    tx.commit()
-        .await
-        .map_err(|e| ApiError::internal(e.into()))?;
+    db::insert_invite_link(&state.db, &hash, &channel, &pk_hex, expires_at, now).await?;
     info!(pubkey = %pk_hex, %channel, "team invite link created");
     ok(
         StatusCode::OK,
@@ -763,6 +758,17 @@ async fn team_join(
     let req: JoinReq = parse_json(&body)?;
     // Before the token is looked at, so an unlinked key learns nothing about it.
     require_linked(&state, &pk_hex).await?;
+    // Every redeem is a relay write signed by the one shared invite key.
+    rate_limit(
+        &state,
+        "team_join",
+        &[(
+            format!("pk:{pk_hex}"),
+            state.cfg.limits.team_joins_per_pubkey_per_hour,
+        )],
+        "rate_limited",
+    )
+    .await?;
     let hash = validate::token_hash(req.token.trim());
     let channel = match db::invite_link_state(&state.db, &hash, state.now()).await? {
         LinkState::Live { channel } => channel,
@@ -814,6 +820,7 @@ struct RevokeReq {
 }
 
 /// Revoke a team's live links (a member only), then the invite key leaves the team at once.
+/// Fails closed: see the comment on the member list below.
 async fn team_revoke(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -825,17 +832,43 @@ async fn team_revoke(
     let req: RevokeReq = parse_json(&body)?;
     let channel = channel_of(&req.channel)?;
     require_linked(&state, &pk_hex).await?;
+    // Every revoke reads the member list as the one shared invite key.
+    rate_limit(
+        &state,
+        "team_revoke",
+        &[(
+            format!("pk:{pk_hex}"),
+            state.cfg.limits.team_revokes_per_pubkey_per_hour,
+        )],
+        "rate_limited",
+    )
+    .await?;
+    let _team = state.lock_team(&channel).await;
     let members = team_members(&state, invite, &relay, &channel).await?;
-    // With the invite key out of the team (it cannot read the list then), its links can add no
-    // one, so revoking them is harmless whoever asks.
-    if members.contains(&invite.public_key().to_hex()) && !members.contains(&pk_hex) {
-        return Err(not_member("revoke"));
-    }
-    let revoked = db::revoke_invite_links(&state.db, &channel, state.now()).await?;
-    if let Err(e) = crate::sync::leave_if_idle(&state, invite, &channel).await {
-        // The sweep retries.
-        warn!(%channel, error = %format!("{e:#}"), "invite key leave after revoke failed");
-    }
+    // A readable list (the invite key is in the team) must name the caller: every live link
+    // goes and the key leaves. An unreadable one (the key was removed, or the relay sent no
+    // list) proves nothing: the caller may revoke only links it made itself, no 9001 is sent,
+    // and anyone else gets the same 403.
+    let revoked = if !members.contains(&invite.public_key().to_hex()) {
+        let n = db::revoke_invite_links(&state.db, &channel, Some(&pk_hex), state.now()).await?;
+        if n == 0 {
+            return Err(not_member("revoke"));
+        }
+        n
+    } else {
+        if !members.contains(&pk_hex) {
+            return Err(not_member("revoke"));
+        }
+        // Tracked even with no row (a link request refused after the key was added), so a
+        // stranded key leaves now.
+        db::track_invite_channel(&state.db, &channel, state.now()).await?;
+        let n = db::revoke_invite_links(&state.db, &channel, None, state.now()).await?;
+        if let Err(e) = sync::leave_if_idle_locked(&state, invite, &channel).await {
+            // The sweep retries.
+            warn!(%channel, error = %format!("{e:#}"), "invite key leave after revoke failed");
+        }
+        n
+    };
     info!(pubkey = %pk_hex, %channel, revoked, "team invite links revoked");
     ok(
         StatusCode::OK,

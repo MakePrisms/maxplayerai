@@ -39,6 +39,9 @@ pub struct AppState {
     pub clock: Arc<Clock>,
     /// The team invite key (`teams.invite_key_file`); `None` = invite links are off.
     pub invite: Option<nostr::Keys>,
+    /// One team at a time for link creation, revoke and the invite key leaving (striped by
+    /// channel). In-process, so no database transaction spans a relay call.
+    invite_locks: Vec<tokio::sync::Mutex<()>>,
 }
 
 /// Wall clock plus a test-only offset, so code expiry, rate windows and retry
@@ -92,6 +95,7 @@ impl AppState {
             webhook_secret,
             clock: Arc::new(Clock::default()),
             invite: None,
+            invite_locks: (0..64).map(|_| tokio::sync::Mutex::new(())).collect(),
         })
     }
 
@@ -120,6 +124,16 @@ impl AppState {
 
     pub fn now(&self) -> DateTime<Utc> {
         self.clock.now()
+    }
+
+    /// The lock of one team's invite links. Not reentrant: take it once per request.
+    pub async fn lock_team(&self, channel: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        channel.hash(&mut h);
+        self.invite_locks[h.finish() as usize % self.invite_locks.len()]
+            .lock()
+            .await
     }
 }
 

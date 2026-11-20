@@ -153,9 +153,9 @@ pub async fn reconcile_once(state: &AppState) -> Result<Option<ReconcileReport>>
 }
 
 /// The invite link sweep (runs after each reconcile): the invite key leaves every team that has
-/// no live (unexpired, unrevoked) link left, with a 9001 naming itself. The team's row stays
-/// locked while it leaves, so a link created meanwhile waits and then finds the key gone.
-/// Returns how many teams it left.
+/// no live (unexpired, unrevoked) link left, with a 9001 naming itself. The team stays locked
+/// ([`AppState::lock_team`]) while it leaves, so a link created meanwhile waits and then finds the
+/// key gone. Returns how many teams it left.
 pub async fn sweep_invites(state: &AppState) -> Result<usize> {
     let Some(invite) = state.invite.as_ref() else {
         return Ok(0);
@@ -169,10 +169,19 @@ pub async fn sweep_invites(state: &AppState) -> Result<usize> {
     Ok(left)
 }
 
-/// One team of [`sweep_invites`] (also run right after a revoke). `Ok(true)` = the key left.
+/// One team of [`sweep_invites`]. `Ok(true)` = the key left.
 pub async fn leave_if_idle(state: &AppState, invite: &nostr::Keys, channel: &str) -> Result<bool> {
-    let mut tx = state.db.begin().await?;
-    if !db::lock_idle_invite_channel(&mut tx, channel, state.now()).await? {
+    let _team = state.lock_team(channel).await;
+    leave_if_idle_locked(state, invite, channel).await
+}
+
+/// [`leave_if_idle`] for a caller already holding the team's lock (it is not reentrant).
+pub(crate) async fn leave_if_idle_locked(
+    state: &AppState,
+    invite: &nostr::Keys,
+    channel: &str,
+) -> Result<bool> {
+    if !db::idle_invite_channel(&state.db, channel, state.now()).await? {
         return Ok(false);
     }
     let now = ts(state.now());
@@ -184,13 +193,14 @@ pub async fn leave_if_idle(state: &AppState, invite: &nostr::Keys, channel: &str
         Ok(()) => {}
         // Removed by an owner already (buzz `NotActiveMember`): nothing to leave.
         Err(e) if e.contains("not an active member") => {}
+        // The team was deleted: nothing to leave, and a retry would never succeed.
+        Err(e) if e.contains("channel not found") => {}
         Err(e) => {
             warn!(%channel, error = %e, "invite key could not leave a team; will retry");
             return Ok(false);
         }
     }
-    db::forget_invite_channel(&mut tx, channel).await?;
-    tx.commit().await?;
+    db::forget_invite_channel(&state.db, channel).await?;
     info!(%channel, "invite key left a team with no live invite link");
     Ok(true)
 }

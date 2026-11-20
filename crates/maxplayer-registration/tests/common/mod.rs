@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
@@ -110,6 +110,8 @@ pub struct FakeRelay {
     pub teams: Mutex<BTreeMap<String, BTreeSet<String>>>,
     /// NIP-98 event ids already used (buzz `check_nip98_replay`: a reuse is 401).
     pub seen_auth: Mutex<BTreeSet<String>>,
+    /// Every /query answers this many ms late (widens race windows in tests).
+    pub query_delay_ms: AtomicU64,
     clock: Arc<Clock>,
 }
 
@@ -319,6 +321,8 @@ async fn relay_query(
         Err(resp) => return resp,
     };
     r.queries.fetch_add(1, Ordering::SeqCst);
+    let delay = r.query_delay_ms.load(Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
     let filter: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     if filter[0]["kinds"][0] == 39002 {
         // A private channel's 39002 is channel-scoped: only its members read it.
@@ -472,6 +476,7 @@ impl TestApp {
             expect_host: Mutex::new(None),
             teams: Mutex::new(BTreeMap::new()),
             seen_auth: Mutex::new(BTreeSet::new()),
+            query_delay_ms: AtomicU64::new(0),
             clock: clock.clone(),
         });
         let router = axum::Router::new()

@@ -729,10 +729,18 @@ async fn reconcile_removals_flag_removes_unregistered_members_except_kept_ones()
         m.insert(probe.to_hex(), "member".into());
         m.insert(other_admin.clone(), "admin".into());
     }
+    // The team invite key is a member this service never registered; it stays.
+    let invite = app.invite.public_key().to_hex();
+    app.relay
+        .members
+        .lock()
+        .unwrap()
+        .insert(invite.clone(), "member".into());
     let report = sync::reconcile_once(&app.state).await.unwrap().unwrap();
     assert_eq!((report.queued_adds, report.queued_removes), (0, 1));
     sync::run_outbox_once(&app.state).await.unwrap();
     assert!(!app.relay.is_member(&stray));
+    assert!(app.relay.is_member(&invite));
     assert!(app.relay.is_member(&probe.to_hex()));
     assert!(app.relay.is_member(&other_admin));
 }

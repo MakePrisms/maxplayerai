@@ -639,27 +639,22 @@ pub enum LinkState {
     Unknown,
 }
 
-/// Mark a team as one the invite key is in, taking its row lock until the transaction ends: a
-/// sweep making the invite key leave that team finishes first, or waits for this one.
-pub async fn lock_invite_channel(
-    conn: &mut PgConnection,
-    channel: &str,
-    now: DateTime<Utc>,
-) -> Result<()> {
+/// Mark a team as one the invite key is in, so the sweep makes it leave once no link is live.
+pub async fn track_invite_channel(db: &PgPool, channel: &str, now: DateTime<Utc>) -> Result<()> {
     sqlx::query(
         "INSERT INTO team_invite_channels (channel, updated_at) VALUES ($1, $2) \
          ON CONFLICT (channel) DO UPDATE SET updated_at = EXCLUDED.updated_at",
     )
     .bind(channel)
     .bind(now)
-    .execute(&mut *conn)
+    .execute(db)
     .await?;
     Ok(())
 }
 
 /// Store a new link (hash only).
 pub async fn insert_invite_link(
-    conn: &mut PgConnection,
+    db: &PgPool,
     token_hash: &[u8],
     channel: &str,
     created_by: &str,
@@ -675,7 +670,7 @@ pub async fn insert_invite_link(
     .bind(created_by)
     .bind(now)
     .bind(expires_at)
-    .execute(&mut *conn)
+    .execute(db)
     .await?;
     Ok(())
 }
@@ -707,14 +702,21 @@ pub async fn invite_link_state(
     })
 }
 
-/// Revoke every live link of a team. Returns how many.
-pub async fn revoke_invite_links(db: &PgPool, channel: &str, now: DateTime<Utc>) -> Result<u64> {
+/// Revoke every live link of a team, or only those `created_by` made. Returns how many.
+pub async fn revoke_invite_links(
+    db: &PgPool,
+    channel: &str,
+    created_by: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<u64> {
     Ok(sqlx::query(
         "UPDATE team_invite_links SET revoked_at = $2 \
-         WHERE channel = $1 AND revoked_at IS NULL AND expires_at > $2",
+         WHERE channel = $1 AND revoked_at IS NULL AND expires_at > $2 \
+         AND ($3::text IS NULL OR created_by = $3)",
     )
     .bind(channel)
     .bind(now)
+    .bind(created_by)
     .execute(db)
     .await?
     .rows_affected())
@@ -728,34 +730,24 @@ pub async fn invite_channels(db: &PgPool) -> Result<Vec<String>> {
     rows.iter().map(|r| Ok(r.try_get("channel")?)).collect()
 }
 
-/// Lock a team's row (held until the transaction ends) and say whether it has no live link
-/// left, i.e. the invite key should leave it. `false` also when the row is gone.
-pub async fn lock_idle_invite_channel(
-    conn: &mut PgConnection,
-    channel: &str,
-    now: DateTime<Utc>,
-) -> Result<bool> {
-    let locked =
-        sqlx::query("SELECT channel FROM team_invite_channels WHERE channel = $1 FOR UPDATE")
-            .bind(channel)
-            .fetch_optional(&mut *conn)
-            .await?
-            .is_some();
-    let live: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM team_invite_links \
+/// Whether a tracked team has no live link left, i.e. the invite key should leave it. `false`
+/// when the team is not tracked. Call it holding [`crate::AppState::lock_team`].
+pub async fn idle_invite_channel(db: &PgPool, channel: &str, now: DateTime<Utc>) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM team_invite_channels WHERE channel = $1) \
+         AND NOT EXISTS (SELECT 1 FROM team_invite_links \
          WHERE channel = $1 AND revoked_at IS NULL AND expires_at > $2)",
     )
     .bind(channel)
     .bind(now)
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(locked && !live)
+    .fetch_one(db)
+    .await?)
 }
 
-pub async fn forget_invite_channel(conn: &mut PgConnection, channel: &str) -> Result<()> {
+pub async fn forget_invite_channel(db: &PgPool, channel: &str) -> Result<()> {
     sqlx::query("DELETE FROM team_invite_channels WHERE channel = $1")
         .bind(channel)
-        .execute(&mut *conn)
+        .execute(db)
         .await?;
     Ok(())
 }

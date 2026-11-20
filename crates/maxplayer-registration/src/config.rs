@@ -189,6 +189,10 @@ pub struct Limits {
     pub nip98_max_skew_secs: i64,
     /// Team invite links one key may create per hour.
     pub invite_links_per_pubkey_per_hour: i32,
+    /// Join-link redeems (each a relay write as the shared invite key) one key may try per hour.
+    pub team_joins_per_pubkey_per_hour: i32,
+    /// Link revokes (each a relay read as the shared invite key) one key may ask per hour.
+    pub team_revokes_per_pubkey_per_hour: i32,
 }
 
 impl Default for Limits {
@@ -204,6 +208,8 @@ impl Default for Limits {
             confirms_per_ip_per_hour: 60,
             nip98_max_skew_secs: 60,
             invite_links_per_pubkey_per_hour: 30,
+            team_joins_per_pubkey_per_hour: 30,
+            team_revokes_per_pubkey_per_hour: 30,
         }
     }
 }
@@ -361,6 +367,8 @@ impl Config {
             || l.confirms_per_ip_per_hour <= 0
             || l.nip98_max_skew_secs <= 0
             || l.invite_links_per_pubkey_per_hour <= 0
+            || l.team_joins_per_pubkey_per_hour <= 0
+            || l.team_revokes_per_pubkey_per_hour <= 0
         {
             bail!("every [limits] value must be positive");
         }
@@ -431,6 +439,17 @@ mod tests {
         assert!(Config::from_toml("[limits]\nmax_attempts = 0").is_err());
         assert!(Config::from_toml("[relay]\nrelay_pubkey = \"nope\"").is_err());
         assert!(Config::from_toml("[sync]\nkeep_members = [\"nope\"]").is_err());
+        for teams in [
+            "[limits]\nteam_joins_per_pubkey_per_hour = 0",
+            "[limits]\nteam_revokes_per_pubkey_per_hour = 0",
+            "[limits]\ninvite_links_per_pubkey_per_hour = 0",
+            "[teams]\njoin_url = \"ftp://x/join\"",
+            "[teams]\njoin_url = \"https://x/join?a=1\"",
+            "[teams]\nlink_ttl_secs = 59",
+            "[teams]\nmax_link_ttl_secs = 3600",
+        ] {
+            assert!(Config::from_toml(teams).is_err(), "{teams}");
+        }
     }
 
     #[test]

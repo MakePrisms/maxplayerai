@@ -4,6 +4,8 @@
 
 mod common;
 
+use std::sync::atomic::Ordering;
+
 use common::TestApp;
 use maxplayer_registration::{api, sync};
 use nostr::Keys;
@@ -40,6 +42,29 @@ fn token_of(link: &Value) -> String {
 async fn join(app: &TestApp, who: &Keys, token: &str) -> common::Resp {
     app.post(who, api::PATH_TEAM_JOIN, json!({ "token": token }))
         .await
+}
+
+async fn revoke(app: &TestApp, who: &Keys, channel: &str) -> common::Resp {
+    app.post(who, api::PATH_TEAM_REVOKE, json!({ "channel": channel }))
+        .await
+}
+
+const LIVE: &str = "SELECT count(*) FROM team_invite_links WHERE revoked_at IS NULL";
+
+fn drop_from_team(app: &TestApp, channel: &str, who: &Keys) {
+    let mut teams = app.relay.teams.lock().unwrap();
+    teams
+        .get_mut(channel)
+        .unwrap()
+        .remove(&who.public_key().to_hex());
+}
+
+fn leaves(app: &TestApp) -> usize {
+    app.relay
+        .commands()
+        .iter()
+        .filter(|e| e.kind.as_u16() == 9001)
+        .count()
 }
 
 #[tokio::test]
@@ -379,4 +404,218 @@ async fn without_an_invite_key_the_sweep_does_nothing() {
     .unwrap();
     assert!(state.invite.is_none(), "AppState::new has no invite key");
     assert_eq!(sync::sweep_invites(&state).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn revoke_fails_closed_when_the_member_list_is_unreadable() {
+    let app = TestApp::start().await;
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    let other = linked(&app, "other").await;
+    app.relay.add_to_team(&channel, &other);
+    for who in [&inviter, &other] {
+        let r = create(&app, who, json!({ "channel": channel })).await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+    }
+    // An owner removed the invite key by hand: it cannot read the list any more.
+    drop_from_team(&app, &channel, &app.invite);
+    let outsider = linked(&app, "outsider").await;
+    let elsewhere = app.relay.team(&[&outsider]);
+    // The same 403 for this team and for one the invite key was never in.
+    for ch in [&channel, &elsewhere] {
+        let r = revoke(&app, &outsider, ch).await;
+        assert_eq!(
+            (r.status, r.body["error"].clone()),
+            (403, json!("not_team_member")),
+            "{ch}"
+        );
+    }
+    assert_eq!(app.count(LIVE).await, 2);
+    // A creator revokes only its own link, and no 9001 is sent for an unverified caller.
+    let r = revoke(&app, &inviter, &channel).await;
+    assert_eq!((r.status, r.body["revoked"].clone()), (200, json!(1)));
+    assert_eq!(app.count(LIVE).await, 1);
+    assert_eq!(leaves(&app), 0);
+}
+
+#[tokio::test]
+async fn a_stranded_invite_key_leaves_on_revoke_or_by_the_sweep() {
+    let app = TestApp::start().await;
+    // The client added the key, then its link request never reached the service.
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    assert_eq!(
+        app.count("SELECT count(*) FROM team_invite_channels").await,
+        0
+    );
+    let r = revoke(&app, &inviter, &channel).await;
+    assert_eq!((r.status, r.body["revoked"].clone()), (200, json!(0)));
+    assert!(!app.relay.in_team(&channel, &app.invite), "left at once");
+
+    // A link request refused once the key is in the team still leaves it to the sweep.
+    let other = app.relay.team(&[&inviter]);
+    app.relay.add_to_team(&other, &app.invite);
+    let outsider = linked(&app, "outsider").await;
+    let r = create(&app, &outsider, json!({ "channel": other })).await;
+    assert_eq!(r.body["error"], "not_team_member");
+    assert_eq!(sync::sweep_invites(&app.state).await.unwrap(), 1);
+    assert!(!app.relay.in_team(&other, &app.invite));
+}
+
+#[tokio::test]
+async fn joins_and_revokes_are_rate_limited_per_key_before_the_relay() {
+    let app = TestApp::start_with(|c| {
+        c.limits.team_joins_per_pubkey_per_hour = 2;
+        c.limits.team_revokes_per_pubkey_per_hour = 2;
+    })
+    .await;
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    let token = token_of(
+        &create(&app, &inviter, json!({ "channel": channel }))
+            .await
+            .body["link"],
+    );
+    let friend = linked(&app, "friend").await;
+    for _ in 0..2 {
+        assert_eq!(join(&app, &friend, &token).await.status, 200);
+    }
+    let sent = app.relay.commands().len();
+    let r = join(&app, &friend, &token).await;
+    assert_eq!(
+        (r.status, r.body["error"].clone()),
+        (429, json!("rate_limited"))
+    );
+    assert_eq!(app.relay.commands().len(), sent, "no relay write");
+
+    // A key probing other teams' ids is held to the same budget.
+    let outsider = linked(&app, "outsider").await;
+    for _ in 0..2 {
+        assert_eq!(revoke(&app, &outsider, &channel).await.status, 403);
+    }
+    let queries = app.relay.queries.load(Ordering::SeqCst);
+    let r = revoke(&app, &outsider, &channel).await;
+    assert_eq!(
+        (r.status, r.body["error"].clone()),
+        (429, json!("rate_limited"))
+    );
+    assert_eq!(
+        app.relay.queries.load(Ordering::SeqCst),
+        queries,
+        "no relay read"
+    );
+    // Per key: the inviter still revokes.
+    assert_eq!(revoke(&app, &inviter, &channel).await.status, 200);
+}
+
+#[tokio::test]
+async fn the_sweep_retries_a_failed_leave_and_forgets_a_deleted_team() {
+    let app = TestApp::start().await;
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    let gone = app.relay.team(&[&inviter]);
+    app.relay.add_to_team(&gone, &app.invite);
+    for ch in [&channel, &gone] {
+        let r = create(
+            &app,
+            &inviter,
+            json!({ "channel": ch, "expires_in_secs": 600 }),
+        )
+        .await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+    }
+    app.relay.teams.lock().unwrap().remove(&gone);
+    app.state.clock.advance(601);
+    // A relay outage: the live team stays tracked for the next sweep; the deleted one is done.
+    app.relay.fail_next.store(1, Ordering::SeqCst);
+    let first = sync::sweep_invites(&app.state).await.unwrap();
+    let second = sync::sweep_invites(&app.state).await.unwrap();
+    assert_eq!(first + second, 2);
+    assert!(first < 2, "one leave failed");
+    assert!(!app.relay.in_team(&channel, &app.invite));
+    assert_eq!(
+        app.count("SELECT count(*) FROM team_invite_channels").await,
+        0
+    );
+}
+
+#[tokio::test]
+async fn without_a_relay_pubkey_links_are_off_and_a_refused_add_is_relay_refused() {
+    let off = TestApp::start_with(|c| c.relay.relay_pubkey = None).await;
+    let (inviter, channel) = team_with_invite_key(&off).await;
+    let r = create(&off, &inviter, json!({ "channel": channel })).await;
+    assert_eq!(
+        (r.status, r.body["error"].clone()),
+        (503, json!("invites_not_configured"))
+    );
+
+    let app = TestApp::start().await;
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    let token = token_of(
+        &create(&app, &inviter, json!({ "channel": channel }))
+            .await
+            .body["link"],
+    );
+    drop_from_team(&app, &channel, &app.invite);
+    let friend = linked(&app, "friend").await;
+    let r = join(&app, &friend, &token).await;
+    assert_eq!(
+        (r.status, r.body["error"].clone()),
+        (502, json!("relay_refused"))
+    );
+    assert!(!app.relay.in_team(&channel, &friend));
+}
+
+#[tokio::test]
+async fn cleanup_keeps_an_expired_link_for_30_days() {
+    let app = TestApp::start().await;
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    let r = create(
+        &app,
+        &inviter,
+        json!({ "channel": channel, "expires_in_secs": 600 }),
+    )
+    .await;
+    let token = token_of(&r.body["link"]);
+    let friend = linked(&app, "friend").await;
+    app.state.clock.advance(601 + 29 * 86400);
+    maxplayer_registration::db::cleanup(&app.db, app.state.now())
+        .await
+        .unwrap();
+    assert_eq!(
+        join(&app, &friend, &token).await.body["error"],
+        "invite_expired"
+    );
+    app.state.clock.advance(2 * 86400);
+    maxplayer_registration::db::cleanup(&app.db, app.state.now())
+        .await
+        .unwrap();
+    assert_eq!(
+        join(&app, &friend, &token).await.body["error"],
+        "invalid_invite"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_racing_a_revoke_never_outlives_the_invite_key() {
+    // Both read the member list first (slowed here); without the per-team lock a link can be
+    // stored just after the revoke made the key leave, and then it adds no one.
+    let app = TestApp::start().await;
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    app.relay.query_delay_ms.store(100, Ordering::SeqCst);
+    for round in 0..8 {
+        app.relay.add_to_team(&channel, &app.invite);
+        let (a, b) = tokio::join!(
+            create(&app, &inviter, json!({ "channel": channel })),
+            revoke(&app, &inviter, &channel)
+        );
+        assert_eq!(b.status, 200, "{:?}", b.body);
+        let live = app.count(LIVE).await > 0;
+        assert_eq!(
+            live,
+            app.relay.in_team(&channel, &app.invite),
+            "round {round}: create {} {:?}",
+            a.status,
+            a.body
+        );
+        if live {
+            assert_eq!(revoke(&app, &inviter, &channel).await.status, 200);
+        }
+    }
 }

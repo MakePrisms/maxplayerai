@@ -178,8 +178,9 @@ async fn main() -> Result<()> {
             let sent = sync::run_outbox_once(&state).await?;
             let report = sync::reconcile_once(&state).await?;
             let sent_after = sync::run_outbox_once(&state).await?;
+            let left = sync::sweep_invites(&state).await?;
             println!(
-                "confirmed {} command(s); reconcile: {report:?}",
+                "confirmed {} command(s); reconcile: {report:?}; invite key left {left} team(s)",
                 sent + sent_after
             );
         }
