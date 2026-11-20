@@ -108,6 +108,8 @@ pub struct FakeRelay {
     pub expect_host: Mutex<Option<String>>,
     /// Team channels: id -> member hex keys (buzz `channel_members`).
     pub teams: Mutex<BTreeMap<String, BTreeSet<String>>>,
+    /// NIP-98 event ids already used (buzz `check_nip98_replay`: a reuse is 401).
+    pub seen_auth: Mutex<BTreeSet<String>>,
     clock: Arc<Clock>,
 }
 
@@ -134,8 +136,15 @@ impl FakeRelay {
         }
         let url = format!("{}{path}", self.expect_origin.lock().unwrap());
         let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
-        nip98::verify(auth, &url, "POST", body, self.clock.unix(), 60)
-            .map_err(|e| json_err(StatusCode::UNAUTHORIZED, &format!("NIP-98: {}", e.code())))
+        let v = nip98::verify(auth, &url, "POST", body, self.clock.unix(), 60)
+            .map_err(|e| json_err(StatusCode::UNAUTHORIZED, &format!("NIP-98: {}", e.code())))?;
+        if !self.seen_auth.lock().unwrap().insert(v.event_id.to_hex()) {
+            return Err(json_err(
+                StatusCode::UNAUTHORIZED,
+                "NIP-98: replay detected",
+            ));
+        }
+        Ok(v)
     }
 }
 
@@ -462,6 +471,7 @@ impl TestApp {
             expect_origin: Mutex::new(relay_base.clone()),
             expect_host: Mutex::new(None),
             teams: Mutex::new(BTreeMap::new()),
+            seen_auth: Mutex::new(BTreeSet::new()),
             clock: clock.clone(),
         });
         let router = axum::Router::new()

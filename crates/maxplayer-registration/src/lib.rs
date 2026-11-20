@@ -42,15 +42,27 @@ pub struct AppState {
 }
 
 /// Wall clock plus a test-only offset, so code expiry, rate windows and retry
-/// backoff can be tested without sleeping. The offset is always 0 in `serve`.
+/// backoff can be tested without sleeping. The offset is always 0 in `serve`, and the clock
+/// is never frozen there.
 #[derive(Debug, Default)]
 pub struct Clock {
     offset_secs: AtomicI64,
+    /// Test-only: when non-zero, `now` is this unix second (plus the offset).
+    frozen_at: AtomicI64,
 }
 
 impl Clock {
     pub fn now(&self) -> DateTime<Utc> {
-        Utc::now() + TimeDelta::seconds(self.offset_secs.load(Ordering::Relaxed))
+        let base = match self.frozen_at.load(Ordering::Relaxed) {
+            0 => Utc::now(),
+            secs => DateTime::from_timestamp(secs, 0).unwrap_or_else(Utc::now),
+        };
+        base + TimeDelta::seconds(self.offset_secs.load(Ordering::Relaxed))
+    }
+    /// Test-only: stop the clock at the current second (`advance` still moves it).
+    pub fn freeze(&self) {
+        self.frozen_at
+            .store(Utc::now().timestamp().max(1), Ordering::Relaxed);
     }
     pub fn unix(&self) -> u64 {
         self.now().timestamp().max(0) as u64

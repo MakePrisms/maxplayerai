@@ -255,6 +255,33 @@ async fn only_linked_members_create_or_revoke_and_the_invite_key_must_be_in_the_
 }
 
 #[tokio::test]
+async fn two_links_for_one_team_in_the_same_second_both_work() {
+    // Both reads of the member list are the same query by the same key; with the clock frozen
+    // they are signed in the same second, so only a per-request nonce keeps them distinct.
+    let app = TestApp::start().await;
+    let (inviter, channel) = team_with_invite_key(&app).await;
+    app.state.clock.freeze();
+    let a = create(&app, &inviter, json!({ "channel": channel })).await;
+    let b = create(&app, &inviter, json!({ "channel": channel })).await;
+    assert_eq!(
+        (a.status, b.status),
+        (200, 200),
+        "{:?} {:?}",
+        a.body,
+        b.body
+    );
+    let r = app
+        .post(
+            &inviter,
+            api::PATH_TEAM_REVOKE,
+            json!({ "channel": channel }),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(r.body["revoked"], 2);
+}
+
+#[tokio::test]
 async fn reading_the_join_paths_with_get_redeems_nothing() {
     let app = TestApp::start().await;
     let (inviter, channel) = team_with_invite_key(&app).await;
