@@ -31,26 +31,27 @@ let
   runDir = "/run/maxplayer-registration";
   hexKey = lib.types.strMatching "[0-9a-f]{64}";
   configFile = (pkgs.formats.toml { }).generate "maxplayer-registration.toml" (
-    lib.recursiveUpdate {
-      bind_addr = "127.0.0.1:${toString cfg.port}";
-      public_base_url = cfg.publicBaseUrl;
-      database_url = "postgresql:///${cfg.database}?host=/run/postgresql&user=${cfg.user}";
-      trust_x_real_ip = true;
-      relay = {
-        base_url = "http://127.0.0.1:${toString config.services.maxplayer.relay.port}";
-        auth_base_url = cfg.publicBaseUrl;
-        admin_key_file = "${runDir}/admin-key";
-        relay_pubkey = cfg.relayPubkey;
-      };
-      email = {
-        api_key_file = "${runDir}/resend-key";
-        webhook_secret_file = "${runDir}/resend-webhook";
-      };
-    }
-    // lib.optionalAttrs (cfg.inviteKeyFile != null) {
-      teams.invite_key_file = "${runDir}/invite-key";
-    }
-    // cfg.settings
+    lib.recursiveUpdate (
+      {
+        bind_addr = "127.0.0.1:${toString cfg.port}";
+        public_base_url = cfg.publicBaseUrl;
+        database_url = "postgresql:///${cfg.database}?host=/run/postgresql&user=${cfg.user}";
+        trust_x_real_ip = true;
+        relay = {
+          base_url = "http://127.0.0.1:${toString config.services.maxplayer.relay.port}";
+          auth_base_url = cfg.publicBaseUrl;
+          admin_key_file = "${runDir}/admin-key";
+          relay_pubkey = cfg.relayPubkey;
+        };
+        email = {
+          api_key_file = "${runDir}/resend-key";
+          webhook_secret_file = "${runDir}/resend-webhook";
+        };
+      }
+      // lib.optionalAttrs (cfg.inviteKeyFile != null) {
+        teams.invite_key_file = "${runDir}/invite-key";
+      }
+    ) cfg.settings
   );
 in
 {
