@@ -178,9 +178,9 @@ async fn main() -> Result<()> {
             let sent = sync::run_outbox_once(&state).await?;
             let report = sync::reconcile_once(&state).await?;
             let sent_after = sync::run_outbox_once(&state).await?;
-            let left = sync::sweep_invites(&state).await?;
+            // No invite link sweep here: its per-team lock is in-process, so only `serve` sweeps.
             println!(
-                "confirmed {} command(s); reconcile: {report:?}; invite key left {left} team(s)",
+                "confirmed {} command(s); reconcile: {report:?}",
                 sent + sent_after
             );
         }

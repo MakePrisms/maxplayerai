@@ -9,9 +9,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use nostr::{PublicKey, Timestamp};
 use tracing::{info, warn};
 
-use crate::AppState;
 use crate::db::{self, OutboxItem};
 use crate::relay::{KIND_REMOVE_USER, MemberAction};
+use crate::{AppState, TeamLock};
 
 fn ts(now: DateTime<Utc>) -> Timestamp {
     Timestamp::from(now.timestamp().max(0) as u64)
@@ -171,8 +171,8 @@ pub async fn sweep_invites(state: &AppState) -> Result<usize> {
 
 /// One team of [`sweep_invites`]. `Ok(true)` = the key left.
 pub async fn leave_if_idle(state: &AppState, invite: &nostr::Keys, channel: &str) -> Result<bool> {
-    let _team = state.lock_team(channel).await;
-    leave_if_idle_locked(state, invite, channel).await
+    let team = state.lock_team(channel).await;
+    leave_if_idle_locked(state, invite, channel, &team).await
 }
 
 /// [`leave_if_idle`] for a caller already holding the team's lock (it is not reentrant).
@@ -180,6 +180,7 @@ pub(crate) async fn leave_if_idle_locked(
     state: &AppState,
     invite: &nostr::Keys,
     channel: &str,
+    _locked: &TeamLock<'_>,
 ) -> Result<bool> {
     if !db::idle_invite_channel(&state.db, channel, state.now()).await? {
         return Ok(false);

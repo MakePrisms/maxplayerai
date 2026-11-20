@@ -16,7 +16,8 @@ CREATE INDEX team_invite_links_expires_idx ON team_invite_links (expires_at);
 
 -- Teams the invite key may still be a member of. The sweep makes the key leave a team once it
 -- has no live link, then deletes the row. Link creation, revoke and the sweep take one in-process
--- lock per team, so a new link and the key leaving never interleave.
+-- lock per team, so a new link and the key leaving never interleave. That assumes a single
+-- `serve` process writes these tables and sweeps; `maxplayer-registration sync` does not sweep.
 CREATE TABLE team_invite_channels (
     channel    TEXT PRIMARY KEY CHECK (channel ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'),
     updated_at TIMESTAMPTZ NOT NULL

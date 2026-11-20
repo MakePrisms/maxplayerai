@@ -40,9 +40,13 @@ pub struct AppState {
     /// The team invite key (`teams.invite_key_file`); `None` = invite links are off.
     pub invite: Option<nostr::Keys>,
     /// One team at a time for link creation, revoke and the invite key leaving (striped by
-    /// channel). In-process, so no database transaction spans a relay call.
+    /// channel). In-process, so no database transaction spans a relay call; it assumes one
+    /// `serve` process writes invite links and sweeps (`sync` does not sweep).
     invite_locks: Vec<tokio::sync::Mutex<()>>,
 }
+
+/// Proof that one team's invite links are locked ([`AppState::lock_team`]).
+pub struct TeamLock<'a>(#[allow(dead_code)] tokio::sync::MutexGuard<'a, ()>);
 
 /// Wall clock plus a test-only offset, so code expiry, rate windows and retry
 /// backoff can be tested without sleeping. The offset is always 0 in `serve`, and the clock
@@ -127,13 +131,15 @@ impl AppState {
     }
 
     /// The lock of one team's invite links. Not reentrant: take it once per request.
-    pub async fn lock_team(&self, channel: &str) -> tokio::sync::MutexGuard<'_, ()> {
+    pub async fn lock_team(&self, channel: &str) -> TeamLock<'_> {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         channel.hash(&mut h);
-        self.invite_locks[h.finish() as usize % self.invite_locks.len()]
-            .lock()
-            .await
+        TeamLock(
+            self.invite_locks[h.finish() as usize % self.invite_locks.len()]
+                .lock()
+                .await,
+        )
     }
 }
 

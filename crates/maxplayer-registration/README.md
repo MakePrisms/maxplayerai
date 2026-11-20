@@ -106,7 +106,8 @@ The reconcile never removes admins, owners, the admin key, the relay key or
 `sync.keep_members`. It removes keys it didn't add only when `sync.reconcile_removals = true`
 (off by default, so keys added by hand before signup existed are kept).
 
-`maxplayer-registration sync` runs one outbox pass and one reconcile, then exits.
+`maxplayer-registration sync` runs one outbox pass and one reconcile, then exits. It does not
+sweep invite links: that lock is in-process, so only the one `serve` process sweeps.
 
 ## Configuration
 

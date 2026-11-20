@@ -707,11 +707,11 @@ async fn team_invite(
         "rate_limited",
     )
     .await?;
-    let now = state.now();
     // Locked before the member list is read: a sweep or revoke that makes the invite key leave
     // this team either finished (the list shows it gone) or waits until this link is stored.
     let _team = state.lock_team(&channel).await;
     let members = team_members(&state, invite, &relay, &channel).await?;
+    let now = state.now();
     if !members.contains(&invite.public_key().to_hex()) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -843,7 +843,7 @@ async fn team_revoke(
         "rate_limited",
     )
     .await?;
-    let _team = state.lock_team(&channel).await;
+    let team = state.lock_team(&channel).await;
     let members = team_members(&state, invite, &relay, &channel).await?;
     // A readable list (the invite key is in the team) must name the caller: every live link
     // goes and the key leaves. An unreadable one (the key was removed, or the relay sent no
@@ -863,7 +863,7 @@ async fn team_revoke(
         // stranded key leaves now.
         db::track_invite_channel(&state.db, &channel, state.now()).await?;
         let n = db::revoke_invite_links(&state.db, &channel, None, state.now()).await?;
-        if let Err(e) = sync::leave_if_idle_locked(&state, invite, &channel).await {
+        if let Err(e) = sync::leave_if_idle_locked(&state, invite, &channel, &team).await {
             // The sweep retries.
             warn!(%channel, error = %format!("{e:#}"), "invite key leave after revoke failed");
         }
