@@ -98,22 +98,33 @@ pub const TEAM_MAXPLAYER: (&str, &str) = (
 
 /// The service-wide team invite key (spec §12): `invite <team> --link` adds it to the team, and
 /// the registration service, which holds its secret, adds whoever redeems a link. It is never a
-/// person: clients drop its messages and leave it out of any member list ([`is_invite_key`]).
+/// person: clients drop its messages and leave it out of any member list ([`admit`]).
 pub const INVITE_PUBKEY: &str = "4e6fba923eef12c189508146981d4c386fcfdbb9e9824d36bbef56a39aa6e008";
 
 /// A test deployment whose registration service holds another invite key names its pubkey here.
+/// Refused against relay.maxplayer.ai; a malformed value is an error, never ignored.
 pub const INVITE_PUBKEY_ENV: &str = "MAXPLAYER_TEAM_INVITE_PUBKEY";
 
-/// The invite key in use: [`INVITE_PUBKEY_ENV`] (64 lowercase hex) if set, else [`INVITE_PUBKEY`].
-pub fn invite_pubkey() -> String {
-    invite_pubkey_from(std::env::var(INVITE_PUBKEY_ENV).ok())
-}
-fn invite_pubkey_from(var: Option<String>) -> String {
-    var.filter(|k| is_hex(k, 32)).unwrap_or_else(|| INVITE_PUBKEY.to_owned())
-}
-
-pub fn is_invite_key(hex: &str) -> bool {
-    hex.eq_ignore_ascii_case(INVITE_PUBKEY) || hex.eq_ignore_ascii_case(&invite_pubkey())
+/// The invite key of a home ([`Home::invite_key`]): [`INVITE_PUBKEY_ENV`] when set and not
+/// empty, else [`INVITE_PUBKEY`].
+fn resolve_invite_key(var: Option<String>, relay: &str, registration_url: &str) -> Result<String> {
+    let Some(key) = var.filter(|k| !k.is_empty()) else {
+        return Ok(INVITE_PUBKEY.to_owned());
+    };
+    if !is_hex(&key, 32) {
+        return Err(format!("{INVITE_PUBKEY_ENV} must be 64 lowercase hex characters").into());
+    }
+    // A URL with no readable host counts as production.
+    let production = |url: &str| {
+        Url::parse(url.trim())
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.trim_end_matches('.').eq_ignore_ascii_case("relay.maxplayer.ai")))
+            .unwrap_or(true)
+    };
+    if production(relay) || production(registration_url) {
+        return Err(format!("{INVITE_PUBKEY_ENV} is for test deployments; unset it to use relay.maxplayer.ai").into());
+    }
+    Ok(key)
 }
 
 /// The token of a join link: `https://<site>/join/<token>` (a trailing `/`, query or fragment is
@@ -255,9 +266,10 @@ enum Outcome {
 /// Shape checks before anything is stored or reviewed (spec §5, §6): kind 9, valid signature,
 /// one canonical `h` naming this channel, bounded text and size; a followed post must come from
 /// its owner (checked here, not trusted to the relay filter).
-pub fn admit(event: &Event, channel: &str, owner: Option<&str>) -> std::result::Result<(), String> {
+/// `invite_key` is the home's [`Home::invite_key`]; [`INVITE_PUBKEY`] is dropped as well.
+pub fn admit(event: &Event, channel: &str, owner: Option<&str>, invite_key: &str) -> std::result::Result<(), String> {
     // The invite key is in many teams and only ever adds members; it has nothing to say.
-    if is_invite_key(&event.pubkey.to_hex()) {
+    if [INVITE_PUBKEY, invite_key].contains(&event.pubkey.to_hex().as_str()) {
         return Err("the invite key does not post".into());
     }
     if owner.is_some_and(|o| event.pubkey.to_hex() != o) {
@@ -370,6 +382,9 @@ pub struct Home {
     /// Longest wait for one verdict (`watch`: [`WATCH_REVIEW_WAIT`]); a review still waiting
     /// counts as unavailable and is retried.
     pub review_wait: Option<Duration>,
+    /// The team invite key: [`INVITE_PUBKEY`], or a test deployment's [`INVITE_PUBKEY_ENV`],
+    /// resolved once by [`Home::open`].
+    pub invite_key: String,
 }
 
 impl Home {
@@ -391,7 +406,9 @@ impl Home {
         fs::DirBuilder::new().recursive(true).mode(0o700).create(dir.join("quarantine"))?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
         http_base(relay)?;
-        Ok(Self { root, keys, relay: relay.to_owned(), config, sync_deadline: None, review_wait: None })
+        let var = std::env::var_os(INVITE_PUBKEY_ENV).map(|v| v.to_string_lossy().into_owned());
+        let invite_key = resolve_invite_key(var, relay, &config.registration_url)?;
+        Ok(Self { root, keys, relay: relay.to_owned(), config, sync_deadline: None, review_wait: None, invite_key })
     }
     /// One relay read: 10 s, or what is left before [`Home::sync_deadline`] (at least 100 ms).
     fn read_wait(&self) -> Duration {
@@ -737,8 +754,11 @@ impl Home {
         &self,
         call: impl FnOnce(&RegistrationClient) -> std::result::Result<T, RegistrationError> + Send + 'static,
     ) -> Result<T> {
-        let (url, keys) = (self.config.registration_url.clone(), self.keys.clone());
         // Under a deadline (MCP) the call must not outlive it and act after the caller gave up.
+        if self.past_deadline() {
+            return Err("ran out of time; the registration service was not asked".into());
+        }
+        let (url, keys) = (self.config.registration_url.clone(), self.keys.clone());
         let timeout = match self.sync_deadline {
             None => Duration::from_secs(30),
             Some(d) => d.saturating_duration_since(std::time::Instant::now()).clamp(Duration::from_secs(1), Duration::from_secs(30)),
@@ -752,7 +772,13 @@ impl Home {
         if expires_in_secs.is_some_and(|s| !(60..=30 * 86400).contains(&s)) {
             return Err("an invite link lasts between 1 minute and 30 days".into());
         }
-        let t = self.member_event(team, &invite_pubkey(), 9000).await?;
+        // An unlinked inviter could make no link, nor revoke one to make the key leave again: it
+        // is refused before the key is added (so is a call when the service cannot be reached).
+        if !self.registration(|c| c.status()).await?.registered {
+            let link = maxplayer_core::registration::LINK_COMMAND;
+            return Err(format!("This key is not linked to an email yet. Run `{link}` first.").into());
+        }
+        let t = self.member_event(team, &self.invite_key, 9000).await?;
         let channel = t.channel.clone();
         let link = self.registration(move |c| c.team_invite_link(&channel, expires_in_secs)).await?;
         Ok((t, link.link, link.expires_at))
@@ -940,7 +966,7 @@ impl Home {
         // The cursor passes what is already stored (the reader's own sends too) and a newly
         // admitted message, never one that fails admission.
         let seen = known.contains(&event.id);
-        if !seen && admit(&event, channel, owner).is_err() {
+        if !seen && admit(&event, channel, owner, &self.invite_key).is_err() {
             return Ok(false);
         }
         state.cursors.insert(channel.into(), state.cursors.get(channel).copied().unwrap_or(0).max(event.created_at.as_secs().min(now())));

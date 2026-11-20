@@ -118,17 +118,17 @@ fn pull(h: &mut Home, t: &Team, f: &RepoFixture) -> Result<String> {
 fn admit_refuses_multi_h_wrong_channel_oversize_and_foreign_follow_author() {
     let (owner, other) = (Keys::generate(), Keys::generate());
     let ok = msg(&owner, vec![vec!["h", CH]], "hi");
-    assert!(admit(&ok, CH, None).is_ok());
-    assert!(admit(&ok, CH, Some(&owner.public_key().to_hex())).is_ok());
+    assert!(admit(&ok, CH, None, INVITE_PUBKEY).is_ok());
+    assert!(admit(&ok, CH, Some(&owner.public_key().to_hex()), INVITE_PUBKEY).is_ok());
     // A followed post from anyone but the owner is dropped even if the relay sent it.
-    assert!(admit(&msg(&other, vec![vec!["h", CH]], "hi"), CH, Some(&owner.public_key().to_hex())).is_err());
+    assert!(admit(&msg(&other, vec![vec!["h", CH]], "hi"), CH, Some(&owner.public_key().to_hex()), INVITE_PUBKEY).is_err());
     for bad in [
         msg(&owner, vec![vec!["h", CH], vec!["h", OTHER]], "hi"),
         msg(&owner, vec![vec!["h", OTHER]], "hi"),
         msg(&owner, vec![vec!["h", CH]], &"x".repeat(8001)),
         msg(&owner, vec![vec!["h", CH], vec!["pad", &"y".repeat(33 * 1024)]], "hi"),
     ] {
-        assert!(admit(&bad, CH, None).is_err());
+        assert!(admit(&bad, CH, None, INVITE_PUBKEY).is_err());
     }
 }
 
@@ -555,24 +555,83 @@ fn join_links_and_bare_tokens_parse_and_anything_else_is_refused() {
 fn the_invite_key_is_a_valid_key_and_its_messages_are_never_admitted() {
     let invite = PublicKey::from_hex(INVITE_PUBKEY).unwrap();
     assert_eq!(invite.to_hex(), INVITE_PUBKEY);
-    assert!(is_invite_key(INVITE_PUBKEY) && is_invite_key(&INVITE_PUBKEY.to_uppercase()));
-    assert!(!is_invite_key(&Keys::generate().public_key().to_hex()));
     // A real member's message passes; one signed by the invite key would be dropped, whoever
     // holds its secret. (Signed here with a stand-in: only the author key is checked first.)
     let member = Keys::generate();
-    assert!(admit(&msg(&member, vec![vec!["h", CH]], "hi"), CH, None).is_ok());
+    assert!(admit(&msg(&member, vec![vec!["h", CH]], "hi"), CH, None, INVITE_PUBKEY).is_ok());
     let mut forged = msg(&member, vec![vec!["h", CH]], "hi");
     forged.pubkey = invite;
-    assert_eq!(admit(&forged, CH, None).unwrap_err(), "the invite key does not post");
+    assert_eq!(admit(&forged, CH, None, INVITE_PUBKEY).unwrap_err(), "the invite key does not post");
 }
 
 #[test]
-fn a_test_deployment_overrides_the_invite_key_only_with_a_valid_key() {
+fn a_test_deployment_overrides_the_invite_key_only_off_production_and_only_with_a_valid_key() {
+    let (relay, reg) = ("ws://127.0.0.1:9", "http://127.0.0.1:9/account");
+    let (prod_relay, prod_reg) = ("wss://relay.maxplayer.ai", "https://relay.maxplayer.ai/account");
     let other = Keys::generate().public_key().to_hex();
-    assert_eq!(invite_pubkey_from(Some(other.clone())), other);
-    for bad in [None, Some(String::new()), Some("nope".into()), Some(other.to_uppercase())] {
-        assert_eq!(invite_pubkey_from(bad), INVITE_PUBKEY);
+    for unset in [None, Some(String::new())] {
+        assert_eq!(resolve_invite_key(unset.clone(), relay, reg).unwrap(), INVITE_PUBKEY);
+        assert_eq!(resolve_invite_key(unset, prod_relay, prod_reg).unwrap(), INVITE_PUBKEY);
     }
+    assert_eq!(resolve_invite_key(Some(other.clone()), relay, reg).unwrap(), other);
+    // Malformed: an error naming the variable, never a silent fall back to the production key.
+    for bad in ["nope".to_owned(), other.to_uppercase(), format!("{other} "), other[1..].to_owned(), format!("npub1{}", &other[5..])] {
+        let e = resolve_invite_key(Some(bad.clone()), relay, reg).unwrap_err().to_string();
+        assert!(e.contains(INVITE_PUBKEY_ENV), "{bad}: {e}");
+    }
+    // Production: refused when either URL names its host, however it is spelled.
+    for (r, g) in [(prod_relay, reg), ("wss://RELAY.Maxplayer.AI/", reg), (relay, prod_reg), (relay, "https://Relay.MaxPlayer.ai.:443/account/")] {
+        let e = resolve_invite_key(Some(other.clone()), r, g).unwrap_err().to_string();
+        assert!(e.contains(INVITE_PUBKEY_ENV) && e.contains("relay.maxplayer.ai"), "{r} {g}: {e}");
+    }
+}
+
+/// The home's resolved invite key (a test deployment's) is dropped like the compiled-in one.
+#[tokio::test]
+async fn catch_up_drops_messages_from_the_homes_invite_key() {
+    let (_relay, url, client) = local_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), &url);
+    h.config.review.team_message = false;
+    let invite = Keys::generate();
+    h.invite_key = invite.public_key().to_hex();
+    join_crew(&h);
+    let mut state = h.load().unwrap();
+    client.send_event(&msg_at(&invite, "from the invite key", now())).await.unwrap();
+    client.send_event(&msg_at(&Keys::generate(), "from a member", now())).await.unwrap();
+    h.catch_up(&client, &mut state).await.unwrap();
+    assert_eq!(delivered(&h), 1);
+}
+
+/// An inviter the service does not know as linked, or a service that cannot be reached, is
+/// refused before the 9000: no invite key is added that the inviter could never revoke.
+#[tokio::test]
+async fn invite_link_adds_nothing_for_an_unlinked_inviter_or_an_unreachable_service() {
+    use std::io::Read as _;
+    let (_relay, url, client) = local_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), &url);
+    join_crew(&h);
+    let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = service.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in service.incoming() {
+            let mut stream = stream.unwrap();
+            let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let body = r#"{"registered":false}"#;
+            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    for (service, expect) in [(format!("http://127.0.0.1:{port}/account"), "not linked to an email"), ("http://127.0.0.1:9/account".to_owned(), "Could not reach")] {
+        h.config.registration_url = service;
+        let e = h.invite_link("crew", None).await.unwrap_err().to_string();
+        assert!(e.contains(expect), "{e}");
+    }
+    let adds = client.fetch_events(Filter::new().kind(Kind::Custom(9000)), Duration::from_secs(2)).await.unwrap();
+    assert!(adds.is_empty(), "the invite key was added: {adds:?}");
 }
 
 /// Local refusals come before anything is sent: no 9000 adds the invite key for a lifetime the
@@ -601,4 +660,8 @@ async fn invite_links_refuse_bad_input_before_the_relay_or_the_service() {
     }
     let e = h.revoke_links("feed").await.unwrap_err().to_string();
     assert!(e.contains("open channel"), "{e}");
+    // An MCP deadline already past: the service is not asked at all.
+    h.sync_deadline = Some(std::time::Instant::now() - Duration::from_secs(1));
+    let e = h.revoke_links("crew").await.unwrap_err().to_string();
+    assert!(e.contains("ran out of time"), "{e}");
 }
