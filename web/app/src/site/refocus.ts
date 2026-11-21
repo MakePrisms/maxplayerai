@@ -31,4 +31,5 @@ export function refocus(target: HTMLElement): void {
   clear();
   if (pointer) { quietEl = target; target.classList.add("quiet"); }
   target.focus({ preventScroll: true });
+  if (document.activeElement !== target) clear();     // hidden or unfocusable: nothing to keep quiet (r4 #1)
 }

@@ -24,7 +24,7 @@ import type { RawEvent } from "../model/events.js";
 import type { MarketSource, SourceCallbacks, SourceState, Transport } from "./source.js";
 
 /** Events per history page. The relay caps a REQ; we page under that cap. */
-export const PAGE_SIZE = 500;
+export const PAGE_SIZE = 1000;    // the relay's cap (speed review of #1361, #5: 38 -> 20 pages for the whole history)
 /** Stop paging after this many pages — a backstop, not an expected limit. */
 export const MAX_PAGES = 40;
 /** Poll cadence. Irrelevant in stream mode. */
@@ -209,6 +209,8 @@ export function createRelaySource(
   /** One incremental ask. A quiet market costs a short re-delivered tail. */
   function pollOnce() {
     if (stopped) return;
+    // No asks from a hidden tab (#9); the first poll after it is shown asks from the newest event seen, so nothing is missed.
+    if (typeof document !== "undefined" && document.hidden) return;
     activeSub = `p${++subCounter}`;
     send(["REQ", activeSub, ...liveFilters(newestSeen == null ? now() : forwardSince(newestSeen))]);
   }

@@ -66,7 +66,7 @@ let showAll = false;
 function board(): void {
   const store = new SwarmStore();
   let wasReady = false;
-  const reader: SwarmReader = new SwarmReader({ url: RELAY_URL, store, onChange: () => changed() });
+  const reader: SwarmReader = new SwarmReader({ url: RELAY_URL, store, onChange: () => changed(), queueMs: 25 });   // 4 small REQs: 1.4 s -> 0.57 s ready (speed review #2)
   const draw = () => {
     const status = reader.status;
     const ready = status.connected && status.historyComplete && !status.error;
@@ -148,14 +148,15 @@ function backToSwarm(focus = true): void {
   if (!profile) return;
   const was = profile.from;
   // The members list is redrawn every second, so the link that opened the profile may be a new element by now.
-  const from = was?.isConnected ? was : was?.dataset.pk ? sheet.querySelector<HTMLElement>(`[data-pk="${CSS.escape(was.dataset.pk)}"]`) : null;
+  const from = was?.isConnected ? was : was?.dataset.pk ? el("swp").querySelector<HTMLElement>(`[data-pk="${CSS.escape(was.dataset.pk)}"]`) : null;
   profile = null;
   sheet.dataset.mode = "swarm";
   el("sheet-back").hidden = true;
   const title = el("swarm-title");
   title.textContent = swarmName; title.classList.remove("hex");
   if (!focus) return;
-  if (from) refocus(from); else sheet.focus({ preventScroll: true });
+  if (from) refocus(from);
+  if (document.activeElement !== from) sheet.focus({ preventScroll: true });     // gone or hidden: the panel itself
 }
 el("sheet-back").addEventListener("click", () => backToSwarm());
 // A member's name, the buyer's name, and any name in a profile's recent jobs open that profile here.
@@ -302,7 +303,7 @@ function closeSwarm(fromHistory = false): void {
   const href = was.from?.getAttribute("href");
   const back = was.from?.isConnected ? was.from : href ? document.querySelector<HTMLElement>(`#swarm-list a.who[href="${CSS.escape(href)}"]`) : null;
   if (back) refocus(back);
-  else if (sheet.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();   // opened from a link: nothing to go back to
+  if (sheet.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();   // no opener, or a hidden one   // opened from a link: nothing to go back to
   sheet.setAttribute("aria-hidden", "true");
   document.title = "Maxplayer - Swarm";
   if (!fromHistory) {
@@ -331,7 +332,8 @@ addEventListener("popstate", () => {
   else if (where.view !== "index") openSwarm(where, null, false);
 });
 
-setInterval(tick, 1000);
+setInterval(() => { if (!document.hidden) tick(); }, 1000);     // nothing to redraw in a hidden tab (speed review #9)
+document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
 onSpotChange(() => { if (snapshot) render(snapshot); });   // the budget shows in dollars at the live BTC-USD rate
 startSpot();
 board();

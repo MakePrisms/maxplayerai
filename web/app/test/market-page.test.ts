@@ -48,7 +48,7 @@ function job(buyer: string, seller: string, at: number): RawEvent[] {
   ];
 }
 
-const WEEK_JOBS = 120, OLD_JOBS = 150;
+const WEEK_JOBS = 240, OLD_JOBS = 150;     // the week (6 events a job) is more than one 1000-event page
 function market(): RawEvent[] {
   const events: RawEvent[] = [];
   for (let i = 0; i < WEEK_JOBS; i++) events.push(...job(i % 4 ? BUYER : BUYER2, SELLERS[i % 3]!, NOW - 600 - i * Math.floor((6 * DAY) / WEEK_JOBS)));
@@ -150,7 +150,7 @@ test("a first visit: nothing until the week is whole, then all of it at once, an
     relay.names.step();
     assert.equal(views.length, 0, "names alone show nothing");
 
-    // The reader asks for 500 events at a time, newest first. The week is 720 events and three heartbeats.
+    // The reader asks for PAGE_SIZE (1000) events at a time, newest first. The week is 1440 events and three heartbeats.
     relay.source.step();
     await tick(120);         // longer than the engine's own 50 ms batching: a recompute per request would have run by now
     assert.equal(h.computes(), 0, "the engine does not compute while history is being read");

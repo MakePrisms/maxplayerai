@@ -207,7 +207,8 @@ function profileLink(doc: Document,pubkey: string|undefined,npub: string,label: 
   return link;
 }
 const skel=(doc: Document,cls: string)=>{const span=doc.createElement('span');span.className=`skel ${cls}`;return span;};
-// Placeholder rows are rebuilt only when what they show changes, so the 1s tick doesn't restart their sheen.
+// Rows are rebuilt only when what they show changes: the 1s tick restarted the placeholders' sheen and rebuilt every
+// live row every second (speed review of #1361, #9).
 const rosterShown=new WeakMap<object,string>();
 export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boolean|SellersMode=false): void {
   const mode: SellersMode=loading===true?'loading':loading===false?'live':loading;
@@ -216,9 +217,10 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
   if(mode==='loading'){rosterShown.delete(list);list.replaceChildren();doc.getElementById('seller-summary')!.textContent='';return;}
   const roster=mode==='roster';
   const shown=listedSellers(s,roster);
-  const key=roster?JSON.stringify([shown.map(a=>[a.name,a.npub,a.minutesOffered,a.state]),s.applicants??[],!!s.relay?.applicantsIncomplete]):null;
-  if(key!==null&&rosterShown.get(list)===key)return;
-  if(key===null)rosterShown.delete(list);else rosterShown.set(list,key);
+  const key=JSON.stringify([mode,privateTasks(s),shown.map(a=>roster?[a.pubkey,a.name,a.npub,a.minutesOffered,a.state]
+    :[a.pubkey,a.name,a.npub,sellerLine(s,a,now),sellerState(s,a,now),reportedLine(s,a)]),s.applicants??[],!!s.relay?.applicantsIncomplete]);
+  if(rosterShown.get(list)===key)return;
+  rosterShown.set(list,key);
   const fragment=doc.createDocumentFragment();
   for(const a of shown) {
     // Roster only: every state, and the minutes used, need the trade data and stay placeholders

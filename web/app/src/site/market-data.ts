@@ -435,7 +435,7 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
   else { try { storage = localStorage; } catch { /* no storage: every visit is a first visit */ } }
   const t0 = Date.now();
   if (seams.spot !== false) startSpot();
-  const engine = createEngine({ windowKey: DEFAULT_WINDOW });
+  const engine = createEngine({ windowKey: DEFAULT_WINDOW, shifts: false });
   const db = seams.db ?? await createEventDb();
   const timers: ReturnType<typeof setTimeout>[] = [];
   const later = (fn: () => void, ms: number) => { timers.push(setTimeout(fn, ms)); };
@@ -508,7 +508,12 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
   };
   onSpotChange(() => { if (full || recent || stale) engine.flush(); else tryRecent(); });
   later(tryRecent, waitMs);
-  every(() => { if (full || recent || stale) engine.flush(); }, 60000);    // online lamps go stale honestly between events
+  // online lamps go stale honestly between events; not while the tab is hidden, and at once when it is back (#9)
+  const doc = typeof document === "undefined" ? null : document;     // tests run without a page
+  const lampsDue = () => { if ((full || recent || stale) && !doc?.hidden) engine.flush(); };
+  every(lampsDue, 60000);
+  const onVisible = () => { if (!doc?.hidden) lampsDue(); };
+  doc?.addEventListener("visibilitychange", onVisible);
 
   // The names are asked for on EVERY visit and nothing is shown before they are in (bob: always load the name). The
   // store is not relied on for them: it is one small request (232 profiles, 0.3 MB), and a name missing from the
@@ -604,6 +609,7 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
     computes: () => computes,
     stop: () => {
       for (const t of timers) clearTimeout(t);      // clears intervals too
+      doc?.removeEventListener("visibilitychange", onVisible);
       stopNames();
       stopJobs();
       source.stop();

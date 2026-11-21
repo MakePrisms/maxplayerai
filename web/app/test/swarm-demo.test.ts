@@ -17,5 +17,6 @@ test("demo snapshot passes the same validation as live data and counts running j
 test("parseSnapshot refuses a non-numeric updatedAt on the swarm job", () => {
   const s = demoSnapshot(1_792_100_000) as { swarmJob: Record<string, unknown> };
   assert.doesNotThrow(() => parseSnapshot({ ...s, swarmJob: { ...s.swarmJob, updatedAt: 1_792_000_000 } }));
-  assert.throws(() => parseSnapshot({ ...s, swarmJob: { ...s.swarmJob, updatedAt: "soon" } }), /Invalid swarm job/);
+  for (const bad of ["soon", Number.NaN, Infinity, null])
+    assert.throws(() => parseSnapshot({ ...s, swarmJob: { ...s.swarmJob, updatedAt: bad } }), /Invalid swarm job/, String(bad));
 });

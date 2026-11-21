@@ -388,9 +388,11 @@ const PARSE_CACHE = new Map<string, ParsedEvent | null>();
 
 export function parseEvent(event: RawEvent | null | undefined): ParsedEvent | null {
   if (!event || typeof event.kind !== "number" || typeof event.created_at !== "number") return null;
-  if (!isHex32(event.id) || !isHex32(event.pubkey)) return null;
+  // The cache first (speed review of #1361, #1): the two hex checks were 38% of a recompute. Only hex ids are ever
+  // cached, and a hit must be for the same author.
   const hit = PARSE_CACHE.get(event.id);
-  if (hit !== undefined) return hit;
+  if (hit !== undefined && (hit === null || hit.pubkey === event.pubkey)) return hit;
+  if (!isHex32(event.id) || !isHex32(event.pubkey)) return null;
   const parsed = parseEventUncached(event);
   PARSE_CACHE.set(event.id, parsed);
   return parsed;

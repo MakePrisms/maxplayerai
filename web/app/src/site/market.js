@@ -171,10 +171,14 @@ function closeSheet() {
   setLink(null);
   root.classList.remove('sheet-open');
   main.inert = false; nav.inert = false;
-  // the board is redrawn while the panel is open, so the link that opened it may be a new element by now
-  const back = sheetFrom && (sheetFrom.isConnected ? sheetFrom : sheetFrom.dataset.pk && $(`#board a[data-pk="${CSS.escape(sheetFrom.dataset.pk)}"]`));
+  // the board is redrawn while the panel is open, so the link that opened it may be a new element by now; on a phone
+  // only one column shows, so it is looked for among the links that are on screen
+  const pk = sheetFrom && !sheetFrom.isConnected && sheetFrom.dataset.pk;
+  const back = sheetFrom && (sheetFrom.isConnected ? sheetFrom : pk && [...$$(`#board a[data-pk="${CSS.escape(pk)}"]`)].find(a => a.getClientRects().length));
+  sheetFrom = null;
   if (back) refocus(back);
-  else if (sheet.contains(document.activeElement)) document.activeElement.blur();
+  // an opener that is hidden by now (See all after a period change) takes no focus: leave the panel anyway (r4 #1)
+  if (sheet.contains(document.activeElement)) document.activeElement.blur();
   sheet.setAttribute('aria-hidden', 'true');      // only once focus has left the panel (review of #1361, r3)
 }
 
