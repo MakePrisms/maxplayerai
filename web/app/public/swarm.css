@@ -2,13 +2,8 @@
    site.css and market.css (html.mk: the sections, the lead numbers, the list rows, the panel, the FAQ, the footer).
    What only /swarm has is here, scoped by html.sw. The ids the panel paints come from src/swarm/page.ts and hero.ts. */
 
-/* the hero: the line to run a swarm, then the way to join one */
+/* the hero */
 html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
-.sw-top .copy{max-width:640px;margin-top:min(26px,3vh)}
-.sw-or{margin-top:14px;font-size:15px;line-height:1.45;color:var(--mut)}
-.sw-or a{color:#fff;border-bottom:1px solid rgba(255,255,255,.35);transition:border-color .2s}
-.sw-or a:hover{border-color:var(--giallo)}
-.mend-c .copy{width:100%;max-width:640px;margin-top:min(30px,3.2vh);text-align:left}
 
 /* the board: one list, in the rows of /market's */
 .swb{margin-top:min(34px,4vh);border-radius:22px;background:#101010;box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);overflow:hidden}
@@ -124,7 +119,5 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
   .sw-run .copy{margin-top:18px}
   .sw-how .steps{margin-top:18px}
   .swp{padding:6px var(--px) 28px}
-  .sw-top .copy{margin-top:16px}
-  .sw-or{font-size:14px}
   .sw-by{margin-left:0;flex-basis:100%}
 }
