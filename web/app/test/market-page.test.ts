@@ -293,14 +293,16 @@ test("the store is marked whole only after what was read has been written", asyn
   const events = market();
   const relay = new FakeRelay(events);
   const storage = memory();
-  const { h } = await open(relay, storage, 80);
+  // markMs is long enough that opening a second handle on the store (slow on a loaded test machine) cannot outlast it:
+  // at 80 ms the full suite sometimes saw the mark already written when it looked "at the moment the read ends".
+  const { h } = await open(relay, storage, 600);
   try {
     relay.names.step();
     relay.source.drain();
     assert.equal(h.ready(), "all");
     assert.ok(!storage.has("maxplayer-market-store"), "not at the moment the read ends: its last events are still queued");
     assert.equal(await (await createEventDb()).historyComplete(), false);
-    await tick(160);
+    for (let waited = 0; !storage.has("maxplayer-market-store") && waited < 3000; waited += 50) await tick(50);
     assert.ok(storage.has("maxplayer-market-store"));
     const db = await createEventDb();
     assert.equal(await db.historyComplete(), true);

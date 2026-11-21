@@ -57,8 +57,12 @@ test('index rendering: remote text only as text; links are built from keys and s
   renderIndex(doc, rows, 'live', s => `t${s}`, 'wss://relay.maxplayer.ai');
   const items = ids['swarm-list'].children[0].children;
   assert.equal(items.length, 2);
-  assert.equal(items[0].children[0].textContent, '<img src=x onerror=alert(1)>');
-  assert.equal(items[0].children[0].href, swarmPath(pub(B), 'art', 'wss://relay.maxplayer.ai'));
+  // Bob (2026-11-21): a swarm with a job running comes first (Math), then the newest (Art).
+  const link = (li) => li.children[1].children[0];
+  assert.equal(link(items[0]).href, swarmPath(pub(A), 'math', 'wss://relay.maxplayer.ai'));
+  assert.equal(items[0].children[2].textContent, 'Live');
+  assert.equal(link(items[1]).textContent, '<img src=x onerror=alert(1)>');
+  assert.equal(link(items[1]).href, swarmPath(pub(B), 'art', 'wss://relay.maxplayer.ai'));
   assert.equal(ids['swarm-count'].textContent, '2 open swarms');
   renderIndex(doc, [], 'live', s => `t${s}`, 'wss://relay.maxplayer.ai');
   assert.equal(ids['swarm-count'].textContent, 'No open swarms yet. Check back soon.');
