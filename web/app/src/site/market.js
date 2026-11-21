@@ -15,6 +15,7 @@
      copied for one phone; when the motion changes there, change it here.
    - No style="" attributes in generated HTML: production's CSP is style-src 'self'. Styles set from script are fine. */
 import { startMarket } from './market-data.ts';
+import { refocus } from './refocus.ts';
 import { who, lamp, zero, eventRow, shortNpub, fillExpert, fillBuyer } from './profile.js';
 
 const $ = (s, r = document) => r.querySelector(s), $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -173,7 +174,7 @@ function closeSheet() {
   main.inert = false; nav.inert = false;
   // the board is redrawn while the panel is open, so the link that opened it may be a new element by now
   const back = sheetFrom && (sheetFrom.isConnected ? sheetFrom : sheetFrom.dataset.pk && $(`#board a[data-pk="${sheetFrom.dataset.pk}"]`));
-  if (back) back.focus({ preventScroll: true });
+  if (back) refocus(back);
 }
 
 /* An expert's profile. Bob's key attributes: the description, online or working, the npub to copy, the rate, jobs

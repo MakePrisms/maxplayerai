@@ -18,6 +18,7 @@ import { SwarmStore, swarmIndex, swarmSnapshot } from "./swarm/shared/model.mjs"
 import { SwarmReader } from "./swarm/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
 import { wireMenu } from "./site/menu.js";
+import { refocus } from "./site/refocus.js";
 import { stylesLoaded } from "./site/styled.js";
 import { startMarket, type MarketHandle } from "./site/market-data.js";
 import { fillBuyer, fillExpert, wireNpubChip } from "./site/profile.js";
@@ -145,7 +146,7 @@ function backToSwarm(): void {
   el("sheet-back").hidden = true;
   const title = el("swarm-title");
   title.textContent = swarmName; title.classList.remove("hex");
-  if (from?.isConnected) from.focus({ preventScroll: true }); else sheet.focus({ preventScroll: true });
+  if (from?.isConnected) refocus(from); else sheet.focus({ preventScroll: true });
 }
 el("sheet-back").addEventListener("click", backToSwarm);
 // A member's name, the buyer's name, and any name in a profile's recent jobs open that profile here.
@@ -292,7 +293,7 @@ function closeSwarm(fromHistory = false): void {
     if (was.pushed) history.back();                       // popstate finds the panel already closed
     else history.replaceState(null, "", "/swarm" + location.search);
   }
-  if (was.from?.isConnected) was.from.focus({ preventScroll: true });
+  if (was.from?.isConnected) refocus(was.from);
 }
 
 // A row, or its name, opens the swarm in the panel. The name is a real link: a new tab goes to the link itself.

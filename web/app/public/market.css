@@ -13,6 +13,7 @@ html.mk body.ready .mk-main{animation:stagein .35s ease backwards}
 html.mk .nav{background:rgba(26,26,26,.86);-webkit-backdrop-filter:saturate(1.4) blur(14px);backdrop-filter:saturate(1.4) blur(14px)}
 html.mk .navfade{display:none}
 html.mk :focus-visible{outline:2px solid var(--giallo);outline-offset:3px}     /* keyboard only; a click or a tap never shows it */
+html.mk .quiet:focus-visible{outline:none}     /* focus given back after a panel used with a pointer (src/site/refocus.ts) */
 .copysrc{position:fixed;left:0;top:0;opacity:0;pointer-events:none;white-space:pre;-webkit-user-select:text;user-select:text}   /* market.js copyText */
 html.mk .phone .msgs{overflow:hidden}                     /* the page scrolls, not the chat in the mock-up */
 html.mk .phone .msgs.tight{--fb:12px}

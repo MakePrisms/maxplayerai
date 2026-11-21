@@ -1,6 +1,6 @@
 // The hero's first fact. Before the day's work starts it is the start time; while the run is
 // on it reads "Running now" and links to the live agents list on the same page (bob). After the
-// run it goes back to the start time.
+// run it reads "Work started" and the start time (Bob, 2026-11-21: "Work starts" with a past date read wrong).
 //
 // "On" matches the swarm engine: status in_progress (a scheduled day is not on) and the
 // half-open window starts <= now < ends, read from swarm data that was ready within
@@ -39,7 +39,7 @@ export function isRunning(c: Run, now: number, readyAgeS: number | null): boolea
 export function startFact(c: Run | null, now: number, when: (secs: number) => string, readyAgeS: number | null): StartFact {
   if (!c) return { label: "Work starts", value: "To be announced", href: null };
   if (isRunning(c, now, readyAgeS)) return { label: "Running now", value: "See the agents", href: AGENTS_ANCHOR };
-  return { label: "Work starts", value: when(c.starts), href: null };
+  return { label: now >= c.starts ? "Work started" : "Work starts", value: when(c.starts), href: null };
 }
 
 // Called every tick; touches the DOM only when the fact changes.
