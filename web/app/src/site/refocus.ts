@@ -13,8 +13,15 @@ addEventListener("click", (e) => { pointer = e.detail > 0; }, true);
 
 export function refocus(target: HTMLElement): void {
   if (pointer) {
+    // Quiet until focus moves to something else on the page. Not on blur: switching windows blurs the link and gives
+    // it focus back on return, and the browser then drew the ring (Bob, 2026-11-21).
     target.classList.add("quiet");
-    target.addEventListener("blur", () => target.classList.remove("quiet"), { once: true });
+    const off = (e: FocusEvent) => {
+      if (e.target === target) return;
+      target.classList.remove("quiet");
+      document.removeEventListener("focusin", off, true);
+    };
+    document.addEventListener("focusin", off, true);
   }
   target.focus({ preventScroll: true });
 }

@@ -245,7 +245,7 @@ export function swarmSnapshot(events, { buyer, swarm: slug }, now) {
   return {
     asOf: now,
     swarm: { ...s, address: swarmAddress(buyer, slug), buyerNpub: npubEncode(buyer), buyerName: names.get(buyer) ?? '' },
-    swarmJob: c && { id: c.id, buyer, buyerNpub: npubEncode(buyer), title: c.title, goal: c.goal, starts: c.starts, ends: c.ends, status: c.status, result: c.result ?? '' },
+    swarmJob: c && { id: c.id, buyer, buyerNpub: npubEncode(buyer), title: c.title, goal: c.goal, starts: c.starts, ends: c.ends, status: c.status, result: c.result ?? '', updatedAt: shown[0].created_at },
     swarmJobs: jobPairs.map(([e, j]) => ({ id: j.id, title: j.title, starts: j.starts, ends: j.ends, status: j.status, budgetSats: j.budgetSats, createdAt: e.created_at, tasks: facts.filter(f => f.job === j.id && f.turn === 1).length }))
       .sort((a, b) => b.starts - a.starts || b.createdAt - a.createdAt),
     sellers, applicants,

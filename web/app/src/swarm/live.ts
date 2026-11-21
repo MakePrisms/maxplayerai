@@ -15,7 +15,7 @@ export interface SwarmJobRow { id: string; title: string; starts: number; ends: 
 export interface Snapshot {
   asOf: number;
   swarm?: SwarmInfo|null;
-  swarmJob: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: SwarmJobStatus; result: string }|null;
+  swarmJob: { id: string; buyer: string; buyerNpub: string; title: string; goal: string; starts: number; ends: number; status: SwarmJobStatus; result: string; updatedAt?: number }|null;
   swarmJobs?: SwarmJobRow[];
   sellers: Seller[]; jobs: Job[]; updates: string[]; applicants?: Applicant[];
   budget: {totalSats: number; committedSats: number; paidSats: number; estimated: boolean; unknownAmounts: number; note: string}|null;

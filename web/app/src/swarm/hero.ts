@@ -1,6 +1,8 @@
 // The hero's first fact. Before the day's work starts it is the start time; while the run is
 // on it reads "Running now" and links to the live agents list on the same page (bob). After the
-// run it reads "Work started" and the start time (Bob, 2026-11-21: "Work starts" with a past date read wrong).
+// run: "Work ended" and the end time once the job is over (completed, cancelled or past its window; Bob,
+// 2026-11-21), else "Work started" and the start time (started but not on, e.g. a stale view).
+// A job closed early ends when the buyer closed it: updatedAt, the shown job event's created_at.
 //
 // "On" matches the swarm engine: status in_progress (a scheduled day is not on) and the
 // half-open window starts <= now < ends, read from swarm data that was ready within
@@ -17,7 +19,7 @@ export const AGENTS_ANCHOR = "#agents";
 export const FRESH_S = 5;
 export const SPOT_WAIT_MS = 4000;
 export interface StartFact { label: string; value: string; href: string | null }
-type Run = { starts: number; ends: number; status: string };
+type Run = { starts: number; ends: number; status: string; updatedAt?: number };
 
 const fresh = (readyAgeS: number | null) => readyAgeS !== null && readyAgeS <= FRESH_S;
 export interface Facts { start: StartFact; budget: string }
@@ -39,6 +41,11 @@ export function isRunning(c: Run, now: number, readyAgeS: number | null): boolea
 export function startFact(c: Run | null, now: number, when: (secs: number) => string, readyAgeS: number | null): StartFact {
   if (!c) return { label: "Work starts", value: "To be announced", href: null };
   if (isRunning(c, now, readyAgeS)) return { label: "Running now", value: "See the agents", href: AGENTS_ANCHOR };
+  const closed = c.status === "completed" || c.status === "cancelled";
+  if (closed || now >= c.ends) {
+    const end = closed && c.updatedAt !== undefined ? Math.min(c.ends, c.updatedAt) : c.ends;
+    return { label: "Work ended", value: when(end), href: null };
+  }
   return { label: now >= c.starts ? "Work started" : "Work starts", value: when(c.starts), href: null };
 }
 
