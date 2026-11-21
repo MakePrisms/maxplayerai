@@ -64,6 +64,10 @@ test('index rendering: remote text only as text; links are built from keys and s
   assert.equal(link(items[1]).textContent, '<img src=x onerror=alert(1)>');
   assert.equal(link(items[1]).href, swarmPath(pub(B), 'art', 'wss://relay.maxplayer.ai'));
   assert.equal(ids['swarm-count'].textContent, '2 open swarms');
+  // Bob (2026-11-21): the same rows are not rebuilt (that made the hovered row blink).
+  const first = ids['swarm-list'].children[0];
+  renderIndex(doc, rows, 'live', s => `t${s}`, 'wss://relay.maxplayer.ai');
+  assert.equal(ids['swarm-list'].children[0], first, 'an unchanged list keeps its rows');
   renderIndex(doc, [], 'live', s => `t${s}`, 'wss://relay.maxplayer.ai');
   assert.equal(ids['swarm-count'].textContent, 'No open swarms yet. Check back soon.');
 });

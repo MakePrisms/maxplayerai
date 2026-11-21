@@ -78,6 +78,7 @@ export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "
   const count = doc.getElementById("swarm-count")!;
   const el = (tag: string, cls: string, text?: string) => { const e = doc.createElement(tag); e.className = cls; if (text !== undefined) e.textContent = text; return e; };
   if (mode === "loading") {
+    (list as unknown as { _key?: string })._key = undefined;
     if (!list.querySelector(".sk")) {
       const fragment = doc.createDocumentFragment();
       for (let i = 0; i < 4; i++) { const li = el("li", "row sk"); li.setAttribute("aria-hidden", "true"); li.append(el("i", `sk${i % 3}`)); fragment.append(li); }
@@ -86,8 +87,16 @@ export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "
     count.textContent = "";
     return;
   }
+  // Bob (2026-11-21): the list is rebuilt only when what it shows changes. Rebuilding the same rows on every relay
+  // update replaced the row under the pointer, so its hover highlight blinked off and on.
+  const shown = boardOrder(rows).slice(0, limit);
+  const key = JSON.stringify(shown.map((r) => [swarmPath(r.buyer, r.id, relay), r.name, firstLine(r.purpose, 140), !!r.running, statusText(r, when), r.members, r.jobsDone ?? 0, age(r.createdAt, now)]));
+  const drawn = list as unknown as { _key?: string };
+  count.textContent = rows.length ? `${rows.length} open ${rows.length === 1 ? "swarm" : "swarms"}` : "No open swarms yet. Check back soon.";
+  if (drawn._key === key) return;
+  drawn._key = key;
   const fragment = doc.createDocumentFragment();
-  for (const r of boardOrder(rows).slice(0, limit)) {
+  for (const r of shown) {
     const li = el("li", "row g-s go");
     const lamp = el("i", r.running ? "lamp on" : "lamp");
     lamp.setAttribute("role", "img");
@@ -106,7 +115,6 @@ export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "
   }
   if (!rows.length) fragment.append(el("li", "note", "No open swarms yet. Check back soon."));
   list.replaceChildren(fragment);
-  count.textContent = rows.length ? `${rows.length} open ${rows.length === 1 ? "swarm" : "swarms"}` : "No open swarms yet. Check back soon.";
 }
 
 /** This swarm's jobs, newest first: title, window, status and task count. */
