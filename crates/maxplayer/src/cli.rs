@@ -121,6 +121,11 @@ pub(crate) fn daemon_preamble(
     if let Some(alias) = deprecated {
         let _ = writeln!(err, "{}", alias.line());
     }
+    // A daemon started from an agent's shell can inherit that agent's credentialed egress proxy,
+    // whose token dies with the agent's run; every later request then fails with 407.
+    if let Some(warning) = maxplayer_core::error_chain::local_proxy_warning(std::env::vars_os()) {
+        let _ = writeln!(err, "{warning}");
+    }
 }
 
 /// A verbless daemon start form that still works but is deprecated: `serve` is the start verb for

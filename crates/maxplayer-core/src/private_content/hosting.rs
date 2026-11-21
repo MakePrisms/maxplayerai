@@ -10,6 +10,39 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+/// A provisioning failure: the fixed [`Error`] text, plus the HTTP cause when there is one
+/// (`private repository provisioning unavailable: error sending request for url (..): client
+/// error (Connect): tunnel error: proxy authorization required`). The leading text is unchanged,
+/// so a match on it still works. The cause is [`crate::error_chain::chain`]: credentials in any
+/// URL are redacted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendError {
+    pub kind: Error,
+    cause: Option<String>,
+}
+impl SendError {
+    fn http(kind: &'static str, error: &reqwest::Error) -> Self {
+        Self {
+            kind: Error(kind),
+            cause: Some(crate::error_chain::chain(error)),
+        }
+    }
+}
+impl From<Error> for SendError {
+    fn from(kind: Error) -> Self {
+        Self { kind, cause: None }
+    }
+}
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.cause {
+            Some(cause) => write!(f, "{}: {cause}", self.kind),
+            None => write!(f, "{}", self.kind),
+        }
+    }
+}
+impl std::error::Error for SendError {}
+
 pub struct ProvisionRequest {
     url: String,
     body: Vec<u8>,
@@ -83,13 +116,13 @@ impl ProvisionRequest {
         &self.repo
     }
 
-    pub async fn send(&self, authorization: &str) -> Result<()> {
+    pub async fn send(&self, authorization: &str) -> std::result::Result<(), SendError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(20))
             .build()
-            .map_err(|_| Error("private hosting client unavailable"))?;
+            .map_err(|e| SendError::http("private hosting client unavailable", &e))?;
         let mut response = client
             .put(&self.url)
             .header("Authorization", authorization)
@@ -97,18 +130,21 @@ impl ProvisionRequest {
             .body(self.body.clone())
             .send()
             .await
-            .map_err(|_| Error("private repository provisioning unavailable"))?;
+            .map_err(|e| SendError::http("private repository provisioning unavailable", &e))?;
         if !response.status().is_success() {
-            return Err(Error("private repository provisioning refused"));
+            return Err(SendError {
+                kind: Error("private repository provisioning refused"),
+                cause: Some(format!("HTTP {}", response.status())),
+            });
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| Error("private hosting response incomplete"))?
+            .map_err(|e| SendError::http("private hosting response incomplete", &e))?
         {
             if bytes.len() + chunk.len() > 4096 {
-                return Err(Error("private hosting response too large"));
+                return Err(Error("private hosting response too large").into());
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -123,7 +159,7 @@ impl ProvisionRequest {
             || reply.max_pack_bytes == 0
             || reply.max_compressed_repository_bytes == 0
         {
-            return Err(Error("private hosting binding or limits mismatch"));
+            return Err(Error("private hosting binding or limits mismatch").into());
         }
         Ok(())
     }
@@ -178,4 +214,43 @@ pub fn auth_header(keys: &Keys, url: &str, body: &[u8]) -> Result<String> {
     .sign_with_keys(keys)
     .map_err(|_| Error("provision signing failed"))?;
     Ok(format!("Nostr {}", STANDARD.encode(event.as_json())))
+}
+
+#[cfg(test)]
+mod send_error_tests {
+    use super::*;
+
+    // The buyer saw only "private repository provisioning unavailable" while every request failed
+    // at its proxy. The fixed text must stay first and the HTTP cause must follow it.
+    #[test]
+    fn unavailable_names_the_http_cause_after_the_fixed_text() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let request = ProvisionRequest {
+            url: format!("http://{closed}/api/jobs/private/{}", "a".repeat(64)),
+            body: b"{}".to_vec(),
+            repo: String::new(),
+            job: String::new(),
+        };
+        let error = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(request.send("Nostr x"))
+            .unwrap_err();
+        assert_eq!(error.kind, Error("private repository provisioning unavailable"));
+        let text = error.to_string();
+        assert!(
+            text.starts_with("private repository provisioning unavailable: error sending request"),
+            "{text}"
+        );
+        assert!(text.to_ascii_lowercase().contains("refused"), "{text}");
+        // A bare static error still reads exactly as before.
+        assert_eq!(
+            SendError::from(Error("private hosting response too large")).to_string(),
+            "private hosting response too large"
+        );
+    }
 }

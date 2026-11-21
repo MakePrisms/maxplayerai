@@ -124,3 +124,56 @@ fn mcp_prints_its_version_first_on_stderr_not_on_the_json_rpc_stream() {
     command.arg("mcp").env("MAXPLAYER_HOME", &home.0);
     assert_first_line(command, "mcp", &home_place(&home.0));
 }
+
+/// A daemon started from an agent's shell inherited `HTTPS_PROXY=http://<user>:<token>@127.0.0.1:<port>`
+/// (the agent's secret-egress proxy); after the agent's run ended every request failed with 407 and
+/// nothing said why. The start must warn once, after the version line, and never print the token.
+#[test]
+fn a_credentialed_local_proxy_is_warned_about_once_without_its_credential() {
+    let mut daemons: Vec<(&str, &[&str], bool)> = vec![("buyer", &["buyer", "serve"], false)];
+    if cfg!(feature = "acp") {
+        daemons.push(("seller", &["seller", "serve"], true));
+    }
+    for (role, args, home_flag) in daemons {
+        let home = NotADir::new(role);
+        let start = |proxy: Option<&str>| {
+            let mut command = maxplayer();
+            command.args(args);
+            if home_flag {
+                command.arg("--home").arg(&home.0);
+            } else {
+                command.env("MAXPLAYER_HOME", &home.0);
+            }
+            for name in [
+                "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy",
+                "NO_PROXY", "no_proxy",
+            ] {
+                command.env_remove(name);
+            }
+            if let Some(proxy) = proxy {
+                command.env("HTTPS_PROXY", proxy);
+            }
+            let out = command.output().expect("run maxplayer");
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        let stderr = start(Some("http://openclaw:secret@127.0.0.1:1"));
+        assert!(!stderr.contains("secret"), "{role}: the credential leaked:\n{stderr}");
+        let warnings: Vec<_> = stderr
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("requires credentials"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{role}: exactly one warning:\n{stderr}");
+        let (at, line) = warnings[0];
+        assert!(at >= 1, "{role}: the version start line stays first:\n{stderr}");
+        assert!(
+            line.contains("HTTPS_PROXY")
+                && line.contains("127.0.0.1:1")
+                && line.contains("407")
+                && line.contains("NO_PROXY"),
+            "{role}: {line}"
+        );
+        let quiet = start(None);
+        assert!(!quiet.contains("requires credentials"), "{role}: no proxy, no warning:\n{quiet}");
+    }
+}

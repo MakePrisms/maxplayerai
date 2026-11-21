@@ -1,7 +1,7 @@
 //! Private posting keeps all existing validation/budget gates. Repository setup
 //! and complete pinned inputs precede publication; no later buyer-input phase.
 use super::{
-    Error, Result, builders, channel::ContentContext, hosting, inputs, repositories, session, wire,
+    Error, builders, channel::ContentContext, hosting, inputs, repositories, session, wire,
 };
 use crate::{
     gateway,
@@ -21,7 +21,7 @@ pub async fn post(
     request: &PostJobRequest,
     validated: &gateway::EventDraft,
     contribution: Option<&crate::contribution::ContributionOffer>,
-) -> Result<PostJobOutcome> {
+) -> std::result::Result<PostJobOutcome, hosting::SendError> {
     let parsed = gateway::parse_offer(validated).map_err(|_| Error("invalid posting request"))?;
     let mut offer = gateway::OfferDraft {
         task: parsed.task,
