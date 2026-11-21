@@ -390,8 +390,6 @@ body.ready #stage{animation:stagein .35s ease backwards}
 .ft-cols h4{margin:0 0 8px;font-size:13.5px;font-weight:500;color:#fff}
 .ft-cols a{display:block;font-size:13.5px;line-height:1.95;color:var(--mut);white-space:nowrap}
 .ft-cols a:hover{color:#fff}
-/* an experimental page (Bob, 2026-11-21: Swarm under Product, marked Lab): a small boxed yellow mark */
-.lab-tag{display:inline-block;margin-left:6px;padding:0 4px;border:1px solid rgba(255,223,0,.5);border-radius:4px;font-size:10px;font-weight:500;line-height:15px;letter-spacing:.06em;text-transform:uppercase;color:var(--giallo);vertical-align:1px}
 
 
 /* ---------- narrow screens: type and sizes. (The layout is in "phone-size pages" at the end of the file; the
