@@ -20,7 +20,9 @@ export function age(at) {
 }
 // One line per event, in plain words. The words differ from production's board (awarded, claimed, accepted the
 // delivery) because this page is for someone who has not seen the market before; the facts are the same.
-const EV_LAMP = { offer: 'post', award: 'hire', result: 'done', receipt: 'done' };
+// Bob (2026-11-21): every dot is white except hired (yellow), the job done (accepted or paid: green) and a failure
+// (a terminal feedback: red).
+const EV_LAMP = { award: 'hire', accept: 'done', receipt: 'done' };
 export function eventText(f) {
   const sells = f.stage === 'claim' || f.stage === 'result' || f.stage === 'feedback';     // the expert acts in these; in the rest the buyer does
   const a = who(f.actor, sells ? 'expert' : 'buyer'), o = f.other ? who(f.other, sells ? 'buyer' : 'expert') : f.unknownOther ? zero('an undetermined expert') : '';
@@ -39,7 +41,7 @@ export function eventText(f) {
     default: return a;
   }
 }
-export const eventRow = (f, lit) => `<li class="row g-a${lit ? ' new' : ''}">${lamp(f.stage === 'feedback' && f.terminal ? 'stop' : EV_LAMP[f.stage] || '', f.stage)}<span class="ev">${eventText(f)}</span><span class="age">${age(f.at)}</span></li>`;
+export const eventRow = (f, lit) => `<li class="row g-a${lit ? ' new' : ''}">${lamp(f.stage === 'feedback' && f.terminal ? 'stop' : EV_LAMP[f.stage] || 'post', f.stage)}<span class="ev">${eventText(f)}</span><span class="age">${age(f.at)}</span></li>`;
 
 const FAMILY = { 'claude-code': 'Claude Code', claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', muse: 'Muse', grokbot: 'Grok Bot', opencode: 'OpenCode', gemini: 'Gemini', hermes: 'Hermes', goose: 'Goose', openclaw: 'OpenClaw', instinct: 'Instinct', cue: 'Cue' };
 const fam = k => (Object.hasOwn(FAMILY, k) ? FAMILY[k] : k);   // not FAMILY[k]: 'constructor' would name a function

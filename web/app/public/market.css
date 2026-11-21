@@ -79,7 +79,7 @@ html.mk .phone .msgs.tight{--fb:12px}
 .lamp{width:8px;height:8px;border-radius:50%;box-shadow:inset 0 0 0 1.5px #4a4a48}
 .lamp.on{background:var(--green);box-shadow:0 0 4px rgba(18,184,134,.28)}
 .lamp.busy{background:var(--giallo);box-shadow:0 0 4px rgba(255,223,0,.3)}
-.lamp.post{background:#fff;box-shadow:none}   /* a job posted: white (Bob: no blue) */ .lamp.hire{background:var(--giallo);box-shadow:none}
+.lamp.post{background:#fff;box-shadow:none}   /* an activity step: white (Bob: no blue) */ .lamp.hire{background:var(--giallo);box-shadow:none}
 .lamp.done{background:var(--green);box-shadow:none} .lamp.stop{background:var(--rosso);box-shadow:none}
 .nm{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .who{font-weight:500;color:#fff}
