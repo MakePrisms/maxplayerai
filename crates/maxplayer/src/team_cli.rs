@@ -24,6 +24,8 @@ Usage: maxplayer team [--home <dir>] [--relay <url>] <command>
   invite revoke <team>                 stop every live join link of the team
   remove <team> <npub|hex>             owner/admin: remove a member
   leave <team>                         leave the channel and stop reading it
+  delete <team>                        owner: delete the team for every member (revokes its
+                                       join links first); cannot be undone
   invites [--json]                     private team channels you were added to and have not joined
   join [<channel uuid>|<link>] [--name <label>]
                                        join a private team channel, or redeem a join link
@@ -301,6 +303,10 @@ async fn execute(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> R
             writeln!(out, "removed")?;
         }
         ("leave", [team]) => writeln!(out, "left {}", home.leave(team).await?)?,
+        ("delete", [team]) => {
+            let (channel, n) = home.delete(team).await?;
+            writeln!(out, "deleted {channel}; revoked {n} live link(s)")?;
+        }
         ("invites", []) => {
             let invites = home.invites().await?;
             if json {

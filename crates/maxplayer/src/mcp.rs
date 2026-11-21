@@ -1653,7 +1653,8 @@ mod tests {
                 "team_invites",
                 "team_join",
                 "team_send",
-                "team_inbox"
+                "team_inbox",
+                "team_delete"
             ]
         );
         assert_eq!(&names[4..], team::TEAM_TOOLS);
@@ -1680,6 +1681,7 @@ mod tests {
             "boolean"
         );
         assert_eq!(schema("team_invite")["required"], json!(["team"]));
+        assert_eq!(schema("team_delete")["required"], json!(["team"]));
         for name in ["team_whoami", "team_list", "team_invites", "team_inbox"] {
             assert_eq!(schema(name)["properties"], json!({}), "{name}");
         }
@@ -1726,6 +1728,7 @@ mod tests {
             ("team_invite", json!({"team": "crew"}), "team_invite: missing npub or link"),
             ("team_invite", json!({"team": "crew", "who": "x"}), "team_invite: unknown argument who"),
             ("team_whoami", json!({"hex": "x"}), "team_whoami: unknown argument hex"),
+            ("team_delete", json!({}), "team_delete: missing team"),
         ] {
             let text = call(name, arguments);
             assert!(text.starts_with(expected), "{name}: {text}");

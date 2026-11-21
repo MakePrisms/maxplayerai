@@ -714,3 +714,109 @@ async fn invite_links_refuse_bad_input_before_the_relay_or_the_service() {
     let e = h.revoke_links("crew").await.unwrap_err().to_string();
     assert!(e.contains("ran out of time"), "{e}");
 }
+
+// BEGIN team delete tests
+/// A registration service that answers every request with `status` and `body`, and counts them.
+fn fake_service(status: &'static str, body: &'static str) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Read as _;
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = service.local_addr().unwrap().port();
+    let counter = hits.clone();
+    std::thread::spawn(move || {
+        for stream in service.incoming() {
+            let mut stream = stream.unwrap();
+            let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = stream.read(&mut [0u8; 4096]);
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    (format!("http://127.0.0.1:{port}/account"), hits)
+}
+/// A home on `url` that owns the joined team "crew"; the deadline only shortens the sign-in wait
+/// (the local relay sends no AUTH).
+fn owned_crew(dir: &Path, url: &str, service: &str) -> Home {
+    let mut h = home(dir, url);
+    h.config.registration_url = service.into();
+    h.sync_deadline = Some(std::time::Instant::now() + Duration::from_secs(4));
+    let t = Team { name: "crew".into(), channel: CH.into(), creator: h.me(), open: false };
+    let _l = h.lock().unwrap();
+    let mut s = h.load().unwrap();
+    s.teams.insert(CH.into(), t);
+    s.cursors.insert(CH.into(), 1);
+    h.save(&s).unwrap();
+    drop(_l);
+    h
+}
+async fn deletes(client: &Client) -> Vec<Event> {
+    client.fetch_events(Filter::new().kind(Kind::Custom(9008)), Duration::from_secs(2)).await.unwrap().into_iter().collect()
+}
+
+/// The owner's delete revokes the live links, sends one 9008 naming the channel in its h tag,
+/// and drops the team (and its cursor) from local state. "No live links" (the service's
+/// `not_team_member`) is not an error.
+#[tokio::test]
+async fn delete_revokes_links_then_sends_9008_and_forgets_the_team() {
+    let (_relay, url, client) = local_relay().await;
+    for (status, body, revoked) in [
+        ("200 OK", r#"{"revoked":2,"channel":"0b0e5f1c-9d4a-4c3e-8f21-6a7b8c9d0e1f"}"#, 2),
+        ("403 Forbidden", r#"{"error":"not_team_member","message":"only a member of the team can revoke its invite links"}"#, 0),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, hits) = fake_service(status, body);
+        let h = owned_crew(dir.path(), &url, &service);
+        let before = deletes(&client).await.len();
+        assert_eq!(h.delete("crew").await.unwrap(), (CH.to_owned(), revoked));
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1, "links revoked once");
+        let sent = deletes(&client).await;
+        assert_eq!(sent.len(), before + 1);
+        let event = sent.iter().find(|e| e.pubkey == h.keys.public_key()).unwrap();
+        assert_eq!(event.tags.iter().map(|t| t.as_slice().to_vec()).collect::<Vec<_>>(), vec![vec!["h".to_owned(), CH.to_owned()]]);
+        let state = h.load().unwrap();
+        assert!(!state.teams.contains_key(CH) && !state.cursors.contains_key(CH));
+    }
+}
+
+/// Nothing is deleted when the links could not be revoked (service down or another error), nor
+/// by a member who is not the owner (refused before the service is asked); a refused 9008 keeps
+/// the team in local state.
+#[tokio::test]
+async fn delete_refuses_a_non_owner_and_deletes_nothing_without_a_revoke() {
+    let (_relay, url, client) = local_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (service, hits) = fake_service("500 Internal Server Error", r#"{"error":"internal","message":"x"}"#);
+    let mut h = owned_crew(dir.path(), &url, &service);
+    let e = h.delete("crew").await.unwrap_err().to_string();
+    assert!(e.contains("could not revoke the team's invite links, so nothing was deleted"), "{e}");
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    h.config.registration_url = "http://127.0.0.1:9/account".into();
+    let e = h.delete("crew").await.unwrap_err().to_string();
+    assert!(e.contains("nothing was deleted"), "{e}");
+    assert!(deletes(&client).await.is_empty(), "a 9008 went out without a revoke");
+    assert!(h.load().unwrap().teams.contains_key(CH));
+
+    // A member who did not create the team.
+    let dir = tempfile::tempdir().unwrap();
+    let (service, hits_member) = fake_service("200 OK", r#"{"revoked":1,"channel":"x"}"#);
+    let mut m = home(dir.path(), &url);
+    m.config.registration_url = service;
+    join_crew(&m);
+    let e = m.delete("crew").await.unwrap_err().to_string();
+    assert_eq!(e, "only the team's owner can delete it");
+    assert_eq!(hits_member.load(std::sync::atomic::Ordering::SeqCst), 0, "a non-owner revoked the links");
+    assert!(deletes(&client).await.is_empty());
+    assert!(m.load().unwrap().teams.contains_key(CH));
+
+    // The relay unreachable after a revoke: the team stays in local state.
+    let dir = tempfile::tempdir().unwrap();
+    let (service, _) = fake_service("200 OK", r#"{"revoked":0,"channel":"x"}"#);
+    let h = owned_crew(dir.path(), "ws://127.0.0.1:9", &service);
+    assert!(h.delete("crew").await.is_err());
+    assert!(h.load().unwrap().teams.contains_key(CH));
+}
+// END team delete tests

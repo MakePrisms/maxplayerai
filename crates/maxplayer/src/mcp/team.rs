@@ -29,6 +29,7 @@ pub(super) const TEAM_TOOLS: &[&str] = &[
     "team_join",
     "team_send",
     "team_inbox",
+    "team_delete",
 ];
 
 /// The sentence every team tool description ends with.
@@ -51,6 +52,7 @@ pub(super) const UNTRUSTED_RESULT: &str =
 pub(super) fn tools() -> Vec<Value> {
     let none = json!({"type": "object", "properties": {}, "additionalProperties": false});
     let team = json!({"type": "string", "description": "A joined team: your local label for it, or its channel id."});
+    let team_ref = team.clone();
     vec![
         json!({"name": "team_whoami",
             "description": format!("Your key on this home, as `maxplayer team whoami` prints it: {{npub, hex}}. Share the npub so a team member can add you with team_invite. {UNTRUSTED}"),
@@ -90,6 +92,9 @@ pub(super) fn tools() -> Vec<Value> {
         json!({"name": "team_inbox",
             "description": format!("Check the relay for new messages in your teams and follows, screen each, and return those not shown before, oldest first, marking them shown: result = the rows `maxplayer team inbox --json` prints, {{team, label, id, from, at, text}} for a delivered message or {{team, label, id, from, at, withheld, unsafe_ppm, threshold_ppm, verdict}} (no text) for a withheld one. warning is set when the relay could not be checked; incomplete: true means the check stopped at its time budget and more may be waiting, so call again. {UNTRUSTED}"),
             "inputSchema": none}),
+        json!({"name": "team_delete",
+            "description": format!("Delete a team you own for every member, as `maxplayer team delete` does: its live join links are revoked, then the relay deletes the channel (kind 9008; owner only) and its repo stops answering. Cannot be undone: call it only on your user's explicit instruction. Returns {{channel, revoked}}. {UNTRUSTED}"),
+            "inputSchema": {"type": "object", "properties": {"team": team_ref}, "required": ["team"], "additionalProperties": false}}),
     ]
 }
 
@@ -101,6 +106,7 @@ fn arguments(tool: &str, arguments: &Value) -> Result<Map<String, Value>, String
         "team_invite" => (&["team", "npub", "link"], &["team"]),
         "team_join" => (&["uuid", "link", "name"], &[]),
         "team_send" => (&["team", "text"], &["team", "text"]),
+        "team_delete" => (&["team"], &["team"]),
         _ => (&[], &[]),
     };
     let map = match arguments {
@@ -260,6 +266,10 @@ pub(super) async fn run(
                 Ok(body)
             })
             .map_err(text)
+        }
+        "team_delete" => {
+            let (channel, revoked) = team.delete(arg("team").unwrap_or_default()).await.map_err(text)?;
+            Ok(json!({ "channel": channel, "revoked": revoked }))
         }
         other => Err(format!("unknown team tool: {other}")),
     }
