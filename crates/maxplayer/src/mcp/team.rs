@@ -268,7 +268,10 @@ pub(super) async fn run(
             .map_err(text)
         }
         "team_delete" => {
-            let (channel, revoked) = team.delete(arg("team").unwrap_or_default()).await.map_err(text)?;
+            let (channel, revoked) = team
+                .delete(arg("team").unwrap_or_default())
+                .await
+                .map_err(text)?;
             Ok(json!({ "channel": channel, "revoked": revoked }))
         }
         other => Err(format!("unknown team tool: {other}")),
