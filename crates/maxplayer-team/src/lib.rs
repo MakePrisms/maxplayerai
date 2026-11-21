@@ -750,6 +750,37 @@ impl Home {
         self.save(&state)?;
         Ok(t.channel)
     }
+    /// `delete <team>`: the owner deletes the team for everyone (kind 9008; the relay accepts it
+    /// from the owner only). The team's live invite links are revoked first, so the service keeps
+    /// no link or invite key for a deleted team; if that call fails, nothing is deleted. Then the
+    /// team leaves local state, as with `leave`. Returns (channel, links revoked).
+    pub async fn delete(&self, team: &str) -> Result<(String, u64)> {
+        let t = self.load()?.resolve(team)?.clone();
+        // Checked before the service is asked: a member's attempt must not revoke the links.
+        if t.creator != self.me() {
+            return Err("only the team's owner can delete it".into());
+        }
+        let mut revoked = 0;
+        if !t.open {
+            let channel = t.channel.clone();
+            revoked = match self.registration(move |c| c.team_revoke(&channel)).await {
+                Ok(r) => r.revoked,
+                // No live link of this team (the invite key is not in it): nothing to revoke.
+                Err(e) if e.downcast_ref::<RegistrationError>().and_then(|e| e.code()) == Some("not_team_member") => 0,
+                Err(e) => return Err(format!("could not revoke the team's invite links, so nothing was deleted: {e}").into()),
+            };
+        }
+        let client = self.connect().await?;
+        let result = self.publish(&client, 9008, "", vec![vec!["h".into(), t.channel.clone()]]).await;
+        client.shutdown().await;
+        result?;
+        let _lock = self.lock()?;
+        let mut state = self.load()?;
+        state.teams.remove(&t.channel);
+        state.cursors.remove(&t.channel);
+        self.save(&state)?;
+        Ok((t.channel, revoked))
+    }
     /// One call to the registration service as this key (NIP-98), for invite links. The client
     /// is blocking, so it is built, used and dropped on a blocking thread.
     async fn registration<T: Send + 'static>(
