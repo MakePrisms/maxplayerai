@@ -29,6 +29,10 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
 .sw-how{display:grid;grid-template-columns:minmax(0,.6fr) minmax(0,1.4fr);gap:clamp(32px,5vw,80px);align-items:start;border-top:1px solid rgba(255,255,255,.1)}
 .sw-how .steps{margin-top:0}
 .sw-how .steps b{color:#fff}
+.sw-run .lede{margin-top:14px;font-size:clamp(16px,1.25vw,18px);line-height:1.4;color:var(--mut)}
+.sw-run .copy{margin-top:22px}
+.steps code{font-family:var(--mono);font-size:.88em;color:#fff;overflow-wrap:anywhere}
+.sw-status:empty{display:none}
 .fa code{font-family:var(--mono);font-size:.88em;color:#fff;overflow-wrap:anywhere}
 .fa a{color:#fff;border-bottom:1px solid rgba(255,255,255,.35)}
 
@@ -102,6 +106,7 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
   .g-s > :nth-child(5),.g-s > :nth-child(6){display:none}
   .swb .st{max-width:34vw;font-size:13px}
   .sw-how{display:block}
+  .sw-run .copy{margin-top:18px}
   .sw-how .steps{margin-top:18px}
   .swp{padding:6px var(--px) 28px}
   .sw-by{margin-left:0;flex-basis:100%}

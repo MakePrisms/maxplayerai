@@ -70,7 +70,9 @@ function board(): void {
       text(id, v === undefined ? "" : nf.format(v));
       el(id).classList.toggle("sk", v === undefined);
     }
-    text("index-status", !wasReady ? (status.error ? `Live view unavailable · ${status.error}` : UPDATING) : relayStatusWord(status));
+    // Bob (2026-11-21): no "Live" under the board; the line speaks only while loading or when something is wrong.
+    const word = relayStatusWord(status);
+    text("index-status", !wasReady ? (status.error ? `Live view unavailable · ${status.error}` : UPDATING) : word === "Live" ? "" : word);
   };
   const changed = coalesce(() => { try { draw(); } catch { text("index-status", "Live view unavailable · check back soon"); } }, RENDER_MS);
   reader.start();
