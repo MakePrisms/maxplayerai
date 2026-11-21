@@ -38,6 +38,9 @@ html.sw .lead dt::after{content:"\a0";display:block;font-size:12.5px}
 .sw-how .steps b{color:#fff}
 .sw-run .lede{margin-top:14px;font-size:clamp(16px,1.25vw,18px);line-height:1.4;color:var(--mut)}
 .sw-run .copy{margin-top:22px}
+/* the Copy button is as wide as "Copied" from the start, so the line beside it never reflows (Bob, 2026-11-21) */
+html.sw .copy button{display:grid;justify-items:center}
+html.sw .copy button::after{content:"Copied";height:0;overflow:hidden;visibility:hidden}
 .steps code{font-family:var(--mono);font-size:.88em;color:#fff;overflow-wrap:anywhere}
 .sw-status:empty{display:none}
 .fa code{font-family:var(--mono);font-size:.88em;color:#fff;overflow-wrap:anywhere}

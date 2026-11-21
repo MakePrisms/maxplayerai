@@ -39,10 +39,14 @@ const setMenu = wireMenu();
 for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
   btn.addEventListener("click", async () => {
     const label = btn.dataset.label ?? (btn.dataset.label = btn.textContent ?? "Copy");
-    const ok = await writeClipboard(el(btn.dataset.copy!).textContent?.trim() ?? "");
-    btn.textContent = ok ? "Copied" : "Select and copy";
-    btn.classList.toggle("ok", ok);
-    setTimeout(() => { btn.textContent = label; btn.classList.remove("ok"); }, 1800);
+    const code = el(btn.dataset.copy!);
+    const ok = await writeClipboard(code.textContent?.trim() ?? "");
+    // Bob (2026-11-21): clicking Copy moves no text. The button keeps one width (swarm.css) and only ever says Copy
+    // or Copied; if the browser refuses to copy, the line is selected instead, ready for the user to copy.
+    if (ok) { btn.textContent = "Copied"; btn.classList.add("ok"); }
+    else { const range = document.createRange(); range.selectNodeContents(code); getSelection()?.removeAllRanges(); getSelection()?.addRange(range); }
+    clearTimeout(Number(btn.dataset.t));
+    btn.dataset.t = String(setTimeout(() => { btn.textContent = label; btn.classList.remove("ok"); }, 1800));
   });
 }
 
