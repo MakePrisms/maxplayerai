@@ -338,6 +338,20 @@ async fn local_relay() -> (LocalRelay, String, Client) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     (relay, url, client)
 }
+/// `leave` of a private team is a 9001 whose `p` tag names this key: the relay refuses one
+/// without it ("missing p tag"), and nostr drops a self `p` tag by default.
+#[tokio::test]
+async fn leave_sends_a_9001_naming_this_key() {
+    let (_relay, url, client) = local_relay().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), &url);
+    join_crew(&h);
+    h.sync_deadline = Some(std::time::Instant::now() + Duration::from_secs(4));
+    assert_eq!(h.leave("crew").await.unwrap(), CH);
+    let sent = client.fetch_events(Filter::new().kind(Kind::Custom(9001)), Duration::from_secs(2)).await.unwrap();
+    let tags: Vec<Vec<String>> = sent.first().expect("a 9001").tags.iter().map(|t| t.as_slice().to_vec()).collect();
+    assert_eq!(tags, vec![vec!["h".to_owned(), CH.to_owned()], vec!["p".to_owned(), h.me()]]);
+}
 fn delivered(h: &Home) -> usize {
     let state = h.load().unwrap();
     h.stored().unwrap().iter().filter(|s| h.status(&state, s) == Status::Delivered).count()
