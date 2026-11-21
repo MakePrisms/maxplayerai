@@ -50,12 +50,13 @@ let want = 'week';                        // the period asked for; the buttons i
 const cur = () => (view && view.windowKey === want ? view : null);
 let seen = null;                           // activity rows already drawn once; a row that is not in it arrives lit
 let sheetTab = null, sheetFrom = null;
-let profileKey = null;                    // the expert whose profile is open: an npub or a 64-hex key
+let profileKey = null;                    // the profile that is open: an npub or a 64-hex key
+let profileKind = 'expert';               // whose: 'expert' or 'buyer'
 
-// An expert's name is a link to its profile: a real address, so it also opens in a new tab and can be shared.
-// A click opens the profile in the panel instead (see openProfile). Buyers have no profile and are plain text.
-const who = (w, expert) => (expert && w.npub
-  ? `<a class="who${w.named ? '' : ' hex'}" href="?expert=${w.npub}" data-pk="${w.key}">${esc(w.name)}</a>`
+// A name is a link to its profile (an expert's, or since Bob 2026-11-21 a buyer's): a real address, so it also opens
+// in a new tab and can be shared. A click opens the profile in the panel instead (see openProfile).
+const who = (w, kind) => (w.npub
+  ? `<a class="who${w.named ? '' : ' hex'}" href="?${kind}=${w.npub}" data-pk="${w.key}" data-kind="${kind}">${esc(w.name)}</a>`
   : `<b class="who${w.named ? '' : ' hex'}">${esc(w.name)}</b>`);
 const lamp = (cls, label) => `<i class="lamp ${cls}" role="img" aria-label="${label}" title="${label}"></i>`;
 const zero = s => `<span class="z">${s}</span>`;
@@ -66,15 +67,15 @@ function age(at) {
   const s = Math.max(0, Date.now() / 1000 - at);
   return s < 60 ? 'now' : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`;
 }
-const expertRow = r => `<li class="row g-x go" data-pk="${r.key}"><span class="pos">${r.rank}</span>${r.working ? lamp('busy', 'Working now') : r.online ? lamp('on', 'Online') : lamp('', 'Offline')}<span class="nm">${who(r, true)}</span><span class="num">${num(r.delivered)}</span><span class="num">${rate(r.ask)}</span><span class="num">${money(r.earned)}</span></li>`;
-const buyerRow = r => `<li class="row g-b"><span class="pos">${r.rank}</span>${r.working ? lamp('busy', 'Has a job running') : r.active ? lamp('on', 'Active in the last 24 hours') : lamp('', 'Not active in the last 24 hours')}<span class="nm">${who(r)}</span><span class="num">${num(r.posted)}</span></li>`;
+const expertRow = r => `<li class="row g-x go" data-pk="${r.key}" data-kind="expert"><span class="pos">${r.rank}</span>${r.working ? lamp('busy', 'Working now') : r.online ? lamp('on', 'Online') : lamp('', 'Offline')}<span class="nm">${who(r, 'expert')}</span><span class="num">${num(r.delivered)}</span><span class="num">${rate(r.ask)}</span><span class="num">${money(r.earned)}</span></li>`;
+const buyerRow = r => `<li class="row g-b go" data-pk="${r.key}" data-kind="buyer"><span class="pos">${r.rank}</span>${r.working ? lamp('busy', 'Has a job running') : r.active ? lamp('on', 'Active in the last 24 hours') : lamp('', 'Not active in the last 24 hours')}<span class="nm">${who(r, 'buyer')}</span><span class="num">${num(r.posted)}</span></li>`;
 
 // One line per event, in plain words. The words differ from production's board (awarded, claimed, accepted the
 // delivery) because this page is for someone who has not seen the market before; the facts are the same.
 const EV_LAMP = { offer: 'post', award: 'hire', result: 'done', receipt: 'done' };
 function eventText(f) {
   const sells = f.stage === 'claim' || f.stage === 'result' || f.stage === 'feedback';     // the expert acts in these; in the rest the buyer does
-  const a = who(f.actor, sells), o = f.other ? who(f.other, !sells) : f.unknownOther ? zero('an undetermined expert') : '';
+  const a = who(f.actor, sells ? 'expert' : 'buyer'), o = f.other ? who(f.other, sells ? 'buyer' : 'expert') : f.unknownOther ? zero('an undetermined expert') : '';
   const rd = f.turn > 1 ? ` <span class="rd">· round ${f.turn}</span>` : '';
   const amt = f.price ? ` <span class="amt">· ${esc(f.price)}</span>` : '';
   switch (f.stage) {
@@ -230,14 +231,17 @@ function ago(at) {
   return s < 60 ? 'just now' : `${n} ${s < 3600 ? 'min' : s < 86400 ? 'hour' + (n === 1 ? '' : 's') : 'day' + (n === 1 ? '' : 's')} ago`;
 }
 const shortNpub = n => `${n.slice(0, 8)}…${n.slice(-4)}`;       // npub17znh…l9c3 (Bob)
-function setLink(npub) {                    // the address names the open profile, so the page can be shared as it is
+function setLink(npub, kind = 'expert') {   // the address names the open profile, so the page can be shared as it is
   const u = new URL(location.href);
-  if ((u.searchParams.get('expert') || null) === npub) return;
-  if (npub) u.searchParams.set('expert', npub); else u.searchParams.delete('expert');
-  u.searchParams.delete('seller');          // the old page's name for the same link
+  if (npub ? u.searchParams.get(kind) === npub && !u.searchParams.has(kind === 'buyer' ? 'expert' : 'buyer')
+    : !u.searchParams.has('expert') && !u.searchParams.has('buyer') && !u.searchParams.has('seller')) return;
+  u.searchParams.delete('expert'); u.searchParams.delete('buyer');
+  u.searchParams.delete('seller');          // the old page's name for an expert's link
+  if (npub) u.searchParams.set(kind, npub);
   history.replaceState(null, '', u);
 }
 function drawProfile() {
+  if (profileKind === 'buyer') { drawBuyer(); return; }
   const pf = $('#pf'), title = $('#sheet-t');
   const x = handle ? handle.expert(profileKey, 6) : null;       // null until the whole history is in
   if (!x) {
@@ -251,14 +255,11 @@ function drawProfile() {
     return;
   }
   pf.dataset.state = 'ok';
-  setLink(x.npub);
+  setLink(x.npub, 'expert');
   title.textContent = x.name; title.classList.toggle('hex', !x.named);
   $('#pf-lamp').className = 'lamp ' + (x.working ? 'busy' : x.online ? 'on' : '');
   $('#pf-st').textContent = x.working ? `Working now${x.working > 1 ? ` · ${x.working} jobs` : ''}` : x.online ? 'Online now' : `Offline${x.lastSeen ? ` · last active ${ago(x.lastSeen)}` : ''}`;
-  const about = $('#pf-about');
-  about.textContent = x.about || ''; about.hidden = !x.about;
-  const chip = $('#pf-npub');              // the short form shows; the whole npub is what is copied (and the tooltip)
-  if (chip.dataset.npub !== x.npub) { chip.dataset.npub = x.npub; chip.title = x.npub; chip.classList.remove('ok', 'full'); $('#pf-short').textContent = shortNpub(x.npub); }
+  profileHead(x);
   const kv = [
     ['Rate', x.rate == null ? '' : x.free ? 'Free' : `From ${esc(x.rate)} a job`],
     ['Jobs delivered', `${nf.format(x.delivered)} <small>all time</small>`],
@@ -268,9 +269,41 @@ function drawProfile() {
   paint($('#pf-kv'), kv.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join(''));
   paint($('#pf-rows'), x.recent.length ? x.recent.map(f => eventRow(f, false)).join('') : '<li class="note">No jobs yet.</li>');
 }
-function openProfile(id, from) {
+function profileHead(x) {                   // the description and the npub chip, the same for an expert and a buyer
+  const about = $('#pf-about');
+  about.textContent = x.about || ''; about.hidden = !x.about;
+  const chip = $('#pf-npub');              // the short form shows; the whole npub is what is copied (and the tooltip)
+  if (chip.dataset.npub !== x.npub) { chip.dataset.npub = x.npub; chip.title = x.npub; chip.classList.remove('ok', 'full'); $('#pf-short').textContent = shortNpub(x.npub); }
+}
+/* A buyer's profile (Bob, 2026-11-21): what it posted and paid, whether it is active, and its recent jobs. */
+function drawBuyer() {
+  const pf = $('#pf'), title = $('#sheet-t');
+  const x = handle ? handle.buyer(profileKey, 6) : null;        // null until the whole history is in
+  if (!x) {
+    const down = failed || state === 'failed', none = !down && view && state === 'live';
+    title.textContent = none ? 'Buyer not found' : 'Buyer'; title.classList.remove('hex');
+    pf.dataset.state = none || down ? 'none' : 'wait';
+    alignSk();
+    $('#pf-note').textContent = down ? 'The live market is not reachable right now.' : none ? 'No buyer with this key has posted a job on the market.' : '';
+    return;
+  }
+  pf.dataset.state = 'ok';
+  setLink(x.npub, 'buyer');
+  title.textContent = x.name; title.classList.toggle('hex', !x.named);
+  $('#pf-lamp').className = 'lamp ' + (x.working ? 'busy' : x.active ? 'on' : '');
+  $('#pf-st').textContent = x.working ? `${x.working} ${x.working === 1 ? 'job' : 'jobs'} running now` : x.active ? 'Active in the last 24 hours' : `Not active lately${x.lastSeen ? ` · last active ${ago(x.lastSeen)}` : ''}`;
+  profileHead(x);
+  const kv = [
+    ['Jobs posted', `${nf.format(x.posted)} <small>all time</small>`],
+    ['Jobs paid', `${nf.format(x.paid)} <small>all time</small>`],
+    ['Paid to experts', `${esc(x.spent)} <small>published receipts</small>`],
+  ];
+  paint($('#pf-kv'), kv.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join(''));
+  paint($('#pf-rows'), x.recent.length ? x.recent.map(f => eventRow(f, false)).join('') : '<li class="note">No jobs yet.</li>');
+}
+function openProfile(id, from, kind = 'expert') {
   if (!root.classList.contains('sheet-open')) sheetFrom = from || null;
-  profileKey = id;
+  profileKey = id; profileKind = kind === 'buyer' ? 'buyer' : 'expert';
   $('#pf').dataset.state = 'wait';
   drawSheet();
   $('#pf').scrollTop = 0;
@@ -284,7 +317,7 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-pk]');
   if (!el || e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;   // a new tab goes to the link itself
   e.preventDefault();
-  openProfile(el.dataset.pk, el.closest('a') || el.querySelector('a') || el);
+  openProfile(el.dataset.pk, el.closest('a') || el.querySelector('a') || el, el.dataset.kind);
 });
 $('#sheet-x').addEventListener('click', closeSheet);
 $('#sheet-bg').addEventListener('click', closeSheet);
@@ -521,9 +554,11 @@ function show() {
   shown = true;
   body.classList.add('ready');
   sizeChat(); draw();
-  // a shared profile link. `seller` is the old market page's name for it (/market?seller=<hex>): those links still open.
+  // a shared profile link. `seller` is the old market page's name for an expert's (/market?seller=<hex>): those links
+  // still open. `buyer`: a buyer's profile (linked from a swarm's "Run by").
   const query = new URLSearchParams(location.search), linked = query.get('expert') || query.get('seller');
   if (linked) openProfile(linked);
+  else if (query.get('buyer')) openProfile(query.get('buyer'), null, 'buyer');
 }
 const FACES = ['400 16px "Instrument Sans"', '500 16px "Instrument Sans"', 'italic 500 16px "Work Sans Logo"'];
 if (document.fonts && document.fonts.load) Promise.all(FACES.map(f => document.fonts.load(f))).then(show, show);

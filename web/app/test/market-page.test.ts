@@ -204,6 +204,14 @@ test("a first visit: nothing until the week is whole, then all of it at once, an
     assert.deepEqual(h.expert(profile.npub), profile, "a profile opens by npub as well as by hex");
     assert.ok(profile.recent.length > 0 && profile.recent.every((f) => (["claim", "result", "feedback"].includes(f.stage) ? f.actor.key : f.other?.key) === SELLERS[0]), "its recent jobs are the ones it did as an expert");
     assert.equal(h.expert(BUYER), null, "a key that only buys has no expert profile");
+    // Bob (2026-11-21): buyers have a profile too.
+    const buyer = h.buyer(BUYER);
+    assert.ok(buyer, "a buyer's profile once everything is in");
+    assert.equal(Buffer.from(decodeNpub(buyer.npub)!).toString("hex"), BUYER);
+    assert.ok(buyer.posted > 0, "it counts the jobs it posted");
+    assert.deepEqual(h.buyer(buyer.npub), buyer, "a buyer's profile opens by npub as well as by hex");
+    assert.ok(buyer.recent.length > 0 && buyer.recent.every((f) => (["claim", "result", "feedback"].includes(f.stage) ? f.other?.key : f.actor.key) === BUYER), "its recent jobs are the ones it did as a buyer");
+    assert.equal(h.buyer(SELLERS[2]!), null, "a key that only sells has no buyer profile");
     assert.equal(h.expert("npub1nonsense"), null);
   } finally { h.stop(); }
 });

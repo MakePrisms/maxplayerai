@@ -74,6 +74,16 @@ export interface ExpertProfile extends Who {
   models: { family: string; model: string }[];
   recent: FeedRow[];
 }
+/** A buyer's profile (Bob, 2026-11-21: buyers are clickable like experts). Counted over all history, like an expert's. */
+export interface BuyerProfile extends Who {
+  about: string | null;
+  /** Active: did anything on the market in the last 24 hours. working: its jobs in progress now. */
+  active: boolean; working: number;
+  lastSeen: number;
+  /** Jobs posted, jobs with a published receipt, and what those receipts add up to (all time). */
+  posted: number; paid: number; spent: string;
+  recent: FeedRow[];
+}
 export interface MarketHandle {
   /**
    * Ask for a period. true: the view for it is `view()` now (the page was told if it changed). false: that period
@@ -88,6 +98,8 @@ export interface MarketHandle {
    * that has never sold on this market.
    */
   expert(id: string, recent?: number): ExpertProfile | null;
+  /** One buyer by npub or 64-hex key; null as for `expert()`, or a key that has never posted a job here. */
+  buyer(id: string, recent?: number): BuyerProfile | null;
   /**
    * "none": nothing whole yet. "recent": 24 hours and Week are whole. "all": everything is.
    * "stale": the relay is slow or cannot be reached, and a return visit shows what the browser holds (whole, but as
@@ -239,6 +251,27 @@ function expertProfile(view: MarketView, id: string, recent: number): ExpertProf
     recent: d.activity.filter((e) => e.stage != null && TRADE_STAGE.has(e.stage)).slice(0, 400)
       .map((e) => feedRow(view, e))
       .filter((f) => (SELLER_ACTS.has(f.stage) ? f.actor.key === pubkey : f.other?.key === pubkey))
+      .slice(0, recent),
+  };
+}
+
+function buyerProfile(view: MarketView, id: string, recent: number): BuyerProfile | null {
+  const pubkey = toHex(id);
+  if (!pubkey) return null;
+  const d = participantDetail(view.allEvents, pubkey, now(), view.allEvents);
+  const b = d.buyer;
+  if (!b) return null;
+  const lastAt = Math.max(view.racerLastSeen.get(pubkey) || 0, b.lastSeen || 0);
+  return {
+    ...who(view, pubkey),
+    about: view.profiles.get(pubkey)?.about ?? null,
+    active: lastAt > 0 && now() - lastAt <= RACER_ACTIVE_SECONDS, working: (view.activeByBuyer.get(pubkey) || []).length,
+    lastSeen: lastAt,
+    posted: b.posted, paid: b.receipted, spent: usd(b.satsPaid),
+    // Its work as a buyer only: it acts in every stage but claim, result and feedback, where it is the other side.
+    recent: d.activity.filter((e) => e.stage != null && TRADE_STAGE.has(e.stage)).slice(0, 400)
+      .map((e) => feedRow(view, e))
+      .filter((f) => (SELLER_ACTS.has(f.stage) ? f.other?.key : f.actor.key) === pubkey)
       .slice(0, recent),
   };
 }
@@ -566,6 +599,7 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
     },
     view: () => last,
     expert: (id, n = 6) => ((full || stale) && namesDone && raw ? expertProfile(raw, id, n) : null),
+    buyer: (id, n = 6) => ((full || stale) && namesDone && raw ? buyerProfile(raw, id, n) : null),
     ready: () => (full && namesDone ? (partial ? "partial" : "all") : stale && namesDone ? "stale" : recent ? "recent" : "none"),
     computes: () => computes,
     stop: () => {

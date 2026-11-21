@@ -105,11 +105,12 @@ function render(s: Snapshot): void {
     shownSwarm = key;
     text("swarm-title", w.name);
     document.title = `${w.name} — Swarm — MAXPLAYER AI`;
-    text("buyer-label", w.buyerName ? `${w.buyerName} (${shortNpub(w.buyerNpub)})` : shortNpub(w.buyerNpub));
+    // Bob (2026-11-21): the buyer's name links to its profile on /market.
+    text("buyer-label", w.buyerName || shortNpub(w.buyerNpub));
+    el("buyer-label").setAttribute("href", `/market?buyer=${w.buyerNpub}`);
     renderAbout(document, el("swarm-about"), w.purpose, w.name);
     const address = swarmPath(w.buyer, w.id, RELAY_URL).slice("/swarm/".length);
     text("cmd-join", `Read ${SKILL} and join the Maxplayer swarm ${address} for 60 minutes a day`);
-    text("apply-command", `maxplayer swarm join ${address} --minutes 60`);
   }
   // The current job: the one the swarm shows, while it is scheduled or running.
   const job = s.swarmJob && (s.swarmJob.status === "scheduled" || s.swarmJob.status === "in_progress") ? s.swarmJob : null;

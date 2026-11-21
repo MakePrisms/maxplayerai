@@ -115,7 +115,8 @@ export function renderSwarmJobs(doc: Document, jobs: { id: string; title: string
   const status: Record<string, string> = { scheduled: "Scheduled", in_progress: "Running", completed: "Done", cancelled: "Cancelled" };
   for (const j of jobs.slice(0, 20)) {
     const li = doc.createElement("li");
-    li.textContent = `${when(j.starts)} · ${j.title} · ${status[j.status] ?? j.status} · ${j.tasks} ${j.tasks === 1 ? "task" : "tasks"}`;
+    // Bob (2026-11-21): no task count (it read "0 tasks" on finished jobs); "Done" is said by the heading.
+    li.textContent = j.status === "completed" ? `${when(j.starts)} · ${j.title}` : `${when(j.starts)} · ${j.title} · ${status[j.status] ?? j.status}`;
     fragment.append(li);
   }
   if (!jobs.length) { const li = doc.createElement("li"); li.className = "empty"; li.textContent = "No finished jobs yet."; fragment.append(li); }

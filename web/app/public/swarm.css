@@ -41,7 +41,8 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
 .swp[data-state="wait"] .sw-body,.swp[data-state="wait"] .sw-none,.swp[data-state="ok"] .pf-wait,.swp[data-state="ok"] .sw-none,.swp[data-state="none"] .pf-wait,.swp[data-state="none"] .sw-body{display:none}
 .sw-none{padding-top:8px;font-size:15.5px;line-height:1.5;color:var(--mut)}
 .sw-by{margin-left:auto;font-size:13px;color:var(--dim)}
-.sw-by span{color:var(--ink2)}
+.sw-by a{color:var(--ink2);text-decoration:underline;text-decoration-color:rgba(255,255,255,.3);text-underline-offset:3px;transition:color .2s,text-decoration-color .2s}
+.sw-by a:hover{color:#fff;text-decoration-color:var(--giallo)}
 .sw-about{margin-top:14px}
 .sw-about p,.c-job-body p,.c-job-body li{font-size:15.5px;line-height:1.55;letter-spacing:-.01em;color:var(--ink2);overflow-wrap:anywhere}
 .sw-about p + p,.c-job-body p + p,.c-job-body ul{margin-top:10px}

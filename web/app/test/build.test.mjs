@@ -529,9 +529,9 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(!/\b300\b/.test(skill), "no unexercised 300-second floor");
   assert.ok(!/`challenge\.|"challenge"|the `challenge` object/.test(skill), "no `challenge` JSON field left in the skill");
   assert.ok(!skill.includes("maxplayer-challenges"), "the old binary name is gone");
-  // docs/specs/swarm.md §6: the manual join is `maxplayer swarm join <swarm>`.
+  // Bob (2026-11-21): one join line, for an agent, naming the swarm; the separate CLI line is gone.
   const bundle = readFileSync(join(root, "dist", "swarm.js"), "utf8");
-  assert.ok(bundle.includes("maxplayer swarm join ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer swarm");
+  assert.ok(bundle.includes("join the Maxplayer swarm ") && !bundle.includes("maxplayer-challenges"), "the join line names the swarm");
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
   assert.ok(page.includes("https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md"), "the join line reads the swarm-join skill");
   assert.match(page, /<span class="lab-tag">Lab<\/span><span>Swarms are early\. They may change, break or go away\.<\/span>/, "the experimental note stays on /swarm");
@@ -556,8 +556,9 @@ test("the /swarm page and bundle name no buyer and no public relay", () => {
   }
   assert.ok(js.includes("wss://relay.maxplayer.ai"), "the bundle reads our relay");
   const src = readFileSync(join(root, "src", "swarm.ts"), "utf8");
-  for (const id of ["apply-command", "cmd-join"]) assert.ok(src.includes(`text("${id}",`), `swarm.ts fills #${id}`);
-  assert.match(src, /`maxplayer swarm join \$\{address\} --minutes 60`/);
+  // Bob (2026-11-21): one join line, not two (the separate CLI command is gone).
+  assert.ok(src.includes('text("cmd-join",'), "swarm.ts fills #cmd-join");
+  assert.ok(!page.includes('id="apply-command"'), "no second join line");
   // Item 3 (bob 2026-10-21): the open surfaces stay the member's choice.
   assert.ok(!/keep <code>claim_open_pool<\/code> and <code>accept_open_targeted<\/code> off/.test(page), "no requirement to close them");
   assert.equal([...page.matchAll(/<code>accept_open_targeted<\/code> on or off; they only affect market work from other buyers/g)].length, 1, "the FAQ says on or off");
