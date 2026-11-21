@@ -8,6 +8,9 @@
    and it takes the rest of the screen). Measured in Chrome at 1280, 1440 and 1920 wide. */
 html.sw .sw-top{padding-bottom:28px}
 html.sw .lead dt::after{content:"\a0";display:block;font-size:12.5px}
+/* the closing call: market.css gives a lone .btn there a top margin; in a row with the link it pushed the button
+   below the link (Bob, 2026-11-21). The row carries the gap instead. */
+html.sw .mend-c .cta-row .btn{margin-top:0}
 
 /* the board: one list, in the rows of /market's */
 .swb{flex:1;min-height:0;display:flex;flex-direction:column;margin-top:calc(min(34px,4vh) + 48px);border-radius:22px;background:#101010;box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);overflow:hidden}
