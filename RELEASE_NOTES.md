@@ -1,3 +1,41 @@
+## v0.8.0-rc4
+
+Release candidate for 0.8.0, built from main after #1366. It carries everything in v0.8.0-rc3 plus
+**team join links**, `maxplayer team delete`, a fix for `team leave` and clearer git fetch errors.
+After publication, install with `npm install -g maxplayer@0.8.0-rc4` (or `install.sh --version
+0.8.0-rc4`). Publish as a GitHub prerelease on npm `rc`; leave stable `latest` unchanged.
+
+**Relay and registration service: already deployed.** The registration side of join links (#1360,
+migration `0002_team_invite_links`) and the flag turning it on for relay.maxplayer.ai (#1364) shipped
+as `relay-v11`, switched on 2026-11-21; the service loaded the production invite key. The sandbox
+image is rebuilt and tagged `maxplayer-sandbox:v0.8.0-rc4`. Buyer and seller stores are unchanged
+from v0.8.0-rc3. Website changes go live with the merge (Vercel).
+
+### Changes
+
+- **New: team join links** (#1360; spec `docs/specs/maxplayer-team.md` §12). Any member runs
+  `maxplayer team invite <team> --link [--expires <n>m|h|d]` (default 72 h) and gets
+  `https://www.maxplayer.ai/join/<token>`. Anyone whose key is linked to an email joins with
+  `maxplayer team join <link> --name <label>`, no approval; opening the link in a browser does not
+  use it. `maxplayer team invite revoke <team>` stops every live link of the team. MCP: `team_invite`
+  with `link: true`, and `team_join` with `link`. Links need this release: v0.8.0-rc3 has a
+  different invite key compiled in and cannot redeem them.
+- **New: `maxplayer team delete <team>`** and the MCP tool `team_delete` (#1366). The team's owner
+  ends it for every member: its live join links are revoked first (if the registration service is
+  unreachable, nothing is deleted), then the relay deletes the channel and the team leaves local
+  state. Members can no longer read or post, and the team repo answers 403. No undo.
+- **Fixed: `maxplayer team leave`** (#1365) was refused by the relay with "missing p tag": the event
+  naming your own key lost that tag. Leaving now works.
+- **Clearer git fetch errors** (#1362): an HTTP failure now names its cause (for example "proxy
+  authorization required" or "connection refused") instead of only "error sending request".
+- **Website:** the tokens page reads relay.maxplayer.ai first, and its closed-lots list follows the
+  selected time window (#1356).
+
+### Upgrade order
+
+The relay is already on `relay-v11`, so any order is safe. Older clients keep working; they just
+cannot create or redeem join links or delete a team.
+
 ## v0.8.0-rc3
 
 Release candidate for 0.8.0, built from main after #1358. It carries everything in v0.8.0-rc2 plus
