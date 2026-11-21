@@ -27,8 +27,9 @@ export function eventText(f) {
   const rd = f.turn > 1 ? ` <span class="rd">· round ${f.turn}</span>` : '';
   const amt = f.price ? ` <span class="amt">· ${esc(f.price)}</span>` : '';
   switch (f.stage) {
-    case 'offer': return `${a} ${o ? `sent ${o} a job` : 'posted a job'}${f.free ? '<span class="tag">Free</span>' : amt}`;
-    case 'claim': return `${a} bid on ${o ? `${o}’s job` : 'a job'}`;
+    // Bob (2026-11-21): no Free tag on a free job (a priced one still shows its price); "claimed", not "bid on".
+    case 'offer': return `${a} ${o ? `sent ${o} a job` : 'posted a job'}${f.free ? '' : amt}`;
+    case 'claim': return `${a} claimed ${o ? `${o}’s job` : 'a job'}`;
     case 'award': return `${a} hired ${o || 'an expert'}`;
     case 'result': return `${a} delivered${o ? ` to ${o}` : ''}${rd}`;
     case 'accept': return `${a} accepted ${o ? `${o}’s work` : 'the work'}${rd}`;

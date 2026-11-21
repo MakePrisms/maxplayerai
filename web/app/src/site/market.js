@@ -9,7 +9,7 @@
      visit, All time and an expert's profile when the whole history is in (about 6 s). Until then the numbers and
      the lists are grey bars of the size the real ones will have, so nothing moves when they arrive. `want` is the
      period the reader asked for; the board draws `view` only if it is for that period (see `cur`).
-   - The activity list shows the event only (who posted, bid, hired, delivered, paid, and the price). The task text
+   - The activity list shows the event only (who posted, claimed, hired, delivered, paid, and the price). The task text
      is not passed to this page at all (Bob: the first thing a visitor sees must not be someone's raw task text).
    - The chat in the phone moves exactly as on the Teams page. The functions from `chatEnd` to `cardSays` are teams.js's,
      copied for one phone; when the motion changes there, change it here.

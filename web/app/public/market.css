@@ -91,7 +91,6 @@ a.who:hover{text-decoration:underline;text-decoration-color:rgba(255,255,255,.5)
 .z{color:var(--dim)}
 .ev{min-width:0;overflow:hidden;text-overflow:ellipsis}
 .ev .amt{color:#fff;font-variant-numeric:tabular-nums}
-.ev .tag{display:inline-block;vertical-align:1px;margin-left:6px;padding:1px 6px 2px;border-radius:6px;background:rgba(255,255,255,.08);font-size:12px;color:var(--ink2)}
 .ev .rd{color:var(--dim)}
 .row .age{font-size:13px;color:var(--dim);font-variant-numeric:tabular-nums}
 .row.new{animation:rowin .7s ease backwards}
