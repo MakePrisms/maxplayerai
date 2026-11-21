@@ -635,8 +635,9 @@ async fn invite_link_adds_nothing_for_an_unlinked_inviter_or_an_unreachable_serv
 }
 
 /// Local refusals come before anything is sent: no 9000 adds the invite key for a lifetime the
-/// service refuses, no link is redeemed for a name `join` refuses, and an open channel has no
-/// links to revoke. (The relay and the registration service here are unreachable.)
+/// service refuses, no link is redeemed for a name `join` refuses, and an open channel or an
+/// unknown team has no links to make or revoke. (The relay and the registration service here are
+/// unreachable.)
 #[tokio::test]
 async fn invite_links_refuse_bad_input_before_the_relay_or_the_service() {
     let dir = tempfile::tempdir().unwrap();
@@ -660,6 +661,10 @@ async fn invite_links_refuse_bad_input_before_the_relay_or_the_service() {
     }
     let e = h.revoke_links("feed").await.unwrap_err().to_string();
     assert!(e.contains("open channel"), "{e}");
+    for (team, expect) in [("nope", "no joined team named"), ("feed", "open channel")] {
+        let e = h.invite_link(team, None).await.unwrap_err().to_string();
+        assert!(e.contains(expect), "{e}");
+    }
     // An MCP deadline already past: the service is not asked at all.
     h.sync_deadline = Some(std::time::Instant::now() - Duration::from_secs(1));
     let e = h.revoke_links("crew").await.unwrap_err().to_string();

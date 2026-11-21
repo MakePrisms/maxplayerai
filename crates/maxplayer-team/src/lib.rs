@@ -772,6 +772,10 @@ impl Home {
         if expires_in_secs.is_some_and(|s| !(60..=30 * 86400).contains(&s)) {
             return Err("an invite link lasts between 1 minute and 30 days".into());
         }
+        // An unknown team or an open channel is refused before the service is asked.
+        if self.load()?.resolve(team)?.open {
+            return Err("an open channel has no invite links".into());
+        }
         // An unlinked inviter could make no link, nor revoke one to make the key leave again: it
         // is refused before the key is added (so is a call when the service cannot be reached).
         if !self.registration(|c| c.status()).await?.registered {
