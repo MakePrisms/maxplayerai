@@ -117,12 +117,14 @@ function drawProfile(): void {
   const pf = el("pf"), title = el("swarm-title");
   const x = market ? (profile.kind === "buyer" ? market.buyer(profile.key, 6) : market.expert(profile.key, 6)) : null;
   if (x) { pf.dataset.state = "ok"; (profile.kind === "buyer" ? fillBuyer : fillExpert)(x, title); return; }
-  const down = marketFailed || marketState === "failed", none = !down && marketState === "live";
+  // Not found only once the market's whole history and names are in (r2 #2); "live" alone comes before the names.
+  const r = market?.ready(), down = marketFailed || marketState === "failed", none = !down && marketState === "live" && (r === "all" || r === "partial");
   const who = profile.kind === "buyer" ? "Buyer" : "Expert";
   title.textContent = none ? `${who} not found` : who; title.classList.remove("hex");
   pf.dataset.state = none || down ? "none" : "wait";
   el("pf-note").textContent = down ? "The live market is not reachable right now."
-    : !none ? "" : profile.kind === "buyer" ? "This buyer hasn't posted a job on the market yet." : "This agent hasn't worked on the market yet.";
+    : !none ? "" : r === "partial" ? "Not found in the part of the market's history that could be read."
+    : profile.kind === "buyer" ? "This buyer hasn't posted a job on the market yet." : "This agent hasn't worked on the market yet.";
 }
 function openProfile(key: string, kind: "expert" | "buyer", from: HTMLElement | null): void {
   profile = { key, kind, from: profile?.from ?? from };
@@ -133,22 +135,28 @@ function openProfile(key: string, kind: "expert" | "buyer", from: HTMLElement | 
   drawProfile();
   sheet.focus({ preventScroll: true });
   if (!marketStarted) {
-    marketStarted = true;
+    marketStarted = true; marketFailed = false;
     startMarket({ onView: () => drawProfile(), onStatus: (s) => { marketState = s; drawProfile(); } })
-      .then((h) => { market = h; drawProfile(); }, () => { marketFailed = true; drawProfile(); });
+      .then((h) => { market = h; drawProfile(); }, (err) => {
+        console.warn("[swarm] the market reader did not start", err);
+        marketStarted = false; marketFailed = true; drawProfile();     // the next profile opened tries again
+      });
   }
 }
-function backToSwarm(): void {
+function backToSwarm(focus = true): void {
   if (!profile) return;
-  const from = profile.from;
+  const was = profile.from;
+  // The members list is redrawn every second, so the link that opened the profile may be a new element by now.
+  const from = was?.isConnected ? was : was?.dataset.pk ? sheet.querySelector<HTMLElement>(`[data-pk="${CSS.escape(was.dataset.pk)}"]`) : null;
   profile = null;
   sheet.dataset.mode = "swarm";
   el("sheet-back").hidden = true;
   const title = el("swarm-title");
   title.textContent = swarmName; title.classList.remove("hex");
-  if (from?.isConnected) refocus(from); else sheet.focus({ preventScroll: true });
+  if (!focus) return;
+  if (from) refocus(from); else sheet.focus({ preventScroll: true });
 }
-el("sheet-back").addEventListener("click", backToSwarm);
+el("sheet-back").addEventListener("click", () => backToSwarm());
 // A member's name, the buyer's name, and any name in a profile's recent jobs open that profile here.
 sheet.addEventListener("click", (e) => {
   const a = (e.target as HTMLElement).closest<HTMLElement>("[data-pk]");
@@ -218,7 +226,8 @@ function receive(value: unknown): void {
 }
 
 function resetPanel(): void {
-  backToSwarm();
+  backToSwarm(false);
+  jobMore.reset();
   swarmName = "Swarm";
   snapshot = null; tracker = { wasLive: false, readyAt: null }; shownSwarm = ""; demoStatus = null;
   text("swarm-title", "Swarm");
@@ -281,7 +290,7 @@ function openSwarm(where: Route, from: HTMLElement | null, pushed: boolean): voi
 
 function closeSwarm(fromHistory = false): void {
   if (!open) return;
-  backToSwarm();
+  backToSwarm(false);
   const was = open;
   open.stop();
   open = null;
@@ -294,6 +303,7 @@ function closeSwarm(fromHistory = false): void {
     else history.replaceState(null, "", "/swarm" + location.search);
   }
   if (was.from?.isConnected) refocus(was.from);
+  else if (sheet.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();   // opened from a link: nothing to go back to
 }
 
 // A row, or its name, opens the swarm in the panel. The name is a real link: a new tab goes to the link itself.
@@ -320,6 +330,7 @@ setInterval(tick, 1000);
 onSpotChange(() => { if (snapshot) render(snapshot); });   // the budget shows in dollars at the live BTC-USD rate
 startSpot();
 board();
+addEventListener("pagehide", (event) => { if (!event.persisted) { market?.stop(); open?.stop(); } });
 
 // Shown once the stylesheets and fonts are in, as on /market (market.css hides the page until body.ready).
 let shown = false;

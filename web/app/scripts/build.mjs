@@ -66,7 +66,7 @@ if (watch) {
   await build(options);
 
   // One stamp derived from every shipped byte the HTML/CSS reference.
-  const fontNames = readdirSync(join(root, "public/fonts"));
+  const fontNames = readdirSync(join(root, "public/fonts")).sort();
   // The pictures of the new pages (agent marks, the sheet of soft marks), referenced from site.css and preloaded
   // by index.html.
   const assetNames = readdirSync(join(root, "public/assets"), { recursive: true })
@@ -75,7 +75,7 @@ if (watch) {
   for (const rel of [...PAGES, "styles.css", "fonts.css", "swarm.css", ...SITE_CSS, ...fontNames.map((f) => join("fonts", f)), ...assetNames.map((f) => join("assets", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
-  for (const bundle of ["terminal.js", "tokens.js", "swarm.js", "teams.js", "market.js"]) hash.update(readFileSync(join(dist, bundle)));
+  for (const bundle of ["terminal.js", "tokens.js", "swarm.js", "teams.js", "market.js", "legal.js"]) hash.update(readFileSync(join(dist, bundle)));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset

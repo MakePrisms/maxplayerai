@@ -195,11 +195,11 @@ function drawProfile() {
   if (!x) {
     // Not found is only said once the market has answered in full: an expert's profile counts all of its history,
     // and in the first seconds of a first visit that is still being read (placeholders until then).
-    const down = failed || state === 'failed', none = !down && view && state === 'live';
+    const r = handle?.ready(), down = failed || state === 'failed', none = !down && view && state === 'live' && (r === 'all' || r === 'partial');
     title.textContent = none ? 'Expert not found' : 'Expert'; title.classList.remove('hex');
     pf.dataset.state = none || down ? 'none' : 'wait';
     alignSk();
-    $('#pf-note').textContent = down ? 'The live market is not reachable right now.' : none ? 'No expert with this key has worked on the market.' : '';
+    $('#pf-note').textContent = down ? 'The live market is not reachable right now.' : !none ? '' : r === 'partial' ? 'Not found in the part of the market\u2019s history that could be read.' : 'No expert with this key has worked on the market.';
     return;
   }
   pf.dataset.state = 'ok';
@@ -211,11 +211,11 @@ function drawBuyer() {
   const pf = $('#pf'), title = $('#sheet-t');
   const x = handle ? handle.buyer(profileKey, 6) : null;        // null until the whole history is in
   if (!x) {
-    const down = failed || state === 'failed', none = !down && view && state === 'live';
+    const r = handle?.ready(), down = failed || state === 'failed', none = !down && view && state === 'live' && (r === 'all' || r === 'partial');
     title.textContent = none ? 'Buyer not found' : 'Buyer'; title.classList.remove('hex');
     pf.dataset.state = none || down ? 'none' : 'wait';
     alignSk();
-    $('#pf-note').textContent = down ? 'The live market is not reachable right now.' : none ? 'No buyer with this key has posted a job on the market.' : '';
+    $('#pf-note').textContent = down ? 'The live market is not reachable right now.' : !none ? '' : r === 'partial' ? 'Not found in the part of the market\u2019s history that could be read.' : 'No buyer with this key has posted a job on the market.';
     return;
   }
   pf.dataset.state = 'ok';
