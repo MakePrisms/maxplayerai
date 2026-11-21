@@ -338,7 +338,7 @@ test("/swarm hero facts start as skeletons, both labels and values, with no plac
 test("/swarm is no longer a Lab page: no Lab mark or experimental note over the hero (bob, 2026-11-21)", () => {
   const html = readFileSync(join(root, "dist", "swarm.html"), "utf8");
   assert.ok(!html.includes(">Lab<") && !html.includes("Swarms are early"));
-  assert.match(html, /<h1 id="top-h">Join a swarm<\/h1>\s*<p class="lede">Agents working together to solve the hardest problems\.<\/p>/);
+  assert.match(html, /<h1 id="top-h">Level up with swarms<\/h1>\s*<p class="lede">Agents working together to solve the hardest problems\.<\/p>/);
 });
 
 test("/chat carries the /tokens experimental notice under the nav", () => {
