@@ -15,6 +15,10 @@ use crate::nip98;
 pub const KIND_ADD_MEMBER: u16 = 9030;
 pub const KIND_REMOVE_MEMBER: u16 = 9031;
 pub const KIND_MEMBER_LIST: u16 = 13534;
+/// NIP-29 team member commands (buzz `side_effects.rs`) and the relay-signed member list.
+pub const KIND_PUT_USER: u16 = 9000;
+pub const KIND_REMOVE_USER: u16 = 9001;
+pub const KIND_GROUP_MEMBERS: u16 = 39002;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberAction {
@@ -57,6 +61,25 @@ pub fn build_member_command(
         .tags([Tag::protected(), Tag::public_key(*target)])
         .custom_created_at(created_at)
         .sign_with_keys(admin)
+        .expect("signing with local keys cannot fail")
+}
+
+/// `{"kind": 9000|9001, "tags": [["h", <channel>], ["p", <target>]]}` signed by `keys` (the team
+/// invite key). Self-tagging is allowed: the invite key leaving a team is a 9001 naming itself,
+/// and nostr drops a `p` tag naming the signer by default.
+pub fn build_team_command(
+    keys: &Keys,
+    kind: u16,
+    channel: &str,
+    target: &PublicKey,
+    created_at: Timestamp,
+) -> Event {
+    let h = Tag::parse(["h", channel]).expect("static tag shape");
+    EventBuilder::new(Kind::Custom(kind), "")
+        .tags([h, Tag::public_key(*target)])
+        .allow_self_tagging()
+        .custom_created_at(created_at)
+        .sign_with_keys(keys)
         .expect("signing with local keys cannot fail")
 }
 
@@ -122,8 +145,19 @@ impl RelayClient {
         body: Vec<u8>,
         now: Timestamp,
     ) -> Result<(reqwest::StatusCode, String), String> {
+        self.post_as(&self.admin, path, body, now).await
+    }
+
+    /// [`Self::post`] signed (NIP-98) by `keys` instead of the admin key.
+    async fn post_as(
+        &self,
+        keys: &Keys,
+        path: &str,
+        body: Vec<u8>,
+        now: Timestamp,
+    ) -> Result<(reqwest::StatusCode, String), String> {
         let auth = nip98::authorization(
-            &self.admin,
+            keys,
             &format!("{}{path}", self.auth_base),
             "POST",
             Some(&body),
@@ -181,6 +215,74 @@ impl RelayClient {
         ))
     }
 
+    /// Publish a team 9000/9001 signed by `keys`. `Ok(())` = accepted; `Err` = the relay's message.
+    pub async fn send_team_command(
+        &self,
+        keys: &Keys,
+        kind: u16,
+        channel: &str,
+        target: &PublicKey,
+        now: Timestamp,
+    ) -> Result<(), String> {
+        let event = build_team_command(keys, kind, channel, target, now);
+        let (status, text) = self
+            .post_as(keys, "/events", event.as_json().into_bytes(), now)
+            .await?;
+        let json: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        if status.is_success() && json["accepted"].as_bool() == Some(true) {
+            return Ok(());
+        }
+        let msg = json["message"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .or_else(|| json["error"].as_str())
+            .unwrap_or("");
+        Err(format!(
+            "relay HTTP {}: {}",
+            status.as_u16(),
+            truncate(msg, 200)
+        ))
+    }
+
+    /// The members (hex) of a team channel, from the newest kind-39002 signed by `relay_pubkey`,
+    /// read as `keys` (buzz shows a private channel's list to its members only, so a key that is
+    /// not a member gets an empty list). Read from the writer (`consistency: strong`) so an add
+    /// that was just accepted is in it.
+    pub async fn fetch_team_members(
+        &self,
+        keys: &Keys,
+        relay_pubkey: &PublicKey,
+        channel: &str,
+        now: Timestamp,
+    ) -> Result<Vec<String>, String> {
+        let filter = serde_json::json!([{
+            "kinds": [KIND_GROUP_MEMBERS],
+            "authors": [relay_pubkey.to_hex()],
+            "#d": [channel],
+            "consistency": "strong"
+        }]);
+        let (status, text) = self
+            .post_as(keys, "/query", filter.to_string().into_bytes(), now)
+            .await?;
+        if !status.is_success() {
+            return Err(format!("relay query HTTP {}", status.as_u16()));
+        }
+        let events: Vec<serde_json::Value> =
+            serde_json::from_str(&text).map_err(|_| "relay query: not a JSON array".to_string())?;
+        let newest = events
+            .iter()
+            .filter_map(|v| Event::from_json(v.to_string()).ok())
+            .filter(|e| {
+                e.kind == Kind::Custom(KIND_GROUP_MEMBERS)
+                    && e.pubkey == *relay_pubkey
+                    && e.tags.identifier() == Some(channel)
+                    && e.verify().is_ok()
+            })
+            .max_by_key(|e| e.created_at);
+        Ok(newest.map(|e| parse_group_members(&e)).unwrap_or_default())
+    }
+
     /// The relay's newest kind-13534 member list, signed by `relay_pubkey`:
     /// `(pubkey hex, role)` pairs. `Ok(None)` = the relay has published none.
     pub async fn fetch_member_list(
@@ -233,9 +335,47 @@ pub fn parse_member_list(event: &Event) -> Vec<(String, String)> {
         .collect()
 }
 
+/// `["p", <hex>, <relay url>, <role>]` tags of a 39002 (buzz `group_members_tags`).
+pub fn parse_group_members(event: &Event) -> Vec<String> {
+    event
+        .tags
+        .iter()
+        .filter_map(|t| {
+            let s = t.as_slice();
+            let pk = s.get(1)?.to_ascii_lowercase();
+            (s.first().map(String::as_str) == Some("p")
+                && pk.len() == 64
+                && pk.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(pk)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_team_leave_keeps_the_p_tag_naming_the_signer() {
+        let invite = Keys::generate();
+        let channel = "0b0e5f1c-9d4a-4c3e-8f21-6a7b8c9d0e1f";
+        let ev = build_team_command(
+            &invite,
+            KIND_REMOVE_USER,
+            channel,
+            &invite.public_key(),
+            Timestamp::from(1_800_000_000),
+        );
+        ev.verify().unwrap();
+        let tags: Vec<Vec<String>> = ev.tags.iter().map(|t| t.as_slice().to_vec()).collect();
+        assert_eq!(
+            tags,
+            vec![
+                vec!["h".to_string(), channel.to_string()],
+                vec!["p".to_string(), invite.public_key().to_hex()]
+            ]
+        );
+    }
 
     #[test]
     fn add_and_remove_commands_have_the_nip43_shape() {

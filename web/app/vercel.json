@@ -20,7 +20,8 @@
     { "source": "/terms/20261029", "destination": "/terms-20261029" },
     { "source": "/privacy/20261029", "destination": "/privacy-20261029" },
     { "source": "/fees/20261029", "destination": "/fees-20261029" },
-    { "source": "/swarm/:address", "destination": "/swarm" }
+    { "source": "/swarm/:address", "destination": "/swarm" },
+    { "source": "/join/:token", "destination": "/join.md" }
   ],
   "headers": [
     {
@@ -69,6 +70,19 @@
     {
       "source": "/swarm",
       "headers": [
+        {
+          "key": "X-Robots-Tag",
+          "value": "noindex, nofollow"
+        }
+      ]
+    },
+    {
+      "source": "/join/:token",
+      "headers": [
+        {
+          "key": "Content-Type",
+          "value": "text/plain; charset=utf-8"
+        },
         {
           "key": "X-Robots-Tag",
           "value": "noindex, nofollow"

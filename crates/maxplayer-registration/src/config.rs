@@ -34,6 +34,7 @@ pub struct Config {
     pub legal: LegalConfig,
     pub limits: Limits,
     pub sync: SyncConfig,
+    pub teams: TeamsConfig,
 }
 
 impl Default for Config {
@@ -51,6 +52,7 @@ impl Default for Config {
             legal: LegalConfig::default(),
             limits: Limits::default(),
             sync: SyncConfig::default(),
+            teams: TeamsConfig::default(),
         }
     }
 }
@@ -185,6 +187,12 @@ pub struct Limits {
     pub confirms_per_ip_per_hour: i32,
     /// NIP-98 `created_at` must be within this many seconds of now.
     pub nip98_max_skew_secs: i64,
+    /// Team invite links one key may create per hour.
+    pub invite_links_per_pubkey_per_hour: i32,
+    /// Join-link redeems (each a relay write as the shared invite key) one key may try per hour.
+    pub team_joins_per_pubkey_per_hour: i32,
+    /// Link revokes (each a relay read as the shared invite key) one key may ask per hour.
+    pub team_revokes_per_pubkey_per_hour: i32,
 }
 
 impl Default for Limits {
@@ -199,6 +207,9 @@ impl Default for Limits {
             confirms_per_pubkey_per_hour: 30,
             confirms_per_ip_per_hour: 60,
             nip98_max_skew_secs: 60,
+            invite_links_per_pubkey_per_hour: 30,
+            team_joins_per_pubkey_per_hour: 30,
+            team_revokes_per_pubkey_per_hour: 30,
         }
     }
 }
@@ -229,6 +240,34 @@ impl Default for SyncConfig {
             reconcile_removals: false,
             keep_members: Vec::new(),
             cleanup_interval_secs: 3600,
+        }
+    }
+}
+
+/// Team invite links (docs/specs/maxplayer-team.md §12).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TeamsConfig {
+    /// Private file holding the service-wide team invite key (64 hex or nsec). Its pubkey is
+    /// compiled into maxplayer (`maxplayer_team::INVITE_PUBKEY`), and it must be a relay member
+    /// (NIP-43) to sign in. Unset = invite links are off (`503 invites_not_configured`); they
+    /// also need `relay.relay_pubkey` (the signer of the member lists read).
+    pub invite_key_file: Option<PathBuf>,
+    /// A link is `<join_url>/<token>`: the site page that tells the agent what to run.
+    pub join_url: String,
+    /// Default link lifetime (72 h).
+    pub link_ttl_secs: i64,
+    /// Longest lifetime a client may ask for (`--expires`).
+    pub max_link_ttl_secs: i64,
+}
+
+impl Default for TeamsConfig {
+    fn default() -> Self {
+        Self {
+            invite_key_file: None,
+            join_url: "https://www.maxplayer.ai/join".into(),
+            link_ttl_secs: 72 * 3600,
+            max_link_ttl_secs: 30 * 86400,
         }
     }
 }
@@ -327,8 +366,19 @@ impl Config {
             || l.confirms_per_pubkey_per_hour <= 0
             || l.confirms_per_ip_per_hour <= 0
             || l.nip98_max_skew_secs <= 0
+            || l.invite_links_per_pubkey_per_hour <= 0
+            || l.team_joins_per_pubkey_per_hour <= 0
+            || l.team_revokes_per_pubkey_per_hour <= 0
         {
             bail!("every [limits] value must be positive");
+        }
+        let t = &self.teams;
+        let join = url::Url::parse(&t.join_url).context("teams.join_url is not a URL")?;
+        if !matches!(join.scheme(), "https" | "http") || join.query().is_some() {
+            bail!("teams.join_url must be an http(s) URL without a query");
+        }
+        if t.link_ttl_secs < 60 || t.max_link_ttl_secs < t.link_ttl_secs {
+            bail!("teams.link_ttl_secs must be >= 60 and <= teams.max_link_ttl_secs");
         }
         if self.max_db_connections == 0 {
             bail!("max_db_connections must be positive");
@@ -389,6 +439,17 @@ mod tests {
         assert!(Config::from_toml("[limits]\nmax_attempts = 0").is_err());
         assert!(Config::from_toml("[relay]\nrelay_pubkey = \"nope\"").is_err());
         assert!(Config::from_toml("[sync]\nkeep_members = [\"nope\"]").is_err());
+        for teams in [
+            "[limits]\nteam_joins_per_pubkey_per_hour = 0",
+            "[limits]\nteam_revokes_per_pubkey_per_hour = 0",
+            "[limits]\ninvite_links_per_pubkey_per_hour = 0",
+            "[teams]\njoin_url = \"ftp://x/join\"",
+            "[teams]\njoin_url = \"https://x/join?a=1\"",
+            "[teams]\nlink_ttl_secs = 59",
+            "[teams]\nmax_link_ttl_secs = 3600",
+        ] {
+            assert!(Config::from_toml(teams).is_err(), "{teams}");
+        }
     }
 
     #[test]

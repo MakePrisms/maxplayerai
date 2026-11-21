@@ -1,9 +1,32 @@
 //! Input validation and code helpers.
 
+use base64::Engine as _;
 use hmac::{Hmac, Mac};
 use nostr::{PublicKey, ToBech32};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+
+/// A team invite token: 32 random bytes, base64url without padding (43 characters). It names
+/// no key; only [`token_hash`] of it is stored.
+pub fn generate_token() -> String {
+    let mut b = [0u8; 32];
+    getrandom::fill(&mut b).expect("OS RNG");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+}
+
+/// SHA-256 of the token. The token has 256 random bits, so no pepper is needed.
+pub fn token_hash(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
+/// A canonical lowercase UUID, the form team channel ids take.
+pub fn is_channel_id(s: &str) -> bool {
+    s.len() == 36
+        && s.bytes().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => b == b'-',
+            _ => b.is_ascii_digit() || (b'a'..=b'f').contains(&b),
+        })
+}
 
 /// Trim + lowercase, then a deliberately plain shape check (one `@`, a dotted
 /// domain, no spaces or control characters, at most 254 bytes). Deliverability is
