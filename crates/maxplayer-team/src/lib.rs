@@ -99,7 +99,7 @@ pub const TEAM_MAXPLAYER: (&str, &str) = (
 /// The service-wide team invite key (spec §12): `invite <team> --link` adds it to the team, and
 /// the registration service, which holds its secret, adds whoever redeems a link. It is never a
 /// person: clients drop its messages and leave it out of any member list ([`admit`]).
-pub const INVITE_PUBKEY: &str = "4e6fba923eef12c189508146981d4c386fcfdbb9e9824d36bbef56a39aa6e008";
+pub const INVITE_PUBKEY: &str = "632471e931d6d82aa4c0db89f7d97817ff020fe46d48cd30c93495b5d67b870c";
 
 /// A test deployment whose registration service holds another invite key names its pubkey here.
 /// Refused against relay.maxplayer.ai; a malformed value is an error, never ignored.
