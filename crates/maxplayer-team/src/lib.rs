@@ -664,7 +664,9 @@ impl Home {
             return Err("ran out of time; not sent".into());
         }
         let tags = tags.into_iter().map(Tag::parse).collect::<std::result::Result<Vec<_>, _>>()?;
-        let event = EventBuilder::new(Kind::Custom(kind), content).tags(tags).sign_with_keys(&self.keys)?;
+        // nostr drops a `p` tag naming the signer unless told otherwise; `leave` is a 9001 naming
+        // this key, and without its `p` tag the relay refuses it ("missing p tag").
+        let event = EventBuilder::new(Kind::Custom(kind), content).tags(tags).allow_self_tagging().sign_with_keys(&self.keys)?;
         let out = client.send_event(&event).await?;
         if out.success.is_empty() {
             let why = out.failed.values().next().cloned().unwrap_or_else(|| "refused".into());
