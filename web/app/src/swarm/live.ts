@@ -172,7 +172,7 @@ export function observe(t: Tracker,r: Relay,nowMs: number,run?: Run): Observed {
 }
 // The section eyebrow says "Live" only while the section is live; it keeps its space otherwise.
 export function renderLiveState(doc: Document,state: LiveState): void {
-  doc.getElementById('agents-eyebrow')!.classList.toggle('is-off',state!=='live');
+  doc.getElementById('agents-eyebrow')?.classList.toggle('is-off',state!=='live');   // /swarm no longer has it (Bob, 2026-11-21)
 }
 export function connectionLine(r: Relay,status: string,wasLive=false,run?: Run): string {
   if(liveState(r,wasLive,run)!=='live')return UPDATING;
@@ -199,6 +199,13 @@ export function listedSellers(s: Snapshot,roster=false): Seller[] {
 // disconnected): no rows and no counts, so nothing reads as current; only "Updating…" shows.
 // 'roster': swarm data only (see ROSTER_ONLY): rows with placeholder job states. 'live' (or false): everything.
 export type SellersMode='loading'|'roster'|'live';
+// A member's name: a link to its market profile (Bob, 2026-11-21). A new tab goes to /market; a click opens the profile
+// in the swarm's own panel (swarm.ts). No npub line under it: the profile has the npub to copy.
+function profileLink(doc: Document,pubkey: string|undefined,npub: string,label: string): HTMLElement {
+  const link=doc.createElement(npub?'a':'strong');link.className='c-who';link.textContent=label;
+  if(npub){link.setAttribute?.('href',`/market?expert=${npub}`);if(pubkey)link.setAttribute?.('data-pk',pubkey);}
+  return link;
+}
 const skel=(doc: Document,cls: string)=>{const span=doc.createElement('span');span.className=`skel ${cls}`;return span;};
 // Placeholder rows are rebuilt only when what they show changes, so the 1s tick doesn't restart their sheen.
 const rosterShown=new WeakMap<object,string>();
@@ -218,14 +225,13 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
     // (no leaver is listed yet, see listedSellers).
     const row=doc.createElement('li');const state=roster?null:sellerState(s,a,now);
     if(state==='Done'||state==='Left')row.className='off';
-    const name=doc.createElement('strong');name.textContent=a.name||shortNpub(a.npub);
+    const name=profileLink(doc,a.pubkey,a.npub,a.name||shortNpub(a.npub));
     const mins=doc.createElement('span');mins.className='c-mins';
     if(roster){const of=doc.createElement('span');of.textContent=` / ${a.minutesOffered} min`;mins.append(skel(doc,'c-skel-used'),of);}
     else mins.textContent=sellerLine(s,a,now);
-    const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
     const st=doc.createElement('span');st.className='c-state';
     if(state===null)st.append(skel(doc,'c-skel-state'));else st.textContent=state;
-    row.append(name,mins,id,st);
+    row.append(name,mins,st);
     const reported=roster?null:reportedLine(s,a);
     if(reported!==null){const r=doc.createElement('span');r.className='c-reported';r.textContent=reported;row.append(r);}
     fragment.append(row);
@@ -234,11 +240,10 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
   const waiting=s.applicants??[],partial=!!s.relay?.applicantsIncomplete;
   for(const a of waiting) {
     const row=doc.createElement('li');row.className='off';
-    const name=doc.createElement('strong');name.textContent=shortNpub(a.npub);
+    const name=profileLink(doc,a.pubkey,a.npub,shortNpub(a.npub));
     const mins=doc.createElement('span');mins.className='c-mins';mins.textContent=`${a.minutesOffered} min offered`;
-    const id=doc.createElement('span');id.className='c-id';id.textContent=shortNpub(a.npub);
     const st=doc.createElement('span');st.className='c-state';st.textContent='Waiting for approval';
-    row.append(name,mins,id,st);fragment.append(row);
+    row.append(name,mins,st);fragment.append(row);
   }
   list.replaceChildren(fragment);
   // A private swarm's running tasks aren't public: no "working now" count there.

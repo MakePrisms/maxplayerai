@@ -70,7 +70,7 @@ function page() {
 const clock = (ms: number, now = NOW) => ({ nowMs: ms, now, when: (x: number) => `t=${x}`, status: "Live", budget: () => "$0.00" });
 const rows = (ids: Record<string, El>) => ids["swarm-sellers"]!.children[0]?.children ?? [];
 // name -> state cell ("" while a placeholder)
-const table = (ids: Record<string, El>) => Object.fromEntries(rows(ids).map((r) => [r.children[0]!.textContent, r.children[3]!.textContent]));
+const table = (ids: Record<string, El>) => Object.fromEntries(rows(ids).map((r) => [r.children[0]!.textContent, r.children[2]!.textContent]));
 const ch = () => [{ role: "swarm", url: "wss://r", connected: true, historyComplete: true, error: null }];
 const relay = (o = {}) => ({ connected: true, authenticated: true, historyComplete: false, windowComplete: false, windowSince: 0, error: null, relays: [{ role: "trade", url: "wss://r", connected: true, historyComplete: false, error: null }, ...ch()], ...o });
 const roster = () => relay();

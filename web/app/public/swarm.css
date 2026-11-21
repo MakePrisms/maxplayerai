@@ -36,7 +36,8 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
 .fa code{font-family:var(--mono);font-size:.88em;color:#fff;overflow-wrap:anywhere}
 .fa a{color:#fff;border-bottom:1px solid rgba(255,255,255,.35)}
 
-/* one swarm, in /market's panel */
+/* one swarm, in /market's panel; a member's or the buyer's profile replaces it (data-mode="profile") */
+.sheet[data-mode="swarm"] .pf,.sheet[data-mode="profile"] .swp{display:none}
 .swp{flex:1;min-height:0;padding:6px 20px 28px}
 .swp[data-state="wait"] .sw-body,.swp[data-state="wait"] .sw-none,.swp[data-state="ok"] .pf-wait,.swp[data-state="ok"] .sw-none,.swp[data-state="none"] .pf-wait,.swp[data-state="none"] .sw-body{display:none}
 .sw-none{padding-top:8px;font-size:15.5px;line-height:1.5;color:var(--mut)}
@@ -83,17 +84,21 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
 .sw-sum{margin-top:4px;font-size:14px;color:var(--ink2)}
 .sw-sum:empty{display:none}
 .c-sellers{list-style:none;margin:8px 0 0;padding:0}
-.c-sellers li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 16px;align-items:baseline;padding:11px 0;border-top:1px solid rgba(255,255,255,.07);font-size:15px}
+.c-sellers li{display:grid;grid-template-columns:minmax(0,1fr) auto auto;gap:2px 16px;align-items:baseline;padding:11px 0;border-top:1px solid rgba(255,255,255,.07);font-size:15px}
 .c-sellers li:last-child{border-bottom:1px solid rgba(255,255,255,.07)}
-.c-sellers strong{font-weight:500;color:#fff;overflow-wrap:anywhere}
+.c-sellers .c-who{font-weight:500;color:#fff;overflow-wrap:anywhere;justify-self:start}
+.c-sellers a.c-who:hover{text-decoration:underline;text-decoration-color:rgba(255,255,255,.5);text-underline-offset:3px}
+.c-sellers .c-state{order:1}
+.c-sellers .c-mins{order:2}
+.c-sellers .c-reported{order:3}
 .c-sellers .c-mins{font-size:14px;color:var(--ink2);font-variant-numeric:tabular-nums;white-space:nowrap;text-align:right}
-.c-sellers .c-id{font-family:var(--mono);font-size:12px;color:var(--dim);overflow-wrap:anywhere}
 .c-sellers .c-state{font-size:13px;color:var(--mut);text-align:right}
-.c-sellers li.off strong,.c-sellers li.off .c-mins{color:var(--mut)}
+.c-sellers li.off .c-who,.c-sellers li.off .c-mins{color:var(--mut)}
 .c-sellers .c-reported{grid-column:1 / -1;font-size:12.5px;color:var(--dim)}
 .c-sellers .c-skel-used{width:2ch}
 .c-sellers .c-skel-state{width:84px}
 .c-note{margin-top:10px;font-size:12.5px;color:var(--dim)}
+.c-note:empty{display:none}
 
 /* past jobs (index.ts renderSwarmJobs) */
 .c-jobs{list-style:none;margin:6px 0 0;padding:0}

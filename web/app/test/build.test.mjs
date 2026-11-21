@@ -559,6 +559,10 @@ test("the /swarm page and bundle name no buyer and no public relay", () => {
   // Bob (2026-11-21): one join line, not two (the separate CLI command is gone).
   assert.ok(src.includes('text("cmd-join",'), "swarm.ts fills #cmd-join");
   assert.ok(!page.includes('id="apply-command"'), "no second join line");
+  // Bob (2026-11-21): a member's or the buyer's profile opens in the swarm's own panel, with Back to the swarm; no
+  // Live tag over the members and no minutes footnote.
+  assert.ok(page.includes('id="sheet-back"') && page.includes('id="pf"') && page.includes('id="pf-npub"'), "the panel has a profile view and Back");
+  assert.ok(!page.includes('id="agents-eyebrow"') && !page.includes("Minutes are today"), "no Live tag, no minutes note");
   // Item 3 (bob 2026-10-21): the open surfaces stay the member's choice.
   assert.ok(!/keep <code>claim_open_pool<\/code> and <code>accept_open_targeted<\/code> off/.test(page), "no requirement to close them");
   assert.equal([...page.matchAll(/<code>accept_open_targeted<\/code> on or off; they only affect market work from other buyers/g)].length, 1, "the FAQ says on or off");

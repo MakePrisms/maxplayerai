@@ -11,13 +11,13 @@ test('completed minutes do not advance; simultaneous jobs count independently',(
 test('snapshot parser accepts no swarm job and rejects malformed data',()=>{assert.equal(parseSnapshot(s),s);assert.equal(parseSnapshot({...s,swarmJob:null,budget:null}).swarmJob,null);for(const value of [null,{}, {...s,asOf:NaN},{...s,sellers:[{...seller,minutesUsed:'32'}]},{...s,swarmJob:{...s.swarmJob,buyer:'wrong'}}])assert.throws(()=>parseSnapshot(value));});
 // Minimal DOM double: remote text must only reach textContent, never innerHTML.
 class Element {textContent='';className='';children:Element[]=[];append(...children:Element[]){this.children.push(...children);}replaceChildren(...children:Element[]){this.children=children;}}
-test('seller rendering preserves literal untrusted names and accepted summary',()=>{const list=new Element(),summary=new Element();const doc={getElementById:(id:string)=>id==='swarm-sellers'?list:summary,createElement:()=>new Element(),createDocumentFragment:()=>new Element()};renderSellers(doc as unknown as Document,s,2920);assert.equal(summary.textContent,'1 agent · 1 working now');assert.equal(list.children[0]!.children[0]!.children[0]!.textContent,'<script>untrusted</script>');assert.equal(list.children[0]!.children[0]!.children[1]!.textContent,'32 / 60 min');assert.equal(list.children[0]!.children[0]!.children[3]!.textContent,'Working now');});
+test('seller rendering preserves literal untrusted names and accepted summary',()=>{const list=new Element(),summary=new Element();const doc={getElementById:(id:string)=>id==='swarm-sellers'?list:summary,createElement:()=>new Element(),createDocumentFragment:()=>new Element()};renderSellers(doc as unknown as Document,s,2920);assert.equal(summary.textContent,'1 agent · 1 working now');assert.equal(list.children[0]!.children[0]!.children[0]!.textContent,'<script>untrusted</script>');assert.equal(list.children[0]!.children[0]!.children[1]!.textContent,'32 / 60 min');assert.equal(list.children[0]!.children[0]!.children[2]!.textContent,'Working now');});
 test('denied members are not listed publicly; finished and left sellers are marked',()=>{const list=new Element(),summary=new Element();const doc={getElementById:(id:string)=>id==='swarm-sellers'?list:summary,createElement:()=>new Element(),createDocumentFragment:()=>new Element()};
   const denied={...seller,pubkey:'d',name:'denied',decision:'denied',eligible:false,state:'denied'};const done={...seller,pubkey:'e',name:'done',minutesUsed:60,state:'accepted'};const gone={...seller,pubkey:'f',name:'gone',state:'left',eligible:false};
   // 'gone' worked in this run, so it is listed as Left (a leaver without a job here is not: swarm-hide-left.test.ts).
   renderSellers(doc as unknown as Document,{...s,sellers:[seller,denied,done,gone],jobs:[...s.jobs,{id:'gone-job',seller:'f',start:1000,deadline:1600,end:1600,running:false,usedMinutes:10}]},2920);
   const rows=list.children[0]!.children;assert.deepEqual(rows.map(r=>r.children[0]!.textContent),['<script>untrusted</script>','done','gone']);
-  assert.deepEqual(rows.map(r=>r.children[3]!.textContent),['Working now','Done','Left']);assert.equal(rows[1]!.className,'off');assert.equal(summary.textContent,'3 agents · 1 working now');});
+  assert.deepEqual(rows.map(r=>r.children[2]!.textContent),['Working now','Done','Left']);assert.equal(rows[1]!.className,'off');assert.equal(summary.textContent,'3 agents · 1 working now');});
 test('a seller whose job finished but has minutes left is Ready, not Done',()=>{const a={...seller,state:'done',minutesUsed:5};assert.equal(sellerState({...s,jobs:[]},a,2920),'Ready');assert.equal(sellerState({...s,jobs:[]},{...a,minutesUsed:60},2920),'Done');});
 
 test('delivered running job is awaiting acceptance and conservative charge never ticks backwards',()=>{
@@ -31,7 +31,7 @@ test('awaiting acceptance is excluded from working-now summary',()=>{
   const list=new Element(),summary=new Element();
   const doc={getElementById:(id:string)=>id==='swarm-sellers'?list:summary,createElement:()=>new Element(),createDocumentFragment:()=>new Element()};
   renderSellers(doc as unknown as Document,{...s,sellers:[{...seller,state:'awaiting acceptance'}]},2920);
-  assert.equal(list.children[0]!.children[0]!.children[3]!.textContent,'Awaiting acceptance');
+  assert.equal(list.children[0]!.children[0]!.children[2]!.textContent,'Awaiting acceptance');
   assert.equal(summary.textContent,'1 agent · 0 working now');
 });
 

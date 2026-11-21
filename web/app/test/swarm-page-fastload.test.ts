@@ -31,7 +31,7 @@ const clock = (ms: number) => ({ nowMs: ms, now: 1500, when: (x: number) => `t=$
 const all = (e: El): string => e.textContent + e.children.map(all).join("");
 // The double's replaceChildren(fragment) keeps the fragment as the one child: rows are inside it.
 const rows = (ids: Record<string, El>) => ids["swarm-sellers"]!.children[0]?.children ?? [];
-const stateCell = (row: El) => row.children[3]!;
+const stateCell = (row: El) => row.children[2]!;
 const placeholder = (row: El) => stateCell(row).textContent === "" && stateCell(row).children[0]?.className === "skel c-skel-state";
 const ch = (o = {}) => [{ role: "swarm", url: "wss://r", connected: true, historyComplete: true, error: null, ...o }];
 const tradeRelay = (o = {}) => ({ role: "trade", url: "wss://r", connected: true, historyComplete: false, error: null, ...o });

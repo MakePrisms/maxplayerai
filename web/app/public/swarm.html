@@ -165,7 +165,7 @@
      and src/swarm/hero.ts paint: the facts, the members and the status line. -->
 <div class="sheet-bg" id="sheet-bg"></div>
 <aside class="sheet" id="sheet" data-mode="swarm" role="dialog" aria-modal="true" tabindex="-1" aria-hidden="true" aria-labelledby="swarm-title">
-  <div class="sheet-h"><h2 id="swarm-title">Swarm</h2><button type="button" class="sheet-x" id="sheet-x">Close</button></div>
+  <div class="sheet-h"><button type="button" class="sheet-back" id="sheet-back" hidden>Back</button><h2 id="swarm-title">Swarm</h2><button type="button" class="sheet-x" id="sheet-x">Close</button></div>
   <div class="swp scrollable" id="swp" data-state="wait">
     <p class="sw-none" id="sw-none"></p>
     <div class="pf-wait" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -195,17 +195,28 @@
       </section>
 
       <section class="sw-sec" id="agents" aria-labelledby="sellers-h">
-        <h3 class="pf-h sw-h"><span id="sellers-h">Members</span><span class="eyebrow is-off" id="agents-eyebrow">Live</span></h3>
+        <h3 class="pf-h" id="sellers-h">Members</h3>
         <p class="sw-sum" id="seller-summary"></p>
         <ul class="c-sellers" id="swarm-sellers"></ul>
         <p class="c-note" id="connection-status" role="status">Updating…</p>
-        <p class="c-note">Minutes are today&rsquo;s (UTC) in this swarm, across all its jobs.</p>
       </section>
 
       <section class="sw-sec" aria-labelledby="past-h">
         <h3 class="pf-h" id="past-h">Past jobs</h3>
         <ul class="c-jobs" id="swarm-jobs"></ul>
       </section>
+    </div>
+  </div>
+  <!-- a member's or the buyer's market profile, in the same panel (src/site/profile.js); Back returns to the swarm -->
+  <div class="pf scrollable" id="pf" data-state="wait">
+    <p class="pf-note" id="pf-note"></p>
+    <div class="pf-wait" aria-hidden="true"><i></i><i></i><i></i></div>
+    <div class="pf-body">
+      <p class="pf-st"><i class="lamp" id="pf-lamp"></i><span id="pf-st"></span><button type="button" class="pf-npub" id="pf-npub" aria-label="Copy npub"><code id="pf-short"></code><svg aria-hidden="true"><use href="#i-copy"/></svg></button></p>
+      <p class="pf-about" id="pf-about"></p>
+      <dl class="pf-kv" id="pf-kv"></dl>
+      <h3 class="pf-h">Recent jobs</h3>
+      <ol class="rows" id="pf-rows"></ol>
     </div>
   </div>
 </aside>

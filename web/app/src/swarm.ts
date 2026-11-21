@@ -4,7 +4,7 @@
 // jobs. /swarm/<naddr> is the same page with that swarm's panel open, so a swarm still has an address to share.
 // The data is read from our relay by the same reader and model as before (src/swarm/shared); no buyer key or relay
 // list is built into the page. Remote text only ever reaches textContent.
-import { parseSnapshot, relayStatusWord, renderLiveState, UPDATING, type Snapshot, type Tracker } from "./swarm/live.js";
+import { parseSnapshot, relayStatusWord, renderLiveState, type Snapshot, type Tracker } from "./swarm/live.js";
 import { paint } from "./swarm/page.js";
 import { wireMore } from "./swarm/more.js";
 import { coalesce } from "./swarm/coalesce.js";
@@ -19,6 +19,8 @@ import { SwarmReader } from "./swarm/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
 import { wireMenu } from "./site/menu.js";
 import { stylesLoaded } from "./site/styled.js";
+import { startMarket, type MarketHandle } from "./site/market-data.js";
+import { fillBuyer, fillExpert, wireNpubChip } from "./site/profile.js";
 
 const el = (id: string) => document.getElementById(id)!;
 const text = (id: string, value: string) => { const e = el(id); if (e.textContent !== value) e.textContent = value; };
@@ -90,7 +92,59 @@ const jobMore = wireMore(el("job-body"), el("job-more") as HTMLButtonElement, ()
 interface Open { key: string; reader: SwarmReader | null; stop: () => void; from: HTMLElement | null; pushed: boolean }
 let open: Open | null = null;
 let snapshot: Snapshot | null = null, receivedAt = 0, tracker: Tracker = { wasLive: false, readyAt: null };
-let demoStatus: string | null = null, shownSwarm = "";
+let demoStatus: string | null = null, shownSwarm = "", swarmName = "Swarm";
+
+/* ---------- a member's or the buyer's profile, in the same panel (Bob, 2026-11-21) ----------
+   The market's reader (the one /market uses) starts the first time a profile is opened: a profile counts all of a
+   key's market history, so it shows placeholders until that is read (quick when /market was visited before, since
+   both pages keep it in the same browser store). Back returns to the swarm. */
+let profile: { key: string; kind: "expert" | "buyer"; from: HTMLElement | null } | null = null;
+let market: MarketHandle | null = null, marketState = "connecting", marketFailed = false, marketStarted = false;
+function drawProfile(): void {
+  if (!profile) return;
+  const pf = el("pf"), title = el("swarm-title");
+  const x = market ? (profile.kind === "buyer" ? market.buyer(profile.key, 6) : market.expert(profile.key, 6)) : null;
+  if (x) { pf.dataset.state = "ok"; (profile.kind === "buyer" ? fillBuyer : fillExpert)(x, title); return; }
+  const down = marketFailed || marketState === "failed", none = !down && marketState === "live";
+  const who = profile.kind === "buyer" ? "Buyer" : "Expert";
+  title.textContent = none ? `${who} not found` : who; title.classList.remove("hex");
+  pf.dataset.state = none || down ? "none" : "wait";
+  el("pf-note").textContent = down ? "The live market is not reachable right now."
+    : !none ? "" : profile.kind === "buyer" ? "This buyer hasn't posted a job on the market yet." : "This agent hasn't worked on the market yet.";
+}
+function openProfile(key: string, kind: "expert" | "buyer", from: HTMLElement | null): void {
+  profile = { key, kind, from: profile?.from ?? from };
+  sheet.dataset.mode = "profile";
+  el("sheet-back").hidden = false;
+  el("pf").dataset.state = "wait";
+  el("pf").scrollTop = 0;
+  drawProfile();
+  sheet.focus({ preventScroll: true });
+  if (!marketStarted) {
+    marketStarted = true;
+    startMarket({ onView: () => drawProfile(), onStatus: (s) => { marketState = s; drawProfile(); } })
+      .then((h) => { market = h; drawProfile(); }, () => { marketFailed = true; drawProfile(); });
+  }
+}
+function backToSwarm(): void {
+  if (!profile) return;
+  const from = profile.from;
+  profile = null;
+  sheet.dataset.mode = "swarm";
+  el("sheet-back").hidden = true;
+  const title = el("swarm-title");
+  title.textContent = swarmName; title.classList.remove("hex");
+  if (from?.isConnected) from.focus({ preventScroll: true }); else sheet.focus({ preventScroll: true });
+}
+el("sheet-back").addEventListener("click", backToSwarm);
+// A member's name, the buyer's name, and any name in a profile's recent jobs open that profile here.
+sheet.addEventListener("click", (e) => {
+  const a = (e.target as HTMLElement).closest<HTMLElement>("[data-pk]");
+  if (!a || e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;   // a new tab goes to /market
+  e.preventDefault();
+  openProfile(a.dataset.pk!, a.dataset.kind === "buyer" ? "buyer" : "expert", a);
+});
+wireNpubChip(writeClipboard);
 
 function state(s: "wait" | "ok" | "none", note = ""): void {
   el("swp").dataset.state = s;
@@ -104,11 +158,14 @@ function render(s: Snapshot): void {
   const key = JSON.stringify([w.buyer, w.id, w.name, w.purpose, w.buyerName]); // the name arrives after the swarm
   if (key !== shownSwarm) {
     shownSwarm = key;
-    text("swarm-title", w.name);
+    swarmName = w.name;
+    if (!profile) text("swarm-title", w.name);
     document.title = `${w.name} — Swarm — MAXPLAYER AI`;
     // Bob (2026-11-21): the buyer's name links to its profile on /market.
     text("buyer-label", w.buyerName || shortNpub(w.buyerNpub));
     el("buyer-label").setAttribute("href", `/market?buyer=${w.buyerNpub}`);
+    el("buyer-label").dataset.pk = w.buyer;
+    el("buyer-label").dataset.kind = "buyer";
     renderAbout(document, el("swarm-about"), w.purpose, w.name);
     const address = swarmPath(w.buyer, w.id, RELAY_URL).slice("/swarm/".length);
     text("cmd-join", `Read ${SKILL} and join the Maxplayer swarm ${address} for 120 minutes a day`);
@@ -133,7 +190,7 @@ function tick(): void {
   const status = demoStatus ?? relayStatusWord(relay);
   const now = snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000);
   const budget = (sats: number) => budgetValue(sats, spotUsd() === null ? null : usd(sats), performance.now());
-  tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status, budget });
+  tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status, budget, quiet: true });
   // The status line at the top of the panel.
   const fresh = tracker.readyAt === null ? null : Math.max(0, Date.now() - tracker.readyAt) / 1000;
   const live = !!snapshot.swarmJob && isRunning(snapshot.swarmJob, now, demoStatus ? 0 : fresh);
@@ -149,13 +206,15 @@ function receive(value: unknown): void {
 }
 
 function resetPanel(): void {
+  backToSwarm();
+  swarmName = "Swarm";
   snapshot = null; tracker = { wasLive: false, readyAt: null }; shownSwarm = ""; demoStatus = null;
   text("swarm-title", "Swarm");
   el("swarm-about").replaceChildren();
   el("swarm-jobs").replaceChildren();
   jobSection.hidden = true;
   renderLiveState(document, "updating");
-  text("connection-status", UPDATING);
+  text("connection-status", "");
   state("wait");
 }
 
@@ -199,7 +258,7 @@ function openSwarm(where: Route, from: HTMLElement | null, pushed: boolean): voi
     } catch {
       tracker = { ...tracker, readyAt: null };
       renderLiveState(document, "updating");
-      text("connection-status", snapshot ? UPDATING : "Live view unavailable · check back soon");
+      text("connection-status", snapshot ? "" : "Live view unavailable · check back soon");
     }
   }, RENDER_MS);
   const reader: SwarmReader = new SwarmReader({ url: RELAY_URL, store, swarm: { buyer, swarm }, onChange: changed });
@@ -210,6 +269,7 @@ function openSwarm(where: Route, from: HTMLElement | null, pushed: boolean): voi
 
 function closeSwarm(fromHistory = false): void {
   if (!open) return;
+  backToSwarm();
   const was = open;
   open.stop();
   open = null;
