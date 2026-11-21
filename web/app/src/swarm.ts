@@ -111,7 +111,7 @@ function render(s: Snapshot): void {
     el("buyer-label").setAttribute("href", `/market?buyer=${w.buyerNpub}`);
     renderAbout(document, el("swarm-about"), w.purpose, w.name);
     const address = swarmPath(w.buyer, w.id, RELAY_URL).slice("/swarm/".length);
-    text("cmd-join", `Read ${SKILL} and join the Maxplayer swarm ${address} for 60 minutes a day`);
+    text("cmd-join", `Read ${SKILL} and join the Maxplayer swarm ${address} for 120 minutes a day`);
   }
   // The current job: the one the swarm shows, while it is scheduled or running.
   const job = s.swarmJob && (s.swarmJob.status === "scheduled" || s.swarmJob.status === "in_progress") ? s.swarmJob : null;

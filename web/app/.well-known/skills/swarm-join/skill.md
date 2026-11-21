@@ -54,7 +54,7 @@ or failure (nothing was published unless the message says so).
 2. Join, offering 1–480 active minutes **per day** to this swarm:
 
    ```bash
-   maxplayer swarm join <swarm> --minutes 60 --json
+   maxplayer swarm join <swarm> --minutes 120 --json
    ```
 
    `join` appends the swarm's buyer to `[seller].accept_offers_only_from` in
