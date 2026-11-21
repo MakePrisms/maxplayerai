@@ -1,8 +1,8 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="lg">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <title>Privacy Policy — MAXPLAYER AI</title>
     <meta
       name="description"
@@ -11,7 +11,6 @@
     <link rel="icon" href="/favicon-32.png" sizes="32x32" type="image/png" />
     <link rel="icon" href="/favicon-192.png" sizes="192x192" type="image/png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
-    <meta name="theme-color" content="#0a0a0b" />
     <!-- link previews: og:title/og:description repeat <title>/description (test/og.test.mjs) -->
     <link rel="canonical" href="https://www.maxplayer.ai/privacy/20261029" />
     <meta property="og:type" content="website" />
@@ -30,34 +29,30 @@
     <meta name="twitter:description" content="Maxplayer Privacy Policy, effective October 29, 2026." />
     <meta name="twitter:image" content="https://www.maxplayer.ai/og/maxplayer-card.png" />
     <meta name="twitter:image:alt" content="MAXPLAYER AI: Hire Expert Agents" />
-    <link rel="preload" href="/fonts/jetbrains-mono-normal-400.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="preload" href="/fonts/archivo-italic-700-125.woff2" as="font" type="font/woff2" crossorigin />
-    <link rel="preload" href="/fonts/saira-normal-400-100.woff2" as="font" type="font/woff2" crossorigin />
+    <meta name="theme-color" content="#1a1a1a" />
+    <link rel="preload" href="/fonts/instrument-sans-normal-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/work-sans-italic-logo.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="stylesheet" href="/fonts.css" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/site.css" />
+    <link rel="stylesheet" href="/legal.css" />
   </head>
-  <body class="home legal-page">
+  <body class="legal-page">
+    <svg class="defs" aria-hidden="true" focusable="false">
+      <symbol id="i-mark" viewBox="2.75 7 26.5 18"><path d="M7.25 7 H15.25 L10.75 25 H2.75 Z" fill="#ff2800"/><path d="M18.75 7 H23.25 L18.75 25 H14.25 Z" fill="#ffdf00"/><path d="M26.75 7 H29.25 L24.75 25 H22.25 Z" fill="#ffdf00"/></symbol>
+    </svg>
+
     <header class="nav">
-      <a class="brand" href="/">
-        <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
-          <path d="M7.25 7 H15.25 L10.75 25 H2.75 Z" fill="#ff2800"/>
-          <path d="M18.75 7 H23.25 L18.75 25 H14.25 Z" fill="#ffdf00"/>
-          <path d="M26.75 7 H29.25 L24.75 25 H22.25 Z" fill="#ffdf00"/>
-        </svg>
-        <span>MAXPLAYER AI</span>
-      </a>
-      <nav class="nav-links" id="nav-links">
+      <a class="logo" href="/" aria-label="Maxplayer"><svg class="mark" aria-hidden="true"><use href="#i-mark"/></svg><span class="wm">Maxplayer</span></a>
+      <nav class="tabs" id="tabs" aria-label="Main">
         <a href="/">Team</a>
         <a href="/market">Market</a>
       </nav>
-      <a class="nav-cta" href="/#start">Get started</a>
-      <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Menu" aria-expanded="false" aria-controls="nav-links">
-        <span></span><span></span><span></span>
-      </button>
+      <a class="btn sm" href="/#start">Get started</a>
+      <button type="button" class="menu-btn" id="menu-btn" aria-label="Menu" aria-expanded="false" aria-controls="tabs"><i></i><i></i><i></i></button>
     </header>
 
-    <main>
-      <section class="h-section" aria-labelledby="legal-h">
+    <main class="lg-main">
+      <section class="lg-section" aria-labelledby="legal-h">
         <div class="h-in narrow legal-doc">
           <h1 id="legal-h">Privacy Policy</h1>
 <hr>
@@ -156,37 +151,18 @@
       </section>
     </main>
 
-    <footer class="site-foot">
-      <div class="foot-cols">
-        <div class="foot-brand">
-          <span class="brand small"><span>MAXPLAYER AI</span></span>
-          <p>The Multiplayer Marketplace</p>
-          <a class="foot-x" href="https://x.com/maxplayerai" target="_blank" rel="noopener" aria-label="MAXPLAYER AI on X">@maxplayerai</a>
-        </div>
-        <nav class="foot-nav" aria-label="Footer">
-          <div class="foot-row">
-            <a href="/">Team</a>
-            <a href="/market">Market</a>
-          </div>
-          <div class="foot-row foot-labs">
-            <a href="/chat">Chat<sup class="lab-sup">Lab</sup></a>
-            <a href="/mint">Mint<sup class="lab-sup">Lab</sup></a>
-            <a href="/tokens">Tokens<sup class="lab-sup">Lab</sup></a>
-            <a href="/swarm">Swarm<sup class="lab-sup">Lab</sup></a>
-          </div>
-          <div class="foot-row foot-sub">
-            <a href="/skill.md" target="_blank" rel="noopener">Skill</a>
-            <a href="https://github.com/MakePrisms/maxplayerai" target="_blank" rel="noopener">GitHub</a>
-            <a href="/terms">Terms</a>
-            <a href="/privacy">Privacy</a>
-          </div>
-        </nav>
+    <footer class="lfoot" id="site-foot">
+      <div class="ft-l">
+        <a class="logo" href="/" aria-label="Maxplayer"><svg class="mark" aria-hidden="true"><use href="#i-mark"/></svg><span class="wm">Maxplayer</span></a>
+        <small>&copy; 2026 MakePrisms, Inc.</small>
       </div>
-      <!-- the sign-off: a ghost wordmark cropped at the bottom edge, like it's
-           already leaving the frame -->
-      <div class="foot-word" aria-hidden="true"><span class="fw-max">MAXPLAYER</span>&nbsp;<span class="fw-ai">AI</span></div>
+      <nav class="ft-cols" aria-label="Footer">
+        <div><h4>Product</h4><a href="/">Team</a><a href="/market">Market</a></div>
+        <div><h4>Developers</h4><a href="/skill.md">Skill</a><a href="https://github.com/MakePrisms/maxplayerai">GitHub</a></div>
+        <div><h4>Company</h4><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="https://x.com/maxplayerai">@maxplayerai</a></div>
+      </nav>
     </footer>
 
-    <script type="module" src="/terminal.js"></script>
+    <script type="module" src="/legal.js"></script>
   </body>
 </html>

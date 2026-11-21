@@ -1,5 +1,6 @@
 /* Maxplayer — the Teams landing page (/), and the base the Market page (/market, market.css) is built on.
-   The pages that keep the earlier look (chat, mint, tokens, swarm, the legal pages) use styles.css, not this file.
+   The legal pages build on it too (legal.css). The pages that keep the earlier look (chat, mint, tokens, swarm) use
+   styles.css, not this file.
    The font faces are in fonts.css.
    Look: the motion deck (dark ground, Instrument Sans, one yellow accent, Work Sans logo word).
    Behaviour, 900 px wide and up: one fixed stage over a tall scroll track; scrolling drives every transition
@@ -385,7 +386,7 @@ body.ready #stage{animation:stagein .35s ease backwards}
 .foot2{flex:none;transform:translate3d(0,calc(var(--ti) * 70px),0);display:flex;justify-content:space-between;align-items:flex-start;gap:48px;padding:38px var(--pad) 56px;border-top:1px solid rgba(255,255,255,.1)}
 .ft-l{display:flex;flex-direction:column;gap:12px}
 .ft-l small{font-size:12px;color:var(--dim)}
-.ft-cols{display:grid;grid-template-columns:repeat(4,auto);gap:28px clamp(28px,4.6vw,76px)}
+.ft-cols{display:grid;grid-template-columns:repeat(3,auto);gap:28px clamp(28px,4.6vw,76px)}
 .ft-cols h4{margin:0 0 8px;font-size:13.5px;font-weight:500;color:#fff}
 .ft-cols a{display:block;font-size:13.5px;line-height:1.95;color:var(--mut);white-space:nowrap}
 .ft-cols a:hover{color:#fff}

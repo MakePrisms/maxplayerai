@@ -29,16 +29,16 @@ if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid REL
 const watch = process.argv.includes("--watch");
 // Legal pages are served one level deep, so they load assets from "/" rather than "./".
 // Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
-// Stylesheets of the two pages in the new look (/ and /market). The other pages use styles.css.
-const SITE_CSS = ["site.css", "market.css", "nojs.css"];
+// Stylesheets of the pages in the new look (/, /market and the legal pages). The other pages use styles.css.
+const SITE_CSS = ["site.css", "market.css", "nojs.css", "legal.css"];
 const PAGES = ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "skill-preview.html"];
 
 const options = {
   // teams.js serves / and market.js serves /market (the two pages in the new look).
-  // terminal.js serves the pages that keep the earlier look (chat, mint, the legal
-  // pages); tokens.js serves /tokens only, so the token-trade reader never ships
+  // legal.js serves the legal pages (their menu); terminal.js serves the pages that keep
+  // the earlier look (chat, mint); tokens.js serves /tokens only, so the token-trade reader never ships
   // in (or changes) another bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts"), teams: join(root, "src/teams.ts"), market: join(root, "src/market-page.ts") },
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts"), teams: join(root, "src/teams.ts"), market: join(root, "src/market-page.ts"), legal: join(root, "src/legal.ts") },
   bundle: true,
   define: {
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
@@ -101,7 +101,7 @@ if (watch) {
     writeFileSync(
       join(dist, page),
       readFileSync(join(root, "public", page), "utf8")
-        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|site\.css|market\.css|nojs\.css|terminal\.js|tokens\.js|swarm\.js|teams\.js|market\.js|swarm\.css|fonts\/[^"?]+|assets\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
+        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|site\.css|market\.css|nojs\.css|legal\.css|legal\.js|terminal\.js|tokens\.js|swarm\.js|teams\.js|market\.js|swarm\.css|fonts\/[^"?]+|assets\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
     );
   }
 

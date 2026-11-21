@@ -89,6 +89,9 @@ test("the root skill alias is byte-identical to the canonical homepage skill", (
 
 // The two pages in the new look (/ and /market) and what each loads; every other page keeps styles.css and its bundle.
 const NEW_PAGES = { "index.html": ["fonts.css", "site.css", "nojs.css", "teams.js"], "market.html": ["fonts.css", "site.css", "market.css", "nojs.css", "market.js"] };
+// Bob (2026-11-21): the legal pages are in the new look too, with a stylesheet and a small script of their own.
+const LEGAL = /^(terms|privacy|fees)-\d{8}\.html$/;
+const LEGAL_ASSETS = ["fonts.css", "site.css", "legal.css", "legal.js"];
 
 test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   const { stamp } = JSON.parse(readFileSync(join(root, "dist", ".buildstamp"), "utf8"));
@@ -98,14 +101,14 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
-    for (const asset of NEW_PAGES[page] ?? ["styles.css", "fonts.css", script]) {
+    for (const asset of NEW_PAGES[page] ?? (LEGAL.test(page) ? LEGAL_ASSETS : ["styles.css", "fonts.css", script])) {
       // Legal pages live at /terms/<date> etc. and /swarm also at /swarm/<naddr>, one level deep:
       // "./styles.css" would miss, so they use "/".
       const prefix = /^(terms|privacy|fees)-/.test(page) || page === "swarm.html" ? "/" : "./";
       assert.ok(pageHtml.includes(`"${prefix}${asset}?v=${stamp}"`), `${asset} is stamped in ${page}`);
       assert.ok(!pageHtml.includes(`"./${asset}"`) && !pageHtml.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
     }
-    if (NEW_PAGES[page]) {
+    if (NEW_PAGES[page] || LEGAL.test(page)) {
       assert.ok(!pageHtml.includes("styles.css") && !pageHtml.includes("terminal.js"), `${page} loads none of the earlier look`);
     }
   }
@@ -259,7 +262,7 @@ test("all site pages share navigation and footer links, with a current page and 
   };
   // bob (2026-11-20): the top nav is Teams and Market, on every page. Buy and Sell are sections of Market.
   // The pages that keep the earlier look.
-  const pages = ["chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"];
+  const pages = ["chat.html", "mint.html", "tokens.html", "swarm.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -271,25 +274,19 @@ test("all site pages share navigation and footer links, with a current page and 
     expectedFooter ??= links(footer);
     assert.deepEqual(links(nav), expectedNav, `${page} nav matches`);
     assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
-    // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
-    assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
-    assert.match(footer, /href="\/market">Market<\/a>\s*<\/div>\s*<div class="foot-row foot-labs">\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat opens the Lab row under Teams, Market, marked Lab`);
-    // Mint is a Lab page too: footer only, right after Chat.
-    assert.ok(!nav.includes('href="/mint"'), `${page}: /mint is not in the top nav`);
-    assert.match(footer, /<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /mint is in the footer after Chat, marked Lab`);
-    // Tokens is a Lab page too: footer only, right after Mint.
-    assert.ok(!nav.includes('href="/tokens"'), `${page}: /tokens is not in the top nav`);
-    assert.match(footer, /<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /tokens is in the footer after Mint, marked Lab`);
-    // bob (2026-10-18): Swarm is a Lab page too, right after Tokens; since 2026-10-19 it lives at /swarm.
-    assert.ok(!nav.includes('href="/swarm"'), `${page}: /swarm is not in the top nav`);
-    assert.match(footer, /<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/swarm">Swarm<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: Swarm is in the footer after Tokens, marked Lab`);
+    // bob (2026-11-21): the Lab pages (Chat, Mint, Tokens, Swarm) are linked from no footer or nav for now. The pages
+    // themselves stay up at their addresses.
+    for (const lab of ["/chat", "/mint", "/tokens", "/swarm"]) {
+      assert.ok(!nav.includes(`href="${lab}"`) && !footer.includes(`href="${lab}"`), `${page}: ${lab} is not linked`);
+    }
+    assert.ok(!html.includes("lab-sup"), `${page}: no Lab marks`);
     // bob: Skill and GitHub leave the top bar; since 2026-10-18 they are the footer's
     // third, dimmer row, under the Lab links.
     assert.deepEqual(links(nav), [["/", "Team"], ["/market", "Market"]], `${page}: top nav is Team, Market`);
     assert.ok(!html.includes('href="/sell"'), `${page}: nothing links the old seller page`);
-    // bob (2026-10-18): three rows on the right: the product pages, the Labs, then Skill · GitHub.
+    // Two rows on the right: the product pages, then Skill · GitHub · Terms · Privacy (the Lab row is gone, 2026-11-21).
     const rows = [...footer.matchAll(/<div class="foot-row[^"]*">([\s\S]*?)<\/div>/g)].map((m) => links(m[1]).map(([, text]) => text));
-    assert.deepEqual(rows, [["Team", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub", "Terms", "Privacy"]], `${page}: footer rows`);
+    assert.deepEqual(rows, [["Team", "Market"], ["Skill", "GitHub", "Terms", "Privacy"]], `${page}: footer rows`);
     // ...and the @maxplayerai handle moves to the left, under "The Multiplayer Marketplace".
     const brand = html.match(/<div class="foot-brand">([\s\S]*?)<\/div>/)?.[1] ?? "";
     assert.match(brand, /<p>The Multiplayer Marketplace<\/p>\s*<a class="foot-x" href="https:\/\/x\.com\/maxplayerai"[^>]*>@maxplayerai<\/a>/, `${page}: X handle under the tagline`);
@@ -299,18 +296,21 @@ test("all site pages share navigation and footer links, with a current page and 
   }
   // The two pages in the new look: the same two tabs, and a footer in four columns that leads to the same places.
   const absolute = (href, self) => (href.startsWith("#") ? self : href);
-  for (const [page, route] of [["index.html", "/"], ["market.html", "/market"]]) {
+  for (const [page, route] of [["index.html", "/"], ["market.html", "/market"], ["terms-20261029.html", "/terms/20261029"], ["privacy-20261029.html", "/privacy/20261029"], ["fees-20261029.html", "/fees/20261029"]]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     const nav = html.match(/<nav class="tabs"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     const footer = html.match(/<nav class="ft-cols"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     assert.ok(nav && footer, `${page} has the new chrome`);
     assert.deepEqual(links(nav).map(([href, text]) => [absolute(href, route), text]), [["/", "Team"], ["/market", "Market"]], `${page}: top nav is Team, Market`);
-    assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 1, `${page} marks one tab current`);
-    assert.match(nav, new RegExp(`<a href="#[a-z]+"[^>]*aria-current="page">${route === "/" ? "Team" : "Market"}</a>`), `${page} marks itself current`);
+    if (LEGAL.test(page)) {
+      assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 0, `${page} is not in the top nav, so nothing there is current`);
+    } else {
+      assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 1, `${page} marks one tab current`);
+      assert.match(nav, new RegExp(`<a href="#[a-z]+"[^>]*aria-current="page">${route === "/" ? "Team" : "Market"}</a>`), `${page} marks itself current`);
+    }
     const columns = [...footer.matchAll(/<div><h4>([^<]+)<\/h4>([\s\S]*?)<\/div>/g)].map((m) => [m[1], links(m[2]).map(([href, text]) => [absolute(href, route), text])]);
     assert.deepEqual(columns, [
       ["Product", [["/", "Team"], ["/market", "Market"]]],
-      ["Lab", [["/chat", "Chat"], ["/mint", "Mint"], ["/tokens", "Tokens"], ["/swarm", "Swarm"]]],
       ["Developers", [["/skill.md", "Skill"], ["https://github.com/MakePrisms/maxplayerai", "GitHub"]]],
       ["Company", [["/terms", "Terms"], ["/privacy", "Privacy"], ["https://x.com/maxplayerai", "@maxplayerai"]]],
     ], `${page}: footer columns`);
@@ -470,14 +470,11 @@ test("swarm page stays noindexed, linked only as the footer's Swarm Lab, and iso
   assert.match(html, /name="robots" content="noindex, nofollow"/);
   assert.ok(html.includes(`"/swarm.css?v=${stamp}"`));
   assert.ok(!html.includes("terminal.js"));
-  // bob (2026-10-18) put Swarm in the footer; that one link is the only place pages name the route.
+  // bob (2026-10-18) put Swarm in the footer; since 2026-11-21 the footer has no Lab links, so no page names the route.
   for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
-    assert.equal([...text.matchAll(/\/swarm\b/g)].length, 1, `${page} names /swarm once`);
+    assert.equal([...text.matchAll(/\/swarm\b/g)].length, 0, `${page} does not name /swarm`);
     assert.ok(!text.includes("/challenges"), `${page} no longer links the old /challenges route`);
-    // In the new look the footer's column is headed "Lab", so the link carries no Lab mark of its own.
-    const link = NEW_PAGES[page] ? '<a href="/swarm">Swarm</a>' : '<a href="/swarm">Swarm<sup class="lab-sup">Lab</sup></a>';
-    assert.ok(text.includes(link), `${page}: only the footer Swarm link`);
   }
   for (const page of ["llms.txt", "skill.md"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
@@ -488,7 +485,7 @@ test("swarm page stays noindexed, linked only as the footer's Swarm Lab, and iso
 });
 
 // bob (2026-10-19, #community-challenges-build): "change the url and mentions of challenge to 'swarm'".
-test("the community page builds at /swarm, every page links it there, and /challenges redirects permanently", () => {
+test("the community page builds at /swarm, no page links it for now, and /challenges redirects permanently", () => {
   assert.ok(existsSync(join(root, "dist", "swarm.html")), "/swarm builds (cleanUrls serves swarm.html)");
   assert.ok(existsSync(join(root, "dist", "swarm.js")) && existsSync(join(root, "dist", "swarm.css")), "its bundle and styles build");
   for (const old of ["challenges.html", "challenges.js", "challenges.css"]) {
@@ -496,8 +493,9 @@ test("the community page builds at /swarm, every page links it there, and /chall
   }
   for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
+    // bob (2026-11-21): the Lab links are out of the footer for now; /swarm stays up at its address.
     const swarmLinks = [...html.matchAll(/<a href="([^"]*)">Swarm<(?:sup|\/a>)/g)].map((m) => m[1]);
-    assert.deepEqual(swarmLinks, ["/swarm"], `${page}: the Swarm link points at /swarm`);
+    assert.deepEqual(swarmLinks, [], `${page}: no footer link to Swarm`);
     assert.ok(!/href="\/challenges/.test(html), `${page}: no link to /challenges`);
   }
   const { redirects = [] } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
@@ -587,7 +585,8 @@ test("terms, privacy and fees are dated static pages, linked from every footer",
     assert.equal(current?.destination, `/${doc}/${date}`, `/${doc} points at the current version`);
     assert.equal(current?.permanent, false, `/${doc} is a temporary redirect, so a new version can replace it`);
     const html = readFileSync(join(root, "dist", `${doc}-${date}.html`), "utf8");
-    assert.match(html, /<body class="home legal-page">/);
+    assert.match(html, /<html lang="en" class="lg">/, `${doc}: in the look of / and /market`);
+    assert.match(html, /<body class="legal-page">/);
     assert.match(html, /<h1 id="legal-h">/);
     assert.match(html, /Effective October 29, 2026/, `${doc} shows its effective date`);
     assert.ok(!/[Nn]ot part of|\[(?:OPEN|FACT|CHECKED|DATE)/.test(html), `${doc}: no internal notes`);
