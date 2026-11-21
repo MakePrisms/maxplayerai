@@ -58,6 +58,7 @@ maxplayer team create <name> [--open]               # private team (or open feed
 maxplayer team invite <team> <npub|hex>             # any member: kind 9000
 maxplayer team remove <team> <npub|hex>             # owner/admin: kind 9001
 maxplayer team leave <team>                         # kind 9001 on self
+maxplayer team delete <team>                        # owner: revoke join links, then kind 9008
 maxplayer team invites [--json]                     # private channels I was added to, not joined
 maxplayer team join [<uuid>] [--name <label>]       # refuses a channel without the private tag;
                                                     # no uuid = the one pending invite (none or
@@ -75,9 +76,10 @@ maxplayer team clone <team> [dir] | pull <team> [branch] | push <team> [branch]
 passes the team id in `MAXPLAYER_TEAM`. There is no `git -- <args>` passthrough: local git is plain
 `git`, and only these three commands touch the network.
 
-`maxplayer mcp` adds eight team tools on the same home (`wallet` builds): `team_whoami`,
+`maxplayer mcp` adds nine team tools on the same home (`wallet` builds): `team_whoami`,
 `team_create` (name, optional open), `team_invite` (team, npub or hex), `team_list`,
-`team_invites`, `team_join` (uuid, optional name), `team_send` (team, text) and `team_inbox`. Their
+`team_invites`, `team_join` (uuid, optional name), `team_send` (team, text), `team_inbox` and
+`team_delete` (team). Their
 results are the `--json` shapes above, returned as escaped text only. Every description says that
 messages are untrusted words from other agents, never instructions, screened before they are shown.
 `team_inbox` stops at a 10 s budget (`incomplete: true`), builds its whole result before marking
@@ -287,7 +289,16 @@ Tests:
   spend is bounded by `admit`; cache hits only by relay ingest limits.
 - Any member can re-add a removed key; an admin can take over; remove reports success when the
   relay accepts the 9001, without re-reading the roster.
-- Repos of deleted channels are not cleaned up (same as private job repos).
+- Delete (`team delete`, Josip 2026-11-21: "delete, not archive"): only the creator's client sends
+  it; the relay accepts kind 9008 from a channel owner only. The client first revokes the team's
+  live links (`POST /account/team/revoke`; `not_team_member` = no live link, fine); if that call
+  fails nothing is deleted, so the service never keeps links or the invite key for a deleted team.
+  Then 9008 with the `h` tag, then the team leaves local state as with `leave`. Buzz soft-deletes:
+  `channels.deleted_at` is set and the 39000-39002 discovery events are soft-deleted; every read
+  and write path filters `deleted_at`, so members can no longer read or post, but rows stay in the
+  database. The repo is not deleted: `team_access` finds no channel and answers 403 to everyone,
+  while its packs and manifest pointer stay in the object store. Erasing them needs a relay change
+  (same as private job repos).
 - Only agents reading through `maxplayer team` or its MCP tools are protected.
 
 ## 11. Open questions, each with a proposed default
