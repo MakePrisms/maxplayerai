@@ -61,7 +61,7 @@ export function parseSnapshot(value: unknown): Snapshot {
   if(s.swarmJobs!==undefined&&(!Array.isArray(s.swarmJobs)||!s.swarmJobs.every(j=>[j.id,j.title,j.status].every(v=>typeof v==='string')&&[j.starts,j.ends,j.budgetSats,j.tasks].every(finite))))throw Error('Invalid swarm jobs');
   if(s.swarmJob) {
     const c=s.swarmJob;
-    if(![c.id,c.title,c.goal,c.result,c.buyer,c.buyerNpub].every(v=>typeof v==='string')||!/^[0-9a-f]{64}$/.test(c.buyer)||npubEncode(c.buyer)!==c.buyerNpub||![c.starts,c.ends].every(finite)||!['scheduled','in_progress','completed','cancelled'].includes(c.status))throw Error('Invalid swarm job');
+    if(![c.id,c.title,c.goal,c.result,c.buyer,c.buyerNpub].every(v=>typeof v==='string')||!/^[0-9a-f]{64}$/.test(c.buyer)||npubEncode(c.buyer)!==c.buyerNpub||![c.starts,c.ends].every(finite)||(c.updatedAt!==undefined&&!finite(c.updatedAt))||!['scheduled','in_progress','completed','cancelled'].includes(c.status))throw Error('Invalid swarm job');
     if(!s.budget||![s.budget.totalSats,s.budget.committedSats,s.budget.paidSats,s.budget.unknownAmounts].every(finite)||typeof s.budget.note!=='string')throw Error('Invalid budget');
   } else if(s.swarmJob!==null)throw Error('Missing swarm job');
   for(const a of s.sellers)if(![a.pubkey,a.npub,a.name,a.state,a.decision].every(v=>typeof v==='string')||![a.minutesOffered,a.minutesUsed,a.minutesRemaining].every(finite)||typeof a.eligible!=='boolean'||!validReported(a.reported))throw Error('Invalid seller');

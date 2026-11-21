@@ -92,3 +92,12 @@ test("a swarm that is over says 'Work ended' and the end; one started but not on
   assert.deepEqual(startFact(run, 1500, when, null), started, "in the window, data not fresh");
   assert.deepEqual(startFact(run, 999, when, ready), starts, "before the start it still says Work starts");
 });
+
+// Review of #1361, r3 #2: a job cancelled before it began says so; the end is never before the start; a bad time is ignored.
+test("a job cancelled before its start says Cancelled; a closed job's end is clamped to its window", () => {
+  assert.deepEqual(startFact({ ...run, status: "cancelled", updatedAt: 900 }, 950, when, ready), { label: "Cancelled", value: "t=900", href: null });
+  assert.deepEqual(startFact({ ...run, status: "cancelled", updatedAt: 900 }, 2500, when, ready), { label: "Cancelled", value: "t=900", href: null });
+  assert.deepEqual(startFact({ ...run, status: "cancelled" }, 950, when, ready), { label: "Cancelled", value: "t=1000", href: null }, "no close time");
+  assert.deepEqual(startFact({ ...run, status: "completed", updatedAt: 900 }, 950, when, ready), ended(1000), "completed before the start: the start");
+  assert.deepEqual(startFact({ ...run, status: "completed", updatedAt: Number.NaN }, 1500, when, ready), ended(2000), "a non-finite close time is ignored");
+});

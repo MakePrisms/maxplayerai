@@ -170,11 +170,12 @@ function closeSheet() {
   sheetTab = null; profileKey = null;
   setLink(null);
   root.classList.remove('sheet-open');
-  sheet.setAttribute('aria-hidden', 'true');
   main.inert = false; nav.inert = false;
   // the board is redrawn while the panel is open, so the link that opened it may be a new element by now
-  const back = sheetFrom && (sheetFrom.isConnected ? sheetFrom : sheetFrom.dataset.pk && $(`#board a[data-pk="${sheetFrom.dataset.pk}"]`));
+  const back = sheetFrom && (sheetFrom.isConnected ? sheetFrom : sheetFrom.dataset.pk && $(`#board a[data-pk="${CSS.escape(sheetFrom.dataset.pk)}"]`));
   if (back) refocus(back);
+  else if (sheet.contains(document.activeElement)) document.activeElement.blur();
+  sheet.setAttribute('aria-hidden', 'true');      // only once focus has left the panel (review of #1361, r3)
 }
 
 /* An expert's profile. Bob's key attributes: the description, online or working, the npub to copy, the rate, jobs

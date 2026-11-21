@@ -111,7 +111,7 @@ let demoStatus: string | null = null, shownSwarm = "", swarmName = "Swarm";
    key's market history, so it shows placeholders until that is read (quick when /market was visited before, since
    both pages keep it in the same browser store). Back returns to the swarm. */
 let profile: { key: string; kind: "expert" | "buyer"; from: HTMLElement | null } | null = null;
-let market: MarketHandle | null = null, marketState = "connecting", marketFailed = false, marketStarted = false;
+let market: MarketHandle | null = null, marketState = "connecting", marketFailed = false, marketStarted = false, pageGone = false;
 function drawProfile(): void {
   if (!profile) return;
   const pf = el("pf"), title = el("swarm-title");
@@ -132,16 +132,17 @@ function openProfile(key: string, kind: "expert" | "buyer", from: HTMLElement | 
   el("sheet-back").hidden = false;
   el("pf").dataset.state = "wait";
   el("pf").scrollTop = 0;
-  drawProfile();
-  sheet.focus({ preventScroll: true });
+  // (Re)started before the first draw, so a retry after a failure shows placeholders, not "not reachable" (r3 #3).
   if (!marketStarted) {
-    marketStarted = true; marketFailed = false;
+    marketStarted = true; marketFailed = false; marketState = "connecting";
     startMarket({ onView: () => drawProfile(), onStatus: (s) => { marketState = s; drawProfile(); } })
-      .then((h) => { market = h; drawProfile(); }, (err) => {
+      .then((h) => { if (pageGone) { h.stop(); return; } market = h; drawProfile(); }, (err) => {
         console.warn("[swarm] the market reader did not start", err);
         marketStarted = false; marketFailed = true; drawProfile();     // the next profile opened tries again
       });
   }
+  drawProfile();
+  sheet.focus({ preventScroll: true });
 }
 function backToSwarm(focus = true): void {
   if (!profile) return;
@@ -216,7 +217,7 @@ function tick(): void {
   const live = !!snapshot.swarmJob && isRunning(snapshot.swarmJob, now, demoStatus ? 0 : fresh);
   const closed = snapshot.swarm?.status === "closed";
   el("sw-lamp").className = live ? "lamp on" : "lamp";
-  text("sw-st", live ? "Live: a job is running" : closed ? "Closed" : snapshot.swarmJob?.status === "scheduled" ? "Open · next job scheduled" : "Open · no job running");
+  text("sw-st", live ? "Live: a job is running" : closed ? "Closed" : snapshot.swarmJob?.status === "scheduled" && now < snapshot.swarmJob.ends ? "Open · next job scheduled" : "Open · no job running");
 }
 
 function receive(value: unknown): void {
@@ -294,16 +295,20 @@ function closeSwarm(fromHistory = false): void {
   const was = open;
   open.stop();
   open = null;
+  // Focus leaves the panel before it is hidden from assistive tech (r3 nit): the page becomes usable again, focus
+  // goes back to the swarm's link (found again if the list was redrawn), and only then is the panel aria-hidden.
   root.classList.remove("sheet-open");
-  sheet.setAttribute("aria-hidden", "true");
   main.inert = false; nav.inert = false;
+  const href = was.from?.getAttribute("href");
+  const back = was.from?.isConnected ? was.from : href ? document.querySelector<HTMLElement>(`#swarm-list a.who[href="${CSS.escape(href)}"]`) : null;
+  if (back) refocus(back);
+  else if (sheet.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();   // opened from a link: nothing to go back to
+  sheet.setAttribute("aria-hidden", "true");
   document.title = "Maxplayer - Swarm";
   if (!fromHistory) {
     if (was.pushed) history.back();                       // popstate finds the panel already closed
     else history.replaceState(null, "", "/swarm" + location.search);
   }
-  if (was.from?.isConnected) refocus(was.from);
-  else if (sheet.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();   // opened from a link: nothing to go back to
 }
 
 // A row, or its name, opens the swarm in the panel. The name is a real link: a new tab goes to the link itself.
@@ -330,7 +335,7 @@ setInterval(tick, 1000);
 onSpotChange(() => { if (snapshot) render(snapshot); });   // the budget shows in dollars at the live BTC-USD rate
 startSpot();
 board();
-addEventListener("pagehide", (event) => { if (!event.persisted) { market?.stop(); open?.stop(); } });
+addEventListener("pagehide", (event) => { if (!event.persisted) { pageGone = true; market?.stop(); open?.stop(); } });
 
 // Shown once the stylesheets and fonts are in, as on /market (market.css hides the page until body.ready).
 let shown = false;

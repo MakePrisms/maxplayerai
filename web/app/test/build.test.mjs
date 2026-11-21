@@ -222,7 +222,7 @@ test("the new pages and their bundles carry no inline style or script", () => {
     assert.ok(!/<style\b/.test(html), `${page}: no <style> element`);
     assert.match(html, /<noscript><link rel="stylesheet" href="\.\/nojs\.css\?v=[0-9a-f]{12}"><\/noscript>/, `${page}: its no-script rules are a stylesheet, not inline`);
   }
-  for (const bundle of ["teams.js", "market.js"]) {
+  for (const bundle of ["teams.js", "market.js", "swarm.js", "legal.js", "tokens.js"]) {
     const js = readFileSync(join(root, "dist", bundle), "utf8");
     assert.ok(!/style=\\?["']/.test(js), `${bundle} writes no style attribute into markup`);
     assert.ok(!js.includes("cssText") && !/setAttribute\(["']style/.test(js), `${bundle} sets no style text`);

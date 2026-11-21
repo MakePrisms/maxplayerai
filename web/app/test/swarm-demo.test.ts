@@ -12,3 +12,10 @@ test("demo snapshot passes the same validation as live data and counts running j
   assert.match(sellerLine(s, crunch, now + 60), /^33 \/ 60 min$/);
   assert.equal(s.sellers.filter((a) => a.eligible).length, 4);
 });
+
+// Review of #1361, r3 #2: a swarm job's close time must be a finite number when present.
+test("parseSnapshot refuses a non-numeric updatedAt on the swarm job", () => {
+  const s = demoSnapshot(1_792_100_000) as { swarmJob: Record<string, unknown> };
+  assert.doesNotThrow(() => parseSnapshot({ ...s, swarmJob: { ...s.swarmJob, updatedAt: 1_792_000_000 } }));
+  assert.throws(() => parseSnapshot({ ...s, swarmJob: { ...s.swarmJob, updatedAt: "soon" } }), /Invalid swarm job/);
+});
