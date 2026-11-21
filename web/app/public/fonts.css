@@ -114,6 +114,8 @@
   font-family: 'Work Sans Logo';
   font-style: italic;
   font-weight: 400 700;
-  font-display: swap;
+  /* block, not swap: the logo word is in the nav, which shows at once (site.css), and the fallback italic is wider.
+     The file is a few KB, preloaded and cached, so after the first visit there is no wait at all. */
+  font-display: block;
   src: url('./fonts/work-sans-italic-logo.woff2') format('woff2');
 }

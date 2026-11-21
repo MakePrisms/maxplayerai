@@ -59,10 +59,10 @@ h1,h2,p,ol,ul{margin:0;padding:0}
    replaces a mask on each whole section, which phones had to redraw on every frame) */
 .navfade{position:fixed;left:0;right:0;top:0;height:calc(var(--nav) + 16px);z-index:50;pointer-events:none;background:linear-gradient(to bottom,var(--bg) calc(var(--nav) - 18px),rgba(26,26,26,0) 100%)}
 .nav{position:fixed;left:0;right:0;top:0;height:var(--nav);z-index:60;display:flex;align-items:center;gap:36px;padding:0 var(--pad)}
-/* the nav appears with the page, once the fonts are in (teams.js show): shown earlier, its logo was drawn in the
-   fallback face and changed width when the real one arrived */
-.nav{visibility:hidden}
-body.ready .nav{visibility:visible;animation:stagein .35s ease backwards}
+/* The nav is drawn with the first paint and never faded in: it is the same bar on / and /market, so moving between
+   them must leave it standing (Bob, 2026-11-21: switching tabs made the whole bar flash). It used to be hidden until
+   the fonts were in, because its logo word changed width when the real face replaced the fallback; that face is now
+   font-display:block (fonts.css), so the word waits invisibly for its face instead of being drawn twice. */
 .tabs{display:flex;gap:6px;margin-right:auto}
 .tabs a{height:34px;padding:0 13px;border-radius:17px;display:flex;align-items:center;font-size:15.5px;letter-spacing:-.01em;color:var(--mut);transition:color .2s,background-color .2s}
 .tabs a:hover{color:#fff}
