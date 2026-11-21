@@ -70,9 +70,10 @@ function board(): void {
       text(id, v === undefined ? "" : nf.format(v));
       el(id).classList.toggle("sk", v === undefined);
     }
-    // Bob (2026-11-21): no "Live" under the board; the line speaks only while loading or when something is wrong.
+    // Bob (2026-11-21): no "Live" under the board, and no "Updating…" while it loads (the grey rows say that); the
+    // line speaks only when something is wrong.
     const word = relayStatusWord(status);
-    text("index-status", !wasReady ? (status.error ? `Live view unavailable · ${status.error}` : UPDATING) : word === "Live" ? "" : word);
+    text("index-status", !wasReady ? (status.error ? `Live view unavailable · ${status.error}` : "") : word === "Live" ? "" : word);
   };
   const changed = coalesce(() => { try { draw(); } catch { text("index-status", "Live view unavailable · check back soon"); } }, RENDER_MS);
   reader.start();
