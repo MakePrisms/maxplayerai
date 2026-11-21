@@ -134,6 +134,9 @@
     # document, top-level "self" (NIP-11 `pubkey` is null on buzz; `self` is the relay keypair, derived
     # from BUZZ_RELAY_PRIVATE_KEY in /var/lib/secrets/buzz-relay.env).
     relayPubkey = "5fda3774ed565fd500ae7e4289f839a0f06dc2aee4cc19a1acf783b77bfe73ec";
+    # Team invite links (#1360). Secret generated on this box by Josip, 2026-11-21; its pubkey
+    # 632471e9… is maxplayer_team::INVITE_PUBKEY and was made a relay member (owner kind 9030).
+    inviteKeyFile = "/var/lib/secrets/maxplayer-team-invite-key";
   };
 
   # The relay binds 127.0.0.1:3000 (loopback, no public bind), so something must terminate TLS and proxy
