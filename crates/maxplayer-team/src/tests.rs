@@ -634,6 +634,36 @@ async fn invite_link_adds_nothing_for_an_unlinked_inviter_or_an_unreachable_serv
     assert!(adds.is_empty(), "the invite key was added: {adds:?}");
 }
 
+/// The service's 403 `not_team_member` on revoke is also what the team's owner gets once no link
+/// is live and the invite key was swept out of the team: the text must not tell them they are not
+/// a member.
+#[tokio::test]
+async fn revoke_refused_as_not_a_member_reads_as_no_live_links_or_not_a_member() {
+    use std::io::Read as _;
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = home(dir.path(), "ws://127.0.0.1:9");
+    join_crew(&h);
+    let service = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = service.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in service.incoming() {
+            let mut stream = stream.unwrap();
+            let (mut head, mut byte) = (Vec::new(), [0u8; 1]);
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let mut body = vec![0u8; 4096];
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+            let _ = stream.read(&mut body);
+            let body = r#"{"error":"not_team_member","message":"only a member of the team can revoke its invite links"}"#;
+            let _ = write!(stream, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        }
+    });
+    h.config.registration_url = format!("http://127.0.0.1:{port}/account");
+    let e = h.revoke_links("crew").await.unwrap_err().to_string();
+    assert_eq!(e, "No live invite links for this team, or you're not a member of it.");
+}
+
 /// Local refusals come before anything is sent: no 9000 adds the invite key for a lifetime the
 /// service refuses, no link is redeemed for a name `join` refuses, and an open channel or an
 /// unknown team has no links to make or revoke. (The relay and the registration service here are

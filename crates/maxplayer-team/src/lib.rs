@@ -794,7 +794,14 @@ impl Home {
             return Err("an open channel has no invite links".into());
         }
         let channel = t.channel;
-        Ok(self.registration(move |c| c.team_revoke(&channel)).await?.revoked)
+        // The service answers an outsider and a member with nothing left to revoke alike (a key
+        // already swept out of the team cannot read the member list), so the text names both.
+        match self.registration(move |c| c.team_revoke(&channel)).await {
+            Err(e) if e.downcast_ref::<RegistrationError>().and_then(|e| e.code()) == Some("not_team_member") => {
+                Err("No live invite links for this team, or you're not a member of it.".into())
+            }
+            r => Ok(r?.revoked),
+        }
     }
     /// `join <link>`: the service adds this key (it must be linked to an email), then the
     /// normal join records the team.
