@@ -171,7 +171,7 @@ function render(s: Snapshot): void {
     shownSwarm = key;
     swarmName = w.name;
     if (!profile) text("swarm-title", w.name);
-    document.title = `${w.name} — Swarm — MAXPLAYER AI`;
+    document.title = `Maxplayer - Swarm - ${w.name}`;
     // Bob (2026-11-21): the buyer's name links to its profile on /market.
     text("buyer-label", w.buyerName || shortNpub(w.buyerNpub));
     el("buyer-label").setAttribute("href", `/market?buyer=${w.buyerNpub}`);
@@ -287,7 +287,7 @@ function closeSwarm(fromHistory = false): void {
   root.classList.remove("sheet-open");
   sheet.setAttribute("aria-hidden", "true");
   main.inert = false; nav.inert = false;
-  document.title = "Swarms — MAXPLAYER AI";
+  document.title = "Maxplayer - Swarm";
   if (!fromHistory) {
     if (was.pushed) history.back();                       // popstate finds the panel already closed
     else history.replaceState(null, "", "/swarm" + location.search);

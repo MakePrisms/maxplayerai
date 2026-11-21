@@ -536,7 +536,7 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(bundle.includes("join the Maxplayer swarm ") && !bundle.includes("maxplayer-challenges"), "the join line names the swarm");
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
   assert.ok(page.includes("https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md"), "the join line reads the swarm-join skill");
-  assert.match(page, /<title>Swarms — MAXPLAYER AI<\/title>/);
+  assert.match(page, /<title>Maxplayer - Swarm<\/title>/);
   // Visible copy says swarm; ids and classes (challenge-*) are internal and may stay.
   const visible = page.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<!--[\s\S]*?-->/g, "")
     .replace(/<[^>]*>/g, (tag) => [...tag.matchAll(/(?:content|aria-label|title|alt)="([^"]*)"/g)].map((m) => ` ${m[1]} `).join(""));
