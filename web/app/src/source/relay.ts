@@ -263,6 +263,7 @@ export function createRelaySource(
         closedByUs.add(activeSub);
         send(["CLOSE", activeSub]);
       }
+      callbacks.onPage?.();
       const exhausted = seenThisPage === 0 || oldestSeen == null;
       // Record this stream's progress at the page boundary, so a drop before
       // the next EOSE resumes here instead of restarting or skipping ahead.

@@ -309,7 +309,11 @@ export function buyerBoard(events: RawEvent[], now: number, activeEvents: RawEve
   // detail view keeps showing the award. `workingJobs` is the subset that is
   // still current execution. Split here, once.
   for (const job of inProgressJobs(activeEvents, now)) {
-    const row = get(job.buyer);
+    // As on the seller board: historical overdue work enriches a row this window earned, but is not evidence of
+    // activity in it. Only current work may add a missing buyer. (Adding every overdue job let an award from months
+    // ago put a buyer on this week's board, and only once the older history had been read.)
+    const row = rows.get(job.buyer) ?? (job.state === JOB_WORKING ? get(job.buyer) : null);
+    if (!row) continue;
     row.inProgressJobs.push(job);
     if (job.state === JOB_WORKING) row.workingJobs.push(job);
   }

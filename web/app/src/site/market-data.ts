@@ -18,13 +18,13 @@
 import { RELAY_URL, TRANSPORT } from "../config.js";
 import { createEngine, type MarketView } from "../market/engine.js";
 import { DEFAULT_WINDOW, WINDOWS, participantDetail } from "../market/participants.js";
-import type { ParsedEvent, RawEvent } from "../model/events.js";
+import { parseEvent, type ParsedEvent, type RawEvent } from "../model/events.js";
 import { createRelaySource } from "../source/relay.js";
 import { recoveryFloor } from "../source/recovery.js";
 import { createEventDb, type EventDb } from "../store/db.js";
 import { now, short } from "../ui/format.js";
 import { onSpotChange, spotUsd, startSpot, usd } from "../ui/spot.js";
-import { PROFILE, UNTAGGED_KINDS } from "../model/kinds.js";
+import { MAXPLAYER_TAGGED_KINDS, OFFER as OFFER_KIND, PROFILE, UNTAGGED_KINDS } from "../model/kinds.js";
 import { decodeNpub, npubEncode } from "../trade/nip19.js";
 
 const RACER_ACTIVE_SECONDS = 86400;      // as board.ts: a buyer is "active" for a day after its last action
@@ -88,8 +88,13 @@ export interface MarketHandle {
    * that has never sold on this market.
    */
   expert(id: string, recent?: number): ExpertProfile | null;
-  /** "none": nothing whole yet. "recent": 24 hours and Week are whole. "all": everything is. */
-  ready(): "none" | "recent" | "all";
+  /**
+   * "none": nothing whole yet. "recent": 24 hours and Week are whole. "all": everything is.
+   * "stale": the relay is slow or cannot be reached, and a return visit shows what the browser holds (whole, but as
+   * of its last visit); the catch-up still replaces it when it arrives.
+   * "partial": the read is over but stopped at the source's page backstop, so older history is missing.
+   */
+  ready(): "none" | "recent" | "stale" | "partial" | "all";
   /**
    * How many times the engine has computed the market, shown or not. A first visit costs two (the week, then
    * everything), whatever the number of requests the history takes; it used to cost one per request.
@@ -246,26 +251,34 @@ function expertProfile(view: MarketView, id: string, recent: number): ExpertProf
  * small answer (232 events, 0.3 MB on 2026-11-20). The source still reads them again at the end; the cache drops
  * what it holds. Paged like the source pages, one cursor, in case the relay ever holds more than one answer's worth.
  */
+const NAMES_PAGE = 500, NAMES_MAX_PAGES = 20;
 function fetchNames(openSocket: (url: string) => WebSocket, waitMs: number, onEvent: (e: RawEvent) => void, done: (ok: boolean) => void): () => void {
-  let ws: WebSocket, finished = false, oldest: number | null = null, n = 0, page = 0;
+  let ws: WebSocket, finished = false, oldest: number | null = null, n = 0, fresh = 0, page = 0;
+  const seen = new Set<string>();
   let timer: ReturnType<typeof setTimeout> | null = null;
+  // End the request, then close with the normal code: a bare close() made Safari's engine log "the network
+  // connection was lost" in the console on every first visit.
+  const close = () => {
+    try {
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      if (ws.readyState === 1 && page > 0) ws.send(JSON.stringify(["CLOSE", `n${page}`]));
+      ws.close(1000);
+    } catch { /* already gone */ }
+  };
   const finish = (ok: boolean) => {
     if (finished) return;
     finished = true;
     if (timer) clearTimeout(timer);
-    // End the request, then close with the normal code: a bare close() made Safari's engine log "the network
-    // connection was lost" in the console on every first visit.
-    try {
-      ws.onmessage = ws.onerror = ws.onclose = null;
-      if (ws.readyState === 1) ws.send(JSON.stringify(["CLOSE", `n${page}`]));
-      ws.close(1000);
-    } catch { /* already gone */ }
+    close();
     done(ok);
   };
   const ask = () => {
-    n = 0; page += 1;
-    const filter: Record<string, unknown> = { kinds: [...UNTAGGED_KINDS], limit: 500 };
-    if (oldest != null) filter.until = oldest - 1;
+    if (page > 0) ws.send(JSON.stringify(["CLOSE", `n${page}`]));     // one subscription at a time
+    n = 0; fresh = 0; page += 1;
+    const filter: Record<string, unknown> = { kinds: [...UNTAGGED_KINDS], limit: NAMES_PAGE };
+    // `until` is inclusive and is kept at the oldest second seen: `oldest - 1` skipped every profile stamped in the
+    // boundary second that did not fit the page before. What is asked for twice is dropped by id.
+    if (oldest != null) filter.until = oldest;
     ws.send(JSON.stringify(["REQ", `n${page}`, filter]));
   };
   try { ws = openSocket(RELAY_URL); } catch { done(false); return () => {}; }
@@ -273,19 +286,75 @@ function fetchNames(openSocket: (url: string) => WebSocket, waitMs: number, onEv
   ws.onmessage = (msg: MessageEvent) => {
     let frame: unknown;
     try { frame = JSON.parse(msg.data as string); } catch { return; }
-    if (!Array.isArray(frame)) return;
+    if (!Array.isArray(frame) || frame[1] !== `n${page}`) return;
     if (frame[0] === "EVENT" && frame[2]) {
       const e = frame[2] as RawEvent;
       n += 1;
       if (oldest == null || e.created_at < oldest) oldest = e.created_at;
+      if (seen.has(e.id)) return;
+      seen.add(e.id);
+      fresh += 1;
       onEvent(e);
     } else if (frame[0] === "EOSE") {
-      if (n < 500 || page >= 20) finish(true); else ask();
+      if (n < NAMES_PAGE) finish(true);              // the relay has nothing older: every profile is in
+      else if (fresh === 0) finish(false);           // a whole page in one second: paging cannot get past it
+      else if (page >= NAMES_MAX_PAGES) finish(false); // stopped at the cap: NOT every profile, so not "in full"
+      else ask();
     } else if (frame[0] === "CLOSED") finish(false);
   };
   ws.onerror = ws.onclose = () => finish(false);
   timer = setTimeout(() => finish(false), waitMs);
-  return () => { if (!finished) { finished = true; if (timer) clearTimeout(timer); try { ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null; ws.close(1000); } catch { /* already gone */ } } };
+  return () => { if (!finished) { finished = true; if (timer) clearTimeout(timer); close(); } };
+}
+
+/**
+ * Every event of the given jobs, on a socket of our own: the jobs that moved this week but began before it.
+ *
+ * The week's numbers come from the week's events, but a few things on it are read from the job as a whole: who the
+ * other side of a delivery was, which round of a session it is, and whether someone is working on it. A job offered
+ * eight days ago and delivered today had none of those until the full history was in, so the week changed when it
+ * arrived ("X delivered" became "X delivered to Y"). Measured 2026-11-21: 1 such job among the 273 the week touches.
+ * One request per 25 jobs (the job's offer by id, and every market event that names it).
+ */
+function fetchJobs(openSocket: (url: string) => WebSocket, ids: string[], waitMs: number, onEvent: (e: RawEvent) => void, done: (ok: boolean) => void): () => void {
+  const chunks: string[][] = [];
+  for (let i = 0; i < ids.length; i += 25) chunks.push(ids.slice(i, i + 25));
+  let ws: WebSocket, finished = false, page = 0;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const close = () => {
+    try {
+      ws.onopen = ws.onmessage = ws.onerror = ws.onclose = null;
+      if (ws.readyState === 1 && page > 0) ws.send(JSON.stringify(["CLOSE", `j${page}`]));
+      ws.close(1000);
+    } catch { /* already gone */ }
+  };
+  const finish = (ok: boolean) => {
+    if (finished) return;
+    finished = true;
+    if (timer) clearTimeout(timer);
+    close();
+    done(ok);
+  };
+  const ask = () => {
+    if (page >= chunks.length) return finish(true);
+    if (page > 0) ws.send(JSON.stringify(["CLOSE", `j${page}`]));
+    const chunk = chunks[page]!;
+    page += 1;
+    ws.send(JSON.stringify(["REQ", `j${page}`, { ids: chunk }, { kinds: [...MAXPLAYER_TAGGED_KINDS], "#e": chunk }]));
+  };
+  try { ws = openSocket(RELAY_URL); } catch { done(false); return () => {}; }
+  ws.onopen = ask;
+  ws.onmessage = (msg: MessageEvent) => {
+    let frame: unknown;
+    try { frame = JSON.parse(msg.data as string); } catch { return; }
+    if (!Array.isArray(frame) || frame[1] !== `j${page}`) return;
+    if (frame[0] === "EVENT" && frame[2]) onEvent(frame[2] as RawEvent);
+    else if (frame[0] === "EOSE") ask();
+    else if (frame[0] === "CLOSED") finish(false);
+  };
+  ws.onerror = ws.onclose = () => finish(false);
+  timer = setTimeout(() => finish(false), waitMs);
+  return () => { if (!finished) { finished = true; if (timer) clearTimeout(timer); close(); } };
 }
 
 /** Our mark on a browser store this code has written and found complete (see startMarket). */
@@ -339,9 +408,14 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
   const later = (fn: () => void, ms: number) => { timers.push(setTimeout(fn, ms)); };
   const every = (fn: () => void, ms: number) => { timers.push(setInterval(fn, ms)); };
 
-  let full = false;            // everything is in: the views are whole for every period, and live events recompute
+  let full = false;            // the read is over: the views are whole for every period, and live events recompute
+  let partial = false;         // ... but it stopped at the source's page backstop, so older history is missing
+  let stale = false;           // the relay is slow or unreachable: a return visit shows its trusted store meanwhile
   let recent = false;          // every event of the last week is in, with names and the rate: 24 hours and Week are whole
-  let pastWeek = false;        // the source has handed over an event older than a week
+  let pastWeek = false;        // a whole answer of the source has reached back past the week
+  let sawOld = false;          // ... an event older than the week has arrived; it counts once its answer is whole
+  let jobs = false;            // the jobs the week touches but which began before it are in (see fetchJobs)
+  let stopJobs: () => void = () => {};
   let names = false;           // the names request has answered in full: every profile the relay holds is in
   let namesDone = false;       // ... or it has failed or run out of time, and is not waited for any longer
   let wanted = DEFAULT_WINDOW;  // the period the page asked for last
@@ -364,7 +438,7 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
     computes += 1;
     raw = view;
     // Nothing reaches the page that is not whole for its period.
-    if (!(full ? namesDone : recent && !isOpenEnded(view.windowKey))) return;
+    if (!((full || stale) ? namesDone : recent && !isOpenEnded(view.windowKey))) return;
     last = plain(view, feedLimit);
     opts.onView(last);
   });
@@ -383,12 +457,12 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
 
   /** Compute once and tell the page: the period it asked for if that is whole now, else the one the engine is on. */
   const show = () => {
-    const ok = full || !isOpenEnded(wanted);
+    const ok = full || stale || !isOpenEnded(wanted);
     if (ok && wanted !== engineWindow) { engineWindow = wanted; engine.setWindow(wanted); } else engine.flush();
   };
   /** The week is whole: show it. */
   const tryRecent = () => {
-    if (full || recent || !pastWeek || !names) return;
+    if (full || recent || !pastWeek || !jobs || !names) return;
     if (seams.spot !== false && spotUsd() == null && Date.now() - t0 < waitMs) return;   // the dollar rate: wait for it, but not for long
     recent = true;
     show();
@@ -399,19 +473,21 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
     full = true;
     show();
   };
-  onSpotChange(() => { if (full || recent) engine.flush(); else tryRecent(); });
+  onSpotChange(() => { if (full || recent || stale) engine.flush(); else tryRecent(); });
   later(tryRecent, waitMs);
-  every(() => { if (full || recent) engine.flush(); }, 60000);    // online lamps go stale honestly between events
+  every(() => { if (full || recent || stale) engine.flush(); }, 60000);    // online lamps go stale honestly between events
 
   // The names are asked for on EVERY visit and nothing is shown before they are in (bob: always load the name). The
   // store is not relied on for them: it is one small request (232 profiles, 0.3 MB), and a name missing from the
   // store would otherwise show as a key.
   const stopNames = fetchNames(openSocket, waitMs, (event) => ingest(event, true), (ok) => {
     names = ok; namesDone = true;
-    if (full) show(); else tryRecent();
+    if (full || stale) show(); else tryRecent();
   });
-  // The relay cannot be reached, or is slow: a return visit shows what the browser holds rather than nothing.
-  const showStore = () => { if (storeComplete) becomeFull(); };
+  // The relay cannot be reached, or is slow: a return visit shows what the browser holds rather than nothing. That
+  // is NOT the read being over: it is reported as "stale", events keep going into the cache without a recompute, and
+  // the catch-up replaces it in one view when it ends.
+  const showStore = () => { if (storeComplete && !full && !stale) { stale = true; show(); } };
   if (storeComplete) later(showStore, waitMs);
 
   const source = createRelaySource(
@@ -428,7 +504,26 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
         ingest(event, true);
         // Newest first: an event from before the week means the week is all here. (Profiles are not market events
         // and come in their own, later, request.)
-        if (!pastWeek && event.kind !== PROFILE && event.created_at < now() - RECENT_SECONDS - 300) { pastWeek = true; tryRecent(); }
+        if (!sawOld && event.kind !== PROFILE && event.created_at < now() - RECENT_SECONDS - 300) sawOld = true;
+      },
+      // Newest first ACROSS requests, not within one: the week is all here once a WHOLE answer has gone past it.
+      onPage: () => {
+        if (pastWeek || !sawOld) return;
+        pastWeek = true;
+        const floor = now() - RECENT_SECONDS - 300;
+        const held = new Map<string, number>();
+        const wanted = new Set<string>();
+        for (const e of engine.cache.all()) if (e.kind === OFFER_KIND) held.set(e.id, e.created_at);
+        for (const e of engine.cache.all()) {
+          if (e.created_at < floor || e.kind === OFFER_KIND) continue;
+          const offerId = parseEvent(e)?.offerId;
+          if (!offerId) continue;
+          const at = held.get(offerId);
+          if (at == null || at < floor) wanted.add(offerId);       // began before the week: read it whole
+        }
+        const done = () => { jobs = true; tryRecent(); };
+        if (!wanted.size) return done();
+        stopJobs = fetchJobs(openSocket, [...wanted], waitMs, (event) => ingest(event, true), done);
       },
       onStatus: ({ state }) => {
         opts.onStatus?.(state === "history" ? "syncing" : state);
@@ -441,8 +536,21 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
         // 2026-11-20: a return visit counted 2,680 jobs delivered, the first visit 2,761.) So: write what is
         // queued, and mark a moment later. Leaving before that costs one more full read, never a hole.
         // (The write waits a quarter of a second so that it does not land in the same moment as the one recompute.)
-        later(() => { if (persistQueue.length) db.save(persistQueue.splice(0)); }, Math.min(250, markMs));
-        if (complete) later(() => { db.markHistoryComplete(); try { storage?.setItem(STORE_MARK, STORE_MARK_VALUE); } catch { /* storage refused */ } }, markMs);
+        // The marker is written in the same transaction as the last queued events, and our own mark only once that
+        // transaction has committed with no earlier write of this visit having failed (a store with a hole must not
+        // say it is whole: quota, a private window).
+        if (complete) {
+          later(() => {
+            if (persistQueue.length) db.save(persistQueue.splice(0));
+            void db.markHistoryComplete().then((ok) => {
+              if (ok) { try { storage?.setItem(STORE_MARK, STORE_MARK_VALUE); } catch { /* storage refused */ } }
+            });
+          }, markMs);
+        } else {
+          later(() => { if (persistQueue.length) db.save(persistQueue.splice(0)); }, Math.min(250, markMs));
+        }
+        partial = !complete;
+        stale = false;
         becomeFull();
       },
     },
@@ -452,17 +560,18 @@ export async function startMarket(opts: StartOptions): Promise<MarketHandle> {
   return {
     setWindow: (key) => {
       wanted = key;
-      if (!(full || (recent && !isOpenEnded(key)))) return false;            // not whole yet: the page is told when it is
+      if (!(full || stale || (recent && !isOpenEnded(key)))) return false;   // not whole yet: the page is told when it is
       if (key !== engineWindow) { engineWindow = key; engine.setWindow(key); }   // computes and tells the page at once
       return true;
     },
     view: () => last,
-    expert: (id, n = 6) => (full && raw ? expertProfile(raw, id, n) : null),
-    ready: () => (full ? "all" : recent ? "recent" : "none"),
+    expert: (id, n = 6) => ((full || stale) && namesDone && raw ? expertProfile(raw, id, n) : null),
+    ready: () => (full && namesDone ? (partial ? "partial" : "all") : stale && namesDone ? "stale" : recent ? "recent" : "none"),
     computes: () => computes,
     stop: () => {
       for (const t of timers) clearTimeout(t);      // clears intervals too
       stopNames();
+      stopJobs();
       source.stop();
     },
   };

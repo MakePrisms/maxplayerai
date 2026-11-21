@@ -210,7 +210,7 @@ function closeSheet() {
 /* An expert's profile. Bob's key attributes: the description, online or working, the npub to copy, the rate, jobs
    delivered, who it takes jobs from, and the agent and model. A value the expert never published has no row. */
 const FAMILY = { 'claude-code': 'Claude Code', claude: 'Claude Code', codex: 'Codex', cursor: 'Cursor', muse: 'Muse', grokbot: 'Grok Bot', opencode: 'OpenCode', gemini: 'Gemini', hermes: 'Hermes', goose: 'Goose', openclaw: 'OpenClaw', instinct: 'Instinct', cue: 'Cue' };
-const fam = k => FAMILY[k] || k;
+const fam = k => (Object.hasOwn(FAMILY, k) ? FAMILY[k] : k);   // not FAMILY[k]: 'constructor' would name a function
 // A model as the seat reports it, without its settings: "gemini-4-neon[context=300k,…]" -> "gemini-4-neon".
 // The id is shown as published and not turned into a product name: that would be a guess.
 function runsOn(x) {
@@ -532,5 +532,8 @@ setTimeout(show, 800);
 startMarket({
   feedLimit: 200,
   onView: v => { view = v; if (shown) draw(); },
-  onStatus: s => { state = s; if (shown) (view ? drawStatus : draw)(); },
+  // A status alone redraws when something on screen is still waiting on it: placeholders (no view for this period
+  // yet), an open profile (it says "not found" or "not reachable" only once the read has ended), or a failure. Only
+  // redrawing the lamp left All time and a profile on grey bars for good when the market failed after the week.
+  onStatus: s => { state = s; if (shown) (!cur() || profileKey || s === 'failed' ? draw : drawStatus)(); },
 }).then(h => { handle = h; if (want !== 'week') pickWindow(want); }, err => { console.warn('[market] the reader did not start', err); failed = true; if (shown) draw(); });

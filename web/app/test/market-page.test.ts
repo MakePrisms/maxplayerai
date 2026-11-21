@@ -68,6 +68,10 @@ function matches(e: RawEvent, f: Filter): boolean {
   if (typeof f.until === "number" && e.created_at > f.until) return false;
   const t = f["#t"] as string[] | undefined;
   if (t && !(e.tags ?? []).some((tag) => tag[0] === "t" && t.includes(tag[1] ?? ""))) return false;
+  const ids = f.ids as string[] | undefined;
+  if (ids && !ids.includes(e.id)) return false;
+  const refs = f["#e"] as string[] | undefined;
+  if (refs && !(e.tags ?? []).some((tag) => tag[0] === "e" && refs.includes(tag[1] ?? ""))) return false;
   return true;
 }
 
@@ -125,13 +129,13 @@ const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 /** What a reader can see of a view: everything but the moment it was computed. */
 const seen = (v: PlainView) => JSON.stringify({ ...v, generatedAt: 0 });
 
-async function open(relay: FakeRelay, storage = memory(), markMs = 5): Promise<{ h: MarketHandle; views: PlainView[]; states: string[] }> {
+async function open(relay: FakeRelay, storage = memory(), markMs = 5, waitMs = 60_000): Promise<{ h: MarketHandle; views: PlainView[]; states: string[] }> {
   const views: PlainView[] = [], states: string[] = [];
   const h = await startMarket({
     feedLimit: 50,
     onView: (v) => views.push(v),
     onStatus: (s) => states.push(s),
-    seams: { openSocket: relay.open, storage, spot: false, waitMs: 60_000, markMs },
+    seams: { openSocket: relay.open, storage, spot: false, waitMs, markMs },
   });
   relay.names.onopen?.();
   relay.source.onopen?.();
@@ -301,5 +305,81 @@ test("the store is marked whole only after what was read has been written", asyn
     const db = await createEventDb();
     assert.equal(await db.historyComplete(), true);
     assert.equal((await db.loadAll()).length, events.length, "every event the relay holds is in the store by then");
+  } finally { h.stop(); }
+});
+
+/* ---------------- review fixes (PR #1361 round 1) ---------------- */
+
+test("a job that began before the week and moved in it: the week is shown with the whole job, and does not change", async () => {
+  globalThis.indexedDB = new IDBFactory();
+  const events = market();
+  // Offered and awarded nine days ago, delivered and paid an hour ago. Its result names no buyer: the other side of
+  // "swift-code delivered" comes from the offer, which the week's own pages do not hold.
+  const at = NOW - 9 * DAY;
+  const offer = ev(OFFER, BUYER2, at, tagged([["i", SECRET], ["amount", "100"], ["param", "deadline", String(NOW + DAY)]]));
+  const root = [["e", offer.id, "", "root"]];
+  const result = ev(RESULT, SELLERS[0], NOW - 3600, tagged(root));
+  events.push(offer, ev(CLAIM, SELLERS[0], at + 1, tagged(root)), ev(AWARD, BUYER2, at + 2, tagged([...root, ["p", SELLERS[0]]])), result);
+  const relay = new FakeRelay(events);
+  const { h, views } = await open(relay);
+  try {
+    relay.names.step();
+    relay.source.step();
+    relay.source.step();
+    assert.equal(views.length, 0, "the week's pages are in, the job that began before it is not: nothing yet");
+    const jobs = relay.sockets[2]!;
+    assert.ok(jobs, "the reader asks for that job on a socket of its own");
+    jobs.onopen?.();
+    jobs.drain();
+    assert.equal(views.length, 1);
+    const row = views[0]!.feed.find((f) => f.id === result.id);
+    assert.equal(row?.other?.key, BUYER2, "the delivery names its buyer in the first view");
+    relay.source.drain();
+    await tick(120);
+    assert.equal(h.ready(), "all");
+    assert.equal(seen(views.at(-1)!), seen(views[0]!), "and the week is identical once all of history is in");
+  } finally { h.stop(); }
+});
+
+test("a return visit on a slow relay shows its store as stale, not as the read being over", async () => {
+  const events = market();
+  await leaveStore(events);
+  const relay = new FakeRelay(events);
+  const { h, views } = await open(relay, memory({ "maxplayer-market-store": "2" }), 5, 40);
+  try {
+    relay.names.step();
+    await tick(80);           // the catch-up has not answered within waitMs
+    assert.equal(views.length, 1, "the store is shown rather than nothing");
+    assert.equal(h.ready(), "stale", "but it does not say it is whole and current");
+    const before = h.computes();
+    relay.source.step();
+    await tick(120);
+    assert.equal(h.computes(), before, "events of the catch-up do not recompute one by one");
+    relay.source.drain();
+    await tick(20);
+    assert.equal(h.ready(), "all", "the catch-up ends it");
+  } finally { h.stop(); }
+});
+
+test("names: a profile in the boundary second of a full page is not skipped, and the requests do not pile up", async () => {
+  globalThis.indexedDB = new IDBFactory();
+  const events = market().filter((e) => !(e.kind === PROFILE && e.pubkey === SELLERS[2]));
+  // 500 newer profiles of other keys, the last of them in the same second as plain-review's.
+  const edge = NOW - 50 * DAY;
+  for (let i = 0; i < 499; i++) events.push(ev(PROFILE, hex((1000 + i).toString(16)), NOW - 41 * DAY + i, [], JSON.stringify({ name: `n${i}` })));
+  events.push(ev(PROFILE, hex("f0"), edge, [], JSON.stringify({ name: "edge-mate" })));
+  events.push(ev(PROFILE, SELLERS[2], edge, [], JSON.stringify({ name: "plain-review" })));
+  const relay = new FakeRelay(events);
+  const sent: string[] = [];
+  const { h, views } = await open(relay);
+  const names = relay.names, send = names.send.bind(names);
+  names.send = (text: string) => { sent.push(text); send(text); };
+  try {
+    names.drain();
+    relay.source.step();
+    relay.source.step();
+    assert.equal(views.length, 1);
+    assert.equal(views[0]!.experts.find((e) => e.key === SELLERS[2])?.name, "plain-review", "named in the first view");
+    assert.ok(sent.some((t) => t.startsWith('["CLOSE","n1"')), "the first page is closed before the next is asked for");
   } finally { h.stop(); }
 });
