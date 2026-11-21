@@ -1,0 +1,4 @@
+/* Loaded only without JavaScript (a <link> inside <noscript>; the CSP allows no inline style). The new pages keep
+   their nav and, on /market, their content hidden until the script has placed everything; with no script they show. */
+.nav{visibility:visible}
+html.mk body .mk-main{visibility:visible}

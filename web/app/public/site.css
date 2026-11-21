@@ -1,0 +1,643 @@
+/* Maxplayer — the Teams landing page (/), and the base the Market page (/market, market.css) is built on.
+   The pages that keep the earlier look (chat, mint, tokens, swarm, the legal pages) use styles.css, not this file.
+   The font faces are in fonts.css.
+   Look: the motion deck (dark ground, Instrument Sans, one yellow accent, Work Sans logo word).
+   Behaviour, 900 px wide and up: one fixed stage over a tall scroll track; scrolling drives every transition
+   (teams.js sets --ti / --to / --o on each scene: how far it still is from coming in, how far it has gone, its opacity).
+   Below 900 px (phones): an ordinary document; see "phone-size pages" at the end of this file. */
+
+
+:root{
+  --bg:#1a1a1a; --panel:#262625; --card:#0c0c0c; --line:#5c5c59; --ink:#fff; --ink2:#d2d2ce; --mut:#8a8a87; --dim:#6b6b68;
+  --blue:#00a1ef; --green:#12b886; --giallo:#ffdf00; --rosso:#ff2800; --purple:#7b61ff;
+  --sans:"Instrument Sans","Helvetica Neue",Helvetica,Arial,sans-serif;
+  --mono:"SF Mono",ui-monospace,Menlo,Consolas,monospace;
+  --sys:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Helvetica,Arial,sans-serif;
+  --E:cubic-bezier(.6,.05,.2,1);
+  --nav:64px; --pad:clamp(20px,5vw,72px);
+  --ps:1;              /* phone scale in the playground, set by teams.js */
+  --pw:430px;          /* phone width on screen in the playground, set by teams.js */
+  --ds:1;              /* diagram scale, set by teams.js */
+}
+*{box-sizing:border-box}
+html{background:var(--bg);overscroll-behavior-y:none;scrollbar-width:none}
+html::-webkit-scrollbar{display:none}
+body{margin:0;background:var(--bg);font-family:var(--sans);color:var(--ink);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+#track{width:1px;height:700vh;pointer-events:none}
+#track i{display:block;height:var(--seg,100vh)}      /* one block per section (teams.js): the snap points on touch screens */
+/* The last block is as tall as the window can get. A phone's toolbar slides away and the window grows (about 80 px
+   on an iPhone) while --seg keeps the height measured at load; the page then ended 80 px short of the last
+   section's place and the closing section never fully arrived. (lvh: the height with the toolbar away; vh for
+   browsers without it.) */
+#track i:last-child{height:max(var(--seg,100vh),100vh);height:max(var(--seg,100vh),100lvh)}
+/* Touch screens: the browser's own scroll snapping, one section per swipe however hard the flick (snap-stop).
+   The mouse and trackpad path is teams.js onWheel. A swipe that starts on the phone mock-up or the command log must
+   move the page, so those lists do not take touch scrolling and do not hold the scroll at their edge. */
+@media (hover:none) and (pointer:coarse){
+  html{scroll-snap-type:y mandatory}
+  #track i{scroll-snap-align:start;scroll-snap-stop:always}
+  html .scrollable{overscroll-behavior:auto}   /* html: this must win over the rule below, which comes later in the file */
+  .phone .msgs{overflow:hidden}
+}
+a{color:inherit;text-decoration:none}
+button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+h1,h2,p,ol,ul{margin:0;padding:0}
+.defs{position:absolute;width:0;height:0;overflow:hidden}
+.scrollable{overflow-y:auto;scrollbar-width:none;overscroll-behavior:contain}
+.hero-marks{display:none}
+.demo,.menu-btn{display:none}   /* phone-size pages only: a phone mock-up per section, and the menu button */
+.scrollable::-webkit-scrollbar{display:none}
+
+/* ---------- logo: three-slash mark at capital height + MAXPLAYER in Work Sans Medium Italic ---------- */
+.logo{display:inline-block;white-space:nowrap;font-size:22px;line-height:1.6}
+.logo .mark{display:inline-block;vertical-align:baseline;overflow:visible;height:.724em;width:1.066em;margin-right:.32em}
+.wm{display:inline-block;font-family:"Work Sans Logo",var(--sans);font-size:1.091em;font-style:italic;font-weight:500;letter-spacing:.1em;text-transform:uppercase;white-space:nowrap;color:#f4f4f1}
+.pl{display:inline-block;vertical-align:baseline;margin-left:14px;padding-left:14px;border-left:1px solid rgba(255,255,255,.22);font-size:19px;letter-spacing:-.02em;line-height:1.2;white-space:nowrap;color:#fff}
+
+/* ---------- nav ---------- */
+/* what leaves a section upward dissolves under the nav: one fixed strip of the page colour over the stage (it
+   replaces a mask on each whole section, which phones had to redraw on every frame) */
+.navfade{position:fixed;left:0;right:0;top:0;height:calc(var(--nav) + 16px);z-index:50;pointer-events:none;background:linear-gradient(to bottom,var(--bg) calc(var(--nav) - 18px),rgba(26,26,26,0) 100%)}
+.nav{position:fixed;left:0;right:0;top:0;height:var(--nav);z-index:60;display:flex;align-items:center;gap:36px;padding:0 var(--pad)}
+/* the nav appears with the page, once the fonts are in (teams.js show): shown earlier, its logo was drawn in the
+   fallback face and changed width when the real one arrived */
+.nav{visibility:hidden}
+body.ready .nav{visibility:visible;animation:stagein .35s ease backwards}
+.tabs{display:flex;gap:6px;margin-right:auto}
+.tabs a{height:34px;padding:0 13px;border-radius:17px;display:flex;align-items:center;font-size:15.5px;letter-spacing:-.01em;color:var(--mut);transition:color .2s,background-color .2s}
+.tabs a:hover{color:#fff}
+.tabs a[aria-current]{color:#fff;background:rgba(255,255,255,.09)}
+.btn{display:inline-flex;align-items:center;gap:8px;height:48px;padding:0 22px;border-radius:24px;background:#fff;color:#111;font-size:16.5px;font-weight:500;letter-spacing:-.012em;white-space:nowrap;transition:transform .2s,background-color .2s}
+.btn:hover{background:var(--giallo)}
+.btn:active{transform:scale(.97)}
+.btn svg{width:18px;height:18px}
+.btn.sm{height:38px;padding:0 17px;font-size:15px}
+.lnk{font-size:16px;color:var(--ink2);border-bottom:1px solid rgba(255,255,255,.3);padding-bottom:1px;transition:color .2s,border-color .2s}
+.lnk:hover{color:#fff;border-color:#fff}
+
+/* ---------- stage and scenes ---------- */
+#stage{position:fixed;inset:0;overflow:hidden;transition:opacity .26s ease}
+#stage.jump{opacity:0;transition-duration:.2s}
+/* the first appearance: once teams.js has placed everything it adds .ready, and the stage fades in once. `backwards`
+   only, so the animation lets go when it ends and the .jump fade above keeps working. */
+body.ready #stage{animation:stagein .35s ease backwards}
+@keyframes stagein{from{opacity:0}to{opacity:1}}
+.dotgrid{position:absolute;inset:0;opacity:0;
+  background-image:radial-gradient(rgba(255,255,255,.085) 1px,transparent 1.4px);background-size:18px 18px;background-position:9px 9px;
+  -webkit-mask-image:radial-gradient(ellipse 62% 58% at 50% 56%,#000 55%,transparent 100%);mask-image:radial-gradient(ellipse 62% 58% at 50% 56%,#000 55%,transparent 100%)}
+
+.sc{position:absolute;inset:0;opacity:var(--o,0);visibility:hidden;pointer-events:none;--ti:0;--to:0}
+.sc.on{pointer-events:auto}
+
+.ey{font-size:16px;color:var(--mut);letter-spacing:0}
+.lede{font-size:19px;line-height:1.35;letter-spacing:-.015em;color:var(--mut)}
+
+/* ---------- the phone (one object for the whole page) ---------- */
+/* Hidden until teams.js has placed it (render() sets visibility): the first paint comes before the script, and the
+   phone used to flash at the top of the page, full size, for that moment. */
+/* the phone is wider than a full phone would allow and is never shown whole: it runs off the bottom of the screen
+   (as on cash.app and poke.com). It stays solid: fading it to transparent let the background glow show through it.
+   --fade is above 0 only where it must stop above other controls. teams.js sets the transform and --cut, the y (in phone units) where it ends. */
+.phone-pos{position:absolute;left:50%;top:0;width:444px;height:912px;margin-left:-222px;z-index:20;transform-origin:50% 0;will-change:transform,opacity;visibility:hidden}
+/* Only where the phone must stop above the bottom of the screen (a phone-size Try it, above the step tiles) is it cut
+   and faded; teams.js sets .cut, --cut and --fade then. Everywhere else it simply runs off the bottom of the stage:
+   a mask that changed on every frame of a transition made phones stutter. */
+.phone-pos.cut{--cut:560px;--fade:0px;clip-path:inset(-20px -20px calc(912px - var(--cut)) -20px);-webkit-mask-image:linear-gradient(to bottom,#000 calc(var(--cut) - var(--fade)),transparent var(--cut));mask-image:linear-gradient(to bottom,#000 calc(var(--cut) - var(--fade)),transparent var(--cut))}
+/* decoration never takes clicks: the glow's circles are 800 px wide, sit above the sections, and covered buttons near the phone */
+.glow,.glow i,.dotgrid{pointer-events:none}
+.glow{position:absolute;left:50%;top:0;width:0;height:0;z-index:1;will-change:transform}
+.glow i{position:absolute;left:-400px;top:-420px;width:800px;height:840px;border-radius:50%;filter:blur(96px);opacity:0;transform:scale(var(--ps))}
+.glow .g-warm{background:radial-gradient(300px 280px at 22% 18%,#ff2800 0,transparent 70%),radial-gradient(330px 320px at 82% 36%,#ff8a1c 0,transparent 70%),radial-gradient(380px 340px at 34% 84%,#ffdf00 0,transparent 70%),radial-gradient(300px 300px at 88% 92%,#c22000 0,transparent 70%)}
+.glow .g-cool{background:radial-gradient(360px 340px at 30% 24%,#2b2b2a 0,transparent 70%),radial-gradient(360px 340px at 74% 76%,#333331 0,transparent 70%)}
+
+.phone{font-family:var(--sys);position:absolute;inset:12px;border-radius:62px;background:#000;box-shadow:0 0 0 2px #2c2c2e,0 0 0 9px #0b0b0c,0 0 0 10.5px #5a5a5e}
+.phone .sbar{position:absolute;left:36px;right:32px;top:21px;height:22px;display:flex;align-items:center;justify-content:space-between;font-size:16px;font-weight:600;letter-spacing:-.01em}
+.phone .sbar svg{width:68px;height:14px}
+.phone .isl{position:absolute;left:50%;top:14px;width:112px;height:32px;margin-left:-56px;border-radius:16px;background:#0a0a0a;box-shadow:inset 0 0 0 1px #181818}
+.phone .hdr{position:absolute;left:0;right:0;top:56px;text-align:center}
+.phone .hdr .av{display:inline-block;width:50px;height:50px}
+.phone .hdr .nm{position:relative;display:table;margin:-10px auto 0;padding:3px 12px;border-radius:12px;background:#1c1c1e;font-size:14px}
+/* the top fade (17 to 20 px) ends on the resting line (20 px padding): the bubble on the line is whole, and the one
+   above it is gone even inside a run of bubbles, where it ends only 3 px higher; the bottom one (44 px) is where new
+   bubbles rise out of the phone's black. teams.js `chatEnd` keeps resting bubbles clear of both. */
+.phone .msgs{position:absolute;left:7px;right:7px;top:124px;height:var(--mh,300px);display:flex;flex-direction:column;gap:9px;transition:opacity .2s ease;padding:20px 9px 48px;-webkit-mask-image:linear-gradient(to bottom,transparent 17px,#000 20px,#000 calc(100% - var(--fb,44px)),transparent 100%);mask-image:linear-gradient(to bottom,transparent 17px,#000 20px,#000 calc(100% - var(--fb,44px)),transparent 100%)}
+.phone .msgs.fade{opacity:0}
+/* bubbles move the way Messages does on an iPhone: each one arrives whole, rises into place and fades in;
+   the list glides up under it (teams.js `follow`), and a reply takes the typing bubble's place whole (teams.js `morph`) */
+.b{position:relative;flex:none;max-width:78%;padding:8px 14px 9px;border-radius:19px;font-size:17px;line-height:1.28;letter-spacing:-.012em;opacity:0;transform:translate3d(0,18px,0) scale(.96);transform-origin:0 100%;transition:opacity .24s ease-out,transform .52s cubic-bezier(.2,.9,.24,1);will-change:transform,opacity}
+.b.vis{opacity:1;transform:none}
+.b.me.vis{transform:none}
+.b b{font-weight:600}
+.b.agt{align-self:flex-start;background:#26252a;color:#fff}
+.b.me{align-self:flex-end;background:#0a84ff;color:#fff;transform:translate3d(0,34px,0) scale(.96);transform-origin:100% 100%}
+.b.agt + .b.agt,.b.agt + .b.dots,.b.me + .b.me{margin-top:-6px}
+.b.me::before,.b.me::after,.b.agt::before,.b.agt::after{content:"";position:absolute;bottom:0;height:19px;opacity:0;transition:opacity .22s ease}
+.b.tail::before,.b.tail::after{opacity:1}
+.b.me::before{right:-7px;width:20px;background:#0a84ff;border-bottom-left-radius:16px 14px}
+.b.me::after{right:-26px;width:26px;height:21px;background:#000;border-bottom-left-radius:10px}
+.b.agt::before{left:-7px;width:20px;background:#26252a;border-bottom-right-radius:16px 14px}
+.b.agt::after{left:-26px;width:26px;height:21px;background:#000;border-bottom-right-radius:10px}
+.b.card{align-self:flex-start;width:82%;max-width:none;background:#1c1c1e;box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);border-radius:18px;padding:12px 14px}
+.b.dots{align-self:flex-start;background:#26252a;padding:14px 15px;transform:scale(.6)}
+.b.dots.vis{transform:none}
+.dz{display:flex;gap:5px}
+/* a reply that takes the typing bubble's place: it is already where it belongs, so it does not rise, it only fades in */
+.b.swap{transform:none;transition:opacity .28s ease-out}
+.dz i{width:7px;height:7px;border-radius:50%;background:#8e8e93;animation:pulse 1s infinite}
+.dz i:nth-child(2){animation-delay:.16s} .dz i:nth-child(3){animation-delay:.32s}
+.b.sug{align-self:flex-start;width:84%;max-width:none;background:#26252a;padding:10px 12px 12px}
+.b.sug p{padding:0 2px 9px}
+.b.sug.short p{padding-bottom:0}   /* the greeting without its buttons (teams.js fitGreeting) */
+.b.sug button{display:block;width:100%;text-align:left;margin-top:7px;padding:9px 12px;border-radius:10px;border:1px dashed rgba(255,255,255,.34);font-size:15px;color:#fff;transition:background-color .2s,border-color .2s}
+.b.sug button:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.7)}
+.b.next{align-self:flex-start;background:none;padding:0}
+.b.next button{padding:9px 13px;border-radius:14px;border:1px dashed rgba(255,255,255,.34);font-size:15px;color:#fff;transition:background-color .2s,border-color .2s}
+.b.next button:hover{background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.7)}
+.tc{display:flex;align-items:center;gap:10px}
+.tc .t{font-size:15.5px} .tc .tm{font-size:13px;color:#8e8e93;margin-top:2px}
+.tc .avs{margin-left:auto;display:flex;gap:6px} .tc .avs .av{width:32px;height:32px}
+.tc>.av{width:36px;height:36px}
+.tc .ico{position:static;flex:none;width:34px;height:34px;border-radius:9px}
+.tc .ico svg{width:19px;height:19px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+
+/* agent marks: round, as the deck shows them */
+.av{display:inline-block;flex:none;border-radius:50%;background-color:#fff;background-repeat:no-repeat;background-position:center;overflow:hidden;vertical-align:middle}
+.av svg{width:100%;height:100%;display:block}
+.av-muse{background-color:#f5f4f6;background-image:url("./assets/muse.jpg");background-size:cover}
+.av-inst{background-image:url("./assets/instinct.png");background-size:auto 62%}
+.av-codex{background-color:#f5f5f5;background-image:url("./assets/agents/codex.webp");background-size:92%}
+.av-dots{background-color:#f7f7f8;background-image:url("./assets/agents/dots.webp");background-size:80%;background-position:50% 54%}
+.av-duet{background-color:#f8f6f1;background-image:url("./assets/agents/duet.webp");background-size:112%}
+.av-hermes{background-image:url("./assets/agents/hermes.webp");background-size:112%}
+.av-openclaw{background-image:url("./assets/agents/openclaw.svg");background-size:66%}
+.av-claude{background-color:#faf9f5;background-image:url("./assets/agents/claude-code.svg");background-size:58%}
+.ico{display:grid;place-items:center;flex:none;width:44px;height:44px;border-radius:11px;color:#fff}
+.ico svg{width:24px;height:24px}
+.c-blue{background:#0091ff} .c-green{background:#1d9964} .c-yel{background:var(--giallo);color:#111} .c-purple{background:var(--purple)}
+
+/* ---------- 0 · hero ---------- */
+.hero-c{position:absolute;left:var(--pad);right:var(--pad);top:calc(var(--nav) + min(3.6vh,40px));text-align:center;transform:translate3d(0,calc(var(--to) * var(--hero-d,300px) * -1),0);will-change:transform}
+/* the headline and buttons leave upward a little faster than the phone rises (teams.js sets --hero-d from the phone's
+   travel), so the phone never catches the button; they dissolve as they pass under the nav instead of crossing it */
+.hero-c h1{font-weight:400;font-size:min(96px,6vw,9.6vh);line-height:1.02;letter-spacing:-.022em}
+.cta-row{margin-top:min(30px,3.2vh);display:flex;align-items:center;justify-content:center;gap:22px;flex-wrap:wrap}
+
+/* ---------- 2 · try it (the playground) ---------- */
+.rail,.calls{position:absolute;top:calc(var(--nav) + 18px);bottom:34px;display:flex;flex-direction:column;justify-content:center;will-change:transform}
+.rail{left:var(--pad);width:min(330px,calc(50vw - var(--pw) / 2 - var(--pad) - 40px))}
+.calls{right:var(--pad);width:min(370px,calc(50vw - var(--pw) / 2 - var(--pad) - 40px))}
+.rail{transform:translate3d(calc(var(--ti) * -110px),calc(var(--to) * -130px),0)}
+.calls{transform:translate3d(calc(var(--ti) * 200px),calc(var(--to) * -70px),0)}
+.rail h2{font-weight:400;font-size:44px;line-height:1;letter-spacing:-.022em}
+.rail .lede{margin-top:10px;font-size:17px}
+.lab{display:flex;align-items:center;gap:12px;margin:24px 0 10px;font-size:13px;color:var(--mut)}
+.lab::after{content:"";flex:1;height:1px;background:rgba(255,255,255,.1)}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:1px;border-radius:11px;background:rgba(255,255,255,.1);box-shadow:0 0 0 1px rgba(255,255,255,.1);overflow:hidden}
+.tile{position:relative;display:flex;align-items:center;gap:11px;height:54px;padding:0 13px;background:#1f1f1e;font-size:15.5px;letter-spacing:-.012em;color:#fff;text-align:left;white-space:nowrap;transition:background-color .2s}
+.tile:hover{background:#292928}
+.tile .av{width:26px;height:26px}
+.tile .gi{width:22px;height:22px;color:var(--green);flex:none}
+.tile[aria-checked="true"],.tile[aria-pressed="true"]{background:#2a2a28;box-shadow:inset 0 0 0 1.5px var(--giallo);border-radius:2px}
+.tiles .tile:first-child[aria-checked="true"],.tiles .tile:first-child[aria-pressed="true"]{border-top-left-radius:11px}
+.tiles .tile:nth-child(2)[aria-checked="true"],.tiles .tile:nth-child(2)[aria-pressed="true"]{border-top-right-radius:11px}
+.tiles .tile:nth-last-child(2)[aria-checked="true"],.tiles .tile:nth-last-child(2)[aria-pressed="true"]{border-bottom-left-radius:11px}
+.tiles .tile:last-child[aria-checked="true"],.tiles .tile:last-child[aria-pressed="true"]{border-bottom-right-radius:11px}
+.tile .dot{margin-left:auto;width:8px;height:8px;border-radius:50%;background:transparent;flex:none;transition:background-color .3s,box-shadow .3s}
+.tile.run .dot{background:var(--giallo);box-shadow:0 0 4px rgba(255,223,0,.3)}   /* steady yellow while it runs, then green: no blink, hardly any glow (Bob) */
+.tile.done .dot{background:var(--green);box-shadow:0 0 4px rgba(18,184,134,.28)}
+
+.calls{justify-content:flex-start;padding:0;top:calc(var(--nav) + 12vh - 2px);bottom:50px;border-radius:16px;background:rgba(12,12,12,.72);box-shadow:inset 0 0 0 1px rgba(255,255,255,.1);overflow:hidden}
+.calls-h{flex:none;display:flex;align-items:center;height:48px;padding:0 16px;font-size:13px;color:var(--mut);border-bottom:1px solid rgba(255,255,255,.08)}
+.calls-x{display:none;margin-left:auto;font-size:13px;color:var(--ink2)}
+.calls-empty{pointer-events:none;position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);padding:0 34px;text-align:center;font-size:15px;line-height:1.4;color:var(--mut);transition:opacity .3s}
+.calls-empty b{display:block;font-weight:400;color:var(--ink2);margin-bottom:2px}
+.calls.has .calls-empty{opacity:0}
+.calls-l{flex:1;list-style:none;padding:12px;display:flex;flex-direction:column;gap:10px;scroll-behavior:smooth}
+.call{flex:none;border-radius:11px;background:#1c1c1b;box-shadow:inset 0 0 0 1px rgba(255,255,255,.07);padding:11px 12px 12px;opacity:0;transform:translateY(8px);transition:opacity .35s,transform .35s}
+.call.vis{opacity:1;transform:none}
+.call .top{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--mut)}
+.call .top .av{width:18px;height:18px}
+.call .top .mk{width:18px;height:12px}
+.call .k{margin-left:auto;font-family:var(--mono);font-size:10.5px;letter-spacing:.04em;color:var(--ink2);padding:2px 7px;border-radius:5px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.16)}
+.call .k.chk{color:#0b0b0b;background:var(--giallo);box-shadow:none}
+.call code{display:block;margin-top:8px;font-family:var(--mono);font-size:12.5px;line-height:1.45;color:#fff;white-space:pre-wrap;overflow-wrap:anywhere;font-variant-ligatures:none}
+.call .res{opacity:0;transition:opacity .3s;margin-top:7px;display:flex;gap:8px;align-items:baseline;font-size:13.5px;line-height:1.35;color:var(--ink2)}
+.call.ok .res{opacity:1}
+.call .res i{flex:none;width:7px;height:7px;border-radius:50%;background:var(--green);transform:translateY(-1px)}
+.calls-pill{display:none}
+
+/* hero: other agents, as part of the background. They are painted UNDER the warm glow (this block comes before
+   .glow in the page and has no z-index), so the glow colours them; a pale disc on top of the glow read as a grey
+   shadow. They are scattered in the band beside the phone, each at its own depth: a nearer mark is larger and
+   clearer, a farther one smaller, fainter and softer (--s size, --fx how far out across the band, --fy how far
+   down from the phone's top, --a opacity, --bl blur: --s and --bl are baked into assets/float-marks.webp, see .fl-soft). They do not move and have no shadows or rings.
+   The two that the hero chat invites start in the middle distance; called, they turn sharp, full colour and fully
+   opaque at the same size (Bob: do not make them grow), with a faint edge of light, for a moment only, and then
+   sink back (teams.js floatFlash).
+   teams.js render() sets --to and the fade as the hero leaves. */
+.floats{position:absolute;inset:0;pointer-events:none;--to:0;--band:calc(50vw - var(--hero-pw,446px) / 2 - var(--pad));--h:calc(100vh - var(--hero-py,420px))}
+.fl{position:absolute;width:var(--s);height:var(--s);top:calc(var(--hero-py,420px) + var(--h) * var(--fy));margin:calc(var(--s) / -2) 0 0 calc(var(--s) / -2);
+  transform:translate3d(calc(var(--to) * var(--out)),calc(var(--to) * var(--hero-d,300px) * -1),0)}
+.fl.l{left:calc(50% - var(--hero-pw,446px) / 2 - max(var(--band) * var(--fx),var(--min,40px)));--out:-200px}
+.fl.r{left:calc(50% + var(--hero-pw,446px) / 2 + max(var(--band) * var(--fx),var(--min,40px)));--out:520px}
+/* the first eight. left: Grok Bot (invited), Codex, Claude Code, Hermes.  right: Instinct (invited), Hermes, OpenClaw, Duet */
+.f1{--s:46px;--fx:.24;--fy:.50;--a:.34;--bl:.6px;--min:78px}
+.f2{--s:30px;--fx:.60;--fy:.44;--a:.17;--bl:1.6px;--min:160px}
+.f3{--s:50px;--fx:.36;--fy:.78;--a:.42;--bl:.4px;--min:104px}
+.f4{--s:40px;--fx:.62;--fy:.64;--a:.27;--bl:1px;--min:172px}
+.f5{--s:46px;--fx:.25;--fy:.58;--a:.34;--bl:.6px;--min:80px}
+.f6{--s:30px;--fx:.59;--fy:.30;--a:.17;--bl:1.6px;--min:164px}
+.f7{--s:42px;--fx:.48;--fy:.48;--a:.27;--bl:1px;--min:152px}
+.f8{--s:48px;--fx:.31;--fy:.84;--a:.42;--bl:.4px;--min:98px}
+/* the second eight are the same agents again (other people's), further back, each on the other side from its twin:
+   left OpenClaw, Duet, Dots, Instinct; right Dots, Codex, Grok Bot, Claude Code
+   (Bob swapped Dots and Hermes on the right, so Dots is the clearer one there) */
+.f9{--s:38px;--fx:.42;--fy:.33;--a:.28;--bl:.9px;--min:118px}
+.f10{--s:26px;--fx:.13;--fy:.30;--a:.14;--bl:1.8px;--min:50px}
+.f11{--s:32px;--fx:.68;--fy:.86;--a:.20;--bl:1.3px;--min:190px}
+.f12{--s:30px;--fx:.15;--fy:.91;--a:.20;--bl:1.3px;--min:52px}
+.f13{--s:38px;--fx:.46;--fy:.70;--a:.28;--bl:.9px;--min:150px}
+.f14{--s:26px;--fx:.14;--fy:.34;--a:.14;--bl:1.8px;--min:50px}
+.f15{--s:32px;--fx:.66;--fy:.60;--a:.20;--bl:1.3px;--min:196px}
+.f16{--s:28px;--fx:.36;--fy:.26;--a:.16;--bl:1.6px;--min:104px}
+/* the trail: four more on each side, low down, each further out, smaller, fainter and softer than the last, so the
+   field runs off into the distance toward the window edge (--fx above 1 reaches into the page margin).
+   left OpenClaw, Codex, Duet, Grok Bot; right Hermes, Claude Code, Instinct, Dots */
+.f17{--s:26px;--fx:.82;--fy:.75;--a:.15;--bl:1.6px;--min:206px}
+.f18{--s:22px;--fx:.94;--fy:.85;--a:.11;--bl:2px;--min:226px}
+.f19{--s:18px;--fx:1.04;--fy:.74;--a:.08;--bl:2.4px;--min:244px}
+.f20{--s:14px;--fx:1.12;--fy:.87;--a:.06;--bl:2.8px;--min:258px}
+.f21{--s:26px;--fx:.80;--fy:.80;--a:.15;--bl:1.6px;--min:208px}
+.f22{--s:22px;--fx:.92;--fy:.71;--a:.11;--bl:2px;--min:228px}
+.f23{--s:18px;--fx:1.03;--fy:.86;--a:.08;--bl:2.4px;--min:246px}
+.f24{--s:14px;--fx:1.11;--fy:.77;--a:.06;--bl:2.8px;--min:260px}
+/* How a mark is drawn. Its soft, toned-down picture (blur --bl, saturation .75) is NOT made with a CSS filter: it is
+   a cell of assets/float-marks.webp, a sheet drawn from --s and --bl above (it has to be drawn again after
+   changing either, a mark's picture, or FLOATS in teams.js; the script that draws it is not in this repo yet). With `filter:blur()` on the marks, desktop Safari drew a
+   stray tab on the left and the bottom of every blurred mark (Bob, twice; more room inside the blurred box did not
+   help, and no test browser here shows it). A picture cannot go wrong that way.
+   .fl-soft is that picture, at the mark's opacity. .fl-in is the sharp, full-colour mark on top of it, not shown
+   until the mark is called. */
+.fl-soft{position:absolute;left:50%;top:50%;width:72px;height:72px;margin:-36px 0 0 -36px;background:url("./assets/float-marks.webp") calc(var(--cx,0) * -72px) calc(var(--cy,0) * -72px) / 432px 360px no-repeat;opacity:var(--a);transition:opacity 2.6s ease}
+.fl-in{position:absolute;inset:0;z-index:1;opacity:0;transition:opacity 2.6s ease}
+.fl-in .av{position:absolute;inset:0;width:100%;height:100%}
+/* the light behind a called mark: a tight radial bloom that hugs the mark (about 4 px beyond its edge, faint), not a
+   ring and not a box-shadow */
+.fl::before{content:"";position:absolute;inset:-9%;border-radius:50%;background:radial-gradient(closest-side,rgba(255,228,160,.5) 0,rgba(255,226,155,.5) 85%,rgba(255,204,110,.2) 92%,rgba(255,190,80,0) 100%);opacity:0;transition:opacity 2.6s ease}
+/* the flash: up in a quarter of a second (these durations), back down over 2.6 s (the ones above; to the eye the fade ends about 2 s in) */
+.fl.lit .fl-in{opacity:1;transition-duration:.25s}
+.fl.lit .fl-soft{opacity:0;transition-duration:.25s}
+.fl.lit::before{opacity:1;transition-duration:.25s}
+
+/* ---------- 1 · tasks: a list on the left, the phone (moved right) plays the one you pick ---------- */
+.tasks-l{position:absolute;left:var(--pad);top:calc(50% + var(--nav) / 2 - 10px);width:min(640px,calc(67vw - var(--pw) / 2 - var(--pad) - 64px));transform:translate3d(calc(var(--ti) * -170px + var(--to) * -230px),calc(-50% + var(--to) * -120px),0);will-change:transform}
+.tasks-l h2{font-weight:400;font-size:clamp(34px,3.7vw,58px);line-height:1.04;letter-spacing:-.022em;text-wrap:balance}
+#task-tiles{margin-top:30px;grid-template-columns:repeat(2,minmax(0,1fr))}
+#task-tiles .tile>span{min-width:0;overflow:hidden;text-overflow:ellipsis}
+#task-tiles .tile{height:58px;padding:0 16px;font-size:17px}
+#task-tiles .cnt{margin-left:auto;font-style:normal;font-size:13px;color:var(--mut);white-space:nowrap}
+#task-tiles .cnt + .dot{margin-left:10px}
+/* the team of the chosen task, under the grid: one mark per agent with its owner's name. Every member is there from
+   the start, faint, so the size of the team shows at once; each one turns solid when the chat brings it in. */
+.team{margin-top:20px}
+.team-h{display:flex;align-items:baseline;gap:10px;font-size:13px;color:var(--mut)}
+.team-h b{font-weight:500;color:var(--ink2)}
+.team-row{margin-top:11px;display:grid;grid-template-columns:repeat(8,minmax(0,48px));gap:10px;min-height:60px}
+.tmm{min-width:0;text-align:center;opacity:.26;transition:opacity .6s ease}
+.tmm.in{opacity:1}
+.tmm .av{display:block;width:100%;max-width:40px;height:auto;aspect-ratio:1;margin:0 auto}
+.tmm i{display:block;margin-top:6px;font-style:normal;font-size:11.5px;line-height:1;color:var(--mut);white-space:nowrap}
+
+/* ---------- 3 · how it works: four cards, each a line of copy over a cropped piece of UI
+   (after the "Everything you'd want in a teammate" cards on x.ai/bot) ---------- */
+.how-head{position:absolute;left:var(--pad);right:var(--pad);top:calc(var(--nav) + min(4vh,36px));text-align:center;transform:translate3d(0,calc(var(--ti) * 70px + var(--to) * -90px),0);will-change:transform}
+.how-head h2{margin-top:8px;font-weight:400;font-size:clamp(32px,4vw,60px);line-height:1.05;letter-spacing:-.02em}
+.how-head p{margin:12px auto 0;max-width:640px;text-wrap:balance;font-size:clamp(16px,1.35vw,20px);line-height:1.38;letter-spacing:-.015em;color:var(--mut)}
+.how-grid{position:absolute;left:var(--pad);right:var(--pad);top:calc(var(--nav) + min(4vh,36px) + clamp(150px,21vh,196px));bottom:40px;display:grid;grid-template-columns:repeat(4,1fr);gap:clamp(12px,1.4vw,22px);align-items:center}
+.hc{display:flex;flex-direction:column;height:min(364px,calc(100vh - var(--nav) - 290px));overflow:hidden;border-radius:24px;background:var(--panel);box-shadow:inset 0 0 0 1px rgba(255,255,255,.08);padding:26px 24px 0;will-change:transform;transform:translate3d(0,calc(var(--ti) * var(--rise,110px) + var(--to) * -60px),0)}
+.hc:nth-child(2){--rise:170px} .hc:nth-child(3){--rise:230px} .hc:nth-child(4){--rise:290px}
+.hc h3{margin:0;font-weight:500;font-size:clamp(18px,1.5vw,22px);line-height:1.15;letter-spacing:-.02em}
+.hc>p{margin-top:9px;min-height:4.26em;font-size:clamp(14px,1.08vw,16px);line-height:1.42;letter-spacing:-.01em;color:var(--mut)}
+.stage{flex:1;min-height:110px;margin:16px -4px 0;padding:14px 12px 0;border-radius:14px 14px 0 0;background:#141414;box-shadow:inset 0 1px 0 rgba(255,255,255,.1),inset 1px 0 0 rgba(255,255,255,.07),inset -1px 0 0 rgba(255,255,255,.07);display:flex;flex-direction:column;gap:8px;overflow:hidden;font-family:var(--sys);
+  -webkit-mask-image:linear-gradient(to bottom,#000 80%,transparent 100%);mask-image:linear-gradient(to bottom,#000 80%,transparent 100%)}
+.mb{flex:none;align-self:flex-start;max-width:90%;padding:6px 11px 7px;border-radius:15px;font-size:13.5px;line-height:1.25;background:#26252a;color:#fff}
+.mb.me{align-self:flex-end;background:#0a84ff}
+.mb b{font-weight:600}
+.mrow{flex:none;display:flex;align-items:center;gap:9px;min-height:42px;padding:7px 10px;border-radius:10px;background:#1f1f1e;box-shadow:inset 0 0 0 1px rgba(255,255,255,.07);font-size:13.5px;color:#fff;white-space:nowrap}
+.mrow .av{width:24px;height:24px}
+.mrow .ico{width:24px;height:24px;border-radius:6px} .mrow .ico svg{width:14px;height:14px}
+.mrow b{font-weight:500}
+.mrow em{margin-left:auto;font-style:normal;font-size:12px;color:var(--mut);display:flex;align-items:center;gap:6px}
+.mrow em.ok::before,.mrow em.wait::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--green)}
+.mrow em.wait::before{background:var(--giallo)}
+.mrow.card2{justify-content:space-between}
+.mrow.card2 div{display:flex;flex-direction:column;gap:1px}
+.mrow.card2 i{font-style:normal;font-size:11.5px;color:var(--mut)}
+.mrow .mk{width:20px;height:13px;flex:none}
+.mrow.chk{background:none;box-shadow:inset 0 0 0 1px rgba(255,223,0,.35)}
+.mmsg{flex:none;display:flex;gap:9px;align-items:flex-start;padding:0 2px;font-size:13.5px;line-height:1.3;color:var(--ink2)}
+.mmsg .av{width:24px;height:24px;margin-top:1px}
+.mmsg b{display:block;font-weight:500;color:#fff;font-size:12.5px}
+.mmsg u{text-decoration:none;font-family:var(--mono);font-size:12px;color:#fff}
+.mrow.xp2 b{font-family:var(--mono);font-weight:400;font-size:13px}
+.mrow.xp2.on{box-shadow:inset 0 0 0 1px rgba(255,255,255,.4)}
+.mrow.pay{background:none;box-shadow:none;min-height:0;padding:0 4px 4px;justify-content:space-between;color:var(--mut);font-size:12.5px}
+.mrow.pay b{color:var(--giallo);font-weight:500}
+
+/* ---------- 4 · get started ---------- */
+.start-l{position:absolute;left:var(--pad);top:calc(50% + var(--nav) / 2 - 20px);width:min(680px,calc(50vw + 24vw - var(--pw) / 2 - var(--pad) - 70px));transform:translate3d(0,calc(-50% + var(--ti) * 130px + var(--to) * -130px),0)}
+/* headline and text as in How it works (.how-head), so the sections read as one family */
+.start-l h2{margin-top:8px;font-weight:400;font-size:clamp(32px,4vw,60px);line-height:1.05;letter-spacing:-.02em;text-wrap:balance}
+.start-l .lede{margin-top:12px;font-size:clamp(16px,1.35vw,20px);line-height:1.38;letter-spacing:-.015em}
+.copy{margin-top:30px;display:flex;align-items:center;gap:14px;border-radius:14px;background:var(--card);box-shadow:inset 0 0 0 1px rgba(255,255,255,.16);padding:8px 8px 8px 18px}
+.copy code{flex:1;min-width:0;font-family:var(--mono);font-size:14.5px;line-height:1.45;color:#fff;font-variant-ligatures:none;overflow-wrap:anywhere;padding:8px 0;user-select:all}
+.copy button{flex:none;height:40px;padding:0 18px;border-radius:10px;background:#fff;color:#111;font-size:15px;font-weight:500;transition:background-color .2s}
+.copy button:hover,.copy button.ok{background:var(--giallo)}
+.gets{list-style:none;margin-top:30px;display:grid;grid-template-columns:1fr 1fr;gap:0 28px}
+.gets li{display:flex;align-items:center;gap:13px;height:52px;border-top:1px solid rgba(255,255,255,.09);font-size:17.5px;letter-spacing:-.02em;color:var(--ink2);white-space:nowrap}
+.gets .gi{width:22px;height:22px;color:var(--green);flex:none}   /* the same line icons as the Try it steps */
+
+/* ---------- 5 · FAQ (after x.ai/bot: heading on the left, a divided list of questions on the right, one open at a
+   time). What leaves at the top dissolves under the nav. ---------- */
+.faq-page{position:absolute;inset:0;transform:translate3d(0,calc(var(--ti) * 120px + var(--to) * -150px),0);will-change:transform}
+.faq-main{position:absolute;left:var(--pad);right:var(--pad);top:calc(var(--nav) + min(7vh,60px));display:grid;grid-template-columns:minmax(0,.6fr) minmax(0,1.4fr);gap:clamp(32px,5vw,80px);align-items:start}
+.faq-main h2{font-weight:400;font-size:clamp(32px,4vw,60px);line-height:1.05;letter-spacing:-.02em}
+.faq-list{border-bottom:1px solid rgba(255,255,255,.1)}
+.fq{border-top:1px solid rgba(255,255,255,.1)}
+.fq h3{margin:0;font-size:inherit;font-weight:inherit}
+.fq button{display:flex;width:100%;align-items:flex-start;justify-content:space-between;gap:24px;padding:17px 0;text-align:left;font-size:17px;line-height:1.4;font-weight:500;letter-spacing:-.012em;color:#fff}
+.fq button svg{flex:none;width:20px;height:20px;margin-top:2px;color:var(--mut);transition:transform .25s ease}
+.fq.open button svg{transform:rotate(45deg)}
+.fq button:hover svg{color:#fff}
+.fa{display:grid;grid-template-rows:0fr;transition:grid-template-rows .32s cubic-bezier(.2,.8,.2,1)}
+.fq.open .fa{grid-template-rows:1fr}
+.fa>div{min-height:0;overflow:hidden}
+.fa p{max-width:660px;padding:0 44px 20px 0;font-size:16px;line-height:1.6;letter-spacing:-.01em;color:var(--ink2)}
+/* ---------- 6 · the closing call to action and the footer (after x.ai/bot: a centred headline, one line and a
+   button; then a footer with the lockup on the left and columns of links on the right). The call to action sits
+   in the middle of the space above the footer; the hero's warm glow comes back behind it (teams.js). ---------- */
+.end-wrap{position:absolute;left:0;right:0;top:var(--nav);bottom:0;display:flex;flex-direction:column}
+.end-c{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:0 var(--pad);transform:translate3d(0,calc(var(--ti) * 110px),0);will-change:transform}
+.end-c h2{font-weight:400;font-size:clamp(32px,4vw,60px);line-height:1.05;letter-spacing:-.02em;text-wrap:balance}
+.end-c p{margin-top:12px;font-size:clamp(16px,1.35vw,20px);line-height:1.38;letter-spacing:-.015em;color:var(--mut)}
+.end-c .btn{margin-top:min(30px,3.2vh)}
+.foot2{flex:none;transform:translate3d(0,calc(var(--ti) * 70px),0);display:flex;justify-content:space-between;align-items:flex-start;gap:48px;padding:38px var(--pad) 56px;border-top:1px solid rgba(255,255,255,.1)}
+.ft-l{display:flex;flex-direction:column;gap:12px}
+.ft-l small{font-size:12px;color:var(--dim)}
+.ft-cols{display:grid;grid-template-columns:repeat(4,auto);gap:28px clamp(28px,4.6vw,76px)}
+.ft-cols h4{margin:0 0 8px;font-size:13.5px;font-weight:500;color:#fff}
+.ft-cols a{display:block;font-size:13.5px;line-height:1.95;color:var(--mut);white-space:nowrap}
+.ft-cols a:hover{color:#fff}
+
+
+/* ---------- narrow screens: type and sizes. (The layout is in "phone-size pages" at the end of the file; the
+   positions and --ti / --to transforms below are left from the narrow stage and do nothing there.) ---------- */
+@media (max-width:899px){
+  :root{--nav:56px}
+  /* the nav on a phone: the logo, Get started (always there, Bob) and a menu button; the tabs are a panel that
+     opens under the nav. The nav is solid, because the page scrolls under it. */
+  .nav{gap:6px;background:var(--bg)}
+  .logo{font-size:17px}
+  .nav .btn.sm{height:34px;padding:0 13px;font-size:14px;margin-left:auto}
+  .menu-btn{display:block;position:relative;flex:none;width:40px;height:40px;margin-right:-9px}
+  .menu-btn i{position:absolute;left:10px;right:10px;top:19px;height:2px;border-radius:1px;background:#fff;transition:transform .22s ease,opacity .15s ease}
+  .menu-btn i:first-child{transform:translateY(-6px)}
+  .menu-btn i:last-child{transform:translateY(6px)}
+  .nav.open .menu-btn i:first-child{transform:rotate(45deg)}
+  .nav.open .menu-btn i:nth-child(2){opacity:0}
+  .nav.open .menu-btn i:last-child{transform:rotate(-45deg)}
+  .tabs{position:fixed;left:0;right:0;top:var(--nav);z-index:1;margin:0;flex-direction:column;gap:0;padding:2px var(--pad) 12px;background:var(--bg);border-radius:0 0 22px 22px;box-shadow:0 1px 0 rgba(255,255,255,.1);
+    opacity:0;visibility:hidden;transform:translate3d(0,-8px,0);transition:opacity .18s ease,transform .18s ease,visibility 0s .18s}
+  .nav.open .tabs{opacity:1;visibility:visible;transform:none;transition-delay:0s}
+  .tabs a{height:54px;padding:0 2px;border-radius:0;font-size:19px;color:var(--ink2);border-top:1px solid rgba(255,255,255,.09)}
+  .tabs a:first-child{border-top:0}
+  .tabs a[aria-current]{background:none;color:#fff}
+  .tabs a[aria-current]::after{content:"";margin-left:auto;width:7px;height:7px;border-radius:50%;background:var(--giallo)}
+  /* the page behind an open menu dims; a tap there closes it (teams.js) */
+  .nav::before{content:"";position:fixed;left:0;right:0;top:var(--nav);bottom:0;background:rgba(0,0,0,.55);opacity:0;visibility:hidden;transition:opacity .18s ease,visibility 0s .18s}
+  .nav.open::before{opacity:1;visibility:visible;transition-delay:0s}
+  .hero-c{top:calc(var(--nav) + 14px);text-align:left}
+  .navfade{height:calc(var(--nav) + 14px);background:linear-gradient(to bottom,var(--bg) var(--nav),rgba(26,26,26,0) 100%)}
+  /* phone-glow:start (generated: every colour fades on a bell curve in 16 stops, exp(-4.5 t^2) shifted to end at 0) */
+  /* phone-size: the glow without the blur filter (a blur this size is heavy on a phone). The soft edge comes from
+     the gradients themselves: each colour fades out on a bell curve, and the box is square-cornered and large
+     enough that nothing is clipped. The first try kept the 800 px circle and straight fades: a hard rim where the
+     circle cut the colours off, and blobs with visible outlines (Bob: too sharp on the edges). */
+  .glow i{filter:none;border-radius:0;left:-600px;top:-620px;width:1260px;height:1330px;transform-origin:600px 620px;will-change:opacity}
+  .glow .g-warm{background:radial-gradient(370px 350px at 392px 368px,rgba(255,40,0,0.350) 0%,rgba(255,40,0,0.344) 6.25%,rgba(255,40,0,0.326) 12.50%,rgba(255,40,0,0.298) 18.75%,rgba(255,40,0,0.263) 25%,rgba(255,40,0,0.224) 31.25%,rgba(255,40,0,0.184) 37.50%,rgba(255,40,0,0.146) 43.75%,rgba(255,40,0,0.111) 50%,rgba(255,40,0,0.081) 56.25%,rgba(255,40,0,0.057) 62.50%,rgba(255,40,0,0.038) 68.75%,rgba(255,40,0,0.024) 75%,rgba(255,40,0,0.014) 81.25%,rgba(255,40,0,0.007) 87.50%,rgba(255,40,0,0.003) 93.75%,rgba(255,40,0,0.000) 100%),radial-gradient(400px 380px at 840px 519px,rgba(255,138,28,0.460) 0%,rgba(255,138,28,0.452) 6.25%,rgba(255,138,28,0.428) 12.50%,rgba(255,138,28,0.392) 18.75%,rgba(255,138,28,0.346) 25%,rgba(255,138,28,0.295) 31.25%,rgba(255,138,28,0.242) 37.50%,rgba(255,138,28,0.191) 43.75%,rgba(255,138,28,0.146) 50%,rgba(255,138,28,0.107) 56.25%,rgba(255,138,28,0.075) 62.50%,rgba(255,138,28,0.050) 68.75%,rgba(255,138,28,0.032) 75%,rgba(255,138,28,0.019) 81.25%,rgba(255,138,28,0.010) 87.50%,rgba(255,138,28,0.004) 93.75%,rgba(255,138,28,0.000) 100%),radial-gradient(430px 400px at 488px 889px,rgba(255,223,0,0.440) 0%,rgba(255,223,0,0.432) 6.25%,rgba(255,223,0,0.410) 12.50%,rgba(255,223,0,0.375) 18.75%,rgba(255,223,0,0.331) 25%,rgba(255,223,0,0.282) 31.25%,rgba(255,223,0,0.231) 37.50%,rgba(255,223,0,0.183) 43.75%,rgba(255,223,0,0.140) 50%,rgba(255,223,0,0.102) 56.25%,rgba(255,223,0,0.072) 62.50%,rgba(255,223,0,0.048) 68.75%,rgba(255,223,0,0.030) 75%,rgba(255,223,0,0.018) 81.25%,rgba(255,223,0,0.009) 87.50%,rgba(255,223,0,0.004) 93.75%,rgba(255,223,0,0.000) 100%),radial-gradient(350px 350px at 888px 956px,rgba(194,32,0,0.420) 0%,rgba(194,32,0,0.413) 6.25%,rgba(194,32,0,0.391) 12.50%,rgba(194,32,0,0.358) 18.75%,rgba(194,32,0,0.316) 25%,rgba(194,32,0,0.269) 31.25%,rgba(194,32,0,0.221) 37.50%,rgba(194,32,0,0.175) 43.75%,rgba(194,32,0,0.133) 50%,rgba(194,32,0,0.098) 56.25%,rgba(194,32,0,0.069) 62.50%,rgba(194,32,0,0.046) 68.75%,rgba(194,32,0,0.029) 75%,rgba(194,32,0,0.017) 81.25%,rgba(194,32,0,0.009) 87.50%,rgba(194,32,0,0.003) 93.75%,rgba(194,32,0,0.000) 100%)}
+  .glow .g-cool{background:radial-gradient(400px 380px at 440px 402px,rgba(43,43,42,0.520) 0%,rgba(43,43,42,0.511) 6.25%,rgba(43,43,42,0.484) 12.50%,rgba(43,43,42,0.443) 18.75%,rgba(43,43,42,0.391) 25%,rgba(43,43,42,0.333) 31.25%,rgba(43,43,42,0.273) 37.50%,rgba(43,43,42,0.216) 43.75%,rgba(43,43,42,0.165) 50%,rgba(43,43,42,0.121) 56.25%,rgba(43,43,42,0.085) 62.50%,rgba(43,43,42,0.057) 68.75%,rgba(43,43,42,0.036) 75%,rgba(43,43,42,0.021) 81.25%,rgba(43,43,42,0.011) 87.50%,rgba(43,43,42,0.004) 93.75%,rgba(43,43,42,0.000) 100%),radial-gradient(400px 380px at 792px 838px,rgba(51,51,49,0.520) 0%,rgba(51,51,49,0.511) 6.25%,rgba(51,51,49,0.484) 12.50%,rgba(51,51,49,0.443) 18.75%,rgba(51,51,49,0.391) 25%,rgba(51,51,49,0.333) 31.25%,rgba(51,51,49,0.273) 37.50%,rgba(51,51,49,0.216) 43.75%,rgba(51,51,49,0.165) 50%,rgba(51,51,49,0.121) 56.25%,rgba(51,51,49,0.085) 62.50%,rgba(51,51,49,0.057) 68.75%,rgba(51,51,49,0.036) 75%,rgba(51,51,49,0.021) 81.25%,rgba(51,51,49,0.011) 87.50%,rgba(51,51,49,0.004) 93.75%,rgba(51,51,49,0.000) 100%)}
+  /* phone-glow:end */
+  /* phone-size hero: no room beside the phone for the scattered marks, so they sit in one faint row under the buttons;
+     the two the chat invites flash the same way */
+  .hero-marks{display:flex;gap:9px;margin-top:20px}
+  .hm{flex:none;width:28px;height:28px;border-radius:50%;opacity:.38;transition:opacity 2.6s ease}
+  .hm .av{display:block;width:100%;height:100%}
+  .hm.lit{opacity:1;transition-duration:.25s}
+  .hero-c h1{font-size:min(54px,11.6vw)}
+  .cta-row{margin-top:16px;justify-content:flex-start}
+  .rail{transform:none}
+  .rail{left:var(--pad);right:var(--pad);width:auto;top:calc(var(--nav) + 6px);bottom:18px;justify-content:space-between;pointer-events:none}
+  .rail>*{pointer-events:auto}
+  .rail h2,.rail .lede,.rail .lab{display:none}
+  #agent-tiles{grid-template-columns:repeat(4,1fr);transform:translate3d(0,calc(var(--ti) * -60px + var(--to) * -60px),0)}
+  #flow-tiles{transform:translate3d(0,calc(var(--ti) * 80px + var(--to) * 40px),0)}
+  #agent-tiles .tile{height:44px;padding:0 6px;gap:6px;font-size:12.5px;justify-content:center}
+  #agent-tiles .tile .av{width:20px;height:20px}
+  #flow-tiles{grid-template-columns:repeat(3,1fr)}
+  #flow-tiles .tile{height:40px;padding:0 8px;gap:6px;font-size:12.5px}
+  #flow-tiles .tile .gi{width:16px;height:16px}
+  .tile .dot{width:6px;height:6px}
+  .calls{position:fixed;left:8px;right:8px;top:auto;bottom:8px;width:auto;height:62vh;z-index:70;background:#111;transform:translateY(112%)!important;transition:transform .45s var(--E)}
+  .calls.open{transform:none!important}
+  .calls-x{display:block}
+  .calls-pill{display:flex;align-items:center;gap:8px;position:absolute;right:var(--pad);bottom:110px;height:32px;padding:0 12px;border-radius:16px;background:#111;box-shadow:inset 0 0 0 1px rgba(255,255,255,.2);font-size:13px;color:var(--ink2);z-index:25}
+  .calls-pill b{font-weight:500;color:#111;background:var(--giallo);border-radius:9px;min-width:18px;height:18px;padding:0 5px;display:grid;place-items:center;font-size:11.5px}
+
+  .ey{font-size:14px}
+  /* the list comes in from above and leaves upward faster than the phone rises, so the phone never touches the tiles */
+  .tasks-l{top:calc(var(--nav) + 12px);right:var(--pad);width:auto;transform:translate3d(0,calc(var(--ti) * -30px + var(--to) * -250px),0)}
+  .tasks-l h2{font-size:27px}
+  #task-tiles{margin-top:14px}
+  #task-tiles .tile{height:40px;padding:0 9px;font-size:13.5px;gap:6px}
+  #task-tiles .cnt{font-size:12px}
+  #task-tiles .cnt + .dot{margin-left:6px}
+  #task-tiles .cnt span{display:none}
+  .team{margin-top:10px}
+  .team-h{display:none}
+  .team-row{margin-top:0;grid-template-columns:repeat(8,minmax(0,28px));gap:6px;min-height:28px}
+  .tmm i{display:none}
+  .how-head{text-align:left;top:calc(var(--nav) + 12px)}
+  .how-head h2{font-size:30px}
+  .how-head p{margin:8px 0 0;font-size:15px}
+  .how-grid{top:calc(var(--nav) + 170px);bottom:16px;grid-template-columns:1fr;gap:8px;align-items:stretch;align-content:start}
+  .hc{height:auto;padding:13px 16px 14px;border-radius:16px}
+  .hc h3{font-size:17px}
+  .hc>p{margin-top:4px;min-height:0;font-size:14px;line-height:1.35}
+  .stage{display:none}
+
+  .start-l{position:absolute;left:var(--pad);right:var(--pad);top:calc(var(--nav) + 18px);width:auto;transform:translate3d(0,calc(var(--ti) * 110px + var(--to) * -110px),0)}
+  .start-l h2{font-size:30px}
+  .start-l .lede{margin-top:8px;font-size:15px}
+  .copy{flex-direction:column;align-items:stretch;padding:12px}
+  .copy code{font-size:13.5px;padding:2px 4px 8px}
+  .gets{grid-template-columns:1fr;margin-top:20px}
+  .gets li{height:46px;font-size:16px}
+  .faq-main{top:calc(var(--nav) + 14px);grid-template-columns:minmax(0,1fr);gap:12px}
+  .faq-main h2{font-size:30px}
+  .end-c h2{font-size:30px}
+  .end-c p{margin-top:8px;font-size:15px}
+  .fq button{padding:13px 0;font-size:15.5px;gap:16px}
+  .fq button svg{width:18px;height:18px}
+  .fa p{padding:0 26px 14px 0;font-size:14.5px;line-height:1.5}
+  .foot2{flex-direction:column;gap:22px;padding:24px var(--pad) 34px}
+  .ft-cols{grid-template-columns:repeat(2,minmax(0,1fr));width:100%;gap:18px 24px}
+}
+/* four How it works cards in a row are narrow in a mid-width window: tighter type, and a status shows as its dot
+   only (the word was cut off) */
+@media (min-width:900px) and (max-width:1279px){
+  .hc{padding:22px 16px 0}
+  .mrow{font-size:12.5px;padding:6px 8px;gap:7px;min-height:38px}
+  .mrow em{font-size:0;gap:0}
+  .mrow .av,.mmsg .av{width:20px;height:20px}
+  .mrow.pay{font-size:11px}
+  .mrow.xp2 b{font-size:12px}
+  .mb,.mmsg{font-size:12.5px}
+}
+/* a mid-width window (small laptop, tablet on its side): the left rail is narrow, so its tiles go compact */
+@media (min-width:900px) and (max-width:1199px){
+  .rail h2{font-size:36px}
+  .rail .lede{font-size:15px}
+  .rail .tiles{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .rail .tile{gap:6px;padding:0 7px;font-size:13px;height:46px}
+  .rail .tile .gi{display:none}
+  .rail .tile .av{width:20px;height:20px}
+  .rail .tile span:not(.av){overflow:hidden;text-overflow:ellipsis}
+}
+@media (max-width:1199px){ #task-tiles .cnt span{display:none} .team-row{gap:6px} .tmm i{font-size:10.5px} }
+@media (min-width:900px) and (max-width:1199px){ #task-tiles .tile{padding:0 10px;font-size:15px;gap:7px} #task-tiles .cnt + .dot{margin-left:7px} }
+@media (min-width:900px) and (max-width:999px){ #task-tiles .tile{padding:0 8px;font-size:13.5px;gap:6px} }
+@media (min-width:900px) and (max-width:959px),(max-width:379px){ #task-tiles .cnt{display:none} }   /* no room for the count: the row below shows the team */
+@media (max-width:899px){ .floats{display:none} }   /* a phone-size screen has no band beside the phone */
+@media (max-width:1099px){ .f19,.f20,.f23,.f24{display:none} }   /* a narrow window has no room for the far end of the trail */
+@media (max-width:999px){ .f18,.f22{display:none} }
+@media (max-width:359px){ .logo{font-size:15px} .nav .btn.sm{padding:0 10px;font-size:13px} }   /* the smallest phones: Get started stays in the nav */
+
+/* ---------- phone-size pages (below 900 px wide): a feed ----------
+   teams.js puts .doc on <html>. The sections are stacked blocks in an ordinary document, one screen each: a section
+   travels with the finger and the browser stops at the next one (scroll snap). Bob tried a free-scrolling long page
+   beside it on his phone and picked this one; the long page is gone.
+   Each section with a demo has its own phone mock-up in a .demo slot: the phone is never shown whole, it runs off
+   the bottom of the hero's screen or of its card.
+   --bar: how much taller the screen is with the browser's bars away (see the next rule). */
+html.doc{overscroll-behavior-y:auto;scroll-snap-type:y mandatory;--padx:max(var(--pad),calc(50vw - 290px));--dtop:22px;--bar:0px}
+@supports (height:100lvh){ html.doc{--bar:calc(100lvh - 100svh)} }
+html.doc #track,html.doc #stage>.glow,html.doc .dotgrid,html.doc .floats,html.doc #phone-pos{display:none}
+html.doc #stage{position:relative;inset:auto;overflow:visible}
+/* A section is as tall as the screen with the browser's bars away (lvh; plain vh means the same on an iPhone).
+   Sized to the screen with the bars showing (svh), the top of the next section showed below each one as soon as
+   the bottom bar slid away (Bob did not like it). With the bars showing, the bottom strip of a section is under
+   the bar instead, so nothing that must be seen sits there: the phones run off the bottom anyway. Nothing here
+   changes size when the bars come and go.
+   No z-index on the sections: the command sheet inside Try it is fixed and must stay above the sections after it. */
+html.doc .sc{position:relative;inset:auto;opacity:1;visibility:visible;pointer-events:auto;background:var(--bg);display:flex;flex-direction:column;min-height:100vh;min-height:100lvh;padding:calc(var(--nav) + 14px) var(--padx) 18px;scroll-snap-align:start;scroll-snap-stop:always}
+/* Sections whose content is text to the bottom (How it works, FAQs, the footer) keep the bar's height clear, so the
+   bar never covers their last lines when it is up. */
+html.doc .sc-how,html.doc .sc-faq{padding-bottom:calc(18px + var(--bar))}
+.barprobe,.lvhprobe{position:fixed;left:0;top:0;width:1px;height:var(--bar,0px);visibility:hidden;pointer-events:none}
+.lvhprobe{height:100vh;height:100lvh}   /* teams.js reads --bar and the screen's full height from these */
+html.doc .phone .msgs{overflow:hidden;overscroll-behavior:auto}   /* a finger on a phone mock-up scrolls the page */
+html.doc .phone .msgs.tight{--fb:12px}   /* a short phone: a short fade over the 16 px kept clear at the bottom (teams.js PAD_TIGHT) */
+
+/* the phone mock-ups: the hero's fills the rest of its screen, a card fills the rest of its section */
+html.doc .demo{display:block;position:relative;flex:none;isolation:isolate}
+html.doc .demo.card{flex:1;min-height:260px;margin-top:14px;border-radius:22px;background:#101010;overflow:hidden}
+html.doc .demo.card::after{content:"";position:absolute;inset:0;z-index:3;border-radius:inherit;box-shadow:inset 0 0 0 1px rgba(255,255,255,.09);pointer-events:none}
+html.doc .dphone{position:absolute;left:50%;top:var(--dtop);z-index:2;width:444px;height:912px;margin-left:-222px;transform-origin:50% 0;transform:scale(var(--dps,.75))}
+html.doc .demo .glow{top:calc(var(--dtop) + 330px * var(--dps,.75))}
+html.doc .sc-hero .g-warm{opacity:.5}
+html.doc .sc-tasks .g-warm{opacity:.34}
+html.doc .sc-play .g-cool{opacity:1}
+html.doc .sc-play .demo{background-image:radial-gradient(rgba(255,255,255,.07) 1px,transparent 1.4px);background-size:18px 18px;background-position:9px 9px}
+
+/* hero: one screen; the phone runs off its bottom */
+html.doc .sc-hero{height:100vh;height:100lvh;min-height:480px;padding:calc(var(--nav) + 14px) var(--padx) 0;overflow:hidden}
+html.doc .hero-c{position:static}
+html.doc .sc-hero .demo{flex:1;min-height:0;margin:22px calc(var(--padx) * -1) 0}
+
+/* tasks */
+html.doc .tasks-l{position:static;width:auto}
+/* six tasks on a phone-size page, not eight: the row that is left out goes to the phone under the tiles (Bob).
+   teams.js PHONE_TASKS. The fifth and sixth tiles are now the bottom corners of the block. */
+html.doc #task-tiles .tile:nth-child(n+7){display:none}
+html.doc #task-tiles .tile:nth-child(5)[aria-pressed="true"]{border-bottom-left-radius:11px}
+html.doc #task-tiles .tile:nth-child(6)[aria-pressed="true"]{border-bottom-right-radius:11px}
+
+/* try it: heading, the agent and step tiles, then the phone; the command log is a sheet opened from the pill, which
+   sits beside the heading, where it shows whether or not the browser's bottom bar is up */
+html.doc .rail{position:static;display:block;width:auto;pointer-events:auto}
+html.doc .rail h2{display:block;font-size:30px;line-height:1.05}
+html.doc #agent-tiles{margin-top:14px}
+html.doc #flow-tiles{margin-top:10px}
+html.doc .calls-pill{top:calc(var(--nav) + 14px);bottom:auto;right:var(--padx);z-index:5}
+
+/* how it works: the four cards in a column, sharing what is left of the screen, whatever its height */
+html.doc .how-head{position:static}
+html.doc .how-grid{position:static;flex:1;margin-top:22px;gap:10px;grid-template-rows:repeat(4,minmax(min-content,1fr));align-content:stretch}
+html.doc .hc{justify-content:center;padding-top:10px;padding-bottom:10px}
+
+/* get started: the text takes most of the screen, so there is no phone here. It sits in the middle of the screen
+   with the bars away, but never lower than 12 px above the bar's line: two spacers share the free room, and the
+   lower one is at least as high as the bar. (Plainly centred, its last row was under Chrome's bar on an iPhone,
+   which is taller than Safari's.) */
+html.doc .start-l{position:static;width:auto}
+html.doc .sc-start{justify-content:flex-start}
+html.doc .sc-start::before,html.doc .sc-start::after{content:"";flex:1 1 0}
+html.doc .sc-start::after{min-height:max(0px,calc(var(--bar) - 6px))}
+
+/* FAQ */
+html.doc .faq-page,html.doc .faq-main{position:static}
+
+/* the closing call to action and the footer. The call to action sits in the middle between the nav and the footer's
+   line, with at least 28 px each side (it had none below: the button touched the line on Bob's iPhone in Chrome).
+   The footer's links end 12 px above the bar's line (see --bar). The strip under them, which the bar covers when it
+   is up, is not left empty: the copyright line sits at its bottom. (The strip was the bar plus the ordinary padding
+   plus the safe area, 182 px of nothing on Bob's iPhone; the bar already covers the other two.) */
+html.doc .sc-end{padding:0}
+html.doc .end-wrap{position:static;flex:1}
+html.doc .end-c{padding:calc(var(--nav) + 28px) var(--padx) 28px}
+html.doc .foot2{position:relative;padding-left:var(--padx);padding-right:var(--padx);padding-bottom:max(calc(52px + env(safe-area-inset-bottom,0px)),calc(var(--bar) + 12px))}
+html.doc .ft-l small{position:absolute;left:var(--padx);bottom:calc(16px + env(safe-area-inset-bottom,0px))}
+
+/* Try it's tiles on narrow phones. 340 to 379 px wide: two across made five rows and left the phone a strip one
+   bubble high, so the tiles stay four and three across, as on wider phones: an agent's name goes under its avatar,
+   a step loses its icon. Under 340 px there is no room for that, and they go two across. */
+@media (min-width:340px) and (max-width:379px){
+  html.doc #agent-tiles{grid-template-columns:repeat(4,minmax(0,1fr))}
+  html.doc #agent-tiles .tile{flex-direction:column;justify-content:center;gap:5px;height:56px;padding:0 2px;font-size:11.5px}
+  html.doc #flow-tiles{grid-template-columns:repeat(3,minmax(0,1fr))}
+  html.doc #flow-tiles .tile{padding:0 7px;gap:4px;font-size:12px}
+  html.doc #flow-tiles .tile .gi{display:none}
+}
+@media (max-width:339px){
+  html.doc #agent-tiles,html.doc #flow-tiles{grid-template-columns:repeat(2,minmax(0,1fr))}
+  html.doc #agent-tiles .tile{justify-content:flex-start;padding:0 10px}
+  html.doc #task-tiles .tile{font-size:12.5px;padding:0 8px}
+}
+/* The yellow ring of the selected agent, where the four agents are one row. The block clips its tiles to its own
+   rounded corners, so a selected tile is rounded like the block where it shares a corner with it and square (2 px)
+   elsewhere. The rules near `.tile[aria-checked]` are for two tiles across: in one row of four they rounded one
+   corner of each end tile only (the other was clipped) and one corner of each middle tile (Bob: the outlines are
+   not right). */
+@media (min-width:340px) and (max-width:899px){
+  html.doc #agent-tiles .tile:first-child[aria-checked="true"]{border-bottom-left-radius:11px}
+  html.doc #agent-tiles .tile:last-child[aria-checked="true"]{border-top-right-radius:11px}
+  html.doc #agent-tiles .tile:nth-child(2)[aria-checked="true"]{border-top-right-radius:2px}
+  html.doc #agent-tiles .tile:nth-last-child(2)[aria-checked="true"]{border-bottom-left-radius:2px}
+}
+/* a phone held sideways (the page area is under 460 px high): a hero one screen tall has no room for its phone.
+   There the hero is as tall as its content, with a 300 px slot for the phone. */
+@media (max-height:460px){
+  html.doc .sc-hero{position:relative;height:auto;min-height:0}
+  html.doc .sc-hero .demo{flex:none;height:300px}
+}
