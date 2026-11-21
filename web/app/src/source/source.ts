@@ -33,6 +33,12 @@ export interface SourceCallbacks {
    * hole and must not be treated as a floor for a later forward read.
    */
   onSynced(result: { complete: boolean }): void;
+  /**
+   * Optional: one history request has been answered in full (its EOSE). The relay answers newest first within a
+   * request, but nothing promises the order of the events INSIDE one answer, so a reader that needs "everything above
+   * this point is in" checks it here, between requests, not per event.
+   */
+  onPage?(): void;
 }
 
 export interface MarketSource {

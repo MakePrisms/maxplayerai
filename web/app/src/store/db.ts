@@ -45,8 +45,13 @@ export interface EventDb {
    * Unknown answers false: re-reading is cheap, a permanent gap is not.
    */
   historyComplete(): Promise<boolean>;
-  /** Record that a walk reached genuine exhaustion. */
-  markHistoryComplete(): void;
+  /**
+   * Record that a walk reached genuine exhaustion. Whatever is still queued is written in the SAME transaction as the
+   * marker, and the answer is that transaction's outcome: true once it has committed, false if it failed, or if any
+   * earlier write of this session failed (the store then has a hole, so it must not say it is whole). Callers that
+   * add a mark of their own must wait for true.
+   */
+  markHistoryComplete(): Promise<boolean>;
 }
 
 function openDb(): Promise<IDBDatabase | null> {
@@ -87,6 +92,8 @@ export async function createEventDb(): Promise<EventDb> {
   let pending: RawEvent[] = [];
   let pendingEvictions: string[] = [];
   let flushQueued = false;
+  /** A write of this session failed: the store may lack events, so it may not be marked complete. */
+  let writeFailed = false;
 
   function flush() {
     flushQueued = false;
@@ -104,10 +111,12 @@ export async function createEventDb(): Promise<EventDb> {
       // Persistence is an optimization, never a dependency — a failed write
       // costs one re-fetch. But it is not allowed to be INVISIBLE: a store that
       // silently accepts nothing looks exactly like a working one.
-      tx.onerror = () => {
+      tx.onerror = tx.onabort = () => {
+        writeFailed = true;
         console.warn(`[db] a batch of ${toWrite.length} writes and ${toEvict.length} evictions failed`, tx.error);
       };
     } catch (err) {
+      writeFailed = true;
       console.warn("[db] storage is unavailable; this session will not persist", err);
     }
   }
@@ -180,13 +189,38 @@ export async function createEventDb(): Promise<EventDb> {
         }
       });
     },
-    markHistoryComplete() {
-      if (!db) return;
-      try {
-        db.transaction(META, "readwrite").objectStore(META).put(true, COMPLETE_KEY);
-      } catch (err) {
-        console.warn("[db] could not record history completeness; next visit re-walks", err);
-      }
+    markHistoryComplete(): Promise<boolean> {
+      if (!db) return Promise.resolve(false);
+      const toWrite = pending;
+      const toEvict = pendingEvictions;
+      pending = [];
+      pendingEvictions = [];
+      return new Promise((resolve) => {
+        let settled = false;
+        const answer = (ok: boolean) => { if (!settled) { settled = true; resolve(ok); } };
+        try {
+          const tx = db.transaction([STORE, META], "readwrite");
+          const store = tx.objectStore(STORE);
+          for (const event of toWrite) store.put(event);
+          for (const id of toEvict) store.delete(id);
+          // Written last and in the same transaction: it commits with the events or not at all.
+          tx.objectStore(META).put(true, COMPLETE_KEY);
+          tx.oncomplete = () => answer(!writeFailed);
+          tx.onerror = tx.onabort = () => {
+            writeFailed = true;
+            console.warn("[db] could not record history completeness; next visit re-walks", tx.error);
+            answer(false);
+          };
+        } catch (err) {
+          writeFailed = true;
+          console.warn("[db] could not record history completeness; next visit re-walks", err);
+          answer(false);
+        }
+      }).then((ok) => {
+        // An earlier batch failed after all: take the marker back rather than leave a store that lies.
+        if (!ok) clearHistoryComplete();
+        return ok as boolean;
+      });
     },
   };
 }

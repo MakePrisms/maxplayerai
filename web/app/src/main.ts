@@ -217,7 +217,7 @@ async function boot(): Promise<void> {
         sawData = true;
         // Only a genuinely drained walk earns the marker that lets the NEXT
         // visit skip history. A truncated read must never certify itself.
-        if (complete) db.markHistoryComplete();
+        if (complete) void db.markHistoryComplete();
         engine.flush();
       },
     },

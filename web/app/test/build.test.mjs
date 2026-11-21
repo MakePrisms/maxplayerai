@@ -87,20 +87,31 @@ test("the root skill alias is byte-identical to the canonical homepage skill", (
   );
 });
 
+// The two pages in the new look (/ and /market) and what each loads; every other page keeps styles.css and its bundle.
+const NEW_PAGES = { "index.html": ["fonts.css", "site.css", "nojs.css", "teams.js"], "market.html": ["fonts.css", "site.css", "market.css", "nojs.css", "market.js"] };
+// Bob (2026-11-21): the legal pages are in the new look too, with a stylesheet and a small script of their own.
+const LEGAL = /^(terms|privacy|fees)-\d{8}\.html$/;
+const LEGAL_ASSETS = ["fonts.css", "site.css", "legal.css", "legal.js"];
+// Bob (2026-11-21): /swarm too, on /market's stylesheet plus its own.
+const SWARM_ASSETS = ["fonts.css", "site.css", "market.css", "swarm.css", "swarm.js"];
+
 test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
   const { stamp } = JSON.parse(readFileSync(join(root, "dist", ".buildstamp"), "utf8"));
   assert.match(stamp, /^[0-9a-f]{12}$/);
 
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"]) {
+  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"]) {
     const pageHtml = readFileSync(join(root, "dist", page), "utf8");
     const script = page === "tokens.html" ? "tokens.js" : page === "swarm.html" ? "swarm.js" : "terminal.js";
-    for (const asset of ["styles.css", "fonts.css", script]) {
+    for (const asset of NEW_PAGES[page] ?? (LEGAL.test(page) ? LEGAL_ASSETS : page === "swarm.html" ? SWARM_ASSETS : ["styles.css", "fonts.css", script])) {
       // Legal pages live at /terms/<date> etc. and /swarm also at /swarm/<naddr>, one level deep:
       // "./styles.css" would miss, so they use "/".
       const prefix = /^(terms|privacy|fees)-/.test(page) || page === "swarm.html" ? "/" : "./";
       assert.ok(pageHtml.includes(`"${prefix}${asset}?v=${stamp}"`), `${asset} is stamped in ${page}`);
       assert.ok(!pageHtml.includes(`"./${asset}"`) && !pageHtml.includes(`"/${asset}"`), `no unstamped ${asset} reference remains in ${page}`);
+    }
+    if (NEW_PAGES[page] || LEGAL.test(page) || page === "swarm.html") {
+      assert.ok(!pageHtml.includes("styles.css") && !pageHtml.includes("terminal.js"), `${page} loads none of the earlier look`);
     }
   }
   // The /skill.md bot preview page loads no script, but its stylesheets ship stamped too (advisor r1, PR #1294).
@@ -119,14 +130,26 @@ test("every asset URL in shipped HTML and CSS carries the deploy stamp", () => {
     assert.ok(fontsCss.includes(`url('./${m[1]}?v=${stamp}')`), `${m[1]} stamped identically in fonts.css`);
   }
   assert.ok(!/url\((['"])\.\/fonts\/[^'"?]+\1\)/.test(fontsCss), "no unstamped font URL remains in fonts.css");
+  // The same for the pictures the homepage preloads: site.css must ask for the very URL that was preloaded.
+  const siteCss = readFileSync(join(root, "dist", "site.css"), "utf8");
+  const pictures = [...html.matchAll(/<link rel="preload" as="image" href="\.\/(assets\/[^"?]+)\?v=([0-9a-f]{12})"/g)];
+  assert.ok(pictures.length >= 8, "the agent marks are preloaded and stamped");
+  for (const m of pictures) {
+    assert.equal(m[2], stamp, `${m[1]} preload carries the stamp`);
+    assert.ok(siteCss.includes(`url("./${m[1]}?v=${stamp}")`), `${m[1]} stamped identically in site.css`);
+    assert.ok(existsSync(join(root, "dist", m[1])), `${m[1]} ships`);
+  }
+  for (const css of ["site.css", "market.css"]) {
+    assert.ok(!/url\((['"])\.\/assets\/[^'"?]+\1\)/.test(readFileSync(join(root, "dist", css), "utf8")), `no unstamped picture URL remains in ${css}`);
+  }
 });
 
-test("the link-preview card and PNG icons ship in dist/ (contents: og.test.mjs)", () => {
-  for (const file of ["og/maxplayer-card.png", "favicon-32.png", "favicon-192.png", "apple-touch-icon.png"]) {
+test("the link-preview cards and PNG icons ship in dist/ (contents: og.test.mjs)", () => {
+  for (const file of ["og/maxplayer-card.png", "og/teams-card.png", "favicon-32.png", "favicon-192.png", "apple-touch-icon.png"]) {
     assert.deepEqual(readFileSync(join(root, "dist", file)), readFileSync(join(root, "public", file)), `${file} ships unchanged`);
   }
   const html = readFileSync(join(root, "dist", "index.html"), "utf8");
-  assert.ok(html.includes('<meta property="og:image" content="https://www.maxplayer.ai/og/maxplayer-card.png" />'), "built homepage keeps og:image");
+  assert.ok(html.includes('<meta property="og:image" content="https://www.maxplayer.ai/og/teams-card.png">'), "built homepage keeps og:image");
   assert.ok(existsSync(join(root, "dist", "skill-preview.html")), "the /skill.md bot preview page builds");
   assert.ok(readFileSync(join(root, "dist", "skill.md"), "utf8").startsWith("---\nname: maxplayer-marketplace"), "/skill.md itself stays the markdown");
 });
@@ -161,28 +184,87 @@ test("the bundle ships as one module and the snapshot stays out of git", () => {
   assert.match(gitignore, /^public\/snapshot\.json$/m, "snapshot.json is baked at deploy, never committed");
 });
 
-test("the live market ships at /market and the homepage links it", () => {
-  // cleanUrls serves dist/market.html at /market. The board's static chrome
-  // (the three lanes main.ts renders into) must live there, and the homepage
-  // must carry no board — it boots no relay.
+// bob (2026-11-20): Buy, Sell and Market are one page, /market; the homepage is Teams.
+test("the live market ships at /market with the buyer's and the seller's line, and /sell leads there", () => {
+  // cleanUrls serves dist/market.html at /market. The board's static chrome (the three lists market.js draws into)
+  // must live there, and the homepage must carry no board — it boots no relay.
   const market = readFileSync(join(root, "dist", "market.html"), "utf8");
-  for (const id of ["market", "buyers", "feed", "sellers", "statgrid", "windows", "conn", "utc-clock"]) {
+  for (const id of ["market", "board", "x-rows", "a-rows", "b-rows", "windows", "st-online", "st-delivered", "st-posted", "st-buyers", "how", "hire", "sell", "faq"]) {
     assert.ok(market.includes(`id="${id}"`), `market.html carries #${id}`);
   }
+  assert.ok(market.includes("follow the buyer instructions"), "the market page hands out the buyer line");
+  assert.ok(market.includes("follow the seller instructions"), "and the seller line");
   const home = readFileSync(join(root, "dist", "index.html"), "utf8");
-  assert.ok(!home.includes('id="market"'), "the homepage carries no board");
+  assert.ok(!home.includes('id="board"') && !home.includes('id="x-rows"'), "the homepage carries no board");
   assert.ok(home.includes('href="/market"'), "the homepage links the live market");
-  assert.ok(home.includes('href="/sell"'), "the homepage links the seller page");
-  const sell = readFileSync(join(root, "dist", "sell.html"), "utf8");
-  assert.ok(!sell.includes('id="market"'), "the seller page carries no board");
-  assert.ok(sell.includes("follow the seller instructions"), "the seller page hands out the seller line");
+  assert.ok(!readFileSync(join(root, "dist", "teams.js"), "utf8").includes("relay.maxplayer.ai"), "and its bundle never opens the relay");
+  // The seller page is gone; its address leads to the selling section. Temporary, so the address can be reused.
+  assert.ok(!existsSync(join(root, "dist", "sell.html")), "no separate seller page");
+  const { redirects } = JSON.parse(readFileSync(join(root, "vercel.json"), "utf8"));
+  for (const source of ["/sell", "/sell.html"]) {
+    assert.ok(redirects.some((r) => r.source === source && r.destination === "/market#sell" && r.permanent === false), `${source} leads to the selling section`);
+  }
   // Old #market deep links (skill.md, llms.txt, shared URLs) still land on the board.
-  assert.match(readFileSync(join(root, "src/main.ts"), "utf8"), /location\.hash === "#market".*location\.replace\("\/market"\)/);
+  // (Before the page's script is even loaded: that script rewrites the hash as soon as it starts, and a check
+  // placed after it never saw #market.)
+  assert.match(readFileSync(join(root, "src/teams.ts"), "utf8"), /if \(location\.hash === "#market"\) location\.replace\("\/market"\);\nelse void stylesLoaded\(\)\.then\(\(\) => import\("\.\/site\/teams\.js"\)\);/);
+  // Old /market?seller=<hex> profile links still open (the page's own are ?expert=<npub>).
+  assert.match(readFileSync(join(root, "src/site/market.js"), "utf8"), /query\.get\('expert'\) \|\| query\.get\('seller'\)/);
   assert.ok(!home.includes("<script>"), "no inline scripts in the browser-key origin");
 });
 
+// The site's CSP is style-src 'self' and script-src 'self': an inline style or script is dropped silently, and the
+// page looks fine everywhere except where the header is sent.
+test("the new pages and their bundles carry no inline style or script", () => {
+  for (const page of Object.keys(NEW_PAGES)) {
+    const html = readFileSync(join(root, "dist", page), "utf8");
+    assert.ok(!/\sstyle="/.test(html), `${page}: no style attribute`);
+    assert.ok(!/<style\b/.test(html), `${page}: no <style> element`);
+    assert.match(html, /<noscript><link rel="stylesheet" href="\.\/nojs\.css\?v=[0-9a-f]{12}"><\/noscript>/, `${page}: its no-script rules are a stylesheet, not inline`);
+  }
+  for (const bundle of ["teams.js", "market.js"]) {
+    const js = readFileSync(join(root, "dist", bundle), "utf8");
+    assert.ok(!/style=\\?["']/.test(js), `${bundle} writes no style attribute into markup`);
+    assert.ok(!js.includes("cssText") && !/setAttribute\(["']style/.test(js), `${bundle} sets no style text`);
+  }
+});
+
+// Safari runs a module script before the page's stylesheets have loaded; these two scripts measure the layout as
+// soon as they start (src/site/styled.ts has the measurement). Neither may be imported statically by its entry.
+test("the page scripts of / and /market start only once the stylesheets are in", () => {
+  for (const [entry, script] of [["src/teams.ts", "teams.js"], ["src/market-page.ts", "market.js"]]) {
+    const source = readFileSync(join(root, entry), "utf8");
+    assert.match(source, new RegExp(`stylesLoaded\\(\\)\\.then\\(\\(\\) => import\\("\\./site/${script.replace(".", "\\.")}"\\)\\)`), `${entry} waits for the stylesheets`);
+    assert.ok(!new RegExp(`^import [^;]*"\\./site/${script.replace(".", "\\.")}";`, "m").test(source), `${entry} does not import ${script} statically`);
+  }
+  // One file per page still: the dynamic import is bundled in, not split out into a second request.
+  for (const bundle of ["teams.js", "market.js"]) {
+    assert.ok(!/import\(["'`]\.\//.test(readFileSync(join(root, "dist", bundle), "utf8")), `${bundle} loads no second file`);
+  }
+});
+
+// bob (2026-11-20): placeholders until the market is whole, and nothing moves when it arrives. What takes room must
+// be in the HTML before any script runs.
+test("/market starts as placeholders: the period buttons and the four number bars are in the HTML", () => {
+  const market = readFileSync(join(root, "dist", "market.html"), "utf8");
+  assert.deepEqual([...market.matchAll(/<div class="seg win" id="(windows2?)"[^>]*>((?:<button[^>]*>[^<]*<\/button>)+)<\/div>/g)].map((m) => [m[1], [...m[2].matchAll(/data-win="([^"]+)" aria-pressed="([^"]+)"/g)].map((b) => b.slice(1, 3).join(":")).join(" ")]),
+    [["windows", "24h:false week:true all:false"], ["windows2", "24h:false week:true all:false"]], "the period buttons are static, with Week pressed");
+  assert.equal([...market.matchAll(/<dd id="st-[a-z]+" class="sk"><\/dd>/g)].length, 4, "four empty number bars");
+  assert.ok(!/id="(x|a|b)-rows">\s*<li class="row(?! sk)/.test(market), "no hand-written rows");
+});
+
 test("all site pages share navigation and footer links, with a current page and no inline scripts", () => {
-  const pages = ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html"];
+  const links = (markup) =>
+    [...markup.matchAll(/<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)].map((m) => [m[1], m[2].replace(/<[^>]+>/g, "")]);
+  const noInlineScript = (html, page) => {
+    for (const script of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
+      assert.match(script[1], /\bsrc="/);
+      assert.equal(script[2].trim(), "", `${page} has no inline script`);
+    }
+  };
+  // bob (2026-11-20): the top nav is Teams and Market, on every page. Buy and Sell are sections of Market.
+  // The pages that keep the earlier look.
+  const pages = ["chat.html", "mint.html", "tokens.html"];
   let expectedNav;
   let expectedFooter;
   for (const page of pages) {
@@ -190,46 +272,56 @@ test("all site pages share navigation and footer links, with a current page and 
     const nav = html.match(/<nav class="nav-links"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     const footer = html.match(/<nav class="foot-nav"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     assert.ok(nav && footer, `${page} has shared chrome`);
-    const links = (markup) =>
-      [...markup.matchAll(/<a href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g)].map((m) => [m[1], m[2].replace(/<[^>]+>/g, "")]);
     expectedNav ??= links(nav);
     expectedFooter ??= links(footer);
     assert.deepEqual(links(nav), expectedNav, `${page} nav matches`);
     assert.deepEqual(links(footer), expectedFooter, `${page} footer matches`);
-    // bob: Chat is linked from the footer only (marked Lab, like Tokens), never the top nav.
-    assert.ok(!nav.includes('href="/chat"'), `${page}: /chat is not in the top nav`);
-    assert.match(footer, /href="\/market">Market<\/a>\s*<\/div>\s*<div class="foot-row foot-labs">\s*<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /chat opens the Lab row under Buy, Sell, Market, marked Lab`);
-    // Mint is a Lab page too: footer only, right after Chat.
-    assert.ok(!nav.includes('href="/mint"'), `${page}: /mint is not in the top nav`);
-    assert.match(footer, /<a href="\/chat">Chat<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /mint is in the footer after Chat, marked Lab`);
-    // Tokens is a Lab page too: footer only, right after Mint.
-    assert.ok(!nav.includes('href="/tokens"'), `${page}: /tokens is not in the top nav`);
-    assert.match(footer, /<a href="\/mint">Mint<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: /tokens is in the footer after Mint, marked Lab`);
-    // bob (2026-10-18): Swarm is a Lab page too, right after Tokens; since 2026-10-19 it lives at /swarm.
+    // bob (2026-11-21): Chat, Mint and Tokens are linked from no footer or nav for now; Swarm is, under the
+    // product pages, marked Lab. The pages themselves stay up at their addresses.
+    for (const lab of ["/chat", "/mint", "/tokens"]) {
+      assert.ok(!nav.includes(`href="${lab}"`) && !footer.includes(`href="${lab}"`), `${page}: ${lab} is not linked`);
+    }
     assert.ok(!nav.includes('href="/swarm"'), `${page}: /swarm is not in the top nav`);
-    assert.match(footer, /<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/swarm">Swarm<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: Swarm is in the footer after Tokens, marked Lab`);
+    assert.match(footer, /<a href="\/market">Market<\/a>\s*<a href="\/swarm">Swarm<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: Swarm after Market, marked Lab`);
     // bob: Skill and GitHub leave the top bar; since 2026-10-18 they are the footer's
     // third, dimmer row, under the Lab links.
-    assert.deepEqual(links(nav).map(([href]) => href), ["/", "/sell", "/market"], `${page}: top nav is Buy, Sell, Market`);
-    // bob (2026-10-18): three rows on the right: Buy · Sell · Market, the Labs, then Skill · GitHub.
+    assert.deepEqual(links(nav), [["/", "Team"], ["/market", "Market"]], `${page}: top nav is Team, Market`);
+    assert.ok(!html.includes('href="/sell"'), `${page}: nothing links the old seller page`);
+    // Two rows on the right: the product pages, then Skill · GitHub · Terms · Privacy (the Lab row is gone, 2026-11-21).
     const rows = [...footer.matchAll(/<div class="foot-row[^"]*">([\s\S]*?)<\/div>/g)].map((m) => links(m[1]).map(([, text]) => text));
-    assert.deepEqual(rows, [["Buy", "Sell", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub", "Terms", "Privacy"]], `${page}: footer rows`);
+    assert.deepEqual(rows, [["Team", "Market", "SwarmLab"], ["Skill", "GitHub", "Terms", "Privacy"]], `${page}: footer rows`);
     // ...and the @maxplayerai handle moves to the left, under "The Multiplayer Marketplace".
     const brand = html.match(/<div class="foot-brand">([\s\S]*?)<\/div>/)?.[1] ?? "";
     assert.match(brand, /<p>The Multiplayer Marketplace<\/p>\s*<a class="foot-x" href="https:\/\/x\.com\/maxplayerai"[^>]*>@maxplayerai<\/a>/, `${page}: X handle under the tagline`);
     assert.ok(!footer.includes("x.com/maxplayerai"), `${page}: X handle is not in the link rows`);
-    const current = [...nav.matchAll(/aria-current="page"/g)].length;
-    if (page === "chat.html" || page === "mint.html" || page === "tokens.html" || page === "swarm.html" || page === "terms-20261029.html" || page === "privacy-20261029.html" || page === "fees-20261029.html") {
-      assert.equal(current, 0, `${page} is not in the top nav, so nothing there is current`);
+    assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 0, `${page} is not in the top nav, so nothing there is current`);
+    noInlineScript(html, page);
+  }
+  // The two pages in the new look: the same two tabs, and a footer in four columns that leads to the same places.
+  const absolute = (href, self) => (href.startsWith("#") ? self : href);
+  for (const [page, route] of [["index.html", "/"], ["market.html", "/market"], ["terms-20261029.html", "/terms/20261029"], ["privacy-20261029.html", "/privacy/20261029"], ["fees-20261029.html", "/fees/20261029"], ["swarm.html", "/swarm"]]) {
+    const html = readFileSync(join(root, "dist", page), "utf8");
+    const nav = html.match(/<nav class="tabs"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
+    const footer = html.match(/<nav class="ft-cols"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
+    assert.ok(nav && footer, `${page} has the new chrome`);
+    assert.deepEqual(links(nav).map(([href, text]) => [absolute(href, route), text]), [["/", "Team"], ["/market", "Market"]], `${page}: top nav is Team, Market`);
+    if (LEGAL.test(page) || page === "swarm.html") {
+      assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 0, `${page} is not in the top nav, so nothing there is current`);
     } else {
-      const route = page === "index.html" ? "/" : `/${page.replace(".html", "")}`;
-      assert.ok(nav.includes(`href="${route}" aria-current="page"`), `${page} marks itself current`);
-      assert.equal(current, 1);
+      assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 1, `${page} marks one tab current`);
+      assert.match(nav, new RegExp(`<a href="#[a-z]+"[^>]*aria-current="page">${route === "/" ? "Team" : "Market"}</a>`), `${page} marks itself current`);
     }
-    for (const script of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/g)) {
-      assert.match(script[1], /\bsrc="/);
-      assert.equal(script[2].trim(), "", `${page} has no inline script`);
-    }
+    const columns = [...footer.matchAll(/<div><h4>([^<]+)<\/h4>([\s\S]*?)<\/div>/g)].map((m) => [m[1], links(m[2]).map(([href, text]) => [absolute(href, route), text])]);
+    assert.deepEqual(columns, [
+      ["Product", [["/", "Team"], ["/market", "Market"], ["/swarm", "SwarmLab"]]],
+      ["Developers", [["/skill.md", "Skill"], ["https://github.com/MakePrisms/maxplayerai", "GitHub"]]],
+      ["Company", [["/terms", "Terms"], ["/privacy", "Privacy"], ["https://x.com/maxplayerai", "@maxplayerai"]]],
+    ], `${page}: footer columns`);
+    // Every place the earlier look's footer leads to, the new one leads to as well.
+    const there = new Set(columns.flatMap(([, list]) => list.map(([href]) => href)));
+    for (const [href] of expectedFooter) assert.ok(there.has(href), `${page}: the footer also links ${href}`);
+    assert.ok(!html.includes('href="/sell"') && !html.includes("maxplayer.ai/sell"), `${page}: nothing links the old seller page`);
+    noInlineScript(html, page);
   }
 });
 
@@ -242,9 +334,9 @@ test("/swarm hero facts start as skeletons, both labels and values, with no plac
   for (const text of ["Loading…", "Work starts", "To be announced", "Budget"]) assert.ok(!facts.includes(text), `no static "${text}"`);
 });
 
-test("/swarm carries the /tokens experimental notice under the nav (bob)", () => {
+test("/swarm says it is a Lab page at the top of the hero (bob)", () => {
   const html = readFileSync(join(root, "dist", "swarm.html"), "utf8");
-  assert.match(html, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>[^<]+<\/span><\/p>/, "experimental strip under the nav, like /tokens");
+  assert.match(html, /<p class="sw-lab"><span class="lab-tag">Lab<\/span><span>Swarms are early\. They may change, break or go away\.<\/span><\/p>\s*<h1 id="top-h">Join a swarm<\/h1>\s*<p class="lede">Agents working together to solve the hardest problems\.<\/p>/);
 });
 
 test("/chat carries the /tokens experimental notice under the nav", () => {
@@ -367,25 +459,26 @@ test("FAQ sections pin their heading so opening an answer never moves it", () =>
   assert.match(css, /\.h-faq\.faq-pinned > \.h-in \{ margin-top: var\(--faq-lift, 0px\); \}/);
   const js = readFileSync(join(root, "dist", "terminal.js"), "utf8");
   assert.ok(js.includes("faq-pinned") && js.includes("--faq-lift"), "the shared bundle pins FAQs");
-  for (const page of ["index.html", "sell.html", "chat.html", "mint.html"]) {
+  // The pages in the earlier look that have an FAQ. (/ and /market have their own, in a grid that cannot move the heading.)
+  for (const page of ["chat.html", "mint.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     assert.match(html, /class="h-section h-faq[" ]/, `${page} has an FAQ`);
     assert.match(html, /src="\.\/terminal\.js/, `${page} loads the bundle that pins it`);
   }
 });
 
-test("swarm page stays noindexed, linked only as the footer's Swarm Lab, and isolated from the main bundle", () => {
+test("swarm page stays noindexed, linked only as the footer's Swarm Lab, and isolated from the earlier bundle", () => {
   const html = readFileSync(join(root, "dist/swarm.html"), "utf8");
   const { stamp } = JSON.parse(readFileSync(join(root, "dist/.buildstamp"), "utf8"));
   assert.match(html, /name="robots" content="noindex, nofollow"/);
   assert.ok(html.includes(`"/swarm.css?v=${stamp}"`));
   assert.ok(!html.includes("terminal.js"));
-  // bob (2026-10-18) put Swarm in the footer; that one link is the only place pages name the route.
-  for (const page of ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html"]) {
+  // bob (2026-11-21): Swarm is in every footer under the product pages, marked Lab; that one link is the only place
+  // the other pages name the route.
+  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
     assert.equal([...text.matchAll(/\/swarm\b/g)].length, 1, `${page} names /swarm once`);
     assert.ok(!text.includes("/challenges"), `${page} no longer links the old /challenges route`);
-    assert.ok(text.includes('<a href="/swarm">Swarm<sup class="lab-sup">Lab</sup></a>'), `${page}: only the footer Swarm link`);
   }
   for (const page of ["llms.txt", "skill.md"]) {
     const text = readFileSync(join(root, "dist", page), "utf8");
@@ -402,9 +495,10 @@ test("the community page builds at /swarm, every page links it there, and /chall
   for (const old of ["challenges.html", "challenges.js", "challenges.css"]) {
     assert.ok(!existsSync(join(root, "dist", old)), `dist/${old} is gone`);
   }
-  for (const page of ["index.html", "sell.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html"]) {
+  for (const page of ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
-    const swarmLinks = [...html.matchAll(/<a href="([^"]*)">Swarm<sup/g)].map((m) => m[1]);
+    // bob (2026-11-21): Swarm is back in the footer, under Product, marked Lab.
+    const swarmLinks = [...html.matchAll(/<a href="([^"]*)">Swarm<(?:sup|span|\/a>)/g)].map((m) => m[1]);
     assert.deepEqual(swarmLinks, ["/swarm"], `${page}: the Swarm link points at /swarm`);
     assert.ok(!/href="\/challenges/.test(html), `${page}: no link to /challenges`);
   }
@@ -440,7 +534,7 @@ test("the community page builds at /swarm, every page links it there, and /chall
   assert.ok(bundle.includes("maxplayer swarm join ") && !bundle.includes("maxplayer-challenges"), "the manual join command uses maxplayer swarm");
   const page = readFileSync(join(root, "dist", "swarm.html"), "utf8");
   assert.ok(page.includes("https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md"), "the join line reads the swarm-join skill");
-  assert.match(page, /<\/header>\s*<!--[^>]*-->\s*<p class="labs-strip" role="note"><span class="labs-pill">Experimental<\/span><span>Swarms are early\. They may change, break or go away\.<\/span><\/p>/, "the experimental strip stays on /swarm");
+  assert.match(page, /<span class="lab-tag">Lab<\/span><span>Swarms are early\. They may change, break or go away\.<\/span>/, "the experimental note stays on /swarm");
   assert.match(page, /<title>Swarms — MAXPLAYER AI<\/title>/);
   // Visible copy says swarm; ids and classes (challenge-*) are internal and may stay.
   const visible = page.replace(/<script[\s\S]*?<\/script>/g, "").replace(/<!--[\s\S]*?-->/g, "")
@@ -462,7 +556,7 @@ test("the /swarm page and bundle name no buyer and no public relay", () => {
   }
   assert.ok(js.includes("wss://relay.maxplayer.ai"), "the bundle reads our relay");
   const src = readFileSync(join(root, "src", "swarm.ts"), "utf8");
-  for (const id of ["buyer-hex", "apply-command", "cmd-join"]) assert.ok(src.includes(`text("${id}",`), `swarm.ts fills #${id}`);
+  for (const id of ["apply-command", "cmd-join"]) assert.ok(src.includes(`text("${id}",`), `swarm.ts fills #${id}`);
   assert.match(src, /`maxplayer swarm join \$\{address\} --minutes 60`/);
   // Item 3 (bob 2026-10-21): the open surfaces stay the member's choice.
   assert.ok(!/keep <code>claim_open_pool<\/code> and <code>accept_open_targeted<\/code> off/.test(page), "no requirement to close them");
@@ -495,13 +589,14 @@ test("terms, privacy and fees are dated static pages, linked from every footer",
     assert.equal(current?.destination, `/${doc}/${date}`, `/${doc} points at the current version`);
     assert.equal(current?.permanent, false, `/${doc} is a temporary redirect, so a new version can replace it`);
     const html = readFileSync(join(root, "dist", `${doc}-${date}.html`), "utf8");
-    assert.match(html, /<body class="home legal-page">/);
+    assert.match(html, /<html lang="en" class="lg">/, `${doc}: in the look of / and /market`);
+    assert.match(html, /<body class="legal-page">/);
     assert.match(html, /<h1 id="legal-h">/);
     assert.match(html, /Effective October 29, 2026/, `${doc} shows its effective date`);
     assert.ok(!/[Nn]ot part of|\[(?:OPEN|FACT|CHECKED|DATE)/.test(html), `${doc}: no internal notes`);
     assert.ok(!/(?:href|src)="\.\//.test(html), `${doc}: no relative asset paths (the page is served one level deep)`);
   }
-  for (const page of ["index.html", "sell.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
+  for (const page of ["index.html", "chat.html", "mint.html", "market.html", "tokens.html", "swarm.html"]) {
     const html = readFileSync(join(root, "dist", page), "utf8");
     assert.ok(html.includes('<a href="/terms">Terms</a>') && html.includes('<a href="/privacy">Privacy</a>'), `${page} links both`);
   }
@@ -512,8 +607,13 @@ test("the Try it flow and its Vercel function are gone", () => {
   assert.ok(!existsSync(join(root, "api")), "no Vercel functions remain");
   assert.ok(!existsSync(join(root, "src", "try")), "no buyer UI source remains");
   const home = readFileSync(join(root, "dist", "index.html"), "utf8");
-  assert.ok(!home.includes('id="try"') && !home.includes("try-section"), "no Try it section on the homepage");
-  const js = readFileSync(join(root, "dist", "terminal.js"), "utf8");
-  assert.ok(!js.includes("/api/try") && !js.includes("bootTry"), "the bundle never loads the buyer UI");
+  assert.ok(!home.includes("try-section"), "no Try it buyer flow on the homepage");
+  // bob (2026-11-19): the Teams homepage has a section called "Try it" (#try). It is a scripted demonstration in a
+  // phone mock-up: it posts no job and calls no function, which is what this test is about.
+  for (const bundle of ["terminal.js", "teams.js", "market.js"]) {
+    const js = readFileSync(join(root, "dist", bundle), "utf8");
+    assert.ok(!js.includes("/api/try") && !js.includes("bootTry") && !js.includes("/api/"), `${bundle} never loads the buyer UI or calls a function`);
+  }
+  assert.ok(!readFileSync(join(root, "dist", "teams.js"), "utf8").includes("fetch("), "the homepage bundle makes no request of its own");
   assert.ok(!readFileSync(join(root, "dist", "styles.css"), "utf8").includes(".try-section"), "its styles are gone");
 });

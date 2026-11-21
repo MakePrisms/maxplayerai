@@ -29,12 +29,16 @@ if (!["ws:", "wss:"].includes(new URL(relay).protocol)) throw Error("Invalid REL
 const watch = process.argv.includes("--watch");
 // Legal pages are served one level deep, so they load assets from "/" rather than "./".
 // Legal pages, one file per effective date: terms-20261029.html is served at /terms/20261029 (vercel.json rewrites); /terms, /privacy and /fees redirect to the current date.
-const PAGES = ["index.html", "market.html", "sell.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "skill-preview.html"];
+// Stylesheets of the pages in the new look (/, /market and the legal pages). The other pages use styles.css.
+const SITE_CSS = ["site.css", "market.css", "nojs.css", "legal.css"];
+const PAGES = ["index.html", "market.html", "chat.html", "mint.html", "tokens.html", "swarm.html", "terms-20261029.html", "privacy-20261029.html", "fees-20261029.html", "skill-preview.html"];
 
 const options = {
-  // terminal.js serves /, /sell and /market; tokens.js serves /tokens only,
-  // so the token-trade reader never ships in (or changes) the jobs bundle.
-  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts") },
+  // teams.js serves / and market.js serves /market (the two pages in the new look).
+  // legal.js serves the legal pages (their menu); terminal.js serves the pages that keep
+  // the earlier look (chat, mint); tokens.js serves /tokens only, so the token-trade reader never ships
+  // in (or changes) another bundle.
+  entryPoints: { terminal: join(root, "src/main.ts"), tokens: join(root, "src/tokens.ts"), swarm: join(root, "src/swarm.ts"), teams: join(root, "src/teams.ts"), market: join(root, "src/market-page.ts"), legal: join(root, "src/legal.ts") },
   bundle: true,
   define: {
     CONFIGURED_RELAY_URL: JSON.stringify(relay),
@@ -63,13 +67,15 @@ if (watch) {
 
   // One stamp derived from every shipped byte the HTML/CSS reference.
   const fontNames = readdirSync(join(root, "public/fonts"));
+  // The pictures of the new pages (agent marks, the sheet of soft marks), referenced from site.css and preloaded
+  // by index.html.
+  const assetNames = readdirSync(join(root, "public/assets"), { recursive: true })
+    .filter((f) => statSync(join(root, "public/assets", f)).isFile()).sort();
   const hash = createHash("sha256");
-  for (const rel of [...PAGES, "styles.css", "fonts.css", "swarm.css", ...fontNames.map((f) => join("fonts", f))]) {
+  for (const rel of [...PAGES, "styles.css", "fonts.css", "swarm.css", ...SITE_CSS, ...fontNames.map((f) => join("fonts", f)), ...assetNames.map((f) => join("assets", f))]) {
     hash.update(readFileSync(join(root, "public", rel)));
   }
-  hash.update(readFileSync(join(dist, "terminal.js")));
-  hash.update(readFileSync(join(dist, "tokens.js")));
-  hash.update(readFileSync(join(dist, "swarm.js")));
+  for (const bundle of ["terminal.js", "tokens.js", "swarm.js", "teams.js", "market.js"]) hash.update(readFileSync(join(dist, bundle)));
   const STAMP = hash.digest("hex").slice(0, 12);
 
   // Stamp the specifiers, not the files: fonts.css's url()s and every asset
@@ -80,13 +86,22 @@ if (watch) {
     readFileSync(join(root, "public/fonts.css"), "utf8")
       .replace(/url\((['"])(\.\/fonts\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
   );
-  // Every page: the buyer homepage (/), the seller page (/sell), the live
+  // The new pages' stylesheets point at pictures in assets/: stamp those url()s the same way, so an index.html
+  // preload of a picture matches the stylesheet's URL byte-for-byte.
+  for (const css of SITE_CSS) {
+    writeFileSync(
+      join(dist, css),
+      readFileSync(join(root, "public", css), "utf8")
+        .replace(/url\((['"])(\.\/assets\/[^'"?]+)\1\)/g, `url($1$2?v=${STAMP}$1)`),
+    );
+  }
+  // Every page: the Teams homepage (/), the
   // market (/market), the chat page (/chat), the mint page (/mint), the token-trade page (/tokens) and the swarms (/swarm and /swarm/<naddr>) — cleanUrls serves them.
   for (const page of PAGES) {
     writeFileSync(
       join(dist, page),
       readFileSync(join(root, "public", page), "utf8")
-        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|terminal\.js|tokens\.js|swarm\.js|swarm\.css|fonts\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
+        .replace(/(href|src)="(\.?\/)(styles\.css|fonts\.css|site\.css|market\.css|nojs\.css|legal\.css|legal\.js|terminal\.js|tokens\.js|swarm\.js|teams\.js|market\.js|swarm\.css|fonts\/[^"?]+|assets\/[^"?]+)"/g, `$1="$2$3?v=${STAMP}"`),
     );
   }
 
@@ -127,5 +142,5 @@ if (watch) {
   writeFileSync(join(dist, ".buildstamp"), JSON.stringify({ flat: true, stamp: STAMP }, null, 2) + "\n");
 
   const kb = (f) => (statSync(join(dist, f)).size / 1024).toFixed(1);
-  console.log(`dist/terminal.js ${kb("terminal.js")} KB · dist/tokens.js ${kb("tokens.js")} KB · stamp ${STAMP}`);
+  console.log(`dist/teams.js ${kb("teams.js")} KB · dist/market.js ${kb("market.js")} KB · dist/terminal.js ${kb("terminal.js")} KB · dist/tokens.js ${kb("tokens.js")} KB · stamp ${STAMP}`);
 }

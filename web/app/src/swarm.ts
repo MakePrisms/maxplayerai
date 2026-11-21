@@ -1,179 +1,261 @@
-// /swarm: every buyer's swarms, read from our relay. /swarm/<naddr>: one swarm, its shown swarm
-// job, members with today's minutes, and how to join (docs/specs/swarm.md §12 PR 3). No buyer key
-// or relay list is built into the page.
+// /swarm, in the look of /market (Bob, 2026-11-21): the call to join, then every open swarm in one list (live ones
+// first, newest first), How it works, FAQs, footer. A swarm opens in /market's panel: its description, status and
+// facts (live stats while a job runs), how to join (a line to copy), the current job, its members and its finished
+// jobs. /swarm/<naddr> is the same page with that swarm's panel open, so a swarm still has an address to share.
+// The data is read from our relay by the same reader and model as before (src/swarm/shared); no buyer key or relay
+// list is built into the page. Remote text only ever reaches textContent.
 import { parseSnapshot, relayStatusWord, renderLiveState, UPDATING, type Snapshot, type Tracker } from "./swarm/live.js";
 import { paint } from "./swarm/page.js";
 import { wireMore } from "./swarm/more.js";
 import { coalesce } from "./swarm/coalesce.js";
 import { demoSnapshot } from "./swarm/demo.js";
-import { renderJob } from "./swarm/job.js";
-import { renderIndex, renderSwarmJobs, route, shortNpub, swarmPath, firstLine, type SwarmRow } from "./swarm/index.js";
+import { renderAbout, renderJob } from "./swarm/job.js";
+import { indexTotals, renderIndex, renderSwarmJobs, route, shortNpub, swarmPath, type Route, type SwarmRow } from "./swarm/index.js";
+import { isRunning, budgetValue } from "./swarm/hero.js";
 import { writeClipboard } from "./ui/clipboard.js";
 import { usd, onSpotChange, spotUsd, startSpot } from "./ui/spot.js";
-import { budgetValue } from "./swarm/hero.js";
 import { SwarmStore, swarmIndex, swarmSnapshot } from "./swarm/shared/model.mjs";
 import { SwarmReader } from "./swarm/shared/relay.mjs";
 import { RELAY_URL } from "./config.js";
+import { wireMenu } from "./site/menu.js";
+import { stylesLoaded } from "./site/styled.js";
 
 const el = (id: string) => document.getElementById(id)!;
-const text = (id: string, value: string) => { el(id).textContent = value; };
+const text = (id: string, value: string) => { const e = el(id); if (e.textContent !== value) e.textContent = value; };
 const when = (secs: number) => new Intl.DateTimeFormat(undefined, {
   weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short",
 }).format(new Date(secs * 1000));
 const SKILL = "https://www.maxplayer.ai/.well-known/skills/swarm-join/skill.md";
+const RENDER_MS = 250; // at most one rebuild per RENDER_MS (see swarm/coalesce.ts)
+const nf = new Intl.NumberFormat("en-US");
+const query = new URLSearchParams(location.search);
+const demo = query.has("demo");
 
-// Shared chrome, same behaviour as /sell. No wallet or job posting here.
-const toggle = el("nav-toggle");
-const nav = el("nav-links");
-toggle.addEventListener("click", () => toggle.setAttribute("aria-expanded", String(nav.classList.toggle("open"))));
-nav.addEventListener("click", () => { nav.classList.remove("open"); toggle.setAttribute("aria-expanded", "false"); });
+const setMenu = wireMenu();
+
+/* ---------- copy ---------- */
 for (const btn of document.querySelectorAll<HTMLButtonElement>("[data-copy]")) {
   btn.addEventListener("click", async () => {
+    const label = btn.dataset.label ?? (btn.dataset.label = btn.textContent ?? "Copy");
     const ok = await writeClipboard(el(btn.dataset.copy!).textContent?.trim() ?? "");
-    btn.textContent = ok ? "✓" : "select it";
+    btn.textContent = ok ? "Copied" : "Select and copy";
     btn.classList.toggle("ok", ok);
-    setTimeout(() => { btn.textContent = "copy"; btn.classList.remove("ok"); }, 1600);
+    setTimeout(() => { btn.textContent = label; btn.classList.remove("ok"); }, 1800);
   });
 }
 
-const query = new URLSearchParams(location.search);
-const demo = query.has("demo");
-const where = demo ? null : route(location.pathname);
-const RENDER_MS = 250; // at most one rebuild per RENDER_MS (see swarm/coalesce.ts)
+/* ---------- FAQ: one answer open at a time (as on /market) ---------- */
+el("faq-list").addEventListener("click", (e) => {
+  const b = (e.target as HTMLElement).closest<HTMLButtonElement>(".fq button");
+  if (!b) return;
+  const item = b.closest(".fq")!, open = !item.classList.contains("open");
+  for (const f of document.querySelectorAll("#faq-list .fq")) { f.classList.remove("open"); f.querySelector("button")!.setAttribute("aria-expanded", "false"); }
+  if (open) { item.classList.add("open"); b.setAttribute("aria-expanded", "true"); }
+});
 
-if (where?.view === "index") index();
-else swarmPage(where);
-
-// ---- index ---------------------------------------------------------------------------------
-
-function index(): void {
+/* ---------- the board ---------- */
+function board(): void {
   const store = new SwarmStore();
-  let reader: SwarmReader | null = null, wasReady = false;
+  let wasReady = false;
+  const reader: SwarmReader = new SwarmReader({ url: RELAY_URL, store, onChange: () => changed() });
   const draw = () => {
-    const status = reader!.status;
+    const status = reader.status;
     const ready = status.connected && status.historyComplete && !status.error;
     wasReady = status.connected && (wasReady || ready);
     const nowS = Math.floor(Date.now() / 1000);
-    renderIndex(document, swarmIndex(store.events.values(), nowS) as SwarmRow[], wasReady ? "live" : "loading", when, RELAY_URL);
+    const rows = swarmIndex(store.events.values(), nowS) as SwarmRow[];
+    renderIndex(document, rows, wasReady ? "live" : "loading", when, RELAY_URL, nowS);
+    const t = wasReady ? indexTotals(rows) : null;
+    for (const [id, v] of [["st-live", t?.live], ["st-open", t?.open], ["st-members", t?.members], ["st-done", t?.done]] as const) {
+      text(id, v === undefined ? "" : nf.format(v));
+      el(id).classList.toggle("sk", v === undefined);
+    }
     text("index-status", !wasReady ? (status.error ? `Live view unavailable · ${status.error}` : UPDATING) : relayStatusWord(status));
   };
   const changed = coalesce(() => { try { draw(); } catch { text("index-status", "Live view unavailable · check back soon"); } }, RENDER_MS);
-  reader = new SwarmReader({ url: RELAY_URL, store, onChange: changed });
   reader.start();
-  addEventListener("pagehide", (event) => { if (!event.persisted) reader!.stop(); });
-  setInterval(changed, 30_000); // "Running now" follows the clock between relay changes
+  addEventListener("pagehide", (event) => { if (!event.persisted) reader.stop(); });
+  setInterval(changed, 30_000); // "Live" and the ages follow the clock between relay changes
 }
 
-// ---- one swarm -----------------------------------------------------------------------------
+/* ---------- one swarm, in the panel ---------- */
+const sheet = el("sheet"), main = document.querySelector<HTMLElement>(".mk-main")!, nav = document.querySelector<HTMLElement>(".nav")!;
+const root = document.documentElement;
+const jobSection = el("job");
+const jobMore = wireMore(el("job-body"), el("job-more") as HTMLButtonElement, () => jobSection.scrollIntoView({ block: "start" }));
 
-function swarmPage(target: Exclude<typeof where, { view: "index" }>): void {
-  document.body.classList.add("view-swarm");
-  // Floating "See the job" pill: gone once the job section reaches it.
-  const jobSection = el("job");
-  const jobFloat = el("job-float");
-  let floatQueued = false;
-  const placeFloat = () => {
-    floatQueued = false;
-    jobFloat.classList.toggle("is-gone", jobSection.getBoundingClientRect().top <= jobFloat.getBoundingClientRect().bottom);
-  };
-  const scheduleFloat = () => { if (!floatQueued) { floatQueued = true; requestAnimationFrame(placeFloat); } };
-  addEventListener("scroll", scheduleFloat, { passive: true });
-  addEventListener("resize", scheduleFloat);
-  placeFloat();
-  jobFloat.addEventListener("click", (e) => {
-    e.preventDefault();
-    history.pushState(null, "", "#job");
-    jobSection.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
-  });
-  // The job is capped at about one screen with a "See more" toggle (bob). Collapsing scrolls the
-  // section back into view so the reader isn't left below it.
-  const jobMore = wireMore(el("job-body"), el("job-more") as HTMLButtonElement, () => {
-    if (jobSection.getBoundingClientRect().top < 0) jobSection.scrollIntoView({ block: "start" });
-  });
-  addEventListener("resize", () => jobMore.update());
-  void document.fonts?.ready.then(() => jobMore.update());
+interface Open { key: string; reader: SwarmReader | null; stop: () => void; from: HTMLElement | null; pushed: boolean }
+let open: Open | null = null;
+let snapshot: Snapshot | null = null, receivedAt = 0, tracker: Tracker = { wasLive: false, readyAt: null };
+let demoStatus: string | null = null, shownSwarm = "";
 
-  let snapshot: Snapshot | null = null;
-  let receivedAt = 0;
-  // wasLive: the data has been live on this page load, so a routine poll or catch-up stays live.
-  // readyAt: last time the swarm data was fully ready (drives "Running now"). See live.ts observe.
-  let tracker: Tracker = { wasLive: false, readyAt: null };
-  let reader: SwarmReader | null = null;
-  let demoStatus: string | null = null;
-  let shownSwarm = "";
+function state(s: "wait" | "ok" | "none", note = ""): void {
+  el("swp").dataset.state = s;
+  text("sw-none", note);
+}
 
-  function render(s: Snapshot): void {
-    const w = s.swarm;
-    if (w) {
-      const key = JSON.stringify([w.buyer, w.id, w.name, w.purpose, w.buyerName]); // the name arrives after the swarm
-      if (key !== shownSwarm) {
-        shownSwarm = key;
-        text("swarm-title", w.name);
-        text("swarm-sub", firstLine(w.purpose));
-        document.title = `${w.name} — Swarm — MAXPLAYER AI`;
-        text("buyer-label", w.buyerName ? `${w.buyerName} (${shortNpub(w.buyerNpub)})` : w.buyerNpub);
-        text("buyer-hex", w.buyer);
-        const address = target?.view === "swarm" ? target.naddr : swarmPath(w.buyer, w.id, RELAY_URL).slice("/swarm/".length);
-        text("cmd-join", `Read ${SKILL} and join the Maxplayer swarm ${address} for 60 minutes a day`);
-        text("apply-command", `maxplayer swarm join ${address} --minutes 60`);
+function render(s: Snapshot): void {
+  const w = s.swarm;
+  if (!w) return;
+  state("ok");
+  const key = JSON.stringify([w.buyer, w.id, w.name, w.purpose, w.buyerName]); // the name arrives after the swarm
+  if (key !== shownSwarm) {
+    shownSwarm = key;
+    text("swarm-title", w.name);
+    document.title = `${w.name} — Swarm — MAXPLAYER AI`;
+    text("buyer-label", w.buyerName ? `${w.buyerName} (${shortNpub(w.buyerNpub)})` : shortNpub(w.buyerNpub));
+    renderAbout(document, el("swarm-about"), w.purpose, w.name);
+    const address = swarmPath(w.buyer, w.id, RELAY_URL).slice("/swarm/".length);
+    text("cmd-join", `Read ${SKILL} and join the Maxplayer swarm ${address} for 60 minutes a day`);
+    text("apply-command", `maxplayer swarm join ${address} --minutes 60`);
+  }
+  // The current job: the one the swarm shows, while it is scheduled or running.
+  const job = s.swarmJob && (s.swarmJob.status === "scheduled" || s.swarmJob.status === "in_progress") ? s.swarmJob : null;
+  jobSection.hidden = !job;
+  if (job) {
+    jobSection.querySelector(".pf-h")!.textContent = job.status === "in_progress" ? "Current job" : "Next job";
+    renderJob(document, job.goal);
+    if (el("job-title").textContent === "The job.") el("job-title").textContent = job.title;
+    jobMore.update();
+  }
+  // Past jobs: the ones it finished, newest first.
+  renderSwarmJobs(document, (s.swarmJobs ?? []).filter((j) => j.status === "completed"), when);
+  tick();
+}
+
+function tick(): void {
+  if (!snapshot || !open) return;
+  const relay = (open.reader ? open.reader.status : snapshot.relay) as Snapshot["relay"];
+  const status = demoStatus ?? relayStatusWord(relay);
+  const now = snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000);
+  const budget = (sats: number) => budgetValue(sats, spotUsd() === null ? null : usd(sats), performance.now());
+  tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status, budget });
+  // The status line at the top of the panel.
+  const fresh = tracker.readyAt === null ? null : Math.max(0, Date.now() - tracker.readyAt) / 1000;
+  const live = !!snapshot.swarmJob && isRunning(snapshot.swarmJob, now, demoStatus ? 0 : fresh);
+  const closed = snapshot.swarm?.status === "closed";
+  el("sw-lamp").className = live ? "lamp on" : "lamp";
+  text("sw-st", live ? "Live: a job is running" : closed ? "Closed" : snapshot.swarmJob?.status === "scheduled" ? "Open · next job scheduled" : "Open · no job running");
+}
+
+function receive(value: unknown): void {
+  snapshot = parseSnapshot(value);
+  receivedAt = performance.now();
+  render(snapshot);
+}
+
+function resetPanel(): void {
+  snapshot = null; tracker = { wasLive: false, readyAt: null }; shownSwarm = ""; demoStatus = null;
+  text("swarm-title", "Swarm");
+  el("swarm-about").replaceChildren();
+  el("swarm-jobs").replaceChildren();
+  jobSection.hidden = true;
+  renderLiveState(document, "updating");
+  text("connection-status", UPDATING);
+  state("wait");
+}
+
+function showSheet(): void {
+  root.classList.add("sheet-open");
+  sheet.setAttribute("aria-hidden", "false");
+  main.inert = true; nav.inert = true;
+  setMenu(false);
+  sheet.focus({ preventScroll: true });
+  el("swp").scrollTop = 0;
+}
+
+/** Open one swarm. `where`: its route; `pushed`: the address was changed to it by this page (Close goes back). */
+function openSwarm(where: Route, from: HTMLElement | null, pushed: boolean): void {
+  const key = where.view === "swarm" ? `${where.buyer}/${where.swarm}` : demo ? "demo" : "missing";
+  if (open?.key === key) return;
+  open?.stop();
+  resetPanel();
+  open = { key, reader: null, stop: () => {}, from, pushed };
+  showSheet();
+  if (demo && where.view !== "swarm") {
+    demoStatus = "Demo data · not a real swarm";
+    receive(demoSnapshot(Date.now() / 1000, { privateTasks: query.get("demo") === "private" }));
+    return;
+  }
+  if (where.view !== "swarm") { text("swarm-title", "Swarm not found"); state("none", "That address isn't a swarm. Pick one from the list."); return; }
+  const store = new SwarmStore();
+  const { buyer, swarm } = where;
+  const mine = open;
+  const changed = coalesce(() => {
+    if (open !== mine) return;
+    try {
+      const s = swarmSnapshot(store.events.values(), { buyer, swarm }, Math.floor(Date.now() / 1000));
+      const status = reader.status;
+      // Read in full and still no such swarm: say so instead of loading forever.
+      if (!s.swarm) {
+        if (status.relays?.[0]?.historyComplete) { text("swarm-title", "Swarm not found"); state("none", "No swarm with this address on our relay yet. Pick one from the list."); }
+        return;
       }
+      receive({ ...s, relay: status });
+    } catch {
+      tracker = { ...tracker, readyAt: null };
+      renderLiveState(document, "updating");
+      text("connection-status", snapshot ? UPDATING : "Live view unavailable · check back soon");
     }
-    if (s.swarmJob) { renderJob(document, s.swarmJob.goal); jobMore.update(); }
-    renderSwarmJobs(document, s.swarmJobs ?? [], when);
-    tick();
-  }
-  function tick(): void {
-    if (!snapshot) return;
-    // The reader's current status, read every tick (not only the one copied into the last snapshot).
-    const relay = (reader ? reader.status : snapshot.relay) as Snapshot["relay"];
-    const status = demoStatus ?? relayStatusWord(relay);
-    const now = snapshot.asOf + Math.max(0, (performance.now() - receivedAt) / 1000);
-    const budget = (sats: number) => budgetValue(sats, spotUsd() === null ? null : usd(sats), performance.now());
-    tracker = paint(document, snapshot, relay, tracker, { nowMs: Date.now(), now, when, status, budget });
-  }
-  function receive(value: unknown): void {
-    snapshot = parseSnapshot(value);
-    receivedAt = performance.now();
-    render(snapshot);
-  }
-  function unavailable(): void {
-    tracker = { ...tracker, readyAt: null };
-    renderLiveState(document, "updating");
-    text("connection-status", snapshot ? UPDATING : "Live view unavailable · check back soon");
-  }
-
-  // Not found: only the hero's title and a way back to the index; no facts, buyer, job or join.
-  function notFound(why: string): void {
-    document.body.classList.remove("view-swarm");
-    document.body.classList.add("view-missing");
-    text("swarm-title", "Swarm not found");
-    text("swarm-sub", `${why} Pick one from the list of swarms.`);
-    const back = document.querySelector<HTMLAnchorElement>('a.h-button[data-view="index"]');
-    if (back) { back.href = "/swarm"; back.firstElementChild!.textContent = "See the swarms"; }
-  }
-  if (demo) { demoStatus = "Demo data · not a real swarm"; receive(demoSnapshot(Date.now() / 1000, { privateTasks: query.get("demo") === "private" })); }
-  else if (target?.view !== "swarm") notFound("That address isn't a swarm."); else {
-    const store = new SwarmStore();
-    const { buyer, swarm } = target;
-    let missing = false;
-    const changed = coalesce(() => {
-      try {
-        const s = swarmSnapshot(store.events.values(), { buyer, swarm }, Math.floor(Date.now() / 1000));
-        const status = reader!.status;
-        // Read in full and still no such swarm: say so instead of loading forever.
-        if (!s.swarm && status.relays?.[0]?.historyComplete && !missing) {
-          missing = true;
-          notFound("No swarm with this address on our relay yet.");
-        }
-        receive({ ...s, relay: status });
-      } catch { unavailable(); }
-    }, RENDER_MS);
-    reader = new SwarmReader({ url: RELAY_URL, store, swarm: { buyer, swarm }, onChange: changed });
-    reader.start();
-    addEventListener("pagehide", (event) => { if (!event.persisted) reader!.stop(); });
-  }
-  setInterval(tick, 1000);
-  // Budget shows in dollars at the live BTC-USD rate, like the rest of the site.
-  onSpotChange(() => { if (snapshot) render(snapshot); });
-  startSpot();
+  }, RENDER_MS);
+  const reader: SwarmReader = new SwarmReader({ url: RELAY_URL, store, swarm: { buyer, swarm }, onChange: changed });
+  mine.reader = reader;
+  mine.stop = () => reader.stop();
+  reader.start();
 }
+
+function closeSwarm(fromHistory = false): void {
+  if (!open) return;
+  const was = open;
+  open.stop();
+  open = null;
+  root.classList.remove("sheet-open");
+  sheet.setAttribute("aria-hidden", "true");
+  main.inert = false; nav.inert = false;
+  document.title = "Swarms — MAXPLAYER AI";
+  if (!fromHistory) {
+    if (was.pushed) history.back();                       // popstate finds the panel already closed
+    else history.replaceState(null, "", "/swarm" + location.search);
+  }
+  if (was.from?.isConnected) was.from.focus({ preventScroll: true });
+}
+
+// A row, or its name, opens the swarm in the panel. The name is a real link: a new tab goes to the link itself.
+el("swarm-list").addEventListener("click", (e) => {
+  const row = (e.target as HTMLElement).closest<HTMLElement>(".row.go");
+  if (!row || e.defaultPrevented || e.button || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const a = row.querySelector<HTMLAnchorElement>("a.who");
+  if (!a) return;
+  e.preventDefault();
+  const path = new URL(a.href).pathname;
+  history.pushState(null, "", path + location.search);
+  openSwarm(route(path), a, true);
+});
+el("sheet-x").addEventListener("click", () => closeSwarm());
+el("sheet-bg").addEventListener("click", () => closeSwarm());
+addEventListener("keydown", (e) => { if (e.key === "Escape") closeSwarm(); });
+addEventListener("popstate", () => {
+  const where = route(location.pathname);
+  if (where.view === "index" && !demo) closeSwarm(true);
+  else if (where.view !== "index") openSwarm(where, null, false);
+});
+
+setInterval(tick, 1000);
+onSpotChange(() => { if (snapshot) render(snapshot); });   // the budget shows in dollars at the live BTC-USD rate
+startSpot();
+board();
+
+// Shown once the stylesheets and fonts are in, as on /market (market.css hides the page until body.ready).
+let shown = false;
+function show(): void {
+  if (shown) return;
+  shown = true;
+  document.body.classList.add("ready");
+  const where = route(location.pathname);
+  if (where.view !== "index" || demo) openSwarm(where, null, false);
+}
+void stylesLoaded().then(() => {
+  const faces = ['400 16px "Instrument Sans"', '500 16px "Instrument Sans"', 'italic 500 16px "Work Sans Logo"'];
+  if (document.fonts?.load) Promise.all(faces.map((f) => document.fonts.load(f))).then(show, show);
+  setTimeout(show, 800);
+});

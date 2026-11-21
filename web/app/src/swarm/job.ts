@@ -36,9 +36,22 @@ function inline(doc: Document, parent: HTMLElement, text: string): void {
 export function renderJob(doc: Document, content: string): void {
   const job = parseJob(content);
   doc.getElementById("job-title")!.textContent = job.headline ?? "The job.";
-  const body = doc.getElementById("job-body")!;
+  renderBlocks(doc, doc.getElementById("job-body")!, job.blocks);
+}
+
+/**
+ * A swarm's description (its event content, same small format) into `el`. A leading "# Heading" is usually the
+ * swarm's name again, which the panel already shows as its title: it is left out then, and kept otherwise.
+ */
+export function renderAbout(doc: Document, el: HTMLElement, content: string, name: string): void {
+  const about = parseJob(content);
+  const blocks: Block[] = about.headline && about.headline.trim() !== name.trim() ? [{ kind: "p", text: about.headline }, ...about.blocks] : about.blocks;
+  renderBlocks(doc, el, blocks.length ? blocks : [{ kind: "p", text: "No description yet." }]);
+}
+
+function renderBlocks(doc: Document, body: HTMLElement, blocks: Block[]): void {
   const fragment = doc.createDocumentFragment();
-  for (const b of job.blocks) {
+  for (const b of blocks) {
     if (b.kind === "p") { const p = doc.createElement("p"); inline(doc, p, b.text); fragment.append(p); }
     else {
       const ul = doc.createElement("ul");

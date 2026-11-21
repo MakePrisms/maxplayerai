@@ -84,9 +84,10 @@ const SOURCES: &[(&str, &str)] = &[
         "web/app/public/llms.txt",
         include_str!("../../../web/app/public/llms.txt"),
     ),
+    // The seller page is gone; its selling section is on the market page now.
     (
-        "web/app/public/sell.html",
-        include_str!("../../../web/app/public/sell.html"),
+        "web/app/public/market.html",
+        include_str!("../../../web/app/public/market.html"),
     ),
     (
         "web/app/public/mint.html",

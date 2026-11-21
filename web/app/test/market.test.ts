@@ -395,3 +395,16 @@ test("current work can still add a seller whose award predates the window", () =
   assert.equal(rows.length, 1);
   assert.equal(rows[0]!.workingJobs.length, 1);
 });
+
+test("overdue historical jobs do not put a buyer on a window it did nothing in", () => {
+  const o = offer(T0, { deadline: T0 + 1000 });
+  const events = [o, claim(o.id, SELLER, T0 + 1), award(o.id, SELLER, T0 + 2)];
+  const now = T0 + 30 * 86400;
+  for (const window of ["24h", "week"]) {
+    assert.equal(buyerBoard(withinWindow(events, window, now), now, events).length, 0);
+  }
+  assert.equal(buyerBoard(events, now, events)[0]!.inProgressJobs[0]!.state, JOB_OVERDUE, "all-time history keeps it");
+  const live = offer(T0, { deadline: now + 1000 });
+  const current = [live, claim(live.id, SELLER, T0 + 1), award(live.id, SELLER, T0 + 2)];
+  assert.equal(buyerBoard([], now, current).length, 1, "current work still adds the buyer, as on the seller board");
+});
