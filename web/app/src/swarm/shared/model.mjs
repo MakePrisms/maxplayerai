@@ -226,7 +226,7 @@ export function swarmSnapshot(events, { buyer, swarm: slug }, now) {
     const allowed = decisions.allows(m.seller, slug), denied = decisions.denies(m.seller, slug);
     if (denied) continue; // denied members are never listed publicly
     if (!allowed) {
-      if (m.status === 'joined') applicants.push({ pubkey: m.seller, npub: npubEncode(m.seller), minutesOffered: m.minutes, since: m.since, joinedAt: e.created_at, note: m.note });
+      if (m.status === 'joined') applicants.push({ pubkey: m.seller, npub: npubEncode(m.seller), name: names.get(m.seller) ?? '', minutesOffered: m.minutes, since: m.since, joinedAt: e.created_at, note: m.note });
       continue;
     }
     const own = today.filter(t => t.seller === m.seller), running = own.filter(t => t.running);

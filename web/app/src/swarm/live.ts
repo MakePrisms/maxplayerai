@@ -6,7 +6,7 @@ export interface Job { id: string; seller: string; start: number; deadline: numb
 export interface Reported { tasksDone: number; minutesToday: number|null }
 export interface Seller { pubkey: string; npub: string; name: string; minutesOffered: number; minutesUsed: number; minutesRemaining: number; state: string; eligible: boolean; decision: string; currentJobStart: number|null; reported?: Reported|null; }
 // Untrusted pending joins (no buyer decision yet). Display only; never eligible.
-export interface Applicant { pubkey: string; npub: string; minutesOffered: number; since: number; joinedAt: number; note: string; }
+export interface Applicant { pubkey: string; npub: string; name?: string; minutesOffered: number; since: number; joinedAt: number; note: string; }
 export type SwarmJobStatus = 'scheduled'|'in_progress'|'completed'|'cancelled';
 export interface SwarmInfo { buyer: string; buyerNpub: string; buyerName: string; id: string; name: string; purpose: string; status: 'open'|'closed'; tasks: 'public'|'private'; address: string }
 export interface SwarmJobRow { id: string; title: string; starts: number; ends: number; status: SwarmJobStatus; budgetSats: number; tasks: number }
@@ -240,7 +240,7 @@ export function renderSellers(doc: Document,s: Snapshot,now: number,loading: boo
   const waiting=s.applicants??[],partial=!!s.relay?.applicantsIncomplete;
   for(const a of waiting) {
     const row=doc.createElement('li');row.className='off';
-    const name=profileLink(doc,a.pubkey,a.npub,shortNpub(a.npub));
+    const name=profileLink(doc,a.pubkey,a.npub,a.name||shortNpub(a.npub));
     const mins=doc.createElement('span');mins.className='c-mins';mins.textContent=`${a.minutesOffered} min offered`;
     const st=doc.createElement('span');st.className='c-state';st.textContent='Waiting for approval';
     row.append(name,mins,st);fragment.append(row);

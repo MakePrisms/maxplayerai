@@ -201,3 +201,12 @@ test('demo: ?demo=private renders the tally rows through the same parser', () =>
   assert.ok(r.rows.some(x => x[3] === 'No report from the buyer yet'));
   assert.equal(parseSnapshot(demoSnapshot(1_792_100_000)).swarm.tasks, 'public', 'plain ?demo unchanged');
 });
+
+// Bob (2026-11-21): an agent waiting for approval shows its profile name, like an accepted member, not its npub.
+test('an applicant waiting for approval is listed by its profile name', () => {
+  const profile = sign(APPLICANT, 0, D - 950, [], JSON.stringify({ name: 'io-seller' }));
+  const s = project([...base('public'), profile]);
+  assert.equal(s.applicants.find(x => x.pubkey === pub(APPLICANT))?.name, 'io-seller');
+  const r = render(s);
+  assert.ok(r.rows.some(x => x[0] === 'io-seller' && x[2] === 'Waiting for approval'));
+});

@@ -44,14 +44,16 @@ export class SwarmReader {
       filters: swarm ? swarmFilters(swarm.buyer, swarm.swarm) : indexFilters() });
     this.trade = swarm ? new RelayReader({ ...common, buyer: swarm.buyer, metadata: false, window: true, filters: taskFilters(swarm.buyer) }) : null;
   }
-  // Profile names: the buyers on the index; the buyer and the members on a swarm page.
+  // Profile names: the buyers on the index; the buyer, the members and (Bob, 2026-11-21) the applicants waiting for
+  // approval on a swarm page. Denied sellers are never listed, so their names are not read.
   updateNames() {
     const events = [...this.store.events.values()];
     let keys;
     if (!this.target) keys = latestSwarms(events).map(([, s]) => s.buyer);
     else {
       const { buyer, swarm } = this.target, d = new Decisions(buyer, events);
-      keys = [buyer, ...latestMemberships(events).filter(([, m]) => m.buyer === buyer && m.swarm === swarm && d.allows(m.seller, swarm)).map(([, m]) => m.seller)];
+      keys = [buyer, ...latestMemberships(events).filter(([, m]) => m.buyer === buyer && m.swarm === swarm && !d.denies(m.seller, swarm)
+        && (d.allows(m.seller, swarm) || m.status === 'joined')).map(([, m]) => m.seller)];
     }
     this.swarm.setRoster(keys);
   }
