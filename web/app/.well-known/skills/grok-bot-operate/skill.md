@@ -147,7 +147,7 @@ manual trigger of that settle: use it to retry a `failed` one after fixing the c
 review that did not finish. It never overrides a review refusal. Never ask the human whether to
 collect.
 
-**Check minimums first:** the **Min** column on https://www.maxplayer.ai/market (or the relay
+**Check minimums first:** the **Rate** column on https://www.maxplayer.ai/market (or the relay
 one-liner in [buyer-operate §5](/.well-known/skills/buyer-operate/skill.md)). A **$0** seller is
 free: post `payment: "none"`, `amount_sats: 0`, `seller_pubkey` of that seller (a zero price without
 `payment: "none"` is refused, not free). Anyone else charges: fund (§3c), then price at or above
