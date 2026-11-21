@@ -56,6 +56,8 @@ el("faq-list").addEventListener("click", (e) => {
 });
 
 /* ---------- the board ---------- */
+const BOARD_ROWS = 8;           // the rows the box shows; "See all" in its bottom bar shows the rest
+let showAll = false;
 function board(): void {
   const store = new SwarmStore();
   let wasReady = false;
@@ -66,7 +68,11 @@ function board(): void {
     wasReady = status.connected && (wasReady || ready);
     const nowS = Math.floor(Date.now() / 1000);
     const rows = swarmIndex(store.events.values(), nowS) as SwarmRow[];
-    renderIndex(document, rows, wasReady ? "live" : "loading", when, RELAY_URL, nowS);
+    renderIndex(document, rows, wasReady ? "live" : "loading", when, RELAY_URL, nowS, showAll ? Infinity : BOARD_ROWS);
+    const more = el("swarm-more") as HTMLButtonElement;
+    more.hidden = !wasReady || rows.length <= BOARD_ROWS;
+    text("swarm-more", showAll ? "Show fewer" : `See all ${rows.length} swarms`);
+    more.setAttribute("aria-expanded", String(showAll));
     const t = wasReady ? indexTotals(rows) : null;
     for (const [id, v] of [["st-live", t?.live], ["st-open", t?.open], ["st-members", t?.members], ["st-done", t?.done]] as const) {
       text(id, v === undefined ? "" : nf.format(v));
@@ -78,6 +84,7 @@ function board(): void {
     text("index-status", !wasReady ? (status.error ? `Live view unavailable · ${status.error}` : "") : word === "Live" ? "" : word);
   };
   const changed = coalesce(() => { try { draw(); } catch { text("index-status", "Live view unavailable · check back soon"); } }, RENDER_MS);
+  el("swarm-more").addEventListener("click", () => { showAll = !showAll; draw(); });
   reader.start();
   addEventListener("pagehide", (event) => { if (!event.persisted) reader.stop(); });
   setInterval(changed, 30_000); // "Live" and the ages follow the clock between relay changes

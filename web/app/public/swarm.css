@@ -24,6 +24,10 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
 .swb .age{font-size:13px;color:var(--dim)}
 .swb .rows .note{padding:18px}
 .sw-status{padding:10px 18px 14px;font-size:12.5px;color:var(--dim)}
+/* the bottom bar (Bob, 2026-11-21: like /market's boxes): always there, with "See all" in it once there are more */
+.swb-f{border-top:1px solid rgba(255,255,255,.08)}
+.swb-f .more{display:block;width:100%;margin:0;border-top:0}
+.swb-f .more[hidden]{visibility:hidden}
 
 /* how it works: the heading on the left, the steps on the right (the steps are /market's) */
 .sw-how{display:grid;grid-template-columns:minmax(0,.6fr) minmax(0,1.4fr);gap:clamp(32px,5vw,80px);align-items:start;border-top:1px solid rgba(255,255,255,.1)}
@@ -111,6 +115,8 @@ html.sw .sw-top{min-height:0;padding-bottom:clamp(48px,8vh,96px)}
   .g-s{grid-template-columns:8px minmax(0,1fr) auto 30px}
   .g-s > :nth-child(5),.g-s > :nth-child(6){display:none}
   .swb .st{max-width:34vw;font-size:13px}
+  .swb-f .more:not([hidden]){display:block}          /* market.css hides .more on a phone; here it is the only way to the rest */
+  .swb-f:has(.more[hidden]){display:none}
   .sw-how{display:block}
   .sw-run .copy{margin-top:18px}
   .sw-how .steps{margin-top:18px}

@@ -71,7 +71,8 @@ export function statusText(r: SwarmRow, when: (secs: number) => string): string 
 // The board, in the rows of /market's lists. mode 'loading': grey placeholder rows only, no counts (nothing reads as
 // current before the relay is read). A row is a link to the swarm (a real address: it opens in a new tab and can be
 // shared); a click opens it in the panel instead (swarm.ts).
-export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "live", when: (secs: number) => string, relay: string, now = Math.floor(Date.now() / 1000)): void {
+// limit: how many rows to show (the rest behind "See all", swarm.ts).
+export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "live", when: (secs: number) => string, relay: string, now = Math.floor(Date.now() / 1000), limit = Infinity): void {
   const list = doc.getElementById("swarm-list")!;
   list.setAttribute("aria-busy", String(mode === "loading"));
   const count = doc.getElementById("swarm-count")!;
@@ -86,7 +87,7 @@ export function renderIndex(doc: Document, rows: SwarmRow[], mode: "loading" | "
     return;
   }
   const fragment = doc.createDocumentFragment();
-  for (const r of boardOrder(rows)) {
+  for (const r of boardOrder(rows).slice(0, limit)) {
     const li = el("li", "row g-s go");
     const lamp = el("i", r.running ? "lamp on" : "lamp");
     lamp.setAttribute("role", "img");
