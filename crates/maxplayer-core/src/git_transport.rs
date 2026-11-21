@@ -1428,9 +1428,7 @@ impl HttpStream {
                     .min(BUYER_FETCH_LEG_TIMEOUT),
             );
         }
-        let response = request
-            .send()
-            .map_err(|error| io::Error::other(format!("http request: {error}")))?;
+        let response = request.send().map_err(http_request_error)?;
         let status = response.status();
         if status.is_redirection() {
             // Unfollowed by construction (`no_redirects`). Name it plainly: the hop was never
@@ -1462,6 +1460,18 @@ impl HttpStream {
         self.response = Some(response);
         Ok(())
     }
+}
+
+/// reqwest's Display stops at "error sending request for url (..)"; the cause (a proxy's 407, a
+/// refused connect, a TLS failure) is only in the source chain, so name all of it.
+fn http_request_error(error: reqwest::Error) -> io::Error {
+    let mut message = format!("http request: {error}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    io::Error::other(message)
 }
 
 /// Marker before a server-supplied refusal excerpt. Text after it is server data,
@@ -1602,6 +1612,68 @@ mod tests {
         assert_eq!(remote.list().expect("list").len(), 0, "an empty advertisement lists no heads");
         let _ = remote.disconnect();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The buyer daemon logged only "error sending request for url (..)" for an HTTPS proxy whose
+    // credential had expired: the 407 lived in reqwest's source chain. Both legs below must name it.
+    #[test]
+    fn http_request_errors_name_their_source_chain() {
+        use std::io::{Read as _, Write as _};
+        // Production leg: nothing listens on this port.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut stream = HttpStream {
+            mint: None,
+            authority: None,
+            lifetime: None,
+            short: true,
+            read_budget: None,
+            url: format!("http://{closed}/git/o/r.git/info/refs?service=git-upload-pack"),
+            destination: String::new(),
+            service: "git-upload-pack",
+            is_post: false,
+            sent: false,
+            request_body: vec![],
+            streaming_body: None,
+            response: None,
+            timeout_override: None,
+        };
+        let refused = stream.send().unwrap_err().to_string();
+        assert!(refused.contains("error sending request"), "{refused}");
+        assert!(
+            refused.to_ascii_lowercase().contains("connect"),
+            "{refused}"
+        );
+        assert!(refused.contains("refused"), "{refused}");
+        // The incident: an explicit proxy answering CONNECT with 407.
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = proxy.accept().unwrap();
+            let mut request = [0; 4096];
+            let _ = socket.read(&mut request).unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let error = reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all(format!("http://{proxy_addr}")).unwrap())
+            .build()
+            .unwrap()
+            .get("https://relay.example/git/o/r.git/info/refs?service=git-upload-pack")
+            .send()
+            .unwrap_err();
+        server.join().unwrap();
+        let message = http_request_error(error).to_string();
+        assert!(message.contains("error sending request"), "{message}");
+        assert!(
+            message.contains("proxy authorization required"),
+            "{message}"
+        );
     }
 
     #[test]
