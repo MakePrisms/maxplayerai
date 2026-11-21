@@ -1,4 +1,19 @@
 /* Loaded only without JavaScript (a <link> inside <noscript>; the CSP allows no inline style). The new pages keep
-   their nav and, on /market, their content hidden until the script has placed everything; with no script they show. */
+   their nav and, on /market, their content hidden until the script has placed everything; with no script they show.
+
+   The homepage is a fixed stage whose scenes the script moves and fades in; with no script every scene stayed
+   hidden and / was blank. Here it becomes a plain page: each scene in order, its text in the flow, the scripted
+   parts (the phone, the scroll track, the tiles the script fills) left out, and every FAQ answer open. */
 .nav{visibility:visible}
 html.mk body .mk-main{visibility:visible}
+
+#track,#phone-pos,#stage>.glow,.dotgrid,.floats,.demo,.calls,.calls-pill,.lab,#agent-tiles,#flow-tiles,#task-tiles,.team,#copy-btn{display:none}
+#stage{position:relative;inset:auto;overflow:visible}
+.sc{position:relative;inset:auto;opacity:1;visibility:visible;pointer-events:auto;padding:calc(var(--nav) + 24px) var(--pad) 40px}
+.hero-c,.tasks-l,.rail,.how-head,.how-grid,.start-l,.faq-page,.faq-main,.end-wrap,.foot2{position:static;inset:auto;width:auto;height:auto;transform:none}
+.how-grid{margin-top:24px}
+.hc{height:auto}
+.end-wrap{display:block}
+
+.fa{grid-template-rows:1fr}
+.fq button svg{display:none}

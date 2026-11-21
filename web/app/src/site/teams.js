@@ -1022,7 +1022,7 @@ selectAgent('muse', { quiet: true });
 fit();
 const h = SCENES.indexOf(location.hash.slice(1));
 const q = Number(new URLSearchParams(location.search).get('scene'));
-const first = h >= 0 ? h : (q >= 0 && q < N ? q : 0);
+const first = h >= 0 ? h : (Number.isInteger(q) && q >= 0 && q < N ? q : 0);   // ?scene=1.5 is not a scene
 const firstY = () => (isDoc() ? secTop(first) : Math.round(first * SEG));
 scrollTo(0, firstY());
 if (isDoc()) { markScene(first); docTick(); }
