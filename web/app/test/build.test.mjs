@@ -285,11 +285,11 @@ test("all site pages share navigation and footer links, with a current page and 
     assert.match(footer, /<a href="\/tokens">Tokens<sup class="lab-sup">Lab<\/sup><\/a>\s*<a href="\/swarm">Swarm<sup class="lab-sup">Lab<\/sup><\/a>/, `${page}: Swarm is in the footer after Tokens, marked Lab`);
     // bob: Skill and GitHub leave the top bar; since 2026-10-18 they are the footer's
     // third, dimmer row, under the Lab links.
-    assert.deepEqual(links(nav), [["/", "Teams"], ["/market", "Market"]], `${page}: top nav is Teams, Market`);
+    assert.deepEqual(links(nav), [["/", "Team"], ["/market", "Market"]], `${page}: top nav is Team, Market`);
     assert.ok(!html.includes('href="/sell"'), `${page}: nothing links the old seller page`);
     // bob (2026-10-18): three rows on the right: the product pages, the Labs, then Skill · GitHub.
     const rows = [...footer.matchAll(/<div class="foot-row[^"]*">([\s\S]*?)<\/div>/g)].map((m) => links(m[1]).map(([, text]) => text));
-    assert.deepEqual(rows, [["Teams", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub", "Terms", "Privacy"]], `${page}: footer rows`);
+    assert.deepEqual(rows, [["Team", "Market"], ["ChatLab", "MintLab", "TokensLab", "SwarmLab"], ["Skill", "GitHub", "Terms", "Privacy"]], `${page}: footer rows`);
     // ...and the @maxplayerai handle moves to the left, under "The Multiplayer Marketplace".
     const brand = html.match(/<div class="foot-brand">([\s\S]*?)<\/div>/)?.[1] ?? "";
     assert.match(brand, /<p>The Multiplayer Marketplace<\/p>\s*<a class="foot-x" href="https:\/\/x\.com\/maxplayerai"[^>]*>@maxplayerai<\/a>/, `${page}: X handle under the tagline`);
@@ -304,12 +304,12 @@ test("all site pages share navigation and footer links, with a current page and 
     const nav = html.match(/<nav class="tabs"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     const footer = html.match(/<nav class="ft-cols"[^>]*>([\s\S]*?)<\/nav>/)?.[1];
     assert.ok(nav && footer, `${page} has the new chrome`);
-    assert.deepEqual(links(nav).map(([href, text]) => [absolute(href, route), text]), [["/", "Teams"], ["/market", "Market"]], `${page}: top nav is Teams, Market`);
+    assert.deepEqual(links(nav).map(([href, text]) => [absolute(href, route), text]), [["/", "Team"], ["/market", "Market"]], `${page}: top nav is Team, Market`);
     assert.equal([...nav.matchAll(/aria-current="page"/g)].length, 1, `${page} marks one tab current`);
-    assert.match(nav, new RegExp(`<a href="#[a-z]+"[^>]*aria-current="page">${route === "/" ? "Teams" : "Market"}</a>`), `${page} marks itself current`);
+    assert.match(nav, new RegExp(`<a href="#[a-z]+"[^>]*aria-current="page">${route === "/" ? "Team" : "Market"}</a>`), `${page} marks itself current`);
     const columns = [...footer.matchAll(/<div><h4>([^<]+)<\/h4>([\s\S]*?)<\/div>/g)].map((m) => [m[1], links(m[2]).map(([href, text]) => [absolute(href, route), text])]);
     assert.deepEqual(columns, [
-      ["Product", [["/", "Teams"], ["/market", "Market"]]],
+      ["Product", [["/", "Team"], ["/market", "Market"]]],
       ["Lab", [["/chat", "Chat"], ["/mint", "Mint"], ["/tokens", "Tokens"], ["/swarm", "Swarm"]]],
       ["Developers", [["/skill.md", "Skill"], ["https://github.com/MakePrisms/maxplayerai", "GitHub"]]],
       ["Company", [["/terms", "Terms"], ["/privacy", "Privacy"], ["https://x.com/maxplayerai", "@maxplayerai"]]],
