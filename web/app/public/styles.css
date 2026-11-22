@@ -554,8 +554,9 @@ ol .row:hover .dot.working i, ol .row:focus-visible .dot.working i {
 }
 .brand.small span { font-size: 12px; letter-spacing: 0.04em; }
 .foot-brand p { margin: 6px 0 0; font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: 0.1em; }
-/* three rows (bob, 2026-10-18): Buy · Sell · Market, then the Lab pages, then
-   Skill · GitHub, dimmer. The X handle sits under the tagline on the left. */
+/* three rows (bob, 2026-10-18): Buy · Sell · Market, then the Lab pages (Chat, Mint,
+   Tokens) plus Swarm, which left Lab on 2026-11-22 (bob), then Skill · GitHub, dimmer.
+   The X handle sits under the tagline on the left. */
 .foot-nav { display: flex; flex-direction: column; align-items: flex-end; gap: 12px; }
 .foot-row { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0 18px; }
 .foot-nav a, .foot-x {
@@ -1215,8 +1216,9 @@ button.chip { cursor: pointer; }
    fixed slot keeps the rest of the nav from sliding when it does. */
 @media (min-width: 701px) { .conn-fixed { min-width: 21ch; justify-content: flex-end; } }
 /* phones hide the status word (dot only), so no slot: it pushed the menu button off-screen */
-/* Experimental pages (/chat, /mint, /tokens, /swarm) get a small yellow boxed "Lab" superscript on
-   their footer link (bob); same rule as feat/trade-market-page. */
+/* Experimental pages (/chat, /mint, /tokens) get a small yellow boxed "Lab" superscript on
+   their footer link (bob); same rule as feat/trade-market-page. /swarm left Lab on 2026-11-22
+   (bob: swarms are no longer experimental), so its link carries no mark. */
 .lab-sup {
   display: inline-block; margin-left: 4px; vertical-align: super;
   font-size: 0.62em; font-weight: 700; letter-spacing: 0.1em; line-height: 1;
@@ -1224,8 +1226,8 @@ button.chip { cursor: pointer; }
   color: var(--neon); border: 1px solid rgba(255, 223, 0, 0.55); border-radius: 2px;
 }
 .foot-nav a:hover .lab-sup { border-color: var(--neon); }
-/* /chat, /mint and /swarm carry the /tokens experimental notice strip (bob); same rules as
-   feat/trade-market-page, so a later merge keeps one copy. */
+/* /chat and /mint carry the /tokens experimental notice strip (bob); same rules as
+   feat/trade-market-page, so a later merge keeps one copy. /swarm dropped it on 2026-11-22. */
 .labs-strip {
   display: flex; align-items: center; gap: 10px;
   margin: 0; min-height: 34px; padding: 8px 16px;

@@ -86,7 +86,8 @@ settlement figure is a FLOOR, and anything user-facing must say so
 `/swarm` (formerly `/challenges`, which now redirects permanently) shows one organizer-maintained
 swarm run (internally a "challenge"; the code keeps that name under `src/challenge/`): goal,
 scheduled work start, planned total budget in sats, joining window, buyer npub and latest
-update. Its only inbound link is the footer's Swarm Lab link; it has no top-nav or discovery
+update. Its only inbound link is the footer's Swarm link (no Lab mark since 2026-11-22: swarms are
+no longer experimental); it has no top-nav or discovery
 (`llms.txt`, `skill.md`) links and is noindexed. Unlisted is not
 access-controlled: anyone with the URL can read it.
 
