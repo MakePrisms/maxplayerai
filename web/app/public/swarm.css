@@ -122,9 +122,15 @@ html.sw .copy button::after{content:"Copied";height:0;overflow:hidden;visibility
   html.sw .lead dt::after{font-size:10.5px}
   .swb{display:block;margin:16px calc(var(--px) * -1) 0;border-radius:0;background:none;box-shadow:none}
   .swb-h{padding:0 var(--px)}
-  .g-s{grid-template-columns:8px minmax(0,1fr) auto 30px}
+  /* fixed widths: the header and the rows are separate grids, so "auto" put Status at a different place in each,
+     and "Members" did not fit a 30px column (Bob, 2026-11-22: fix the spacing) */
+  .g-s{grid-template-columns:8px minmax(0,1fr) 124px 64px}
   .g-s > :nth-child(5),.g-s > :nth-child(6){display:none}
-  .swb .st{max-width:34vw;font-size:13px}
+  .swb .st{font-size:13px}
+  /* Bob (2026-11-22): on a phone a row is the swarm's name only, no purpose line under it, at the lists' row height */
+  .swb .pp{display:none}
+  .swb .nm{gap:0}
+  .swb .rows .row,.swb .rows .row.sk{min-height:var(--rh);padding-top:0;padding-bottom:0}
   .swb-f .more:not([hidden]){display:block}          /* market.css hides .more on a phone; here it is the only way to the rest */
   .swb-f:has(.more[hidden]){display:none}
   .sw-how{display:block}
