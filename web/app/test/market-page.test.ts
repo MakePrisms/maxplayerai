@@ -18,7 +18,7 @@ import { decodeNpub } from "../src/trade/nip19.js";
 import { startMarket, type MarketHandle, type PlainView } from "../src/site/market-data.js";
 import type { RawEvent } from "../src/model/events.js";
 
-/* ---------------- a market: 120 jobs this week, 150 older ---------------- */
+/* ---------------- a market: 240 jobs this week, 150 older ---------------- */
 
 const hex = (seed: string): string => seed.repeat(64).slice(0, 64);
 const BUYER = hex("a"), BUYER2 = hex("b");

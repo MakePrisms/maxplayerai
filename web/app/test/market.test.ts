@@ -227,6 +227,34 @@ test("rankClimbs diffs all-time standings now vs 24h ago; new entrants are not c
   assert.equal(climbs.get(SELLER2), undefined, "the seller passed does not climb");
 });
 
+// Speed review of #1361, #1 (and r5): the new site's engine (shifts: false) skips exactly this work.
+test("createEngine shifts:false computes no climbs or overtakes where shifts:true does", () => {
+  const o1 = offer(T0, { amount: 5 }), o0 = offer(T0 - 10, { amount: 5 }), o2 = offer(T0 - 9, { amount: 5 });
+  const t = T0 + 86400 + 100;
+  const all = [o0, claim(o0.id, SELLER2, T0 - 8), award(o0.id, SELLER2, T0 - 7), result(o0.id, SELLER2, T0 - 6),
+    o2, claim(o2.id, SELLER, T0 - 5), o1, claim(o1.id, SELLER, T0 + 1), award(o1.id, SELLER, T0 + 2), result(o1.id, SELLER, T0 + 3),
+    result(o1.id, SELLER, t - 50), result(o2.id, SELLER, t - 40)];
+  const view = (shifts: boolean) => {
+    const engine = createEngine({ windowKey: "all", now: () => t, shifts });
+    for (const e of all) engine.ingest(e);
+    engine.flush();
+    return engine.view()!;
+  };
+  const on = view(true), off = view(false);
+  assert.ok((on.sellerClimbs.get(SELLER) ?? 0) >= 1 && on.overtakes.length > 0, "the fixture does make a climb");
+  assert.equal(off.sellerClimbs.size + off.buyerClimbs.size, 0);
+  assert.deepEqual(off.overtakes, []);
+  assert.deepEqual(off.sellers, on.sellers, "the boards themselves are the same");
+});
+
+test("parseEvent: a cached parse is never handed out for another author; a non-hex id is never parsed", () => {
+  const o = offer(T0 + 7, { amount: 5 });
+  assert.equal(parseEvent(o)?.pubkey, o.pubkey);
+  const forged = { ...o, pubkey: hex("e") };
+  assert.equal(parseEvent(forged)?.pubkey, forged.pubkey, "same id, other author: parsed again");
+  assert.equal(parseEvent({ ...o, id: "zz" }), null);
+});
+
 test("windowed views include only in-window events", () => {
   const oldEvent = offer(T0);
   const newEvent = offer(T0 + 100_000);

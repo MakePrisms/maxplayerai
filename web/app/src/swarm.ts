@@ -66,7 +66,9 @@ let showAll = false;
 function board(): void {
   const store = new SwarmStore();
   let wasReady = false;
-  const reader: SwarmReader = new SwarmReader({ url: RELAY_URL, store, onChange: () => changed(), queueMs: 25 });   // 4 small REQs: 1.4 s -> 0.57 s ready (speed review #2)
+  const reader: SwarmReader = new SwarmReader({ url: RELAY_URL, store, onChange: () => changed(), queueMs: 25 });
+  // 4 small REQs: 1.4 s -> 0.57 s ready (speed review #2). It scales with buyers (4 REQs each, 40/s): if there are
+  // ever hundreds, batch the profiles into one authors REQ instead (review of #1361, r5).
   const draw = () => {
     const status = reader.status;
     const ready = status.connected && status.historyComplete && !status.error;
@@ -303,7 +305,7 @@ function closeSwarm(fromHistory = false): void {
   const href = was.from?.getAttribute("href");
   const back = was.from?.isConnected ? was.from : href ? document.querySelector<HTMLElement>(`#swarm-list a.who[href="${CSS.escape(href)}"]`) : null;
   if (back) refocus(back);
-  if (sheet.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();   // no opener, or a hidden one   // opened from a link: nothing to go back to
+  if (sheet.contains(document.activeElement)) (document.activeElement as HTMLElement).blur();   // no opener (opened from a link), or a hidden one
   sheet.setAttribute("aria-hidden", "true");
   document.title = "Maxplayer - Swarm";
   if (!fromHistory) {

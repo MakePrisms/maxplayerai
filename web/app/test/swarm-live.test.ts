@@ -139,3 +139,12 @@ test('status word: authenticated or anonymous posture is Live; pending AUTH or a
   assert.equal(relayStatusWord(r),'Polling');
   assert.equal(relayStatusWord(undefined),'Polling');
 });
+
+// Speed review of #1361, #9 (and r5): live rows are rebuilt only when what they show changes.
+test('live seller rows are not rebuilt when nothing they show changed, and are when the minutes move',()=>{
+  const list=new Element(),summary=new Element();const doc={getElementById:(id:string)=>id==='swarm-sellers'?list:summary,createElement:()=>new Element(),createDocumentFragment:()=>new Element()};
+  renderSellers(doc as unknown as Document,s,2920);const first=list.children;
+  renderSellers(doc as unknown as Document,s,2925);assert.equal(list.children,first,'same second-of-minute text: untouched');
+  renderSellers(doc as unknown as Document,s,2990);assert.notEqual(list.children,first,'a minute on: rebuilt');
+  assert.equal(list.children[0]!.children[0]!.children[1]!.textContent,'33 / 60 min');
+});

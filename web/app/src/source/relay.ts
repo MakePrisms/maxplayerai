@@ -169,6 +169,10 @@ export function createRelaySource(
   let attempt = 0;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The poll in flight: its id, the mark it asked from, and how many events it brought. */
+  let pollSub: string | null = null;
+  let pollFrom: number | null = null;
+  let pollEvents = 0;
   let stopped = false;
   const closedByUs = new Set<string>();
 
@@ -212,6 +216,7 @@ export function createRelaySource(
     // No asks from a hidden tab (#9); the first poll after it is shown asks from the newest event seen, so nothing is missed.
     if (typeof document !== "undefined" && document.hidden) return;
     activeSub = `p${++subCounter}`;
+    pollSub = activeSub; pollFrom = newestSeen; pollEvents = 0;
     send(["REQ", activeSub, ...liveFilters(newestSeen == null ? now() : forwardSince(newestSeen))]);
   }
 
@@ -293,6 +298,18 @@ export function createRelaySource(
       closedByUs.add(activeSub);
       send(["CLOSE", activeSub]);
     }
+    // A poll is one unpaged ask. After a long hidden spell it can come back full (the relay's cap), newest first,
+    // and moving the mark past it would leave a hole the store then claims to be whole (review of #1361, r5 #2).
+    // So the mark goes back to where the poll asked from and a paged forward walk fills it, as after a reconnect.
+    if (subId === pollSub) {
+      const full = pollEvents >= PAGE_SIZE;
+      pollSub = null;
+      if (full) {
+        console.warn(`[relay] a poll came back full (${pollEvents} events); reading forward page by page`);
+        newestSeen = pollFrom;
+        connect();
+      }
+    }
   }
 
   function handleFrame(frame: unknown[]) {
@@ -300,6 +317,7 @@ export function createRelaySource(
     if (type === "EVENT") {
       const event = frame[2] as RawEvent | undefined;
       seenThisPage += 1;
+      if (pollSub !== null && frame[1] === pollSub) pollEvents += 1;
       if (event && (oldestSeen == null || event.created_at < oldestSeen)) oldestSeen = event.created_at;
       if (event && (newestSeen == null || event.created_at > newestSeen)) newestSeen = event.created_at;
       if (event) callbacks.onEvent(event);

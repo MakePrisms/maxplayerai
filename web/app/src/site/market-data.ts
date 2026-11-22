@@ -405,8 +405,8 @@ const isOpenEnded = (key: string) => (WINDOWS.find((w) => w.key === key)?.second
  * board counted up while it did (Bob, 2026-11-20: load in under 3 s, placeholders until it is complete, no jumps).
  *
  * Measured on 2026-11-20 against the production relay: it holds 18,143 market events, 23 MB,
- * and gives at most 1,000 per request; the source asks for 500 at a time, newest first, 37 requests one after the
- * other: 5.9 s of network alone. And the engine recomputed the whole market after every request (50 ms after the
+ * and gives at most 1,000 per request; the source asked for 500 at a time, newest first, 37 requests one after the
+ * other: 5.9 s of network alone. (Since 2026-11-21 it asks for 1,000, the relay's cap: about 20 requests.) And the engine recomputed the whole market after every request (50 ms after the
  * first event of each): 47 recomputes, about 7 s of the main thread in WebKit.
  *
  * So:
