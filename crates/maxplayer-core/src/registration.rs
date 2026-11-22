@@ -22,14 +22,14 @@ use sha2::{Digest, Sha256};
 
 /// Terms of Service version this build shows and accepts: its effective date (spec §7.1: one page
 /// per version; Bob, 29 Oct 2026: versions are dates, not v1/v2).
-pub const TERMS_VERSION: &str = "20261029";
+pub const TERMS_VERSION: &str = "20261123";
 /// Privacy Policy version shown when the email is asked for (spec §7.1, §3 step 1).
-pub const PRIVACY_VERSION: &str = "20261029";
+pub const PRIVACY_VERSION: &str = "20261123";
 /// Version of [`MARKETING_NOTICE`] (spec §8.1: the notice version shown is recorded).
 pub const MARKETING_NOTICE_VERSION: &str = "v1";
 /// The versioned pages the CLI links (the service also returns its own URLs on `link/request`).
-pub const TERMS_URL: &str = "https://www.maxplayer.ai/terms/20261029";
-pub const PRIVACY_URL: &str = "https://www.maxplayer.ai/privacy/20261029";
+pub const TERMS_URL: &str = "https://www.maxplayer.ai/terms/20261123";
+pub const PRIVACY_URL: &str = "https://www.maxplayer.ai/privacy/20261123";
 
 /// Spec §3 step 1: shown when the CLI asks for the email, or before it sends one given by flag.
 pub fn privacy_notice() -> String {
@@ -995,8 +995,10 @@ mod tests {
 
     #[test]
     fn notices_carry_the_versioned_links_and_the_off_switch() {
-        assert!(privacy_notice().contains("https://www.maxplayer.ai/privacy/20261029"));
+        assert!(privacy_notice().contains("https://www.maxplayer.ai/privacy/20261123"));
         assert!(MARKETING_NOTICE.contains("maxplayer account marketing off"));
-        assert_eq!(TERMS_URL, "https://www.maxplayer.ai/terms/20261029");
+        assert_eq!(TERMS_URL, "https://www.maxplayer.ai/terms/20261123");
+        assert_eq!((TERMS_VERSION, PRIVACY_VERSION), ("20261123", "20261123"));
+        assert!(PRIVACY_URL.ends_with(PRIVACY_VERSION) && TERMS_URL.ends_with(TERMS_VERSION));
     }
 }

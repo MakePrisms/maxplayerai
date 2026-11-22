@@ -808,16 +808,16 @@ mod interactive_tests {
         let (code, out, err) = drive(&fake, &keys, Opts::default(), stdin);
         assert_eq!(code, SUCCESS, "{out}\n{err}");
         assert!(
-            out.contains("https://www.maxplayer.ai/privacy/20261029"),
+            out.contains("https://www.maxplayer.ai/privacy/20261123"),
             "{out}"
         );
         assert!(out.contains("maxplayer account marketing off"), "{out}");
         assert!(
-            out.contains("accepts the Maxplayer Terms of Service, effective 20261029"),
+            out.contains("accepts the Maxplayer Terms of Service, effective 20261123"),
             "{out}"
         );
         assert!(
-            out.contains("https://www.maxplayer.ai/terms/20261029"),
+            out.contains("https://www.maxplayer.ai/terms/20261123"),
             "{out}"
         );
         assert!(

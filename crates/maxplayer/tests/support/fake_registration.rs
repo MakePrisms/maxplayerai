@@ -25,6 +25,8 @@ use serde_json::{Value, json};
 
 pub const MAX_ATTEMPTS: u32 = 5;
 pub const CODE_TTL_SECS: u64 = 600;
+/// The service's default `legal.terms_versions`/`privacy_versions` (maxplayer-registration config.rs).
+pub const OFFERED_VERSIONS: [&str; 2] = ["20261029", "20261123"];
 
 #[derive(Debug, Clone)]
 pub struct Pending {
@@ -34,6 +36,8 @@ pub struct Pending {
     pub attempts: u32,
     pub expires_at: u64,
     pub created_at: u64,
+    pub terms_version: String,
+    pub privacy_version: String,
 }
 
 #[derive(Debug, Clone)]
@@ -431,10 +435,10 @@ fn link_request(state: &mut State, pk: &str, body: &Value) -> Answer {
             "label must be 1-64 letters, digits, spaces, '.', '_' or '-'",
         );
     }
-    if terms != "20261029" {
+    if !OFFERED_VERSIONS.contains(&terms.as_str()) {
         return fail(400, "unknown_terms_version", "terms version is not offered");
     }
-    if privacy != "20261029" {
+    if !OFFERED_VERSIONS.contains(&privacy.as_str()) {
         return fail(
             400,
             "unknown_privacy_version",
@@ -478,16 +482,19 @@ fn link_request(state: &mut State, pk: &str, body: &Value) -> Answer {
             attempts: 0,
             expires_at: t + CODE_TTL_SECS,
             created_at: t,
+            terms_version: terms.clone(),
+            privacy_version: privacy.clone(),
         },
     );
+    let (terms_url, privacy_url) = (terms, privacy);
     ok(
         202,
         json!({
             "status": "code_sent",
             "expires_in_secs": CODE_TTL_SECS,
             "max_attempts": MAX_ATTEMPTS,
-            "terms_url": "https://www.maxplayer.ai/terms/20261029",
-            "privacy_url": "https://www.maxplayer.ai/privacy/20261029",
+            "terms_url": format!("https://www.maxplayer.ai/terms/{terms_url}"),
+            "privacy_url": format!("https://www.maxplayer.ai/privacy/{privacy_url}"),
         }),
     )
 }
@@ -559,8 +566,8 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             email: pending.email.clone(),
             label: pending.label.clone(),
             entered_by: entered_by.to_owned(),
-            terms_version: "20261029".into(),
-            privacy_version: "20261029".into(),
+            terms_version: pending.terms_version.clone(),
+            privacy_version: pending.privacy_version.clone(),
             notice_version: "v1".into(),
         },
     );
@@ -572,8 +579,8 @@ fn link_confirm(state: &mut State, pk: &str, body: &Value) -> Answer {
             "first_link": first_link,
             "email": pending.email,
             "label": pending.label,
-            "terms_version": "20261029",
-            "privacy_version": "20261029",
+            "terms_version": pending.terms_version,
+            "privacy_version": pending.privacy_version,
             "relay_member": state.relay_member,
             "marketing": if subscribed { "subscribed" } else { "unsubscribed" },
         }),
