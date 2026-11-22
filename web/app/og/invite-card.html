@@ -1,0 +1,42 @@
+<!doctype html>
+<!--
+  Link-preview card for team join links (/join/<token>), 1200×630.
+  Source of public/og/invite-card.png — re-render with `npm run og`
+  (scripts/render-og.mjs, headless Chrome); edit here, never the PNG.
+  Teams-site look (public/site.css): palette, Instrument Sans, the mark and
+  wordmark, the warm glow, and the agent marks scattered at different depths
+  like the homepage hero (a nearer mark is larger and clearer, a farther one
+  smaller, fainter and softer). Muse is the sharp one, faded back a little
+  (Bob, 2026-11-22). Local file only: inline style attributes are fine here.
+-->
+<html lang="en"><head><meta charset="utf-8" />
+<link rel="stylesheet" href="../public/fonts.css" />
+<style>
+:root { --bg:#1a1a1a; --sans:"Instrument Sans","Helvetica Neue",Helvetica,Arial,sans-serif; }
+html, body { margin:0; width: 1200px; height: 630px; overflow:hidden; background:var(--bg); }
+.card { position:relative; width:1200px; height:630px; overflow:hidden; color:#fff; font-family:var(--sans); -webkit-font-smoothing:antialiased; }
+.m { position:absolute; left:calc(var(--x)*1px); top:calc(var(--y)*1px); width:calc(var(--s)*1px); height:calc(var(--s)*1px);
+  margin:calc(var(--s)*-.5px) 0 0 calc(var(--s)*-.5px); border-radius:50%; overflow:hidden; background-color:#fff;
+  background-repeat:no-repeat; background-position:center; opacity:var(--a); filter:blur(calc(var(--bl)*1px)) saturate(.75); }
+.m svg { width:100%; height:100%; display:block; }
+.av-muse { background-color:#f5f4f6; background-image:url("../public/assets/muse.jpg"); background-size:cover; }
+.av-inst { background-image:url("../public/assets/instinct.png"); background-size:auto 62%; }
+.av-codex { background-color:#f5f5f5; background-image:url("../public/assets/agents/codex.webp"); background-size:92%; }
+.av-dots { background-color:#f7f7f8; background-image:url("../public/assets/agents/dots.webp"); background-size:80%; background-position:50% 54%; }
+.av-duet { background-color:#f8f6f1; background-image:url("../public/assets/agents/duet.webp"); background-size:112%; }
+.av-hermes { background-image:url("../public/assets/agents/hermes.webp"); background-size:112%; }
+.av-openclaw { background-image:url("../public/assets/agents/openclaw.svg"); background-size:66%; }
+.av-claude { background-color:#faf9f5; background-image:url("../public/assets/agents/claude-code.svg"); background-size:58%; }
+.glow { position:absolute; left:500px;top:-20px;width:800px;height:640px;opacity:.55; border-radius:50%; filter:blur(96px);
+  background:radial-gradient(300px 280px at 30% 30%,#ff2800 0,transparent 70%),radial-gradient(330px 320px at 78% 46%,#ff8a1c 0,transparent 70%),radial-gradient(380px 340px at 44% 88%,#ffdf00 0,transparent 70%); }
+.m.lit { z-index:2; filter:none; overflow:visible; }
+.bloom { position:absolute; z-index:1; border-radius:50%; background:radial-gradient(closest-side,rgba(255,228,160,.55) 0,rgba(255,226,155,.5) 85%,rgba(255,204,110,.2) 92%,rgba(255,190,80,0) 100%); }
+.logo { position:absolute; z-index:3; left:72px; top:48px; white-space:nowrap; font-size:44px; line-height:1.6; }
+.logo svg { display:inline-block; vertical-align:baseline; overflow:visible; height:.724em; width:1.066em; margin-right:.32em; }
+.wm { display:inline-block; font-family:"Work Sans Logo",var(--sans); font-size:1.091em; font-style:italic; font-weight:500; letter-spacing:.1em; text-transform:uppercase; color:#f4f4f1; }
+h1 { position:absolute; z-index:3; left:68px; top:50%; transform:translateY(-40%); margin:0; text-align:left; font-weight:500; font-size:78px; line-height:1.1; letter-spacing:-.025em; }
+</style></head><body><div class="card">
+<div class="m av-codex" style="--x:1150;--y:78;--s:30;--a:0.21;--bl:2.2"></div><div class="m av-dots" style="--x:1010;--y:585;--s:30;--a:0.21;--bl:2.2"></div><div class="m av-claude" style="--x:850;--y:92;--s:28;--a:0.2;--bl:2.2"></div><div class="m av-duet" style="--x:870;--y:560;--s:26;--a:0.17;--bl:2.4"></div><div class="m av-hermes" style="--x:1170;--y:430;--s:26;--a:0.17;--bl:2.4"></div><div class="m" style="--x:770;--y:575;--s:22;--a:0.14;--bl:2.8"><svg viewBox="0 0 26 26"><circle cx="13" cy="13" r="13" fill="#fff"/><g fill="#0b0b0b" transform="translate(-2.9 2.1)"><rect x="12.5" y="6.3" width="2.6" height="6.2" rx="1.3" transform="rotate(-37 13.8 9.4)"/><rect x="19" y="3.7" width="2.6" height="6.2" rx="1.3" transform="rotate(-37 20.3 6.8)"/></g></svg></div><div class="m av-openclaw" style="--x:1050;--y:245;--s:24;--a:0.15;--bl:2.6"></div><div class="m av-openclaw" style="--x:1010;--y:125;--s:52;--a:0.42;--bl:1.2000000000000002"></div><div class="m av-hermes" style="--x:965;--y:480;--s:54;--a:0.42;--bl:1.2000000000000002"></div><div class="m av-claude" style="--x:1115;--y:525;--s:48;--a:0.39;--bl:1.4"></div><div class="m av-duet" style="--x:1115;--y:175;--s:46;--a:0.35;--bl:1.4"></div><div class="m av-dots" style="--x:800;--y:255;--s:44;--a:0.35;--bl:1.4"></div><div class="m" style="--x:1080;--y:340;--s:76;--a:0.63;--bl:0.4"><svg viewBox="0 0 26 26"><circle cx="13" cy="13" r="13" fill="#fff"/><g fill="#0b0b0b" transform="translate(-2.9 2.1)"><rect x="12.5" y="6.3" width="2.6" height="6.2" rx="1.3" transform="rotate(-37 13.8 9.4)"/><rect x="19" y="3.7" width="2.6" height="6.2" rx="1.3" transform="rotate(-37 20.3 6.8)"/></g></svg></div><div class="m av-codex" style="--x:840;--y:415;--s:70;--a:0.59;--bl:0.4"></div>
+<div class="glow"></div><div class="m av-muse" style="--x:905;--y:215;--s:96;--a:0.72;--bl:0"></div>
+<div class="logo"><svg viewBox="2.75 7 26.5 18" aria-hidden="true"><path d="M7.25 7 H15.25 L10.75 25 H2.75 Z" fill="#ff2800"/><path d="M18.75 7 H23.25 L18.75 25 H14.25 Z" fill="#ffdf00"/><path d="M26.75 7 H29.25 L24.75 25 H22.25 Z" fill="#ffdf00"/></svg><span class="wm">Maxplayer</span></div>
+<h1>You’re invited<br />to a Maxplayer<br />team</h1></div></body></html>

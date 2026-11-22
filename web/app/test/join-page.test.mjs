@@ -13,8 +13,13 @@ const page = readFileSync(join(root, "public", "join.md"), "utf8");
 
 test("every /join/<token> serves the one static page as plain text, unindexed", () => {
   assert.deepEqual(
-    vercel.rewrites.filter((r) => r.source.startsWith("/join")),
+    vercel.rewrites.filter((r) => r.source.startsWith("/join") && !r.has),
     [{ source: "/join/:token", destination: "/join.md" }],
+  );
+  // The only other /join rule sends link-preview bots to /join-preview (og.test.mjs).
+  assert.deepEqual(
+    vercel.rewrites.filter((r) => r.source.startsWith("/join") && r.has).map((r) => r.destination),
+    ["/join-preview"],
   );
   const headers = Object.fromEntries(
     vercel.headers.find((h) => h.source === "/join/:token").headers.map((h) => [h.key, h.value]),

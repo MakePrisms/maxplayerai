@@ -3,6 +3,7 @@
  * og/ with headless Chrome, so the images are reproducible from source:
  *
  *   og/card.html → public/og/maxplayer-card.png   (1200×630, og:image / twitter:image)
+ *   og/invite-card.html → public/og/invite-card.png (1200×630, the /join/<token> bot preview)
  *   og/icon.html → public/favicon-32.png, public/favicon-192.png (transparent)
  *                  public/apple-touch-icon.png     (180×180, solid background)
  *
@@ -21,7 +22,12 @@ import { dirname, extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const TYPES = { ".html": "text/html", ".css": "text/css", ".woff2": "font/woff2" };
+// Images too: the invite card's agent marks are CSS backgrounds, and Chrome will not draw an SVG
+// served as application/octet-stream.
+const TYPES = {
+  ".html": "text/html", ".css": "text/css", ".woff2": "font/woff2",
+  ".png": "image/png", ".jpg": "image/jpeg", ".webp": "image/webp", ".svg": "image/svg+xml",
+};
 
 const server = createServer((req, res) => {
   const path = normalize(decodeURIComponent(new URL(req.url, "http://x").pathname)).replace(/^\/+/, "");
@@ -61,6 +67,7 @@ async function shot(url, out, w, h, transparent) {
 
 try {
   await shot("og/card.html", "public/og/maxplayer-card.png", 1200, 630, false);
+  await shot("og/invite-card.html", "public/og/invite-card.png", 1200, 630, false);
   await shot("og/icon.html?size=32", "public/favicon-32.png", 32, 32, true);
   await shot("og/icon.html?size=192", "public/favicon-192.png", 192, 192, true);
   await shot("og/icon.html?size=180&bg=1", "public/apple-touch-icon.png", 180, 180, false);
