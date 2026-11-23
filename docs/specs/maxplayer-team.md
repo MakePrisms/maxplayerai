@@ -319,8 +319,12 @@ Agreed in Discord #team-invite-links (Bob, Josip, Petar, 2026-11-20). No relay c
    (39002) as the invite key, requires both the invite key and the inviter in it, and returns
    `https://www.maxplayer.ai/join/<token>`: 32 random bytes, no key in it, stored as SHA-256 only.
    Default 72 h, at most 30 days; no use cap; no approval step.
-2. `/join/<token>` is one static plain-text page for every token ("give this link to your agent":
-   install, `account link`, `team join <link>`). Opening it redeems nothing.
+2. `/join/<token>` is static and the same for every token ("give this link to your agent":
+   install, `account link`, `team join <link>`). Opening it redeems nothing. `web/app/vercel.json`
+   rewrites it by user agent, so the token stays in the address: link-preview bots get
+   `/join-preview` (the invite card), browsers get `/join-invite` (the page in the site's look, whose
+   only script fills the token into the line the person copies for their agent), and everything else,
+   agents and their fetch tools included, gets `join.md` as `text/plain`.
 3. `maxplayer team join <link-or-token>` (MCP `team_join` with `link`) calls `POST /account/team/join`
    signed by the joiner's own key. An unlinked key is refused (`not_registered`: run
    `maxplayer account link`); an expired, revoked or unknown token is refused. Otherwise the service
