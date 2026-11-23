@@ -1636,8 +1636,10 @@ Lines worth knowing when something is slow:
 | `RELAY-STALL recovery SUCCEEDED (attempts=…, recovery=Ns, outage=Ns since last confirmation)` | `recovery` is how long the reconnect took; `outage` is how long the relay had gone unconfirmed. |
 | `shutdown: abandoned in-flight work after Ns` | Stopping did not wait for slow relay work. Nothing is lost: pending publications are retried and jobs are resumed on the next start. An `INCIDENT` suffix means a payment redeem was still running after 60 s; the next start re-checks it. |
 
-Routine no-ops (a re-seen offer already claimed, a duplicate award) are hidden by default. Set
-`MAXPLAYER_VERBOSE=1` in the daemon's environment to see them. Nothing that reports a state change
+Routine no-ops (a re-seen offer already claimed, a duplicate award, awards and acceptances for
+other sellers' jobs, lapsed offers replayed by backfill, a relay `CLOSED` for a subscription that is
+not ours) are hidden by default; the status tick prints one `seller node routine (since last
+status): …` line counting them. Set `MAXPLAYER_VERBOSE=1` in the daemon's environment to see each one. Nothing that reports a state change
 or a failure is behind that flag — you never have to enable it to see something go wrong.
 
 Optional: BYO delivery + custom agent (power-user hatch):

@@ -798,6 +798,61 @@ impl FedUnderRateOffersInner {
     }
 }
 
+/// Routine no-ops the seat counts instead of printing one line each.
+///
+/// After a reconnect the backfill replays the relay's recent history, and an open-pool seat sees
+/// every other seller's awards, acceptances and lapsed offers in it: hundreds of lines in one
+/// second, none of which needs an operator. Each still prints in full under `MAXPLAYER_VERBOSE`;
+/// by default they are only counted, and the status tick prints one summary line so the operator
+/// can still see that they happened. Nothing that reports a state change of OUR work or a failure
+/// goes through here.
+#[derive(Default)]
+struct QuietTally {
+    /// An award or acceptance for an offer this seat never recorded (another seller's job).
+    not_ours: std::sync::atomic::AtomicU64,
+    /// An acceptance (pay-bind) for a job whose award already bound it here.
+    already_awarded: std::sync::atomic::AtomicU64,
+    /// An offer skipped because its deadline passed or it was authored too long ago.
+    stale_offers: std::sync::atomic::AtomicU64,
+    /// A relay CLOSED for a subscription id this seat never registered.
+    unknown_closes: std::sync::atomic::AtomicU64,
+    /// A follow-up for a session that already ended.
+    ended_followups: std::sync::atomic::AtomicU64,
+}
+
+impl QuietTally {
+    fn bump(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The summary of everything counted since the last call, resetting the counts. `None` when
+    /// nothing was counted, so an idle seat prints nothing extra.
+    fn take_summary(&self) -> Option<String> {
+        let take = |counter: &std::sync::atomic::AtomicU64| {
+            counter.swap(0, std::sync::atomic::Ordering::Relaxed)
+        };
+        let parts: Vec<String> = [
+            (take(&self.not_ours), "award/accept for other sellers' jobs"),
+            (take(&self.already_awarded), "pay-bind for jobs already awarded here"),
+            (take(&self.stale_offers), "lapsed or aged offers skipped"),
+            (take(&self.unknown_closes), "relay CLOSED for subscriptions not ours"),
+            (take(&self.ended_followups), "follow-ups to ended sessions"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, what)| format!("{count} {what}"))
+        .collect();
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "seller node routine (since last status): {} — set {}=1 to print each",
+            parts.join(", "),
+            crate::oplog::VERBOSE_ENV
+        ))
+    }
+}
+
 impl FedUnderRateOffers {
     fn new(cap: usize) -> Self {
         Self {
@@ -4927,6 +4982,8 @@ pub struct SellerNodeRunner {
     /// every pass. Feedback-only wire-noise dedup — never consulted on the claim/money path. See
     /// [`FedUnderRateOffers`].
     fed_under_rate_offers: FedUnderRateOffers,
+    /// Routine no-ops counted instead of printed (see [`QuietTally`]).
+    quiet: QuietTally,
     /// #747: how this node is asked to leave the selling role, so it can publish its terminal
     /// `accepting=n` beat before exiting. See [`shutdown`] and [`Self::shutdown_handle`].
     shutdown: shutdown::ShutdownChannel,
@@ -5415,6 +5472,7 @@ impl SellerNodeRunner {
             runsc_gate: std::sync::Mutex::new(runsc_gate),
             terminal_offers: TerminalOffers::new(TERMINAL_OFFERS_CAP, TERMINAL_AUTHORS_PER_OFFER),
             fed_under_rate_offers: FedUnderRateOffers::new(FED_UNDER_RATE_OFFERS_CAP),
+            quiet: QuietTally::default(),
             shutdown: shutdown::ShutdownChannel::new(),
             drain: shutdown::DrainSignal::new(),
             wrap_backfill_interval_secs: resolve_wrap_backfill_interval_secs(),
@@ -6705,6 +6763,9 @@ impl SellerNodeRunner {
                         ),
                         drain_left,
                     );
+                    if let Some(summary) = self.quiet.take_summary() {
+                        opline!("{summary}");
+                    }
                     // Wraps then offers (#560), on the lane, on this owned cadence — a recovery leg
                     // must not depend on a tick config can disable.
                     queue.request_backfill();
@@ -6910,10 +6971,17 @@ impl SellerNodeRunner {
                         }) => {
                             let id = subscription_id.to_string();
                             let label = subscription_label(&id);
-                            opline!(
-                                "seller node RELAY-CLOSED: relay closed the {label} subscription \
-                                 (id={id}): {reason}"
-                            );
+                            if is_our_subscription(&id) {
+                                opline!(
+                                    "seller node RELAY-CLOSED: relay closed the {label} subscription \
+                                     (id={id}): {reason}"
+                                );
+                            } else {
+                                opline_verbose!(
+                                    "seller node RELAY-CLOSED: relay closed the {label} subscription \
+                                     (id={id}): {reason}"
+                                );
+                            }
 
                             // An id we never registered cannot be a leg of ours going deaf, so it
                             // must not cost a reconnect — and escalating it did exactly that. Field
@@ -6929,7 +6997,11 @@ impl SellerNodeRunner {
                             // re-challenge sweep closing auth-scoped subs from the pre-expiry
                             // generation.
                             if !is_our_subscription(&id) {
-                                opline!(
+                                // Not a leg of ours, so nothing for the operator to do: counted
+                                // for the status summary, printed in full under MAXPLAYER_VERBOSE
+                                // for the relay owner who needs the two ages.
+                                QuietTally::bump(&self.quiet.unknown_closes);
+                                opline_verbose!(
                                     "{}",
                                     unknown_close_diagnostic(
                                         &id,
@@ -8075,6 +8147,12 @@ impl SellerNodeRunner {
                         skip.reason(),
                         buyer_pubkey
                     ),
+                    // Backfill replays every expired offer on the relay; those are counted, not
+                    // printed (see `QuietTally`).
+                    SkipReason::Lapsed | SkipReason::TooOld => {
+                        QuietTally::bump(&self.quiet.stale_offers);
+                        opline_verbose!("seller node offer skip id={}: {}", event.id, skip.reason());
+                    }
                     _ => opline!("seller node offer skip id={}: {}", event.id, skip.reason()),
                 }
                 // Buyer-visibility: a TARGETED-to-self under-rate refusal also emits a feedback-kind
@@ -8730,7 +8808,8 @@ impl SellerNodeRunner {
         let buyer = match self.node.store().offer_facts(&job_id) {
             Ok(Some((buyer, _, _))) => buyer,
             Ok(None) => {
-                opline!("seller node accept ignore job_id={job_id}: no offer of ours recorded");
+                QuietTally::bump(&self.quiet.not_ours);
+                opline_verbose!("seller node accept ignore job_id={job_id}: no offer of ours recorded");
                 return;
             }
             Err(error) => {
@@ -8767,7 +8846,8 @@ impl SellerNodeRunner {
             // The overwhelmingly common case: the AWARD already bound this job. The ACCEPT is
             // information, not instruction — record nothing, run nothing.
             Ok(Some(_)) => {
-                opline!(
+                QuietTally::bump(&self.quiet.already_awarded);
+                opline_verbose!(
                     "seller node accept job_id={job_id} buyer={buyer}: pay-bind observed (already awarded — no action)"
                 );
             }
@@ -9020,7 +9100,8 @@ impl SellerNodeRunner {
         let buyer = match self.node.store().offer_facts(&job_id) {
             Ok(Some((buyer, _, _))) => buyer,
             Ok(None) => {
-                opline!("seller node award ignore job_id={job_id}: no offer of ours recorded");
+                QuietTally::bump(&self.quiet.not_ours);
+                opline_verbose!("seller node award ignore job_id={job_id}: no offer of ours recorded");
                 return;
             }
             Err(error) => {
@@ -19131,6 +19212,69 @@ mod tests {
         f.record("offerX");
         assert_eq!(f.len(), 1, "one id however many re-ingests");
         assert!(f.contains("offerX"));
+    }
+
+    /// An idle seat prints no summary; a busy one prints one line naming only the non-zero counts,
+    /// and the counts reset so the next status tick reports only what happened since.
+    #[test]
+    fn quiet_tally_summarises_then_resets() {
+        let tally = QuietTally::default();
+        assert_eq!(tally.take_summary(), None, "nothing counted, nothing printed");
+
+        for _ in 0..3 {
+            QuietTally::bump(&tally.not_ours);
+        }
+        QuietTally::bump(&tally.stale_offers);
+        let summary = tally.take_summary().expect("counted events produce a summary");
+        assert!(summary.starts_with("seller node routine (since last status): "), "{summary}");
+        assert!(summary.contains("3 award/accept for other sellers' jobs"), "{summary}");
+        assert!(summary.contains("1 lapsed or aged offers skipped"), "{summary}");
+        assert!(!summary.contains("pay-bind"), "zero counts stay out of the line: {summary}");
+        assert!(summary.contains("MAXPLAYER_VERBOSE=1"), "names the knob: {summary}");
+
+        assert_eq!(tally.take_summary(), None, "counts reset after each summary");
+    }
+
+    /// An award or acceptance for an offer this seat never recorded (another seller's job, replayed
+    /// by backfill) is counted for the summary instead of printed one line each.
+    ///
+    /// RED ON REVERT: drop either `QuietTally::bump(&self.quiet.not_ours)` in `on_accept` /
+    /// `on_award` and the count stays short.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_sellers_awards_and_accepts_are_counted_not_printed() {
+        use nostr_relay_builder::prelude::{LocalRelay, RelayBuilder};
+
+        let relay = LocalRelay::new(RelayBuilder::default());
+        relay.run().await.expect("relay run");
+        let relay_url = relay.url().await.to_string();
+        let (runner, root) =
+            boot_capacity_skip_seller("quiet-not-ours", &relay_url, true, 0, None).await;
+        let runner = Arc::new(runner);
+
+        let buyer = Keys::generate();
+        let other_seller = Keys::generate().public_key().to_hex();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for offer in ["0".repeat(64), "1".repeat(64)] {
+                    runner
+                        .on_award(&award_event(&offer, "their-claim", &buyer, &other_seller, &buyer))
+                        .await;
+                    runner
+                        .on_accept(&accept_event(&offer, "their-claim", &buyer, &other_seller, &buyer))
+                        .await;
+                }
+            })
+            .await;
+
+        assert_eq!(
+            runner.quiet.not_ours.load(std::sync::atomic::Ordering::Relaxed),
+            4,
+            "two awards and two acceptances for offers we never recorded"
+        );
+        let summary = runner.quiet.take_summary().expect("summary");
+        assert!(summary.contains("4 award/accept for other sellers' jobs"), "{summary}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A targeted (non-open-pool) seller wired to `relay_url` with a controllable `rate_sats`, so a

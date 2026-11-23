@@ -250,7 +250,13 @@ impl SellerNodeRunner {
             record.turn,
             record.state.is_live(),
         ) {
-            opline!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
+            if why == session::Ignore::SessionEnded {
+                // Routine after a session closes (relay replays): counted, not printed.
+                super::QuietTally::bump(&self.quiet.ended_followups);
+                opline_verbose!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
+            } else {
+                opline!("seller node follow-up ignore id={fid} job_id={job_id}: {why:?}");
+            }
             // An ended session answers each follow-up for a turn it never reached once, ever
             // (#1203). The marker is written only after the refusal is out (or, private, durably
             // queued), so a failed publish is retried by the next replay instead of silencing it.
